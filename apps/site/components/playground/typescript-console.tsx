@@ -18,7 +18,8 @@ import { retailSchema } from "@/lib/dataset/retail";
 import { SETUP_SNIPPET, playgroundDeclarations } from "./declarations";
 import { compile, loadMonaco, type Monaco } from "./monaco";
 import { Output } from "./output";
-import { runSnippet, type RunResult } from "./run";
+import { runSnippet, unsupportedRuntimeImports, type RunResult } from "./run";
+import { PLAYGROUND_RUNTIME_MODULES, type PlaygroundRuntimeModule } from "./runtime-modules";
 import { defaultSnippet, snippets } from "./snippets";
 
 const STORAGE_KEY = "minnow-playground-typescript";
@@ -70,10 +71,26 @@ export function TypeScriptConsole({
       }
       setStatus({ kind: "ready" });
 
-      const [{ createKysely }, kysely, core] = await Promise.all([
+      const unsupported = unsupportedRuntimeImports(
+        compiled.javascript,
+        PLAYGROUND_RUNTIME_MODULES,
+      );
+      if (unsupported.length > 0) {
+        setStatus({
+          kind: "rejected",
+          errors: unsupported.map(
+            (specifier) =>
+              `The console can type-check declarations from ${specifier}, but cannot execute that module.`,
+          ),
+        });
+        return;
+      }
+
+      const [{ createKysely, search }, kysely, core, coreClient] = await Promise.all([
         import("@minnowdb/kysely"),
         import("kysely"),
         import("@minnowdb/core"),
+        import("@minnowdb/core/client"),
       ]);
       const db = createKysely({
         driver: database.current,
@@ -82,10 +99,11 @@ export function TypeScriptConsole({
       setResult(
         await runSnippet(compiled.javascript, {
           modules: {
-            "@minnowdb/kysely": { createKysely },
+            "@minnowdb/kysely": { createKysely, search },
             kysely: { sql: kysely.sql },
             "@minnowdb/core": core,
-          },
+            "@minnowdb/core/client": coreClient,
+          } satisfies Record<PlaygroundRuntimeModule, unknown>,
           globals: { db, database: database.current },
         }),
       );

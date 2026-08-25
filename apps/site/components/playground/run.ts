@@ -13,6 +13,25 @@
 
 /** The forms TypeScript emits for an `import`, in the order they have to be matched. */
 const IMPORT = /^[ \t]*import(?:\s+([\s\S]*?)\s+from)?\s*(['"])([^'"]+)\2\s*;?[ \t]*$/gm;
+const DYNAMIC_IMPORT = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
+const REEXPORT = /^[ \t]*export\s+(?:\*|\{[\s\S]*?\})\s+from\s*(['"])([^'"]+)\1\s*;?[ \t]*$/gm;
+
+/** Runtime imports left after TypeScript erases `import type`, outside the page's module registry. */
+export function unsupportedRuntimeImports(compiled: string, allowed: readonly string[]): string[] {
+  const accepted = new Set(allowed);
+  const unsupported = new Set<string>();
+  for (const match of compiled.matchAll(new RegExp(IMPORT.source, IMPORT.flags))) {
+    const specifier = match[3];
+    if (specifier !== undefined && !accepted.has(specifier)) unsupported.add(specifier);
+  }
+  for (const pattern of [DYNAMIC_IMPORT, REEXPORT]) {
+    for (const match of compiled.matchAll(new RegExp(pattern.source, pattern.flags))) {
+      const specifier = match[2];
+      if (specifier !== undefined && !accepted.has(specifier)) unsupported.add(specifier);
+    }
+  }
+  return [...unsupported].sort();
+}
 
 /**
  * Rewrites a compiled module into the body of an async function.

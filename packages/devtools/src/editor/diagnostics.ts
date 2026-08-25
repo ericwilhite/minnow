@@ -1,5 +1,6 @@
 import matrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
-import { SqlCompileError, compileStatement } from "@minnowdb/core";
+import { SqlCompileError } from "@minnowdb/core";
+import { compileStatement } from "@minnowdb/core/query";
 import { buildFailureIndex, describeUnsupported, lookupFailure } from "../sql/feature-matrix.js";
 
 /**

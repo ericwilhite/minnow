@@ -56,6 +56,42 @@ Interpolating values produces a new statement string every time and throws that 
 A statement's placeholders must all be bound: passing too few or too many is an error, not a
 silently-null column.
 
+## Fixed compilation and value limits
+
+SQL compilation happens before a query has an execution-memory account, and scalar functions can
+allocate before a sort or join gets a chance to spill. Minnow therefore refuses these inputs at a
+fixed boundary:
+
+| Input                                         |                                                                 Limit |
+| --------------------------------------------- | --------------------------------------------------------------------: |
+| SQL text                                      |                                                  1,048,576 characters |
+| Tokens in one statement                       |                                                                 4,096 |
+| Nested SQL syntax                             |                                                            128 levels |
+| Parameter positions                           |                                                                 4,096 |
+| `LIKE` / `SIMILAR TO` / full-text search text |                                                     16,384 characters |
+| Work in one `LIKE` / `SIMILAR TO` match       |                                         8,388,608 deterministic steps |
+| A NUMERIC input significand or precision      |                                                        100,000 digits |
+| A string created by a scalar function         |                                                  1,048,576 characters |
+| A JSON, JSONB, or ARRAY value                 | 65,536 values and names, 128 levels, and 1,048,576 encoded characters |
+| A value tokenized for full-text search        |                                                     16,384 characters |
+
+These are safety limits, not cache tuning. Inputs are checked before tokenization, structural pattern
+compilation, JSON parsing, padding, or other expanding work. Pattern matching uses a glob walker or
+Thompson NFA instead of an attacker-controlled host regular expression and charges every transition
+against the fixed work ceiling. Plain selection and cursor streaming do not apply the scalar-result
+limit to an existing stored string. All accepted SQL, pattern, JSON, and full-text strings must also
+be well-formed Unicode; an unpaired UTF-16 surrogate is rejected instead of being silently replaced
+during UTF-8 persistence.
+
+The corresponding `MAX_SQL_*` constants are exported from `@minnowdb/core` so an application can
+validate editor or API input without copying the numbers.
+
+Compilation cannot create lifetime growth either. The plan and statement caches each retain at
+most 512 entries per database, and catalog-state, pattern, full-text-term, collation, and compiled-check
+caches have smaller fixed entry or byte ceilings. Accepted SQL or constraint text longer than
+16,384 characters is compiled normally but not cached. Closing the database clears its
+per-database resident caches; process-global helper caches remain within their fixed bounds.
+
 ## Writing
 
 `execute` returns a tagged union, so the result tells you what the statement did:
@@ -84,7 +120,7 @@ the statement had a `RETURNING` clause.
 When the same statement runs in a loop, compile it once and skip even the plan-cache lookup:
 
 ```ts
-import { bindStatementParameters, compileStatement } from "@minnowdb/core";
+import { bindStatementParameters, compileStatement } from "@minnowdb/core/query";
 
 const statement = compileStatement("INSERT INTO events (id, kind) VALUES ($1, $2)");
 for (const event of batch) {

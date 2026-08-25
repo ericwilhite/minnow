@@ -28,6 +28,13 @@ const output = path.join(here, "../public/playground-types.json");
 
 /** The packages a snippet in the console may import from. */
 const PACKAGES = ["@minnowdb/core", "@minnowdb/kysely", "kysely"];
+/** Must match `components/playground/runtime-modules.ts`; a test ratchets the generated result. */
+const RUNTIME_IMPORTS = new Set([
+  "@minnowdb/core",
+  "@minnowdb/core/client",
+  "@minnowdb/kysely",
+  "kysely",
+]);
 
 /** Where the editor is told each package lives; matches what a real `node_modules` would hold. */
 const root = (name) => `file:///node_modules/${name}`;
@@ -96,7 +103,10 @@ if (missing.length > 0) {
 }
 
 await mkdir(path.dirname(output), { recursive: true });
-await writeFile(output, JSON.stringify({ paths, files }));
+await writeFile(
+  output,
+  JSON.stringify({ paths, files, runtimeModules: [...RUNTIME_IMPORTS].sort() }),
+);
 
 const bytes = Object.values(files).reduce((total, source) => total + source.length, 0);
 console.log(

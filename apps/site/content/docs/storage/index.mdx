@@ -7,16 +7,21 @@ A database is an engine plus a store. The engine decides what to write; the stor
 goes. Minnow includes three adapters, all using the same `BlockStore` interface, so swapping one
 for another changes nothing else about your code.
 
-| Adapter                                          | Import                   | Survives a reload | Use it for                                         |
-| ------------------------------------------------ | ------------------------ | ----------------- | -------------------------------------------------- |
-| [`IndexedDbBlockStore`](/docs/storage/indexeddb) | `@minnowdb/core/storage` | Yes               | Applications.                                      |
-| [`OpfsBlockStore`](/docs/storage/opfs)           | `@minnowdb/core/storage` | Yes               | Applications, where OPFS exists (worker required). |
-| [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage` | No                | Tests, scratch work, throwaway analysis.           |
+| Adapter                                          | Import                             | Survives a reload | Use it for                                         |
+| ------------------------------------------------ | ---------------------------------- | ----------------- | -------------------------------------------------- |
+| [`IndexedDbBlockStore`](/docs/storage/indexeddb) | `@minnowdb/core/storage/indexeddb` | Yes               | Applications.                                      |
+| [`OpfsBlockStore`](/docs/storage/opfs)           | `@minnowdb/core/storage/opfs`      | Yes               | Applications, where OPFS exists (worker required). |
+| [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage/memory`    | No                | Tests, scratch work, throwaway analysis.           |
 
 The two durable adapters hold the same block format, and a [snapshot](/docs/storage/snapshots)
 moves a database between them. OPFS is usually faster for small reads and writes; use the
 [benchmarks page](/benchmarks) to measure both in your browser. Where OPFS is unavailable — notably
 Safari private browsing — use IndexedDB, which remains the default.
+
+Both durable adapters default to strict per-commit flushing. Browser quota eviction is a separate
+origin-level decision: call `ensureOriginPersistence("required")` before opening a store when the
+application cannot safely recreate its local data, and keep an export or remote copy when the user
+must not be the only person capable of deleting it.
 
 ## What a store holds
 
@@ -24,17 +29,26 @@ Not rows. The engine hands the store immutable, compressed, self-describing **bl
 column's values for one row group — plus the records that say which blocks are live:
 
 - **Blocks** — the data, keyed by an immutable id.
-- **Manifests** — which block ids are live at each version. Publishing a manifest is what makes a
-  commit visible.
+- **Manifest summaries and membership provenance** — one bounded summary per version plus the
+  ordered add/remove interval for each block. Publishing the next summary and its membership
+  changes is what makes a commit visible; no commit clones the complete live block-ID set.
 - **Segments** — which blocks belong to which table, and which row ids they cover.
 - **Transactions** — the commit each segment belongs to, which is how visibility resolves.
 - **Catalog** — tables, columns, counters, unique-key membership, full-text index state.
 - **Leases, temp pages, and job records** — reader pins, query spill, and the cursors that let
   compaction and collection resume.
 
-Because published blocks are immutable and a version is just a set of block ids, a reader can hold
-a version open while writers keep committing. That is the whole concurrency story, and it is a
-property of this layout rather than of any locking.
+Because published blocks are immutable and membership at a version is resolved from durable
+intervals, a reader can hold a version open while writers keep committing. Fixed pinned-history
+ceilings eventually backpressure new writes rather than reclaiming bytes a live reader still
+needs. That is the whole concurrency story, and it is a property of this layout rather than of any
+locking.
+
+Cold history walks are cursor-paged. Manifest membership, retired provenance, segments,
+transactions, leases, temporary owners, and maintenance jobs all expose bounded pages rather than
+an API that materializes the database's retained history. The engine's public
+`listVisibleSegmentPage()` adds a stable version and table identity to its cursor, so concurrent
+writes cannot turn later pages into a mixed-version scan.
 
 ## Writing your own
 
@@ -48,6 +62,27 @@ the included adapters.
 
 ## Moving data between stores
 
-A [snapshot](/docs/storage/snapshots) copies one committed version out as a single portable file
+A [snapshot](/docs/storage/snapshots) streams one committed version into a single portable file
 and loads it into any store — memory to IndexedDB, one browser to another, or a build script to a
 published asset.
+
+## Inspecting durability and growth
+
+The durable adapters expose the same explicit diagnostics. These calls scan storage and are not on
+query or commit hot paths:
+
+```ts
+const quick = await store.checkIntegrity({ mode: "metadata" });
+const complete = await store.checkIntegrity({ mode: "full", maxIssues: 100 });
+const stats = await store.getStorageStats();
+```
+
+Metadata mode validates control-record shapes, manifest chains, references, and accounting. Full
+mode additionally reads and checksum-verifies every live payload. Reports bound their retained
+issue list while preserving the total count. Ordinary reads and writes do not wait for this audit:
+they validate the control data they consume and throw `StorageCorruptionError` rather than treating
+malformed persisted state as empty or absent.
+
+`getStorageStats()` separates live logical bytes from obsolete blocks, temporary spill, WAL, and
+checkpoints. OPFS can also report actual file allocation and orphan bytes; IndexedDB has no browser
+API for a single database's physical allocation, so that field is `null` rather than a guess.

@@ -3,7 +3,7 @@ import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../stora
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import { SqlCompileError } from "./errors.js";
-import { QueryMemoryBudgetError } from "./memory.js";
+import { DEFAULT_QUERY_MEMORY_BUDGET_BYTES, QueryMemoryBudgetError } from "./memory.js";
 import {
   compileQuery,
   compileStatement,
@@ -207,6 +207,23 @@ describe("public SQL queries", () => {
       spillToStorage: false,
     });
     expect(generous.rows).toEqual([{ value: 2 }, { value: 3 }]);
+  });
+
+  it("bounds low-level query preparation and pre-resolution subqueries by default", () => {
+    const tables = new Map([["rows", [{ value: 1 }, { value: 2 }, { value: 3 }] as DatabaseRow[]]]);
+    const prepared = createPreparedQuery(compileQuery("SELECT value FROM rows"), tables);
+    expect(prepared.memoryUsage.budgetBytes).toBe(DEFAULT_QUERY_MEMORY_BUDGET_BYTES);
+    prepared.close();
+
+    expect(() =>
+      createPreparedQuery(
+        compileQuery(
+          "SELECT value FROM rows WHERE value IN (SELECT value FROM rows) ORDER BY value",
+        ),
+        tables,
+        { executionMemoryBudgetBytes: 20 },
+      ),
+    ).toThrow(QueryMemoryBudgetError);
   });
 
   it("keeps catalog-typed empty MinnowDatabase queries inside the memory model", async () => {

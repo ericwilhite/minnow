@@ -12,21 +12,42 @@
  * a Node file descriptor, or anything with positioned synchronous I/O.
  */
 import { describe, it } from "vitest";
+import {
+  MAX_TEMP_BYTES_PER_OWNER,
+  MAX_TEMP_BYTES_TOTAL,
+  MAX_TEMP_PAGES_PER_OWNER,
+  MAX_TEMP_PAGES_TOTAL,
+  MAX_TEMP_RUNS_PER_OWNER,
+  MAX_TEMP_RUNS_TOTAL,
+  PostingBuildConflictError,
+  StorageResourceLimitError,
+  assertStorageBulkReadItems,
+  assertTempRunPageBatchLimits,
+  validateStorageId,
+} from "../index.js";
 import type {
   BlockStore,
-  BlockWrite,
+  AbortTransactionIfExpiredInput,
+  AdoptAbortedSegmentInput,
+  RenewTransactionInput,
   CommitTransactionInput,
   CompactionJobRecord,
   CreateGarbageCollectionJobInput,
+  UpdateGarbageCollectionPlanningInput,
+  DropTableColumnInput,
+  DropTableInput,
   GarbageCollectionJobRecord,
   GarbageCollectionStepResult,
   LeaseRecord,
   Manifest,
   ManifestSummary,
-  PublishManifestInput,
   RowIdRange,
+  RollbackTransactionArtifactsInput,
+  RenewLeaseInput,
+  RenewTempOwnerInput,
   RunGarbageCollectionStepInput,
   SegmentRecord,
+  StageTransactionArtifactsInput,
   StoragePage,
   TableRecord,
   TempOwnerRecord,
@@ -40,7 +61,9 @@ import {
   WalWriter,
   decodeSyncCheckpoint,
   encodeSyncCheckpoint,
+  readFully,
   replayWalFrames,
+  writeFully,
   type ExtentFiles,
   type ExtentMeta,
   type Placement,
@@ -53,20 +76,50 @@ import {
 } from "../../testing/index.js";
 
 type TableUpdate = Parameters<BlockStore["updateTable"]>[2];
+type TransactionBegin = Parameters<BlockStore["beginTransaction"]>[0];
 type CompactionUpdate = Parameters<BlockStore["updateCompactionJob"]>[2];
 type FtsBaseInput = Parameters<BlockStore["writeFtsBase"]>[2];
 type FtsTerms = Parameters<BlockStore["readFtsCandidates"]>[2];
-type FtsBuildChunk = Parameters<BlockStore["writeFtsBaseBuildChunk"]>[4];
+type FtsBuildBegin = Parameters<BlockStore["beginFtsBaseBuild"]>[0];
+type FtsBuildRenewal = Parameters<BlockStore["renewFtsBaseBuild"]>[0];
+type FtsBuildAppend = Parameters<BlockStore["writeFtsBaseBuildChunk"]>[0];
+type FtsBuildFinish = Parameters<BlockStore["finishFtsBaseBuild"]>[0];
+type FtsBuildAbort = Parameters<BlockStore["abortFtsBaseBuild"]>[0];
+type FtsBuildChunk = FtsBuildAppend["chunk"];
+type UniqueBuildBegin = Parameters<BlockStore["beginUniqueKeyBuild"]>[0];
+type UniqueBuildRenew = Parameters<BlockStore["renewUniqueKeyBuild"]>[0];
+type UniqueBuildAppend = Parameters<BlockStore["appendUniqueKeyBuildChunk"]>[0];
+type UniqueBuildFinish = Parameters<BlockStore["finishUniqueKeyBuild"]>[0];
+type UniqueBuildAbort = Parameters<BlockStore["abortUniqueKeyBuild"]>[0];
+interface FtsBuildState {
+  buildId: string;
+  ownerId: string;
+  createdAt: string;
+  expiresAt: string;
+  chunks: Map<number, FtsBuildChunk>;
+}
+interface PersistedFtsBuildState extends Omit<FtsBuildState, "chunks"> {
+  chunks: Array<readonly [number, FtsBuildChunk]>;
+}
 
 /** One durable mutation, exactly what replay needs to reproduce it. */
 type Frame =
-  | { op: "addBlocks"; blocks: Array<{ id: string; placement: Placement }> }
-  | { op: "removeBlock"; id: string }
-  | { op: "addTable"; record: TableRecord }
+  | {
+      op: "addTable";
+      record: TableRecord;
+      expectedCatalogEpoch?: number;
+    }
   | { op: "updateTable"; id: string; expectedRevision: number; update: TableUpdate }
-  | { op: "removeTable"; id: string; expectedRevision: number }
-  | { op: "addSegment"; record: SegmentRecord }
-  | { op: "removeSegment"; id: string }
+  | {
+      op: "removeTable";
+      id: string;
+      expectedRevision: number;
+      expectedCatalogEpoch?: number;
+    }
+  | { op: "dropTable"; input: DropTableInput }
+  | { op: "dropTableColumn"; input: DropTableColumnInput }
+  | { op: "removeAbortedSegment"; id: string; expectedTransactionId: string }
+  | { op: "adoptAbortedSegment"; input: AdoptAbortedSegmentInput }
   | { op: "reserveRowIds"; tableId: string; count: number }
   | {
       op: "reserveAutoIncrement";
@@ -75,24 +128,34 @@ type Frame =
       count: number;
       atLeast?: bigint;
     }
-  | { op: "publishManifest"; input: PublishManifestInput }
   | { op: "createTransaction"; record: TransactionRecord }
+  | { op: "beginTransaction"; input: TransactionBegin }
+  | { op: "renewTransaction"; input: RenewTransactionInput }
+  | { op: "abortTransactionIfExpired"; input: AbortTransactionIfExpiredInput }
   | {
       op: "updateTransaction";
       id: string;
       expectedRevision: number;
       update: TransactionRecordUpdate;
     }
+  | {
+      op: "stageTransactionArtifacts";
+      input: Omit<StageTransactionArtifactsInput, "blocks"> & {
+        blocks: Array<{ id: string; placement: Placement }>;
+      };
+    }
+  | { op: "rollbackTransactionArtifacts"; input: RollbackTransactionArtifactsInput }
   | { op: "commitTransaction"; input: CommitTransactionInput }
   | { op: "createLease"; record: LeaseRecord }
-  | { op: "renewLease"; id: string; expectedRevision: number; expiresAt: string }
+  | { op: "renewLease"; input: RenewLeaseInput }
   | { op: "removeLeaseIfExpired"; id: string; expectedRevision: number; expiresAtCutoff: string }
-  | { op: "removeLease"; id: string }
+  | { op: "removeLease"; input: { id: string; ownerId: string } }
   | { op: "createCompactionJob"; record: CompactionJobRecord }
   | { op: "updateCompactionJob"; id: string; expectedRevision: number; update: CompactionUpdate }
   | { op: "cancelCompactionJob"; id: string; expectedRevision: number; cancelledAt: string }
   | { op: "removeCompactionJob"; id: string }
   | { op: "createGarbageCollectionJob"; input: CreateGarbageCollectionJobInput }
+  | { op: "updateGarbageCollectionPlanning"; input: UpdateGarbageCollectionPlanningInput }
   | {
       op: "garbageCollectionStep";
       effect: {
@@ -100,23 +163,34 @@ type Frame =
         prunedManifestVersions: number[];
         reclaimedSegmentIds: string[];
         reclaimedBlockIds: string[];
-        reclaimedTransactionIds?: string[];
+        reclaimedTransactionIds: string[];
         updatedAt: string;
       };
     }
   | { op: "removeGarbageCollectionJob"; id: string }
-  | { op: "removePrunedManifestRecords" }
+  | { op: "removePrunedManifestRecords"; maxItems: number }
   | { op: "createTempOwner"; record: TempOwnerRecord }
-  | { op: "renewTempOwner"; ownerId: string; expectedRevision: number; expiresAt: string }
+  | { op: "renewTempOwner"; input: RenewTempOwnerInput }
   | { op: "removeTempOwnerIfExpired"; ownerId: string; expiresAtCutoff: string }
   | { op: "removeTempOwner"; ownerId: string }
   | { op: "removeFtsColumn"; tableId: string; columnId: string }
-  | { op: "writeFtsBase"; tableId: string; columnId: string; input: FtsBaseInput };
+  | { op: "writeFtsBase"; tableId: string; columnId: string; input: FtsBaseInput }
+  | { op: "beginFtsBaseBuild"; input: FtsBuildBegin }
+  | { op: "renewFtsBaseBuild"; input: FtsBuildRenewal }
+  | { op: "writeFtsBaseBuildChunk"; input: FtsBuildAppend }
+  | { op: "finishFtsBaseBuild"; input: FtsBuildFinish }
+  | { op: "abortFtsBaseBuild"; input: FtsBuildAbort }
+  | { op: "beginUniqueKeyBuild"; input: UniqueBuildBegin }
+  | { op: "renewUniqueKeyBuild"; input: UniqueBuildRenew }
+  | { op: "appendUniqueKeyBuildChunk"; input: UniqueBuildAppend }
+  | { op: "finishUniqueKeyBuild"; input: UniqueBuildFinish }
+  | { op: "abortUniqueKeyBuild"; input: UniqueBuildAbort };
 
 interface Checkpoint {
   core: RecordCoreState;
   blocks: Array<readonly [string, Placement]>;
   extents: ExtentMeta;
+  ftsBuilds: Array<readonly [string, PersistedFtsBuildState]>;
 }
 
 /** Minimal `ExtentFiles` (and general file access) over a directory handle. */
@@ -147,6 +221,22 @@ function filesOver(root: FileSystemDirectoryHandle): ExtentFiles {
   };
 }
 
+function sameFtsChunk(left: FtsBuildChunk, right: FtsBuildChunk): boolean {
+  return (
+    left.length === right.length &&
+    left.every((posting, postingIndex) => {
+      const other = right[postingIndex];
+      return (
+        other?.term === posting.term &&
+        posting.rowIds.length === other.rowIds.length &&
+        posting.rowIds.every((rowId, index) => rowId === other.rowIds[index]) &&
+        posting.tf.length === other.tf.length &&
+        posting.tf.every((frequency, index) => frequency === other.tf[index])
+      );
+    })
+  );
+}
+
 class MiniLogStore implements BlockStore {
   readonly #files: ExtentFiles;
   readonly #wal: WalWriter;
@@ -155,7 +245,15 @@ class MiniLogStore implements BlockStore {
   readonly #core: RecordCore;
   /** Spill pages are scratch; they live and die with the instance, like the OPFS store's. */
   readonly #tempPages = new Map<string, Uint8Array>();
-  readonly #ftsBuilds = new Map<string, { buildId: string; chunks: Map<number, FtsBuildChunk> }>();
+  readonly #tempPageKeysByRun = new Map<string, Set<string>>();
+  readonly #tempUsageByOwner = new Map<
+    string,
+    { bytes: number; pages: number; runs: Map<string, number> }
+  >();
+  #tempBytesTotal = 0;
+  #tempPagesTotal = 0;
+  #tempRunsTotal = 0;
+  readonly #ftsBuilds: Map<string, FtsBuildState>;
   #queue = Promise.resolve();
 
   private constructor(
@@ -164,12 +262,14 @@ class MiniLogStore implements BlockStore {
     pool: ExtentPool,
     placements: Map<string, Placement>,
     core: RecordCore,
+    ftsBuilds: Map<string, FtsBuildState>,
   ) {
     this.#files = files;
     this.#wal = wal;
     this.#pool = pool;
     this.#placements = placements;
     this.#core = core;
+    this.#ftsBuilds = ftsBuilds;
   }
 
   static async open(root: FileSystemDirectoryHandle): Promise<MiniLogStore> {
@@ -180,33 +280,43 @@ class MiniLogStore implements BlockStore {
     try {
       const handle = await files.openHandle(["checkpoint"], { create: false });
       const bytes = new Uint8Array(handle.getSize());
-      handle.read(bytes, { at: 0 });
+      readFully(handle, bytes, 0, "reading the toolkit example checkpoint");
       handle.close();
       checkpoint = decodeSyncCheckpoint(bytes) as Checkpoint | undefined;
     } catch {
       checkpoint = undefined;
     }
 
-    const placements = new Map<string, Placement>(checkpoint?.blocks ?? []);
+    const placements = new Map<string, Placement>(
+      checkpoint === undefined ? [] : checkpoint.blocks,
+    );
     const core = new RecordCore({
       hasBlock: (id) => placements.has(id),
       blockByteLength: (id) => placements.get(id)?.length,
     });
     if (checkpoint !== undefined) core.load(checkpoint.core);
-    const pool = await ExtentPool.open(files, checkpoint?.extents);
+    const pool = await ExtentPool.open(
+      files,
+      checkpoint === undefined ? undefined : checkpoint.extents,
+    );
+    const ftsBuilds = new Map<string, FtsBuildState>(
+      (checkpoint === undefined ? [] : checkpoint.ftsBuilds).map(([key, build]) => [
+        key,
+        { ...build, chunks: new Map(build.chunks) },
+      ]),
+    );
 
     // 2. Replay every whole frame past the checkpoint; a torn tail is overwritten.
     const walHandle = await files.openHandle(["wal"], { create: true });
     const { payloads, endOffset } = replayWalFrames(walHandle);
     const wal = new WalWriter(walHandle, endOffset);
-    const store = new MiniLogStore(files, wal, pool, placements, core);
+    const store = new MiniLogStore(files, wal, pool, placements, core, ftsBuilds);
     let newestExtent: Placement | undefined;
     for (const payload of payloads) {
       const frame = payload as Frame;
       store.#replay(frame);
-      if (frame.op === "addBlocks") {
-        for (const block of frame.blocks) {
-          pool.restorePlacement(block.placement);
+      if (frame.op === "stageTransactionArtifacts") {
+        for (const block of frame.input.blocks) {
           if (newestExtent === undefined || block.placement.extent >= newestExtent.extent) {
             newestExtent = block.placement;
           }
@@ -226,12 +336,6 @@ class MiniLogStore implements BlockStore {
 
   #replay(frame: Frame): void {
     switch (frame.op) {
-      case "addBlocks":
-        for (const block of frame.blocks) this.#placements.set(block.id, block.placement);
-        break;
-      case "removeBlock":
-        this.#placements.delete(frame.id);
-        break;
       case "addTable":
         this.#core.addTable(frame.record);
         break;
@@ -241,11 +345,17 @@ class MiniLogStore implements BlockStore {
       case "removeTable":
         this.#core.removeTable(frame.id, frame.expectedRevision);
         break;
-      case "addSegment":
-        this.#core.addSegment(frame.record);
+      case "dropTable":
+        this.#core.dropTable(frame.input);
         break;
-      case "removeSegment":
-        this.#core.removeSegment(frame.id);
+      case "dropTableColumn":
+        this.#core.dropTableColumn(frame.input);
+        break;
+      case "removeAbortedSegment":
+        this.#core.removeAbortedSegment(frame.id, frame.expectedTransactionId);
+        break;
+      case "adoptAbortedSegment":
+        this.#core.adoptAbortedSegment(frame.input);
         break;
       case "reserveRowIds":
         this.#core.reserveRowIds(frame.tableId, frame.count);
@@ -253,14 +363,41 @@ class MiniLogStore implements BlockStore {
       case "reserveAutoIncrement":
         this.#core.reserveAutoIncrement(frame.tableId, frame.columnId, frame.count, frame.atLeast);
         break;
-      case "publishManifest":
-        this.#core.publishManifest(frame.input);
-        break;
       case "createTransaction":
         this.#core.createTransaction(frame.record);
         break;
+      case "beginTransaction":
+        this.#core.beginTransaction(frame.input);
+        break;
+      case "renewTransaction":
+        this.#core.renewTransaction(frame.input);
+        break;
+      case "abortTransactionIfExpired":
+        this.#core.abortTransactionIfExpired(frame.input);
+        break;
       case "updateTransaction":
         this.#core.updateTransaction(frame.id, frame.expectedRevision, frame.update);
+        break;
+      case "stageTransactionArtifacts":
+        for (const block of frame.input.blocks) {
+          this.#pool.restorePlacement(block.placement);
+          this.#placements.set(block.id, block.placement);
+        }
+        this.#core.stageTransactionArtifacts(
+          {
+            ...frame.input,
+            blocks: frame.input.blocks.map(({ id }) => ({ id, bytes: new Uint8Array(0) })),
+          },
+          { blocksPrevalidated: true },
+        );
+        break;
+      case "rollbackTransactionArtifacts":
+        this.#core.rollbackTransactionArtifacts(frame.input);
+        for (const id of frame.input.removeBlockIds) {
+          const placement = this.#placements.get(id);
+          if (placement !== undefined) this.#pool.release([placement]);
+          this.#placements.delete(id);
+        }
         break;
       case "commitTransaction":
         this.#core.commitTransaction(frame.input);
@@ -269,13 +406,13 @@ class MiniLogStore implements BlockStore {
         this.#core.createLease(frame.record);
         break;
       case "renewLease":
-        this.#core.renewLease(frame.id, frame.expectedRevision, frame.expiresAt);
+        this.#core.renewLease(frame.input);
         break;
       case "removeLeaseIfExpired":
         this.#core.removeLeaseIfExpired(frame.id, frame.expectedRevision, frame.expiresAtCutoff);
         break;
       case "removeLease":
-        this.#core.removeLease(frame.id);
+        this.#core.removeLease(frame.input);
         break;
       case "createCompactionJob":
         this.#core.createCompactionJob(frame.record);
@@ -292,6 +429,9 @@ class MiniLogStore implements BlockStore {
       case "createGarbageCollectionJob":
         this.#core.createGarbageCollectionJob(frame.input);
         break;
+      case "updateGarbageCollectionPlanning":
+        this.#core.updateGarbageCollectionPlanning(frame.input);
+        break;
       case "garbageCollectionStep":
         this.#core.applyGarbageCollectionEffect(frame.effect);
         for (const id of frame.effect.reclaimedBlockIds) {
@@ -306,13 +446,13 @@ class MiniLogStore implements BlockStore {
         this.#core.removeGarbageCollectionJob(frame.id);
         break;
       case "removePrunedManifestRecords":
-        this.#core.removePrunedManifestRecords();
+        this.#core.removePrunedManifestRecords(frame.maxItems);
         break;
       case "createTempOwner":
         this.#core.createTempOwner(frame.record);
         break;
       case "renewTempOwner":
-        this.#core.renewTempOwner(frame.ownerId, frame.expectedRevision, frame.expiresAt);
+        this.#core.renewTempOwner(frame.input);
         break;
       case "removeTempOwnerIfExpired":
         this.#core.removeTempOwnerIfExpired(frame.ownerId, frame.expiresAtCutoff);
@@ -326,6 +466,36 @@ class MiniLogStore implements BlockStore {
       case "removeFtsColumn":
         this.#core.removeFtsColumn(frame.tableId, frame.columnId);
         break;
+      case "beginFtsBaseBuild":
+        this.#applyBeginFtsBaseBuild(frame.input);
+        break;
+      case "renewFtsBaseBuild":
+        this.#applyRenewFtsBaseBuild(frame.input);
+        break;
+      case "writeFtsBaseBuildChunk":
+        this.#applyFtsBaseBuildChunk(frame.input);
+        break;
+      case "finishFtsBaseBuild":
+        this.#applyFinishFtsBaseBuild(frame.input);
+        break;
+      case "abortFtsBaseBuild":
+        this.#applyAbortFtsBaseBuild(frame.input);
+        break;
+      case "beginUniqueKeyBuild":
+        this.#core.beginUniqueKeyBuild(frame.input);
+        break;
+      case "renewUniqueKeyBuild":
+        this.#core.renewUniqueKeyBuild(frame.input);
+        break;
+      case "appendUniqueKeyBuildChunk":
+        this.#core.appendUniqueKeyBuildChunk(frame.input);
+        break;
+      case "finishUniqueKeyBuild":
+        this.#core.finishUniqueKeyBuild(frame.input);
+        break;
+      case "abortUniqueKeyBuild":
+        this.#core.abortUniqueKeyBuild(frame.input);
+        break;
     }
   }
 
@@ -335,12 +505,16 @@ class MiniLogStore implements BlockStore {
       core: this.#core.dump(),
       blocks: [...this.#placements.entries()],
       extents: this.#pool.meta(),
+      ftsBuilds: [...this.#ftsBuilds].map(([key, build]) => [
+        key,
+        { ...build, chunks: [...build.chunks] },
+      ]),
     };
     const bytes = encodeSyncCheckpoint(payload);
     const handle = await this.#files.openHandle(["checkpoint"], { create: true });
     try {
       handle.truncate(0);
-      handle.write(bytes, { at: 0 });
+      writeFully(handle, bytes, 0, "writing the toolkit example checkpoint");
       handle.flush();
     } finally {
       handle.close();
@@ -367,29 +541,6 @@ class MiniLogStore implements BlockStore {
 
   // ---- blocks: bytes in extents, ids to placements, both published by one frame ----
 
-  async addBlock(id: string, bytes: Uint8Array): Promise<void> {
-    return this.addBlocks([{ id, bytes }]);
-  }
-
-  async addBlocks(blocks: readonly BlockWrite[]): Promise<void> {
-    return this.#run(async () => {
-      const ids = new Set<string>();
-      for (const block of blocks) {
-        if (ids.has(block.id) || this.#placements.has(block.id)) {
-          throw new Error(`Block already exists: ${block.id}`);
-        }
-        ids.add(block.id);
-      }
-      const entries: Array<{ id: string; placement: Placement }> = [];
-      for (const block of blocks) {
-        entries.push({ id: block.id, placement: await this.#pool.append(block.bytes, true) });
-      }
-      this.#logged({ op: "addBlocks", blocks: entries }, () => {
-        for (const entry of entries) this.#placements.set(entry.id, entry.placement);
-      });
-    });
-  }
-
   async getBlock(id: string): Promise<Uint8Array | undefined> {
     return this.#run(() => {
       const placement = this.#placements.get(id);
@@ -398,31 +549,27 @@ class MiniLogStore implements BlockStore {
   }
 
   async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    assertStorageBulkReadItems(ids, "Block read");
     const blocks: Array<Uint8Array | undefined> = [];
     for (const id of ids) blocks.push(await this.getBlock(id));
     return blocks;
   }
 
-  async removeBlock(id: string): Promise<void> {
-    return this.#run(async () => {
-      const placement = this.#placements.get(id);
-      if (placement === undefined) return;
-      const drained = this.#pool.release([placement]);
-      this.#logged({ op: "removeBlock", id }, () => this.#placements.delete(id));
-      for (const extent of drained) await this.#pool.deleteExtent(extent);
-    });
+  async readManifestBlock(version: number | null, id: string): Promise<Uint8Array | undefined> {
+    if (this.#core.hasManifestBlocks(version, [id])[0] !== true) return undefined;
+    return this.getBlock(id);
   }
 
-  async listBlockIds(): Promise<string[]> {
-    return [...this.#placements.keys()].sort();
+  async hasManifestBlocks(version: number | null, ids: readonly string[]): Promise<boolean[]> {
+    return this.#core.hasManifestBlocks(version, ids);
   }
 
   // ---- records: every mutation is one core call plus one frame ----
 
-  async addTable(record: TableRecord): Promise<void> {
+  async addTable(record: TableRecord, options: Parameters<BlockStore["addTable"]>[1] = {}) {
     return this.#run(() =>
-      this.#logged({ op: "addTable", record }, () => {
-        this.#core.addTable(record);
+      this.#logged({ op: "addTable", record, ...options }, () => {
+        this.#core.addTable(record, options);
       }),
     );
   }
@@ -448,19 +595,27 @@ class MiniLogStore implements BlockStore {
     );
   }
 
-  async removeTable(id: string, expectedRevision: number): Promise<void> {
+  async removeTable(
+    id: string,
+    expectedRevision: number,
+    options: Parameters<BlockStore["removeTable"]>[2] = {},
+  ): Promise<void> {
     return this.#run(() =>
-      this.#logged({ op: "removeTable", id, expectedRevision }, () => {
-        this.#core.removeTable(id, expectedRevision);
+      this.#logged({ op: "removeTable", id, expectedRevision, ...options }, () => {
+        this.#core.removeTable(id, expectedRevision, options);
       }),
     );
   }
 
-  async addSegment(record: SegmentRecord): Promise<void> {
+  async dropTable(input: DropTableInput): Promise<ManifestSummary> {
     return this.#run(() =>
-      this.#logged({ op: "addSegment", record }, () => {
-        this.#core.addSegment(record);
-      }),
+      this.#logged({ op: "dropTable", input }, () => this.#core.dropTable(input)),
+    );
+  }
+
+  async dropTableColumn(input: DropTableColumnInput): Promise<ManifestSummary> {
+    return this.#run(() =>
+      this.#logged({ op: "dropTableColumn", input }, () => this.#core.dropTableColumn(input)),
     );
   }
 
@@ -468,19 +623,27 @@ class MiniLogStore implements BlockStore {
     return this.#core.getSegment(id);
   }
 
-  async listSegments(tableId?: string): Promise<SegmentRecord[]> {
-    return this.#core.listSegments(tableId);
-  }
-
   async listSegmentPage(afterId: string | null, limit: number) {
     return this.#core.listSegmentPage(afterId, limit);
   }
 
-  async removeSegment(id: string): Promise<void> {
+  async listTableSegmentPage(tableId: string, afterId: string | null, limit: number) {
+    return this.#core.listTableSegmentPage(tableId, afterId, limit);
+  }
+
+  async removeAbortedSegment(id: string, expectedTransactionId: string): Promise<boolean> {
     return this.#run(() =>
-      this.#logged({ op: "removeSegment", id }, () => {
-        this.#core.removeSegment(id);
-      }),
+      this.#logged({ op: "removeAbortedSegment", id, expectedTransactionId }, () =>
+        this.#core.removeAbortedSegment(id, expectedTransactionId),
+      ),
+    );
+  }
+
+  async adoptAbortedSegment(input: AdoptAbortedSegmentInput): Promise<TransactionRecord> {
+    return this.#run(() =>
+      this.#logged({ op: "adoptAbortedSegment", input }, () =>
+        this.#core.adoptAbortedSegment(input),
+      ),
     );
   }
 
@@ -516,6 +679,50 @@ class MiniLogStore implements BlockStore {
     return this.#core.getExistingUniqueKeys(tableId, keyTokens);
   }
 
+  async beginUniqueKeyBuild(input: UniqueBuildBegin) {
+    return this.#run(() =>
+      this.#logged({ op: "beginUniqueKeyBuild", input }, () =>
+        this.#core.beginUniqueKeyBuild(input),
+      ),
+    );
+  }
+
+  async getUniqueKeyBuild(buildId: string) {
+    return this.#core.getUniqueKeyBuild(buildId);
+  }
+
+  async renewUniqueKeyBuild(input: UniqueBuildRenew) {
+    return this.#run(() =>
+      this.#logged({ op: "renewUniqueKeyBuild", input }, () =>
+        this.#core.renewUniqueKeyBuild(input),
+      ),
+    );
+  }
+
+  async appendUniqueKeyBuildChunk(input: UniqueBuildAppend) {
+    return this.#run(() =>
+      this.#logged({ op: "appendUniqueKeyBuildChunk", input }, () =>
+        this.#core.appendUniqueKeyBuildChunk(input),
+      ),
+    );
+  }
+
+  async finishUniqueKeyBuild(input: UniqueBuildFinish) {
+    return this.#run(() =>
+      this.#logged({ op: "finishUniqueKeyBuild", input }, () =>
+        this.#core.finishUniqueKeyBuild(input),
+      ),
+    );
+  }
+
+  async abortUniqueKeyBuild(input: UniqueBuildAbort) {
+    return this.#run(() =>
+      this.#logged({ op: "abortUniqueKeyBuild", input }, () =>
+        this.#core.abortUniqueKeyBuild(input),
+      ),
+    );
+  }
+
   async getCurrentManifest(): Promise<Manifest | undefined> {
     return this.#core.getCurrentManifest();
   }
@@ -524,22 +731,26 @@ class MiniLogStore implements BlockStore {
     return this.#core.getCurrentManifestVersion();
   }
 
+  async getCatalogProbe() {
+    return this.#core.getCatalogProbe();
+  }
+
   async getManifest(version: number): Promise<Manifest | undefined> {
     return this.#core.getManifest(version);
   }
 
-  async listManifests(): Promise<Manifest[]> {
-    return this.#core.listManifests();
+  async listManifestBlockPage(input: Parameters<BlockStore["listManifestBlockPage"]>[0]) {
+    return this.#core.listManifestBlockPage(input);
+  }
+
+  async listRetiredManifestBlockPage(
+    input: Parameters<BlockStore["listRetiredManifestBlockPage"]>[0],
+  ) {
+    return this.#core.listRetiredManifestBlockPage(input);
   }
 
   async listManifestPage(afterVersion: number | null, limit: number) {
     return this.#core.listManifestPage(afterVersion, limit);
-  }
-
-  async publishManifest(input: PublishManifestInput): Promise<Manifest> {
-    return this.#run(() =>
-      this.#logged({ op: "publishManifest", input }, () => this.#core.publishManifest(input)),
-    );
   }
 
   async createTransaction(record: TransactionRecord): Promise<void> {
@@ -550,16 +761,34 @@ class MiniLogStore implements BlockStore {
     );
   }
 
+  async beginTransaction(input: TransactionBegin) {
+    return this.#run(() =>
+      this.#logged({ op: "beginTransaction", input }, () => this.#core.beginTransaction(input)),
+    );
+  }
+
+  async renewTransaction(input: RenewTransactionInput): Promise<boolean> {
+    return this.#run(() =>
+      this.#logged({ op: "renewTransaction", input }, () => this.#core.renewTransaction(input)),
+    );
+  }
+
+  async abortTransactionIfExpired(
+    input: AbortTransactionIfExpiredInput,
+  ): Promise<TransactionRecord | undefined> {
+    return this.#run(() =>
+      this.#logged({ op: "abortTransactionIfExpired", input }, () =>
+        this.#core.abortTransactionIfExpired(input),
+      ),
+    );
+  }
+
   async getTransaction(id: string): Promise<TransactionRecord | undefined> {
     return this.#core.getTransaction(id);
   }
 
   async getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>> {
     return this.#core.getTransactions(ids);
-  }
-
-  async listTransactions(): Promise<TransactionRecord[]> {
-    return this.#core.listTransactions();
   }
 
   async listTransactionPage(afterId: string | null, limit: number) {
@@ -576,6 +805,69 @@ class MiniLogStore implements BlockStore {
         this.#core.updateTransaction(id, expectedRevision, update),
       ),
     );
+  }
+
+  async stageTransactionArtifacts(
+    input: StageTransactionArtifactsInput,
+  ): Promise<TransactionRecord> {
+    return this.#run(async () => {
+      const ids = new Set<string>();
+      for (const block of input.blocks) {
+        if (ids.has(block.id) || this.#placements.has(block.id)) {
+          throw new Error(`Block already exists: ${block.id}`);
+        }
+        ids.add(block.id);
+      }
+      const incomingBytes = new Map(
+        input.blocks.map((block) => [block.id, block.bytes.byteLength]),
+      );
+      const trial = new RecordCore({
+        hasBlock: (id) => this.#placements.has(id) || incomingBytes.has(id),
+        blockByteLength: (id) => this.#placements.get(id)?.length ?? incomingBytes.get(id),
+      });
+      trial.load(this.#core.dump());
+      trial.stageTransactionArtifacts(input, { blocksPrevalidated: true });
+      const blocks: Array<{ id: string; placement: Placement }> = [];
+      for (const block of input.blocks) {
+        blocks.push({ id: block.id, placement: await this.#pool.append(block.bytes, true) });
+      }
+      return this.#logged({ op: "stageTransactionArtifacts", input: { ...input, blocks } }, () => {
+        const updated = this.#core.stageTransactionArtifacts(
+          {
+            ...input,
+            blocks: blocks.map(({ id }) => ({ id, bytes: new Uint8Array(0) })),
+          },
+          { blocksPrevalidated: true },
+        );
+        for (const block of blocks) this.#placements.set(block.id, block.placement);
+        return updated;
+      });
+    });
+  }
+
+  async rollbackTransactionArtifacts(
+    input: RollbackTransactionArtifactsInput,
+  ): Promise<TransactionRecord> {
+    return this.#run(async () => {
+      const trial = new RecordCore({
+        hasBlock: (id) => this.#placements.has(id),
+        blockByteLength: (id) => this.#placements.get(id)?.length,
+      });
+      trial.load(this.#core.dump());
+      trial.rollbackTransactionArtifacts(input);
+      const drained: number[] = [];
+      const updated = this.#logged({ op: "rollbackTransactionArtifacts", input }, () => {
+        const record = this.#core.rollbackTransactionArtifacts(input);
+        for (const id of input.removeBlockIds) {
+          const placement = this.#placements.get(id);
+          if (placement !== undefined) drained.push(...this.#pool.release([placement]));
+          this.#placements.delete(id);
+        }
+        return record;
+      });
+      for (const extent of new Set(drained)) await this.#pool.deleteExtent(extent);
+      return updated;
+    });
   }
 
   async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
@@ -600,11 +892,13 @@ class MiniLogStore implements BlockStore {
     return this.#core.listLeases();
   }
 
-  async renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord> {
+  async listExpiredLeasePage(expiresAtCutoff: string, afterCursor: string | null, limit: number) {
+    return this.#core.listExpiredLeasePage(expiresAtCutoff, afterCursor, limit);
+  }
+
+  async renewLease(input: RenewLeaseInput): Promise<LeaseRecord> {
     return this.#run(() =>
-      this.#logged({ op: "renewLease", id, expectedRevision, expiresAt }, () =>
-        this.#core.renewLease(id, expectedRevision, expiresAt),
-      ),
+      this.#logged({ op: "renewLease", input }, () => this.#core.renewLease(input)),
     );
   }
 
@@ -620,11 +914,9 @@ class MiniLogStore implements BlockStore {
     );
   }
 
-  async removeLease(id: string): Promise<void> {
+  async removeLease(input: { id: string; ownerId: string }): Promise<boolean> {
     return this.#run(() =>
-      this.#logged({ op: "removeLease", id }, () => {
-        this.#core.removeLease(id);
-      }),
+      this.#logged({ op: "removeLease", input }, () => this.#core.removeLease(input)),
     );
   }
 
@@ -664,11 +956,9 @@ class MiniLogStore implements BlockStore {
     );
   }
 
-  async removeCompactionJob(id: string): Promise<void> {
+  async removeCompactionJob(id: string): Promise<boolean> {
     return this.#run(() =>
-      this.#logged({ op: "removeCompactionJob", id }, () => {
-        this.#core.removeCompactionJob(id);
-      }),
+      this.#logged({ op: "removeCompactionJob", id }, () => this.#core.removeCompactionJob(id)),
     );
   }
 
@@ -682,12 +972,26 @@ class MiniLogStore implements BlockStore {
     );
   }
 
+  async updateGarbageCollectionPlanning(
+    input: UpdateGarbageCollectionPlanningInput,
+  ): Promise<GarbageCollectionJobRecord> {
+    return this.#run(() =>
+      this.#logged({ op: "updateGarbageCollectionPlanning", input }, () =>
+        this.#core.updateGarbageCollectionPlanning(input),
+      ),
+    );
+  }
+
   async getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined> {
     return this.#core.getGarbageCollectionJob(id);
   }
 
   async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
     return this.#core.listGarbageCollectionJobs();
+  }
+
+  async listGarbageCollectionJobPage(afterId: string | null, limit: number) {
+    return this.#core.listGarbageCollectionJobPage(afterId, limit);
   }
 
   async runGarbageCollectionStep(
@@ -733,11 +1037,10 @@ class MiniLogStore implements BlockStore {
     );
   }
 
-  async removePrunedManifestRecords(): Promise<number> {
+  async removePrunedManifestRecords(maxItems: number): Promise<number> {
     return this.#run(() =>
-      this.#logged(
-        { op: "removePrunedManifestRecords" },
-        () => this.#core.removePrunedManifestRecords().length,
+      this.#logged({ op: "removePrunedManifestRecords", maxItems }, () =>
+        this.#core.removePrunedManifestRecords(maxItems),
       ),
     );
   }
@@ -758,66 +1061,167 @@ class MiniLogStore implements BlockStore {
     );
   }
 
-  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+  async beginFtsBaseBuild(input: FtsBuildBegin): Promise<void> {
     await this.#run(() => {
-      this.#ftsBuilds.set(`${tableId}/${columnId}`, { buildId, chunks: new Map() });
+      const key = `${input.tableId}/${input.columnId}`;
+      const current = this.#ftsBuilds.get(key);
+      if (
+        current?.buildId === input.buildId &&
+        current.ownerId === input.ownerId &&
+        current.createdAt === input.createdAt &&
+        current.expiresAt === input.expiresAt
+      ) {
+        return;
+      }
+      this.#logged({ op: "beginFtsBaseBuild", input }, () => this.#applyBeginFtsBaseBuild(input));
     });
   }
 
-  async writeFtsBaseBuildChunk(
+  async renewFtsBaseBuild(input: FtsBuildRenewal): Promise<void> {
+    await this.#run(() =>
+      this.#logged({ op: "renewFtsBaseBuild", input }, () => this.#applyRenewFtsBaseBuild(input)),
+    );
+  }
+
+  async writeFtsBaseBuildChunk(input: FtsBuildAppend): Promise<void> {
+    await this.#run(() => {
+      const build = this.#requireFtsBuild(input);
+      const replay = build.chunks.get(input.ordinal);
+      if (replay !== undefined) {
+        if (!sameFtsChunk(replay, input.chunk)) {
+          throw new PostingBuildConflictError(input.buildId, input.ownerId, "chunk replay changed");
+        }
+        if (build.expiresAt === input.expiresAt) return;
+      }
+      this.#logged({ op: "writeFtsBaseBuildChunk", input }, () =>
+        this.#applyFtsBaseBuildChunk(input),
+      );
+    });
+  }
+
+  async finishFtsBaseBuild(input: FtsBuildFinish): Promise<void> {
+    await this.#run(() =>
+      this.#logged({ op: "finishFtsBaseBuild", input }, () => this.#applyFinishFtsBaseBuild(input)),
+    );
+  }
+
+  async abortFtsBaseBuild(input: FtsBuildAbort): Promise<void> {
+    await this.#run(() => {
+      if (this.#ftsBuilds.get(`${input.tableId}/${input.columnId}`) === undefined) return;
+      this.#logged({ op: "abortFtsBaseBuild", input }, () => this.#applyAbortFtsBaseBuild(input));
+    });
+  }
+
+  #applyBeginFtsBaseBuild(input: FtsBuildBegin): void {
+    const key = `${input.tableId}/${input.columnId}`;
+    const current = this.#ftsBuilds.get(key);
+    if (current !== undefined && Date.parse(current.expiresAt) > Date.parse(input.createdAt)) {
+      if (current.buildId === input.buildId && current.ownerId === input.ownerId) return;
+      throw new PostingBuildConflictError(
+        current.buildId,
+        current.ownerId,
+        "another live build owns the column",
+      );
+    }
+    this.#ftsBuilds.set(key, {
+      buildId: input.buildId,
+      ownerId: input.ownerId,
+      createdAt: input.createdAt,
+      expiresAt: input.expiresAt,
+      chunks: new Map(),
+    });
+  }
+
+  #applyRenewFtsBaseBuild(input: FtsBuildRenewal): void {
+    this.#requireFtsBuild(input).expiresAt = input.expiresAt;
+  }
+
+  #applyFtsBaseBuildChunk(input: FtsBuildAppend): void {
+    const build = this.#requireFtsBuild(input);
+    const replay = build.chunks.get(input.ordinal);
+    if (replay !== undefined) {
+      if (!sameFtsChunk(replay, input.chunk)) {
+        throw new PostingBuildConflictError(input.buildId, input.ownerId, "chunk replay changed");
+      }
+    } else {
+      if (input.ordinal !== build.chunks.size) {
+        throw new Error(`Postings chunk is out of order: ${String(input.ordinal)}`);
+      }
+      build.chunks.set(input.ordinal, structuredClone(input.chunk));
+    }
+    build.expiresAt = input.expiresAt;
+  }
+
+  #applyFinishFtsBaseBuild(input: FtsBuildFinish): void {
+    const key = `${input.tableId}/${input.columnId}`;
+    const build = this.#requireFtsBuild(input);
+    const chunks = Array.from({ length: input.chunkCount }, (_, ordinal) => {
+      const chunk = build.chunks.get(ordinal);
+      if (chunk === undefined) throw new Error(`Postings chunk is missing: ${String(ordinal)}`);
+      return structuredClone(chunk) as FtsBaseInput["chunks"][number];
+    });
+    this.#core.writeFtsBase(input.tableId, input.columnId, {
+      coversVersion: input.coversVersion,
+      chunks,
+      totalTokens: input.totalTokens,
+    });
+    this.#ftsBuilds.delete(key);
+  }
+
+  #applyAbortFtsBaseBuild(input: FtsBuildAbort): void {
+    const key = `${input.tableId}/${input.columnId}`;
+    const build = this.#ftsBuilds.get(key);
+    if (build === undefined) return;
+    if (
+      build.buildId !== input.buildId ||
+      (build.ownerId !== input.ownerId &&
+        Date.parse(build.expiresAt) > Date.parse(input.expiresAtCutoff))
+    ) {
+      throw new PostingBuildConflictError(build.buildId, build.ownerId, "abort ownership changed");
+    }
+    this.#ftsBuilds.delete(key);
+  }
+
+  #requireFtsBuild(input: FtsBuildRenewal | FtsBuildFinish): {
+    buildId: string;
+    ownerId: string;
+    createdAt: string;
+    expiresAt: string;
+    chunks: Map<number, FtsBuildChunk>;
+  } {
+    const build = this.#ftsBuilds.get(`${input.tableId}/${input.columnId}`);
+    if (
+      build?.buildId !== input.buildId ||
+      build.ownerId !== input.ownerId ||
+      Date.parse(build.expiresAt) <= Date.parse(input.expiresAtCutoff)
+    ) {
+      throw new PostingBuildConflictError(
+        build?.buildId ?? input.buildId,
+        build?.ownerId ?? input.ownerId,
+        "session is missing, expired, or owned by another caller",
+      );
+    }
+    return build;
+  }
+
+  async readFtsCandidates(
     tableId: string,
     columnId: string,
-    buildId: string,
-    ordinal: number,
-    chunk: FtsBuildChunk,
-  ): Promise<void> {
-    await this.#run(() => {
-      const build = this.#ftsBuilds.get(`${tableId}/${columnId}`);
-      if (build?.buildId !== buildId) throw new Error(`Postings build changed: ${buildId}`);
-      build.chunks.set(ordinal, structuredClone(chunk));
-    });
+    terms: FtsTerms,
+    upToVersion: number,
+    maxRowIds?: number,
+  ) {
+    return this.#core.readFtsCandidates(tableId, columnId, terms, upToVersion, maxRowIds);
   }
 
-  async finishFtsBaseBuild(
+  async readFtsPostings(
     tableId: string,
     columnId: string,
-    buildId: string,
-    input: Parameters<BlockStore["finishFtsBaseBuild"]>[3],
-  ): Promise<void> {
-    await this.#run(() => {
-      const key = `${tableId}/${columnId}`;
-      const build = this.#ftsBuilds.get(key);
-      if (build?.buildId !== buildId) throw new Error(`Postings build changed: ${buildId}`);
-      const chunks = Array.from({ length: input.chunkCount }, (_, ordinal) => {
-        const chunk = build.chunks.get(ordinal);
-        if (chunk === undefined) throw new Error(`Postings chunk is missing: ${String(ordinal)}`);
-        return chunk;
-      });
-      const base = {
-        coversVersion: input.coversVersion,
-        chunks,
-        totalTokens: input.totalTokens,
-      };
-      this.#logged({ op: "writeFtsBase", tableId, columnId, input: base }, () => {
-        this.#core.writeFtsBase(tableId, columnId, base);
-      });
-      this.#ftsBuilds.delete(key);
-    });
-  }
-
-  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    await this.#run(() => {
-      const key = `${tableId}/${columnId}`;
-      if (this.#ftsBuilds.get(key)?.buildId === buildId) this.#ftsBuilds.delete(key);
-    });
-  }
-
-  async readFtsCandidates(tableId: string, columnId: string, terms: FtsTerms, upToVersion: number) {
-    return this.#core.readFtsCandidates(tableId, columnId, terms, upToVersion);
-  }
-
-  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
-    return this.#core.readFtsPostings(tableId, columnId, upToVersion);
+    upToVersion: number,
+    maxRowIds?: number,
+    maxRetainedBytes?: number,
+  ) {
+    return this.#core.readFtsPostings(tableId, columnId, upToVersion, maxRowIds, maxRetainedBytes);
   }
 
   // ---- temp spill: owner records are durable records; page bytes are instance scratch ----
@@ -834,15 +1238,9 @@ class MiniLogStore implements BlockStore {
     return this.#core.getTempOwner(ownerId);
   }
 
-  async renewTempOwner(
-    ownerId: string,
-    expectedRevision: number,
-    expiresAt: string,
-  ): Promise<TempOwnerRecord> {
+  async renewTempOwner(input: RenewTempOwnerInput): Promise<TempOwnerRecord> {
     return this.#run(() =>
-      this.#logged({ op: "renewTempOwner", ownerId, expectedRevision, expiresAt }, () =>
-        this.#core.renewTempOwner(ownerId, expectedRevision, expiresAt),
-      ),
+      this.#logged({ op: "renewTempOwner", input }, () => this.#core.renewTempOwner(input)),
     );
   }
 
@@ -869,18 +1267,73 @@ class MiniLogStore implements BlockStore {
     afterOwnerId: string | null,
     limit: number,
   ): Promise<StoragePage<string, string>> {
-    const pageOwnerIds: string[] = [];
-    for (const key of this.#tempPages.keys()) {
-      pageOwnerIds.push((JSON.parse(key) as [string, string, number])[0]);
-    }
+    const pageOwnerIds = [...this.#tempUsageByOwner.keys()];
     return this.#core.listTempOwnerIdsPage(afterOwnerId, limit, pageOwnerIds);
   }
 
+  async listExpiredTempOwnerPage(
+    expiresAtCutoff: string,
+    afterCursor: string | null,
+    limit: number,
+  ): Promise<StoragePage<string, string>> {
+    return this.#core.listExpiredTempOwnerPage(expiresAtCutoff, afterCursor, limit);
+  }
+
   async putTempRunPage(page: TempRunPage): Promise<void> {
-    this.#tempPages.set(
-      JSON.stringify([page.ownerId, page.runId, page.pageIndex]),
-      page.bytes.slice(),
-    );
+    assertTempRunPageBatchLimits([page]);
+    validateStorageId(page.ownerId, "Temp owner ID");
+    validateStorageId(page.runId, "Temp run ID");
+    if (!Number.isSafeInteger(page.pageIndex) || page.pageIndex < 0) {
+      throw new RangeError("Temp run page index must be a non-negative whole number");
+    }
+    return this.#run(() => {
+      if (this.#core.getTempOwner(page.ownerId) === undefined) {
+        throw new Error(`Temp owner does not exist: ${page.ownerId}`);
+      }
+      const key = JSON.stringify([page.ownerId, page.runId, page.pageIndex]);
+      const previousBytes = this.#tempPages.get(key)?.byteLength ?? 0;
+      const isNewPage = !this.#tempPages.has(key);
+      const usage = this.#tempUsageByOwner.get(page.ownerId) ?? {
+        bytes: 0,
+        pages: 0,
+        runs: new Map<string, number>(),
+      };
+      const previousRunPages = usage.runs.get(page.runId) ?? 0;
+      const byteDelta = page.bytes.byteLength - previousBytes;
+      const pageDelta = isNewPage ? 1 : 0;
+      const runDelta = isNewPage && previousRunPages === 0 ? 1 : 0;
+      assertTempResourceLimit("temp owner byte", usage.bytes + byteDelta, MAX_TEMP_BYTES_PER_OWNER);
+      assertTempResourceLimit("temp page", usage.pages + pageDelta, MAX_TEMP_PAGES_PER_OWNER);
+      assertTempResourceLimit("temp run", usage.runs.size + runDelta, MAX_TEMP_RUNS_PER_OWNER);
+      assertTempResourceLimit(
+        "temporary byte",
+        this.#tempBytesTotal + byteDelta,
+        MAX_TEMP_BYTES_TOTAL,
+      );
+      assertTempResourceLimit(
+        "temporary page total",
+        this.#tempPagesTotal + pageDelta,
+        MAX_TEMP_PAGES_TOTAL,
+      );
+      assertTempResourceLimit(
+        "temporary run total",
+        this.#tempRunsTotal + runDelta,
+        MAX_TEMP_RUNS_TOTAL,
+      );
+
+      this.#tempPages.set(key, page.bytes.slice());
+      const runKey = JSON.stringify([page.ownerId, page.runId]);
+      const runKeys = this.#tempPageKeysByRun.get(runKey) ?? new Set<string>();
+      runKeys.add(key);
+      this.#tempPageKeysByRun.set(runKey, runKeys);
+      usage.bytes += byteDelta;
+      usage.pages += pageDelta;
+      if (isNewPage) usage.runs.set(page.runId, previousRunPages + 1);
+      this.#tempUsageByOwner.set(page.ownerId, usage);
+      this.#tempBytesTotal += byteDelta;
+      this.#tempPagesTotal += pageDelta;
+      this.#tempRunsTotal += runDelta;
+    });
   }
 
   async getTempRunPage(
@@ -892,23 +1345,57 @@ class MiniLogStore implements BlockStore {
   }
 
   async removeTempRun(ownerId: string, runId: string): Promise<void> {
-    for (const key of this.#tempPages.keys()) {
-      const [owner, run] = JSON.parse(key) as [string, string, number];
-      if (owner === ownerId && run === runId) this.#tempPages.delete(key);
-    }
+    validateStorageId(ownerId, "Temp owner ID");
+    validateStorageId(runId, "Temp run ID");
+    return this.#run(() => this.#dropTempRunPages(ownerId, runId));
   }
 
   #dropTempPages(ownerId: string): void {
-    for (const key of this.#tempPages.keys()) {
-      if ((JSON.parse(key) as [string, string, number])[0] === ownerId) {
-        this.#tempPages.delete(key);
-      }
+    const usage = this.#tempUsageByOwner.get(ownerId);
+    if (usage === undefined) return;
+    for (const runId of [...usage.runs.keys()]) this.#dropTempRunPages(ownerId, runId);
+  }
+
+  #dropTempRunPages(ownerId: string, runId: string): void {
+    const runKey = JSON.stringify([ownerId, runId]);
+    const keys = this.#tempPageKeysByRun.get(runKey);
+    if (keys === undefined) return;
+    let removedBytes = 0;
+    for (const key of keys) {
+      removedBytes += this.#tempPages.get(key)?.byteLength ?? 0;
+      this.#tempPages.delete(key);
     }
+    this.#tempPageKeysByRun.delete(runKey);
+    this.#tempBytesTotal -= removedBytes;
+    this.#tempPagesTotal -= keys.size;
+    this.#tempRunsTotal -= 1;
+    const usage = this.#tempUsageByOwner.get(ownerId);
+    if (usage === undefined) return;
+    usage.bytes -= removedBytes;
+    usage.pages -= keys.size;
+    usage.runs.delete(runId);
+    if (usage.pages === 0) this.#tempUsageByOwner.delete(ownerId);
   }
 
   close(): void {
     this.#wal.close();
     this.#pool.close();
+  }
+}
+
+function assertTempResourceLimit(
+  resource:
+    | "temp owner byte"
+    | "temp page"
+    | "temp run"
+    | "temporary byte"
+    | "temporary page total"
+    | "temporary run total",
+  actual: number,
+  limit: number,
+): void {
+  if (!Number.isSafeInteger(actual) || actual < 0 || actual > limit) {
+    throw new StorageResourceLimitError(resource, actual, limit);
   }
 }
 
@@ -924,7 +1411,9 @@ const target: BlockStoreConformanceTarget = {
     const root = roots.get(store);
     if (root === undefined) throw new Error("unknown store");
     store.close();
-    return MiniLogStore.open(root);
+    const reopened = await MiniLogStore.open(root);
+    roots.set(reopened, root);
+    return reopened;
   },
 };
 

@@ -10,6 +10,7 @@ import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writ
 export {
   attachLifecycleFlush,
   BufferedTableWriter,
+  MAX_BUFFERED_WRITER_PENDING_ADDS,
   type BufferedFlushResult,
   type BufferedWriterOptions,
   type LifecycleDocumentTarget,
@@ -21,11 +22,14 @@ import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
+  MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
   UniqueConstraintError,
+  VisibleSegmentCursorStaleError,
 } from "./errors.js";
 import {
+  BLOCK_HEADER_LENGTH,
   buildPhysicalColumnFromRanges,
   decodeBlock,
   decodePhysicalBlock,
@@ -34,8 +38,15 @@ import {
   getCompressionMemoryBound,
   inspectBlock,
   maximumPhysicalBlockByteLength,
+  MAX_BLOCK_METADATA_BYTE_LENGTH,
+  MAX_BLOCK_ROW_COUNT,
+  MAX_PHYSICAL_COLUMN_BYTE_LENGTH,
+  MAX_STORED_BLOCK_BYTE_LENGTH,
   measurePhysicalColumnRanges,
+  physicalColumnByteLength,
   slicePhysicalColumn,
+  StoredBlockPayloadTooLargeError,
+  wellFormedUtf8ByteLength,
   type ColumnInput,
   type Compression,
   type DecodedColumn,
@@ -44,6 +55,13 @@ import {
   type PhysicalColumnRange,
   type ValidatedPhysicalColumn,
 } from "../block-format/index.js";
+import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import {
+  estimateCompactionRowsPerOutput,
+  planAlignedWriteBlockRanges as writeBlockRanges,
+  type WriteColumnValues,
+} from "./write-block-planner.js";
+import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
 import {
   fillColumnDefaults,
   patchAutoIncrementValues,
@@ -58,9 +76,12 @@ import {
   type FtsStats,
 } from "./fts.js";
 import {
+  boundedMaintenanceBatchItems,
   simpleDataTypes,
   floorWholeNumberProduct,
   type BlockStore,
+  type BlockWrite,
+  BlockReadBatchTooLargeError,
   type ColumnDefault,
   validateColumnDefault,
   validateEnumValues,
@@ -73,6 +94,7 @@ import {
   secondaryIndexDirections,
   secondaryUniqueKeyNamespace,
   CompactionJobConflictError,
+  CompactionBacklogError,
   type CompactionJobRecord,
   type CompactionJobState,
   GarbageCollectionJobConflictError,
@@ -86,6 +108,21 @@ import {
   type MergeCompactionSourceColumn,
   type MergeCompactionSourceSegment,
   type MergeOutputPartition,
+  MAX_LEVEL_ZERO_SEGMENTS,
+  MAX_FTS_CANDIDATE_ROW_IDS,
+  MAX_FTS_POSTING_TERM_CHARACTERS,
+  MAX_FTS_POSTINGS_PER_CHUNK,
+  MAX_FTS_POSTING_ROW_IDS_PER_CHUNK,
+  MAX_INDEXED_STRING_CHARACTERS,
+  MAX_CATALOG_NAME_CHARACTERS,
+  MAX_MANIFEST_BLOCK_PRESENCE_IDS,
+  MAX_MAINTENANCE_BATCH_ITEMS,
+  MAX_STORAGE_BULK_READ_ITEMS,
+  MAX_TRANSACTION_STAGE_BLOCKS,
+  MAX_TRANSACTION_STAGE_BYTES,
+  MAX_SNAPSHOT_SESSION_TTL_MS,
+  MAX_POSTING_BUILD_TTL_MS,
+  MAX_TEMP_OWNER_TTL_MS,
   type QueryCatalogState,
   type RowIdRange,
   type RechunkCompactionOutputWindow,
@@ -97,20 +134,39 @@ import {
   type SegmentRecord,
   type SimpleDataType,
   type SqlDomain,
-  decodeSnapshot,
-  encodeSnapshot,
-  type SnapshotExportProgress,
-  type SnapshotLoadProgress,
+  type SnapshotFrame,
+  type SnapshotFrameFooter,
+  MAX_SNAPSHOT_FRAME_BATCH_BYTES,
+  MAX_SNAPSHOT_FRAME_BATCH_ITEMS,
+  MAX_SNAPSHOT_METADATA_BATCH_BYTES,
+  SNAPSHOT_FRAME_KINDS,
+  type StorageIntegrityMode,
+  type StorageIntegrityReport,
+  type StorageStats,
+  type InterruptedSnapshotImport,
+  type InterruptedSnapshotImportAbortResult,
   type TableColumnRecord,
   type TableRecord,
   type TransactionRecord,
+  validateStorageId,
   SnapshotManifestMissingError,
+  SchemaConflictError,
+  TableInUseError,
   TableRecordConflictError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
   UniqueIndexCoverageError,
   WriteConflictError,
-} from "../storage/index.js";
+} from "../storage/types.js";
+import type { SnapshotExportProgress, SnapshotLoadProgress } from "../storage/snapshot.js";
+import {
+  decodeSnapshotFrameStream,
+  encodeSnapshotFrameStreamFooter,
+  encodeSnapshotFrameStreamHeader,
+  extendSnapshotFrameStreamChecksum,
+  snapshotFrameEnvelopeParts,
+  snapshotFrameStreamHeaderIdentity,
+} from "../storage/snapshot.js";
 import {
   Snapshot,
   TransactionManager,
@@ -184,9 +240,16 @@ import {
 import {
   QueryMemoryBudgetError,
   QueryMemoryContext,
+  DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
   type QueryMemoryReservation,
 } from "./memory.js";
-import { LiveQuerySet, type LiveQueryInput, type LiveQuerySetOptions } from "./live.js";
+import {
+  LiveQueryLimitError,
+  LiveQuerySet,
+  MAX_LIVE_QUERY_SETS_PER_DATABASE,
+  type LiveQueryInput,
+  type LiveQuerySetOptions,
+} from "./live.js";
 import { chooseJoinOrder, renderPlan } from "./optimizer.js";
 import { encodeSqlEqualityValue } from "./sql-semantics.js";
 import {
@@ -229,7 +292,16 @@ const ENUM_TYPE_PREFIX = "\u0000minnow_enum_type:";
 const SEQUENCE_PREFIX = "\u0000minnow_sequence:";
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
+/** Persistent rebuild failure cannot let an accelerator append one durable delta per commit. */
+const FTS_HARD_DELTA_CHUNKS = 64;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
+/**
+ * Ordinary writes use the same physical target as compaction. Row count remains an upper bound,
+ * while this byte target keeps wide string columns from turning one nominal row group into a
+ * tens-of-megabytes allocation. A single row may exceed the target, but never the format's hard
+ * physical-column limit.
+ */
+const DEFAULT_WRITE_TARGET_BLOCK_BYTES = DEFAULT_COMPACTION_TARGET_BLOCK_BYTES;
 const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
 const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS = 64;
@@ -275,8 +347,34 @@ const AUTO_COLLECT_QUIET_MS = 60_000;
 const AUTO_COLLECT_STEP_ITEMS = 64;
 /** Passes one background collection run makes before handing the rest to the next trigger. */
 const AUTO_COLLECT_MAX_PASSES = 32;
+/** Durable discovery pages one public collection step may advance before yielding. */
+const GARBAGE_COLLECTION_DISCOVERY_PAGES_PER_STEP = 5;
+/** Persisted compaction records inspected by one quiet maintenance run. */
+const AUTO_COMPACTION_RECONCILE_RECORDS = 8;
 /** Finished job records of each kind a background run leaves for inspection. */
 const AUTO_COLLECT_RETAINED_JOB_RECORDS = 8;
+const MAINTENANCE_JOB_PAGE_SIZE = 64;
+const CATALOG_SEGMENT_READ_CONCURRENCY = 8;
+/** Nested SQL savepoints and their total cloned transaction state are both hard bounded. */
+export const MAX_TRANSACTION_SAVEPOINTS = 64;
+export const MAX_TRANSACTION_SAVEPOINT_BYTES = 8 * 1024 * 1024;
+/** Outstanding simple writes retained by one database instance before callers must await. */
+export const MAX_DATABASE_PENDING_WRITES = 64;
+/** Concurrent direct reads retained by one database instance. Reads still execute in parallel. */
+export const MAX_DATABASE_ACTIVE_READS = 256;
+
+export class DatabaseReadBacklogError extends Error {
+  override readonly name = "DatabaseReadBacklogError";
+
+  constructor(readonly limit = MAX_DATABASE_ACTIVE_READS) {
+    super(`A database cannot retain more than ${String(limit)} active reads; await a read`);
+  }
+}
+/** Commits tolerated while collection fails before foreground writes assist and backpressure. */
+const AUTO_COLLECT_MAX_DEBT_COMMITS = 4_096;
+/** Failed background passes retry without another write, with bounded exponential backoff. */
+const AUTO_COLLECT_RETRY_MIN_MS = 1_000;
+const AUTO_COLLECT_RETRY_MAX_MS = 60_000;
 /** Output blocks one background compaction step writes before yielding to the event loop. */
 const AUTO_COMPACT_STEP_BLOCKS = 4;
 /**
@@ -331,6 +429,69 @@ const GZIP_VERDICT_CACHE_LIMIT = 256;
 const GZIP_MINIMUM_INPUT_BYTES = 4 * 1024;
 /** Bounds concurrent compression work without serializing independent column blocks. */
 const WRITE_ENCODE_CONCURRENCY = 6;
+/** Posting rows accumulated by an index builder before one bounded sorted flush. */
+const FTS_BUILD_POSTING_WINDOW = 16_384;
+
+/**
+ * Holds at most one storage-sized block batch. Before encoding the next block, callers provide
+ * its conservative stored-size bound; if it would cross the batch limit the existing bytes are
+ * durably staged first. Staged blocks remain invisible until the segment and transaction commit,
+ * and an exception later in validation or a trigger aborts the journal normally.
+ */
+class BoundedWriteBlockStager {
+  readonly #pending: BlockWrite[] = [];
+  #pendingBytes = 0;
+  #earlyStageMs = 0;
+
+  constructor(private readonly transaction: DatabaseTransaction) {}
+
+  get earlyStageMs(): number {
+    return this.#earlyStageMs;
+  }
+
+  async prepare(maximumNextBytes: number): Promise<void> {
+    await this.prepareBatch(1, maximumNextBytes);
+  }
+
+  async prepareBatch(nextBlockCount: number, maximumNextBytes: number): Promise<void> {
+    if (
+      this.#pending.length > 0 &&
+      (this.#pending.length + nextBlockCount > MAX_TRANSACTION_STAGE_BLOCKS ||
+        this.#pendingBytes + maximumNextBytes > MAX_TRANSACTION_STAGE_BYTES)
+    ) {
+      await this.#flush();
+    }
+  }
+
+  add(block: BlockWrite): void {
+    if (
+      this.#pending.length >= MAX_TRANSACTION_STAGE_BLOCKS ||
+      this.#pendingBytes + block.bytes.byteLength > MAX_TRANSACTION_STAGE_BYTES
+    ) {
+      throw new Error("Write block accumulator crossed its prepared storage bound");
+    }
+    this.#pending.push(block);
+    this.#pendingBytes += block.bytes.byteLength;
+  }
+
+  pendingBlocks(): readonly BlockWrite[] {
+    return this.#pending;
+  }
+
+  async stageWithSegments(segments: readonly SegmentRecord[]): Promise<void> {
+    await this.transaction.stageArtifacts(this.#pending, segments);
+    this.#pending.length = 0;
+    this.#pendingBytes = 0;
+  }
+
+  async #flush(): Promise<void> {
+    const started = performance.now();
+    await this.transaction.stageBlocks(this.#pending);
+    this.#earlyStageMs += performance.now() - started;
+    this.#pending.length = 0;
+    this.#pendingBytes = 0;
+  }
+}
 
 type PhysicalCompactionRewritePlan = RechunkCompactionRewritePlan | MergeCompactionRewritePlan;
 
@@ -385,6 +546,8 @@ interface LiveProofContext {
 interface SegmentVisibilityCatalog {
   readonly transactions: ReadonlyMap<string, { readonly committedVersion: number | null }>;
   readonly segmentsByTable: ReadonlyMap<string, readonly SegmentRecord[]>;
+  /** One staged writer exposed as a synthetic post-snapshot commit inside a transaction scope. */
+  readonly overlayTransactionId?: string;
 }
 
 interface ZonePredicate {
@@ -439,7 +602,7 @@ function normalizedColumnBackfill(
   }
   const valid =
     column.type === "datetime"
-      ? value instanceof Date && Number.isFinite(value.getTime())
+      ? value instanceof Date && Number.isFinite(dateMilliseconds(value))
       : column.type === "number"
         ? typeof value === "number" &&
           Number.isFinite(value) &&
@@ -469,6 +632,39 @@ export interface MigrateOptions {
    * as well, since dropping a table destroys its rows.
    */
   readonly schemaOwnsDatabase?: boolean;
+}
+
+export interface MigrateResult {
+  createdTables: string[];
+  alteredTables: string[];
+  droppedTables: string[];
+  replacedViews: string[];
+  droppedViews: string[];
+  steps: MigrationStep[];
+}
+
+/** Reports the durable before-to-declaration delta, including work completed before a retry. */
+function migrationResult(steps: readonly MigrationStep[]): MigrateResult {
+  const createdTables: string[] = [];
+  const alteredTables = new Set<string>();
+  const droppedTables: string[] = [];
+  const replacedViews: string[] = [];
+  const droppedViews: string[] = [];
+  for (const step of steps) {
+    if (step.kind === "create-table") createdTables.push(step.table.name);
+    else if (step.kind === "drop-table") droppedTables.push(step.tableName);
+    else if (step.kind === "replace-view") replacedViews.push(step.view.name);
+    else if (step.kind === "drop-view") droppedViews.push(step.viewName);
+    else alteredTables.add(step.tableName);
+  }
+  return {
+    createdTables,
+    alteredTables: [...alteredTables],
+    droppedTables,
+    replacedViews,
+    droppedViews,
+    steps: [...steps],
+  };
 }
 
 export interface CreateTableInput {
@@ -510,7 +706,9 @@ export interface UpsertBatchResult extends InsertBatchResult {
 }
 
 export interface UpdateBatchInput {
+  /** Stable ordinary arrays; do not mutate or expose changing accessors until the write settles. */
   keys: readonly BatchValue[];
+  /** Stable ordinary arrays; do not mutate or expose changing accessors until the write settles. */
   changes: Readonly<Record<string, readonly BatchValue[]>>;
 }
 
@@ -595,7 +793,7 @@ export interface WriteSession {
    * Read-your-writes: the query observes the pre-scope snapshot PLUS everything this scope
    * has staged so far, ordered after all committed data — without publishing anything.
    */
-  query(sql: string, options?: { params?: QueryOptions["params"] }): Promise<QueryResult>;
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   /** Runs a SELECT, INSERT, UPDATE, or DELETE inside this write scope. */
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
@@ -613,6 +811,24 @@ export interface QueryExecutionStats {
    * overhead, and allocator overhead are outside it. Not reported for a memo hit — nothing ran.
    */
   readonly peakMemoryBytes: number;
+}
+
+export interface MaintenanceStatus {
+  readonly autoCollectionEnabled: boolean;
+  readonly collectionRunning: boolean;
+  readonly collectionRequested: boolean;
+  /** Commits since collection last proved there was no immediately reclaimable work. */
+  readonly pendingCommitDebt: number;
+  readonly consecutiveFailures: number;
+  /** In-memory posting-tail retry markers; bounded and cleared with their catalog owner. */
+  readonly postingDeltaTailMarkers: number;
+  /** SQL text caches retain only inputs below the fixed cacheability ceiling. */
+  readonly retainedPlanEntries: number;
+  readonly retainedStatementEntries: number;
+  readonly lastStartedAt: Date | null;
+  readonly lastCompletedAt: Date | null;
+  readonly nextRetryAt: Date | null;
+  readonly lastError: { readonly name: string; readonly message: string; readonly at: Date } | null;
 }
 
 export interface QueryOptions {
@@ -652,7 +868,15 @@ export interface QueryOptions {
   readonly spillPageRows?: number;
 }
 
+export interface QueryCursorOptions extends QueryOptions {
+  /** Maximum rows in one yielded result batch. Defaults to the vector scan batch size. */
+  readonly batchRows?: number;
+  /** Cancels the scan and releases its snapshot lease. */
+  readonly signal?: AbortSignal;
+}
+
 export interface DeleteBatchInput {
+  /** Stable ordinary array; do not mutate or expose changing accessors until the write settles. */
   keys: readonly BatchValue[];
 }
 
@@ -668,8 +892,6 @@ export interface DeleteBatchResult {
 }
 
 export interface CompactTableOptions {
-  /** @deprecated Use minimumLevel0Segments. */
-  minimumSegments?: number;
   /** Minimum L0 segments promoted; one also permits a direct L0 -> L2 promotion. */
   minimumLevel0Segments?: number;
   /** Target maximum L0 segments promoted by one job. Equal-order groups remain indivisible. */
@@ -794,6 +1016,8 @@ export interface CollectGarbageStepOptions {
   retainRecentVersions?: number;
 }
 
+export const MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS = 1_024;
+
 export interface GarbageCollectionResult {
   jobId: string;
   prunedManifestCount: number;
@@ -831,12 +1055,16 @@ export interface TableDefinition {
 export type DatabaseRow = Record<string, Exclude<BatchValue, null> | null>;
 
 export {
+  CompactionBacklogError,
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
+  MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
+  TableInUseError,
   UniqueConstraintError,
+  VisibleSegmentCursorStaleError,
 };
 
 export interface MinnowDatabaseOptions {
@@ -852,12 +1080,20 @@ export interface MinnowDatabaseOptions {
    * storage quota; the browser usually makes the opposite trade worth it.
    */
   compression?: Compression;
+  /**
+   * Target maximum uncompressed bytes in a newly written column block. `rowsPerBlock` remains a
+   * second ceiling. A single value may exceed this target when it still fits the format's 64 MiB
+   * hard limit. Defaults to 2 MiB, matching compaction output.
+   */
+  targetBlockBytes?: number;
   rowsPerBlock?: number;
   maxCommitRetries?: number;
   now?: () => Date;
   createId?: () => string;
   /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
   spillOwnerLeaseMs?: number;
+  /** Durable active-writer deadline; renewed every third while the writer is live. */
+  transactionOwnerLeaseMs?: number;
   /**
    * How long a statement-level transaction (`BEGIN` … `COMMIT`) may sit untouched before it
    * rolls itself back; 30 seconds by default. A scope nobody ever closes would otherwise hold
@@ -873,6 +1109,12 @@ export interface MinnowDatabaseOptions {
    * LRU. 0 disables the pool. Defaults to 64 MiB.
    */
   bufferPoolBytes?: number;
+  /**
+   * Default modeled execution-memory budget for every query, including mutation selection,
+   * triggers, subqueries, and read-your-writes scopes. Eligible sorts and groups spill
+   * automatically. Defaults to 64 MiB; `null` explicitly restores unbounded mode.
+   */
+  executionMemoryBudgetBytes?: number | null;
   /**
    * Visible-row threshold at which a full-text MATCH on an unindexed append-only column
    * schedules a background index build (fire-and-forget; correctness never waits on it).
@@ -891,10 +1133,15 @@ export interface MinnowDatabaseOptions {
    * Background collection: a garbage-collection pass after every background fold, and one
    * every 64 commits, each keeping the 64 most recent versions readable. Without it the
    * blocks a fold supersedes and the manifest every commit writes stay on disk until the
-   * caller runs `collectGarbage`. Defaults to `autoCompact`; false leaves collection to the
-   * caller.
+   * caller runs `collectGarbage`. Defaults to true independently of compaction; false leaves
+   * collection to the caller.
    */
   autoCollect?: boolean;
+  /**
+   * Successful commits tolerated while automatic collection is failing before a foreground
+   * write assists and, if maintenance still fails, is refused. Defaults to 4096.
+   */
+  autoCollectDebtLimitCommits?: number;
   /**
    * Defaults for every compaction this database plans, background folds included. A call's
    * own `CompactTableOptions` override them.
@@ -1092,7 +1339,18 @@ export interface StatementWriter extends WriteSession {
 interface TransactionStatementWriter extends StatementWriter {
   executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
   checkpoint(): TransactionCheckpoint;
+  checkpointRetainedBytes(): number;
   rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;
+}
+
+interface OpenStatementTransaction {
+  session: TransactionStatementWriter;
+  settle: (outcome: "commit" | "rollback") => void;
+  finished: Promise<{ version: number | null | undefined }>;
+  timer: ReturnType<typeof setInterval>;
+  busy: number;
+  activeAt: number;
+  savepoints: Array<{ name: string; checkpoint: TransactionCheckpoint; retainedBytes: number }>;
 }
 
 export interface VisibleSegment {
@@ -1101,35 +1359,262 @@ export interface VisibleSegment {
   columnBlockIds: Readonly<Record<string, readonly string[]>>;
 }
 
+export interface VisibleSegmentPageRecord extends VisibleSegment {
+  /** Stable logical scan order, exposed so bounded-page consumers can order a completed fold. */
+  readonly logicalOrder: number;
+  /** The commit that made the segment eligible at the captured manifest version. */
+  readonly committedVersion: number;
+  /** Stable order among segments from the same commit. */
+  readonly commitOrdinal: number;
+}
+
+/** One public segment-inspection page; kept small for direct and worker callers alike. */
+export const MAX_VISIBLE_SEGMENT_PAGE_ITEMS = 64;
+
+/**
+ * Opaque continuation state for a visible-segment scan. The manifest version and table identity
+ * are captured on the first page, so later commits cannot move an in-progress scan onto different
+ * data. Dropping or replacing the table makes this cursor stale and fails the next page.
+ */
+export interface VisibleSegmentPageCursor {
+  readonly tableName: string;
+  readonly tableId: string;
+  readonly version: number | null;
+  readonly afterId: string;
+}
+
+export interface VisibleSegmentPageOptions {
+  /** First page only. Omit for the current committed version; null names the empty version. */
+  readonly version?: number | null;
+  /** Use the exact cursor returned by the previous page; do not combine with `version`. */
+  readonly cursor?: VisibleSegmentPageCursor;
+  /** Defaults to and may not exceed MAX_VISIBLE_SEGMENT_PAGE_ITEMS. */
+  readonly limit?: number;
+}
+
+export interface VisibleSegmentPage {
+  /** Visible records from this bounded physical segment-ID window, in lexical ID order. */
+  readonly records: VisibleSegmentPageRecord[];
+  /** The exact manifest version captured for every page in this scan. */
+  readonly version: number | null;
+  /** May be non-null when `records` is empty because historical records were filtered out. */
+  readonly nextCursor: VisibleSegmentPageCursor | null;
+}
+
 /**
  * Snapshots are optional members of `BlockStore` — a store can be a complete database backend
  * without being able to copy itself out — so the database checks at the call and says plainly
  * when the capability is absent rather than failing as a missing property.
  */
-function exportingStore(store: BlockStore): Required<Pick<BlockStore, "exportSnapshot">> {
-  const exportSnapshot = store.exportSnapshot?.bind(store);
-  if (exportSnapshot === undefined) {
-    throw new Error("This database's block store cannot export snapshots");
+type StreamingSnapshotExportStore = Required<
+  Pick<
+    BlockStore,
+    "beginSnapshotFrameExport" | "readSnapshotExportFrame" | "closeSnapshotFrameExport"
+  >
+>;
+
+function streamingSnapshotExportStore(store: BlockStore): StreamingSnapshotExportStore {
+  const beginSnapshotFrameExport = store.beginSnapshotFrameExport?.bind(store);
+  const readSnapshotExportFrame = store.readSnapshotExportFrame?.bind(store);
+  const closeSnapshotFrameExport = store.closeSnapshotFrameExport?.bind(store);
+  if (
+    beginSnapshotFrameExport === undefined ||
+    readSnapshotExportFrame === undefined ||
+    closeSnapshotFrameExport === undefined
+  ) {
+    throw new Error("This database's block store cannot stream snapshots");
   }
-  return { exportSnapshot };
+  return { beginSnapshotFrameExport, readSnapshotExportFrame, closeSnapshotFrameExport };
 }
 
-function importingStore(store: BlockStore): Required<Pick<BlockStore, "importSnapshot">> {
-  const importSnapshot = store.importSnapshot?.bind(store);
-  if (importSnapshot === undefined) {
-    throw new Error("This database's block store cannot load snapshots");
+type StreamingSnapshotImportStore = Required<
+  Pick<
+    BlockStore,
+    | "beginSnapshotFrameImport"
+    | "appendSnapshotImportFrames"
+    | "finishSnapshotFrameImport"
+    | "cancelSnapshotFrameImport"
+  >
+>;
+
+function streamingSnapshotImportStore(store: BlockStore): StreamingSnapshotImportStore {
+  const beginSnapshotFrameImport = store.beginSnapshotFrameImport?.bind(store);
+  const appendSnapshotImportFrames = store.appendSnapshotImportFrames?.bind(store);
+  const finishSnapshotFrameImport = store.finishSnapshotFrameImport?.bind(store);
+  const cancelSnapshotFrameImport = store.cancelSnapshotFrameImport?.bind(store);
+  if (
+    beginSnapshotFrameImport === undefined ||
+    appendSnapshotImportFrames === undefined ||
+    finishSnapshotFrameImport === undefined ||
+    cancelSnapshotFrameImport === undefined
+  ) {
+    throw new Error("This database's block store cannot stream snapshots");
   }
-  return { importSnapshot };
+  return {
+    beginSnapshotFrameImport,
+    appendSnapshotImportFrames,
+    finishSnapshotFrameImport,
+    cancelSnapshotFrameImport,
+  };
+}
+
+function queryCursorError(value: unknown, fallback = "Query cursor failed"): Error {
+  return value instanceof Error ? value : new Error(fallback, { cause: value });
+}
+
+/** Cold compatibility helper while callers that need all table metadata migrate to page folds. */
+async function listTableSegmentsPaged(
+  store: BlockStore,
+  tableId: string,
+): Promise<SegmentRecord[]> {
+  const records: SegmentRecord[] = [];
+  let afterId: string | null = null;
+  for (;;) {
+    const page = await store.listTableSegmentPage(tableId, afterId, MAX_MAINTENANCE_BATCH_ITEMS);
+    records.push(...page.records);
+    if (page.nextCursor === null) return records;
+    afterId = page.nextCursor;
+  }
+}
+
+/** A one-page rendezvous: the producer cannot scan again until the iterator asks for the page. */
+class QueryBatchChannel {
+  #page:
+    | {
+        value: QueryResult;
+        resolve: () => void;
+        reject: (error: unknown) => void;
+      }
+    | undefined;
+  #reader:
+    | {
+        resolve: (value: IteratorResult<QueryResult, undefined>) => void;
+        reject: (error: unknown) => void;
+      }
+    | undefined;
+  #finished = false;
+  #error: Error | undefined;
+
+  push(value: QueryResult): Promise<void> {
+    if (this.#finished) return Promise.reject(this.#error ?? new Error("Query cursor is closed"));
+    const reader = this.#reader;
+    if (reader !== undefined) {
+      this.#reader = undefined;
+      reader.resolve({ done: false, value });
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.#page = { value, resolve, reject };
+    });
+  }
+
+  next(): Promise<IteratorResult<QueryResult, undefined>> {
+    const page = this.#page;
+    if (page !== undefined) {
+      this.#page = undefined;
+      page.resolve();
+      return Promise.resolve({ done: false, value: page.value });
+    }
+    if (this.#finished) {
+      return this.#error === undefined
+        ? Promise.resolve({ done: true, value: undefined })
+        : Promise.reject(this.#error);
+    }
+    return new Promise((resolve, reject) => {
+      this.#reader = { resolve, reject };
+    });
+  }
+
+  finish(): void {
+    if (this.#finished) return;
+    this.#finished = true;
+    const reader = this.#reader;
+    this.#reader = undefined;
+    reader?.resolve({ done: true, value: undefined });
+  }
+
+  fail(error: unknown): void {
+    if (this.#finished) return;
+    const reason = queryCursorError(error);
+    this.#finished = true;
+    this.#error = reason;
+    const page = this.#page;
+    this.#page = undefined;
+    page?.reject(reason);
+    const reader = this.#reader;
+    this.#reader = undefined;
+    reader?.reject(reason);
+  }
+}
+
+interface QueryBatchCursorExecution {
+  readonly batchRows: number;
+  readonly signal: AbortSignal;
+  readonly consume: (batch: QueryResult) => Promise<void>;
 }
 
 export interface SnapshotExportOptions {
   /** Called as the export moves through its phases; see SnapshotExportProgress. */
   onProgress?: (progress: SnapshotExportProgress) => void;
+  /** Cancels transfer and releases the durable export pin. */
+  signal?: AbortSignal;
 }
 
 export interface SnapshotImportOptions {
   /** Called as blocks land, for a progress bar over a multi-megabyte file. */
   onProgress?: (progress: SnapshotLoadProgress) => void;
+  /** Cancels transfer and atomically removes this caller's staged import. */
+  signal?: AbortSignal;
+}
+
+const SNAPSHOT_TRANSFER_CHUNK_BYTES = 1024 * 1024;
+const MAX_SNAPSHOT_BYTE_ARRAY_LENGTH = 0xffffffff;
+
+function snapshotSessionTimes(now: Date): { createdAt: string; expiresAt: string } {
+  const createdAtMs = dateMilliseconds(now);
+  const expiresAtMs = createdAtMs + MAX_SNAPSHOT_SESSION_TTL_MS;
+  if (!Number.isSafeInteger(expiresAtMs)) {
+    throw new RangeError("Snapshot session expiration is outside the safe timestamp range");
+  }
+  return {
+    createdAt: dateIsoString(new Date(createdAtMs)),
+    expiresAt: dateIsoString(new Date(expiresAtMs)),
+  };
+}
+
+function snapshotAbortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("Snapshot operation was aborted", { cause: signal.reason });
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfSnapshotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw snapshotAbortError(signal);
+}
+
+async function* abortableSnapshotSource(
+  source: AsyncIterable<Uint8Array>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array> {
+  const iterator = source[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      throwIfSnapshotAborted(signal);
+      const next = await iterator.next();
+      throwIfSnapshotAborted(signal);
+      if (next.done === true) return;
+      yield next.value;
+    }
+  } finally {
+    await iterator.return?.();
+  }
+}
+
+async function* singleSnapshotChunk(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  for (let offset = 0; offset < bytes.byteLength; offset += SNAPSHOT_TRANSFER_CHUNK_BYTES) {
+    yield bytes.subarray(offset, offset + SNAPSHOT_TRANSFER_CHUNK_BYTES);
+  }
 }
 
 export class MinnowDatabase {
@@ -1147,50 +1632,46 @@ export class MinnowDatabase {
   /** CURRVAL is connection-local, matching PostgreSQL session semantics. */
   readonly #sequenceCurrValues = new Map<string, number>();
   /** The scope a statement-level BEGIN opened, held until COMMIT, ROLLBACK, or the idle sweep. */
-  #openTransaction:
-    | {
-        session: TransactionStatementWriter;
-        settle: (outcome: "commit" | "rollback") => void;
-        finished: Promise<{ version: number | null | undefined }>;
-        timer: ReturnType<typeof setInterval>;
-        /** Statements running right now: a transaction working is never idle, however slow. */
-        busy: number;
-        /** When the last statement started or finished, by the injected clock. */
-        activeAt: number;
-        /** Nested SQL savepoints in creation order; duplicate names shadow earlier markers. */
-        savepoints: Array<{ name: string; checkpoint: TransactionCheckpoint }>;
-      }
-    | undefined;
+  #openTransaction: OpenStatementTransaction | undefined;
+  /** Joins the durable abort after an idle timer has detached the statement transaction. */
+  #statementTransactionCleanup: Promise<void> | undefined;
   readonly #compression: Compression;
   /** Per-column count since gzip last failed to repay itself; successful probes need no entry. */
   readonly #gzipVerdicts = new Map<string, number>();
   readonly #rowsPerBlock: number;
+  readonly #targetBlockBytes: number;
   readonly #maxCommitRetries: number;
   readonly #now: () => Date;
   readonly #spillOwnerLeaseMs: number;
+  readonly #transactionOwnerLeaseMs: number;
   readonly #createId: () => string;
   readonly #internalLeaseOwnerId: string;
   readonly #liveSets = new Set<LiveQuerySet>();
   /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
   readonly #liveProofContexts = new Map<string, Promise<LiveProofContext>>();
-  #internalLeaseSequence = 0;
   readonly #artifactCache: ArtifactCache;
+  /** Finite default applied before every engine query path; MAX_SAFE is explicit unbounded mode. */
+  readonly #queryExecutionMemoryBudgetBytes: number;
   readonly #ftsAutoIndexRows: number;
   readonly #autoCompact: boolean;
   readonly #compactionPartitionRows: number;
   readonly #autoCollect: boolean;
+  readonly #autoCollectionDebtLimitCommits: number;
   /** Data commits since the last background collection pass. */
   #commitsSinceCollection = 0;
-  /**
-   * The highest manifest version below which everything is known to be collected — pruned,
-   * with no block left behind; a collection plan starts its walk there. In memory only: a
-   * fresh instance walks the whole history once and learns it again.
-   */
-  #collectionWatermark: number | null = null;
+  /** Rotating durable-job scan cursor; keeps one quiet reconciliation pass bounded. */
+  #compactionReconciliationCursor: string | null = null;
   #autoCollectionInFlight = false;
   /** A trigger that arrived while a run was in flight; honoured when the run ends. */
   #autoCollectionRequested = false;
-  #autoCollectionBackoffUntilCommit = 0;
+  /** Conservative debt: reset only after a pass finds no more immediately reclaimable work. */
+  #autoCollectionDebtCommits = 0;
+  #manualCollectionDebtInitialized = false;
+  #autoCollectionConsecutiveFailures = 0;
+  #autoCollectionLastError: { name: string; message: string; at: number } | undefined;
+  #lastCollectionCompletedAt: number | undefined;
+  #autoCollectionRetryAt: number | undefined;
+  #autoCollectionRetryTimer: ReturnType<typeof setTimeout> | undefined;
   /** When the last background collection pass started, by the database clock. */
   #lastCollectionAt: number | undefined;
   /** The idle pass scheduled after the last commit; reset by the next commit. */
@@ -1199,11 +1680,14 @@ export class MinnowDatabase {
   #collectionSteps: Promise<unknown> = Promise.resolve();
   /** One background build attempt per (table, column) per session; misses just stay scans. */
   readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
+  /** Highest authoritative commit hint observed while a postings fold is in flight. */
+  readonly #postingDeltaTailCounts = new Map<string, number>();
   readonly #droppingFtsColumns = new Set<string>();
   /** Tables with a fire-and-forget compaction step already running. */
   readonly #autoCompactionsInFlight = new Map<string, Promise<void>>();
   /** Tables whose maintenance threshold was observed again while their fold was still running. */
   readonly #autoCompactionsRequested = new Set<string>();
+  readonly #accountedCompactionVersions = new Set<number>();
   /** Changed tables awaiting the debounced check that closes a write burst. */
   readonly #idleCompactionTableIds = new Set<string>();
   #idleCompactionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1217,6 +1701,8 @@ export class MinnowDatabase {
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
   /** The simple writes in flight, chained so they commit one after another: see #runWrite. */
   #writeChain: Promise<unknown> = Promise.resolve();
+  #pendingWriteReservations = 0;
+  #activeReadReservations = 0;
   /** The complete automatic collection loop, retained so close() can join it before the store. */
   #autoCollectionTask: Promise<void> | undefined;
   /**
@@ -1228,7 +1714,6 @@ export class MinnowDatabase {
   readonly #planCache = new Map<string, CompiledQuery>();
   /** Mutation/DDL SQL to immutable parsed statement, with parameter binding cloning on hits. */
   readonly #statementCache = new Map<string, CompiledStatement>();
-  readonly #visibilityFingerprints = new WeakMap<SegmentVisibilityCatalog, Map<string, string>>();
   readonly #visibleSegmentsMemo = new WeakMap<
     SegmentVisibilityCatalog,
     Map<string, SegmentRecord[]>
@@ -1239,6 +1724,13 @@ export class MinnowDatabase {
   #sharedLeaseRenewal: Promise<void> | undefined;
   /** An in-flight re-pin of the shared lease; acquirers wait for it, never join it. */
   #sharedLeaseMove: Promise<void> | undefined;
+  /** Retired shared pins release off the read fast path; close joins them before store shutdown. */
+  readonly #sharedLeaseReleases = new Set<Promise<void>>();
+  /** Acquisitions can be suspended in store I/O before they install an entry. */
+  #sharedLeaseAcquisitions = 0;
+  /** Sum of refCount across current and retired shared entries. */
+  #sharedLeaseUses = 0;
+  readonly #sharedLeaseStateWaiters = new Set<() => void>();
   /**
    * Catalog states keyed by requested table-name set, valid only at #catalogStateEpoch.
    * The (version, epoch) probe is the sole validity signal: a matched epoch proves a cached
@@ -1246,6 +1738,20 @@ export class MinnowDatabase {
    */
   readonly #catalogStateCache = new Map<string, QueryCatalogState>();
   #catalogStateEpoch: number | undefined;
+  /**
+   * Immutable maps derived from one epoch-gated catalog state. A settled table can retain many
+   * historical segment and transaction records after their payloads are reclaimed; rebuilding
+   * these indexes on every query would make steady-state preparation O(history), and a fresh
+   * visibility object would also defeat #visibleSegmentsMemo. Weak keys keep eviction owned by
+   * the bounded catalog-state cache without a second retention policy.
+   */
+  readonly #preparedCatalogStates = new WeakMap<
+    QueryCatalogState,
+    {
+      readonly realTables: Map<string, TableRecord>;
+      readonly visibility: SegmentVisibilityCatalog;
+    }
+  >();
 
   constructor(
     private readonly store: BlockStore,
@@ -1257,8 +1763,24 @@ export class MinnowDatabase {
     // flat from ~16k rows per block and 2k-row blocks cost up to 66% on top-n; 65,536 sits
     // on the plateau while keeping eviction granularity moderate.
     this.#rowsPerBlock = options.rowsPerBlock ?? 65_536;
-    if (!Number.isSafeInteger(this.#rowsPerBlock) || this.#rowsPerBlock <= 0) {
-      throw new RangeError("Rows per block must be a positive whole number");
+    if (
+      !Number.isSafeInteger(this.#rowsPerBlock) ||
+      this.#rowsPerBlock <= 0 ||
+      this.#rowsPerBlock > MAX_BLOCK_ROW_COUNT
+    ) {
+      throw new RangeError(
+        `Rows per block must be a positive whole number no larger than ${String(MAX_BLOCK_ROW_COUNT)}`,
+      );
+    }
+    this.#targetBlockBytes = options.targetBlockBytes ?? DEFAULT_WRITE_TARGET_BLOCK_BYTES;
+    if (
+      !Number.isSafeInteger(this.#targetBlockBytes) ||
+      this.#targetBlockBytes <= 0 ||
+      this.#targetBlockBytes > MAX_PHYSICAL_COLUMN_BYTE_LENGTH
+    ) {
+      throw new RangeError(
+        `Target block bytes must be a positive whole number no larger than ${String(MAX_PHYSICAL_COLUMN_BYTE_LENGTH)}`,
+      );
     }
     this.#maxCommitRetries = options.maxCommitRetries ?? 8;
     if (!Number.isSafeInteger(this.#maxCommitRetries) || this.#maxCommitRetries < 0) {
@@ -1268,13 +1790,38 @@ export class MinnowDatabase {
     this.#createId = options.createId ?? (() => crypto.randomUUID());
     this.#internalLeaseOwnerId = `minnow/${this.#createId()}`;
     this.#spillOwnerLeaseMs = options.spillOwnerLeaseMs ?? 60_000;
-    if (!Number.isSafeInteger(this.#spillOwnerLeaseMs) || this.#spillOwnerLeaseMs <= 0) {
-      throw new RangeError("Spill owner lease lifetime must be a positive whole number");
+    if (
+      !Number.isSafeInteger(this.#spillOwnerLeaseMs) ||
+      this.#spillOwnerLeaseMs <= 0 ||
+      this.#spillOwnerLeaseMs > MAX_TEMP_OWNER_TTL_MS
+    ) {
+      throw new RangeError(
+        `Spill owner lease lifetime must be a positive whole number no greater than ${String(MAX_TEMP_OWNER_TTL_MS)}`,
+      );
+    }
+    this.#transactionOwnerLeaseMs = options.transactionOwnerLeaseMs ?? 30_000;
+    if (
+      !Number.isSafeInteger(this.#transactionOwnerLeaseMs) ||
+      this.#transactionOwnerLeaseMs <= 0
+    ) {
+      throw new RangeError("Transaction owner lease lifetime must be a positive whole number");
     }
     this.#artifactCache = new ArtifactCache(options.bufferPoolBytes ?? 64 * 1024 * 1024);
+    const queryBudget = options.executionMemoryBudgetBytes;
+    this.#queryExecutionMemoryBudgetBytes =
+      queryBudget === null
+        ? Number.MAX_SAFE_INTEGER
+        : positiveWholeNumber(
+            queryBudget ?? DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
+            "Query execution memory budget",
+          );
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
     this.#autoCompact = options.autoCompact ?? true;
-    this.#autoCollect = options.autoCollect ?? this.#autoCompact;
+    this.#autoCollect = options.autoCollect ?? true;
+    this.#autoCollectionDebtLimitCommits = positiveWholeNumber(
+      options.autoCollectDebtLimitCommits ?? AUTO_COLLECT_MAX_DEBT_COMMITS,
+      "Automatic collection debt limit",
+    );
     this.#compactionPartitionRows = positiveWholeNumber(
       options.compaction?.partitionRows ?? DEFAULT_COMPACTION_PARTITION_ROWS,
       "Compaction partition rows",
@@ -1288,7 +1835,9 @@ export class MinnowDatabase {
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
       createId: this.#createId,
+      transactionTtlMs: this.#transactionOwnerLeaseMs,
     });
+    this.#armIdleCollection();
   }
 
   /**
@@ -1313,13 +1862,16 @@ export class MinnowDatabase {
       clearTimeout(this.#idleCollectionTimer);
       this.#idleCollectionTimer = undefined;
     }
+    if (this.#autoCollectionRetryTimer !== undefined) {
+      clearTimeout(this.#autoCollectionRetryTimer);
+      this.#autoCollectionRetryTimer = undefined;
+    }
 
     const open = this.#openTransaction;
-    this.#openTransaction = undefined;
-    if (open !== undefined) {
-      clearInterval(open.timer);
-      open.settle("rollback");
-    }
+    const statementCleanup =
+      open === undefined
+        ? this.#statementTransactionCleanup
+        : this.#rollbackStatementTransaction(open);
 
     for (const set of [...this.#liveSets]) set.close();
     this.#liveSets.clear();
@@ -1330,7 +1882,13 @@ export class MinnowDatabase {
       ...this.#autoCompactionsInFlight.values(),
       ...this.#ftsBuildsInFlight.values(),
       ...(this.#autoCollectionTask === undefined ? [] : [this.#autoCollectionTask]),
+      ...(statementCleanup === undefined ? [] : [statementCleanup]),
     ]);
+
+    // An acquire already inside store I/O can otherwise install a fresh lease after the close
+    // path detached what it believed was the final entry. #closed prevents any new acquire from
+    // entering after this point; join the ones that entered before it flipped.
+    while (this.#sharedLeaseAcquisitions > 0) await this.#sharedLeaseStateChange();
 
     // A move or renewal owns the lease while suspended. Let it settle before detaching the
     // final entry, otherwise it could install a fresh persistent lease after close returned.
@@ -1342,6 +1900,13 @@ export class MinnowDatabase {
     const shared = this.#sharedLease;
     this.#sharedLease = undefined;
     if (shared?.refCount === 0) await shared.lease.release().catch(() => undefined);
+    // Active snapshot/query callbacks release retired entries in their finally blocks. Wait for
+    // those references before draining the tracked removals, so none can enqueue store work after
+    // close has returned to a caller that may immediately close the injected adapter.
+    while (this.#sharedLeaseUses > 0) await this.#sharedLeaseStateChange();
+    while (this.#sharedLeaseReleases.size > 0) {
+      await Promise.allSettled([...this.#sharedLeaseReleases]);
+    }
     if (open !== undefined) await open.finished.catch(() => undefined);
 
     this.#planCache.clear();
@@ -1354,6 +1919,32 @@ export class MinnowDatabase {
     this.#autoCompactionBackoff.clear();
     this.#commitsSinceCompactionCheck.clear();
     this.#artifactCache.clear();
+  }
+
+  /** Current background-collection health, returned as a defensive snapshot. */
+  maintenanceStatus(): MaintenanceStatus {
+    const error = this.#autoCollectionLastError;
+    return {
+      autoCollectionEnabled: this.#autoCollect,
+      collectionRunning: this.#autoCollectionInFlight,
+      collectionRequested: this.#autoCollectionRequested,
+      pendingCommitDebt: this.#autoCollectionDebtCommits,
+      consecutiveFailures: this.#autoCollectionConsecutiveFailures,
+      postingDeltaTailMarkers: this.#postingDeltaTailCounts.size,
+      retainedPlanEntries: this.#planCache.size,
+      retainedStatementEntries: this.#statementCache.size,
+      lastStartedAt: this.#lastCollectionAt === undefined ? null : new Date(this.#lastCollectionAt),
+      lastCompletedAt:
+        this.#lastCollectionCompletedAt === undefined
+          ? null
+          : new Date(this.#lastCollectionCompletedAt),
+      nextRetryAt:
+        this.#autoCollectionRetryAt === undefined ? null : new Date(this.#autoCollectionRetryAt),
+      lastError:
+        error === undefined
+          ? null
+          : { name: error.name, message: error.message, at: new Date(error.at) },
+    };
   }
 
   async createTable(input: CreateTableInput): Promise<void> {
@@ -1472,8 +2063,22 @@ export class MinnowDatabase {
         }
       }
     }
+    const constraintNames = new Set<string>();
+    const claimConstraintName = (rawName: string): string => {
+      const constraintName = validateName(rawName, "Constraint");
+      if (constraintNames.has(constraintName)) {
+        throw new TypeError(`Constraint already exists: ${constraintName}`);
+      }
+      constraintNames.add(constraintName);
+      return constraintName;
+    };
+    const foreignKeyNames = (input.foreignKeys ?? []).map((key) => claimConstraintName(key.name));
+    const checkNames = (input.checks ?? []).map((check) => claimConstraintName(check.name));
+    const uniqueConstraintNames = (input.uniqueConstraints ?? []).map((constraint) =>
+      claimConstraintName(constraint.name),
+    );
     const foreignKeys = await Promise.all(
-      (input.foreignKeys ?? []).map(async (key) => {
+      (input.foreignKeys ?? []).map(async (key, keyIndex) => {
         const childNames = key.columns ?? [key.column];
         const children = childNames.map((columnName) => {
           const column = columns.find((candidate) => candidate.name === columnName);
@@ -1557,30 +2162,38 @@ export class MinnowDatabase {
         });
         const parentNames = parentPrimary.map((column) => column.name);
         return {
-          name: validateName(key.name, "Constraint"),
-          column: childNames[0] ?? "",
-          ...(childNames.length === 1 ? {} : { columns: childNames }),
+          name: foreignKeyNames[keyIndex] ?? key.name,
+          columns: childNames,
           parentTable: key.parentTable,
-          parentColumn: parentNames[0] ?? "",
-          ...(parentNames.length === 1 ? {} : { parentColumns: parentNames }),
+          parentColumns: parentNames,
           onDelete: key.onDelete,
         };
       }),
     );
-    const checks = (input.checks ?? []).map((check) => {
+    const checks = (input.checks ?? []).map((check, checkIndex) => {
       // Compiling here means a constraint the engine could never evaluate is refused at
       // definition rather than on the first write.
-      compileCheckExpression(check.sql, check.name);
-      return { name: validateName(check.name, "Constraint"), sql: check.sql };
+      const referencedColumns = expressionColumnNames(
+        compileCheckExpression(check.sql, check.name),
+      );
+      for (const reference of referencedColumns) {
+        const pieces = reference.split(".");
+        const columnName = pieces.at(-1) ?? reference;
+        const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
+        if (qualifier !== undefined && qualifier !== name) {
+          throw new TypeError(`CHECK ${check.name} references another table: ${reference}`);
+        }
+        if (!columns.some((column) => column.name === columnName && !column.hidden)) {
+          throw new TypeError(`CHECK ${check.name} names an unknown column: ${columnName}`);
+        }
+      }
+      return { name: checkNames[checkIndex] ?? check.name, sql: check.sql };
     });
     const tableId = this.#createId();
     const currentVersion = (await this.store.getCurrentManifest())?.version ?? -1;
-    const indexNames = new Set<string>();
     const secondaryIndexes: Record<string, SecondaryIndexRecord> = {};
-    for (const constraint of input.uniqueConstraints ?? []) {
-      const indexName = validateName(constraint.name, "Constraint");
-      if (indexNames.has(indexName)) throw new TypeError(`Constraint already exists: ${indexName}`);
-      indexNames.add(indexName);
+    for (const [constraintIndex, constraint] of (input.uniqueConstraints ?? []).entries()) {
+      const indexName = uniqueConstraintNames[constraintIndex] ?? constraint.name;
       const indexedColumns = constraint.columns.map((columnName) => {
         const column = columns.find(
           (candidate) => candidate.name === columnName && !candidate.hidden,
@@ -1616,16 +2229,17 @@ export class MinnowDatabase {
       id: tableId,
       name,
       columns,
+      revision: 0,
+      managed: input.managed === true,
       ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
       ...(checks.length === 0 ? {} : { checks }),
-      ...(input.managed === true ? { managed: true } : {}),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
       ...(compositePrimaryColumns.length === 0
         ? {}
         : { primaryKeyColumnIds: compositePrimaryColumns.map((column) => column.id) }),
       ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
-      createdAt: this.#now().toISOString(),
+      createdAt: dateIsoString(this.#now()),
     });
   }
 
@@ -1679,10 +2293,15 @@ export class MinnowDatabase {
    */
   async #runWrite<T>(run: () => Promise<T>): Promise<T> {
     const restarting = async (): Promise<T> => {
+      await this.#assistAutomaticCollection();
       for (let attempt = 0; ; attempt += 1) {
         try {
           return await run();
         } catch (error) {
+          if (error instanceof SchemaConflictError) {
+            if (attempt >= this.#maxCommitRetries) throw error;
+            continue;
+          }
           if (error instanceof UniqueIndexCoverageError) {
             if (attempt >= this.#maxCommitRetries) throw error;
             continue;
@@ -1702,10 +2321,95 @@ export class MinnowDatabase {
     }
   }
 
-  /** Turns the storage namespace/token of a secondary UNIQUE conflict into a public SQL error. */
-  async #translateSecondaryUniqueConflict(error: unknown): Promise<unknown> {
+  async #withWriteReservation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.#pendingWriteReservations >= MAX_DATABASE_PENDING_WRITES) {
+      throw new RangeError(
+        `A database cannot queue more than ${String(MAX_DATABASE_PENDING_WRITES)} writes; await a write for backpressure`,
+      );
+    }
+    this.#pendingWriteReservations += 1;
+    try {
+      return await run();
+    } finally {
+      this.#pendingWriteReservations -= 1;
+    }
+  }
+
+  async #withReadReservation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.#activeReadReservations >= MAX_DATABASE_ACTIVE_READS) {
+      throw new DatabaseReadBacklogError();
+    }
+    this.#activeReadReservations += 1;
+    try {
+      return await run();
+    } finally {
+      this.#activeReadReservations -= 1;
+    }
+  }
+
+  async #queryWithReadReservation(sql: string, options: QueryOptions): Promise<QueryResult> {
+    await this.#settleExpiredStatementTransaction();
+    // An open statement transaction routes through its session, which owns the reservation for
+    // the actual execution. Avoid charging the same query twice at this public boundary.
+    return this.#openTransaction === undefined
+      ? this.#withReadReservation(() => this.#queryUnreserved(sql, options))
+      : this.#queryUnreserved(sql, options);
+  }
+
+  /**
+   * A persistent collector failure must not let obsolete history grow forever. The threshold is
+   * intentionally far above the normal 64-commit cadence: only a genuinely unhealthy store pays
+   * foreground latency, and a write is refused only after an assisted pass still fails.
+   */
+  async #assistAutomaticCollection(): Promise<void> {
+    if (!this.#autoCollect && !this.#manualCollectionDebtInitialized) {
+      const current = await this.store.getCurrentManifestVersion();
+      const first = (await this.store.listManifestPage(null, 1)).records[0];
+      if (current !== null && first !== undefined) {
+        const distance = current - first.version;
+        const durableDebt =
+          distance >= this.#autoCollectionDebtLimitCommits
+            ? this.#autoCollectionDebtLimitCommits
+            : distance + 1;
+        this.#autoCollectionDebtCommits = Math.max(this.#autoCollectionDebtCommits, durableDebt);
+      }
+      this.#manualCollectionDebtInitialized = true;
+    }
+    if (this.#autoCollectionDebtCommits < this.#autoCollectionDebtLimitCommits) return;
+    if (!this.#autoCollect) {
+      throw new MaintenanceBacklogError(
+        this.#autoCollectionDebtCommits,
+        "automatic collection is disabled; call collectGarbage() before writing again",
+      );
+    }
+    // Foreground work is capped at one already-bounded collector run. If a very old database
+    // needs more, the run requeues itself in the background and this write refuses before it
+    // starts; foreground latency must not scale with the total retained history.
+    this.#maybeScheduleAutoCollection(true);
+    const task = this.#autoCollectionTask;
+    if (task !== undefined) await task;
+    if (this.#autoCollectionDebtCommits >= this.#autoCollectionDebtLimitCommits) {
+      throw new MaintenanceBacklogError(
+        this.#autoCollectionDebtCommits,
+        this.#autoCollectionLastError?.message ?? "bounded collection assistance left a backlog",
+      );
+    }
+  }
+
+  /** Turns a storage namespace/token UNIQUE conflict into the public table/constraint error. */
+  async #translateUniqueConflict(error: unknown): Promise<unknown> {
     if (!(error instanceof UniqueKeyConflictError)) return error;
     for (const table of await this.store.listTables()) {
+      if (table.id === error.tableId) {
+        const keyColumn = getUniqueKeyColumn(table);
+        if (keyColumn !== undefined) {
+          return new UniqueConstraintError(
+            table.name,
+            publicKeyName(table, keyColumn),
+            error.keyToken,
+          );
+        }
+      }
       for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
         if (
           index.unique !== true ||
@@ -1719,10 +2423,7 @@ export class MinnowDatabase {
         if (columns.some((column) => column === undefined)) return error;
         try {
           const presentColumns = columns as TableColumnRecord[];
-          const values =
-            index.termEncoding === "tuple-v1"
-              ? decodeSecondaryTupleTerm(index, presentColumns, error.keyToken)
-              : [error.keyToken];
+          const values = decodeSecondaryTupleTerm(index, presentColumns, error.keyToken);
           const columnName =
             presentColumns.length === 1
               ? (presentColumns[0]?.name ?? index.name)
@@ -1759,93 +2460,222 @@ export class MinnowDatabase {
   ): Promise<void> {
     const viewName = validateName(name, "View");
     const plan = compileQuery(sql);
-    const existing = await this.store.getTableByName(viewName);
-    if (existing !== undefined) {
-      if (existing.view === undefined) throw new TypeError(`Table already exists: ${viewName}`);
-      if (options.orReplace !== true) throw new TypeError(`View already exists: ${viewName}`);
+    let pinnedExistingId: string | null | undefined;
+    for (let attempt = 0; ; attempt += 1) {
+      const proof = await this.#stableCatalogProof();
+      const existing = proof.records.find((record) => record.name === viewName);
+      const existingId = existing?.id ?? null;
+      if (pinnedExistingId === undefined) pinnedExistingId = existingId;
+      else if (pinnedExistingId !== existingId) {
+        throw new TableRecordConflictError(viewName, 0, existing?.revision ?? null);
+      }
+      if (existing !== undefined) {
+        if (existing.view === undefined) throw new TypeError(`Table already exists: ${viewName}`);
+        if (options.orReplace !== true) throw new TypeError(`View already exists: ${viewName}`);
+      }
+      assertViewDefinitionAcyclic(proof.records, viewName, plan);
+      const schemas = catalogQuerySchemas(proof.records);
+      const inferred = inferBlockSchema(plan, schemas);
+      if (inferred.length === 0) {
+        throw new TypeError(`A view needs at least one column: ${viewName}`);
+      }
+      if (existing !== undefined) {
+        schemas.set(viewName, inferred);
+        assertDependentViewsKeepSchema(proof.records, existing, schemas);
+      }
+      const columns = inferred.map((column, index) => {
+        const previous = existing?.columns[index];
+        return {
+          id:
+            previous !== undefined && querySchemasEqual([column], [previous])
+              ? previous.id
+              : this.#createId(),
+          name: column.name,
+          type: column.type,
+          ...(column.integer === true ? { integer: true as const } : {}),
+          ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+          nullable: true,
+        };
+      });
+      const view = { sql, managed: options.managed === true };
+      try {
+        if (existing !== undefined) {
+          await this.store.updateTable(existing.id, existing.revision, {
+            columns,
+            ftsColumns: null,
+            secondaryIndexes: null,
+            triggers: null,
+            view,
+            expectedCatalogEpoch: proof.catalogEpoch,
+          });
+        } else {
+          await this.store.addTable(
+            {
+              id: this.#createId(),
+              name: viewName,
+              columns,
+              view,
+              managed: false,
+              revision: 0,
+              createdAt: dateIsoString(this.#now()),
+            },
+            { expectedCatalogEpoch: proof.catalogEpoch },
+          );
+        }
+        this.#planCache.clear();
+        return;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+          throw error;
+        }
+        if (existing !== undefined) {
+          const current = await this.store.getTable(existing.id);
+          if (current?.revision !== existing.revision) throw error;
+        }
+      }
     }
-    // The schema is inferred against the catalog as it stands, where a view answers with its own
-    // stored columns — so a view over a view types without expanding anything, and a body that
-    // cannot be typed fails where it is written rather than on the first read.
-    const schemas = new Map(
-      (await this.store.listTables()).map((table) => [
-        table.name,
-        table.columns.map(({ name: column, type, integer, sqlDomain }) => ({
-          name: column,
-          type,
-          ...(integer === true ? { integer: true as const } : {}),
-          ...(sqlDomain === undefined ? {} : { sqlDomain }),
-        })),
-      ]),
-    );
-    const inferred = inferBlockSchema(plan, schemas);
-    if (inferred.length === 0) throw new TypeError(`A view needs at least one column: ${viewName}`);
-    if (existing !== undefined) await this.store.removeTable(existing.id, existing.revision ?? 0);
-    await this.store.addTable({
-      id: this.#createId(),
-      name: viewName,
-      columns: inferred.map((column) => ({
-        id: this.#createId(),
-        name: column.name,
-        type: column.type,
-        ...(column.integer === true ? { integer: true as const } : {}),
-        ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
-        nullable: true,
-      })),
-      view: { sql, ...(options.managed === true ? { managed: true } : {}) },
-      createdAt: this.#now().toISOString(),
-    });
-    this.#planCache.clear();
   }
 
   /** Removes a view. Returns whether one was dropped; `ifExists` makes a missing one no error. */
   async dropView(name: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
-    const record = await this.store.getTableByName(name);
-    if (record?.view === undefined) {
-      if (record !== undefined) throw new TypeError(`Not a view: ${name}`);
-      if (options.ifExists === true) return false;
-      throw new Error(`View not found: ${name}`);
+    let pinnedId: string | undefined;
+    for (let attempt = 0; ; attempt += 1) {
+      const proof = await this.#stableCatalogProof();
+      const record = proof.records.find((candidate) => candidate.name === name);
+      if (record?.view === undefined) {
+        if (pinnedId !== undefined) {
+          throw new TableRecordConflictError(pinnedId, 0, record?.revision ?? null);
+        }
+        if (record !== undefined) throw new TypeError(`Not a view: ${name}`);
+        if (options.ifExists === true) return false;
+        throw new Error(`View not found: ${name}`);
+      }
+      pinnedId ??= record.id;
+      if (record.id !== pinnedId) {
+        throw new TableRecordConflictError(pinnedId, 0, record.revision);
+      }
+      const dependent = proof.records.find(
+        (candidate) =>
+          candidate.id !== record.id &&
+          candidate.view !== undefined &&
+          viewReadsTable(candidate.view.sql, record.name),
+      );
+      if (dependent !== undefined) {
+        throw new TypeError(`Cannot drop ${record.name}: view ${dependent.name} reads it`);
+      }
+      try {
+        await this.store.removeTable(record.id, record.revision, {
+          expectedCatalogEpoch: proof.catalogEpoch,
+        });
+        this.#planCache.clear();
+        return true;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+          throw error;
+        }
+      }
     }
-    await this.store.removeTable(record.id, record.revision ?? 0);
-    this.#planCache.clear();
-    return true;
+  }
+
+  /** Reads all catalog records under one epoch proof, retrying only the bounded read window. */
+  async #stableCatalogProof(): Promise<{
+    catalogEpoch: number;
+    manifestVersion: number | null;
+    records: TableRecord[];
+  }> {
+    for (let attempt = 0; ; attempt += 1) {
+      const before = await this.store.getCatalogProbe();
+      const records = await this.store.listTables();
+      const after = await this.store.getCatalogProbe();
+      if (
+        before.catalogEpoch === after.catalogEpoch &&
+        before.manifestVersion === after.manifestVersion
+      ) {
+        return {
+          catalogEpoch: before.catalogEpoch,
+          manifestVersion: before.manifestVersion,
+          records,
+        };
+      }
+      if (attempt >= this.#maxCommitRetries) {
+        throw new TableRecordConflictError("catalog", before.catalogEpoch, after.catalogEpoch);
+      }
+    }
   }
 
   /**
-   * Drops one non-key column as a metadata-only operation. Stored bytes remain reachable until
-   * compaction rewrites their segments; storage removes any persisted full-text accelerator in
-   * the same catalog mutation, so repeated schema evolution cannot accumulate orphan indexes.
+   * Drops one non-key column in one storage transaction: catalog metadata and segment references
+   * change with the successor manifest that retires the column's exclusively owned live blocks.
+   * Payload bytes remain readable to historical leases until ordinary collection reclaims them.
    */
   async dropColumn(
     tableName: string,
     columnName: string,
     options: { ifExists?: boolean } = {},
   ): Promise<boolean> {
+    let pinnedTableId: string | undefined;
+    let pinnedColumnId: string | undefined;
     for (let attempt = 0; ; attempt += 1) {
+      const catalogProof = await this.store.getCatalogProbe();
       const records = await this.store.listTables();
+      if ((await this.store.getCatalogProbe()).catalogEpoch !== catalogProof.catalogEpoch) {
+        if (attempt >= this.#maxCommitRetries) {
+          throw new TableRecordConflictError(tableName, 0, null);
+        }
+        continue;
+      }
       const table = records.find((record) => record.name === tableName);
       if (table === undefined || table.view !== undefined) {
+        if (pinnedTableId !== undefined) {
+          throw new TableRecordConflictError(pinnedTableId, 0, table?.revision ?? null);
+        }
         if (table?.view !== undefined) throw new TypeError(`${tableName} is a view, not a table`);
         if (options.ifExists === true) return false;
         throw new Error(`Table not found: ${tableName}`);
       }
+      pinnedTableId ??= table.id;
+      if (table.id !== pinnedTableId) {
+        throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
+      }
       const column = table.columns.find((candidate) => candidate.name === columnName);
       if (column === undefined) {
+        if (pinnedColumnId !== undefined) {
+          throw new TableRecordConflictError(pinnedTableId, table.revision, table.revision);
+        }
         if (options.ifExists === true) return false;
         throw new TypeError(`Column not found: ${tableName}.${columnName}`);
+      }
+      pinnedColumnId ??= column.id;
+      if (column.id !== pinnedColumnId) {
+        throw new TableRecordConflictError(pinnedTableId, table.revision, table.revision);
       }
       this.#assertColumnDropSafe(records, table, column);
       const buildKey = `${table.id}/${column.id}`;
       this.#droppingFtsColumns.add(buildKey);
       try {
-        await this.store.updateTable(table.id, table.revision ?? 0, {
-          columns: table.columns.filter((candidate) => candidate.id !== column.id),
+        await this.#cancelTableCompactions(table.id);
+        const manifest = await this.store.dropTableColumn({
+          tableId: table.id,
+          columnId: column.id,
+          expectedTableRevision: table.revision,
+          expectedManifestVersion: await this.store.getCurrentManifestVersion(),
+          expectedCatalogEpoch: catalogProof.catalogEpoch,
+          committedAt: dateIsoString(this.#now()),
         });
+        this.#afterCommit(manifest);
         this.#gzipVerdicts.delete(column.id);
+        this.#postingDeltaTailCounts.delete(buildKey);
         this.#planCache.clear();
         return true;
       } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+        if (
+          (!(error instanceof TableRecordConflictError) &&
+            !(error instanceof TableInUseError) &&
+            !(error instanceof WriteConflictError)) ||
+          attempt >= this.#maxCommitRetries
+        ) {
+          throw error;
+        }
       } finally {
         this.#droppingFtsColumns.delete(buildKey);
       }
@@ -1932,112 +2762,117 @@ export class MinnowDatabase {
    * Returns whether a table was dropped; with `ifExists`, a missing table is not an error.
    */
   async dropTable(tableName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
-    const table = await this.store.getTableByName(tableName);
-    if (table === undefined) {
-      if (options.ifExists === true) return false;
-      throw new Error(`Table not found: ${tableName}`);
-    }
-    if (table.view !== undefined) throw new TypeError(`${tableName} is a view; use DROP VIEW`);
-    // Anything that would be left pointing at a table that is no longer there refuses the drop:
-    // a view over it would fail on its next read, and a trigger body writing to it at every
-    // firing. Both are worse outcomes than an error here, which is the rule a column rename
-    // already follows.
-    for (const owner of await this.store.listTables()) {
-      if (owner.id === table.id) continue;
-      if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
-        throw new TypeError(`Cannot drop ${table.name}: view ${owner.name} reads it`);
+    let pinnedTableId: string | undefined;
+    for (let attempt = 0; ; attempt += 1) {
+      const catalogProof = await this.store.getCatalogProbe();
+      const records = await this.store.listTables();
+      if ((await this.store.getCatalogProbe()).catalogEpoch !== catalogProof.catalogEpoch) {
+        if (attempt >= this.#maxCommitRetries) {
+          throw new TableRecordConflictError(tableName, 0, null);
+        }
+        continue;
       }
-      for (const key of owner.foreignKeys ?? []) {
-        if (key.parentTable === table.name) {
-          throw new TypeError(
-            `Cannot drop ${table.name}: foreign key ${key.name} on ${owner.name} references it`,
-          );
+      const table = records.find((record) => record.name === tableName);
+      if (table === undefined) {
+        if (pinnedTableId !== undefined) {
+          throw new TableRecordConflictError(pinnedTableId, 0, null);
+        }
+        if (options.ifExists === true) return false;
+        throw new Error(`Table not found: ${tableName}`);
+      }
+      pinnedTableId ??= table.id;
+      if (table.id !== pinnedTableId) {
+        throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
+      }
+      if (table.view !== undefined) throw new TypeError(`${tableName} is a view; use DROP VIEW`);
+      // Anything that would be left pointing at the table refuses the drop. The catalog-epoch
+      // CAS below makes this complete-catalog proof serializable with concurrent DDL.
+      for (const owner of records) {
+        if (owner.id === table.id) continue;
+        if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
+          throw new TypeError(`Cannot drop ${table.name}: view ${owner.name} reads it`);
+        }
+        for (const key of owner.foreignKeys ?? []) {
+          if (key.parentTable === table.name) {
+            throw new TypeError(
+              `Cannot drop ${table.name}: foreign key ${key.name} on ${owner.name} references it`,
+            );
+          }
+        }
+        for (const trigger of owner.triggers ?? []) {
+          const writesHere = trigger.statements.some((triggerStatement) => {
+            const compiled = compileStatement(triggerStatement.sql);
+            return (
+              (compiled.kind === "insert" ||
+                compiled.kind === "update" ||
+                compiled.kind === "delete") &&
+              compiled.table === table.name
+            );
+          });
+          if (writesHere) {
+            throw new TypeError(
+              `Cannot drop ${table.name}: trigger ${trigger.name} on ${owner.name} writes to it`,
+            );
+          }
         }
       }
-      for (const trigger of owner.triggers ?? []) {
-        const writesHere = trigger.statements.some((statement) => {
-          const compiled = compileStatement(statement.sql);
-          return (
-            (compiled.kind === "insert" ||
-              compiled.kind === "update" ||
-              compiled.kind === "delete") &&
-            compiled.table === table.name
-          );
+      this.#droppingTables.add(table.id);
+      try {
+        await this.#cancelTableCompactions(table.id);
+        const manifest = await this.store.dropTable({
+          tableId: table.id,
+          expectedTableRevision: table.revision,
+          expectedManifestVersion: await this.store.getCurrentManifestVersion(),
+          expectedCatalogEpoch: catalogProof.catalogEpoch,
+          committedAt: dateIsoString(this.#now()),
         });
-        if (writesHere) {
-          throw new TypeError(
-            `Cannot drop ${table.name}: trigger ${trigger.name} on ${owner.name} writes to it`,
-          );
+        this.#afterCommit(manifest);
+        for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
+        this.#autoCompactionBackoff.delete(table.id);
+        this.#commitsSinceCompactionCheck.delete(table.id);
+        this.#idleCompactionTableIds.delete(table.id);
+        const postingPrefix = `${table.id}/`;
+        for (const key of this.#postingDeltaTailCounts.keys()) {
+          if (key.startsWith(postingPrefix)) this.#postingDeltaTailCounts.delete(key);
         }
-      }
-    }
-    this.#droppingTables.add(table.id);
-    try {
-      // Stop every fold already attached to the table before its catalog record disappears.
-      // Otherwise an unpublished job can no longer resume or be cancelled by table name, and
-      // its transaction and staged output become permanent roots.
-      await this.#cancelTableCompactions(table.id);
-      // Retiring the blocks is a commit like any other, and background compaction publishes
-      // underneath it: a block this table owned a moment ago can already have been rewritten. The
-      // list is therefore taken from the transaction's own snapshot — the manifest its commit will
-      // be validated against — and a scope that loses the race simply runs again.
-      for (let attempt = 0; ; attempt += 1) {
-        const transaction = await this.#transactions.begin();
-        try {
-          const segments = await this.store.listSegments(table.id);
-          const snapshot =
-            transaction.snapshotVersion === null
-              ? undefined
-              : await this.store.getManifest(transaction.snapshotVersion);
-          const live = new Set(snapshot?.blockIds ?? []);
-          const blockIds = [
-            ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
-          ].filter((id) => live.has(id));
-          transaction.markTableChanged(table.id);
-          if (blockIds.length > 0) transaction.supersedeBlocks(blockIds);
-          await transaction.commit();
-          break;
-        } catch (error) {
-          await transaction.abort();
-          if (!(error instanceof WriteConflictError) || attempt >= this.#maxCommitRetries)
-            throw error;
+        this.#planCache.clear();
+        return true;
+      } catch (error) {
+        if (
+          (!(error instanceof TableRecordConflictError) &&
+            !(error instanceof TableInUseError) &&
+            !(error instanceof WriteConflictError)) ||
+          attempt >= this.#maxCommitRetries
+        ) {
+          throw error;
         }
+      } finally {
+        this.#droppingTables.delete(table.id);
       }
-      // The catalog goes last: until it does, the table is merely empty of live blocks, and a
-      // crash in between leaves a table whose rows are gone rather than a segment pointing at a
-      // table that is not there.
-      // Catch a fold that was already between its scheduling check and job creation when the
-      // drop began. The dropping marker prevents another one from starting after this point.
-      await this.#cancelTableCompactions(table.id);
-      await this.store.removeTable(table.id, table.revision ?? 0);
-      for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
-      this.#autoCompactionBackoff.delete(table.id);
-      this.#commitsSinceCompactionCheck.delete(table.id);
-      this.#idleCompactionTableIds.delete(table.id);
-      this.#planCache.clear();
-      return true;
-    } finally {
-      this.#droppingTables.delete(table.id);
     }
   }
 
-  async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
-    const table = await this.#findTable(tableName);
-    const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
-    await this.#assertForeignKeysPresent(
-      table,
-      (column) => batch.columns[column] ?? [],
-      (sql, params) => this.query(sql, { params, memoize: false }),
-    );
-    const keys =
-      autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
-        ? batchKeys(table, batch)
-        : undefined;
-    const result = await this.#runWrite(async () => {
+  insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
+    return this.#withWriteReservation(() => this.#insertBatchReserved(tableName, input));
+  }
+
+  async #insertBatchReserved(
+    tableName: string,
+    input: InsertBatchInput,
+  ): Promise<InsertBatchResult> {
+    const completed = await this.#runWrite(async () => {
+      const table = await this.#findTable(tableName);
+      const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
+      const keys =
+        autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
+          ? batchKeys(table, batch)
+          : undefined;
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
-      return this.#writeBatch(current, batch, "insert", keys, autoIncrement);
+      const result = await this.#writeBatch(current, batch, "insert", keys, autoIncrement);
+      return { result, batch, generated, autoIncrement, rowCount };
     });
+    const { result, batch, generated, autoIncrement, rowCount } = completed;
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       tableName: result.tableName,
@@ -2109,25 +2944,29 @@ export class MinnowDatabase {
     return this.insertBatch(tableName, [row]);
   }
 
-  async upsertBatch(tableName: string, input: InsertBatchInput): Promise<UpsertBatchResult> {
-    const table = await this.#findTable(tableName);
-    const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined) {
-      throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
-    }
-    const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
-    await this.#assertForeignKeysPresent(
-      table,
-      (column) => batch.columns[column] ?? [],
-      (sql, params) => this.query(sql, { params, memoize: false }),
-    );
-    const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
-    const keys = deferred ? undefined : batchKeys(table, batch);
-    const result = await this.#runWrite(async () => {
+  upsertBatch(tableName: string, input: InsertBatchInput): Promise<UpsertBatchResult> {
+    return this.#withWriteReservation(() => this.#upsertBatchReserved(tableName, input));
+  }
+
+  async #upsertBatchReserved(
+    tableName: string,
+    input: InsertBatchInput,
+  ): Promise<UpsertBatchResult> {
+    const completed = await this.#runWrite(async () => {
+      const table = await this.#findTable(tableName);
+      const keyColumn = getUniqueKeyColumn(table);
+      if (keyColumn === undefined) {
+        throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
+      }
+      const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
+      const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
+      const keys = deferred ? undefined : batchKeys(table, batch);
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
-      return this.#writeBatch(current, batch, "upsert", keys, autoIncrement);
+      const result = await this.#writeBatch(current, batch, "upsert", keys, autoIncrement);
+      return { result, batch, generated, autoIncrement, rowCount };
     });
+    const { result, batch, generated, autoIncrement, rowCount } = completed;
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       ...result,
@@ -2140,57 +2979,29 @@ export class MinnowDatabase {
     return this.upsertBatch(tableName, [row]);
   }
 
-  async updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
-    const table = await this.#findTable(tableName);
-    const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined) {
-      throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
-    }
-    input = normalizeDomainUpdate(table, input);
-    const keys = validateUpdateBatch(table, keyColumn, input);
-    const changedForeignKey = (table.foreignKeys ?? []).some((key) =>
-      foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
-    );
-    if (changedForeignKey) {
-      const selectedColumns = [
-        ...visibleTableColumns(table),
-        ...(keyColumn.hidden === true ? [keyColumn] : []),
-      ];
-      const selected = selectedColumns.map(({ name }) => quoteSqlIdentifier(name)).join(", ");
-      const rows = await this.query(
-        `SELECT ${selected} FROM ${quoteSqlIdentifier(table.name)} WHERE ${quoteSqlIdentifier(
-          keyColumn.name,
-        )} IN (${input.keys.map(() => "?").join(", ")})`,
-        { params: input.keys, memoize: false },
-      );
-      const byKey = new Map(
-        rows.rows.map(
-          (row) => [keyToken(keyColumn.type, row[keyColumn.name] ?? null), row] as const,
-        ),
-      );
-      const postImages = input.keys.map((key, index) => {
-        const old = byKey.get(keyToken(keyColumn.type, key));
-        return Object.fromEntries(
-          visibleTableColumns(table).map(({ name }) => [
-            name,
-            input.changes[name]?.[index] ?? old?.[name] ?? null,
-          ]),
-        );
-      });
-      await this.#assertForeignKeysPresent(
-        table,
-        (column) => postImages.map((row) => row[column] ?? null),
-        (sql, params) => this.query(sql, { params, memoize: false }),
-      );
-    }
+  updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
+    return this.#withWriteReservation(() => this.#updateBatchReserved(tableName, input));
+  }
+
+  async #updateBatchReserved(
+    tableName: string,
+    input: UpdateBatchInput,
+  ): Promise<UpdateBatchResult> {
     return this.#runWrite(async () => {
+      const table = await this.#findTable(tableName);
+      const keyColumn = getUniqueKeyColumn(table);
+      if (keyColumn === undefined) {
+        throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
+      }
+      const normalizedInput = normalizeDomainUpdate(table, input);
+      const keys = validateUpdateBatch(table, keyColumn, normalizedInput);
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
       const currentKey = getUniqueKeyColumn(current);
       if (currentKey?.id !== keyColumn.id) {
         throw new TypeError(`Table unique key changed during update: ${tableName}`);
       }
-      return this.#writeUpdateBatch(current, currentKey, input, keys);
+      return this.#writeUpdateBatch(current, currentKey, normalizedInput, keys);
     });
   }
 
@@ -2205,51 +3016,62 @@ export class MinnowDatabase {
     });
   }
 
-  async deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
-    const table = await this.#findTable(tableName);
-    const keyColumn = getUniqueKeyColumn(table);
-    const keyDomain = keyColumn?.sqlDomain;
-    if (keyDomain !== undefined) {
-      input = {
-        keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)),
-      };
-    }
-    const dependents = await this.#childForeignKeys(tableName);
-    if (dependents.length === 0) {
-      return this.#runWrite(() => this.#deleteBatchOnce(tableName, input));
-    }
-    // E141-04: the referential actions and the delete itself publish as one commit, so no tab
-    // can observe a parent gone while its children still point at it.
-    const started = performance.now();
-    const { result, version } = await this.write(async (session) => {
-      await this.#applyReferentialActions(table, [...input.keys], session, REFERENTIAL_CASCADES);
-      return session.deleteBatch(tableName, input);
-    });
-    return {
-      tableName,
-      segmentId: result.segmentId,
-      requestedKeyCount: input.keys.length,
-      deletedRowCount: result.rowCount,
-      blockCount: 0,
-      storedBytes: 0,
-      version,
-      metrics: {
-        logicalBytes: 0,
+  deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
+    return this.#withWriteReservation(() => this.#deleteBatchReserved(tableName, input));
+  }
+
+  async #deleteBatchReserved(
+    tableName: string,
+    input: DeleteBatchInput,
+  ): Promise<DeleteBatchResult> {
+    return this.#runWrite(async () => {
+      const table = await this.#findTable(tableName);
+      const keyColumn = getUniqueKeyColumn(table);
+      const keyDomain = keyColumn?.sqlDomain;
+      const normalizedInput =
+        keyDomain === undefined
+          ? input
+          : { keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)) };
+      const dependents = await this.#childForeignKeys(tableName);
+      if (dependents.length === 0) return this.#deleteBatchOnce(tableName, normalizedInput);
+      // E141-04: the referential actions and the delete itself publish as one commit.
+      const started = performance.now();
+      const { result, version } = await this.write(async (session) => {
+        await this.#applyReferentialActions(
+          table,
+          [...normalizedInput.keys],
+          session,
+          REFERENTIAL_CASCADES,
+        );
+        return session.deleteBatch(tableName, normalizedInput);
+      });
+      return {
+        tableName,
+        segmentId: result.segmentId,
+        requestedKeyCount: normalizedInput.keys.length,
+        deletedRowCount: result.rowCount,
+        blockCount: 0,
         storedBytes: 0,
-        writeAmplification: 0,
-        encodeMs: 0,
-        stageMs: 0,
-        commitMs: 0,
-        totalMs: performance.now() - started,
-        retries: 0,
-        rowsPerSecond: 0,
-      },
-    };
+        version,
+        metrics: {
+          logicalBytes: 0,
+          storedBytes: 0,
+          writeAmplification: 0,
+          encodeMs: 0,
+          stageMs: 0,
+          commitMs: 0,
+          totalMs: performance.now() - started,
+          retries: 0,
+          rowsPerSecond: 0,
+        },
+      };
+    });
   }
 
   async #deleteBatchOnce(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
     const started = performance.now();
     const table = await this.#findTable(tableName);
+    await this.#assertCompactionCapacity(table);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
@@ -2262,19 +3084,28 @@ export class MinnowDatabase {
     }
     if (input.keys.length === 0) throw new TypeError("A delete batch needs at least one key");
     const keys = new Map<string, Exclude<BatchValue, null>>();
-    input.keys.forEach((value, index) => {
-      validateValue(keyColumn, value, index);
+    const keyStringByteLengths =
+      keyColumn.type === "string" ? new Array<number>(input.keys.length) : undefined;
+    for (let index = 0; index < input.keys.length; index += 1) {
+      const value = input.keys[index] as BatchValue;
+      const byteLength = validateValue(keyColumn, value, index);
+      if (keyStringByteLengths !== undefined) keyStringByteLengths[index] = byteLength ?? 0;
       if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
       const token = keyToken(keyColumn.type, value);
       if (keys.has(token))
         throw new TypeError(`Duplicate key in delete batch: ${formatValue(value)}`);
       keys.set(token, value);
-    });
+    }
+    if (keyStringByteLengths !== undefined) {
+      validatedStringByteLengths.set(input.keys, keyStringByteLengths);
+    }
     const logicalBytes = estimateValuesBytes(input.keys);
 
     // Deferred: the record is written only if something stages in two steps (trigger rows),
     // and otherwise rides the single-shot commit below — or never exists, for a no-op delete.
-    const transaction = await this.#transactions.beginDeferred();
+    const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
+    transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
+    const blockStager = new BoundedWriteBlockStager(transaction);
     const segmentId = this.#createId();
     transaction.setUniqueKeyChanges({
       tableId: table.id,
@@ -2321,10 +3152,22 @@ export class MinnowDatabase {
       }
 
       const blockIds: string[] = [];
-      const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
       const values = [...keys.values()];
-      for (let start = 0, part = 0; start < values.length; start += this.#rowsPerBlock, part += 1) {
-        const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, values.length));
+      if (keyStringByteLengths !== undefined) {
+        validatedStringByteLengths.set(values, keyStringByteLengths);
+      }
+      const plannedColumn = writeColumnValues(keyColumn.type, values);
+      const ranges = writeBlockRanges(
+        [plannedColumn],
+        values.length,
+        this.#rowsPerBlock,
+        this.#targetBlockBytes,
+      );
+      for (const [part, { start, end }] of ranges.entries()) {
+        await blockStager.prepare(
+          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
+        );
+        const slice = values.slice(start, end);
         const encodeStarted = performance.now();
         const bytes = await this.#encodeColumnBlock(
           keyColumn.id,
@@ -2341,7 +3184,7 @@ export class MinnowDatabase {
           "part",
           String(part).padStart(6, "0"),
         ].join("/");
-        blockWrites.push({ id: blockId, bytes });
+        blockStager.add({ id: blockId, bytes });
         blockIds.push(blockId);
         storedBytes += bytes.byteLength;
         blockCount += 1;
@@ -2383,14 +3226,17 @@ export class MinnowDatabase {
         kind: "delete",
         keyColumnId: keyColumn.id,
         level: 0,
-        createdAt: this.#now().toISOString(),
+        logicalOrder: 0,
+        commitOrdinal: transaction.pendingSegmentIds.length,
+        rowIdSpans: [],
+        createdAt: dateIsoString(this.#now()),
       };
       // AFTER triggers stage derived rows between the segment and the commit, which keeps the
       // two apart; without them the stage and the commit collapse into one storage write.
       const stagesAfter = firesAfterTriggers(table, "delete");
       const stageStarted = performance.now();
       if (stagesAfter) {
-        await transaction.stageArtifacts(blockWrites, [segment]);
+        await blockStager.stageWithSegments([segment]);
         await this.#stageTriggerDerivedInserts(
           transaction,
           table,
@@ -2400,16 +3246,16 @@ export class MinnowDatabase {
           "after",
         );
       }
-      stageMs += performance.now() - stageStarted;
+      stageMs += performance.now() - stageStarted + blockStager.earlyStageMs;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
         try {
           const manifest = stagesAfter
             ? await transaction.commit()
-            : await transaction.stageArtifactsAndCommit(blockWrites, [segment]);
+            : await transaction.stageArtifactsAndCommit(blockStager.pendingBlocks(), [segment]);
           commitMs += performance.now() - commitStarted;
-          this.#afterCommit(manifest);
+          this.#afterCommit(manifest, transaction);
           return {
             tableName: table.name,
             segmentId,
@@ -2445,7 +3291,7 @@ export class MinnowDatabase {
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      throw await this.#translateSecondaryUniqueConflict(error);
+      throw await this.#translateUniqueConflict(error);
     }
   }
 
@@ -2459,6 +3305,7 @@ export class MinnowDatabase {
     input: UpdateBatchInput,
     keys: Map<string, Exclude<BatchValue, null>>,
   ): Promise<UpdateBatchResult> {
+    await this.#assertCompactionCapacity(table);
     const started = performance.now();
     const logicalBytes =
       estimateValuesBytes(input.keys) +
@@ -2467,7 +3314,9 @@ export class MinnowDatabase {
         0,
       );
     // Deferred: the record rides the single-shot commit below unless trigger rows stage first.
-    const transaction = await this.#transactions.beginDeferred();
+    const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
+    transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
+    const blockStager = new BoundedWriteBlockStager(transaction);
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const changedColumns = Object.keys(input.changes).sort();
@@ -2481,22 +3330,33 @@ export class MinnowDatabase {
     try {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, keys);
       const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
-      const batchBlockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-      for (const column of columns) {
+      const plannedColumns = columns.map((column) =>
+        writeColumnValues(
+          column.type,
+          column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
+        ),
+      );
+      const ranges = writeBlockRanges(
+        plannedColumns,
+        input.keys.length,
+        this.#rowsPerBlock,
+        this.#targetBlockBytes,
+      );
+      for (const [columnIndex, column] of columns.entries()) {
         const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
+        const plannedColumn = plannedColumns[columnIndex];
+        if (plannedColumn === undefined) {
+          throw new Error(`Write column disappeared: ${column.name}`);
+        }
         const blockIds: string[] = [];
-        const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-        const encodeStarted = performance.now();
-        for (
-          let start = 0, part = 0;
-          start < input.keys.length;
-          start += this.#rowsPerBlock, part += 1
-        ) {
-          const slice = values.slice(
-            start,
-            Math.min(start + this.#rowsPerBlock, input.keys.length),
+        for (const [part, { start, end }] of ranges.entries()) {
+          await blockStager.prepare(
+            maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
           );
+          const slice = values.slice(start, end);
+          const encodeStarted = performance.now();
           const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
+          encodeMs += performance.now() - encodeStarted;
           const blockId = [
             "table",
             table.id,
@@ -2507,23 +3367,25 @@ export class MinnowDatabase {
             "part",
             String(part).padStart(6, "0"),
           ].join("/");
-          blockWrites.push({ id: blockId, bytes });
+          blockStager.add({ id: blockId, bytes });
           blockIds.push(blockId);
+          storedBytes += bytes.byteLength;
+          blockCount += 1;
         }
-        encodeMs += performance.now() - encodeStarted;
         columnBlockIds[column.id] = blockIds;
-        storedBytes += sumBytes(blockWrites);
-        blockCount += blockWrites.length;
-        batchBlockWrites.push(...blockWrites);
       }
       const checks = table.checks ?? [];
+      const changedForeignKey = (table.foreignKeys ?? []).some((key) =>
+        foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
+      );
       const preImages = await this.#triggerPreImages(
         table,
         keyColumn,
         input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
         "update",
-        undefined,
+        (sql, params) => this.#sessionQuery(transaction, sql, { params }),
         checks.length > 0 ||
+          changedForeignKey ||
           secondaryIndexUpdateNeedsPreImages(table, input) ||
           readyUniqueSecondaryIndexes(table).some(({ columns }) =>
             columns.some((column) => input.changes[column.name] !== undefined),
@@ -2545,6 +3407,14 @@ export class MinnowDatabase {
           ? (preImages[rowIndex]?.[column] ?? null)
           : (changed[rowIndex] ?? null);
       };
+      if (changedForeignKey) {
+        await this.#assertForeignKeysPresent(
+          table,
+          (column) => input.keys.map((_, row) => updateValueAt("new", column, row)),
+          (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+          transaction,
+        );
+      }
       // E141-06 on the write that changes a row rather than writes a whole one: the constraint
       // sees the post-image, the row as it will be once this update lands.
       if (checks.length > 0) {
@@ -2576,14 +3446,17 @@ export class MinnowDatabase {
         kind: "update",
         keyColumnId: keyColumn.id,
         level: 0,
-        createdAt: this.#now().toISOString(),
+        logicalOrder: 0,
+        commitOrdinal: transaction.pendingSegmentIds.length,
+        rowIdSpans: [],
+        createdAt: dateIsoString(this.#now()),
       };
       // AFTER triggers stage derived rows between the segment and the commit, which keeps the
       // two apart; without them the stage and the commit collapse into one storage write.
       const stagesAfter = firesAfterTriggers(table, "update");
       const stageStarted = performance.now();
       if (stagesAfter) {
-        await transaction.stageArtifacts(batchBlockWrites, [segment]);
+        await blockStager.stageWithSegments([segment]);
         await this.#stageTriggerDerivedInserts(
           transaction,
           table,
@@ -2593,16 +3466,16 @@ export class MinnowDatabase {
           "after",
         );
       }
-      stageMs += performance.now() - stageStarted;
+      stageMs += performance.now() - stageStarted + blockStager.earlyStageMs;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
         try {
           const manifest = stagesAfter
             ? await transaction.commit()
-            : await transaction.stageArtifactsAndCommit(batchBlockWrites, [segment]);
+            : await transaction.stageArtifactsAndCommit(blockStager.pendingBlocks(), [segment]);
           commitMs += performance.now() - commitStarted;
-          this.#afterCommit(manifest);
+          this.#afterCommit(manifest, transaction);
           return {
             tableName: table.name,
             segmentId,
@@ -2637,7 +3510,7 @@ export class MinnowDatabase {
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      throw await this.#translateSecondaryUniqueConflict(error);
+      throw await this.#translateUniqueConflict(error);
     }
   }
 
@@ -2663,6 +3536,7 @@ export class MinnowDatabase {
     keys: Map<string, Exclude<BatchValue, null>> | undefined,
     autoIncrement?: AutoIncrementFill,
   ): Promise<UpsertBatchResult> {
+    await this.#assertCompactionCapacity(table);
     const started = performance.now();
     const rowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     const logicalBytes = estimateBatchBytes(input);
@@ -2681,10 +3555,11 @@ export class MinnowDatabase {
             atLeast: autoIncrement.atLeast,
           },
     );
+    transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
+    const blockStager = new BoundedWriteBlockStager(transaction);
     let resolvedKeys = keys;
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const batchBlockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
     let storedBytes = 0;
     let blockCount = 0;
     let counts: { inserted: number; updated: number };
@@ -2721,6 +3596,17 @@ export class MinnowDatabase {
           requireAbsent: kind === "insert",
         });
       }
+      const assertForeignKeys = (): Promise<void> =>
+        this.#assertForeignKeysPresent(
+          table,
+          (column) => input.columns[column] ?? [],
+          (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+          transaction,
+        );
+      // The proof belongs to the transaction that publishes the child row. Doing it after
+      // generated values are patched also covers an auto-incremented referencing column, and
+      // registering this batch's key membership first permits valid self-references.
+      await assertForeignKeys();
       counts =
         kind === "insert" && resolvedKeys !== undefined
           ? { inserted: resolvedKeys.size, updated: 0 }
@@ -2740,55 +3626,83 @@ export class MinnowDatabase {
       if (secondaryDeltas.length > 0) {
         transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
       }
-      const encodeStarted = performance.now();
-      for (
-        let columnStart = 0;
-        columnStart < table.columns.length;
-        columnStart += WRITE_ENCODE_CONCURRENCY
-      ) {
-        const encodedColumns = await Promise.all(
-          table.columns
-            .slice(columnStart, columnStart + WRITE_ENCODE_CONCURRENCY)
-            .map(async (column) => {
-              const values = input.columns[column.name] ?? [];
-              const blockIds: string[] = [];
-              const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-              for (
-                let start = 0, part = 0;
-                start < rowCount;
-                start += this.#rowsPerBlock, part += 1
-              ) {
-                const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
-                const bytes = await this.#encodeColumnBlock(
-                  column.id,
-                  asColumnInput(column.type, slice),
-                );
-                const blockId = [
-                  "table",
-                  table.id,
-                  "segment",
-                  segmentId,
-                  "column",
-                  column.id,
-                  "part",
-                  String(part).padStart(6, "0"),
-                ].join("/");
-                blockWrites.push({ id: blockId, bytes });
-                blockIds.push(blockId);
-              }
-              return { columnId: column.id, blockIds, blockWrites };
-            }),
+      const plannedColumns = table.columns.map((column) =>
+        writeColumnValues(column.type, input.columns[column.name] ?? []),
+      );
+      const ranges = writeBlockRanges(
+        plannedColumns,
+        rowCount,
+        this.#rowsPerBlock,
+        this.#targetBlockBytes,
+      );
+      const plannedBlocks = table.columns.flatMap((column, columnIndex) => {
+        const values = input.columns[column.name] ?? [];
+        const plannedColumn = plannedColumns[columnIndex];
+        if (plannedColumn === undefined)
+          throw new Error(`Write column disappeared: ${column.name}`);
+        columnBlockIds[column.id] = [];
+        return ranges.map(({ start, end }, part) => ({
+          column,
+          values,
+          plannedColumn,
+          start,
+          end,
+          part,
+          maximumStoredBytes: maximumWriteBlockStoredBytes(
+            plannedColumn,
+            start,
+            end,
+            this.#compression,
+          ),
+        }));
+      });
+      for (let next = 0; next < plannedBlocks.length;) {
+        const group: typeof plannedBlocks = [];
+        let maximumGroupBytes = 0;
+        while (next < plannedBlocks.length && group.length < WRITE_ENCODE_CONCURRENCY) {
+          const candidate = plannedBlocks[next];
+          if (candidate === undefined) break;
+          if (
+            group.length > 0 &&
+            maximumGroupBytes + candidate.maximumStoredBytes > MAX_TRANSACTION_STAGE_BYTES
+          ) {
+            break;
+          }
+          group.push(candidate);
+          maximumGroupBytes += candidate.maximumStoredBytes;
+          next += 1;
+        }
+        await blockStager.prepareBatch(group.length, maximumGroupBytes);
+        const encodeStarted = performance.now();
+        const encoded = await Promise.all(
+          group.map(async ({ column, values, start, end, part }) => {
+            const bytes = await this.#encodeColumnBlock(
+              column.id,
+              asColumnInput(column.type, values.slice(start, end)),
+            );
+            const blockId = [
+              "table",
+              table.id,
+              "segment",
+              segmentId,
+              "column",
+              column.id,
+              "part",
+              String(part).padStart(6, "0"),
+            ].join("/");
+            return { columnId: column.id, blockId, bytes };
+          }),
         );
-        // Promise.all preserves schema order, keeping metadata and staged writes deterministic
-        // regardless of which native compressor finishes first.
-        for (const encoded of encodedColumns) {
-          columnBlockIds[encoded.columnId] = encoded.blockIds;
-          storedBytes += sumBytes(encoded.blockWrites);
-          blockCount += encoded.blockWrites.length;
-          batchBlockWrites.push(...encoded.blockWrites);
+        encodeMs += performance.now() - encodeStarted;
+        // Promise.all preserves column/range order even when native compressors finish out of
+        // order. The group bound means their completed buffers plus the accumulator stay finite.
+        for (const block of encoded) {
+          blockStager.add({ id: block.blockId, bytes: block.bytes });
+          columnBlockIds[block.columnId]?.push(block.blockId);
+          storedBytes += block.bytes.byteLength;
+          blockCount += 1;
         }
       }
-      encodeMs += performance.now() - encodeStarted;
 
       const segment: SegmentRecord = {
         id: segmentId,
@@ -2801,7 +3715,10 @@ export class MinnowDatabase {
         kind,
         ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
         level: 0,
-        createdAt: this.#now().toISOString(),
+        logicalOrder: 0,
+        commitOrdinal: transaction.pendingSegmentIds.length,
+        rowIdSpans: [],
+        createdAt: dateIsoString(this.#now()),
       };
       const stageStarted = performance.now();
       const insertValueAt = (
@@ -2841,7 +3758,7 @@ export class MinnowDatabase {
           ? firesAfterTriggers(table, "insert")
           : upsertFirings !== undefined && firesAfterTriggers(table, "insert", "update");
       if (stagesAfter) {
-        await transaction.stageArtifacts(batchBlockWrites, [segment]);
+        await blockStager.stageWithSegments([segment]);
         if (kind === "insert") {
           await this.#stageTriggerDerivedInserts(
             transaction,
@@ -2855,16 +3772,16 @@ export class MinnowDatabase {
           await this.#stageUpsertTriggerFirings(transaction, table, input, upsertFirings, "after");
         }
       }
-      stageMs += performance.now() - stageStarted;
+      stageMs += performance.now() - stageStarted + blockStager.earlyStageMs;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
         try {
           const manifest = stagesAfter
             ? await transaction.commit()
-            : await transaction.stageArtifactsAndCommit(batchBlockWrites, [segment]);
+            : await transaction.stageArtifactsAndCommit(blockStager.pendingBlocks(), [segment]);
           commitMs += performance.now() - commitStarted;
-          this.#afterCommit(manifest);
+          this.#afterCommit(manifest, transaction);
           return {
             tableName: table.name,
             segmentId,
@@ -2897,6 +3814,10 @@ export class MinnowDatabase {
           if (stagedDerivations) throw new StaleTriggerDerivationsError(error);
           retries += 1;
           const snapshot = await transaction.rebase();
+          // A parent may have disappeared in the commit that forced this rebase. Never carry
+          // the old proof across that boundary: re-prove through the rebased transaction before
+          // the child transaction gets another chance to publish.
+          await assertForeignKeys();
           counts =
             kind === "insert" && resolvedKeys !== undefined
               ? { inserted: resolvedKeys.size, updated: 0 }
@@ -2913,11 +3834,18 @@ export class MinnowDatabase {
           throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
         }
       }
-      throw await this.#translateSecondaryUniqueConflict(error);
+      throw await this.#translateUniqueConflict(error);
     }
   }
 
   async readTable(
+    tableName: string,
+    versionOrOptions?: number | ReadTableOptions,
+  ): Promise<DatabaseRow[]> {
+    return this.#withReadReservation(() => this.#readTableUnreserved(tableName, versionOrOptions));
+  }
+
+  async #readTableUnreserved(
     tableName: string,
     versionOrOptions?: number | ReadTableOptions,
   ): Promise<DatabaseRow[]> {
@@ -2967,7 +3895,10 @@ export class MinnowDatabase {
         const session: SnapshotSession = {
           version,
           query: (sql: string, options: QueryOptions = {}) =>
-            this.query(sql, { ...options, ...(version === null ? {} : { version }) }),
+            this.#queryWithReadReservation(sql, {
+              ...options,
+              ...(version === null ? {} : { version }),
+            }),
         };
         return await action(session);
       } finally {
@@ -2977,13 +3908,15 @@ export class MinnowDatabase {
   }
 
   #compileCached(sql: string): CompiledQuery {
-    const cached = this.#planCache.get(sql);
+    const cacheable = sql.length <= MAX_CACHEABLE_TEXT_CHARACTERS;
+    const cached = cacheable ? this.#planCache.get(sql) : undefined;
     if (cached !== undefined) {
       this.#planCache.delete(sql);
       this.#planCache.set(sql, cached);
       return cached;
     }
     const plan = compileQuery(sql);
+    if (!cacheable) return plan;
     this.#planCache.set(sql, plan);
     if (this.#planCache.size > PLAN_CACHE_LIMIT) {
       const oldest = this.#planCache.keys().next().value;
@@ -2993,13 +3926,15 @@ export class MinnowDatabase {
   }
 
   #compileStatementCached(sql: string): CompiledStatement {
-    const cached = this.#statementCache.get(sql);
+    const cacheable = sql.length <= MAX_CACHEABLE_TEXT_CHARACTERS;
+    const cached = cacheable ? this.#statementCache.get(sql) : undefined;
     if (cached !== undefined) {
       this.#statementCache.delete(sql);
       this.#statementCache.set(sql, cached);
       return cached;
     }
     const statement = compileStatement(sql);
+    if (!cacheable) return statement;
     this.#statementCache.set(sql, statement);
     if (this.#statementCache.size > PLAN_CACHE_LIMIT) {
       const oldest = this.#statementCache.keys().next().value;
@@ -3013,6 +3948,7 @@ export class MinnowDatabase {
     options: QueryOptions = {},
     probe?: CatalogProbe,
   ): Promise<PreparedQuery> {
+    options = this.#effectiveQueryOptions(options);
     // The ORDER-BY-expression desugar's wrapper is projection-only: prepare the inner block
     // directly (no derived materialization) and project each result to the visible aliases,
     // so `.search()` costs the same whether or not the caller also selects the score.
@@ -3028,6 +3964,10 @@ export class MinnowDatabase {
         execute: () => projectResultColumns(prepared.execute(), wrapper.aliases),
         executeAsync: async (asyncOptions) =>
           projectResultColumns(await prepared.executeAsync(asyncOptions), wrapper.aliases),
+        executeBatches: (batchOptions, consume) =>
+          prepared.executeBatches(batchOptions, (batch) =>
+            consume(projectResultColumns(batch, wrapper.aliases)),
+          ),
         close: () => prepared.close(),
       };
     }
@@ -3069,6 +4009,10 @@ export class MinnowDatabase {
               memory,
               realTables,
               typedSchemas,
+              options.memoize !== false,
+              options.spillToStorage !== false,
+              options.spillToStorage === true,
+              options.spillPageRows,
             ),
           );
         }
@@ -3087,6 +4031,9 @@ export class MinnowDatabase {
           // memoize: false means "compute this statement's results" — that covers the
           // columnar forms of derived and windowed sources too, not just the result memo.
           options.memoize !== false,
+          options.spillToStorage !== false,
+          options.spillToStorage === true,
+          options.spillPageRows,
         );
         outputNeedsExternalization = queryResultNeedsExternalization(resolvedPlan, typedSchemas);
       };
@@ -3136,25 +4083,37 @@ export class MinnowDatabase {
     ) => Promise<T>,
     probe?: CatalogProbe,
   ): Promise<T> {
+    if (names.length > MAX_STORAGE_BULK_READ_ITEMS) {
+      throw new RangeError(
+        `A query cannot reference more than ${String(MAX_STORAGE_BULK_READ_ITEMS)} tables`,
+      );
+    }
     for (;;) {
       const state = await this.#cachedCatalogState(names, probe);
-      const realTables = new Map<string, TableRecord>();
-      names.forEach((name, index) => {
-        const table = state.tables[index];
-        if (table === undefined) throw new Error(`Table not found: ${name}`);
-        realTables.set(table.name, table);
-      });
-      const segmentsByTable = new Map<string, SegmentRecord[]>();
-      for (const segment of state.segments) {
-        const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
-        tableSegments.push(segment);
-        segmentsByTable.set(segment.tableId, tableSegments);
+      let prepared = this.#preparedCatalogStates.get(state);
+      if (prepared === undefined) {
+        const realTables = new Map<string, TableRecord>();
+        names.forEach((name, index) => {
+          const table = state.tables[index];
+          if (table === undefined) throw new Error(`Table not found: ${name}`);
+          realTables.set(table.name, table);
+        });
+        const segmentsByTable = new Map<string, SegmentRecord[]>();
+        for (const segment of state.segments) {
+          const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
+          tableSegments.push(segment);
+          segmentsByTable.set(segment.tableId, tableSegments);
+        }
+        prepared = {
+          realTables,
+          visibility: {
+            transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
+            segmentsByTable,
+          },
+        };
+        this.#preparedCatalogStates.set(state, prepared);
       }
-      const visibility: SegmentVisibilityCatalog = {
-        transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
-        segmentsByTable,
-      };
-      const entry = await this.#acquireSharedLease(state.manifestVersion, state.manifestBlockIds);
+      const entry = await this.#acquireSharedLease(state.manifestVersion);
       if (entry === undefined) {
         // The manifest disappeared between the read and the lease, so the cached state is
         // anchored to a pruned version; drop it and re-read.
@@ -3163,7 +4122,7 @@ export class MinnowDatabase {
         continue;
       }
       try {
-        return await action(entry.lease, realTables, visibility);
+        return await action(entry.lease, prepared.realTables, prepared.visibility);
       } finally {
         this.#releaseSharedLease(entry);
       }
@@ -3174,8 +4133,8 @@ export class MinnowDatabase {
    * The catalog freshness probe: one atomic (version, epoch) read decides whether the cached
    * catalog state is provably identical to a fresh read. An unchanged epoch means no table
    * record, manifest publish, or commit has landed anywhere — this tab or another — since the
-   * cached state was read, so reuse is exact, not heuristic. Stores without a probe are never
-   * cached. Entries key on the requested table-name set; a changed epoch clears them all.
+   * cached state was read, so reuse is exact, not heuristic. Entries key on the requested
+   * table-name set; a changed epoch clears them all.
    */
   async #cachedCatalogState(
     names: readonly string[],
@@ -3183,9 +4142,7 @@ export class MinnowDatabase {
   ): Promise<QueryCatalogState> {
     // A probe the caller read moments earlier in the same statement serves: a state read under
     // it is at least as fresh, and the cache is only consulted under its epoch.
-    const read = this.store.getCatalogProbe?.bind(this.store);
-    if (read === undefined) return this.#queryCatalogState(names);
-    const { catalogEpoch } = probe ?? (await read());
+    const { catalogEpoch } = probe ?? (await this.store.getCatalogProbe());
     // Table names are only trimmed, never charset-restricted, so no join separator is
     // collision-free; JSON encoding is.
     const key = JSON.stringify(names);
@@ -3213,23 +4170,31 @@ export class MinnowDatabase {
     return state;
   }
 
-  /** One coherent catalog read via the store's batched method, or its sequential shape. */
+  /** One coherent catalog read assembled from bounded pages under a stable epoch probe. */
   async #queryCatalogState(names: readonly string[]): Promise<QueryCatalogState> {
-    const batched = this.store.getQueryCatalogState?.bind(this.store);
-    if (batched !== undefined) return batched(names);
-    // The version is read first so the segment listing is a superset of the version's
-    // committed segments; blocks outside the leased manifest filter out during reads.
-    const manifestVersion = await this.store.getCurrentManifestVersion();
-    const tables = await Promise.all(names.map((name) => this.store.getTableByName(name)));
-    const found = tables.filter((table): table is TableRecord => table !== undefined);
-    const tableIds = new Set(found.map((table) => table.id));
-    const only = found.length === 1 ? found[0] : undefined;
-    const segments =
-      only !== undefined
-        ? await this.store.listSegments(only.id)
-        : (await this.store.listSegments()).filter((segment) => tableIds.has(segment.tableId));
-    const transactions = await this.#transactionRecordsForSegments(segments);
-    return { manifestVersion, tables, segments, transactions };
+    const atomic = this.store.getQueryCatalogState?.bind(this.store);
+    if (atomic !== undefined) return atomic(names);
+    for (;;) {
+      const before = await this.store.getCatalogProbe();
+      // The version is read first so the segment listing is a superset of that version's
+      // committed records; exact manifest membership filters physical reads later.
+      const manifestVersion = before.manifestVersion;
+      const tables = await Promise.all(names.map((name) => this.store.getTableByName(name)));
+      const found = tables.filter((table): table is TableRecord => table !== undefined);
+      const segments = await this.#listSegmentsForTableIds(found.map((table) => table.id));
+      const transactions = await this.#transactionRecordsForSegments(segments);
+      const after = await this.store.getCatalogProbe();
+      if (before.catalogEpoch === after.catalogEpoch && manifestVersion === after.manifestVersion) {
+        return {
+          manifestVersion,
+          tables,
+          segments,
+          transactions,
+          catalogEpoch: after.catalogEpoch,
+        };
+      }
+      await yieldToEventLoop();
+    }
   }
 
   /**
@@ -3240,65 +4205,71 @@ export class MinnowDatabase {
    * version and the old one retires as they finish. Returns undefined when the version's
    * manifest disappeared between the catalog read and the lease, so the caller can re-read.
    */
-  async #acquireSharedLease(
-    version: number | null,
-    knownBlockIds?: readonly string[],
-  ): Promise<SharedLeaseEntry | undefined> {
-    for (;;) {
-      // A move in flight is closing the shared snapshot it re-pins; wait for it rather than
-      // hand that snapshot out, then look again.
-      if (this.#sharedLeaseMove !== undefined) {
-        await this.#sharedLeaseMove;
-        continue;
-      }
-      const current = this.#sharedLease;
-      if (
-        current?.version === version &&
-        current.lease.expiresAt.getTime() - this.#now().getTime() > 0
-      ) {
-        current.refCount += 1;
+  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+    if (this.#closed) throw new Error("Database is closed");
+    this.#sharedLeaseAcquisitions += 1;
+    try {
+      for (;;) {
+        // A move in flight is closing the shared snapshot it re-pins; wait for it rather than
+        // hand that snapshot out, then look again.
+        if (this.#sharedLeaseMove !== undefined) {
+          await this.#sharedLeaseMove;
+          continue;
+        }
+        const current = this.#sharedLease;
+        if (
+          current?.version === version &&
+          dateMilliseconds(current.lease.expiresAt) - dateMilliseconds(this.#now()) > 0
+        ) {
+          current.refCount += 1;
+          this.#sharedLeaseUses += 1;
+          try {
+            await this.#renewInternalLeaseIfNeeded(current.lease);
+            return current;
+          } catch (error) {
+            this.#releaseSharedLease(current);
+            throw error;
+          }
+        }
+        const options = {
+          id: `${this.#internalLeaseOwnerId}/${crypto.randomUUID()}`,
+          ownerId: this.#internalLeaseOwnerId,
+          ttlMs: INTERNAL_READ_LEASE_TTL_MS,
+          version,
+        };
+        let lease: LeasedSnapshot;
         try {
-          await this.#renewInternalLeaseIfNeeded(current.lease);
-          return current;
+          if (current?.refCount === 0) {
+            const move = this.#transactions.moveLeasedSnapshot(current.lease, options);
+            this.#sharedLeaseMove = move.then(
+              () => undefined,
+              () => undefined,
+            );
+            try {
+              lease = await move;
+            } finally {
+              this.#sharedLeaseMove = undefined;
+            }
+          } else {
+            lease = await this.#transactions.openLeasedSnapshot(options);
+          }
         } catch (error) {
-          this.#releaseSharedLease(current);
+          if (error instanceof SnapshotManifestMissingError) return undefined;
           throw error;
         }
-      }
-      const options = {
-        id: `${this.#internalLeaseOwnerId}/${String(this.#internalLeaseSequence++)}`,
-        ownerId: this.#internalLeaseOwnerId,
-        ttlMs: INTERNAL_READ_LEASE_TTL_MS,
-        version,
-      };
-      let lease: LeasedSnapshot;
-      try {
-        if (current?.refCount === 0) {
-          const move = this.#transactions.moveLeasedSnapshot(current.lease, options, knownBlockIds);
-          this.#sharedLeaseMove = move.then(
-            () => undefined,
-            () => undefined,
-          );
-          try {
-            lease = await move;
-          } finally {
-            this.#sharedLeaseMove = undefined;
-          }
-        } else {
-          lease = await this.#transactions.openLeasedSnapshot(options, knownBlockIds);
+        const entry: SharedLeaseEntry = { lease, version, refCount: 1 };
+        this.#sharedLeaseUses += 1;
+        const previous = this.#sharedLease;
+        this.#sharedLease = entry;
+        if (previous?.refCount === 0) {
+          // Already closed when it was the one just moved; a remove otherwise.
+          this.#trackSharedLeaseRelease(previous.lease.release());
         }
-      } catch (error) {
-        if (error instanceof SnapshotManifestMissingError) return undefined;
-        throw error;
+        return entry;
       }
-      const entry: SharedLeaseEntry = { lease, version, refCount: 1 };
-      const previous = this.#sharedLease;
-      this.#sharedLease = entry;
-      if (previous?.refCount === 0) {
-        // Already closed when it was the one just moved; a remove otherwise.
-        void previous.lease.release().catch(() => undefined);
-      }
-      return entry;
+    } finally {
+      this.#sharedLeaseAcquisitions -= 1;
+      this.#signalSharedLeaseStateChange();
     }
   }
 
@@ -3313,14 +4284,36 @@ export class MinnowDatabase {
     const current = this.#sharedLease;
     if (current?.refCount !== 0) return;
     this.#sharedLease = undefined;
-    void current.lease.release().catch(() => undefined);
+    this.#trackSharedLeaseRelease(current.lease.release());
   }
 
   #releaseSharedLease(entry: SharedLeaseEntry): void {
     entry.refCount -= 1;
-    if (entry.refCount === 0 && entry !== this.#sharedLease) {
-      void entry.lease.release().catch(() => undefined);
+    this.#sharedLeaseUses -= 1;
+    if (entry.refCount < 0 || this.#sharedLeaseUses < 0) {
+      throw new Error("Shared lease reference accounting underflow");
     }
+    if (entry.refCount === 0 && entry !== this.#sharedLease) {
+      this.#trackSharedLeaseRelease(entry.lease.release());
+    }
+    this.#signalSharedLeaseStateChange();
+  }
+
+  #trackSharedLeaseRelease(release: Promise<void>): void {
+    this.#sharedLeaseReleases.add(release);
+    void release.then(
+      () => this.#sharedLeaseReleases.delete(release),
+      () => this.#sharedLeaseReleases.delete(release),
+    );
+  }
+
+  #sharedLeaseStateChange(): Promise<void> {
+    return new Promise((resolve) => this.#sharedLeaseStateWaiters.add(resolve));
+  }
+
+  #signalSharedLeaseStateChange(): void {
+    for (const resolve of this.#sharedLeaseStateWaiters) resolve();
+    this.#sharedLeaseStateWaiters.clear();
   }
 
   /** Collects every real table referenced by a block, its derived sources, or its subqueries. */
@@ -3334,11 +4327,7 @@ export class MinnowDatabase {
     realTables: ReadonlyMap<string, TableRecord>,
   ): Promise<SegmentVisibilityCatalog> {
     const tableIds = new Set([...realTables.values()].map((table) => table.id));
-    const onlyTable = realTables.size === 1 ? [...realTables.values()][0] : undefined;
-    const segmentRecords =
-      onlyTable !== undefined
-        ? await this.store.listSegments(onlyTable.id)
-        : await this.store.listSegments();
+    const segmentRecords = await this.#listSegmentsForTableIds([...tableIds]);
     const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
     const segmentsByTable = new Map<string, SegmentRecord[]>();
     for (const segment of segmentRecords) {
@@ -3351,6 +4340,24 @@ export class MinnowDatabase {
       transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
       segmentsByTable,
     };
+  }
+
+  /**
+   * Reads only the requested tables' segment indexes. A multi-table query must not scan every
+   * unrelated table's history; the small concurrency window also prevents a generated query
+   * with many joins from issuing an unbounded burst of adapter requests.
+   */
+  async #listSegmentsForTableIds(tableIds: readonly string[]): Promise<SegmentRecord[]> {
+    const uniqueIds = [...new Set(tableIds)];
+    const segments: SegmentRecord[] = [];
+    for (let offset = 0; offset < uniqueIds.length; offset += CATALOG_SEGMENT_READ_CONCURRENCY) {
+      const page = uniqueIds.slice(offset, offset + CATALOG_SEGMENT_READ_CONCURRENCY);
+      const listed = await Promise.all(
+        page.map((tableId) => listTableSegmentsPaged(this.store, tableId)),
+      );
+      for (const tableSegments of listed) segments.push(...tableSegments);
+    }
+    return segments;
   }
 
   /**
@@ -3368,6 +4375,9 @@ export class MinnowDatabase {
     typedSchemas: Map<string, SqlColumnSchema[]>,
     extraInputs?: ReadonlyMap<string, ColumnarTable>,
     cacheResults = true,
+    allowSpill = true,
+    forceSpill = false,
+    spillPageRows?: number,
   ): Promise<Map<string, ColumnarTable>> {
     const inputs = new Map<string, ColumnarTable>(extraInputs ?? []);
     const sources = [block.base, ...block.joins];
@@ -3383,6 +4393,9 @@ export class MinnowDatabase {
           realTables,
           typedSchemas,
           cacheResults,
+          allowSpill,
+          forceSpill,
+          spillPageRows,
         );
         typedSchemas.set(reference, schema);
         const state = createRecursiveCteState(baseResult, all);
@@ -3405,6 +4418,10 @@ export class MinnowDatabase {
                 realTables,
                 typedSchemas,
                 new Map([[reference, frontierTable]]),
+                cacheResults,
+                allowSpill,
+                forceSpill,
+                spillPageRows,
               ),
             );
           } finally {
@@ -3433,6 +4450,10 @@ export class MinnowDatabase {
             memory,
             realTables,
             typedSchemas,
+            cacheResults,
+            allowSpill,
+            forceSpill,
+            spillPageRows,
           );
           if (schema === undefined) schema = memberSchema;
           else {
@@ -3490,6 +4511,9 @@ export class MinnowDatabase {
           realTables,
           typedSchemas,
           cacheResults,
+          allowSpill,
+          forceSpill,
+          spillPageRows,
         );
         const windowed = applyWindowFunctions(inner, source.windowed.windows, {
           copyRows: cacheResults,
@@ -3540,6 +4564,9 @@ export class MinnowDatabase {
         realTables,
         typedSchemas,
         cacheResults,
+        allowSpill,
+        forceSpill,
+        spillPageRows,
       );
       typedSchemas.set(source.table, schema);
       const derivedTable = derivedColumnarTable(source.table, result, schema);
@@ -3584,16 +4611,26 @@ export class MinnowDatabase {
     return inputs;
   }
 
+  #effectiveQueryOptions(options: QueryOptions): QueryOptions {
+    if (options.executionMemoryBudgetBytes !== undefined) return options;
+    return {
+      ...options,
+      executionMemoryBudgetBytes: this.#queryExecutionMemoryBudgetBytes,
+    };
+  }
+
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    return this.#queryWithReadReservation(sql, options);
+  }
+
+  async #queryUnreserved(sql: string, options: QueryOptions): Promise<QueryResult> {
     const open = this.#openTransaction;
     if (open !== undefined) {
       // Read-your-writes: inside BEGIN … COMMIT a read sees the pre-scope snapshot plus what
       // this transaction has staged, and nothing another writer published in between.
       return externalizeQueryResult(
-        await this.#duringTransaction(open, () =>
-          open.session.query(sql, options.params === undefined ? {} : { params: options.params }),
-        ),
+        await this.#duringTransaction(open, () => open.session.query(sql, options)),
       );
     }
     const plan = bindPlanParameters(this.#compileCached(sql), options.params);
@@ -3601,9 +4638,10 @@ export class MinnowDatabase {
     // of the key, so any commit or DDL changes the key and a hit can never be stale. Only
     // plain current-version queries memoize — explicit versions, budgets, and spill options
     // carry semantics of their own.
-    const probe = this.store.getCatalogProbe?.bind(this.store);
+    const probe = this.store.getCatalogProbe.bind(this.store);
     const memoizable =
       options.memoize !== false &&
+      cacheableQueryInput(sql, options.params ?? []) &&
       // A statement that reads the clock is not a function of the data, so the catalog epoch
       // cannot tell a fresh answer from a stale one.
       plan.usesStatementDatetime !== true &&
@@ -3611,18 +4649,129 @@ export class MinnowDatabase {
       options.version === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
       options.spillToStorage === undefined &&
-      options.spillPageRows === undefined &&
-      probe !== undefined;
-    const result =
-      probe === undefined || !memoizable
-        ? await this.#queryCompiled(plan, options)
-        : await this.#memoizedQuery(
-            plan,
-            `res ${queryResultMemoKey(sql, options.params ?? [])}`,
-            options,
-            probe,
-          );
+      options.spillPageRows === undefined;
+    const result = !memoizable
+      ? await this.#queryCompiled(plan, options)
+      : await this.#memoizedQuery(
+          plan,
+          `res ${queryResultMemoKey(sql, options.params ?? [])}`,
+          options,
+          probe,
+        );
     return externalizeQueryResult(result);
+  }
+
+  /**
+   * Pull-driven query batches. Cursor-safe scans emit directly from vector batches; blocking
+   * plans (sorts, groups, joins, derived sources) use the ordinary correct execution and page
+   * its result. In both cases the iterator applies backpressure and owns one snapshot at a time.
+   */
+  queryCursor(
+    sql: string,
+    options: QueryCursorOptions = {},
+  ): AsyncIterableIterator<QueryResult, undefined> {
+    const batchRows = positiveWholeNumber(options.batchRows ?? 2_048, "Query batch rows");
+    const controller = new AbortController();
+    const channel = new QueryBatchChannel();
+    const { batchRows: _batchRows, signal, ...queryOptions } = options;
+    void _batchRows;
+    let producer: Promise<void> | undefined;
+    const abort = (): void => {
+      const reason = queryCursorError(signal?.reason, "Query cursor is closed");
+      controller.abort(reason);
+      channel.fail(reason);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted === true) abort();
+    const start = (): void => {
+      if (producer !== undefined) return;
+      if (controller.signal.aborted) {
+        producer = Promise.resolve();
+        return;
+      }
+      producer = this.#withReadReservation(() =>
+        this.#queryBatches(sql, queryOptions, {
+          batchRows,
+          signal: controller.signal,
+          consume: (batch) => channel.push(batch),
+        }),
+      ).then(
+        () => channel.finish(),
+        (error: unknown) => channel.fail(error),
+      );
+    };
+    const close = async (): Promise<void> => {
+      if (!controller.signal.aborted) controller.abort(new Error("Query cursor is closed"));
+      channel.fail(controller.signal.reason);
+      await producer?.catch(() => undefined);
+      signal?.removeEventListener("abort", abort);
+    };
+    return {
+      next: () => {
+        start();
+        return channel.next();
+      },
+      return: async () => {
+        await close();
+        return { done: true, value: undefined };
+      },
+      throw: async (error?: unknown) => {
+        if (!controller.signal.aborted) controller.abort(error);
+        channel.fail(error);
+        await close();
+        throw error;
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  }
+
+  async #queryBatches(
+    sql: string,
+    options: QueryOptions,
+    cursor: QueryBatchCursorExecution,
+  ): Promise<void> {
+    options = this.#effectiveQueryOptions(options);
+    // A transaction's staged overlay has its own executor. Keep its read-your-writes semantics
+    // and page the materialized result; native scan batching is for durable snapshots.
+    if (this.#openTransaction === undefined) {
+      const plan = bindPlanParameters(this.#compileCached(sql), options.params);
+      const probe = await this.store.getCatalogProbe();
+      const rewritten = await this.#applyCatalogRewrites(plan, probe);
+      if (
+        !compiledPlanIsGrouped(rewritten) &&
+        rewritten.orderBy.length === 0 &&
+        rewritten.joins.length === 0 &&
+        this.#canStreamPlanShape(rewritten, options)
+      ) {
+        const spillPageRows =
+          options.spillPageRows === undefined
+            ? undefined
+            : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
+        const streamed = await this.#queryStreamed(
+          rewritten,
+          options,
+          spillPageRows,
+          probe,
+          cursor,
+        );
+        if (streamed !== undefined) return;
+      }
+    }
+    cursor.signal.throwIfAborted();
+    const result = await this.query(sql, options);
+    if (result.rows.length === 0) {
+      await cursor.consume(result);
+      return;
+    }
+    for (let start = 0; start < result.rows.length; start += cursor.batchRows) {
+      cursor.signal.throwIfAborted();
+      await cursor.consume({
+        columns: [...result.columns],
+        rows: result.rows.slice(start, start + cursor.batchRows),
+      });
+    }
   }
 
   /**
@@ -3795,10 +4944,10 @@ export class MinnowDatabase {
    * when a catalog mutation — anywhere, including another tab — moves the epoch.
    */
   async #catalogFacts(probe?: CatalogProbe): Promise<CatalogFacts> {
-    probe ??= await this.store.getCatalogProbe?.();
-    const epoch = probe?.catalogEpoch;
+    probe ??= await this.store.getCatalogProbe();
+    const epoch = probe.catalogEpoch;
     const cached = this.#catalogCache;
-    if (cached !== undefined && epoch !== undefined && cached.epoch === epoch) return cached.facts;
+    if (cached?.epoch === epoch) return cached.facts;
     const views = new Map<string, string>();
     const childKeys = new Map<string, ChildForeignKey[]>();
     const domains = new Map<string, ReadonlyMap<string, SqlDomain>>();
@@ -3817,7 +4966,7 @@ export class MinnowDatabase {
       }
     }
     const facts: CatalogFacts = { views, childKeys, domains };
-    if (epoch !== undefined) this.#catalogCache = { epoch, facts };
+    this.#catalogCache = { epoch, facts };
     return facts;
   }
 
@@ -3836,9 +4985,10 @@ export class MinnowDatabase {
     options: QueryOptions = {},
     probe?: CatalogProbe,
   ): Promise<QueryResult> {
+    options = this.#effectiveQueryOptions(options);
     // One freshness probe per query: read here unless the caller already has one, and handed
     // to the view lookup and the catalog state below, which would otherwise probe again each.
-    probe ??= await this.store.getCatalogProbe?.();
+    probe ??= await this.store.getCatalogProbe();
     plan = await this.#applyCatalogRewrites(plan, probe);
     const spillPageRows =
       options.spillPageRows === undefined
@@ -3892,25 +5042,27 @@ export class MinnowDatabase {
   #leasedSpillStore(): QuerySpillStore {
     const leases = new Map<string, { revision: number; expiresAtMs: number }>();
     const ensureLease = async (ownerId: string): Promise<void> => {
-      const nowMs = this.#now().getTime();
+      const nowMs = dateMilliseconds(this.#now());
       const lease = leases.get(ownerId);
       if (lease === undefined) {
-        const expiresAtMs = nowMs + this.#spillOwnerLeaseMs;
+        const expiresAtMs = boundedExpiryMilliseconds(nowMs, this.#spillOwnerLeaseMs);
         await this.store.createTempOwner({
           ownerId,
-          expiresAt: new Date(expiresAtMs).toISOString(),
+          createdAt: dateIsoString(new Date(nowMs)),
+          expiresAt: dateIsoString(new Date(expiresAtMs)),
           revision: 0,
         });
         leases.set(ownerId, { revision: 0, expiresAtMs });
         return;
       }
       if (nowMs < lease.expiresAtMs - this.#spillOwnerLeaseMs / 2) return;
-      const expiresAtMs = nowMs + this.#spillOwnerLeaseMs;
-      const renewed = await this.store.renewTempOwner(
+      const expiresAtMs = boundedExpiryMilliseconds(nowMs, this.#spillOwnerLeaseMs);
+      const renewed = await this.store.renewTempOwner({
         ownerId,
-        lease.revision,
-        new Date(expiresAtMs).toISOString(),
-      );
+        expectedRevision: lease.revision,
+        expiresAtCutoff: dateIsoString(new Date(nowMs)),
+        expiresAt: dateIsoString(new Date(expiresAtMs)),
+      });
       leases.set(ownerId, { revision: renewed.revision, expiresAtMs });
     };
     const batched = this.store.putTempRunPages?.bind(this.store);
@@ -3953,16 +5105,16 @@ export class MinnowDatabase {
       options.maxOwners === undefined
         ? Number.MAX_SAFE_INTEGER
         : positiveWholeNumber(options.maxOwners, "Spill cleanup owner limit");
-    const cutoff = this.#now().toISOString();
+    const cutoff = dateIsoString(this.#now());
     const result: QuerySpillCleanupResult = {
       ownersExamined: 0,
       ownersReclaimed: 0,
       ownersRetained: 0,
     };
-    let afterOwnerId: string | null = null;
+    let cursor: string | null = null;
     while (result.ownersExamined < maxOwners) {
       const page = await this.store.listTempOwnerIdsPage(
-        afterOwnerId,
+        cursor,
         Math.min(64, maxOwners - result.ownersExamined),
       );
       for (const ownerId of page.records) {
@@ -3974,7 +5126,38 @@ export class MinnowDatabase {
         }
       }
       if (page.nextCursor === null) break;
-      afterOwnerId = page.nextCursor;
+      cursor = page.nextCursor;
+      await yieldToEventLoop();
+    }
+    return result;
+  }
+
+  /** Automatic cleanup visits only actual expired candidates, so a live prefix cannot starve it. */
+  async #cleanupExpiredQuerySpill(maxOwners: number): Promise<QuerySpillCleanupResult> {
+    const cutoff = dateIsoString(this.#now());
+    const result: QuerySpillCleanupResult = {
+      ownersExamined: 0,
+      ownersReclaimed: 0,
+      ownersRetained: 0,
+    };
+    let cursor: string | null = null;
+    while (result.ownersExamined < maxOwners) {
+      const page = await this.store.listExpiredTempOwnerPage(
+        cutoff,
+        cursor,
+        Math.min(64, maxOwners - result.ownersExamined),
+      );
+      for (const ownerId of page.records) {
+        result.ownersExamined += 1;
+        if (await this.store.removeTempOwnerIfExpired(ownerId, cutoff)) {
+          result.ownersReclaimed += 1;
+        } else {
+          result.ownersRetained += 1;
+        }
+      }
+      if (page.nextCursor === null) break;
+      cursor = page.nextCursor;
+      await yieldToEventLoop();
     }
     return result;
   }
@@ -3983,10 +5166,18 @@ export class MinnowDatabase {
    * Creates a live-query set over this database. Local commits hint it directly, an optional
    * channel carries cross-tab hints, and an optional poll interval bounds staleness without any
    * hint; every hint path converges on the durable manifest version, so missed messages delay a
-   * refresh but never produce a stale result. Subscriptions retain a result digest, not rows.
+   * refresh but never produce a stale result. Equal subscriptions retain one private exact
+   * result snapshot plus a digest that rejects most inequality before exact comparison.
    */
   liveQueries(options: LiveQuerySetOptions = {}): LiveQuerySet {
     if (this.#closed) throw new Error("Database is closed");
+    if (this.#liveSets.size >= MAX_LIVE_QUERY_SETS_PER_DATABASE) {
+      throw new LiveQueryLimitError("set", MAX_LIVE_QUERY_SETS_PER_DATABASE);
+    }
+    const channelName =
+      options.channel === undefined && options.channelName === undefined
+        ? this.store.liveQueryChannelName
+        : options.channelName;
     const compileLiveQuery = (query: LiveQueryInput): CompiledQuery => {
       if (typeof query === "string") return this.#compileCached(query);
       if (query.kind === "typed-query") return query.plan;
@@ -3994,7 +5185,9 @@ export class MinnowDatabase {
     };
     const set = new LiveQuerySet(
       {
-        currentVersion: () => this.store.getCurrentManifestVersion(),
+        currentProbe: async () => {
+          return this.store.getCatalogProbe();
+        },
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
         dependencyTableIds: async (query) => {
           const compiled = compileLiveQuery(query);
@@ -4013,6 +5206,7 @@ export class MinnowDatabase {
       },
       {
         ...options,
+        ...(channelName === undefined ? {} : { channelName }),
         onClosed: () => {
           this.#liveSets.delete(set);
           options.onClosed?.();
@@ -4055,7 +5249,7 @@ export class MinnowDatabase {
       if (entry === undefined) return true;
       const predicates = zonePredicates(plan, entry.table);
       for (const segment of entry.windowSegments) {
-        const kind = segment.kind ?? "insert";
+        const kind = segment.kind;
         // Compaction rewrites are visible-data-neutral by construction.
         if (kind === "base") continue;
         // Updates and deletes change existing rows; upserts can remove a row from a result
@@ -4090,7 +5284,7 @@ export class MinnowDatabase {
           ),
         ];
         if (uncachedIds.length > 0) {
-          const fetched = await this.store.getBlocks(uncachedIds);
+          const fetched = await this.#getBlocksWindowed(uncachedIds);
           for (const [index, blockId] of uncachedIds.entries()) {
             const bytes = fetched[index];
             if (bytes === undefined) return true;
@@ -4145,7 +5339,7 @@ export class MinnowDatabase {
         const page = await this.store.listManifestPage(cursor, 64);
         for (const manifest of page.records) {
           if (manifest.version > until) break pages;
-          for (const tableId of manifest.changedTableIds ?? []) {
+          for (const tableId of manifest.changedTableIds) {
             const versions = changedVersions.get(tableId) ?? new Set<number>();
             versions.add(manifest.version);
             changedVersions.set(tableId, versions);
@@ -4171,7 +5365,7 @@ export class MinnowDatabase {
     const entry = (async (): Promise<LiveProofTable | undefined> => {
       const table = await this.store.getTable(tableId);
       if (table === undefined) return undefined;
-      const segments = await this.store.listSegments(tableId);
+      const segments = await listTableSegmentsPaged(this.store, tableId);
       const transactions = new Map(
         (await this.#transactionRecordsForSegments(segments)).map(
           (record) => [record.id, record] as const,
@@ -4216,7 +5410,7 @@ export class MinnowDatabase {
       for (const manifest of page.records) {
         if (expected > until) break;
         if (manifest.version !== expected) return false;
-        if (manifest.changedTableIds?.length !== 0) return false;
+        if (manifest.changedTableIds.length !== 0) return false;
         expected += 1;
       }
       if (page.nextCursor === null) break;
@@ -4280,6 +5474,32 @@ export class MinnowDatabase {
     void run;
   }
 
+  async #assertCompactionCapacity(
+    table: TableRecord,
+    transaction?: DatabaseTransaction,
+  ): Promise<void> {
+    transaction?.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
+    // Every commit atomically enforces the same ceiling. Without automatic compaction there is
+    // no useful work for this preflight to do, so avoid a full segment/owner/manifest scan on
+    // every write and let the commit return the identical CompactionBacklogError at the CAS.
+    if (!this.#autoCompact) return;
+    let segments = await this.#currentVisibleSegments(table);
+    let levelZero = 0;
+    for (const segment of segments) {
+      if (segment.level === 0) levelZero += 1;
+    }
+    if (levelZero < MAX_LEVEL_ZERO_SEGMENTS) return;
+    await this.compactTableStep(table.name, {
+      maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
+      maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+    });
+    segments = await this.#currentVisibleSegments(table);
+    levelZero = segments.reduce((count, segment) => count + (segment.level === 0 ? 1 : 0), 0);
+    if (levelZero >= MAX_LEVEL_ZERO_SEGMENTS) {
+      throw new CompactionBacklogError(table.name, levelZero, MAX_LEVEL_ZERO_SEGMENTS);
+    }
+  }
+
   /**
    * Plans a compaction job and drives it to publication in small steps, yielding to the event
    * loop between them so queries and writes interleave with the maintenance; then, while the
@@ -4331,12 +5551,9 @@ export class MinnowDatabase {
     // once it ends.
     let segments: SegmentRecord[] = [];
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const manifest = await this.store.getCurrentManifest();
-      segments = await this.#visibleSegmentRecords(
-        table,
-        new Snapshot(this.store, manifest?.version ?? null, manifest?.blockIds ?? []),
-      );
-      if ((await this.store.getCurrentManifestVersion()) === (manifest?.version ?? null)) {
+      const version = await this.store.getCurrentManifestVersion();
+      segments = await this.#visibleSegmentRecords(table, new Snapshot(this.store, version));
+      if ((await this.store.getCurrentManifestVersion()) === version) {
         return segments;
       }
     }
@@ -4347,16 +5564,91 @@ export class MinnowDatabase {
    * What every data commit shares: live sets learn of it, and the tables it changed count
    * toward their next write-path auto-compaction check.
    */
-  #afterCommit(manifest: ManifestSummary): void {
+  #afterCommit(manifest: ManifestSummary, transaction?: DatabaseTransaction): void {
     if (this.#closed) return;
+    const contribution = transaction?.committedCatalogContribution;
+    const initial = contribution?.initialCatalogProbe;
+    const contributedTableIds = new Set(
+      contribution?.segments.map((segment) => segment.tableId) ?? [],
+    );
+    if (
+      contribution !== undefined &&
+      initial !== undefined &&
+      this.#catalogStateEpoch === initial.catalogEpoch &&
+      manifest.previousVersion === initial.manifestVersion &&
+      // Fail closed if a future write path cannot describe every changed table. Leaving the
+      // old epoch in place makes the next probe reload from storage; partially advancing a
+      // cached state could instead return rows from before the commit indefinitely.
+      manifest.changedTableIds.every((tableId) => contributedTableIds.has(tableId))
+    ) {
+      const nextEpoch = initial.catalogEpoch + 1;
+      for (const state of this.#catalogStateCache.values()) {
+        if (
+          state.catalogEpoch !== initial.catalogEpoch ||
+          state.manifestVersion !== initial.manifestVersion
+        ) {
+          continue;
+        }
+        // The state object is retained so cache/LRU identity stays stable, but its derived maps
+        // are immutable snapshots. Drop them before appending the newly committed owner/segment;
+        // otherwise the same database instance keeps reading the pre-commit visibility graph.
+        this.#preparedCatalogStates.delete(state);
+        const tableIds = new Set(
+          state.tables.flatMap((table) => (table === undefined ? [] : [table.id])),
+        );
+        const additions = contribution.segments
+          .filter((segment) => tableIds.has(segment.tableId))
+          .map((segment) => ({
+            ...segment,
+            // Stores stamp newly published level-zero records with their manifest order.
+            // Advance the cache with that canonical shape, not the staged placeholder order.
+            logicalOrder: segment.level === 0 ? manifest.version : segment.logicalOrder,
+          }));
+        if (additions.length > 0) {
+          // A query can run outside an open write scope after its second stage has made the
+          // active transaction and segments durable. Its atomic catalog state therefore already
+          // contains these ids with an active owner and pre-publication logical order. Publication
+          // must replace those records, not merely append missing ids, or the cache keeps treating
+          // the committed segments as invisible until another connection changes the epoch.
+          const additionsById = new Map(additions.map((segment) => [segment.id, segment] as const));
+          for (let index = 0; index < state.segments.length; index += 1) {
+            const current = state.segments[index];
+            if (current === undefined) continue;
+            const replacement = additionsById.get(current.id);
+            if (replacement === undefined) continue;
+            state.segments[index] = replacement;
+            additionsById.delete(current.id);
+          }
+          state.segments.push(...additionsById.values());
+          state.segments.sort((left, right) => left.id.localeCompare(right.id));
+          const ownerIndex = state.transactions.findIndex(
+            (record) => record.id === contribution.transaction.id,
+          );
+          if (ownerIndex === -1) {
+            state.transactions.push(contribution.transaction);
+          } else {
+            state.transactions[ownerIndex] = contribution.transaction;
+          }
+        }
+        state.manifestVersion = manifest.version;
+        state.catalogEpoch = nextEpoch;
+      }
+      this.#catalogStateEpoch = nextEpoch;
+    }
     this.#notifyLiveCommit();
     for (const hint of manifest.ftsDeltaCounts ?? []) {
       if (hint.count > FTS_FOLD_DELTA_CHUNKS) {
+        const key = `${hint.tableId}/${hint.columnId}`;
+        this.#postingDeltaTailCounts.set(
+          key,
+          Math.max(this.#postingDeltaTailCounts.get(key) ?? 0, hint.count),
+        );
         this.#scheduleFtsDeltaFold(hint.tableId, hint.columnId);
       }
     }
     this.#commitsSinceCollection += 1;
-    const now = this.#now().getTime();
+    this.#autoCollectionDebtCommits += 1;
+    const now = dateMilliseconds(this.#now());
     if (
       this.#commitsSinceCollection >= AUTO_COLLECT_COMMIT_INTERVAL ||
       (this.#lastCollectionAt !== undefined &&
@@ -4366,7 +5658,7 @@ export class MinnowDatabase {
     }
     this.#armIdleCollection();
     if (!this.#autoCompact) return;
-    for (const tableId of manifest.changedTableIds ?? []) {
+    for (const tableId of manifest.changedTableIds) {
       this.#idleCompactionTableIds.add(tableId);
       const commits = (this.#commitsSinceCompactionCheck.get(tableId) ?? 0) + 1;
       if (commits < AUTO_COMPACT_COMMIT_CHECK_INTERVAL) {
@@ -4377,6 +5669,17 @@ export class MinnowDatabase {
       void this.#checkAutoCompaction(tableId);
     }
     this.#armIdleCompactionCheck();
+  }
+
+  /** Counts one physical rewrite version once in this engine, including lost-ack recovery. */
+  #afterCompactionCommit(manifest: ManifestSummary): void {
+    if (this.#accountedCompactionVersions.has(manifest.version)) return;
+    this.#accountedCompactionVersions.add(manifest.version);
+    if (this.#accountedCompactionVersions.size > 128) {
+      const oldest = this.#accountedCompactionVersions.values().next().value;
+      if (oldest !== undefined) this.#accountedCompactionVersions.delete(oldest);
+    }
+    this.#afterCommit(manifest);
   }
 
   /**
@@ -4439,9 +5742,20 @@ export class MinnowDatabase {
       }>;
     },
   ): Promise<void> {
+    const triggerId = this.#createId();
+    const createdAt = dateIsoString(this.#now());
+    let pinnedTableId: string | undefined;
     for (let attempt = 0; ; attempt += 1) {
-      const table = await this.#findTable(tableName);
-      const tables = await this.store.listTables();
+      const proof = await this.#stableCatalogProof();
+      const tables = proof.records;
+      const table = tables.find((record) => record.name === tableName);
+      if (table === undefined) throw new TypeError(`Table not found: ${tableName}`);
+      if (table.view !== undefined)
+        throw new TypeError(`Cannot create a trigger on view ${tableName}`);
+      pinnedTableId ??= table.id;
+      if (table.id !== pinnedTableId) {
+        throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
+      }
       for (const record of tables) {
         if ((record.triggers ?? []).some((existing) => existing.name === trigger.name)) {
           throw new TypeError(`Trigger already exists: ${trigger.name}`);
@@ -4470,99 +5784,76 @@ export class MinnowDatabase {
         }
         const target = tables.find((record) => record.name === compiled.table);
         if (target === undefined) throw new TypeError(`Table not found: ${compiled.table}`);
+        if (target.view !== undefined) {
+          throw new TypeError(`Trigger bodies cannot write to views: ${compiled.table}`);
+        }
         if (target.id === table.id) {
           throw new TypeError("A trigger cannot write to its own table");
         }
         if (compiled.kind === "insert" && target.uniqueKeyColumnId !== undefined) {
           throw new TypeError(`Trigger bodies insert into keyless tables only: ${compiled.table}`);
         }
-        if (compiled.kind === "insert") {
-          // Validate the body's column list now: a body that can never fire successfully
-          // must fail CREATE, not every later write to the trigger's table.
-          for (const name of compiled.columns) {
-            if (!target.columns.some((column) => column.name === name)) {
-              throw new TypeError(`Trigger body INSERT column does not exist: ${name}`);
-            }
-          }
-          for (const column of target.columns) {
-            if (
-              !compiled.columns.includes(column.name) &&
-              !column.nullable &&
-              column.defaultValue === undefined
-            ) {
-              throw new TypeError(
-                `Trigger body INSERT omits a non-nullable column without a default: ${column.name}`,
-              );
-            }
-          }
-        }
         if (compiled.kind !== "insert" && target.uniqueKeyColumnId === undefined) {
           throw new TypeError(
             `Trigger body ${compiled.kind.toUpperCase()}s need a keyed table: ${compiled.table}`,
           );
         }
+        // A stored body is an executable catalog dependency. Prove its complete target schema
+        // now, rather than persisting a statement that fails on every later firing.
+        assertTriggerBodyTargetSchema(compiled, target);
         // Cascades are allowed one level deep; the runtime budget errors on deeper chains.
       }
       try {
-        const createdAt = this.#now().toISOString();
-        await this.store.updateTable(table.id, table.revision ?? 0, {
-          triggers: [...(table.triggers ?? []), { ...trigger, createdAt }],
+        await this.store.updateTable(table.id, table.revision, {
+          triggers: [...(table.triggers ?? []), { ...trigger, id: triggerId, createdAt }],
+          expectedCatalogEpoch: proof.catalogEpoch,
         });
-        // The CAS guards only this table's record, so a concurrent create of the same name on
-        // a different table can slip through the pre-check. Re-read and settle it the same
-        // way on both sides — earliest createdAt wins, table id breaks ties — so exactly one
-        // survives and the loser removes its own entry.
-        const loser = (await this.store.listTables()).some(
-          (record) =>
-            record.id !== table.id &&
-            (record.triggers ?? []).some(
-              (existing) =>
-                existing.name === trigger.name &&
-                (existing.createdAt < createdAt ||
-                  (existing.createdAt === createdAt && record.id < table.id)),
-            ),
-        );
-        if (loser) {
-          await this.#removeTriggerFrom(table.id, trigger.name);
-          throw new TypeError(`Trigger already exists: ${trigger.name}`);
+        return;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+          throw error;
         }
-        return;
-      } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
-      }
-    }
-  }
-
-  /** Removes one named trigger from one specific table record, retrying the record CAS. */
-  async #removeTriggerFrom(tableId: string, name: string): Promise<void> {
-    for (let attempt = 0; ; attempt += 1) {
-      const record = await this.store.getTable(tableId);
-      if (record === undefined) return;
-      const remaining = (record.triggers ?? []).filter((trigger) => trigger.name !== name);
-      if (remaining.length === (record.triggers ?? []).length) return;
-      try {
-        await this.store.updateTable(record.id, record.revision ?? 0, { triggers: remaining });
-        return;
-      } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
       }
     }
   }
 
   async #dropTrigger(name: string): Promise<void> {
+    let pinnedOwnerId: string | undefined;
+    let pinnedTriggerId: string | undefined;
     for (let attempt = 0; ; attempt += 1) {
-      const tables = await this.store.listTables();
+      const proof = await this.#stableCatalogProof();
+      const tables = proof.records;
       const owner = tables.find((record) =>
         (record.triggers ?? []).some((trigger) => trigger.name === name),
       );
-      if (owner === undefined) throw new TypeError(`Trigger not found: ${name}`);
+      if (owner === undefined) {
+        if (pinnedOwnerId !== undefined) {
+          throw new TableRecordConflictError(pinnedOwnerId, 0, null);
+        }
+        throw new TypeError(`Trigger not found: ${name}`);
+      }
+      pinnedOwnerId ??= owner.id;
+      if (owner.id !== pinnedOwnerId) {
+        throw new TableRecordConflictError(pinnedOwnerId, 0, owner.revision);
+      }
+      const ownedTrigger = (owner.triggers ?? []).find((trigger) => trigger.name === name);
+      if (ownedTrigger === undefined) {
+        throw new TableRecordConflictError(pinnedOwnerId, owner.revision, owner.revision);
+      }
+      pinnedTriggerId ??= ownedTrigger.id;
+      if (ownedTrigger.id !== pinnedTriggerId) {
+        throw new TableRecordConflictError(pinnedOwnerId, 0, owner.revision);
+      }
       try {
-        await this.store.updateTable(owner.id, owner.revision ?? 0, {
-          triggers: (owner.triggers ?? []).filter((trigger) => trigger.name !== name),
+        await this.store.updateTable(owner.id, owner.revision, {
+          triggers: (owner.triggers ?? []).filter((trigger) => trigger.id !== pinnedTriggerId),
+          expectedCatalogEpoch: proof.catalogEpoch,
         });
         return;
       } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+        if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+          throw error;
+        }
       }
     }
   }
@@ -4960,12 +6251,26 @@ export class MinnowDatabase {
     }
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-    for (const column of table.columns) {
+    const blockStager = new BoundedWriteBlockStager(transaction);
+    const plannedColumns = table.columns.map((column) =>
+      writeColumnValues(column.type, batch.columns[column.name] ?? []),
+    );
+    const ranges = writeBlockRanges(
+      plannedColumns,
+      rowCount,
+      this.#rowsPerBlock,
+      this.#targetBlockBytes,
+    );
+    for (const [columnIndex, column] of table.columns.entries()) {
       const values = batch.columns[column.name] ?? [];
+      const plannedColumn = plannedColumns[columnIndex];
+      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
       const blockIds: string[] = [];
-      for (let start = 0, part = 0; start < rowCount; start += this.#rowsPerBlock, part += 1) {
-        const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
+      for (const [part, { start, end }] of ranges.entries()) {
+        await blockStager.prepare(
+          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
+        );
+        const slice = values.slice(start, end);
         const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
         const blockId = [
           "table",
@@ -4977,7 +6282,7 @@ export class MinnowDatabase {
           "part",
           String(part).padStart(6, "0"),
         ].join("/");
-        blockWrites.push({ id: blockId, bytes });
+        blockStager.add({ id: blockId, bytes });
         blockIds.push(blockId);
       }
       columnBlockIds[column.id] = blockIds;
@@ -4993,9 +6298,12 @@ export class MinnowDatabase {
       kind,
       ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
       level: 0,
-      createdAt: this.#now().toISOString(),
+      logicalOrder: 0,
+      commitOrdinal: transaction.pendingSegmentIds.length,
+      rowIdSpans: [],
+      createdAt: dateIsoString(this.#now()),
     };
-    await transaction.stageArtifacts(blockWrites, [segment]);
+    await blockStager.stageWithSegments([segment]);
     return segmentId;
   }
 
@@ -5025,8 +6333,15 @@ export class MinnowDatabase {
       transaction: DatabaseTransaction,
       writer: TransactionStatementWriter,
     ) => Promise<T>,
+    options: { durableSnapshot?: boolean } = {},
   ): Promise<{ result: T; version: number | null }> {
-    const transaction = await this.#transactions.begin();
+    await this.#assistAutomaticCollection();
+    // Keep one storage-sized statement batch process-local. The common single-statement write
+    // then publishes through writeTransaction atomically; a second stage spills the first batch
+    // to the durable journal before accepting more, preserving bounded memory and recovery.
+    const transaction = await this.#transactions.beginDeferred({
+      durableSnapshot: options.durableSnapshot ?? true,
+    });
     let closed = false;
     let staged = 0;
     /**
@@ -5057,20 +6372,20 @@ export class MinnowDatabase {
     const session: WriteSession = {
       query: async (sql, options) => {
         open();
-        return this.#sessionQuery(transaction, sql, options);
+        return this.#withReadReservation(() => this.#sessionQuery(transaction, sql, options));
       },
       execute: async (sql, params) => {
         open();
         const compiled = compileStatement(sql);
         if (compiled.kind === "select") {
-          return {
-            kind: "rows",
+          return this.#withReadReservation(async () => ({
+            kind: "rows" as const,
             result: await this.#sessionQuery(
               transaction,
               compiled.sql,
               params === undefined ? {} : { params },
             ),
-          };
+          }));
         }
         const statement = bindStatementParameters(compiled, params);
         if (!isTransactionalStatement(statement)) {
@@ -5106,7 +6421,16 @@ export class MinnowDatabase {
     };
     const writer: TransactionStatementWriter = {
       ...session,
-      queryPlan: (plan) => this.#sessionQueryPlan(transaction, plan),
+      queryPlan: (plan) =>
+        this.#withReadReservation(async () => {
+          // Before this scope stages anything, its view is exactly the catalog probe captured
+          // by beginDeferred. Reuse the ordinary current-version pipeline and its compact
+          // catalog/lease caches; once work is staged, switch to the overlay pipeline below.
+          const probe = transaction.initialCatalogProbe;
+          return transaction.stagedWorkCount === 0 && probe !== undefined
+            ? this.#queryCompiled(plan, {}, probe)
+            : this.#sessionQueryPlan(transaction, await this.#applyCatalogRewrites(plan));
+        }),
       executeStatement: (statement) => {
         open();
         return guarded(() => this.runStatement(statement, { writer }));
@@ -5114,6 +6438,10 @@ export class MinnowDatabase {
       checkpoint: () => {
         open();
         return transaction.checkpoint();
+      },
+      checkpointRetainedBytes: () => {
+        open();
+        return transaction.checkpointRetainedBytes();
       },
       rollbackTo: async (checkpoint) => {
         if (closed) throw new Error("The write scope has ended");
@@ -5141,7 +6469,7 @@ export class MinnowDatabase {
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         try {
           const manifest = await transaction.commit();
-          this.#afterCommit(manifest);
+          this.#afterCommit(manifest, transaction);
           return { result, version: manifest.version };
         } catch (error) {
           if (!(error instanceof WriteConflictError) || attempt === this.#maxCommitRetries) {
@@ -5161,7 +6489,7 @@ export class MinnowDatabase {
     } catch (error) {
       closed = true;
       await transaction.abort().catch(() => undefined);
-      throw await this.#translateSecondaryUniqueConflict(error);
+      throw await this.#translateUniqueConflict(error);
     }
   }
 
@@ -5174,20 +6502,23 @@ export class MinnowDatabase {
   async #sessionQuery(
     transaction: DatabaseTransaction,
     sql: string,
-    options: { params?: QueryOptions["params"] } = {},
+    options: QueryOptions = {},
   ): Promise<QueryResult> {
+    options = this.#effectiveQueryOptions(options);
     const bound = bindPlanParameters(this.#compileCached(sql), options.params);
     // The same catalog rewrites a read outside a scope gets: a scope that could not see a view
     // would make the scope's reads a different language from everyone else's.
     const plan = await this.#applyCatalogRewrites(bound);
-    return this.#sessionQueryPlan(transaction, plan);
+    return this.#sessionQueryPlan(transaction, plan, options);
   }
 
   /** #sessionQuery for an already-bound plan: trigger bodies resolve their reads through it. */
   async #sessionQueryPlan(
     transaction: DatabaseTransaction,
     plan: CompiledQuery,
+    options: QueryOptions = {},
   ): Promise<QueryResult> {
+    options = this.#effectiveQueryOptions(options);
     const names = collectRealTableNames(plan);
     const tables = await Promise.all(names.map((name) => this.#findTable(name)));
     const realTables = new Map(tables.map((table) => [table.name, table] as const));
@@ -5206,19 +6537,71 @@ export class MinnowDatabase {
         get expiresAt() {
           return snapshot.expiresAt;
         },
-        hasBlock: (blockId: string) => pendingBlocks.has(blockId) || snapshot.hasBlock(blockId),
+        hasBlock: async (blockId: string) =>
+          pendingBlocks.has(blockId) || (await snapshot.hasBlock(blockId)),
+        hasBlocks: async (blockIds: readonly string[]) => {
+          const committedIds = blockIds.filter((blockId) => !pendingBlocks.has(blockId));
+          const committedMembership = await snapshot.hasBlocks(committedIds);
+          let committedIndex = 0;
+          return blockIds.map((blockId) =>
+            pendingBlocks.has(blockId) ? true : committedMembership[committedIndex++] === true,
+          );
+        },
+        getBlock: async (blockId: string) =>
+          pendingBlocks.has(blockId) ? transaction.getBlock(blockId) : snapshot.getBlock(blockId),
+        getBlocks: async (blockIds: readonly string[]) => {
+          const blocks: Array<Uint8Array | undefined> = [];
+          for (let start = 0; start < blockIds.length; start += 64) {
+            const window = blockIds.slice(start, start + 64);
+            const committedIds: string[] = [];
+            const committedIndexes: number[] = [];
+            const stagedIds: string[] = [];
+            const stagedIndexes: number[] = [];
+            window.forEach((blockId, index) => {
+              if (pendingBlocks.has(blockId)) {
+                stagedIds.push(blockId);
+                stagedIndexes.push(index);
+              } else {
+                committedIds.push(blockId);
+                committedIndexes.push(index);
+              }
+            });
+            // Committed membership was proved by #visibleSegmentRecords under this pinned
+            // manifest, so it keeps the adapter's ordinary bulk payload path. Only journaled
+            // ids need the transaction overlay; restoring their positions preserves the exact
+            // positional contract without turning a large in-scope scan into one IDB read per
+            // committed block.
+            const [committed, staged] = await Promise.all([
+              this.#getBlocksWindowed(committedIds),
+              Promise.all(stagedIds.map((blockId) => transaction.getBlock(blockId))),
+            ]);
+            const ordered = new Array<Uint8Array | undefined>(window.length);
+            committedIndexes.forEach((index, offset) => {
+              ordered[index] = committed[offset];
+            });
+            stagedIndexes.forEach((index, offset) => {
+              ordered[index] = staged[offset];
+            });
+            blocks.push(...ordered);
+          }
+          return blocks;
+        },
         renew: (ttlMs: number) => snapshot.renew(ttlMs),
         release: () => snapshot.release(),
       } as unknown as LeasedSnapshot;
       const segmentsByTable = new Map<string, SegmentRecord[]>();
       const transactionRecords = new Map<string, TransactionRecord>();
+      const deferredSegments = transaction.deferredSegments;
       for (const table of tables) {
-        const segments = await this.store.listSegments(table.id);
+        const segments = [
+          ...(await listTableSegmentsPaged(this.store, table.id)),
+          ...deferredSegments.filter((segment) => segment.tableId === table.id),
+        ];
         // Staged segments sort after every committed one; commitOrdinal keeps their
         // staging order (the journal's id list is sorted, so it cannot).
         const doctored = segments.map((segment) =>
           pendingIds.has(segment.id)
-            ? { ...segment, logicalOrder: STAGED_OVERLAY_ORDER_BASE + (segment.commitOrdinal ?? 0) }
+            ? { ...segment, logicalOrder: STAGED_OVERLAY_ORDER_BASE + segment.commitOrdinal }
             : segment,
         );
         segmentsByTable.set(table.id, doctored);
@@ -5236,8 +6619,9 @@ export class MinnowDatabase {
       const visibility: SegmentVisibilityCatalog = {
         transactions: transactionRecords,
         segmentsByTable,
+        overlayTransactionId: transaction.id,
       };
-      return this.#queryAtVisibility(plan, overlaySnapshot, visibility, realTables);
+      return this.#queryAtVisibility(plan, overlaySnapshot, visibility, realTables, true, options);
     });
   }
 
@@ -5248,7 +6632,9 @@ export class MinnowDatabase {
     visibility: SegmentVisibilityCatalog,
     realTables: ReadonlyMap<string, TableRecord>,
     cacheResults = true,
+    options: QueryOptions = {},
   ): Promise<QueryResult> {
+    options = this.#effectiveQueryOptions(options);
     plan = expandFtsColumns(plan, (name) => searchableFtsColumns(realTables.get(name)));
     const typedSchemas = new Map<string, SqlColumnSchema[]>(
       [...realTables.values()].map((table) => [
@@ -5261,7 +6647,13 @@ export class MinnowDatabase {
         })),
       ]),
     );
-    const memory = new QueryMemoryContext();
+    const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
+    const allowSpill = options.spillToStorage !== false;
+    const forceSpill = options.spillToStorage === true;
+    const spillPageRows =
+      options.spillPageRows === undefined
+        ? undefined
+        : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
     try {
       const resolution = subqueryResolutionSteps(plan);
       for (const step of resolution.steps) {
@@ -5275,6 +6667,9 @@ export class MinnowDatabase {
             typedSchemas,
             undefined,
             cacheResults,
+            allowSpill,
+            forceSpill,
+            spillPageRows,
           ),
         );
       }
@@ -5290,6 +6685,9 @@ export class MinnowDatabase {
             typedSchemas,
             undefined,
             cacheResults,
+            allowSpill,
+            forceSpill,
+            spillPageRows,
           ),
           wrapper.aliases,
         );
@@ -5303,6 +6701,9 @@ export class MinnowDatabase {
         typedSchemas,
         undefined,
         cacheResults,
+        allowSpill,
+        forceSpill,
+        spillPageRows,
       );
     } finally {
       memory.close();
@@ -5339,13 +6740,8 @@ export class MinnowDatabase {
     cascadeBudget = 1,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
+    await this.#assertCompactionCapacity(table, transaction);
     const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
-    await this.#assertForeignKeysPresent(
-      table,
-      (column) => batch.columns[column] ?? [],
-      (sql, params) => this.#sessionQuery(transaction, sql, { params }),
-      transaction,
-    );
     if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
         table.id,
@@ -5367,6 +6763,12 @@ export class MinnowDatabase {
         requireAbsent: kind === "insert",
       });
     }
+    await this.#assertForeignKeysPresent(
+      table,
+      (column) => batch.columns[column] ?? [],
+      (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+      transaction,
+    );
     const rowIds = await this.store.reserveRowIds(table.id, rowCount);
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
@@ -5453,6 +6855,7 @@ export class MinnowDatabase {
     cascadeBudget = 1,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
+    await this.#assertCompactionCapacity(table, transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
@@ -5537,16 +6940,29 @@ export class MinnowDatabase {
     const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-    for (const column of columns) {
+    const blockStager = new BoundedWriteBlockStager(transaction);
+    const plannedColumns = columns.map((column) =>
+      writeColumnValues(
+        column.type,
+        column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
+      ),
+    );
+    const ranges = writeBlockRanges(
+      plannedColumns,
+      input.keys.length,
+      this.#rowsPerBlock,
+      this.#targetBlockBytes,
+    );
+    for (const [columnIndex, column] of columns.entries()) {
       const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
+      const plannedColumn = plannedColumns[columnIndex];
+      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
       const blockIds: string[] = [];
-      for (
-        let start = 0, part = 0;
-        start < input.keys.length;
-        start += this.#rowsPerBlock, part += 1
-      ) {
-        const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, input.keys.length));
+      for (const [part, { start, end }] of ranges.entries()) {
+        await blockStager.prepare(
+          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
+        );
+        const slice = values.slice(start, end);
         const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
         const blockId = [
           "table",
@@ -5558,12 +6974,12 @@ export class MinnowDatabase {
           "part",
           String(part).padStart(6, "0"),
         ].join("/");
-        blockWrites.push({ id: blockId, bytes });
+        blockStager.add({ id: blockId, bytes });
         blockIds.push(blockId);
       }
       columnBlockIds[column.id] = blockIds;
     }
-    await transaction.stageArtifacts(blockWrites, [
+    await blockStager.stageWithSegments([
       {
         id: segmentId,
         tableId: table.id,
@@ -5575,7 +6991,10 @@ export class MinnowDatabase {
         kind: "update",
         keyColumnId: keyColumn.id,
         level: 0,
-        createdAt: this.#now().toISOString(),
+        logicalOrder: 0,
+        commitOrdinal: transaction.pendingSegmentIds.length,
+        rowIdSpans: [],
+        createdAt: dateIsoString(this.#now()),
       },
     ]);
     await this.#stageTriggerDerivedInserts(
@@ -5598,6 +7017,7 @@ export class MinnowDatabase {
     referentialBudget = REFERENTIAL_CASCADES,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
+    await this.#assertCompactionCapacity(table, transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
@@ -5623,14 +7043,21 @@ export class MinnowDatabase {
     );
     if (input.keys.length === 0) throw new TypeError("A delete batch needs at least one key");
     const keys = new Map<string, Exclude<BatchValue, null>>();
-    input.keys.forEach((value, index) => {
-      validateValue(keyColumn, value, index);
+    const keyStringByteLengths =
+      keyColumn.type === "string" ? new Array<number>(input.keys.length) : undefined;
+    for (let index = 0; index < input.keys.length; index += 1) {
+      const value = input.keys[index] as BatchValue;
+      const byteLength = validateValue(keyColumn, value, index);
+      if (keyStringByteLengths !== undefined) keyStringByteLengths[index] = byteLength ?? 0;
       if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
       const token = keyToken(keyColumn.type, value);
       if (keys.has(token))
         throw new TypeError(`Duplicate key in delete batch: ${formatValue(value)}`);
       keys.set(token, value);
-    });
+    }
+    if (keyStringByteLengths !== undefined) {
+      validatedStringByteLengths.set(input.keys, keyStringByteLengths);
+    }
     transaction.setUniqueKeyChanges({
       tableId: table.id,
       keyTokens: [...keys.keys()],
@@ -5669,11 +7096,24 @@ export class MinnowDatabase {
       cascadeBudget,
     );
     const values = [...keys.values()];
+    if (keyStringByteLengths !== undefined) {
+      validatedStringByteLengths.set(values, keyStringByteLengths);
+    }
     const segmentId = this.#createId();
     const blockIds: string[] = [];
-    const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-    for (let start = 0, part = 0; start < values.length; start += this.#rowsPerBlock, part += 1) {
-      const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, values.length));
+    const blockStager = new BoundedWriteBlockStager(transaction);
+    const plannedColumn = writeColumnValues(keyColumn.type, values);
+    const ranges = writeBlockRanges(
+      [plannedColumn],
+      values.length,
+      this.#rowsPerBlock,
+      this.#targetBlockBytes,
+    );
+    for (const [part, { start, end }] of ranges.entries()) {
+      await blockStager.prepare(
+        maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
+      );
+      const slice = values.slice(start, end);
       const bytes = await this.#encodeColumnBlock(
         keyColumn.id,
         asColumnInput(keyColumn.type, slice),
@@ -5688,23 +7128,27 @@ export class MinnowDatabase {
         "part",
         String(part).padStart(6, "0"),
       ].join("/");
-      blockWrites.push({ id: blockId, bytes });
+      blockStager.add({ id: blockId, bytes });
       blockIds.push(blockId);
     }
-    await transaction.stageBlocks(blockWrites);
-    await transaction.stageSegment({
-      id: segmentId,
-      tableId: table.id,
-      transactionId: transaction.id,
-      rowCount: keys.size,
-      rowIdStart: 0n,
-      rowIdEndExclusive: 0n,
-      columnBlockIds: { [keyColumn.id]: blockIds },
-      kind: "delete",
-      keyColumnId: keyColumn.id,
-      level: 0,
-      createdAt: this.#now().toISOString(),
-    });
+    await blockStager.stageWithSegments([
+      {
+        id: segmentId,
+        tableId: table.id,
+        transactionId: transaction.id,
+        rowCount: keys.size,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        columnBlockIds: { [keyColumn.id]: blockIds },
+        kind: "delete",
+        keyColumnId: keyColumn.id,
+        level: 0,
+        logicalOrder: 0,
+        commitOrdinal: transaction.pendingSegmentIds.length,
+        rowIdSpans: [],
+        createdAt: dateIsoString(this.#now()),
+      },
+    ]);
     await this.#stageTriggerDerivedInserts(
       transaction,
       table,
@@ -5727,14 +7171,10 @@ export class MinnowDatabase {
     plan: CompiledQuery;
     __row?: TRow;
   }): Promise<TRow[]> {
-    const probe = this.store.getCatalogProbe?.bind(this.store);
+    const probe = this.store.getCatalogProbe.bind(this.store);
     // The same memo a SQL query gets, keyed by the plan: a typed query is compiled once by the
     // builder and run many times, and it used to re-execute on every run.
-    if (
-      probe === undefined ||
-      query.plan.usesStatementDatetime === true ||
-      query.plan.usesVolatileFunctions === true
-    ) {
+    if (query.plan.usesStatementDatetime === true || query.plan.usesVolatileFunctions === true) {
       return (await this.#queryCompiled(query.plan)).rows as TRow[];
     }
     return (await this.#memoizedQuery(query.plan, `typed ${planMemoKey(query.plan)}`, {}, probe))
@@ -5751,23 +7191,26 @@ export class MinnowDatabase {
   async migrate(
     definition: SchemaDefinition<readonly AnyTable[]>,
     options: MigrateOptions = {},
-  ): Promise<{
-    createdTables: string[];
-    alteredTables: string[];
-    droppedTables: string[];
-    replacedViews: string[];
-    droppedViews: string[];
-    steps: MigrationStep[];
-  }> {
+  ): Promise<MigrateResult> {
     // Table revisions also move under background full-text index activity (build stamps,
     // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
     // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
     // a genuinely concurrent migrator still fails explicitly once the retries are exhausted.
+    let originalSteps: MigrationStep[] | undefined;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.#migrateOnce(definition, options);
+        const result = await this.#migrateOnce(definition, options, (steps) => {
+          originalSteps ??= [...steps];
+        });
+        return originalSteps === undefined ? result : migrationResult(originalSteps);
       } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+        if (
+          (!(error instanceof TableRecordConflictError) &&
+            !(error instanceof WriteConflictError)) ||
+          attempt >= this.#maxCommitRetries
+        ) {
+          throw error;
+        }
       }
     }
   }
@@ -5817,9 +7260,10 @@ export class MinnowDatabase {
    * Whether any visible row holds NULL in this column, proven from block headers alone.
    *
    * Every block records its own null count, and that field is covered by the envelope checksum
-   * the format authenticates independently of the payload — the same guarantee zone-map pruning
-   * already relies on. So tightening a column to NOT NULL costs one header read per block of that
-   * column, not a scan of its values: bytes are fetched, but nothing is decompressed or decoded.
+   * the format integrity-checks independently of the payload — the same guarantee zone-map
+   * pruning already relies on. So tightening a column to NOT NULL costs one header read per block
+   * of that column, not a scan of its values: bytes are fetched, but nothing is decompressed or
+   * decoded.
    *
    * A segment written before the column existed contributes NULLs for all its rows unless the
    * column carries a backfill, which is exactly what makes those rows non-null.
@@ -5831,7 +7275,7 @@ export class MinnowDatabase {
     const segments = await this.#visibleSegmentRecords(table, snapshot);
     for (const segment of segments) {
       if (segment.rowCount === 0) continue;
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       // Only append-shaped histories are provable this way: a delete or update segment means a
       // row's live value is decided by replay, which headers cannot settle.
       if (kind !== "insert" && kind !== "base") return true;
@@ -5842,7 +7286,7 @@ export class MinnowDatabase {
       }
       for (let start = 0; start < blockIds.length; start += 16) {
         const window = blockIds.slice(start, start + 16);
-        const fetched = await this.store.getBlocks(window);
+        const fetched = await this.#getBlocksWindowed(window);
         for (const bytes of fetched) {
           if (bytes === undefined) return true;
           if (inspectBlock(bytes).nullCount > 0) return true;
@@ -5861,9 +7305,14 @@ export class MinnowDatabase {
    * zone map (or a non-numeric column) makes the maximum unknowable this way, and the migration
    * is refused rather than seeded from an incomplete picture.
    */
-  async #seedAutoIncrement(table: TableRecord, columnName: string): Promise<void> {
+  async #autoIncrementSeed(
+    table: TableRecord,
+    columnName: string,
+  ): Promise<{ columnId: string; atLeast: bigint }> {
     const column = table.columns.find(({ name }) => name === columnName);
-    if (column === undefined) return;
+    if (column === undefined) {
+      throw new TypeError(`Auto-increment column does not exist: ${table.name}.${columnName}`);
+    }
     if (column.type !== "number") {
       throw new TypeError(`Auto-increment requires a number column: ${table.name}.${columnName}`);
     }
@@ -5875,7 +7324,7 @@ export class MinnowDatabase {
       const blockIds = segment.columnBlockIds[column.id] ?? [];
       if (blockIds.length === 0) continue;
       for (let start = 0; start < blockIds.length; start += 16) {
-        const fetched = await this.store.getBlocks(blockIds.slice(start, start + 16));
+        const fetched = await this.#getBlocksWindowed(blockIds.slice(start, start + 16));
         for (const bytes of fetched) {
           if (bytes === undefined) {
             throw new TypeError(
@@ -5893,33 +7342,30 @@ export class MinnowDatabase {
         }
       }
     }
-    if (largest <= 0) return;
-    await this.store.reserveAutoIncrement(table.id, column.id, 0, BigInt(Math.trunc(largest)) + 1n);
+    return {
+      columnId: column.id,
+      atLeast: largest <= 0 ? 1n : BigInt(Math.trunc(largest)) + 1n,
+    };
   }
 
   async #migrateOnce(
     definition: SchemaDefinition<readonly AnyTable[]>,
     options: MigrateOptions = {},
-  ): Promise<{
-    createdTables: string[];
-    alteredTables: string[];
-    droppedTables: string[];
-    replacedViews: string[];
-    droppedViews: string[];
-    steps: MigrationStep[];
-  }> {
+    onPlan?: (steps: readonly MigrationStep[]) => void,
+  ): Promise<MigrateResult> {
     // One listTables pass drives planning and execution: a create step exists only because the
     // table was absent from this snapshot, and each altered table applies all of its steps in a
     // single compare-and-swap, so a migration costs one catalog write per changed table however
     // many tables or steps the schema carries. A concurrent creator or migrator still fails
     // explicitly through createTable's uniqueness check or the revision conflict.
-    const records = await this.store.listTables();
-    const recordsByName = new Map(records.map((record) => [record.name, record]));
+    const initialProof = await this.#stableCatalogProof();
+    const records = initialProof.records;
     const plan = planMigration(toCatalog(records), definition, {
       ...(options.schemaOwnsDatabase === undefined
         ? {}
         : { schemaOwnsDatabase: options.schemaOwnsDatabase }),
     });
+    onPlan?.(plan.steps);
     // A migration runs when an application opens, with nobody to review it. A schema file that
     // drifted — a rename typed wrong, a branch checked out — would otherwise delete rows on
     // launch, so destroying anything is a decision the caller makes, not a default.
@@ -5943,6 +7389,7 @@ export class MinnowDatabase {
     const replacedViews: string[] = [];
     const droppedViews: string[] = [];
     const droppedTables: string[] = [];
+    let catalogChangedBeforeAlterations = false;
     const alterationsByTable = new Map<string, MigrationStep[]>();
     for (const step of plan.steps) {
       if (step.kind === "create-table") {
@@ -5953,6 +7400,14 @@ export class MinnowDatabase {
         // condition must reject the same writes whichever path created it. Dropping them here
         // is what made `migrate()` produce a weaker table than the equivalent SQL DDL.
         const foreignKeys = declaredForeignKeys(step.table);
+        const statementForeignKeys = foreignKeys.map((key) => {
+          const column = key.columns[0];
+          const parentColumn = key.parentColumns[0];
+          if (column === undefined || parentColumn === undefined) {
+            throw new TypeError(`FOREIGN KEY ${key.name} must name at least one column`);
+          }
+          return { ...key, column, parentColumn };
+        });
         await this.runStatement({
           kind: "create-table",
           table: step.table.name,
@@ -5983,16 +7438,38 @@ export class MinnowDatabase {
                       : columnDefinition.backfillValue,
                 }),
           })),
-          ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
+          ...(statementForeignKeys.length === 0 ? {} : { foreignKeys: statementForeignKeys }),
           ...(step.table.checks.length === 0 ? {} : { checks: [...step.table.checks] }),
           managed: true,
         });
         createdTables.push(step.table.name);
+        catalogChangedBeforeAlterations = true;
         continue;
       }
       // Views carry no data, so they are applied directly rather than batched into a table's
       // atomic column rewrite. `orReplace` makes create and redefine one path.
       if (step.kind === "replace-view") {
+        const proof = await this.#stableCatalogProof();
+        const inferred = inferBlockSchema(
+          compileQuery(step.view.sql),
+          catalogQuerySchemas(proof.records),
+        );
+        this.#assertViewMatchesDeclaration(
+          {
+            id: "prospective-view",
+            name: step.view.name,
+            columns: inferred.map((column, index) => ({
+              id: `prospective-column-${String(index)}`,
+              ...column,
+              nullable: true,
+            })),
+            managed: false,
+            revision: 0,
+            view: { sql: step.view.sql, managed: true },
+            createdAt: dateIsoString(this.#now()),
+          },
+          step,
+        );
         await this.runStatement({
           kind: "create-view",
           view: step.view.name,
@@ -6002,16 +7479,19 @@ export class MinnowDatabase {
         });
         this.#assertViewMatchesDeclaration(await this.store.getTableByName(step.view.name), step);
         replacedViews.push(step.view.name);
+        catalogChangedBeforeAlterations = true;
         continue;
       }
       if (step.kind === "drop-table") {
         await this.runStatement({ kind: "drop-table", table: step.tableName, ifExists: true });
         droppedTables.push(step.tableName);
+        catalogChangedBeforeAlterations = true;
         continue;
       }
       if (step.kind === "drop-view") {
         await this.runStatement({ kind: "drop-view", view: step.viewName, ifExists: true });
         droppedViews.push(step.viewName);
+        catalogChangedBeforeAlterations = true;
         continue;
       }
       const steps = alterationsByTable.get(step.tableName) ?? [];
@@ -6019,20 +7499,33 @@ export class MinnowDatabase {
       alterationsByTable.set(step.tableName, steps);
     }
     const alteredTables: string[] = [];
-    for (const [tableName, steps] of alterationsByTable) {
-      const record = recordsByName.get(tableName);
-      if (record === undefined) {
+    let alterationProof =
+      alterationsByTable.size === 0
+        ? undefined
+        : catalogChangedBeforeAlterations
+          ? await this.#stableCatalogProof()
+          : initialProof;
+    for (const [tableName, plannedSteps] of alterationsByTable) {
+      let changed = false;
+      // Destructive migration uses the same physical-retirement primitive as SQL DROP COLUMN.
+      // Each removal gets a fresh dependency/catalog/manifest proof and immediately retires its
+      // blocks; an idle table therefore cannot retain dead column payloads forever.
+      for (const step of plannedSteps) {
+        if (step.kind !== "drop-column") continue;
+        await this.dropColumn(tableName, step.columnName);
+        changed = true;
+        alterationProof = await this.#stableCatalogProof();
+      }
+      const steps = plannedSteps.filter((step) => step.kind !== "drop-column");
+      if (steps.length === 0) {
+        if (changed) alteredTables.push(tableName);
+        continue;
+      }
+      const proof = alterationProof;
+      if (proof === undefined) throw new Error("Migration catalog proof is missing");
+      const record = proof.records.find((candidate) => candidate.name === tableName);
+      if (record === undefined || record.view !== undefined) {
         throw new Error(`Migration target table is missing: ${tableName}`);
-      }
-      const droppedColumnNames = new Set(
-        steps.flatMap((step) => (step.kind === "drop-column" ? [step.columnName] : [])),
-      );
-      if (droppedColumnNames.size >= record.columns.length) {
-        throw new TypeError(`A table must retain at least one column: ${tableName}`);
-      }
-      for (const columnName of droppedColumnNames) {
-        const column = record.columns.find((candidate) => candidate.name === columnName);
-        if (column !== undefined) this.#assertColumnDropSafe(records, record, column);
       }
       // Tightening to NOT NULL is the one step that has to be earned rather than declared: the
       // catalog cannot promise what the stored rows contain, so prove it from block headers
@@ -6050,47 +7543,23 @@ export class MinnowDatabase {
       }
       // Adopting auto-increment seeds the counter past the largest key already stored, so a
       // generated id can never collide with one already written.
+      let autoIncrementSeed: { columnId: string; atLeast: bigint } | undefined;
       for (const step of steps) {
         if (step.kind !== "set-auto-increment" || !step.enabled) continue;
-        await this.#seedAutoIncrement(record, step.columnName);
+        if (autoIncrementSeed !== undefined) {
+          throw new TypeError(`A table may adopt only one auto-increment column: ${tableName}`);
+        }
+        autoIncrementSeed = await this.#autoIncrementSeed(record, step.columnName);
       }
       // A renamed column that a trigger references would silently bind NULL forever (NEW/OLD
       // bindings) or fail every firing (body target columns), so reject the rename instead.
       for (const step of steps) {
         if (step.kind !== "rename-column") continue;
-        for (const owner of records) {
+        const renamed = record.columns.find((column) => column.name === step.from);
+        if (renamed === undefined) continue;
+        for (const owner of proof.records) {
           for (const trigger of owner.triggers ?? []) {
-            const referencesBinding =
-              owner.id === record.id &&
-              trigger.statements.some((statement) =>
-                statement.bindings.some((binding) => binding.column === step.from),
-              );
-            const referencesBody = trigger.statements.some((statement) => {
-              const compiled = compileStatement(statement.sql);
-              if (compiled.kind === "insert") {
-                return compiled.table === record.name && compiled.columns.includes(step.from);
-              }
-              if (compiled.kind !== "update" && compiled.kind !== "delete") return false;
-              if (compiled.table !== record.name) return false;
-              const referenced = new Set<string>();
-              for (const predicate of compiled.predicates) {
-                for (const side of [predicate.left, predicate.right]) {
-                  if (side.kind === "column") {
-                    referenced.add(side.reference.split(".").at(-1) ?? side.reference);
-                  }
-                }
-              }
-              if (compiled.kind === "update") {
-                for (const assignment of compiled.assignments) {
-                  referenced.add(assignment.column);
-                  for (const column of expressionColumnNames(assignment.expression)) {
-                    referenced.add(column.split(".").at(-1) ?? column);
-                  }
-                }
-              }
-              return referenced.has(step.from);
-            });
-            if (referencesBinding || referencesBody) {
+            if (triggerReferencesColumn(owner, trigger, record, renamed.name, false)) {
               throw new TypeError(
                 `Cannot rename ${record.name}.${step.from}: trigger ${trigger.name} references it`,
               );
@@ -6098,13 +7567,27 @@ export class MinnowDatabase {
           }
         }
       }
-      // SQL currently represents one ADD or DROP per ALTER TABLE statement. The schema planner
-      // deliberately keeps all of a table's metadata-only edits in this single CAS: splitting
-      // them into separately parsed statements would add catalog round trips and allow a
-      // concurrent migrator to interleave halfway through one declared table evolution.
+      // The remaining metadata-only steps share one catalog/manifest CAS. Physical drops ran
+      // above because segment rewriting and payload retirement have a stronger atomic boundary.
       const columns = applyColumnSteps(record, steps, this.#createId);
-      if (JSON.stringify(columns) === JSON.stringify(record.columns)) continue;
-      await this.store.updateTable(record.id, record.revision ?? 0, { columns });
+      if (JSON.stringify(columns) === JSON.stringify(record.columns)) {
+        if (changed) alteredTables.push(tableName);
+        continue;
+      }
+      assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
+      const candidateSchemas = catalogQuerySchemas(proof.records);
+      candidateSchemas.set(record.name, columns);
+      assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
+      const updated = await this.store.updateTable(record.id, record.revision, {
+        columns,
+        ...(autoIncrementSeed === undefined ? {} : { autoIncrementSeed }),
+        expectedManifestVersion: { value: proof.manifestVersion },
+        expectedCatalogEpoch: proof.catalogEpoch,
+      });
+      proof.records = proof.records.map((candidate) =>
+        candidate.id === updated.id ? updated : candidate,
+      );
+      proof.catalogEpoch += 1;
       alteredTables.push(tableName);
     }
     return {
@@ -6216,6 +7699,7 @@ export class MinnowDatabase {
    * in between fails the statement explicitly rather than silently mutating other rows.
    */
   async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
+    await this.#settleExpiredStatementTransaction();
     const statement = this.#compileStatementCached(sql);
     if (statement.kind === "transaction") {
       return this.#runTransactionStatement(statement.action, statement.name);
@@ -6304,7 +7788,7 @@ export class MinnowDatabase {
             (token) => overlay?.added.has(token) !== true,
           );
           const present = new Set(
-            probed.length === 0 ? [] : await this.store.getExistingUniqueKeys(parent.id, probed),
+            probed.length === 0 ? [] : await this.#existingUniqueKeysWindowed(parent.id, probed),
           );
           wanted = wanted.filter((tuple) => {
             const token = byTuple.get(sqlTupleToken(tuple)) ?? "";
@@ -6338,7 +7822,12 @@ export class MinnowDatabase {
         }
         continue;
       }
-      const values = rowsByColumn(key.column);
+      const childColumn = key.columns[0];
+      const parentColumn = key.parentColumns[0];
+      if (childColumn === undefined || parentColumn === undefined) {
+        throw new TypeError(`FOREIGN KEY ${key.name} has no columns`);
+      }
+      const values = rowsByColumn(childColumn);
       const distinct = [...new Set(values.filter((value): value is QueryValue => value !== null))];
       if (distinct.length === 0) continue;
       // A NULL reference names no parent, which the standard leaves satisfied.
@@ -6353,14 +7842,14 @@ export class MinnowDatabase {
       ];
       if (wanted.length === 0) continue;
       const found = await read(
-        `SELECT ${quoteSqlIdentifier(key.parentColumn)} AS parent_key FROM ${quoteSqlIdentifier(
+        `SELECT ${quoteSqlIdentifier(parentColumn)} AS parent_key FROM ${quoteSqlIdentifier(
           key.parentTable,
-        )} WHERE ${quoteSqlIdentifier(key.parentColumn)} IN (${wanted.map(() => "?").join(", ")})`,
+        )} WHERE ${quoteSqlIdentifier(parentColumn)} IN (${wanted.map(() => "?").join(", ")})`,
         wanted,
       );
       // Compared by the same token the keyed paths use, so 1 and '1' cannot pass for each other.
       const token = (value: QueryValue): string =>
-        value instanceof Date ? `d${value.toISOString()}` : `${typeof value}:${String(value)}`;
+        value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value}:${String(value)}`;
       const present = new Set(
         found.rows.flatMap((row) => {
           const value = row.parent_key ?? null;
@@ -6370,7 +7859,7 @@ export class MinnowDatabase {
       const missing = wanted.find((value) => !present.has(token(value)));
       if (missing !== undefined) {
         throw new TypeError(
-          `FOREIGN KEY ${key.name} has no ${key.parentTable} row with ${key.parentColumn} ${String(missing)}`,
+          `FOREIGN KEY ${key.name} has no ${key.parentTable} row with ${parentColumn} ${String(missing)}`,
         );
       }
     }
@@ -6392,7 +7881,7 @@ export class MinnowDatabase {
   ): Promise<readonly QueryValue[]> {
     if (parent.uniqueKeyLookupReady !== true) return wanted;
     const parentKey = getUniqueKeyColumn(parent);
-    if (parentKey?.name !== key.parentColumn) return wanted;
+    if (parentKey === undefined || parentKey.name !== key.parentColumns[0]) return wanted;
     const tokens = new Map<QueryValue, string>();
     for (const value of wanted) {
       // A value the key encoding rejects (wrong type for the parent key, a non-finite number)
@@ -6409,7 +7898,7 @@ export class MinnowDatabase {
     const present =
       probed.length === 0
         ? new Set<string>()
-        : new Set(await this.store.getExistingUniqueKeys(parent.id, probed));
+        : new Set(await this.#existingUniqueKeysWindowed(parent.id, probed));
     return wanted.filter((value) => {
       const token = tokens.get(value) ?? "";
       if (overlay?.removed.has(token) === true) return true;
@@ -6428,7 +7917,7 @@ export class MinnowDatabase {
     parent: TableRecord,
     keys: readonly QueryValue[],
     session: {
-      query: (sql: string, options?: { params?: QueryOptions["params"] }) => Promise<QueryResult>;
+      query: (sql: string, options?: QueryOptions) => Promise<QueryResult>;
       updateBatch: (table: string, input: UpdateBatchInput) => Promise<unknown>;
       deleteBatch: (table: string, input: DeleteBatchInput) => Promise<unknown>;
     },
@@ -6463,10 +7952,14 @@ export class MinnowDatabase {
     if (parentTuples.length === 0) return;
     for (const { table: child, key } of children) {
       const childColumns = foreignKeyColumns(key);
+      const firstChildColumn = childColumns[0];
+      if (firstChildColumn === undefined) {
+        throw new Error(`FOREIGN KEY ${key.name} has no child columns`);
+      }
       const childKeyColumn = getUniqueKeyColumn(child);
       const selected =
         childKeyColumn === undefined
-          ? quoteSqlIdentifier(childColumns[0] ?? key.column)
+          ? quoteSqlIdentifier(firstChildColumn)
           : `${quoteSqlIdentifier(childKeyColumn.name)} AS child_key`;
       const predicates = parentTuples
         .map(
@@ -6511,13 +8004,49 @@ export class MinnowDatabase {
     run: () => Promise<T>,
   ): Promise<T> {
     state.busy += 1;
-    state.activeAt = this.#now().getTime();
+    state.activeAt = dateMilliseconds(this.#now());
     try {
       return await run();
     } finally {
       state.busy -= 1;
-      state.activeAt = this.#now().getTime();
+      state.activeAt = dateMilliseconds(this.#now());
     }
+  }
+
+  /**
+   * Detaches one statement transaction and joins its durable abort. Timers cannot await, so the
+   * cleanup promise remains database-owned and the next statement joins it before opening or
+   * reading another scope.
+   */
+  #rollbackStatementTransaction(state: OpenStatementTransaction): Promise<void> {
+    if (this.#openTransaction === state) this.#openTransaction = undefined;
+    clearInterval(state.timer);
+    state.settle("rollback");
+    const cleanup = state.finished.then(() => undefined);
+    this.#statementTransactionCleanup = cleanup;
+    void cleanup
+      .finally(() => {
+        if (this.#statementTransactionCleanup === cleanup) {
+          this.#statementTransactionCleanup = undefined;
+        }
+      })
+      .catch(() => undefined);
+    return cleanup;
+  }
+
+  /** A throttled/background timer cannot make an already-idle transaction live again. */
+  async #settleExpiredStatementTransaction(): Promise<void> {
+    const pending = this.#statementTransactionCleanup;
+    if (pending !== undefined) await pending;
+    const open = this.#openTransaction;
+    if (
+      open === undefined ||
+      open.busy > 0 ||
+      dateMilliseconds(this.#now()) - open.activeAt < this.#transactionIdleTimeoutMs
+    ) {
+      return;
+    }
+    await this.#rollbackStatementTransaction(open);
   }
 
   /**
@@ -6539,8 +8068,10 @@ export class MinnowDatabase {
         throw new TypeError("A transaction is already open; COMMIT or ROLLBACK it first");
       }
       let start!: (writer: TransactionStatementWriter) => void;
-      const opened = new Promise<TransactionStatementWriter>((resolve) => {
+      let failStart!: (error: unknown) => void;
+      const opened = new Promise<TransactionStatementWriter>((resolve, reject) => {
         start = resolve;
+        failStart = reject;
       });
       let settle!: (outcome: "commit" | "rollback") => void;
       const decided = new Promise<"commit" | "rollback">((resolve) => {
@@ -6551,12 +8082,20 @@ export class MinnowDatabase {
         if ((await decided) === "rollback") throw new TransactionRollback();
         return null;
       });
+      // Scope startup performs maintenance admission, the catalog probe, and the durable lease
+      // admission before invoking its callback. Reflect any refusal into the startup rendezvous;
+      // otherwise BEGIN waits forever on a resolve-only promise while `finished` rejects with no
+      // state installed to observe it. Promise settlement is idempotent, so a later failure after
+      // `start(writer)` cannot replace the successfully opened session.
+      void finished.catch((error: unknown) => {
+        failStart(error);
+      });
       const session = await opened;
       const state = {
         session,
         settle,
         busy: 0,
-        activeAt: this.#now().getTime(),
+        activeAt: dateMilliseconds(this.#now()),
         savepoints: [],
         finished: finished.then(
           ({ version }) => ({ version }),
@@ -6570,10 +8109,9 @@ export class MinnowDatabase {
           // elapsed. A statement in flight, however slow, and one that finished a moment ago
           // both count as activity; only a caller that walked away trips this.
           if (this.#openTransaction !== state || state.busy > 0) return;
-          if (this.#now().getTime() - state.activeAt < this.#transactionIdleTimeoutMs) return;
-          this.#openTransaction = undefined;
-          clearInterval(state.timer);
-          state.settle("rollback");
+          if (dateMilliseconds(this.#now()) - state.activeAt < this.#transactionIdleTimeoutMs)
+            return;
+          void this.#rollbackStatementTransaction(state).catch(() => undefined);
         }, this.#transactionIdleTimeoutMs),
       };
       // An idle sweep must never keep a process alive on its own; browsers have no unref.
@@ -6588,7 +8126,26 @@ export class MinnowDatabase {
     if (action === "savepoint") {
       if (name === undefined) throw new TypeError("SAVEPOINT needs a name");
       await this.#duringTransaction(open, async () => {
-        open.savepoints.push({ name, checkpoint: open.session.checkpoint() });
+        if (open.savepoints.length >= MAX_TRANSACTION_SAVEPOINTS) {
+          throw new RangeError(
+            `A transaction cannot hold more than ${String(MAX_TRANSACTION_SAVEPOINTS)} savepoints`,
+          );
+        }
+        const retainedBytes = open.session.checkpointRetainedBytes();
+        const totalBytes = open.savepoints.reduce(
+          (total, savepoint) =>
+            safeWholeNumberSum(
+              [total, savepoint.retainedBytes],
+              "Transaction savepoint retained bytes",
+            ),
+          retainedBytes,
+        );
+        if (totalBytes > MAX_TRANSACTION_SAVEPOINT_BYTES) {
+          throw new RangeError(
+            `Transaction savepoints cannot retain more than ${String(MAX_TRANSACTION_SAVEPOINT_BYTES)} bytes`,
+          );
+        }
+        open.savepoints.push({ name, checkpoint: open.session.checkpoint(), retainedBytes });
       });
       return { kind: "transaction", action, name };
     }
@@ -6675,7 +8232,7 @@ export class MinnowDatabase {
     validateBatch(table, proposed, filledProposed.autoIncrement?.column.name);
     const keyValues = proposed.columns[keyColumn.name] ?? [];
     const keyToken = (value: QueryValue): string =>
-      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+      value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value} ${String(value)}`;
     const proposedKeys = new Set<string>();
     for (const key of keyValues) {
       if (key === null) continue;
@@ -6992,7 +8549,7 @@ export class MinnowDatabase {
     const existing = new Set<QueryValue | string>(
       existingRows.rows.map((row) => {
         const value = storedSqlValueFromExecution(keyColumn, row.key ?? null);
-        return value instanceof Date ? value.toISOString() : value;
+        return value instanceof Date ? dateIsoString(value) : value;
       }),
     );
     return {
@@ -7001,7 +8558,7 @@ export class MinnowDatabase {
       rows: materializedRows.filter((_, index) => {
         const value = keys[index] ?? null;
         if (value === null) return true;
-        const normalized = value instanceof Date ? value.toISOString() : value;
+        const normalized = value instanceof Date ? dateIsoString(value) : value;
         if (existing.has(normalized)) return false;
         // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
         // therefore conflicts with the first retained proposal and takes DO NOTHING too.
@@ -7167,8 +8724,10 @@ export class MinnowDatabase {
             hidden: true,
           },
         ],
+        managed: false,
+        revision: 0,
         enumType: { name: statement.name, values },
-        createdAt: this.#now().toISOString(),
+        createdAt: dateIsoString(this.#now()),
       });
       this.#planCache.clear();
       return { kind: "create-type", name: statement.name };
@@ -7193,8 +8752,10 @@ export class MinnowDatabase {
             defaultValue: { kind: "autoincrement" },
           },
         ],
+        managed: false,
+        revision: 0,
         sequence: { name: statement.name, start: 1, columnId },
-        createdAt: this.#now().toISOString(),
+        createdAt: dateIsoString(this.#now()),
       });
       return { kind: "create-sequence", name: statement.name };
     }
@@ -7203,69 +8764,191 @@ export class MinnowDatabase {
         const existing = await this.store.getTableByName(statement.table);
         if (existing !== undefined) return { kind: "create-table", table: statement.table };
       }
-      await this.createTable({
-        name: statement.table,
-        columns: statement.columns,
-        ...(statement.checks === undefined ? {} : { checks: statement.checks }),
-        ...(statement.foreignKeys === undefined ? {} : { foreignKeys: statement.foreignKeys }),
-        ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
-        ...(statement.compositePrimaryKey === undefined
-          ? {}
-          : { compositePrimaryKey: statement.compositePrimaryKey }),
-        ...(statement.uniqueConstraints === undefined
-          ? {}
-          : { uniqueConstraints: statement.uniqueConstraints }),
-        ...(statement.managed === undefined ? {} : { managed: statement.managed }),
-      });
+      try {
+        await this.createTable({
+          name: statement.table,
+          columns: statement.columns,
+          ...(statement.checks === undefined ? {} : { checks: statement.checks }),
+          ...(statement.foreignKeys === undefined ? {} : { foreignKeys: statement.foreignKeys }),
+          ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
+          ...(statement.compositePrimaryKey === undefined
+            ? {}
+            : { compositePrimaryKey: statement.compositePrimaryKey }),
+          ...(statement.uniqueConstraints === undefined
+            ? {}
+            : { uniqueConstraints: statement.uniqueConstraints }),
+          ...(statement.managed === undefined ? {} : { managed: statement.managed }),
+        });
+      } catch (error) {
+        // The optimistic existence read is not the admission point. When another engine wins
+        // after it, IF NOT EXISTS converges on that durable object instead of leaking the
+        // adapter's duplicate-name error.
+        if (
+          statement.ifNotExists !== true ||
+          (await this.store.getTableByName(statement.table)) === undefined
+        ) {
+          throw error;
+        }
+      }
       return { kind: "create-table", table: statement.table };
     }
     if (statement.kind === "create-table-as") {
-      // T172: the query runs first, its output schema becomes the table's, and its rows are the
-      // table's first insert — one statement, but the same createTable and insertBatch paths.
-      const existing = await this.store.getTableByName(statement.table);
-      if (existing !== undefined) {
-        if (statement.ifNotExists === true) {
-          return { kind: "create-table", table: statement.table };
+      // T172: the catalog record is transaction-owned and invisible while its blocks and
+      // segments stage. The commit publishes the table, its row-id counter, and its first
+      // manifest together, so a crash/fault exposes either the complete result or no table.
+      for (let attempt = 0; ; attempt += 1) {
+        const before = await this.store.getCatalogProbe();
+        const existing = await this.store.getTableByName(statement.table);
+        if (existing !== undefined) {
+          if (statement.ifNotExists === true) {
+            return { kind: "create-table", table: statement.table };
+          }
+          throw new TypeError(`Table already exists: ${statement.table}`);
         }
-        throw new TypeError(`Table already exists: ${statement.table}`);
-      }
-      const records = await this.store.listTables();
-      const schemas = new Map(
-        records.map((record) => [
-          record.name,
-          record.columns.map(({ name, type, integer, sqlDomain }) => ({
-            name,
+        const records = await this.store.listTables();
+        const after = await this.store.getCatalogProbe();
+        if (after.catalogEpoch !== before.catalogEpoch) {
+          if (attempt >= this.#maxCommitRetries) {
+            throw new TableRecordConflictError(statement.table, 0, null);
+          }
+          continue;
+        }
+        const schemas = new Map(
+          records.map((record) => [
+            record.name,
+            record.columns.map(({ name, type, integer, sqlDomain }) => ({
+              name,
+              type,
+              ...(integer === true ? { integer: true as const } : {}),
+              ...(sqlDomain === undefined ? {} : { sqlDomain }),
+            })),
+          ]),
+        );
+        const tableColumns: TableColumnRecord[] = inferBlockSchema(statement.query, schemas).map(
+          ({ name, type, integer, sqlDomain }) => ({
+            id: this.#createId(),
+            name: validateName(name, "Column"),
             type,
             ...(integer === true ? { integer: true as const } : {}),
-            ...(sqlDomain === undefined ? {} : { sqlDomain }),
-          })),
-        ]),
-      );
-      const columns = inferBlockSchema(statement.query, schemas).map(
-        ({ name, type, integer, sqlDomain }) => ({
-          name,
-          type,
-          ...(integer === true ? { integer: true as const } : {}),
-          ...(sqlDomain === undefined ? {} : { sqlDomain }),
-          nullable: true,
-        }),
-      );
-      const result = await this.#queryCompiled(statement.query);
-      await this.createTable({ name: statement.table, columns });
-      if (result.rows.length > 0) {
-        await this.insertBatch(
-          statement.table,
-          result.rows.map((row) =>
-            Object.fromEntries(
-              columns.map((column) => [
-                column.name,
-                storedSqlValueFromExecution(column, row[column.name] ?? null),
-              ]),
-            ),
-          ),
+            ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
+            nullable: true,
+          }),
         );
+        const pendingTable: TableRecord = {
+          id: this.#createId(),
+          name: validateName(statement.table, "Table"),
+          columns: tableColumns,
+          revision: 0,
+          managed: false,
+          createdAt: dateIsoString(this.#now()),
+        };
+        const transaction = await this.#transactions.beginWithPendingTable(
+          pendingTable,
+          before.catalogEpoch,
+        );
+        try {
+          const plan = await this.#applyCatalogRewrites(statement.query);
+          const executionMemoryBudgetBytes = Math.min(
+            this.#queryExecutionMemoryBudgetBytes,
+            DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
+          );
+          const stageBatchRows = 16_384;
+          let nextRowId = 1n;
+          let stagedRows = 0;
+          transaction.limitLevelZeroSegments(pendingTable.id, MAX_LEVEL_ZERO_SEGMENTS);
+          const stageRows = async (rows: readonly QueryRow[]): Promise<void> => {
+            if (rows.length === 0) return;
+            const batchResult = { columns: tableColumns.map(({ name }) => name), rows: [...rows] };
+            if (queryResultRetainedBytes(batchResult) > executionMemoryBudgetBytes) {
+              throw new QueryMemoryBudgetError(
+                "CREATE TABLE AS result batch",
+                queryResultRetainedBytes(batchResult),
+                0,
+                executionMemoryBudgetBytes,
+              );
+            }
+            const batch: ColumnarBatch = {
+              columns: Object.fromEntries(
+                tableColumns.map((column) => [
+                  column.name,
+                  rows.map((row) => storedSqlValueFromExecution(column, row[column.name] ?? null)),
+                ]),
+              ),
+              rowCount: rows.length,
+            };
+            normalizeDomainBatch(pendingTable, batch);
+            validateBatch(pendingTable, batch);
+            const endExclusive = nextRowId + BigInt(rows.length);
+            await this.#stageInsertSegment(
+              transaction,
+              pendingTable,
+              batch,
+              rows.length,
+              "insert",
+              { start: nextRowId, endExclusive },
+            );
+            nextRowId = endExclusive;
+            stagedRows += rows.length;
+          };
+          const queryOptions: QueryOptions = {
+            ...(transaction.snapshotVersion === null
+              ? {}
+              : { version: transaction.snapshotVersion }),
+            executionMemoryBudgetBytes,
+            spillToStorage: true,
+            memoize: false,
+          };
+          let streamed: QueryResult | undefined;
+          if (
+            !compiledPlanIsGrouped(plan) &&
+            plan.orderBy.length === 0 &&
+            plan.joins.length === 0 &&
+            this.#canStreamPlanShape(plan, queryOptions)
+          ) {
+            streamed = await this.#queryStreamed(plan, queryOptions, undefined, undefined, {
+              batchRows: stageBatchRows,
+              signal: new AbortController().signal,
+              consume: async (batch) => stageRows(batch.rows),
+            });
+          }
+          if (streamed === undefined) {
+            if (stagedRows !== 0) {
+              throw new Error("CREATE TABLE AS streaming stopped after staging rows");
+            }
+            // Blocking shapes use the ordinary spillable executor under a CTAS-specific hard
+            // ceiling even when the database was configured with an unbounded query budget.
+            // The retained-result check is a second guard before the first durable artifact.
+            const result = await this.#sessionQueryPlan(transaction, plan, queryOptions);
+            const retainedBytes = queryResultRetainedBytes(result);
+            if (retainedBytes > executionMemoryBudgetBytes) {
+              throw new QueryMemoryBudgetError(
+                "CREATE TABLE AS result",
+                retainedBytes,
+                0,
+                executionMemoryBudgetBytes,
+              );
+            }
+            for (let start = 0; start < result.rows.length; start += stageBatchRows) {
+              await stageRows(result.rows.slice(start, start + stageBatchRows));
+            }
+          }
+          transaction.markTableChanged(pendingTable.id);
+          const manifest = await transaction.commit();
+          this.#afterCommit(manifest);
+          return { kind: "create-table", table: statement.table };
+        } catch (error) {
+          await transaction.abort().catch(() => undefined);
+          if (
+            (error instanceof WriteConflictError ||
+              error instanceof SchemaConflictError ||
+              error instanceof TableRecordConflictError) &&
+            attempt < this.#maxCommitRetries
+          ) {
+            continue;
+          }
+          throw error;
+        }
       }
-      return { kind: "create-table", table: statement.table };
     }
     if (statement.kind === "create-index") {
       const indexStatement = statement;
@@ -7284,9 +8967,20 @@ export class MinnowDatabase {
           unique: statement.unique === true,
         };
       }
-      await this.createIndex(statement.index, statement.table, statement.columns, {
-        unique: statement.unique === true,
-      });
+      try {
+        await this.createIndex(statement.index, statement.table, statement.columns, {
+          unique: statement.unique === true,
+        });
+      } catch (error) {
+        const admitted =
+          statement.ifNotExists === true &&
+          (await this.store.listTables()).some((table) =>
+            Object.values(table.secondaryIndexes ?? {}).some(
+              (index) => index.name === indexStatement.index,
+            ),
+          );
+        if (!admitted) throw error;
+      }
       return {
         kind: "create-index",
         index: statement.index,
@@ -7305,78 +8999,111 @@ export class MinnowDatabase {
     if (statement.kind === "add-column") {
       // F031-04. Existing rows have no value for the new column, so it is always nullable;
       // a DEFAULT fills the rows written afterwards.
-      let added = statement.column;
-      if (added.sqlDomain?.kind === "enum" && added.sqlDomain.values.length === 0) {
-        const enumRecord = await this.store.getTableByName(
-          `${ENUM_TYPE_PREFIX}${added.sqlDomain.name}`,
-        );
-        if (enumRecord?.enumType === undefined) {
-          throw new TypeError(`Unsupported column type: ${added.sqlDomain.name}`);
-        }
-        added = {
-          ...added,
-          sqlDomain: {
-            kind: "enum",
-            name: enumRecord.enumType.name,
-            values: [...enumRecord.enumType.values],
-          },
-        };
-      }
-      const record = await this.store.getTableByName(statement.table);
-      if (record === undefined) throw new TypeError(`Unknown table: ${statement.table}`);
-      if (
-        added.nullable !== true &&
-        !(statement.allowNonNullableWithBackfill === true && added.backfill !== undefined)
-      ) {
-        throw new TypeError(
-          "ALTER TABLE ADD COLUMN adds a nullable column; existing rows have no value for it",
-        );
-      }
-      if (record.columns.some(({ name }) => name === added.name)) {
-        throw new TypeError(`Column already exists: ${statement.table}.${added.name}`);
-      }
-      if (added.defaultValue !== undefined) {
-        validateColumnDefault(
-          {
-            name: added.name,
-            type: added.type,
-            ...(added.integer === true ? { integer: true as const } : {}),
-            ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
-            nullable: added.nullable ?? false,
-            isUniqueKey: false,
-            ...(added.enumValues === undefined ? {} : { enumValues: added.enumValues }),
-          },
-          added.defaultValue,
-        );
-        if (added.defaultValue.kind === "literal" && added.sqlDomain !== undefined) {
-          normalizeSqlDomainValue(added.sqlDomain, added.defaultValue.value);
-        }
-        if (added.defaultValue.kind === "expression") {
-          validateDefaultExpression(added.defaultValue.sql, {
-            name: `${statement.table}.${added.name}`,
-            type: added.type,
-            ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+      let pinnedTableId: string | undefined;
+      const addColumnStatement = statement;
+      for (let attempt = 0; ; attempt += 1) {
+        const proof = await this.#stableCatalogProof();
+        try {
+          let added = addColumnStatement.column;
+          if (added.sqlDomain?.kind === "enum" && added.sqlDomain.values.length === 0) {
+            const enumName = added.sqlDomain.name;
+            const enumRecord = proof.records.find(
+              (record) => record.name === `${ENUM_TYPE_PREFIX}${enumName}`,
+            );
+            if (enumRecord?.enumType === undefined) {
+              throw new TypeError(`Unsupported column type: ${enumName}`);
+            }
+            added = {
+              ...added,
+              sqlDomain: {
+                kind: "enum",
+                name: enumRecord.enumType.name,
+                values: [...enumRecord.enumType.values],
+              },
+            };
+          }
+          const record = proof.records.find(
+            (candidate) => candidate.name === addColumnStatement.table,
+          );
+          if (record === undefined)
+            throw new TypeError(`Unknown table: ${addColumnStatement.table}`);
+          if (record.view !== undefined)
+            throw new TypeError(`${addColumnStatement.table} is a view, not a table`);
+          pinnedTableId ??= record.id;
+          if (record.id !== pinnedTableId) {
+            throw new TableRecordConflictError(pinnedTableId, 0, record.revision);
+          }
+          if (
+            added.nullable !== true &&
+            !(
+              addColumnStatement.allowNonNullableWithBackfill === true &&
+              added.backfill !== undefined
+            )
+          ) {
+            throw new TypeError(
+              "ALTER TABLE ADD COLUMN adds a nullable column; existing rows have no value for it",
+            );
+          }
+          if (record.columns.some(({ name }) => name === added.name)) {
+            throw new TypeError(`Column already exists: ${addColumnStatement.table}.${added.name}`);
+          }
+          if (added.defaultValue !== undefined) {
+            validateColumnDefault(
+              {
+                name: added.name,
+                type: added.type,
+                ...(added.integer === true ? { integer: true as const } : {}),
+                ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+                nullable: added.nullable ?? false,
+                isUniqueKey: false,
+                ...(added.enumValues === undefined ? {} : { enumValues: added.enumValues }),
+              },
+              added.defaultValue,
+            );
+            if (added.defaultValue.kind === "literal" && added.sqlDomain !== undefined) {
+              normalizeSqlDomainValue(added.sqlDomain, added.defaultValue.value);
+            }
+            if (added.defaultValue.kind === "expression") {
+              validateDefaultExpression(added.defaultValue.sql, {
+                name: `${addColumnStatement.table}.${added.name}`,
+                type: added.type,
+                ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+              });
+            }
+          }
+          const columns = [
+            ...structuredClone(record.columns),
+            {
+              id: this.#createId(),
+              name: added.name,
+              type: added.type,
+              ...(added.integer === true ? { integer: true as const } : {}),
+              ...(added.sqlDomain === undefined
+                ? {}
+                : { sqlDomain: structuredClone(added.sqlDomain) }),
+              nullable: added.nullable ?? false,
+              ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
+              ...(added.enumValues === undefined ? {} : { enumValues: [...added.enumValues] }),
+              ...(added.backfill === undefined
+                ? {}
+                : { backfill: normalizedColumnBackfill(added, added.backfill) }),
+            },
+          ];
+          assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
+          const candidateSchemas = catalogQuerySchemas(proof.records);
+          candidateSchemas.set(record.name, columns);
+          assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
+          await this.store.updateTable(record.id, record.revision, {
+            columns,
+            expectedCatalogEpoch: proof.catalogEpoch,
           });
+          return { kind: "add-column", table: addColumnStatement.table, column: added.name };
+        } catch (error) {
+          if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+            throw error;
+          }
         }
       }
-      const columns = [
-        ...structuredClone(record.columns),
-        {
-          id: this.#createId(),
-          name: added.name,
-          type: added.type,
-          ...(added.integer === true ? { integer: true as const } : {}),
-          ...(added.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(added.sqlDomain) }),
-          nullable: added.nullable ?? false,
-          ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
-          ...(added.enumValues === undefined ? {} : { enumValues: [...added.enumValues] }),
-          ...(added.backfill === undefined
-            ? {}
-            : { backfill: normalizedColumnBackfill(added, added.backfill) }),
-        },
-      ];
-      await this.store.updateTable(record.id, record.revision ?? 0, { columns });
-      return { kind: "add-column", table: statement.table, column: added.name };
     }
     if (statement.kind === "drop-column") {
       const dropped = await this.dropColumn(statement.table, statement.column, {
@@ -7419,6 +9146,38 @@ export class MinnowDatabase {
     }
     if (statement.kind === "transaction") {
       return this.#runTransactionStatement(statement.action, statement.name);
+    }
+    if (options.writer === undefined) {
+      // Selection, assignment evaluation, constraint proofs, trigger derivation, and the write
+      // itself are one statement transaction. A genuine concurrent data commit does not rebase
+      // stale derived values: it aborts this scope, then the loop restarts the whole statement
+      // against a fresh snapshot. Maintenance-only commits are handled inside #openWriteScope.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const completed = await this.#openWriteScope(
+            (_session, _transaction, writer) =>
+              this.runStatement(statement, { ...options, writer }),
+            // A standalone statement has no user-controlled idle gap. Its selection reads hold
+            // their own lease and a data conflict restarts the complete statement, so retain the
+            // atomic one-write fast path; public write() scopes keep the durable pin by default.
+            { durableSnapshot: false },
+          );
+          const result = completed.result;
+          if (result.kind !== "insert" && result.kind !== "update" && result.kind !== "delete") {
+            throw new Error(`Mutation statement returned an unexpected result: ${result.kind}`);
+          }
+          return result.rowCount === 0 || completed.version === null
+            ? result
+            : { ...result, version: completed.version };
+        } catch (error) {
+          if (
+            (!(error instanceof WriteConflictError) && !(error instanceof SchemaConflictError)) ||
+            attempt >= this.#maxCommitRetries
+          ) {
+            throw error;
+          }
+        }
+      }
     }
     if (statement.kind === "insert" && statement.columns.length === 0) {
       const table = await this.#findTable(statement.table);
@@ -7489,6 +9248,20 @@ export class MinnowDatabase {
       // Normalize before dispatch as well as inside the write path so RETURNING echoes the exact
       // stored/public domain value rather than the caller's unnormalized spelling.
       normalizeDomainBatch(table, input);
+      let returningColumns: readonly string[] | undefined;
+      if (options.returning !== undefined) {
+        returningColumns =
+          options.returning === "*"
+            ? visibleTableColumns(table).map((column) => column.name)
+            : options.returning;
+        // RETURNING is statement validation, not result decoration. Reject it before the first
+        // byte or key-membership delta is staged so an invalid projection can never commit data.
+        for (const name of returningColumns) {
+          if (!table.columns.some((column) => column.name === name)) {
+            throw new TypeError(`RETURNING column does not exist: ${name}`);
+          }
+        }
+      }
       const writer = options.writer;
       // A scope stages and reports rows; a standalone write also publishes a version and any
       // values the engine generated. Both shapes answer here, and the narrow one has less to
@@ -7500,18 +9273,6 @@ export class MinnowDatabase {
         ? (writer?.upsertBatch(statement.table, input) ?? this.upsertBatch(statement.table, input))
         : (writer?.insertBatch(statement.table, input) ??
           this.insertBatch(statement.table, input)));
-      let returningColumns: readonly string[] | undefined;
-      if (options.returning !== undefined) {
-        returningColumns =
-          options.returning === "*"
-            ? visibleTableColumns(table).map((column) => column.name)
-            : options.returning;
-        for (const name of returningColumns) {
-          if (!table.columns.some((column) => column.name === name)) {
-            throw new TypeError(`RETURNING column does not exist: ${name}`);
-          }
-        }
-      }
       const generated = "generatedColumns" in result ? (result.generatedColumns ?? {}) : {};
       return {
         kind: "insert",
@@ -7749,7 +9510,9 @@ export class MinnowDatabase {
     options: QueryOptions,
     spillPageRows: number | undefined,
     probe?: CatalogProbe,
+    cursor?: QueryBatchCursorExecution,
   ): Promise<QueryResult | undefined> {
+    options = this.#effectiveQueryOptions(options);
     const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
     const uniqueTableNames = [...new Set(tableNames)];
     if (options.version === undefined) {
@@ -7765,6 +9528,7 @@ export class MinnowDatabase {
             snapshot,
             [...realTables.values()],
             visibility,
+            cursor,
           ),
         probe,
       );
@@ -7773,11 +9537,7 @@ export class MinnowDatabase {
     const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
     return this.#withLeasedSnapshot(options.version, async (snapshot) => {
       const tableIds = new Set(tables.map((table) => table.id));
-      const only = tables.length === 1 ? tables[0] : undefined;
-      const segmentRecords =
-        only !== undefined
-          ? await this.store.listSegments(only.id)
-          : await this.store.listSegments();
+      const segmentRecords = await this.#listSegmentsForTableIds([...tableIds]);
       const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
       const segmentsByTable = new Map<string, SegmentRecord[]>();
       for (const segment of segmentRecords) {
@@ -7797,6 +9557,7 @@ export class MinnowDatabase {
         snapshot,
         tables,
         visibility,
+        cursor,
       );
     });
   }
@@ -7808,6 +9569,7 @@ export class MinnowDatabase {
     snapshot: LeasedSnapshot,
     tables: readonly TableRecord[],
     visibility: SegmentVisibilityCatalog,
+    cursor?: QueryBatchCursorExecution,
   ): Promise<QueryResult | undefined> {
     // Copy-on-write: expansion clones only full-text plans, leaving the compile cache's copy
     // untouched.
@@ -7839,7 +9601,7 @@ export class MinnowDatabase {
       visibleByTable.set(table.name, segments);
       if (
         segments.every((segment) => {
-          const kind = segment.kind ?? "insert";
+          const kind = segment.kind;
           return kind === "insert" || kind === "base";
         })
       ) {
@@ -7982,6 +9744,25 @@ export class MinnowDatabase {
             ...(ftsStats === undefined ? {} : { ftsStats }),
             outputNeedsExternalization: queryResultNeedsExternalization(plan, typedSchemas),
           });
+          if (cursor !== undefined) {
+            const emission = { happened: false };
+            const columns = await prepared.executeBatches(
+              {
+                batchRows: cursor.batchRows,
+                signal: cursor.signal,
+                loadScanWindow: streamed.load,
+              },
+              async (batch) => {
+                emission.happened = true;
+                await cursor.consume(externalizeQueryResult(batch));
+              },
+            );
+            if (!emission.happened) {
+              await cursor.consume({ columns: [...columns], rows: [] });
+            }
+            options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
+            return { columns: [...columns], rows: [] };
+          }
           if (!attempt.spill) {
             try {
               const streamedResult = await prepared.executeAsync({
@@ -8011,14 +9792,13 @@ export class MinnowDatabase {
       // materialized path would.
       const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
       if (!spill) return runStreamedExecution({ spill: false });
-      // Retained state is usually far smaller than the scan: a limited ORDER BY keeps only its
-      // top rows and a grouped plan keeps one state per distinct group. Try the in-memory
-      // execution before committing to a spill of every scanned row; only a genuine budget
-      // overflow falls through. The streamed loader is forward-only, so the fallback rebuilds
-      // the stream rather than rewinding it.
-      const boundedStateShape =
-        compiledPlanIsGrouped(plan) || (plan.limit !== undefined && plan.orderBy.length > 0);
-      if (boundedStateShape) {
+      // A finite budget permits in-memory execution up to the budget; it does not itself mean
+      // that every spill-capable plan should use durable temporary storage. In particular, a
+      // full ORDER BY that fits comfortably in the default budget is tens of times faster in
+      // the typed radix kernel than after serializing and merging spill pages. Try the bounded
+      // in-memory execution first and spill only on a genuine budget overflow. The streamed
+      // loader is forward-only, so the fallback rebuilds the stream rather than rewinding it.
+      if (options.spillToStorage !== true) {
         const bounded = await runStreamedExecution({ spill: false });
         if (bounded !== undefined) return bounded;
       }
@@ -8047,7 +9827,7 @@ export class MinnowDatabase {
       (segment) => segment.kind === "delete" || segment.kind === "update",
     );
     const appends = segments.filter((segment) => {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       return kind === "insert" || kind === "base";
     });
     if (appends.length + mutations.length !== segments.length) return undefined;
@@ -8135,7 +9915,7 @@ export class MinnowDatabase {
     for (let start = 0; start < missingIds.length; start += 16) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
       const ids = missingIds.slice(start, start + 16);
-      const blocks = await this.store.getBlocks(ids);
+      const blocks = await this.#getSnapshotBlocksWindowed(snapshot, ids);
       for (let index = 0; index < ids.length; index += 1) {
         const id = ids[index] ?? "";
         const bytes = blocks[index];
@@ -8238,7 +10018,7 @@ export class MinnowDatabase {
       }
     | undefined {
     const scanSegments = segments.filter((segment) => {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       return kind === "insert" || kind === "base";
     });
     const mutationSegments = segments.filter(
@@ -8595,7 +10375,7 @@ export class MinnowDatabase {
     for (let start = 0; start < missing.length; start += 16) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
       const ids = missing.slice(start, start + 16);
-      const blocks = await this.store.getBlocks(ids);
+      const blocks = await this.#getSnapshotBlocksWindowed(snapshot, ids);
       for (let index = 0; index < ids.length; index += 1) {
         const id = ids[index] ?? "";
         const bytes = blocks[index];
@@ -8641,7 +10421,7 @@ export class MinnowDatabase {
     load: (start: number, length: number) => number | Promise<number>;
   }> {
     const scanSegments = baseSegments.filter((segment) => {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       return kind === "insert" || kind === "base";
     });
     const overlay = await this.#streamedOverlayState(
@@ -8899,7 +10679,7 @@ export class MinnowDatabase {
     const touched = new Set<OverlayKey>();
     let retainedBytes = 0;
     for (const segment of deltaSegments) {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       const keyVector = await deltaVector(keyColumn, segment);
       memory.reserve(columnVectorRetainedBytes(keyVector), "Streamed mutation replay");
       mutationKeyVectors.set(segment.id, keyVector);
@@ -8984,7 +10764,7 @@ export class MinnowDatabase {
     const patches = new Map<number, Map<string, OverlayPatch>>();
     let deadCount = 0;
     for (const segment of baseSegments) {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       if (kind === "insert" || kind === "base") {
         for (const entry of touchedByScanSegment.get(segment.id) ?? []) {
           if (slotByKey.has(entry.key)) {
@@ -9059,6 +10839,9 @@ export class MinnowDatabase {
     typedSchemas: Map<string, SqlColumnSchema[]>,
     extraInputs?: ReadonlyMap<string, ColumnarTable>,
     cacheResults = true,
+    allowSpill = true,
+    forceSpill = false,
+    spillPageRows?: number,
   ): Promise<QueryResult> {
     const ftsStats = await this.#ftsIndexStats(block, realTables, snapshot, visibility);
     const inputs = await this.#prepareBlockInputs(
@@ -9070,6 +10853,9 @@ export class MinnowDatabase {
       typedSchemas,
       extraInputs,
       cacheResults,
+      allowSpill,
+      forceSpill,
+      spillPageRows,
     );
     const prepared = createPreparedColumnarQuery(
       block,
@@ -9078,7 +10864,20 @@ export class MinnowDatabase {
       ftsStats === undefined ? {} : { ftsStats },
     );
     try {
-      return prepared.execute();
+      if (!allowSpill || memory.usage.budgetBytes === Number.MAX_SAFE_INTEGER) {
+        return prepared.execute();
+      }
+      if (!forceSpill) {
+        try {
+          return prepared.execute();
+        } catch (error) {
+          if (!(error instanceof QueryMemoryBudgetError)) throw error;
+        }
+      }
+      return await prepared.executeAsync({
+        spillStore: this.#leasedSpillStore(),
+        ...(spillPageRows === undefined ? {} : { spillPageRows }),
+      });
     } finally {
       prepared.close();
     }
@@ -9099,6 +10898,9 @@ export class MinnowDatabase {
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
     cacheResults = true,
+    allowSpill = true,
+    forceSpill = false,
+    spillPageRows?: number,
   ): Promise<QueryResult> {
     const key = await this.#blockResultCacheKey(
       block,
@@ -9120,6 +10922,9 @@ export class MinnowDatabase {
       typedSchemas,
       undefined,
       cacheResults,
+      allowSpill,
+      forceSpill,
+      spillPageRows,
     );
     if (key !== undefined) this.#cachePut(key, result, queryResultRetainedBytes(result));
     return result;
@@ -9139,6 +10944,9 @@ export class MinnowDatabase {
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
     cacheResults = true,
+    allowSpill = true,
+    forceSpill = false,
+    spillPageRows?: number,
   ): Promise<{ result: QueryResult; schema: SqlColumnSchema[] }> {
     const key = await this.#blockResultCacheKey(
       block,
@@ -9162,6 +10970,9 @@ export class MinnowDatabase {
       typedSchemas,
       undefined,
       cacheResults,
+      allowSpill,
+      forceSpill,
+      spillPageRows,
     );
     const schema = inferBlockSchema(block, typedSchemas);
     const entry = { result, schema };
@@ -9184,11 +10995,17 @@ export class MinnowDatabase {
     // the single switch that makes a statement compute its results instead of reusing them.
     if (!cacheResults) return undefined;
     if (!this.#artifactCache.enabled) return undefined;
+    // Staged writes can change repeatedly without changing either the pinned manifest version or
+    // their transaction id. Do not cache them under an identity that could become stale.
+    if (visibility.overlayTransactionId !== undefined) return undefined;
     const parts: string[] = [];
     for (const name of collectRealTableNames(block).sort()) {
       const table = realTables.get(name);
       if (table === undefined) return undefined;
-      parts.push(`${table.id}=${await this.#tableFingerprint(table, snapshot, visibility)}`);
+      // A manifest version is an exact immutable database identity. It deliberately invalidates
+      // a table result after an unrelated-table commit: that small hit-rate cost keeps key work
+      // and retained characters independent of the table's segment count.
+      parts.push(`${table.id}=${String(snapshot.version ?? -1)}`);
     }
     try {
       return `blk\u0000${parts.join(";")}\u0000${JSON.stringify(block)}`;
@@ -9197,89 +11014,408 @@ export class MinnowDatabase {
     }
   }
 
-  /** The ordered visible segment ids of one table, memoized per visibility catalog. */
-  async #tableFingerprint(
-    table: TableRecord,
-    snapshot: LeasedSnapshot,
-    visibility: SegmentVisibilityCatalog,
-  ): Promise<string> {
-    let memo = this.#visibilityFingerprints.get(visibility);
-    if (memo === undefined) {
-      memo = new Map();
-      this.#visibilityFingerprints.set(visibility, memo);
-    }
-    const existing = memo.get(table.id);
-    if (existing !== undefined) return existing;
-    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
-    const fingerprint = segments.map((segment) => segment.id).join(",");
-    memo.set(table.id, fingerprint);
-    return fingerprint;
-  }
-
-  async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {
-    const table = await this.#findTable(tableName);
-    return this.#withLeasedSnapshot(version, async (snapshot) =>
-      (await this.#visibleSegmentRecords(table, snapshot)).map((segment) => ({
-        id: segment.id,
-        rowCount: segment.rowCount,
-        columnBlockIds: structuredClone(segment.columnBlockIds),
-      })),
+  /**
+   * Inspects exactly one bounded physical segment-ID window at a stable manifest version.
+   * Historical records that are not visible are filtered rather than replaced from later
+   * windows, so callers must follow `nextCursor` even when a page returns no records.
+   */
+  async listVisibleSegmentPage(
+    tableName: string,
+    options: VisibleSegmentPageOptions = {},
+  ): Promise<VisibleSegmentPage> {
+    const normalizedTableName = validateName(tableName, "Table");
+    const limit = positiveWholeNumber(
+      options.limit ?? MAX_VISIBLE_SEGMENT_PAGE_ITEMS,
+      "Visible segment page limit",
     );
+    if (limit > MAX_VISIBLE_SEGMENT_PAGE_ITEMS) {
+      throw new RangeError(
+        `Visible segment page limit cannot exceed ${String(MAX_VISIBLE_SEGMENT_PAGE_ITEMS)}`,
+      );
+    }
+
+    const rawCursor: unknown = options.cursor;
+    if (rawCursor !== undefined && (typeof rawCursor !== "object" || rawCursor === null)) {
+      throw new TypeError("A visible segment cursor must be an object");
+    }
+    const cursor = rawCursor as VisibleSegmentPageCursor | undefined;
+    if (cursor !== undefined && options.version !== undefined) {
+      throw new TypeError("A visible segment cursor cannot be combined with a version");
+    }
+    let tableId: string;
+    let version: number | null | undefined;
+    let afterId: string | null;
+    if (cursor === undefined) {
+      tableId = (await this.#findTable(normalizedTableName)).id;
+      version = visibleSegmentManifestVersion(options.version, "Visible segment version");
+      afterId = null;
+    } else {
+      if (cursor.tableName !== normalizedTableName) {
+        throw new TypeError("A visible segment cursor belongs to a different table name");
+      }
+      tableId = validateStorageId(cursor.tableId, "Visible segment cursor table ID");
+      version = visibleSegmentManifestVersion(cursor.version, "Visible segment cursor version");
+      if (version === undefined) throw new TypeError("A visible segment cursor needs a version");
+      afterId = validateStorageId(cursor.afterId, "Visible segment cursor ID");
+    }
+
+    return this.#withLeasedSnapshot(version, async (snapshot) => {
+      await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
+      const page = await this.store.listTableSegmentPage(tableId, afterId, limit);
+      // A drop can interleave with the async physical read and remove the old table's segment
+      // metadata. Check again so that race fails closed instead of returning a truncated page.
+      await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
+      const transactions = new Map(
+        (await this.#transactionRecordsForSegments(page.records)).map((record) => [
+          record.id,
+          record,
+        ]),
+      );
+      const versionEligible = page.records.filter((segment) => {
+        const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
+        return (
+          snapshot.version !== null &&
+          committedVersion !== null &&
+          committedVersion !== undefined &&
+          committedVersion <= snapshot.version
+        );
+      });
+      const visible = await filterSnapshotSegments(snapshot, versionEligible);
+      return {
+        records: visible.map((segment) => ({
+          id: segment.id,
+          rowCount: segment.rowCount,
+          columnBlockIds: structuredClone(segment.columnBlockIds),
+          logicalOrder: segment.logicalOrder,
+          committedVersion: transactions.get(segment.transactionId)?.committedVersion ?? -1,
+          commitOrdinal: segment.commitOrdinal,
+        })),
+        version: snapshot.version,
+        nextCursor:
+          page.nextCursor === null
+            ? null
+            : {
+                tableName: normalizedTableName,
+                tableId,
+                version: snapshot.version,
+                afterId: page.nextCursor,
+              },
+      };
+    });
   }
 
   /**
-   * Copies the current committed version out as a portable snapshot file — the byte array
-   * `../storage/snapshot.ts` describes, which `importSnapshot()` loads back into any store.
-   *
-   * The bytes are the unit here rather than the structured `DatabaseSnapshot` the store returns,
-   * because that is what a caller does with a snapshot: write it to disk, hand it to a colleague,
-   * ship it as an asset. Reach for `store.exportSnapshot()` directly when you want the records
-   * instead. Either way the whole snapshot is materialized in memory, so a database of hundreds
-   * of megabytes needs the headroom for a copy of itself.
-   *
-   * Stores differ in how they hold still while this runs: see the note on exporting safely in the
-   * snapshots guide.
+   * Collects the pull-driven framed snapshot stream into one portable byte array. This helper is
+   * convenient for small and medium databases, but it necessarily retains the complete file and
+   * has the Uint8Array 4-GiB ceiling. Use `exportSnapshotStream()` for larger databases or direct
+   * file/network transfer. See the snapshots guide for framing and durability guarantees.
    */
   async exportSnapshot(options: SnapshotExportOptions = {}): Promise<Uint8Array> {
-    // Announced before the work starts, because reading and encoding report nothing in between:
-    // the encoded length is not known until the last block has been copied.
-    options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
-    const bytes = await encodeSnapshot(await exportingStore(this.store).exportSnapshot());
-    options.onProgress?.({
-      phase: "done",
-      transferredBytes: bytes.byteLength,
-      totalBytes: bytes.byteLength,
-    });
+    const chunks: Uint8Array[] = [];
+    let byteLength = 0;
+    for await (const chunk of this.exportSnapshotStream(options)) {
+      byteLength = safeWholeNumberSum([byteLength, chunk.byteLength], "Snapshot byte-array length");
+      if (byteLength > MAX_SNAPSHOT_BYTE_ARRAY_LENGTH) {
+        throw new RangeError("Snapshot exceeds the byte-array API's 4 GiB limit");
+      }
+      chunks.push(chunk);
+    }
+    const bytes = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
     return bytes;
   }
 
   /**
+   * Streams one pinned committed snapshot with at most one payload block resident. Stopping the
+   * iterator releases its durable backup lease in `finally`.
+   */
+  async *exportSnapshotStream(
+    options: SnapshotExportOptions = {},
+  ): AsyncGenerator<Uint8Array, void, void> {
+    const store = streamingSnapshotExportStore(this.store);
+    throwIfSnapshotAborted(options.signal);
+    options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
+    const ownerId = `snapshot-export/${crypto.randomUUID()}`;
+    const initialTimes = snapshotSessionTimes(this.#now());
+    const session = await store.beginSnapshotFrameExport({ ownerId, ...initialTimes });
+    let succeeded = false;
+    let transferredBytes = 0;
+    let checksum = 0;
+    let frameCount = 0;
+    let itemCount = 0;
+    let storedBytes = 0;
+    try {
+      const header = session.header;
+      const observed = Object.fromEntries(
+        SNAPSHOT_FRAME_KINDS.map((kind) => [kind, { frameCount: 0, itemCount: 0, storedBytes: 0 }]),
+      ) as Record<
+        (typeof SNAPSHOT_FRAME_KINDS)[number],
+        { frameCount: number; itemCount: number; storedBytes: number }
+      >;
+      const encodedHeader = encodeSnapshotFrameStreamHeader(header);
+      const expectedFrames = Object.values(header.kinds).reduce(
+        (total, kind) => safeWholeNumberSum([total, kind.frameCount], "Snapshot frame count"),
+        0,
+      );
+      const transfer = async function* (bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+        for (let offset = 0; offset < bytes.byteLength; offset += SNAPSHOT_TRANSFER_CHUNK_BYTES) {
+          yield bytes.subarray(offset, offset + SNAPSHOT_TRANSFER_CHUNK_BYTES);
+        }
+      };
+      for await (const chunk of transfer(encodedHeader)) {
+        throwIfSnapshotAborted(options.signal);
+        yield chunk;
+        transferredBytes += chunk.byteLength;
+        options.onProgress?.({ phase: "transfer", transferredBytes, totalBytes: 0 });
+      }
+      for (let sequence = 0; sequence < expectedFrames; sequence += 1) {
+        throwIfSnapshotAborted(options.signal);
+        const times = snapshotSessionTimes(this.#now());
+        const frame = await store.readSnapshotExportFrame({
+          sessionId: session.sessionId,
+          ownerId,
+          sequence,
+          expiresAtCutoff: times.createdAt,
+          expiresAt: times.expiresAt,
+        });
+        throwIfSnapshotAborted(options.signal);
+        if (frame?.sequence !== sequence) {
+          throw new Error(`Snapshot export omitted frame ${String(sequence)}`);
+        }
+        const parts = snapshotFrameEnvelopeParts(frame);
+        checksum = extendSnapshotFrameStreamChecksum(checksum, parts);
+        frameCount = safeWholeNumberSum([frameCount, 1], "Snapshot frame count");
+        itemCount = safeWholeNumberSum([itemCount, frame.itemCount], "Snapshot frame item count");
+        storedBytes = safeWholeNumberSum(
+          [storedBytes, frame.payload.byteLength],
+          "Snapshot frame stored bytes",
+        );
+        const kindObserved = observed[frame.kind];
+        kindObserved.frameCount = safeWholeNumberSum(
+          [kindObserved.frameCount, 1],
+          "Snapshot kind frame count",
+        );
+        kindObserved.itemCount = safeWholeNumberSum(
+          [kindObserved.itemCount, frame.itemCount],
+          "Snapshot kind item count",
+        );
+        kindObserved.storedBytes = safeWholeNumberSum(
+          [kindObserved.storedBytes, frame.payload.byteLength],
+          "Snapshot kind stored bytes",
+        );
+        const expected = header.kinds[frame.kind];
+        if (
+          kindObserved.frameCount > expected.frameCount ||
+          kindObserved.itemCount > expected.itemCount ||
+          kindObserved.storedBytes > expected.storedBytes
+        ) {
+          throw new Error(`Snapshot export exceeded its ${frame.kind} summary`);
+        }
+        for (const part of parts) {
+          for await (const chunk of transfer(part)) {
+            throwIfSnapshotAborted(options.signal);
+            yield chunk;
+            transferredBytes = safeWholeNumberSum(
+              [transferredBytes, chunk.byteLength],
+              "Snapshot transferred bytes",
+            );
+            options.onProgress?.({ phase: "transfer", transferredBytes, totalBytes: 0 });
+          }
+        }
+      }
+      for (const kind of SNAPSHOT_FRAME_KINDS) {
+        const actual = observed[kind];
+        const expected = header.kinds[kind];
+        if (
+          actual.frameCount !== expected.frameCount ||
+          actual.itemCount !== expected.itemCount ||
+          actual.storedBytes !== expected.storedBytes
+        ) {
+          throw new Error(`Snapshot export did not satisfy its ${kind} summary`);
+        }
+      }
+      const footer: SnapshotFrameFooter = { frameCount, itemCount, storedBytes, checksum };
+      for await (const chunk of transfer(encodeSnapshotFrameStreamFooter(footer))) {
+        throwIfSnapshotAborted(options.signal);
+        yield chunk;
+        transferredBytes = safeWholeNumberSum(
+          [transferredBytes, chunk.byteLength],
+          "Snapshot transferred bytes",
+        );
+        options.onProgress?.({ phase: "transfer", transferredBytes, totalBytes: 0 });
+      }
+      succeeded = true;
+    } finally {
+      await store.closeSnapshotFrameExport({ sessionId: session.sessionId, ownerId });
+      if (succeeded) {
+        options.onProgress?.({
+          phase: "done",
+          transferredBytes,
+          totalBytes: transferredBytes,
+        });
+      }
+    }
+  }
+
+  /**
    * Loads a snapshot file into this database's store, which must be empty. Every block is
-   * authenticated while decoding, so a corrupt file fails here rather than mid-query, and a store
-   * that already holds a database throws rather than merging two histories.
+   * integrity-checked while decoding, so a corrupt file fails here rather than mid-query, and a
+   * store that already holds a database throws rather than merging two histories.
    */
   async importSnapshot(bytes: Uint8Array, options: SnapshotImportOptions = {}): Promise<void> {
-    // Asked before the file is decoded, so a store that could never load it fails immediately
-    // rather than after parsing and authenticating hundreds of megabytes.
-    const store = importingStore(this.store);
-    const snapshot = await decodeSnapshot(bytes);
-    await store.importSnapshot(snapshot, {
-      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
-    });
-    // This database is now looking at a catalog it has never seen. Both stores bump their catalog
-    // epoch as they load, which is what expires the cached catalog state, but the compiled-plan
-    // cache is keyed by statement text alone; clearing both is cheap and leaves nothing behind
-    // from the database this one replaced.
+    await this.importSnapshotStream(singleSnapshotChunk(bytes), options);
+  }
+
+  /** Incrementally validates and stages a snapshot; only the final adapter CAS makes it visible. */
+  async importSnapshotStream(
+    source: AsyncIterable<Uint8Array>,
+    options: SnapshotImportOptions = {},
+  ): Promise<void> {
+    const store = streamingSnapshotImportStore(this.store);
+    const ownerId = `snapshot-import/${crypto.randomUUID()}`;
+    let identity: string | undefined;
+    let acquired = false;
+    let totalBytes = 0;
+    let writtenBytes = 0;
+    let batchBytes = 0;
+    let metadataBatchBytes = 0;
+    const batch: SnapshotFrame[] = [];
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0 || identity === undefined) return;
+      throwIfSnapshotAborted(options.signal);
+      const times = snapshotSessionTimes(this.#now());
+      const session = await store.appendSnapshotImportFrames({
+        identity,
+        ownerId,
+        expiresAtCutoff: times.createdAt,
+        expiresAt: times.expiresAt,
+        frames: batch.splice(0),
+      });
+      batchBytes = 0;
+      metadataBatchBytes = 0;
+      writtenBytes = session.stagedBytes;
+      options.onProgress?.({ phase: "blocks", writtenBytes, totalBytes });
+    };
+    try {
+      throwIfSnapshotAborted(options.signal);
+      for await (const entry of decodeSnapshotFrameStream(
+        abortableSnapshotSource(source, options.signal),
+      )) {
+        throwIfSnapshotAborted(options.signal);
+        if (entry.type === "header") {
+          if (identity !== undefined) throw new Error("Snapshot stream repeats its header");
+          identity = snapshotFrameStreamHeaderIdentity(entry.header);
+          totalBytes = Object.values(entry.header.kinds).reduce(
+            (total, kind) =>
+              safeWholeNumberSum([total, kind.storedBytes], "Snapshot streamed payload length"),
+            0,
+          );
+          const times = snapshotSessionTimes(this.#now());
+          await store.beginSnapshotFrameImport({
+            identity,
+            ownerId,
+            ...times,
+            header: entry.header,
+          });
+          acquired = true;
+          options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
+          continue;
+        }
+        if (entry.type === "frame") {
+          if (identity === undefined) throw new Error("Snapshot frame precedes its header");
+          if (
+            batch.length > 0 &&
+            (batch.length >= MAX_SNAPSHOT_FRAME_BATCH_ITEMS ||
+              batchBytes + entry.frame.payload.byteLength > MAX_SNAPSHOT_FRAME_BATCH_BYTES ||
+              (entry.frame.kind !== "block" &&
+                metadataBatchBytes + entry.frame.payload.byteLength >
+                  MAX_SNAPSHOT_METADATA_BATCH_BYTES))
+          ) {
+            await flush();
+          }
+          batch.push(entry.frame);
+          batchBytes = safeWholeNumberSum(
+            [batchBytes, entry.frame.payload.byteLength],
+            "Snapshot import batch bytes",
+          );
+          if (entry.frame.kind !== "block") {
+            metadataBatchBytes = safeWholeNumberSum(
+              [metadataBatchBytes, entry.frame.payload.byteLength],
+              "Snapshot import metadata batch bytes",
+            );
+          }
+          continue;
+        }
+        if (identity === undefined) throw new Error("Snapshot footer precedes its header");
+        await flush();
+        throwIfSnapshotAborted(options.signal);
+        const cutoff = dateIsoString(this.#now());
+        options.onProgress?.({ phase: "catalog", writtenBytes, totalBytes });
+        await store.finishSnapshotFrameImport({
+          identity,
+          ownerId,
+          expiresAtCutoff: cutoff,
+          footer: entry.footer,
+        });
+        acquired = false;
+      }
+      if (identity === undefined) throw new Error("Snapshot stream is empty");
+      if (acquired) throw new Error("Snapshot stream ended without its footer");
+    } catch (error) {
+      if (options.signal?.aborted === true && acquired && identity !== undefined) {
+        await store.cancelSnapshotFrameImport({ identity, ownerId });
+      }
+      throw error;
+    }
     this.#planCache.clear();
     this.#catalogStateCache.clear();
     this.#catalogStateEpoch = undefined;
+    options.onProgress?.({ phase: "done", writtenBytes, totalBytes });
+  }
+
+  /** Verifies adapter metadata, or metadata plus every live payload, without changing storage. */
+  async checkIntegrity(
+    options: {
+      mode?: StorageIntegrityMode;
+      maxIssues?: number;
+    } = {},
+  ): Promise<StorageIntegrityReport> {
+    const check = this.store.checkIntegrity?.bind(this.store);
+    if (check === undefined) throw new Error("This database's block store cannot check integrity");
+    return check(options);
+  }
+
+  /** Explicit, potentially storage-scanning accounting for live, obsolete, temp, and WAL bytes. */
+  async storageStats(): Promise<StorageStats> {
+    const inspect = this.store.getStorageStats?.bind(this.store);
+    if (inspect === undefined)
+      throw new Error("This database's block store cannot report storage stats");
+    return inspect();
+  }
+
+  async inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null> {
+    const inspect = this.store.inspectInterruptedImport?.bind(this.store);
+    if (inspect === undefined) return null;
+    return inspect();
+  }
+
+  async abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult> {
+    const abort = this.store.abortInterruptedImport?.bind(this.store);
+    if (abort === undefined) {
+      throw new Error("This database's block store cannot abort interrupted imports");
+    }
+    return abort(identity);
   }
 
   async compactTable(
     tableName: string,
     options: CompactTableOptions = {},
   ): Promise<CompactTableResult> {
-    const maxBlocks = positiveWholeNumber(
+    const maxBlocks = boundedMaintenanceBatchItems(
       options.maxBlocksPerStep ?? 16,
       "Compaction blocks per step",
     );
@@ -9296,25 +11432,20 @@ export class MinnowDatabase {
     tableName: string,
     options: CompactTableStepOptions = {},
   ): Promise<CompactionJobProgress> {
+    const maxBlocks = boundedMaintenanceBatchItems(
+      options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
+      "Compaction step block limit",
+    );
     const table = await this.#findTable(tableName);
     return this.#serializedCompactionStep(table.id, async () => {
-      const active = (await this.store.listCompactionJobs(table.id)).find((job) =>
-        isActiveCompactionState(job.state),
-      );
+      const active = await this.#findActiveCompactionJob(table.id);
       let job = active;
       if (job === undefined) {
         const planned = await this.#planCompaction(table, options);
         if ("compacted" in planned) return compactionSkippedProgress(planned);
         job = planned;
       }
-      return this.#runCompactionJob(
-        table,
-        job,
-        positiveWholeNumber(
-          options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
-          "Compaction step block limit",
-        ),
-      );
+      return this.#runCompactionJob(table, job, maxBlocks);
     });
   }
 
@@ -9323,16 +11454,16 @@ export class MinnowDatabase {
     jobId: string,
     options: { maxBlocks?: number } = {},
   ): Promise<CompactionJobProgress> {
+    const maxBlocks = boundedMaintenanceBatchItems(
+      options.maxBlocks ?? 1,
+      "Compaction step block limit",
+    );
     const job = await this.store.getCompactionJob(jobId);
     if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
     const table = await this.store.getTable(job.tableId);
     if (table === undefined) throw new Error(`Compaction table not found: ${job.tableId}`);
     return this.#serializedCompactionStep(table.id, () =>
-      this.#runCompactionJob(
-        table,
-        job,
-        positiveWholeNumber(options.maxBlocks ?? 1, "Compaction step block limit"),
-      ),
+      this.#runCompactionJob(table, job, maxBlocks),
     );
   }
 
@@ -9354,6 +11485,21 @@ export class MinnowDatabase {
     }
   }
 
+  async #findActiveCompactionJob(tableId?: string): Promise<CompactionJobRecord | undefined> {
+    let cursor: string | null = null;
+    do {
+      const page = await this.store.listCompactionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      const active = page.records.find(
+        (job) =>
+          (tableId === undefined || job.tableId === tableId) && isActiveCompactionState(job.state),
+      );
+      if (active !== undefined) return active;
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+    return undefined;
+  }
+
   async listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]> {
     if (tableName === undefined) return this.store.listCompactionJobs();
     const table = await this.#findTable(tableName);
@@ -9370,7 +11516,7 @@ export class MinnowDatabase {
       }
       try {
         return compactionCancellationResult(
-          await this.store.cancelCompactionJob(job.id, job.revision, this.#now().toISOString()),
+          await this.store.cancelCompactionJob(job.id, job.revision, dateIsoString(this.#now())),
         );
       } catch (error) {
         if (error instanceof CompactionJobConflictError) continue;
@@ -9380,16 +11526,25 @@ export class MinnowDatabase {
   }
 
   async #cancelTableCompactions(tableId: string): Promise<void> {
-    for (const job of await this.store.listCompactionJobs(tableId)) {
-      if (job.state === "planned" || job.state === "running" || job.state === "ready") {
-        await this.cancelCompactionJob(job.id);
+    let cursor: string | null = null;
+    do {
+      const page = await this.store.listCompactionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const job of page.records) {
+        if (
+          job.tableId === tableId &&
+          (job.state === "planned" || job.state === "running" || job.state === "ready")
+        ) {
+          await this.cancelCompactionJob(job.id);
+        }
       }
-    }
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
   }
 
   /** Runs restart-safe lease-aware reclamation to completion in bounded durable steps. */
   async collectGarbage(options: CollectGarbageOptions = {}): Promise<GarbageCollectionResult> {
-    const maxItems = positiveWholeNumber(
+    const maxItems = boundedMaintenanceBatchItems(
       options.maxItemsPerStep ?? 64,
       "Garbage collection items per step",
     );
@@ -9406,6 +11561,13 @@ export class MinnowDatabase {
       progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
     }
     await this.#pruneFinishedJobRecords();
+    // An explicit successful pass is the caller accepting responsibility for manual mode. It
+    // reopens the generous write window; if the store cannot complete, the exception leaves the
+    // ceiling in place.
+    this.#autoCollectionDebtCommits = 0;
+    this.#manualCollectionDebtInitialized = true;
+    this.#commitsSinceCollection = 0;
+    this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
     return progress.result;
   }
 
@@ -9421,28 +11583,37 @@ export class MinnowDatabase {
     options: CollectGarbageStepOptions,
     retainedVersionMaxAgeMs = Number.POSITIVE_INFINITY,
   ): Promise<GarbageCollectionProgress> {
+    const maxPlanningItems = boundedMaintenanceBatchItems(
+      options.maxPlanningItems ?? 1_024,
+      "Garbage collection planning limit",
+    );
+    const maxItems = boundedMaintenanceBatchItems(
+      options.maxItems ?? 1,
+      "Garbage collection item limit",
+    );
     return this.#serializedCollectionStep(async () => {
-      const active = (await this.store.listGarbageCollectionJobs()).find(
-        (job) => job.state === "planned" || job.state === "running",
-      );
+      const active = await this.#findActiveGarbageCollectionJob();
       const job =
         active ??
         (await this.#planGarbageCollection(
-          positiveWholeNumber(
-            options.maxPlanningItems ?? 1_024,
-            "Garbage collection planning limit",
-          ),
-          nonNegativeWholeNumber(
-            options.retainRecentVersions ?? 0,
-            "Garbage collection retained versions",
-          ),
+          maxPlanningItems,
+          boundedRetainedVersions(options.retainRecentVersions ?? 0),
           retainedVersionMaxAgeMs,
         ));
-      return this.#runGarbageCollectionJob(
-        job,
-        positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
-      );
+      return this.#runGarbageCollectionJob(job, maxItems);
     });
+  }
+
+  async #findActiveGarbageCollectionJob(): Promise<GarbageCollectionJobRecord | undefined> {
+    let cursor: string | null = null;
+    do {
+      const page = await this.store.listGarbageCollectionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      const active = page.records.find((job) => job.state === "planned" || job.state === "running");
+      if (active !== undefined) return active;
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+    return undefined;
   }
 
   /** Continues a persisted reclamation pass after a cooperative yield or restart. */
@@ -9455,7 +11626,7 @@ export class MinnowDatabase {
     return this.#serializedCollectionStep(() =>
       this.#runGarbageCollectionJob(
         job,
-        positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
+        boundedMaintenanceBatchItems(options.maxItems ?? 1, "Garbage collection item limit"),
       ),
     );
   }
@@ -9484,7 +11655,7 @@ export class MinnowDatabase {
    * disk until pruned. Keeps the most recent versions readable. Never surfaces through a
    * write or a scan; a failed pass backs off for an interval of commits.
    */
-  #maybeScheduleAutoCollection(): void {
+  #maybeScheduleAutoCollection(force = false): void {
     if (this.#closed) return;
     if (!this.#autoCollect) return;
     if (this.#autoCollectionInFlight) {
@@ -9494,30 +11665,71 @@ export class MinnowDatabase {
       this.#autoCollectionRequested = true;
       return;
     }
-    if (this.#commitsSinceCollection < this.#autoCollectionBackoffUntilCommit) return;
+    if (this.#autoCollectionRetryTimer !== undefined && !force) return;
+    if (force && this.#autoCollectionRetryTimer !== undefined) {
+      clearTimeout(this.#autoCollectionRetryTimer);
+      this.#autoCollectionRetryTimer = undefined;
+      this.#autoCollectionRetryAt = undefined;
+    }
     this.#autoCollectionInFlight = true;
     this.#autoCollectionRequested = false;
     this.#commitsSinceCollection = 0;
-    this.#lastCollectionAt = this.#now().getTime();
+    this.#lastCollectionAt = dateMilliseconds(this.#now());
     const run = this.#runAutoCollection()
-      .then(() => {
-        this.#autoCollectionBackoffUntilCommit = 0;
+      .then((moreWork) => {
+        this.#autoCollectionConsecutiveFailures = 0;
+        this.#autoCollectionLastError = undefined;
+        this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
+        this.#autoCollectionRetryAt = undefined;
+        if (moreWork) this.#autoCollectionRequested = true;
+        else this.#autoCollectionDebtCommits = 0;
       })
-      .catch(() => {
-        this.#autoCollectionBackoffUntilCommit = AUTO_COLLECT_COMMIT_INTERVAL * 2;
+      .catch((error: unknown) => {
+        this.#autoCollectionConsecutiveFailures += 1;
+        const at = dateMilliseconds(this.#now());
+        this.#autoCollectionLastError = {
+          name: error instanceof Error ? error.name : "Error",
+          message: error instanceof Error ? error.message : String(error),
+          at,
+        };
+        this.#scheduleAutoCollectionRetry();
       })
       .finally(() => {
         if (this.#autoCollectionTask === run) this.#autoCollectionTask = undefined;
         this.#autoCollectionInFlight = false;
         if (this.#autoCollectionRequested) {
-          this.#autoCollectionRequested = false;
           void yieldToEventLoop().then(() => {
+            // Keep `collectionRequested` true until the continuation takes ownership. Otherwise
+            // maintenanceStatus briefly reports a false idle state between bounded runs, and a
+            // caller waiting for quiescence can leave a real backlog behind.
+            if (this.#closed) {
+              this.#autoCollectionRequested = false;
+              return;
+            }
+            // A commit may already have started the requested run during the yield. Its start
+            // clears the flag, and any newer request made while it runs remains set for that
+            // run's own continuation.
+            if (this.#autoCollectionInFlight) return;
             this.#maybeScheduleAutoCollection();
           });
         }
       });
     this.#autoCollectionTask = run;
     void run;
+  }
+
+  #scheduleAutoCollectionRetry(): void {
+    if (this.#closed || !this.#autoCollect || this.#autoCollectionRetryTimer !== undefined) return;
+    const exponent = Math.min(16, Math.max(0, this.#autoCollectionConsecutiveFailures - 1));
+    const delay = Math.min(AUTO_COLLECT_RETRY_MAX_MS, AUTO_COLLECT_RETRY_MIN_MS * 2 ** exponent);
+    this.#autoCollectionRetryAt = dateMilliseconds(this.#now()) + delay;
+    const timer = setTimeout(() => {
+      this.#autoCollectionRetryTimer = undefined;
+      this.#autoCollectionRetryAt = undefined;
+      this.#maybeScheduleAutoCollection(true);
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.#autoCollectionRetryTimer = timer;
   }
 
   /**
@@ -9538,16 +11750,19 @@ export class MinnowDatabase {
     this.#idleCollectionTimer = timer;
   }
 
-  async #runAutoCollection(): Promise<void> {
+  async #runAutoCollection(): Promise<boolean> {
+    const reconciliationMoreWork = await this.#reconcileCompactionMaintenance();
     // One pass plans a bounded number of candidates, so a backlog — a burst of commits that
     // outran the passes between them — takes several. Keep passing while a pass still finds
     // something, up to a ceiling that keeps a pathological store from pinning the loop.
+    let moreWork = false;
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
       if (this.#closed) break;
       this.#releaseIdleSharedLease();
       let progress = await this.#collectGarbageStep(
         {
           maxItems: AUTO_COLLECT_STEP_ITEMS,
+          maxPlanningItems: AUTO_COLLECT_STEP_ITEMS,
           retainRecentVersions: AUTO_COLLECT_RETAINED_VERSIONS,
         },
         AUTO_COLLECT_RETAINED_VERSION_MS,
@@ -9559,59 +11774,196 @@ export class MinnowDatabase {
         });
       }
       const result = progress.result;
-      if (
+      moreWork = !(
         result.prunedManifestCount === 0 &&
         result.reclaimedBlockCount === 0 &&
         result.reclaimedSegmentCount === 0 &&
         result.reclaimedTransactionCount === 0
-      ) {
+      );
+      if (!moreWork) {
         break;
       }
       await yieldToEventLoop();
     }
     await this.#pruneFinishedJobRecords();
+    return moreWork || reconciliationMoreWork;
+  }
+
+  /**
+   * Advances or cancels a bounded page of crash-left compaction work before collection plans
+   * roots. A rotating cursor prevents old terminal diagnostics from starving later active jobs;
+   * one output block per job keeps a quiet pass out of the foreground latency budget.
+   */
+  async #reconcileCompactionMaintenance(): Promise<boolean> {
+    const page = await this.store.listCompactionJobPage(
+      this.#compactionReconciliationCursor,
+      AUTO_COMPACTION_RECONCILE_RECORDS,
+    );
+    this.#compactionReconciliationCursor = page.nextCursor;
+    let moreWork = page.nextCursor !== null;
+    const cutoff = dateIsoString(this.#now());
+    for (const listed of page.records) {
+      if (!isActiveCompactionState(listed.state)) continue;
+      let job = (await this.store.getCompactionJob(listed.id)) ?? listed;
+      if (!isActiveCompactionState(job.state)) continue;
+      moreWork = true;
+
+      const table = await this.store.getTable(job.tableId);
+      if (table === undefined) {
+        await this.cancelCompactionJob(job.id);
+        continue;
+      }
+
+      if (job.transactionId !== null) {
+        let owner = await this.store.getTransaction(job.transactionId);
+        if (owner?.status === "active" && Date.parse(owner.expiresAt) <= Date.parse(cutoff)) {
+          await this.store.abortTransactionIfExpired({
+            transactionId: owner.id,
+            expectedOwnerId: owner.ownerId,
+            expiresAtCutoff: cutoff,
+            updatedAt: cutoff,
+          });
+          owner = await this.store.getTransaction(job.transactionId);
+        }
+        if (owner?.status === "committed" && owner.committedVersion !== null) {
+          await this.resumeCompactionJob(job.id, { maxBlocks: 1 });
+          continue;
+        }
+        if (owner?.status !== "active") {
+          await this.cancelCompactionJob(job.id);
+          this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
+          continue;
+        }
+      }
+
+      const currentVersion = await this.store.getCurrentManifestVersion();
+      const sourcePresence = await this.#manifestBlockPresence(currentVersion, job.sourceBlockIds);
+      const visibleSegmentIds = new Set(
+        (await this.#currentVisibleSegments(table)).map((segment) => segment.id),
+      );
+      if (
+        sourcePresence.some((present) => !present) ||
+        job.sourceSegmentIds.some((id) => !visibleSegmentIds.has(id))
+      ) {
+        await this.cancelCompactionJob(job.id);
+        this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
+        continue;
+      }
+
+      const progress = await this.resumeCompactionJob(job.id, { maxBlocks: 1 });
+      if (progress.result !== null) {
+        job = (await this.store.getCompactionJob(job.id)) ?? job;
+        if (!isActiveCompactionState(job.state)) continue;
+      }
+    }
+    return moreWork;
   }
 
   /** Drops finished maintenance records while preserving the state needed for safe L2 retries. */
   async #pruneFinishedJobRecords(): Promise<void> {
-    const newestFirst = <T extends { updatedAt: string }>(jobs: T[]): T[] =>
-      jobs.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    const terminalCompactions = newestFirst(
-      (await this.store.listCompactionJobs()).filter(
-        (job) => job.state === "published" || job.state === "cancelled" || job.state === "aborted",
-      ),
-    );
-    const retainedCompactionIds = new Set(
-      terminalCompactions.slice(0, AUTO_COLLECT_RETAINED_JOB_RECORDS).map((job) => job.id),
-    );
-    // A retry persists the cumulative bytes written by earlier attempts. Keep only the newest
-    // failure for each still-readable source snapshot; it carries the whole lifetime budget.
-    // Once the source manifest is pruned, that exact retry can never be planned again.
-    const retainedFailureBases = new Set<string>();
-    const manifestReadable = new Map<number, boolean>();
-    for (const job of terminalCompactions) {
-      if (job.state !== "cancelled" && job.state !== "aborted") continue;
-      const baseId = job.id.split("/retry/", 1)[0] ?? job.id;
-      if (retainedFailureBases.has(baseId)) continue;
-      let readable = manifestReadable.get(job.sourceManifestVersion);
-      if (readable === undefined) {
-        const manifest = await this.store.getManifest(job.sourceManifestVersion);
-        readable = manifest !== undefined && manifest.prunedAt === undefined;
-        manifestReadable.set(job.sourceManifestVersion, readable);
+    interface UpdatedRecord {
+      id: string;
+      updatedAt: string;
+    }
+    const newestFirst = (left: UpdatedRecord, right: UpdatedRecord): number =>
+      right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id);
+    const retainNewest = <T extends UpdatedRecord>(retained: T[], record: T): void => {
+      retained.push(record);
+      retained.sort(newestFirst);
+      if (retained.length > AUTO_COLLECT_RETAINED_JOB_RECORDS) retained.pop();
+    };
+
+    // First pass retains only a fixed-size diagnostic tail. This is deliberately not the public
+    // list API: a million old job records cost one adapter page plus eight IDs of resident memory.
+    const newestCompactions: CompactionJobRecord[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await this.store.listCompactionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const job of page.records) {
+        if (job.state === "published" || job.state === "cancelled" || job.state === "aborted") {
+          retainNewest(newestCompactions, job);
+        }
       }
-      if (!readable) continue;
-      retainedFailureBases.add(baseId);
-      retainedCompactionIds.add(job.id);
-    }
-    for (const job of terminalCompactions) {
-      if (!retainedCompactionIds.has(job.id)) await this.store.removeCompactionJob(job.id);
-    }
-    const collections = newestFirst(
-      (await this.store.listGarbageCollectionJobs()).filter((job) => job.state === "completed"),
-    );
-    for (const job of collections.slice(AUTO_COLLECT_RETAINED_JOB_RECORDS)) {
-      await this.store.removeGarbageCollectionJob(job.id);
-    }
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+    const retainedCompactionIds = new Set(newestCompactions.map((job) => job.id));
+
+    // Retry IDs sort next to their base ID. Keep at most one newest failed attempt for each
+    // still-readable source snapshot; it carries the cumulative lifetime write budget. The
+    // single group candidate avoids an unbounded base-id map, while the diagnostic tail above
+    // remains independently retained.
+    cursor = null;
+    let failureBaseId: string | undefined;
+    let newestReadableFailure: CompactionJobRecord | undefined;
+    let readableManifestVersion: number | undefined;
+    let readableManifest = false;
+    do {
+      const page = await this.store.listCompactionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const job of page.records) {
+        if (job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted") {
+          continue;
+        }
+        if (job.state === "published") {
+          if (!retainedCompactionIds.has(job.id)) await this.store.removeCompactionJob(job.id);
+          continue;
+        }
+
+        const baseId = job.id.split("/retry/", 1)[0] ?? job.id;
+        if (baseId !== failureBaseId) {
+          failureBaseId = baseId;
+          newestReadableFailure = undefined;
+          readableManifestVersion = undefined;
+        }
+        if (readableManifestVersion !== job.sourceManifestVersion) {
+          const manifest = await this.store.getManifest(job.sourceManifestVersion);
+          readableManifest = manifest !== undefined && manifest.prunedAt === undefined;
+          readableManifestVersion = job.sourceManifestVersion;
+        }
+        if (!readableManifest) {
+          if (!retainedCompactionIds.has(job.id)) await this.store.removeCompactionJob(job.id);
+          continue;
+        }
+
+        if (newestReadableFailure === undefined) {
+          newestReadableFailure = job;
+          continue;
+        }
+        if (newestFirst(job, newestReadableFailure) < 0) {
+          if (!retainedCompactionIds.has(newestReadableFailure.id)) {
+            await this.store.removeCompactionJob(newestReadableFailure.id);
+          }
+          newestReadableFailure = job;
+        } else if (!retainedCompactionIds.has(job.id)) {
+          await this.store.removeCompactionJob(job.id);
+        }
+      }
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+
+    const newestCollections: GarbageCollectionJobRecord[] = [];
+    cursor = null;
+    do {
+      const page = await this.store.listGarbageCollectionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const job of page.records) {
+        if (job.state === "completed") retainNewest(newestCollections, job);
+      }
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+    const retainedCollectionIds = new Set(newestCollections.map((job) => job.id));
+    cursor = null;
+    do {
+      const page = await this.store.listGarbageCollectionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const job of page.records) {
+        if (job.state === "completed" && !retainedCollectionIds.has(job.id)) {
+          await this.store.removeGarbageCollectionJob(job.id);
+        }
+      }
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
   }
 
   async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
@@ -9627,265 +11979,548 @@ export class MinnowDatabase {
     // records as part of every explicit or background collection so callers never need a
     // separate maintenance loop to keep either family bounded.
     await this.#transactions.removeExpiredLeases(this.#now());
-    await this.cleanupQuerySpill();
-    const current = await this.store.getCurrentManifest();
-    const currentBlockIds = new Set(current?.blockIds ?? []);
-    // Manifest versions are consecutive, so the retained window is a version floor; a version
-    // inside it is still collected once it is older than the window's age.
-    const retainAbove = (current?.version ?? 0) - retainRecentVersions;
-    const retainAfter = this.#now().getTime() - retainedVersionMaxAgeMs;
-    const retained = (manifest: { version: number; createdAt: string }): boolean =>
-      manifest.version > retainAbove && Date.parse(manifest.createdAt) > retainAfter;
-    const candidateManifestVersions: number[] = [];
-    const candidateBlockIds: string[] = [];
-    const candidateSegmentIds: string[] = [];
-    const candidateTransactionIds: string[] = [];
-    const candidateBlockIdSet = new Set<string>();
-    const candidateSegmentIdSet = new Set<string>();
-    const remaining = () =>
-      maxPlanningItems -
-      candidateBlockIds.length -
-      candidateSegmentIds.length -
-      candidateTransactionIds.length;
-    const addBlocks = (ids: readonly string[]) => {
-      for (const id of ids) {
-        if (remaining() <= 0) break;
-        if (candidateBlockIdSet.has(id)) continue;
-        candidateBlockIdSet.add(id);
-        candidateBlockIds.push(id);
+    await this.#cleanupExpiredQuerySpill(MAINTENANCE_JOB_PAGE_SIZE);
+    const discoveryCutoff = dateIsoString(this.#now());
+    const discoveryCurrent = await this.store.getCurrentManifestVersion();
+    const continuation = await this.#garbageCollectionDiscoveryContinuation();
+    const input = {
+      id: `garbage-collection/${this.#createId()}`,
+      candidateManifestVersions: [],
+      candidateSegmentIds: [],
+      candidateBlockIds: [],
+      candidateTransactionIds: [],
+      leaseCutoff: discoveryCutoff,
+      createdAt: discoveryCutoff,
+      discovery: {
+        phase: "manifests",
+        currentManifestVersion: discoveryCurrent,
+        retainAboveVersion: (discoveryCurrent ?? 0) - retainRecentVersions,
+        retainAfter: Number.isFinite(retainedVersionMaxAgeMs)
+          ? dateMilliseconds(this.#now()) - retainedVersionMaxAgeMs
+          : Number.MIN_SAFE_INTEGER,
+        maxPlanningItems,
+        manifestCursor:
+          continuation?.discovery.resumePhase === "manifests"
+            ? continuation.discovery.manifestCursor
+            : null,
+        segmentCursor: continuation?.discovery.segmentCursor ?? null,
+        transactionCursor: continuation?.discovery.transactionCursor ?? null,
+        compactionCursor: continuation?.discovery.compactionCursor ?? null,
+        visitedRecords: 0,
+        resumePhase: null,
+        postManifestPhase:
+          continuation?.discovery.resumePhase === "manifests"
+            ? (continuation.discovery.postManifestPhase ?? null)
+            : (continuation?.discovery.resumePhase ?? null),
+        artifactCursor: continuation?.discovery.artifactCursor ?? null,
+      },
+    } satisfies Parameters<BlockStore["createGarbageCollectionJob"]>[0];
+    let discovered: GarbageCollectionJobRecord;
+    try {
+      discovered = await this.store.createGarbageCollectionJob(input);
+    } catch (error) {
+      if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+      const raced = await this.#findActiveGarbageCollectionJob();
+      if (raced === undefined) throw error;
+      return raced;
+    }
+    // The successor job now durably owns the exact continuation cursor. Retaining the source
+    // forever makes a same-timestamp reopen choose an arbitrary old cursor and can replay or
+    // lose a bounded provenance tail. Handoff is create-before-delete, so a crash always leaves
+    // at least one durable owner of the cursor.
+    if (continuation !== undefined) {
+      await this.store.removeGarbageCollectionJob(continuation.jobId);
+    }
+    return this.#advanceGarbageCollectionPlanning(discovered);
+  }
+
+  async #garbageCollectionDiscoveryContinuation(): Promise<
+    | {
+        jobId: string;
+        discovery: NonNullable<GarbageCollectionJobRecord["discovery"]>;
       }
-    };
-    const addSegments = (ids: readonly string[]) => {
-      for (const id of ids) {
-        if (remaining() <= 0) break;
-        if (candidateSegmentIdSet.has(id)) continue;
-        candidateSegmentIdSet.add(id);
-        candidateSegmentIds.push(id);
-      }
-    };
-    // The walk starts past the prefix of history this database has already seen fully
-    // collected — every manifest pruned and none of its blocks left — and extends that prefix
-    // as it goes. A pruned manifest's blocks can only disappear, and a block it shares with a
-    // later manifest is found through that manifest or the job that superseded it, so skipping
-    // the dead prefix loses nothing; it is what keeps a pass proportional to the live history
-    // rather than to everything the database ever committed.
-    let manifestCursor: number | null = this.#collectionWatermark;
-    let deadPrefixEnd = this.#collectionWatermark;
-    let prefixContiguous = true;
-    walk: do {
-      const page = await this.store.listManifestPage(manifestCursor, 64);
-      for (const manifest of page.records) {
-        if (manifest.version === current?.version) break walk;
-        if (retained(manifest)) {
-          prefixContiguous = false;
+    | undefined
+  > {
+    let cursor: string | null = null;
+    let newest: GarbageCollectionJobRecord | undefined;
+    do {
+      const page = await this.store.listGarbageCollectionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const job of page.records) {
+        if (
+          job.state !== "completed" ||
+          job.discovery?.resumePhase === undefined ||
+          job.discovery.resumePhase === null
+        ) {
           continue;
         }
-        const candidateCapacity = remaining();
-        const existing = await this.#existingGarbageBlockCandidates(
-          manifest.blockIds,
-          currentBlockIds,
-          candidateCapacity,
-        );
-        if (manifest.prunedAt === undefined) {
-          // Only an unpruned manifest is a pruning candidate: one already pruned would spend a
-          // step's capacity confirming it, and with enough of them in front, the unpruned ones
-          // behind them were never reached at all. Their leftover blocks still count.
-          // A block candidate must carry persisted provenance in this same job. Once the bounded
-          // manifest list is full, continuing to add blocks from later manifests would make an
-          // unsafe, unreplayable plan; the next pass resumes with those manifests still unpruned.
-          if (candidateManifestVersions.length >= 64) {
-            break walk;
-          }
-          candidateManifestVersions.push(manifest.version);
-          prefixContiguous = false;
-        } else if (prefixContiguous && candidateCapacity > 0 && existing.length === 0) {
-          deadPrefixEnd = manifest.version;
-        } else {
-          prefixContiguous = false;
+        if (
+          newest === undefined ||
+          job.updatedAt > newest.updatedAt ||
+          (job.updatedAt === newest.updatedAt && job.id > newest.id)
+        ) {
+          newest = job;
         }
-        addBlocks(existing);
-        // A full payload budget must not stop manifest discovery. Earlier pruned tombstones can
-        // name blocks that a later unpruned manifest still roots; stopping here would select the
-        // same retained blocks forever and never reach the manifest whose pruning unlocks them.
-        // existingGarbageBlockCandidates receives a zero limit from here on, so the scan adds no
-        // more payload memory and still stops at the separate 64-manifest bound above.
       }
-      manifestCursor = page.nextCursor;
-    } while (manifestCursor !== null);
-    this.#collectionWatermark = deadPrefixEnd;
-
-    if (remaining() > 0) {
-      // Segment records are durable metadata, not reachability roots by themselves. Discover
-      // every record whose blocks are absent from the current manifest, including records left
-      // by terminal compactions whose diagnostic job record has already aged out. The atomic
-      // collection step rechecks older readable manifests, active transactions, and unfinished
-      // compactions before deleting one. Paging keeps recovery from an old backlog bounded.
-      let segmentCursor: string | null = null;
-      do {
-        const page = await this.store.listSegmentPage(segmentCursor, 64);
-        for (const segment of page.records) {
-          const touchesCurrentManifest = Object.values(segment.columnBlockIds).some((ids) =>
-            ids.some((id) => currentBlockIds.has(id)),
-          );
-          if (!touchesCurrentManifest) addSegments([segment.id]);
-          if (remaining() <= 0) break;
-        }
-        if (remaining() <= 0) break;
-        segmentCursor = page.nextCursor;
-      } while (segmentCursor !== null);
-    }
-
-    if (remaining() > 0) {
-      const manifestEligibility = new Map<number, boolean>();
-      const candidateManifestSet = new Set(candidateManifestVersions);
-      let transactionCursor: string | null = null;
-      do {
-        const page = await this.store.listTransactionPage(transactionCursor, 64);
-        const possiblyUnownedCommittedIds: string[] = [];
-        for (const transaction of page.records) {
-          if (transaction.status === "aborted") {
-            const pendingBlocks = await this.#existingGarbageBlockCandidates(
-              transaction.pendingBlockIds,
-              currentBlockIds,
-              remaining(),
-            );
-            addBlocks(pendingBlocks);
-            const pendingSegments = await this.#existingGarbageSegmentCandidates(
-              transaction.pendingSegmentIds,
-              remaining(),
-            );
-            addSegments(pendingSegments);
-            // The artifacts are deleted before transaction candidates within a job. A later
-            // pass sees the empty journal and removes the aborted record itself.
-            if (pendingBlocks.length === 0 && pendingSegments.length === 0 && remaining() > 0) {
-              candidateTransactionIds.push(transaction.id);
-            }
-          } else if (
-            transaction.status === "committed" &&
-            transaction.committedVersion !== null &&
-            remaining() > 0
-          ) {
-            let eligible = manifestEligibility.get(transaction.committedVersion);
-            if (eligible === undefined) {
-              const manifest = await this.store.getManifest(transaction.committedVersion);
-              eligible =
-                manifest === undefined ||
-                manifest.prunedAt !== undefined ||
-                candidateManifestSet.has(transaction.committedVersion);
-              if (manifestEligibility.size < 4_096) {
-                manifestEligibility.set(transaction.committedVersion, eligible);
-              }
-            }
-            if (eligible) possiblyUnownedCommittedIds.push(transaction.id);
-          }
-          if (remaining() <= 0) break;
-        }
-        if (remaining() > 0 && possiblyUnownedCommittedIds.length > 0) {
-          // Do not build an owner set for the whole database. For this bounded transaction
-          // page, stream bounded segment pages and remember only matching owner ids.
-          const owners = new Set<string>();
-          const possibleOwners = new Set(possiblyUnownedCommittedIds);
-          let segmentCursor: string | null = null;
-          do {
-            const segmentPage = await this.store.listSegmentPage(segmentCursor, 64);
-            for (const segment of segmentPage.records) {
-              if (possibleOwners.has(segment.transactionId)) owners.add(segment.transactionId);
-            }
-            if (owners.size === possibleOwners.size) break;
-            segmentCursor = segmentPage.nextCursor;
-          } while (segmentCursor !== null);
-          for (const id of possiblyUnownedCommittedIds) {
-            if (!owners.has(id)) candidateTransactionIds.push(id);
-            if (remaining() <= 0) break;
-          }
-        }
-        if (remaining() <= 0) break;
-        transactionCursor = page.nextCursor;
-      } while (transactionCursor !== null);
-    }
-
-    if (remaining() > 0) {
-      let compactionCursor: string | null = null;
-      do {
-        const page = await this.store.listCompactionJobPage(compactionCursor, 64);
-        for (const job of page.records) {
-          if (job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted") {
-            continue;
-          }
-          addBlocks(
-            await this.#existingGarbageBlockCandidates(
-              [...job.sourceBlockIds, ...job.outputBlockIds],
-              currentBlockIds,
-              remaining(),
-            ),
-          );
-          addSegments(
-            await this.#existingGarbageSegmentCandidates(
-              [...job.sourceSegmentIds, ...compactionOutputSegmentIds(job)],
-              remaining(),
-            ),
-          );
-          if (remaining() <= 0) break;
-        }
-        if (remaining() <= 0) break;
-        compactionCursor = page.nextCursor;
-      } while (compactionCursor !== null);
-    }
-    const timestamp = this.#now().toISOString();
-    return this.store.createGarbageCollectionJob({
-      id: `garbage-collection/${this.#createId()}`,
-      candidateManifestVersions,
-      candidateSegmentIds,
-      candidateBlockIds,
-      candidateTransactionIds,
-      leaseCutoff: timestamp,
-      createdAt: timestamp,
-    });
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+    return newest?.discovery === undefined
+      ? undefined
+      : { jobId: newest.id, discovery: newest.discovery };
   }
 
-  async #existingGarbageBlockCandidates(
-    ids: readonly string[],
-    currentBlockIds: ReadonlySet<string>,
-    limit: number,
-  ): Promise<string[]> {
-    if (limit <= 0) return [];
-    // A block the current manifest still carries is not garbage, whatever else references it,
-    // and an unpruned manifest shares nearly all of its blocks with the current one. Deciding
-    // that from the set first leaves the store lookups to the few blocks that might be gone —
-    // reading every block of every manifest to find them made a planning pass cost the table
-    // times the history.
-    const possible: string[] = [];
-    const seen = new Set<string>();
-    for (const id of ids) {
-      if (currentBlockIds.has(id) || seen.has(id)) continue;
-      seen.add(id);
-      possible.push(id);
+  async #advanceGarbageCollectionPlanning(
+    initialJob: GarbageCollectionJobRecord,
+  ): Promise<GarbageCollectionJobRecord> {
+    let job = initialJob;
+    for (;;) {
+      const discovery = job.discovery;
+      if (discovery === undefined || discovery.phase === "complete") return job;
+      const candidateCount =
+        job.candidateManifestVersions.length +
+        job.candidateBlockIds.length +
+        job.candidateSegmentIds.length +
+        job.candidateTransactionIds.length;
+      let remaining = discovery.maxPlanningItems - candidateCount;
+      const currentVersion = discovery.currentManifestVersion;
+      const appendManifestVersions: number[] = [];
+      const appendBlockIds: string[] = [];
+      const appendSegmentIds: string[] = [];
+      const appendTransactionIds: string[] = [];
+      const knownBlocks = new Set(job.candidateBlockIds);
+      const knownSegments = new Set(job.candidateSegmentIds);
+      const knownTransactions = new Set(job.candidateTransactionIds);
+      let next: NonNullable<GarbageCollectionJobRecord["discovery"]> = {
+        ...discovery,
+      };
+      const addBlocks = (ids: readonly string[]) => {
+        for (const id of ids) {
+          if (remaining <= 0) break;
+          if (knownBlocks.has(id)) continue;
+          knownBlocks.add(id);
+          appendBlockIds.push(id);
+          remaining -= 1;
+        }
+      };
+      const addManifests = (versions: readonly number[]) => {
+        const known = new Set([...job.candidateManifestVersions, ...appendManifestVersions]);
+        for (const version of versions) {
+          if (remaining <= 0) break;
+          if (known.has(version)) continue;
+          known.add(version);
+          appendManifestVersions.push(version);
+          remaining -= 1;
+        }
+      };
+      const addSegments = (ids: readonly string[]) => {
+        for (const id of ids) {
+          if (remaining <= 0) break;
+          if (knownSegments.has(id)) continue;
+          knownSegments.add(id);
+          appendSegmentIds.push(id);
+          remaining -= 1;
+        }
+      };
+      const addTransactions = (ids: readonly string[]) => {
+        for (const id of ids) {
+          if (remaining <= 0) break;
+          if (knownTransactions.has(id)) continue;
+          knownTransactions.add(id);
+          appendTransactionIds.push(id);
+          remaining -= 1;
+        }
+      };
+
+      if (remaining <= 0) {
+        next = {
+          ...next,
+          phase: "complete",
+          resumePhase: discovery.phase,
+        };
+      } else if (discovery.phase === "manifests") {
+        const page = await this.store.listManifestPage(
+          discovery.manifestCursor,
+          MAINTENANCE_JOB_PAGE_SIZE,
+        );
+        let reachedPlanningCurrent = false;
+        let lastVisited = discovery.manifestCursor;
+        for (const manifest of page.records) {
+          if (
+            discovery.currentManifestVersion !== null &&
+            manifest.version >= discovery.currentManifestVersion
+          ) {
+            reachedPlanningCurrent = true;
+            break;
+          }
+          lastVisited = manifest.version;
+          const retained =
+            manifest.version > discovery.retainAboveVersion &&
+            Date.parse(manifest.createdAt) > discovery.retainAfter;
+          if (retained) continue;
+          if (manifest.prunedAt === undefined) addManifests([manifest.version]);
+          if (remaining <= 0) break;
+        }
+        const complete = reachedPlanningCurrent || page.nextCursor === null || remaining <= 0;
+        next = {
+          ...next,
+          phase: complete
+            ? remaining <= 0
+              ? "complete"
+              : (discovery.postManifestPhase ?? "manifest-blocks")
+            : "manifests",
+          resumePhase: remaining <= 0 ? "manifests" : null,
+          postManifestPhase: remaining <= 0 ? (discovery.postManifestPhase ?? null) : null,
+          manifestCursor: remaining <= 0 ? lastVisited : complete ? null : page.nextCursor,
+          visitedRecords: safeWholeNumberSum(
+            [discovery.visitedRecords, page.records.length],
+            "Garbage collection discovery records",
+          ),
+        };
+      } else if (discovery.phase === "manifest-blocks") {
+        const cursor = discovery.artifactCursor;
+        const afterBlockId = cursor?.family === "manifest" ? cursor.blockId : null;
+        const page = await this.store.listRetiredManifestBlockPage({
+          removedThroughVersion: currentVersion ?? 0,
+          afterBlockId,
+          limit: MAINTENANCE_JOB_PAGE_SIZE,
+        });
+        const pageIds = page.records.map((record) => record.blockId);
+        const scanned = await this.#existingGarbageBlockCandidatesFrom(
+          pageIds,
+          currentVersion,
+          knownBlocks,
+          0,
+          remaining,
+        );
+        addBlocks(scanned.candidateIds);
+        const pageComplete = scanned.nextIndex >= pageIds.length;
+        const reachedEnd = pageComplete && page.nextCursor === null;
+        const lastExaminedBlockId =
+          scanned.nextIndex === 0 ? afterBlockId : (pageIds[scanned.nextIndex - 1] ?? afterBlockId);
+        next = {
+          ...next,
+          phase: remaining <= 0 ? "complete" : reachedEnd ? "segments" : "manifest-blocks",
+          resumePhase: remaining <= 0 ? "manifest-blocks" : null,
+          manifestCursor: null,
+          artifactCursor:
+            reachedEnd && remaining > 0
+              ? null
+              : {
+                  family: "manifest",
+                  recordId: String(currentVersion ?? 0),
+                  blockId: lastExaminedBlockId,
+                  blockIndex: 0,
+                  segmentIndex: 0,
+                },
+          visitedRecords: safeWholeNumberSum(
+            [discovery.visitedRecords, page.records.length],
+            "Garbage collection discovery records",
+          ),
+        };
+      } else if (discovery.phase === "segments") {
+        const page = await this.store.listSegmentPage(discovery.segmentCursor, 1);
+        for (const segment of page.records) {
+          const listedOwner = await this.store.getTransaction(segment.transactionId);
+          if (
+            listedOwner?.status === "active" &&
+            Date.parse(listedOwner.expiresAt) <= Date.parse(job.leaseCutoff)
+          ) {
+            await this.store.abortTransactionIfExpired({
+              transactionId: listedOwner.id,
+              expectedOwnerId: listedOwner.ownerId,
+              expiresAtCutoff: job.leaseCutoff,
+              updatedAt: job.leaseCutoff,
+            });
+          }
+          const segmentBlockIds = [...new Set(Object.values(segment.columnBlockIds).flat())];
+          const touchesCurrent = (
+            await this.#manifestBlockPresence(currentVersion, segmentBlockIds)
+          ).some(Boolean);
+          if (!touchesCurrent) addSegments([segment.id]);
+          if (remaining <= 0) break;
+        }
+        const record = page.records[0];
+        const filled = remaining <= 0;
+        next = {
+          ...next,
+          phase: record === undefined ? "transactions" : filled ? "complete" : "segments",
+          resumePhase: filled ? "segments" : null,
+          segmentCursor: record?.id ?? null,
+          artifactCursor: null,
+          visitedRecords: safeWholeNumberSum(
+            [discovery.visitedRecords, page.records.length],
+            "Garbage collection discovery records",
+          ),
+        };
+      } else if (discovery.phase === "transactions") {
+        const cursor = discovery.artifactCursor;
+        let transaction: TransactionRecord | undefined;
+        let blockIndex = 0;
+        let segmentIndex = 0;
+        if (cursor?.family === "transaction") {
+          transaction = await this.store.getTransaction(cursor.recordId);
+          blockIndex = cursor.blockIndex;
+          segmentIndex = cursor.segmentIndex;
+        } else {
+          const page = await this.store.listTransactionPage(discovery.transactionCursor, 1);
+          transaction = page.records[0];
+          if (transaction === undefined) {
+            next = {
+              ...next,
+              phase: "compactions",
+              transactionCursor: null,
+              artifactCursor: null,
+              resumePhase: null,
+            };
+          }
+        }
+        if (transaction !== undefined) {
+          if (
+            transaction.status === "active" &&
+            Date.parse(transaction.expiresAt) <= Date.parse(job.leaseCutoff)
+          ) {
+            transaction =
+              (await this.store.abortTransactionIfExpired({
+                transactionId: transaction.id,
+                expectedOwnerId: transaction.ownerId,
+                expiresAtCutoff: job.leaseCutoff,
+                updatedAt: job.leaseCutoff,
+              })) ?? transaction;
+          }
+          let revisit = false;
+          if (transaction.status === "aborted") {
+            const blocks = await this.#existingGarbageBlockCandidatesFrom(
+              transaction.pendingBlockIds,
+              currentVersion,
+              knownBlocks,
+              blockIndex,
+              remaining,
+            );
+            addBlocks(blocks.candidateIds);
+            blockIndex = blocks.nextIndex;
+            if (blockIndex >= transaction.pendingBlockIds.length && remaining > 0) {
+              const segments = await this.#existingGarbageSegmentCandidatesFrom(
+                transaction.pendingSegmentIds,
+                knownSegments,
+                segmentIndex,
+                remaining,
+              );
+              addSegments(segments.candidateIds);
+              segmentIndex = segments.nextIndex;
+            }
+            revisit =
+              blocks.candidateIds.length > 0 ||
+              appendSegmentIds.length > 0 ||
+              blockIndex < transaction.pendingBlockIds.length ||
+              segmentIndex < transaction.pendingSegmentIds.length;
+            if (!revisit) addTransactions([transaction.id]);
+          } else if (transaction.status === "committed" && transaction.committedVersion !== null) {
+            const manifest = await this.store.getManifest(transaction.committedVersion);
+            if (
+              manifest === undefined ||
+              manifest.prunedAt !== undefined ||
+              job.candidateManifestVersions.includes(transaction.committedVersion) ||
+              appendManifestVersions.includes(transaction.committedVersion)
+            ) {
+              addTransactions([transaction.id]);
+            }
+          }
+          const filled = remaining <= 0;
+          next = {
+            ...next,
+            phase: filled ? "complete" : "transactions",
+            resumePhase: filled ? "transactions" : null,
+            transactionCursor: revisit ? discovery.transactionCursor : transaction.id,
+            artifactCursor: revisit
+              ? {
+                  family: "transaction",
+                  recordId: transaction.id,
+                  blockId: null,
+                  blockIndex,
+                  segmentIndex,
+                }
+              : null,
+            visitedRecords: safeWholeNumberSum(
+              [discovery.visitedRecords, cursor?.family === "transaction" ? 0 : 1],
+              "Garbage collection discovery records",
+            ),
+          };
+        } else if (cursor?.family === "transaction") {
+          next = {
+            ...next,
+            transactionCursor: cursor.recordId,
+            artifactCursor: null,
+            resumePhase: null,
+          };
+        }
+      } else {
+        const cursor = discovery.artifactCursor;
+        let compaction: CompactionJobRecord | undefined;
+        let blockIndex = 0;
+        let segmentIndex = 0;
+        if (cursor?.family === "compaction") {
+          compaction = await this.store.getCompactionJob(cursor.recordId);
+          blockIndex = cursor.blockIndex;
+          segmentIndex = cursor.segmentIndex;
+        } else {
+          const page = await this.store.listCompactionJobPage(discovery.compactionCursor, 1);
+          compaction = page.records[0];
+          if (compaction === undefined) {
+            next = {
+              ...next,
+              phase: "complete",
+              compactionCursor: null,
+              artifactCursor: null,
+              resumePhase: null,
+            };
+          }
+        }
+        if (compaction !== undefined) {
+          const terminal =
+            compaction.state === "published" ||
+            compaction.state === "cancelled" ||
+            compaction.state === "aborted";
+          let revisit = false;
+          if (terminal) {
+            const blockIds = [...compaction.sourceBlockIds, ...compaction.outputBlockIds];
+            const blocks = await this.#existingGarbageBlockCandidatesFrom(
+              blockIds,
+              currentVersion,
+              knownBlocks,
+              blockIndex,
+              remaining,
+            );
+            addBlocks(blocks.candidateIds);
+            blockIndex = blocks.nextIndex;
+            const segmentIds = [
+              ...compaction.sourceSegmentIds,
+              ...compactionOutputSegmentIds(compaction),
+            ];
+            if (blockIndex >= blockIds.length && remaining > 0) {
+              const segments = await this.#existingGarbageSegmentCandidatesFrom(
+                segmentIds,
+                knownSegments,
+                segmentIndex,
+                remaining,
+              );
+              addSegments(segments.candidateIds);
+              segmentIndex = segments.nextIndex;
+            }
+            revisit =
+              blocks.candidateIds.length > 0 ||
+              appendSegmentIds.length > 0 ||
+              blockIndex < blockIds.length ||
+              segmentIndex < segmentIds.length;
+          }
+          const filled = remaining <= 0;
+          next = {
+            ...next,
+            phase: filled ? "complete" : "compactions",
+            resumePhase: filled ? "compactions" : null,
+            compactionCursor: revisit ? discovery.compactionCursor : compaction.id,
+            artifactCursor: revisit
+              ? {
+                  family: "compaction",
+                  recordId: compaction.id,
+                  blockId: null,
+                  blockIndex,
+                  segmentIndex,
+                }
+              : null,
+            visitedRecords: safeWholeNumberSum(
+              [discovery.visitedRecords, cursor?.family === "compaction" ? 0 : 1],
+              "Garbage collection discovery records",
+            ),
+          };
+        } else if (cursor?.family === "compaction") {
+          next = {
+            ...next,
+            compactionCursor: cursor.recordId,
+            artifactCursor: null,
+            resumePhase: null,
+          };
+        }
+      }
+
+      try {
+        job = await this.store.updateGarbageCollectionPlanning({
+          jobId: job.id,
+          expectedRevision: job.revision,
+          ...(appendManifestVersions.length === 0
+            ? {}
+            : { candidateManifestVersions: appendManifestVersions }),
+          ...(appendSegmentIds.length === 0 ? {} : { candidateSegmentIds: appendSegmentIds }),
+          ...(appendBlockIds.length === 0 ? {} : { candidateBlockIds: appendBlockIds }),
+          ...(appendTransactionIds.length === 0
+            ? {}
+            : { candidateTransactionIds: appendTransactionIds }),
+          discovery: next,
+          updatedAt: dateIsoString(this.#now()),
+        });
+        return job;
+      } catch (error) {
+        if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+        const latest = await this.store.getGarbageCollectionJob(job.id);
+        if (latest === undefined) throw error;
+        job = latest;
+      }
     }
+  }
+
+  async #existingGarbageBlockCandidatesFrom(
+    ids: readonly string[],
+    currentVersion: number | null,
+    alreadyPlanned: ReadonlySet<string>,
+    startIndex: number,
+    limit: number,
+  ): Promise<{ candidateIds: string[]; nextIndex: number }> {
+    if (limit <= 0) return { candidateIds: [], nextIndex: startIndex };
+    // A block the current manifest still carries is not garbage, whatever else references it.
+    // Ask the adapter's interval-membership index in bounded windows instead of materializing
+    // the current database-sized membership set in the planner.
     const candidates: string[] = [];
-    for (let start = 0; start < possible.length && candidates.length < limit; start += 64) {
-      const page = possible.slice(start, start + 64);
-      const blocks = await this.store.getBlocks(page);
+    let nextIndex = startIndex;
+    while (nextIndex < ids.length && candidates.length < limit) {
+      const page: string[] = [];
+      const pageLimit = Math.min(64, limit - candidates.length);
+      while (nextIndex < ids.length && page.length < pageLimit) {
+        const id = ids[nextIndex];
+        nextIndex += 1;
+        if (id === undefined || alreadyPlanned.has(id)) continue;
+        page.push(id);
+      }
+      if (page.length === 0) continue;
+      const present = await this.#manifestBlockPresence(currentVersion, page);
+      const blocks = await this.#getBlocksWindowed(page);
       for (let index = 0; index < page.length && candidates.length < limit; index += 1) {
         const id = page[index] ?? "";
-        if (blocks[index] !== undefined) candidates.push(id);
+        if (present[index] !== true && blocks[index] !== undefined) candidates.push(id);
       }
     }
-    return candidates;
+    return { candidateIds: candidates, nextIndex };
   }
 
-  async #existingGarbageSegmentCandidates(
+  async #existingGarbageSegmentCandidatesFrom(
     ids: readonly string[],
+    alreadyPlanned: ReadonlySet<string>,
+    startIndex: number,
     limit: number,
-  ): Promise<string[]> {
+  ): Promise<{ candidateIds: string[]; nextIndex: number }> {
     const candidates: string[] = [];
-    const seen = new Set<string>();
-    for (const id of ids) {
-      if (candidates.length >= limit) break;
-      if (seen.has(id) || (await this.store.getSegment(id)) === undefined) continue;
-      seen.add(id);
+    let nextIndex = startIndex;
+    while (nextIndex < ids.length && candidates.length < limit) {
+      const id = ids[nextIndex];
+      nextIndex += 1;
+      if (
+        id === undefined ||
+        alreadyPlanned.has(id) ||
+        (await this.store.getSegment(id)) === undefined
+      ) {
+        continue;
+      }
       candidates.push(id);
     }
-    return candidates;
+    return { candidateIds: candidates, nextIndex };
   }
 
   async #runGarbageCollectionJob(
@@ -9894,8 +12529,22 @@ export class MinnowDatabase {
   ): Promise<GarbageCollectionProgress> {
     let job = initialJob;
     for (;;) {
+      if (job.discovery !== undefined && job.discovery.phase !== "complete") {
+        for (
+          let page = 0;
+          page < GARBAGE_COLLECTION_DISCOVERY_PAGES_PER_STEP &&
+          job.discovery !== undefined &&
+          job.discovery.phase !== "complete";
+          page += 1
+        ) {
+          job = await this.#advanceGarbageCollectionPlanning(job);
+        }
+        if (job.discovery !== undefined && job.discovery.phase !== "complete") {
+          return garbageCollectionProgress(job);
+        }
+      }
       if (job.state === "completed") {
-        await this.store.removePrunedManifestRecords();
+        await this.store.removePrunedManifestRecords(MAINTENANCE_JOB_PAGE_SIZE);
         return garbageCollectionProgress(job);
       }
       try {
@@ -9903,9 +12552,11 @@ export class MinnowDatabase {
           jobId: job.id,
           expectedRevision: job.revision,
           maxItems,
-          updatedAt: this.#now().toISOString(),
+          updatedAt: dateIsoString(this.#now()),
         });
-        if (step.job.state === "completed") await this.store.removePrunedManifestRecords();
+        if (step.job.state === "completed") {
+          await this.store.removePrunedManifestRecords(MAINTENANCE_JOB_PAGE_SIZE);
+        }
         return garbageCollectionProgress(step.job);
       } catch (error) {
         if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
@@ -9940,18 +12591,8 @@ export class MinnowDatabase {
     version: number | null,
     snapshot: LeasedSnapshot,
   ): Promise<CompactionJobRecord | CompactTableResult> {
-    const legacyMinimumSegments: number | undefined = Reflect.get(options, "minimumSegments");
-    if (
-      options.minimumLevel0Segments !== undefined &&
-      legacyMinimumSegments !== undefined &&
-      options.minimumLevel0Segments !== legacyMinimumSegments
-    ) {
-      throw new RangeError("Compaction L0 segment thresholds conflict");
-    }
     const minimumLevel0Segments = positiveWholeNumber(
-      options.minimumLevel0Segments ??
-        legacyMinimumSegments ??
-        DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS,
+      options.minimumLevel0Segments ?? DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS,
       "Compaction minimum L0 segments",
     );
     const maxLevel0Segments = positiveWholeNumber(
@@ -10061,7 +12702,7 @@ export class MinnowDatabase {
     } else if (
       table.uniqueKeyColumnId !== undefined ||
       visibleSegments.some(
-        (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+        (segment) => segment.kind !== "insert" || segment.rowIdSpans.length !== 0,
       )
     ) {
       // Keyed multi-range L2: merge (the level-one partitions + oldest level-zero prefix) into
@@ -10141,7 +12782,7 @@ export class MinnowDatabase {
       // anyway; otherwise they open a new partition behind it and it stays untouched.
       const last = keyedLevelOne.partitions[keyedLevelOne.partitions.length - 1];
       const bearsNewRows = level0Selection.segments.some((segment) =>
-        mergeSourceBearsRows(segment.kind ?? "insert"),
+        mergeSourceBearsRows(segment.kind),
       );
       const absorbsTail =
         last !== undefined &&
@@ -10157,18 +12798,22 @@ export class MinnowDatabase {
         partitions: keyedLevelOne.partitions,
         partitionRows,
         absorbsTail,
-        nextLevelZeroOrder: level0Selection.nextLogicalOrder ?? version + 1,
+        nextLevelZeroOrder:
+          level0Selection.nextLogicalOrder ??
+          safeWholeNumberSum([version, 1], "Compaction successor logical order"),
       };
     } else if (keylessLevelOne !== undefined) {
       const last = keylessLevelOne.partitions.at(-1);
-      // A partial tail is extended. An oversized legacy anchor is included once so this fold
+      // A partial tail is extended. A pre-existing oversized anchor is included once so this fold
       // heals it into bounded partitions; a full tail stays immutable and new rows start after it.
       const absorbsTail =
         last !== undefined && (last.rowCount < partitionRows || last.rowCount > partitionRows);
       anchors = absorbsTail ? [last] : [];
       rechunkPartitioning = {
         partitionRows,
-        nextLevelZeroOrder: level0Selection.nextLogicalOrder ?? version + 1,
+        nextLevelZeroOrder:
+          level0Selection.nextLogicalOrder ??
+          safeWholeNumberSum([version, 1], "Compaction successor logical order"),
       };
     }
     const anchorMeasurement = await this.#measureCompactionSources(
@@ -10193,8 +12838,7 @@ export class MinnowDatabase {
         ? true
         : targetLevel === 1 &&
           sourceSegments.some(
-            (segment) =>
-              (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+            (segment) => segment.kind !== "insert" || segment.rowIdSpans.length !== 0,
           );
     if (
       !requiresMerge &&
@@ -10281,23 +12925,10 @@ export class MinnowDatabase {
       // Attempts at promoting the same sources share one lifetime ceiling: bytes a cancelled
       // or aborted attempt already wrote for this manifest version reduce what the next
       // attempt may spend, so repeated failures cannot multiply the physical write budget.
-      const priorAttemptOutputStoredBytes = (await this.store.listCompactionJobs(table.id))
-        .filter(
-          (candidate) =>
-            (candidate.state === "cancelled" || candidate.state === "aborted") &&
-            (candidate.id === baseJobId || candidate.id.startsWith(`${baseJobId}/retry/`)),
-        )
-        .reduce(
-          (largest, candidate) =>
-            Math.max(
-              largest,
-              safeWholeNumberSum(
-                [candidate.priorAttemptOutputStoredBytes ?? 0, candidate.outputStoredBytes],
-                "Compaction prior-attempt output stored bytes",
-              ),
-            ),
-          0,
-        );
+      const priorAttemptOutputStoredBytes = await this.#priorCompactionAttemptOutputStoredBytes(
+        table.id,
+        baseJobId,
+      );
       const maximumOutputStoredBytes = Math.max(
         0,
         floorWholeNumberProduct(
@@ -10342,7 +12973,7 @@ export class MinnowDatabase {
       return existing;
     }
     if (existing !== undefined) id = `${id}/retry/${this.#createId()}`;
-    const timestamp = this.#now().toISOString();
+    const timestamp = dateIsoString(this.#now());
     const job: CompactionJobRecord = {
       id,
       tableId: table.id,
@@ -10387,8 +13018,42 @@ export class MinnowDatabase {
     } catch (error) {
       const raced = await this.store.getCompactionJob(id);
       if (raced !== undefined) return raced;
+      if (error instanceof CompactionJobConflictError) {
+        const active = await this.#findActiveCompactionJob(table.id);
+        if (active !== undefined) return active;
+      }
       throw error;
     }
+  }
+
+  async #priorCompactionAttemptOutputStoredBytes(
+    tableId: string,
+    baseJobId: string,
+  ): Promise<number> {
+    let largest = 0;
+    let cursor: string | null = null;
+    do {
+      const page = await this.store.listCompactionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const candidate of page.records) {
+        if (
+          candidate.tableId !== tableId ||
+          (candidate.state !== "cancelled" && candidate.state !== "aborted") ||
+          (candidate.id !== baseJobId && !candidate.id.startsWith(`${baseJobId}/retry/`))
+        ) {
+          continue;
+        }
+        largest = Math.max(
+          largest,
+          safeWholeNumberSum(
+            [candidate.priorAttemptOutputStoredBytes ?? 0, candidate.outputStoredBytes],
+            "Compaction prior-attempt output stored bytes",
+          ),
+        );
+      }
+      cursor = page.nextCursor;
+      if (cursor !== null) await yieldToEventLoop();
+    } while (cursor !== null);
+    return largest;
   }
 
   /**
@@ -10447,7 +13112,7 @@ export class MinnowDatabase {
       if (owner?.status !== "committed" || owner.committedVersion === null) {
         throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
       }
-      return segment.logicalOrder ?? owner.committedVersion;
+      return segment.logicalOrder;
     };
     const seenBlockIds = new Set<string>();
     const selected: SegmentRecord[] = [];
@@ -10513,9 +13178,7 @@ export class MinnowDatabase {
   ): Promise<Set<string>> {
     const touched = new Set<string>();
     if (partitions.length === 0) return touched;
-    const deltas = level0Segments.filter((segment) =>
-      mergeSourceReferencesKeys(segment.kind ?? "insert"),
-    );
+    const deltas = level0Segments.filter((segment) => mergeSourceReferencesKeys(segment.kind));
     if (deltas.length === 0) return touched;
     const referencedBytes = safeWholeNumberProduct(
       deltas.reduce((total, segment) => total + segment.rowCount, 0),
@@ -10669,11 +13332,11 @@ export class MinnowDatabase {
     if (!Number.isFinite(maximumEncodedBytesPerRow) || maximumEncodedBytesPerRow <= 0) {
       throw new Error("Compaction could not estimate an output block size");
     }
-    const rowsPerOutput = Math.max(
-      1,
-      Math.min(0xffff_ffff, Math.floor(targetBlockBytes / maximumEncodedBytesPerRow)),
+    const rowsPerOutput = estimateCompactionRowsPerOutput(
+      targetBlockBytes,
+      maximumEncodedBytesPerRow,
     );
-    const logicalOrder = await this.#firstLogicalOrder(sourceSegments);
+    const logicalOrder = this.#firstLogicalOrder(sourceSegments);
     const partitions =
       partitioning === undefined
         ? undefined
@@ -10750,7 +13413,7 @@ export class MinnowDatabase {
       if (transaction?.status !== "committed" || transaction.committedVersion === null) {
         throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
       }
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       const keyColumnId = segment.keyColumnId ?? table.uniqueKeyColumnId ?? null;
       if (keyColumnId !== keyColumn.id) {
         throw new Error(`Compaction source key differs from the table key: ${segment.id}`);
@@ -10807,8 +13470,8 @@ export class MinnowDatabase {
         committedVersion: transaction.committedVersion,
         kind,
         keyColumnId,
-        level: segment.level ?? 0,
-        logicalOrder: segment.logicalOrder ?? transaction.committedVersion,
+        level: segment.level,
+        logicalOrder: segment.logicalOrder,
         rowCount: segment.rowCount,
         rowIdStart: segment.rowIdStart,
         rowIdEndExclusive: segment.rowIdEndExclusive,
@@ -10856,9 +13519,9 @@ export class MinnowDatabase {
       if (!Number.isFinite(maximumEncodedBytesPerRow) || maximumEncodedBytesPerRow <= 0) {
         throw new Error("Compaction could not estimate an output block size");
       }
-      const rowsPerOutput = Math.max(
-        1,
-        Math.min(0xffff_ffff, Math.floor(targetBlockBytes / maximumEncodedBytesPerRow)),
+      const rowsPerOutput = estimateCompactionRowsPerOutput(
+        targetBlockBytes,
+        maximumEncodedBytesPerRow,
       );
       // Windows never straddle a partition: each partition's blocks are its own.
       const estimatedOutputs: RechunkCompactionOutputWindow[] = [];
@@ -11275,9 +13938,16 @@ export class MinnowDatabase {
       job.transactionId === null ? undefined : await this.store.getTransaction(job.transactionId);
     if (linkedTransaction?.status === "committed" && linkedTransaction.committedVersion !== null) {
       job = await this.#markCompactionPublished(job, linkedTransaction.committedVersion);
+      const recoveredManifest = await this.store.getManifest(linkedTransaction.committedVersion);
+      if (recoveredManifest === undefined) {
+        throw new Error(
+          `Compaction manifest is missing: ${String(linkedTransaction.committedVersion)}`,
+        );
+      }
+      this.#afterCompactionCommit(recoveredManifest);
       return this.#publishedCompactionProgress(table, job);
     }
-    const rewritePlan = job.rewritePlan ?? { kind: "copy-v1" as const };
+    const rewritePlan = job.rewritePlan;
     if (rewritePlan.kind !== "copy-v1") validatePhysicalTablePlan(table, rewritePlan);
     const sourceSegments =
       rewritePlan.kind === "copy-v1" ? await this.#loadCompactionSources(job) : [];
@@ -11302,7 +13972,7 @@ export class MinnowDatabase {
           if (job.state !== "running") {
             job = await this.store.updateCompactionJob(job.id, job.revision, {
               state: "running",
-              updatedAt: this.#now().toISOString(),
+              updatedAt: dateIsoString(this.#now()),
               error: null,
             });
           }
@@ -11314,6 +13984,12 @@ export class MinnowDatabase {
       }
       throw error;
     }
+
+    // Recovery may need to atomically adopt the prior aborted attempt's exact output segment
+    // before this replacement reaches publication. Bind the replacement transaction to the
+    // durable job as soon as it is acquired; delaying until commit leaves adoption unable to
+    // prove which compaction authorized the journal transfer.
+    transaction.setCompactionIntent(job.id, job.sourceBlockIds);
 
     try {
       if (job.outputBlockIds.length > 0) {
@@ -11343,7 +14019,7 @@ export class MinnowDatabase {
             job = await this.store.updateCompactionJob(job.id, job.revision, {
               cursor: { sourceSegmentIndex: segmentIndex + 1, sourceBlockIndex: 0 },
               processedRows: job.processedRows + segment.rowCount,
-              updatedAt: this.#now().toISOString(),
+              updatedAt: dateIsoString(this.#now()),
             });
             continue;
           }
@@ -11376,7 +14052,7 @@ export class MinnowDatabase {
             sourceStoredBytes: job.sourceStoredBytes + source.byteLength,
             outputStoredBytes: job.outputStoredBytes + source.byteLength,
             logicalBytes: job.logicalBytes + description.encodedLength,
-            updatedAt: this.#now().toISOString(),
+            updatedAt: dateIsoString(this.#now()),
             error: null,
           });
           processedBlocks += 1;
@@ -11416,7 +14092,7 @@ export class MinnowDatabase {
         }
       } else {
         if (outputSegmentId === null) throw new Error("Compaction output segment ID is missing");
-        const createdAt = this.#now().toISOString();
+        const createdAt = dateIsoString(this.#now());
         const desiredOutputSegments: SegmentRecord[] =
           rewritePlan.kind === "copy-v1"
             ? [
@@ -11436,7 +14112,9 @@ export class MinnowDatabase {
                   ...(job.outputPartitionOrdinal === undefined
                     ? {}
                     : { partitionOrdinal: job.outputPartitionOrdinal }),
-                  logicalOrder: await this.#firstLogicalOrder(sourceSegments),
+                  logicalOrder: this.#firstLogicalOrder(sourceSegments),
+                  commitOrdinal: 0,
+                  rowIdSpans: [],
                   createdAt,
                 },
               ]
@@ -11453,18 +14131,19 @@ export class MinnowDatabase {
         job = await this.store.updateCompactionJob(job.id, job.revision, {
           outputBlockIds: expectedOutputIds,
           state: "ready",
-          updatedAt: this.#now().toISOString(),
+          updatedAt: dateIsoString(this.#now()),
           error: null,
         });
       }
 
-      transaction.supersedeBlocks(job.sourceBlockIds);
+      transaction.setCompactionIntent(job.id, job.sourceBlockIds);
       transaction.markLogicallyUnchanged();
       let manifest: ManifestSummary;
       for (;;) {
         let publicationConflict: WriteConflictError | undefined;
         try {
           manifest = await transaction.commit();
+          this.#afterCompactionCommit(manifest);
           break;
         } catch (error) {
           if (!(error instanceof WriteConflictError)) throw error;
@@ -11477,9 +14156,12 @@ export class MinnowDatabase {
         // manifest CAS again between rebase and commit, leaving an otherwise complete job stuck
         // in `ready` after the last write. Keep rebasing until publication wins or a source
         // genuinely changes.
-        const current = await this.store.getCurrentManifest();
-        const currentIds = new Set(current?.blockIds ?? []);
-        if (job.sourceBlockIds.some((id) => !currentIds.has(id))) {
+        const currentVersion = await this.store.getCurrentManifestVersion();
+        const sourcePresence = await this.#manifestBlockPresence(
+          currentVersion,
+          job.sourceBlockIds,
+        );
+        if (sourcePresence.some((present) => !present)) {
           if (transaction.status === "active") await transaction.abort();
           job = await this.#abortCompactionJob(
             job,
@@ -11495,7 +14177,7 @@ export class MinnowDatabase {
           job = await this.#abortCompactionJob(job, errorMessage(error));
           throw new Error(job.error, { cause: error });
         }
-        const missingSourceId = job.sourceBlockIds.find((id) => !rebased.hasBlock(id));
+        const missingSourceId = await firstMissingSnapshotBlock(rebased, job.sourceBlockIds);
         if (missingSourceId !== undefined) {
           if (transaction.status === "active") await transaction.abort();
           job = await this.#abortCompactionJob(
@@ -11504,7 +14186,7 @@ export class MinnowDatabase {
           );
           throw new Error(job.error, { cause: publicationConflict });
         }
-        transaction.supersedeBlocks(job.sourceBlockIds);
+        transaction.setCompactionIntent(job.id, job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
         await yieldToEventLoop();
       }
@@ -11539,7 +14221,7 @@ export class MinnowDatabase {
       ) {
         try {
           await this.store.updateCompactionJob(latest.id, latest.revision, {
-            updatedAt: this.#now().toISOString(),
+            updatedAt: dateIsoString(this.#now()),
             error: errorMessage(error),
           });
         } catch {
@@ -11562,7 +14244,7 @@ export class MinnowDatabase {
     while ((job.outputCursor?.outputIndex ?? 0) < layout.outputs.length) {
       if (processedBlocks >= maxBlocks) break;
       const cursor = job.outputCursor;
-      if (cursor === null || cursor === undefined) {
+      if (cursor === null) {
         throw new Error("Physical compaction cursor is missing");
       }
       const output = layout.outputs[cursor.outputIndex];
@@ -11575,7 +14257,7 @@ export class MinnowDatabase {
         layout,
         column,
         output,
-        job.memoryBudgetBytes ?? 0,
+        job.memoryBudgetBytes,
       );
       const existing = await this.store.getBlock(outputBlockId);
       let outputBytes: Uint8Array;
@@ -11639,11 +14321,11 @@ export class MinnowDatabase {
         processedRows: nextRowStart,
         outputStoredBytes: nextOutputStoredBytes,
         outputLogicalBytes: safeWholeNumberSum(
-          [job.outputLogicalBytes ?? 0, description.encodedLength],
+          [job.outputLogicalBytes, description.encodedLength],
           "Compaction output logical bytes",
         ),
-        peakWorkingBytes: Math.max(job.peakWorkingBytes ?? 0, built.peakWorkingBytes),
-        updatedAt: this.#now().toISOString(),
+        peakWorkingBytes: Math.max(job.peakWorkingBytes, built.peakWorkingBytes),
+        updatedAt: dateIsoString(this.#now()),
         error: null,
       });
       processedBlocks += 1;
@@ -11735,33 +14417,35 @@ export class MinnowDatabase {
     job: CompactionJobRecord,
     snapshot: Snapshot,
   ): Promise<void> {
-    const plan = job.rewritePlan ?? { kind: "copy-v1" as const };
+    const plan = job.rewritePlan;
     const sourceIds = new Set(job.sourceSegmentIds);
-    const allVisibleSegments = (await this.store.listSegments()).filter((segment) =>
-      Object.values(segment.columnBlockIds)
-        .flat()
-        .every((blockId) => snapshot.hasBlock(blockId)),
-    );
+    const tableSegments = await listTableSegmentsPaged(this.store, job.tableId);
+    const visibleSegments = await filterSnapshotSegments(snapshot, tableSegments);
     const plannedSourceSegments = (
       await Promise.all(job.sourceSegmentIds.map((id) => this.store.getSegment(id)))
     ).filter((segment): segment is SegmentRecord => segment !== undefined);
     const transactions = new Map(
       (
-        await this.#transactionRecordsForSegments([...allVisibleSegments, ...plannedSourceSegments])
+        await this.#transactionRecordsForSegments([...visibleSegments, ...plannedSourceSegments])
       ).map((record) => [record.id, record]),
     );
-    const visibleSegments = allVisibleSegments.filter((segment) => segment.tableId === job.tableId);
     const sourceBlockIds = new Set(job.sourceBlockIds);
-    for (const segment of allVisibleSegments) {
-      if (sourceIds.has(segment.id)) continue;
-      if (
-        Object.values(segment.columnBlockIds)
-          .flat()
-          .some((blockId) => sourceBlockIds.has(blockId))
-      ) {
-        throw new Error(`Concurrent segment shares a compaction source block: ${segment.id}`);
+    let segmentCursor: string | null = null;
+    do {
+      const page = await this.store.listSegmentPage(segmentCursor, MAINTENANCE_JOB_PAGE_SIZE);
+      for (const segment of page.records) {
+        if (sourceIds.has(segment.id)) continue;
+        if (
+          Object.values(segment.columnBlockIds)
+            .flat()
+            .some((blockId) => sourceBlockIds.has(blockId))
+        ) {
+          throw new Error(`Concurrent segment shares a compaction source block: ${segment.id}`);
+        }
       }
-    }
+      segmentCursor = page.nextCursor;
+      if (segmentCursor !== null) await yieldToEventLoop();
+    } while (segmentCursor !== null);
     if (
       job.outputPartitionOrdinal === undefined &&
       job.targetLevel === 1 &&
@@ -11817,7 +14501,7 @@ export class MinnowDatabase {
           throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
         }
         const tuple = {
-          logicalOrder: segment.logicalOrder ?? committedVersion,
+          logicalOrder: segment.logicalOrder,
           committedVersion,
           segmentId: segment.id,
         };
@@ -11839,14 +14523,14 @@ export class MinnowDatabase {
         retainedPartitionOrdinals.push(segment.partitionOrdinal);
         continue;
       }
-      if ((segment.level ?? 0) !== 0) {
+      if (segment.level !== 0) {
         throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
       }
       const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
       if (committedVersion === null || committedVersion === undefined) {
         throw new Error(`Concurrent compaction segment has no committed owner: ${segment.id}`);
       }
-      const logicalOrder = segment.logicalOrder ?? committedVersion;
+      const logicalOrder = segment.logicalOrder;
       if (
         logicalOrder <= outputLogicalOrder ||
         compareMergeSourceOrder(latestSource, {
@@ -11895,7 +14579,7 @@ export class MinnowDatabase {
     }
     const plannedVisible = await this.#visibleSegmentRecords(
       table,
-      new Snapshot(this.store, sourceManifest.version, sourceManifest.blockIds),
+      new Snapshot(this.store, sourceManifest.version),
     );
     const plannedById = new Map(plannedVisible.map((segment) => [segment.id, segment]));
     const plannedLayout =
@@ -11952,7 +14636,7 @@ export class MinnowDatabase {
     );
     for (const segment of visibleSegments) {
       if (sourceIds.has(segment.id)) continue;
-      if ((segment.level ?? 0) === 1) {
+      if (segment.level === 1) {
         const planned = retained.get(segment.id);
         if (
           planned?.transactionId !== segment.transactionId ||
@@ -11962,7 +14646,7 @@ export class MinnowDatabase {
         }
         continue;
       }
-      if ((segment.level ?? 0) !== 0) {
+      if (segment.level !== 0) {
         throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
       }
       const tuple = sourceOrderTuple(segment, transactions, "Concurrent compaction segment");
@@ -11994,11 +14678,7 @@ export class MinnowDatabase {
         `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
       );
     }
-    const plannedSnapshot = new Snapshot(
-      this.store,
-      sourceManifest.version,
-      sourceManifest.blockIds,
-    );
+    const plannedSnapshot = new Snapshot(this.store, sourceManifest.version);
     const plannedVisible = await this.#visibleSegmentRecords(table, plannedSnapshot);
     const plannedLayout = appendLevelTwoLayout(plannedVisible);
     if (
@@ -12069,10 +14749,10 @@ export class MinnowDatabase {
     }
     for (const segment of currentTail) {
       if (
-        (segment.level ?? 0) !== 0 ||
+        segment.level !== 0 ||
         segment.partitionOrdinal !== undefined ||
-        (segment.kind ?? "insert") !== "insert" ||
-        segment.rowIdSpans !== undefined
+        segment.kind !== "insert" ||
+        segment.rowIdSpans.length !== 0
       ) {
         throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
       }
@@ -12107,7 +14787,7 @@ export class MinnowDatabase {
       }
       throw error;
     }
-    const missingSourceId = job.sourceBlockIds.find((id) => !snapshot.hasBlock(id));
+    const missingSourceId = await firstMissingSnapshotBlock(snapshot, job.sourceBlockIds);
     if (missingSourceId !== undefined) {
       if (candidate.status === "active") await candidate.abort();
       const latest = await this.store.getCompactionJob(job.id);
@@ -12129,7 +14809,7 @@ export class MinnowDatabase {
       const linked = await this.store.updateCompactionJob(job.id, job.revision, {
         state: "running",
         transactionId: candidate.id,
-        updatedAt: this.#now().toISOString(),
+        updatedAt: dateIsoString(this.#now()),
         error: null,
       });
       return { job: linked, transaction: candidate };
@@ -12155,7 +14835,7 @@ export class MinnowDatabase {
       return await this.store.updateCompactionJob(job.id, job.revision, {
         state: "published",
         publishedVersion: version,
-        updatedAt: this.#now().toISOString(),
+        updatedAt: dateIsoString(this.#now()),
         error: null,
       });
     } catch (error) {
@@ -12165,7 +14845,7 @@ export class MinnowDatabase {
         return this.store.updateCompactionJob(latest.id, latest.revision, {
           state: "published",
           publishedVersion: version,
-          updatedAt: this.#now().toISOString(),
+          updatedAt: dateIsoString(this.#now()),
           error: null,
         });
       }
@@ -12196,23 +14876,28 @@ export class MinnowDatabase {
       return;
     }
     const owner = await this.store.getTransaction(existing.transactionId);
-    if (
-      (owner !== undefined && owner.status !== "aborted") ||
-      !sameCompactionSegment(existing, desired)
-    ) {
+    if (owner?.status !== "aborted" || !sameCompactionSegment(existing, desired)) {
       throw new Error(`Compaction output segment cannot be adopted: ${desired.id}`);
     }
     if (await this.#unprunedManifestContainsAll(expectedOutputIds)) {
       throw new Error(`Compaction output segment is already visible: ${desired.id}`);
     }
-    await this.store.removeSegment(desired.id);
-    await transaction.stageSegment(desired);
+    await transaction.adoptAbortedCompactionSegment(
+      {
+        ...desired,
+        // The timestamp was fixed by the first durable staging attempt. commitOrdinal belongs to
+        // the replacement journal and is rewritten atomically when an earlier partition has
+        // already moved out of the aborted owner's journal.
+        createdAt: existing.createdAt,
+      },
+      owner,
+    );
   }
 
   async #abortCompactionJob(job: CompactionJobRecord, error: string): Promise<CompactionJobRecord> {
     return this.store.updateCompactionJob(job.id, job.revision, {
       state: "aborted",
-      updatedAt: this.#now().toISOString(),
+      updatedAt: dateIsoString(this.#now()),
       error,
     });
   }
@@ -12233,9 +14918,9 @@ export class MinnowDatabase {
     job: CompactionJobRecord,
     version: number,
   ): CompactTableResult {
-    const rewritePlan = job.rewritePlan ?? { kind: "copy-v1" as const };
+    const rewritePlan = job.rewritePlan;
     const rowCount = rewritePlan.kind === "copy-v1" ? job.processedRows : rewritePlan.totalRows;
-    const outputLogicalBytes = job.outputLogicalBytes ?? job.logicalBytes;
+    const outputLogicalBytes = job.outputLogicalBytes;
     const totalMs = Math.max(Date.parse(job.updatedAt) - Date.parse(job.createdAt), 0);
     return {
       jobId: job.id,
@@ -12249,13 +14934,9 @@ export class MinnowDatabase {
       rowCount,
       sourceStoredBytes: job.sourceStoredBytes,
       outputStoredBytes: job.outputStoredBytes,
-      ...(job.level0SourceStoredBytes === undefined || job.anchorSourceStoredBytes === undefined
-        ? {}
-        : {
-            level0SourceStoredBytes: job.level0SourceStoredBytes,
-            anchorSourceStoredBytes: job.anchorSourceStoredBytes,
-            compactionWriteAmplification: job.outputStoredBytes / job.level0SourceStoredBytes,
-          }),
+      level0SourceStoredBytes: job.level0SourceStoredBytes,
+      anchorSourceStoredBytes: job.anchorSourceStoredBytes,
+      compactionWriteAmplification: job.outputStoredBytes / job.level0SourceStoredBytes,
       ...(job.outputPartitionOrdinal === undefined
         ? {}
         : {
@@ -12272,9 +14953,9 @@ export class MinnowDatabase {
         ? {
             targetBlockBytes: rewritePlan.targetBlockBytes,
             outputCompression: rewritePlan.outputCompression,
-            memoryBudgetBytes: job.memoryBudgetBytes ?? 0,
-            minimumMemoryBytes: job.minimumMemoryBytes ?? 0,
-            peakWorkingBytes: job.peakWorkingBytes ?? 0,
+            memoryBudgetBytes: job.memoryBudgetBytes,
+            minimumMemoryBytes: job.minimumMemoryBytes,
+            peakWorkingBytes: job.peakWorkingBytes,
           }
         : {}),
       supersededBlockCount: job.sourceBlockIds.length,
@@ -12293,19 +14974,8 @@ export class MinnowDatabase {
     };
   }
 
-  async #firstLogicalOrder(sourceSegments: readonly SegmentRecord[]): Promise<number> {
-    const transactions = new Map(
-      (await this.#transactionRecordsForSegments(sourceSegments)).map((record) => [
-        record.id,
-        record,
-      ]),
-    );
-    return Math.min(
-      ...sourceSegments.map(
-        (segment) =>
-          segment.logicalOrder ?? transactions.get(segment.transactionId)?.committedVersion ?? 0,
-      ),
-    );
+  #firstLogicalOrder(sourceSegments: readonly SegmentRecord[]): number {
+    return Math.min(...sourceSegments.map((segment) => segment.logicalOrder));
   }
 
   async #classifyKeys(
@@ -12339,7 +15009,7 @@ export class MinnowDatabase {
     requestedTokens: readonly string[],
   ): Promise<Set<string>> {
     if (table.uniqueKeyLookupReady === true) {
-      return new Set(await this.store.getExistingUniqueKeys(table.id, requestedTokens));
+      return new Set(await this.#existingUniqueKeysWindowed(table.id, requestedTokens));
     }
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) throw new Error("Unique key metadata is missing");
@@ -12349,6 +15019,22 @@ export class MinnowDatabase {
         .map((row) => keyToken(keyColumn.type, row[keyColumn.name] ?? null))
         .filter((token) => requested.has(token)),
     );
+  }
+
+  async #existingUniqueKeysWindowed(
+    tableId: string,
+    requestedTokens: readonly string[],
+  ): Promise<string[]> {
+    const found: string[] = [];
+    for (let start = 0; start < requestedTokens.length; start += MAX_STORAGE_BULK_READ_ITEMS) {
+      found.push(
+        ...(await this.store.getExistingUniqueKeys(
+          tableId,
+          requestedTokens.slice(start, start + MAX_STORAGE_BULK_READ_ITEMS),
+        )),
+      );
+    }
+    return found;
   }
 
   async #materializeTable(
@@ -12524,7 +15210,7 @@ export class MinnowDatabase {
     const indexId = this.#createId();
     const storageColumnId = `secondary-index:${indexId}`;
     const buildId = this.#createId();
-    const marked = await this.store.updateTable(table.id, table.revision ?? 0, {
+    const marked = await this.store.updateTable(table.id, table.revision, {
       secondaryIndexes: {
         ...table.secondaryIndexes,
         [indexId]: {
@@ -12579,7 +15265,7 @@ export class MinnowDatabase {
         Object.entries(fresh.secondaryIndexes ?? {}).filter(([candidate]) => candidate !== indexId),
       );
       try {
-        await this.store.updateTable(fresh.id, fresh.revision ?? 0, {
+        await this.store.updateTable(fresh.id, fresh.revision, {
           secondaryIndexes: Object.keys(secondaryIndexes).length === 0 ? null : secondaryIndexes,
         });
         return;
@@ -12604,7 +15290,7 @@ export class MinnowDatabase {
           ([candidateId]) => candidateId !== indexId,
         ),
       );
-      await this.store.updateTable(table.id, table.revision ?? 0, {
+      await this.store.updateTable(table.id, table.revision, {
         secondaryIndexes: Object.keys(indexes).length === 0 ? null : indexes,
       });
       return true;
@@ -12663,7 +15349,7 @@ export class MinnowDatabase {
     const buildId = ownsMarkedBuild ? ownedBuildId : this.#createId();
     const marked = ownsMarkedBuild
       ? current
-      : await this.store.updateTable(current.id, current.revision ?? 0, {
+      : await this.store.updateTable(current.id, current.revision, {
           secondaryIndexes: {
             ...current.secondaryIndexes,
             [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
@@ -12720,7 +15406,7 @@ export class MinnowDatabase {
         const fresh = await this.store.getTable(marked.id);
         const freshIndex = fresh?.secondaryIndexes?.[indexId];
         if (freshIndex === undefined) {
-          // DROP INDEX / DROP TABLE can win while a legacy whole-base fallback is writing.
+          // DROP INDEX / DROP TABLE can win while a whole-base build is writing.
           // Its storage identity is never reused, so reclaiming it here cannot touch a new index.
           await this.store.removeFtsColumn(marked.id, index.storageColumnId);
           return;
@@ -12732,7 +15418,7 @@ export class MinnowDatabase {
         ) {
           const { buildId: _completedBuild, ...readyIndex } = freshIndex;
           void _completedBuild;
-          await this.store.updateTable(fresh.id, fresh.revision ?? 0, {
+          await this.store.updateTable(fresh.id, fresh.revision, {
             secondaryIndexes: {
               ...fresh.secondaryIndexes,
               [indexId]: {
@@ -12766,17 +15452,93 @@ export class MinnowDatabase {
       ) {
         const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
         void _failedBuild;
-        await this.store
-          .updateTable(fresh.id, fresh.revision ?? 0, {
+        const invalidated = await this.store
+          .updateTable(fresh.id, fresh.revision, {
             secondaryIndexes: {
               ...fresh.secondaryIndexes,
               [indexId]: { ...invalidIndex, state: "invalid" },
             },
           })
-          .catch(() => undefined);
+          .then(() => true)
+          .catch(() => false);
+        // Catalog first: every intermediate reader scans. Once invalid, postings are neither
+        // truth nor maintained; removing their base and deltas bounds a persistently failing
+        // rebuild without touching a UNIQUE index's separate membership namespace.
+        if (invalidated) {
+          await this.store
+            .removeFtsColumn(fresh.id, freshIndex.storageColumnId)
+            .catch(() => undefined);
+        }
       }
       throw error;
     }
+  }
+
+  #postingBuildExpiry(now: Date): string {
+    const expiresAt = dateMilliseconds(now) + MAX_POSTING_BUILD_TTL_MS;
+    if (!Number.isSafeInteger(expiresAt)) throw new RangeError("Posting build expiry overflow");
+    return dateIsoString(new Date(expiresAt));
+  }
+
+  async #beginPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    const now = this.#now();
+    await this.store.beginFtsBaseBuild({
+      tableId,
+      columnId,
+      buildId,
+      ownerId: this.#internalLeaseOwnerId,
+      createdAt: dateIsoString(now),
+      expiresAt: this.#postingBuildExpiry(now),
+    });
+  }
+
+  async #writePostingBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: readonly FtsPosting[],
+  ): Promise<void> {
+    const now = this.#now();
+    await this.store.writeFtsBaseBuildChunk({
+      tableId,
+      columnId,
+      buildId,
+      ownerId: this.#internalLeaseOwnerId,
+      expiresAtCutoff: dateIsoString(now),
+      expiresAt: this.#postingBuildExpiry(now),
+      updatedAt: dateIsoString(now),
+      ordinal,
+      chunk,
+    });
+  }
+
+  async #finishPostingBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: { coversVersion: number; chunkCount: number; totalTokens: number },
+  ): Promise<void> {
+    const now = this.#now();
+    await this.store.finishFtsBaseBuild({
+      tableId,
+      columnId,
+      buildId,
+      ownerId: this.#internalLeaseOwnerId,
+      expiresAtCutoff: dateIsoString(now),
+      ...input,
+      completedAt: dateIsoString(now),
+    });
+  }
+
+  async #abortPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.store.abortFtsBaseBuild({
+      tableId,
+      columnId,
+      buildId,
+      ownerId: this.#internalLeaseOwnerId,
+      expiresAtCutoff: dateIsoString(this.#now()),
+    });
   }
 
   /**
@@ -12800,10 +15562,10 @@ export class MinnowDatabase {
     if (keyColumn === undefined) {
       throw new Error(`Materialized UNIQUE-index fallback needs a table key: ${table.name}`);
     }
-    const begin = this.store.beginFtsBaseBuild.bind(this.store);
-    const writeChunk = this.store.writeFtsBaseBuildChunk.bind(this.store);
-    const finish = this.store.finishFtsBaseBuild.bind(this.store);
-    const abort = this.store.abortFtsBaseBuild.bind(this.store);
+    const begin = this.#beginPostingBuild.bind(this);
+    const writeChunk = this.#writePostingBuildChunk.bind(this);
+    const finish = this.#finishPostingBuild.bind(this);
+    const abort = this.#abortPostingBuild.bind(this);
     await begin(table.id, index.storageColumnId, buildId);
     try {
       const materialized = await this.#materializeColumnarTableAtSnapshot(
@@ -12817,6 +15579,7 @@ export class MinnowDatabase {
         throw new Error(`UNIQUE-index source columns are missing: ${index.name}`);
       }
       let ordinal = 0;
+      let totalTokens = 0;
       for (let start = 0; start < materialized.rowCount; start += this.#rowsPerBlock) {
         const end = Math.min(materialized.rowCount, start + this.#rowsPerBlock);
         const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
@@ -12834,15 +15597,19 @@ export class MinnowDatabase {
           addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
         }
         const postings = sortedSecondaryPostings(byTerm);
-        if (postings.length > 0) {
-          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, postings);
+        for (const chunk of chunkFtsPostings(postings)) {
+          totalTokens = safeWholeNumberSum(
+            [totalTokens, postingFrequencyTotal(chunk)],
+            "Secondary-index posting count",
+          );
+          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk);
           ordinal += 1;
         }
       }
       await finish(table.id, index.storageColumnId, buildId, {
         coversVersion,
         chunkCount: ordinal,
-        totalTokens: 0,
+        totalTokens,
       });
     } catch (error) {
       await abort(table.id, index.storageColumnId, buildId).catch(() => undefined);
@@ -12861,10 +15628,10 @@ export class MinnowDatabase {
     buildId: string,
     uniqueTerms?: Set<string>,
   ): Promise<boolean> {
-    const begin = this.store.beginFtsBaseBuild.bind(this.store);
-    const writeChunk = this.store.writeFtsBaseBuildChunk.bind(this.store);
-    const finish = this.store.finishFtsBaseBuild.bind(this.store);
-    const abort = this.store.abortFtsBaseBuild.bind(this.store);
+    const begin = this.#beginPostingBuild.bind(this);
+    const writeChunk = this.#writePostingBuildChunk.bind(this);
+    const finish = this.#finishPostingBuild.bind(this);
+    const abort = this.#abortPostingBuild.bind(this);
     const segments = await this.#visibleSegmentRecords(table, snapshot);
     const factory = this.#streamedViewFactory(table, projectedColumns, segments, snapshot);
     if (factory === undefined) return false;
@@ -12883,6 +15650,7 @@ export class MinnowDatabase {
       const rowIdAt =
         keyColumn === undefined ? appendRowIdLocator(segments, streamed.table.rowCount) : undefined;
       let ordinal = 0;
+      let totalTokens = 0;
       for (let start = 0; start < streamed.table.rowCount;) {
         const requested = Math.min(this.#rowsPerBlock, streamed.table.rowCount - start);
         const residentEnd = await streamed.load(start, requested);
@@ -12908,8 +15676,12 @@ export class MinnowDatabase {
           addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
         }
         const postings = sortedSecondaryPostings(byTerm);
-        if (postings.length > 0) {
-          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, postings);
+        for (const chunk of chunkFtsPostings(postings)) {
+          totalTokens = safeWholeNumberSum(
+            [totalTokens, postingFrequencyTotal(chunk)],
+            "Secondary-index posting count",
+          );
+          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk);
           ordinal += 1;
         }
         start = end;
@@ -12917,7 +15689,7 @@ export class MinnowDatabase {
       await finish(table.id, index.storageColumnId, buildId, {
         coversVersion,
         chunkCount: ordinal,
-        totalTokens: 0,
+        totalTokens,
       });
       return true;
     } catch (error) {
@@ -12945,14 +15717,15 @@ export class MinnowDatabase {
     coversVersion: number,
     buildId: string,
   ): Promise<void> {
-    const begin = this.store.beginFtsBaseBuild.bind(this.store);
-    const writeChunk = this.store.writeFtsBaseBuildChunk.bind(this.store);
-    const finish = this.store.finishFtsBaseBuild.bind(this.store);
-    const abort = this.store.abortFtsBaseBuild.bind(this.store);
+    const begin = this.#beginPostingBuild.bind(this);
+    const writeChunk = this.#writePostingBuildChunk.bind(this);
+    const finish = this.#finishPostingBuild.bind(this);
+    const abort = this.#abortPostingBuild.bind(this);
     const segments = await this.#visibleSegmentRecords(table, snapshot);
     await begin(table.id, index.storageColumnId, buildId);
     try {
       let ordinal = 0;
+      let totalTokens = 0;
       for (const segment of segments) {
         const anchorIds =
           (keyColumn === undefined ? undefined : segment.columnBlockIds[keyColumn.id]) ??
@@ -13031,8 +15804,12 @@ export class MinnowDatabase {
             addSecondaryPosting(byTerm, index, columns, values, locator);
           }
           const postings = sortedSecondaryPostings(byTerm);
-          if (postings.length > 0) {
-            await writeChunk(table.id, index.storageColumnId, buildId, ordinal, postings);
+          for (const chunk of chunkFtsPostings(postings)) {
+            totalTokens = safeWholeNumberSum(
+              [totalTokens, postingFrequencyTotal(chunk)],
+              "Secondary-index posting count",
+            );
+            await writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk);
             ordinal += 1;
           }
           segmentRow += rowCount;
@@ -13044,7 +15821,7 @@ export class MinnowDatabase {
       await finish(table.id, index.storageColumnId, buildId, {
         coversVersion,
         chunkCount: ordinal,
-        totalTokens: 0,
+        totalTokens,
       });
     } catch (error) {
       await abort(table.id, index.storageColumnId, buildId).catch(() => undefined);
@@ -13092,7 +15869,7 @@ export class MinnowDatabase {
       state: FtsColumnIndexRecord["state"],
       buildFromVersion: number,
     ): Promise<TableRecord> =>
-      this.store.updateTable(record.id, record.revision ?? 0, {
+      this.store.updateTable(record.id, record.revision, {
         ftsColumns: {
           ...record.ftsColumns,
           [column.id]: {
@@ -13107,57 +15884,134 @@ export class MinnowDatabase {
     // committed against the older record flip the column to "invalid" in the store, which the
     // ready-CAS below observes as a revision conflict and abandons the build.
     const marked = await stamp(table, "building", -1);
-    await this.#withLeasedSnapshot(undefined, async (snapshot) => {
-      const segments = await this.#visibleSegmentRecords(marked, snapshot);
-      if (segments.some((segment) => (segment.kind ?? "insert") !== "insert")) {
-        await stamp(marked, "invalid", -1).catch(() => undefined);
-        throw new TypeError(
-          `Full-text indexes support append-only tables; ${tableName} has keyed mutations`,
-        );
-      }
-      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
-      const vector = await this.#materializeAppendColumnVector(
-        column,
-        segments,
-        snapshot,
-        rowCount,
-      );
-      const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
-      let totalTokens = 0;
-      let offset = 0;
-      for (const segment of segments) {
-        for (let row = 0; row < segment.rowCount; row += 1) {
-          totalTokens += addFtsDocument(
-            byTerm,
-            vectorValue(vector, offset + row),
-            segment.rowIdStart + BigInt(row),
+    try {
+      await this.#withLeasedSnapshot(undefined, async (snapshot) => {
+        const segments = await this.#visibleSegmentRecords(marked, snapshot);
+        if (segments.some((segment) => segment.kind !== "insert")) {
+          await stamp(marked, "invalid", -1).catch(() => undefined);
+          throw new TypeError(
+            `Full-text indexes support append-only tables; ${tableName} has keyed mutations`,
           );
         }
-        offset += segment.rowCount;
-      }
-      const coversVersion = snapshot.version ?? -1;
-      await this.store.writeFtsBase(table.id, column.id, {
-        coversVersion,
-        chunks: chunkFtsPostings(sortedFtsPostings(byTerm)),
-        totalTokens,
+        const buildId = this.#createId();
+        const begin = this.#beginPostingBuild.bind(this);
+        const writeChunk = this.#writePostingBuildChunk.bind(this);
+        const finish = this.#finishPostingBuild.bind(this);
+        const abort = this.#abortPostingBuild.bind(this);
+        const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
+        let totalTokens = 0;
+        let pendingTokens = 0;
+        let ordinal = 0;
+        const flush = async (): Promise<void> => {
+          if (byTerm.size === 0) return;
+          for (const postings of chunkFtsPostings(sortedFtsPostings(byTerm))) {
+            await writeChunk(table.id, column.id, buildId, ordinal, postings);
+            ordinal += 1;
+          }
+          byTerm.clear();
+          pendingTokens = 0;
+        };
+        await begin(table.id, column.id, buildId);
+        try {
+          for (const segment of segments) {
+            const blockIds = segment.columnBlockIds[column.id];
+            let segmentRow = 0;
+            if (blockIds === undefined || blockIds.length === 0) {
+              while (segmentRow < segment.rowCount) {
+                const end = Math.min(segment.rowCount, segmentRow + this.#rowsPerBlock);
+                for (; segmentRow < end; segmentRow += 1) {
+                  const tokens = addFtsDocument(
+                    byTerm,
+                    column.backfill ?? null,
+                    segment.rowIdStart + BigInt(segmentRow),
+                  );
+                  totalTokens = safeWholeNumberSum(
+                    [totalTokens, tokens],
+                    "Full-text base token count",
+                  );
+                  pendingTokens += tokens;
+                  if (pendingTokens >= FTS_BUILD_POSTING_WINDOW) await flush();
+                }
+              }
+              continue;
+            }
+            for (const blockId of blockIds) {
+              await this.#renewInternalLeaseIfNeeded(snapshot);
+              const [decoded] = await this.#decodedBlocksThroughCache([blockId], snapshot);
+              if (decoded?.column.type !== column.type) {
+                throw new Error(`Full-text source block is invalid: ${blockId}`);
+              }
+              const vector = this.#blockColumnVector(blockId, decoded);
+              for (let row = 0; row < decoded.column.rowCount; row += 1) {
+                const tokens = addFtsDocument(
+                  byTerm,
+                  vectorValue(vector, row),
+                  segment.rowIdStart + BigInt(segmentRow),
+                );
+                totalTokens = safeWholeNumberSum(
+                  [totalTokens, tokens],
+                  "Full-text base token count",
+                );
+                pendingTokens += tokens;
+                segmentRow += 1;
+                if (pendingTokens >= FTS_BUILD_POSTING_WINDOW) await flush();
+              }
+            }
+            if (segmentRow !== segment.rowCount) {
+              throw new Error(`Full-text source row count differs in segment ${segment.id}`);
+            }
+          }
+          await flush();
+          await finish(table.id, column.id, buildId, {
+            coversVersion: snapshot.version ?? -1,
+            chunkCount: ordinal,
+            totalTokens,
+          });
+        } catch (error) {
+          await abort(table.id, column.id, buildId).catch(() => undefined);
+          throw error;
+        }
+        const coversVersion = snapshot.version ?? -1;
+        const fresh = await this.store.getTable(table.id);
+        const current = fresh?.ftsColumns?.[column.id];
+        if (fresh?.columns.some((candidate) => candidate.id === column.id) !== true) {
+          // A concurrent DROP COLUMN won after this build took its snapshot. The catalog update
+          // already removed any older index; remove the base this stale builder just wrote too.
+          await this.store.removeFtsColumn(table.id, column.id);
+          return;
+        }
+        if (current?.state === "building") {
+          await this.store.updateTable(fresh.id, fresh.revision, {
+            ftsColumns: {
+              ...fresh.ftsColumns,
+              [column.id]: { ...current, state: "ready", buildFromVersion: coversVersion },
+            },
+          });
+        }
       });
+    } catch (error) {
+      // A failed build must never leave a catalog entry perpetually "building" or a partial
+      // generation pinning chunks. Make scan-correctness durable first, then discard the cold
+      // accelerator. A concurrent successful replacement is left untouched.
       const fresh = await this.store.getTable(table.id);
       const current = fresh?.ftsColumns?.[column.id];
-      if (fresh?.columns.some((candidate) => candidate.id === column.id) !== true) {
-        // A concurrent DROP COLUMN won after this build took its snapshot. The catalog update
-        // already removed any older index; remove the base this stale builder just wrote too.
-        await this.store.removeFtsColumn(table.id, column.id);
-        return;
+      if (fresh !== undefined && current?.state === "building") {
+        const invalidated = await this.store
+          .updateTable(fresh.id, fresh.revision, {
+            ftsColumns: {
+              ...fresh.ftsColumns,
+              [column.id]: { ...current, state: "invalid" },
+            },
+          })
+          .then(() => true)
+          .catch(() => false);
+        if (invalidated)
+          await this.store.removeFtsColumn(table.id, column.id).catch(() => undefined);
+      } else if (current?.state === "invalid") {
+        await this.store.removeFtsColumn(table.id, column.id).catch(() => undefined);
       }
-      if (current?.state === "building") {
-        await this.store.updateTable(fresh.id, fresh.revision ?? 0, {
-          ftsColumns: {
-            ...fresh.ftsColumns,
-            [column.id]: { ...current, state: "ready", buildFromVersion: coversVersion },
-          },
-        });
-      }
-    });
+      throw error;
+    }
   }
 
   /**
@@ -13192,7 +16046,7 @@ export class MinnowDatabase {
     segments: readonly SegmentRecord[],
   ): boolean {
     if (plan.joins.length > 0 || plan.base.table !== table.name) return false;
-    if (!segments.every((segment) => (segment.kind ?? "insert") === "insert")) return false;
+    if (!segments.every((segment) => segment.kind === "insert")) return false;
     const columnsByName = new Map(table.columns.map((column) => [column.name, column] as const));
     for (const node of this.#ftsBm25Nodes(plan).values()) {
       for (const expression of node.columns) {
@@ -13227,12 +16081,30 @@ export class MinnowDatabase {
       this.#ftsCandidatesMemo.set(snapshot, memo);
     }
     const key = `${tableId}\u0000${columnId}\u0000${String(upToVersion)}\u0000${JSON.stringify(terms)}`;
+    const cacheable =
+      key.length <= MAX_CACHEABLE_TEXT_CHARACTERS &&
+      terms.every((term) => !("term" in term) || term.term.length <= MAX_CACHEABLE_TEXT_CHARACTERS);
+    if (!cacheable) {
+      return this.store.readFtsCandidates(
+        tableId,
+        columnId,
+        terms,
+        upToVersion,
+        MAX_FTS_CANDIDATE_ROW_IDS,
+      );
+    }
     const cached = memo.get(key);
     if (cached !== undefined) return cached;
     // Shared leases live across queries at one version; results are version-deterministic, but
     // candidate arrays can be large, so the memo sheds wholesale rather than growing unbounded.
-    if (memo.size >= 64) memo.clear();
-    const read = this.store.readFtsCandidates(tableId, columnId, terms, upToVersion);
+    if (memo.size >= 1) memo.clear();
+    const read = this.store.readFtsCandidates(
+      tableId,
+      columnId,
+      terms,
+      upToVersion,
+      MAX_FTS_CANDIDATE_ROW_IDS,
+    );
     memo.set(key, read);
     return read;
   }
@@ -13277,7 +16149,11 @@ export class MinnowDatabase {
           this.#readFtsCandidatesMemoized(snapshot, table.id, column.id, terms, upToVersion),
         ),
       );
-      if (perColumn.some((result) => !result.hasBase || result.coversVersion > upToVersion)) {
+      if (
+        perColumn.some(
+          (result) => result.overflow || !result.hasBase || result.coversVersion > upToVersion,
+        )
+      ) {
         return undefined;
       }
       if (perColumn.some((result) => result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS)) {
@@ -13305,7 +16181,7 @@ export class MinnowDatabase {
     if (plan.joins.length > 0 || plan.base.table !== table.name) return segments;
     const matches = topLevelFtsMatchConjuncts(plan);
     if (matches.length === 0) return segments;
-    if (!segments.every((segment) => (segment.kind ?? "insert") === "insert")) return segments;
+    if (!segments.every((segment) => segment.kind === "insert")) return segments;
     // A scoring plan may only prune when the index serves its corpus statistics — otherwise
     // the scan-side stats pass would measure a shrunken corpus and scores would change the
     // moment an index appeared. The shared predicate keeps this in lockstep with the stats
@@ -13330,7 +16206,12 @@ export class MinnowDatabase {
         return state?.state === "ready" && state.tokenizerVersion === FTS_TOKENIZER_VERSION;
       });
       if (!ready) {
-        this.#scheduleFtsBuilds(table, resolved, segments);
+        this.#scheduleFtsBuilds(
+          table,
+          resolved,
+          segments,
+          resolved.some((column) => table.ftsColumns?.[column.id] !== undefined),
+        );
         continue;
       }
       const upToVersion = snapshot.version ?? -1;
@@ -13339,6 +16220,7 @@ export class MinnowDatabase {
           this.#readFtsCandidatesMemoized(snapshot, table.id, column.id, terms, upToVersion),
         ),
       );
+      if (perColumn.some((result) => result.overflow)) return segments;
       if (perColumn.some((result) => !result.hasBase)) {
         this.#scheduleFtsBuilds(table, resolved, segments, true);
         return segments;
@@ -13408,14 +16290,14 @@ export class MinnowDatabase {
       }
       return { segments, pruned: false };
     }
-    if (segments.some((segment) => (segment.kind ?? "insert") === "upsert")) {
+    if (segments.some((segment) => segment.kind === "upsert")) {
       return { segments, pruned: false };
     }
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       if (
         segments.some((segment) => {
-          const kind = segment.kind ?? "insert";
+          const kind = segment.kind;
           return kind !== "insert" && kind !== "base";
         })
       ) {
@@ -13454,6 +16336,7 @@ export class MinnowDatabase {
         predicate.queries,
         upToVersion,
       );
+      if (result.overflow) return { segments, pruned: false };
       if (!result.hasBase) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
         return { segments, pruned: false };
@@ -13584,30 +16467,102 @@ export class MinnowDatabase {
     if (this.#closed) return;
     const key = `${tableId}/${columnId}`;
     if (this.#ftsBuildsInFlight.has(key)) return;
+    let observedCount: number | undefined;
+    let invalidated = false;
     const build = (async () => {
-      const table = await this.store.getTable(tableId);
-      // Once scheduled, finish even if close() starts: close joins this promise specifically so
-      // the durable tail reaches its bound before the caller closes the store.
-      if (table === undefined) return;
-      const state = table.ftsColumns?.[columnId];
-      if (state !== undefined && state.state !== "invalid") {
-        const column = table.columns.find((candidate) => candidate.id === columnId);
-        if (column !== undefined) await this.#buildFtsIndex(table, column);
-        return;
+      try {
+        const table = await this.store.getTable(tableId);
+        // Once scheduled, finish even if close() starts: close joins this promise specifically so
+        // the durable tail reaches its bound before the caller closes the store.
+        if (table === undefined) {
+          invalidated = true;
+          this.#postingDeltaTailCounts.delete(key);
+          return;
+        }
+        const state = table.ftsColumns?.[columnId];
+        if (state !== undefined && state.state !== "invalid") {
+          const column = table.columns.find((candidate) => candidate.id === columnId);
+          if (column !== undefined) await this.#buildFtsIndex(table, column);
+        } else {
+          const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
+            ([, index]) => index.storageColumnId === columnId && index.state !== "invalid",
+          );
+          if (secondary !== undefined) {
+            await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1]);
+          } else {
+            invalidated = true;
+            this.#postingDeltaTailCounts.delete(key);
+            return;
+          }
+        }
+        const version = (await this.store.getCurrentManifestVersion()) ?? -1;
+        observedCount = (await this.store.readFtsCandidates(tableId, columnId, [], version))
+          .deltaChunkCount;
+        this.#postingDeltaTailCounts.set(key, observedCount);
+      } catch {
+        if ((this.#postingDeltaTailCounts.get(key) ?? 0) >= FTS_HARD_DELTA_CHUNKS) {
+          try {
+            await this.#invalidateOversizedPostingTail(tableId, columnId);
+            invalidated = true;
+            this.#postingDeltaTailCounts.delete(key);
+          } catch {
+            // Keep the hard-threshold marker. A later commit or relevant read will retry; losing
+            // it here would turn a transient catalog/cleanup refusal into silent unbounded growth.
+          }
+        }
       }
-      const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
-        ([, index]) => index.storageColumnId === columnId && index.state !== "invalid",
-      );
-      if (secondary !== undefined) {
-        await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1]);
+    })().finally(() => {
+      if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
+      if (!invalidated && observedCount !== undefined && observedCount <= FTS_FOLD_DELTA_CHUNKS) {
+        this.#postingDeltaTailCounts.delete(key);
       }
-    })()
-      .catch(() => undefined)
-      .finally(() => {
-        if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
-      });
+    });
     this.#ftsBuildsInFlight.set(key, build);
     void build;
+  }
+
+  /**
+   * Turns a persistently unhealthy accelerator into a scan-correct catalog state before
+   * deleting its bounded base/delta storage. UNIQUE membership is a separate namespace and is
+   * deliberately untouched. A later relevant query can rebuild the invalid accelerator.
+   */
+  async #invalidateOversizedPostingTail(tableId: string, columnId: string): Promise<void> {
+    for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
+      const table = await this.store.getTable(tableId);
+      if (table === undefined) return;
+      const fts = table.ftsColumns?.[columnId];
+      const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
+        ([, index]) => index.storageColumnId === columnId,
+      );
+      if (fts === undefined && secondary === undefined) return;
+      if (fts?.state === "invalid" || secondary?.[1].state === "invalid") break;
+      try {
+        if (fts !== undefined) {
+          await this.store.updateTable(table.id, table.revision, {
+            ftsColumns: {
+              ...table.ftsColumns,
+              [columnId]: { ...fts, state: "invalid", buildFromVersion: -1 },
+            },
+          });
+        } else if (secondary !== undefined) {
+          const [indexId, index] = secondary;
+          const { buildId: _buildId, ...stable } = index;
+          void _buildId;
+          await this.store.updateTable(table.id, table.revision, {
+            secondaryIndexes: {
+              ...table.secondaryIndexes,
+              [indexId]: { ...stable, state: "invalid", buildFromVersion: -1 },
+            },
+          });
+        }
+        break;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt === this.#maxCommitRetries) {
+          throw error;
+        }
+      }
+    }
+    await this.store.removeFtsColumn(tableId, columnId);
   }
 
   async #materializeColumnarTableAtSnapshot(
@@ -13640,7 +16595,7 @@ export class MinnowDatabase {
     const keyColumn = getUniqueKeyColumn(table);
     if (
       segments.every((segment) => {
-        const kind = segment.kind ?? "insert";
+        const kind = segment.kind;
         return kind === "insert" || kind === "base";
       })
     ) {
@@ -13696,7 +16651,7 @@ export class MinnowDatabase {
     if (
       keyColumn !== undefined &&
       segments.every((segment) => {
-        const kind = segment.kind ?? "insert";
+        const kind = segment.kind;
         return kind === "insert" || kind === "base" || kind === "delete" || kind === "update";
       })
     ) {
@@ -13718,7 +16673,7 @@ export class MinnowDatabase {
         : [keyColumn]),
     ];
     const maximumRows = segments.reduce((total, segment) => {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       return (
         total + (kind === "insert" || kind === "base" || kind === "upsert" ? segment.rowCount : 0)
       );
@@ -13888,22 +16843,25 @@ export class MinnowDatabase {
     if (ordered === undefined || table.uniqueKeyColumnId !== undefined) return undefined;
     if (
       segments.some((segment) => {
-        const kind = segment.kind ?? "insert";
+        const kind = segment.kind;
         return kind !== "insert" && kind !== "base";
       })
     ) {
       return undefined;
     }
+    const expectedRows = segments.reduce((total, segment) => total + segment.rowCount, 0);
+    if (expectedRows > MAX_FTS_CANDIDATE_ROW_IDS) return undefined;
     const result = await this.store.readFtsPostings(
       table.id,
       ordered.index.storageColumnId,
       snapshot.version ?? -1,
+      MAX_FTS_CANDIDATE_ROW_IDS,
     );
     const rebuild = (): undefined => {
       this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
       return undefined;
     };
-    if (!result.hasBase) return rebuild();
+    if (result.overflow || !result.hasBase) return rebuild();
     if (result.coversVersion > (snapshot.version ?? -1)) return undefined;
     if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
       this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
@@ -13914,7 +16872,6 @@ export class MinnowDatabase {
     if (indexColumns.some((column) => column === undefined)) return rebuild();
     const columns = indexColumns as TableColumnRecord[];
     const postings = ordered.reverse ? [...result.postings].reverse() : result.postings;
-    const expectedRows = segments.reduce((total, segment) => total + segment.rowCount, 0);
     const rowForLocator = appendRowForLocator(segments, expectedRows);
     // A byte per visible row is substantially smaller than retaining every bigint locator in a
     // Set, and the inverse span lookup also proves that each posting names a real current row.
@@ -13969,16 +16926,18 @@ export class MinnowDatabase {
     });
     const ordered = secondaryIndexOrderForPlan(plan, table, projectedColumns, false);
     if (ordered === undefined) return undefined;
+    if (materialized.rowCount > MAX_FTS_CANDIDATE_ROW_IDS) return undefined;
     const result = await this.store.readFtsPostings(
       table.id,
       ordered.index.storageColumnId,
       snapshot.version ?? -1,
+      MAX_FTS_CANDIDATE_ROW_IDS,
     );
     const rebuild = (): undefined => {
       this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
       return undefined;
     };
-    if (!result.hasBase) return rebuild();
+    if (result.overflow || !result.hasBase) return rebuild();
     if (result.coversVersion > (snapshot.version ?? -1)) return undefined;
     if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
       this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
@@ -14025,7 +16984,7 @@ export class MinnowDatabase {
     const appendOrders: number[] = [];
     const deltas: Array<{ segment: SegmentRecord; order: number }> = [];
     segments.forEach((segment, order) => {
-      const kind = segment.kind ?? "insert";
+      const kind = segment.kind;
       if (kind === "insert" || kind === "base") {
         appends.push(segment);
         appendOrders.push(order);
@@ -14230,7 +17189,7 @@ export class MinnowDatabase {
     for (let start = 0; start < predicateBlockIds.length; start += 16) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
       const ids = predicateBlockIds.slice(start, start + 16);
-      const blocks = await this.store.getBlocks(ids);
+      const blocks = await this.#getSnapshotBlocksWindowed(snapshot, ids);
       for (let index = 0; index < ids.length; index += 1) {
         const id = ids[index] ?? "";
         const bytes = blocks[index];
@@ -14416,7 +17375,7 @@ export class MinnowDatabase {
     // query — outside the buffer pool's budget and never charged to the memory context.
     const fetchedBytes = new Map<string, Uint8Array>();
     if (fetchIds.length > 0) {
-      const fetched = await this.store.getBlocks(fetchIds);
+      const fetched = await this.#getSnapshotBlocksWindowed(snapshot, fetchIds);
       for (let index = 0; index < fetchIds.length; index += 1) {
         const id = fetchIds[index] ?? "";
         const bytes = fetched[index];
@@ -14429,7 +17388,7 @@ export class MinnowDatabase {
       const bytes = fetchedBytes.get(id) ?? storedBlocks?.get(id);
       if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
       const decoded = await decodePhysicalBlock(bytes);
-      this.#cachePut(`dpb\0${id}`, decoded, bytes.byteLength);
+      this.#cachePut(`dpb\0${id}`, decoded, decodedPhysicalBlockRetainedBytes(decoded));
       decodedBlocks[index] = decoded;
     }
     return decodedBlocks.map((decoded, index) => {
@@ -14473,7 +17432,7 @@ export class MinnowDatabase {
             stringCodes === undefined
               ? 0
               : dictionaryCodeForText(stringDictionary, String(backfill));
-          const numeric = backfill instanceof Date ? backfill.getTime() : Number(backfill);
+          const numeric = backfill instanceof Date ? dateMilliseconds(backfill) : Number(backfill);
           for (let offset = 0; offset < segment.rowCount; offset += 1) {
             const index = outputRow + offset;
             setBitmapValue(validity, index);
@@ -14607,7 +17566,10 @@ export class MinnowDatabase {
     for (let start = 0; start < blockIds.length; start += decodeWindow) {
       if (snapshot !== undefined) await this.#renewInternalLeaseIfNeeded(snapshot);
       const ids = blockIds.slice(start, start + decodeWindow);
-      const blocks = await this.store.getBlocks(ids);
+      const blocks =
+        snapshot === undefined
+          ? await this.#getBlocksWindowed(ids)
+          : await this.#getSnapshotBlocksWindowed(snapshot, ids);
       const columns = await Promise.all(
         blocks.map(async (bytes, index) => {
           const blockId = ids[index] ?? "";
@@ -14618,6 +17580,63 @@ export class MinnowDatabase {
       for (const [blockId, column] of columns) decoded.set(blockId, column);
     }
     return decoded;
+  }
+
+  async #getBlocksWindowed(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    const blocks: Array<Uint8Array | undefined> = [];
+    for (let start = 0; start < ids.length; start += 64) {
+      blocks.push(...(await this.#readBlockWindow(ids.slice(start, start + 64))));
+    }
+    return blocks;
+  }
+
+  /**
+   * Reads query-visible bytes through a staged overlay when the snapshot supplies one. Ordinary
+   * committed snapshots deliberately have no bulk method: their manifest membership was proved
+   * while the reader lease pinned the version, so the store's bulk payload path stays fast.
+   * A write scope's wrapper does supply one and routes each pending id through its transaction;
+   * bypassing it would report a journaled block as missing until the scope publishes.
+   */
+  async #getSnapshotBlocksWindowed(
+    snapshot: LeasedSnapshot,
+    ids: readonly string[],
+  ): Promise<Array<Uint8Array | undefined>> {
+    const overlayRead = (
+      snapshot as LeasedSnapshot & {
+        getBlocks?: (blockIds: readonly string[]) => Promise<Array<Uint8Array | undefined>>;
+      }
+    ).getBlocks;
+    if (overlayRead === undefined) return this.#getBlocksWindowed(ids);
+    const blocks: Array<Uint8Array | undefined> = [];
+    for (let start = 0; start < ids.length; start += 64) {
+      blocks.push(...(await overlayRead.call(snapshot, ids.slice(start, start + 64))));
+    }
+    return blocks;
+  }
+
+  async #manifestBlockPresence(version: number | null, ids: readonly string[]): Promise<boolean[]> {
+    const present: boolean[] = [];
+    for (let start = 0; start < ids.length; start += MAX_MANIFEST_BLOCK_PRESENCE_IDS) {
+      present.push(
+        ...(await this.store.hasManifestBlocks(
+          version,
+          ids.slice(start, start + MAX_MANIFEST_BLOCK_PRESENCE_IDS),
+        )),
+      );
+    }
+    return present;
+  }
+
+  async #readBlockWindow(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    try {
+      return await this.store.getBlocks(ids);
+    } catch (error) {
+      if (!(error instanceof BlockReadBatchTooLargeError) || ids.length <= 1) throw error;
+      const middle = ids.length >>> 1;
+      const left = await this.#readBlockWindow(ids.slice(0, middle));
+      const right = await this.#readBlockWindow(ids.slice(middle));
+      return [...left, ...right];
+    }
   }
 
   async #visibleSegmentRecords(
@@ -14650,30 +17669,43 @@ export class MinnowDatabase {
     catalog?: SegmentVisibilityCatalog,
   ): Promise<SegmentRecord[]> {
     const segments =
-      catalog?.segmentsByTable.get(table.id) ?? (await this.store.listSegments(table.id));
+      catalog === undefined
+        ? await listTableSegmentsPaged(this.store, table.id)
+        : (catalog.segmentsByTable.get(table.id) ?? []);
     const transactions =
       catalog?.transactions ??
       new Map(
         (await this.#transactionRecordsForSegments(segments)).map((record) => [record.id, record]),
       );
-    return segments
-      .filter((segment) =>
-        Object.values(segment.columnBlockIds)
-          .flat()
-          .every((blockId) => snapshot.hasBlock(blockId)),
-      )
-      .sort((left, right) => {
-        const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
-        const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
-        const leftOrder = left.logicalOrder ?? leftVersion;
-        const rightOrder = right.logicalOrder ?? rightVersion;
-        return (
-          leftOrder - rightOrder ||
-          leftVersion - rightVersion ||
-          (left.commitOrdinal ?? 0) - (right.commitOrdinal ?? 0) ||
-          left.id.localeCompare(right.id)
-        );
-      });
+    // Segment metadata outlives the manifest version that made it visible. Block membership is
+    // necessary but not sufficient for historical reads: a later compaction can publish a new
+    // segment that aliases blocks already present in the old manifest. Always gate on the
+    // owner's committed version as well as exact manifest membership. The sole exception is a
+    // transaction-scoped overlay, whose pending owner is deliberately presented after the
+    // pinned committed snapshot.
+    const versionEligible = segments.filter((segment) => {
+      if (segment.transactionId === catalog?.overlayTransactionId) return true;
+      const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
+      return (
+        snapshot.version !== null &&
+        committedVersion !== null &&
+        committedVersion !== undefined &&
+        committedVersion <= snapshot.version
+      );
+    });
+    const visible = await filterSnapshotSegments(snapshot, versionEligible);
+    return [...visible].sort((left, right) => {
+      const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
+      const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
+      const leftOrder = left.logicalOrder;
+      const rightOrder = right.logicalOrder;
+      return (
+        leftOrder - rightOrder ||
+        leftVersion - rightVersion ||
+        left.commitOrdinal - right.commitOrdinal ||
+        left.id.localeCompare(right.id)
+      );
+    });
   }
 
   async #transactionRecordsForSegments(
@@ -14695,8 +17727,9 @@ export class MinnowDatabase {
       const page = await this.store.listManifestPage(cursor, 8);
       for (const manifest of page.records) {
         if (manifest.prunedAt !== undefined) continue;
-        const visibleBlockIds = new Set(manifest.blockIds);
-        if (blockIds.every((id) => visibleBlockIds.has(id))) return true;
+        if ((await this.#manifestBlockPresence(manifest.version, blockIds)).every(Boolean)) {
+          return true;
+        }
       }
       cursor = page.nextCursor;
     } while (cursor !== null);
@@ -14709,7 +17742,7 @@ export class MinnowDatabase {
   ): Promise<T> {
     for (;;) {
       const lease = await this.#transactions.openLeasedSnapshot({
-        id: `${this.#internalLeaseOwnerId}/${String(this.#internalLeaseSequence++)}`,
+        id: `${this.#internalLeaseOwnerId}/${crypto.randomUUID()}`,
         ownerId: this.#internalLeaseOwnerId,
         ttlMs: INTERNAL_READ_LEASE_TTL_MS,
         ...(version === undefined ? {} : { version }),
@@ -14725,7 +17758,10 @@ export class MinnowDatabase {
   }
 
   async #renewInternalLeaseIfNeeded(snapshot: LeasedSnapshot): Promise<void> {
-    if (snapshot.expiresAt.getTime() - this.#now().getTime() > INTERNAL_READ_LEASE_TTL_MS / 2) {
+    if (
+      dateMilliseconds(snapshot.expiresAt) - dateMilliseconds(this.#now()) >
+      INTERNAL_READ_LEASE_TTL_MS / 2
+    ) {
       return;
     }
     if (snapshot === this.#sharedLease?.lease) {
@@ -14780,7 +17816,17 @@ export class MinnowDatabase {
       }
       this.#gzipVerdicts.delete(columnId);
     }
-    const bytes = await encode("gzip");
+    let bytes: Uint8Array;
+    try {
+      bytes = await encode("gzip");
+    } catch (error) {
+      // A legal physical column can sit exactly below the 64 MiB logical ceiling while an
+      // incompressible gzip representation grows a few bytes past the stored-payload ceiling.
+      // Gzip is adaptive here, so preserve the legal write as raw. The dedicated error class
+      // keeps malformed input and every other encoder failure visible to the caller.
+      if (error instanceof StoredBlockPayloadTooLargeError) return encode("raw");
+      throw error;
+    }
     const description = inspectBlock(bytes);
     const worthwhile = description.encodedLength >= bytes.byteLength * GZIP_WORTHWHILE_RATIO;
     if (!worthwhile) {
@@ -14801,12 +17847,22 @@ export class MinnowDatabase {
   }
 
   async #findTable(name: string): Promise<TableRecord> {
+    validateName(name, "Table");
     const table = await this.store.getTableByName(name);
     if (table === undefined) throw new Error(`Table not found: ${name}`);
     // Reads resolve a view into its query before reaching here, so a view arriving at this
     // point is a write, a DDL statement, or a path that forgot to rewrite: all of them errors.
     if (table.view !== undefined) throw new TypeError(`${name} is a view, not a table`);
     return table;
+  }
+
+  async #assertVisibleSegmentCursorTable(
+    tableName: string,
+    capturedTableId: string,
+  ): Promise<void> {
+    const current = await this.store.getTableByName(tableName);
+    if (current?.id === capturedTableId) return;
+    throw new VisibleSegmentCursorStaleError(tableName, capturedTableId, current?.id ?? null);
   }
 }
 
@@ -14913,9 +17969,239 @@ function viewReadsTable(sql: string, table: string): boolean {
   try {
     return collectRealTableNames(compileQuery(sql)).includes(table);
   } catch {
-    // A view whose body no longer compiles cannot be shown to depend on this table, and its own
-    // next read will say so far more clearly than a refused drop would.
-    return false;
+    // A malformed stored dependency is corruption, not proof that destructive DDL is safe.
+    return true;
+  }
+}
+
+type QueryColumnShape = SqlColumnSchema;
+
+function catalogQuerySchemas(records: readonly TableRecord[]): Map<string, QueryColumnShape[]> {
+  return new Map(
+    records.map((record) => [
+      record.name,
+      record.columns.map(({ name, type, integer, sqlDomain }) => ({
+        name,
+        type,
+        ...(integer === true ? { integer: true as const } : {}),
+        ...(sqlDomain === undefined ? {} : { sqlDomain }),
+      })),
+    ]),
+  );
+}
+
+function querySchemasEqual(
+  left: readonly QueryColumnShape[],
+  right: readonly QueryColumnShape[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((column, index) => {
+      const other = right[index];
+      return (
+        column.name === other?.name &&
+        column.type === other.type &&
+        column.integer === other.integer &&
+        JSON.stringify(column.sqlDomain) === JSON.stringify(other.sqlDomain)
+      );
+    })
+  );
+}
+
+function assertDependentViewsKeepSchema(
+  records: readonly TableRecord[],
+  replaced: TableRecord,
+  candidateSchemas: ReadonlyMap<string, QueryColumnShape[]>,
+): void {
+  for (const dependent of records) {
+    if (
+      dependent.id === replaced.id ||
+      dependent.view === undefined ||
+      !viewReadsTable(dependent.view.sql, replaced.name)
+    ) {
+      continue;
+    }
+    try {
+      const inferred = inferBlockSchema(compileQuery(dependent.view.sql), candidateSchemas);
+      if (!querySchemasEqual(inferred, dependent.columns)) {
+        throw new TypeError("view output would change");
+      }
+    } catch {
+      throw new TypeError(
+        `Cannot replace ${replaced.name}: view ${dependent.name} depends on its current schema`,
+      );
+    }
+  }
+}
+
+function assertViewDefinitionAcyclic(
+  records: readonly TableRecord[],
+  viewName: string,
+  plan: CompiledQuery,
+): void {
+  const views = new Map(
+    records.flatMap((record) =>
+      record.view === undefined ? [] : ([[record.name, record.view.sql]] as const),
+    ),
+  );
+  const reaches = (name: string, target: string, visited: Set<string>): boolean => {
+    if (name === target) return true;
+    if (visited.has(name)) return false;
+    visited.add(name);
+    const sql = views.get(name);
+    if (sql === undefined) return false;
+    let dependencies: string[];
+    try {
+      dependencies = collectRealTableNames(compileQuery(sql));
+    } catch {
+      throw new TypeError(`Stored view has an invalid definition: ${name}`);
+    }
+    return dependencies.some((dependency) => reaches(dependency, target, visited));
+  };
+  if (
+    collectRealTableNames(plan).some((dependency) =>
+      reaches(dependency, viewName, new Set<string>()),
+    )
+  ) {
+    throw new TypeError(`View dependency cycle: ${viewName}`);
+  }
+}
+
+function assertTriggerBodyTargetSchema(
+  compiled: Extract<CompiledStatement, { kind: "insert" | "update" | "delete" }>,
+  target: TableRecord,
+): void {
+  const columns = visibleTableColumns(target);
+  const columnsByName = new Map(columns.map((column) => [column.name, column] as const));
+  if (compiled.kind === "insert") {
+    let provided: Set<string>;
+    let insertColumns: TableColumnRecord[] = [];
+    if (compiled.defaultValues === true) {
+      provided = new Set();
+    } else if (compiled.columns.length === 0) {
+      for (const row of compiled.rows) {
+        if (row.length !== columns.length) {
+          throw new TypeError(
+            `Trigger body INSERT has ${String(row.length)} values for ${String(columns.length)} target columns`,
+          );
+        }
+      }
+      provided = new Set(columnsByName.keys());
+      insertColumns = columns;
+    } else {
+      provided = new Set(compiled.columns);
+      for (const name of provided) {
+        if (!columnsByName.has(name)) {
+          throw new TypeError(`Trigger body INSERT column does not exist: ${name}`);
+        }
+      }
+      insertColumns = compiled.columns.flatMap((name) => {
+        const column = columnsByName.get(name);
+        return column === undefined ? [] : [column];
+      });
+    }
+    for (const row of compiled.rows) {
+      for (const [index, value] of row.entries()) {
+        const column = insertColumns[index];
+        if (
+          column !== undefined &&
+          isDefaultInsertValue(value) &&
+          !column.nullable &&
+          column.defaultValue === undefined
+        ) {
+          throw new TypeError(
+            `Trigger body INSERT uses DEFAULT for a non-nullable column without a default: ${column.name}`,
+          );
+        }
+      }
+    }
+    for (const column of columns) {
+      if (!provided.has(column.name) && !column.nullable && column.defaultValue === undefined) {
+        throw new TypeError(
+          `Trigger body INSERT omits a non-nullable column without a default: ${column.name}`,
+        );
+      }
+    }
+    return;
+  }
+
+  const assertReference = (reference: string): void => {
+    const pieces = reference.split(".");
+    const name = pieces.at(-1) ?? reference;
+    const qualifier = pieces.length === 2 ? pieces[0] : undefined;
+    if (
+      pieces.length > 2 ||
+      (qualifier !== undefined && qualifier !== target.name) ||
+      !columnsByName.has(name)
+    ) {
+      throw new TypeError(
+        `Trigger body ${compiled.kind.toUpperCase()} column does not exist: ${reference}`,
+      );
+    }
+  };
+  if (compiled.kind === "update") {
+    for (const assignment of compiled.assignments) {
+      const assignedColumn = columnsByName.get(assignment.column);
+      if (assignedColumn === undefined) {
+        throw new TypeError(
+          `Trigger body UPDATE assignment column does not exist: ${assignment.column}`,
+        );
+      }
+      if (
+        assignedColumn.id === target.uniqueKeyColumnId ||
+        (target.primaryKeyColumnIds ?? []).includes(assignedColumn.id)
+      ) {
+        throw new TypeError(`Trigger body UPDATE cannot update a key column: ${assignment.column}`);
+      }
+      for (const reference of expressionColumnNames(assignment.expression)) {
+        assertReference(reference);
+      }
+    }
+  }
+  for (const predicate of compiled.predicates) {
+    for (const expression of [predicate.left, predicate.right]) {
+      for (const reference of expressionColumnNames(expression)) assertReference(reference);
+    }
+  }
+}
+
+/** Every stored body that targets this table must remain executable after a schema change. */
+function assertTriggerBodiesAcceptTableSchema(
+  records: readonly TableRecord[],
+  target: TableRecord,
+  columns: TableColumnRecord[],
+): void {
+  const candidate = { ...target, columns };
+  for (const owner of records) {
+    for (const trigger of owner.triggers ?? []) {
+      for (const statement of trigger.statements) {
+        let compiled: CompiledStatement;
+        try {
+          compiled = compileStatement(statement.sql);
+        } catch (error) {
+          throw new TypeError(
+            `Cannot alter ${target.name}: trigger ${trigger.name} has an invalid stored body`,
+            { cause: error },
+          );
+        }
+        if (
+          (compiled.kind !== "insert" &&
+            compiled.kind !== "update" &&
+            compiled.kind !== "delete") ||
+          compiled.table !== target.name
+        ) {
+          continue;
+        }
+        try {
+          assertTriggerBodyTargetSchema(compiled, candidate);
+        } catch (error) {
+          throw new TypeError(
+            `Cannot alter ${target.name}: trigger ${trigger.name} would become invalid: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
+      }
+    }
   }
 }
 
@@ -14924,6 +18210,7 @@ function triggerReferencesColumn(
   trigger: NonNullable<TableRecord["triggers"]>[number],
   target: TableRecord,
   columnName: string,
+  implicitInsertDepends = true,
 ): boolean {
   for (const statement of trigger.statements) {
     if (
@@ -14946,7 +18233,12 @@ function triggerReferencesColumn(
       continue;
     }
     if (compiled.kind === "insert") {
-      if (compiled.columns.length === 0 || compiled.columns.includes(columnName)) return true;
+      if (
+        (compiled.columns.length === 0 && implicitInsertDepends) ||
+        compiled.columns.includes(columnName)
+      ) {
+        return true;
+      }
       continue;
     }
     const references = new Set<string>();
@@ -15012,7 +18304,18 @@ function compiledPlanIsGrouped(plan: CompiledQuery): boolean {
 function validateName(name: string, kind: string): string {
   const trimmed = name.trim();
   if (trimmed.length === 0) throw new TypeError(`${kind} name cannot be empty`);
+  if (trimmed.length > MAX_CATALOG_NAME_CHARACTERS) {
+    throw new TypeError(`${kind} name exceeds ${String(MAX_CATALOG_NAME_CHARACTERS)} characters`);
+  }
   return trimmed;
+}
+
+function visibleSegmentManifestVersion(value: unknown, label: string): number | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new RangeError(`${label} must be a non-negative safe integer or null`);
+  }
+  return value as number;
 }
 
 /**
@@ -15025,13 +18328,19 @@ const compiledChecks = new Map<string, ReadonlyArray<{ name: string; expression:
 const COMPILED_CHECK_CACHE_LIMIT = 64;
 
 function tableChecks(table: TableRecord): ReadonlyArray<{ name: string; expression: Expression }> {
-  const key = `${table.id}/${String(table.revision ?? 0)}`;
+  const key = `${table.id}/${String(table.revision)}`;
   const cached = compiledChecks.get(key);
   if (cached !== undefined) return cached;
   const compiled = (table.checks ?? []).map((check) => ({
     name: check.name,
     expression: compileCheckExpression(check.sql, check.name),
   }));
+  const cacheable =
+    (table.checks ?? []).reduce(
+      (characters, check) => characters + check.name.length + check.sql.length,
+      0,
+    ) <= MAX_CACHEABLE_TEXT_CHARACTERS;
+  if (!cacheable) return compiled;
   // Bounded and insertion-ordered: the oldest entry leaves, which is the table written least
   // recently. Constraint expressions are small, so the cap bounds the map, not the memory.
   if (compiledChecks.size >= COMPILED_CHECK_CACHE_LIMIT) {
@@ -15080,6 +18389,13 @@ function batchRowAt(
   return row;
 }
 
+/**
+ * Exact UTF-8 lengths measured by input validation, keyed by the caller's column array. The weak
+ * keys keep this operation-local in practice: once a batch is released, its sizing data follows
+ * it. Range planning can reuse the validation pass instead of walking every string a second time.
+ */
+const validatedStringByteLengths = new WeakMap<readonly BatchValue[], readonly number[]>();
+
 function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?: string): number {
   const expected = new Set(table.columns.map((column) => column.name));
   for (const name of Object.keys(input.columns)) {
@@ -15101,11 +18417,18 @@ function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?:
     // An index loop rather than forEach: forEach skips holes in sparse arrays, which would let an
     // undefined value reach the block encoder and persist a corrupt block that only fails at read
     // time. Every slot is validated, holes included.
+    const stringByteLengths =
+      column.type === "string" ? new Array<number>(values.length) : undefined;
     for (let index = 0; index < values.length; index += 1) {
       const value = values[index] as BatchValue;
-      if (allowNull && value === null) continue;
-      validateValue(column, value, index);
+      if (allowNull && value === null) {
+        if (stringByteLengths !== undefined) stringByteLengths[index] = 0;
+        continue;
+      }
+      const byteLength = validateValue(column, value, index);
+      if (stringByteLengths !== undefined) stringByteLengths[index] = byteLength ?? 0;
     }
+    if (stringByteLengths !== undefined) validatedStringByteLengths.set(values, stringByteLengths);
   }
   // The constraints run last, over whole rows, once every column has been type-checked.
   if ((table.checks ?? []).length > 0) {
@@ -15135,13 +18458,20 @@ function validateUpdateBatch(
   const changeNames = Object.keys(input.changes);
   if (changeNames.length === 0) throw new TypeError("An update batch needs at least one change");
   const keys = new Map<string, Exclude<BatchValue, null>>();
-  input.keys.forEach((value, index) => {
-    validateValue(keyColumn, value, index);
+  const keyStringByteLengths =
+    keyColumn.type === "string" ? new Array<number>(input.keys.length) : undefined;
+  for (let index = 0; index < input.keys.length; index += 1) {
+    const value = input.keys[index] as BatchValue;
+    const byteLength = validateValue(keyColumn, value, index);
+    if (keyStringByteLengths !== undefined) keyStringByteLengths[index] = byteLength ?? 0;
     if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
     const token = keyToken(keyColumn.type, value);
     if (keys.has(token)) throw new TypeError(`Duplicate update key: ${formatValue(value)}`);
     keys.set(token, value);
-  });
+  }
+  if (keyStringByteLengths !== undefined) {
+    validatedStringByteLengths.set(input.keys, keyStringByteLengths);
+  }
   for (const name of changeNames) {
     const column = table.columns.find((candidate) => candidate.name === name);
     if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
@@ -15153,7 +18483,14 @@ function validateUpdateBatch(
     if (values.length !== input.keys.length) {
       throw new TypeError("Every changed column must have the same row count as the keys");
     }
-    values.forEach((value, index) => validateValue(column, value, index));
+    const stringByteLengths =
+      column.type === "string" ? new Array<number>(values.length) : undefined;
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index] as BatchValue;
+      const byteLength = validateValue(column, value, index);
+      if (stringByteLengths !== undefined) stringByteLengths[index] = byteLength ?? 0;
+    }
+    if (stringByteLengths !== undefined) validatedStringByteLengths.set(values, stringByteLengths);
   }
   return keys;
 }
@@ -15198,10 +18535,14 @@ function resolvePublicReadColumns(
   });
 }
 
-function validateValue(column: TableColumnRecord, value: BatchValue, index: number): void {
+function validateValue(
+  column: TableColumnRecord,
+  value: BatchValue,
+  index: number,
+): number | undefined {
   if (value === null) {
     if (!column.nullable) throw new TypeError(`${column.name}[${String(index)}] cannot be null`);
-    return;
+    return column.type === "string" ? 0 : undefined;
   }
   const valid =
     (column.type === "boolean" && typeof value === "boolean") ||
@@ -15210,12 +18551,18 @@ function validateValue(column: TableColumnRecord, value: BatchValue, index: numb
       Number.isFinite(value) &&
       (column.integer !== true || Number.isSafeInteger(value))) ||
     (column.type === "string" && typeof value === "string") ||
-    (column.type === "datetime" && value instanceof Date && Number.isFinite(value.getTime()));
+    (column.type === "datetime" &&
+      value instanceof Date &&
+      Number.isFinite(dateMilliseconds(value)));
   if (!valid) {
     throw new TypeError(
       `${column.name}[${String(index)}] must be ${column.integer === true ? "a safe integer" : column.type}`,
     );
   }
+  const stringByteLength =
+    column.type === "string" && typeof value === "string"
+      ? wellFormedUtf8ByteLength(value, `${column.name}[${String(index)}]`)
+      : undefined;
   if (
     column.enumValues !== undefined &&
     typeof value === "string" &&
@@ -15225,6 +18572,7 @@ function validateValue(column: TableColumnRecord, value: BatchValue, index: numb
       `${column.name}[${String(index)}] must be one of: ${column.enumValues.join(", ")}`,
     );
   }
+  return stringByteLength;
 }
 
 /** Merges per-column sorted row-id arrays into one sorted, de-duplicated array. */
@@ -15328,6 +18676,16 @@ function sortedFtsPostings(byTerm: Map<string, { rowIds: bigint[]; tf: number[] 
     .map(([term, posting]) => ({ term, rowIds: posting.rowIds, tf: posting.tf }));
 }
 
+function postingFrequencyTotal(postings: readonly FtsPosting[]): number {
+  let total = 0;
+  for (const posting of postings) {
+    for (const frequency of posting.tf) {
+      total = safeWholeNumberSum([total, frequency], "Posting term-frequency total");
+    }
+  }
+  return total;
+}
+
 const secondaryNumberBits = new DataView(new ArrayBuffer(8));
 
 /** Converts a SQL evaluator's unambiguous TEXT representation back to its physical user value. */
@@ -15367,13 +18725,14 @@ function secondaryIndexTerm(type: SimpleDataType, value: BatchValue): string {
   if (value === null) throw new TypeError("A NULL has no secondary-index comparison term");
   if (type === "string") {
     if (typeof value !== "string") throw new TypeError("Invalid string index value");
+    assertIndexedStringLength(value);
     return value;
   }
   if (type === "boolean") {
     if (typeof value !== "boolean") throw new TypeError("Invalid boolean index value");
     return value ? "1" : "0";
   }
-  const numeric = type === "datetime" && value instanceof Date ? value.getTime() : value;
+  const numeric = type === "datetime" && value instanceof Date ? dateMilliseconds(value) : value;
   if (typeof numeric !== "number" || !Number.isFinite(numeric)) {
     throw new TypeError(`Invalid ${type} index value`);
   }
@@ -15391,6 +18750,10 @@ function secondaryTupleComponent(type: SimpleDataType, value: BatchValue): strin
   if (value === null) throw new TypeError("A NULL has no secondary-index comparison term");
   if (type === "string") {
     if (typeof value !== "string") throw new TypeError("Invalid string index value");
+    assertIndexedStringLength(value);
+    if (value.length * 5 + 5 > MAX_FTS_POSTING_TERM_CHARACTERS) {
+      throw new RangeError("Composite index term exceeds the persisted term limit");
+    }
     let encoded = "";
     for (let index = 0; index < value.length; index += 1) {
       encoded += (value.charCodeAt(index) + 1).toString(16).padStart(5, "0");
@@ -15430,13 +18793,15 @@ function secondaryTupleIndexTerm(
 ): string {
   if (columns.length !== values.length) throw new TypeError("Index key has the wrong arity");
   const directions = secondaryIndexDirections(index);
-  return columns
-    .map((column, position) => {
-      const component = secondaryTupleComponent(column.type, values[position] ?? null);
-      if (directions[position] !== "desc") return component;
-      return reverseSecondaryHex(component);
-    })
-    .join("");
+  let term = "";
+  for (const [position, column] of columns.entries()) {
+    const component = secondaryTupleComponent(column.type, values[position] ?? null);
+    if (term.length + component.length > MAX_FTS_POSTING_TERM_CHARACTERS) {
+      throw new RangeError("Composite index term exceeds the persisted term limit");
+    }
+    term += directions[position] === "desc" ? reverseSecondaryHex(component) : component;
+  }
+  return term;
 }
 
 function secondaryIndexComponentTerm(
@@ -15445,10 +18810,6 @@ function secondaryIndexComponentTerm(
   position: number,
   value: BatchValue,
 ): string {
-  if (index.termEncoding !== "tuple-v1") {
-    if (position !== 0) throw new TypeError("A legacy index has one key component");
-    return secondaryIndexTerm(column.type, value);
-  }
   const component = secondaryTupleComponent(column.type, value);
   if (secondaryIndexDirections(index)[position] !== "desc") return component;
   return reverseSecondaryHex(component);
@@ -15526,10 +18887,7 @@ function addSecondaryPosting(
   if (values.some((value) => value === null)) return;
   const first = columns[0];
   if (first === undefined) return;
-  const term =
-    index.termEncoding === "tuple-v1"
-      ? secondaryTupleIndexTerm(index, columns, values)
-      : secondaryIndexTerm(first.type, values[0] ?? null);
+  const term = secondaryTupleIndexTerm(index, columns, values);
   if (uniqueTerms?.has(term) === true) {
     throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
   }
@@ -15580,7 +18938,7 @@ function appendRowIdSpans(segments: readonly SegmentRecord[], expectedRows: numb
   const spans: RowIdSpan[] = [];
   let outputStart = 0;
   for (const segment of segments) {
-    const kind = segment.kind ?? "insert";
+    const kind = segment.kind;
     if (kind !== "insert" && kind !== "base") continue;
     for (const span of mergeSourceRowIdSpans(segment, kind)) {
       spans.push({ ...span, rowStart: outputStart + span.rowStart });
@@ -15616,12 +18974,31 @@ function appendRowForLocator(
   };
 }
 
-/** Term-range partitioning for the base chunks; 128 terms per chunk keeps records small. */
+/** Term-range partitioning bounded by both record count and aggregate posting cardinality. */
 function chunkFtsPostings(postings: FtsPosting[], size = 128): FtsPosting[][] {
   const chunks: FtsPosting[][] = [];
-  for (let start = 0; start < postings.length; start += size) {
-    chunks.push(postings.slice(start, start + size));
+  let chunk: FtsPosting[] = [];
+  let rowIds = 0;
+  const flush = (): void => {
+    if (chunk.length === 0) return;
+    chunks.push(chunk);
+    chunk = [];
+    rowIds = 0;
+  };
+  for (const posting of postings) {
+    if (posting.rowIds.length > MAX_FTS_POSTING_ROW_IDS_PER_CHUNK) {
+      throw new RangeError("One posting exceeds the persisted row-id chunk limit");
+    }
+    if (
+      chunk.length >= Math.min(size, MAX_FTS_POSTINGS_PER_CHUNK) ||
+      rowIds + posting.rowIds.length > MAX_FTS_POSTING_ROW_IDS_PER_CHUNK
+    ) {
+      flush();
+    }
+    chunk.push(posting);
+    rowIds += posting.rowIds.length;
   }
+  flush();
   return chunks;
 }
 
@@ -15671,20 +19048,26 @@ function buildSecondaryInsertDeltas(
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
     const keys = keyColumn === undefined ? undefined : (input.columns[keyColumn.name] ?? []);
     const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
-    for (let row = 0; row < rowCount; row += 1) {
-      const values = indexedColumns.map((column) => input.columns[column.name]?.[row] ?? null);
-      if (values.some((value) => value === null)) continue;
-      const locator =
-        keyColumn === undefined
-          ? rowIdStart + BigInt(row)
-          : secondaryKeyLocator(keyColumn.type, keys?.[row] ?? null);
-      addSecondaryPosting(byTerm, index, indexedColumns, values, locator);
+    try {
+      for (let row = 0; row < rowCount; row += 1) {
+        const values = indexedColumns.map((column) => input.columns[column.name]?.[row] ?? null);
+        if (values.some((value) => value === null)) continue;
+        const locator =
+          keyColumn === undefined
+            ? rowIdStart + BigInt(row)
+            : secondaryKeyLocator(keyColumn.type, keys?.[row] ?? null);
+        addSecondaryPosting(byTerm, index, indexedColumns, values, locator);
+      }
+    } catch (error) {
+      if (error instanceof RangeError && index.unique !== true) return [];
+      throw error;
     }
+    const postings = sortedSecondaryPostings(byTerm);
     return [
       {
         columnId: index.storageColumnId,
-        postings: sortedSecondaryPostings(byTerm),
-        totalTokens: 0,
+        postings,
+        totalTokens: postingFrequencyTotal(postings),
       },
     ];
   });
@@ -15710,27 +19093,33 @@ function buildSecondaryUpdateDeltas(
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
     const affected = indexedColumns.some((column) => input.changes[column.name] !== undefined);
     if (affected) {
-      for (let row = 0; row < input.keys.length; row += 1) {
-        const values = indexedColumns.map((column) =>
-          input.changes[column.name] === undefined
-            ? (preImages[row]?.[column.name] ?? null)
-            : (input.changes[column.name]?.[row] ?? null),
-        );
-        if (values.some((value) => value === null)) continue;
-        addSecondaryPosting(
-          byTerm,
-          index,
-          indexedColumns,
-          values,
-          secondaryKeyLocator(keyColumn.type, input.keys[row] ?? null),
-        );
+      try {
+        for (let row = 0; row < input.keys.length; row += 1) {
+          const values = indexedColumns.map((column) =>
+            input.changes[column.name] === undefined
+              ? (preImages[row]?.[column.name] ?? null)
+              : (input.changes[column.name]?.[row] ?? null),
+          );
+          if (values.some((value) => value === null)) continue;
+          addSecondaryPosting(
+            byTerm,
+            index,
+            indexedColumns,
+            values,
+            secondaryKeyLocator(keyColumn.type, input.keys[row] ?? null),
+          );
+        }
+      } catch (error) {
+        if (error instanceof RangeError && index.unique !== true) return [];
+        throw error;
       }
     }
+    const postings = sortedSecondaryPostings(byTerm);
     return [
       {
         columnId: index.storageColumnId,
-        postings: sortedSecondaryPostings(byTerm),
-        totalTokens: 0,
+        postings,
+        totalTokens: postingFrequencyTotal(postings),
       },
     ];
   });
@@ -15783,9 +19172,7 @@ function secondaryUniqueTerm(
   values: readonly BatchValue[],
 ): string | undefined {
   if (values.some((value) => value === null)) return undefined;
-  return index.termEncoding === "tuple-v1"
-    ? secondaryTupleIndexTerm(index, columns, values)
-    : secondaryIndexTerm(columns[0]?.type ?? "string", values[0] ?? null);
+  return secondaryTupleIndexTerm(index, columns, values);
 }
 
 function assertNoDuplicateUniqueTerms(index: SecondaryIndexRecord, terms: readonly string[]): void {
@@ -15929,13 +19316,13 @@ function primaryKeyColumns(table: TableRecord): TableColumnRecord[] {
 function foreignKeyColumns(
   key: NonNullable<TableRecord["foreignKeys"]>[number],
 ): readonly string[] {
-  return key.columns ?? [key.column];
+  return key.columns;
 }
 
 function foreignKeyParentColumns(
   key: NonNullable<TableRecord["foreignKeys"]>[number],
 ): readonly string[] {
-  return key.parentColumns ?? [key.parentColumn];
+  return key.parentColumns;
 }
 
 function sqlTupleToken(values: readonly unknown[]): string {
@@ -16172,8 +19559,8 @@ function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
   let levelZero = 0;
   let deltas = 0;
   for (const segment of segments) {
-    if ((segment.level ?? 0) === 0) levelZero += 1;
-    const kind = segment.kind ?? "insert";
+    if (segment.level === 0) levelZero += 1;
+    const kind = segment.kind;
     if (kind !== "insert" && kind !== "base") deltas += 1;
   }
   return levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
@@ -16181,7 +19568,37 @@ function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
 
 /** A macrotask boundary, so background work lets queued queries and writes run between steps. */
 function yieldToEventLoop(): Promise<void> {
+  // A timer is clamped to roughly 1–4 ms in the runtimes Minnow targets. Maintenance can yield
+  // once per bounded page, so using timers turns a healthy thousand-page cleanup into seconds of
+  // artificial latency. MessageChannel is still a genuine task boundary (rendering, timers, and
+  // other clients can run) without the timer clamp.
+  // Vitest/Sinon fake timers expose a `clock` marker and intentionally expect cooperative work
+  // to remain timer-driven. Production timers have no such property.
+  if (typeof MessageChannel !== "undefined" && !Reflect.has(setTimeout, "clock")) {
+    return new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close();
+        channel.port2.close();
+        resolve();
+      };
+      channel.port2.postMessage(undefined);
+    });
+  }
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function boundedExpiryMilliseconds(nowMs: number, ttlMs: number): number {
+  const expiresAt = nowMs + ttlMs;
+  if (
+    !Number.isSafeInteger(nowMs) ||
+    !Number.isSafeInteger(ttlMs) ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt > 8_640_000_000_000_000
+  ) {
+    throw new RangeError("Lease expiry is outside the supported Date range");
+  }
+  return expiresAt;
 }
 
 function keyToken(type: SimpleDataType, value: BatchValue): string {
@@ -16197,17 +19614,26 @@ function keyToken(type: SimpleDataType, value: BatchValue): string {
       return `number:${String(value)}`;
     case "string":
       if (typeof value !== "string") throw new TypeError("Invalid string unique key");
+      assertIndexedStringLength(value);
       return `string:${value}`;
     case "datetime":
-      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+      if (!(value instanceof Date) || !Number.isFinite(dateMilliseconds(value))) {
         throw new TypeError("Invalid datetime unique key");
       }
-      return `datetime:${String(value.getTime())}`;
+      return `datetime:${String(dateMilliseconds(value))}`;
+  }
+}
+
+function assertIndexedStringLength(value: string): void {
+  if (value.length > MAX_INDEXED_STRING_CHARACTERS) {
+    throw new RangeError(
+      `Indexed strings cannot exceed ${String(MAX_INDEXED_STRING_CHARACTERS)} characters`,
+    );
   }
 }
 
 function formatValue(value: Exclude<BatchValue, null>): string {
-  return value instanceof Date ? value.toISOString() : String(value);
+  return value instanceof Date ? dateIsoString(value) : String(value);
 }
 
 function nonNegativeWholeNumber(value: number, name: string): number {
@@ -16215,6 +19641,16 @@ function nonNegativeWholeNumber(value: number, name: string): number {
     throw new RangeError(`${name} must be a non-negative whole number`);
   }
   return value;
+}
+
+function boundedRetainedVersions(value: number): number {
+  const retained = nonNegativeWholeNumber(value, "Garbage collection retained versions");
+  if (retained > MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS) {
+    throw new RangeError(
+      `Garbage collection retained versions cannot exceed ${String(MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS)}`,
+    );
+  }
+  return retained;
 }
 
 function positiveWholeNumber(value: number, name: string): number {
@@ -16634,7 +20070,7 @@ function fillColumnVectorRange(
   }
   if (vector.kind === "number" || vector.kind === "datetime") {
     vector.values.fill(
-      value instanceof Date ? value.getTime() : Number(value),
+      value instanceof Date ? dateMilliseconds(value) : Number(value),
       start,
       start + count,
     );
@@ -16764,7 +20200,7 @@ function joinPartitionOf(value: Exclude<QueryValue, null>, partitions: number): 
     mix(value ? 1 : 0);
     mix(0x42);
   } else {
-    const numeric = value instanceof Date ? value.getTime() : value;
+    const numeric = value instanceof Date ? dateMilliseconds(value) : value;
     joinHashScratch.setFloat64(0, numeric === 0 ? 0 : numeric, true);
     mix(joinHashScratch.getUint32(0, true));
     mix(joinHashScratch.getUint32(4, true));
@@ -16826,7 +20262,7 @@ function estimatedColumnarBytes(
 ): number {
   let rows = 0;
   for (const segment of segments) {
-    const kind = segment.kind ?? "insert";
+    const kind = segment.kind;
     if (kind === "insert" || kind === "base") rows += segment.rowCount;
   }
   let rowWidth = 0;
@@ -16847,7 +20283,7 @@ interface OverlayUpdate {
 
 /** Whether a visible segment is a delete or update delta rather than appended rows. */
 function mutationSegmentKind(segment: SegmentRecord): boolean {
-  const kind = segment.kind ?? "insert";
+  const kind = segment.kind;
   return kind !== "insert" && kind !== "base";
 }
 
@@ -17321,7 +20757,7 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     const value =
       column.type === "datetime"
         ? expression.value instanceof Date
-          ? expression.value.getTime()
+          ? dateMilliseconds(expression.value)
           : undefined
         : typeof expression.value === "number"
           ? expression.value
@@ -17365,7 +20801,7 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     const value =
       column.type === "datetime"
         ? literal.value instanceof Date
-          ? literal.value.getTime()
+          ? dateMilliseconds(literal.value)
           : undefined
         : typeof literal.value === "number"
           ? literal.value
@@ -17584,11 +21020,7 @@ function secondaryIndexOrderForPlan(
   const orderColumns = plan.orderBy.map((order) => resolveOrderColumn(order.expression));
   if (orderColumns.some((column) => column === undefined)) return undefined;
   for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
-    if (
-      index.state !== "ready" ||
-      index.termEncoding !== "tuple-v1" ||
-      index.locator !== "row-id"
-    ) {
+    if (index.state !== "ready" || index.locator !== "row-id") {
       continue;
     }
     const ids = secondaryIndexColumnIds(index);
@@ -17640,7 +21072,7 @@ function segmentRowsIntersectLocators(
   candidates: readonly bigint[],
 ): boolean {
   const rowEnd = rowStart + rowCount;
-  const kind = segment.kind ?? "insert";
+  const kind = segment.kind;
   for (const span of mergeSourceRowIdSpans(segment, kind)) {
     const from = Math.max(rowStart, span.rowStart);
     const to = Math.min(rowEnd, span.rowStart + span.rowCount);
@@ -17814,19 +21246,16 @@ function mergeSourceRowIdSpans(segment: SegmentRecord, kind: SegmentKind): RowId
     if (
       segment.rowIdStart !== 0n ||
       segment.rowIdEndExclusive !== 0n ||
-      (segment.rowIdSpans?.length ?? 0) !== 0
+      segment.rowIdSpans.length !== 0
     ) {
       throw new Error(`Mutation marker unexpectedly owns row IDs: ${segment.id}`);
     }
     return [];
   }
-  const spans = segment.rowIdSpans?.map((span) => ({ ...span })) ?? [
-    {
-      rowStart: 0,
-      rowCount: segment.rowCount,
-      rowIdStart: segment.rowIdStart,
-    },
-  ];
+  const spans =
+    segment.rowIdSpans.length === 0
+      ? [{ rowStart: 0, rowCount: segment.rowCount, rowIdStart: segment.rowIdStart }]
+      : segment.rowIdSpans.map((span) => ({ ...span }));
   const envelope = rowIdSpanEnvelope(spans);
   let rowStart = 0;
   for (const [index, span] of spans.entries()) {
@@ -17901,7 +21330,7 @@ function sourceOrderTuple(
     throw new Error(`${label} has no committed owner: ${segment.id}`);
   }
   return {
-    logicalOrder: segment.logicalOrder ?? owner.committedVersion,
+    logicalOrder: segment.logicalOrder,
     committedVersion: owner.committedVersion,
     segmentId: segment.id,
   };
@@ -18200,10 +21629,10 @@ function overlayKeyOf(type: SimpleDataType, value: BatchValue): OverlayKey {
       if (typeof value !== "string") throw new TypeError("Invalid string unique key");
       return value;
     case "datetime":
-      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+      if (!(value instanceof Date) || !Number.isFinite(dateMilliseconds(value))) {
         throw new TypeError("Invalid datetime unique key");
       }
-      return value.getTime();
+      return dateMilliseconds(value);
   }
 }
 
@@ -18682,7 +22111,7 @@ function partitionOutputSegmentId(outputSegmentId: string, index: number): strin
 function compactionOutputSegmentIds(job: CompactionJobRecord): string[] {
   if (job.outputSegmentId === null) return [];
   const plan = job.rewritePlan;
-  if ((plan?.kind !== "merge-v1" && plan?.kind !== "rechunk-v1") || plan.partitions === undefined) {
+  if ((plan.kind !== "merge-v1" && plan.kind !== "rechunk-v1") || plan.partitions === undefined) {
     return [job.outputSegmentId];
   }
   const outputSegmentId = job.outputSegmentId;
@@ -18737,7 +22166,8 @@ function compactionOutputSegments(
         level: job.targetLevel,
         ...partitionOrdinal,
         logicalOrder: partition.logicalOrder,
-        ...(rowIdSpans === undefined ? {} : { rowIdSpans }),
+        commitOrdinal: index,
+        rowIdSpans: rowIdSpans ?? [],
         createdAt,
       };
     });
@@ -18756,7 +22186,8 @@ function compactionOutputSegments(
       level: job.targetLevel,
       ...partitionOrdinal,
       logicalOrder: plan.logicalOrder,
-      ...(plan.kind === "merge-v1" ? { rowIdSpans: structuredClone(plan.rowIdSpans) } : {}),
+      commitOrdinal: 0,
+      rowIdSpans: plan.kind === "merge-v1" ? structuredClone(plan.rowIdSpans) : [],
       createdAt,
     },
   ];
@@ -18847,7 +22278,7 @@ function compactionProgress(
   job: CompactionJobRecord,
   result: CompactTableResult | null,
 ): CompactionJobProgress {
-  const rewritePlan = job.rewritePlan ?? { kind: "copy-v1" as const };
+  const rewritePlan = job.rewritePlan;
   return {
     jobId: job.id,
     tableName,
@@ -18856,12 +22287,8 @@ function compactionProgress(
     sourceSegmentCount: job.sourceSegmentIds.length,
     sourceBlockCount: job.sourceBlockIds.length,
     outputBlockCount: job.outputBlockIds.length,
-    ...(job.level0SourceStoredBytes === undefined || job.anchorSourceStoredBytes === undefined
-      ? {}
-      : {
-          level0SourceStoredBytes: job.level0SourceStoredBytes,
-          anchorSourceStoredBytes: job.anchorSourceStoredBytes,
-        }),
+    level0SourceStoredBytes: job.level0SourceStoredBytes,
+    anchorSourceStoredBytes: job.anchorSourceStoredBytes,
     ...(job.outputPartitionOrdinal === undefined
       ? {}
       : {
@@ -18875,9 +22302,9 @@ function compactionProgress(
         }),
     ...(rewritePlan.kind !== "copy-v1"
       ? {
-          memoryBudgetBytes: job.memoryBudgetBytes ?? 0,
-          minimumMemoryBytes: job.minimumMemoryBytes ?? 0,
-          peakWorkingBytes: job.peakWorkingBytes ?? 0,
+          memoryBudgetBytes: job.memoryBudgetBytes,
+          minimumMemoryBytes: job.minimumMemoryBytes,
+          peakWorkingBytes: job.peakWorkingBytes,
         }
       : {}),
     result,
@@ -19030,6 +22457,18 @@ function columnVectorRetainedBytes(vector: ColumnVector): number {
 }
 
 /**
+ * Retained bytes for a decoded physical block. A raw column keeps the store-returned backing
+ * buffer alive through its zero-copy view, while a compressed column keeps the decompressor's
+ * uncompressed backing buffer. Charging the stored byte length undercounts highly compressible
+ * blocks by orders of magnitude and lets the cache retain far more memory than its byte budget.
+ */
+function decodedPhysicalBlockRetainedBytes(block: DecodedPhysicalBlock): number {
+  const retainedPayloadBytes = block.column.bytes.buffer.byteLength;
+  const metadataBytes = block.description.metadata.zoneMap === undefined ? 0 : 32;
+  return retainedPayloadBytes + metadataBytes + 192;
+}
+
+/**
  * Memoized retained size of a *block* vector. A block vector is built once per block id and
  * then shared by reference across every query that scans it, so its size never changes —
  * but a streamed scan re-reserves that size on every window install, and for a string column
@@ -19057,9 +22496,9 @@ function sameCompactionSegment(left: SegmentRecord, right: SegmentRecord): boole
     left.rowCount !== right.rowCount ||
     left.rowIdStart !== right.rowIdStart ||
     left.rowIdEndExclusive !== right.rowIdEndExclusive ||
-    (left.kind ?? "insert") !== (right.kind ?? "insert") ||
+    left.kind !== right.kind ||
     left.keyColumnId !== right.keyColumnId ||
-    (left.level ?? 0) !== (right.level ?? 0) ||
+    left.level !== right.level ||
     left.partitionOrdinal !== right.partitionOrdinal ||
     left.logicalOrder !== right.logicalOrder
   ) {
@@ -19112,10 +22551,10 @@ function sameMergeSourceSegment(
     owner.committedVersion !== planned.committedVersion ||
     actual.id !== planned.segmentId ||
     actual.transactionId !== planned.transactionId ||
-    (actual.kind ?? "insert") !== planned.kind ||
+    actual.kind !== planned.kind ||
     (actual.keyColumnId ?? planned.keyColumnId) !== planned.keyColumnId ||
-    (actual.level ?? 0) !== planned.level ||
-    (actual.logicalOrder ?? owner.committedVersion) !== planned.logicalOrder ||
+    actual.level !== planned.level ||
+    actual.logicalOrder !== planned.logicalOrder ||
     actual.rowCount !== planned.rowCount ||
     actual.rowIdStart !== planned.rowIdStart ||
     actual.rowIdEndExclusive !== planned.rowIdEndExclusive
@@ -19171,9 +22610,7 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
   const levelOneSegments = levelOnePartitionPrefix(segments);
   if (
     levelOneSegments === null ||
-    levelOneSegments.some(
-      (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
-    )
+    levelOneSegments.some((segment) => segment.kind !== "insert" || segment.rowIdSpans.length !== 0)
   ) {
     return null;
   }
@@ -19183,10 +22620,10 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
   retainedPrefix.push(...levelOneSegments);
   for (;;) {
     const segment = segments[index];
-    if (segment === undefined || (segment.level ?? 0) !== 2) break;
+    if (segment?.level !== 2) break;
     if (
-      (segment.kind ?? "insert") !== "insert" ||
-      segment.rowIdSpans !== undefined ||
+      segment.kind !== "insert" ||
+      segment.rowIdSpans.length !== 0 ||
       segment.partitionOrdinal !== levelTwoSegments.length ||
       !validLogicalOrder(segment.logicalOrder) ||
       segment.rowIdEndExclusive - segment.rowIdStart !== BigInt(segment.rowCount)
@@ -19201,11 +22638,11 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
   if (
     level0Segments.some(
       (segment) =>
-        (segment.level ?? 0) !== 0 ||
+        segment.level !== 0 ||
         segment.partitionOrdinal !== undefined ||
-        (segment.kind ?? "insert") !== "insert" ||
-        segment.rowIdSpans !== undefined ||
-        (segment.logicalOrder !== undefined && !validLogicalOrder(segment.logicalOrder)),
+        segment.kind !== "insert" ||
+        segment.rowIdSpans.length !== 0 ||
+        !validLogicalOrder(segment.logicalOrder),
     )
   ) {
     return null;
@@ -19243,9 +22680,7 @@ function keyedLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOneL
   if (partitions === null) return null;
   const level0Segments = segments.slice(partitions.length);
   if (
-    level0Segments.some(
-      (segment) => (segment.level ?? 0) !== 0 || segment.partitionOrdinal !== undefined,
-    )
+    level0Segments.some((segment) => segment.level !== 0 || segment.partitionOrdinal !== undefined)
   ) {
     return null;
   }
@@ -19256,20 +22691,17 @@ function keyedLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOneL
 /** The append-only counterpart: bounded L1 partitions followed by contiguous insert deltas. */
 function keylessLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOneLayout | null {
   const partitions = levelOnePartitionPrefix(segments);
-  if (
-    partitions === null ||
-    partitions.some((segment) => (segment.kind ?? "insert") !== "insert")
-  ) {
+  if (partitions === null || partitions.some((segment) => segment.kind !== "insert")) {
     return null;
   }
   const level0Segments = segments.slice(partitions.length);
   if (
     level0Segments.some(
       (segment) =>
-        (segment.level ?? 0) !== 0 ||
+        segment.level !== 0 ||
         segment.partitionOrdinal !== undefined ||
-        (segment.kind ?? "insert") !== "insert" ||
-        segment.rowIdSpans !== undefined,
+        segment.kind !== "insert" ||
+        segment.rowIdSpans.length !== 0,
     ) ||
     !hasContiguousRowIds(segments)
   ) {
@@ -19285,14 +22717,14 @@ function keylessLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOn
 function levelOnePartitionPrefix(segments: readonly SegmentRecord[]): SegmentRecord[] | null {
   const partitions: SegmentRecord[] = [];
   for (const segment of segments) {
-    if ((segment.level ?? 0) !== 1) break;
-    const kind = segment.kind ?? "insert";
+    if (segment.level !== 1) break;
+    const kind = segment.kind;
     const previousOrder = partitions[partitions.length - 1]?.logicalOrder ?? -1;
     if (
       (kind !== "insert" && kind !== "base") ||
       segment.partitionOrdinal !== undefined ||
       !validLogicalOrder(segment.logicalOrder) ||
-      (segment.logicalOrder ?? -1) <= previousOrder
+      segment.logicalOrder <= previousOrder
     ) {
       return null;
     }
@@ -19308,7 +22740,7 @@ function levelOnePartitionPrefix(segments: readonly SegmentRecord[]): SegmentRec
 function disjointRowIdFootprints(segments: readonly SegmentRecord[]): boolean {
   const intervals: Array<{ start: bigint; end: bigint }> = [];
   for (const segment of segments) {
-    if (segment.rowIdSpans !== undefined) {
+    if (segment.rowIdSpans.length !== 0) {
       for (const span of segment.rowIdSpans) {
         intervals.push({ start: span.rowIdStart, end: span.rowIdStart + BigInt(span.rowCount) });
       }
@@ -19349,14 +22781,14 @@ function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoL
   const levelTwoSegments: SegmentRecord[] = [];
   for (;;) {
     const segment = segments[index];
-    if (segment === undefined || (segment.level ?? 0) !== 2) break;
-    const kind = segment.kind ?? "insert";
+    if (segment?.level !== 2) break;
+    const kind = segment.kind;
     if (
       segment.partitionOrdinal !== levelTwoSegments.length ||
       !validLogicalOrder(segment.logicalOrder) ||
       (kind !== "insert" && kind !== "base") ||
-      (kind === "insert" && segment.rowIdSpans !== undefined) ||
-      (kind === "base" && (segment.rowIdSpans?.length ?? 0) === 0)
+      (kind === "insert" && segment.rowIdSpans.length !== 0) ||
+      (kind === "base" && segment.rowIdSpans.length === 0)
     ) {
       return null;
     }
@@ -19368,9 +22800,7 @@ function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoL
   index += anchors.length;
   const level0Segments = segments.slice(index);
   if (
-    level0Segments.some(
-      (segment) => (segment.level ?? 0) !== 0 || segment.partitionOrdinal !== undefined,
-    )
+    level0Segments.some((segment) => segment.level !== 0 || segment.partitionOrdinal !== undefined)
   ) {
     return null;
   }
@@ -19462,6 +22892,42 @@ function estimateBatchBytes(input: ColumnarBatch): number {
   );
 }
 
+function writeColumnValues(type: LogicalType, values: readonly BatchValue[]): WriteColumnValues {
+  const cached = type === "string" ? validatedStringByteLengths.get(values) : undefined;
+  return {
+    type,
+    values,
+    ...(cached?.length === values.length ? { stringByteLengths: cached } : {}),
+  };
+}
+
+/** Conservative complete stored-byte bound used to flush an accumulator before encoding. */
+function maximumWriteBlockStoredBytes(
+  column: WriteColumnValues,
+  start: number,
+  end: number,
+  compression: Compression,
+): number {
+  let stringBytes = 0;
+  if (column.type === "string") {
+    for (let index = start; index < end; index += 1) {
+      const value = column.values[index];
+      if (value === null) continue;
+      if (typeof value !== "string") throw new TypeError("String column contains a non-string");
+      stringBytes += column.stringByteLengths?.[index] ?? wellFormedUtf8ByteLength(value);
+    }
+  }
+  const physicalBytes = physicalColumnByteLength(column.type, end - start, stringBytes);
+  const storedPayloadBytes =
+    compression === "gzip"
+      ? Math.max(physicalBytes, getCompressionMemoryBound("gzip", physicalBytes).maximumOutputBytes)
+      : physicalBytes;
+  return Math.min(
+    MAX_STORED_BLOCK_BYTE_LENGTH,
+    BLOCK_HEADER_LENGTH + MAX_BLOCK_METADATA_BYTE_LENGTH + storedPayloadBytes,
+  );
+}
+
 function estimateValuesBytes(values: readonly BatchValue[]): number {
   let bytes = 0;
   for (const value of values) {
@@ -19475,8 +22941,39 @@ function estimateValuesBytes(values: readonly BatchValue[]): number {
   return bytes;
 }
 
-function sumBytes(blocks: ReadonlyArray<{ bytes: Uint8Array }>): number {
-  return blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
+function cacheableQueryInput(sql: string, params: readonly QueryValue[]): boolean {
+  let characters = sql.length;
+  if (characters > MAX_CACHEABLE_TEXT_CHARACTERS) return false;
+  for (const value of params) {
+    if (typeof value !== "string") continue;
+    characters += value.length;
+    if (characters > MAX_CACHEABLE_TEXT_CHARACTERS) return false;
+  }
+  return true;
+}
+
+async function filterSnapshotSegments(
+  snapshot: Snapshot,
+  segments: readonly SegmentRecord[],
+): Promise<SegmentRecord[]> {
+  const blockIds = [
+    ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+  ];
+  const membership = await snapshot.hasBlocks(blockIds);
+  const visibleBlockIds = new Set(blockIds.filter((_blockId, index) => membership[index] === true));
+  return segments.filter((segment) =>
+    Object.values(segment.columnBlockIds)
+      .flat()
+      .every((blockId) => visibleBlockIds.has(blockId)),
+  );
+}
+
+async function firstMissingSnapshotBlock(
+  snapshot: Snapshot,
+  blockIds: readonly string[],
+): Promise<string | undefined> {
+  const membership = await snapshot.hasBlocks(blockIds);
+  return blockIds.find((_blockId, index) => membership[index] !== true);
 }
 
 function createWriteMetrics(input: {

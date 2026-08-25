@@ -22,3 +22,86 @@ export interface SyncFileHandle {
   /** Releases the handle (and any exclusive lock the platform ties to it). */
   close(): void;
 }
+
+/**
+ * Writes the complete buffer, retrying the short transfers permitted by sync-access handles.
+ * The common path is one `write` call; retries pass subarray views and never copy payload bytes.
+ */
+export function writeFully(
+  handle: SyncFileHandle,
+  buffer: Uint8Array,
+  at: number,
+  operation = "writing file bytes",
+): void {
+  assertTransferRange(at, buffer.byteLength, "write", operation);
+  let transferred = 0;
+  while (transferred < buffer.byteLength) {
+    const remaining = buffer.byteLength - transferred;
+    const chunk = transferred === 0 ? buffer : buffer.subarray(transferred);
+    const count = handle.write(chunk, { at: at + transferred });
+    assertTransferCount(count, remaining, "write", operation, at + transferred);
+    if (count === 0) {
+      throw new Error(
+        `OPFS write made no progress while ${operation}: wrote ${String(transferred)} of ` +
+          `${String(buffer.byteLength)} bytes (stalled at file offset ${String(at + transferred)})`,
+      );
+    }
+    transferred += count;
+  }
+}
+
+/**
+ * Reads exactly `buffer.byteLength` bytes, retrying short transfers without copying data. A zero
+ * transfer before the requested range is complete is an unexpected EOF, not a successful read.
+ */
+export function readFully(
+  handle: SyncFileHandle,
+  buffer: Uint8Array,
+  at: number,
+  operation = "reading file bytes",
+): void {
+  assertTransferRange(at, buffer.byteLength, "read", operation);
+  let transferred = 0;
+  while (transferred < buffer.byteLength) {
+    const remaining = buffer.byteLength - transferred;
+    const chunk = transferred === 0 ? buffer : buffer.subarray(transferred);
+    const count = handle.read(chunk, { at: at + transferred });
+    assertTransferCount(count, remaining, "read", operation, at + transferred);
+    if (count === 0) {
+      throw new Error(
+        `Unexpected EOF while ${operation}: read ${String(transferred)} of ` +
+          `${String(buffer.byteLength)} bytes (EOF at file offset ${String(at + transferred)})`,
+      );
+    }
+    transferred += count;
+  }
+}
+
+function assertTransferRange(
+  at: number,
+  length: number,
+  kind: "read" | "write",
+  operation: string,
+): void {
+  if (!Number.isSafeInteger(at) || at < 0 || length > Number.MAX_SAFE_INTEGER - at) {
+    throw new RangeError(
+      `Invalid OPFS ${kind} range while ${operation}: ${String(at)}+${String(length)} ` +
+        `must be a non-negative safe-integer byte range`,
+    );
+  }
+}
+
+function assertTransferCount(
+  count: number,
+  remaining: number,
+  kind: "read" | "write",
+  operation: string,
+  at: number,
+): void {
+  if (!Number.isSafeInteger(count) || count < 0 || count > remaining) {
+    throw new Error(
+      `Invalid OPFS ${kind} result while ${operation}: handle reported ${String(count)} bytes ` +
+        `for a ${String(remaining)}-byte request at file offset ${String(at)}`,
+    );
+  }
+}

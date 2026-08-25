@@ -16,6 +16,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { allVisibleSegments } from "./storage-test-helpers.js";
 import { seedsFor } from "../testing/seeds.js";
 
 function mulberry32(seed: number): () => number {
@@ -71,10 +72,10 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
       });
       const reference = new Map<number, Row>();
       const liveBlocks = async (): Promise<number> =>
-        (await store.getCurrentManifest())?.blockIds.length ?? 0;
+        (await store.getCurrentManifest())?.liveBlockCount ?? 0;
       const visibleRecords = async () =>
         Promise.all(
-          (await database.listVisibleSegments("items")).map(async (segment) => {
+          (await allVisibleSegments(database, "items")).map(async (segment) => {
             const record = await store.getSegment(segment.id);
             if (record === undefined) throw new Error(`Visible segment is missing: ${segment.id}`);
             return record;
@@ -82,9 +83,9 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
         );
       const autoCompactionDue = async (): Promise<boolean> => {
         const records = await visibleRecords();
-        const levelZero = records.filter((segment) => (segment.level ?? 0) === 0).length;
+        const levelZero = records.filter((segment) => segment.level === 0).length;
         const deltas = records.filter((segment) => {
-          const kind = segment.kind ?? "insert";
+          const kind = segment.kind;
           return kind !== "insert" && kind !== "base";
         }).length;
         return levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
@@ -175,7 +176,7 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
         // Give the background loops room every so often; a tight loop starves their timers.
         if (operation % 25 === 0) await breathe(5);
         if (operation % CHECKPOINT_EVERY === 0) {
-          peakVisible = Math.max(peakVisible, (await database.listVisibleSegments("items")).length);
+          peakVisible = Math.max(peakVisible, (await allVisibleSegments(database, "items")).length);
           await checkContents(operation);
         }
       }
@@ -196,11 +197,12 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
             (await database.listGarbageCollectionJobs()).some(
               (job) => job.state === "planned" || job.state === "running",
             );
-          const visible = (await database.listVisibleSegments("items")).length;
+          const visible = (await allVisibleSegments(database, "items")).length;
+          const storageStats = await store.getStorageStats();
           const current = JSON.stringify([
             visible,
             await liveBlocks(),
-            (await store.listBlockIds()).length,
+            storageStats.liveBlockCount + storageStats.obsoleteBlockCount,
           ]);
           quiet = !active && !(await autoCompactionDue()) && current === previous ? quiet + 1 : 0;
           previous = current;
@@ -231,14 +233,15 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
 
       // Convergence: the history was long, and what is left of it is small.
       const records = await visibleRecords();
-      const levelOne = records.filter((segment) => (segment.level ?? 0) === 1);
-      const levelZero = records.filter((segment) => (segment.level ?? 0) === 0);
+      const levelOne = records.filter((segment) => segment.level === 1);
+      const levelZero = records.filter((segment) => segment.level === 0);
       const deltas = records.filter((segment) => {
-        const kind = segment.kind ?? "insert";
+        const kind = segment.kind;
         return kind !== "insert" && kind !== "base";
       });
       const visible = records.length;
-      const stored = (await store.listBlockIds()).length;
+      const storageStats = await store.getStorageStats();
+      const stored = storageStats.liveBlockCount + storageStats.obsoleteBlockCount;
       expect(peakVisible, `seed ${String(seed)}: the soak has to have soaked`).toBeGreaterThan(32);
       expect(reference.size).toBeGreaterThan(40);
       // The folded table fits in one L1 partition. A mixed tail can stop below the 48-segment
@@ -257,6 +260,7 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
       expect(stored, `seed ${String(seed)}: collection left non-live blocks`).toBe(
         await liveBlocks(),
       );
+      expect(storageStats.obsoleteBlockCount, `seed ${String(seed)}: obsolete payloads`).toBe(0);
       expect((await database.listCompactionJobs()).length).toBeGreaterThan(0);
       expect((await database.listGarbageCollectionJobs()).length).toBeGreaterThan(0);
     }, 180_000);

@@ -1,3 +1,4 @@
+import { copyDate } from "../date-value.js";
 import type { BatchValue } from "./batch.js";
 import type { InsertBatchResult, MinnowDatabase, UpsertBatchResult } from "./database.js";
 
@@ -31,6 +32,9 @@ export interface LifecycleFlushOptions {
   page?: LifecyclePageTarget;
 }
 
+/** Maximum accepted `add()` calls that have not completed. Callers must await for backpressure. */
+export const MAX_BUFFERED_WRITER_PENDING_ADDS = 64;
+
 /** Batches row-oriented writes by row count, estimated bytes, or age. */
 export class BufferedTableWriter {
   readonly #mode: "insert" | "upsert";
@@ -42,6 +46,9 @@ export class BufferedTableWriter {
   #estimatedBytes = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #inFlight: Promise<BufferedFlushResult> | undefined;
+  #addTail: Promise<void> = Promise.resolve();
+  #pendingAddCount = 0;
+  #acceptingAdds = true;
   #closed = false;
 
   constructor(
@@ -66,14 +73,23 @@ export class BufferedTableWriter {
 
   async add(row: Readonly<Record<string, BatchValue>>): Promise<BufferedFlushResult | undefined> {
     this.#assertOpen();
-    const copy = cloneRow(row);
-    this.#rows.push(copy);
-    this.#estimatedBytes += estimateRowBytes(copy);
-    this.#scheduleAgeFlush();
-    if (this.#rows.length >= this.#maxRows || this.#estimatedBytes >= this.#maxBytes) {
-      return this.flush();
+    if (!this.#acceptingAdds) return Promise.reject(new Error("Buffered writer is closing"));
+    if (this.#pendingAddCount >= MAX_BUFFERED_WRITER_PENDING_ADDS) {
+      return Promise.reject(
+        new RangeError(
+          `Buffered writer cannot queue more than ${String(MAX_BUFFERED_WRITER_PENDING_ADDS)} adds; await add() for backpressure`,
+        ),
+      );
     }
-    return undefined;
+    this.#pendingAddCount += 1;
+    const operation = this.#addTail.then(() => this.#addSerial(row));
+    this.#addTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation.finally(() => {
+      this.#pendingAddCount -= 1;
+    });
   }
 
   async flush(): Promise<BufferedFlushResult | undefined> {
@@ -105,6 +121,8 @@ export class BufferedTableWriter {
 
   async close(): Promise<BufferedFlushResult | undefined> {
     if (this.#closed) return undefined;
+    this.#acceptingAdds = false;
+    await this.#addTail;
     let result: BufferedFlushResult | undefined;
     while (this.#inFlight !== undefined || this.#rows.length > 0) {
       result = await this.flush();
@@ -117,6 +135,9 @@ export class BufferedTableWriter {
 
   discard(): number {
     this.#assertOpen();
+    if (this.#pendingAddCount > 0) {
+      throw new Error("Cannot discard while buffered adds are pending");
+    }
     const discarded = this.#rows.length;
     this.#rows.length = 0;
     this.#estimatedBytes = 0;
@@ -129,6 +150,20 @@ export class BufferedTableWriter {
       if (this.#inFlight !== undefined) await this.#inFlight;
       else await this.flush();
     }
+  }
+
+  async #addSerial(
+    row: Readonly<Record<string, BatchValue>>,
+  ): Promise<BufferedFlushResult | undefined> {
+    const copy = cloneRow(row);
+    this.#rows.push(copy);
+    this.#estimatedBytes += estimateRowBytes(copy);
+    this.#scheduleAgeFlush();
+    if (this.#rows.length < this.#maxRows && this.#estimatedBytes < this.#maxBytes) {
+      return undefined;
+    }
+    if (this.#inFlight !== undefined) await this.#inFlight;
+    return this.flush();
   }
 
   #scheduleAgeFlush(): void {
@@ -181,7 +216,7 @@ function cloneRow(row: Readonly<Record<string, BatchValue>>): Readonly<Record<st
   return Object.fromEntries(
     Object.entries(row).map(([name, value]) => [
       name,
-      value instanceof Date ? new Date(value.getTime()) : value,
+      value instanceof Date ? copyDate(value) : value,
     ]),
   );
 }

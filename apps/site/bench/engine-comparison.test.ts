@@ -1,4 +1,5 @@
-import { compileQuery, executeQuery, type DatabaseRow } from "@minnowdb/core";
+import type { DatabaseRow } from "@minnowdb/core";
+import { compileQuery, executeQuery } from "@minnowdb/core/query";
 import { describe, expect, it } from "vitest";
 import { generateEntityBatch, getScenario } from "./benchmark";
 import { comparisonQueries } from "./engines/shared";

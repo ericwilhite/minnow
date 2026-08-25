@@ -37,3 +37,21 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:simulator:full
+
+  randomized-soak:
+    name: Randomized engine and storage soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Merge tests replay every recorded regression seed. This scheduled frontier deliberately
+      # tries seeds that are not in that corpus yet across SQL semantics, mutation semantics,
+      # differential execution, cross-client simulation, and both compaction state machines.
+      # A failure prints the exact suite and seed so it can be committed to regression-seeds.json
+      # and replayed on every later change.
+      - run: npm run soak -- --rounds 5

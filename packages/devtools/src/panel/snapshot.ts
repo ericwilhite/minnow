@@ -1,5 +1,9 @@
-import { readSnapshotSummary, type SnapshotSummary } from "@minnowdb/core/storage";
-import type { SnapshotExportProgress, SnapshotLoadProgress } from "@minnowdb/core/storage";
+import {
+  readSnapshotSummary,
+  type SnapshotExportProgress,
+  type SnapshotLoadProgress,
+  type SnapshotSummary,
+} from "@minnowdb/core/storage/snapshots";
 import type { ConfirmLayer, ConfirmRequest } from "../confirm.js";
 import { el, iconButton, icons } from "../dom.js";
 import type { SnapshotTarget } from "../target.js";

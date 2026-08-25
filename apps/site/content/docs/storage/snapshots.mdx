@@ -3,13 +3,14 @@ title: Snapshots
 description: Copy one committed version out as a portable file, and load it back into any store.
 ---
 
-A snapshot is one committed version of a database, copied out as a single byte array and loadable
-into any block store. It is how you back a database up, seed a test fixture from real data, ship a
-prepared database as a static asset, or hand a colleague exactly what you were looking at.
+A snapshot is one committed version of a database in a portable streamed container. It is how you
+back a database up, seed a test fixture from real data, ship a prepared database as a static asset,
+or hand a colleague exactly what you were looking at. IndexedDB, OPFS, and memory use the same
+container.
 
 ## From the database
 
-The database copies itself out as the finished file, and loads one back:
+The byte-array helpers are convenient for small and medium snapshots:
 
 ```ts
 const bytes = await db.exportSnapshot();
@@ -19,105 +20,183 @@ await restored.importSnapshot(bytes);
 ```
 
 Both take an `onProgress` callback, and both work the same way through the
-[worker client](/docs/engine/workers) — there the file crosses the channel in slices, so the main
-thread copies a few megabytes at a time instead of stalling on one clone of the whole database.
+[worker client](/docs/engine/workers). `exportSnapshot()` necessarily retains the finished file
+and is limited to 4 GiB by its `Uint8Array` result. Use the stream APIs for large databases or to
+write directly to a file or upload body:
+
+```ts
+import { readSnapshotSummary } from "@minnowdb/core/storage/snapshots";
+
+const summary = await readSnapshotSummary(bytes);
+// { formatVersion, version, createdAt, tableCount, blockCount, payloadBytes, byteLength }
+```
+
+The summary helper validates the canonical header and its CRC without walking the body. It is for
+confirmation UI, not a substitute for import's complete frame, footer, reference, and block
+validation.
+
+```ts
+const writable = await fileHandle.createWritable();
+for await (const chunk of db.exportSnapshotStream({ signal })) {
+  await writable.write(chunk);
+}
+await writable.close();
+
+await restored.importSnapshotStream(file.stream(), { signal });
+```
+
+Each export chunk is at most 1 MiB. Export is pull-driven and keeps at most one payload block plus
+that chunk in the container layer. A direct import source may partition its bytes into non-empty
+`Uint8Array` chunks of any size; the decoder still allocates frame payloads only within the fixed
+metadata and block limits. Adapter metadata planning is bounded separately: IndexedDB's largest
+authoritative UNIQUE merge retains at most one 2 MiB part from the base and each of 16 tails plus
+one 2 MiB output part, a conservative 36 MiB peak. Import acknowledges bounded batches before
+asking for more. Across a worker, transport is re-chunked to at most 1 MiB and the same
+pull/acknowledgement boundary applies to the message channel, so a slow file or upload cannot turn
+into an unbounded main-thread or worker queue. The streamed container may exceed 4 GiB.
+
+Cancelling an export releases its backup lease in `finally`. Cancelling an import with its
+`AbortSignal` removes the matching unpublished staging session. On a durable adapter, a quota
+error, killed tab, or other non-cancellation failure deliberately leaves that session resumable:
+replay the exact same snapshot to continue. A different identity is refused while that owner is
+live. After its bounded lease expires, the durable adapters may atomically clear the unpublished
+prefix and let a different snapshot take over; a failed takeover leaves the old prefix intact.
 
 That is also what the devtools' **Download database** button does; see
 [the devtools](/docs/devtools#downloading-the-database).
 
-Everything below is the layer underneath, for when you want the records rather than the file, or
-a store that has no database in front of it.
+## Loading and resuming
 
-```ts
-import { encodeSnapshot, decodeSnapshot } from "@minnowdb/core/storage";
-
-const bytes = await encodeSnapshot(await store.exportSnapshot());
-```
-
-## Loading
-
-Into a fresh in-memory store:
-
-```ts
-import { MemoryBlockStore } from "@minnowdb/core/storage";
-
-const db = new MinnowDatabase(MemoryBlockStore.fromSnapshot(await decodeSnapshot(bytes)));
-```
-
-Or into IndexedDB or OPFS, where it is durable and available on the next visit:
+Create an empty target store and import through its database:
 
 ```ts
 const store = await IndexedDbBlockStore.open({ name: "seeded" });
-await store.importSnapshot(await decodeSnapshot(bytes), {
+const restored = new MinnowDatabase(store);
+
+await restored.importSnapshotStream(response.body!, {
+  signal,
   onProgress: ({ writtenBytes, totalBytes }) => {
     setProgress(writtenBytes / totalBytes);
   },
 });
 ```
 
-The target store must be empty. Loading into a database that already holds one throws rather than
-merging two histories. `MemoryBlockStore.fromSnapshot` builds a store around a snapshot instead,
-which is the same thing for a store that was never used.
+The target must be empty. Import never merges histories. Before accepting the first frame, the
+adapter durably claims the snapshot identity and owner. It stages bounded, contiguous frame
+batches and publishes the manifest pointer only after the verified footer arrives. A crash,
+quota refusal, or lost response cannot publish a prefix.
+
+Retry the exact same file to continue an interrupted import. A repeated sequence is accepted only
+when every persisted byte matches; changed bytes, a different identity, an expired owner, or a
+store that has since published are refused. Ordinary catalog writes are refused while an import
+owns the empty target.
+
+To abandon an interrupted import deliberately:
+
+```ts
+const interrupted = await restored.inspectInterruptedImport();
+if (interrupted !== null) {
+  await restored.abortInterruptedImport(interrupted.identity);
+}
+```
+
+Cancellation is an identity-checked removal of the unpublished session and every staged byte. It
+does not delete a database that has already been published.
 
 ## What it carries
 
 Everything needed to read the data and to keep writing correctly afterwards:
 
 - The block bytes the current manifest points at — verbatim, already compressed.
-- One checkpoint manifest, the table catalog, the live segments, and the committed transactions
-  that segment visibility resolves through.
+- One bounded manifest summary and its complete live block membership, the table catalog, the
+  live segments, and the committed transactions that segment visibility resolves through.
 - The row-id and auto-increment counters, so later writes continue past the high-water mark
   instead of colliding with rows that are there but hidden.
 - Unique-key membership, so an insert that duplicates an existing key still conflicts.
-- Full-text bases, when they already cover the exported version.
+- Ready full-text and secondary-index bases, when they exactly cover the exported version and fit
+  the adapter's bounded export merge.
 
 And what it deliberately drops: leases, query spill pages, garbage-collection and compaction job
 records, in-flight transactions, and **version history**. A database with ten thousand commits
 behind it loads as one clean version. Superseded blocks a compaction left behind are not copied,
 so a snapshot is usually smaller than the database it came from.
 
-A full-text index that does not already cover the exported version is marked for rebuild rather
-than shipped stale. The index is a pruning accelerator that the scan re-verifies, so that costs a
-rebuild, never a wrong answer.
+A full-text or secondary index that does not already cover the exported version is marked for
+rebuild rather than shipped stale. Both durable adapters apply a 64 MiB ordered-read fuse to each
+generation, and OPFS additionally caps the merge at 65,536 retained row IDs. If an exact merged
+generation exceeds its fuse, export omits the whole generation and marks its catalog state
+invalid; it never emits a partial ready accelerator. These indexes are pruning accelerators that
+scans re-verify, so either case costs a rebuild, never a wrong answer.
 
-## The container
+## The framed container
 
-A magic number, a format version, a gzipped JSON header, and the block payloads laid end to end.
-Blocks are already self-describing and doubly CRC-checked, so loading authenticates every block
-header without decompressing any payload — a corrupt file fails at load rather than mid-query.
+Snapshot format 1 is a bounded frame stream, not one database-sized metadata object. All integers
+in envelopes are little-endian.
 
-Read the header alone when you only need to know what a file is:
+The file starts with a 20-byte prefix:
 
-```ts
-import { readSnapshotSummary } from "@minnowdb/core/storage";
+| Offset | Width | Field                         |
+| -----: | ----: | ----------------------------- |
+|      0 |     8 | ASCII magic `MINSNAP1`        |
+|      8 |     4 | snapshot format version (`1`) |
+|     12 |     4 | canonical header byte length  |
+|     16 |     4 | CRC-32 of the header bytes    |
 
-const summary = await readSnapshotSummary(bytes);
-// { formatVersion, version, createdAt, tableCount, blockCount, payloadBytes, byteLength }
-```
+The header is at most 64 KiB of canonical UTF-8 JSON. It contains only the database version,
+creation time, and exact frame/item/byte totals for six ordered families:
+`catalog-page`, `segment-page`, `transaction-page`, `unique-page`, `posting-page`, and `block`.
+It never contains row keys, posting lists, block descriptors, or another database-sized array.
 
-Cheap enough to run against a large file before deciding whether to load it.
+Each body frame has a fixed 40-byte envelope followed by its optional block ID and payload:
+
+| Offset | Width | Field                         |
+| -----: | ----: | ----------------------------- |
+|      0 |     4 | frame marker                  |
+|      4 |     4 | frame-kind ordinal            |
+|      8 |     8 | global sequence               |
+|     16 |     4 | item count                    |
+|     20 |     4 | block-ID byte length, or zero |
+|     24 |     8 | payload byte length           |
+|     32 |     4 | CRC-32 of the exact payload   |
+|     36 |     4 | reserved zero                 |
+
+Metadata frames use Minnow's canonical binary wire encoding and hold exactly one semantic item,
+up to 4 MiB. A block frame holds exactly one ID and one complete block-format-2 value. Metadata batches
+are capped at 64 frames and 16 MiB; a block is acknowledged alone when needed. Lengths, item
+counts, sequence, family order, canonical strings and timestamps, cross-record references,
+counters, and checksums are validated before publication.
+
+A fixed 40-byte footer records the total frame count, item count, stored payload bytes, and a
+rolling CRC over every frame envelope, key, and payload. The decoder also rejects a missing
+footer, trailing bytes, a family/header-total mismatch, and integer totals outside JavaScript's
+exact safe range. Every embedded block independently checks its envelope, stored payload, and
+logical payload, so corruption is localized before a query can observe it.
+
+CRC-32 detects accidental corruption; it does not authenticate hostile input. Sign or
+authenticate snapshots received across a trust boundary.
 
 ## Exporting safely
 
-`MemoryBlockStore#exportSnapshot` runs on the store's commit queue, so it always sees one
-consistent version.
+Export begin atomically captures one version and creates a backup lease, persisted by the durable
+adapters. Metadata is emitted in bounded pages; block membership is walked by cursor, and payload
+bytes are read and verified one block at a time. A concurrent commit lands wholly before or after
+the captured version. Garbage collection cannot reclaim the pinned version until export closes or
+its bounded lease expires.
 
-`IndexedDbBlockStore#exportSnapshot` reads across several transactions, so a concurrent commit
-could move the version underneath it. Hold a backup lease across the call when another writer is
-possible; a build script that is the only writer in its process does not need one.
+At most one export and one unpublished import session may exist in a store. Pull-driven export
+creates no unbounded producer queue, and stopping the iterator releases its session in `finally`.
+`exportSnapshot()` deliberately collects that stream into one `Uint8Array` and therefore has a
+4,294,967,295-byte ceiling; `exportSnapshotStream()` does not have a whole-file size ceiling.
 
-`OpfsBlockStore#exportSnapshot` runs as a single operation on the leader's queue, so no commit
-or garbage collection can interleave with it — always consistent, like the memory store, with no
-lease needed. Derived full-text and secondary-index bases are copied only when the store can prove
-they cover the exported version; otherwise they export as rebuilds — a cost in speed on the
-restored database, never in answers.
+Full-text and secondary-index generations are included only when their exact coverage can be
+proved and one exact merged generation fits the adapter's ordered-read fuse. Both durable
+adapters cap that merge at 64 MiB; OPFS also caps it at 65,536 retained row IDs. Otherwise the
+restored catalog marks the accelerator for rebuild. That can make its first query slower, but
+cannot change the answer. UNIQUE membership is authoritative rather than optional: IndexedDB
+exports it in deterministic lexical chunks through the fixed 36 MiB merge bound and restore
+re-enables duplicate enforcement before publication.
 
-`MinnowDatabase#exportSnapshot` delegates to whichever of those the database was built on, so it
-inherits the same rule. A store that implements neither method says so rather than failing as a
-missing property.
-
-<Callout type="warn">
-  The snapshot format is versioned and validated, but like the block format it carries no
-  compatibility promise while the library is version zero. Treat a snapshot as a copy of a database
-  you can rebuild, not as an archival format.
-</Callout>
+Snapshot format 1 and its embedded block-format-2 bytes are frozen by a raw fixture and opened on
+every test run. A future incompatible writer uses a new format number; it does not reinterpret
+these bytes. A snapshot is still only as durable as the media and origin that holds it, so keep
+independent copies for irreplaceable data.

@@ -29,7 +29,7 @@ after generated declarations or asynchronous signatures change.
 | `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                           | Docs, examples, and site changes   |
 | `npm run test:browser`         | Both browser runners, in sequence                                               | Cross-browser regression checks    |
 | `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                  | Query-executor performance changes |
-| `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages           | Dependency or public-entry changes |
+| `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages   | Dependency or public-entry changes |
 | `npm run check`                | Format, types, lint, build, coverage, and fast SQLLogicTest                     | The local merge gate               |
 | `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners            | Release candidates                 |
 
@@ -182,10 +182,17 @@ A browser database's data lives in the user's browser, so it outlives every depl
 migration window and no way to reach back and rewrite it: if a format change makes yesterday's
 blocks unreadable, the first anyone hears is a user whose application will not open.
 
-`packages/core/format-fixtures/` holds one frozen database per released format version — a
-snapshot, which carries the raw block bytes verbatim, plus the answers that build gave to a fixed
-set of queries. `format-compatibility.test.ts` opens all of them on every run, checks the answers
-still hold, and checks that writes into a restored database still work.
+`packages/core/format-fixtures/` holds one frozen database per released block/snapshot pair — a
+framed snapshot, which carries the raw block bytes verbatim, plus the answers that build gave to a
+fixed set of queries. `format-compatibility.test.ts` reproduces the current writer byte for byte,
+opens every fixture, checks the answers still hold, and checks that writes into a restored
+database still work. Frozen raw vectors independently cover every block-format-2 physical type.
+
+The directory also holds one native fixture for every locked OPFS layout. The test requires a
+fixture for the current writer, then reopens each fixture's format marker, checkpoint, WAL tail,
+and packed extent through the current adapter before committing and recovering another write. That
+catches both a control-layout break and an accidentally dropped old reader that a portable snapshot
+alone cannot see.
 
 It also fails when the current `BLOCK_FORMAT_VERSION` or `SNAPSHOT_FORMAT_VERSION` has no fixture
 behind it. That failure is the useful one, because it fires _before_ the damage:
@@ -194,9 +201,17 @@ behind it. That failure is the useful one, because it fires _before_ the damage:
 npm run fixture:format
 ```
 
-Run it on the build that still writes the old format, commit the fixture, and only then change the
-version. A fixture can only be produced by the build that writes it — once that code is gone, the
-format it wrote cannot be regenerated. For the same reason, never delete one.
+The native OPFS fixture has its own writer:
+
+```bash
+npx vite-node scripts/write-opfs-format-fixture.mts
+```
+
+Run the relevant writer on the build that still writes the old format, commit the fixture, and
+only then change the version. A fixture can only be produced by the build that writes it — once
+that code is gone, the format it wrote cannot be regenerated. For the same reason, never delete a
+released, locked fixture. Block format 2 is the first such lock; the unsupported experimental
+block-1 fixture was replaced before v1.
 
 ## Running out of quota
 
@@ -377,8 +392,9 @@ public entry point changes:
 npm run benchmark:sizes
 ```
 
-Each engine's browser entry is bundled and minified with identical esbuild settings, and the
-WebAssembly and data files it fetches at run time are added at their shipped size. The result
-lands in `apps/site/components/bench/library-sizes.json`, which is a scratch output — nothing
-imports it. The figure each engine shows on the page is the `download` field in
+Each measured engine's browser entry is bundled and minified with identical esbuild settings, and
+the WebAssembly and data files it fetches at run time are added at their shipped size. The script
+measures Minnow, SQLite Wasm, and PGlite. The result lands in
+`apps/site/components/bench/library-sizes.json`, which is a scratch output — nothing imports it.
+The figure each measured engine shows on the page is the `download` field in
 `apps/site/components/bench/config.ts`, updated by hand from that run.

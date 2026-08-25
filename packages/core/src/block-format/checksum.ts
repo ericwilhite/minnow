@@ -22,7 +22,12 @@ for (let slice = 1; slice < 8; slice += 1) {
  * times over, and the tail falls back to single-byte steps.
  */
 export function crc32(bytes: Uint8Array): number {
-  let checksum = 0xffffffff;
+  return crc32Continue(0, bytes);
+}
+
+/** Extends an already-finalized CRC-32 without concatenating or retaining the preceding bytes. */
+export function crc32Continue(previous: number, bytes: Uint8Array): number {
+  let checksum = (previous ^ 0xffffffff) >>> 0;
   const length = bytes.byteLength;
   const wordEnd = length - (length % 8);
   let index = 0;

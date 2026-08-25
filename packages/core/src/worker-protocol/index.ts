@@ -1,10 +1,8 @@
 export const protocolVersion = 2 as const;
+/** Outstanding request/response pairs retained by either side of one database RPC connection. */
+export const MAX_DATABASE_RPC_IN_FLIGHT = 256;
 
 export type WorkerOperation =
-  | "ping"
-  | "writeBlock"
-  | "readBlock"
-  | "publishManifest"
   | "benchmark"
   | "cancelBenchmark"
   | "memorySample"
@@ -204,10 +202,6 @@ export function parseRpcResponse(value: unknown): RpcResponse | null {
 
 function isOperation(value: unknown): value is WorkerOperation {
   return [
-    "ping",
-    "writeBlock",
-    "readBlock",
-    "publishManifest",
     "benchmark",
     "cancelBenchmark",
     "memorySample",

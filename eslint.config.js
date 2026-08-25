@@ -84,7 +84,9 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // Bundles the built package with esbuild to prove the storage adapters tree-shake.
       "packages/core/src/tree-shaking.test.ts",
-      "scripts/**/*.{ts,mts}",
+      // Bundles the built Kysely adapter and applies deterministic gzip size ratchets.
+      "packages/kysely/src/tree-shaking.test.ts",
+      "scripts/**/*.{ts,mts,mjs}",
     ],
     rules: { "no-restricted-imports": "off" },
   },

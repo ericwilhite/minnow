@@ -1,3 +1,9 @@
+import { dateMilliseconds } from "../date-value.js";
+import {
+  MAX_TEMP_RUN_BATCH_BYTES,
+  MAX_TEMP_RUN_PAGE_BYTES,
+  MAX_TEMP_RUN_PAGES_PER_BATCH,
+} from "../storage/types.js";
 import type { DatabaseRow } from "./database.js";
 import type {
   AggregateName,
@@ -143,6 +149,10 @@ export interface PreparedVectorQuery {
   readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
   executeAsync(options?: AsyncQueryExecutionOptions): Promise<QueryResult>;
+  executeBatches(
+    options: QueryBatchExecutionOptions,
+    consume: (batch: QueryResult) => void | Promise<void>,
+  ): Promise<readonly string[]>;
   close(): void;
 }
 
@@ -162,7 +172,18 @@ export interface QuerySpillStore {
 }
 
 /** Pages per batched spill write: bounds the transient encoded copies a batch holds. */
-const SPILL_WRITE_BATCH_PAGES = 8;
+const SPILL_WRITE_BATCH_PAGES = Math.min(8, MAX_TEMP_RUN_PAGES_PER_BATCH);
+
+function boundedSpillPageRows(value: number | undefined): number {
+  const rows = value ?? DEFAULT_BATCH_ROWS;
+  if (!Number.isSafeInteger(rows) || rows <= 0) {
+    throw new RangeError("Query spill page rows must be a positive whole number");
+  }
+  // Page rows are a tuning target, not a request to buffer an unbounded number of rows. Larger
+  // pages do not improve the block-store round trip because byte-bounded batches provide that
+  // amortization independently.
+  return Math.min(rows, DEFAULT_BATCH_ROWS);
+}
 
 /** Writes already-materialized pages through the batch method when the store offers one. */
 async function writeSpillPages(
@@ -176,9 +197,60 @@ async function writeSpillPages(
     }
     return;
   }
-  for (let start = 0; start < pages.length; start += SPILL_WRITE_BATCH_PAGES) {
-    await batched(pages.slice(start, start + SPILL_WRITE_BATCH_PAGES));
+  let batch: typeof pages = [];
+  let batchBytes = 0;
+  for (const page of pages) {
+    if (page.bytes.byteLength > MAX_TEMP_RUN_PAGE_BYTES) {
+      throw new RangeError("Query spill page exceeds the storage limit");
+    }
+    if (
+      batch.length > 0 &&
+      (batch.length === SPILL_WRITE_BATCH_PAGES ||
+        batchBytes + page.bytes.byteLength > MAX_TEMP_RUN_BATCH_BYTES)
+    ) {
+      await batched(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+    batch.push(page);
+    batchBytes += page.bytes.byteLength;
   }
+  if (batch.length > 0) await batched(batch);
+}
+
+async function writeSpillRowPages(
+  store: QuerySpillStore,
+  ownerId: string,
+  runId: string,
+  startPageIndex: number,
+  columns: readonly string[],
+  rows: readonly QueryRow[],
+  pageRows: number,
+): Promise<number> {
+  let pending: Array<{
+    ownerId: string;
+    runId: string;
+    pageIndex: number;
+    bytes: Uint8Array;
+  }> = [];
+  let pendingBytes = 0;
+  let pageCount = 0;
+  for (const bytes of encodeSpillRowPages(columns, rows, pageRows)) {
+    if (
+      pending.length > 0 &&
+      (pending.length === SPILL_WRITE_BATCH_PAGES ||
+        pendingBytes + bytes.byteLength > MAX_TEMP_RUN_BATCH_BYTES)
+    ) {
+      await writeSpillPages(store, pending);
+      pending = [];
+      pendingBytes = 0;
+    }
+    pending.push({ ownerId, runId, pageIndex: startPageIndex + pageCount, bytes });
+    pendingBytes += bytes.byteLength;
+    pageCount += 1;
+  }
+  await writeSpillPages(store, pending);
+  return pageCount;
 }
 
 export interface AsyncQueryExecutionOptions {
@@ -193,6 +265,13 @@ export interface AsyncQueryExecutionOptions {
    * reference instead of stitching copies.
    */
   readonly loadScanWindow?: (start: number, length: number) => number | Promise<number>;
+}
+
+export interface QueryBatchExecutionOptions extends AsyncQueryExecutionOptions {
+  /** Maximum result rows handed to the consumer at once. */
+  readonly batchRows: number;
+  /** Stops before the next scan batch and is checked after every awaited storage read. */
+  readonly signal?: AbortSignal;
 }
 
 export interface PrepareVectorQueryOptions {
@@ -553,6 +632,23 @@ export function prepareVectorQuery(
           executionMemory.close();
         }
       },
+      async executeBatches(executionOptions, consume) {
+        if (closed) throw new Error("Prepared vector query is closed");
+        if (bound.grouped || bound.orderBy.length > 0 || bound.joins.length > 0) {
+          throw new TypeError(
+            "Native query batching requires an ungrouped, unordered, single-source plan",
+          );
+        }
+        if (!Number.isSafeInteger(executionOptions.batchRows) || executionOptions.batchRows <= 0) {
+          throw new RangeError("Query batch rows must be a positive whole number");
+        }
+        const executionMemory = retainedMemory.createChild();
+        try {
+          return await executeBoundPlanBatches(bound, executionMemory, executionOptions, consume);
+        } finally {
+          executionMemory.close();
+        }
+      },
       close() {
         if (closed) return;
         closed = true;
@@ -609,7 +705,7 @@ function createVector(input: ColumnarColumnInput): ColumnVector {
     const numericValue =
       input.type === "datetime"
         ? value instanceof Date
-          ? value.getTime()
+          ? dateMilliseconds(value)
           : Number.NaN
         : typeof value === "number"
           ? value
@@ -1863,6 +1959,60 @@ async function executeBoundPlanAsync(
   return finishResult(plan, rows, memory);
 }
 
+/**
+ * Pull-driven scan execution for cursor-safe plans. A result page owns a child memory context
+ * that closes after the consumer settles, so both modeled memory and live row objects are
+ * bounded by one page. OFFSET/LIMIT are applied once across the whole scan, never per page.
+ */
+async function executeBoundPlanBatches(
+  plan: BoundPlan,
+  memory: QueryMemoryContext,
+  options: QueryBatchExecutionOptions,
+  consume: (batch: QueryResult) => void | Promise<void>,
+): Promise<readonly string[]> {
+  const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
+  const { limit, offset, ...unbounded } = plan;
+  const scanPlan: BoundPlan = unbounded;
+  let skipped = 0;
+  let emitted = 0;
+  const scanRows = scanPlan.sourceTables[scanPlan.scanSource]?.rowCount ?? 0;
+  const step = Math.min(DEFAULT_BATCH_ROWS, options.batchRows);
+  for (let start = 0; start < scanRows && (limit === undefined || emitted < limit);) {
+    options.signal?.throwIfAborted();
+    let length = Math.min(step, scanRows - start);
+    const loaded = options.loadScanWindow?.(start, length);
+    const residentEnd = typeof loaded === "number" || loaded === undefined ? loaded : await loaded;
+    options.signal?.throwIfAborted();
+    if (typeof residentEnd === "number" && residentEnd > start) {
+      length = Math.min(length, residentEnd - start);
+    }
+    const pageMemory = memory.createChild();
+    try {
+      const groups = new GroupAccumulator(scanPlan, pageMemory);
+      const output = new ResultSink(scanPlan, pageMemory, options.loadScanWindow === undefined);
+      runScanBatch(scanPlan, start, length, groups, output, pageMemory);
+      let rows = output.finish();
+      const remainingOffset = Math.max(0, (offset ?? 0) - skipped);
+      if (remainingOffset > 0) {
+        const remove = Math.min(remainingOffset, rows.length);
+        rows = rows.slice(remove);
+        skipped += remove;
+      }
+      if (limit !== undefined && rows.length > limit - emitted) {
+        rows = rows.slice(0, limit - emitted);
+      }
+      if (rows.length > 0) {
+        emitted += rows.length;
+        await consume({ columns: [...columns], rows });
+      }
+    } finally {
+      pageMemory.close();
+    }
+    start += length;
+  }
+  return columns;
+}
+
 interface SpillRun {
   readonly id: string;
   readonly pageCount: number;
@@ -1878,10 +2028,7 @@ async function executeBoundPlanWithSortSpill(
   options: AsyncQueryExecutionOptions,
 ): Promise<QueryResult> {
   const store = required(options.spillStore, "Query spill store is missing");
-  const pageRows = options.spillPageRows ?? DEFAULT_BATCH_ROWS;
-  if (!Number.isSafeInteger(pageRows) || pageRows <= 0) {
-    throw new RangeError("Query spill page rows must be a positive whole number");
-  }
+  const pageRows = boundedSpillPageRows(options.spillPageRows);
   const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
   const ownerId = createSpillOwnerId();
   const runs: SpillRun[] = [];
@@ -1939,8 +2086,16 @@ async function executeBoundPlanWithSortSpill(
                 ordering.release();
               }
               const runId = `run-${String(runSequence++)}`;
-              await store.putPage(ownerId, runId, 0, encodeSpillRows(columns, rows));
-              runs.push({ id: runId, pageCount: 1 });
+              const pageCount = await writeSpillRowPages(
+                store,
+                ownerId,
+                runId,
+                0,
+                columns,
+                rows,
+                pageRows,
+              );
+              runs.push({ id: runId, pageCount });
             } finally {
               outputMemory.close();
             }
@@ -2007,10 +2162,7 @@ async function executeBoundPlanWithHashSpill(
   options: AsyncQueryExecutionOptions,
 ): Promise<QueryResult> {
   const store = required(options.spillStore, "Query spill store is missing");
-  const pageRows = options.spillPageRows ?? DEFAULT_BATCH_ROWS;
-  if (!Number.isSafeInteger(pageRows) || pageRows <= 0) {
-    throw new RangeError("Query spill page rows must be a positive whole number");
-  }
+  const pageRows = boundedSpillPageRows(options.spillPageRows);
   const partitionCount = 64;
   const columns = plan.select.map((item) => item.alias);
   const groupColumnNames = plan.groupBy.map((_, index) => `g${String(index)}`);
@@ -2109,15 +2261,28 @@ async function executeBoundPlanWithHashSpill(
           pageIndex: number;
           bytes: Uint8Array;
         }> = [];
+        let flushBytes = 0;
         for (const [partition, rows] of partitionBuffers) {
-          const pageIndex = partitionPages[partition] ?? 0;
-          flush.push({
-            ownerId,
-            runId: `partition-${String(partition)}`,
-            pageIndex,
-            bytes: encodeSpillRows(spillColumns, rows),
-          });
-          partitionPages[partition] = pageIndex + 1;
+          for (const bytes of encodeSpillRowPages(spillColumns, rows, pageRows)) {
+            if (
+              flush.length > 0 &&
+              (flush.length === SPILL_WRITE_BATCH_PAGES ||
+                flushBytes + bytes.byteLength > MAX_TEMP_RUN_BATCH_BYTES)
+            ) {
+              await writeSpillPages(store, flush);
+              flush.length = 0;
+              flushBytes = 0;
+            }
+            const pageIndex = partitionPages[partition] ?? 0;
+            flush.push({
+              ownerId,
+              runId: `partition-${String(partition)}`,
+              pageIndex,
+              bytes,
+            });
+            flushBytes += bytes.byteLength;
+            partitionPages[partition] = pageIndex + 1;
+          }
         }
         await writeSpillPages(store, flush);
       } finally {
@@ -2177,28 +2342,16 @@ async function executeBoundPlanWithHashSpill(
           }
         }
         const runId = `group-${String(runSequence++)}`;
-        let outputPage = 0;
-        let pending: Array<{
-          ownerId: string;
-          runId: string;
-          pageIndex: number;
-          bytes: Uint8Array;
-        }> = [];
-        for (let start = 0; start < rows.length; start += pageRows) {
-          pending.push({
-            ownerId,
-            runId,
-            pageIndex: outputPage,
-            bytes: encodeSpillRows(columns, rows.slice(start, start + pageRows)),
-          });
-          outputPage += 1;
-          if (pending.length >= SPILL_WRITE_BATCH_PAGES) {
-            await writeSpillPages(store, pending);
-            pending = [];
-          }
-        }
-        await writeSpillPages(store, pending);
-        runs.push({ id: runId, pageCount: outputPage });
+        const pageCount = await writeSpillRowPages(
+          store,
+          ownerId,
+          runId,
+          0,
+          columns,
+          rows,
+          pageRows,
+        );
+        runs.push({ id: runId, pageCount });
       } finally {
         partitionMemory.close();
         await store.removeRun(ownerId, `partition-${String(partition)}`);
@@ -2394,11 +2547,18 @@ async function mergeSpillRuns(
   let pageIndex = 0;
   const flush = async () => {
     if (outputPage.length === 0) return;
-    await store.putPage(ownerId, outputId, pageIndex, encodeSpillRows(columns, outputPage));
+    pageIndex += await writeSpillRowPages(
+      store,
+      ownerId,
+      outputId,
+      pageIndex,
+      columns,
+      outputPage,
+      pageRows,
+    );
     outputPage = [];
     outputMemory.close();
     outputMemory = mergeMemory.createChild();
-    pageIndex += 1;
   };
   try {
     let leftRow = await leftReader.next();
@@ -2483,20 +2643,79 @@ function compareOrderedRows(
   return 0;
 }
 
-function encodeSpillRows(columns: readonly string[], rows: readonly QueryRow[]): Uint8Array {
-  const encoded = rows.map((row) => columns.map((column) => encodeSpillValue(row[column] ?? null)));
-  const payload = vectorTextEncoder.encode(JSON.stringify(encoded));
-  const modeledBytes = rows.reduce(
-    (total, row) => safeMemorySum(total, queryRowPayloadBytes(row), "Spill page rows"),
-    0,
-  );
-  if (modeledBytes > 0xffffffff) throw new RangeError("Spill page modeled bytes exceed uint32");
-  const bytes = new Uint8Array(SPILL_PAGE_HEADER_BYTES + payload.byteLength);
+interface EncodedSpillRow {
+  readonly bytes: Uint8Array;
+  readonly modeledBytes: number;
+}
+
+function encodeSpillRow(columns: readonly string[], row: QueryRow): EncodedSpillRow {
+  return {
+    bytes: vectorTextEncoder.encode(
+      JSON.stringify(columns.map((column) => encodeSpillValue(row[column] ?? null))),
+    ),
+    modeledBytes: queryRowPayloadBytes(row),
+  };
+}
+
+function buildSpillPage(
+  rows: readonly EncodedSpillRow[],
+  byteLength: number,
+  modeledBytes: number,
+) {
+  const bytes = new Uint8Array(byteLength);
   const header = new DataView(bytes.buffer);
   header.setUint32(0, SPILL_PAGE_MAGIC, true);
   header.setUint32(4, modeledBytes, true);
-  bytes.set(payload, SPILL_PAGE_HEADER_BYTES);
+  let offset = SPILL_PAGE_HEADER_BYTES;
+  bytes[offset++] = 0x5b;
+  for (let index = 0; index < rows.length; index += 1) {
+    if (index > 0) bytes[offset++] = 0x2c;
+    const row = required(rows[index], "Encoded spill row is missing");
+    bytes.set(row.bytes, offset);
+    offset += row.bytes.byteLength;
+  }
+  bytes[offset] = 0x5d;
   return bytes;
+}
+
+/** Encodes pages incrementally and splits on both the requested row target and the hard byte cap. */
+function* encodeSpillRowPages(
+  columns: readonly string[],
+  rows: readonly QueryRow[],
+  pageRows: number,
+): Generator<Uint8Array> {
+  let pending: EncodedSpillRow[] = [];
+  let byteLength = SPILL_PAGE_HEADER_BYTES + 2;
+  let modeledBytes = 0;
+  const flush = (): Uint8Array => {
+    const page = buildSpillPage(pending, byteLength, modeledBytes);
+    pending = [];
+    byteLength = SPILL_PAGE_HEADER_BYTES + 2;
+    modeledBytes = 0;
+    return page;
+  };
+  for (const row of rows) {
+    const encoded = encodeSpillRow(columns, row);
+    const separatorBytes = pending.length === 0 ? 0 : 1;
+    const nextByteLength = byteLength + separatorBytes + encoded.bytes.byteLength;
+    const nextModeledBytes = modeledBytes + encoded.modeledBytes;
+    if (
+      pending.length > 0 &&
+      (pending.length === pageRows ||
+        nextByteLength > MAX_TEMP_RUN_PAGE_BYTES ||
+        nextModeledBytes > 0xffffffff)
+    ) {
+      yield flush();
+    }
+    const addedSeparatorBytes = pending.length === 0 ? 0 : 1;
+    byteLength += addedSeparatorBytes + encoded.bytes.byteLength;
+    modeledBytes += encoded.modeledBytes;
+    if (byteLength > MAX_TEMP_RUN_PAGE_BYTES || modeledBytes > 0xffffffff) {
+      throw new RangeError("One query result row exceeds the spill page storage limit");
+    }
+    pending.push(encoded);
+  }
+  if (pending.length > 0) yield flush();
 }
 
 function decodeSpillRows(columns: readonly string[], bytes: Uint8Array): QueryRow[] {
@@ -2529,7 +2748,7 @@ function encodeSpillValue(value: QueryValue): readonly unknown[] {
   if (typeof value === "boolean") return [1, value];
   if (typeof value === "number") return [2, Object.is(value, -0) ? "-0" : String(value)];
   if (typeof value === "string") return [3, value];
-  return [4, value.getTime()];
+  return [4, dateMilliseconds(value)];
 }
 
 function decodeSpillValue(value: unknown): QueryValue {
@@ -4437,7 +4656,7 @@ function createGroupState(
  * string a row genuinely holds.
  */
 function distinctKey(value: unknown): unknown {
-  return value instanceof Date ? ` d${String(value.getTime())}` : value;
+  return value instanceof Date ? `\0d${String(value.getTime())}` : value;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { retailSchema } from "@/lib/dataset/retail";
-import { playgroundDeclarations } from "./declarations";
+import { PLAYGROUND_DATABASE } from "@/lib/dataset/load";
+import { SETUP_SNIPPET, playgroundDeclarations } from "./declarations";
 
 /**
  * The editor's promises are only worth something if they come from the schema the database was
@@ -43,5 +44,10 @@ describe("the playground's ambient declarations", () => {
 
   it("stays a script, so what it declares is global", () => {
     expect(printed).not.toMatch(/^\s*(import|export)\s/m);
+  });
+
+  it("shows the playground's stable generated database name", () => {
+    expect(SETUP_SNIPPET).toContain(`name: "${PLAYGROUND_DATABASE}"`);
+    expect(SETUP_SNIPPET).not.toContain("incompatibleSchema");
   });
 });

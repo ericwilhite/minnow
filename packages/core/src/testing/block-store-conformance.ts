@@ -1,7 +1,13 @@
 import {
   CompactionJobConflictError,
   LeaseConflictError,
+  LeaseOwnerConflictError,
+  MAX_LEVEL_ZERO_SEGMENTS,
+  MAX_MANIFEST_BLOCK_PRESENCE_IDS,
+  MAX_STORAGE_BULK_READ_ITEMS,
+  PostingBuildConflictError,
   SnapshotManifestMissingError,
+  TableInUseError,
   TableRecordConflictError,
   TempOwnerConflictError,
   TransactionRecordConflictError,
@@ -9,6 +15,7 @@ import {
   secondaryUniqueKeyNamespace,
   WriteConflictError,
   type BlockStore,
+  type CompactionJobRecord,
   type SegmentRecord,
   type TableRecord,
   type TransactionRecord,
@@ -155,13 +162,40 @@ function render(value: unknown): string {
   }
 }
 
+async function manifestBlockIds(store: BlockStore, version: number): Promise<string[]> {
+  const ids: string[] = [];
+  let afterBlockId: string | null = null;
+  for (;;) {
+    const page = await store.listManifestBlockPage({ version, afterBlockId, limit: 256 });
+    ids.push(...page.records.map(({ blockId }) => blockId));
+    if (page.nextCursor === null) return ids;
+    afterBlockId = page.nextCursor;
+  }
+}
+
+async function currentManifestBlockIds(store: BlockStore): Promise<string[]> {
+  const version = await store.getCurrentManifestVersion();
+  return version === null ? [] : manifestBlockIds(store, version);
+}
+
+async function tableSegments(store: BlockStore, tableId: string): Promise<SegmentRecord[]> {
+  const records: SegmentRecord[] = [];
+  let afterId: string | null = null;
+  for (;;) {
+    const page = await store.listTableSegmentPage(tableId, afterId, 256);
+    records.push(...page.records);
+    if (page.nextCursor === null) return records;
+    afterId = page.nextCursor;
+  }
+}
+
 // ------------------------------------------------------------------------------------------
 // Fixtures — the smallest records that exercise each rule.
 // ------------------------------------------------------------------------------------------
 
 const T0 = "2026-01-01T00:00:00.000Z";
+const MIDDLE = "2026-01-01T00:30:00.000Z";
 const LATER = "2026-01-01T01:00:00.000Z";
-const FAR_FUTURE = "2999-01-01T00:00:00.000Z";
 const PAST = "2000-01-01T00:00:00.000Z";
 
 function table(name: string, keyed = false): TableRecord {
@@ -172,6 +206,7 @@ function table(name: string, keyed = false): TableRecord {
       { id: "col-id", name: "id", type: "number", nullable: false },
       { id: "col-v", name: "v", type: "string", nullable: true },
     ],
+    managed: false,
     revision: 0,
     createdAt: T0,
     ...(keyed ? { uniqueKeyColumnId: "col-id" } : {}),
@@ -181,6 +216,8 @@ function table(name: string, keyed = false): TableRecord {
 function transaction(id: string, snapshotVersion: number | null): TransactionRecord {
   return {
     id,
+    ownerId: `owner-${id}`,
+    expiresAt: LATER,
     snapshotVersion,
     pendingBlockIds: [],
     pendingSegmentIds: [],
@@ -197,6 +234,7 @@ function segment(
   tableId: string,
   transactionId: string,
   blockId: string,
+  commitOrdinal = 0,
 ): SegmentRecord {
   return {
     id,
@@ -206,6 +244,11 @@ function segment(
     rowIdStart: 1n,
     rowIdEndExclusive: 3n,
     columnBlockIds: { "col-id": [blockId], "col-v": [blockId] },
+    kind: "insert",
+    level: 0,
+    logicalOrder: 0,
+    commitOrdinal,
+    rowIdSpans: [],
     createdAt: T0,
   };
 }
@@ -220,19 +263,20 @@ async function commitOne(
   const transactionId = `txn-${suffix}`;
   const blockId = `table/t/segment/${suffix}/part/000000`;
   await store.createTransaction(transaction(transactionId, version));
-  await store.addBlock(blockId, Uint8Array.of(1, 2, 3, 4));
-  await store.addSegment(
-    segment(`segment-${suffix}`, options.tableId ?? "table-t", transactionId, blockId),
-  );
-  await store.updateTransaction(transactionId, 0, {
-    pendingBlockIds: [blockId],
-    pendingSegmentIds: [`segment-${suffix}`],
+  await store.stageTransactionArtifacts({
+    transactionId,
+    expectedRevision: 0,
+    blocks: [{ id: blockId, bytes: Uint8Array.of(1, 2, 3, 4) }],
+    segments: [segment(`segment-${suffix}`, options.tableId ?? "table-t", transactionId, blockId)],
     updatedAt: T0,
   });
   const summary = await store.commitTransaction({
     transactionId,
     expectedTransactionRevision: 1,
     expectedManifestVersion: version,
+    levelZeroSegmentLimits: [
+      { tableId: options.tableId ?? "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS },
+    ],
     committedAt: LATER,
     ...(options.keyTokens === undefined
       ? {}
@@ -256,11 +300,93 @@ async function commitOne(
 export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
   return [
     {
-      name: "blocks are immutable, copied both directions, and duplicates are refused",
+      name: "pending tables stay invisible across multi-batch reopen and publish only at commit",
+      async run(target) {
+        let store = await target.create();
+        const pending = table("pending");
+        const epoch = (await store.getCatalogProbe()).catalogEpoch;
+        const begun = await store.beginTransaction({
+          record: {
+            id: "pending-owner",
+            ownerId: "owner-pending",
+            expiresAt: LATER,
+            pendingBlockIds: [],
+            pendingSegmentIds: [],
+            status: "active",
+            revision: 0,
+            startedAt: T0,
+            updatedAt: T0,
+            committedVersion: null,
+          },
+          pendingTable: { record: pending, nextRowId: 1n, expectedCatalogEpoch: epoch },
+        });
+        check(begun.record.pendingTable?.id === pending.id, "pending reservation was not recorded");
+        check(
+          (await store.getTable(pending.id)) === undefined,
+          "pending table became public early",
+        );
+        checkEqual(await store.listTables(), [], "pending table appeared in the public catalog");
+
+        const firstBlock = "pending/block/1";
+        await store.stageTransactionArtifacts({
+          transactionId: begun.record.id,
+          expectedRevision: begun.record.revision,
+          blocks: [{ id: firstBlock, bytes: Uint8Array.of(1) }],
+          segments: [segment("pending-segment-1", pending.id, begun.record.id, firstBlock)],
+          updatedAt: MIDDLE,
+        });
+        if (target.reopen !== undefined) store = await target.reopen(store);
+        check((await store.getTable(pending.id)) === undefined, "reopen exposed a pending table");
+        const resumed = await store.getTransaction(begun.record.id);
+        check(resumed?.revision === 1, "reopen lost the first pending-table stage");
+
+        const secondBlock = "pending/block/2";
+        await store.stageTransactionArtifacts({
+          transactionId: begun.record.id,
+          expectedRevision: resumed.revision,
+          blocks: [{ id: secondBlock, bytes: Uint8Array.of(2) }],
+          segments: [
+            {
+              ...segment("pending-segment-2", pending.id, begun.record.id, secondBlock),
+              rowIdStart: 3n,
+              rowIdEndExclusive: 5n,
+              commitOrdinal: 1,
+            },
+          ],
+          updatedAt: LATER,
+        });
+        const manifest = await store.commitTransaction({
+          transactionId: begun.record.id,
+          expectedTransactionRevision: 2,
+          expectedManifestVersion: null,
+          levelZeroSegmentLimits: [{ tableId: pending.id, limit: MAX_LEVEL_ZERO_SEGMENTS }],
+          committedAt: LATER,
+        });
+        check(manifest.version === 0, "pending-table commit did not publish the first manifest");
+        check(
+          (await store.getTable(pending.id))?.name === pending.name,
+          "commit lost pending table",
+        );
+        check(
+          (await store.getTransaction(begun.record.id))?.pendingTable === undefined,
+          "commit retained the pending catalog reservation",
+        );
+        store.close();
+      },
+    },
+    {
+      name: "staged blocks are immutable, copied both directions, and duplicates are refused",
       async run(target) {
         const store = await target.create();
+        await store.createTransaction(transaction("txn-block-copy", null));
         const bytes = Uint8Array.of(1, 2, 3);
-        await store.addBlock("block-a", bytes);
+        await store.stageTransactionArtifacts({
+          transactionId: "txn-block-copy",
+          expectedRevision: 0,
+          blocks: [{ id: "block-a", bytes }],
+          segments: [],
+          updatedAt: T0,
+        });
         bytes[0] = 99; // The store must not alias the caller's buffer.
         const first = await store.getBlock("block-a");
         check(first?.[0] === 1, "stored bytes changed with the caller's buffer");
@@ -268,7 +394,13 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         const second = await store.getBlock("block-a");
         check(second?.[1] === 2, "returned bytes alias the store's copy");
         try {
-          await store.addBlock("block-a", Uint8Array.of(9));
+          await store.stageTransactionArtifacts({
+            transactionId: "txn-block-copy",
+            expectedRevision: 1,
+            blocks: [{ id: "block-a", bytes: Uint8Array.of(9) }],
+            segments: [],
+            updatedAt: LATER,
+          });
           throw new Error("a duplicate block id was accepted");
         } catch (error) {
           check(error instanceof Error, "duplicate rejection must be an Error");
@@ -282,26 +414,120 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
-      name: "a block batch with any duplicate writes nothing at all",
+      name: "an artifact batch with any duplicate writes nothing at all",
       async run(target) {
         const store = await target.create();
-        await store.addBlock("block-a", Uint8Array.of(1));
+        await store.createTransaction(transaction("txn-block-batch", null));
+        await store.stageTransactionArtifacts({
+          transactionId: "txn-block-batch",
+          expectedRevision: 0,
+          blocks: [{ id: "block-a", bytes: Uint8Array.of(1) }],
+          segments: [],
+          updatedAt: T0,
+        });
         try {
-          await store.addBlocks([
-            { id: "block-b", bytes: Uint8Array.of(2) },
-            { id: "block-a", bytes: Uint8Array.of(3) },
-            { id: "block-c", bytes: Uint8Array.of(4) },
-          ]);
+          await store.stageTransactionArtifacts({
+            transactionId: "txn-block-batch",
+            expectedRevision: 1,
+            blocks: [
+              { id: "block-b", bytes: Uint8Array.of(2) },
+              { id: "block-a", bytes: Uint8Array.of(3) },
+              { id: "block-c", bytes: Uint8Array.of(4) },
+            ],
+            segments: [],
+            updatedAt: LATER,
+          });
           throw new Error("a batch containing an existing id was accepted");
         } catch {
           // Expected; what matters is that nothing landed.
         }
         checkEqual(await store.getBlock("block-b"), undefined, "a failed batch leaked block-b");
         checkEqual(await store.getBlock("block-c"), undefined, "a failed batch leaked block-c");
+        checkEqual(await store.getBlock("block-a"), Uint8Array.of(1), "the first block changed");
+        store.close();
+      },
+    },
+    {
+      name: "version-scoped block reads are exact, bounded, and reject missing history",
+      async run(target) {
+        const store = await target.create();
+        await store.addTable(table("t"));
+        const first = await commitOne(store, "manifest-read-first");
+        const second = await commitOne(store, "manifest-read-second");
         checkEqual(
-          await store.listBlockIds(),
-          ["block-a"],
-          "listBlockIds must be sorted and exact",
+          await store.hasManifestBlocks(first.version, [first.blockId, "not-a-member"]),
+          [true, false],
+          "manifest membership must be positional and exact",
+        );
+        checkEqual(
+          await store.readManifestBlock(first.version, first.blockId),
+          Uint8Array.of(1, 2, 3, 4),
+          "a readable manifest member must return its payload",
+        );
+        checkEqual(
+          await store.readManifestBlock(first.version, second.blockId),
+          undefined,
+          "a non-member block must not be readable through an older manifest",
+        );
+        await checkThrows(
+          () =>
+            store.hasManifestBlocks(
+              second.version,
+              Array.from(
+                { length: MAX_MANIFEST_BLOCK_PRESENCE_IDS + 1 },
+                (_, index) => `presence-${String(index)}`,
+              ),
+            ),
+          RangeError,
+          "manifest membership cap+1",
+        );
+        await checkThrows(
+          () =>
+            store.getBlocks(
+              Array.from(
+                { length: MAX_STORAGE_BULK_READ_ITEMS + 1 },
+                (_, index) => `block-${String(index)}`,
+              ),
+            ),
+          RangeError,
+          "block read cap+1",
+        );
+        const oversizedIds = Array.from(
+          { length: MAX_STORAGE_BULK_READ_ITEMS + 1 },
+          (_, index) => `id-${String(index)}`,
+        );
+        await checkThrows(
+          () => store.getTransactions(oversizedIds),
+          RangeError,
+          "transaction read cap+1",
+        );
+        await checkThrows(
+          () => store.getExistingUniqueKeys("table-t", oversizedIds),
+          RangeError,
+          "unique-key lookup cap+1",
+        );
+        let job = await store.createGarbageCollectionJob({
+          id: "gc-prune-manifest-read",
+          candidateManifestVersions: [first.version],
+          candidateSegmentIds: [],
+          candidateBlockIds: [],
+          leaseCutoff: LATER,
+          createdAt: T0,
+        });
+        while (job.state !== "completed") {
+          job = (
+            await store.runGarbageCollectionStep({
+              jobId: job.id,
+              expectedRevision: job.revision,
+              maxItems: 16,
+              updatedAt: LATER,
+            })
+          ).job;
+        }
+        checkEqual(
+          await store.readManifestBlock(first.version, first.blockId),
+          undefined,
+          "a pruned manifest must not expose its former member",
         );
         store.close();
       },
@@ -332,7 +558,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
-      name: "secondary-index metadata cannot claim ordering its term encoding does not provide",
+      name: "secondary-index metadata must describe one direction per indexed column",
       async run(target) {
         const store = await target.create();
         const record = table("bad-secondary");
@@ -341,9 +567,11 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             ...record,
             secondaryIndexes: {
               bad: {
-                name: "bad_descending_legacy_index",
+                name: "bad_direction_arity_index",
                 columnId: "col-v",
-                directions: ["desc"],
+                columnIds: ["col-v"],
+                directions: ["asc", "desc"],
+                termEncoding: "tuple-v1",
                 storage: "postings-v1",
                 storageColumnId: "secondary-index:bad",
                 locator: "row-id",
@@ -352,7 +580,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
               },
             },
           });
-          throw new Error("a descending legacy term encoding was accepted");
+          throw new Error("secondary-index metadata with mismatched direction arity was accepted");
         } catch (error) {
           check(error instanceof TypeError, "invalid secondary-index metadata must be rejected");
         }
@@ -370,13 +598,26 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           tableId: "table-t",
         });
         await store.reserveRowIds("table-t", 10);
-        await store.removeTable("table-t", 0);
-        checkEqual(await store.listSegments("table-t"), [], "segments must go with the table");
+        const dropped = await store.dropTable({
+          tableId: "table-t",
+          expectedTableRevision: 0,
+          expectedManifestVersion: 0,
+          expectedCatalogEpoch: (await store.getCatalogProbe()).catalogEpoch,
+          committedAt: LATER,
+        });
+        check(dropped.version === 1, "dropTable must publish one successor manifest");
+        checkEqual(
+          await currentManifestBlockIds(store),
+          [],
+          "dropTable must retire the table's manifest blocks",
+        );
+        checkEqual(await tableSegments(store, "table-t"), [], "segments must go with the table");
         checkEqual(
           await store.getExistingUniqueKeys("table-t", ["number:1"]),
           [],
           "unique keys must go with the table",
         );
+        await store.addTable(table("t", true));
         const range = await store.reserveRowIds("table-t", 1);
         check(range.start === 1n, "row-id counters must reset with the table");
         check(
@@ -387,9 +628,167 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
+      name: "fused table drop rejects without change and resolves without partial state",
+      async run(target) {
+        const store = await target.create();
+        await store.addTable(table("t"));
+        const source = await commitOne(store, "source");
+        const catalogEpoch = (await store.getCatalogProbe()).catalogEpoch;
+        const drop = () =>
+          store.dropTable({
+            tableId: "table-t",
+            expectedTableRevision: 0,
+            expectedManifestVersion: source.version,
+            expectedCatalogEpoch: catalogEpoch,
+            committedAt: LATER,
+          });
+        await checkThrows(
+          () =>
+            store.dropTable({
+              tableId: "table-t",
+              expectedTableRevision: 9,
+              expectedManifestVersion: source.version,
+              expectedCatalogEpoch: catalogEpoch,
+              committedAt: LATER,
+            }),
+          TableRecordConflictError,
+          "dropping with a stale table revision",
+        );
+        await checkThrows(
+          () =>
+            store.dropTable({
+              tableId: "table-t",
+              expectedTableRevision: 0,
+              expectedManifestVersion: source.version - 1,
+              expectedCatalogEpoch: catalogEpoch,
+              committedAt: LATER,
+            }),
+          WriteConflictError,
+          "dropping with a stale manifest revision",
+        );
+        check(
+          (await store.getTable("table-t")) !== undefined &&
+            (await store.getCurrentManifestVersion()) === source.version,
+          "a fused drop CAS refusal changed the catalog or manifest",
+        );
+        const active = transaction("txn-active-table", source.version);
+        await store.createTransaction(active);
+        const activeBlockId = "table/t/segment/active/part/000000";
+        const activeSegment = segment("segment-active-table", "table-t", active.id, activeBlockId);
+        const staged = await store.stageTransactionArtifacts({
+          transactionId: active.id,
+          expectedRevision: 0,
+          blocks: [{ id: activeBlockId, bytes: Uint8Array.of(9, 8, 7, 6) }],
+          segments: [activeSegment],
+          updatedAt: LATER,
+        });
+        const activeRefusal = await checkThrows(
+          drop,
+          TableInUseError,
+          "dropping a table with an active transaction",
+        );
+        checkEqual(
+          {
+            tableId: activeRefusal.tableId,
+            ownerKind: activeRefusal.ownerKind,
+            ownerId: activeRefusal.ownerId,
+          },
+          { tableId: "table-t", ownerKind: "transaction", ownerId: active.id },
+          "an active-transaction refusal must identify its exact owner",
+        );
+        check(
+          (await store.getTable("table-t")) !== undefined &&
+            (await store.getSegment(activeSegment.id)) !== undefined &&
+            (await store.getBlock(activeBlockId)) !== undefined &&
+            (await store.getCurrentManifestVersion()) === source.version,
+          "a refused table drop must leave catalog, manifest, and active artifacts unchanged",
+        );
+        await store.updateTransaction(active.id, staged.revision, {
+          status: "aborted",
+          updatedAt: LATER,
+        });
+
+        await store.createCompactionJob({
+          id: "job-table-in-use",
+          tableId: "table-t",
+          sourceManifestVersion: source.version,
+          sourceSegmentIds: ["segment-source"],
+          sourceBlockIds: [source.blockId],
+          outputBlockIds: [],
+          cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+          processedRows: 0,
+          sourceStoredBytes: 0,
+          outputStoredBytes: 0,
+          logicalBytes: 0,
+          rewritePlan: { kind: "copy-v1" },
+          outputCursor: null,
+          memoryBudgetBytes: 0,
+          minimumMemoryBytes: 0,
+          level0SourceStoredBytes: 0,
+          anchorSourceStoredBytes: 0,
+          peakWorkingBytes: 0,
+          outputLogicalBytes: 0,
+          targetLevel: 1,
+          state: "planned",
+          transactionId: null,
+          outputSegmentId: null,
+          publishedVersion: null,
+          revision: 0,
+          createdAt: T0,
+          updatedAt: T0,
+        });
+        const jobRefusal = await checkThrows(
+          drop,
+          TableInUseError,
+          "dropping a table with a nonterminal compaction job",
+        );
+        checkEqual(
+          {
+            tableId: jobRefusal.tableId,
+            ownerKind: jobRefusal.ownerKind,
+            ownerId: jobRefusal.ownerId,
+          },
+          {
+            tableId: "table-t",
+            ownerKind: "compaction job",
+            ownerId: "job-table-in-use",
+          },
+          "a compaction refusal must identify its exact owner",
+        );
+        check(
+          (await store.getTable("table-t")) !== undefined &&
+            (await store.getCurrentManifestVersion()) === source.version &&
+            (await store.hasManifestBlocks(source.version, [source.blockId]))[0] === true,
+          "a compaction refusal changed the catalog or manifest",
+        );
+        await store.cancelCompactionJob("job-table-in-use", 0, LATER);
+        const published = await drop();
+        check(
+          published.version === source.version + 1,
+          "a fused table drop must publish exactly one successor manifest",
+        );
+        check((await store.getTable("table-t")) === undefined, "a terminal owner blocked removal");
+        checkEqual(await tableSegments(store, "table-t"), [], "a fused drop left table segments");
+        checkEqual(await currentManifestBlockIds(store), [], "a fused drop left table blocks live");
+        check(
+          (await store.getBlock(source.blockId)) !== undefined,
+          "a fused drop physically deleted a block pinned readers may still need",
+        );
+        store.close();
+      },
+    },
+    {
       name: "counter reservations never overlap, even issued concurrently",
       async run(target) {
         const store = await target.create();
+        const counterTable = table("t", true);
+        const counterColumn = counterTable.columns[0];
+        if (counterColumn === undefined) throw new Error("counter fixture column is missing");
+        counterTable.columns[0] = {
+          ...counterColumn,
+          defaultValue: { kind: "autoincrement" },
+        };
+        await store.addTable(counterTable);
         const ranges = await Promise.all(
           Array.from({ length: 8 }, () => store.reserveRowIds("table-t", 5)),
         );
@@ -400,6 +799,158 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         }
         const bumped = await store.reserveAutoIncrement("table-t", "col-id", 3, 100n);
         check(bumped.start >= 100n, "reserveAutoIncrement must honor atLeast");
+
+        const maximumExclusive = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+        const { snapshotVersion: _invalidSnapshot, ...invalidRecord } = transaction(
+          "txn-invalid-counter",
+          null,
+        );
+        void _invalidSnapshot;
+        await checkThrows(
+          () =>
+            store.beginTransaction({
+              record: invalidRecord,
+              reserveAutoIncrement: {
+                tableId: "table-t",
+                columnId: "col-id",
+                count: 0,
+                atLeast: maximumExclusive + 1n,
+              },
+            }),
+          RangeError,
+          "an invalid fused auto-increment reservation",
+        );
+        check(
+          (await store.getTransaction(invalidRecord.id)) === undefined,
+          "a refused fused reservation must not create its transaction",
+        );
+
+        const { snapshotVersion: _validSnapshot, ...validRecord } = transaction(
+          "txn-valid-counter",
+          null,
+        );
+        void _validSnapshot;
+        const valid = await store.beginTransaction({
+          record: validRecord,
+          reserveAutoIncrement: {
+            tableId: "table-t",
+            columnId: "col-id",
+            count: 1,
+            atLeast: 150n,
+          },
+        });
+        check(
+          valid.autoIncrementValues?.start === 150n &&
+            valid.autoIncrementValues.endExclusive === 151n,
+          "a valid fused reservation after refusal must use the unchanged counter",
+        );
+        await store.updateTransaction(valid.record.id, valid.record.revision, {
+          status: "aborted",
+          updatedAt: LATER,
+        });
+        await checkThrows(
+          () => store.reserveAutoIncrement("table-t", "col-id", 0, maximumExclusive + 1n),
+          RangeError,
+          "an auto-increment bump outside the safe-integer range",
+        );
+        const afterRefusal = await store.reserveAutoIncrement("table-t", "col-id", 1, 200n);
+        check(
+          afterRefusal.start === 200n && afterRefusal.endExclusive === 201n,
+          "a refused auto-increment bump must not mutate the counter",
+        );
+        const boundary = await store.reserveAutoIncrement(
+          "table-t",
+          "col-id",
+          1,
+          maximumExclusive - 1n,
+        );
+        check(
+          boundary.endExclusive === maximumExclusive,
+          "the final safe auto-increment value must remain reservable",
+        );
+        const exhausted = await store.reserveAutoIncrement(
+          "table-t",
+          "col-id",
+          0,
+          maximumExclusive,
+        );
+        check(
+          exhausted.start === maximumExclusive && exhausted.endExclusive === maximumExclusive,
+          "a zero-count bump to the exclusive boundary must be representable",
+        );
+        await checkThrows(
+          () => store.reserveAutoIncrement("table-t", "col-id", 1),
+          RangeError,
+          "an auto-increment range crossing the safe-integer boundary",
+        );
+        store.close();
+      },
+    },
+    {
+      name: "transaction ownership renewal races expiry abort atomically",
+      async run(target) {
+        const store = await target.create();
+        const record = transaction("txn-live", null);
+        record.expiresAt = MIDDLE;
+        await store.createTransaction(record);
+        check(
+          !(await store.renewTransaction({
+            transactionId: record.id,
+            ownerId: record.ownerId,
+            expiresAtCutoff: MIDDLE,
+            expiresAt: LATER,
+          })),
+          "ownership expired exactly at the cutoff must not be resurrected",
+        );
+        check(
+          (await store.getTransaction(record.id))?.expiresAt === MIDDLE,
+          "a refused expiry-boundary renewal mutated the record",
+        );
+        check(
+          !(await store.renewTransaction({
+            transactionId: record.id,
+            ownerId: "wrong-owner",
+            expiresAtCutoff: T0,
+            expiresAt: LATER,
+          })),
+          "another owner must not renew a transaction",
+        );
+        check(
+          (await store.getTransaction(record.id))?.revision === 0,
+          "ownership renewal must not contend on the data revision",
+        );
+
+        const [renewed, aborted] = await Promise.all([
+          store.renewTransaction({
+            transactionId: record.id,
+            ownerId: record.ownerId,
+            expiresAtCutoff: T0,
+            expiresAt: LATER,
+          }),
+          store.abortTransactionIfExpired({
+            transactionId: record.id,
+            expectedOwnerId: record.ownerId,
+            expiresAtCutoff: MIDDLE,
+            updatedAt: LATER,
+          }),
+        ]);
+        const final = await store.getTransaction(record.id);
+        check(final !== undefined, "the liveness race lost its transaction record");
+        check(
+          (renewed && aborted === undefined && final.status === "active") ||
+            (!renewed && aborted?.status === "aborted" && final.status === "aborted"),
+          "renewal and expiry abort must have one linearized winner",
+        );
+        if (final.status === "active") {
+          check(final.expiresAt === LATER, "the winning renewal did not extend ownership");
+          const expired = await store.abortTransactionIfExpired({
+            transactionId: final.id,
+            expectedOwnerId: final.ownerId,
+            expiresAtCutoff: "9999-12-31T23:59:59.999Z",
+            updatedAt: LATER,
+          });
+          check(expired?.status === "aborted", "an expired owner was not atomically aborted");
+        }
         store.close();
       },
     },
@@ -414,7 +965,8 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         checkEqual(await store.getCurrentManifestVersion(), version, "the version must advance");
         const manifest = await store.getCurrentManifest();
         check(
-          manifest?.blockIds.includes(blockId) === true,
+          manifest !== undefined &&
+            (await store.hasManifestBlocks(manifest.version, [blockId]))[0] === true,
           "the manifest must include the committed block",
         );
         const record = await store.getTransaction("txn-one");
@@ -478,9 +1030,11 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         await store.addTable(table("t", true));
         const { version } = await commitOne(store, "one", { keyTokens: ["number:1"] });
         await store.createTransaction(transaction("txn-dup", version));
-        await store.addBlock("block-dup", Uint8Array.of(9));
-        await store.updateTransaction("txn-dup", 0, {
-          pendingBlockIds: ["block-dup"],
+        await store.stageTransactionArtifacts({
+          transactionId: "txn-dup",
+          expectedRevision: 0,
+          blocks: [{ id: "block-dup", bytes: Uint8Array.of(9) }],
+          segments: [],
           updatedAt: T0,
         });
         await checkThrows(
@@ -506,38 +1060,6 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
-      name: "publishManifest compare-and-swaps and refuses missing blocks",
-      async run(target) {
-        const store = await target.create();
-        await store.addBlock("block-a", Uint8Array.of(1));
-        await checkThrows(
-          () => store.publishManifest({ expectedVersion: 3, blockIds: ["block-a"], createdAt: T0 }),
-          WriteConflictError,
-          "publishing against the wrong expected version",
-        );
-        try {
-          await store.publishManifest({
-            expectedVersion: null,
-            blockIds: ["missing"],
-            createdAt: T0,
-          });
-          throw new Error("a manifest referencing a missing block was published");
-        } catch (error) {
-          check(
-            !(error instanceof WriteConflictError),
-            "missing blocks are not a version conflict",
-          );
-        }
-        const manifest = await store.publishManifest({
-          expectedVersion: null,
-          blockIds: ["block-a"],
-          createdAt: T0,
-        });
-        check(manifest.version === 0, "the first published version must be 0");
-        store.close();
-      },
-    },
-    {
       name: "leases pin versions, renew by CAS, and expire honestly",
       async run(target) {
         const store = await target.create();
@@ -548,16 +1070,37 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           kind: "reader",
           manifestVersion: version,
           ownerId: "owner-a",
-          expiresAt: FAR_FUTURE,
+          createdAt: T0,
+          expiresAt: LATER,
           revision: 0,
         });
         await checkThrows(
-          () => store.renewLease("lease-a", 9, FAR_FUTURE),
+          () =>
+            store.renewLease({
+              id: "lease-a",
+              expectedRevision: 9,
+              expiresAtCutoff: T0,
+              expiresAt: LATER,
+            }),
           LeaseConflictError,
           "renewing with a stale revision",
         );
-        const renewed = await store.renewLease("lease-a", 0, FAR_FUTURE);
+        const renewed = await store.renewLease({
+          id: "lease-a",
+          expectedRevision: 0,
+          expiresAtCutoff: T0,
+          expiresAt: LATER,
+        });
         check(renewed.revision === 1, "a renewal must advance the revision");
+        await checkThrows(
+          () => store.removeLease({ id: "lease-a", ownerId: "wrong-owner" }),
+          LeaseOwnerConflictError,
+          "releasing another owner's lease",
+        );
+        check(
+          (await store.getLease("lease-a"))?.revision === 1,
+          "a refused lease release mutated the record",
+        );
         checkEqual(
           await store.removeLeaseIfExpired("lease-a", 1, PAST),
           false,
@@ -568,6 +1111,29 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           true,
           "an expired lease must be removed",
         );
+        await store.createLease({
+          id: "lease-race",
+          kind: "reader",
+          manifestVersion: version,
+          ownerId: "owner-a",
+          createdAt: T0,
+          expiresAt: LATER,
+          revision: 0,
+        });
+        const [, release] = await Promise.allSettled([
+          store.renewLease({
+            id: "lease-race",
+            expectedRevision: 0,
+            expiresAtCutoff: T0,
+            expiresAt: LATER,
+          }),
+          store.removeLease({ id: "lease-race", ownerId: "owner-a" }),
+        ]);
+        check(release.status === "fulfilled", "a same-owner renewal made release unsafe");
+        check(
+          (await store.getLease("lease-race")) === undefined,
+          "same-owner release did not linearize after/before renewal",
+        );
         store.close();
       },
     },
@@ -577,31 +1143,41 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         const store = await target.create();
         await store.addTable(table("t"));
         const first = await commitOne(store, "one");
-        // Supersede the first commit's block so version 0 becomes collectable.
-        const transactionId = "txn-two";
-        await store.createTransaction(transaction(transactionId, first.version));
-        await store.addBlock("block-two", Uint8Array.of(5));
-        await store.addSegment(segment("segment-two", "table-t", transactionId, "block-two"));
-        await store.updateTransaction(transactionId, 0, {
-          pendingBlockIds: ["block-two"],
-          pendingSegmentIds: ["segment-two"],
-          updatedAt: T0,
-        });
-        await store.commitTransaction({
-          transactionId,
-          expectedTransactionRevision: 1,
+        // A fused table drop is the ordinary, intent-bound way to retire visible table bytes.
+        await store.dropTable({
+          tableId: "table-t",
+          expectedTableRevision: 0,
           expectedManifestVersion: first.version,
-          removedBlockIds: [first.blockId],
+          expectedCatalogEpoch: (await store.getCatalogProbe()).catalogEpoch,
           committedAt: LATER,
         });
+        const retiredBeforeCollection = await store.listRetiredManifestBlockPage({
+          removedThroughVersion: first.version + 1,
+          afterBlockId: null,
+          limit: 1,
+        });
+        checkEqual(
+          retiredBeforeCollection.records.map((record) => record.blockId),
+          [first.blockId],
+          "retired provenance must remain independently pageable before collection",
+        );
         const job = await store.createGarbageCollectionJob({
           id: "gc-1",
           candidateManifestVersions: [first.version],
-          candidateSegmentIds: ["segment-one"],
+          candidateSegmentIds: [],
           candidateBlockIds: [first.blockId],
           leaseCutoff: LATER,
           createdAt: LATER,
         });
+        await checkThrows(
+          () => store.removeGarbageCollectionJob(job.id),
+          Error,
+          "removing a non-completed garbage-collection job",
+        );
+        check(
+          (await store.getGarbageCollectionJob(job.id))?.state === "planned",
+          "a refused garbage-collection job removal mutated the record",
+        );
         const step = await store.runGarbageCollectionStep({
           jobId: job.id,
           expectedRevision: job.revision,
@@ -615,9 +1191,25 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         );
         checkEqual(step.reclaimedBlockIds, [first.blockId], "the superseded block must reclaim");
         checkEqual(await store.getBlock(first.blockId), undefined, "reclaimed bytes must be gone");
-        check((await store.getBlock("block-two")) !== undefined, "live bytes must survive");
+        checkEqual(
+          (
+            await store.listRetiredManifestBlockPage({
+              removedThroughVersion: first.version + 1,
+              afterBlockId: null,
+              limit: 1,
+            })
+          ).records,
+          [],
+          "payload reclamation must atomically remove its retired provenance",
+        );
+        checkEqual(await store.getCurrentManifestVersion(), 1, "the successor manifest was lost");
         const pruned = await store.getManifest(first.version);
         check(pruned?.prunedAt !== undefined, "pruned manifests are tombstoned, not deleted");
+        await store.removeGarbageCollectionJob(job.id);
+        check(
+          (await store.getGarbageCollectionJob(job.id)) === undefined,
+          "a completed garbage-collection job was retained",
+        );
         store.close();
       },
     },
@@ -625,6 +1217,12 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       name: "temp spill pages are isolated scratch; owner records conflict by exact class",
       async run(target) {
         const store = await target.create();
+        await store.createTempOwner({
+          ownerId: "o1",
+          createdAt: T0,
+          expiresAt: LATER,
+          revision: 0,
+        });
         await store.putTempRunPage({
           ownerId: "o1",
           runId: "r1",
@@ -649,9 +1247,14 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           undefined,
           "a removed run must be gone",
         );
-        await store.createTempOwner({ ownerId: "o1", expiresAt: FAR_FUTURE, revision: 0 });
         await checkThrows(
-          () => store.renewTempOwner("o1", 9, FAR_FUTURE),
+          () =>
+            store.renewTempOwner({
+              ownerId: "o1",
+              expectedRevision: 9,
+              expiresAtCutoff: T0,
+              expiresAt: LATER,
+            }),
           TempOwnerConflictError,
           "renewing a temp owner with a stale revision",
         );
@@ -683,6 +1286,14 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           sourceStoredBytes: 0,
           outputStoredBytes: 0,
           logicalBytes: 0,
+          rewritePlan: { kind: "copy-v1" },
+          outputCursor: null,
+          memoryBudgetBytes: 0,
+          minimumMemoryBytes: 0,
+          level0SourceStoredBytes: 0,
+          anchorSourceStoredBytes: 0,
+          peakWorkingBytes: 0,
+          outputLogicalBytes: 0,
           targetLevel: 1,
           state: "planned",
           transactionId: null,
@@ -693,6 +1304,15 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           updatedAt: T0,
         });
         await checkThrows(
+          () => store.removeCompactionJob("job-1"),
+          Error,
+          "removing a nonterminal compaction job",
+        );
+        check(
+          (await store.getCompactionJob("job-1"))?.state === "planned",
+          "a refused compaction-job removal mutated the record",
+        );
+        await checkThrows(
           () =>
             store.updateCompactionJob("job-1", 9, {
               state: "running",
@@ -702,12 +1322,61 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           CompactionJobConflictError,
           "updating a compaction job with a stale revision",
         );
-        const updated = await store.updateCompactionJob("job-1", 0, {
-          state: "running",
-          transactionId: "txn-one",
+        const updated = await store.updateCompactionJob("job-1", 0, { updatedAt: LATER });
+        check(updated.revision === 1, "a job update must advance the revision");
+        await store.cancelCompactionJob("job-1", updated.revision, LATER);
+        check(await store.removeCompactionJob("job-1"), "terminal job was not removed");
+        check((await store.getCompactionJob("job-1")) === undefined, "terminal job was retained");
+
+        await store.createTransaction(transaction("txn-orphan-output", version));
+        await store.stageTransactionArtifacts({
+          transactionId: "txn-orphan-output",
+          expectedRevision: 0,
+          blocks: [{ id: "orphan-compaction-output", bytes: Uint8Array.of(9) }],
+          segments: [],
+          updatedAt: T0,
+        });
+        await store.updateTransaction("txn-orphan-output", 1, {
+          status: "aborted",
           updatedAt: LATER,
         });
-        check(updated.revision === 1, "a job update must advance the revision");
+        await store.createCompactionJob({
+          id: "job-orphan-output",
+          tableId: "table-t",
+          sourceManifestVersion: version,
+          sourceSegmentIds: ["segment-one"],
+          sourceBlockIds: [blockId],
+          outputBlockIds: ["orphan-compaction-output"],
+          cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
+          processedRows: 0,
+          sourceStoredBytes: 0,
+          outputStoredBytes: 1,
+          logicalBytes: 1,
+          rewritePlan: { kind: "copy-v1" },
+          outputCursor: null,
+          memoryBudgetBytes: 0,
+          minimumMemoryBytes: 0,
+          level0SourceStoredBytes: 0,
+          anchorSourceStoredBytes: 0,
+          peakWorkingBytes: 0,
+          outputLogicalBytes: 1,
+          targetLevel: 1,
+          state: "cancelled",
+          transactionId: null,
+          outputSegmentId: null,
+          publishedVersion: null,
+          revision: 0,
+          createdAt: T0,
+          updatedAt: LATER,
+        });
+        check(
+          await store.removeCompactionJob("job-orphan-output"),
+          "terminal compaction metadata with independent transaction provenance was retained",
+        );
+        check(
+          (await store.getBlock("orphan-compaction-output")) !== undefined,
+          "removing terminal metadata deleted an independently proven output",
+        );
         store.close();
       },
     },
@@ -715,6 +1384,17 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       name: "full-text bases serve exact and prefix candidates with honest coverage",
       async run(target) {
         const store = await target.create();
+        await store.addTable({
+          ...table("t"),
+          ftsColumns: {
+            "col-v": {
+              storage: "fts-chunks-v1",
+              tokenizerVersion: 1,
+              state: "ready",
+              buildFromVersion: 0,
+            },
+          },
+        });
         await store.writeFtsBase("table-t", "col-v", {
           coversVersion: 0,
           chunks: [
@@ -776,21 +1456,84 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             },
           },
         });
-        await store.beginFtsBaseBuild("table-postings", "col-v", "abandoned");
-        await store.writeFtsBaseBuildChunk("table-postings", "col-v", "abandoned", 0, [
-          { term: "old", rowIds: [1n], tf: [1] },
-        ]);
-        await store.beginFtsBaseBuild("table-postings", "col-v", "replacement");
-        await store.writeFtsBaseBuildChunk("table-postings", "col-v", "replacement", 0, [
-          { term: "alpha", rowIds: [2n], tf: [1] },
-        ]);
-        await store.writeFtsBaseBuildChunk("table-postings", "col-v", "replacement", 1, [
-          { term: "omega", rowIds: [3n], tf: [1] },
-        ]);
-        await store.finishFtsBaseBuild("table-postings", "col-v", "replacement", {
+        await store.beginFtsBaseBuild({
+          tableId: "table-postings",
+          columnId: "col-v",
+          buildId: "abandoned",
+          ownerId: "owner-abandoned",
+          createdAt: "2099-01-01T00:00:00.000Z",
+          expiresAt: "2099-01-01T00:10:00.000Z",
+        });
+        await store.writeFtsBaseBuildChunk({
+          tableId: "table-postings",
+          columnId: "col-v",
+          buildId: "abandoned",
+          ownerId: "owner-abandoned",
+          expiresAtCutoff: "2099-01-01T00:00:01.000Z",
+          expiresAt: "2099-01-01T00:10:00.000Z",
+          updatedAt: "2099-01-01T00:00:01.000Z",
+          ordinal: 0,
+          chunk: [{ term: "old", rowIds: [1n], tf: [1] }],
+        });
+        await store.beginFtsBaseBuild({
+          tableId: "table-postings",
+          columnId: "col-v",
+          buildId: "replacement",
+          ownerId: "owner-replacement",
+          createdAt: "2099-01-01T00:10:00.000Z",
+          expiresAt: "2099-01-01T00:20:00.000Z",
+        });
+        const firstChunk: Parameters<BlockStore["writeFtsBaseBuildChunk"]>[0] = {
+          tableId: "table-postings",
+          columnId: "col-v",
+          buildId: "replacement",
+          ownerId: "owner-replacement",
+          expiresAtCutoff: "2099-01-01T00:10:01.000Z",
+          expiresAt: "2099-01-01T00:20:00.000Z",
+          updatedAt: "2099-01-01T00:10:01.000Z",
+          ordinal: 0,
+          chunk: [{ term: "alpha", rowIds: [2n], tf: [1] }],
+        };
+        await store.writeFtsBaseBuildChunk(firstChunk);
+        // Lost-ack replay is idempotent: retrying the identical chunk neither duplicates it nor
+        // advances the ordinal, while changing acknowledged bytes is an ownership conflict.
+        await store.writeFtsBaseBuildChunk(firstChunk);
+        await checkThrows(
+          () =>
+            store.writeFtsBaseBuildChunk({
+              ...firstChunk,
+              chunk: [{ term: "alpha", rowIds: [999n], tf: [1] }],
+            }),
+          PostingBuildConflictError,
+          "replaying an acknowledged postings ordinal with changed bytes",
+        );
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          // The active owner and completed ordinal are durable too. Replaying after a process
+          // restart must still be a no-op, not a duplicate allocation or a vanished build.
+          await store.writeFtsBaseBuildChunk(firstChunk);
+        }
+        await store.writeFtsBaseBuildChunk({
+          tableId: "table-postings",
+          columnId: "col-v",
+          buildId: "replacement",
+          ownerId: "owner-replacement",
+          expiresAtCutoff: "2099-01-01T00:10:02.000Z",
+          expiresAt: "2099-01-01T00:20:00.000Z",
+          updatedAt: "2099-01-01T00:10:02.000Z",
+          ordinal: 1,
+          chunk: [{ term: "omega", rowIds: [3n], tf: [1] }],
+        });
+        await store.finishFtsBaseBuild({
+          tableId: "table-postings",
+          columnId: "col-v",
+          buildId: "replacement",
+          ownerId: "owner-replacement",
+          expiresAtCutoff: "2099-01-01T00:10:03.000Z",
           coversVersion: 4,
           chunkCount: 2,
           totalTokens: 2,
+          completedAt: "2099-01-01T00:10:03.000Z",
         });
         let candidates = await store.readFtsCandidates(
           "table-postings",
@@ -819,6 +1562,26 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           checkEqual(candidates.rowIdsByTerm, [[3n]], "a finished generation must survive reopen");
           check(candidates.hasBase, "a reopened generation must still report its base");
         }
+        await checkThrows(
+          () => store.removeFtsColumn("table-postings", "col-v"),
+          Error,
+          "removing postings still owned by a ready catalog accelerator",
+        );
+        const indexed = await store.getTable("table-postings");
+        check(indexed !== undefined, "the postings table disappeared");
+        await store.updateTable(indexed.id, indexed.revision, {
+          ftsColumns: {
+            ...indexed.ftsColumns,
+            "col-v": {
+              ...(indexed.ftsColumns?.["col-v"] ?? {
+                storage: "fts-chunks-v1" as const,
+                tokenizerVersion: 1,
+                buildFromVersion: -1,
+              }),
+              state: "invalid",
+            },
+          },
+        });
         await store.removeFtsColumn("table-postings", "col-v");
         candidates = await store.readFtsCandidates(
           "table-postings",
@@ -912,15 +1675,16 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
-      name: "optional atomic methods, when present, equal the sequential calls",
+      name: "atomic staging and rollback keep journals and artifacts inseparable",
       async run(target) {
-        const store = await target.create();
+        let store = await target.create();
         await store.addTable(table("t"));
-        const begin = store.beginTransaction?.bind(store);
-        if (begin !== undefined) {
-          const begun = await begin({
+        {
+          const begun = await store.beginTransaction({
             record: {
               id: "txn-b",
+              ownerId: "txn-b/owner",
+              expiresAt: LATER,
               pendingBlockIds: [],
               pendingSegmentIds: [],
               status: "active",
@@ -940,66 +1704,162 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             "beginTransaction must honor the reservation",
           );
         }
-        const stage = store.stageTransactionArtifacts?.bind(store);
-        if (stage !== undefined) {
-          await store.createTransaction(
-            transaction("txn-s", await store.getCurrentManifestVersion()),
+        const stage = store.stageTransactionArtifacts.bind(store);
+        await store.createTransaction(
+          transaction("txn-s", await store.getCurrentManifestVersion()),
+        );
+        const duplicate = segment("segment-duplicate", "table-t", "txn-s", "block-none");
+        await checkThrows(
+          () =>
+            stage({
+              transactionId: "txn-s",
+              expectedRevision: 0,
+              blocks: [],
+              segments: [duplicate, duplicate],
+              updatedAt: LATER,
+            }),
+          Error,
+          "staging duplicate segment IDs",
+        );
+        await checkThrows(
+          () =>
+            stage({
+              transactionId: "txn-s",
+              expectedRevision: 0,
+              blocks: [],
+              segments: [segment("segment-foreign", "table-t", "another-txn", "block-none")],
+              updatedAt: LATER,
+            }),
+          Error,
+          "staging a segment owned by another transaction",
+        );
+        check(
+          (await store.getSegment("segment-duplicate")) === undefined &&
+            (await store.getSegment("segment-foreign")) === undefined &&
+            (await store.getTransaction("txn-s"))?.revision === 0,
+          "refused staging must leave the transaction and segment store unchanged",
+        );
+        const first = await stage({
+          transactionId: "txn-s",
+          expectedRevision: 0,
+          blocks: [{ id: "block-z", bytes: Uint8Array.of(7) }],
+          segments: [segment("segment-z", "table-t", "txn-s", "block-z")],
+          updatedAt: LATER,
+        });
+        await checkThrows(
+          () =>
+            stage({
+              transactionId: "txn-s",
+              expectedRevision: first.revision,
+              blocks: [{ id: "block-gap", bytes: Uint8Array.of(9) }],
+              segments: [segment("segment-gap", "table-t", "txn-s", "block-gap", 0)],
+              updatedAt: LATER,
+            }),
+          TypeError,
+          "staging a segment whose commit ordinal does not continue the journal",
+        );
+        check(
+          (await store.getTransaction("txn-s"))?.revision === first.revision &&
+            (await store.getBlock("block-gap")) === undefined &&
+            (await store.getSegment("segment-gap")) === undefined,
+          "an ordinal refusal must leave the record, block, and segment unchanged",
+        );
+        const staged = await stage({
+          transactionId: "txn-s",
+          expectedRevision: first.revision,
+          blocks: [{ id: "block-a", bytes: Uint8Array.of(8) }],
+          segments: [segment("segment-a", "table-t", "txn-s", "block-a", 1)],
+          updatedAt: LATER,
+        });
+        checkEqual(staged.pendingBlockIds, ["block-z", "block-a"], "staging journals blocks");
+        checkEqual(
+          staged.pendingSegmentIds,
+          ["segment-z", "segment-a"],
+          "staging preserves the canonical segment journal order",
+        );
+        check(
+          (await store.getBlock("block-a")) !== undefined &&
+            (await store.getSegment("segment-a")) !== undefined,
+          "staging must write bytes and segments",
+        );
+        const rollbackInput = {
+          transactionId: "txn-s",
+          expectedRevision: staged.revision,
+          pendingBlockIds: ["block-z"],
+          pendingSegmentIds: ["segment-z"],
+          removeBlockIds: ["block-a"],
+          removeSegmentIds: ["segment-a"],
+          updatedAt: LATER,
+        } as const;
+        await checkThrows(
+          () =>
+            store.rollbackTransactionArtifacts({
+              ...rollbackInput,
+              expectedRevision: staged.revision + 1,
+            }),
+          TransactionRecordConflictError,
+          "rollback with a stale transaction revision",
+        );
+        await checkThrows(
+          () =>
+            store.rollbackTransactionArtifacts({
+              ...rollbackInput,
+              removeBlockIds: [],
+            }),
+          TypeError,
+          "rollback whose lists do not exactly partition the journal",
+        );
+        await checkThrows(
+          () =>
+            store.rollbackTransactionArtifacts({
+              ...rollbackInput,
+              pendingBlockIds: ["block-a"],
+              pendingSegmentIds: ["segment-a"],
+              removeBlockIds: ["block-z"],
+              removeSegmentIds: ["segment-z"],
+            }),
+          TypeError,
+          "rollback that retains a non-prefix journal partition",
+        );
+        check(
+          (await store.getBlock("block-a")) !== undefined &&
+            (await store.getSegment("segment-a")) !== undefined,
+          "a refused rollback must leave every artifact intact",
+        );
+        const rolledBack = await store.rollbackTransactionArtifacts(rollbackInput);
+        checkEqual(
+          rolledBack.pendingBlockIds,
+          ["block-z"],
+          "rollback must retain checkpoint block",
+        );
+        check(
+          (await store.getBlock("block-a")) === undefined &&
+            (await store.getSegment("segment-a")) === undefined &&
+            (await store.getBlock("block-z")) !== undefined &&
+            (await store.getSegment("segment-z")) !== undefined,
+          "rollback must delete only its exact removed partition",
+        );
+        if (target.reopen !== undefined) {
+          const reopened = await target.reopen(store);
+          checkEqual(
+            (await reopened.getTransaction("txn-s"))?.pendingBlockIds,
+            ["block-z"],
+            "rollback journal must survive reopen",
           );
-          const staged = await stage({
-            transactionId: "txn-s",
-            expectedRevision: 0,
-            blocks: [{ id: "block-staged", bytes: Uint8Array.of(7) }],
-            segments: [segment("segment-staged", "table-t", "txn-s", "block-staged")],
-            updatedAt: LATER,
-          });
-          checkEqual(staged.pendingBlockIds, ["block-staged"], "staging must journal the block");
           check(
-            (await store.getBlock("block-staged")) !== undefined,
-            "staging must write the bytes",
+            (await reopened.getBlock("block-a")) === undefined &&
+              (await reopened.getBlock("block-z")) !== undefined,
+            "rollback artifact removal must survive reopen",
           );
-          check(
-            (await store.getSegment("segment-staged")) !== undefined,
-            "staging must write the segment",
-          );
+          store = reopened;
         }
-        const probe = store.getCatalogProbe?.bind(store);
-        if (probe !== undefined) {
-          const before = await probe();
-          await store.addTable(table("probe-check"));
-          const after = await probe();
-          check(
-            after.catalogEpoch > before.catalogEpoch,
-            "a catalog mutation must advance the probe's epoch",
-          );
-        }
-        const catalogState = store.getQueryCatalogState?.bind(store);
-        if (catalogState !== undefined) {
-          const state = await catalogState(["t", "missing-table"]);
-          check(
-            state.tables.length === 2 && state.tables[1] === undefined,
-            "getQueryCatalogState must be positional with undefined for missing tables",
-          );
-          checkEqual(
-            state.tables[0]?.id,
-            (await store.getTableByName("t"))?.id,
-            "getQueryCatalogState must return the same records the individual reads do",
-          );
-          checkEqual(
-            state.segments,
-            [],
-            "getQueryCatalogState must omit staged segments outside the current manifest",
-          );
-          checkEqual(
-            state.transactions,
-            [],
-            "getQueryCatalogState must omit transactions used only by non-current segments",
-          );
-          checkEqual(
-            state.manifestBlockIds,
-            [],
-            "getQueryCatalogState must return the exact current manifest block set",
-          );
-        }
+        const before = await store.getCatalogProbe();
+        await store.addTable(table("probe-check"));
+        const after = await store.getCatalogProbe();
+        check(
+          after.catalogEpoch > before.catalogEpoch,
+          "a catalog mutation must advance the probe's epoch",
+        );
         store.close();
       },
     },
@@ -1013,10 +1873,11 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           return;
         }
         await store.addTable(table("t", true));
+        const schemaEpoch = (await store.getCatalogProbe()).schemaEpoch;
         const fresh = (id: string): Omit<TransactionRecord, "snapshotVersion"> => {
           const { snapshotVersion: _pinned, ...record } = transaction(id, null);
           void _pinned;
-          return record;
+          return { ...record, schemaEpochGuard: schemaEpoch };
         };
         // A fresh record: begun, staged, and committed in the one step.
         const first = await write({
@@ -1024,6 +1885,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           blocks: [{ id: "block-w1", bytes: Uint8Array.of(1) }],
           segments: [segment("segment-w1", "table-t", "txn-w1", "block-w1")],
           expectedManifestVersion: null,
+          levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
           uniqueKeyChanges: [{ tableId: "table-t", keyTokens: ["number:1"], requireAbsent: true }],
           committedAt: LATER,
         });
@@ -1059,6 +1921,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
               blocks: [{ id: "block-stale", bytes: Uint8Array.of(2) }],
               segments: [segment("segment-stale", "table-t", "txn-stale", "block-stale")],
               expectedManifestVersion: null,
+              levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
               committedAt: LATER,
             }),
           WriteConflictError,
@@ -1078,6 +1941,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
               blocks: [{ id: "block-dup", bytes: Uint8Array.of(3) }],
               segments: [segment("segment-dup", "table-t", "txn-dup", "block-dup")],
               expectedManifestVersion: 0,
+              levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
               uniqueKeyChanges: [
                 { tableId: "table-t", keyTokens: ["number:1"], requireAbsent: true },
               ],
@@ -1101,6 +1965,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
               blocks: [{ id: "block-w2", bytes: Uint8Array.of(4) }],
               segments: [segment("segment-w2", "table-t", "txn-w2", "block-w2")],
               expectedManifestVersion: 0,
+              levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
               committedAt: LATER,
             }),
           TransactionRecordConflictError,
@@ -1115,21 +1980,144 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           blocks: [{ id: "block-w2", bytes: Uint8Array.of(4) }],
           segments: [segment("segment-w2", "table-t", "txn-w2", "block-w2")],
           expectedManifestVersion: 0,
-          removedBlockIds: ["block-w1"],
+          levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
           changedTableIds: ["table-t"],
           committedAt: LATER,
         });
         checkEqual(second.version, 1, "the continued write must publish the next version");
         checkEqual(second.changedTableIds, ["table-t"], "the summary must carry the change set");
-        const manifest = await store.getManifest(1);
         checkEqual(
-          manifest?.blockIds,
-          ["block-w2"],
-          "the continued write must add its blocks and apply supersessions",
+          await manifestBlockIds(store, 1),
+          ["block-w1", "block-w2"],
+          "the continued write must preserve visible blocks and add its own",
         );
         check(
           (await store.getTransaction("txn-w2"))?.status === "committed",
           "the begun record must end committed",
+        );
+        store.close();
+      },
+    },
+    {
+      name: "compaction commit proves exact output provenance before publication",
+      async run(target) {
+        const store = await target.create();
+        await store.addTable({
+          id: "table-compact",
+          name: "compact",
+          columns: [{ id: "col-value", name: "value", type: "number", nullable: false }],
+          managed: false,
+          revision: 0,
+          createdAt: T0,
+        });
+        await store.createTransaction(transaction("txn-compact-source", null));
+        const source = await store.stageTransactionArtifacts({
+          transactionId: "txn-compact-source",
+          expectedRevision: 0,
+          blocks: [{ id: "compact-source-block", bytes: Uint8Array.of(1) }],
+          segments: [
+            {
+              ...segment(
+                "compact-source-segment",
+                "table-compact",
+                "txn-compact-source",
+                "compact-source-block",
+              ),
+              columnBlockIds: { "col-value": ["compact-source-block"] },
+            },
+          ],
+          updatedAt: T0,
+        });
+        await store.commitTransaction({
+          transactionId: source.id,
+          expectedTransactionRevision: source.revision,
+          expectedManifestVersion: null,
+          levelZeroSegmentLimits: [{ tableId: "table-compact", limit: MAX_LEVEL_ZERO_SEGMENTS }],
+          committedAt: T0,
+        });
+
+        const jobId = "compact-proof-job";
+        const outputBlockId = `${jobId}/output/segment/000000/column/000000/part/000000`;
+        await store.createTransaction(transaction("txn-compact-output", 0));
+        const output = await store.stageTransactionArtifacts({
+          transactionId: "txn-compact-output",
+          expectedRevision: 0,
+          blocks: [{ id: outputBlockId, bytes: Uint8Array.of(2) }],
+          segments: [
+            {
+              ...segment(
+                "compact-output-segment",
+                "table-compact",
+                "txn-compact-output",
+                outputBlockId,
+              ),
+              columnBlockIds: { "col-value": [outputBlockId] },
+              // Structurally valid, but copy-v1 is required to publish an insert segment.
+              kind: "base",
+              level: 1,
+            },
+          ],
+          updatedAt: LATER,
+        });
+        const job: CompactionJobRecord = {
+          id: jobId,
+          tableId: "table-compact",
+          sourceManifestVersion: 0,
+          sourceSegmentIds: ["compact-source-segment"],
+          sourceBlockIds: ["compact-source-block"],
+          outputBlockIds: [outputBlockId],
+          cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
+          processedRows: 2,
+          sourceStoredBytes: 1,
+          outputStoredBytes: 1,
+          logicalBytes: 1,
+          rewritePlan: { kind: "copy-v1" },
+          outputCursor: null,
+          memoryBudgetBytes: 0,
+          minimumMemoryBytes: 0,
+          level0SourceStoredBytes: 1,
+          anchorSourceStoredBytes: 0,
+          peakWorkingBytes: 0,
+          outputLogicalBytes: 1,
+          targetLevel: 1,
+          state: "ready",
+          transactionId: output.id,
+          outputSegmentId: "compact-output-segment",
+          publishedVersion: null,
+          revision: 0,
+          createdAt: T0,
+          updatedAt: LATER,
+        };
+        await store.createCompactionJob(job);
+        await checkThrows(
+          () =>
+            store.commitTransaction({
+              transactionId: output.id,
+              expectedTransactionRevision: output.revision,
+              expectedManifestVersion: 0,
+              compactionJobId: job.id,
+              removedBlockIds: ["compact-source-block"],
+              committedAt: LATER,
+            }),
+          Error,
+          "a structurally valid compaction segment that differs from the immutable plan",
+        );
+        checkEqual(
+          await store.getCurrentManifestVersion(),
+          0,
+          "a provenance refusal must not publish a manifest",
+        );
+        check(
+          (await store.getTransaction(output.id))?.status === "active" &&
+            (await store.getSegment("compact-output-segment"))?.kind === "base" &&
+            (await store.getBlock(outputBlockId)) !== undefined &&
+            (await store.getCompactionJob(job.id))?.state === "ready",
+          "a provenance refusal must leave the transaction, artifacts, and job unchanged",
+        );
+        checkEqual(
+          await manifestBlockIds(store, 0),
+          ["compact-source-block"],
+          "a provenance refusal must retain every source block",
         );
         store.close();
       },
@@ -1151,16 +2139,31 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           kind: "reader",
           manifestVersion: first.version,
           ownerId: "owner-m",
+          createdAt: T0,
           expiresAt: LATER,
           revision: 0,
         });
         await checkThrows(
-          () => move("lease-m", 9, second.version, FAR_FUTURE),
+          () =>
+            move({
+              id: "lease-m",
+              expectedRevision: 9,
+              manifestVersion: second.version,
+              expiresAtCutoff: T0,
+              expiresAt: LATER,
+            }),
           LeaseConflictError,
           "moving with a stale revision",
         );
         await checkThrows(
-          () => move("lease-m", 0, 999, FAR_FUTURE),
+          () =>
+            move({
+              id: "lease-m",
+              expectedRevision: 0,
+              manifestVersion: 999,
+              expiresAtCutoff: T0,
+              expiresAt: LATER,
+            }),
           SnapshotManifestMissingError,
           "moving to a version with no manifest",
         );
@@ -1171,12 +2174,19 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             kind: "reader",
             manifestVersion: first.version,
             ownerId: "owner-m",
+            createdAt: T0,
             expiresAt: LATER,
             revision: 0,
           },
           "a refused move must leave the lease exactly as it was",
         );
-        const moved = await move("lease-m", 0, second.version, FAR_FUTURE);
+        const moved = await move({
+          id: "lease-m",
+          expectedRevision: 0,
+          manifestVersion: second.version,
+          expiresAtCutoff: T0,
+          expiresAt: LATER,
+        });
         checkEqual(
           moved,
           {
@@ -1184,7 +2194,8 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             kind: "reader",
             manifestVersion: second.version,
             ownerId: "owner-m",
-            expiresAt: FAR_FUTURE,
+            createdAt: T0,
+            expiresAt: LATER,
             revision: 1,
           },
           "a move must re-pin, renew, and advance the revision",
@@ -1211,10 +2222,16 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           const { snapshotVersion: _pinned, ...record } = transaction("txn-single", null);
           void _pinned;
           const summary = await write({
-            transaction: { record },
+            transaction: {
+              record: {
+                ...record,
+                schemaEpochGuard: (await store.getCatalogProbe()).schemaEpoch,
+              },
+            },
             blocks: [{ id: "block-single", bytes: Uint8Array.of(1, 2, 3, 4) }],
             segments: [segment("segment-single", "table-t", "txn-single", "block-single")],
             expectedManifestVersion: version,
+            levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
             uniqueKeyChanges: [
               { tableId: "table-t", keyTokens: ["number:1"], requireAbsent: false },
             ],
@@ -1230,10 +2247,17 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             kind: "reader",
             manifestVersion: null,
             ownerId: "owner",
-            expiresAt: FAR_FUTURE,
+            createdAt: T0,
+            expiresAt: LATER,
             revision: 0,
           });
-          await move("lease-durable", 0, version, FAR_FUTURE);
+          await move({
+            id: "lease-durable",
+            expectedRevision: 0,
+            manifestVersion: version,
+            expiresAtCutoff: T0,
+            expiresAt: LATER,
+          });
         }
         store = await target.reopen(store);
 

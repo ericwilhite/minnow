@@ -1,3 +1,4 @@
+import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import {
   childExpressions,
   expressionAliases,
@@ -1122,8 +1123,8 @@ function foldBinary(
   }
   if (typeof leftValue === "boolean" || typeof rightValue === "boolean") return undefined;
   if (typeof leftValue === "string" || typeof rightValue === "string") return undefined;
-  const left = leftValue instanceof Date ? leftValue.getTime() : leftValue;
-  const right = rightValue instanceof Date ? rightValue.getTime() : rightValue;
+  const left = leftValue instanceof Date ? dateMilliseconds(leftValue) : leftValue;
+  const right = rightValue instanceof Date ? dateMilliseconds(rightValue) : rightValue;
   if ((operator === "/" || operator === "%") && right === 0) return null;
   const result =
     operator === "+"
@@ -1512,7 +1513,7 @@ function renderExpression(expression: Expression): string {
   if (expression.kind === "literal") {
     const value = expression.value;
     if (value === null) return "null";
-    if (value instanceof Date) return `date ${value.toISOString()}`;
+    if (value instanceof Date) return `date ${dateIsoString(value)}`;
     if (typeof value === "string") return `'${value}'`;
     return String(value);
   }

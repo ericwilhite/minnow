@@ -1,0 +1,76 @@
+---
+title: Cursors and exports
+description: Pull query pages through a worker and stream CSV or NDJSON with backpressure.
+---
+
+`queryCursor()` yields bounded `QueryResult` pages from an in-thread database or worker client:
+
+```ts
+for await (const batch of database.queryCursor(
+  "SELECT order_id, placed_at, total FROM orders WHERE status = $1",
+  { params: ["complete"], batchRows: 1000 },
+)) {
+  upload(batch.rows);
+}
+```
+
+Each page has the same `columns` and `rows` shape as `query()`. Empty results yield one empty page,
+so exporters can still write a header. Breaking out of the loop, calling `return()`, or aborting the
+optional `signal` releases the scan and its snapshot lease.
+
+An unordered, ungrouped single-table SELECT emits directly from vector scan batches. The producer
+waits for the consumer before scanning onward and keeps one pending page at most. A blocking plan
+such as `ORDER BY`, grouping, a join, or a derived source first uses the ordinary correct executor
+(including configured spill behavior), then pages the completed result. `batchRows` is therefore a
+hard page maximum, not a claim that every SQL shape can produce rows before it sees all input.
+
+Worker cursors use one pull RPC per page. The worker pivots rows into column arrays and transfers
+their typed buffers, then the client reconstructs only that page on the main thread.
+
+## Kysely streaming
+
+Kysely's standard stream API uses the same cursor:
+
+```ts
+for await (const order of db
+  .selectFrom("orders")
+  .select(["order_id", "total"])
+  .where("status", "=", "complete")
+  .stream(1000)) {
+  consume(order);
+}
+```
+
+The row type and Kysely result plugins are preserved.
+
+## CSV and NDJSON
+
+Install the streaming export package:
+
+```bash
+npm install @minnowdb/export
+```
+
+Both helpers return a standard `ReadableStream<Uint8Array>` and accept either a direct database or
+worker client:
+
+```ts
+import { streamCsv, streamNdjson } from "@minnowdb/export";
+
+const csv = streamCsv(database, "SELECT order_id, placed_at, total FROM orders", {
+  batchRows: 1000,
+});
+await csv.pipeTo(await fileHandle.createWritable());
+
+const ndjson = streamNdjson(database, "SELECT * FROM orders", { batchRows: 1000 });
+await ndjson.pipeTo(uploadWritable);
+```
+
+CSV includes a header by default, uses CRLF records, doubles quotes, and quotes fields containing
+the delimiter, a quote, or a newline. Configure `header`, one-character `delimiter`, `newline`, and
+`nullValue` as needed.
+
+NDJSON writes one object per row in query-column order. It preserves `-0` and writes dates as ISO
+strings. Because JSON has no exact representation for `NaN`, infinity, or an invalid date, the
+stream rejects those values instead of silently changing them. Cancelling either readable stream
+closes its underlying query cursor.

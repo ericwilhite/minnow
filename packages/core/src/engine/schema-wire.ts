@@ -1,4 +1,4 @@
-import type { ColumnDefault, SqlDomain } from "../storage/index.js";
+import type { ColumnDefault, SqlDomain } from "../storage/types.js";
 import {
   columnFromState,
   schema,

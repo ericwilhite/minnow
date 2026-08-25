@@ -12,8 +12,9 @@
  *   `InvalidModificationError`, `NoModificationAllowedError`, and injected
  *   `QuotaExceededError`s are actual `DOMException`s, since error identity is part of the
  *   storage contract.
- * - **Injectable write faults.** `setWriteFault` throws from inside sync writes, creates, or
- *   flushes — how the quota and crash suites produce a failure at an exact byte boundary.
+ * - **Injectable write faults and short transfers.** `setWriteFault` throws from inside sync
+ *   writes, creates, or flushes; `setTransferLimit` makes reads or writes return any valid short
+ *   byte count, including zero progress, at deterministic offsets.
  *
  * For applications, `MemoryBlockStore` remains the right store in Node tests. This shim is for
  * adapter authors: it hosts `OpfsBlockStore` (pass `root`) or anything built on the storage
@@ -34,10 +35,19 @@ interface DirectoryNode {
 }
 
 export type WriteFault = (path: string, phase: "create" | "write" | "flush") => void;
+export type DeleteFault = (path: string) => void;
+export type TransferLimit = (
+  path: string,
+  operation: "read" | "write",
+  requestedBytes: number,
+  at: number,
+) => number | undefined;
 
 export class MemoryOpfs {
   readonly #rootNode: DirectoryNode = { kind: "directory", name: "", children: new Map() };
   #writeFault: WriteFault | null = null;
+  #deleteFault: DeleteFault | null = null;
+  #transferLimit: TransferLimit | null = null;
 
   /** The tree's root, shaped like `navigator.storage.getDirectory()`'s result. */
   get root(): FileSystemDirectoryHandle {
@@ -53,8 +63,37 @@ export class MemoryOpfs {
     this.#writeFault = fault;
   }
 
+  /** Installs a fault at file/directory removal, for post-commit cleanup tests. */
+  setDeleteFault(fault: DeleteFault | null): void {
+    this.#deleteFault = fault;
+  }
+
+  /** Limits individual sync-handle transfers so tests can deterministically exercise short I/O. */
+  setTransferLimit(limit: TransferLimit | null): void {
+    this.#transferLimit = limit;
+  }
+
   maybeFault(path: string, phase: "create" | "write" | "flush"): void {
     this.#writeFault?.(path, phase);
+  }
+
+  maybeDeleteFault(path: string): void {
+    this.#deleteFault?.(path);
+  }
+
+  limitTransfer(
+    path: string,
+    operation: "read" | "write",
+    requestedBytes: number,
+    at: number,
+  ): number {
+    const limited = this.#transferLimit?.(path, operation, requestedBytes, at) ?? requestedBytes;
+    if (!Number.isSafeInteger(limited) || limited < 0 || limited > requestedBytes) {
+      throw new RangeError(
+        `Invalid test transfer limit ${String(limited)} for ${String(requestedBytes)} requested bytes`,
+      );
+    }
+    return limited;
   }
 
   /** Test-side peek: the file's current bytes, or undefined. Bypasses locks on purpose. */
@@ -86,6 +125,16 @@ export class MemoryOpfs {
       bytes: bytes.slice(),
       lockHolder: existing?.lockHolder ?? null,
     });
+  }
+
+  /** Test-side in-place corruption: existing sync handles observe the changed byte. */
+  corruptFileByte(path: string, offset: number): void {
+    const node = this.#find(path);
+    if (node?.kind !== "file") throw new Error(`Not a file: ${path}`);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset >= node.bytes.byteLength) {
+      throw new RangeError(`Invalid corruption offset ${String(offset)} for ${path}`);
+    }
+    node.bytes[offset] = (node.bytes[offset] ?? 0) ^ 0xff;
   }
 
   #find(path: string): FileNode | DirectoryNode | undefined {
@@ -173,6 +222,7 @@ class ShimDirectoryHandle {
     validateEntryName(name);
     const existing = this.#node.children.get(name);
     if (existing === undefined) throw notFound(name);
+    this.#shim.maybeDeleteFault(this.#childPath(name));
     if (existing.kind === "file") {
       if (existing.lockHolder !== null) throw locked(name);
     } else if (options?.recursive !== true) {
@@ -295,7 +345,8 @@ class ShimSyncAccessHandle {
     this.#assertOpen();
     const at = options?.at ?? 0;
     const target = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-    const source = this.#node.bytes.subarray(at, at + target.byteLength);
+    const limit = this.#shim.limitTransfer(this.#path, "read", target.byteLength, at);
+    const source = this.#node.bytes.subarray(at, at + limit);
     target.set(source);
     return source.byteLength;
   }
@@ -304,9 +355,11 @@ class ShimSyncAccessHandle {
     this.#assertOpen();
     this.#shim.maybeFault(this.#path, "write");
     const at = options?.at ?? 0;
-    const source = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const requested = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const limit = this.#shim.limitTransfer(this.#path, "write", requested.byteLength, at);
+    const source = requested.subarray(0, limit);
     const end = at + source.byteLength;
-    if (end > this.#node.bytes.byteLength) {
+    if (source.byteLength > 0 && end > this.#node.bytes.byteLength) {
       const grown = new Uint8Array(end);
       grown.set(this.#node.bytes);
       this.#node.bytes = grown;

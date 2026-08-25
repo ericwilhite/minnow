@@ -1,4 +1,5 @@
-import type { MinnowDatabase, MinnowDatabaseClient } from "@minnowdb/core";
+import type { MinnowDatabase } from "@minnowdb/core";
+import type { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { describe, expect, it } from "vitest";
 import {
   isEditableTarget,

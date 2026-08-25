@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MAX_INDEXED_STRING_CHARACTERS } from "../storage/types.js";
 import {
   bm25DocumentScore,
   bm25Score,
@@ -60,6 +61,12 @@ describe("query grammar", () => {
     const wide = Array.from({ length: 33 }, (_, index) => `t${String(index)}`).join(" ");
     expect(() => validateFtsQuery(wide)).toThrow("at most 32 terms");
     expect(() => validateFtsQuery("just fine")).not.toThrow();
+    const adversarial = Array.from({ length: 100_000 }, () => "term").join(" ");
+    expect(() => tokenizeQuery(adversarial)).toThrow("Full-text queries cannot exceed");
+    expect(() => validateFtsQuery(adversarial)).toThrow("Full-text queries cannot exceed");
+    expect(() => tokenize("x".repeat(MAX_INDEXED_STRING_CHARACTERS + 1))).toThrow(
+      "Full-text values cannot exceed",
+    );
   });
 });
 

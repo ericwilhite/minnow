@@ -35,7 +35,9 @@ const targets: Array<{ name: string; target: BlockStoreConformanceTarget }> = [
           const opened = factories.get(store as IndexedDbBlockStore);
           if (opened === undefined) throw new Error("unknown store");
           store.close();
-          return IndexedDbBlockStore.open(opened);
+          const reopened = await IndexedDbBlockStore.open(opened);
+          factories.set(reopened, opened);
+          return reopened;
         },
       } satisfies BlockStoreConformanceTarget;
     })(),
@@ -56,7 +58,9 @@ const targets: Array<{ name: string; target: BlockStoreConformanceTarget }> = [
           const opened = roots.get(store as OpfsBlockStore);
           if (opened === undefined) throw new Error("unknown store");
           store.close();
-          return OpfsBlockStore.open(opened);
+          const reopened = await OpfsBlockStore.open(opened);
+          roots.set(reopened, opened);
+          return reopened;
         },
       } satisfies BlockStoreConformanceTarget;
     })(),

@@ -1,0 +1,19 @@
+---
+title: Extensions
+description: Typed search, reactive queries, framework bindings, cursors, and streaming output built on Minnow.
+---
+
+Minnow keeps the SQL engine and its structural driver contracts in `@minnowdb/core`. Small optional
+packages add query-library types, framework subscriptions, and output formats without pulling them
+into every application.
+
+| Extension                                              | Use it for                                                                 |
+| ------------------------------------------------------ | -------------------------------------------------------------------------- |
+| [Typed search](/docs/adapters/kysely#full-text-search) | Checked `MATCH` columns and numeric BM25 ranking in Kysely.                |
+| [Live queries](/docs/extensions/live-queries)          | Typed reactive Kysely queries, keyed patches, and ordered bounded windows. |
+| [React](/docs/extensions/react)                        | Concurrent-safe and server-renderable live-query snapshots.                |
+| [Cursors and exports](/docs/extensions/exports)        | Pull-driven direct/worker/Kysely streams plus CSV and NDJSON.              |
+
+The adapter contracts are structural. A custom query-library wrapper can target
+`LiveQuerySource` / `LiveQueryManager`, and any direct or worker-backed SQL layer can target
+`MinnowSqlDriver`. See [Extending Minnow](/docs/reference/extending).

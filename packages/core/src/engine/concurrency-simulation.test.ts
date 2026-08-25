@@ -36,7 +36,7 @@
  * 244 writes and IndexedDB rejects 9 of 244 -- which is the asymmetry write-contention.test.ts
  * characterizes, and the reason both stores run here.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import {
   IndexedDbBlockStore,
@@ -92,7 +92,11 @@ async function openTab(store: BlockStore): Promise<MinnowDatabase> {
 async function simulate(
   store: BlockStore,
   seed: number,
-): Promise<{ tabs: MinnowDatabase[]; outcomes: TabOutcome[] }> {
+  options: { tabs?: number; rounds?: number; compactEvery?: number | null } = {},
+): Promise<{ tabs: MinnowDatabase[]; outcomes: TabOutcome[]; setup: MinnowDatabase }> {
+  const tabCount = options.tabs ?? TABS;
+  const rounds = options.rounds ?? ROUNDS;
+  const compactEvery = options.compactEvery === undefined ? 5 : options.compactEvery;
   const setup = await openTab(store);
   await setup.createTable({
     name: "items",
@@ -104,11 +108,11 @@ async function simulate(
     ],
   });
 
-  const tabs = await Promise.all(Array.from({ length: TABS }, () => openTab(store)));
+  const tabs = await Promise.all(Array.from({ length: tabCount }, () => openTab(store)));
   const outcomes: TabOutcome[] = tabs.map(() => ({ accepted: [], rejected: [], unexpected: [] }));
   let sequence = 0;
 
-  for (let round = 0; round < ROUNDS; round += 1) {
+  for (let round = 0; round < rounds; round += 1) {
     // Every tab acts in the same round without awaiting the others: the schedule is whatever the
     // event loop and the store produce, which is the point.
     await Promise.all(
@@ -134,11 +138,9 @@ async function simulate(
           // Upsert rather than insert: two tabs racing on the same key is the interesting case,
           // and a plain insert would make "already exists" the dominant outcome rather than a
           // genuine commit race.
-          await database.execute(
-            "INSERT INTO items (id, tab, amount) VALUES (?, ?, ?) " +
-              "ON CONFLICT (id) DO UPDATE SET tab = excluded.tab, amount = excluded.amount",
-            [key, tab, amount],
-          );
+          await database.upsertBatch("items", {
+            columns: { id: [key], tab: [tab], amount: [amount] },
+          });
           // Stamped after the await resolves, so it records when the store acknowledged the
           // commit rather than when the call was issued.
           sequence += 1;
@@ -153,9 +155,16 @@ async function simulate(
         }
       }),
     );
+    // This suite is about cross-tab commit ordering, not the deliberately pathological cost of
+    // retaining one L0 segment per mutation forever. Fold at deterministic quiescent points so
+    // the same 244 racing writes run while query preparation remains bounded. Compaction itself
+    // is part of the concurrency contract: it must preserve every accepted winner exactly.
+    if (compactEvery !== null && (round + 1) % compactEvery === 0) {
+      await setup.compactTable("items");
+    }
   }
 
-  return { tabs, outcomes };
+  return { tabs, outcomes, setup };
 }
 
 const stores: Array<{ name: string; create: () => Promise<BlockStore> }> = [
@@ -172,11 +181,47 @@ const stores: Array<{ name: string; create: () => Promise<BlockStore> }> = [
   },
 ];
 
+it("keeps a small uncompacted IndexedDB multi-tab conflict path exact", async () => {
+  const store = await IndexedDbBlockStore.open({
+    name: crypto.randomUUID(),
+    indexedDB: new IDBFactory(),
+  });
+  const { tabs, outcomes, setup } = await simulate(store, 0x51c1, {
+    tabs: 4,
+    rounds: 4,
+    compactEvery: null,
+  });
+  onTestFinished(async () => {
+    await Promise.allSettled([...tabs, setup].map((database) => database.close()));
+    store.close();
+  });
+  expect(outcomes.flatMap((outcome) => outcome.unexpected)).toEqual([]);
+  const canonical = JSON.stringify(
+    (await tabs[0]?.query("SELECT id, tab, amount FROM items ORDER BY id", { memoize: false }))
+      ?.rows ?? [],
+  );
+  for (const tab of tabs) {
+    expect(
+      JSON.stringify(
+        (await tab.query("SELECT id, tab, amount FROM items ORDER BY id", { memoize: false })).rows,
+      ),
+    ).toBe(canonical);
+  }
+  expect(outcomes.reduce((total, outcome) => total + outcome.accepted.length, 0)).toBeGreaterThan(
+    0,
+  );
+});
+
 describe.each(stores)("many tabs over one store ($name)", ({ create }) => {
   for (const seed of seedsFor("concurrency-simulation", [0x51c1])) {
     it(`leaves a database every tab agrees on (seed ${String(seed)})`, async () => {
       const store = await create();
-      const { tabs, outcomes } = await simulate(store, seed);
+      const { tabs, outcomes, setup } = await simulate(store, seed);
+      const databases = [...tabs, setup];
+      onTestFinished(async () => {
+        await Promise.allSettled(databases.map((database) => database.close()));
+        store.close();
+      });
 
       // Nothing failed for a reason this simulation does not model.
       for (const [tab, outcome] of outcomes.entries()) {
@@ -261,6 +306,35 @@ describe.each(stores)("many tabs over one store ($name)", ({ create }) => {
       // And the run has to have been a real race, or none of the above proves anything.
       const accepted = outcomes.reduce((total, outcome) => total + outcome.accepted.length, 0);
       expect(accepted, `seed ${String(seed)}: no writes landed at all`).toBeGreaterThan(50);
-    }, 60_000);
+
+      // Idle per-tab reader leases correctly pin their snapshots. Close those tabs before the
+      // explicit collection pass, then prove the physical history collapses to live state.
+      await Promise.all([...tabs, setup].map((database) => database.close()));
+      const cleanup = await openTab(store);
+      databases.push(cleanup);
+      // One pass prunes old manifests; the next can reclaim artifacts they had rooted. The third
+      // proves the fixed point and keeps this explicit rather than relying on background timing.
+      for (let pass = 0; pass < 3; pass += 1) {
+        await cleanup.collectGarbage({ maxItemsPerStep: 256, retainRecentVersions: 1 });
+      }
+      // Manifest tombstones are removed by a separately bounded adapter cursor so foreground
+      // collection never monopolizes the event loop. Drive that cursor to its fixed point here.
+      for (let page = 0; page < 4; page += 1) {
+        await store.removePrunedManifestRecords(256);
+      }
+      const storage = await cleanup.storageStats();
+      expect(
+        storage.segmentCount,
+        `seed ${String(seed)}: segment history stayed unbounded`,
+      ).toBeLessThanOrEqual(8);
+      expect(
+        storage.transactionCount,
+        `seed ${String(seed)}: transaction history stayed unbounded`,
+      ).toBeLessThanOrEqual(16);
+      expect(
+        storage.manifestCount,
+        `seed ${String(seed)}: manifest history stayed unbounded`,
+      ).toBeLessThanOrEqual(2);
+    }, 120_000);
   }
 });

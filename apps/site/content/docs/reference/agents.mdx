@@ -46,18 +46,27 @@ curl -o AGENTS-minnow.md https://minnowdb.com/agent-rules.md
 Minnow (`@minnowdb/core`) is a columnar SQL database that runs in the browser. Documentation for
 machines: https://minnowdb.com/llms.txt
 
-- Browser only. It needs `CompressionStream` plus one durable store — IndexedDB, or OPFS in a
-  worker — and there is no Node build. In Node tests, use `MemoryBlockStore` from
-  `@minnowdb/core/storage`, or `fake-indexeddb`.
+- Browser only. It needs `CompressionStream` and `DecompressionStream` plus one durable store —
+  IndexedDB, or OPFS in a worker — and there is no Node build. In Node tests, use `MemoryBlockStore` from
+  `@minnowdb/core/storage/memory`, or `fake-indexeddb`.
 - Open a database with `new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }))` —
-  `MinnowDatabase` from `@minnowdb/core`, `IndexedDbBlockStore` from `@minnowdb/core/storage`.
+  `MinnowDatabase` from `@minnowdb/core`, `IndexedDbBlockStore` from
+  `@minnowdb/core/storage/indexeddb`.
   `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
   exist in Safari private browsing, so fall back to IndexedDB when
   `navigator.storage?.getDirectory` is missing or rejects.
-- `@minnowdb/core`, `@minnowdb/kysely`, and `@minnowdb/devtools` share a major version and move
-  independently inside it. Install them on the same major; npm refuses a mixed-major set.
+- Durable adapters default to `durability: "strict"`. Use `"relaxed"` only when extra write
+  throughput is worth a power-loss window. For irreplaceable browser-local data, call
+  `ensureOriginPersistence("required")` from `@minnowdb/core/storage/persistence` before opening
+  the store;
+  this prevents automatic quota eviction when granted, not deliberate site-data clearing.
+- All `@minnowdb/*` packages share a major version and move independently inside it. Install them
+  on the same major; npm refuses a mixed-major set.
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
   statement that writes, rather than writing.
+- `db.queryCursor(sql, { params, batchRows, signal })` pulls bounded result pages. Single-table,
+  unordered scans stream directly; blocking sorts, groups, joins, and derived sources page the
+  ordinary completed result. The worker transfers one columnar page per pull.
 - `db.execute(sql, params)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
   `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`, `create-view`, `drop-view`,
@@ -66,6 +75,11 @@ machines: https://minnowdb.com/llms.txt
   also accepted as a Minnow extension. Never concatenate values into SQL: compiled plans are
   cached on the statement text, so a parameterized statement is planned once and interpolation
   throws that work away on every call.
+- Treat Minnow's fixed SQL safety limits as input validation, not tuning: one statement is capped
+  at 1,048,576 characters, 4,096 tokens and parameter positions, and 128 syntax levels. Pattern,
+  JSON/array, numeric, scalar-result, and full-text inputs have their own documented ceilings in
+  https://minnowdb.com/docs/sql/. Keep the 64 MiB execution budget unless the application has a
+  measured reason to change it; `null` explicitly opts into unbounded execution memory.
 - `UPDATE` and `DELETE` require scalar or composite row identity: a `PRIMARY KEY`, or the
   single inline `UNIQUE` form. A table without one can only be appended to. Primary-key components
   cannot be updated.
@@ -78,13 +92,26 @@ machines: https://minnowdb.com/llms.txt
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
   This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
   releases reader leases, and drops resident caches.
-- For anything interactive, run the engine in a worker:
-  `new MinnowDatabaseClient(new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }), { store: { kind: "indexeddb", name: "app-db" } })`,
-  or `{ kind: "opfs", name: "app-db" }` for the OPFS store,
-  importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Queries, writes, migrations,
-  live queries, snapshots, and maintenance use the same calls as `MinnowDatabase`.
+- For anything interactive, run the engine in a worker. Put
+  `import "@minnowdb/core/worker"` in a local `db-worker.ts`, then pass
+  `new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })` to
+  `MinnowDatabaseClient` with `{ store: { kind: "indexeddb", name: "app-db" } }`, or
+  `{ kind: "opfs", name: "app-db" }` for the OPFS store. Import the client from
+  `@minnowdb/core/client`. Queries, writes, migrations, cursors, live queries, snapshots, and
+  maintenance use the same calls as `MinnowDatabase`.
+- For typed Kysely live queries, create one `createKyselyLiveQueries({ driver })` manager and wrap
+  a selectable query with `query.$call(live)` or `live(query)`. Prefer `live.window()` with a
+  unique result key, `ORDER BY`, and a limit for UI lists. Close queries and then the manager.
+- A Kysely DB derived from the Minnow schema infers `count()` / `countAll()` as `number`, numeric
+  `sum()` / `avg()` from the column domain, and fixed-return Minnow functions through `fn` /
+  `fn.agg`; supported `cast()` targets are inferred too. Do not add redundant output generics.
+  Preserve `InferKyselyDatabase` when constructing Kysely manually. Only arbitrary function names
+  and raw SQL strings need an explicit result type. All aggregates except `count` include `null`
+  for empty input; use inferred `fn.coalesce()` when the query supplies a fallback.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
+  With Kysely, use `search.match(eb, columns, query)` and `search.rank(eb, columns, query)` so the
+  non-empty column list is checked against the query's visible tables and aliases.
 - `CREATE INDEX name ON table(a, b DESC)` creates a durable scalar or composite accelerator.
   Leftmost equality/`IN` prefixes and the next range prune candidates. `CREATE UNIQUE INDEX`
   enforces additional candidate keys atomically; any NULL component does not conflict.

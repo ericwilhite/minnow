@@ -3,27 +3,11 @@ import type {
   CompiledQuery,
   DatabaseConnection,
   Driver,
+  AbortableOperationOptions,
   QueryResult,
   TransactionSettings,
 } from "kysely";
-
-function queryValues(parameters: readonly unknown[]): QueryValue[] {
-  return parameters.map((value, index) => {
-    if (
-      value === null ||
-      typeof value === "boolean" ||
-      typeof value === "number" ||
-      typeof value === "string" ||
-      value instanceof Date
-    ) {
-      return value;
-    }
-    throw new TypeError(
-      `Kysely parameter ${String(index + 1)} has unsupported type ${typeof value}; ` +
-        "Minnow accepts boolean, number, string, Date, or null",
-    );
-  });
-}
+import { kyselyQueryValues } from "./query-values.js";
 
 function affectedRows(result: ExecuteResult): number | undefined {
   return result.kind === "insert" ||
@@ -52,7 +36,7 @@ class MinnowKyselyConnection implements DatabaseConnection {
   async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
     const result = await this.#driver.execute(
       compiledQuery.sql,
-      queryValues(compiledQuery.parameters),
+      kyselyQueryValues(compiledQuery.parameters),
     );
     const count = affectedRows(result);
     return {
@@ -61,10 +45,18 @@ class MinnowKyselyConnection implements DatabaseConnection {
     };
   }
 
-  async *streamQuery<R>(): AsyncIterableIterator<QueryResult<R>> {
-    yield await Promise.reject<QueryResult<R>>(
-      new TypeError("Kysely streaming is not supported by Minnow"),
-    );
+  async *streamQuery<R>(
+    compiledQuery: CompiledQuery,
+    chunkSize: number,
+    options?: AbortableOperationOptions,
+  ): AsyncIterableIterator<QueryResult<R>> {
+    for await (const batch of this.#driver.queryCursor(compiledQuery.sql, {
+      params: kyselyQueryValues(compiledQuery.parameters),
+      batchRows: chunkSize,
+      ...(options?.signal === undefined ? {} : { signal: options.signal }),
+    })) {
+      yield { rows: batch.rows as R[] };
+    }
   }
 }
 

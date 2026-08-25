@@ -70,8 +70,10 @@ it("costs the budgeted number of readwrite transactions per simple write and rea
     await work();
     return log.filter((entry) => entry.startsWith("rw"));
   };
-  const WRITE = "rw[blocks+catalog+manifests+segments+transactions]";
-  const BEGIN = "rw[catalog+manifests+transactions]";
+  const WRITE =
+    "rw[blocks+catalog+leases+manifests+segments+snapshotHeaders+statistics+transactions]";
+  const BEGIN = "rw[catalog+leases+manifests+statistics+transactions]";
+  const REPIN_READER = "rw[blocks+catalog+leases+manifests+transactions]";
 
   // Inserts reserve row ids at begin, then stage and commit as one step.
   expect(
@@ -94,20 +96,28 @@ it("costs the budgeted number of readwrite transactions per simple write and rea
       ]),
     ),
   ).toEqual([BEGIN, WRITE]);
+  const people = await store.getTableByName("people");
+  if (people === undefined) throw new Error("Missing people table");
+  expect(
+    await store.getExistingUniqueKeys(people.id, ["number:0", "number:1", "number:2", "number:3"]),
+  ).toEqual(["number:0", "number:1", "number:2", "number:3"]);
   // The first read after a commit re-pins the shared lease in place; the next read is free.
   expect(await readwrite(() => database.query("SELECT COUNT(*) AS n FROM people"))).toEqual([
-    "rw[blocks+leases+manifests]",
+    REPIN_READER,
   ]);
   expect(await readwrite(() => database.query("SELECT name FROM people WHERE id = 1"))).toEqual([]);
-  // A point update or delete needs no reservation: begin, stage, and commit are one step.
+  // A standalone SQL mutation reads under the deferred transaction's exact manifest pin, then
+  // publishes its one bounded artifact batch with the transaction record in one atomic write.
+  // A concurrent writer still loses the manifest/schema CAS; no durable staging journal is
+  // needed unless a scope grows past one storage-sized batch.
   expect(
     await readwrite(() => database.execute("UPDATE people SET name = 'uno' WHERE id = 1")),
   ).toEqual([WRITE]);
   expect(await readwrite(() => database.update("people", 2, { name: "dos" }))).toEqual([WRITE]);
   expect(await readwrite(() => database.deleteBatch("people", { keys: [2] }))).toEqual([WRITE]);
-  // A SQL delete first reads the matching keys, which re-pins the lease after the update above.
+  // Direct writes moved the shared reader pin behind, so DELETE re-pins once and then publishes.
   expect(await readwrite(() => database.execute("DELETE FROM people WHERE id = 3"))).toEqual([
-    "rw[blocks+leases+manifests]",
+    REPIN_READER,
     WRITE,
   ]);
   // A delete that matches nothing writes nothing at all.

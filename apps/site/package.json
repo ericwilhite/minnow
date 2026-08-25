@@ -9,7 +9,7 @@
     "start": "next start",
     "predev": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-playground-types.mjs && node scripts/generate-llms.mjs",
     "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-playground-types.mjs && node scripts/generate-llms.mjs",
-    "build:packages": "tsc -b ../../packages/core ../../packages/kysely ../../packages/devtools --force",
+    "build:packages": "tsc -b ../../packages/core ../../packages/kysely ../../packages/react ../../packages/export ../../packages/devtools --force",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {

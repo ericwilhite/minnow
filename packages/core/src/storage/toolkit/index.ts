@@ -22,14 +22,25 @@
  * `FileSystemSyncAccessHandle` satisfies it as-is, and so does anything with positioned
  * synchronous I/O. See `/docs/storage/custom` for the guide.
  */
-export type { SyncFileHandle } from "./sync-file.js";
+export { readFully, writeFully, type SyncFileHandle } from "./sync-file.js";
 export { RecordCore, type PhysicalBlocks, type RecordCoreState } from "./record-core.js";
-export { WalWriter, replayWalFrames } from "./wal.js";
+export {
+  MAX_WAL_FRAME_BYTES,
+  WalWriter,
+  iterateWalFrames,
+  replayWalFrames,
+  type ReplayedWalFrame,
+} from "./wal.js";
 export {
   ExtentPool,
+  assertValidExtentMeta,
+  assertValidPlacement,
   extentPath,
+  validPlacement,
+  type ExtentBatchMark,
   type ExtentFiles,
   type ExtentMeta,
+  type ExtentPoolOptions,
   type Placement,
 } from "./extents.js";
 export {

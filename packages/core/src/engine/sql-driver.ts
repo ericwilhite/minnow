@@ -1,5 +1,5 @@
 import type { Catalog } from "./catalog.js";
-import type { ExecuteResult, QueryOptions } from "./database.js";
+import type { ExecuteResult, QueryCursorOptions, QueryOptions } from "./database.js";
 import type { QueryResult, QueryValue } from "./query.js";
 
 /**
@@ -11,6 +11,7 @@ import type { QueryResult, QueryValue } from "./query.js";
  */
 export interface MinnowSqlExecutor {
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
+  queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult>;
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
 }
 

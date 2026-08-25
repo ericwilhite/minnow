@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPhysicalColumnFromRanges,
+  BLOCK_HEADER_LENGTH,
   concatenatePhysicalColumns,
   crc32,
   decodeBlock,
@@ -10,6 +11,7 @@ import {
   encodeColumn,
   encodePhysicalBlock,
   measurePhysicalColumnRanges,
+  MAX_BLOCK_ROW_COUNT,
   physicalBitmapByteLength,
   physicalColumnByteLength,
   slicePhysicalColumn,
@@ -21,7 +23,7 @@ import type { ColumnInput, Compression, LogicalType, PhysicalColumnPayload } fro
 function resignEnvelope(block: Uint8Array): void {
   const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
   const metadataLength = view.getUint32(24, true);
-  view.setUint32(4, crc32(block.subarray(8, 40 + metadataLength)), true);
+  view.setUint32(4, crc32(block.subarray(8, BLOCK_HEADER_LENGTH + metadataLength)), true);
 }
 
 const columns: ColumnInput[] = [
@@ -53,6 +55,25 @@ it("rejects unknown physical logical types at runtime", () => {
       bytes: new Uint8Array(),
     }),
   ).toThrow("Unknown logical type: binary");
+});
+
+it("enforces the decoded-row ceiling without allocating row values", () => {
+  expect(physicalBitmapByteLength(MAX_BLOCK_ROW_COUNT)).toBe(131_072);
+  expect(physicalColumnByteLength("boolean", MAX_BLOCK_ROW_COUNT)).toBe(262_144);
+  expect(physicalColumnByteLength("string", MAX_BLOCK_ROW_COUNT)).toBe(4_325_380);
+  expect(() => physicalColumnByteLength("boolean", MAX_BLOCK_ROW_COUNT + 1)).toThrow(
+    "maximum row count",
+  );
+  expect(() => physicalColumnByteLength("string", MAX_BLOCK_ROW_COUNT + 1)).toThrow(
+    "maximum row count",
+  );
+  expect(() =>
+    validatePhysicalColumn({
+      type: "boolean",
+      rowCount: MAX_BLOCK_ROW_COUNT + 1,
+      bytes: new Uint8Array(),
+    }),
+  ).toThrow("maximum row count");
 });
 
 for (const compression of ["raw", "gzip"] satisfies Compression[]) {
@@ -258,11 +279,13 @@ it("preserves canonical null counts and numeric metadata in physical block heade
 
   const wrongMetadata = new Uint8Array(block);
   const description = decoded.description;
-  const metadataLength = wrongMetadata.byteLength - 40 - description.storedLength;
-  const metadata = new TextDecoder().decode(wrongMetadata.subarray(40, 40 + metadataLength));
+  const metadataLength = wrongMetadata.byteLength - BLOCK_HEADER_LENGTH - description.storedLength;
+  const metadata = new TextDecoder().decode(
+    wrongMetadata.subarray(BLOCK_HEADER_LENGTH, BLOCK_HEADER_LENGTH + metadataLength),
+  );
   const maxCharacter = metadata.lastIndexOf("8");
   expect(maxCharacter).toBeGreaterThanOrEqual(0);
-  wrongMetadata[40 + maxCharacter] = "9".charCodeAt(0);
+  wrongMetadata[BLOCK_HEADER_LENGTH + maxCharacter] = "9".charCodeAt(0);
   resignEnvelope(wrongMetadata);
   await expect(decodePhysicalBlock(wrongMetadata)).rejects.toThrow("metadata");
 });
@@ -344,6 +367,131 @@ it("validates string offsets, null spans, and UTF-8 without decoding row strings
     8,
   ).setUint32(0, 1, true);
   expect(() => validatePhysicalColumn(nonzeroFirstOffset)).toThrow("first string offset");
+});
+
+it("rejects lossy UTF-16 and wrong runtime scalar types before persistence", () => {
+  for (const value of ["\uD800", "x\uDBFFy", "\uDC00", "x\uDFFF"] as const) {
+    expect(() => encodeColumn({ type: "string", values: [value] })).toThrow("unpaired surrogate");
+  }
+  expect(() => encodeColumn({ type: "boolean", values: [1] } as never)).toThrow("booleans or null");
+  expect(() => encodeColumn({ type: "number", values: ["1"] } as never)).toThrow("numbers or null");
+  expect(() => encodeColumn({ type: "datetime", values: [0] } as never)).toThrow(
+    "Date objects or null",
+  );
+  expect(() => encodeColumn({ type: "string", values: [1] } as never)).toThrow("strings or null");
+
+  const sparse = new Array<string | null>(4);
+  sparse[0] = "present";
+  sparse[2] = null;
+  expect(() => encodeColumn({ type: "string", values: sparse })).toThrow(
+    "Column values cannot be undefined",
+  );
+});
+
+it("sizes string columns exactly and rejects impossible row counts before allocation", () => {
+  const values = ["ascii", "é", "🌍", "", null] as const;
+  const encoded = encodeColumn({ type: "string", values });
+  const contentByteLength = values.reduce(
+    (total, value) => total + new TextEncoder().encode(value ?? "").byteLength,
+    0,
+  );
+  expect(encoded.bytes.byteLength).toBe(
+    physicalColumnByteLength("string", values.length, contentByteLength),
+  );
+
+  const impossible = { length: 16_777_216 };
+  expect(() => encodeColumn({ type: "string", values: impossible } as never)).toThrow(
+    "Physical column exceeds maximum row count",
+  );
+});
+
+it("fills the exact UTF-8 payload across native encodeInto chunk boundaries", () => {
+  // Node 26's encoder stops two bytes short with an exactly-sized destination for this shape.
+  // The block encoder's three-byte private tail prevents that native chunk-boundary truncation.
+  const value = `${"\u0800".repeat(257)}\u0400`;
+  const encoded = encodeColumn({ type: "string", values: [value] });
+  expect(decodeColumn("string", encoded.bytes, 1).values).toEqual([value]);
+  expect(encoded.bytes.byteLength).toBe(
+    physicalColumnByteLength("string", 1, new TextEncoder().encode(value).byteLength),
+  );
+});
+
+it("the public row decoder rejects noncanonical physical values", () => {
+  const boolean = encodeColumn({ type: "boolean", values: [null] }).bytes.slice();
+  boolean[1] = 1;
+  expect(() => decodeColumn("boolean", boolean, 1)).toThrow("null row");
+
+  const number = encodeColumn({ type: "number", values: [null] }).bytes.slice();
+  new DataView(number.buffer, number.byteOffset, number.byteLength).setFloat64(1, 42, true);
+  expect(() => decodeColumn("number", number, 1)).toThrow("null row");
+});
+
+it("reads fixed-width accessor values once and revalidates the string sizing pass", () => {
+  function unstable<T>(first: T, second: unknown): readonly T[] {
+    let reads = 0;
+    return {
+      length: 1,
+      get 0() {
+        reads += 1;
+        return (reads === 1 ? first : second) as T;
+      },
+    } as unknown as readonly T[];
+  }
+
+  expect(
+    decodeColumn(
+      "boolean",
+      encodeColumn({ type: "boolean", values: unstable(true, "not-a-boolean") }).bytes,
+      1,
+    ).values,
+  ).toEqual([true]);
+  expect(
+    decodeColumn(
+      "number",
+      encodeColumn({ type: "number", values: unstable(1, Number.NaN) }).bytes,
+      1,
+    ).values,
+  ).toEqual([1]);
+  expect(
+    decodeColumn(
+      "datetime",
+      encodeColumn({ type: "datetime", values: unstable(new Date(0), new Date(Number.NaN)) }).bytes,
+      1,
+    ).values,
+  ).toEqual([new Date(0)]);
+  expect(() => encodeColumn({ type: "string", values: unstable("\uFFFD", "\uD800") })).toThrow(
+    "unpaired surrogate",
+  );
+});
+
+it("reads Date internal values instead of an overridable getTime method", () => {
+  const value = new Date("2026-08-24T12:34:56.789Z");
+  value.getTime = () => 0.5;
+  const encoded = encodeColumn({ type: "datetime", values: [value] });
+  const decoded = decodeColumn("datetime", encoded.bytes, 1).values[0];
+  if (!(decoded instanceof Date)) throw new Error("Expected a decoded Date");
+  expect(decoded.toISOString()).toBe("2026-08-24T12:34:56.789Z");
+});
+
+it("takes a stable physical input before asynchronous compression", async () => {
+  for (const compression of ["raw", "gzip"] satisfies Compression[]) {
+    const source = physical({ type: "string", values: ["stable", "🌍"] });
+    const expected = source.bytes.slice();
+    const encoding = encodePhysicalBlock(source, compression);
+    source.bytes.fill(0xff);
+    const decoded = await decodePhysicalBlock(await encoding);
+    expect(decoded.column.bytes).toEqual(expected);
+  }
+});
+
+it("makes the zero-copy raw decode ownership contract explicit", async () => {
+  const raw = await encodeBlock({ type: "string", values: ["borrowed"] }, "raw");
+  const rawPhysical = await decodePhysicalBlock(raw);
+  expect(rawPhysical.column.bytes.buffer).toBe(raw.buffer);
+
+  const gzip = await encodeBlock({ type: "string", values: ["owned"] }, "gzip");
+  const gzipPhysical = await decodePhysicalBlock(gzip);
+  expect(gzipPhysical.column.bytes.buffer).not.toBe(gzip.buffer);
 });
 
 it("validates range bounds before allocating an output", () => {

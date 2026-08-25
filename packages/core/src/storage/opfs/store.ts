@@ -1,50 +1,23 @@
 import {
-  type BeginTransactionInput,
-  type BeginTransactionResult,
+  assertStorageBulkReadItems,
+  assertTempRunPageBatchLimits,
+  OpfsUncertainOutcomeError,
+  StorageCorruptionError,
+  StorageFormatVersionError,
+  validateStorageDatabaseName,
   type BlockStore,
-  type BlockWrite,
-  type CatalogProbe,
-  type CommitTransactionInput,
-  type CompactionJobRecord,
-  type CompactionJobRecordUpdate,
-  type CreateGarbageCollectionJobInput,
-  type FtsCandidates,
-  type FtsColumnIndexRecord,
-  type FtsPostingQuery,
-  type GarbageCollectionJobRecord,
-  type GarbageCollectionStepResult,
-  type LeaseRecord,
-  type Manifest,
-  type ManifestSummary,
-  type PublishManifestInput,
-  type QueryCatalogState,
-  type RowIdRange,
-  type RunGarbageCollectionStepInput,
-  type SegmentRecord,
-  type StageTransactionArtifactsInput,
-  type StoragePage,
-  type TableColumnRecord,
-  type TableRecord,
-  type SecondaryIndexRecord,
-  type TempOwnerRecord,
   type TempRunPage,
-  type TransactionRecord,
-  type TransactionRecordUpdate,
-  type TriggerRecord,
-  type FtsPosting,
-  type WriteTransactionInput,
 } from "../types.js";
-import type { DatabaseSnapshot, SnapshotLoadProgress } from "../snapshot.js";
-import {
-  validateId,
-  validateTempRunPage,
-  validateTempRunPageIdentity,
-} from "../toolkit/record-core.js";
+import { validateTempRunPage, validateTempRunPageIdentity } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, isDomError } from "./files.js";
 import { LOG_FORMAT_VERSION } from "../toolkit/wire.js";
 import { OpfsLeader } from "./leader.js";
 import {
   rehydrateStoreError,
+  estimateRpcValueBytes,
+  fingerprintStoreRequest,
+  MAX_OPFS_RPC_MESSAGE_BYTES,
+  parseStoreRpcMessage,
   serializeStoreError,
   type SerializedStoreError,
   type StoreRpcMessage,
@@ -60,77 +33,102 @@ const DISPATCH_ATTEMPTS = 10;
 const YIELD_COOLDOWN_MS = 3_000;
 /** Results remembered for retried requests whose acknowledgement was lost. */
 const DEDUPE_CACHE_SIZE = 512;
+/** Requests admitted concurrently by either side of the follower protocol. */
+const RPC_IN_FLIGHT_LIMIT = 512;
+const RPC_IN_FLIGHT_MUTATION_BYTES = 128 * 1024 * 1024;
+const RPC_IN_FLIGHT_READ_BYTES = 256 * 1024 * 1024;
+const RPC_SETTLED_OUTCOME_BYTES = 128 * 1024 * 1024;
+const RPC_SERVER_ADMISSION_LIMIT = 1024;
+const RPC_SERVER_ADMISSION_BYTES = 256 * 1024 * 1024;
 /** Channels into requesters' inboxes a leader keeps open between answers. */
 const ANSWER_CHANNEL_CACHE_SIZE = 64;
+const BULK_READ_ARGUMENT_INDEX = {
+  getBlocks: 0,
+  getTransactions: 0,
+  getExistingUniqueKeys: 1,
+  hasManifestBlocks: 1,
+} as const;
 
 export interface OpfsBlockStoreOptions {
   /** Databases live under `minnowdb/<name>` in the origin's private file system. */
   name: string;
   /**
-   * `"relaxed"` (the default, matching the IndexedDB store) lets the operating system
-   * schedule the final flush to disk; `"strict"` flushes every log frame and payload write
-   * before the operation resolves.
+   * `"strict"` (the default) flushes the payload before flushing its publishing WAL frame,
+   * both before the operation resolves. `"relaxed"` writes the complete payload and
+   * WAL frame before resolving but lets the operating system schedule their final flush; a
+   * power loss may roll back a fully consistent suffix.
    */
   durability?: "relaxed" | "strict";
   /** The storage root; defaults to `navigator.storage.getDirectory()`. Tests inject a shim. */
   root?: FileSystemDirectoryHandle;
   /** @internal Test seam: checkpoint after this many WAL entries (default 1024). */
   checkpointEntries?: number;
+  /** @internal Test seam: cleanup-debt backpressure limit (default 64 MiB). */
+  cleanupLimitBytes?: number;
   /** @internal Test seam: how long a follower waits for the leader (default 1000ms). */
   rpcTimeoutMs?: number;
 }
 
 /** Methods a follower may invoke on the leader. Temp-page IO is instance-local by design. */
 const RPC_METHODS = new Set([
-  "addBlock",
-  "addBlocks",
   "getBlock",
   "getBlocks",
-  "removeBlock",
-  "listBlockIds",
+  "readManifestBlock",
+  "hasManifestBlocks",
+  "listManifestBlockPage",
+  "listRetiredManifestBlockPage",
   "addTable",
   "getTable",
   "getTableByName",
   "listTables",
   "updateTable",
   "removeTable",
+  "dropTable",
+  "dropTableColumn",
   "removeFtsColumn",
   "writeFtsBase",
   "beginFtsBaseBuild",
+  "renewFtsBaseBuild",
   "writeFtsBaseBuildChunk",
   "finishFtsBaseBuild",
   "abortFtsBaseBuild",
   "readFtsCandidates",
   "readFtsPostings",
-  "addSegment",
   "getSegment",
-  "listSegments",
   "listSegmentPage",
-  "removeSegment",
+  "listTableSegmentPage",
+  "removeAbortedSegment",
+  "adoptAbortedSegment",
   "reserveRowIds",
   "reserveAutoIncrement",
   "getExistingUniqueKeys",
+  "beginUniqueKeyBuild",
+  "getUniqueKeyBuild",
+  "renewUniqueKeyBuild",
+  "appendUniqueKeyBuildChunk",
+  "finishUniqueKeyBuild",
+  "abortUniqueKeyBuild",
   "getCurrentManifest",
   "getCurrentManifestVersion",
   "getCatalogProbe",
-  "getQueryCatalogState",
   "getManifest",
-  "listManifests",
   "listManifestPage",
-  "publishManifest",
   "createTransaction",
+  "renewTransaction",
+  "abortTransactionIfExpired",
   "beginTransaction",
   "getTransaction",
   "getTransactions",
-  "listTransactions",
   "listTransactionPage",
   "updateTransaction",
   "stageTransactionArtifacts",
+  "rollbackTransactionArtifacts",
   "commitTransaction",
   "writeTransaction",
   "createLease",
   "getLease",
   "listLeases",
+  "listExpiredLeasePage",
   "renewLease",
   "moveLease",
   "removeLeaseIfExpired",
@@ -143,20 +141,35 @@ const RPC_METHODS = new Set([
   "cancelCompactionJob",
   "removeCompactionJob",
   "createGarbageCollectionJob",
+  "updateGarbageCollectionPlanning",
   "getGarbageCollectionJob",
   "listGarbageCollectionJobs",
+  "listGarbageCollectionJobPage",
   "runGarbageCollectionStep",
   "removePrunedManifestRecords",
   "removeGarbageCollectionJob",
   "createTempOwner",
   "getTempOwner",
+  "putTempRunPage",
+  "putTempRunPages",
+  "getTempRunPage",
+  "removeTempRun",
   "renewTempOwner",
   "removeTempOwnerIfExpired",
   "removeTempOwner",
   "listTempOwnerIdsPage",
+  "listExpiredTempOwnerPage",
   "getLogicalStorageBytes",
-  "exportSnapshot",
-  "importSnapshot",
+  "getStorageStats",
+  "checkIntegrity",
+  "beginSnapshotFrameExport",
+  "readSnapshotExportFrame",
+  "closeSnapshotFrameExport",
+  "beginSnapshotFrameImport",
+  "renewSnapshotFrameImport",
+  "appendSnapshotImportFrames",
+  "finishSnapshotFrameImport",
+  "cancelSnapshotFrameImport",
 ]);
 
 /**
@@ -167,38 +180,45 @@ const RPC_METHODS = new Set([
 const READ_METHODS = new Set([
   "getBlock",
   "getBlocks",
-  "listBlockIds",
+  "readManifestBlock",
+  "hasManifestBlocks",
+  "listManifestBlockPage",
+  "listRetiredManifestBlockPage",
   "getTable",
   "getTableByName",
   "listTables",
   "readFtsCandidates",
   "readFtsPostings",
   "getSegment",
-  "listSegments",
   "listSegmentPage",
+  "listTableSegmentPage",
   "getExistingUniqueKeys",
+  "getUniqueKeyBuild",
   "getCurrentManifest",
   "getCurrentManifestVersion",
   "getCatalogProbe",
-  "getQueryCatalogState",
   "getManifest",
-  "listManifests",
   "listManifestPage",
   "getTransaction",
   "getTransactions",
-  "listTransactions",
   "listTransactionPage",
   "getLease",
   "listLeases",
+  "listExpiredLeasePage",
   "getCompactionJob",
   "listCompactionJobs",
   "listCompactionJobPage",
   "getGarbageCollectionJob",
   "listGarbageCollectionJobs",
+  "listGarbageCollectionJobPage",
   "getTempOwner",
+  "getTempRunPage",
   "listTempOwnerIdsPage",
+  "listExpiredTempOwnerPage",
   "getLogicalStorageBytes",
-  "exportSnapshot",
+  "getStorageStats",
+  "checkIntegrity",
+  "readSnapshotExportFrame",
 ]);
 
 interface ServedOutcome {
@@ -207,10 +227,27 @@ interface ServedOutcome {
   error?: SerializedStoreError;
 }
 
+interface ServedMutation<Outcome> {
+  method: string;
+  signature: string;
+  requestBytes: number;
+  outcome: Outcome;
+  outcomeBytes?: number;
+}
+
 type OpMessage = Extract<StoreRpcMessage, { kind: "op" }>;
+
+function sameServedRequest(
+  remembered: Pick<ServedMutation<unknown>, "method" | "signature">,
+  message: OpMessage,
+  signature: string,
+): boolean {
+  return remembered.method === message.method && remembered.signature === signature;
+}
 
 interface PendingRpc {
   message: OpMessage;
+  retainedBytes: number;
   /** Which leader this request was last posted to, so announces only trigger real re-sends. */
   sentTo: string | undefined;
   resolve: (value: unknown) => void;
@@ -233,22 +270,27 @@ interface PendingRpc {
  * Leadership is the write-ahead log's own exclusive sync-access handle — enforced by the
  * browser against the actual resource, released the instant its holder dies. Elections are
  * simply attempts to open it. Correctness never rides on a message: an operation is
- * acknowledged only after the leader's WAL holds it, a lost message costs a retry (request
- * ids deduplicate retries while the same leader serves), and a dead leader costs a failover
- * in which the next acquirer replays checkpoint-plus-WAL. A retry that crosses a failover is
- * the one case a duplicate can execute — the same "committed but the response was lost"
- * class the IndexedDB store has — and it resolves the same way: compare-and-swap operations
- * surface a conflict the engine's recovery already reconciles. The channel affects how fast
- * multi-tab work moves, never whether it is right.
+ * acknowledged only after the leader's WAL holds it. Request ids deduplicate delivery retries
+ * while the same leader serves. A dead leader costs a failover in which the next acquirer
+ * replays checkpoint-plus-WAL; an in-flight read moves to it, while an in-flight mutation fails
+ * with `OpfsUncertainOutcomeError` instead of risking a second execution after a lost reply.
+ * The channel affects how fast multi-tab work moves, never whether it is right.
  *
  * `setForeground(true)` marks this connection as the one the user is looking at; a background
  * leader yields to a foreground bidder, so the tab doing the work is normally the tab holding
  * the microsecond-fast path.
  */
-export class OpfsBlockStore implements BlockStore {
+// The runtime methods in `RPC_METHODS` share one generated dispatch body below. This interface
+// supplies their exact public types without emitting one repetitive wrapper per operation.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface OpfsBlockStore extends Required<BlockStore> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class OpfsBlockStore {
+  readonly liveQueryChannelName: string;
   readonly #tree: OpfsTree;
   readonly #durability: "relaxed" | "strict";
   readonly #checkpointEntries: number | undefined;
+  readonly #cleanupLimitBytes: number | undefined;
   readonly #rpcTimeoutMs: number;
   readonly #instanceId = crypto.randomUUID();
   readonly #channelName: string;
@@ -265,15 +307,27 @@ export class OpfsBlockStore implements BlockStore {
   #lastYieldAt = 0;
   #electing: Promise<boolean> | undefined;
   readonly #pending = new Map<string, PendingRpc>();
-  readonly #dedupe = new Map<string, Promise<ServedOutcome>>();
+  readonly #inFlightMutations = new Map<string, ServedMutation<Promise<ServedOutcome>>>();
+  readonly #settledMutations = new Map<string, ServedMutation<ServedOutcome>>();
+  readonly #servedRequestLocks = new Map<string, Promise<void>>();
+  #inFlightMutationBytes = 0;
+  #inFlightReadBytes = 0;
+  #settledMutationBytes = 0;
+  #pendingRpcBytes = 0;
+  #servedRequestCount = 0;
+  #servedRequestBytes = 0;
+  #servedMutationGateForTests: Promise<void> | undefined;
+  #dropNextRpcResultForTests = false;
   #reacquireTimer: ReturnType<typeof setTimeout> | undefined;
 
   private constructor(tree: OpfsTree, options: OpfsBlockStoreOptions) {
     this.#tree = tree;
-    this.#durability = options.durability ?? "relaxed";
+    this.#durability = options.durability ?? "strict";
     this.#checkpointEntries = options.checkpointEntries;
+    this.#cleanupLimitBytes = options.cleanupLimitBytes;
     this.#rpcTimeoutMs = options.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
     this.#channelName = `minnowdb-store:${options.name}`;
+    this.liveQueryChannelName = `minnowdb-live:opfs:${options.name}`;
   }
 
   static async open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore> {
@@ -282,7 +336,8 @@ export class OpfsBlockStore implements BlockStore {
     await store.#ensureFormatMarker();
     if (typeof BroadcastChannel === "function") {
       const onMessage = (event: MessageEvent<unknown>) => {
-        store.#onMessage(event.data as StoreRpcMessage);
+        const message = parseStoreRpcMessage(event.data, RPC_METHODS);
+        if (message !== undefined) store.#onMessage(message);
       };
       const channel = new BroadcastChannel(store.#channelName);
       channel.onmessage = onMessage;
@@ -332,6 +387,7 @@ export class OpfsBlockStore implements BlockStore {
         this.#durability === "strict",
         { wal, slotA, slotB },
         this.#checkpointEntries,
+        this.#cleanupLimitBytes,
       );
     } catch (error) {
       wal.close();
@@ -404,13 +460,32 @@ export class OpfsBlockStore implements BlockStore {
     if (this.#closed) return;
     switch (message.kind) {
       case "op": {
-        if (this.#leader !== undefined) void this.#serveOp(message);
+        if (this.#leader !== undefined) {
+          const requestBytes = estimateRpcValueBytes(message.args);
+          if (
+            this.#servedRequestCount >= RPC_SERVER_ADMISSION_LIMIT ||
+            this.#servedRequestBytes + requestBytes > RPC_SERVER_ADMISSION_BYTES
+          ) {
+            this.#answer(message.from, {
+              kind: "result",
+              requestId: message.requestId,
+              ok: false,
+              error: { name: "Error", message: "The OPFS leader RPC queue is full" },
+            });
+            return;
+          }
+          this.#servedRequestCount += 1;
+          this.#servedRequestBytes += requestBytes;
+          void this.#serveOp(message).finally(() => {
+            this.#servedRequestCount = Math.max(0, this.#servedRequestCount - 1);
+            this.#servedRequestBytes = Math.max(0, this.#servedRequestBytes - requestBytes);
+          });
+        }
         return;
       }
       case "result": {
-        const pending = this.#pending.get(message.requestId);
+        const pending = this.#takePending(message.requestId);
         if (pending === undefined) return;
-        this.#pending.delete(message.requestId);
         clearTimeout(pending.timer);
         if (message.ok) pending.resolve(message.value);
         else pending.reject(rehydrateStoreError(message.error));
@@ -421,8 +496,8 @@ export class OpfsBlockStore implements BlockStore {
         if (pending === undefined) return;
         clearTimeout(pending.timer);
         pending.timer = setTimeout(() => {
-          this.#pending.delete(message.requestId);
-          pending.reject(RPC_TIMED_OUT);
+          const expired = this.#takePending(message.requestId);
+          expired?.reject(RPC_TIMED_OUT);
         }, this.#rpcTimeoutMs);
         return;
       }
@@ -432,11 +507,16 @@ export class OpfsBlockStore implements BlockStore {
           clearTimeout(this.#reacquireTimer);
           this.#reacquireTimer = undefined;
         }
-        // A new leader never saw our in-flight requests; send those again (ids deduplicate).
-        // Requests already sitting with this same leader stay put — every ping triggers an
-        // announce, and blind re-sends would race their own in-flight executions.
-        for (const pending of this.#pending.values()) {
+        // Reads can move to the new leader. A mutation may already be durable on the old one;
+        // never execute it twice merely because its acknowledgement was lost.
+        for (const [requestId, pending] of this.#pending) {
           if (pending.sentTo === message.leaderId) continue;
+          if (!READ_METHODS.has(pending.message.method)) {
+            this.#takePending(requestId);
+            clearTimeout(pending.timer);
+            pending.reject(new OpfsUncertainOutcomeError(pending.message.method));
+            continue;
+          }
           pending.sentTo = message.leaderId;
           this.#send(message.leaderId, pending.message);
         }
@@ -475,28 +555,131 @@ export class OpfsBlockStore implements BlockStore {
     }
   }
 
+  #takePending(requestId: string): PendingRpc | undefined {
+    const pending = this.#pending.get(requestId);
+    if (pending === undefined) return undefined;
+    this.#pending.delete(requestId);
+    this.#pendingRpcBytes -= pending.retainedBytes;
+    return pending;
+  }
+
   async #serveOp(message: OpMessage): Promise<void> {
+    const requestKey = `${String(message.from.length)}:${message.from}${message.requestId}`;
+    // Once an identity is admitted, duplicates can compare their fingerprint immediately and
+    // either attach to the exact execution or fail closed. The short lock below exists only for
+    // the pre-admission fingerprint race between two first deliveries.
+    if (this.#inFlightMutations.has(requestKey) || this.#settledMutations.has(requestKey)) {
+      await this.#serveOpLocked(message, requestKey);
+      return;
+    }
+    const previous = this.#servedRequestLocks.get(requestKey) ?? Promise.resolve();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => hold);
+    this.#servedRequestLocks.set(requestKey, tail);
+    await previous;
+    try {
+      await this.#serveOpLocked(message, requestKey);
+    } finally {
+      release();
+      if (this.#servedRequestLocks.get(requestKey) === tail) {
+        this.#servedRequestLocks.delete(requestKey);
+      }
+    }
+  }
+
+  async #serveOpLocked(message: OpMessage, requestKey: string): Promise<void> {
     const leader = this.#leader;
     if (leader === undefined || !RPC_METHODS.has(message.method)) return;
-    let outcome = this.#dedupe.get(message.requestId);
-    if (outcome === undefined) {
-      outcome = this.#executeServedOp(leader, message);
-      // Only mutations need at-most-once; reads simply run again on a retried request, and
-      // caching their results (block bytes included) would be pure memory waste.
-      if (!READ_METHODS.has(message.method)) {
-        this.#dedupe.set(message.requestId, outcome);
-        if (this.#dedupe.size > DEDUPE_CACHE_SIZE) {
-          const [oldest] = this.#dedupe.keys();
-          if (oldest !== undefined) this.#dedupe.delete(oldest);
-        }
-      }
-    } else {
-      // A duplicate of a request that is still running (or already remembered): attach to it
-      // rather than executing twice, and reset the caller's patience meanwhile — the original
-      // may legitimately take longer than one timeout (a snapshot import, a checkpoint pause).
-      this.#answer(message.from, { kind: "busy", requestId: message.requestId });
+    const isRead = READ_METHODS.has(message.method);
+    let fingerprint: { signature: string; retainedBytes: number };
+    try {
+      fingerprint = await fingerprintStoreRequest(message.method, message.args);
+    } catch {
+      return;
     }
-    const settled = await outcome;
+    const remembered = isRead ? undefined : this.#settledMutations.get(requestKey);
+    let settled: ServedOutcome;
+    if (remembered !== undefined) {
+      if (!sameServedRequest(remembered, message, fingerprint.signature)) {
+        this.#rejectReusedRequestIdentity(message);
+        return;
+      }
+      // Refresh bounded settled outcomes as an LRU. This is the lost-ack retry path.
+      this.#settledMutations.delete(requestKey);
+      this.#settledMutations.set(requestKey, remembered);
+      settled = remembered.outcome;
+    } else if (!isRead && this.#inFlightMutations.has(requestKey)) {
+      const inFlight = this.#inFlightMutations.get(requestKey);
+      if (inFlight === undefined) throw new Error("In-flight RPC identity disappeared");
+      if (!sameServedRequest(inFlight, message, fingerprint.signature)) {
+        this.#rejectReusedRequestIdentity(message);
+        return;
+      }
+      // Never evict an in-flight mutation. A duplicate attaches to the one execution and resets
+      // the requester's patience while it remains queued or running.
+      this.#answer(message.from, { kind: "busy", requestId: message.requestId });
+      settled = await inFlight.outcome;
+    } else {
+      if (
+        !isRead &&
+        (this.#inFlightMutations.size >= RPC_IN_FLIGHT_LIMIT ||
+          this.#inFlightMutationBytes + fingerprint.retainedBytes > RPC_IN_FLIGHT_MUTATION_BYTES)
+      ) {
+        this.#answer(message.from, {
+          kind: "result",
+          requestId: message.requestId,
+          ok: false,
+          error: { name: "Error", message: "The OPFS leader mutation queue is full" },
+        });
+        return;
+      }
+      if (isRead) {
+        const reservation = Math.max(fingerprint.retainedBytes, MAX_OPFS_RPC_MESSAGE_BYTES);
+        if (this.#inFlightReadBytes + reservation > RPC_IN_FLIGHT_READ_BYTES) {
+          this.#answer(message.from, {
+            kind: "result",
+            requestId: message.requestId,
+            ok: false,
+            error: { name: "Error", message: "The OPFS leader read queue is full" },
+          });
+          return;
+        }
+        this.#inFlightReadBytes += reservation;
+        try {
+          settled = await this.#executeServedOpAfterGate(leader, message, true);
+        } finally {
+          this.#inFlightReadBytes = Math.max(0, this.#inFlightReadBytes - reservation);
+        }
+      } else {
+        this.#inFlightMutationBytes += fingerprint.retainedBytes;
+        const execution = this.#executeServedOpAfterGate(leader, message, false);
+        const outcome = execution.then((result) => {
+          this.#inFlightMutations.delete(requestKey);
+          this.#inFlightMutationBytes = Math.max(
+            0,
+            this.#inFlightMutationBytes - fingerprint.retainedBytes,
+          );
+          if (!this.#closed) {
+            this.#rememberSettledMutation(requestKey, message.method, fingerprint, result);
+          }
+          return result;
+        });
+        this.#inFlightMutations.set(requestKey, {
+          method: message.method,
+          signature: fingerprint.signature,
+          requestBytes: fingerprint.retainedBytes,
+          outcome,
+        });
+        settled = await outcome;
+      }
+    }
+    if (this.#dropNextRpcResultForTests) {
+      this.#dropNextRpcResultForTests = false;
+      return;
+    }
     this.#answer(
       message.from,
       settled.ok
@@ -508,6 +691,56 @@ export class OpfsBlockStore implements BlockStore {
             error: settled.error ?? { name: "Error", message: "unknown" },
           },
     );
+  }
+
+  #rememberSettledMutation(
+    requestKey: string,
+    method: string,
+    fingerprint: { signature: string; retainedBytes: number },
+    outcome: ServedOutcome,
+  ): void {
+    const outcomeBytes = estimateRpcValueBytes(outcome);
+    while (
+      this.#settledMutations.size >= DEDUPE_CACHE_SIZE ||
+      this.#settledMutationBytes + outcomeBytes > RPC_SETTLED_OUTCOME_BYTES
+    ) {
+      const oldest = this.#settledMutations.keys().next().value;
+      if (oldest === undefined) break;
+      const removed = this.#settledMutations.get(oldest);
+      this.#settledMutations.delete(oldest);
+      this.#settledMutationBytes -= removed?.outcomeBytes ?? 0;
+    }
+    if (outcomeBytes > RPC_SETTLED_OUTCOME_BYTES) return;
+    this.#settledMutations.set(requestKey, {
+      method,
+      signature: fingerprint.signature,
+      requestBytes: fingerprint.retainedBytes,
+      outcome,
+      outcomeBytes,
+    });
+    this.#settledMutationBytes += outcomeBytes;
+  }
+
+  #rejectReusedRequestIdentity(message: OpMessage): void {
+    this.#answer(message.from, {
+      kind: "result",
+      requestId: message.requestId,
+      ok: false,
+      error: {
+        name: "Error",
+        message: "The OPFS RPC request identity was reused with different contents",
+      },
+    });
+  }
+
+  async #executeServedOpAfterGate(
+    leader: OpfsLeader,
+    message: OpMessage,
+    isRead: boolean,
+  ): Promise<ServedOutcome> {
+    const gate = this.#servedMutationGateForTests;
+    if (!isRead && gate !== undefined) await gate;
+    return this.#executeServedOp(leader, message);
   }
 
   async #executeServedOp(leader: OpfsLeader, message: OpMessage): Promise<ServedOutcome> {
@@ -638,6 +871,7 @@ export class OpfsBlockStore implements BlockStore {
       } catch (error) {
         if (error === RPC_TIMED_OUT) {
           this.#knownLeader = undefined;
+          if (!READ_METHODS.has(method)) throw new OpfsUncertainOutcomeError(method);
           continue;
         }
         throw error;
@@ -652,14 +886,34 @@ export class OpfsBlockStore implements BlockStore {
   }
 
   #rpc(requestId: string, method: string, args: unknown[]): Promise<unknown> {
+    let retainedBytes: number;
+    try {
+      retainedBytes = estimateRpcValueBytes(args);
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    if (
+      this.#pending.size >= RPC_IN_FLIGHT_LIMIT ||
+      this.#pendingRpcBytes + retainedBytes > RPC_IN_FLIGHT_MUTATION_BYTES
+    ) {
+      return Promise.reject(new Error("The OPFS follower request queue is full"));
+    }
     return new Promise<unknown>((resolve, reject) => {
       const message: OpMessage = { kind: "op", requestId, from: this.#instanceId, method, args };
       const timer = setTimeout(() => {
-        this.#pending.delete(requestId);
-        reject(RPC_TIMED_OUT);
+        const expired = this.#takePending(requestId);
+        expired?.reject(RPC_TIMED_OUT);
       }, this.#rpcTimeoutMs);
       const leaderId = this.#knownLeader;
-      this.#pending.set(requestId, { message, sentTo: leaderId, resolve, reject, timer });
+      this.#pending.set(requestId, {
+        message,
+        retainedBytes,
+        sentTo: leaderId,
+        resolve,
+        reject,
+        timer,
+      });
+      this.#pendingRpcBytes += retainedBytes;
       // The dispatch loop only gets here with a leader known; should it have slipped away in
       // between, the timeout (or the next leader's announcement, which re-sends) takes over.
       if (leaderId !== undefined) this.#send(leaderId, message);
@@ -670,41 +924,16 @@ export class OpfsBlockStore implements BlockStore {
   // The BlockStore surface.
   // ---------------------------------------------------------------------------------------
 
-  async addBlock(id: string, bytes: Uint8Array): Promise<void> {
-    await this.#dispatch("addBlock", [id, bytes]);
-  }
-
-  async addBlocks(blocks: readonly BlockWrite[]): Promise<void> {
-    await this.#dispatch("addBlocks", [blocks]);
-  }
-
-  async getBlock(id: string): Promise<Uint8Array | undefined> {
-    return (await this.#dispatch("getBlock", [id])) as Uint8Array | undefined;
-  }
-
-  async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
-    return (await this.#dispatch("getBlocks", [ids])) as Array<Uint8Array | undefined>;
-  }
-
-  async removeBlock(id: string): Promise<void> {
-    await this.#dispatch("removeBlock", [id]);
-  }
-
-  async listBlockIds(): Promise<string[]> {
-    return (await this.#dispatch("listBlockIds", [])) as string[];
-  }
-
   async putTempRunPage(page: TempRunPage): Promise<void> {
     validateTempRunPage(page);
-    await this.#tree.writeFile(
-      ["temp", encodeSegment(page.ownerId), encodeSegment(page.runId), String(page.pageIndex)],
-      page.bytes,
-    );
+    await this.#dispatch("putTempRunPage", [page]);
   }
 
   async putTempRunPages(pages: readonly TempRunPage[]): Promise<void> {
     // Spill pages are instance-local files; the batch is a convenience, not a round-trip win.
-    for (const page of pages) await this.putTempRunPage(page);
+    assertTempRunPageBatchLimits(pages);
+    for (const page of pages) validateTempRunPage(page);
+    await this.#dispatch("putTempRunPages", [pages]);
   }
 
   async getTempRunPage(
@@ -713,462 +942,24 @@ export class OpfsBlockStore implements BlockStore {
     pageIndex: number,
   ): Promise<Uint8Array | undefined> {
     validateTempRunPageIdentity(ownerId, runId, pageIndex);
-    return this.#tree.readFile([
-      "temp",
-      encodeSegment(ownerId),
-      encodeSegment(runId),
-      String(pageIndex),
-    ]);
+    return (await this.#dispatch("getTempRunPage", [ownerId, runId, pageIndex])) as
+      Uint8Array | undefined;
   }
 
   async removeTempRun(ownerId: string, runId: string): Promise<void> {
     validateTempRunPageIdentity(ownerId, runId, 0);
-    await this.#tree.deleteTree(["temp", encodeSegment(ownerId), encodeSegment(runId)]);
+    await this.#dispatch("removeTempRun", [ownerId, runId]);
   }
 
-  async removeTempOwner(ownerId: string): Promise<void> {
-    validateId(ownerId);
-    await this.#dispatch("removeTempOwner", [ownerId]);
-    await this.#tree.deleteTree(["temp", encodeSegment(ownerId)]);
-  }
-
-  async createTempOwner(record: TempOwnerRecord): Promise<void> {
-    await this.#dispatch("createTempOwner", [record]);
-  }
-
-  async getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined> {
-    return (await this.#dispatch("getTempOwner", [ownerId])) as TempOwnerRecord | undefined;
-  }
-
-  async renewTempOwner(
-    ownerId: string,
-    expectedRevision: number,
-    expiresAt: string,
-  ): Promise<TempOwnerRecord> {
-    return (await this.#dispatch("renewTempOwner", [
-      ownerId,
-      expectedRevision,
-      expiresAt,
-    ])) as TempOwnerRecord;
-  }
-
-  async removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean> {
-    const removed = (await this.#dispatch("removeTempOwnerIfExpired", [
-      ownerId,
-      expiresAtCutoff,
-    ])) as boolean;
-    if (removed) await this.#tree.deleteTree(["temp", encodeSegment(ownerId)]);
-    return removed;
-  }
-
-  async listTempOwnerIdsPage(
-    afterOwnerId: string | null,
-    limit: number,
-  ): Promise<StoragePage<string, string>> {
-    return (await this.#dispatch("listTempOwnerIdsPage", [afterOwnerId, limit])) as StoragePage<
-      string,
-      string
-    >;
-  }
-
-  async addTable(record: TableRecord): Promise<void> {
-    await this.#dispatch("addTable", [record]);
-  }
-
-  async getTable(id: string): Promise<TableRecord | undefined> {
-    return (await this.#dispatch("getTable", [id])) as TableRecord | undefined;
-  }
-
-  async getTableByName(name: string): Promise<TableRecord | undefined> {
-    return (await this.#dispatch("getTableByName", [name])) as TableRecord | undefined;
-  }
-
-  async listTables(): Promise<TableRecord[]> {
-    return (await this.#dispatch("listTables", [])) as TableRecord[];
-  }
-
-  async updateTable(
-    id: string,
-    expectedRevision: number,
-    update: {
-      columns?: TableColumnRecord[];
-      ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
-      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
-      expectedManifestVersion?: { value: number | null };
-      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
-      triggers?: TriggerRecord[] | null;
-    },
-  ): Promise<TableRecord> {
-    return (await this.#dispatch("updateTable", [id, expectedRevision, update])) as TableRecord;
-  }
-
-  async removeTable(id: string, expectedRevision: number): Promise<void> {
-    await this.#dispatch("removeTable", [id, expectedRevision]);
-  }
-
-  async writeFtsBase(
-    tableId: string,
-    columnId: string,
-    input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
-  ): Promise<void> {
-    await this.#dispatch("writeFtsBase", [tableId, columnId, input]);
-  }
-
-  async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
-    await this.#dispatch("removeFtsColumn", [tableId, columnId]);
-  }
-
-  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    await this.#dispatch("beginFtsBaseBuild", [tableId, columnId, buildId]);
-  }
-
-  async writeFtsBaseBuildChunk(
-    tableId: string,
-    columnId: string,
-    buildId: string,
-    ordinal: number,
-    chunk: FtsPosting[],
-  ): Promise<void> {
-    await this.#dispatch("writeFtsBaseBuildChunk", [tableId, columnId, buildId, ordinal, chunk]);
-  }
-
-  async finishFtsBaseBuild(
-    tableId: string,
-    columnId: string,
-    buildId: string,
-    input: { coversVersion: number; chunkCount: number; totalTokens: number },
-  ): Promise<void> {
-    await this.#dispatch("finishFtsBaseBuild", [tableId, columnId, buildId, input]);
-  }
-
-  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    await this.#dispatch("abortFtsBaseBuild", [tableId, columnId, buildId]);
-  }
-
-  async readFtsCandidates(
-    tableId: string,
-    columnId: string,
-    terms: readonly FtsPostingQuery[],
-    upToVersion: number,
-  ): Promise<
-    FtsCandidates & {
-      deltaChunkCount: number;
-      totalTokens: number;
-      coversVersion: number;
-      hasBase: boolean;
+  /** @internal Shared implementation installed for every ordinary RPC method below. */
+  async _dispatchGenerated(method: string, args: unknown[]): Promise<unknown> {
+    const bulkIndex = (BULK_READ_ARGUMENT_INDEX as Partial<Record<string, number>>)[method];
+    if (bulkIndex !== undefined) {
+      const bulkItems = args[bulkIndex];
+      if (!Array.isArray(bulkItems)) throw new TypeError(`${method} items must be an array`);
+      assertStorageBulkReadItems(bulkItems, `${method} request`);
     }
-  > {
-    return (await this.#dispatch("readFtsCandidates", [
-      tableId,
-      columnId,
-      terms,
-      upToVersion,
-    ])) as FtsCandidates & {
-      deltaChunkCount: number;
-      totalTokens: number;
-      coversVersion: number;
-      hasBase: boolean;
-    };
-  }
-
-  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
-    return this.#dispatch("readFtsPostings", [tableId, columnId, upToVersion]) as Promise<
-      Awaited<ReturnType<BlockStore["readFtsPostings"]>>
-    >;
-  }
-
-  async addSegment(record: SegmentRecord): Promise<void> {
-    await this.#dispatch("addSegment", [record]);
-  }
-
-  async getSegment(id: string): Promise<SegmentRecord | undefined> {
-    return (await this.#dispatch("getSegment", [id])) as SegmentRecord | undefined;
-  }
-
-  async listSegments(tableId?: string): Promise<SegmentRecord[]> {
-    return (await this.#dispatch("listSegments", [tableId])) as SegmentRecord[];
-  }
-
-  async listSegmentPage(
-    afterId: string | null,
-    limit: number,
-  ): Promise<StoragePage<SegmentRecord, string>> {
-    return (await this.#dispatch("listSegmentPage", [afterId, limit])) as StoragePage<
-      SegmentRecord,
-      string
-    >;
-  }
-
-  async removeSegment(id: string): Promise<void> {
-    await this.#dispatch("removeSegment", [id]);
-  }
-
-  async reserveRowIds(tableId: string, count: number): Promise<RowIdRange> {
-    return (await this.#dispatch("reserveRowIds", [tableId, count])) as RowIdRange;
-  }
-
-  async reserveAutoIncrement(
-    tableId: string,
-    columnId: string,
-    count: number,
-    atLeast?: bigint,
-  ): Promise<RowIdRange> {
-    return (await this.#dispatch("reserveAutoIncrement", [
-      tableId,
-      columnId,
-      count,
-      atLeast,
-    ])) as RowIdRange;
-  }
-
-  async getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]> {
-    return (await this.#dispatch("getExistingUniqueKeys", [tableId, keyTokens])) as string[];
-  }
-
-  async getCurrentManifest(): Promise<Manifest | undefined> {
-    return (await this.#dispatch("getCurrentManifest", [])) as Manifest | undefined;
-  }
-
-  async getCurrentManifestVersion(): Promise<number | null> {
-    return (await this.#dispatch("getCurrentManifestVersion", [])) as number | null;
-  }
-
-  async getCatalogProbe(): Promise<CatalogProbe> {
-    return (await this.#dispatch("getCatalogProbe", [])) as CatalogProbe;
-  }
-
-  async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
-    return (await this.#dispatch("getQueryCatalogState", [tableNames])) as QueryCatalogState;
-  }
-
-  async getManifest(version: number): Promise<Manifest | undefined> {
-    return (await this.#dispatch("getManifest", [version])) as Manifest | undefined;
-  }
-
-  async listManifests(): Promise<Manifest[]> {
-    return (await this.#dispatch("listManifests", [])) as Manifest[];
-  }
-
-  async listManifestPage(
-    afterVersion: number | null,
-    limit: number,
-  ): Promise<StoragePage<Manifest, number>> {
-    return (await this.#dispatch("listManifestPage", [afterVersion, limit])) as StoragePage<
-      Manifest,
-      number
-    >;
-  }
-
-  async publishManifest(input: PublishManifestInput): Promise<Manifest> {
-    return (await this.#dispatch("publishManifest", [input])) as Manifest;
-  }
-
-  async createTransaction(record: TransactionRecord): Promise<void> {
-    await this.#dispatch("createTransaction", [record]);
-  }
-
-  async beginTransaction(input: BeginTransactionInput): Promise<BeginTransactionResult> {
-    return (await this.#dispatch("beginTransaction", [input])) as BeginTransactionResult;
-  }
-
-  async getTransaction(id: string): Promise<TransactionRecord | undefined> {
-    return (await this.#dispatch("getTransaction", [id])) as TransactionRecord | undefined;
-  }
-
-  async getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>> {
-    return (await this.#dispatch("getTransactions", [ids])) as Array<TransactionRecord | undefined>;
-  }
-
-  async listTransactions(): Promise<TransactionRecord[]> {
-    return (await this.#dispatch("listTransactions", [])) as TransactionRecord[];
-  }
-
-  async listTransactionPage(
-    afterId: string | null,
-    limit: number,
-  ): Promise<StoragePage<TransactionRecord, string>> {
-    return (await this.#dispatch("listTransactionPage", [afterId, limit])) as StoragePage<
-      TransactionRecord,
-      string
-    >;
-  }
-
-  async updateTransaction(
-    id: string,
-    expectedRevision: number,
-    update: TransactionRecordUpdate,
-  ): Promise<TransactionRecord> {
-    return (await this.#dispatch("updateTransaction", [
-      id,
-      expectedRevision,
-      update,
-    ])) as TransactionRecord;
-  }
-
-  async stageTransactionArtifacts(
-    input: StageTransactionArtifactsInput,
-  ): Promise<TransactionRecord> {
-    return (await this.#dispatch("stageTransactionArtifacts", [input])) as TransactionRecord;
-  }
-
-  async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
-    return (await this.#dispatch("commitTransaction", [input])) as ManifestSummary;
-  }
-
-  async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
-    return (await this.#dispatch("writeTransaction", [input])) as ManifestSummary;
-  }
-
-  async createLease(record: LeaseRecord): Promise<void> {
-    await this.#dispatch("createLease", [record]);
-  }
-
-  async getLease(id: string): Promise<LeaseRecord | undefined> {
-    return (await this.#dispatch("getLease", [id])) as LeaseRecord | undefined;
-  }
-
-  async listLeases(): Promise<LeaseRecord[]> {
-    return (await this.#dispatch("listLeases", [])) as LeaseRecord[];
-  }
-
-  async renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord> {
-    return (await this.#dispatch("renewLease", [id, expectedRevision, expiresAt])) as LeaseRecord;
-  }
-
-  async moveLease(
-    id: string,
-    expectedRevision: number,
-    manifestVersion: number | null,
-    expiresAt: string,
-  ): Promise<LeaseRecord> {
-    return (await this.#dispatch("moveLease", [
-      id,
-      expectedRevision,
-      manifestVersion,
-      expiresAt,
-    ])) as LeaseRecord;
-  }
-
-  async removeLeaseIfExpired(
-    id: string,
-    expectedRevision: number,
-    expiresAtCutoff: string,
-  ): Promise<boolean> {
-    return (await this.#dispatch("removeLeaseIfExpired", [
-      id,
-      expectedRevision,
-      expiresAtCutoff,
-    ])) as boolean;
-  }
-
-  async removeLease(id: string): Promise<void> {
-    await this.#dispatch("removeLease", [id]);
-  }
-
-  async createCompactionJob(record: CompactionJobRecord): Promise<void> {
-    await this.#dispatch("createCompactionJob", [record]);
-  }
-
-  async getCompactionJob(id: string): Promise<CompactionJobRecord | undefined> {
-    return (await this.#dispatch("getCompactionJob", [id])) as CompactionJobRecord | undefined;
-  }
-
-  async listCompactionJobs(tableId?: string): Promise<CompactionJobRecord[]> {
-    return (await this.#dispatch("listCompactionJobs", [tableId])) as CompactionJobRecord[];
-  }
-
-  async listCompactionJobPage(
-    afterId: string | null,
-    limit: number,
-  ): Promise<StoragePage<CompactionJobRecord, string>> {
-    return (await this.#dispatch("listCompactionJobPage", [afterId, limit])) as StoragePage<
-      CompactionJobRecord,
-      string
-    >;
-  }
-
-  async updateCompactionJob(
-    id: string,
-    expectedRevision: number,
-    update: CompactionJobRecordUpdate,
-  ): Promise<CompactionJobRecord> {
-    return (await this.#dispatch("updateCompactionJob", [
-      id,
-      expectedRevision,
-      update,
-    ])) as CompactionJobRecord;
-  }
-
-  async cancelCompactionJob(
-    id: string,
-    expectedRevision: number,
-    cancelledAt: string,
-  ): Promise<CompactionJobRecord> {
-    return (await this.#dispatch("cancelCompactionJob", [
-      id,
-      expectedRevision,
-      cancelledAt,
-    ])) as CompactionJobRecord;
-  }
-
-  async removeCompactionJob(id: string): Promise<void> {
-    await this.#dispatch("removeCompactionJob", [id]);
-  }
-
-  async createGarbageCollectionJob(
-    input: CreateGarbageCollectionJobInput,
-  ): Promise<GarbageCollectionJobRecord> {
-    return (await this.#dispatch("createGarbageCollectionJob", [
-      input,
-    ])) as GarbageCollectionJobRecord;
-  }
-
-  async getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined> {
-    return (await this.#dispatch("getGarbageCollectionJob", [id])) as
-      GarbageCollectionJobRecord | undefined;
-  }
-
-  async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
-    return (await this.#dispatch("listGarbageCollectionJobs", [])) as GarbageCollectionJobRecord[];
-  }
-
-  async runGarbageCollectionStep(
-    input: RunGarbageCollectionStepInput,
-  ): Promise<GarbageCollectionStepResult> {
-    return (await this.#dispatch("runGarbageCollectionStep", [
-      input,
-    ])) as GarbageCollectionStepResult;
-  }
-
-  async removeGarbageCollectionJob(id: string): Promise<void> {
-    await this.#dispatch("removeGarbageCollectionJob", [id]);
-  }
-
-  async removePrunedManifestRecords(): Promise<number> {
-    return (await this.#dispatch("removePrunedManifestRecords", [])) as number;
-  }
-
-  async getLogicalStorageBytes(): Promise<number> {
-    return (await this.#dispatch("getLogicalStorageBytes", [])) as number;
-  }
-
-  async exportSnapshot(): Promise<DatabaseSnapshot> {
-    return (await this.#dispatch("exportSnapshot", [])) as DatabaseSnapshot;
-  }
-
-  async importSnapshot(
-    snapshot: DatabaseSnapshot,
-    options: { onProgress?: (progress: SnapshotLoadProgress) => void } = {},
-  ): Promise<void> {
-    const leader = this.#leader;
-    if (leader !== undefined) {
-      return leader.importSnapshot(snapshot, options);
-    }
-    // The progress callback cannot cross the channel; report the two ends locally.
-    const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
-    options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
-    await this.#dispatch("importSnapshot", [snapshot, {}]);
-    options.onProgress?.({ phase: "done", writtenBytes: totalBytes, totalBytes });
+    return this.#dispatch(method, args);
   }
 
   close(): void {
@@ -1180,7 +971,15 @@ export class OpfsBlockStore implements BlockStore {
       pending.reject(new Error("This OPFS store connection is closed"));
     }
     this.#pending.clear();
-    this.#dedupe.clear();
+    this.#inFlightMutations.clear();
+    this.#settledMutations.clear();
+    this.#servedRequestLocks.clear();
+    this.#pendingRpcBytes = 0;
+    this.#inFlightMutationBytes = 0;
+    this.#inFlightReadBytes = 0;
+    this.#settledMutationBytes = 0;
+    this.#servedRequestCount = 0;
+    this.#servedRequestBytes = 0;
     const leader = this.#leader;
     this.#leader = undefined;
     if (leader !== undefined) {
@@ -1208,17 +1007,52 @@ export class OpfsBlockStore implements BlockStore {
     return this.#instanceId;
   }
 
+  /** Test-only: simulates an acknowledgement lost after the served operation settles. */
+  _dropNextRpcResultForTests(): void {
+    this.#dropNextRpcResultForTests = true;
+  }
+
+  /** Test-only: holds newly admitted served mutations until the returned release is called. */
+  _holdServedMutationsForTests(): () => void {
+    if (this.#servedMutationGateForTests !== undefined) {
+      throw new Error("Served mutations are already held");
+    }
+    let release!: () => void;
+    this.#servedMutationGateForTests = new Promise((resolve) => {
+      release = resolve;
+    });
+    return () => {
+      this.#servedMutationGateForTests = undefined;
+      release();
+    };
+  }
+
+  /** Test-only: retransmits the oldest request with its stable deduplication identity. */
+  _resendOldestPendingForTests(): void {
+    const pending = this.#pending.values().next().value;
+    if (pending?.sentTo !== undefined) this.#send(pending.sentTo, pending.message);
+  }
+
   /** Test-only counters that pin the connection's bounded RPC state and close-time cleanup. */
   _residentStateForTests(): {
     answerChannels: number;
     dedupeEntries: number;
+    inFlightMutations: number;
     pendingRequests: number;
+    retainedRpcBytes: number;
     closed: boolean;
   } {
     return {
       answerChannels: this.#answerChannels.size,
-      dedupeEntries: this.#dedupe.size,
+      dedupeEntries: this.#settledMutations.size,
+      inFlightMutations: this.#inFlightMutations.size,
       pendingRequests: this.#pending.size,
+      retainedRpcBytes:
+        this.#pendingRpcBytes +
+        this.#inFlightMutationBytes +
+        this.#inFlightReadBytes +
+        this.#settledMutationBytes +
+        this.#servedRequestBytes,
       closed: this.#closed,
     };
   }
@@ -1229,43 +1063,121 @@ export class OpfsBlockStore implements BlockStore {
     if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
     for (const pending of this.#pending.values()) clearTimeout(pending.timer);
     this.#pending.clear();
-    this.#dedupe.clear();
+    this.#inFlightMutations.clear();
+    this.#settledMutations.clear();
+    this.#servedRequestLocks.clear();
+    this.#pendingRpcBytes = 0;
+    this.#inFlightMutationBytes = 0;
+    this.#inFlightReadBytes = 0;
+    this.#settledMutationBytes = 0;
+    this.#servedRequestCount = 0;
+    this.#servedRequestBytes = 0;
     this.#leader?.crash();
     this.#leader = undefined;
     this.#closeChannels();
   }
 
   async #ensureFormatMarker(): Promise<void> {
-    const existing = await this.#tree.readFile(["format.json"], { lockedMeansAbsent: true });
+    const existing = await this.#tree.readFile(["format.json"], {
+      lockedMeansAbsent: true,
+      maxBytes: 1024,
+    });
     if (existing !== undefined) {
       try {
-        const parsed = JSON.parse(new TextDecoder().decode(existing)) as {
-          formatVersion?: number;
-        };
-        if (
-          typeof parsed.formatVersion === "number" &&
-          parsed.formatVersion !== LOG_FORMAT_VERSION
-        ) {
-          throw new Error(
-            `This database uses OPFS layout version ${String(parsed.formatVersion)}; this build ` +
-              `reads version ${String(LOG_FORMAT_VERSION)}. Delete it with deleteOpfsDatabase() — ` +
-              `earlier layouts were experimental and carry no compatibility promise.`,
-          );
-        }
+        this.#validateFormatMarker(existing);
         return;
       } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
-        // A torn marker from a crashed first open: rewrite it below.
+        // A torn marker from a crashed first open is repairable only while no database
+        // artifacts exist. Never stamp the current version over an unversioned WAL.
       }
+    }
+    let artifact: string | undefined;
+    for await (const name of this.#tree.iterateNames([])) {
+      if (name !== "format.json") {
+        artifact = name;
+        break;
+      }
+    }
+    if (artifact !== undefined) {
+      throw new StorageCorruptionError(
+        "opfs",
+        "format.json",
+        `The OPFS format marker is ${existing === undefined ? "missing" : "torn"}, but the ` +
+          `database directory already contains storage artifacts (${artifact}). ` +
+          `Refusing to guess their layout version.`,
+      );
     }
     const bytes = new TextEncoder().encode(JSON.stringify({ formatVersion: LOG_FORMAT_VERSION }));
     try {
       await this.#tree.writeFile(["format.json"], bytes, { flush: true });
     } catch (error) {
-      // A concurrent open won the marker; theirs says the same thing.
       if (!isLockContention(error)) throw error;
+      // Another opener owns the marker write. Do not assume it writes this build's version:
+      // wait until its handle closes, then validate the bytes it actually published.
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await sleep(5 + Math.random() * 10);
+        const published = await this.#tree.readFile(["format.json"], {
+          lockedMeansAbsent: true,
+          maxBytes: 1024,
+        });
+        if (published === undefined) continue;
+        this.#validateFormatMarker(published);
+        return;
+      }
+      throw new Error("A concurrent opener did not publish a readable OPFS format marker", {
+        cause: error,
+      });
     }
   }
+
+  #validateFormatMarker(bytes: Uint8Array): void {
+    const text = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(text) as unknown;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      !Number.isSafeInteger((parsed as { formatVersion?: unknown }).formatVersion)
+    ) {
+      throw new StorageCorruptionError(
+        "opfs",
+        "format.json",
+        "The OPFS format marker is invalid: formatVersion must be a safe integer",
+      );
+    }
+    const formatVersion = (parsed as { formatVersion: number }).formatVersion;
+    if (formatVersion !== LOG_FORMAT_VERSION) {
+      throw new StorageFormatVersionError(
+        "opfs",
+        "format.json",
+        formatVersion,
+        LOG_FORMAT_VERSION,
+        formatVersion < LOG_FORMAT_VERSION ? "older" : "newer",
+      );
+    }
+    if (
+      Object.keys(parsed).length !== 1 ||
+      !Object.hasOwn(parsed, "formatVersion") ||
+      text !== JSON.stringify({ formatVersion })
+    ) {
+      throw new StorageCorruptionError(
+        "opfs",
+        "format.json",
+        "The OPFS format marker is not the canonical layout marker",
+      );
+    }
+  }
+}
+
+for (const method of RPC_METHODS) {
+  if (method in OpfsBlockStore.prototype) continue;
+  Object.defineProperty(OpfsBlockStore.prototype, method, {
+    configurable: true,
+    value(this: OpfsBlockStore, ...args: unknown[]) {
+      return this._dispatchGenerated(method, args);
+    },
+  });
 }
 
 /** Removes every file of a database created by `OpfsBlockStore.open` under this name. */
@@ -1273,10 +1185,11 @@ export async function deleteOpfsDatabase(options: {
   name: string;
   root?: FileSystemDirectoryHandle;
 }): Promise<void> {
+  const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
   const root = options.root ?? (await navigator.storage.getDirectory());
   try {
     const namespace = await root.getDirectoryHandle("minnowdb");
-    await namespace.removeEntry(encodeSegment(options.name), { recursive: true });
+    await namespace.removeEntry(encodedName, { recursive: true });
   } catch (error) {
     if (!isDomError(error, "NotFoundError")) throw error;
   }
@@ -1287,10 +1200,10 @@ const RPC_TIMED_OUT = new Error("The leader did not answer in time");
 async function resolveDatabaseRoot(
   options: OpfsBlockStoreOptions,
 ): Promise<FileSystemDirectoryHandle> {
-  if (options.name.length === 0) throw new TypeError("Database name cannot be empty");
+  const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
   const root = options.root ?? (await navigator.storage.getDirectory());
   const namespace = await root.getDirectoryHandle("minnowdb", { create: true });
-  return namespace.getDirectoryHandle(encodeSegment(options.name), { create: true });
+  return namespace.getDirectoryHandle(encodedName, { create: true });
 }
 
 function isLockContention(error: unknown): boolean {

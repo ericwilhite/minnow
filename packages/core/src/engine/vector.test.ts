@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { DatabaseRow } from "./database.js";
 import { QueryMemoryBudgetError } from "./memory.js";
 import {
+  MAX_TEMP_RUN_BATCH_BYTES,
+  MAX_TEMP_RUN_PAGE_BYTES,
+  MAX_TEMP_RUN_PAGES_PER_BATCH,
+} from "../storage/types.js";
+import {
   compileQuery,
   createPreparedColumnarQuery,
   createPreparedQuery,
@@ -13,10 +18,32 @@ import { createColumnarTable, type QuerySpillStore } from "./vector.js";
 class TestSpillStore implements QuerySpillStore {
   readonly pages = new Map<string, Uint8Array>();
   putCount = 0;
+  maxBatchPages = 0;
+  maxBatchBytes = 0;
+  maxPageBytes = 0;
 
   async putPage(ownerId: string, runId: string, pageIndex: number, bytes: Uint8Array) {
     this.putCount += 1;
+    this.maxPageBytes = Math.max(this.maxPageBytes, bytes.byteLength);
     this.pages.set(`${ownerId}/${runId}/${String(pageIndex)}`, bytes.slice());
+  }
+
+  async putPages(
+    pages: ReadonlyArray<{
+      ownerId: string;
+      runId: string;
+      pageIndex: number;
+      bytes: Uint8Array;
+    }>,
+  ) {
+    this.maxBatchPages = Math.max(this.maxBatchPages, pages.length);
+    this.maxBatchBytes = Math.max(
+      this.maxBatchBytes,
+      pages.reduce((total, page) => total + page.bytes.byteLength, 0),
+    );
+    for (const page of pages) {
+      await this.putPage(page.ownerId, page.runId, page.pageIndex, page.bytes);
+    }
   }
 
   async getPage(ownerId: string, runId: string, pageIndex: number) {
@@ -109,7 +136,31 @@ describe("vector query execution", () => {
     const result = await prepared.executeAsync({ spillStore: spill, spillPageRows: 64 });
     expect(result).toEqual(executeRowQuery(plan, new Map([["rows", rows]])));
     expect(spill.pages.size).toBe(0);
+    expect(spill.maxPageBytes).toBeLessThanOrEqual(MAX_TEMP_RUN_PAGE_BYTES);
+    expect(spill.maxBatchPages).toBeLessThanOrEqual(MAX_TEMP_RUN_PAGES_PER_BATCH);
+    expect(spill.maxBatchBytes).toBeLessThanOrEqual(MAX_TEMP_RUN_BATCH_BYTES);
     expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(150_000);
+    prepared.close();
+  });
+
+  it("bounds spill pages and batches when the requested page row target is enormous", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
+      id: index,
+      bucket: index % 17,
+    }));
+    const plan = compileQuery("SELECT id, bucket FROM rows ORDER BY bucket, id DESC");
+    const prepared = createPreparedQuery(plan, new Map([["rows", rows]]), {
+      executionMemoryBudgetBytes: 300_000,
+    });
+    const spill = new TestSpillStore();
+    const result = await prepared.executeAsync({
+      spillStore: spill,
+      spillPageRows: Number.MAX_SAFE_INTEGER,
+    });
+    expect(result).toEqual(executeRowQuery(plan, new Map([["rows", rows]])));
+    expect(spill.maxPageBytes).toBeLessThanOrEqual(MAX_TEMP_RUN_PAGE_BYTES);
+    expect(spill.maxBatchPages).toBeLessThanOrEqual(MAX_TEMP_RUN_PAGES_PER_BATCH);
+    expect(spill.maxBatchBytes).toBeLessThanOrEqual(MAX_TEMP_RUN_BATCH_BYTES);
     prepared.close();
   });
 

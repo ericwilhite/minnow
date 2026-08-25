@@ -9,10 +9,52 @@
  * collection pass, or lets either one grow without limit fails here; a change that merely makes
  * them slower does not, which is what the benchmark gate is for.
  */
-import { describe, expect, it } from "vitest";
-import { MemoryBlockStore } from "../storage/index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryBlockStore, type Manifest, type TransactionRecord } from "../storage/index.js";
 import { SnapshotManifestMissingError } from "../storage/types.js";
-import { MinnowDatabase } from "./database.js";
+import { MaintenanceBacklogError, MinnowDatabase } from "./database.js";
+import { allVisibleSegments } from "./storage-test-helpers.js";
+
+async function manifestRecords(store: MemoryBlockStore) {
+  const records: Manifest[] = [];
+  let cursor: number | null = null;
+  for (;;) {
+    const page = await store.listManifestPage(cursor, 256);
+    records.push(...page.records);
+    if (page.nextCursor === null) return records;
+    cursor = page.nextCursor;
+  }
+}
+
+async function transactionRecords(store: MemoryBlockStore) {
+  const records: TransactionRecord[] = [];
+  let cursor: string | null = null;
+  for (;;) {
+    const page = await store.listTransactionPage(cursor, 256);
+    records.push(...page.records);
+    if (page.nextCursor === null) return records;
+    cursor = page.nextCursor;
+  }
+}
+
+class CollectionFaultStore extends MemoryBlockStore {
+  failuresRemaining = 0;
+  attempts = 0;
+
+  override async listGarbageCollectionJobPage(
+    afterId: Parameters<MemoryBlockStore["listGarbageCollectionJobPage"]>[0],
+    limit: Parameters<MemoryBlockStore["listGarbageCollectionJobPage"]>[1],
+  ) {
+    this.attempts += 1;
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1;
+      throw new Error("injected collection failure");
+    }
+    return super.listGarbageCollectionJobPage(afterId, limit);
+  }
+}
+
+afterEach(() => vi.useRealTimers());
 
 const REGIONS = ["west", "east", "north", "south"] as const;
 const ROWS = 4_000;
@@ -110,18 +152,16 @@ async function burst(
 
 /** The store's footprint as a reader and as a disk see it. */
 async function footprint(store: MemoryBlockStore, database: MinnowDatabase) {
-  const blockIds = await store.listBlockIds();
-  let storedBytes = 0;
-  for (const id of blockIds) storedBytes += (await store.getBlock(id))?.byteLength ?? 0;
-  const manifests = await store.listManifests();
+  const stats = await store.getStorageStats();
+  const manifests = await manifestRecords(store);
   return {
-    visibleSegments: (await database.listVisibleSegments("items")).length,
-    liveBlocks: (await store.getCurrentManifest())?.blockIds.length ?? 0,
-    storedBlocks: blockIds.length,
-    storedBytes,
+    visibleSegments: (await allVisibleSegments(database, "items")).length,
+    liveBlocks: stats.liveBlockCount,
+    storedBlocks: stats.liveBlockCount + stats.obsoleteBlockCount,
+    storedBytes: stats.liveBlockBytes + stats.obsoleteBlockBytes,
     manifests: manifests.length,
     unprunedManifests: manifests.filter((manifest) => manifest.prunedAt === undefined).length,
-    transactions: (await store.listTransactions()).length,
+    transactions: (await transactionRecords(store)).length,
   };
 }
 
@@ -178,6 +218,188 @@ async function expectContents(database: MinnowDatabase, reference: Map<number, R
 }
 
 describe("background maintenance", () => {
+  it("retries a failed collection on a timer without another committed write", async () => {
+    const store = new CollectionFaultStore();
+    const database = new MinnowDatabase(store, {
+      autoCompact: false,
+      autoCollectDebtLimitCommits: 1,
+    });
+    await database.createTable({
+      name: "retry_items",
+      uniqueKey: "id",
+      columns: [{ name: "id", type: "number" }],
+    });
+    await database.insert("retry_items", { id: 1 });
+    // Seed on real timers so the test is not responsible for the unrelated cooperative yields
+    // of setup maintenance; fake time controls the retry interval under test from here on.
+    vi.useFakeTimers();
+    store.failuresRemaining = 1;
+    await expect(database.insert("retry_items", { id: 2 })).rejects.toBeInstanceOf(
+      MaintenanceBacklogError,
+    );
+    const failed = database.maintenanceStatus();
+    expect(failed).toMatchObject({
+      pendingCommitDebt: 1,
+      consecutiveFailures: 1,
+      collectionRunning: false,
+    });
+    expect(failed.lastError?.message).toBe("injected collection failure");
+    expect(failed.nextRetryAt).not.toBeNull();
+    const attemptsAfterFailure = store.attempts;
+
+    // Drive the retry timer and the collector's zero-delay cooperative yields separately. The
+    // synchronous timer advance avoids Vitest waiting on the async collector that those yields
+    // themselves unblock.
+    vi.advanceTimersByTime(1_000);
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      await Promise.resolve();
+      vi.runOnlyPendingTimers();
+      await Promise.resolve();
+      const status = database.maintenanceStatus();
+      if (!status.collectionRunning && status.nextRetryAt === null) break;
+    }
+    expect(store.attempts).toBeGreaterThan(attemptsAfterFailure);
+    expect(database.maintenanceStatus()).toMatchObject({
+      pendingCommitDebt: 0,
+      consecutiveFailures: 0,
+      collectionRunning: false,
+      lastError: null,
+      nextRetryAt: null,
+    });
+    expect((await database.query("SELECT id FROM retry_items ORDER BY id")).rows).toEqual([
+      { id: 1 },
+    ]);
+    await database.close();
+  });
+
+  it("requeues beyond one 32-pass run until a large history backlog is empty", async () => {
+    const store = new MemoryBlockStore();
+    let version: number | null = null;
+    // Automatic planning is capped at the same 64-record work page as reclamation. This is
+    // deliberately more than the 32-pass per-run ceiling, without constructing a quadratic
+    // 32k-manifest fixture merely to prove scheduler requeueing.
+    for (let index = 0; index < 32 * 64 + 257; index += 1) {
+      const transactionId = `history-${String(index)}`;
+      await store.createTransaction({
+        id: transactionId,
+        ownerId: `owner-${String(index)}`,
+        expiresAt: "2025-01-01T00:30:00.000Z",
+        snapshotVersion: version,
+        pendingBlockIds: [],
+        pendingSegmentIds: [],
+        status: "active",
+        revision: 0,
+        startedAt: "2025-01-01T00:00:00.000Z",
+        updatedAt: "2025-01-01T00:00:00.000Z",
+        committedVersion: null,
+      });
+      const manifest = await store.commitTransaction({
+        transactionId,
+        expectedTransactionRevision: 0,
+        expectedManifestVersion: version,
+        changedTableIds: [],
+        committedAt: "2025-01-01T00:00:00.000Z",
+      });
+      version = manifest.version;
+    }
+    const database = new MinnowDatabase(store, {
+      autoCompact: false,
+      autoCollectDebtLimitCommits: 1,
+      now: () => new Date("2026-01-01T00:00:00.000Z"),
+    });
+    await database.createTable({
+      name: "backlog_items",
+      uniqueKey: "id",
+      columns: [{ name: "id", type: "number" }],
+    });
+    await database.insert("backlog_items", { id: 1 });
+    // Foreground assistance is one bounded run: this old history needs a follow-up, so the
+    // attempted write is refused before staging instead of blocking in proportion to the whole
+    // backlog. The collector requeues itself and settles the remainder without another write.
+    await expect(database.insert("backlog_items", { id: 2 })).rejects.toBeInstanceOf(
+      MaintenanceBacklogError,
+    );
+    expect((await database.query("SELECT COUNT(*) AS n FROM backlog_items")).rows).toEqual([
+      { n: 1 },
+    ]);
+    for (let attempt = 0; attempt < 2_000; attempt += 1) {
+      const status = database.maintenanceStatus();
+      if (
+        status.pendingCommitDebt === 0 &&
+        !status.collectionRunning &&
+        !status.collectionRequested
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // Finished marker cleanup may remove the pruned record entirely; either way the oldest
+    // version is no longer readable and the >32-pass backlog has settled.
+    expect(await store.getManifest(0)).toBeUndefined();
+    expect(database.maintenanceStatus()).toMatchObject({
+      pendingCommitDebt: 0,
+      consecutiveFailures: 0,
+      lastError: null,
+    });
+    await database.insert("backlog_items", { id: 2 });
+    expect((await store.listGarbageCollectionJobs()).length).toBeLessThanOrEqual(8);
+    expect((await database.query("SELECT COUNT(*) AS n FROM backlog_items")).rows).toEqual([
+      { n: 2 },
+    ]);
+    await database.close();
+  }, 120_000);
+
+  it("keeps tombstone provenance across bounded jobs and reopen", async () => {
+    class CandidateReadCountingStore extends MemoryBlockStore {
+      candidateReadCalls = 0;
+
+      override getBlocks(ids: readonly string[]) {
+        this.candidateReadCalls += 1;
+        return super.getBlocks(ids);
+      }
+    }
+    const store = new CandidateReadCountingStore();
+    const options = {
+      autoCollect: false,
+      autoCompact: false,
+      rowsPerBlock: 4,
+      now: () => new Date("2026-01-01T00:00:00.000Z"),
+    } as const;
+    let database = new MinnowDatabase(store, options);
+    await database.createTable({
+      name: "wide_history",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "payload", type: "string" },
+      ],
+    });
+    await database.insertBatch(
+      "wide_history",
+      Array.from({ length: 200 }, (_, id) => ({ id, payload: `row-${String(id)}` })),
+    );
+    const initialStats = await store.getStorageStats();
+    const obsoleteBlockCount = initialStats.liveBlockCount + initialStats.obsoleteBlockCount;
+    expect(obsoleteBlockCount).toBeGreaterThan(64);
+    await database.dropTable("wide_history");
+    expect((await store.getCurrentManifest())?.liveBlockCount).toBe(0);
+    await database.close();
+
+    let previous = obsoleteBlockCount;
+    for (let pass = 0; pass < 16 && previous > 0; pass += 1) {
+      database = new MinnowDatabase(store, options);
+      await database.collectGarbage({ maxItemsPerStep: 64, maxPlanningItems: 64 });
+      await database.close();
+      const stats = await store.getStorageStats();
+      const remaining = stats.liveBlockCount + stats.obsoleteBlockCount;
+      expect(remaining).toBeLessThan(previous);
+      previous = remaining;
+    }
+    expect(previous).toBe(0);
+    expect(store.candidateReadCalls).toBeLessThanOrEqual(2);
+    expect(await store.getManifest(0)).toBeUndefined();
+  });
+
   it("folds a burst of writes back down and collects what the folds superseded", async () => {
     const { store, database, reference, clock } = await seeded();
     const fresh = await footprint(store, database);
@@ -260,8 +482,45 @@ describe("background maintenance", () => {
     );
   }, 120_000);
 
-  it("does nothing when told not to", async () => {
-    const { store, database, reference } = await seeded({ autoCompact: false });
+  it("still collects when only compaction is disabled", async () => {
+    const { store, database, reference, clock } = await seeded({ autoCompact: false });
+    await burst(database, reference, 120, 0);
+    await quietMinute(database, reference, clock);
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      const active = (await database.listGarbageCollectionJobs()).some(
+        (job) => job.state === "planned" || job.state === "running",
+      );
+      const status = database.maintenanceStatus();
+      if (
+        !active &&
+        status.pendingCommitDebt === 0 &&
+        !status.collectionRunning &&
+        !status.collectionRequested
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const idle = await footprint(store, database);
+    expect(database.maintenanceStatus()).toMatchObject({
+      pendingCommitDebt: 0,
+      collectionRunning: false,
+      collectionRequested: false,
+      consecutiveFailures: 0,
+      lastError: null,
+    });
+    expect(idle.visibleSegments).toBe(4 + 120 + 1);
+    expect(await database.listCompactionJobs()).toEqual([]);
+    expect((await database.listGarbageCollectionJobs()).length).toBeGreaterThan(0);
+    expect(idle.unprunedManifests).toBeLessThanOrEqual(64 + 2);
+    await expectContents(database, reference);
+  }, 60_000);
+
+  it("does nothing when compaction and collection are both disabled", async () => {
+    const { store, database, reference } = await seeded({
+      autoCompact: false,
+      autoCollect: false,
+    });
     await burst(database, reference, 120, 0);
     await new Promise((resolve) => setTimeout(resolve, 200));
     const idle = await footprint(store, database);
@@ -271,6 +530,79 @@ describe("background maintenance", () => {
     expect(idle.unprunedManifests).toBe(idle.manifests);
     await expectContents(database, reference);
   }, 60_000);
+
+  it("reclaims a reopened backlog of crashed active writers without another write", async () => {
+    vi.useFakeTimers();
+    const reopenedAt = new Date("2026-01-01T01:00:00.000Z");
+    vi.setSystemTime(reopenedAt);
+    const store = new MemoryBlockStore();
+    await store.addTable({
+      id: "abandoned-table",
+      name: "abandoned_rows",
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      managed: false,
+      revision: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    for (let index = 0; index < 100; index += 1) {
+      const id = `abandoned-${String(index).padStart(3, "0")}`;
+      const blockId = `${id}/block`;
+      const segmentId = `${id}/segment`;
+      await store.createTransaction({
+        id,
+        ownerId: `${id}/owner`,
+        expiresAt: "2026-01-01T00:59:59.999Z",
+        snapshotVersion: null,
+        pendingBlockIds: [],
+        pendingSegmentIds: [],
+        status: "active",
+        revision: 0,
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        committedVersion: null,
+      });
+      await store.stageTransactionArtifacts({
+        transactionId: id,
+        expectedRevision: 0,
+        blocks: [{ id: blockId, bytes: Uint8Array.of(index) }],
+        segments: [
+          {
+            id: segmentId,
+            tableId: "abandoned-table",
+            transactionId: id,
+            rowCount: 1,
+            rowIdStart: BigInt(index + 1),
+            rowIdEndExclusive: BigInt(index + 2),
+            columnBlockIds: { value: [blockId] },
+            kind: "insert",
+            level: 0,
+            logicalOrder: index,
+            commitOrdinal: 0,
+            rowIdSpans: [],
+            createdAt: "2026-01-01T00:00:00.001Z",
+          },
+        ],
+        updatedAt: "2026-01-01T00:00:00.001Z",
+      });
+    }
+
+    const reopened = new MinnowDatabase(store, {
+      now: () => new Date(Date.now()),
+      autoCompact: false,
+    });
+    const stagedStats = await store.getStorageStats();
+    expect(stagedStats.liveBlockCount + stagedStats.obsoleteBlockCount).toBe(100);
+    await vi.advanceTimersByTimeAsync(60_000);
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      const status = reopened.maintenanceStatus();
+      if (!status.collectionRunning && !status.collectionRequested) break;
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    const collectedStats = await store.getStorageStats();
+    expect(collectedStats.liveBlockCount + collectedStats.obsoleteBlockCount).toBe(0);
+    expect(await transactionRecords(store)).toEqual([]);
+    await reopened.close();
+  });
 
   it("folds but keeps every version when only collection is off", async () => {
     const { store, database, reference } = await seeded({ autoCollect: false });

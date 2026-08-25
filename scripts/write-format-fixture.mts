@@ -2,9 +2,9 @@
  * Writes one compatibility fixture: a database built by *this* build, frozen on disk.
  *
  * A browser database's data lives in the user's browser, not on a server, so it outlives every
- * deploy. The block format therefore has to keep reading what earlier builds wrote — and today
- * `readBlock` accepts exactly one version and throws on anything else. The moment that constant
- * changes, every database already in the wild becomes unreadable, and nothing would report it.
+ * deploy. Once a format ships, the reader therefore has to keep accepting what that build wrote.
+ * The moment an old version reader disappears, every database using it becomes unreadable, and
+ * nothing would report it.
  *
  * These fixtures are what reports it. Each one is a snapshot — which carries the raw block bytes
  * verbatim, so it pins the block format and the snapshot envelope together — plus a manifest of
@@ -16,38 +16,23 @@
  *     npm run fixture:format
  *
  * The output is named for the versions it was written at, so fixtures accumulate rather than
- * replace one another. Never delete one: it is the only remaining copy of what that release
- * wrote, and once the code that produced it is gone it cannot be regenerated.
+ * replace one another. Never delete a released, locked fixture: it is the only remaining copy of
+ * what that release wrote, and once the code that produced it is gone it cannot be regenerated.
+ * Before the first lock, an explicitly unsupported experimental fixture may be replaced; block 2
+ * is Minnow's first locked format.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { MemoryBlockStore } from "../packages/core/src/storage/index.js";
 import { SNAPSHOT_FORMAT_VERSION } from "../packages/core/src/storage/snapshot.js";
-import { MinnowDatabase } from "../packages/core/src/engine/database.js";
 import { BLOCK_FORMAT_VERSION } from "../packages/core/src/block-format/index.js";
-import {
-  buildFixtureDatabase,
-  FIXTURE_QUERIES,
-} from "../packages/core/src/storage/fixture-shape.js";
+import { createFormatFixtureArtifact } from "../packages/core/src/storage/fixture-shape.js";
 
 const directory = new URL("../packages/core/format-fixtures/", import.meta.url);
 mkdirSync(fileURLToPath(directory), { recursive: true });
 
-const store = new MemoryBlockStore();
-const database = new MinnowDatabase(store, { rowsPerBlock: 64, autoCompact: false });
-await buildFixtureDatabase(database);
-
-// The expectations travel with the fixture. Recording this build's answers rather than
-// hand-writing them keeps the two in step; the test's job is to notice when a *later* build
-// disagrees with what was recorded here.
-const expectations: Array<{ sql: string; rows: unknown }> = [];
-for (const sql of FIXTURE_QUERIES) {
-  const result = await database.query(sql, { memoize: false });
-  expectations.push({ sql, rows: result.rows });
-}
-
-// `exportSnapshot` already encodes: it hands back the bytes an application would write to a file.
-const bytes = await database.exportSnapshot();
+// The shared generator freezes the database clock and IDs, records the query answers, and exports
+// the framed bytes. The compatibility test calls this same function and byte-compares the result.
+const { bytes, expectations } = await createFormatFixtureArtifact();
 const stem = `block${String(BLOCK_FORMAT_VERSION)}-snapshot${String(SNAPSHOT_FORMAT_VERSION)}`;
 
 writeFileSync(new URL(`${stem}.minnow`, directory), bytes);

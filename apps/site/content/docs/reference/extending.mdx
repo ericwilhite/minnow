@@ -11,16 +11,17 @@ real adapter instead of a set of hooks that have never been used outside the eng
 
 ## The building blocks
 
-| API                             | Import                | What it gives you                                                                         |
-| ------------------------------- | --------------------- | ----------------------------------------------------------------------------------------- |
-| `MinnowSqlExecutor`             | `@minnowdb/core`      | Structural `query` / `execute` boundary implemented in-thread and through a worker.       |
-| `MinnowSqlDriver`               | `@minnowdb/core`      | The SQL executor plus `introspect()` for schema-aware adapters.                           |
-| `execute(sql, params)`          | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                     |
-| `introspect()`                  | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                              |
-| Statement transactions          | `@minnowdb/core`      | `BEGIN`, savepoints, `COMMIT`, and `ROLLBACK` for adapter-owned control flow.             |
-| Plan construction               | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.             |
-| `sql-feature-matrix.json`       | `@minnowdb/core`      | A machine-readable list of supported and rejected SQL.                                    |
-| `postgres-feature-profile.json` | `@minnowdb/core`      | PostgreSQL-compatible forms, deliberate differences, extensions, and embedded exclusions. |
+| API                                    | Import                | What it gives you                                                                         |
+| -------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------- |
+| `MinnowSqlExecutor`                    | `@minnowdb/core`      | Structural `query` / `queryCursor` / `execute` boundary, direct or worker-backed.         |
+| `MinnowSqlDriver`                      | `@minnowdb/core`      | The SQL executor plus `introspect()` for schema-aware adapters.                           |
+| `LiveQuerySource` / `LiveQueryManager` | `@minnowdb/core/live` | Adapter-owned typed execution plus Minnow-owned durable invalidation.                     |
+| `execute(sql, params)`                 | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                     |
+| `introspect()`                         | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                              |
+| Statement transactions                 | `@minnowdb/core`      | `BEGIN`, savepoints, `COMMIT`, and `ROLLBACK` for adapter-owned control flow.             |
+| Plan construction                      | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.             |
+| `sql-feature-matrix.json`              | `@minnowdb/core`      | A machine-readable list of supported and rejected SQL.                                    |
+| `postgres-feature-profile.json`        | `@minnowdb/core`      | PostgreSQL-compatible forms, deliberate differences, extensions, and embedded exclusions. |
 
 ## Running statements
 
@@ -43,6 +44,34 @@ distinct key.
 
 Identifiers quote with double quotes, doubling an embedded quote: `"order id"`, `"say ""hi"""`.
 
+Use `queryCursor(sql, { params, batchRows, signal })` when an adapter exposes streaming. It returns
+query-result pages through the same structural interface on `MinnowDatabase` and
+`MinnowDatabaseClient`; the worker implementation transfers one columnar page per pull.
+
+## Adding typed live queries
+
+A query-builder adapter should keep execution in the builder and give Minnow only the statement it
+needs to track:
+
+```ts
+import { createLiveQueryManager } from "@minnowdb/core/live";
+
+const manager = createLiveQueryManager(driver);
+const watched = manager.watch({
+  query: { kind: "sql-query", sql: compiled.sql, params },
+  execute: (signal) => builder.execute({ signal }),
+});
+```
+
+That returns `LiveQuery<AwaitedRow>` with a stable external-store snapshot and async iteration.
+Compile once when wrapping the query, snapshot parameter values, and execute through the source
+library so its result plugins remain in force. A library may add a composition method around the
+callable wrapper—Kysely uses `$call`—but core does not depend on one library's method name.
+
+Use `KeyedLiveQuery` when the adapter exposes exact keyed patches. Restrict its key to a unique,
+non-null scalar result column, and prefer an ordered limited query for UI windows. See the complete
+[live-query guide](/docs/extensions/live-queries).
+
 ## Introspecting the catalog
 
 `introspect()` returns what a schema tool needs to diff a live database against a desired state.
@@ -58,7 +87,7 @@ for (const table of catalog.tables) {
   table.columns; // { id, name, type, integer?, sqlDomain?, nullable, defaultValue?, enumValues?, isAutoIncrementing }
   table.foreignKeys; // scalar column fields plus columns?/parentColumns? for composite keys
   table.checks; // { name, sql }
-  table.triggers; // { name, event, timing }
+  table.triggers; // { id, name, event, timing }; id is immutable until that trigger is dropped
 }
 
 for (const declared of catalog.views) {
@@ -73,6 +102,8 @@ Two things make it plannable rather than merely descriptive:
 
 - **Column IDs are stable across renames.** A rename is only expressible as a diff because the
   column keeps its ID; matching on names alone cannot tell a rename from a drop plus an add.
+- **Trigger IDs identify exact objects.** A trigger keeps its ID for its lifetime. A later trigger
+  may reuse a dropped name but receives a different ID, so tools can detect drop/recreate races.
 - **Derived facts are resolved for you.** `isAutoIncrementing` is reported directly rather than
   leaving a planner to decode a default spec.
 

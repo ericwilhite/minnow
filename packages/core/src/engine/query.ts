@@ -1,5 +1,27 @@
+import {
+  copyDate,
+  dateIsoString,
+  dateMilliseconds,
+  dateUtcDate,
+  dateUtcDay,
+  dateUtcFullYear,
+  dateUtcHours,
+  dateUtcMinutes,
+  dateUtcMonth,
+  dateUtcSeconds,
+  setDateUtcDate,
+  setDateUtcMonth,
+} from "../date-value.js";
 import type { DatabaseRow } from "./database.js";
 import type { ColumnDefault, SqlDomain } from "../storage/types.js";
+import { assertWellFormedString, wellFormedUtf8ByteLength } from "../block-format/unicode.js";
+import {
+  MAX_SQL_NESTING_DEPTH,
+  MAX_SQL_PARAMETERS,
+  MAX_SQL_SCALAR_RESULT_CHARACTERS,
+  MAX_SQL_TEXT_CHARACTERS,
+  MAX_SQL_TOKENS,
+} from "./cache-limits.js";
 import { SqlCompileError } from "./errors.js";
 import {
   cachedQueryTerms,
@@ -31,6 +53,7 @@ import {
 } from "./sql-semantics.js";
 import {
   arrayDomainValue,
+  boundedJsonText,
   collatedDomainValue,
   exactNumericBinary,
   exactNumericValue,
@@ -49,6 +72,7 @@ import {
   prepareVectorQuery,
   type ColumnarTable,
   type AsyncQueryExecutionOptions,
+  type QueryBatchExecutionOptions,
   type PreparedVectorQuery,
 } from "./vector.js";
 
@@ -70,6 +94,10 @@ export interface PreparedQuery {
   readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
   executeAsync(options?: AsyncQueryExecutionOptions): Promise<QueryResult>;
+  executeBatches(
+    options: QueryBatchExecutionOptions,
+    consume: (batch: QueryResult) => void | Promise<void>,
+  ): Promise<readonly string[]>;
   close(): void;
 }
 
@@ -282,7 +310,7 @@ function castValue(value: unknown, target: string): unknown {
     if (typeof external === "string") return protectedSqlTextValue(external);
     if (typeof value === "number") return protectedSqlTextValue(String(value));
     if (typeof value === "boolean") return protectedSqlTextValue(value ? "true" : "false");
-    if (value instanceof Date) return protectedSqlTextValue(value.toISOString());
+    if (value instanceof Date) return protectedSqlTextValue(dateIsoString(value));
   }
   if (target === "number" || target === "number-integer") {
     let parsed: number | undefined;
@@ -323,7 +351,7 @@ function castValue(value: unknown, target: string): unknown {
     if (value instanceof Date) return value;
     if (typeof value === "string" || typeof value === "number") {
       const parsed = new Date(value);
-      if (Number.isFinite(parsed.getTime())) return parsed;
+      if (Number.isFinite(dateMilliseconds(parsed))) return parsed;
       throw new TypeError(`Cannot cast this value to a datetime: ${String(value)}`);
     }
   }
@@ -384,7 +412,7 @@ export function scalarFunctionValue(
     // scalar equality encodings is prefix-free and keeps strings, numbers, booleans, and
     // datetimes distinct, so the ordinary single-key hash join can safely carry a composite.
     if (values.some((value) => value === null || value === undefined)) return null;
-    return JSON.stringify(values.map(encodeSqlEqualityValue));
+    return boundedJsonText(values.map(encodeSqlEqualityValue), false, "Composite key");
   }
   const first = values[0];
   if (first === null || first === undefined) return null;
@@ -421,11 +449,15 @@ export function scalarFunctionValue(
     case "REPLACE": {
       if (values[1] === null || values[1] === undefined) return null;
       if (values[2] === null || values[2] === undefined) return null;
+      const source = stringArgument("REPLACE", first);
       const search = stringArgument("REPLACE", values[1]);
-      if (search === "") return stringArgument("REPLACE", first);
-      return protectedSqlTextValue(
-        stringArgument("REPLACE", first).split(search).join(stringArgument("REPLACE", values[2])),
-      );
+      const replacement = stringArgument("REPLACE", values[2]);
+      assertScalarInputLength(source, "REPLACE source");
+      assertScalarInputLength(search, "REPLACE search text");
+      assertScalarInputLength(replacement, "REPLACE replacement text");
+      if (search === "") return source;
+      assertReplacementResultLength(source, search, replacement);
+      return protectedSqlTextValue(source.split(search).join(replacement));
     }
     case "INSTR": {
       if (values[1] === null || values[1] === undefined) return null;
@@ -433,7 +465,7 @@ export function scalarFunctionValue(
       const needle = stringArgument("INSTR", values[1]);
       const index = haystack.indexOf(needle);
       // 1-based character position, 0 when absent, counting codepoints like LENGTH.
-      return index === -1 ? 0 : Array.from(haystack.slice(0, index)).length + 1;
+      return index === -1 ? 0 : codePointLength(haystack, index) + 1;
     }
     case "EXTRACT":
       return extractDatePart(typeof first === "string" ? first : "", values[1]);
@@ -444,17 +476,23 @@ export function scalarFunctionValue(
     }
     case "ABS":
       return Math.abs(numeric(first));
-    case "UPPER":
-      return protectedSqlTextValue(stringArgument("UPPER", first).toUpperCase());
-    case "LOWER":
-      return protectedSqlTextValue(stringArgument("LOWER", first).toLowerCase());
+    case "UPPER": {
+      const source = stringArgument("UPPER", first);
+      assertScalarInputLength(source, "UPPER input");
+      return boundedScalarResult(source.toUpperCase(), "UPPER result");
+    }
+    case "LOWER": {
+      const source = stringArgument("LOWER", first);
+      assertScalarInputLength(source, "LOWER input");
+      return boundedScalarResult(source.toLowerCase(), "LOWER result");
+    }
     case "TRIM":
       // SQL TRIM removes spaces, not general whitespace.
       return trimEnds("TRIM", first, values[1], "both");
     case "LENGTH":
-      return Array.from(stringArgument("LENGTH", first)).length;
+      return codePointLength(stringArgument("LENGTH", first));
     case "OCTET_LENGTH":
-      return new TextEncoder().encode(stringArgument("OCTET_LENGTH", first)).length;
+      return wellFormedUtf8ByteLength(stringArgument("OCTET_LENGTH", first), "OCTET_LENGTH input");
     case "IS_JSON": {
       const kind = values[1];
       return jsonIsValid(first, typeof kind === "string" ? kind : "value");
@@ -484,22 +522,25 @@ export function scalarFunctionValue(
       if (!Number.isInteger(width) || width < 0) {
         throw new TypeError(`${name} length must be a non-negative integer`);
       }
-      const text = Array.from(stringArgument(name, first));
-      if (text.length >= width) return text.slice(0, width).join("");
+      if (width > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+        throw new RangeError(
+          `${name} result exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+        );
+      }
+      const source = stringArgument(name, first);
+      const text = codePointPrefix(source, width);
+      if (text.count >= width) return boundedScalarResult(text.text, `${name} result`);
       let fill = " ";
       if (values.length > 2) {
         if (values[2] === null || values[2] === undefined) return null;
         fill = stringArgument(name, values[2]);
       }
-      const filler = Array.from(fill);
       // An empty fill cannot pad, so the value passes through, matching PostgreSQL.
-      if (filler.length === 0) return protectedSqlTextValue(text.join(""));
-      const padding: string[] = [];
-      while (padding.length < width - text.length) {
-        padding.push(filler[padding.length % filler.length] ?? "");
-      }
-      return protectedSqlTextValue(
-        name === "LPAD" ? padding.join("") + text.join("") : text.join("") + padding.join(""),
+      const padding = repeatedCodePointPrefix(fill, width - text.count);
+      if (padding === "") return protectedSqlTextValue(text.text);
+      return boundedScalarResult(
+        name === "LPAD" ? padding + text.text : text.text + padding,
+        `${name} result`,
       );
     }
     case "OVERLAY": {
@@ -510,8 +551,12 @@ export function scalarFunctionValue(
           return null;
         }
       }
-      const text = Array.from(stringArgument("OVERLAY", first));
-      const replacement = Array.from(stringArgument("OVERLAY", values[1]));
+      const sourceText = stringArgument("OVERLAY", first);
+      const replacementText = stringArgument("OVERLAY", values[1]);
+      assertScalarInputLength(sourceText, "OVERLAY source");
+      assertScalarInputLength(replacementText, "OVERLAY replacement");
+      const text = Array.from(sourceText);
+      const replacement = Array.from(replacementText);
       const start = numeric(values[2]);
       if (!Number.isInteger(start) || start < 1) {
         throw new TypeError("OVERLAY start must be a positive integer");
@@ -520,12 +565,13 @@ export function scalarFunctionValue(
       if (!Number.isInteger(span) || span < 0) {
         throw new TypeError("OVERLAY length must be a non-negative integer");
       }
-      return protectedSqlTextValue(
+      return boundedScalarResult(
         [
           ...text.slice(0, start - 1),
           ...replacement,
           ...text.slice(Math.min(start - 1 + span, text.length)),
         ].join(""),
+        "OVERLAY result",
       );
     }
     case "CAST":
@@ -534,11 +580,11 @@ export function scalarFunctionValue(
       // PostgreSQL SUBSTRING returns the characters whose positions fall in both the requested
       // window and the string, so a start before 1 shortens the result instead of shifting it,
       // and a window entirely off the string is empty rather than an error.
-      const text = Array.from(stringArgument("SUBSTR", first));
+      const source = stringArgument("SUBSTR", first);
       if (values[1] === null || values[1] === undefined) return null;
       const start = numeric(values[1]);
       if (!Number.isInteger(start)) throw new TypeError("SUBSTR start must be an integer");
-      let until = text.length + 1;
+      let until = Number.POSITIVE_INFINITY;
       if (values.length > 2) {
         if (values[2] === null || values[2] === undefined) return null;
         const length = numeric(values[2]);
@@ -548,9 +594,112 @@ export function scalarFunctionValue(
         until = start + length;
       }
       const from = Math.max(start, 1);
-      const to = Math.min(until, text.length + 1);
-      return protectedSqlTextValue(to <= from ? "" : text.slice(from - 1, to - 1).join(""));
+      if (until <= from) return "";
+      return boundedScalarResult(codePointSlice(source, from - 1, until - 1), "SUBSTR result");
     }
+  }
+}
+
+function assertScalarInputLength(value: string, label: string): void {
+  if (value.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+}
+
+function boundedScalarResult(value: string, label: string): string {
+  if (value.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  return protectedSqlTextValue(value);
+}
+
+function codePointLength(value: string, end = value.length): number {
+  let count = 0;
+  for (let index = 0; index < end; index += 1) {
+    const first = value.charCodeAt(index);
+    if (first >= 0xd800 && first <= 0xdbff && index + 1 < end) {
+      const second = value.charCodeAt(index + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) index += 1;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+function codePointPrefix(value: string, count: number): { text: string; count: number } {
+  let index = 0;
+  let found = 0;
+  while (index < value.length && found < count) {
+    const first = value.charCodeAt(index);
+    index +=
+      first >= 0xd800 &&
+      first <= 0xdbff &&
+      index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 &&
+      value.charCodeAt(index + 1) <= 0xdfff
+        ? 2
+        : 1;
+    found += 1;
+  }
+  return { text: value.slice(0, index), count: found };
+}
+
+function repeatedCodePointPrefix(value: string, count: number): string {
+  if (count <= 0 || value.length === 0) return "";
+  const first = codePointPrefix(value, count);
+  if (first.count >= count) return first.text;
+  const copies = Math.floor(count / first.count);
+  const remainder = count % first.count;
+  return first.text.repeat(copies) + codePointPrefix(first.text, remainder).text;
+}
+
+function codePointSlice(value: string, from: number, to: number): string {
+  let codePoint = 0;
+  let index = 0;
+  let start = value.length;
+  let end = value.length;
+  while (index < value.length) {
+    if (codePoint === from) start = index;
+    if (codePoint === to) {
+      end = index;
+      break;
+    }
+    const first = value.charCodeAt(index);
+    index +=
+      first >= 0xd800 &&
+      first <= 0xdbff &&
+      index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 &&
+      value.charCodeAt(index + 1) <= 0xdfff
+        ? 2
+        : 1;
+    codePoint += 1;
+  }
+  if (codePoint < from) return "";
+  if (to === Number.POSITIVE_INFINITY) end = value.length;
+  const length = end - start;
+  if (length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(
+      `SUBSTR result exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+    );
+  }
+  return value.slice(start, end);
+}
+
+function assertReplacementResultLength(source: string, search: string, replacement: string): void {
+  let matches = 0;
+  let from = 0;
+  for (;;) {
+    const index = source.indexOf(search, from);
+    if (index < 0) break;
+    matches += 1;
+    from = index + search.length;
+  }
+  const resultLength = source.length + matches * (replacement.length - search.length);
+  if (!Number.isSafeInteger(resultLength) || resultLength > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(
+      `REPLACE result exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+    );
   }
 }
 
@@ -615,17 +764,15 @@ export function dateAddValue(value: unknown, months: unknown, milliseconds: unkn
   if (value === null || value === undefined) return null;
   if (!(value instanceof Date)) throw new TypeError("Date arithmetic requires a datetime value");
   const monthCount = Number(months ?? 0);
-  const shifted = new Date(value.getTime());
+  const shifted = copyDate(value);
   if (monthCount !== 0) {
-    const day = shifted.getUTCDate();
-    shifted.setUTCDate(1);
-    shifted.setUTCMonth(shifted.getUTCMonth() + monthCount);
-    const lastDay = new Date(
-      Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, 0),
-    ).getUTCDate();
-    shifted.setUTCDate(Math.min(day, lastDay));
+    const day = dateUtcDate(shifted);
+    setDateUtcDate(shifted, 1);
+    setDateUtcMonth(shifted, dateUtcMonth(shifted) + monthCount);
+    const lastDay = new Date(Date.UTC(dateUtcFullYear(shifted), dateUtcMonth(shifted) + 1, 0));
+    setDateUtcDate(shifted, Math.min(day, dateUtcDate(lastDay)));
   }
-  return new Date(shifted.getTime() + Number(milliseconds ?? 0));
+  return new Date(dateMilliseconds(shifted) + Number(milliseconds ?? 0));
 }
 
 export function dateTruncValue(unit: unknown, value: unknown): Date | null {
@@ -637,9 +784,9 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
   if (value === null || value === undefined) return null;
   if (!(value instanceof Date)) throw new TypeError("DATE_TRUNC requires a datetime value");
   const normalized = unit.toLowerCase();
-  const year = value.getUTCFullYear();
-  const month = value.getUTCMonth();
-  const day = value.getUTCDate();
+  const year = dateUtcFullYear(value);
+  const month = dateUtcMonth(value);
+  const day = dateUtcDate(value);
   switch (normalized) {
     case "year":
       return new Date(Date.UTC(year, 0, 1));
@@ -649,24 +796,24 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
       return new Date(Date.UTC(year, month, 1));
     case "week": {
       const start = new Date(Date.UTC(year, month, day));
-      start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+      setDateUtcDate(start, dateUtcDate(start) - ((dateUtcDay(start) + 6) % 7));
       return start;
     }
     case "day":
       return new Date(Date.UTC(year, month, day));
     case "hour":
-      return new Date(Date.UTC(year, month, day, value.getUTCHours()));
+      return new Date(Date.UTC(year, month, day, dateUtcHours(value)));
     case "minute":
-      return new Date(Date.UTC(year, month, day, value.getUTCHours(), value.getUTCMinutes()));
+      return new Date(Date.UTC(year, month, day, dateUtcHours(value), dateUtcMinutes(value)));
     default:
       return new Date(
         Date.UTC(
           year,
           month,
           day,
-          value.getUTCHours(),
-          value.getUTCMinutes(),
-          value.getUTCSeconds(),
+          dateUtcHours(value),
+          dateUtcMinutes(value),
+          dateUtcSeconds(value),
         ),
       );
   }
@@ -1122,6 +1269,7 @@ function throwLocated(error: unknown, offset: number, span: { start: number; end
 }
 
 export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
+  validateSqlSource(sql);
   const { text, offset } = normalizeSql(sql);
   if (text.length === 0) throw new SqlCompileError("Enter a SELECT query", offset, 0);
   let parser: Parser | undefined;
@@ -1159,7 +1307,7 @@ function columnDefaultFor(expression: Expression, sql: string): ColumnDefault {
     if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
       return { kind: "literal", value };
     }
-    if (value instanceof Date) return { kind: "literal", value: new Date(value.getTime()) };
+    if (value instanceof Date) return { kind: "literal", value: copyDate(value) };
   }
   return { kind: "expression", sql };
 }
@@ -1641,7 +1789,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     if (compiled.kind === "insert" && compiled.onConflict !== undefined) {
       throw new TypeError("Trigger body INSERTs cannot carry ON CONFLICT");
     }
-    if (compiled.kind !== "insert" && compiled.returning !== undefined) {
+    if (compiled.returning !== undefined) {
       throw new TypeError("Trigger bodies cannot carry RETURNING");
     }
     if ((compiled.parameterCount ?? 0) !== bindings.length) {
@@ -1661,6 +1809,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
  * leading keyword fails explicitly.
  */
 export function compileStatement(sql: string): CompiledStatement {
+  validateSqlSource(sql);
   const { text, offset } = normalizeSql(sql);
   if (text.length === 0) throw new SqlCompileError("Enter a SQL statement", offset, 0);
   let parser: Parser | undefined;
@@ -2050,7 +2199,7 @@ function validateParameters(count: number, params: readonly QueryValue[] | undef
       return;
     }
     if (value instanceof Date) {
-      if (!Number.isFinite(value.getTime())) {
+      if (!Number.isFinite(dateMilliseconds(value))) {
         throw new TypeError(`Parameter ${label} must be a valid date`);
       }
       return;
@@ -2171,7 +2320,7 @@ export function clonePlanTree<T>(value: T): T {
 
 function cloneTreeValue(value: unknown): unknown {
   if (typeof value !== "object" || value === null) return value;
-  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof Date) return copyDate(value);
   if (Array.isArray(value)) {
     const copy = new Array<unknown>(value.length);
     for (let index = 0; index < value.length; index += 1)
@@ -2822,6 +2971,8 @@ function trimPreparedResults(
     },
     execute: () => trim(prepared.execute()),
     executeAsync: async (options) => trim(await prepared.executeAsync(options)),
+    executeBatches: (options, consume) =>
+      prepared.executeBatches(options, (batch) => consume(trim(batch))),
     close: () => {
       prepared.close();
     },
@@ -2851,22 +3002,27 @@ export function createPreparedQuery(
   // Every engine entry expands MATCH(*) exactly once, here against the row tables' own
   // columns; past this point no executor sees the "*" sentinel.
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
-  const resolution = subqueryResolutionSteps(plan);
-  for (const step of resolution.steps) step.substitute(executeRowQueryInternal(step.block, tables));
-  plan = resolution.plan;
-  tables = resolveDerivedRowTables(plan, tables);
-  plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
   const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
-  if ([...tables.values()].some((rows) => rows.length === 0)) {
-    if (options.executionMemoryBudgetBytes !== undefined) {
-      memory.close();
-      throw new TypeError(
-        "Query memory budgets require typed columnar schemas when an input table is empty",
-      );
-    }
-    return createPreparedRowQuery(plan, tables, memory);
-  }
   try {
+    // Scalar subqueries and derived row sources are materialized before the vector plan is
+    // prepared. They must share the same context: otherwise a tiny (or the finite default)
+    // budget would apply only after an arbitrarily large intermediate had already escaped the
+    // memory model.
+    const resolution = subqueryResolutionSteps(plan);
+    for (const step of resolution.steps) {
+      step.substitute(executeRowQueryInternal(step.block, tables, memory));
+    }
+    plan = resolution.plan;
+    tables = resolveDerivedRowTables(plan, tables, memory);
+    plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
+    if ([...tables.values()].some((rows) => rows.length === 0)) {
+      if (options.executionMemoryBudgetBytes !== undefined) {
+        throw new TypeError(
+          "Query memory budgets require typed columnar schemas when an input table is empty",
+        );
+      }
+      return createPreparedRowQuery(plan, tables, memory);
+    }
     return trimPreparedResults(
       createPreparedColumnarQuery(plan, normalizeColumnarTables(plan, tables), memory),
       externalizeQueryResult,
@@ -2934,6 +3090,12 @@ export function createPreparedColumnarQuery(
         outputNeedsExternalization,
       );
     },
+    executeBatches(options, consume) {
+      if (closed || prepared === undefined) throw new Error("Prepared query is closed");
+      return prepared.executeBatches(options, (batch) =>
+        consume(markExternalizationState(batch, outputNeedsExternalization)),
+      );
+    },
     close() {
       if (closed) return;
       closed = true;
@@ -2959,11 +3121,48 @@ function createPreparedRowQuery(
     },
     execute() {
       if (closed || rows === undefined) throw new Error("Prepared query is closed");
-      return externalizeQueryResult(executeRowQueryInternal(plan, cloneRowTables(rows)));
+      const executionMemory = memory.createChild();
+      try {
+        return externalizeQueryResult(
+          executeRowQueryInternal(plan, cloneRowTables(rows), executionMemory),
+        );
+      } finally {
+        executionMemory.close();
+      }
     },
     async executeAsync() {
       if (closed || rows === undefined) throw new Error("Prepared query is closed");
-      return externalizeQueryResult(executeRowQueryInternal(plan, cloneRowTables(rows)));
+      const executionMemory = memory.createChild();
+      try {
+        return externalizeQueryResult(
+          executeRowQueryInternal(plan, cloneRowTables(rows), executionMemory),
+        );
+      } finally {
+        executionMemory.close();
+      }
+    },
+    async executeBatches(options, consume) {
+      if (closed || rows === undefined) throw new Error("Prepared query is closed");
+      if (!Number.isSafeInteger(options.batchRows) || options.batchRows <= 0) {
+        throw new RangeError("Query batch rows must be a positive whole number");
+      }
+      const executionMemory = memory.createChild();
+      let result: QueryResult;
+      try {
+        result = externalizeQueryResult(
+          executeRowQueryInternal(plan, cloneRowTables(rows), executionMemory),
+        );
+      } finally {
+        executionMemory.close();
+      }
+      for (let start = 0; start < result.rows.length; start += options.batchRows) {
+        options.signal?.throwIfAborted();
+        await consume({
+          columns: [...result.columns],
+          rows: result.rows.slice(start, start + options.batchRows),
+        });
+      }
+      return result.columns;
     },
     close() {
       closed = true;
@@ -2985,7 +3184,7 @@ function cloneRowTables(
           Object.entries(row).map(([column, value]) => [
             column,
             value instanceof Date
-              ? new Date(value.getTime())
+              ? copyDate(value)
               : protectText && typeof value === "string"
                 ? protectedSqlTextValue(value)
                 : value,
@@ -3304,10 +3503,10 @@ export function resolveStatementDatetimes(
   now: Date = new Date(),
 ): CompiledQuery {
   if (plan.usesStatementDatetime !== true) return plan;
-  const iso = now.toISOString();
+  const iso = dateIsoString(now);
   const values = new Map<string, QueryValue>([
     ["CURRENT_DATE", new Date(`${iso.slice(0, 10)}T00:00:00.000Z`)],
-    ["CURRENT_TIMESTAMP", new Date(now.getTime())],
+    ["CURRENT_TIMESTAMP", copyDate(now)],
     ["LOCALTIME", iso.slice(11, 19)],
   ]);
   const resolved = clonePlanTree(plan);
@@ -3942,6 +4141,7 @@ export function applyWindowFunctions(
 function resolveDerivedRowTables(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
+  memory?: QueryMemoryContext,
 ): ReadonlyMap<string, DatabaseRow[]> {
   const sources = [plan.base, ...plan.joins];
   const needsDual = sources.some(
@@ -3964,27 +4164,29 @@ function resolveDerivedRowTables(
   for (const source of sources) {
     if (source.recursive !== undefined) {
       const { reference, base, step, all } = source.recursive;
-      const state = createRecursiveCteState(executeRowQueryInternal(base, tables), all);
+      const state = createRecursiveCteState(executeRowQueryInternal(base, tables, memory), all);
       while (state.frontier.length > 0) {
         const stepTables = new Map(tables);
         stepTables.set(reference, state.frontier);
-        state.absorb(executeRowQueryInternal(step, stepTables));
+        state.absorb(executeRowQueryInternal(step, stepTables, memory));
       }
       resolved.set(source.table, state.rows);
       continue;
     }
     if (source.union !== undefined) {
-      const results = source.union.blocks.map((block) => executeRowQueryInternal(block, tables));
+      const results = source.union.blocks.map((block) =>
+        executeRowQueryInternal(block, tables, memory),
+      );
       resolved.set(source.table, combineUnionResults(results, source.union.ops).rows);
       continue;
     }
     if (source.windowed !== undefined) {
-      const inner = executeRowQueryInternal(source.windowed.block, tables);
+      const inner = executeRowQueryInternal(source.windowed.block, tables, memory);
       resolved.set(source.table, applyWindowFunctions(inner, source.windowed.windows).rows);
       continue;
     }
     if (source.derived === undefined) continue;
-    resolved.set(source.table, executeRowQueryInternal(source.derived, tables).rows);
+    resolved.set(source.table, executeRowQueryInternal(source.derived, tables, memory).rows);
   }
   return resolved;
 }
@@ -4022,6 +4224,7 @@ export function executeRowQuery(
 function executeRowQueryInternal(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
+  memory?: QueryMemoryContext,
 ): QueryResult {
   assertTailParametersBound(plan);
   validateGrouping(plan);
@@ -4034,7 +4237,7 @@ function executeRowQueryInternal(
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
   for (const step of resolution.steps) {
-    step.substitute(executeRowQueryInternal(step.block, tables));
+    step.substitute(executeRowQueryInternal(step.block, tables, memory));
   }
   // Stats annotation writes into the plan; when resolution had nothing to clone, the plan is
   // still the caller's (possibly cached) object, and frozen statistics would survive into later
@@ -4043,7 +4246,7 @@ function executeRowQueryInternal(
     resolution.plan === plan && planContainsFts(plan, "bm25")
       ? structuredClone(plan)
       : resolution.plan;
-  tables = resolveDerivedRowTables(plan, tables);
+  tables = resolveDerivedRowTables(plan, tables, memory);
   plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
   annotateRowFtsStats(plan, tables);
   let contexts: RowContext[] = (tables.get(plan.base.table) ?? []).map((row) => ({
@@ -4068,9 +4271,10 @@ function executeRowQueryInternal(
       group.push(context);
       groups.set(key, group);
     }
-    rows = [...groups.values()]
-      .filter((group) =>
-        plan.having.every(
+    rows = [];
+    for (const group of groups.values()) {
+      if (
+        !plan.having.every(
           (predicate) =>
             evaluateBooleanExpression(
               {
@@ -4081,11 +4285,21 @@ function executeRowQueryInternal(
               },
               (nested) => evaluate(nested, group[0] ?? {}, group),
             ) === true,
-        ),
-      )
-      .map((group) => project(plan.select, group[0] ?? {}, group));
+        )
+      ) {
+        continue;
+      }
+      const row = project(plan.select, group[0] ?? {}, group);
+      memory?.tally(rowQueryPayloadBytes(row), "Row query result");
+      rows.push(row);
+    }
   } else {
-    rows = contexts.map((context) => project(plan.select, context));
+    rows = [];
+    for (const context of contexts) {
+      const row = project(plan.select, context);
+      memory?.tally(rowQueryPayloadBytes(row), "Row query result");
+      rows.push(row);
+    }
   }
   if (plan.orderBy.length > 0) {
     // Only a wildcard select needs the source shapes: every other select resolves against its
@@ -4122,6 +4336,26 @@ function executeRowQueryInternal(
       ? Object.keys(rows[0] ?? {})
       : plan.select.map((item) => item.alias);
   return ties.trim({ columns, rows });
+}
+
+/** Matches the vector executor's deliberately inexpensive modeled result-payload accounting. */
+function rowQueryPayloadBytes(row: QueryRow): number {
+  let total = 8;
+  for (const key in row) {
+    const value = row[key] ?? null;
+    total +=
+      value === null
+        ? 1
+        : typeof value === "boolean"
+          ? 2
+          : typeof value === "number" || value instanceof Date
+            ? 9
+            : 1 + value.length;
+  }
+  if (!Number.isSafeInteger(total) || total < 0) {
+    throw new RangeError("Row query result payload exceeds the safe integer range");
+  }
+  return total;
 }
 
 /** One ORDER BY resolution source: an alias and the columns a wildcard select exposes from it. */
@@ -4426,7 +4660,7 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (expression.distinct === true) {
           const seen = new Set<unknown>();
           values = values.filter((value) => {
-            const key = value instanceof Date ? ` d${String(value.getTime())}` : value;
+            const key = value instanceof Date ? ` d${String(dateMilliseconds(value))}` : value;
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
@@ -4596,11 +4830,6 @@ export function cachedListMembership(
   return cached;
 }
 
-/** Compiles a LIKE pattern (% = any run, _ = any character) to an anchored RegExp, cached. */
-export function likeRegExp(pattern: string, caseInsensitive = false, escape?: string): RegExp {
-  return compileLikePattern(pattern, caseInsensitive, escape);
-}
-
 const extractFields: ReadonlySet<string> = new Set([
   "year",
   "quarter",
@@ -4627,42 +4856,38 @@ function extractDatePart(field: string, value: unknown): number | null {
   if (!(value instanceof Date)) throw new TypeError("EXTRACT requires a datetime value");
   switch (normalized) {
     case "year":
-      return value.getUTCFullYear();
+      return dateUtcFullYear(value);
     case "quarter":
-      return Math.floor(value.getUTCMonth() / 3) + 1;
+      return Math.floor(dateUtcMonth(value) / 3) + 1;
     case "month":
-      return value.getUTCMonth() + 1;
+      return dateUtcMonth(value) + 1;
     case "week": {
       const date = new Date(
-        Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()),
+        Date.UTC(dateUtcFullYear(value), dateUtcMonth(value), dateUtcDate(value)),
       );
       // ISO week: shift to the Thursday of this week, then count weeks from January 1st.
-      date.setUTCDate(date.getUTCDate() + 4 - (date.getUTCDay() || 7));
-      const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
-      return Math.ceil(((date.getTime() - yearStart) / 86_400_000 + 1) / 7);
+      setDateUtcDate(date, dateUtcDate(date) + 4 - (dateUtcDay(date) || 7));
+      const yearStart = Date.UTC(dateUtcFullYear(date), 0, 1);
+      return Math.ceil(((dateMilliseconds(date) - yearStart) / 86_400_000 + 1) / 7);
     }
     case "day":
-      return value.getUTCDate();
+      return dateUtcDate(value);
     case "hour":
-      return value.getUTCHours();
+      return dateUtcHours(value);
     case "minute":
-      return value.getUTCMinutes();
+      return dateUtcMinutes(value);
     case "second":
-      return value.getUTCSeconds();
+      return dateUtcSeconds(value);
     case "epoch":
-      return value.getTime() / 1000;
+      return dateMilliseconds(value) / 1000;
     default:
-      return value.getUTCDay();
+      return dateUtcDay(value);
   }
 }
 
-type LikeMatcher = (value: string) => boolean;
-const likeMatcherCache = new Map<string, LikeMatcher>();
-
 /**
- * A compiled LIKE matcher. Patterns shaped `abc%`, `%abc`, `%abc%`, and `abc` skip the regular
- * expression entirely — prefix/suffix/containment string scans are several times faster and
- * dominate real workloads — and everything else falls back to the anchored RegExp.
+ * Shared bounded LIKE matcher. Compilation and the common literal prefix/suffix/containment
+ * fast paths are cached in sql-semantics; complex wildcard shapes have deterministic work caps.
  */
 export function likeMatches(
   pattern: string,
@@ -4670,38 +4895,7 @@ export function likeMatches(
   caseInsensitive = false,
   escape?: string,
 ): boolean {
-  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""}\0${pattern}`;
-  let matcher = likeMatcherCache.get(key);
-  if (matcher === undefined) {
-    matcher = buildLikeMatcher(pattern, caseInsensitive, escape);
-    if (likeMatcherCache.size >= 128) likeMatcherCache.clear();
-    likeMatcherCache.set(key, matcher);
-  }
-  return matcher(value);
-}
-
-function buildLikeMatcher(
-  pattern: string,
-  caseInsensitive: boolean,
-  escape: string | undefined,
-): LikeMatcher {
-  if (escape === undefined && !pattern.includes("_")) {
-    const leading = pattern.startsWith("%");
-    const trailing = pattern.endsWith("%");
-    const body = pattern.slice(leading ? 1 : 0, trailing ? pattern.length - 1 : undefined);
-    if (!body.includes("%")) {
-      const needle = caseInsensitive ? body.toLowerCase() : body;
-      const fold = caseInsensitive
-        ? (value: string) => value.toLowerCase()
-        : (value: string) => value;
-      if (leading && trailing) return (value) => fold(value).includes(needle);
-      if (trailing) return (value) => fold(value).startsWith(needle);
-      if (leading) return (value) => fold(value).endsWith(needle);
-      return (value) => fold(value) === needle;
-    }
-  }
-  const regExp = likeRegExp(pattern, caseInsensitive, escape);
-  return (value) => regExp.test(value);
+  return compileLikePattern(pattern, caseInsensitive, escape).test(value);
 }
 
 /** Splits a quantified operator like "> ANY" into its comparison and quantifier. */
@@ -5049,7 +5243,7 @@ export function expressionAliases(expression: Expression): Set<string> {
 }
 
 function comparable(value: unknown): unknown {
-  return value instanceof Date ? value.getTime() : value;
+  return value instanceof Date ? dateMilliseconds(value) : value;
 }
 
 /**
@@ -7552,6 +7746,11 @@ class Parser {
         throw new TypeError("Use either ? or $n placeholders in one statement, not both");
       }
       this.#positionalParameters += 1;
+      if (this.#positionalParameters > MAX_SQL_PARAMETERS) {
+        throw new RangeError(
+          `A SQL statement cannot exceed ${String(MAX_SQL_PARAMETERS)} parameters`,
+        );
+      }
       return { kind: "parameter", index: this.#positionalParameters - 1 };
     }
     if (this.#positionalParameters > 0) {
@@ -7560,6 +7759,11 @@ class Parser {
     const number = Number(token.text);
     if (!Number.isInteger(number) || number < 1) {
       throw new TypeError(`Parameter numbers start at $1: $${token.text}`);
+    }
+    if (number > MAX_SQL_PARAMETERS) {
+      throw new RangeError(
+        `A SQL statement cannot exceed ${String(MAX_SQL_PARAMETERS)} parameters`,
+      );
     }
     this.#highestNumberedParameter = Math.max(this.#highestNumberedParameter, number);
     return { kind: "parameter", index: number - 1 };
@@ -7809,7 +8013,7 @@ class Parser {
     }
     if (upper === "DATE" && this.#peek().kind === "string") {
       const date = new Date(`${this.#take("string").text}T00:00:00.000Z`);
-      if (!Number.isFinite(date.getTime())) throw new TypeError("Invalid DATE literal");
+      if (!Number.isFinite(dateMilliseconds(date))) throw new TypeError("Invalid DATE literal");
       return { kind: "literal", value: date };
     }
     if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
@@ -9414,7 +9618,9 @@ function jsonTableColumnValue(
   else if (typeof value === "string") date = new Date(value);
   else if (typeof value === "number") date = new Date(value);
   else throw new TypeError("JSON_TABLE datetime is invalid");
-  if (!Number.isFinite(date.getTime())) throw new TypeError("JSON_TABLE datetime is invalid");
+  if (!Number.isFinite(dateMilliseconds(date))) {
+    throw new TypeError("JSON_TABLE datetime is invalid");
+  }
   return date;
 }
 
@@ -9428,7 +9634,9 @@ export function timestampLiteral(text: string): Date {
   const [, day, time = "00:00:00", zone = "Z"] = match;
   const seconds = time.length === 5 ? `${time}:00` : time;
   const date = new Date(`${String(day)}T${seconds}${zone === "Z" ? "Z" : zone}`);
-  if (!Number.isFinite(date.getTime())) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
+  if (!Number.isFinite(dateMilliseconds(date))) {
+    throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
+  }
   return date;
 }
 
@@ -9628,6 +9836,31 @@ function validNumericLiteral(text: string, radix: number): boolean {
 
 function tokenize(sql: string): Token[] {
   const tokens: Token[] = [];
+  let nestingDepth = 0;
+  const push = (token: Token): void => {
+    if (tokens.length >= MAX_SQL_TOKENS) {
+      throw new SqlCompileError(
+        `A SQL statement cannot exceed ${String(MAX_SQL_TOKENS)} tokens`,
+        token.start,
+        Math.max(token.end - token.start, 1),
+      );
+    }
+    if (token.kind === "punctuation") {
+      if (token.text === "(" || token.text === "[") {
+        nestingDepth += 1;
+        if (nestingDepth > MAX_SQL_NESTING_DEPTH) {
+          throw new SqlCompileError(
+            `SQL nesting cannot exceed ${String(MAX_SQL_NESTING_DEPTH)} levels`,
+            token.start,
+            1,
+          );
+        }
+      } else if ((token.text === ")" || token.text === "]") && nestingDepth > 0) {
+        nestingDepth -= 1;
+      }
+    }
+    tokens.push(token);
+  };
   let index = 0;
   while (index < sql.length) {
     const character = sql[index] ?? "";
@@ -9638,7 +9871,7 @@ function tokenize(sql: string): Token[] {
     if (/[A-Za-z_]/.test(character)) {
       const start = index++;
       while (index < sql.length && /[A-Za-z0-9_]/.test(sql[index] ?? "")) index += 1;
-      tokens.push({ kind: "identifier", text: sql.slice(start, index), start, end: index });
+      push({ kind: "identifier", text: sql.slice(start, index), start, end: index });
       continue;
     }
     if (/\d/.test(character)) {
@@ -9658,7 +9891,7 @@ function tokenize(sql: string): Token[] {
             index - start,
           );
         }
-        tokens.push({ kind: "number", text: String(value), start, end: index });
+        push({ kind: "number", text: String(value), start, end: index });
         continue;
       }
       index += 1;
@@ -9667,7 +9900,7 @@ function tokenize(sql: string): Token[] {
       const text = sql.slice(start, index);
       if (!validNumericLiteral(text, 10))
         throw new SqlCompileError(`Invalid number: ${text}`, start, index - start);
-      tokens.push({ kind: "number", text: text.replaceAll("_", ""), start, end: index });
+      push({ kind: "number", text: text.replaceAll("_", ""), start, end: index });
       continue;
     }
     if (character === "'") {
@@ -9686,7 +9919,7 @@ function tokenize(sql: string): Token[] {
       }
       if (!closed)
         throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
-      tokens.push({ kind: "string", text: value, start, end: index });
+      push({ kind: "string", text: value, start, end: index });
       continue;
     }
     if (character === '"') {
@@ -9709,11 +9942,11 @@ function tokenize(sql: string): Token[] {
       if (value.length === 0) {
         throw new SqlCompileError("Quoted identifiers cannot be empty", start, index - start);
       }
-      tokens.push({ kind: "identifier", text: value, quoted: true, start, end: index });
+      push({ kind: "identifier", text: value, quoted: true, start, end: index });
       continue;
     }
     if (character === "?") {
-      tokens.push({ kind: "parameter", text: "", start: index, end: index + 1 });
+      push({ kind: "parameter", text: "", start: index, end: index + 1 });
       index += 1;
       continue;
     }
@@ -9724,7 +9957,7 @@ function tokenize(sql: string): Token[] {
       if (digits.length === 0) {
         throw new SqlCompileError("Expected a parameter number after $", start, 1);
       }
-      tokens.push({ kind: "parameter", text: digits, start, end: index });
+      push({ kind: "parameter", text: digits, start, end: index });
       continue;
     }
     const pair = sql.slice(index, index + 2);
@@ -9746,22 +9979,30 @@ function tokenize(sql: string): Token[] {
     if (character === ";") {
       // Statement separators lex normally; the routers reject them everywhere except inside
       // a CREATE TRIGGER body, which is the one multi-statement construct.
-      tokens.push({ kind: "punctuation", text: ";", start: index, end: index + 1 });
+      push({ kind: "punctuation", text: ";", start: index, end: index + 1 });
       index += 1;
       continue;
     }
     if ([">=", "<=", "!=", "<>", "||"].includes(pair)) {
-      tokens.push({ kind: "operator", text: pair, start: index, end: index + 2 });
+      push({ kind: "operator", text: pair, start: index, end: index + 2 });
       index += 2;
       continue;
     }
     if (["+", "-", "*", "/", "%", "=", ">", "<"].includes(character))
-      tokens.push({ kind: "operator", text: character, start: index, end: index + 1 });
+      push({ kind: "operator", text: character, start: index, end: index + 1 });
     else if (["(", ")", "[", "]", ",", "."].includes(character))
-      tokens.push({ kind: "punctuation", text: character, start: index, end: index + 1 });
+      push({ kind: "punctuation", text: character, start: index, end: index + 1 });
     else throw new SqlCompileError(`Unsupported SQL character: ${character}`, index, 1);
     index += 1;
   }
   tokens.push({ kind: "eof", text: "", start: sql.length, end: sql.length });
   return tokens;
+}
+
+function validateSqlSource(sql: string): void {
+  if (typeof sql !== "string") throw new TypeError("SQL must be a string");
+  if (sql.length > MAX_SQL_TEXT_CHARACTERS) {
+    throw new RangeError(`SQL text cannot exceed ${String(MAX_SQL_TEXT_CHARACTERS)} characters`);
+  }
+  assertWellFormedString(sql, "SQL text");
 }

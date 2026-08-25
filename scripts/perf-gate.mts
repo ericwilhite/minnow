@@ -13,9 +13,30 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { MemoryBlockStore } from "../packages/core/src/storage/index.js";
-import { MinnowDatabase } from "../packages/core/src/engine/database.js";
+import {
+  MinnowDatabase,
+  type VisibleSegment,
+  type VisibleSegmentPageCursor,
+} from "../packages/core/src/engine/database.js";
 import { MinnowDialect } from "../packages/kysely/src/dialect.js";
 import { Kysely } from "kysely";
+
+async function allVisibleSegments(
+  database: MinnowDatabase,
+  tableName: string,
+): Promise<VisibleSegment[]> {
+  const records: VisibleSegment[] = [];
+  let cursor: VisibleSegmentPageCursor | null = null;
+  do {
+    const page = await database.listVisibleSegmentPage(
+      tableName,
+      cursor === null ? {} : { cursor },
+    );
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
 
 const BASELINE_PATH = new URL("../packages/core/perf-baseline.json", import.meta.url);
 const ROWS = 200_000;
@@ -621,13 +642,14 @@ const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
   // Wait for the background loops to finish: no active job, the table folded, and the store's
   // footprint no longer moving. A history that does not settle is a failure of the gate, not a
   // slow sample: maintenance has to keep up with a thousand updates.
-  const footprint = async (): Promise<string> =>
-    JSON.stringify([
-      (await settled.listVisibleSegments("data_settled")).length,
-      (await settledStore.listBlockIds()).length,
-      (await settledStore.listManifests()).filter((manifest) => manifest.prunedAt === undefined)
-        .length,
+  const footprint = async (): Promise<string> => {
+    const stats = await settledStore.getStorageStats();
+    return JSON.stringify([
+      (await allVisibleSegments(settled, "data_settled")).length,
+      stats.liveBlockCount + stats.obsoleteBlockCount,
+      stats.manifestCount,
     ]);
+  };
   let previous = await footprint();
   let quiet = 0;
   const deadline = performance.now() + 60_000;
@@ -642,7 +664,7 @@ const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
     const activeCollection = (await settled.listGarbageCollectionJobs()).some(
       (job) => job.state === "planned" || job.state === "running",
     );
-    const due = (await settled.listVisibleSegments("data_settled")).length >= 32;
+    const due = (await allVisibleSegments(settled, "data_settled")).length >= 32;
     const current = await footprint();
     quiet = !activeCompaction && !activeCollection && !due && current === previous ? quiet + 1 : 0;
     previous = current;

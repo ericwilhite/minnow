@@ -22,6 +22,10 @@ threshold plans a fold and drives it to publication in small steps, yielding bet
 keeps going while the table is still due. To drive it yourself — a slice per idle callback, so it
 never holds the main thread:
 
+Setting `autoCompact: false` transfers that responsibility to the caller. Small-write segments
+then accumulate, so scans become progressively slower and writes eventually meet the fixed
+segment-history ceiling unless the application drives `compactTable` or `compactTableStep`.
+
 ```ts
 const db = new MinnowDatabase(store, { autoCompact: false });
 
@@ -85,6 +89,10 @@ above the fold threshold.
 Jobs are records in the store, so `listCompactionJobs()` finds one a previous session left behind
 and `resumeCompactionJob(jobId)` picks it up. `cancelCompactionJob(jobId)` stops one cleanly —
 compaction is visible-data-neutral by construction, so cancelling it can never lose data.
+The store atomically admits only one non-terminal compaction for a table, so two tabs racing the
+plan step converge on the same durable job instead of creating parallel roots. A table may retain
+at most 4,096 level-zero segments; a write at the ceiling first assists compaction and then applies
+backpressure rather than letting every later query grow linearly forever.
 
 ## Garbage collection
 
@@ -102,27 +110,61 @@ non-terminal job still roots it. That is what makes collection safe while a repo
 everything that version needs.
 
 The completed pass also removes expired reader leases, abandoned query-spill owners and pages,
-old manifest markers below the earliest readable checkpoint once every unused block they name
-is gone, and finished maintenance-job records beyond the small diagnostic tail. Keeping that
-marker until its last block disappears lets small passes resume a large cleanup without losing
-its durable block list. These are record bounds, not just block-byte bounds: normal
+old manifest summaries below the earliest readable checkpoint, and finished maintenance-job
+records beyond the small diagnostic tail. Retired block intervals live in a separate paged
+provenance index until collection removes each payload and its provenance atomically. Summary
+pruning therefore cannot lose a large cleanup's durable discovery cursor. These are record bounds,
+not just block-byte bounds: normal
 commits, cancelled folds, and crashed readers do not leave one permanent metadata record per
 event. Segment discovery reads bounded `listSegmentPage()` windows directly, so reclaiming old
 segment and transaction records does not depend on keeping an unbounded compaction-job history.
+Only one planned/running collection job may exist. Its durable cursor advances across the
+ID-ordered retired-provenance and segment pages, so a large obsolete history is read once across
+bounded steps and reopen—not rescanned from its first ID on every step.
 
-It runs automatically by default (`autoCollect`, which follows `autoCompact`): a pass after every
-background fold, whose superseded blocks are what a pass reclaims; a pass every 64 commits, since
-every commit writes a manifest; and a pass a minute after the last commit, so a tab that stops
-writing still shrinks. Background passes keep the 64 most recent versions readable for up to a
-minute, so `query({ version })` on a version you were just handed still finds it. An explicit
-`collectGarbage()` reclaims everything no lease or job pins; pass `retainRecentVersions` to keep a
-window.
+It runs automatically by default. `autoCollect` is independent of `autoCompact`: disabling folds
+must not also disable reclamation of manifests, expired leases, abandoned transactions, spill,
+or job records. A pass follows every background fold, runs every 64 commits, and runs a minute
+after open or the last commit so a reopened, read-only tab still shrinks. A large backlog schedules another
+bounded pass until it settles instead of stopping at one internal batch. Background passes keep
+the 64 most recent versions readable for up to a minute, so `query({ version })` on a version you
+were just handed still finds it. An explicit `collectGarbage()` reclaims everything no lease or
+job pins; pass `retainRecentVersions` to keep a window.
+
+Collection failures are visible and bounded. `db.maintenanceStatus()` reports pending commit
+debt, whether a pass is running or queued, retry time, consecutive failures, and the last error.
+Failures retry on a capped timer even when no more writes arrive. If repeated failures let debt
+reach the safety ceiling, the next write first assists collection and throws
+`MaintenanceBacklogError` if growth still cannot be bounded; already committed data is unchanged.
+
+Active writers are durable but not immortal. A one-stage explicit scope starts with a renewable
+reader lease on its pre-scope manifest, so compaction and collection cannot reclaim that snapshot
+while its only staged batch is still process-local. When a second stage makes the journal durable,
+ownership passes without a gap to the transaction record. The live scope renews whichever owner is
+current, including while an awaited `write()` callback or SQL transaction is idle. A deadline that
+has passed cannot be resurrected. Collection atomically races record renewal against expiry-abort,
+then reclaims the aborted journal and its staged blocks; an expired pre-journal lease is ordinary
+reader-lease garbage. Artifacts left by a killed tab therefore need neither a later write nor manual
+recovery.
+
+Posting accelerators have their own growth fuse. Full-text and scalar secondary indexes fold
+their per-commit delta tail back into a base in the background. If a persistent storage failure
+prevents rebuilding, Minnow first marks the accelerator invalid (so every reader scans), then
+removes its base and deltas before the tail can grow without limit. Query results stay exact and a
+later relevant query rebuilds the accelerator after storage recovers. A `UNIQUE` index keeps its
+separate fail-closed membership set throughout; losing acceleration never weakens enforcement.
 
 The same stepped shape applies:
 
 ```ts
-await db.collectGarbageStep({ jobId, maxItems: 128 });
+let progress = await db.collectGarbageStep({ maxItems: 128 });
+while (progress.result === null) {
+  progress = await db.resumeGarbageCollectionJob(progress.jobId, { maxItems: 128 });
+}
 ```
+
+Public maintenance steps accept at most 1,024 planning or work items per call. Larger cleanups use
+the cursor and another call, keeping adapter transactions, WAL frames, and response arrays bounded.
 
 ## Scheduling
 
@@ -135,6 +177,7 @@ yield between them. To drive them yourself instead, turn both off and use the st
 - At startup, resume jobs a previous session left and call
   [`cleanupQuerySpill()`](/docs/engine/memory#spill-cleanup) if automatic collection is off.
 
-Leaving them undone costs storage and scan speed. It never costs correctness — a database that
-is never compacted or collected still answers every query correctly, just over more blocks and
-more bytes than it needs.
+Leaving them undone costs storage and scan speed. It never changes an answer — a database that is
+not compacted or collected still reads correctly over more blocks and bytes — but new growth is
+eventually refused at the fixed segment, history, or maintenance-debt safety ceiling. Run or
+restore maintenance rather than treating those fuses as an operating target.

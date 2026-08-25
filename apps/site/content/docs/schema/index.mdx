@@ -12,7 +12,8 @@ surface that [client adapters and other tooling](/docs/reference/extending) buil
 ## Defining a schema
 
 ```ts
-import { column, schema, table, typedTable, view } from "@minnowdb/core";
+import { column, schema, table, view } from "@minnowdb/core";
+import { typedTable } from "@minnowdb/core/schema";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -167,8 +168,9 @@ CREATE TABLE children (
 ```
 
 Each check is a boolean SQL expression over the table's own columns, compiled when the table is
-created — so an expression the engine cannot evaluate fails at migration time rather than on the
-first write.
+declared — so invalid SQL, an unknown column, or a reference to another relation fails before
+`migrate()` can change the catalog. CHECK and FOREIGN KEY names share the table's constraint
+namespace; a duplicate name across kinds is rejected at declaration time.
 
 ### Composite primary and foreign keys
 
@@ -321,7 +323,7 @@ SQL/Kysely migration concerns; the schema DSL does not claim ownership of them.
 ### Proven rather than assumed
 
 Two changes are earned rather than declared. Both read block headers only — the same
-checksum-authenticated statistics that drive data skipping — so they cost one header read per
+checksum-verified statistics that drive data skipping — so they cost one header read per
 block, with nothing decompressed or decoded:
 
 - **Tightening a column to NOT NULL.** Every block records its own null count. If any visible row

@@ -1,6 +1,8 @@
-import type { BlockStore } from "../storage/index.js";
+import type { BlockStore } from "../storage/types.js";
+import { MAX_SNAPSHOT_STREAM_CHUNK_BYTES } from "../storage/snapshot.js";
 import {
   parseRpcRequest,
+  MAX_DATABASE_RPC_IN_FLIGHT,
   rpcEvent,
   rpcFailure,
   rpcResult,
@@ -14,6 +16,7 @@ import {
   type BufferedTableWriter,
   type BatchValue,
   type BufferedWriterOptions,
+  type QueryCursorOptions,
   type QueryOptions,
   type ReadTableOptions,
 } from "./database.js";
@@ -45,7 +48,18 @@ export type StoreDescriptor =
 /** The cloneable subset of MinnowDatabaseOptions; function-valued seams stay worker-side. */
 export type WireDatabaseOptions = Pick<
   MinnowDatabaseOptions,
-  "compression" | "rowsPerBlock" | "maxCommitRetries" | "spillOwnerLeaseMs" | "bufferPoolBytes"
+  | "compression"
+  | "targetBlockBytes"
+  | "rowsPerBlock"
+  | "maxCommitRetries"
+  | "spillOwnerLeaseMs"
+  | "transactionOwnerLeaseMs"
+  | "transactionIdleTimeoutMs"
+  | "bufferPoolBytes"
+  | "executionMemoryBudgetBytes"
+  | "autoCollectDebtLimitCommits"
+  | "autoCollect"
+  | "autoCompact"
 >;
 
 export interface DatabaseInitPayload {
@@ -74,12 +88,117 @@ class ColumnarResult {
   constructor(readonly encoded: EncodedQueryResult) {}
 }
 
+class CursorBatchResult {
+  constructor(readonly encoded: EncodedQueryResult | undefined) {}
+}
+
+class SnapshotChunkResult {
+  constructor(readonly chunk: Uint8Array<ArrayBuffer>) {}
+}
+
 class WriteScopeAbortedError extends Error {
   override readonly name = "WriteScopeAbortedError";
 
   constructor() {
     super("Write scope aborted");
   }
+}
+
+/** One-chunk rendezvous. The sender is acknowledged only when the decoder asks for more. */
+class SnapshotImportChunkQueue implements AsyncIterable<Uint8Array>, AsyncIterator<Uint8Array> {
+  #queued:
+    | {
+        chunk: Uint8Array;
+        resolve: () => void;
+        reject: (error: unknown) => void;
+      }
+    | undefined;
+  #consumed:
+    | {
+        resolve: () => void;
+        reject: (error: unknown) => void;
+      }
+    | undefined;
+  #reader:
+    | {
+        resolve: (result: IteratorResult<Uint8Array>) => void;
+        reject: (error: unknown) => void;
+      }
+    | undefined;
+  #finished = false;
+  #failure: unknown;
+
+  [Symbol.asyncIterator](): AsyncIterator<Uint8Array> {
+    return this;
+  }
+
+  push(chunk: Uint8Array): Promise<void> {
+    if (chunk.byteLength > MAX_SNAPSHOT_STREAM_CHUNK_BYTES) {
+      throw new RangeError("Snapshot transfer chunk exceeds the 1 MiB limit");
+    }
+    if (this.#failure !== undefined) return Promise.reject(snapshotQueueError(this.#failure));
+    if (this.#finished) return Promise.reject(new Error("Snapshot import transfer is closed"));
+    if (this.#queued !== undefined) {
+      return Promise.reject(new Error("Snapshot import transfer already has a queued chunk"));
+    }
+    return new Promise<void>((resolve, reject) => {
+      const reader = this.#reader;
+      if (reader === undefined) {
+        this.#queued = { chunk, resolve, reject };
+        return;
+      }
+      this.#reader = undefined;
+      this.#consumed = { resolve, reject };
+      reader.resolve({ done: false, value: chunk });
+    });
+  }
+
+  async next(): Promise<IteratorResult<Uint8Array>> {
+    this.#consumed?.resolve();
+    this.#consumed = undefined;
+    if (this.#failure !== undefined) throw snapshotQueueError(this.#failure);
+    const queued = this.#queued;
+    if (queued !== undefined) {
+      this.#queued = undefined;
+      this.#consumed = { resolve: queued.resolve, reject: queued.reject };
+      return { done: false, value: queued.chunk };
+    }
+    if (this.#finished) return { done: true, value: undefined };
+    return new Promise<IteratorResult<Uint8Array>>((resolve, reject) => {
+      this.#reader = { resolve, reject };
+    });
+  }
+
+  async return(): Promise<IteratorResult<Uint8Array>> {
+    this.finish();
+    return { done: true, value: undefined };
+  }
+
+  finish(): void {
+    if (this.#finished) return;
+    this.#finished = true;
+    if (this.#queued === undefined) {
+      const reader = this.#reader;
+      this.#reader = undefined;
+      reader?.resolve({ done: true, value: undefined });
+    }
+  }
+
+  fail(error: unknown): void {
+    if (this.#failure !== undefined) return;
+    this.#failure = error;
+    this.#finished = true;
+    this.#queued?.reject(error);
+    this.#queued = undefined;
+    this.#consumed?.reject(error);
+    this.#consumed = undefined;
+    this.#reader?.reject(error);
+    this.#reader = undefined;
+  }
+}
+
+function snapshotQueueError(value: unknown): Error {
+  return value instanceof Error ? value : new Error("Snapshot transfer failed", { cause: value });
 }
 
 /** The slice of DedicatedWorkerGlobalScope (or MessagePort) the host needs. */
@@ -96,6 +215,11 @@ export interface ExposeDatabaseOptions {
   /** Called when the client sends its dispose frame, after every handle has been closed. */
   onDispose?: () => void | Promise<void>;
   /**
+   * Rolls back a worker write handle after this long without a handle RPC. Match the constructed
+   * database's `transactionIdleTimeoutMs` when it is customized. Defaults to 30 seconds.
+   */
+  writeHandleIdleTimeoutMs?: number;
+  /**
    * Called when the main thread reports its page visibility. The stock entry forwards this to
    * the store's `setForeground` when it has one — the OPFS store uses it to keep leadership
    * on the tab the user is looking at.
@@ -109,34 +233,87 @@ export interface AttachDatabaseWorkerOptions {
 }
 
 type Handle =
-  | { type: "snapshot"; release: () => void }
-  | { type: "snapshot-export"; bytes: Uint8Array }
-  | { type: "snapshot-import"; chunks: Uint8Array[]; byteLength: number }
+  | { type: "snapshot"; release: () => void; done: Promise<void> }
+  | {
+      type: "snapshot-export";
+      iterator: AsyncIterator<Uint8Array>;
+      reading: boolean;
+      done: boolean;
+    }
+  | {
+      type: "snapshot-import";
+      queue: SnapshotImportChunkQueue;
+      task: Promise<void>;
+      abort: AbortController;
+    }
   | {
       type: "write";
       session: WriteSession;
       finish: (commit: boolean) => void;
       done: Promise<{ version: number | null }>;
+      activeCalls: number;
+      activeCallDone: Promise<void> | undefined;
+      finishActiveCall: (() => void) | undefined;
+      open: boolean;
+      idleTimer: ReturnType<typeof setTimeout> | undefined;
     }
   | { type: "writer"; writer: BufferedTableWriter }
+  | { type: "query-cursor"; iterator: AsyncIterator<import("./query.js").QueryResult, undefined> }
   | { type: "live-set"; set: LiveQuerySet; subscriptionIds: Set<string> }
   | { type: "live-subscription"; subscription: LiveQuerySubscription; setId: string };
 
+/** Hard per-connection ceiling for resident worker resources abandoned by a client. */
+export const MAX_WORKER_HANDLES_PER_CONNECTION = 256;
+const DEFAULT_WRITE_HANDLE_IDLE_TIMEOUT_MS = 30_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 class DatabaseRpcServer {
   readonly #handles = new Map<string, Handle>();
+  readonly #reservedHandleIds = new Set<string>();
+  readonly #openingHandlePromises = new Set<Promise<unknown>>();
+  readonly #settlingWritePromises = new Set<Promise<unknown>>();
   #disposed = false;
+  #inFlightRpcCount = 0;
+  #inFlightRpcDrain: Promise<void> | undefined;
+  #resolveInFlightRpcDrain: (() => void) | undefined;
+  readonly #writeHandleIdleTimeoutMs: number;
 
   constructor(
     private readonly database: MinnowDatabase,
     private readonly scope: RpcScope,
     private readonly options: ExposeDatabaseOptions,
-  ) {}
+  ) {
+    this.#writeHandleIdleTimeoutMs =
+      options.writeHandleIdleTimeoutMs ?? DEFAULT_WRITE_HANDLE_IDLE_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(this.#writeHandleIdleTimeoutMs) ||
+      this.#writeHandleIdleTimeoutMs <= 0 ||
+      this.#writeHandleIdleTimeoutMs > MAX_TIMER_DELAY_MS
+    ) {
+      throw new RangeError(
+        `Worker write-handle idle timeout must be a positive whole number no greater than ${String(MAX_TIMER_DELAY_MS)}`,
+      );
+    }
+  }
 
   async handle(request: RpcRequest): Promise<void> {
     if (request.kind === "rpc-init") {
       this.scope.postMessage(rpcResult(request.requestId, { ready: true }));
       return;
     }
+    const bypassLimit = request.method === "dispose";
+    if (!bypassLimit && this.#inFlightRpcCount >= MAX_DATABASE_RPC_IN_FLIGHT) {
+      this.scope.postMessage(
+        rpcFailure(
+          request.requestId,
+          new RangeError(
+            `A database worker connection cannot hold more than ${String(MAX_DATABASE_RPC_IN_FLIGHT)} in-flight requests`,
+          ),
+        ),
+      );
+      return;
+    }
+    if (!bypassLimit) this.#inFlightRpcCount += 1;
     try {
       if (this.#disposed) throw new Error("Database connection is disposed");
       const result =
@@ -147,11 +324,33 @@ class DatabaseRpcServer {
         this.scope.postMessage(rpcResult(request.requestId, result.encoded.payload), {
           transfer: result.encoded.transfer,
         });
+      } else if (result instanceof CursorBatchResult) {
+        this.scope.postMessage(
+          rpcResult(
+            request.requestId,
+            result.encoded === undefined
+              ? { done: true }
+              : { done: false, batch: result.encoded.payload },
+          ),
+          result.encoded === undefined ? undefined : { transfer: result.encoded.transfer },
+        );
+      } else if (result instanceof SnapshotChunkResult) {
+        this.scope.postMessage(rpcResult(request.requestId, { done: false, chunk: result.chunk }), {
+          transfer: [result.chunk.buffer],
+        });
       } else {
         this.scope.postMessage(rpcResult(request.requestId, result));
       }
     } catch (error) {
       this.scope.postMessage(rpcFailure(request.requestId, error));
+    } finally {
+      if (!bypassLimit) this.#inFlightRpcCount -= 1;
+      if (this.#inFlightRpcCount === 0 && this.#resolveInFlightRpcDrain !== undefined) {
+        const resolve = this.#resolveInFlightRpcDrain;
+        this.#inFlightRpcDrain = undefined;
+        this.#resolveInFlightRpcDrain = undefined;
+        resolve();
+      }
     }
   }
 
@@ -171,10 +370,11 @@ class DatabaseRpcServer {
       case "updateBatch":
       case "update":
       case "deleteBatch":
+      case "delete":
       case "runStatement":
       case "explain":
       case "execute":
-      case "listVisibleSegments":
+      case "listVisibleSegmentPage":
       case "cleanupQuerySpill":
       case "compactTable":
       case "compactTableStep":
@@ -185,11 +385,28 @@ class DatabaseRpcServer {
       case "collectGarbageStep":
       case "resumeGarbageCollectionJob":
       case "bufferPoolStats":
+      case "maintenanceStatus":
+      case "checkIntegrity":
+      case "storageStats":
+      case "inspectInterruptedImport":
+      case "abortInterruptedImport":
       case "listGarbageCollectionJobs":
         return database[method]?.(...args);
       case "query": {
         const [sql, options] = args as [string, QueryOptions | undefined];
         return new ColumnarResult(encodeQueryResult(await this.database.query(sql, options)));
+      }
+      case "queryCursorOpen": {
+        const handleId = this.#claimHandleId(args[0]);
+        const [sql, options] = args.slice(1) as [string, QueryCursorOptions | undefined];
+        try {
+          const iterator = this.database.queryCursor(sql, options);
+          this.#publishHandle(handleId, { type: "query-cursor", iterator });
+        } catch (error) {
+          this.#releaseHandleId(handleId);
+          throw error;
+        }
+        return { handleId };
       }
       case "run": {
         const query = args[0] as { kind: "typed-query"; plan: CompiledQuery; __row?: QueryRow };
@@ -219,77 +436,69 @@ class DatabaseRpcServer {
           steps: serializeMigrationSteps(result.steps),
         };
       }
-      case "writeOpen": {
-        // Same deferred-callback shape as snapshotOpen: the scoped write() stays pending
-        // until the client commits or aborts, so its staged transaction spans the RPC session.
-        const handleId = crypto.randomUUID();
-        let sessionResolve!: (session: WriteSession) => void;
-        const sessionReady = new Promise<WriteSession>((resolveSession) => {
-          sessionResolve = resolveSession;
-        });
-        let finish!: (commit: boolean) => void;
-        const done = this.database
-          .write(async (session) => {
-            sessionResolve(session);
-            await new Promise<void>((resolveCommit, rejectAbort) => {
-              finish = (commit) => {
-                if (commit) resolveCommit();
-                else rejectAbort(new WriteScopeAbortedError());
-              };
-            });
-          })
-          .then((outcome) => ({ version: outcome.version }));
-        const session = await sessionReady;
-        this.#handles.set(handleId, { type: "write", session, finish, done });
-        return { handleId };
-      }
-      case "snapshotOpen": {
-        // The scoped snapshot() holds its lease until the callback settles; the handle keeps
-        // the callback pending until the client closes it, so the pin spans the RPC session.
-        const handleId = crypto.randomUUID();
-        let release!: () => void;
-        const version = await new Promise<number | null>((resolveVersion, rejectVersion) => {
-          void this.database
-            .snapshot(async (session) => {
-              resolveVersion(session.version);
-              await new Promise<void>((resolveRelease) => {
-                release = resolveRelease;
-              });
-            })
-            .catch((error: unknown) => {
-              rejectVersion(error instanceof Error ? error : new Error(String(error)));
-            });
-        });
-        this.#handles.set(handleId, { type: "snapshot", release });
-        return { handleId, version };
-      }
+      case "writeOpen":
+        return this.#trackOpeningHandle(this.#openWriteHandle());
+      case "snapshotOpen":
+        return this.#trackOpeningHandle(this.#openSnapshotHandle());
       case "exportSnapshotOpen": {
-        // The snapshot is encoded here and held by the handle so the client can pull it across
-        // in slices. One result frame carrying the whole thing would be a structured clone the
-        // size of the database, and the main thread would sit still for all of it.
-        const handleId = crypto.randomUUID();
-        const bytes = await this.database.exportSnapshot();
-        this.#handles.set(handleId, { type: "snapshot-export", bytes });
-        return { handleId, byteLength: bytes.byteLength };
+        const handleId = this.#claimGeneratedHandleId();
+        const iterator = this.database.exportSnapshotStream()[Symbol.asyncIterator]();
+        try {
+          this.#publishHandle(handleId, {
+            type: "snapshot-export",
+            iterator,
+            reading: false,
+            done: false,
+          });
+        } catch (error) {
+          await iterator.return(undefined);
+          this.#releaseHandleId(handleId);
+          throw error;
+        }
+        return { handleId };
       }
       case "importSnapshotOpen": {
         // Named by the client, like the other event-producing handles, so its progress route
         // exists before the first frame the load can emit.
         const handleId = this.#claimHandleId(args[0]);
-        this.#handles.set(handleId, { type: "snapshot-import", chunks: [], byteLength: 0 });
+        const queue = new SnapshotImportChunkQueue();
+        const abort = new AbortController();
+        const task = this.database.importSnapshotStream(queue, {
+          signal: abort.signal,
+          onProgress: (progress) => {
+            this.scope.postMessage(rpcEvent(handleId, "progress", progress));
+          },
+        });
+        void task.catch((error: unknown) => queue.fail(error));
+        try {
+          this.#publishHandle(handleId, { type: "snapshot-import", queue, task, abort });
+        } catch (error) {
+          abort.abort(error);
+          queue.fail(error);
+          await task.catch(() => undefined);
+          this.#releaseHandleId(handleId);
+          throw error;
+        }
         return { handleId };
       }
       case "bufferedWriter": {
         // Event-producing handles are named by the client so its event routes exist before the
         // first frame the handle can emit.
         const handleId = this.#claimHandleId(args[0]);
-        const writer = this.database.bufferedWriter(args[1] as string, {
-          ...(args[2] as Omit<BufferedWriterOptions, "onError">),
-          onError: (error) => {
-            this.scope.postMessage(rpcEvent(handleId, "error", serializeError(error)));
-          },
-        });
-        this.#handles.set(handleId, { type: "writer", writer });
+        let writer: BufferedTableWriter | undefined;
+        try {
+          writer = this.database.bufferedWriter(args[1] as string, {
+            ...(args[2] as Omit<BufferedWriterOptions, "onError">),
+            onError: (error) => {
+              this.scope.postMessage(rpcEvent(handleId, "error", serializeError(error)));
+            },
+          });
+          this.#publishHandle(handleId, { type: "writer", writer });
+        } catch (error) {
+          await writer?.close().catch(() => undefined);
+          this.#releaseHandleId(handleId);
+          throw error;
+        }
         return { handleId };
       }
       case "liveQueries": {
@@ -299,11 +508,18 @@ class DatabaseRpcServer {
           channelName?: string;
         };
         // The database owns channelName resolution (and closes the channel with the set).
-        const set = this.database.liveQueries({
-          ...(channelName === undefined ? {} : { channelName }),
-          ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
-        });
-        this.#handles.set(handleId, { type: "live-set", set, subscriptionIds: new Set() });
+        let set: LiveQuerySet | undefined;
+        try {
+          set = this.database.liveQueries({
+            ...(channelName === undefined ? {} : { channelName }),
+            ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
+          });
+          this.#publishHandle(handleId, { type: "live-set", set, subscriptionIds: new Set() });
+        } catch (error) {
+          set?.close();
+          this.#releaseHandleId(handleId);
+          throw error;
+        }
         return { handleId };
       }
       case "dispose": {
@@ -319,48 +535,116 @@ class DatabaseRpcServer {
     }
   }
 
+  async #openWriteHandle(): Promise<{ handleId: string }> {
+    // Same deferred-callback shape as snapshotOpen: the scoped write() stays pending until the
+    // client commits or aborts, so its staged transaction spans the RPC session.
+    const handleId = this.#claimGeneratedHandleId();
+    let sessionResolve!: (session: WriteSession) => void;
+    let sessionReject!: (error: unknown) => void;
+    const sessionReady = new Promise<WriteSession>((resolveSession, rejectSession) => {
+      sessionResolve = resolveSession;
+      sessionReject = rejectSession;
+    });
+    let finish: ((commit: boolean) => void) | undefined;
+    const done = this.database
+      .write(async (session) => {
+        sessionResolve(session);
+        await new Promise<void>((resolveCommit, rejectAbort) => {
+          finish = (commit) => {
+            if (commit) resolveCommit();
+            else rejectAbort(new WriteScopeAbortedError());
+          };
+        });
+      })
+      .then((outcome) => ({ version: outcome.version }));
+    // beginDeferred can fail before the callback starts (for example at the durable reader-lease
+    // ceiling). Reject the open rendezvous too and observe `done` immediately.
+    void done.catch((error: unknown) => sessionReject(error));
+    try {
+      const session = await sessionReady;
+      if (finish === undefined) throw new Error("Write scope did not install its settlement");
+      this.#publishHandle(handleId, {
+        type: "write",
+        session,
+        finish,
+        done,
+        activeCalls: 0,
+        activeCallDone: undefined,
+        finishActiveCall: undefined,
+        open: true,
+        idleTimer: undefined,
+      });
+      return { handleId };
+    } catch (error) {
+      // Publication can lose a race with connection disposal. If the callback started, abort and
+      // join it before the opening task releases its lifecycle slot.
+      finish?.(false);
+      await done.catch(() => undefined);
+      this.#releaseHandleId(handleId);
+      throw error;
+    }
+  }
+
+  async #openSnapshotHandle(): Promise<{ handleId: string; version: number | null }> {
+    // The scoped snapshot() holds its lease until the callback settles; the handle keeps the
+    // callback pending until close, so the pin spans the RPC session.
+    const handleId = this.#claimGeneratedHandleId();
+    let release: (() => void) | undefined;
+    let resolveVersion!: (version: number | null) => void;
+    let rejectVersion!: (error: unknown) => void;
+    const versionReady = new Promise<number | null>((resolve, reject) => {
+      resolveVersion = resolve;
+      rejectVersion = reject;
+    });
+    const done = this.database.snapshot(async (session) => {
+      resolveVersion(session.version);
+      await new Promise<void>((resolveRelease) => {
+        release = resolveRelease;
+      });
+    });
+    // Lease admission may fail before the callback installs `release`. Preserve that typed error
+    // through the rendezvous and keep the task observed from creation.
+    void done.catch((error: unknown) => rejectVersion(error));
+    try {
+      const version = await versionReady;
+      if (release === undefined) throw new Error("Snapshot scope did not install its release");
+      this.#publishHandle(handleId, { type: "snapshot", release, done });
+      return { handleId, version };
+    } catch (error) {
+      release?.();
+      await done.catch(() => undefined);
+      this.#releaseHandleId(handleId);
+      throw error;
+    }
+  }
+
+  #trackOpeningHandle<T>(opening: Promise<T>): Promise<T> {
+    this.#openingHandlePromises.add(opening);
+    void opening.then(
+      () => this.#openingHandlePromises.delete(opening),
+      () => this.#openingHandlePromises.delete(opening),
+    );
+    return opening;
+  }
+
   async #callHandle(handleId: string, method: string, args: unknown[]): Promise<unknown> {
     const handle = this.#handles.get(handleId);
     if (handle === undefined) throw new Error(`Unknown handle: ${handleId}`);
+    if (handle.type === "write") {
+      this.#beginWriteHandleCall(handle);
+      try {
+        return await this.#callWriteHandle(handleId, handle, method, args);
+      } finally {
+        this.#endWriteHandleCall(handleId, handle);
+      }
+    }
     switch (handle.type) {
       case "snapshot": {
         if (method !== "close") throw new Error(`Unsupported snapshot method: ${method}`);
         handle.release();
         this.#handles.delete(handleId);
+        await handle.done;
         return undefined;
-      }
-      case "write": {
-        if (method === "query") {
-          const [sql, options] = args as [string, { params?: unknown } | undefined];
-          return new ColumnarResult(
-            encodeQueryResult(await handle.session.query(sql, options as never)),
-          );
-        }
-        if (method === "execute") {
-          const [sql, params] = args as [string, readonly QueryValue[] | undefined];
-          return handle.session.execute(sql, params);
-        }
-        if (method === "stage") {
-          const [op, tableName, input] = args as [unknown, string, never];
-          if (!isStageOp(op)) {
-            throw new Error(`Unsupported write stage operation: ${String(op)}`);
-          }
-          return handle.session[op](tableName, input);
-        }
-        if (method === "commit") {
-          handle.finish(true);
-          this.#handles.delete(handleId);
-          return handle.done;
-        }
-        if (method === "abort") {
-          handle.finish(false);
-          this.#handles.delete(handleId);
-          return handle.done.catch((error: unknown) => {
-            if (error instanceof WriteScopeAbortedError) return undefined;
-            throw error;
-          });
-        }
-        throw new Error(`Unsupported write method: ${method}`);
       }
       case "snapshot-export":
         return this.#callSnapshotExport(handleId, handle, method, args);
@@ -368,6 +652,22 @@ class DatabaseRpcServer {
         return this.#callSnapshotImport(handleId, handle, method, args);
       case "writer":
         return this.#callWriter(handleId, handle.writer, method, args);
+      case "query-cursor": {
+        if (method === "next") {
+          const next = await handle.iterator.next();
+          if (next.done) {
+            this.#handles.delete(handleId);
+            return new CursorBatchResult(undefined);
+          }
+          return new CursorBatchResult(encodeQueryResult(next.value));
+        }
+        if (method === "close") {
+          await handle.iterator.return?.();
+          this.#handles.delete(handleId);
+          return undefined;
+        }
+        throw new Error(`Unsupported query cursor method: ${method}`);
+      }
       case "live-set":
         return this.#callLiveSet(handleId, handle, method, args);
       case "live-subscription": {
@@ -381,30 +681,68 @@ class DatabaseRpcServer {
     }
   }
 
+  async #callWriteHandle(
+    handleId: string,
+    handle: Extract<Handle, { type: "write" }>,
+    method: string,
+    args: unknown[],
+  ): Promise<unknown> {
+    if (method === "query") {
+      const [sql, options] = args as [string, { params?: unknown } | undefined];
+      return new ColumnarResult(
+        encodeQueryResult(await handle.session.query(sql, options as never)),
+      );
+    }
+    if (method === "execute") {
+      const [sql, params] = args as [string, readonly QueryValue[] | undefined];
+      return handle.session.execute(sql, params);
+    }
+    if (method === "stage") {
+      const [op, tableName, input] = args as [unknown, string, never];
+      if (!isStageOp(op)) {
+        throw new Error(`Unsupported write stage operation: ${String(op)}`);
+      }
+      return handle.session[op](tableName, input);
+    }
+    if (method === "commit") return this.#settleWriteHandle(handleId, handle, true);
+    if (method === "abort") return this.#settleWriteHandle(handleId, handle, false);
+    throw new Error(`Unsupported write method: ${method}`);
+  }
+
   /**
    * Hands one slice of an encoded snapshot back. The slice is copied rather than viewed: a
    * subarray shares the whole buffer, and structured clone copies the buffer behind a view, not
    * the window into it — so every read would post the entire snapshot again.
    */
-  #callSnapshotExport(
+  async #callSnapshotExport(
     handleId: string,
     handle: Extract<Handle, { type: "snapshot-export" }>,
     method: string,
     args: unknown[],
-  ): unknown {
+  ): Promise<unknown> {
     switch (method) {
       case "read": {
-        const [offset, length] = args as [unknown, unknown];
-        if (!Number.isSafeInteger(offset) || (offset as number) < 0) {
-          throw new RangeError("Snapshot read offset must be a non-negative whole number");
+        if (args.length !== 0) throw new TypeError("Snapshot stream read takes no arguments");
+        if (handle.reading) throw new Error("Snapshot stream already has a read in flight");
+        if (handle.done) return { done: true };
+        handle.reading = true;
+        try {
+          const next = await handle.iterator.next();
+          if (next.done === true) {
+            handle.done = true;
+            return { done: true };
+          }
+          // The iterator may yield a view into a 64 MiB block. Transfer only this bounded slice;
+          // detaching the larger backing buffer would corrupt subsequent slices.
+          const chunk = new Uint8Array(next.value.byteLength);
+          chunk.set(next.value);
+          return new SnapshotChunkResult(chunk);
+        } finally {
+          handle.reading = false;
         }
-        if (!Number.isSafeInteger(length) || (length as number) <= 0) {
-          throw new RangeError("Snapshot read length must be a positive whole number");
-        }
-        const start = offset as number;
-        return handle.bytes.slice(start, start + (length as number));
       }
       case "close": {
+        await handle.iterator.return?.();
         this.#handles.delete(handleId);
         return undefined;
       }
@@ -426,32 +764,28 @@ class DatabaseRpcServer {
         if (!(chunk instanceof Uint8Array)) {
           throw new TypeError("Snapshot chunk must be a Uint8Array");
         }
-        handle.chunks.push(chunk);
-        handle.byteLength += chunk.byteLength;
+        await handle.queue.push(chunk);
         return undefined;
       }
       case "finish": {
-        const bytes = new Uint8Array(handle.byteLength);
-        let offset = 0;
-        for (const chunk of handle.chunks) {
-          bytes.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        // Dropped before the load starts: the decoded snapshot is another copy of these bytes,
-        // and holding the chunks too would make three of them.
-        handle.chunks.length = 0;
         try {
-          await this.database.importSnapshot(bytes, {
-            onProgress: (progress) => {
-              this.scope.postMessage(rpcEvent(handleId, "progress", progress));
-            },
-          });
+          handle.queue.finish();
+          await handle.task;
         } finally {
           this.#handles.delete(handleId);
         }
         return undefined;
       }
       case "close": {
+        handle.queue.fail(new Error("Snapshot import transfer was cancelled"));
+        await handle.task.catch(() => undefined);
+        this.#handles.delete(handleId);
+        return undefined;
+      }
+      case "cancel": {
+        handle.abort.abort(new Error("Snapshot import was cancelled"));
+        handle.queue.fail(handle.abort.signal.reason);
+        await handle.task.catch(() => undefined);
         this.#handles.delete(handleId);
         return undefined;
       }
@@ -500,28 +834,67 @@ class DatabaseRpcServer {
         // posted before this call's own result frame.
         const subscriptionId = this.#claimHandleId(args[0]);
         const query = args[1] as LiveQueryInput;
-        const subscription = await handle.set.subscribe(query, {
-          onChange: (result) => {
-            const encoded = encodeQueryResult(result);
-            this.scope.postMessage(rpcEvent(subscriptionId, "change", encoded.payload), {
-              transfer: encoded.transfer,
-            });
-          },
-          onError: (error) => {
-            this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));
-          },
-          onComplete: () => {
-            this.scope.postMessage(rpcEvent(subscriptionId, "complete", null));
-            this.#handles.delete(subscriptionId);
-            const parent = this.#handles.get(handleId);
-            if (parent?.type === "live-set") parent.subscriptionIds.delete(subscriptionId);
-          },
-        });
-        this.#handles.set(subscriptionId, {
-          type: "live-subscription",
-          subscription,
-          setId: handleId,
-        });
+        let subscription: LiveQuerySubscription | undefined;
+        try {
+          subscription = await handle.set.subscribe(query, {
+            onChange: (result) => {
+              const encoded = encodeQueryResult(result);
+              this.scope.postMessage(rpcEvent(subscriptionId, "change", encoded.payload), {
+                transfer: encoded.transfer,
+              });
+            },
+            onError: (error) => {
+              this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));
+            },
+            onComplete: () => {
+              this.scope.postMessage(rpcEvent(subscriptionId, "complete", null));
+              this.#handles.delete(subscriptionId);
+              const parent = this.#handles.get(handleId);
+              if (parent?.type === "live-set") parent.subscriptionIds.delete(subscriptionId);
+            },
+          });
+          this.#publishHandle(subscriptionId, {
+            type: "live-subscription",
+            subscription,
+            setId: handleId,
+          });
+        } catch (error) {
+          subscription?.close();
+          this.#releaseHandleId(subscriptionId);
+          throw error;
+        }
+        handle.subscriptionIds.add(subscriptionId);
+        return { dependencyTableIds: subscription.dependencyTableIds };
+      }
+      case "observe": {
+        const subscriptionId = this.#claimHandleId(args[0]);
+        const query = args[1] as LiveQueryInput;
+        let subscription: LiveQuerySubscription | undefined;
+        try {
+          subscription = await handle.set.observe(query, {
+            onInvalidate: (invalidation) => {
+              this.scope.postMessage(rpcEvent(subscriptionId, "invalidate", invalidation));
+            },
+            onError: (error) => {
+              this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));
+            },
+            onComplete: () => {
+              this.scope.postMessage(rpcEvent(subscriptionId, "complete", null));
+              this.#handles.delete(subscriptionId);
+              const parent = this.#handles.get(handleId);
+              if (parent?.type === "live-set") parent.subscriptionIds.delete(subscriptionId);
+            },
+          });
+          this.#publishHandle(subscriptionId, {
+            type: "live-subscription",
+            subscription,
+            setId: handleId,
+          });
+        } catch (error) {
+          subscription?.close();
+          this.#releaseHandleId(subscriptionId);
+          throw error;
+        }
         handle.subscriptionIds.add(subscriptionId);
         return { dependencyTableIds: subscription.dependencyTableIds };
       }
@@ -544,8 +917,102 @@ class DatabaseRpcServer {
     if (typeof value !== "string" || value.length === 0) {
       throw new TypeError("Handle ID must be a non-empty string");
     }
-    if (this.#handles.has(value)) throw new Error(`Handle ID already exists: ${value}`);
+    if (this.#handles.has(value) || this.#reservedHandleIds.has(value)) {
+      throw new Error(`Handle ID already exists: ${value}`);
+    }
+    if (
+      this.#handles.size + this.#reservedHandleIds.size + this.#settlingWritePromises.size >=
+      MAX_WORKER_HANDLES_PER_CONNECTION
+    ) {
+      throw new Error(
+        `Database connection cannot hold more than ${String(MAX_WORKER_HANDLES_PER_CONNECTION)} open handles (active or settling)`,
+      );
+    }
+    this.#reservedHandleIds.add(value);
     return value;
+  }
+
+  #claimGeneratedHandleId(): string {
+    for (;;) {
+      const id = crypto.randomUUID();
+      if (!this.#handles.has(id) && !this.#reservedHandleIds.has(id))
+        return this.#claimHandleId(id);
+    }
+  }
+
+  #publishHandle(id: string, handle: Handle): void {
+    if (this.#disposed) throw new Error("Database connection is disposed");
+    if (!this.#reservedHandleIds.delete(id)) throw new Error(`Handle ID was not reserved: ${id}`);
+    this.#handles.set(id, handle);
+    if (handle.type === "write") this.#armWriteHandleIdleTimer(id, handle);
+  }
+
+  #releaseHandleId(id: string): void {
+    this.#reservedHandleIds.delete(id);
+  }
+
+  #beginWriteHandleCall(handle: Extract<Handle, { type: "write" }>): void {
+    if (!handle.open) throw new Error("Write handle is closed");
+    if (handle.activeCalls !== 0) {
+      throw new Error("Write handle already has a call in flight");
+    }
+    handle.activeCalls = 1;
+    handle.activeCallDone = new Promise<void>((resolve) => {
+      handle.finishActiveCall = resolve;
+    });
+    if (handle.idleTimer !== undefined) {
+      clearTimeout(handle.idleTimer);
+      handle.idleTimer = undefined;
+    }
+  }
+
+  #endWriteHandleCall(handleId: string, handle: Extract<Handle, { type: "write" }>): void {
+    handle.activeCalls -= 1;
+    if (handle.activeCalls < 0) throw new Error("Write handle activity count underflow");
+    const finishActiveCall = handle.finishActiveCall;
+    handle.activeCallDone = undefined;
+    handle.finishActiveCall = undefined;
+    finishActiveCall?.();
+    if (handle.open && handle.activeCalls === 0) this.#armWriteHandleIdleTimer(handleId, handle);
+  }
+
+  #armWriteHandleIdleTimer(handleId: string, handle: Extract<Handle, { type: "write" }>): void {
+    if (!handle.open || handle.activeCalls !== 0 || this.#handles.get(handleId) !== handle) return;
+    if (handle.idleTimer !== undefined) clearTimeout(handle.idleTimer);
+    handle.idleTimer = setTimeout(() => {
+      handle.idleTimer = undefined;
+      if (!handle.open || handle.activeCalls !== 0 || this.#handles.get(handleId) !== handle)
+        return;
+      // Delete first: a late commit or stage frame must fail rather than revive an expired scope
+      // while its asynchronous durable rollback is still joining.
+      void this.#settleWriteHandle(handleId, handle, false).catch(() => undefined);
+    }, this.#writeHandleIdleTimeoutMs);
+    unrefTimer(handle.idleTimer);
+  }
+
+  async #settleWriteHandle(
+    handleId: string,
+    handle: Extract<Handle, { type: "write" }>,
+    commit: boolean,
+  ): Promise<{ version: number | null } | undefined> {
+    if (!handle.open) throw new Error("Write handle is closed");
+    handle.open = false;
+    if (handle.idleTimer !== undefined) {
+      clearTimeout(handle.idleTimer);
+      handle.idleTimer = undefined;
+    }
+    if (this.#handles.get(handleId) === handle) this.#handles.delete(handleId);
+    handle.finish(commit);
+    const settlement = handle.done.catch((error: unknown) => {
+      if (!commit && error instanceof WriteScopeAbortedError) return undefined;
+      throw error;
+    });
+    this.#settlingWritePromises.add(settlement);
+    void settlement.then(
+      () => this.#settlingWritePromises.delete(settlement),
+      () => this.#settlingWritePromises.delete(settlement),
+    );
+    return settlement;
   }
 
   #closeLiveSet(handleId: string, handle: Extract<Handle, { type: "live-set" }>): void {
@@ -556,22 +1023,75 @@ class DatabaseRpcServer {
 
   async #dispose(): Promise<void> {
     this.#disposed = true;
+    this.#reservedHandleIds.clear();
     const handles = [...this.#handles.entries()];
     this.#handles.clear();
+    const handleCleanup: Array<Promise<unknown>> = [];
+    // Stop every abandoned-write deadline before waiting on active calls. The cleared handle map
+    // also prevents their completions from rearming one while disposal is in progress.
+    for (const [, handle] of handles) {
+      if (handle.type === "write" && handle.idleTimer !== undefined) {
+        clearTimeout(handle.idleTimer);
+        handle.idleTimer = undefined;
+      }
+    }
+    // Signal every handle before awaiting any cleanup. Imports and iterators can have an admitted
+    // RPC blocked inside them; closing sequentially could wait on the first while never reaching
+    // the signal that lets a later one finish.
     for (const [handleId, handle] of handles) {
       try {
-        if (handle.type === "snapshot") handle.release();
-        else if (handle.type === "write") {
-          handle.finish(false);
-          await handle.done.catch(() => undefined);
-        } else if (handle.type === "writer") await handle.writer.close();
-        else if (handle.type === "live-set") this.#closeLiveSet(handleId, handle);
+        if (handle.type === "snapshot") {
+          handle.release();
+          handleCleanup.push(handle.done.catch(() => undefined));
+        } else if (handle.type === "write") {
+          // A session operation owns the transaction revision until it returns. Aborting sooner
+          // can race its final journal update and leave an active owner until TTL. Once it exits,
+          // abort only if commit/abort/idle expiry has not already chosen a terminal outcome.
+          handleCleanup.push(
+            (async () => {
+              await handle.activeCallDone;
+              if (handle.open) {
+                await this.#settleWriteHandle(handleId, handle, false).catch(() => undefined);
+              }
+            })(),
+          );
+        } else if (handle.type === "writer") handleCleanup.push(handle.writer.close());
+        else if (handle.type === "query-cursor") {
+          handleCleanup.push(Promise.resolve(handle.iterator.return?.()));
+        } else if (handle.type === "snapshot-export") {
+          handleCleanup.push(Promise.resolve(handle.iterator.return?.()));
+        } else if (handle.type === "snapshot-import") {
+          handle.abort.abort(new Error("Database connection was disposed"));
+          handle.queue.fail(new Error("Database connection was disposed"));
+          handleCleanup.push(handle.task.catch(() => undefined));
+        } else if (handle.type === "live-set") this.#closeLiveSet(handleId, handle);
       } catch {
         // Dispose every handle even when one close fails; the client is already gone.
       }
     }
+    await Promise.allSettled(handleCleanup);
+    // Commit/abort/expiry removes its handle before durable settlement completes so late RPCs
+    // fail closed. Join those detached operations before closing the database or injected store.
+    while (this.#settlingWritePromises.size > 0) {
+      await Promise.allSettled([...this.#settlingWritePromises]);
+    }
+    // A handle whose lease admission was already in flight when disposal began is not yet in the
+    // handle map. Its opener observes the disposed publication, releases any admitted lease, and
+    // settles only after that cleanup is complete.
+    while (this.#openingHandlePromises.size > 0) {
+      await Promise.allSettled([...this.#openingHandlePromises]);
+    }
+    await this.#waitForInFlightRpcs();
     await this.database.close();
     await this.options.onDispose?.();
+  }
+
+  #waitForInFlightRpcs(): Promise<void> {
+    if (this.#inFlightRpcCount === 0) return Promise.resolve();
+    this.#inFlightRpcDrain ??= new Promise<void>((resolve) => {
+      this.#resolveInFlightRpcDrain = resolve;
+    });
+    return this.#inFlightRpcDrain;
   }
 }
 
@@ -667,6 +1187,9 @@ async function createServer(
   const store = await createStore(payload.store, options);
   const database = new MinnowDatabase(store, payload.options ?? {});
   return new DatabaseRpcServer(database, scope, {
+    ...(payload.options?.transactionIdleTimeoutMs === undefined
+      ? {}
+      : { writeHandleIdleTimeoutMs: payload.options.transactionIdleTimeoutMs }),
     onDispose: () => store.close(),
     onVisibility: (visible) => {
       (store as { setForeground?: (foreground: boolean) => void }).setForeground?.(visible);
@@ -711,4 +1234,10 @@ function requestIdOf(value: unknown): string | undefined {
     if (typeof requestId === "string") return requestId;
   }
   return undefined;
+}
+
+/** A worker cleanup deadline must not keep a Node process alive by itself. */
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  const candidate = timer as unknown as { unref?: () => void };
+  candidate.unref?.();
 }

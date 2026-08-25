@@ -1,6 +1,8 @@
-import { MinnowDatabase, exposeDatabase } from "@minnowdb/core";
+import { MinnowDatabase } from "@minnowdb/core";
+import { exposeDatabase } from "@minnowdb/core/worker-host";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
-import { IndexedDbBlockStore, type BlockStore } from "@minnowdb/core/storage";
+import type { BlockStore } from "@minnowdb/core/storage/contracts";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 import { generateEntityBatch, getScenario } from "../benchmark";
 import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol";
 import { canonicalizeRow, createSecondaryIndexes, normalizeRows } from "./shared";

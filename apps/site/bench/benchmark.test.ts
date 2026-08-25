@@ -1,5 +1,5 @@
 import { MinnowDatabase } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { describe, expect, it } from "vitest";
 import {
   getScenario,

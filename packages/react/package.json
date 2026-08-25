@@ -1,0 +1,44 @@
+{
+  "name": "@minnowdb/react",
+  "version": "0.1.0",
+  "description": "React hooks for Minnow live queries.",
+  "license": "MIT",
+  "author": "Eric Wilhite",
+  "homepage": "https://minnowdb.com/docs/extensions/react/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ericwilhite/minnow.git",
+    "directory": "packages/react"
+  },
+  "bugs": "https://github.com/ericwilhite/minnow/issues",
+  "keywords": [
+    "database",
+    "live-query",
+    "minnow",
+    "react"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "!dist/**/*.spec.*",
+    "!dist/**/*.map",
+    "!dist/*.tsbuildinfo"
+  ],
+  "peerDependencies": {
+    "react": ">=18.0.0 <20.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  }
+}

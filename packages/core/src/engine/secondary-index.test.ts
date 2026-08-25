@@ -6,11 +6,20 @@ import {
   MemoryBlockStore,
   OpfsBlockStore,
   type BlockStore,
+  type WriteTransactionInput,
 } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { UniqueConstraintError } from "./errors.js";
 import { compileStatement } from "./query.js";
-import { collectFtsPostings } from "../storage/types.js";
+import { collectFtsPostings, secondaryUniqueKeyNamespace } from "../storage/types.js";
+
+function ascendingStringTupleTerm(value: string): string {
+  let term = "";
+  for (let index = 0; index < value.length; index += 1) {
+    term += (value.charCodeAt(index) + 1).toString(16).padStart(5, "0");
+  }
+  return `${term}00000`;
+}
 
 function implementations(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
@@ -366,7 +375,8 @@ describe("secondary-index SQL", () => {
     await first.execute("INSERT INTO stale_unique VALUES (1, 'taken')");
     const table = await store.getTableByName("stale_unique");
     if (table === undefined) throw new Error("Expected stale_unique table");
-    const commit = store.writeTransaction.bind(store);
+    const commit = store.commitTransaction.bind(store);
+    const write = store.writeTransaction.bind(store);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -376,13 +386,21 @@ describe("secondary-index SQL", () => {
       entered = resolve;
     });
     let pause = true;
-    store.writeTransaction = async (input) => {
+    store.commitTransaction = async (input) => {
       if (pause && input.changedTableIds?.includes(table.id)) {
         pause = false;
         entered();
         await gate;
       }
       return commit(input);
+    };
+    store.writeTransaction = async (input: WriteTransactionInput) => {
+      if (pause && input.changedTableIds?.includes(table.id)) {
+        pause = false;
+        entered();
+        await gate;
+      }
+      return write(input);
     };
     try {
       const staleWrite = first.execute("INSERT INTO stale_unique VALUES (2, 'taken')");
@@ -405,7 +423,8 @@ describe("secondary-index SQL", () => {
       ]);
     } finally {
       release();
-      store.writeTransaction = commit;
+      store.commitTransaction = commit;
+      store.writeTransaction = write;
       await Promise.all([first.close(), second.close()]);
       store.close();
     }
@@ -671,10 +690,22 @@ describe("secondary-index SQL", () => {
             `UPDATE bounded_unique SET code = 'code-${String(revision)}' WHERE id = 1`,
           );
         }
-        const snapshot = await store.exportSnapshot?.();
-        const membership = snapshot?.tables.find(({ record }) => record.name === "bounded_unique")
-          ?.secondaryUniqueKeys?.[0];
-        expect(membership?.keyTokens).toHaveLength(1);
+        const table = await store.getTableByName("bounded_unique");
+        const indexEntry = Object.entries(table?.secondaryIndexes ?? {}).find(
+          ([, index]) => index.name === "bounded_code",
+        );
+        if (table === undefined || indexEntry === undefined) {
+          throw new Error("Expected the bounded UNIQUE index");
+        }
+        const terms = Array.from({ length: 33 }, (_, revision) =>
+          ascendingStringTupleTerm(`code-${String(revision)}`),
+        );
+        expect(
+          await store.getExistingUniqueKeys(
+            secondaryUniqueKeyNamespace(table.id, indexEntry[0]),
+            terms,
+          ),
+        ).toEqual([terms.at(-1)]);
         await expect(
           database.execute("INSERT INTO bounded_unique VALUES (2, 'code-32')"),
         ).rejects.toBeInstanceOf(UniqueConstraintError);
@@ -805,11 +836,15 @@ describe("secondary-index SQL", () => {
       await database.execute("INSERT INTO abandoned VALUES (1, 10), (2, 20), (3, 30)");
       const table = await store.getTableByName("abandoned");
       if (table === undefined) throw new Error("Expected abandoned table");
-      await store.updateTable(table.id, table.revision ?? 0, {
+      const valueColumnId = table.columns.find((column) => column.name === "value")?.id ?? "";
+      await store.updateTable(table.id, table.revision, {
         secondaryIndexes: {
           abandoned: {
             name: "abandoned_by_value",
-            columnId: table.columns.find((column) => column.name === "value")?.id ?? "",
+            columnId: valueColumnId,
+            columnIds: [valueColumnId],
+            directions: ["asc"],
+            termEncoding: "tuple-v1",
             storage: "postings-v1",
             storageColumnId: "abandoned-storage",
             locator: "key-hash-v1",
@@ -911,13 +946,19 @@ describe("secondary-index SQL", () => {
     if (table === undefined || index === undefined) throw new Error("Expected raced index");
 
     const read = store.readFtsCandidates.bind(store);
-    let removed = false;
+    let hidden = false;
     store.readFtsCandidates = async (...args) => {
-      if (!removed) {
-        removed = true;
-        await store.removeFtsColumn(table.id, index.storageColumnId);
+      const candidates = await read(...args);
+      if (!hidden) {
+        hidden = true;
+        return {
+          ...candidates,
+          rowIdsByTerm: args[2].map(() => []),
+          coversVersion: -1,
+          hasBase: false,
+        };
       }
-      return read(...args);
+      return candidates;
     };
     expect((await database.query("SELECT id FROM raced WHERE value = 20")).rows).toEqual([
       { id: 2 },
@@ -939,7 +980,7 @@ describe("secondary-index SQL", () => {
     const chunkWrite = store.writeFtsBaseBuildChunk.bind(store);
     store.writeFtsBaseBuildChunk = async (...args) => {
       chunks += 1;
-      largestChunk = Math.max(largestChunk, args[4].length);
+      largestChunk = Math.max(largestChunk, args[0].chunk.length);
       return chunkWrite(...args);
     };
     const database = new MinnowDatabase(store, { rowsPerBlock: 32 });
@@ -975,7 +1016,7 @@ describe("secondary-index SQL", () => {
     store.writeFtsBaseBuildChunk = async (...args) => {
       largestChunkRows = Math.max(
         largestChunkRows,
-        args[4].reduce((count, posting) => count + posting.rowIds.length, 0),
+        args[0].chunk.reduce((count, posting) => count + posting.rowIds.length, 0),
       );
       return chunkWrite(...args);
     };
@@ -1139,7 +1180,7 @@ describe("secondary-index SQL", () => {
       const table = await restoredStore.getTableByName("snapshot_rows");
       expect(Object.values(table?.secondaryIndexes ?? {}).map((index) => index.state)).toEqual([
         "ready",
-        "invalid",
+        "ready",
       ]);
       expect(
         Object.values(table?.secondaryIndexes ?? {}).find(

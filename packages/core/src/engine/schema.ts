@@ -1,3 +1,4 @@
+import { copyDate, dateMilliseconds } from "../date-value.js";
 import {
   validateColumnDefault,
   validateEnumValues,
@@ -6,7 +7,7 @@ import {
   type SqlDomain,
   type TableColumnRecord,
   type TableRecord,
-} from "../storage/index.js";
+} from "../storage/types.js";
 import { type Catalog, type CatalogColumn, type CatalogTable } from "./catalog.js";
 import {
   compileCheckExpression,
@@ -71,9 +72,6 @@ type ValueOf<TType extends SchemaColumnType> = TType extends "boolean"
  * is an optional phantom property — plain values stay assignable in both directions.
  */
 export type HasDefault<TValue> = TValue & { readonly __minnowHasDefault?: true };
-
-/** Legacy compatibility marker. Schema-derived core and Kysely types read defaults directly. */
-export type Generated<TValue> = HasDefault<TValue>;
 
 export interface ColumnBuilder<
   TValue extends SchemaValue,
@@ -196,10 +194,10 @@ function defaultSpecFromArg(
   }
   switch (type) {
     case "datetime":
-      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+      if (!(value instanceof Date) || !Number.isFinite(dateMilliseconds(value))) {
         throw new TypeError("Default literal must be a valid Date");
       }
-      return { kind: "literal", value: new Date(value.getTime()) };
+      return { kind: "literal", value: copyDate(value) };
     case "string":
       if (typeof value !== "string") throw new TypeError("Default literal must be a string");
       return { kind: "literal", value };
@@ -495,7 +493,7 @@ function validateDeclaredColumnValue(
   }
   const matches =
     definition.type === "datetime"
-      ? value instanceof Date && Number.isFinite(value.getTime())
+      ? value instanceof Date && Number.isFinite(dateMilliseconds(value))
       : definition.type === "number"
         ? typeof value === "number" &&
           Number.isFinite(value) &&
@@ -627,6 +625,7 @@ export function table(
     }
   }
   const foreignKeys = options.foreignKeys ?? [];
+  const constraintNames = new Set<string>();
   const foreignKeyNames = new Set<string>();
   for (const key of foreignKeys) {
     validateSchemaName(key.name, "FOREIGN KEY");
@@ -634,6 +633,10 @@ export function table(
       throw new TypeError(`Duplicate FOREIGN KEY in table ${name}: ${key.name}`);
     }
     foreignKeyNames.add(key.name);
+    if (constraintNames.has(key.name)) {
+      throw new TypeError(`Duplicate constraint in table ${name}: ${key.name}`);
+    }
+    constraintNames.add(key.name);
     if (key.columns.length === 0 || new Set(key.columns).size !== key.columns.length) {
       throw new TypeError(`FOREIGN KEY ${key.name} needs distinct child columns`);
     }
@@ -670,8 +673,23 @@ export function table(
       throw new TypeError(`Duplicate CHECK in table ${name}: ${check.name}`);
     }
     checkNames.add(check.name);
+    if (constraintNames.has(check.name)) {
+      throw new TypeError(`Duplicate constraint in table ${name}: ${check.name}`);
+    }
+    constraintNames.add(check.name);
     if (check.sql.trim().length === 0) {
       throw new TypeError(`CHECK ${check.name} in table ${name} has no expression`);
+    }
+    for (const reference of expressionColumns(compileCheckExpression(check.sql, check.name))) {
+      const pieces = reference.split(".");
+      const columnName = pieces.at(-1) ?? reference;
+      const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
+      if (qualifier !== undefined && qualifier !== name) {
+        throw new TypeError(`CHECK ${check.name} references another table: ${reference}`);
+      }
+      if (columns[columnName] === undefined) {
+        throw new TypeError(`CHECK ${check.name} names an unknown column: ${columnName}`);
+      }
     }
   }
   return {
@@ -737,11 +755,9 @@ export function table(
  */
 export function declaredForeignKeys(definition: AnyTable): Array<{
   name: string;
-  column: string;
-  columns?: string[];
+  columns: string[];
   parentTable: string;
-  parentColumn: string;
-  parentColumns?: string[];
+  parentColumns: string[];
   onDelete: ReferentialAction;
 }> {
   const keys: ReturnType<typeof declaredForeignKeys> = [];
@@ -750,9 +766,9 @@ export function declaredForeignKeys(definition: AnyTable): Array<{
     if (reference === undefined) continue;
     keys.push({
       name: foreignKeyName(definition.name, columnName),
-      column: columnName,
+      columns: [columnName],
       parentTable: reference.table,
-      parentColumn: reference.column,
+      parentColumns: [reference.column],
       onDelete: reference.onDelete,
     });
   }
@@ -761,11 +777,9 @@ export function declaredForeignKeys(definition: AnyTable): Array<{
     const parentColumns = [...key.references.columns];
     keys.push({
       name: key.name,
-      column: childColumns[0] ?? "",
-      ...(childColumns.length === 1 ? {} : { columns: childColumns }),
+      columns: childColumns,
       parentTable: key.references.table,
-      parentColumn: parentColumns[0] ?? "",
-      ...(parentColumns.length === 1 ? {} : { parentColumns }),
+      parentColumns,
       onDelete: key.onDelete ?? "restrict",
     });
   }
@@ -858,8 +872,8 @@ export function schema<TTables extends readonly AnyTable[], TViews extends reado
         throw new TypeError(`Duplicate FOREIGN KEY in table ${definition.name}: ${key.name}`);
       }
       declaredNames.add(key.name);
-      const childNames = key.columns ?? [key.column];
-      const parentNames = key.parentColumns ?? [key.parentColumn];
+      const childNames = key.columns;
+      const parentNames = key.parentColumns;
       const target = tables.find(({ name }) => name === key.parentTable);
       if (
         target === undefined ||
@@ -1100,7 +1114,7 @@ export function assertColumnDroppable(record: CatalogTable, column: CatalogColum
     );
   }
   for (const key of record.foreignKeys) {
-    if ((key.columns ?? [key.column]).includes(column.name)) {
+    if (key.columns.includes(column.name)) {
       throw new TypeError(`FOREIGN KEY ${key.name} still uses this column: ${where}`);
     }
   }
@@ -1131,11 +1145,8 @@ function assertColumnRenamable(
   const where = `${record.name}.${column.name}`;
   for (const owner of catalog.tables) {
     for (const key of owner.foreignKeys) {
-      const usesChild =
-        owner.name === record.name && (key.columns ?? [key.column]).includes(column.name);
-      const usesParent =
-        key.parentTable === record.name &&
-        (key.parentColumns ?? [key.parentColumn]).includes(column.name);
+      const usesChild = owner.name === record.name && key.columns.includes(column.name);
+      const usesParent = key.parentTable === record.name && key.parentColumns.includes(column.name);
       if (usesChild || usesParent) {
         throw new TypeError(`FOREIGN KEY ${key.name} prevents renaming ${where}`);
       }
@@ -1178,7 +1189,7 @@ function backfillsEqual(left: unknown, right: unknown): boolean {
     return (
       externalLeft instanceof Date &&
       externalRight instanceof Date &&
-      externalLeft.getTime() === externalRight.getTime()
+      dateMilliseconds(externalLeft) === dateMilliseconds(externalRight)
     );
   }
   return externalLeft === externalRight;
@@ -1193,15 +1204,13 @@ function backfillsEqual(left: unknown, right: unknown): boolean {
  */
 function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable): void {
   const describeKey = (key: {
-    column: string;
-    columns?: readonly string[];
+    columns: readonly string[];
     parentTable: string;
-    parentColumn: string;
-    parentColumns?: readonly string[];
+    parentColumns: readonly string[];
     onDelete: string;
   }): string =>
-    `${(key.columns ?? [key.column]).join(",")} -> ${key.parentTable}.` +
-    `${(key.parentColumns ?? [key.parentColumn]).join(",")} ON DELETE ${key.onDelete}`;
+    `${key.columns.join(",")} -> ${key.parentTable}.` +
+    `${key.parentColumns.join(",")} ON DELETE ${key.onDelete}`;
 
   const existingKeys = new Map(record.foreignKeys.map((key) => [key.name, key]));
   const declaredKeys = new Map(declaredForeignKeys(definition).map((key) => [key.name, key]));
@@ -1209,13 +1218,13 @@ function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable):
     const existing = existingKeys.get(name);
     if (existing === undefined) {
       throw new TypeError(
-        `FOREIGN KEY cannot be added after creation: ${definition.name}.${declared.column}. ` +
+        `FOREIGN KEY cannot be added after creation: ${definition.name}.${declared.columns.join(",")}. ` +
           `Existing rows are not known to satisfy it; recreate the table to add a relation.`,
       );
     }
     if (describeKey(existing) !== describeKey(declared)) {
       throw new TypeError(
-        `FOREIGN KEY cannot change: ${definition.name}.${declared.column} is ` +
+        `FOREIGN KEY cannot change: ${definition.name}.${declared.columns.join(",")} is ` +
           `${describeKey(existing)}, schema says ${describeKey(declared)}`,
       );
     }
@@ -1612,7 +1621,7 @@ export function typedTable<TTable extends AnyTable>(
     const parts = keyParts(value);
     return JSON.stringify(
       parts.map((part) =>
-        part instanceof Date ? ["date", part.getTime()] : [typeof part, String(part)],
+        part instanceof Date ? ["date", dateMilliseconds(part)] : [typeof part, String(part)],
       ),
     );
   };
@@ -1803,7 +1812,7 @@ function columnDefaultsEqual(
     return (
       left.value instanceof Date &&
       right.value instanceof Date &&
-      left.value.getTime() === right.value.getTime()
+      dateMilliseconds(left.value) === dateMilliseconds(right.value)
     );
   }
   return left.value === right.value;

@@ -12,8 +12,8 @@
  * `worker.ts` is two lines and had no test at all; those two lines are what every production
  * request goes through.
  */
-import { MinnowDatabaseClient } from "../src/engine/client.js";
-import { UniqueConstraintError } from "../src/engine/errors.js";
+import { MinnowDatabaseClient } from "@minnowdb/core/client";
+import { UniqueConstraintError } from "@minnowdb/core";
 
 interface WorkerTestResult {
   /** The worker booted, answered, and reported the rows it was given. */
@@ -39,9 +39,9 @@ interface WorkerTestResult {
   };
 }
 
-/** A module worker at the published entry — the exact construction the documentation shows. */
+/** A relative wrapper around the published entry — the portable construction the docs show. */
 function spawn(): Worker {
-  return new Worker(new URL("../src/engine/worker.ts", import.meta.url), { type: "module" });
+  return new Worker(new URL("./published-worker.ts", import.meta.url), { type: "module" });
 }
 
 async function run(): Promise<WorkerTestResult> {
@@ -50,7 +50,10 @@ async function run(): Promise<WorkerTestResult> {
 
   // --- boot, round trip, and a transfer big enough to matter -----------------------------------
   const worker = spawn();
-  const client = new MinnowDatabaseClient(worker, { store, options: { rowsPerBlock: 256 } });
+  const client = new MinnowDatabaseClient(worker, {
+    store,
+    databaseOptions: { rowsPerBlock: 256 },
+  });
   await client.createTable({
     name: "events",
     uniqueKey: "id",

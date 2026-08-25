@@ -9,7 +9,7 @@ without a server round trip.
 
 ```ts
 import { MinnowDatabase } from "@minnowdb/core";
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 
 const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }));
 
@@ -29,9 +29,10 @@ const { rows } = await db.query(`
 ```
 
 <Callout type="warn" title="Experimental">
-  Minnow is in 0.x. Minor releases can include breaking changes, and the stored block format may
-  change. Pin exact package versions in applications. The [versioning
-  guide](/docs/reference/versioning) explains the policy.
+  Minnow is in 0.x, so minor releases can include API and SQL breaking changes. The separately
+  versioned block-format 2, snapshot-format 1, and native OPFS-layout 5 bytes are locked; an
+  incompatible future writer must use a new format number. Pin exact package versions. The
+  [versioning guide](/docs/reference/versioning) explains the policy.
 </Callout>
 
 ## Why use Minnow
@@ -50,7 +51,10 @@ const { rows } = await db.query(`
 - **Works off the UI thread.** The worker client exposes the same query, write, migration,
   snapshot, and maintenance calls as the direct engine.
 - **Handles larger working sets.** Queries run in batches. Sorts and grouped results can spill to
-  storage when they exceed the configured execution budget.
+  storage when they exceed the configured execution budget; pull-driven cursors transfer one
+  bounded page at a time.
+- **Reactive, typed views.** Kysely live queries preserve inferred rows and result plugins, with
+  keyed changes, ordered windows, and a React external-store hook.
 
 ## Choose how you query
 
@@ -79,5 +83,6 @@ the full PostgreSQL server, see the [comparison guide](/docs/comparison).
 - **[Schema and migrations](/docs/schema)** — define tables in TypeScript and evolve them without
   rewriting stored data.
 - **[Client adapters](/docs/adapters)** — connect Kysely to Minnow's SQL engine.
+- **[Extensions](/docs/extensions/live-queries)** — live queries, React, cursors, CSV, and NDJSON.
 - **[Workers and engine options](/docs/engine)** — keep work off the main thread and tune memory.
 - **[Storage](/docs/storage)** — IndexedDB, OPFS, memory, snapshots, and custom adapters.

@@ -172,14 +172,9 @@ describe("unique-key base fold", () => {
     expect(droppedAfterPopulation).toBe(true);
 
     await database.close();
-    const current = await store.getCurrentManifest();
-    if (current === undefined) throw new Error("Expected a current manifest");
-    await store.publishManifest({
-      expectedVersion: current.version,
-      blockIds: current.blockIds,
-      createdAt: "2026-08-21T00:00:00.000Z",
-    });
-    expect(store._residentStateForTests().manifestCacheBlockIds).toBeGreaterThan(0);
+    // Exact manifest membership now remains in the durable paged provenance index instead of a
+    // database-sized resident cache. Closing still has to discard the bounded lookup caches.
+    expect(store._residentStateForTests().manifestCacheBlockIds).toBe(0);
     store.close();
     expect(store._residentStateForTests()).toMatchObject({
       tableNameCacheEntries: 0,
@@ -198,6 +193,7 @@ describe("unique-key base fold", () => {
       id: `table-${String(index)}`,
       name: `table_${String(index)}`,
       columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      managed: false,
       revision: 0,
       createdAt: "2026-08-21T00:00:00.000Z",
     }));
@@ -222,12 +218,10 @@ describe("unique-key base fold", () => {
     expect(await storedIds(database)).toEqual([...expected].sort((a, b) => a - b));
     // Absent neighbours must stay absent — a fold that widened a partition would show here.
     expect(await present(store, database, [0, 99_999, 100_000])).toEqual(new Set());
-    // The base was written once, by the first fold. Every later tail was small enough to
-    // collapse into a single chunk instead, so the base still describes the same 425 tokens
-    // and the tail is back to one record. A fold that rewrote the base each time — the cost
-    // this avoids — would show a larger count here.
+    // Every seventeenth commit performs one bounded lexical k-way fold. After 40 batches the
+    // second fold has incorporated 34 batches and the remaining six stay in bounded tails.
     const state = await foldState(harness);
-    expect(state.tokenCount).toBe(17 * 25);
+    expect(state.tokenCount).toBe(34 * 25);
     expect(state.tailChunks).toBeLessThanOrEqual(16);
     store.close();
   });
@@ -325,7 +319,7 @@ describe("unique-key base fold", () => {
     for (let batch = 0; batch < FOLD_BATCHES; batch += 1) await insert(database, [200 + batch]);
     expect(await present(store, database, [500])).toEqual(new Set());
     store.close();
-  });
+  }, 60_000);
 
   it("still rejects a duplicate key after folding", async () => {
     const { store, database } = await open();

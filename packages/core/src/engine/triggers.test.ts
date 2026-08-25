@@ -1,4 +1,10 @@
-import { MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import {
+  MemoryBlockStore,
+  TableRecordConflictError,
+  type BlockStore,
+  type TableRecord,
+  type TableRecordUpdate,
+} from "../storage/index.js";
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
@@ -30,6 +36,47 @@ async function seeded(store: BlockStore = new MemoryBlockStore()): Promise<Minno
     ],
   });
   return database;
+}
+
+/** Moves a trigger after DROP has read it but before its owner CAS reaches storage. */
+class TriggerDropAbaStore extends MemoryBlockStore {
+  #replacementOwnerId: string | undefined;
+
+  armReplacement(ownerId: string): void {
+    this.#replacementOwnerId = ownerId;
+  }
+
+  override async updateTable(
+    id: string,
+    expectedRevision: number,
+    update: TableRecordUpdate,
+  ): Promise<TableRecord> {
+    const replacementOwnerId = this.#replacementOwnerId;
+    const current = await super.getTable(id);
+    const removed = current?.triggers?.find(
+      (trigger) => !(update.triggers ?? []).some((candidate) => candidate.id === trigger.id),
+    );
+    if (replacementOwnerId === undefined || removed === undefined) {
+      return super.updateTable(id, expectedRevision, update);
+    }
+    this.#replacementOwnerId = undefined;
+    await super.updateTable(id, expectedRevision, {
+      triggers: (current?.triggers ?? []).filter((trigger) => trigger.id !== removed.id),
+    });
+    const replacementOwner = await super.getTable(replacementOwnerId);
+    if (replacementOwner === undefined) throw new Error("Replacement trigger owner disappeared");
+    await super.updateTable(replacementOwner.id, replacementOwner.revision, {
+      triggers: [
+        ...(replacementOwner.triggers ?? []),
+        {
+          ...removed,
+          id: "replacement-trigger-id",
+          statements: [{ sql: "INSERT INTO accounts (id) VALUES (1)", bindings: [] }],
+        },
+      ],
+    });
+    return super.updateTable(id, expectedRevision, update);
+  }
 }
 
 describe("AFTER triggers", () => {
@@ -387,6 +434,83 @@ describe("AFTER triggers", () => {
     ).rejects.toThrow("column does not exist");
   });
 
+  it("refuses later schema changes that would invalidate stored INSERT bodies", async () => {
+    const defaultDatabase = new MinnowDatabase(new MemoryBlockStore());
+    await defaultDatabase.migrate(
+      schema([
+        table("source", { value: column.string() }),
+        table("sink", {
+          value: column.string(),
+          required: column.string().default("generated"),
+        }),
+      ]),
+    );
+    await defaultDatabase.execute(
+      "CREATE TRIGGER preserve_default AFTER INSERT ON source BEGIN " +
+        "INSERT INTO sink (value, required) VALUES (NEW.value, DEFAULT); END",
+    );
+    await expect(
+      defaultDatabase.migrate(
+        schema([
+          table("source", { value: column.string() }),
+          table("sink", { value: column.string(), required: column.string() }),
+        ]),
+      ),
+    ).rejects.toThrow("trigger preserve_default would become invalid");
+    expect(
+      (await defaultDatabase.introspect()).tables
+        .find((candidate) => candidate.name === "sink")
+        ?.columns.find((candidate) => candidate.name === "required")?.defaultValue,
+    ).toBeDefined();
+
+    const requiredDatabase = new MinnowDatabase(new MemoryBlockStore());
+    await requiredDatabase.migrate(
+      schema([
+        table("source", { value: column.string() }),
+        table("sink", { value: column.string() }),
+      ]),
+    );
+    await requiredDatabase.execute(
+      "CREATE TRIGGER preserve_required_shape AFTER INSERT ON source BEGIN " +
+        "INSERT INTO sink (value) VALUES (NEW.value); END",
+    );
+    await expect(
+      requiredDatabase.migrate(
+        schema([
+          table("source", { value: column.string() }),
+          table("sink", {
+            value: column.string(),
+            required: column.string().backfill("legacy"),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("trigger preserve_required_shape would become invalid");
+    expect(
+      (await requiredDatabase.introspect()).tables.find((candidate) => candidate.name === "sink")
+        ?.columns,
+    ).toHaveLength(1);
+
+    const implicitDatabase = new MinnowDatabase(new MemoryBlockStore());
+    await implicitDatabase.migrate(
+      schema([
+        table("source", { value: column.string() }),
+        table("sink", { value: column.string() }),
+      ]),
+    );
+    await implicitDatabase.execute(
+      "CREATE TRIGGER preserve_implicit_arity AFTER INSERT ON source BEGIN " +
+        "INSERT INTO sink VALUES (NEW.value); END",
+    );
+    await expect(
+      implicitDatabase.migrate(
+        schema([
+          table("source", { value: column.string() }),
+          table("sink", { value: column.string(), extra: column.string().nullable() }),
+        ]),
+      ),
+    ).rejects.toThrow("trigger preserve_implicit_arity would become invalid");
+  });
+
   it("rejects renaming a column a trigger references", async () => {
     const database = await seeded();
     await database.execute(
@@ -444,6 +568,7 @@ describe("AFTER triggers", () => {
       (record.triggers ?? []).filter((trigger) => trigger.name === "dup"),
     );
     expect(named).toHaveLength(1);
+    expect(named[0]?.id).toMatch(/\S/);
     // The survivor is intact and droppable by name.
     await database.execute("DROP TRIGGER dup");
     expect(
@@ -451,6 +576,40 @@ describe("AFTER triggers", () => {
         (record.triggers ?? []).filter((trigger) => trigger.name === "dup"),
       ),
     ).toHaveLength(0);
+  });
+
+  it("never drops a replacement that reused the name during a DROP ABA race", async () => {
+    const store = new TriggerDropAbaStore();
+    const database = await seeded(store);
+    await database.execute(
+      "CREATE TRIGGER aba AFTER INSERT ON accounts BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('a', NEW.id, NEW.balance); END",
+    );
+    const original = (await store.listTables())
+      .flatMap((record) => record.triggers ?? [])
+      .find((trigger) => trigger.name === "aba");
+    const replacementOwner = (await store.listTables()).find((record) => record.name === "audit");
+    if (original === undefined || replacementOwner === undefined) {
+      throw new Error("Trigger race fixture was not installed");
+    }
+    store.armReplacement(replacementOwner.id);
+
+    await expect(database.execute("DROP TRIGGER aba")).rejects.toBeInstanceOf(
+      TableRecordConflictError,
+    );
+    const survivors = (await store.listTables()).flatMap((record) =>
+      (record.triggers ?? []).map((trigger) => ({ tableId: record.id, trigger })),
+    );
+    expect(survivors).toHaveLength(1);
+    expect(survivors[0]).toMatchObject({
+      tableId: replacementOwner.id,
+      trigger: { id: "replacement-trigger-id", name: "aba" },
+    });
+    expect(survivors[0]?.trigger.id).not.toBe(original.id);
+
+    // A new DROP invocation pins the replacement's identity and may remove it normally.
+    await database.execute("DROP TRIGGER aba");
+    expect((await store.listTables()).flatMap((record) => record.triggers ?? [])).toHaveLength(0);
   });
 
   it("allows one cascade level and errors loudly on deeper chains", async () => {
@@ -514,6 +673,66 @@ describe("AFTER triggers", () => {
           "INSERT INTO accounts (id, balance, owner) VALUES (1, 2, 'x'); END",
       ),
     ).rejects.toThrow("keyless tables only");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_assignment AFTER INSERT ON audit BEGIN " +
+          "UPDATE accounts SET missing = 1 WHERE id = 1; END",
+      ),
+    ).rejects.toThrow("assignment column does not exist: missing");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_expression AFTER INSERT ON audit BEGIN " +
+          "UPDATE accounts SET balance = missing + 1 WHERE id = 1; END",
+      ),
+    ).rejects.toThrow("UPDATE column does not exist: missing");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_key_update AFTER INSERT ON audit BEGIN " +
+          "UPDATE accounts SET id = 2 WHERE id = 1; END",
+      ),
+    ).rejects.toThrow("cannot update a key column: id");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_update_predicate AFTER INSERT ON audit BEGIN " +
+          "UPDATE accounts SET balance = 1 WHERE abs(missing) = 1; END",
+      ),
+    ).rejects.toThrow("UPDATE column does not exist: missing");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_delete_predicate AFTER INSERT ON audit BEGIN " +
+          "DELETE FROM accounts WHERE abs(missing) = 1; END",
+      ),
+    ).rejects.toThrow("DELETE column does not exist: missing");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_qualifier AFTER INSERT ON audit BEGIN " +
+          "DELETE FROM accounts WHERE audit.action = 'x'; END",
+      ),
+    ).rejects.toThrow("DELETE column does not exist: audit.action");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_arity AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit VALUES ('only one'); END",
+      ),
+    ).rejects.toThrow("1 values for 3 target columns");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_default_values AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit DEFAULT VALUES; END",
+      ),
+    ).rejects.toThrow("omits a non-nullable column");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_explicit_default AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit (action) VALUES (DEFAULT); END",
+      ),
+    ).rejects.toThrow("uses DEFAULT for a non-nullable column");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER bad_returning AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit (action) VALUES ('x') RETURNING action; END",
+      ),
+    ).rejects.toThrow("cannot carry RETURNING");
     await database.createTable({
       name: "mirror",
       columns: [{ name: "action", type: "string" }],

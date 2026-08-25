@@ -4,6 +4,9 @@ export interface QueryMemoryUsage {
   readonly peakBytes: number;
 }
 
+/** Finite default for every public engine execution path. */
+export const DEFAULT_QUERY_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
+
 export class QueryMemoryBudgetError extends Error {
   override readonly name = "QueryMemoryBudgetError";
 
@@ -33,7 +36,10 @@ export class QueryMemoryContext {
   #talliedBytes = 0;
   #closed = false;
 
-  constructor(budgetBytes: number = Number.MAX_SAFE_INTEGER, parent?: QueryMemoryContext) {
+  constructor(
+    budgetBytes: number = DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
+    parent?: QueryMemoryContext,
+  ) {
     if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 0) {
       throw new RangeError("Query memory budget must be a non-negative safe integer");
     }

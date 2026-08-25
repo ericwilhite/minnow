@@ -1,0 +1,40 @@
+{
+  "name": "@minnowdb/export",
+  "version": "0.1.0",
+  "description": "Backpressure-aware CSV and NDJSON streams for Minnow queries.",
+  "license": "MIT",
+  "author": "Eric Wilhite",
+  "homepage": "https://minnowdb.com/docs/extensions/exports/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ericwilhite/minnow.git",
+    "directory": "packages/export"
+  },
+  "bugs": "https://github.com/ericwilhite/minnow/issues",
+  "keywords": [
+    "csv",
+    "database",
+    "export",
+    "minnow",
+    "ndjson",
+    "stream"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "!dist/**/*.spec.*",
+    "!dist/**/*.map",
+    "!dist/*.tsbuildinfo"
+  ],
+  "dependencies": {
+    "@minnowdb/core": ">=0.3.0 <1.0.0"
+  }
+}

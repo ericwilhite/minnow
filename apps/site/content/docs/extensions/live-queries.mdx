@@ -1,0 +1,131 @@
+---
+title: Live queries
+description: Type-safe reactive SQL through Kysely, workers, keyed changes, and bounded windows.
+---
+
+Live queries re-run a SELECT only when a durable commit can affect it. The public typed primitive
+is adapter-neutral: Minnow tracks the SQL statement and its table dependencies, while the query
+adapter executes it. That split preserves the adapter's inferred row type and result plugins.
+
+For Kysely, install the adapter and create one shared live-query manager:
+
+```ts
+import { createKyselyLiveQueries } from "@minnowdb/kysely";
+
+const live = createKyselyLiveQueries({ driver: database });
+
+const openOrders = db
+  .selectFrom("orders")
+  .select(["order_id", "customer_id", "total"])
+  .where("status", "=", "open")
+  .orderBy("order_id")
+  .$call(live);
+
+const unsubscribe = openOrders.subscribe(() => {
+  const snapshot = openOrders.getSnapshot();
+  if (snapshot.status === "ready") render(snapshot.rows);
+});
+```
+
+`typeof openOrders.$inferRow` is the inferred Kysely row. A snapshot is one of:
+
+- `loading`, with an empty or last-known `rows` array;
+- `ready`, with immutable `rows` and the manifest `version` that invalidated it;
+- `error`, with the error and the last good rows retained.
+
+`getSnapshot()` keeps the same object identity until state changes, and `subscribe()` returns a
+synchronous cleanup function. The same object therefore works with framework external-store APIs
+and as an async iterable:
+
+```ts
+for await (const snapshot of openOrders) {
+  if (snapshot.status === "ready") console.log(snapshot.rows);
+}
+```
+
+Close individual queries when their owner goes away and close the manager at application teardown:
+
+```ts
+unsubscribe();
+openOrders.close();
+await live.close();
+```
+
+## Why the wrapper, not `$call` in core
+
+`$call` is Kysely's composition method; it is not a shared query-builder standard. The reusable
+piece is the callable wrapper: `live(query)` and `query.$call(live)` are equivalent. A Drizzle or
+another query-library adapter can expose the same `live(query)` shape by supplying:
+
+- the compiled SQL and parameters used for dependency tracking;
+- an `execute(signal)` function returning that library's inferred rows.
+
+`@minnowdb/core/live` exports `LiveQuerySource`, `LiveQueryManager`, and
+`createLiveQueryManager` for that purpose.
+The adapter continues to execute its own query, so name mapping and other result transforms are not
+bypassed. A library-specific composition helper may call the wrapper, but is not required.
+
+## Keyed changes
+
+When a UI needs patches rather than a replacement array, select a unique, non-null result key:
+
+```ts
+const orderChanges = live.changes(
+  db.selectFrom("orders").select(["order_id", "status", "total"]).orderBy("order_id"),
+  { key: "order_id" },
+);
+
+orderChanges.subscribe(() => {
+  const snapshot = orderChanges.getSnapshot();
+  if (snapshot.status !== "ready") return;
+  for (const change of snapshot.changes) {
+    // insert | update | delete | move — all fully typed
+  }
+});
+```
+
+Key types are restricted at compile time to non-null string, number, boolean, or `Date` columns.
+Duplicate or null keys fail at runtime instead of producing an ambiguous diff. Diffing is exact and
+linear in the previous plus current row counts.
+
+## Ordered, bounded windows
+
+Large reactive result sets cost query time, comparison time, and worker transfer time. Prefer a
+bounded window for lists and dashboards:
+
+```ts
+const newestOrders = live.window(
+  db
+    .selectFrom("orders")
+    .select(["order_id", "placed_at", "total"])
+    .orderBy("placed_at", "desc")
+    .orderBy("order_id"),
+  { key: "order_id", limit: 100 },
+);
+```
+
+`window()` requires a top-level `ORDER BY`, applies `LIMIT` and optional `OFFSET`, and refuses a
+result above the declared limit. When the primary ordering can tie, include the unique result key
+as the final ordering term so window membership and `move` patches are deterministic.
+
+## How invalidation works
+
+Broadcast messages are only latency hints. Every sweep reads the store's durable manifest and
+catalog probe, unions the tables changed by missed commits, and re-runs only intersecting queries.
+The engine can also use block statistics to prove that some same-table inserts cannot affect a
+predicate. Equal low-level SQL subscriptions share execution and dependency work. Typed adapters
+share dependency/invalidation work; each typed store still executes through its own adapter so
+different result-plugin stacks cannot be merged incorrectly.
+
+Catalog-only changes, including replacing a view, refresh dependencies before execution. A failed
+query remains dirty so `refresh()` retries without requiring another commit. Exact row comparison
+suppresses an unchanged notification; its digest is only a fast inequality check, never the proof
+of equality.
+
+Built-in IndexedDB and OPFS stores derive a cross-tab channel name from the database name. Set
+`channelName` explicitly only to coordinate a custom store or naming scheme, and use
+`pollIntervalMs` when an environment needs a bounded fallback without BroadcastChannel hints.
+
+The low-level `database.liveQueries()` / `client.liveQueries()` API remains available for raw SQL
+callbacks. Its `observe()` form reports invalidations without also executing the statement, which
+is what typed adapters use to avoid duplicate SQL work.

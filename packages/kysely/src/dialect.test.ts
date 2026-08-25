@@ -1,16 +1,9 @@
 import { Kysely, sql, type Insertable, type Selectable, type Updateable } from "kysely";
 import { Migrator, type MigrationProvider } from "kysely/migration";
 import { beforeEach, describe, expect, expectTypeOf, it } from "vitest";
-import {
-  MinnowDatabase,
-  column,
-  schema,
-  table,
-  view,
-  type MinnowDatabaseClient,
-  type MinnowSqlDriver,
-} from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MinnowDatabase, column, schema, table, view, type MinnowSqlDriver } from "@minnowdb/core";
+import type { MinnowDatabaseClient } from "@minnowdb/core/client";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { MinnowDialect } from "./dialect.js";
 import { createKysely } from "./create-kysely.js";
 import type { InferKyselyDatabase } from "./schema.js";
@@ -55,6 +48,18 @@ const declaredSchema = schema(
 
 type DeclaredDatabase = InferKyselyDatabase<typeof declaredSchema>;
 
+const functionSchema = schema([
+  table("events", {
+    amount: column.number(),
+    exact_amount: column.numeric({ precision: 12, scale: 2 }),
+    happened_at: column.datetime(),
+    label: column.string().nullable(),
+    payload: column.string(),
+  }),
+]);
+
+type FunctionDatabase = InferKyselyDatabase<typeof functionSchema>;
+
 function invalidDerivedWritesAreRejected(): void {
   const lineChange: Updateable<DeclaredDatabase["order_lines"]> = {};
   // @ts-expect-error composite primary-key columns are not updateable
@@ -64,9 +69,113 @@ function invalidDerivedWritesAreRejected(): void {
   viewInsert.id = 1;
 }
 
+function portableKyselyCountRemainsPortable(db: Kysely<TestDatabase>): void {
+  const counted = db.selectFrom("person").select((builder) => builder.fn.countAll().as("count"));
+  expectTypeOf<Awaited<ReturnType<typeof counted.execute>>>().toEqualTypeOf<
+    Array<{ count: number | string | bigint }>
+  >();
+  const explicit = db
+    .selectFrom("person")
+    .select((builder) => builder.fn.countAll<number>().as("count"));
+  expectTypeOf<Awaited<ReturnType<typeof explicit.execute>>>().toEqualTypeOf<
+    Array<{ count: number }>
+  >();
+  void counted;
+  void explicit;
+}
+
+function portableKyselyFunctionsRemainPortable(db: Kysely<TestDatabase>): void {
+  const query = db
+    .selectFrom("person")
+    .select((builder) => [
+      builder.fn.sum("score").as("sum"),
+      builder.fn.avg("score").as("average"),
+      builder.fn("round", ["score"]).as("rounded"),
+      builder.fn("coalesce", ["score", builder.val(0)]).as("coalesced"),
+      builder.cast("score", "integer").as("cast_score"),
+    ]);
+  expectTypeOf<Awaited<ReturnType<typeof query.execute>>>().toEqualTypeOf<
+    Array<{
+      sum: number | string | bigint;
+      average: number | string;
+      rounded: unknown;
+      coalesced: unknown;
+      cast_score: unknown;
+    }>
+  >();
+  void query;
+}
+
+function inferredMinnowFunctions(db: Kysely<FunctionDatabase>): void {
+  const query = db
+    .selectFrom("events")
+    .select((builder) => [
+      builder.fn.sum("amount").as("sum"),
+      builder.fn.avg("amount").as("average"),
+      builder.fn.min("amount").as("minimum"),
+      builder.fn.max("amount").as("maximum"),
+      builder.fn.sum("exact_amount").as("exact_sum"),
+      builder.fn.avg("exact_amount").as("exact_average"),
+      builder
+        .fn("round", [
+          builder.fn.coalesce(builder.fn.sum("amount"), builder.val(0)),
+          builder.val(2),
+        ])
+        .as("rounded"),
+      builder.fn("date_trunc", [builder.val("month"), "happened_at"]).as("month"),
+      builder.fn("upper", ["label"]).as("upper_label"),
+      builder.fn("json_value", ["payload", builder.val("$.name")]).as("json_name"),
+      builder.fn("coalesce", ["label", builder.val("unknown")]).as("coalesced_label"),
+      builder.fn("nullif", ["amount", builder.val(0)]).as("nullif_amount"),
+      builder.fn("greatest", ["amount", builder.val(0)]).as("greatest_amount"),
+      builder.fn("least", ["label", builder.val("zzzz")]).as("least_label"),
+      builder.fn.agg("count", ["amount"]).as("aggregate_count"),
+      builder.fn.agg("sum", ["exact_amount"]).as("aggregate_sum"),
+      builder.cast("amount", "text").as("text_amount"),
+      builder.cast("amount", "numeric(12, 2)").as("numeric_amount"),
+      builder.cast("happened_at", "date").as("date_amount"),
+      builder.cast("label", "text").as("nullable_text"),
+    ]);
+  expectTypeOf<Awaited<ReturnType<typeof query.execute>>>().toEqualTypeOf<
+    Array<{
+      sum: number | null;
+      average: number | null;
+      minimum: number | null;
+      maximum: number | null;
+      exact_sum: string | null;
+      exact_average: string | null;
+      rounded: number;
+      month: Date;
+      upper_label: string | null;
+      json_name: string | null;
+      coalesced_label: string;
+      nullif_amount: number | null;
+      greatest_amount: number;
+      least_label: string;
+      aggregate_count: number;
+      aggregate_sum: string | null;
+      text_amount: string;
+      numeric_amount: string;
+      date_amount: Date;
+      nullable_text: string | null;
+    }>
+  >();
+
+  const explicit = db
+    .selectFrom("events")
+    .select((builder) => builder.fn.sum<number>("exact_amount").as("sum"));
+  expectTypeOf<Awaited<ReturnType<typeof explicit.execute>>>().toEqualTypeOf<
+    Array<{ sum: number }>
+  >();
+  void query;
+  void explicit;
+}
+
 describe("schema-derived Kysely types", () => {
   it("derives select, insert, and update shapes without a second DB interface", () => {
     expect(invalidDerivedWritesAreRejected).toBeTypeOf("function");
+    expect(inferredMinnowFunctions).toBeTypeOf("function");
+    expect(portableKyselyFunctionsRemainPortable).toBeTypeOf("function");
     expectTypeOf<Selectable<DeclaredDatabase["orders"]>>().toEqualTypeOf<{
       id: number;
       total: string;
@@ -137,6 +246,176 @@ describe("schema-derived Kysely types", () => {
       { id: 3, total: "0", status: "open" },
       { id: 4, total: "0", status: "open" },
     ]);
+    await db.destroy();
+    store.close();
+  });
+
+  it("infers Minnow COUNT results without a generic", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(declaredSchema);
+    const db = createKysely({ driver: database, schema: declaredSchema });
+    expect(portableKyselyCountRemainsPortable).toBeTypeOf("function");
+
+    await db
+      .insertInto("orders")
+      .values([{ note: "kept" }, { note: null }])
+      .execute();
+    const counted = db
+      .selectFrom("orders")
+      .select((builder) => [
+        builder.fn.countAll().as("orders"),
+        builder.fn.count("note").as("notes"),
+      ]);
+    expectTypeOf<Awaited<ReturnType<typeof counted.execute>>>().toEqualTypeOf<
+      Array<{ orders: number; notes: number }>
+    >();
+    expect(await counted.executeTakeFirstOrThrow()).toEqual({ orders: 2, notes: 1 });
+
+    const derived = db
+      .selectFrom(db.selectFrom("orders").select("id").as("selected_orders"))
+      .select((builder) => builder.fn.countAll().as("orders"));
+    expectTypeOf<Awaited<ReturnType<typeof derived.execute>>>().toEqualTypeOf<
+      Array<{ orders: number }>
+    >();
+    expect(await derived.executeTakeFirstOrThrow()).toEqual({ orders: 2 });
+
+    const explicit = db
+      .selectFrom("orders")
+      .select((builder) => builder.fn.countAll<string>().as("orders"));
+    expectTypeOf<Awaited<ReturnType<typeof explicit.execute>>>().toEqualTypeOf<
+      Array<{ orders: string }>
+    >();
+    void explicit;
+
+    await db.destroy();
+    store.close();
+  });
+
+  it("infers Minnow aggregate and scalar function results without generics", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(functionSchema);
+    const db = createKysely({ driver: database, schema: functionSchema });
+    const january = new Date("2026-01-19T14:23:00.000Z");
+
+    await db
+      .insertInto("events")
+      .values([
+        {
+          amount: 2,
+          exact_amount: 1.25,
+          happened_at: january,
+          label: "minnow",
+          payload: '{"name":"Minnow"}',
+        },
+        {
+          amount: 4,
+          exact_amount: 2.75,
+          happened_at: new Date("2026-02-01T00:00:00.000Z"),
+          label: null,
+          payload: "{}",
+        },
+      ])
+      .execute();
+
+    const aggregate = db
+      .selectFrom("events")
+      .select((builder) => [
+        builder.fn.sum("amount").as("sum"),
+        builder.fn.avg("amount").as("average"),
+        builder.fn.min("amount").as("minimum"),
+        builder.fn.max("amount").as("maximum"),
+        builder.fn.sum("exact_amount").as("exact_sum"),
+        builder.fn.avg("exact_amount").as("exact_average"),
+        builder
+          .fn("round", [
+            builder.fn.coalesce(builder.fn.sum("amount"), builder.val(0)),
+            builder.val(2),
+          ])
+          .as("rounded"),
+        builder.fn.agg("count", ["amount"]).as("aggregate_count"),
+      ]);
+    expectTypeOf<Awaited<ReturnType<typeof aggregate.execute>>>().toEqualTypeOf<
+      Array<{
+        sum: number | null;
+        average: number | null;
+        minimum: number | null;
+        maximum: number | null;
+        exact_sum: string | null;
+        exact_average: string | null;
+        rounded: number;
+        aggregate_count: number;
+      }>
+    >();
+    expect(await aggregate.executeTakeFirstOrThrow()).toEqual({
+      sum: 6,
+      average: 3,
+      minimum: 2,
+      maximum: 4,
+      exact_sum: "4",
+      exact_average: "2",
+      rounded: 6,
+      aggregate_count: 2,
+    });
+    expect(await aggregate.where("amount", ">", 100).executeTakeFirstOrThrow()).toEqual({
+      sum: null,
+      average: null,
+      minimum: null,
+      maximum: null,
+      exact_sum: null,
+      exact_average: null,
+      rounded: 0,
+      aggregate_count: 0,
+    });
+
+    const derived = db
+      .selectFrom(db.selectFrom("events").select("exact_amount").as("selected_events"))
+      .select((builder) => builder.fn.sum("exact_amount").as("exact_sum"));
+    expectTypeOf<Awaited<ReturnType<typeof derived.execute>>>().toEqualTypeOf<
+      Array<{ exact_sum: string | null }>
+    >();
+    expect(await derived.executeTakeFirstOrThrow()).toEqual({ exact_sum: "4" });
+
+    const scalar = db
+      .selectFrom("events")
+      .select((builder) => [
+        builder.fn("date_trunc", [builder.val("month"), "happened_at"]).as("month"),
+        builder.fn("upper", ["label"]).as("upper_label"),
+        builder.fn("json_value", ["payload", builder.val("$.name")]).as("json_name"),
+        builder.fn("coalesce", ["label", builder.val("unknown")]).as("coalesced_label"),
+        builder.fn("nullif", ["amount", builder.val(0)]).as("nullif_amount"),
+        builder.fn("greatest", ["amount", builder.val(0)]).as("greatest_amount"),
+        builder.fn("least", ["label", builder.val("zzzz")]).as("least_label"),
+        builder.cast("amount", "text").as("text_amount"),
+        builder.cast("amount", "numeric").as("numeric_amount"),
+      ])
+      .where("amount", "=", 2);
+    expectTypeOf<Awaited<ReturnType<typeof scalar.execute>>>().toEqualTypeOf<
+      Array<{
+        month: Date;
+        upper_label: string | null;
+        json_name: string | null;
+        coalesced_label: string;
+        nullif_amount: number | null;
+        greatest_amount: number;
+        least_label: string;
+        text_amount: string;
+        numeric_amount: string;
+      }>
+    >();
+    expect(await scalar.executeTakeFirstOrThrow()).toEqual({
+      month: new Date("2026-01-01T00:00:00.000Z"),
+      upper_label: "MINNOW",
+      json_name: "Minnow",
+      coalesced_label: "minnow",
+      nullif_amount: 2,
+      greatest_amount: 2,
+      least_label: "minnow",
+      text_amount: "2",
+      numeric_amount: "2",
+    });
+
     await db.destroy();
     store.close();
   });
@@ -398,12 +677,26 @@ describe("MinnowDialect", () => {
     ]);
   });
 
-  it("rejects values and execution modes Minnow cannot represent", async () => {
+  it("rejects values Minnow cannot represent and streams typed rows", async () => {
     const bigintQuery = sql`SELECT ${1n} AS value`.compile(db);
     await expect(db.executeQuery(bigintQuery)).rejects.toThrow("unsupported type bigint");
-    await expect(db.selectFrom("person").selectAll().stream().next()).rejects.toThrow(
-      "streaming is not supported",
-    );
+    await db
+      .insertInto("person")
+      .values([
+        { id: 1, name: "Ada", score: 8 },
+        { id: 2, name: "Grace", score: 9 },
+        { id: 3, name: "Katherine", score: 10 },
+      ])
+      .execute();
+    const rows: Array<{ id: number; name: string }> = [];
+    for await (const row of db.selectFrom("person").select(["id", "name"]).stream(2)) {
+      rows.push(row);
+    }
+    expect(rows).toEqual([
+      { id: 1, name: "Ada" },
+      { id: 2, name: "Grace" },
+      { id: 3, name: "Katherine" },
+    ]);
   });
 
   it("does not take ownership of the underlying database", async () => {

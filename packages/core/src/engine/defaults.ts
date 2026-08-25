@@ -4,6 +4,7 @@
  * validation. Auto-increment slots stay null until the write path atomically reserves a range.
  */
 
+import { copyDate } from "../date-value.js";
 import type { RowIdRange, TableColumnRecord, TableRecord } from "../storage/types.js";
 import type { BatchValue, ColumnarBatch } from "./batch.js";
 
@@ -109,9 +110,7 @@ export async function fillColumnDefaults(
       switch (defaultValue.kind) {
         case "literal":
           values[index] =
-            defaultValue.value instanceof Date
-              ? new Date(defaultValue.value.getTime())
-              : defaultValue.value;
+            defaultValue.value instanceof Date ? copyDate(defaultValue.value) : defaultValue.value;
           break;
         case "expression":
           values[index] = await evaluateExpression(defaultValue.sql, index);

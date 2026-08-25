@@ -1,5 +1,6 @@
 import { stringArgument } from "./sql-semantics.js";
 import { externalSqlDomainValue } from "./sql-domains.js";
+import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
 
 /**
  * SQL/JSON scalar support (T801 family). Documents may be ordinary JSON text or native JSON/JSONB
@@ -15,6 +16,11 @@ interface JsonPathStep {
 
 export function parseJsonPath(path: unknown, caller: string): JsonPathStep[] {
   const text = stringArgument(caller, path).trim();
+  if (text.length > MAX_CACHEABLE_TEXT_CHARACTERS) {
+    throw new RangeError(
+      `${caller} path exceeds ${String(MAX_CACHEABLE_TEXT_CHARACTERS)} characters`,
+    );
+  }
   if (!text.startsWith("$")) throw new TypeError(`${caller} paths start at $`);
   const steps: JsonPathStep[] = [];
   let cursor = 1;
@@ -56,8 +62,9 @@ export function jsonAtPath(
 ): { found: boolean; value?: unknown } {
   const steps = parseJsonPath(path, caller);
   let current: unknown;
+  const source = boundedJsonDocument(document, caller);
   try {
-    current = JSON.parse(stringArgument(caller, externalSqlDomainValue(document)));
+    current = JSON.parse(source);
   } catch {
     // A document that is not JSON selects nothing rather than failing the whole statement,
     // matching the standard's default ON ERROR behaviour for these functions.
@@ -83,6 +90,11 @@ export function jsonAtPath(
 export function jsonIsValid(document: unknown, kind: string): boolean {
   document = externalSqlDomainValue(document);
   if (typeof document !== "string") return false;
+  if (document.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(
+      `JSON document exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+    );
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(document);
@@ -105,7 +117,7 @@ export function jsonIsValid(document: unknown, kind: string): boolean {
 /** A SQL value as its JSON counterpart: datetimes serialize as ISO text, like every cast. */
 export function jsonValueOf(value: unknown): unknown {
   const external = externalSqlDomainValue(value);
-  return external instanceof Date ? external.toISOString() : external;
+  return external instanceof Date ? dateIsoString(external) : external;
 }
 
 /**
@@ -118,7 +130,8 @@ export function jsonConstructor(
   values: readonly unknown[],
 ): string {
   if (name === "JSON_ARRAY") {
-    return JSON.stringify(values.map((value) => jsonValueOf(value ?? null)));
+    const members = values.map((value) => boundedJsonValue(value ?? null, "JSON_ARRAY value"));
+    return joinBoundedJson("[", members, "]", "JSON_ARRAY result");
   }
   const members: string[] = [];
   for (let index = 0; index + 1 < values.length; index += 2) {
@@ -127,7 +140,7 @@ export function jsonConstructor(
       throw new TypeError("JSON_OBJECT keys cannot be NULL");
     }
     let key: string;
-    if (rawKey instanceof Date) key = rawKey.toISOString();
+    if (rawKey instanceof Date) key = dateIsoString(rawKey);
     else if (typeof rawKey === "string") key = rawKey;
     else if (typeof rawKey === "number" || typeof rawKey === "boolean") key = String(rawKey);
     else throw new TypeError("JSON_OBJECT keys must be scalar values");
@@ -135,7 +148,55 @@ export function jsonConstructor(
     // Build JSON text directly. WITHOUT UNIQUE KEYS is the default, so duplicate names must be
     // preserved; assigning through a JavaScript object would collapse them and mishandle
     // special names such as "__proto__".
-    members.push(`${JSON.stringify(key)}:${JSON.stringify(jsonValueOf(member ?? null))}`);
+    const encodedKey = boundedJsonValue(key, "JSON_OBJECT key");
+    const encodedValue = boundedJsonValue(member ?? null, "JSON_OBJECT value");
+    members.push(`${encodedKey}:${encodedValue}`);
   }
-  return `{${members.join(",")}}`;
+  return joinBoundedJson("{", members, "}", "JSON_OBJECT result");
 }
+
+function boundedJsonDocument(value: unknown, caller: string): string {
+  const document = stringArgument(caller, externalSqlDomainValue(value));
+  if (document.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(
+      `${caller} document exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+    );
+  }
+  return document;
+}
+
+function boundedJsonValue(value: unknown, label: string): string {
+  const normalized = jsonValueOf(value);
+  if (typeof normalized === "string" && normalized.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  const encoded: unknown = JSON.stringify(normalized);
+  if (typeof encoded !== "string") throw new TypeError(`${label} is not JSON serializable`);
+  if (encoded.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  return encoded;
+}
+
+function joinBoundedJson(
+  prefix: string,
+  members: readonly string[],
+  suffix: string,
+  label: string,
+): string {
+  let length = prefix.length + suffix.length;
+  for (const member of members) {
+    length += member.length;
+    if (!Number.isSafeInteger(length) || length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+      throw new RangeError(
+        `${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+      );
+    }
+  }
+  if (members.length > 1) length += members.length - 1;
+  if (!Number.isSafeInteger(length) || length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  return `${prefix}${members.join(",")}${suffix}`;
+}
+import { dateIsoString } from "../date-value.js";

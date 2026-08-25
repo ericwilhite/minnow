@@ -1,0 +1,57 @@
+---
+title: React
+description: Read Minnow live-query snapshots with React's concurrent external-store API.
+---
+
+`@minnowdb/react` is a small adapter over the framework-neutral store implemented by every typed
+live query and keyed live query.
+
+```bash
+npm install @minnowdb/react
+```
+
+Create the query once, then pass it to `useLiveQuery`:
+
+```tsx
+import { useEffect, useMemo } from "react";
+import { useLiveQuery } from "@minnowdb/react";
+
+function OpenOrders() {
+  const query = useMemo(
+    () =>
+      db
+        .selectFrom("orders")
+        .select(["order_id", "customer_id", "total"])
+        .where("status", "=", "open")
+        .$call(live),
+    [],
+  );
+  useEffect(() => () => query.close(), [query]);
+
+  const snapshot = useLiveQuery(query);
+  if (snapshot.status === "loading") return <p>Loading…</p>;
+  if (snapshot.status === "error") return <p>Could not refresh this view.</p>;
+  return (
+    <ul>
+      {snapshot.rows.map((row) => (
+        <li key={row.order_id}>{row.customer_id}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+The hook uses React's concurrent-safe external-store primitive and the same stable snapshot for
+server rendering. Observation starts with the first subscriber and stops after the last cleanup;
+duplicate subscriptions are independent leases. Keep the live manager and query stable across
+renders so a render does not create a new database subscription.
+
+`useLiveQuery` is generic over the store snapshot, so keyed changes require no second hook:
+
+```tsx
+const snapshot = useLiveQuery(orderChanges);
+if (snapshot.status === "ready") applyChanges(snapshot.changes);
+```
+
+See [Live queries](/docs/extensions/live-queries) for query construction, errors, keyed changes,
+windows, and teardown.

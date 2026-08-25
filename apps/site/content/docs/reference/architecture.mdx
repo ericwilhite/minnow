@@ -18,9 +18,11 @@ Everything else is built around these ideas.
   events can all fail silently. Minnow uses them to speed things up, never for correctness.
   Correct behavior always rests on a committed storage write — an IndexedDB transaction, or a
   checksummed entry in the OPFS store's command log.
-- **Durability ends at a committed write.** A committed write is safe. A write still in
-  flight when the tab closes is not. Minnow flushes early when the page hides, but treats that as
-  a bonus, not a guarantee.
+- **A committed write is the visibility boundary.** Durable adapters acknowledge only after their
+  atomic storage commit. Their default `strict` mode also requests or performs the final flush;
+  `relaxed` keeps atomicity but explicitly accepts that power loss can remove an acknowledged
+  suffix. Origin eviction and deliberate site-data clearing remain separate risks, so
+  irreplaceable data still needs an independent copy.
 - **Where the engine runs is your choice.** Put it in a worker and hold an async proxy in the
   page, or construct it on the main thread. The API is async everywhere, so your code — and any
   adapter written against it — looks the same either way.
@@ -40,10 +42,11 @@ OPFS per file open. So Minnow stores a few large values instead of many small on
 - Data is packed into **compressed columnar blocks** — one column for a group of rows, roughly a
   megabyte before compression.
 - No row is ever its own storage entry, and no table is one giant entry.
-- Each block carries **checksums** (one over the payload, one over the header and its statistics)
-  and min/max stats, so queries can skip blocks that can't match a filter without even
-  decompressing them. A declared scalar or composite secondary index adds a durable candidate map
-  when block statistics are not selective enough.
+- Each block carries separate **checksums** over its stored payload, logical uncompressed payload,
+  and header plus statistics. Recovery can reject damaged compressed bytes without decompressing
+  them, while queries can trust min/max statistics and skip blocks that cannot match a filter.
+  A declared scalar or composite secondary index adds a durable candidate map when block
+  statistics are not selective enough.
 
 Columns beat rows here because most reads touch a few columns across many rows: filter, aggregate,
 scan. Similar values sit together, so they compress well, and queries fetch only the columns they
@@ -54,13 +57,64 @@ stay gzip only when they save at least 20%, and an unhelpful column is re-probed
 The configured codec is therefore a preference: each self-describing block records the codec it
 actually used. This keeps repetitive strings compressed without making random numeric data pay a
 compression and decompression pass for single-digit percentage savings.
+Compression also stops at the format's 64 MiB stored-payload ceiling before joining output
+chunks. A legal wide value that gzip expands falls back to raw without first allocating a second
+oversized compressed result.
 
 Keeping published blocks unchanged pays for everything else:
 
 - A crash can strand unused data — it can never corrupt visible data.
 - Retrying a write is always safe.
-- Another tab can keep reading old data for as long as it needs.
-- A snapshot is just a list of blocks, so snapshots cost nothing.
+- Another tab can keep reading its leased old version; if it falls far enough behind, fixed
+  retained-history ceilings backpressure writers rather than reclaiming data under the reader.
+- A snapshot reuses the published block bytes verbatim, so export never rewrites or recompresses
+  table data.
+
+### Locked block envelope
+
+Block format 2 is little-endian. Every block starts with this fixed 44-byte header, followed by
+canonical UTF-8 JSON metadata and then the stored payload:
+
+| Offset | Width | Field                                                       |
+| -----: | ----: | ----------------------------------------------------------- |
+|      0 |     4 | ASCII magic `BRDB`                                          |
+|      4 |     4 | envelope CRC-32 over bytes `[8, 44 + metadata byte length)` |
+|      8 |     2 | format version (`2`)                                        |
+|     10 |     2 | header length (`44`)                                        |
+|     12 |     1 | logical type ID                                             |
+|     13 |     1 | physical encoding ID                                        |
+|     14 |     1 | compression ID                                              |
+|     15 |     1 | mandatory flags; currently zero                             |
+|     16 |     4 | row count                                                   |
+|     20 |     4 | null count                                                  |
+|     24 |     4 | metadata byte length                                        |
+|     28 |     4 | uncompressed physical payload byte length                   |
+|     32 |     4 | stored payload byte length                                  |
+|     36 |     4 | CRC-32 of the uncompressed physical payload                 |
+|     40 |     4 | CRC-32 of the stored payload                                |
+
+Readers verify the envelope before trusting a header field or statistic. A storage verifier can
+then check all stored bytes without decompressing them; a query additionally checks the logical
+checksum after decompression. Metadata is capped at 1 KiB, either payload at 64 MiB, and one block
+at 1,048,576 rows. The row ceiling keeps even bitmap-dense blocks safe to decode into JavaScript
+values. Unknown flags and identifiers are rejected, and raw blocks require their stored and logical
+checksums and stored/uncompressed lengths to match.
+CRC-32 detects accidental corruption; it is not a cryptographic authenticity check.
+
+Logical and physical type IDs are `1` boolean, `2` number, `3` string, and `4` datetime; the two
+fields must match in format 2. Compression ID `0` is raw and `2` is gzip. ID `1` is permanently
+reserved for an abandoned pre-lock prototype and can never be reassigned. Metadata is exactly
+`{}` or `{"zoneMap":{"min":number,"max":number}}` in that key order with no insignificant
+whitespace; unknown fields and alternate JSON spellings are rejected.
+
+All physical columns begin with a validity bitmap. Booleans add a value bitmap. Numbers use
+little-endian IEEE-754 float64 values, datetimes use float64 Unix milliseconds, and strings use
+`rowCount + 1` little-endian uint32 offsets followed by strictly well-formed UTF-8. Minnow's
+physical rewrite operations validate and preserve these same canonical bitmap, null-slot,
+padding, numeric, UTF-8, offset, metadata, checksum, and size rules without materializing row
+objects. The public low-level `decodeColumn` applies that validation too; only the already-verified
+block reader uses its internal no-second-pass materializer. Frozen vectors cover every physical
+type, and the native database fixture locks the block and snapshot containers together.
 
 Writes append small **delta segments**: an update stores just the key and the changed columns, a
 delete stores a key marker. Background compaction folds deltas into larger read-friendly segments
@@ -74,17 +128,18 @@ the million.
 
 ## How a write commits
 
-Readers see the database through a **manifest** — the list of exactly which blocks make up
-version N. Physically each commit stores only what changed (a full checkpoint lands every 32
-versions), so publishing costs the size of the change, not the size of the database. A commit
-publishes version N + 1, in strict order:
+Readers see the database through a **manifest version**. Its record is a bounded summary; exact
+block membership lives in an ordered provenance record per block, with the version that added it
+and, after retirement, the version that removed it. Each commit writes only changed provenance
+plus the next summary, so publishing costs the size of the change rather than cloning the live
+block-ID set. A commit publishes version N + 1, in strict order:
 
 ```
 1. encode and compress the new blocks
 2. write the blocks               (nothing points to them yet)
 3. open a short metadata transaction
 4. check the manifest is still at version N
-5. publish manifest N + 1
+5. publish summary N + 1 and the changed membership intervals
 ```
 
 Data first, version last. The version change is all or nothing. A crash anywhere in between leaves
@@ -114,10 +169,11 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   the same time; only one publishes, the other retries.
 - **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
   reconciles against the durable store. A missed message costs a little latency, never a stale
-  result. [Live queries](/docs/engine/workers#buffered-writers-and-live-queries) are built on this.
+  result. [Live queries](/docs/extensions/live-queries) are built on this.
 - **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
   expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
-  pinned becomes reclaimable. No heartbeats, no guessing.
+  pinned becomes reclaimable. Correctness depends on the durable lease record, not an in-memory
+  heartbeat or a lifecycle notification.
 
 ## How queries run
 
@@ -132,7 +188,9 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.
 - Spill pages are lease-protected, so a query abandoned by a dead tab gets cleaned up.
 - Compiled plans are cached separately, by statement text, so re-issuing a statement doesn't
-  re-parse or re-plan it.
+  re-parse or re-plan it. Plan, statement, pattern, full-text-term, collation, constraint, and
+  catalog-state caches all have fixed entry or byte bounds; oversized accepted text executes but
+  does not become permanent process state.
 - Everything else repeated is cached in one byte-bounded buffer pool (`bufferPoolBytes`,
   default 64 MiB): decoded blocks by immutable block id, assembled column vectors and zone
   descriptions by the same, and computed results — whole-block results, the columnar forms of
@@ -165,12 +223,12 @@ Compaction and garbage collection run for a long time inside a tab that can die 
 ```
 Page (UI thread)       async proxy: requests, cancellation, results
         |
-Coordinator worker     catalog, snapshots, transactions, planning, live queries
+Engine worker          catalog, snapshots, transactions, planning, live queries
         |
 Storage                IndexedDB or OPFS, block codecs, manifests, leases, GC
 ```
 
-- Each tab owns its own coordinator worker.
+- Each tab owns its own engine worker when it uses the worker client.
 - Buffers cross the boundary as transferable `ArrayBuffer`s — no shared memory, which is why no
   cross-origin isolation is needed. Query results and live change events cross as one array per
   column (typed arrays transferred, strings as one flat text), and the proxy rebuilds the row
@@ -201,8 +259,9 @@ so your own tests can crash the engine on purpose too.
   cap the JavaScript heap.
 - **Performance depends on the browser and workload.** Run the [benchmarks](/benchmarks) to measure
   the queries and storage adapters on your target device.
-- **The block format may change during 0.x.** Formats only grow: new codecs get new IDs and old
-  bytes are never reinterpreted. Version 1 checksums both its header and statistics.
+- **The block format is explicitly versioned.** Version 2 freezes its 44-byte envelope and raw
+  physical layouts in permanent byte vectors. A future format gets a new version and reader;
+  existing bytes are never reinterpreted.
 - **Indexes use tuple postings, not a general B-tree.** Scalar and composite keys prune leftmost
   equality/`IN` prefixes plus a following range. `UNIQUE` has independent atomic membership.
   Exact non-null indexes can also deliver `ORDER BY` and covering reads for keyless append-only

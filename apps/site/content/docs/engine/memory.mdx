@@ -9,7 +9,7 @@ decoded blocks.
 
 ## The execution budget
 
-Set a ceiling for what one statement may allocate:
+Every statement has a 64 MiB modeled execution budget by default. Override it for one statement:
 
 ```ts
 await db.query(sql, { executionMemoryBudgetBytes: 32 * 1024 * 1024 });
@@ -76,7 +76,9 @@ concurrently with queries.
 
 ## Choosing numbers
 
-The defaults — 64 MiB of buffer pool, no explicit execution budget — suit an application working
-over tens of megabytes of data. Lower the pool on a memory-constrained device or when many
-databases are open at once. Set an execution budget when a user can write arbitrary queries, which
-is exactly the case the [console on the home page](/#console) is in.
+The defaults — a 64 MiB buffer pool and a separate 64 MiB per-statement execution budget — suit an
+application working over tens of megabytes of data. Lower either on a constrained device or when
+many databases are open at once. Set the database-wide default with
+`new MinnowDatabase(store, { executionMemoryBudgetBytes })`; pass `null` there only when an
+application deliberately accepts unbounded execution memory. The same database default applies
+to mutation selection, triggers, subqueries, and read-your-writes scopes, not only public SELECTs.

@@ -1,4 +1,4 @@
-import type { SnapshotSummary } from "@minnowdb/core/storage";
+import type { SnapshotSummary } from "@minnowdb/core/storage/snapshots";
 import { describe, expect, it } from "vitest";
 import {
   confirmRestore,

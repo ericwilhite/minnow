@@ -70,6 +70,34 @@ async function waitFor(condition: () => boolean, what: string): Promise<void> {
   throw new Error(`Timed out waiting for ${what}`);
 }
 
+let transactionOrdinal = 0;
+
+async function stageBlock(store: OpfsBlockStore, id: string, bytes: Uint8Array): Promise<void> {
+  transactionOrdinal += 1;
+  const transactionId = `routing-transaction-${String(transactionOrdinal)}`;
+  await store.beginTransaction({
+    record: {
+      id: transactionId,
+      ownerId: `routing-owner-${String(transactionOrdinal)}`,
+      expiresAt: "2026-08-24T01:00:00.000Z",
+      pendingBlockIds: [],
+      pendingSegmentIds: [],
+      status: "active",
+      revision: 0,
+      startedAt: "2026-08-24T00:00:00.000Z",
+      updatedAt: "2026-08-24T00:00:00.000Z",
+      committedVersion: null,
+    },
+  });
+  await store.stageTransactionArtifacts({
+    transactionId,
+    expectedRevision: 0,
+    blocks: [{ id, bytes }],
+    segments: [],
+    updatedAt: "2026-08-24T00:00:01.000Z",
+  });
+}
+
 describe("OPFS request routing", () => {
   afterEach(() => {
     globalThis.BroadcastChannel = RealBroadcastChannel;
@@ -86,7 +114,7 @@ describe("OPFS request routing", () => {
     observed.setLabel("bystander");
     const bystander = await open();
     const bytes = new Uint8Array(64 * 1024).fill(7);
-    await leader.addBlock("x", bytes);
+    await stageBlock(leader, "x", bytes);
     // Both followers learn the leader, so the bystander is a fully connected follower — the
     // shape in which the old broadcast design cloned every answer into it.
     await bystander.getCurrentManifestVersion();
@@ -138,14 +166,14 @@ describe("OPFS request routing", () => {
     const second = await open();
     const bytes = new Uint8Array(16 * 1024).fill(1);
     for (let round = 0; round < 3; round += 1) {
-      await first.addBlock(`first-${String(round)}`, bytes);
-      await second.addBlock(`second-${String(round)}`, bytes);
+      await stageBlock(first, `first-${String(round)}`, bytes);
+      await stageBlock(second, `second-${String(round)}`, bytes);
     }
     const [leaderInbox, ...outbound] = observed.inboxOf(leader);
-    expect(leaderInbox?.heard.filter((message) => message.kind === "op")).toHaveLength(6);
+    expect(leaderInbox?.heard.filter((message) => message.kind === "op")).toHaveLength(12);
     // The transient outbound objects heard nothing: each was closed before any other
     // follower's operation could reach it.
-    expect(outbound).toHaveLength(6);
+    expect(outbound).toHaveLength(12);
     expect(heard(outbound, "op")).toEqual([]);
     leader.close();
     first.close();
@@ -204,7 +232,7 @@ describe("OPFS request routing", () => {
       rpcTimeoutMs: 200,
     });
     const bytes = new Uint8Array(1024).fill(3);
-    await leader.addBlock("x", bytes);
+    await stageBlock(leader, "x", bytes);
     await follower.getCurrentManifestVersion();
     await successor.getCurrentManifestVersion();
 
@@ -214,7 +242,7 @@ describe("OPFS request routing", () => {
     const pending = follower.getBlock("x");
     // The successor's own operation finds no leader, takes the lock, and announces itself; the
     // follower hears that on the shared channel and re-sends its request to the new inbox.
-    await successor.addBlock("y", bytes);
+    expect(await successor.getBlock("x")).toEqual(bytes);
     expect(await pending).toEqual(bytes);
     expect(Date.now() - started).toBeLessThan(2_000);
     const arrived = heard(observed.inboxOf(successor), "op").filter(
@@ -238,7 +266,7 @@ describe("OPFS request routing", () => {
       root: shim.root,
       rpcTimeoutMs: 100,
     });
-    await leader.addBlock("x", new Uint8Array([1, 2, 3]));
+    await stageBlock(leader, "x", new Uint8Array([1, 2, 3]));
     expect(await follower.getBlock("x")).toEqual(new Uint8Array([1, 2, 3]));
     leader._crashForTests();
     const started = Date.now();

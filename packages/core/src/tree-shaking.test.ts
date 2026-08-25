@@ -1,9 +1,7 @@
 /**
- * Pins the packaging promise that an application ships only the store it uses. Two mechanisms
- * carry it, and either can regress silently: the package's `sideEffects` declaration (a stray
- * top-level side effect anywhere under a barrel makes bundlers keep everything), and the
- * worker host's dynamic adapter imports (a static import fuses every adapter into the worker
- * chunk again).
+ * Pins the package download budget and the promise that an application ships only the store it
+ * uses. Both can regress silently through a barrel export, a stray side effect, or a static worker
+ * adapter import.
  *
  * Bundles the built package the way an application's bundler would — so like the playground
  * declaration suite, it reads `dist/` and expects it to be current (`tsc -b`, which every
@@ -14,11 +12,23 @@
  * package.
  */
 import { join } from "node:path";
+import { constants, gzipSync } from "node:zlib";
 import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
 
 const OPFS_MARKER = "minnowdb-store:";
 const IDB_MARKER = "unique-key-base-part";
+const CLIENT_MARKER = "Database client is closed";
+const KEYED_LIVE_MARKER = "Live query window maxRows must be a positive whole number";
+const TYPED_TABLE_MARKER = "Upsert requires a unique key:";
+const DATABASE_MARKER = "A database cannot queue more than";
+const COMPLETE_ENTRY_RAW_BUDGET = 680 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 195 * 1024;
+// The v1 hardening pass measures 1007.6 KiB raw / 277.5 KiB gzip. Keep roughly 0.25% raw and
+// 0.9% compressed headroom: enough to avoid byte-at-a-time churn, but small enough that one
+// accidentally retained module still fails loudly.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1010 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 280 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
@@ -37,7 +47,65 @@ async function bundle(contents: string): Promise<string> {
   return output.text;
 }
 
-describe("adapters tree-shake out of application bundles", () => {
+describe("core packaging", () => {
+  it("keeps the complete main entry below its download budget", async () => {
+    const result = await build({
+      entryPoints: ["@minnowdb/core"],
+      absWorkingDir: repoRoot,
+      bundle: true,
+      write: false,
+      minify: true,
+      format: "esm",
+      platform: "browser",
+      target: "es2022",
+      define: { "process.env.NODE_ENV": '"production"' },
+      logLevel: "silent",
+    });
+    const output = result.outputFiles[0];
+    if (output === undefined) throw new Error("esbuild produced no main-entry output");
+    const gzipBytes = gzipSync(output.contents, {
+      level: constants.Z_BEST_COMPRESSION,
+    }).byteLength;
+
+    expect(output.contents.byteLength, "complete main entry raw bytes").toBeLessThanOrEqual(
+      COMPLETE_ENTRY_RAW_BUDGET,
+    );
+    expect(gzipBytes, "complete main entry gzip bytes").toBeLessThanOrEqual(
+      COMPLETE_ENTRY_GZIP_BUDGET,
+    );
+  });
+
+  it("keeps a usable engine with the larger durable adapter below its download budget", async () => {
+    const result = await build({
+      stdin: {
+        contents:
+          'export { MinnowDatabase } from "@minnowdb/core"; ' +
+          'export { OpfsBlockStore } from "@minnowdb/core/storage/opfs";',
+        resolveDir: repoRoot,
+      },
+      bundle: true,
+      write: false,
+      minify: true,
+      format: "esm",
+      platform: "browser",
+      target: "es2022",
+      define: { "process.env.NODE_ENV": '"production"' },
+      logLevel: "silent",
+    });
+    const output = result.outputFiles[0];
+    if (output === undefined) throw new Error("esbuild produced no durable-engine output");
+    const gzipBytes = gzipSync(output.contents, {
+      level: constants.Z_BEST_COMPRESSION,
+    }).byteLength;
+
+    expect(output.contents.byteLength, "engine plus OPFS raw bytes").toBeLessThanOrEqual(
+      ENGINE_WITH_OPFS_RAW_BUDGET,
+    );
+    expect(gzipBytes, "engine plus OPFS gzip bytes").toBeLessThanOrEqual(
+      ENGINE_WITH_OPFS_GZIP_BUDGET,
+    );
+  });
+
   it("the engine alone carries no adapter", async () => {
     const output = await bundle(
       `import { MinnowDatabase } from "@minnowdb/core"; console.log(MinnowDatabase);`,
@@ -46,20 +114,83 @@ describe("adapters tree-shake out of application bundles", () => {
     expect(output).not.toContain(IDB_MARKER);
   });
 
-  it("importing the IndexedDB store does not pull the OPFS store", async () => {
+  it("keeps optional client and typed-live APIs out of the complete main surface", async () => {
+    const output = await bundle(`import * as core from "@minnowdb/core"; console.log(core);`);
+    expect(output).not.toContain(CLIENT_MARKER);
+    expect(output).not.toContain(KEYED_LIVE_MARKER);
+
+    const live = await bundle(
+      `import { KeyedLiveQuery } from "@minnowdb/core/live"; console.log(KeyedLiveQuery);`,
+    );
+    expect(live).toContain(KEYED_LIVE_MARKER);
+  });
+
+  it("keeps the optional typed-table renderer on the schema entry", async () => {
+    const main = await bundle(`import * as core from "@minnowdb/core"; console.log(core);`);
+    expect(main).not.toContain(TYPED_TABLE_MARKER);
+
+    const schema = await bundle(
+      `import { typedTable } from "@minnowdb/core/schema"; console.log(typedTable);`,
+    );
+    expect(schema).toContain(TYPED_TABLE_MARKER);
+  });
+
+  it("the standalone query tools carry no engine or adapter", async () => {
     const output = await bundle(
-      `import { IndexedDbBlockStore } from "@minnowdb/core/storage"; console.log(IndexedDbBlockStore);`,
+      `import { compileStatement } from "@minnowdb/core/query"; console.log(compileStatement);`,
+    );
+    expect(output).not.toContain(CLIENT_MARKER);
+    expect(output).not.toContain(OPFS_MARKER);
+    expect(output).not.toContain(IDB_MARKER);
+  });
+
+  it("the standalone schema DSL carries no database engine or adapter", async () => {
+    const output = await bundle(
+      `import { column, table } from "@minnowdb/core/schema"; console.log(column, table);`,
+    );
+    expect(output).not.toContain(DATABASE_MARKER);
+    expect(output).not.toContain(CLIENT_MARKER);
+    expect(output).not.toContain(OPFS_MARKER);
+    expect(output).not.toContain(IDB_MARKER);
+  });
+
+  it("retains the worker's side-effect attachment through a bare package import", async () => {
+    const output = await bundle('import "@minnowdb/core/worker";');
+
+    // This protocol refusal is emitted by the attached host before initialization. An entry-point
+    // build would survive even if package.json accidentally stopped marking worker.js as a side
+    // effect; a consumer's bare import would not.
+    expect(output).toContain("Database is not initialized: send init first");
+  });
+
+  it("an IndexedDB-only subpath does not pull the OPFS store", async () => {
+    const output = await bundle(
+      `import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb"; console.log(IndexedDbBlockStore);`,
     );
     expect(output).toContain(IDB_MARKER);
     expect(output).not.toContain(OPFS_MARKER);
   });
 
-  it("importing the OPFS store does not pull the IndexedDB store", async () => {
+  it("an OPFS-only subpath does not pull the IndexedDB store", async () => {
     const output = await bundle(
-      `import { OpfsBlockStore } from "@minnowdb/core/storage"; console.log(OpfsBlockStore);`,
+      `import { OpfsBlockStore } from "@minnowdb/core/storage/opfs"; console.log(OpfsBlockStore);`,
     );
     expect(output).toContain(OPFS_MARKER);
     expect(output).not.toContain(IDB_MARKER);
+  });
+
+  it("keeps named imports from the complete storage barrel tree-shakable", async () => {
+    const indexedDb = await bundle(
+      `import { IndexedDbBlockStore } from "@minnowdb/core/storage"; console.log(IndexedDbBlockStore);`,
+    );
+    expect(indexedDb).toContain(IDB_MARKER);
+    expect(indexedDb).not.toContain(OPFS_MARKER);
+
+    const opfs = await bundle(
+      `import { OpfsBlockStore } from "@minnowdb/core/storage"; console.log(OpfsBlockStore);`,
+    );
+    expect(opfs).toContain(OPFS_MARKER);
+    expect(opfs).not.toContain(IDB_MARKER);
   });
 
   it("the worker entry splits every adapter into its own lazy chunk", async () => {

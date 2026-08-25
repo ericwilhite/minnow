@@ -5,7 +5,7 @@ description: One major across every package, what a version change means, and ho
 
 Every Minnow package shares a major version and moves independently inside it. The major is the
 compatibility line: any `@minnowdb/kysely@0.x` works with any `@minnowdb/core@0.x`, whichever
-minors the two happen to be on. The same rule covers `@minnowdb/devtools`.
+minors the two happen to be on. The same rule covers the React, export, and devtools packages.
 
 ```bash
 npm install @minnowdb/core @minnowdb/kysely
@@ -35,7 +35,9 @@ A change is breaking when it is one of these:
 - **The API.** An export removed or renamed, a signature narrowed, or a default changed.
 - **SQL.** A form that used to run and no longer does, or one that runs and now answers
   differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
-- **Stored data.** A database written by the old version that the new one cannot open.
+- **Stored data.** A database written by the old version that the new one cannot open. The locked
+  byte contracts below narrow this category: a release cannot reinterpret or drop an existing
+  block-format-2, snapshot-format-1, IndexedDB-schema-1, or OPFS-layout-5 reader.
 
 From 1.0 onwards these move the major version — every package's, together — and minor releases
 stay additive.
@@ -46,10 +48,46 @@ The version on the package describes the code. The stored bytes carry a separate
 `BLOCK_FORMAT_VERSION`, and a snapshot file carries `SNAPSHOT_FORMAT_VERSION`. They move on their
 own schedule — most package releases do not touch them.
 
-Every released format version keeps a frozen database in `packages/core/format-fixtures/`, opened
-and queried on every test run, so a change that would make an existing database unreadable fails
-in CI rather than in an application. See [Testing](/docs/reference/testing) for how that suite
-works.
+Block format 2 is the first locked envelope: a 44-byte header followed by canonical metadata and
+the stored payload. Permanent raw vectors freeze every Minnow-owned byte for all four physical
+types. A future writer uses a new format number and retains the format-2 reader rather than
+changing those bytes in place.
+
+Snapshot format 1 is locked with block format 2 embedded inside it. Its raw fixture freezes the
+file framing, canonical header, checksums, and payload order. An incompatible snapshot writer must
+use a new snapshot format number and keep the format-1 reader.
+
+IndexedDB schema 1 is its first locked native layout; no pre-contract schema readers or recreation
+policy ship. Every future integer schema version must add one ordered migration to the explicit
+registry and a frozen fixture for the version it supersedes. The browser runs the complete chain
+inside one `versionchange` transaction, so either every schema and data step commits or the old
+database remains intact. An older application build refuses a newer database without mutation.
+
+OPFS native layout 5 is locked separately. Its fixture freezes the format marker, checkpoint,
+WAL tail, and extent payloads, including the structural `schemaEpoch` required to reject a staged
+write after incompatible DDL. It then proves the current adapter can reopen and continue writing
+the tree. A future incompatible OPFS layout uses a new marker and keeps the layout-5 reader or an
+explicit conversion path; it never guesses old control bytes into the current record shape.
+
+An OPFS conversion is version-preserving until its new marker is durable: an old reader must see an
+unsupported marker before any new-format checkpoint, WAL, extent, or recovery-cleanup rule can
+appear. The new reader must either keep writing layout 5 while it has a layout-5 tree open, or run an
+explicit crash-resumable conversion and validate the complete result before publishing it. It never
+rewrites, repairs, downgrades, or deletes a tree merely because its version differs. A portable
+snapshot imported into a separate database is the simplest conversion when an atomic directory
+swap is unavailable.
+
+There is deliberately no data migration for unsupported pre-v1 prototypes. They were removed
+before the schema-1 IndexedDB contract was frozen. OPFS always rejects an unknown layout marker;
+to keep experimental OPFS data, use the build that can still open it to export a supported framed
+snapshot before upgrading.
+
+Every released block/snapshot pair keeps a frozen database in
+`packages/core/format-fixtures/`, opened and queried on every test run. Native OPFS layouts keep a
+separate frozen file tree in the same directory. The native test enumerates every layout fixture,
+requires one for the current writer, and reopens and continues writing each supported older tree. A
+change that would make either kind unreadable fails in CI rather than in an application. See
+[Testing](/docs/reference/testing) for how that suite works.
 
 ## How a release is cut
 

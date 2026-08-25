@@ -4,18 +4,18 @@ description: The file-based durable adapter — how leadership, the write-ahead 
 ---
 
 ```ts
-import { OpfsBlockStore } from "@minnowdb/core/storage";
+import { OpfsBlockStore } from "@minnowdb/core/storage/opfs";
 
 const store = await OpfsBlockStore.open({
   name: "shop",
-  durability: "relaxed",
+  durability: "strict",
 });
 ```
 
 | Option       | Default      | Effect                                                                            |
 | ------------ | ------------ | --------------------------------------------------------------------------------- |
 | `name`       | —            | The database directory name. Two stores with the same name are the same database. |
-| `durability` | `"relaxed"`  | `"strict"` flushes to disk per commit.                                            |
+| `durability` | `"strict"`   | `"relaxed"` allows deferred final flushes for more write throughput.              |
 | `root`       | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                          |
 
 The store lives in the [Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
@@ -58,10 +58,22 @@ Other tabs are **followers**: their operations travel a `BroadcastChannel` to th
 acknowledged only after the leader's log holds them. Requests and answers are addressed — an
 operation goes to the leader's own channel and its answer to the asking tab's — so a block read's
 bytes are copied into the tab that asked and no other; only leadership traffic is heard by every
-tab. A lost message costs a retry — request ids keep a retried operation from applying twice —
-and a dead leader costs a failover. Correctness never rides on a message; the channel affects how
-fast multi-tab work moves, never whether it is right. Followers' query spill stays in their own
-local files and never crosses the channel.
+tab. Request ids keep delivery retries from applying a mutation twice while the same leader is
+serving. In-flight mutations are never evicted from deduplication; completed answers use a bounded
+512-entry, 128 MiB cache that retains request fingerprints rather than request payloads. Each
+follower admits at most 512 pending requests or 128 MiB of request data. The leader admits at most
+1,024 requests in total, with separate 128 MiB mutation and 256 MiB read ceilings; an individual
+message cannot exceed 66 MiB. Overload is rejected before a timer, queue entry, or storage
+operation is created, so a stalled or hostile tab cannot create an unbounded message queue.
+Request identity includes the follower, request id, method, and a canonical SHA fingerprint of
+the arguments. Reusing an identity with different arguments is refused.
+After failover, reads retry automatically. An in-flight mutation instead rejects with
+`OpfsUncertainOutcomeError`: the old leader may have durably committed it before its reply was
+lost, so automatically sending it to the new leader could execute it twice. Reconcile the
+operation's stable ids or revisions before deciding whether to retry. Correctness never rides on
+a message; the channel affects how fast multi-tab work moves, never whether it is right.
+Temporary spill writes are reserved in the leader's durable ledger before a follower writes the
+file, so all tabs share the same page, run, and byte limits.
 
 The store also prefers to put leadership where the work is: the worker client reports page
 visibility, and a background leader yields to a foreground tab that asks. The tab the user is
@@ -74,43 +86,140 @@ another file-based store can be built from the same parts.
 
 ## What it creates
 
-One directory per database under `minnowdb/` in the origin's private file system: `wal` (the
-write-ahead log), `checkpoint-a` and `checkpoint-b` (alternating full-state snapshots),
-`extents/` (packed, append-only files holding column blocks and index postings), and `temp/`
-(query spill). Posting row locators use a compact delta-varint encoding rather than JSON, so a
-secondary index does not spend most of its space spelling out bigint values. Deleting the
-directory deletes the database — `deleteOpfsDatabase({ name })` does exactly that.
+One directory per database under `minnowdb/` in the origin's private file system: `format.json`
+(the native-layout version), `wal` (the write-ahead log), `checkpoint-a` and `checkpoint-b`
+(alternating full-state snapshots), `extents/` (packed, append-only files holding column blocks
+and index postings), `temp/` (query spill), and `snapshots-v1/` (checksummed, append-only ledgers
+for active or recently completed framed-snapshot sessions). Opening fails closed when the format
+marker is missing or malformed beside storage artifacts; a torn marker is repaired only in an
+otherwise empty database directory. The locked marker is canonical: extra fields, duplicate keys,
+or alternate JSON spellings are corruption rather than extension points that an older reader might
+silently ignore. Posting row locators use a compact delta-varint encoding rather than JSON, so a
+secondary index does not spend most of its space spelling out bigint values. Deleting the directory
+deletes the database — `deleteOpfsDatabase({ name })` does exactly that.
+
+Layout 5 is the locked native OPFS contract. Its checkpoint includes the structural `schemaEpoch`
+used to reject a staged write after incompatible DDL. An unknown or pre-v1 layout marker is rejected
+without replaying or mutating its WAL, checkpoint, or extents; the adapter never guesses an old
+record shape forward. `StorageFormatVersionError` reports the found and supported versions; it is
+not storage corruption and never triggers automatic repair or deletion. A newer marker means to use
+the build that wrote it. For unsupported development data, use a matching older build to export a
+framed snapshot, or delete it only after deciding that its data is disposable.
+
+Every extent placement records its offset, length, and a CRC over all stored bytes. The checksum
+belongs to the placement layer rather than a block codec, so recovery verifies column blocks,
+postings, and opaque `BlockStore` payloads uniformly with one linear scan and no decompression.
 
 Collection deletes a sealed extent when it becomes empty and repacks one once dead payloads take
 more than half its file. Sealed extent bytes therefore stay below twice their live payload, plus
-the single append tail. Relocations are WAL-logged like any other index change and survive a
-crash without changing block IDs.
+the single append tail. A reverse extent index finds only the payloads in the extent being moved,
+and relocation is split into WAL frames of at most 256 placements. Each batch survives a crash
+without changing block IDs, and the source extent is deleted only after all of its live placements
+have moved.
 
-The log is folded into a checkpoint slot at a size bound, always in the order write → flush →
-reset, so a crash at any moment leaves either a torn tail frame — detectably invalid, invisible
-— or a torn slot with the other slot and the un-reset log still holding everything. Opening the
-database is the recovery; there is no repair step.
+The WAL and either checkpoint are each capped at 256 MiB. The log is folded into a checkpoint slot
+before approaching that bound; a database whose validated metadata cannot fit is refused rather
+than opened or partially checkpointed. Relaxed payload writes are flushed first, then the new
+checkpoint is written and flushed, and only then is the log reset. A crash at any moment therefore
+leaves either a torn tail frame — detectably invalid, invisible — or a torn slot with the other
+slot and the un-reset log still holding everything. Opening the database is the recovery; there is
+no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
+from the fully validated current layout. A recognized but unsupported envelope or checkpoint
+version stops before redundant-slot fallback and before any truncation or deletion.
 
 ## Durability
 
-`relaxed` leaves the final flush to the operating system. A commit is still atomic and still
-ordered — a tab that closes, crashes, or is killed loses nothing acknowledged — but a power loss
-can lose the most recent commits. `strict` flushes the log frame (and payload writes) before the
-operation resolves; on held handles that costs fractions of a millisecond rather than the
-milliseconds it costs elsewhere.
+`strict`, the default, flushes each payload before flushing the WAL frame that publishes it, and
+does both before the operation resolves. A missing or corrupt durable payload is reported as
+storage corruption rather than silently rolled back.
+
+`relaxed` completes the payload and WAL writes before acknowledging, but lets the operating
+system schedule their final flush. A tab, worker, or browser-process failure normally recovers
+the acknowledged writes already held by the operating system; a machine or device power loss can
+lose an acknowledged suffix. Recovery still accepts only a consecutive WAL prefix whose extent
+ranges and checksums verify. The extra strict-mode flushes cost write throughput, so select
+`relaxed` only when that loss window is an accepted performance trade-off.
 
 ## Quota
 
 The same origin quota as everything else, and the same two calls to watch it:
 
 ```ts
+import { ensureOriginPersistence } from "@minnowdb/core/storage/persistence";
+
 const { quota, usage } = await navigator.storage.estimate();
-await navigator.storage.persist(); // ask to be exempt from eviction
+await ensureOriginPersistence("required");
 ```
 
 A refused write escapes as the browser's own `QuotaExceededError`, with everything committed
-before it intact and the same write succeeding once space frees. `getLogicalStorageBytes()`
-reports what this database occupies.
+before it intact and the same write succeeding once space frees. Origin persistence protects
+against automatic quota eviction when the browser grants it; it cannot prevent the user from
+clearing site data. `getLogicalStorageBytes()` reports the database's logical footprint, including
+its control log, newest checkpoint, and temporary spill.
+
+Use `getStorageStats()` when diagnosing growth. It reports actual bytes across extents, WAL,
+checkpoint slots, and temporary files alongside live and obsolete logical bytes, plus checkpoint
+and cleanup failure health, cleanup debt and its backpressure limit, and the WAL safety limit.
+`checkIntegrity({ mode: "full" })` reads every live extent placement and verifies both its extent
+checksum and its block or postings envelope; metadata mode checks checkpoint, WAL, reference, and
+live-byte accounting without paying the complete payload scan.
+
+Failed file deletion or truncation becomes explicit cleanup debt rather than a forgotten promise.
+The leader retries it before later growth; 64 MiB of unresolved debt applies write backpressure so
+repeated filesystem failures cannot grow packed files without limit. Statistics report the debt,
+last cleanup error, and ceiling. An unrecognized zero-byte temporary file still contributes 64 KiB
+of modeled debt, so file-count growth cannot bypass the byte ceiling.
+
+### Durable resource limits
+
+Low-level storage calls have hard global limits as well as bounded batches. A database admits at
+most 4,096 active transactions, 4,096 leases, 1,024 temporary owners, 1,024 active compaction jobs,
+one active garbage-collection job, 1,024 active UNIQUE builds, 128 active full-text builds,
+128 active secondary-index builds, and 4,096 catalog table/view records, including a table owned
+by an unpublished transaction. Active transaction journals are
+capped in aggregate at 65,536 staged blocks, 65,536 staged segments, and 512 MiB. Staged UNIQUE,
+full-text, and secondary-index generations share a 1 GiB and 16,777,216-entry ceiling. The catalog
+also has a 64 MiB aggregate ceiling measured as its exact UTF-8 record-wire bytes. Manifest
+history holds at most 65,536 summaries or 64 MiB of reservation bytes, and segment metadata holds
+at most 1,048,576 records or 512 MiB of exact segment-wire bytes. An unpruned manifest reserves the
+exact canonical summary bytes it will occupy after its 24-byte UTC `prunedAt` tombstone is added.
+Pruning is therefore byte-neutral even at the ceiling; removing the tombstone later releases the
+reservation. Collecting or dropping a segment releases its exact reservation. The counts, bytes,
+and records change inside one leader operation before its WAL frame is acknowledged. Checkpoint
+load and reopen recompute the exact accounting from the records and reject an over-limit or
+inconsistent state before accepting new growth.
+
+Temporary spill is bounded across every tab by a durable reservation ledger: 65,536 runs,
+262,144 pages, and 1 GiB per database, with per-owner limits of 1,024 runs, 16,384 pages, and
+512 MiB. Overwriting a page reserves only its byte delta; deleting a run or expired owner releases
+the exact reservation. Reopening streams the temporary directory, reconciles missing and orphaned
+files, rebuilds the counters, and refuses a write before creating a file if a limit would be
+crossed.
+
+Durable history is bounded too. A reader or maintenance pin may lag the current manifest by at
+most 4,096 versions and may retain at most 65,536 retired blocks or 512 MiB. Total retired payload
+history is capped at 1 GiB, and retained terminal metadata is capped at 65,536 transactions,
+4,096 compaction jobs, and 1,024 completed collection jobs. These limits are checked before the
+WAL or an extent changes, so refusal leaves the previous durable state intact.
+
+### Framed snapshots
+
+OPFS exports one semantic metadata item per bounded snapshot frame and one raw block per block
+frame. Imports durably stage consecutive frames and publish the catalog, generations, and blocks
+in one final operation; replay compares exact bytes, so a lost acknowledgement cannot duplicate or
+silently replace an import. Final validation shares the durable accelerator ceiling of 1 GiB and
+16,777,216 retained entries across combined UNIQUE and posting generations; a larger framed import
+is refused before publication, leaving the destination logically empty and the staged session
+resumable or cancellable instead of risking an origin-sized validation allocation. Closing,
+cancelling, or replacing a session checkpoints the resolved state and resets WAL history before
+deleting its ledger, so every crash point retains either the old resumable session or the new
+durable state.
+
+Ready posting accelerators remain ready when their exact merged generation fits the ordered-read
+fuse: at most 64 MiB and 65,536 retained row IDs in OPFS. A larger accelerator is deliberately
+omitted from the portable snapshot, restored as invalid, and rebuilt in the background; queries
+continue to scan correctly while that rebuild runs. UNIQUE membership remains authoritative and
+enforced.
 
 ## Multiple tabs
 

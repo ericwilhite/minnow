@@ -5,7 +5,7 @@
  * Serve the repository root with vite and open /packages/devtools/demo/.
  */
 import { column, MinnowDatabase, schema, table } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { mountMinnowDevtools, type DevtoolsTheme } from "@minnowdb/devtools";
 
 const people = table("people", {

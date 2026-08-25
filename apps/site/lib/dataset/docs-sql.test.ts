@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { retailBatches, retailDefinition } from "./retail";
 
 /**

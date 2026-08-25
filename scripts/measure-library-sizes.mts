@@ -1,6 +1,7 @@
 /**
- * Measures what a browser downloads to run each comparison engine, and writes the result to
- * apps/site/components/bench/library-sizes.json for the benchmarks page.
+ * Measures what a browser downloads to run each comparison engine, and writes a scratch report
+ * to apps/site/components/bench/library-sizes.json. Copy the rounded result into the benchmark
+ * configuration and comparison prose; the generated report is not a page data source.
  *
  * Every engine gets identical treatment: its browser entry is bundled with the same esbuild
  * settings (ESM, browser platform, minified, production), and the binary assets the bundle
@@ -27,6 +28,8 @@ interface EngineSpec {
   packageName: string;
   /** Module specifier bundled as the entry point. */
   entry: string;
+  /** Optional virtual application entry when a usable engine requires more than one subpath. */
+  entrySource?: string;
   /**
    * Files the entry fetches at run time rather than importing, resolved against the package
    * directory. They never reach the bundle, but the browser downloads every one of them.
@@ -41,8 +44,11 @@ const ENGINES: EngineSpec[] = [
     name: "Minnow",
     packageName: "@minnowdb/core",
     entry: "@minnowdb/core",
+    entrySource:
+      'export { MinnowDatabase } from "@minnowdb/core"; ' +
+      'export { OpfsBlockStore } from "@minnowdb/core/storage/opfs";',
     runtimeAssets: [],
-    note: "Plain JavaScript. Nothing else to fetch.",
+    note: "The main engine plus its larger durable adapter (OPFS). Plain JavaScript; nothing else to fetch.",
   },
   {
     id: "sqlite",
@@ -102,7 +108,15 @@ const gzipBytes = (bytes: Uint8Array): number =>
  */
 async function bundleBytes(spec: EngineSpec): Promise<Uint8Array> {
   const result = await build({
-    entryPoints: [spec.entry],
+    ...(spec.entrySource === undefined
+      ? { entryPoints: [spec.entry] }
+      : {
+          stdin: {
+            contents: spec.entrySource,
+            resolveDir: repoRoot,
+            sourcefile: `${spec.id}-size-entry.js`,
+          },
+        }),
     absWorkingDir: repoRoot,
     bundle: true,
     write: false,

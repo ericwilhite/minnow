@@ -1,4 +1,4 @@
-import { compileStatement, type CompiledStatement } from "@minnowdb/core";
+import { compileStatement, type CompiledStatement } from "@minnowdb/core/query";
 
 /**
  * What a statement will do, read off the compiled plan rather than the text. Matching on the

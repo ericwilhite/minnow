@@ -1,5 +1,5 @@
 import { MinnowDatabase, type QueryRow } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { describe, expect, it } from "vitest";
 import { toCatalog, type TableInfo } from "../explorer/catalog.js";
 import type { Filter } from "../explorer/filters.js";

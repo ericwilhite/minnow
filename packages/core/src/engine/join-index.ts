@@ -1,3 +1,4 @@
+import { dateMilliseconds } from "../date-value.js";
 import {
   copyScratchKey,
   encodeSingleScalarKey,
@@ -207,7 +208,7 @@ export class ByteJoinIndex {
  * so a Date and its number representation join as the same key.
  */
 function encodeJoinKey(value: unknown): number {
-  const key = value instanceof Date ? value.getTime() : value;
+  const key = value instanceof Date ? dateMilliseconds(value) : value;
   if (key === null || key === undefined) return -1;
   if (typeof key === "number" && Number.isNaN(key)) return -1;
   if (typeof key === "boolean" || typeof key === "number" || typeof key === "string") {

@@ -25,6 +25,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { allSegmentRecords } from "./storage-test-helpers.js";
 
 /** Counts the blocks a read pulls, which is what pruning changes and wall-clock only reflects. */
 class CountingStore extends MemoryBlockStore {
@@ -159,7 +160,7 @@ describe("zone-map pruning across a mutation history", () => {
     const amountColumn = table.columns.find((column) => column.name === "amount");
     if (amountColumn === undefined) throw new Error("amount column is missing");
     const irrelevantPatchBlockIds = new Set(
-      (await store.listSegments(table.id))
+      (await allSegmentRecords(store, table.id))
         .filter((segment) => segment.kind === "update")
         .flatMap((segment) => segment.columnBlockIds[amountColumn.id] ?? []),
     );

@@ -44,6 +44,20 @@ WHERE rank <= 3
 ORDER BY category, revenue DESC`,
   },
   {
+    id: "search",
+    label: "Full-text search",
+    note: "A ranked MATCH across product names and brands, with no index declaration required.",
+    sql: `SELECT name,
+       category,
+       brand,
+       list_price,
+       BM25(name, brand) AGAINST 'copper' AS rank
+FROM products
+WHERE MATCH(name, brand) AGAINST 'copper'
+ORDER BY rank DESC
+LIMIT 10`,
+  },
+  {
     id: "store-performance",
     label: "Store performance",
     note: "A three-way join with a filtered aggregate, ordered by revenue per square metre.",

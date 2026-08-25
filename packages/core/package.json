@@ -41,13 +41,57 @@
       "types": "./dist/engine/client.d.ts",
       "default": "./dist/engine/client.js"
     },
+    "./query": {
+      "types": "./dist/engine/query-api.d.ts",
+      "default": "./dist/engine/query-api.js"
+    },
+    "./live": {
+      "types": "./dist/engine/live-api.d.ts",
+      "default": "./dist/engine/live-api.js"
+    },
+    "./schema": {
+      "types": "./dist/engine/schema.d.ts",
+      "default": "./dist/engine/schema.js"
+    },
+    "./schema-wire": {
+      "types": "./dist/engine/schema-wire.d.ts",
+      "default": "./dist/engine/schema-wire.js"
+    },
     "./worker": {
       "types": "./dist/engine/worker.d.ts",
       "default": "./dist/engine/worker.js"
     },
+    "./worker-host": {
+      "types": "./dist/engine/worker-host.d.ts",
+      "default": "./dist/engine/worker-host.js"
+    },
     "./storage": {
       "types": "./dist/storage/index.d.ts",
       "default": "./dist/storage/index.js"
+    },
+    "./storage/contracts": {
+      "types": "./dist/storage/types.d.ts",
+      "default": "./dist/storage/types.js"
+    },
+    "./storage/snapshots": {
+      "types": "./dist/storage/snapshot.d.ts",
+      "default": "./dist/storage/snapshot.js"
+    },
+    "./storage/indexeddb": {
+      "types": "./dist/storage/indexeddb.d.ts",
+      "default": "./dist/storage/indexeddb.js"
+    },
+    "./storage/memory": {
+      "types": "./dist/storage/memory.d.ts",
+      "default": "./dist/storage/memory.js"
+    },
+    "./storage/opfs": {
+      "types": "./dist/storage/opfs/index.d.ts",
+      "default": "./dist/storage/opfs/index.js"
+    },
+    "./storage/persistence": {
+      "types": "./dist/storage/persistence.d.ts",
+      "default": "./dist/storage/persistence.js"
     },
     "./storage/toolkit": {
       "types": "./dist/storage/toolkit/index.d.ts",
@@ -77,6 +121,9 @@
     "dist",
     "!dist/**/*.test.*",
     "!dist/**/*.spec.*",
+    "!dist/**/*.map",
+    "!dist/storage/fixture-shape.*",
+    "!dist/engine/storage-test-helpers.*",
     "!dist/*.tsbuildinfo",
     "sql-feature-matrix.json",
     "postgres-feature-profile.json"

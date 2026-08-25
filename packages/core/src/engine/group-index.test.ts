@@ -94,17 +94,16 @@ describe("byte group index", () => {
     memory.close();
   });
 
-  it("folds unpaired surrogates to U+FFFD the way TextEncoder does", () => {
+  it("rejects unpaired surrogates before encoding a group key", () => {
     const memory = new QueryMemoryContext();
     const index = new ByteGroupIndex<string>(memory);
-    // A lone high or low surrogate encodes as the replacement character, so each is the same key.
-    index.setOne("\uD800", "high");
-    expect(index.getOne("\uDFFF")).toBe("high");
-    expect(index.getOne("�")).toBe("high");
-    expect(index.size).toBe(1);
+    expect(() => index.setOne("\uD800", "high")).toThrow("unpaired surrogate at UTF-16 index 0");
+    expect(() => index.setOne("x\uDFFF", "low")).toThrow("unpaired surrogate at UTF-16 index 1");
+    expect(index.size).toBe(0);
 
-    // A well-formed pair stays distinct from the replacement character it surrounds.
+    // A well-formed pair and an explicit replacement character remain distinct.
     index.setOne("𝄞", "paired");
+    index.setOne("�", "replacement");
     expect(index.getOne("\u{1D11E}")).toBe("paired");
     expect(index.size).toBe(2);
     memory.close();

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { retailBatches, retailEstimatedRows, retailSchema, type Row } from "./retail";
 
 /** One small build, loaded once and shared: every assertion below reads the same database. */

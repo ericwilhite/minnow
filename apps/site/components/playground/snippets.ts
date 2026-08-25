@@ -27,13 +27,13 @@ export const snippets: readonly Snippet[] = [
 
 // Every completed order, bucketed by month. Hover \`rows\` to see the type the
 // select list produced — three keys, not the fourteen columns \`orders\` has.
-const month = sql<Date>\`DATE_TRUNC('month', placed_at)\`;
+const month = db.fn("date_trunc", [sql.lit("month"), "orders.placed_at"]);
 const rows = await db
   .selectFrom("orders")
   .select((eb) => [
     month.as("month"),
     eb.fn.countAll().as("orders"),
-    sql<number>\`ROUND(SUM(total), 2)\`.as("revenue"),
+    eb.fn("round", [eb.fn.coalesce(eb.fn.sum("total"), eb.val(0)), eb.val(2)]).as("revenue"),
   ])
   .where("status", "=", "completed")
   .groupBy(month)
@@ -65,9 +65,7 @@ console.log(rows);`,
     id: "store-performance",
     label: "Store performance",
     note: "A join, and an alias that carries through every later column reference.",
-    code: `import { sql } from "kysely";
-
-// Aliasing a table renames it for the whole query: after \`stores as s\`, only
+    code: `// Aliasing a table renames it for the whole query: after \`stores as s\`, only
 // \`s.\` resolves, and a stale \`stores.name\` is a compile error.
 const rows = await db
   .selectFrom("stores as s")
@@ -76,7 +74,7 @@ const rows = await db
     "s.name",
     "s.city",
     eb.fn.countAll().as("orders"),
-    sql<number>\`ROUND(SUM(o.total), 2)\`.as("revenue"),
+    eb.fn("round", [eb.fn.coalesce(eb.fn.sum("o.total"), eb.val(0)), eb.val(2)]).as("revenue"),
   ])
   .where("o.status", "=", "completed")
   .groupBy(["s.store_id", "s.name", "s.city"])
@@ -108,15 +106,13 @@ console.log(rows);`,
     id: "customer-value",
     label: "Who spends the most",
     note: "A grouped aggregate with HAVING, ordered by an alias from the select list.",
-    code: `import { sql } from "kysely";
-
-const rows = await db
+    code: `const rows = await db
   .selectFrom("customers as c")
   .innerJoin("orders as o", "o.customer_id", "c.customer_id")
   .select((eb) => [
     "c.loyalty_tier",
     eb.fn.count("c.customer_id").distinct().as("customers"),
-    sql<number>\`ROUND(SUM(o.total), 2)\`.as("revenue"),
+    eb.fn("round", [eb.fn.coalesce(eb.fn.sum("o.total"), eb.val(0)), eb.val(2)]).as("revenue"),
   ])
   .groupBy("c.loyalty_tier")
   .having((eb) => eb(eb.fn.countAll(), ">", 100))
@@ -128,20 +124,20 @@ console.log(rows);`,
   {
     id: "search",
     label: "Full-text search",
-    note: "Ranked by BM25, with no index to declare and no schema change to make.",
-    code: `import { sql } from "kysely";
+    note: "Type-safe columns and BM25 ranking, with no index declaration or schema change.",
+    code: `import { search } from "@minnowdb/kysely";
 
-const query = "espresso grinder";
+const query = "copper";
 const hits = await db
   .selectFrom("products")
-  .select([
+  .select((eb) => [
     "name",
     "category",
     "brand",
     "list_price",
-    sql<number>\`BM25(name) AGAINST \${query}\`.as("rank"),
+    search.rank(eb, ["name", "brand"], query).as("rank"),
   ])
-  .where(sql<boolean>\`MATCH(name) AGAINST \${query}\`)
+  .where((eb) => search.match(eb, ["name", "brand"], query))
   .orderBy("rank", "desc")
   .limit(10)
   .execute();

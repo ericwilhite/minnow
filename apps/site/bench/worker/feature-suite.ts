@@ -9,14 +9,9 @@
  */
 import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json";
 import { loadPglite, loadSqlite } from "../engines/vendored";
-import {
-  MinnowDatabase,
-  bindPlanParameters,
-  compileQuery,
-  executeQuery,
-  type DatabaseRow,
-} from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { bindPlanParameters, compileQuery, executeQuery } from "@minnowdb/core/query";
+import { MinnowDatabase, type DatabaseRow } from "@minnowdb/core";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { engineIds, engineNames } from "../protocol";
 import type {
   EngineId,

@@ -48,7 +48,7 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
   const worker = useRef<Worker | undefined>(undefined);
   const [status, setStatus] = useState<Status>({ kind: "starting" });
   const [scale, setScale] = useState(0.25);
-  const [generation, setGeneration] = useState(0);
+  const [build, setBuild] = useState({ generation: 0, force: false });
   const [language, setLanguage] = useState<Language>("sql");
   /** Sticky: once the type checker has been fetched, its tab stays mounted and keeps its state. */
   const [everTyped, setEverTyped] = useState(false);
@@ -68,28 +68,49 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
 
   useEffect(() => {
     let cancelled = false;
+    let attemptClient: MinnowDatabaseClient | undefined;
+    let attemptWorker: Worker | undefined;
     // Read through a call rather than the variable: TypeScript keeps a narrowed local narrowed
     // across awaits, which would quietly turn every later cancellation check into dead code.
     const stopped = (): boolean => cancelled;
+
+    const releaseAttempt = (): void => {
+      const connection = attemptClient;
+      const spawned = attemptWorker;
+      attemptClient = undefined;
+      attemptWorker = undefined;
+      if (client.current === connection) client.current = undefined;
+      if (worker.current === spawned) worker.current = undefined;
+      if (connection === undefined) {
+        spawned?.terminate();
+        return;
+      }
+      // close() always terminates in its finally block. The fallback covers a transport that
+      // throws before the close promise can observe its own worker.
+      void connection.close({ terminateWorker: true }).catch(() => spawned?.terminate());
+    };
 
     async function start(): Promise<void> {
       const { MinnowDatabaseClient: Client } = await import("@minnowdb/core/client");
       if (stopped()) return;
 
-      const spawned = new Worker(new URL("@minnowdb/core/worker", import.meta.url), {
+      const spawned = new Worker(new URL("./minnow-worker.ts", import.meta.url), {
         type: "module",
       });
+      attemptWorker = spawned;
       worker.current = spawned;
       const connection = new Client(spawned, {
         store: { kind: "indexeddb", name: PLAYGROUND_DATABASE },
       });
+      attemptClient = connection;
       client.current = connection;
       await connection.ready();
       if (stopped()) return;
 
-      const already = await isLoaded(connection);
-      let rows = 0;
-      if (already) {
+      const already = build.force ? undefined : await isLoaded(connection, scale);
+      let rows: number;
+      if (already !== undefined) {
+        rows = already.rows;
         setStatus({ kind: "building", label: "Opening your database", done: 0, total: 1 });
       } else {
         rows = await loadRetailDataset(connection, {
@@ -109,12 +130,15 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
         });
       }
       if (stopped()) return;
-      setStatus({ kind: "ready", client: connection, rows, fresh: !already });
+      setStatus({ kind: "ready", client: connection, rows, fresh: already === undefined });
     }
 
     setStatus({ kind: "starting" });
     start().catch((error: unknown) => {
       if (stopped()) return;
+      // A failed init can still own a blocked IndexedDB request. Tear down this exact attempt so
+      // it cannot retain a worker or wake after the UI has already reported the failure.
+      releaseAttempt();
       setStatus({
         kind: "failed",
         message: error instanceof Error ? error.message : String(error),
@@ -123,28 +147,23 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
 
     return () => {
       cancelled = true;
-      void client.current?.close();
-      client.current = undefined;
-      worker.current?.terminate();
-      worker.current = undefined;
+      releaseAttempt();
     };
-  }, [scale, generation]);
+  }, [scale, build.force, build.generation]);
 
   const reset = useCallback(() => {
-    void client.current?.close();
-    client.current = undefined;
-    worker.current?.terminate();
-    worker.current = undefined;
-    indexedDB.deleteDatabase(PLAYGROUND_DATABASE);
-    setGeneration((value) => value + 1);
+    setBuild((current) => ({ generation: current.generation + 1, force: true }));
   }, []);
 
-  const chooseSize = useCallback((id: string, next: number) => {
-    window.localStorage.setItem(SIZE_KEY, id);
-    indexedDB.deleteDatabase(PLAYGROUND_DATABASE);
-    setScale(next);
-    setGeneration((value) => value + 1);
-  }, []);
+  const chooseSize = useCallback(
+    (id: string, next: number) => {
+      window.localStorage.setItem(SIZE_KEY, id);
+      if (next === scale) return;
+      setScale(next);
+      setBuild((current) => ({ generation: current.generation + 1, force: false }));
+    },
+    [scale],
+  );
 
   const choose = useCallback((next: Language) => {
     window.localStorage.setItem(LANGUAGE_KEY, next);

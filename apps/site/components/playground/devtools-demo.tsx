@@ -50,7 +50,7 @@ export function DevtoolsDemo() {
     const [{ MinnowDatabase }, { MemoryBlockStore }, { mountMinnowDevtools }, dataset] =
       await Promise.all([
         import("@minnowdb/core"),
-        import("@minnowdb/core/storage"),
+        import("@minnowdb/core/storage/memory"),
         import("@minnowdb/devtools"),
         import("@/lib/dataset/retail"),
       ]);

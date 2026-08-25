@@ -53,7 +53,57 @@ async function bank(store: BlockStore): Promise<MinnowDatabase> {
   return database;
 }
 
+/** Refuses the exact bug this suite guards: pending bytes are not ordinary store-visible data. */
+class PendingOverlayReadGuardStore extends MemoryBlockStore {
+  readonly pendingBlockIds = new Set<string>();
+  pendingSingleReads = 0;
+  committedBulkReadCalls = 0;
+  directPendingBatchReads = 0;
+
+  override async stageTransactionArtifacts(
+    input: Parameters<MemoryBlockStore["stageTransactionArtifacts"]>[0],
+  ) {
+    for (const block of input.blocks) this.pendingBlockIds.add(block.id);
+    return super.stageTransactionArtifacts(input);
+  }
+
+  override async getBlock(id: string): Promise<Uint8Array | undefined> {
+    if (this.pendingBlockIds.has(id)) this.pendingSingleReads += 1;
+    return super.getBlock(id);
+  }
+
+  override async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    if (ids.some((id) => this.pendingBlockIds.has(id))) {
+      this.directPendingBatchReads += 1;
+      throw new Error("Pending block bypassed the transaction overlay");
+    }
+    this.committedBulkReadCalls += 1;
+    return super.getBlocks(ids);
+  }
+}
+
 describe("atomic write scopes", () => {
+  it("routes pruned headers and projected staged blocks through the transaction overlay", async () => {
+    const store = new PendingOverlayReadGuardStore();
+    const database = await bank(store);
+    await database.write(async (tx) => {
+      await tx.insertBatch("accounts", { columns: { id: [30], balance: [11] } });
+      // A second stage flushes the first bounded batch to the transaction journal. That makes
+      // its bytes durable-but-uncommitted and therefore able to expose a bulk-read bypass.
+      await tx.insertBatch("accounts", { columns: { id: [31], balance: [12] } });
+      // The key predicate takes the zone-map materializer: it first inspects the staged key
+      // header, then decodes the staged projected value. Neither byte exists in the committed
+      // manifest yet, so both reads must go through transaction.getBlock rather than store bulk.
+      expect((await tx.query("SELECT balance FROM accounts WHERE id = 30")).rows).toEqual([
+        { balance: 11 },
+      ]);
+      expect(store.pendingSingleReads).toBeGreaterThan(0);
+      expect(store.committedBulkReadCalls).toBeGreaterThan(0);
+      expect(store.directPendingBatchReads).toBe(0);
+    });
+    await database.close();
+  });
+
   for (const implementation of implementations) {
     it(`${implementation.name} publishes a multi-table transfer as one commit`, async () => {
       const store = await implementation.create();
@@ -485,6 +535,100 @@ describe("atomic write scopes", () => {
       expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([
         { n: beforeCount + 1 },
       ]);
+    });
+
+    it(`${implementation.name} pins an idle one-stage scope through compaction and collection`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      for (let id = 100; id < 112; id += 1) {
+        await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
+      }
+      const sourceVersion = await store.getCurrentManifestVersion();
+      if (sourceVersion === null) throw new Error("Expected a source manifest");
+
+      let signalStaged!: () => void;
+      const staged = new Promise<void>((resolve) => {
+        signalStaged = resolve;
+      });
+      let resumeScope!: () => void;
+      const maintenanceFinished = new Promise<void>((resolve) => {
+        resumeScope = resolve;
+      });
+      const scopedWrite = database.write(async (tx) => {
+        // Exactly one bounded stage remains process-local; only the separate reader lease can
+        // protect the pre-scope manifest while user code is idle here.
+        await tx.insertBatch("accounts", { columns: { id: [30], balance: [11] } });
+        signalStaged();
+        await maintenanceFinished;
+        expect(
+          (await tx.query("SELECT id, balance FROM accounts WHERE id IN (1, 30) ORDER BY id")).rows,
+        ).toEqual([
+          { id: 1, balance: 500 },
+          { id: 30, balance: 11 },
+        ]);
+      });
+      await staged;
+      expect(
+        (await store.listLeases()).some((lease) => lease.manifestVersion === sourceVersion),
+      ).toBe(true);
+
+      await compactToPublication(database, store, "accounts");
+      const collection = await database.collectGarbage({
+        maxItemsPerStep: 1,
+        retainRecentVersions: 0,
+      });
+      expect(collection.retainedManifestCount).toBeGreaterThan(0);
+      expect(await store.getManifest(sourceVersion)).toBeDefined();
+
+      resumeScope();
+      const { version } = await scopedWrite;
+      expect(version).not.toBeNull();
+      expect((await database.query("SELECT balance FROM accounts WHERE id = 30")).rows).toEqual([
+        { balance: 11 },
+      ]);
+      await database.close();
+    });
+
+    it(`${implementation.name} pins an idle one-stage SQL transaction through compaction and collection`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      for (let id = 100; id < 112; id += 1) {
+        await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
+      }
+      const sourceVersion = await store.getCurrentManifestVersion();
+      if (sourceVersion === null) throw new Error("Expected a source manifest");
+
+      await database.execute("BEGIN");
+      // This is exactly one bounded stage, so its artifacts remain process-local. The BEGIN
+      // lease is the only durable root for the version the statement read and staged against.
+      await database.execute("INSERT INTO accounts (id, balance) VALUES (31, 12)");
+      expect(
+        (await store.listLeases()).some((lease) => lease.manifestVersion === sourceVersion),
+      ).toBe(true);
+
+      await compactToPublication(database, store, "accounts");
+      const collection = await database.collectGarbage({
+        maxItemsPerStep: 1,
+        retainRecentVersions: 0,
+      });
+      expect(collection.retainedManifestCount).toBeGreaterThan(0);
+      expect(await store.getManifest(sourceVersion)).toBeDefined();
+      expect(
+        (await database.query("SELECT id, balance FROM accounts WHERE id IN (1, 31) ORDER BY id"))
+          .rows,
+      ).toEqual([
+        { id: 1, balance: 500 },
+        { id: 31, balance: 12 },
+      ]);
+
+      await expect(database.execute("COMMIT")).resolves.toMatchObject({
+        kind: "transaction",
+        action: "commit",
+      });
+      expect((await database.query("SELECT balance FROM accounts WHERE id = 31")).rows).toEqual([
+        { balance: 12 },
+      ]);
+      await database.close();
     });
   }
 

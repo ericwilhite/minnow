@@ -1,3 +1,4 @@
+import { copyDate, dateMilliseconds } from "../date-value.js";
 import { copyQueryResultExternalization, type QueryResult, type QueryRow } from "./query.js";
 import { defineSqlResultProperty } from "./sql-semantics.js";
 
@@ -16,7 +17,7 @@ export function queryResultMemoKey(sql: string, params: readonly unknown[]): str
  */
 export function planMemoKey(plan: unknown): string {
   return JSON.stringify(plan, (_key, value: unknown) => {
-    if (value instanceof Date) return { $date: value.getTime() };
+    if (value instanceof Date) return { $date: dateMilliseconds(value) };
     if (typeof value === "bigint") return { $bigint: value.toString() };
     if (typeof value === "number") {
       if (Object.is(value, -0)) return { $number: "-0" };
@@ -41,7 +42,7 @@ export function copyQueryResult(result: QueryResult): QueryResult {
       const copy: QueryRow = { ...row };
       for (const name of columns) {
         const value = copy[name];
-        if (value instanceof Date) defineSqlResultProperty(copy, name, new Date(value.getTime()));
+        if (value instanceof Date) defineSqlResultProperty(copy, name, copyDate(value));
       }
       return copy;
     }),
@@ -75,6 +76,6 @@ function encodeParameter(value: unknown): readonly unknown[] {
     return [2, String(value)];
   }
   if (typeof value === "string") return [3, value];
-  if (value instanceof Date) return [4, value.getTime()];
+  if (value instanceof Date) return [4, dateMilliseconds(value)];
   throw new TypeError("Query parameter has an unsupported value");
 }

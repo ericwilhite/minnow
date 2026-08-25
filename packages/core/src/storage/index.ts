@@ -13,5 +13,6 @@
 export * from "./indexeddb.js";
 export * from "./memory.js";
 export * from "./opfs/index.js";
+export * from "./persistence.js";
 export * from "./snapshot.js";
 export * from "./types.js";

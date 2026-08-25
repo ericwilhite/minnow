@@ -288,7 +288,8 @@ write(
     `Published at ${ORIGIN}. Every link below is site-relative, so this file reads the same from ` +
       "a local build as from the live site.",
     "",
-    `Engine version ${version}. \`@minnowdb/core\`, \`@minnowdb/kysely\`, and \`@minnowdb/devtools\` ` +
+    `Engine version ${version}. \`@minnowdb/core\`, \`@minnowdb/kysely\`, \`@minnowdb/react\`, ` +
+      `\`@minnowdb/export\`, and \`@minnowdb/devtools\` ` +
       "share a major version and move independently inside it; install them on the same major.",
     "",
     `Every page below is the markdown the site was written from. The whole set in one file is at ${url("/llms-full.txt")}, ` +

@@ -1,13 +1,27 @@
-import { decodeBlock, encodeBlock, inspectBlock } from "../block-format/index.js";
+import {
+  BLOCK_HEADER_LENGTH,
+  crc32,
+  decodeBlock,
+  encodeBlock,
+  inspectBlock,
+} from "../block-format/index.js";
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   IndexedDbBlockStore,
+  BlockReadBatchTooLargeError,
+  MAX_ACTIVE_LEASES,
+  MAX_MAINTENANCE_BATCH_ITEMS,
+  MAX_INDEXED_STRING_CHARACTERS,
+  MAX_TRANSACTION_STAGE_BYTES,
   MemoryBlockStore,
+  StorageResourceLimitError,
+  TableInUseError,
   TableRecordConflictError,
   type BlockStore,
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
+  type LeaseRecord,
   type RowIdSpan,
   type SegmentRecord,
   type TableRecord,
@@ -15,17 +29,218 @@ import {
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { TransactionManager } from "../transactions/index.js";
 import { QueryMemoryBudgetError } from "./memory.js";
+import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
 import { compileQuery, type QueryRow } from "./query.js";
 import { column, schema, table } from "./schema.js";
+import { allVisibleSegments } from "./storage-test-helpers.js";
 import {
   attachLifecycleFlush,
+  DatabaseReadBacklogError,
+  MAX_DATABASE_ACTIVE_READS,
+  MAX_DATABASE_PENDING_WRITES,
+  MAX_BUFFERED_WRITER_PENDING_ADDS,
+  MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS,
+  MAX_VISIBLE_SEGMENT_PAGE_ITEMS,
   MinnowDatabase,
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   type DatabaseRow,
+  type VisibleSegmentPageCursor,
   MissingKeyError,
   UniqueConstraintError,
+  VisibleSegmentCursorStaleError,
 } from "./database.js";
+
+async function manifestBlockIdsAt(store: BlockStore, version: number): Promise<string[]> {
+  const ids: string[] = [];
+  let afterBlockId: string | null = null;
+  for (;;) {
+    const page = await store.listManifestBlockPage({ version, afterBlockId, limit: 1_024 });
+    ids.push(...page.records.map(({ blockId }) => blockId));
+    if (page.nextCursor === null) return ids;
+    afterBlockId = page.nextCursor;
+  }
+}
+
+async function currentManifestBlockIds(store: BlockStore): Promise<string[]> {
+  const manifest = await store.getCurrentManifest();
+  return manifest === undefined ? [] : manifestBlockIdsAt(store, manifest.version);
+}
+
+async function segmentRecords(store: BlockStore): Promise<SegmentRecord[]> {
+  const records: SegmentRecord[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await store.listSegmentPage(cursor, 1_024);
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
+
+async function tableSegmentRecords(store: BlockStore, tableId: string): Promise<SegmentRecord[]> {
+  const records: SegmentRecord[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await store.listTableSegmentPage(tableId, cursor, 1_024);
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
+
+async function physicalBlockCount(store: BlockStore): Promise<number> {
+  if (store.getStorageStats === undefined) throw new Error("Store has no storage statistics");
+  const stats = await store.getStorageStats();
+  return stats.liveBlockCount + stats.obsoleteBlockCount;
+}
+
+async function transactionRecords(store: BlockStore) {
+  const records: Array<Awaited<ReturnType<BlockStore["listTransactionPage"]>>["records"][number]> =
+    [];
+  let cursor: string | null = null;
+  do {
+    const page = await store.listTransactionPage(cursor, 1_024);
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
+
+async function manifestRecords(store: BlockStore) {
+  const records: Array<Awaited<ReturnType<BlockStore["listManifestPage"]>>["records"][number]> = [];
+  let cursor: number | null = null;
+  do {
+    const page = await store.listManifestPage(cursor, 1_024);
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
+
+it("caps public maintenance step sizes before durable work", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  await database.createTable({
+    name: "bounded_maintenance",
+    uniqueKey: "id",
+    columns: [{ name: "id", type: "number" }],
+  });
+  const oversized = MAX_MAINTENANCE_BATCH_ITEMS + 1;
+  await expect(database.collectGarbageStep({ maxItems: oversized })).rejects.toThrow(
+    `cannot exceed ${String(MAX_MAINTENANCE_BATCH_ITEMS)}`,
+  );
+  await expect(database.collectGarbageStep({ maxPlanningItems: oversized })).rejects.toThrow(
+    `cannot exceed ${String(MAX_MAINTENANCE_BATCH_ITEMS)}`,
+  );
+  await expect(
+    database.collectGarbageStep({
+      retainRecentVersions: MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS + 1,
+    }),
+  ).rejects.toThrow(`cannot exceed ${String(MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS)}`);
+  await expect(
+    database.compactTableStep("bounded_maintenance", { maxBlocks: oversized }),
+  ).rejects.toThrow(`cannot exceed ${String(MAX_MAINTENANCE_BATCH_ITEMS)}`);
+  expect(await store.listGarbageCollectionJobs()).toEqual([]);
+  expect(await store.listCompactionJobs()).toEqual([]);
+  await database.close();
+});
+
+it("converges when two database instances race to plan garbage collection", async () => {
+  const store = new GarbageCollectionCreateBarrierStore();
+  const left = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  const right = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  const [leftProgress, rightProgress] = await Promise.all([
+    left.collectGarbageStep(),
+    right.collectGarbageStep(),
+  ]);
+  expect(leftProgress.jobId).toBe(rightProgress.jobId);
+  const jobs = await store.listGarbageCollectionJobs();
+  expect(jobs).toHaveLength(1);
+  expect(jobs.filter((job) => job.state !== "completed")).toHaveLength(0);
+  await left.close();
+  await right.close();
+});
+
+it("bounds indexed strings without restricting ordinary stored text", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  await database.createTable({
+    name: "bounded_index_values",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "indexed", type: "string" },
+      { name: "payload", type: "string" },
+    ],
+  });
+  await database.insert("bounded_index_values", {
+    id: 1,
+    indexed: "ordinary",
+    payload: "ordinary",
+  });
+  await database.createIndex("bounded_indexed_idx", "bounded_index_values", "indexed");
+  const oversized = "x".repeat(MAX_INDEXED_STRING_CHARACTERS + 1);
+  await expect(
+    database.insert("bounded_index_values", { id: 2, indexed: oversized, payload: oversized }),
+  ).resolves.toMatchObject({ rowCount: 1, tableName: "bounded_index_values" });
+  expect(
+    (
+      await database.query("SELECT id, payload FROM bounded_index_values WHERE indexed = ?", {
+        params: [oversized],
+        memoize: false,
+      })
+    ).rows,
+  ).toEqual([{ id: 2, payload: oversized }]);
+  expect(
+    Object.values((await store.getTableByName("bounded_index_values"))?.secondaryIndexes ?? {})[0]
+      ?.state,
+  ).toBe("invalid");
+
+  await expect(
+    database.createIndex("oversized_unique_idx", "bounded_index_values", "payload", {
+      unique: true,
+    }),
+  ).rejects.toThrow(`cannot exceed ${String(MAX_INDEXED_STRING_CHARACTERS)} characters`);
+  expect(
+    Object.values(
+      (await store.getTableByName("bounded_index_values"))?.secondaryIndexes ?? {},
+    ).some((index) => index.name === "oversized_unique_idx"),
+  ).toBe(false);
+
+  await database.createTable({
+    name: "bounded_primary_key",
+    uniqueKey: "id",
+    columns: [{ name: "id", type: "string" }],
+  });
+  await expect(database.insert("bounded_primary_key", { id: oversized })).rejects.toThrow(
+    `cannot exceed ${String(MAX_INDEXED_STRING_CHARACTERS)} characters`,
+  );
+  expect(await database.readTable("bounded_primary_key")).toEqual([]);
+  await database.close();
+});
+
+it("executes oversized SQL without retaining its text or compiled trees", async () => {
+  const database = new MinnowDatabase(new MemoryBlockStore(), {
+    autoCollect: false,
+    autoCompact: false,
+  });
+  const before = database.maintenanceStatus();
+  const text = "x".repeat(MAX_CACHEABLE_TEXT_CHARACTERS + 1);
+  expect((await database.query(`SELECT '${text}' AS value`, { memoize: false })).rows).toEqual([
+    { value: text },
+  ]);
+  expect(database.maintenanceStatus()).toMatchObject({
+    retainedPlanEntries: before.retainedPlanEntries,
+    retainedStatementEntries: before.retainedStatementEntries,
+  });
+  await database.execute(`${" ".repeat(MAX_CACHEABLE_TEXT_CHARACTERS + 1)}BEGIN`);
+  expect(database.maintenanceStatus().retainedStatementEntries).toBe(
+    before.retainedStatementEntries,
+  );
+  await database.execute("ROLLBACK");
+  await database.close();
+});
 
 class CountingMemoryBlockStore extends MemoryBlockStore {
   blockWriteCalls = 0;
@@ -33,16 +248,18 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   transactionListCalls = 0;
   transactionGetCalls = 0;
   transactionBatchCalls = 0;
+  queryCatalogStateCalls = 0;
   segmentListCalls = 0;
+  globalSegmentListCalls = 0;
+  scopedSegmentTableIds: string[] = [];
   manifestGetCalls = 0;
+  currentManifestGetCalls = 0;
+  manifestMembershipIds = 0;
   blockIdsRead: string[][] = [];
   singleBlockIdsRead: string[] = [];
   pendingBlockJournalSizes: number[] = [];
-
-  override async addBlocks(blocks: Parameters<MemoryBlockStore["addBlocks"]>[0]): Promise<void> {
-    this.blockWriteCalls += 1;
-    return super.addBlocks(blocks);
-  }
+  stagedBlockBatchSizes: number[] = [];
+  stagedBlockBatchBytes: number[] = [];
 
   override async getBlocks(
     ids: Parameters<MemoryBlockStore["getBlocks"]>[0],
@@ -57,9 +274,12 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
     return super.getBlock(id);
   }
 
-  override async listTransactions() {
+  override async listTransactionPage(
+    afterId: Parameters<MemoryBlockStore["listTransactionPage"]>[0],
+    limit: Parameters<MemoryBlockStore["listTransactionPage"]>[1],
+  ) {
     this.transactionListCalls += 1;
-    return super.listTransactions();
+    return super.listTransactionPage(afterId, limit);
   }
 
   override async getTransaction(id: string) {
@@ -73,14 +293,43 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
     return super.getTransactions(ids);
   }
 
-  override async listSegments(tableId?: string) {
+  override async getQueryCatalogState(names: readonly string[]) {
+    this.queryCatalogStateCalls += 1;
+    return super.getQueryCatalogState(names);
+  }
+
+  override async listSegmentPage(
+    afterId: Parameters<MemoryBlockStore["listSegmentPage"]>[0],
+    limit: Parameters<MemoryBlockStore["listSegmentPage"]>[1],
+  ) {
     this.segmentListCalls += 1;
-    return super.listSegments(tableId);
+    this.globalSegmentListCalls += 1;
+    return super.listSegmentPage(afterId, limit);
+  }
+
+  override async listTableSegmentPage(
+    tableId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[0],
+    afterId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[1],
+    limit: Parameters<MemoryBlockStore["listTableSegmentPage"]>[2],
+  ) {
+    this.segmentListCalls += 1;
+    this.scopedSegmentTableIds.push(tableId);
+    return super.listTableSegmentPage(tableId, afterId, limit);
   }
 
   override async getManifest(version: number) {
     this.manifestGetCalls += 1;
     return super.getManifest(version);
+  }
+
+  override async getCurrentManifest() {
+    this.currentManifestGetCalls += 1;
+    return super.getCurrentManifest();
+  }
+
+  override async hasManifestBlocks(version: number | null, ids: readonly string[]) {
+    this.manifestMembershipIds += ids.length;
+    return super.hasManifestBlocks(version, ids);
   }
 
   override async updateTransaction(
@@ -97,7 +346,13 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   override async stageTransactionArtifacts(
     input: Parameters<NonNullable<MemoryBlockStore["stageTransactionArtifacts"]>>[0],
   ) {
-    if (input.blocks.length > 0) this.blockWriteCalls += 1;
+    if (input.blocks.length > 0) {
+      this.blockWriteCalls += 1;
+      this.stagedBlockBatchSizes.push(input.blocks.length);
+      this.stagedBlockBatchBytes.push(
+        input.blocks.reduce((total, block) => total + block.bytes.byteLength, 0),
+      );
+    }
     const updated = await super.stageTransactionArtifacts(input);
     this.pendingBlockJournalSizes.push(updated.pendingBlockIds.length);
     return updated;
@@ -111,6 +366,267 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   }
 }
 
+class ReadAdmissionBarrierStore extends MemoryBlockStore {
+  enabled = false;
+  entered = 0;
+  readonly #gate: Promise<void>;
+  #release!: () => void;
+
+  constructor() {
+    super();
+    this.#gate = new Promise((resolve) => {
+      this.#release = resolve;
+    });
+  }
+
+  release(): void {
+    this.#release();
+  }
+
+  async #waitForRelease(): Promise<void> {
+    if (!this.enabled) return;
+    this.entered += 1;
+    await this.#gate;
+  }
+
+  override async getQueryCatalogState(names: readonly string[]) {
+    await this.#waitForRelease();
+    return super.getQueryCatalogState(names);
+  }
+
+  override async getBlocks(ids: readonly string[]) {
+    await this.#waitForRelease();
+    return super.getBlocks(ids);
+  }
+
+  override async getBlock(id: string) {
+    await this.#waitForRelease();
+    return super.getBlock(id);
+  }
+
+  override async listTableSegmentPage(
+    tableId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[0],
+    afterId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[1],
+    limit: Parameters<MemoryBlockStore["listTableSegmentPage"]>[2],
+  ) {
+    await this.#waitForRelease();
+    return super.listTableSegmentPage(tableId, afterId, limit);
+  }
+}
+
+class RefusingLeaseAdmissionStore extends MemoryBlockStore {
+  refuseLeaseAdmission = true;
+
+  override async createLease(record: LeaseRecord): Promise<void> {
+    if (this.refuseLeaseAdmission) {
+      throw new StorageResourceLimitError("lease", MAX_ACTIVE_LEASES + 1, MAX_ACTIVE_LEASES);
+    }
+    return super.createLease(record);
+  }
+}
+
+class DelayedRetiredSharedLeaseStore extends MemoryBlockStore {
+  holdNextBlockRead = false;
+  delayLeaseRemoval = false;
+  #releaseBlockRead!: () => void;
+  #signalBlockReadStarted!: () => void;
+  #releaseLeaseRemoval!: () => void;
+  #signalLeaseRemovalStarted!: () => void;
+  readonly blockReadStarted = new Promise<void>((resolve) => {
+    this.#signalBlockReadStarted = resolve;
+  });
+  readonly leaseRemovalStarted = new Promise<void>((resolve) => {
+    this.#signalLeaseRemovalStarted = resolve;
+  });
+  readonly #blockReadGate = new Promise<void>((resolve) => {
+    this.#releaseBlockRead = resolve;
+  });
+  readonly #leaseRemovalGate = new Promise<void>((resolve) => {
+    this.#releaseLeaseRemoval = resolve;
+  });
+
+  releaseBlockRead(): void {
+    this.#releaseBlockRead();
+  }
+
+  releaseLeaseRemoval(): void {
+    this.#releaseLeaseRemoval();
+  }
+
+  override async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    if (this.holdNextBlockRead) {
+      this.holdNextBlockRead = false;
+      this.#signalBlockReadStarted();
+      await this.#blockReadGate;
+    }
+    return super.getBlocks(ids);
+  }
+
+  override async removeLease(input: { id: string; ownerId: string }): Promise<boolean> {
+    const removed = await super.removeLease(input);
+    if (!this.delayLeaseRemoval) return removed;
+    this.#signalLeaseRemovalStarted();
+    await this.#leaseRemovalGate;
+    return removed;
+  }
+}
+
+it("rejects BEGIN promptly when durable lease admission is full and can begin later", async () => {
+  const store = new RefusingLeaseAdmissionStore();
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+
+  await expect(database.execute("BEGIN")).rejects.toMatchObject({
+    name: "StorageResourceLimitError",
+    resource: "lease",
+    count: MAX_ACTIVE_LEASES + 1,
+    limit: MAX_ACTIVE_LEASES,
+  });
+  await expect(database.execute("ROLLBACK")).rejects.toThrow(
+    "ROLLBACK without an open transaction",
+  );
+
+  store.refuseLeaseAdmission = false;
+  await expect(database.execute("BEGIN")).resolves.toEqual({
+    kind: "transaction",
+    action: "begin",
+  });
+  await expect(database.execute("ROLLBACK")).resolves.toEqual({
+    kind: "transaction",
+    action: "rollback",
+  });
+  await database.close();
+});
+
+it("joins a retired shared-lease removal before database close returns", async () => {
+  const store = new DelayedRetiredSharedLeaseStore();
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  await database.createTable({
+    name: "close_retired_lease",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("close_retired_lease", { value: 1 });
+
+  store.holdNextBlockRead = true;
+  const oldQuery = database.query("SELECT value FROM close_retired_lease ORDER BY value", {
+    memoize: false,
+  });
+  await store.blockReadStarted;
+  await database.insert("close_retired_lease", { value: 2 });
+  expect(
+    (
+      await database.query("SELECT value FROM close_retired_lease ORDER BY value", {
+        memoize: false,
+      })
+    ).rows,
+  ).toEqual([{ value: 1 }, { value: 2 }]);
+
+  // The old query now retires its no-longer-shared pin. Model a store that applied the durable
+  // delete but has not acknowledged its transaction yet.
+  store.delayLeaseRemoval = true;
+  store.releaseBlockRead();
+  await expect(oldQuery).resolves.toMatchObject({ rows: [{ value: 1 }] });
+  await store.leaseRemovalStarted;
+
+  const closing = database.close();
+  await expect(
+    Promise.race([closing.then(() => "closed"), Promise.resolve("pending")]),
+  ).resolves.toBe("pending");
+  store.releaseLeaseRemoval();
+  await expect(closing).resolves.toBeUndefined();
+  expect(await store.listLeases()).toEqual([]);
+  store.close();
+});
+
+it("waits for an active snapshot scope and its lease removal before close returns", async () => {
+  const store = new DelayedRetiredSharedLeaseStore();
+  store.delayLeaseRemoval = true;
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  let signalScopeEntered!: () => void;
+  const scopeEntered = new Promise<void>((resolve) => {
+    signalScopeEntered = resolve;
+  });
+  let finishScope!: () => void;
+  const scopeGate = new Promise<void>((resolve) => {
+    finishScope = resolve;
+  });
+  const scoped = database.snapshot(async () => {
+    signalScopeEntered();
+    await scopeGate;
+    return "finished";
+  });
+  await scopeEntered;
+  expect(await store.listLeases()).toHaveLength(1);
+
+  const closing = database.close();
+  await expect(
+    Promise.race([closing.then(() => "closed"), Promise.resolve("pending")]),
+  ).resolves.toBe("pending");
+  finishScope();
+  await store.leaseRemovalStarted;
+  await expect(scoped).resolves.toBe("finished");
+  await expect(
+    Promise.race([closing.then(() => "closed"), Promise.resolve("pending")]),
+  ).resolves.toBe("pending");
+
+  store.releaseLeaseRemoval();
+  await expect(closing).resolves.toBeUndefined();
+  expect(await store.listLeases()).toEqual([]);
+  store.close();
+});
+
+it("bounds concurrent direct reads without serializing admitted work", async () => {
+  const store = new ReadAdmissionBarrierStore();
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  await database.createTable({
+    name: "read_admission",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("read_admission", { value: 1 });
+  store.enabled = true;
+  const admitted = Array.from({ length: MAX_DATABASE_ACTIVE_READS }, () =>
+    database.query("SELECT value FROM read_admission", { memoize: false }),
+  );
+  await vi.waitFor(() => expect(store.entered).toBe(MAX_DATABASE_ACTIVE_READS));
+  await expect(database.readTable("read_admission")).rejects.toBeInstanceOf(
+    DatabaseReadBacklogError,
+  );
+  const cursor = database.queryCursor("SELECT value FROM read_admission", { memoize: false });
+  await expect(cursor.next()).rejects.toBeInstanceOf(DatabaseReadBacklogError);
+  store.release();
+  await expect(Promise.all(admitted)).resolves.toHaveLength(MAX_DATABASE_ACTIVE_READS);
+  store.enabled = false;
+  await expect(database.readTable("read_admission")).resolves.toEqual([{ value: 1 }]);
+  await database.close();
+});
+
+it.each(["snapshot", "write"] as const)(
+  "bounds concurrent reads inside one %s scope",
+  async (scope) => {
+    const store = new ReadAdmissionBarrierStore();
+    const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+    await database.createTable({
+      name: "scoped_read_admission",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await database.insert("scoped_read_admission", { value: 1 });
+    store.enabled = true;
+    const exercise = async (session: { query(sql: string): Promise<unknown> }) => {
+      const admitted = Array.from({ length: MAX_DATABASE_ACTIVE_READS }, () =>
+        session.query("SELECT value FROM scoped_read_admission"),
+      );
+      await vi.waitFor(() => expect(store.entered).toBe(MAX_DATABASE_ACTIVE_READS));
+      await expect(session.query("SELECT value FROM scoped_read_admission")).rejects.toBeInstanceOf(
+        DatabaseReadBacklogError,
+      );
+      store.release();
+      await expect(Promise.all(admitted)).resolves.toHaveLength(MAX_DATABASE_ACTIVE_READS);
+    };
+    if (scope === "snapshot") await database.snapshot(exercise);
+    else await database.write(exercise);
+    await database.close();
+  },
+);
+
 class ReplacementRestageFaultMemoryBlockStore extends CountingMemoryBlockStore {
   failNextRestageRead = false;
 
@@ -120,6 +636,57 @@ class ReplacementRestageFaultMemoryBlockStore extends CountingMemoryBlockStore {
       throw new Error("injected before replacement output restaging");
     }
     return super.getBlock(id);
+  }
+}
+
+class TransientTableInUseMemoryBlockStore extends MemoryBlockStore {
+  dropTableCalls = 0;
+  refuseNextRemoval = true;
+
+  override async dropTable(input: Parameters<MemoryBlockStore["dropTable"]>[0]) {
+    this.dropTableCalls += 1;
+    if (this.refuseNextRemoval) {
+      this.refuseNextRemoval = false;
+      throw new TableInUseError(input.tableId, "compaction job", "late-fold");
+    }
+    return super.dropTable(input);
+  }
+}
+
+class RefusingViewUpdateMemoryBlockStore extends MemoryBlockStore {
+  refuseNextViewUpdate = false;
+
+  override async updateTable(
+    id: string,
+    expectedRevision: number,
+    update: Parameters<MemoryBlockStore["updateTable"]>[2],
+  ) {
+    if (this.refuseNextViewUpdate && update.view !== undefined) {
+      this.refuseNextViewUpdate = false;
+      throw new DOMException("injected view quota refusal", "QuotaExceededError");
+    }
+    return super.updateTable(id, expectedRevision, update);
+  }
+}
+
+class RacingViewUpdateMemoryBlockStore extends MemoryBlockStore {
+  raceNextViewUpdate = false;
+
+  override async updateTable(
+    id: string,
+    expectedRevision: number,
+    update: Parameters<MemoryBlockStore["updateTable"]>[2],
+  ) {
+    if (this.raceNextViewUpdate && update.view !== undefined) {
+      this.raceNextViewUpdate = false;
+      const current = await this.getTable(id);
+      if (current === undefined) throw new Error(`Missing racing view: ${id}`);
+      await super.updateTable(id, expectedRevision, {
+        columns: current.columns,
+        view: { sql: "SELECT 7 AS value", managed: false },
+      });
+    }
+    return super.updateTable(id, expectedRevision, update);
   }
 }
 
@@ -136,6 +703,101 @@ class CheckpointFaultMemoryBlockStore extends MemoryBlockStore {
       throw new Error("injected before compaction cursor checkpoint");
     }
     return super.updateCompactionJob(id, expectedRevision, update);
+  }
+}
+
+class PersistentPostingBuildFaultStore extends MemoryBlockStore {
+  failFtsBuilds = false;
+  failSecondaryBuilds = false;
+  failPostingInvalidations = false;
+  postingInvalidationAttempts = 0;
+
+  override async writeFtsBase(
+    tableId: Parameters<MemoryBlockStore["writeFtsBase"]>[0],
+    columnId: Parameters<MemoryBlockStore["writeFtsBase"]>[1],
+    input: Parameters<MemoryBlockStore["writeFtsBase"]>[2],
+  ): Promise<void> {
+    if (this.failFtsBuilds) throw new Error("injected full-text rebuild failure");
+    return super.writeFtsBase(tableId, columnId, input);
+  }
+
+  override async beginFtsBaseBuild(
+    input: Parameters<MemoryBlockStore["beginFtsBaseBuild"]>[0],
+  ): Promise<void> {
+    if (this.failSecondaryBuilds) throw new Error("injected scalar rebuild failure");
+    return super.beginFtsBaseBuild(input);
+  }
+
+  override async writeFtsBaseBuildChunk(
+    input: Parameters<MemoryBlockStore["writeFtsBaseBuildChunk"]>[0],
+  ): Promise<void> {
+    if (this.failFtsBuilds) throw new Error("injected streamed full-text build failure");
+    return super.writeFtsBaseBuildChunk(input);
+  }
+
+  override async updateTable(
+    id: Parameters<MemoryBlockStore["updateTable"]>[0],
+    expectedRevision: Parameters<MemoryBlockStore["updateTable"]>[1],
+    update: Parameters<MemoryBlockStore["updateTable"]>[2],
+  ): ReturnType<MemoryBlockStore["updateTable"]> {
+    const invalidatesPostingStorage =
+      Object.values(update.ftsColumns ?? {}).some((state) => state.state === "invalid") ||
+      Object.values(update.secondaryIndexes ?? {}).some((state) => state.state === "invalid");
+    if (invalidatesPostingStorage && this.failPostingInvalidations) {
+      this.postingInvalidationAttempts += 1;
+      throw new Error("injected postings invalidation failure");
+    }
+    return super.updateTable(id, expectedRevision, update);
+  }
+}
+
+class OverflowingFtsCandidateStore extends MemoryBlockStore {
+  candidateReads = 0;
+
+  override async readFtsCandidates(
+    tableId: string,
+    columnId: string,
+    terms: Parameters<MemoryBlockStore["readFtsCandidates"]>[2],
+    upToVersion: number,
+    maxRowIds?: number,
+  ) {
+    if (terms.length === 0) {
+      return super.readFtsCandidates(tableId, columnId, terms, upToVersion, maxRowIds);
+    }
+    this.candidateReads += 1;
+    const metadata = await super.readFtsCandidates(tableId, columnId, [], upToVersion, maxRowIds);
+    return {
+      ...metadata,
+      rowIdsByTerm: terms.map(() => []),
+      overflow: true,
+    };
+  }
+}
+
+class TinyBlockReadBatchStore extends MemoryBlockStore {
+  largestAttempt = 0;
+
+  override async getBlocks(ids: readonly string[]) {
+    this.largestAttempt = Math.max(this.largestAttempt, ids.length);
+    if (ids.length > 2) throw new BlockReadBatchTooLargeError(ids.length, 2);
+    return super.getBlocks(ids);
+  }
+}
+
+class GarbageCollectionCreateBarrierStore extends MemoryBlockStore {
+  #arrivals = 0;
+  #release!: () => void;
+  readonly #gate = new Promise<void>((resolve) => {
+    this.#release = resolve;
+  });
+
+  override async createGarbageCollectionJob(
+    input: Parameters<MemoryBlockStore["createGarbageCollectionJob"]>[0],
+  ) {
+    this.#arrivals += 1;
+    if (this.#arrivals === 2) this.#release();
+    await this.#gate;
+    return super.createGarbageCollectionJob(input);
   }
 }
 
@@ -159,33 +821,21 @@ class GzipVariantCheckpointFaultMemoryBlockStore extends CheckpointFaultMemoryBl
     }
     const variant = new Uint8Array(bytes);
     const view = new DataView(variant.buffer, variant.byteOffset, variant.byteLength);
-    const storedOffset = 40 + view.getUint32(24, true);
+    const metadataLength = view.getUint32(24, true);
+    const storedOffset = BLOCK_HEADER_LENGTH + metadataLength;
     if (variant[storedOffset] !== 0x1f || variant[storedOffset + 1] !== 0x8b) {
       throw new Error("Expected a gzip compaction payload");
     }
     variant[storedOffset + 4] = (variant[storedOffset + 4] ?? 0) ^ 1;
+    view.setUint32(40, crc32(variant.subarray(storedOffset)), true);
+    view.setUint32(4, crc32(variant.subarray(8, BLOCK_HEADER_LENGTH + metadataLength)), true);
     this.variantReadCount += 1;
     return variant;
   }
 }
 
-class PublicationCheckpointFaultMemoryBlockStore extends MemoryBlockStore {
-  failPublishedCheckpoint = true;
-
-  override async updateCompactionJob(
-    id: string,
-    expectedRevision: number,
-    update: CompactionJobRecordUpdate,
-  ) {
-    if (update.state === "published" && this.failPublishedCheckpoint) {
-      throw new Error("injected before compaction publication checkpoint");
-    }
-    return super.updateCompactionJob(id, expectedRevision, update);
-  }
-}
-
 class InitialCompactionPlanningBarrierStore extends MemoryBlockStore {
-  #listReadCount = 0;
+  #pageReadCount = 0;
   #jobReadCount = 0;
   #releaseListReads: (() => void) | undefined;
   #releaseJobReads: (() => void) | undefined;
@@ -196,13 +846,16 @@ class InitialCompactionPlanningBarrierStore extends MemoryBlockStore {
     this.#releaseJobReads = resolve;
   });
 
-  override async listCompactionJobs(tableId?: string): Promise<CompactionJobRecord[]> {
-    if (this.#listReadCount >= 2) return super.listCompactionJobs(tableId);
-    const records = await super.listCompactionJobs(tableId);
-    this.#listReadCount += 1;
-    if (this.#listReadCount === 2) this.#releaseListReads?.();
+  override async listCompactionJobPage(
+    afterId: Parameters<MemoryBlockStore["listCompactionJobPage"]>[0],
+    limit: Parameters<MemoryBlockStore["listCompactionJobPage"]>[1],
+  ) {
+    if (this.#pageReadCount >= 2) return super.listCompactionJobPage(afterId, limit);
+    const page = await super.listCompactionJobPage(afterId, limit);
+    this.#pageReadCount += 1;
+    if (this.#pageReadCount === 2) this.#releaseListReads?.();
     await this.#listReadsReady;
-    return records;
+    return page;
   }
 
   override async getCompactionJob(id: string): Promise<CompactionJobRecord | undefined> {
@@ -298,6 +951,73 @@ function recoveryImplementations(): Array<{
 
 for (const implementation of implementations()) {
   describe(`${implementation.name} SQL boundary durability`, () => {
+    it("advances same-instance mutation visibility and reads deferred blocks in a write scope", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, {
+        autoCompact: false,
+        compression: "raw",
+        rowsPerBlock: 1,
+      });
+      await database.execute(
+        "CREATE TABLE mutation_visibility (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)",
+      );
+      await database.execute("INSERT INTO mutation_visibility VALUES (1, 0), (2, 10), (3, 20)");
+
+      await database.execute("UPDATE mutation_visibility SET n = n + 1 WHERE id = 1");
+      await database.execute("UPDATE mutation_visibility SET n = n + 1 WHERE id = 1");
+      await database.execute("DELETE FROM mutation_visibility WHERE id = 2");
+      expect(
+        (
+          await database.query("SELECT id, n FROM mutation_visibility ORDER BY id", {
+            memoize: false,
+          })
+        ).rows,
+      ).toEqual([
+        { id: 1, n: 2 },
+        { id: 3, n: 20 },
+      ]);
+
+      await database.write(async (session) => {
+        // The second stage flushes the first bounded batch and makes an active owner plus its
+        // segments visible to catalog reads. A concurrent ordinary read still sees only the
+        // committed snapshot, and caching that state must not hide those segments after commit.
+        await session.insertBatch("mutation_visibility", [{ id: 4, n: 40 }]);
+        await session.updateBatch("mutation_visibility", {
+          keys: [1, 3],
+          changes: { n: [3, 21] },
+        });
+        expect(
+          (
+            await database.query("SELECT id, n FROM mutation_visibility ORDER BY id", {
+              memoize: false,
+            })
+          ).rows,
+        ).toEqual([
+          { id: 1, n: 2 },
+          { id: 3, n: 20 },
+        ]);
+        expect(
+          (await session.query("SELECT id, n FROM mutation_visibility ORDER BY id")).rows,
+        ).toEqual([
+          { id: 1, n: 3 },
+          { id: 3, n: 21 },
+          { id: 4, n: 40 },
+        ]);
+      });
+      expect(
+        (
+          await database.query("SELECT id, n FROM mutation_visibility ORDER BY id", {
+            memoize: false,
+          })
+        ).rows,
+      ).toEqual([
+        { id: 1, n: 3 },
+        { id: 3, n: 21 },
+        { id: 4, n: 40 },
+      ]);
+      store.close();
+    });
+
     it("preserves private-namespace TEXT through queries, transactions, compaction, and snapshots", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, {
@@ -590,6 +1310,529 @@ for (const implementation of implementations()) {
   });
 }
 
+it("reports unsupported storage diagnostics explicitly for custom stores", async () => {
+  const store = new MemoryBlockStore();
+  Object.defineProperties(store, {
+    checkIntegrity: { configurable: true, value: undefined },
+    getStorageStats: { configurable: true, value: undefined },
+    inspectInterruptedImport: { configurable: true, value: undefined },
+    abortInterruptedImport: { configurable: true, value: undefined },
+  });
+  const database = new MinnowDatabase(store);
+  await expect(database.checkIntegrity()).rejects.toThrow("cannot check integrity");
+  await expect(database.storageStats()).rejects.toThrow("cannot report storage stats");
+  await expect(database.inspectInterruptedImport()).resolves.toBeNull();
+  await expect(database.abortInterruptedImport("missing")).rejects.toThrow(
+    "cannot abort interrupted imports",
+  );
+  await database.close();
+});
+
+describe("table-scoped segment catalog reads", () => {
+  it("does not scan unrelated segment history for an explicit-version join", async () => {
+    const store = new CountingMemoryBlockStore();
+    const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+    await database.execute("CREATE TABLE scoped_left (id INTEGER PRIMARY KEY, value INTEGER)");
+    await database.execute("CREATE TABLE scoped_right (id INTEGER PRIMARY KEY, label TEXT)");
+    await database.execute("INSERT INTO scoped_left VALUES (1, 10)");
+    await database.execute("INSERT INTO scoped_right VALUES (1, 'one')");
+    for (let index = 0; index < 32; index += 1) {
+      const name = `unrelated_${String(index)}`;
+      await database.execute(`CREATE TABLE ${name} (id INTEGER PRIMARY KEY)`);
+      await database.execute(`INSERT INTO ${name} VALUES (${String(index)})`);
+    }
+    const left = await store.getTableByName("scoped_left");
+    const right = await store.getTableByName("scoped_right");
+    const version = await store.getCurrentManifestVersion();
+    if (left === undefined || right === undefined || version === null) {
+      throw new Error("Scoped segment test setup failed");
+    }
+    store.globalSegmentListCalls = 0;
+    store.scopedSegmentTableIds = [];
+
+    const result = await database.query(
+      "SELECT l.value, r.label FROM scoped_left l JOIN scoped_right r ON r.id = l.id",
+      { version },
+    );
+
+    expect(result.rows).toEqual([{ value: 10, label: "one" }]);
+    expect(store.globalSegmentListCalls).toBe(0);
+    expect(new Set(store.scopedSegmentTableIds)).toEqual(new Set([left.id, right.id]));
+    await database.close();
+  });
+});
+
+it("renews a durable snapshot pin while one bounded write batch idles process-local", async () => {
+  const store = new MemoryBlockStore();
+  const transactionRenewals = vi.spyOn(store, "renewTransaction");
+  const leaseRenewals = vi.spyOn(store, "renewLease");
+  const database = new MinnowDatabase(store, {
+    transactionOwnerLeaseMs: 30,
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "idle_scope_rows",
+    columns: [{ name: "value", type: "number" }],
+  });
+  let staged!: () => void;
+  const didStage = new Promise<void>((resolve) => {
+    staged = resolve;
+  });
+  let release!: () => void;
+  const idle = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const write = database.write(async (session) => {
+    await session.insertBatch("idle_scope_rows", [{ value: 1 }]);
+    staged();
+    await idle;
+  });
+  await didStage;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  expect(transactionRenewals).not.toHaveBeenCalled();
+  expect(leaseRenewals.mock.calls.length).toBeGreaterThanOrEqual(2);
+  expect(await transactionRecords(store)).toEqual([]);
+  expect(await store.listLeases()).toHaveLength(1);
+  release();
+  await write;
+  expect((await transactionRecords(store)).map((record) => record.status)).toEqual(["committed"]);
+  await vi.waitFor(async () => expect(await store.listLeases()).toEqual([]));
+  expect(await database.readTable("idle_scope_rows")).toEqual([{ value: 1 }]);
+  await database.close();
+});
+
+it("applies the database memory default to ordinary, transactional, and mutation queries", async () => {
+  const store = new MemoryBlockStore();
+  const pageWrites = vi.spyOn(store, "putTempRunPages");
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 256,
+    compression: "raw",
+    executionMemoryBudgetBytes: 280_000,
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "default_budget_rows",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "bucket", type: "number" },
+    ],
+  });
+  await database.insertBatch("default_budget_rows", {
+    columns: {
+      id: Array.from({ length: 5_000 }, (_, index) => index),
+      bucket: Array.from({ length: 5_000 }, (_, index) => index % 17),
+    },
+  });
+  const sql = "SELECT id, bucket FROM default_budget_rows ORDER BY bucket, id DESC";
+  const ordinary = await database.query(sql, { memoize: false, spillPageRows: 64 });
+  expect(ordinary.rows).toHaveLength(5_000);
+  // The streamed form fits under the database default and therefore stays on the radix path;
+  // having a finite default is not itself a reason to write durable spill pages.
+  expect(pageWrites).not.toHaveBeenCalled();
+
+  pageWrites.mockClear();
+  await database.execute("BEGIN");
+  const transactional = await database.query(sql, { memoize: false });
+  expect(transactional.rows).toEqual(ordinary.rows);
+  expect(pageWrites).toHaveBeenCalled();
+  await database.execute("ROLLBACK");
+
+  const before = await database.query("SELECT bucket FROM default_budget_rows WHERE id = 1");
+  const constrained = new MinnowDatabase(store, {
+    executionMemoryBudgetBytes: 1,
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await expect(
+    constrained.execute("UPDATE default_budget_rows SET bucket = bucket + 1 WHERE id = 1"),
+  ).rejects.toBeInstanceOf(QueryMemoryBudgetError);
+  expect(await database.query("SELECT bucket FROM default_budget_rows WHERE id = 1")).toEqual(
+    before,
+  );
+  await constrained.close();
+  await database.close();
+});
+
+it("supports per-query budget overrides and an explicit unbounded database opt-out", async () => {
+  const store = new MemoryBlockStore();
+  const bounded = new MinnowDatabase(store, {
+    executionMemoryBudgetBytes: 1,
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await bounded.createTable({
+    name: "budget_override_rows",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await bounded.insertBatch("budget_override_rows", {
+    columns: { value: Array.from({ length: 1_000 }, (_, index) => index) },
+  });
+  await expect(
+    bounded.query("SELECT value FROM budget_override_rows", { memoize: false }),
+  ).rejects.toBeInstanceOf(QueryMemoryBudgetError);
+  expect(
+    (
+      await bounded.query("SELECT value FROM budget_override_rows", {
+        memoize: false,
+        executionMemoryBudgetBytes: 256_000,
+      })
+    ).rows,
+  ).toHaveLength(1_000);
+
+  await bounded.execute("BEGIN");
+  await expect(
+    bounded.query("SELECT value FROM budget_override_rows", { memoize: false }),
+  ).rejects.toBeInstanceOf(QueryMemoryBudgetError);
+  expect(
+    (
+      await bounded.query("SELECT value FROM budget_override_rows", {
+        memoize: false,
+        executionMemoryBudgetBytes: 256_000,
+      })
+    ).rows,
+  ).toHaveLength(1_000);
+  await bounded.execute("ROLLBACK");
+  await bounded.close();
+
+  const unbounded = new MinnowDatabase(store, {
+    executionMemoryBudgetBytes: null,
+    autoCompact: false,
+    autoCollect: false,
+  });
+  expect(
+    (await unbounded.query("SELECT value FROM budget_override_rows", { memoize: false })).rows,
+  ).toHaveLength(1_000);
+  await unbounded.close();
+});
+
+it("keeps a full numeric sort in memory when it fits the default query budget", async () => {
+  const store = new MemoryBlockStore();
+  const pageWrites = vi.spyOn(store, "putTempRunPages");
+  const ownerCreates = vi.spyOn(store, "createTempOwner");
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 512,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "fitting_sort_rows",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "amount", type: "number" },
+    ],
+  });
+  const rowCount = 20_000;
+  await database.insertBatch("fitting_sort_rows", {
+    columns: {
+      id: Array.from({ length: rowCount }, (_, index) => index),
+      amount: Array.from({ length: rowCount }, (_, index) => (index * 7_919) % 1_000),
+    },
+  });
+
+  const result = await database.query(
+    "SELECT id, amount FROM fitting_sort_rows ORDER BY amount, id",
+    { memoize: false },
+  );
+
+  expect(result.rows).toHaveLength(rowCount);
+  expect(result.rows[0]).toEqual({ id: 0, amount: 0 });
+  expect(result.rows.at(-1)).toEqual({ id: 19_321, amount: 999 });
+  let ordered = true;
+  for (let index = 1; index < result.rows.length; index += 1) {
+    const previous = result.rows[index - 1];
+    const current = result.rows[index];
+    if (
+      Number(previous?.amount) > Number(current?.amount) ||
+      (previous?.amount === current?.amount && Number(previous?.id) >= Number(current?.id))
+    ) {
+      ordered = false;
+      break;
+    }
+  }
+  expect(ordered).toBe(true);
+  expect(ownerCreates).not.toHaveBeenCalled();
+  expect(pageWrites).not.toHaveBeenCalled();
+  await database.close();
+});
+
+it("invalidates and reclaims a persistently failing full-text delta fold, then rebuilds", async () => {
+  const store = new PersistentPostingBuildFaultStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 2,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "tail_articles",
+    columns: [{ name: "body", type: "string" }],
+  });
+  await database.insert("tail_articles", { body: "seed" });
+  await database.buildFtsIndex("tail_articles", "body");
+  store.failFtsBuilds = true;
+  store.failPostingInvalidations = true;
+  for (let commit = 0; commit < 80 && store.postingInvalidationAttempts === 0; commit += 1) {
+    await database.insert("tail_articles", { body: `later ${String(commit)}` });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  expect(store.postingInvalidationAttempts).toBeGreaterThan(0);
+  // Let the failed background attempt release its in-flight key. The hard-tail marker must
+  // survive so exactly one later commit is enough to trigger a successful retry.
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  store.failPostingInvalidations = false;
+  await database.insert("tail_articles", { body: "later retry" });
+  let table = await store.getTableByName("tail_articles");
+  const column = table?.columns[0];
+  if (table === undefined || column === undefined) throw new Error("FTS table is missing");
+  for (
+    let attempt = 0;
+    attempt < 500 && table.ftsColumns?.[column.id]?.state !== "invalid";
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    table = await store.getTableByName("tail_articles");
+    if (table === undefined) throw new Error("FTS table disappeared");
+  }
+  expect(table.ftsColumns?.[column.id]?.state).toBe("invalid");
+  const failedTail = await store.readFtsCandidates(
+    table.id,
+    column.id,
+    [{ term: "later", prefix: false }],
+    (await store.getCurrentManifestVersion()) ?? -1,
+  );
+  expect(failedTail.hasBase).toBe(false);
+  expect(failedTail.deltaChunkCount).toBe(0);
+  expect(
+    (
+      await database.query(
+        "SELECT COUNT(*) AS n FROM tail_articles WHERE MATCH(body) AGAINST 'later'",
+        { memoize: false },
+      )
+    ).rows,
+  ).toEqual([{ n: (await database.readTable("tail_articles")).length - 1 }]);
+
+  store.failFtsBuilds = false;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    await database.query(
+      "SELECT COUNT(*) AS n FROM tail_articles WHERE MATCH(body) AGAINST 'later'",
+      { memoize: false },
+    );
+    table = await store.getTableByName("tail_articles");
+    if (table?.ftsColumns?.[column.id]?.state === "ready") break;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  expect(table?.ftsColumns?.[column.id]?.state).toBe("ready");
+  await database.close();
+});
+
+it("aborts a failed streamed full-text build and remains scan-correct", async () => {
+  const store = new PersistentPostingBuildFaultStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 1,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "stream_build_fault",
+    columns: [{ name: "body", type: "string" }],
+  });
+  await database.insertBatch(
+    "stream_build_fault",
+    Array.from({ length: 64 }, (_, index) => ({ body: `needle ${String(index)}` })),
+  );
+
+  store.failFtsBuilds = true;
+  await expect(database.buildFtsIndex("stream_build_fault", "body")).rejects.toThrow(
+    "injected streamed full-text build failure",
+  );
+  const failed = await store.getTableByName("stream_build_fault");
+  const column = failed?.columns[0];
+  if (failed === undefined || column === undefined) throw new Error("FTS fixture is missing");
+  expect(failed.ftsColumns?.[column.id]?.state).toBe("invalid");
+  expect(
+    await store.readFtsCandidates(
+      failed.id,
+      column.id,
+      [{ term: "needle", prefix: false }],
+      (await store.getCurrentManifestVersion()) ?? -1,
+    ),
+  ).toMatchObject({ hasBase: false, deltaChunkCount: 0 });
+  expect(
+    (
+      await database.query(
+        "SELECT COUNT(*) AS n FROM stream_build_fault WHERE MATCH(body) AGAINST 'needle'",
+        { memoize: false },
+      )
+    ).rows,
+  ).toEqual([{ n: 64 }]);
+
+  store.failFtsBuilds = false;
+  await database.buildFtsIndex("stream_build_fault", "body");
+  expect((await store.getTableByName("stream_build_fault"))?.ftsColumns?.[column.id]?.state).toBe(
+    "ready",
+  );
+  await database.close();
+});
+
+it("falls back to an exact scan when a postings candidate read reaches its memory fuse", async () => {
+  const store = new OverflowingFtsCandidateStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 2,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "candidate_fuse",
+    columns: [{ name: "body", type: "string" }],
+  });
+  await database.insertBatch(
+    "candidate_fuse",
+    Array.from({ length: 20 }, (_, index) => ({
+      body: index % 2 === 0 ? `common ${String(index)}` : `other ${String(index)}`,
+    })),
+  );
+  await database.buildFtsIndex("candidate_fuse", "body");
+
+  expect(
+    (
+      await database.query(
+        "SELECT COUNT(*) AS n FROM candidate_fuse WHERE MATCH(body) AGAINST 'common'",
+        { memoize: false },
+      )
+    ).rows,
+  ).toEqual([{ n: 10 }]);
+  expect(store.candidateReads).toBeGreaterThan(0);
+  await database.close();
+});
+
+it("adaptively splits a storage-refused block batch without changing query results", async () => {
+  const store = new TinyBlockReadBatchStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 1,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "split_block_reads",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insertBatch(
+    "split_block_reads",
+    Array.from({ length: 8 }, (_, value) => ({ value })),
+  );
+  expect((await database.query("SELECT value FROM split_block_reads ORDER BY value")).rows).toEqual(
+    Array.from({ length: 8 }, (_, value) => ({ value })),
+  );
+  expect(store.largestAttempt).toBeGreaterThan(2);
+  await database.close();
+});
+
+it("releases posting-tail retry markers when their table is dropped", async () => {
+  const store = new PersistentPostingBuildFaultStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 2,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "temporary_articles",
+    columns: [{ name: "body", type: "string" }],
+  });
+  await database.insert("temporary_articles", { body: "seed" });
+  await database.buildFtsIndex("temporary_articles", "body");
+  store.failFtsBuilds = true;
+  store.failPostingInvalidations = true;
+  for (
+    let commit = 0;
+    commit < 80 && database.maintenanceStatus().postingDeltaTailMarkers === 0;
+    commit += 1
+  ) {
+    await database.insert("temporary_articles", { body: `later ${String(commit)}` });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  expect(database.maintenanceStatus().postingDeltaTailMarkers).toBeGreaterThan(0);
+  await database.dropTable("temporary_articles");
+  expect(database.maintenanceStatus().postingDeltaTailMarkers).toBe(0);
+  await database.close();
+});
+
+it("invalidates and reclaims a failing scalar-index fold without weakening UNIQUE state", async () => {
+  const store = new PersistentPostingBuildFaultStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 2,
+    compression: "raw",
+    autoCompact: false,
+    autoCollect: false,
+  });
+  await database.createTable({
+    name: "tail_values",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "value", type: "number" },
+    ],
+  });
+  await database.insert("tail_values", { id: 0, value: 0 });
+  await database.createIndex("tail_value_idx", "tail_values", "value", { unique: true });
+  store.failSecondaryBuilds = true;
+  for (let commit = 1; commit <= 40; commit += 1) {
+    await database.insert("tail_values", { id: commit, value: commit });
+  }
+  let table = await store.getTableByName("tail_values");
+  const indexEntry = Object.entries(table?.secondaryIndexes ?? {})[0];
+  if (table === undefined || indexEntry === undefined) throw new Error("Scalar index is missing");
+  const [indexId, index] = indexEntry;
+  for (
+    let attempt = 0;
+    attempt < 500 && table.secondaryIndexes?.[indexId]?.state !== "invalid";
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    table = await store.getTableByName("tail_values");
+    if (table === undefined) throw new Error("Scalar table disappeared");
+  }
+  expect(table.secondaryIndexes?.[indexId]).toMatchObject({
+    state: "invalid",
+    unique: true,
+    uniqueEnforced: true,
+  });
+  const failedTail = await store.readFtsCandidates(
+    table.id,
+    index.storageColumnId,
+    [],
+    (await store.getCurrentManifestVersion()) ?? -1,
+  );
+  expect(failedTail.hasBase).toBe(false);
+  expect(failedTail.deltaChunkCount).toBe(0);
+  expect(
+    (await database.query("SELECT id FROM tail_values WHERE value = 37", { memoize: false })).rows,
+  ).toEqual([{ id: 37 }]);
+  await expect(database.insert("tail_values", { id: 99, value: 37 })).rejects.toBeInstanceOf(
+    UniqueConstraintError,
+  );
+
+  store.failSecondaryBuilds = false;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    await database.query("SELECT id FROM tail_values WHERE value = 37", { memoize: false });
+    table = await store.getTableByName("tail_values");
+    if (table?.secondaryIndexes?.[indexId]?.state === "ready") break;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  expect(table?.secondaryIndexes?.[indexId]).toMatchObject({
+    state: "ready",
+    uniqueEnforced: true,
+  });
+  await database.close();
+});
+
 interface MutationCompactionFixture {
   database: MinnowDatabase;
   tableId: string;
@@ -674,7 +1917,7 @@ async function createMutationCompactionFixture(
   ];
   expect(expectedRowIds[0]).not.toBe(upsertRowIds[0]);
 
-  const visibleSourceIds = (await database.listVisibleSegments(tableName)).map(
+  const visibleSourceIds = (await allVisibleSegments(database, tableName)).map(
     (segment) => segment.id,
   );
   const sourceSegments = await Promise.all(
@@ -767,10 +2010,9 @@ function requiredItem<T>(values: readonly T[], index: number, label: string): T 
 
 function expandSegmentRowIds(segment: SegmentRecord): bigint[] {
   const spans =
-    segment.rowIdSpans ??
-    (segment.rowCount === 0
-      ? []
-      : [{ rowStart: 0, rowCount: segment.rowCount, rowIdStart: segment.rowIdStart }]);
+    segment.rowIdSpans.length === 0 && segment.rowCount > 0
+      ? [{ rowStart: 0, rowCount: segment.rowCount, rowIdStart: segment.rowIdStart }]
+      : segment.rowIdSpans;
   const rowIds: Array<bigint | undefined> = Array.from({ length: segment.rowCount });
   for (const span of spans) {
     for (let offset = 0; offset < span.rowCount; offset += 1) {
@@ -796,8 +2038,8 @@ function canonicalRowIdSpans(rowIds: readonly bigint[]): RowIdSpan[] {
   return spans;
 }
 
-function legacyAppendOnlyCompactionEligible(segment: SegmentRecord): boolean {
-  return (segment.kind ?? "insert") === "insert";
+function appendOnlyCompactionEligible(segment: SegmentRecord): boolean {
+  return segment.kind === "insert";
 }
 
 async function assertPublishedMutationMerge(
@@ -810,7 +2052,7 @@ async function assertPublishedMutationMerge(
 ): Promise<SegmentRecord> {
   const job = await store.getCompactionJob(jobId);
   if (job === undefined) throw new Error(`Expected compaction job ${jobId}`);
-  if (job.rewritePlan?.kind !== "merge-v1") throw new Error("Expected a merge-v1 plan");
+  if (job.rewritePlan.kind !== "merge-v1") throw new Error("Expected a merge-v1 plan");
   expect(job).toMatchObject({ state: "published", processedRows: expectedRows.length });
   expect(new Set(job.outputBlockIds).size).toBe(job.outputBlockIds.length);
   expect(job.rewritePlan).toMatchObject({
@@ -842,7 +2084,7 @@ async function assertPublishedMutationMerge(
   );
   expect(expandSegmentRowIds(output)).toEqual(expectedRowIds);
   expect(await database.readTable(tableName)).toEqual(expectedRows);
-  expect(await database.listVisibleSegments(tableName)).toHaveLength(1);
+  expect(await allVisibleSegments(database, tableName)).toHaveLength(1);
   return output;
 }
 
@@ -883,7 +2125,7 @@ async function createMutationRebaseGuardFixture(
   if (progress.jobId === null) throw new Error("Expected a guarded mutation compaction job");
   expect(progress).toMatchObject({ state: "running", outputBlockCount: 1, result: null });
   const job = await store.getCompactionJob(progress.jobId);
-  if (job?.rewritePlan?.kind !== "merge-v1") throw new Error("Expected a merge-v1 guard plan");
+  if (job?.rewritePlan.kind !== "merge-v1") throw new Error("Expected a merge-v1 guard plan");
   const table = await store.getTableByName(tableName);
   if (table === undefined) throw new Error(`Expected guard table ${tableName}`);
   return { database, table, job, expectedRows };
@@ -929,6 +2171,8 @@ async function commitLowLevelDeleteSegment(
     keyColumnId: keyColumn.id,
     level: 0,
     logicalOrder: input.logicalOrder,
+    commitOrdinal: 0,
+    rowIdSpans: [],
     createdAt: "2026-01-01T00:00:00.000Z",
   });
   const manifest = await transaction.commit();
@@ -970,10 +2214,202 @@ async function commitLowLevelNumberSegment(
     level: input.level,
     ...(input.partitionOrdinal === undefined ? {} : { partitionOrdinal: input.partitionOrdinal }),
     logicalOrder: input.logicalOrder,
+    commitOrdinal: 0,
+    rowIdSpans: [],
     createdAt: "2026-01-01T00:00:00.000Z",
   });
   await transaction.commit();
 }
+
+it("retries only a typed transient table-use race without repeating block retirement", async () => {
+  const store = new TransientTableInUseMemoryBlockStore();
+  const database = new MinnowDatabase(store, { maxCommitRetries: 2 });
+  await database.createTable({
+    name: "notes",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("notes", { value: 1 });
+  const versionBeforeDrop = await store.getCurrentManifestVersion();
+
+  await expect(database.dropTable("notes")).resolves.toBe(true);
+
+  expect(store.dropTableCalls).toBe(2);
+  expect(await store.getCurrentManifestVersion()).toBe((versionBeforeDrop ?? -1) + 1);
+  expect(await store.getTableByName("notes")).toBeUndefined();
+  store.close();
+});
+
+it("keeps the old view intact when an atomic replacement is refused", async () => {
+  const store = new RefusingViewUpdateMemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.createView("answer", "SELECT 1 AS value");
+  const before = await store.getTableByName("answer");
+  store.refuseNextViewUpdate = true;
+
+  await expect(
+    database.createView("answer", "SELECT 2 AS value", { orReplace: true }),
+  ).rejects.toMatchObject({ name: "QuotaExceededError" });
+
+  expect(await store.getTableByName("answer")).toEqual(before);
+  expect((await database.query("SELECT value FROM answer")).rows).toEqual([{ value: 1 }]);
+  store.close();
+});
+
+it("preserves a concurrent view update when OR REPLACE loses its catalog CAS", async () => {
+  const store = new RacingViewUpdateMemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.createView("answer", "SELECT 1 AS value");
+  store.raceNextViewUpdate = true;
+
+  await expect(
+    database.createView("answer", "SELECT 2 AS value", { orReplace: true }),
+  ).rejects.toBeInstanceOf(TableRecordConflictError);
+
+  expect((await database.query("SELECT value FROM answer")).rows).toEqual([{ value: 7 }]);
+  store.close();
+});
+
+it("keeps dependent views valid across replace and drop DDL", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.execute("CREATE TABLE source_values (value INTEGER)");
+  await database.execute("INSERT INTO source_values VALUES (-1), (1)");
+  await database.createView("source_view", "SELECT value FROM source_values");
+  await database.createView("dependent_view", "SELECT value FROM source_view");
+
+  await database.createView("source_view", "SELECT value FROM source_values WHERE value > 0", {
+    orReplace: true,
+  });
+  expect((await database.query("SELECT value FROM dependent_view")).rows).toEqual([{ value: 1 }]);
+  await expect(
+    database.createView("source_view", "SELECT value AS renamed FROM source_values", {
+      orReplace: true,
+    }),
+  ).rejects.toThrow("dependent_view depends on its current schema");
+  await expect(database.dropView("source_view")).rejects.toThrow("view dependent_view reads it");
+  expect((await database.query("SELECT value FROM dependent_view")).rows).toEqual([{ value: 1 }]);
+  store.close();
+});
+
+it("rejects view cycles at DDL time and preserves the previous definition", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.createView("first_view", "SELECT 1 AS value");
+  await database.createView("second_view", "SELECT value FROM first_view");
+
+  await expect(
+    database.createView("first_view", "SELECT value FROM second_view", { orReplace: true }),
+  ).rejects.toThrow("View dependency cycle");
+  expect((await database.query("SELECT value FROM first_view")).rows).toEqual([{ value: 1 }]);
+  store.close();
+});
+
+it("protects stored view schemas when columns are added", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.execute("CREATE TABLE view_source (id INTEGER)");
+  await database.createView("star_view", "SELECT * FROM view_source");
+  await expect(database.execute("ALTER TABLE view_source ADD COLUMN note TEXT")).rejects.toThrow(
+    "star_view depends on its current schema",
+  );
+  await database.dropView("star_view");
+  await database.createView("explicit_view", "SELECT id FROM view_source");
+  await expect(
+    database.execute("ALTER TABLE view_source ADD COLUMN note TEXT"),
+  ).resolves.toMatchObject({ kind: "add-column" });
+  expect((await database.query("SELECT * FROM explicit_view")).columns).toEqual(["id"]);
+  store.close();
+});
+
+it("refuses trigger ownership or targets that are views", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.execute("CREATE TABLE trigger_rows (id INTEGER PRIMARY KEY)");
+  await database.createView("trigger_view", "SELECT id FROM trigger_rows");
+  await expect(
+    database.execute(
+      "CREATE TRIGGER view_owner AFTER INSERT ON trigger_view BEGIN " +
+        "INSERT INTO trigger_rows (id) VALUES (NEW.id); END",
+    ),
+  ).rejects.toThrow("Cannot create a trigger on view");
+  await expect(
+    database.execute(
+      "CREATE TRIGGER view_target AFTER INSERT ON trigger_rows BEGIN " +
+        "INSERT INTO trigger_view (id) VALUES (NEW.id); END",
+    ),
+  ).rejects.toThrow("Trigger bodies cannot write to views");
+  store.close();
+});
+
+it("validates CHECK references and one table-wide constraint-name namespace before admission", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+
+  await expect(
+    database.createTable({
+      name: "bad_check",
+      columns: [{ name: "id", type: "number" }],
+      checks: [{ name: "known_columns", sql: "missing > 0" }],
+    }),
+  ).rejects.toThrow("CHECK known_columns names an unknown column: missing");
+  await expect(
+    database.createTable({
+      name: "cross_table_check",
+      columns: [{ name: "id", type: "number" }],
+      checks: [{ name: "local_only", sql: "other.id > 0" }],
+    }),
+  ).rejects.toThrow("CHECK local_only references another table: other.id");
+  await expect(
+    database.createTable({
+      name: "duplicate_constraints",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "parent_id", type: "number" },
+      ],
+      foreignKeys: [
+        {
+          name: "same_name",
+          column: "parent_id",
+          parentTable: "duplicate_constraints",
+          parentColumn: "id",
+          onDelete: "restrict",
+        },
+      ],
+      checks: [{ name: "same_name", sql: "parent_id >= 0" }],
+    }),
+  ).rejects.toThrow("Constraint already exists: same_name");
+
+  expect(await store.listTables()).toEqual([]);
+  store.close();
+});
+
+it("makes concurrent CREATE TABLE/INDEX IF NOT EXISTS converge on one catalog object", async () => {
+  const store = new MemoryBlockStore();
+  const left = new MinnowDatabase(store);
+  const right = new MinnowDatabase(store);
+
+  await Promise.all([
+    left.execute("CREATE TABLE IF NOT EXISTS shared_rows (id INTEGER PRIMARY KEY, value TEXT)"),
+    right.execute("CREATE TABLE IF NOT EXISTS shared_rows (id INTEGER PRIMARY KEY, value TEXT)"),
+  ]);
+  expect((await store.listTables()).filter((table) => table.name === "shared_rows")).toHaveLength(
+    1,
+  );
+
+  await Promise.all([
+    left.execute("CREATE INDEX IF NOT EXISTS shared_value_idx ON shared_rows (value)"),
+    right.execute("CREATE INDEX IF NOT EXISTS shared_value_idx ON shared_rows (value)"),
+  ]);
+  const indexes = (await store.listTables()).flatMap((table) =>
+    Object.values(table.secondaryIndexes ?? {}).filter(
+      (index) => index.name === "shared_value_idx",
+    ),
+  );
+  expect(indexes).toHaveLength(1);
+  expect(indexes[0]?.state).toBe("ready");
+  store.close();
+});
 
 for (const implementation of implementations()) {
   describe(implementation.name, () => {
@@ -998,9 +2434,9 @@ for (const implementation of implementations()) {
       });
       await database.insertBatch("notes", { columns: { id: [1, 2, 3], body: ["a", "b", "c"] } });
       await database.insertBatch("kept", { columns: { id: [1], body: ["stays"] } });
-      const before = await store.listBlockIds();
+      const before = await physicalBlockCount(store);
       const notesId = (await store.getTableByName("notes"))?.id ?? "";
-      expect((await store.listSegments(notesId)).length).toBeGreaterThan(0);
+      expect((await tableSegmentRecords(store, notesId)).length).toBeGreaterThan(0);
 
       expect(await database.dropTable("notes")).toBe(true);
 
@@ -1010,17 +2446,17 @@ for (const implementation of implementations()) {
         "Table not found: notes",
       );
       // Its segments go with it, so nothing points at a table that is not there.
-      expect(await store.listSegments(notesId)).toEqual([]);
+      expect(await tableSegmentRecords(store, notesId)).toEqual([]);
       const remainingTables = await store.listTables();
       const liveIds = new Set(remainingTables.map((table) => table.id));
-      expect((await store.listSegments()).every((segment) => liveIds.has(segment.tableId))).toBe(
+      expect((await segmentRecords(store)).every((segment) => liveIds.has(segment.tableId))).toBe(
         true,
       );
       // The bytes are retired rather than deleted: still stored until the lease-aware collector
       // reclaims them, which is what keeps a pinned reader's blocks resolvable.
-      expect((await store.listBlockIds()).length).toBe(before.length);
+      expect(await physicalBlockCount(store)).toBe(before);
       await database.collectGarbage();
-      expect((await store.listBlockIds()).length).toBeLessThan(before.length);
+      expect(await physicalBlockCount(store)).toBeLessThan(before);
       // The surviving table is untouched, and the name is free again.
       expect((await database.query("SELECT body FROM kept")).rows).toEqual([{ body: "stays" }]);
       await database.createTable({
@@ -1102,10 +2538,11 @@ for (const implementation of implementations()) {
           ],
         },
       ]);
-      expect(await database.listVisibleSegments("people")).toHaveLength(1);
+      expect(await allVisibleSegments(database, "people")).toHaveLength(1);
 
       const table = (await store.listTables())[0];
-      const segment = (await store.listSegments(table?.id))[0];
+      const segment =
+        table === undefined ? undefined : (await tableSegmentRecords(store, table.id))[0];
       const nameColumn = table?.columns.find((column) => column.name === "name");
       const firstNameBlockId =
         nameColumn === undefined ? undefined : segment?.columnBlockIds[nameColumn.id]?.[0];
@@ -1149,7 +2586,8 @@ for (const implementation of implementations()) {
 
       expect(result.blockCount).toBe(24);
       const table = (await store.listTables())[0];
-      const segment = (await store.listSegments(table?.id))[0];
+      const segment =
+        table === undefined ? undefined : (await tableSegmentRecords(store, table.id))[0];
       expect(segment).toBeDefined();
       for (const column of table?.columns ?? []) {
         const ids = segment?.columnBlockIds[column.id];
@@ -1476,9 +2914,7 @@ for (const implementation of implementations()) {
         "safe integer range",
       );
       await database.insertBatch("events", [{ id: Number.MAX_SAFE_INTEGER }]);
-      await expect(database.insertBatch("events", [{}])).rejects.toThrow(
-        "exhausted the safe integer range",
-      );
+      await expect(database.insertBatch("events", [{}])).rejects.toBeInstanceOf(RangeError);
       store.close();
     });
 
@@ -1942,6 +3378,52 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("reports the complete durable migration when a retry follows partial progress", async () => {
+      const store = await implementation.create();
+      const initial = schema([
+        table("first_table", { id: column.number().unique() }),
+        table("second_table", { id: column.number().unique() }),
+      ]);
+      await new MinnowDatabase(store).migrate(initial);
+      let updateCalls = 0;
+      const database = new MinnowDatabase(
+        new (class extends FaultInjectingBlockStore {
+          override updateTable(
+            id: string,
+            expectedRevision: number,
+            update: Parameters<BlockStore["updateTable"]>[2],
+          ): ReturnType<BlockStore["updateTable"]> {
+            updateCalls += 1;
+            if (updateCalls === 2) {
+              throw new TableRecordConflictError(id, expectedRevision, expectedRevision + 1);
+            }
+            return super.updateTable(id, expectedRevision, update);
+          }
+        })(store, () => undefined),
+      );
+
+      const result = await database.migrate(
+        schema([
+          table("first_table", {
+            id: column.number().unique(),
+            note: column.string().nullable(),
+          }),
+          table("second_table", {
+            id: column.number().unique(),
+            note: column.string().nullable(),
+          }),
+        ]),
+      );
+
+      expect(result.alteredTables).toEqual(["first_table", "second_table"]);
+      expect(result.steps.filter((step) => step.kind === "add-column")).toHaveLength(2);
+      expect(updateCalls).toBe(3);
+      expect((await database.introspect()).tables.map((record) => record.columns.length)).toEqual([
+        2, 2,
+      ]);
+      store.close();
+    });
+
     it("agrees between indexed and scan-only search over a randomized corpus", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { rowsPerBlock: 4, compression: "raw" });
@@ -2102,7 +3584,7 @@ for (const implementation of implementations()) {
           columns: { value: [1, undefined] as unknown as number[] },
         }),
       ).rejects.toThrow("must be number");
-      expect(await store.listBlockIds()).toEqual([]);
+      expect(await physicalBlockCount(store)).toBe(0);
       store.close();
     });
 
@@ -2203,9 +3685,9 @@ for (const implementation of implementations()) {
         { active: true, score: 25 },
       ]);
       const table = (await store.listTables())[0];
-      const updateSegment = (await store.listSegments(table?.id)).find(
-        (segment) => segment.kind === "update",
-      );
+      const updateSegment = (
+        table === undefined ? [] : await tableSegmentRecords(store, table.id)
+      ).find((segment) => segment.kind === "update");
       expect(Object.keys(updateSegment?.columnBlockIds ?? {})).toHaveLength(2);
       store.close();
     });
@@ -2275,7 +3757,7 @@ for (const implementation of implementations()) {
         }),
       ).rejects.toBeInstanceOf(UniqueConstraintError);
       expect(
-        (await store.listTransactions()).filter((record) => record.status === "active"),
+        (await transactionRecords(store)).filter((record) => record.status === "active"),
       ).toEqual([]);
 
       await database.createTable({
@@ -2452,8 +3934,9 @@ it("keeps concurrent batch inserts from two browser connections", async () => {
 
   expect(results.map((result) => result.version).sort()).toEqual([0, 1]);
   expect(results.map((result) => result.metrics.retries).sort()).toEqual([0, 1]);
-  expect(await left.listVisibleSegments("events")).toHaveLength(2);
-  const segments = await leftStore.listSegments((await leftStore.listTables())[0]?.id);
+  expect(await allVisibleSegments(left, "events")).toHaveLength(2);
+  const tableId = (await leftStore.listTables())[0]?.id;
+  const segments = tableId === undefined ? [] : await tableSegmentRecords(leftStore, tableId);
   const ranges = segments
     .map((segment): [bigint, bigint] => [segment.rowIdStart, segment.rowIdEndExclusive])
     .sort((left, right) => (left[0] < right[0] ? -1 : 1));
@@ -2671,6 +4154,8 @@ it("keeps older unique-key tables correct before their lookup is rebuilt", async
       { id: "legacy-score", name: "score", type: "number", nullable: false },
     ],
     uniqueKeyColumnId: "legacy-email",
+    managed: false,
+    revision: 0,
     createdAt: "2026-01-01T00:00:00.000Z",
   });
   const database = new MinnowDatabase(store);
@@ -2768,7 +4253,7 @@ it("compacts append-only segments without changing current or older snapshots", 
     columns: { name: ["three", "four"], value: [3, 4] },
   });
   const expected = await database.readTable("events");
-  const oldBlockIds = await store.listBlockIds();
+  const oldBlockIds = await currentManifestBlockIds(store);
 
   const result = await database.compactTable("events");
 
@@ -2784,12 +4269,114 @@ it("compacts append-only segments without changing current or older snapshots", 
   });
   expect(await database.readTable("events")).toEqual(expected);
   expect(await database.readTable("events", second.version)).toEqual(expected);
-  expect(await database.listVisibleSegments("events")).toHaveLength(1);
-  expect(await database.listVisibleSegments("events", second.version)).toHaveLength(2);
-  expect((await store.listBlockIds()).filter((id) => oldBlockIds.includes(id))).toEqual(
-    oldBlockIds,
-  );
+  expect(await allVisibleSegments(database, "events")).toHaveLength(1);
+  expect(await allVisibleSegments(database, "events", second.version)).toHaveLength(2);
+  expect((await store.getBlocks(oldBlockIds)).every((bytes) => bytes !== undefined)).toBe(true);
   store.close();
+});
+
+it("pages visible segments at one captured version across concurrent commits", async () => {
+  const database = new MinnowDatabase(new MemoryBlockStore(), {
+    autoCollect: false,
+    autoCompact: false,
+  });
+  await database.createTable({
+    name: "paged_events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const before = [];
+  for (let value = 1; value <= 5; value += 1) {
+    before.push(await database.insert("paged_events", { value }));
+  }
+
+  const first = await database.listVisibleSegmentPage("paged_events", { limit: 2 });
+  expect(first.records).toHaveLength(2);
+  expect(first.records.map(({ id }) => id)).toEqual([...first.records.map(({ id }) => id)].sort());
+  expect(first.nextCursor).toMatchObject({
+    tableName: "paged_events",
+    version: first.version,
+  });
+  const concurrent = await database.insert("paged_events", { value: 6 });
+
+  const captured = [...first.records];
+  let cursor = first.nextCursor;
+  while (cursor !== null) {
+    const page = await database.listVisibleSegmentPage("paged_events", { cursor, limit: 2 });
+    expect(page.records.length).toBeLessThanOrEqual(2);
+    expect(page.version).toBe(first.version);
+    captured.push(...page.records);
+    cursor = page.nextCursor;
+  }
+  expect(captured.map(({ id }) => id).sort()).toEqual(
+    before.map(({ segmentId }) => segmentId).sort(),
+  );
+  expect(captured.map(({ id }) => id)).not.toContain(concurrent.segmentId);
+  expect((await allVisibleSegments(database, "paged_events")).map(({ id }) => id)).toContain(
+    concurrent.segmentId,
+  );
+
+  await expect(
+    database.listVisibleSegmentPage("paged_events", {
+      limit: MAX_VISIBLE_SEGMENT_PAGE_ITEMS + 1,
+    }),
+  ).rejects.toThrow(`cannot exceed ${String(MAX_VISIBLE_SEGMENT_PAGE_ITEMS)}`);
+  if (first.nextCursor === null) throw new Error("Expected a visible segment cursor");
+  await expect(
+    database.listVisibleSegmentPage("paged_events", {
+      cursor: first.nextCursor,
+      version: first.version,
+    }),
+  ).rejects.toThrow(/cannot be combined/u);
+  await expect(
+    database.listVisibleSegmentPage("other_table", { cursor: first.nextCursor }),
+  ).rejects.toThrow(/different table name/u);
+
+  const capturedTableId = first.nextCursor.tableId;
+  await database.dropTable("paged_events");
+  await database.createTable({
+    name: "paged_events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const stale = await database
+    .listVisibleSegmentPage("paged_events", { cursor: first.nextCursor })
+    .catch((error: unknown) => error);
+  expect(stale).toBeInstanceOf(VisibleSegmentCursorStaleError);
+  const typedStale = stale as VisibleSegmentCursorStaleError;
+  expect(typedStale).toMatchObject({ tableName: "paged_events", capturedTableId });
+  expect(typeof typedStale.currentTableId).toBe("string");
+  expect(typedStale.currentTableId).not.toBe(capturedTableId);
+  await database.close();
+});
+
+it("advances a visible-segment cursor across empty historical windows", async () => {
+  const database = new MinnowDatabase(new MemoryBlockStore(), {
+    autoCollect: false,
+    autoCompact: false,
+  });
+  await database.createTable({
+    name: "paged_history",
+    columns: [{ name: "value", type: "number" }],
+  });
+  for (let value = 1; value <= 3; value += 1) {
+    await database.insert("paged_history", { value });
+  }
+  await database.compactTable("paged_history", { outputCompression: "raw" });
+
+  let cursor: VisibleSegmentPageCursor | null = null;
+  let sawEmptyContinuation = false;
+  let visible = 0;
+  do {
+    const page = await database.listVisibleSegmentPage(
+      "paged_history",
+      cursor === null ? { limit: 1 } : { cursor, limit: 1 },
+    );
+    visible += page.records.length;
+    if (page.records.length === 0 && page.nextCursor !== null) sawEmptyContinuation = true;
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  expect(sawEmptyContinuation).toBe(true);
+  expect(visible).toBe(1);
+  await database.close();
 });
 
 it("physically rechunks every simple type on shared bitmap-aligned row windows", async () => {
@@ -2846,7 +4433,7 @@ it("physically rechunks every simple type on shared bitmap-aligned row windows",
   expect(await database.readTable("readings", sourceSnapshot.version)).toEqual(expected);
 
   const job = (await database.listCompactionJobs("readings"))[0];
-  if (job?.rewritePlan?.kind !== "rechunk-v1") {
+  if (job?.rewritePlan.kind !== "rechunk-v1") {
     throw new Error("Expected a persisted rechunk plan");
   }
   expect(job.rewritePlan.outputs).toEqual([
@@ -3057,7 +4644,7 @@ it("refines skewed strings to exact target-sized windows before persisting the p
   if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
   const jobId = progress.jobId;
   const planned = await store.getCompactionJob(jobId);
-  if (planned?.rewritePlan?.kind !== "rechunk-v1") {
+  if (planned?.rewritePlan.kind !== "rechunk-v1") {
     throw new Error("Expected a persisted rechunk plan");
   }
   expect(planned.rewritePlan.outputs).toContainEqual({ rowStart: 7, rowCount: 1 });
@@ -3204,8 +4791,8 @@ it("enforces the persisted compaction memory bound before publishing job output"
   await database.insertBatch("events", {
     columns: { value: [4, 5, null], label: ["four", "five", null] },
   });
-  const sourceBlockIds = await store.listBlockIds();
-  const sourceManifestCount = (await store.listManifests()).length;
+  const sourceBlockIds = await currentManifestBlockIds(store);
+  const sourceManifestCount = (await manifestRecords(store)).length;
   const options = { targetBlockBytes: 64, outputCompression: "raw" as const };
 
   let discoveryError: unknown;
@@ -3231,8 +4818,8 @@ it("enforces the persisted compaction memory bound before publishing job output"
     minimumBytes: discoveryError.minimumBytes,
   });
   expect(await store.listCompactionJobs()).toEqual([]);
-  expect(await store.listBlockIds()).toEqual(sourceBlockIds);
-  expect(await store.listManifests()).toHaveLength(sourceManifestCount);
+  expect(await currentManifestBlockIds(store)).toEqual(sourceBlockIds);
+  expect(await manifestRecords(store)).toHaveLength(sourceManifestCount);
 
   const result = await database.compactTable("events", {
     ...options,
@@ -3407,7 +4994,7 @@ it("checkpoints and resumes append compaction one immutable block at a time", as
     { value: 2 },
     { value: 3 },
   ]);
-  expect(await reopened.listVisibleSegments("events")).toHaveLength(1);
+  expect(await allVisibleSegments(reopened, "events")).toHaveLength(1);
   const job = (await reopened.listCompactionJobs("events"))[0];
   const output =
     job?.outputSegmentId === null ? undefined : await store.getSegment(job?.outputSegmentId ?? "");
@@ -3437,7 +5024,7 @@ it("rebases resumable compaction across an append without reordering rows", asyn
   expect(result).toMatchObject({ compacted: true, sourceSegmentCount: 2, version: 3 });
   expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
   expect(await database.readTable("events", second.version)).toEqual([{ value: 1 }, { value: 2 }]);
-  expect(await database.listVisibleSegments("events")).toHaveLength(2);
+  expect(await allVisibleSegments(database, "events")).toHaveLength(2);
   store.close();
 });
 
@@ -3504,7 +5091,12 @@ it("reconciles a valid gzip header variant by decoded physical content", async (
   const variant = await store.getBlock(outputBlockId);
   if (variant === undefined) throw new Error("Expected gzip header variant");
   expect(variant).not.toEqual(canonical);
-  expect(await decodeBlock(variant)).toEqual(await decodeBlock(canonical));
+  const [decodedVariant, decodedCanonical] = await Promise.all([
+    decodeBlock(variant),
+    decodeBlock(canonical),
+  ]);
+  expect(decodedVariant.column).toEqual(decodedCanonical.column);
+  expect(decodedVariant.description.checksum).toBe(decodedCanonical.description.checksum);
 
   const result = await new MinnowDatabase(store).compactTable("events");
 
@@ -3797,7 +5389,7 @@ it("reconciles cancellation with a compaction transaction that already committed
   });
   await database.insert("events", { value: 1 });
   await database.insert("events", { value: 2 });
-  const manifestCount = (await store.listManifests()).length;
+  const manifestCount = (await manifestRecords(store)).length;
 
   let signalCommitted: (() => void) | undefined;
   const committed = new Promise<void>((resolve) => {
@@ -3846,7 +5438,7 @@ it("reconciles cancellation with a compaction transaction that already committed
     state: "published",
     publishedVersion: committedVersion,
   });
-  expect(await store.listManifests()).toHaveLength(manifestCount + 1);
+  expect(await manifestRecords(store)).toHaveLength(manifestCount + 1);
   expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
   store.close();
 });
@@ -3963,7 +5555,8 @@ it("restages checkpointed outputs with bounded reads after stale-transaction rec
   expect(
     store.singleBlockIdsRead.filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
   ).toEqual(interrupted.outputBlockIds);
-  expect(store.pendingBlockJournalSizes).toEqual([3, 4]);
+  // Three recovered blocks, the final block, then the output segment's atomic journal step.
+  expect(store.pendingBlockJournalSizes).toEqual([3, 4, 4]);
   const completed = await store.getCompactionJob(progress.jobId);
   expect(completed?.transactionId).not.toBe(interrupted.transactionId);
   expect(await reopened.readTable("events")).toEqual([
@@ -4041,7 +5634,7 @@ it("reconciles outputs when a crash follows replacement-transaction linkage", as
   expect(
     store.singleBlockIdsRead.filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
   ).toEqual(interrupted.outputBlockIds);
-  expect(store.pendingBlockJournalSizes).toEqual([3, 4]);
+  expect(store.pendingBlockJournalSizes).toEqual([3, 4, 4]);
   expect(await reopened.readTable("events")).toEqual([
     { value: 1 },
     { value: 2 },
@@ -4153,7 +5746,7 @@ for (const implementation of recoveryImplementations()) {
   });
 }
 
-it("aborts a replacement compaction transaction when its sources were superseded", async () => {
+it("resumes a partial compaction with a replacement transaction when recovery retains blocks", async () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
   const store = new MemoryBlockStore();
   const database = new MinnowDatabase(store, { now: () => new Date(now.getTime()) });
@@ -4176,14 +5769,6 @@ it("aborts a replacement compaction transaction when its sources were superseded
     throw new Error("Expected a linked compaction transaction");
   }
 
-  const replacer = new TransactionManager(store, {
-    now: () => new Date(now.getTime()),
-    createId: () => "source-replacer",
-  });
-  const replacement = await replacer.begin();
-  replacement.supersedeBlocks(interrupted.sourceBlockIds);
-  await replacement.commit();
-
   now = new Date("2026-01-01T01:00:00.000Z");
   const recovery = new TransactionManager(store, { now: () => new Date(now.getTime()) });
   const report = await recovery.recover({
@@ -4193,27 +5778,20 @@ it("aborts a replacement compaction transaction when its sources were superseded
   expect(report.abortedTransactionIds).toContain(interrupted.transactionId);
 
   const reopened = new MinnowDatabase(store, { now: () => new Date(now.getTime()) });
-  await expect(reopened.resumeCompactionJob(progress.jobId)).rejects.toThrow(
-    "Compaction source is no longer visible",
-  );
-  const aborted = await store.getCompactionJob(progress.jobId);
-  expect(aborted?.state).toBe("aborted");
-  expect(aborted?.error).toContain("Compaction source is no longer visible");
-  if (aborted === undefined) throw new Error("Expected a failed compaction job");
-  const abortedTransaction =
-    aborted.transactionId === null ? undefined : await store.getTransaction(aborted.transactionId);
-  const manifestBeforeCancellation = await store.getCurrentManifest();
-
-  expect(await reopened.cancelCompactionJob(progress.jobId)).toEqual({
+  let resumed = await reopened.resumeCompactionJob(progress.jobId);
+  while (resumed.result === null) resumed = await reopened.resumeCompactionJob(progress.jobId);
+  expect(resumed).toMatchObject({
     jobId: progress.jobId,
-    state: "aborted",
-    publishedVersion: null,
+    state: "published",
+    result: { compacted: true, rowCount: 3 },
   });
-  expect(await store.getCompactionJob(progress.jobId)).toEqual(aborted);
-  expect(
-    aborted.transactionId === null ? undefined : await store.getTransaction(aborted.transactionId),
-  ).toEqual(abortedTransaction);
-  expect(await store.getCurrentManifest()).toEqual(manifestBeforeCancellation);
+  expect(await store.getTransaction(interrupted.transactionId)).toMatchObject({
+    status: "aborted",
+  });
+  const completed = await store.getCompactionJob(progress.jobId);
+  expect(completed?.state).toBe("published");
+  expect(completed?.transactionId).not.toBe(interrupted.transactionId);
+  expect(await reopened.readTable("events")).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
   store.close();
 });
 
@@ -4233,8 +5811,8 @@ it("returns a published compaction job repeatedly without publishing another man
   if (published === undefined) throw new Error("Expected the published compaction job");
   if (published.transactionId === null) throw new Error("Expected a published transaction");
   const publishedTransaction = await store.getTransaction(published.transactionId);
-  const manifestCount = (await store.listManifests()).length;
-  const transactionCount = (await store.listTransactions()).length;
+  const manifestCount = (await manifestRecords(store)).length;
+  const transactionCount = (await transactionRecords(store)).length;
 
   const first = await new MinnowDatabase(store).resumeCompactionJob(result.jobId);
   const second = await new MinnowDatabase(store).resumeCompactionJob(result.jobId);
@@ -4254,41 +5832,8 @@ it("returns a published compaction job repeatedly without publishing another man
   });
   expect(await store.getCompactionJob(result.jobId)).toEqual(published);
   expect(await store.getTransaction(published.transactionId)).toEqual(publishedTransaction);
-  expect(await store.listManifests()).toHaveLength(manifestCount);
-  expect(await store.listTransactions()).toHaveLength(transactionCount);
-  store.close();
-});
-
-it("reconciles a committed compaction after its source segment metadata is reclaimed", async () => {
-  const store = new PublicationCheckpointFaultMemoryBlockStore();
-  const database = new MinnowDatabase(store);
-  await database.createTable({
-    name: "events",
-    columns: [{ name: "value", type: "number" }],
-  });
-  await database.insert("events", { value: 1 });
-  await database.insert("events", { value: 2 });
-
-  await expect(database.compactTable("events")).rejects.toThrow(
-    "injected before compaction publication checkpoint",
-  );
-  const interrupted = (await store.listCompactionJobs())[0];
-  expect(interrupted?.state).toBe("ready");
-  if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
-    throw new Error("Expected a committed compaction transaction");
-  }
-  const committed = await store.getTransaction(interrupted.transactionId);
-  expect(committed?.status).toBe("committed");
-  expect(committed?.committedVersion).not.toBeNull();
-  for (const segmentId of interrupted.sourceSegmentIds) await store.removeSegment(segmentId);
-  store.failPublishedCheckpoint = false;
-
-  const resumed = await new MinnowDatabase(store).resumeCompactionJob(interrupted.id);
-  expect(resumed).toMatchObject({
-    state: "published",
-    result: { compacted: true, rowCount: 2 },
-  });
-  expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
+  expect(await manifestRecords(store)).toHaveLength(manifestCount);
+  expect(await transactionRecords(store)).toHaveLength(transactionCount);
   store.close();
 });
 
@@ -4320,7 +5865,7 @@ it("aborts the unlinked transaction when initial compaction coordinators race", 
 
   const job = (await store.listCompactionJobs())[0];
   expect(job?.transactionId).toEqual(expect.any(String));
-  const coordinatorTransactions = (await store.listTransactions()).filter(
+  const coordinatorTransactions = (await transactionRecords(store)).filter(
     (record) =>
       record.id.startsWith("left-coordinator-") || record.id.startsWith("right-coordinator-"),
   );
@@ -4367,10 +5912,12 @@ for (const implementation of implementations()) {
       fixture.expectedRows,
       fixture.expectedRowIds,
     );
-    expect(legacyAppendOnlyCompactionEligible(firstOutput)).toBe(false);
+    expect(appendOnlyCompactionEligible(firstOutput)).toBe(false);
     const firstManifest = await store.getCurrentManifest();
+    const firstManifestBlockIds =
+      firstManifest === undefined ? [] : await manifestBlockIdsAt(store, firstManifest.version);
     expect(
-      fixture.sourceBlockIds.every((blockId) => !firstManifest?.blockIds.includes(blockId)),
+      fixture.sourceBlockIds.every((blockId) => !firstManifestBlockIds.includes(blockId)),
     ).toBe(true);
     for (const snapshot of fixture.snapshots) {
       expect(await fixture.database.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
@@ -4454,7 +6001,7 @@ for (const implementation of implementations()) {
     const insertedSegment = await requiredSegment(store, inserted.segmentId);
     const insertedRowId = requiredItem(expandSegmentRowIds(insertedSegment), 0, "inserted row ID");
     await database.deleteBatch(tableName, { keys: ["a@example.com"] });
-    const sourceBlockIds = await store.listBlockIds();
+    const sourceBlockIds = await currentManifestBlockIds(store);
 
     const result = await database.compactTable(tableName, {
       maxBlocksPerStep: 1,
@@ -4478,9 +6025,9 @@ for (const implementation of implementations()) {
       processedRows: 0,
       rewritePlan: { kind: "merge-v1", totalRows: 0, rowIdSpans: [], outputs: [] },
     });
-    expect((await store.getCurrentManifest())?.blockIds).toEqual([]);
+    expect(await currentManifestBlockIds(store)).toEqual([]);
     expect(await database.readTable(tableName)).toEqual([]);
-    expect(await database.listVisibleSegments(tableName)).toEqual([]);
+    expect(await allVisibleSegments(database, tableName)).toEqual([]);
     expect(await database.readTable(tableName, inserted.version)).toEqual([
       { email: "a@example.com", score: 1 },
     ]);
@@ -4682,7 +6229,7 @@ it("rebases a mutation merge across later IndexedDB deltas without absorbing the
   expect(resumed.result).toMatchObject({ compacted: true, sourceSegmentCount: 6 });
   expect(await fixture.database.readTable(tableName)).toEqual(expectedRows);
   expect(await fixture.database.readTable(tableName, sourceVersion)).toEqual(fixture.expectedRows);
-  expect(await fixture.database.listVisibleSegments(tableName)).toHaveLength(4);
+  expect(await allVisibleSegments(fixture.database, tableName)).toHaveLength(4);
   const firstOutput = await requiredSegment(
     compactorStore,
     resumed.result.outputSegmentId ?? "missing-output",
@@ -4707,11 +6254,11 @@ it("rebases a mutation merge across later IndexedDB deltas without absorbing the
   writerStore.close();
 });
 
-it("aborts a mutation merge when a concurrent segment would sort inside its source interval", async () => {
+it("canonicalizes a hostile concurrent logical order and safely rebases a mutation merge", async () => {
   const store = new MemoryBlockStore();
   const fixture = await createMutationRebaseGuardFixture(store, "interleaved_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan?.kind !== "merge-v1") throw new Error("Expected an interleaved merge plan");
+  if (plan.kind !== "merge-v1") throw new Error("Expected an interleaved merge plan");
   const earliest = requiredItem(plan.sourceSegments, 0, "earliest guarded source");
   const latest = requiredItem(
     plan.sourceSegments,
@@ -4728,39 +6275,31 @@ it("aborts a mutation merge when a concurrent segment would sort inside its sour
     logicalOrder: interleavedLogicalOrder,
     key: "missing@example.com",
   });
-  const concurrentManifest = await store.getCurrentManifest();
+  const concurrentManifestBlockIds = await currentManifestBlockIds(store);
   expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
-  expect(concurrentManifest?.blockIds).toContain(concurrent.blockId);
+  expect(concurrentManifestBlockIds).toContain(concurrent.blockId);
+  expect((await requiredSegment(store, concurrent.segmentId)).logicalOrder).toBe(
+    concurrent.manifestVersion,
+  );
 
-  await expect(
-    fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
-  ).rejects.toThrow(`Concurrent segment would reorder compaction output: ${concurrent.segmentId}`);
-  const aborted = await store.getCompactionJob(fixture.job.id);
-  expect(aborted).toMatchObject({
-    state: "aborted",
-    error: `Concurrent segment would reorder compaction output: ${concurrent.segmentId}`,
-    publishedVersion: null,
-  });
+  const resumed = await fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 });
+  expect(resumed).toMatchObject({ state: "published", result: { compacted: true } });
+  const published = await store.getCompactionJob(fixture.job.id);
+  expect(published).toMatchObject({ state: "published" });
   if (fixture.job.transactionId === null) throw new Error("Expected a guarded transaction");
   expect(await store.getTransaction(fixture.job.transactionId)).toMatchObject({
-    status: "aborted",
+    status: "committed",
   });
-  expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
-  expect(
-    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
-  ).toBe(true);
-  expect(
-    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
-  ).toBe(true);
+  expect((await store.getCurrentManifest())?.version).toBe(concurrent.manifestVersion + 1);
   expect(await fixture.database.readTable(fixture.table.name)).toEqual(fixture.expectedRows);
   store.close();
 });
 
-it("aborts a mutation merge when a later concurrent tuple shares the base logical order", async () => {
+it("canonicalizes a hostile equal logical order before rebasing a mutation merge", async () => {
   const store = new MemoryBlockStore();
   const fixture = await createMutationRebaseGuardFixture(store, "equal_order_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan?.kind !== "merge-v1") throw new Error("Expected an equal-order merge plan");
+  if (plan.kind !== "merge-v1") throw new Error("Expected an equal-order merge plan");
   const latestPlannedCommit = Math.max(
     ...plan.sourceSegments.map((segment) => segment.committedVersion),
   );
@@ -4771,31 +6310,23 @@ it("aborts a mutation merge when a later concurrent tuple shares the base logica
     logicalOrder: plan.logicalOrder,
     key: "missing@example.com",
   });
-  const concurrentManifest = await store.getCurrentManifest();
+  const concurrentManifestBlockIds = await currentManifestBlockIds(store);
   expect(concurrent.manifestVersion).toBeGreaterThan(latestPlannedCommit);
   expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
-  expect(concurrentManifest?.blockIds).toContain(concurrent.blockId);
+  expect(concurrentManifestBlockIds).toContain(concurrent.blockId);
+  expect((await requiredSegment(store, concurrent.segmentId)).logicalOrder).toBe(
+    concurrent.manifestVersion,
+  );
 
-  await expect(
-    fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
-  ).rejects.toThrow(`Concurrent segment would reorder compaction output: ${concurrent.segmentId}`);
-  const aborted = await store.getCompactionJob(fixture.job.id);
-  expect(aborted).toMatchObject({
-    state: "aborted",
-    error: `Concurrent segment would reorder compaction output: ${concurrent.segmentId}`,
-    publishedVersion: null,
-  });
+  const resumed = await fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 });
+  expect(resumed).toMatchObject({ state: "published", result: { compacted: true } });
+  const published = await store.getCompactionJob(fixture.job.id);
+  expect(published).toMatchObject({ state: "published" });
   if (fixture.job.transactionId === null) throw new Error("Expected a guarded transaction");
   expect(await store.getTransaction(fixture.job.transactionId)).toMatchObject({
-    status: "aborted",
+    status: "committed",
   });
-  expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
-  expect(
-    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
-  ).toBe(true);
-  expect(
-    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
-  ).toBe(true);
+  expect((await store.getCurrentManifest())?.version).toBe(concurrent.manifestVersion + 1);
   expect(await fixture.database.readTable(fixture.table.name)).toEqual(fixture.expectedRows);
   store.close();
 });
@@ -4804,21 +6335,26 @@ it("aborts a mutation merge before supersession when a concurrent segment aliase
   const store = new MemoryBlockStore();
   const fixture = await createMutationRebaseGuardFixture(store, "shared_block_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan?.kind !== "merge-v1") throw new Error("Expected a shared-block merge plan");
+  if (plan.kind !== "merge-v1") throw new Error("Expected a shared-block merge plan");
   const keyBlockId = plan.sourceSegments
     .flatMap((segment) => segment.columns)
     .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
   if (keyBlockId === undefined) throw new Error("Expected a guarded source key block");
   const manifestBeforeConcurrent = await store.getCurrentManifest();
   if (manifestBeforeConcurrent === undefined) throw new Error("Expected a guarded source manifest");
+  const manifestBlockIdsBeforeConcurrent = await manifestBlockIdsAt(
+    store,
+    manifestBeforeConcurrent.version,
+  );
   const concurrent = await commitLowLevelDeleteSegment(store, fixture.table, {
     segmentId: "shared-source-block-delete",
     logicalOrder: 10,
     blockId: keyBlockId,
   });
   const concurrentManifest = await store.getCurrentManifest();
+  const concurrentManifestBlockIds = await currentManifestBlockIds(store);
   expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
-  expect(concurrentManifest?.blockIds).toEqual(manifestBeforeConcurrent.blockIds);
+  expect(concurrentManifestBlockIds).toEqual(manifestBlockIdsBeforeConcurrent);
 
   await expect(
     fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
@@ -4835,33 +6371,38 @@ it("aborts a mutation merge before supersession when a concurrent segment aliase
   });
   expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
   expect(
-    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
+    fixture.job.sourceBlockIds.every((blockId) => concurrentManifestBlockIds.includes(blockId)),
   ).toBe(true);
   expect(
-    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
+    fixture.job.outputBlockIds.every((blockId) => !concurrentManifestBlockIds.includes(blockId)),
   ).toBe(true);
   store.close();
 });
 
 it("aborts a mutation merge when a segment from another table aliases a global source block", async () => {
   const store = new MemoryBlockStore();
-  const fixture = await createMutationRebaseGuardFixture(store, "cross_table_block_merge_guard");
-  const plan = fixture.job.rewritePlan;
-  if (plan?.kind !== "merge-v1") throw new Error("Expected a cross-table merge plan");
-  const keyBlockId = plan.sourceSegments
-    .flatMap((segment) => segment.columns)
-    .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
-  if (keyBlockId === undefined) throw new Error("Expected a cross-table guarded source block");
-  await fixture.database.createTable({
+  const setup = new MinnowDatabase(store);
+  await setup.createTable({
     name: "source_alias_owner",
     uniqueKey: "alias",
     columns: [{ name: "alias", type: "string" }],
   });
+  const fixture = await createMutationRebaseGuardFixture(store, "cross_table_block_merge_guard");
+  const plan = fixture.job.rewritePlan;
+  if (plan.kind !== "merge-v1") throw new Error("Expected a cross-table merge plan");
+  const keyBlockId = plan.sourceSegments
+    .flatMap((segment) => segment.columns)
+    .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
+  if (keyBlockId === undefined) throw new Error("Expected a cross-table guarded source block");
   const aliasTable = await store.getTableByName("source_alias_owner");
   if (aliasTable === undefined) throw new Error("Expected a source-alias table");
   expect(aliasTable.id).not.toBe(fixture.table.id);
   const manifestBeforeConcurrent = await store.getCurrentManifest();
   if (manifestBeforeConcurrent === undefined) throw new Error("Expected a guarded source manifest");
+  const manifestBlockIdsBeforeConcurrent = await manifestBlockIdsAt(
+    store,
+    manifestBeforeConcurrent.version,
+  );
   const concurrent = await commitLowLevelDeleteSegment(store, aliasTable, {
     segmentId: "cross-table-shared-source-block-delete",
     logicalOrder: 0,
@@ -4869,8 +6410,9 @@ it("aborts a mutation merge when a segment from another table aliases a global s
   });
   expect((await store.getSegment(concurrent.segmentId))?.tableId).toBe(aliasTable.id);
   const concurrentManifest = await store.getCurrentManifest();
+  const concurrentManifestBlockIds = await currentManifestBlockIds(store);
   expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
-  expect(concurrentManifest?.blockIds).toEqual(manifestBeforeConcurrent.blockIds);
+  expect(concurrentManifestBlockIds).toEqual(manifestBlockIdsBeforeConcurrent);
 
   await expect(
     fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
@@ -4887,10 +6429,10 @@ it("aborts a mutation merge when a segment from another table aliases a global s
   });
   expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
   expect(
-    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
+    fixture.job.sourceBlockIds.every((blockId) => concurrentManifestBlockIds.includes(blockId)),
   ).toBe(true);
   expect(
-    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
+    fixture.job.outputBlockIds.every((blockId) => !concurrentManifestBlockIds.includes(blockId)),
   ).toBe(true);
   store.close();
 });
@@ -4914,7 +6456,7 @@ for (const implementation of implementations()) {
       version: insert.version,
       rows: expectedRows.slice(0, index + 1),
     }));
-    expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual(
+    expect((await allVisibleSegments(database, tableName)).map((segment) => segment.id)).toEqual(
       originalSegmentIds,
     );
 
@@ -4970,7 +6512,7 @@ for (const implementation of implementations()) {
       const output = await requiredSegment(store, result.outputSegmentId);
       expect(output).toMatchObject({ level: 1, rowCount: selectedRowCount, logicalOrder: 0 });
       anchorSegmentId = output.id;
-      expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+      expect((await allVisibleSegments(database, tableName)).map((segment) => segment.id)).toEqual([
         anchorSegmentId,
         ...originalSegmentIds.slice((jobIndex + 1) * 2),
       ]);
@@ -4979,7 +6521,7 @@ for (const implementation of implementations()) {
         expect(await database.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
       }
     }
-    expect(await database.listVisibleSegments(tableName)).toHaveLength(1);
+    expect(await allVisibleSegments(database, tableName)).toHaveLength(1);
     store.close();
   });
 
@@ -5062,7 +6604,7 @@ for (const implementation of implementations()) {
       expect(expandSegmentRowIds(output)).toEqual(rowIds);
       anchorSegmentId = output.id;
       expect(
-        (await fixture.database.listVisibleSegments(tableName)).map((segment) => segment.id),
+        (await allVisibleSegments(fixture.database, tableName)).map((segment) => segment.id),
       ).toEqual([anchorSegmentId, ...originalSegmentIds.slice((jobIndex + 1) * 2)]);
       expect(await fixture.database.readTable(tableName)).toEqual(fixture.expectedRows);
       for (const snapshot of fixture.snapshots) {
@@ -5071,7 +6613,7 @@ for (const implementation of implementations()) {
         );
       }
     }
-    expect(await fixture.database.listVisibleSegments(tableName)).toHaveLength(1);
+    expect(await allVisibleSegments(fixture.database, tableName)).toHaveLength(1);
     store.close();
   });
 
@@ -5122,7 +6664,7 @@ for (const implementation of implementations()) {
       outputBlockCount: 0,
       rowCount: 0,
     });
-    expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+    expect((await allVisibleSegments(database, tableName)).map((segment) => segment.id)).toEqual([
       later.segmentId,
     ]);
     expect(await database.readTable(tableName)).toEqual([{ email: "a@example.com", score: 2 }]);
@@ -5181,7 +6723,7 @@ for (const implementation of recoveryImplementations()) {
       rowCount: 2,
       outputCompression: "raw",
     });
-    expect((await reopened.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+    expect((await allVisibleSegments(reopened, tableName)).map((segment) => segment.id)).toEqual([
       progress.result.outputSegmentId,
       ...inserts.slice(2).map((insert) => insert.segmentId),
     ]);
@@ -5255,7 +6797,7 @@ it("rebases a bounded IndexedDB mutation prefix without absorbing its existing o
     requiredItem(initialRowIds, 1, "rebased B row ID"),
     requiredItem(upsertRowIds, 1, "rebased C row ID"),
   ]);
-  expect((await compactor.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+  expect((await allVisibleSegments(compactor, tableName)).map((segment) => segment.id)).toEqual([
     firstOutput.id,
     tailUpdate.segmentId,
     concurrentDelete.segmentId,
@@ -5276,7 +6818,7 @@ it("rebases a bounded IndexedDB mutation prefix without absorbing its existing o
     outputCompression: "raw",
   });
   if (converged.outputSegmentId === null) throw new Error("Expected a converged bounded base");
-  expect((await compactor.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+  expect((await allVisibleSegments(compactor, tableName)).map((segment) => segment.id)).toEqual([
     converged.outputSegmentId,
   ]);
   expect(
@@ -5293,7 +6835,7 @@ it("rebases a bounded IndexedDB mutation prefix without absorbing its existing o
   writerStore.close();
 });
 
-it("keeps an oversized oldest equal-order L0 group indivisible", async () => {
+it("canonicalizes caller-supplied L0 orders before bounded prefix selection", async () => {
   const store = new MemoryBlockStore();
   const database = new MinnowDatabase(store);
   await database.createTable({
@@ -5308,7 +6850,7 @@ it("keeps an oversized oldest equal-order L0 group indivisible", async () => {
       segmentId,
       level: 0,
       logicalOrder: index < 3 ? 0 : 1,
-      rowId: BigInt(index),
+      rowId: BigInt(index + 1),
       value: index + 1,
     });
   }
@@ -5322,11 +6864,11 @@ it("keeps an oversized oldest equal-order L0 group indivisible", async () => {
   if (result.jobId === undefined || result.outputSegmentId === null) {
     throw new Error("Expected an oversized equal-order prefix");
   }
-  expect(result.sourceSegmentCount).toBe(3);
-  await assertPersistedCompactionSelection(store, result.jobId, segmentIds.slice(0, 3), null);
+  expect(result.sourceSegmentCount).toBe(2);
+  await assertPersistedCompactionSelection(store, result.jobId, segmentIds.slice(0, 2), null);
   expect(
-    (await database.listVisibleSegments("equal_order_prefix")).map((segment) => segment.id),
-  ).toEqual([result.outputSegmentId, requiredItem(segmentIds, 3, "later equal-order segment")]);
+    (await allVisibleSegments(database, "equal_order_prefix")).map((segment) => segment.id),
+  ).toEqual([result.outputSegmentId, ...segmentIds.slice(2)]);
   expect(await database.readTable("equal_order_prefix")).toEqual([
     { value: 1 },
     { value: 2 },
@@ -5368,7 +6910,7 @@ it("stops an oldest-prefix selection at its L0 stored-byte cap after the minimum
     level0SourceStoredBytes: sourceStats.storedBytes,
   });
   expect(
-    (await database.listVisibleSegments("stored_byte_prefix")).map((segment) => segment.id),
+    (await allVisibleSegments(database, "stored_byte_prefix")).map((segment) => segment.id),
   ).toEqual([result.outputSegmentId, ...inserts.slice(2).map((insert) => insert.segmentId)]);
   expect(await database.readTable("stored_byte_prefix")).toEqual(
     inserts.map((_insert, index) => ({ value: index + 1 })),
@@ -5423,7 +6965,7 @@ it("drains an odd append tail only when an anchored job explicitly lowers its mi
     first.outputSegmentId,
   );
   expect(
-    (await database.listVisibleSegments("odd_tail_drain")).map((segment) => segment.id),
+    (await allVisibleSegments(database, "odd_tail_drain")).map((segment) => segment.id),
   ).toEqual([second.outputSegmentId, requiredItem(inserts, 4, "odd L0 tail").segmentId]);
 
   const skipped = await database.compactTable("odd_tail_drain");
@@ -5448,7 +6990,7 @@ it("drains an odd append tail only when an anchored job explicitly lowers its mi
     [second.outputSegmentId, requiredItem(inserts, 4, "drained L0 tail").segmentId],
     second.outputSegmentId,
   );
-  expect(await database.listVisibleSegments("odd_tail_drain")).toEqual([
+  expect(await allVisibleSegments(database, "odd_tail_drain")).toEqual([
     expect.objectContaining({ id: drained.outputSegmentId, rowCount: 5 }),
   ]);
   expect(await database.readTable("odd_tail_drain")).toEqual(expectedRows);
@@ -5458,7 +7000,7 @@ it("drains an odd append tail only when an anchored job explicitly lowers its mi
   store.close();
 });
 
-it("validates bounded compaction options and preserves the deprecated threshold alias", async () => {
+it("validates bounded compaction options", async () => {
   const store = new MemoryBlockStore();
   const database = new MinnowDatabase(store);
   await database.createTable({
@@ -5474,7 +7016,6 @@ it("validates bounded compaction options and preserves the deprecated threshold 
     { maxLevel0StoredBytes: 0 },
     { maxLevel0StoredBytes: 2.5 },
     { targetLevel: 3 },
-    { minimumSegments: 2, minimumLevel0Segments: 3 },
   ]) {
     await expect(database.compactTable("bounded_options", options)).rejects.toBeInstanceOf(
       RangeError,
@@ -5494,49 +7035,34 @@ it("validates bounded compaction options and preserves the deprecated threshold 
     sourceSegmentCount: 1,
   });
   await database.insert("bounded_options", { value: 2 });
-  const aliased = await database.compactTable("bounded_options", {
-    minimumSegments: 2,
+  const compacted = await database.compactTable("bounded_options", {
+    minimumLevel0Segments: 2,
     outputCompression: "raw",
   });
-  expect(aliased).toMatchObject({ compacted: true, sourceSegmentCount: 2 });
+  expect(compacted).toMatchObject({ compacted: true, sourceSegmentCount: 2 });
   store.close();
 });
 
-it("skips unsupported compaction level layouts without creating jobs", async () => {
+it("refuses high-level segments that no compaction job authorized", async () => {
   const store = new MemoryBlockStore();
   const database = new MinnowDatabase(store);
-  const layouts = [
-    {
-      tableName: "nonleading_anchor",
-      levels: [0, 1, 0],
-    },
-    {
-      tableName: "level_two_anchor",
-      levels: [2, 0, 0],
-    },
-  ];
-  for (const { tableName, levels } of layouts) {
-    await database.createTable({
-      name: tableName,
-      columns: [{ name: "value", type: "number" }],
-    });
-    const table = await store.getTableByName(tableName);
-    if (table === undefined) throw new Error(`Expected layout table ${tableName}`);
-    for (const [index, level] of levels.entries()) {
-      await commitLowLevelNumberSegment(store, table, {
-        segmentId: `${tableName}-${String(index)}`,
+  await database.createTable({
+    name: "unauthorized_layout",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const table = await store.getTableByName("unauthorized_layout");
+  if (table === undefined) throw new Error("Expected the authorization test table");
+  for (const level of [1, 2]) {
+    await expect(
+      commitLowLevelNumberSegment(store, table, {
+        segmentId: `unauthorized-level-${String(level)}`,
         level,
-        logicalOrder: index,
-        rowId: BigInt(index),
-        value: index,
-      });
-    }
-    const result = await database.compactTable(tableName, { minimumLevel0Segments: 2 });
-    expect(result).toMatchObject({
-      compacted: false,
-      skipReason: "unsupported-level-layout",
-      sourceSegmentCount: levels.length,
-    });
+        ...(level === 2 ? { partitionOrdinal: 0 } : {}),
+        logicalOrder: level,
+        rowId: BigInt(level),
+        value: level,
+      }),
+    ).rejects.toThrow(/compaction job authorize(s)? output segment/iu);
   }
   expect(await store.listCompactionJobs()).toEqual([]);
   store.close();
@@ -5645,7 +7171,7 @@ for (const implementation of implementations()) {
       );
       partitions.push({ segment: output, blocks: outputBlocks });
 
-      expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+      expect((await allVisibleSegments(database, tableName)).map((segment) => segment.id)).toEqual([
         ...partitions.map((partition) => partition.segment.id),
         ...originalSegmentIds.slice((partitionOrdinal + 1) * 2),
       ]);
@@ -5712,7 +7238,7 @@ it("retains an optional L1 prefix while omitted targets continue established L2 
     expect(await store.getBlock(blockId)).toEqual(retainedBlocks[index]);
   }
   expect(
-    (await database.listVisibleSegments("l1_l2_transition")).map((segment) => segment.id),
+    (await allVisibleSegments(database, "l1_l2_transition")).map((segment) => segment.id),
   ).toEqual([retainedSegment.id, firstL2.outputSegmentId, secondL2.outputSegmentId]);
   expect(await database.readTable("l1_l2_transition")).toEqual(
     inserts.map((_insert, index) => ({ value: index + 1 })),
@@ -5720,92 +7246,6 @@ it("retains an optional L1 prefix while omitted targets continue established L2 
   expect(
     await database.readTable("l1_l2_transition", requiredItem(inserts, 1, "L1 snapshot").version),
   ).toEqual([{ value: 1 }, { value: 2 }]);
-  store.close();
-});
-
-it("rejects non-keyed mutation histories and malformed L2 layouts without creating jobs", async () => {
-  const store = new MemoryBlockStore();
-  const database = new MinnowDatabase(store, { compression: "raw" });
-  await database.createTable({
-    name: "interleaved_l2_layout",
-    columns: [{ name: "value", type: "number" }],
-  });
-  const interleaved = await store.getTableByName("interleaved_l2_layout");
-  if (interleaved === undefined) throw new Error("Expected an interleaved L2 table");
-  await commitLowLevelNumberSegment(store, interleaved, {
-    segmentId: "interleaved-l0-first",
-    level: 0,
-    logicalOrder: 0,
-    rowId: 0n,
-    value: 1,
-  });
-  await commitLowLevelNumberSegment(store, interleaved, {
-    segmentId: "interleaved-l2",
-    level: 2,
-    partitionOrdinal: 0,
-    logicalOrder: 1,
-    rowId: 1n,
-    value: 2,
-  });
-  await commitLowLevelNumberSegment(store, interleaved, {
-    segmentId: "interleaved-l0-tail",
-    level: 0,
-    logicalOrder: 2,
-    rowId: 2n,
-    value: 3,
-  });
-  expect(
-    await database.compactTable("interleaved_l2_layout", {
-      targetLevel: 2,
-      minimumLevel0Segments: 1,
-    }),
-  ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
-
-  await database.createTable({
-    name: "gapped_l2_ordinals",
-    columns: [{ name: "value", type: "number" }],
-  });
-  const gapped = await store.getTableByName("gapped_l2_ordinals");
-  if (gapped === undefined) throw new Error("Expected a gapped L2 table");
-  for (const input of [
-    { segmentId: "gapped-l2-zero", level: 2, partitionOrdinal: 0, logicalOrder: 0, rowId: 1n },
-    { segmentId: "gapped-l2-two", level: 2, partitionOrdinal: 2, logicalOrder: 1, rowId: 2n },
-    { segmentId: "gapped-l0-a", level: 0, logicalOrder: 2, rowId: 3n },
-    { segmentId: "gapped-l0-b", level: 0, logicalOrder: 3, rowId: 4n },
-  ]) {
-    await commitLowLevelNumberSegment(store, gapped, { ...input, value: Number(input.rowId) });
-  }
-  expect(
-    await database.compactTable("gapped_l2_ordinals", {
-      targetLevel: 2,
-      minimumLevel0Segments: 1,
-    }),
-  ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
-
-  await database.createTable({
-    name: "overlapping_l2_ranges",
-    columns: [{ name: "value", type: "number" }],
-  });
-  const overlapping = await store.getTableByName("overlapping_l2_ranges");
-  if (overlapping === undefined) throw new Error("Expected an overlapping L2 table");
-  for (const input of [
-    { segmentId: "overlap-l2-zero", level: 2, partitionOrdinal: 0, logicalOrder: 0, rowId: 1n },
-    { segmentId: "overlap-l2-one", level: 2, partitionOrdinal: 1, logicalOrder: 1, rowId: 1n },
-    { segmentId: "overlap-l0-a", level: 0, logicalOrder: 2, rowId: 3n },
-    { segmentId: "overlap-l0-b", level: 0, logicalOrder: 3, rowId: 4n },
-  ]) {
-    await commitLowLevelNumberSegment(store, overlapping, {
-      ...input,
-      value: Number(input.rowId),
-    });
-  }
-  expect(
-    await database.compactTable("overlapping_l2_ranges", {
-      targetLevel: 2,
-      minimumLevel0Segments: 1,
-    }),
-  ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
-  expect(await store.listCompactionJobs()).toEqual([]);
   store.close();
 });
 
@@ -5865,7 +7305,7 @@ it("promotes keyed mutation prefixes into immutable multi-range L2 partitions", 
     // The published partition is a merged full-row base carrying disjoint row-ID spans.
     const table = await store.getTableByName("keyed_l2");
     if (table === undefined) throw new Error("Expected the keyed table record");
-    const partitions = (await store.listSegments(table.id))
+    const partitions = (await tableSegmentRecords(store, table.id))
       .filter((segment) => segment.partitionOrdinal !== undefined)
       .sort((left, right) => (left.partitionOrdinal ?? 0) - (right.partitionOrdinal ?? 0));
     expect(partitions.map((segment) => segment.partitionOrdinal)).toEqual(
@@ -5874,9 +7314,9 @@ it("promotes keyed mutation prefixes into immutable multi-range L2 partitions", 
     const record = partitions[wave];
     if (record === undefined) throw new Error("Expected a published keyed partition");
     expect(record).toMatchObject({ kind: "base", level: 2, partitionOrdinal: wave });
-    expect(record.rowIdSpans?.length ?? 0).toBeGreaterThan(0);
+    expect(record.rowIdSpans.length).toBeGreaterThan(0);
     partitionSpans.push(
-      (record.rowIdSpans ?? []).map((span) => ({
+      record.rowIdSpans.map((span) => ({
         rowIdStart: span.rowIdStart,
         rowCount: span.rowCount,
       })),
@@ -5949,7 +7389,7 @@ it("retries a cancelled keyed L2 promotion under the shared lifetime ceiling", a
   if (first.jobId === null) throw new Error("Expected a keyed promotion job");
   const interrupted = await store.getCompactionJob(first.jobId);
   const attemptBytes = interrupted?.outputStoredBytes ?? 0;
-  expect(interrupted?.rewritePlan?.kind).toBe("merge-v1");
+  expect(interrupted?.rewritePlan.kind).toBe("merge-v1");
   expect(interrupted?.outputPartitionOrdinal).toBe(0);
   expect(attemptBytes).toBeGreaterThan(0);
   await database.cancelCompactionJob(first.jobId);
@@ -5987,7 +7427,7 @@ it("shares one lifetime write-amplification budget across failed L2 attempts", a
   const attemptBytes = interrupted.outputStoredBytes;
   const fullCeiling = interrupted.maximumOutputStoredBytes ?? 0;
   const plannedUpperBound = interrupted.plannedOutputStoredBytesUpperBound ?? 0;
-  const level0Bytes = interrupted.level0SourceStoredBytes ?? 0;
+  const level0Bytes = interrupted.level0SourceStoredBytes;
   expect(attemptBytes).toBeGreaterThan(0);
   expect(interrupted.priorAttemptOutputStoredBytes).toBe(0);
   await database.cancelCompactionJob(first.jobId);
@@ -6142,8 +7582,8 @@ it("enforces the conservative L2 write-amplification ceiling at an exact byte bo
   );
   expect(belowStats.storedBytes).toBe(calibratedSourceStats.storedBytes);
   const jobsBefore = await store.listCompactionJobs();
-  const blocksBefore = await store.listBlockIds();
-  const segmentsBefore = await store.listSegments();
+  const blocksBefore = await currentManifestBlockIds(store);
+  const segmentsBefore = await segmentRecords(store);
   const manifestBefore = await store.getCurrentManifest();
   const below = await database.compactTable("l2_budget_below", {
     ...options,
@@ -6157,8 +7597,8 @@ it("enforces the conservative L2 write-amplification ceiling at an exact byte bo
     plannedOutputStoredBytesUpperBound: plannedUpperBound,
   });
   expect(await store.listCompactionJobs()).toEqual(jobsBefore);
-  expect(await store.listBlockIds()).toEqual(blocksBefore);
-  expect(await store.listSegments()).toEqual(segmentsBefore);
+  expect(await currentManifestBlockIds(store)).toEqual(blocksBefore);
+  expect(await segmentRecords(store)).toEqual(segmentsBefore);
   expect(await store.getCurrentManifest()).toEqual(manifestBefore);
   expect(await database.readTable("l2_budget_below")).toEqual([{ value: 1 }, { value: 2 }]);
 
@@ -6210,7 +7650,7 @@ it("does not round a binary write-amplification ratio up by one output byte", as
   };
 
   const belowStats = await seed("l2_binary_ratio_below");
-  expect(belowStats.storedBytes).toBe(220);
+  expect(belowStats.storedBytes).toBe(240);
   expect(
     await database.compactTable("l2_binary_ratio_below", {
       ...options,
@@ -6219,12 +7659,12 @@ it("does not round a binary write-amplification ratio up by one output byte", as
   ).toMatchObject({
     compacted: false,
     skipReason: "write-amplification-budget",
-    maximumOutputStoredBytes: 43,
-    plannedOutputStoredBytesUpperBound: 44,
+    maximumOutputStoredBytes: 47,
+    plannedOutputStoredBytesUpperBound: 48,
   });
 
   const exactStats = await seed("l2_binary_ratio_exact");
-  expect(exactStats.storedBytes).toBe(220);
+  expect(exactStats.storedBytes).toBe(240);
   expect(
     await database.compactTable("l2_binary_ratio_exact", {
       ...options,
@@ -6232,9 +7672,9 @@ it("does not round a binary write-amplification ratio up by one output byte", as
     }),
   ).toMatchObject({
     compacted: true,
-    maximumOutputStoredBytes: 44,
-    plannedOutputStoredBytesUpperBound: 44,
-    outputStoredBytes: 44,
+    maximumOutputStoredBytes: 48,
+    plannedOutputStoredBytesUpperBound: 48,
+    outputStoredBytes: 48,
   });
   store.close();
 });
@@ -6311,7 +7751,7 @@ for (const implementation of recoveryImplementations()) {
     });
     if (second.outputSegmentId === null) throw new Error("Expected a second L2 output");
     expect(second.outputPartitionOrdinal).toBe(1);
-    expect((await reopened.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+    expect((await allVisibleSegments(reopened, tableName)).map((segment) => segment.id)).toEqual([
       progress.result.outputSegmentId,
       second.outputSegmentId,
     ]);
@@ -6379,7 +7819,7 @@ it("rebases an L2 prefix across a concurrent L0 append while retaining prior par
   for (const [index, blockId] of retainedBlockIds.entries()) {
     expect(await compactorStore.getBlock(blockId)).toEqual(retainedBlocks[index]);
   }
-  expect((await compactor.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+  expect((await allVisibleSegments(compactor, tableName)).map((segment) => segment.id)).toEqual([
     retained.id,
     progress.result.outputSegmentId,
     concurrent.segmentId,
@@ -6438,6 +7878,72 @@ it("does not lose an age flush that fires behind an in-flight batch", async () =
   expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
   await writer.close();
   store.close();
+});
+
+it("backpressures concurrent buffered adds before cloning an unbounded queue", async () => {
+  const store = new FirstCommitBarrierMemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const writer = database.bufferedWriter("events", {
+    maxAgeMs: 60_000,
+    maxRows: 1,
+  });
+  const firstAdd = writer.add({ value: 0 });
+  await store.firstCommitReached;
+
+  const queued = Array.from({ length: MAX_BUFFERED_WRITER_PENDING_ADDS - 1 }, (_, index) =>
+    writer.add({ value: index + 1 }),
+  );
+  expect(writer.pendingRowCount).toBe(0);
+  await expect(writer.add({ value: 999 })).rejects.toThrow(
+    `more than ${String(MAX_BUFFERED_WRITER_PENDING_ADDS)} adds`,
+  );
+  expect(writer.pendingRowCount).toBe(0);
+
+  store.releaseFirstCommit();
+  await Promise.all([firstAdd, ...queued]);
+  await writer.add({ value: MAX_BUFFERED_WRITER_PENDING_ADDS });
+  await writer.close();
+  expect(await database.readTable("events")).toEqual(
+    Array.from({ length: MAX_BUFFERED_WRITER_PENDING_ADDS + 1 }, (_, value) => ({ value })),
+  );
+  store.close();
+});
+
+it("bounds the direct write queue before preprocessing caller rows", async () => {
+  const store = new FirstCommitBarrierMemoryBlockStore();
+  const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const first = database.insert("events", { value: 0 });
+  await store.firstCommitReached;
+  const queued = Array.from({ length: MAX_DATABASE_PENDING_WRITES - 1 }, (_, index) =>
+    database.insert("events", { value: index + 1 }),
+  );
+  let inspected = false;
+  const refused = {
+    get value(): number {
+      inspected = true;
+      return 999;
+    },
+  };
+  await expect(database.insert("events", refused)).rejects.toThrow(
+    `more than ${String(MAX_DATABASE_PENDING_WRITES)} writes`,
+  );
+  expect(inspected).toBe(false);
+
+  store.releaseFirstCommit();
+  await Promise.all([first, ...queued]);
+  await database.insert("events", { value: MAX_DATABASE_PENDING_WRITES });
+  expect(await database.readTable("events")).toEqual(
+    Array.from({ length: MAX_DATABASE_PENDING_WRITES + 1 }, (_, value) => ({ value })),
+  );
+  await database.close();
 });
 
 it("requests a best-effort buffered flush when a page becomes hidden", async () => {
@@ -6502,6 +8008,38 @@ it("stages a bounded batch in one write and uses bulk reads", async () => {
   store.close();
 });
 
+it("stages encoded blocks early in bounded batches and aborts them after a late trigger fault", async () => {
+  const store = new CountingMemoryBlockStore();
+  const database = new MinnowDatabase(store, {
+    autoCollect: false,
+    compression: "raw",
+    rowsPerBlock: 1,
+  });
+  await database.execute("CREATE TABLE bounded_source (value INTEGER NOT NULL)");
+  await database.execute("CREATE TABLE bounded_audit (value INTEGER NOT NULL)");
+  await database.execute(
+    "CREATE TRIGGER bad_after AFTER INSERT ON bounded_source BEGIN " +
+      "INSERT INTO bounded_audit (value) VALUES ('not a number'); END",
+  );
+
+  await expect(
+    database.insertBatch("bounded_source", {
+      columns: { value: Array.from({ length: 130 }, (_, value) => value) },
+    }),
+  ).rejects.toThrow();
+
+  expect(store.stagedBlockBatchSizes.length).toBeGreaterThanOrEqual(3);
+  expect(Math.max(...store.stagedBlockBatchSizes)).toBeLessThanOrEqual(64);
+  expect(Math.max(...store.stagedBlockBatchBytes)).toBeLessThanOrEqual(MAX_TRANSACTION_STAGE_BYTES);
+  expect(await database.readTable("bounded_source")).toEqual([]);
+  expect(await database.readTable("bounded_audit")).toEqual([]);
+  const aborted = await transactionRecords(store);
+  expect(aborted).toHaveLength(1);
+  expect(aborted[0]?.status).toBe("aborted");
+  expect(aborted[0]?.pendingBlockIds).toHaveLength(130);
+  await database.close();
+});
+
 it("answers metadata-only queries without loading a data block", async () => {
   const store = new CountingMemoryBlockStore();
   const database = new MinnowDatabase(store);
@@ -6515,6 +8053,7 @@ it("answers metadata-only queries without loading a data block", async () => {
   store.transactionListCalls = 0;
   store.transactionGetCalls = 0;
   store.transactionBatchCalls = 0;
+  store.queryCatalogStateCalls = 0;
   store.segmentListCalls = 0;
 
   expect(await database.query("SELECT COUNT(*) AS count FROM events")).toEqual({
@@ -6528,6 +8067,7 @@ it("answers metadata-only queries without loading a data block", async () => {
   expect(store.transactionGetCalls).toBe(0);
   expect(store.transactionBatchCalls).toBe(0);
   expect(store.segmentListCalls).toBe(0);
+  expect(store.queryCatalogStateCalls).toBeLessThanOrEqual(1);
   store.close();
 });
 
@@ -6557,7 +8097,7 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   if (scoreColumn === undefined || labelColumn === undefined || recordedAtColumn === undefined) {
     throw new Error("Expected pruning columns");
   }
-  const segment = (await database.listVisibleSegments("pruned_metrics"))[0];
+  const segment = (await allVisibleSegments(database, "pruned_metrics"))[0];
   if (segment === undefined) throw new Error("Expected pruning segment");
 
   store.blockReadCalls = 0;
@@ -6904,6 +8444,7 @@ it("shares one visibility catalog across multi-table query preparation", async (
   store.transactionListCalls = 0;
   store.transactionGetCalls = 0;
   store.transactionBatchCalls = 0;
+  store.queryCatalogStateCalls = 0;
   store.segmentListCalls = 0;
 
   expect(
@@ -6915,6 +8456,7 @@ it("shares one visibility catalog across multi-table query preparation", async (
   expect(store.transactionGetCalls).toBe(0);
   expect(store.transactionBatchCalls).toBe(0);
   expect(store.segmentListCalls).toBe(0);
+  expect(store.queryCatalogStateCalls).toBe(1);
   store.close();
 });
 
@@ -7494,6 +9036,7 @@ for (const implementation of implementations()) {
 
     await store.createTempOwner({
       ownerId: "abandoned-query",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
@@ -7505,6 +9048,7 @@ for (const implementation of implementations()) {
     });
     await store.createTempOwner({
       ownerId: "live-query",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T01:00:00.000Z",
       revision: 0,
     });
@@ -7514,16 +9058,8 @@ for (const implementation of implementations()) {
       pageIndex: 0,
       bytes: Uint8Array.of(3),
     });
-    await store.putTempRunPage({
-      ownerId: "orphan-query",
-      runId: "run-1",
-      pageIndex: 0,
-      bytes: Uint8Array.of(4),
-    });
-
     const early = await database.cleanupQuerySpill();
-    expect(early).toEqual({ ownersExamined: 3, ownersReclaimed: 1, ownersRetained: 2 });
-    expect(await store.getTempRunPage("orphan-query", "run-1", 0)).toBeUndefined();
+    expect(early).toEqual({ ownersExamined: 2, ownersReclaimed: 0, ownersRetained: 2 });
     expect(await store.getTempRunPage("abandoned-query", "run-1", 0)).toEqual(Uint8Array.of(1, 2));
 
     nowMs = Date.parse("2026-01-01T00:02:00.000Z");
@@ -7557,11 +9093,13 @@ for (const implementation of implementations()) {
       kind: "reader",
       manifestVersion: null,
       ownerId: "dead-tab",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
     await store.createTempOwner({
       ownerId: "crashed-query",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
@@ -7572,7 +9110,7 @@ for (const implementation of implementations()) {
       bytes: Uint8Array.of(4),
     });
 
-    await database.collectGarbage();
+    const first = await database.collectGarbage();
     expect(await store.getBlock("abandoned-block")).toBeUndefined();
     expect(await store.getLease("crashed-reader")).toBeUndefined();
     expect(await store.getTempOwner("crashed-query")).toBeUndefined();
@@ -7580,7 +9118,7 @@ for (const implementation of implementations()) {
     // The journal was still a provenance root when the first pass planned its block. Once the
     // artifact is gone, the next pass is allowed to remove the terminal record itself.
     const second = await database.collectGarbage();
-    expect(second.reclaimedTransactionCount).toBe(1);
+    expect(first.reclaimedTransactionCount + second.reclaimedTransactionCount).toBe(1);
     expect(await store.getTransaction("abandoned-transaction")).toBeUndefined();
     store.close();
   });
@@ -7596,7 +9134,7 @@ for (const implementation of implementations()) {
       await database.insert("gc_transaction_records", { value });
     }
     const sourceRecords = await Promise.all(
-      (await database.listVisibleSegments("gc_transaction_records")).map((segment) =>
+      (await allVisibleSegments(database, "gc_transaction_records")).map((segment) =>
         store.getSegment(segment.id),
       ),
     );
@@ -7610,7 +9148,7 @@ for (const implementation of implementations()) {
       outputCompression: "raw",
     });
     expect(compacted.compacted).toBe(true);
-    const outputSummary = (await database.listVisibleSegments("gc_transaction_records"))[0];
+    const outputSummary = (await allVisibleSegments(database, "gc_transaction_records"))[0];
     const output =
       outputSummary === undefined ? undefined : await store.getSegment(outputSummary.id);
     if (output === undefined) throw new Error("Expected a folded output segment");
@@ -7619,15 +9157,18 @@ for (const implementation of implementations()) {
     // a bounded diagnostic tail, which can expire long before an old metadata backlog is swept.
     for (const job of await store.listCompactionJobs()) await store.removeCompactionJob(job.id);
 
-    // The first pass removes the superseded segments. Their owners were structural roots when
-    // that pass was planned, so the next pass is the one allowed to nominate the records.
-    await database.collectGarbage();
-    const reclaimed = await database.collectGarbage();
-    expect(reclaimed.reclaimedTransactionCount).toBeGreaterThanOrEqual(sourceTransactionIds.length);
+    // A store may reclaim segments and then their now-unreferenced owners atomically in one
+    // ordered job, or retain the owners until the next bounded plan. Both passes together must
+    // reclaim the complete source history.
+    const firstCollection = await database.collectGarbage();
+    const secondCollection = await database.collectGarbage();
+    expect(
+      firstCollection.reclaimedTransactionCount + secondCollection.reclaimedTransactionCount,
+    ).toBeGreaterThanOrEqual(sourceTransactionIds.length);
     for (const id of sourceTransactionIds) expect(await store.getTransaction(id)).toBeUndefined();
     expect(await store.getTransaction(output.transactionId)).toMatchObject({ status: "committed" });
-    expect(await store.listSegments()).toEqual([output]);
-    expect(await store.listTransactions()).toEqual([
+    expect(await segmentRecords(store)).toEqual([output]);
+    expect(await transactionRecords(store)).toEqual([
       expect.objectContaining({ id: output.transactionId, status: "committed" }),
     ]);
     expect(await database.readTable("gc_transaction_records")).toEqual(
@@ -7752,7 +9293,7 @@ for (const implementation of implementations()) {
     const table = await store.getTableByName("bounded_failed_jobs");
     const version = await store.getCurrentManifestVersion();
     if (table === undefined || version === null) throw new Error("Expected a source snapshot");
-    const source = (await store.listSegments(table.id))[0];
+    const source = (await tableSegmentRecords(store, table.id))[0];
     if (source === undefined) throw new Error("Expected a source segment");
     const sourceBlockIds = Object.values(source.columnBlockIds).flat();
     const sourceStoredBytes = (
@@ -7773,7 +9314,15 @@ for (const implementation of implementations()) {
         sourceStoredBytes,
         outputStoredBytes: 10,
         logicalBytes: 100,
-        targetLevel: 2,
+        rewritePlan: { kind: "copy-v1" },
+        outputCursor: null,
+        memoryBudgetBytes: 0,
+        minimumMemoryBytes: 0,
+        level0SourceStoredBytes: sourceStoredBytes,
+        anchorSourceStoredBytes: 0,
+        peakWorkingBytes: 0,
+        outputLogicalBytes: 100,
+        targetLevel: 1,
         state: "cancelled",
         transactionId: null,
         outputSegmentId: null,
@@ -7805,8 +9354,9 @@ for (const implementation of implementations()) {
     const source = await database.insert("gc_leased_events", { value: 2 });
     const sourceManifest = await store.getManifest(source.version);
     if (sourceManifest === undefined) throw new Error("Expected a source manifest");
+    const sourceManifestBlockIds = await manifestBlockIdsAt(store, sourceManifest.version);
     const sourceBytes = await Promise.all(
-      sourceManifest.blockIds.map(async (id) => {
+      sourceManifestBlockIds.map(async (id) => {
         const bytes = await store.getBlock(id);
         if (bytes === undefined) throw new Error(`Expected source block ${id}`);
         return bytes;
@@ -7830,18 +9380,18 @@ for (const implementation of implementations()) {
 
     const retained = await database.collectGarbage({ maxItemsPerStep: 2 });
     expect(retained.retainedManifestCount).toBeGreaterThan(0);
-    expect(retained.retainedBlockCount).toBeGreaterThanOrEqual(sourceManifest.blockIds.length);
-    for (const [index, id] of sourceManifest.blockIds.entries()) {
+    expect(retained.retainedBlockCount).toBeGreaterThanOrEqual(sourceManifestBlockIds.length);
+    for (const [index, id] of sourceManifestBlockIds.entries()) {
       expect(await lease.getBlock(id)).toEqual(sourceBytes[index]);
     }
 
     await lease.release();
     const reclaimed = await database.collectGarbage({ maxItemsPerStep: 2 });
     expect(reclaimed).toMatchObject({
-      reclaimedBlockCount: sourceManifest.blockIds.length,
+      reclaimedBlockCount: sourceManifestBlockIds.length,
       physicallyReclaimedBytes: expectedReclaimedBytes,
     });
-    for (const id of sourceManifest.blockIds) {
+    for (const id of sourceManifestBlockIds) {
       expect(await store.getBlock(id)).toBeUndefined();
     }
     expect(await database.readTable("gc_leased_events")).toEqual([{ value: 1 }, { value: 2 }]);
@@ -7859,6 +9409,7 @@ for (const implementation of implementations()) {
     await writer.insert("gc_read_race_events", { value: 2 });
     const sourceManifest = await store.getCurrentManifest();
     if (sourceManifest === undefined) throw new Error("Expected a source manifest");
+    const sourceManifestBlockIds = await manifestBlockIdsAt(store, sourceManifest.version);
 
     let signalReadStarted: (() => void) | undefined;
     const readStarted = new Promise<void>((resolve) => {
@@ -7885,7 +9436,7 @@ for (const implementation of implementations()) {
         outputCompression: "raw",
       });
       await writer.collectGarbage({ maxItemsPerStep: 1 });
-      for (const id of sourceManifest.blockIds) {
+      for (const id of sourceManifestBlockIds) {
         expect(await store.getBlock(id)).toBeDefined();
       }
     } finally {
@@ -7895,7 +9446,7 @@ for (const implementation of implementations()) {
     expect(await readPromise).toEqual([{ value: 1 }, { value: 2 }]);
     expect(await store.listLeases()).toEqual([]);
     await writer.collectGarbage({ maxItemsPerStep: 1 });
-    for (const id of sourceManifest.blockIds) {
+    for (const id of sourceManifestBlockIds) {
       expect(await store.getBlock(id)).toBeUndefined();
     }
     store.close();
@@ -7929,8 +9480,8 @@ for (const implementation of recoveryImplementations()) {
 
     let progress = await database.collectGarbageStep({ maxItems: 1 });
     expect(progress).toMatchObject({
-      state: "running",
-      examinedManifestCount: 1,
+      state: "planned",
+      examinedManifestCount: 0,
       examinedSegmentCount: 0,
       examinedBlockCount: 0,
       result: null,
@@ -8065,11 +9616,51 @@ describe("prepared-input cache and shared read lease", () => {
       return super.moveLease(...args);
     }
 
-    override async getQueryCatalogState(
-      tableNames: readonly string[],
-    ): Promise<Awaited<ReturnType<MemoryBlockStore["getQueryCatalogState"]>>> {
+    override async listTableSegmentPage(
+      tableId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[0],
+      afterId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[1],
+      limit: Parameters<MemoryBlockStore["listTableSegmentPage"]>[2],
+    ): ReturnType<MemoryBlockStore["listTableSegmentPage"]> {
       this.catalogStateCalls += 1;
-      return super.getQueryCatalogState(tableNames);
+      return super.listTableSegmentPage(tableId, afterId, limit);
+    }
+  }
+
+  class SegmentIdReadCountingStore extends LeaseCountingStore {
+    segmentIdReads = 0;
+    segmentTableIdReads = 0;
+
+    override async listTableSegmentPage(
+      tableId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[0],
+      afterId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[1],
+      limit: Parameters<MemoryBlockStore["listTableSegmentPage"]>[2],
+    ): ReturnType<MemoryBlockStore["listTableSegmentPage"]> {
+      const page = await super.listTableSegmentPage(tableId, afterId, limit);
+      return {
+        ...page,
+        records: page.records.map((record) => {
+          const id = record.id;
+          const tableId = record.tableId;
+          const counted = { ...record };
+          Object.defineProperty(counted, "id", {
+            enumerable: true,
+            configurable: true,
+            get: () => {
+              this.segmentIdReads += 1;
+              return id;
+            },
+          });
+          Object.defineProperty(counted, "tableId", {
+            enumerable: true,
+            configurable: true,
+            get: () => {
+              this.segmentTableIdReads += 1;
+              return tableId;
+            },
+          });
+          return counted;
+        }),
+      };
     }
   }
 
@@ -8093,6 +9684,24 @@ describe("prepared-input cache and shared read lease", () => {
     });
     return { store, database };
   }
+
+  it("opens ordinary queries without cloning or scanning the database manifest", async () => {
+    const { store, database } = await seededStore();
+    store.manifestGetCalls = 0;
+    store.currentManifestGetCalls = 0;
+    store.manifestMembershipIds = 0;
+
+    await Promise.all(
+      Array.from({ length: 16 }, () =>
+        database.query("SELECT amount FROM orders WHERE region = 'west'", { memoize: false }),
+      ),
+    );
+
+    expect(store.manifestGetCalls).toBe(0);
+    expect(store.currentManifestGetCalls).toBe(0);
+    expect(store.manifestMembershipIds).toBe(64);
+    await database.close();
+  });
 
   it("skips block reads and lease writes on repeated queries at one version", async () => {
     const { store, database } = await seededStore();
@@ -8153,22 +9762,6 @@ describe("prepared-input cache and shared read lease", () => {
     expect(totals.rows).toEqual([{ region: "south", total: 11 }]);
   });
 
-  it("still prepares correctly when the store lacks the batched catalog read", async () => {
-    const { store, database } = await seededStore();
-    (store as { getQueryCatalogState?: unknown }).getQueryCatalogState = undefined;
-    const result = await database.query(
-      "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
-    );
-    expect(result.rows).toEqual([
-      { region: "east", total: 14 },
-      { region: "north", total: 4 },
-      { region: "west", total: 15 },
-    ]);
-    const blockReadsAfterFirst = store.blockReadCalls;
-    await database.query("SELECT region, SUM(amount) AS total FROM orders GROUP BY region");
-    expect(store.blockReadCalls).toBe(blockReadsAfterFirst);
-  });
-
   it("re-reads blocks when the cache is disabled", async () => {
     const { store, database } = await seededStore({ bufferPoolBytes: 0 });
     await database.query("SELECT SUM(amount) AS total FROM orders");
@@ -8189,6 +9782,40 @@ describe("prepared-input cache and shared read lease", () => {
         { region: "west", total: 15 },
       ]);
     }
+  });
+
+  it("charges decoded gzip payloads by retained memory instead of compressed bytes", async () => {
+    const store = new LeaseCountingStore();
+    const database = new MinnowDatabase(store, {
+      autoCollect: false,
+      autoCompact: false,
+      bufferPoolBytes: 128 * 1024,
+      compression: "gzip",
+      rowsPerBlock: 1_024,
+    });
+    await database.createTable({
+      name: "compressed_cache",
+      columns: [{ name: "value", type: "string" }],
+    });
+    const values = Array.from(
+      { length: 1_024 },
+      (_, index) => `${"x".repeat(1_024)}${String(index).padStart(4, "0")}`,
+    );
+    await database.insertBatch("compressed_cache", { columns: { value: values } });
+
+    const query = "SELECT MIN(value) AS first FROM compressed_cache";
+    await database.query(query, { memoize: false });
+    const firstReadCount = store.blockReadCalls;
+    expect(firstReadCount).toBeGreaterThan(0);
+    expect(database.bufferPoolStats().usedBytes).toBeLessThanOrEqual(128 * 1024);
+
+    // The decoded physical payload and its string vector both exceed the pool. A second scan
+    // must re-read the block rather than retaining a multi-megabyte decompression under the
+    // small stored gzip length.
+    await database.query(query, { memoize: false });
+    expect(store.blockReadCalls).toBeGreaterThan(firstReadCount);
+    expect(database.bufferPoolStats().usedBytes).toBeLessThanOrEqual(128 * 1024);
+    await database.close();
   });
 
   it("rejects invalid cache sizes", () => {
@@ -8243,6 +9870,65 @@ describe("prepared-input cache and shared read lease", () => {
     expect(store.catalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
   });
 
+  it("keeps warm result-cache identity work independent of visible segment count", async () => {
+    const store = new SegmentIdReadCountingStore();
+    const database = new MinnowDatabase(store, {
+      autoCollect: false,
+      autoCompact: false,
+      rowsPerBlock: 1,
+    });
+    await database.createTable({
+      name: "many_segments",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 0; value < 96; value += 1) {
+      await database.insert("many_segments", { value });
+    }
+    const sql = "SELECT SUM(value) AS total FROM many_segments";
+    expect((await database.query(sql)).rows).toEqual([{ total: 4_560 }]);
+    const hits = database.bufferPoolStats().hits;
+    store.segmentIdReads = 0;
+
+    expect((await database.query(sql)).rows).toEqual([{ total: 4_560 }]);
+    expect(database.bufferPoolStats().hits).toBeGreaterThan(hits);
+    expect(store.segmentIdReads).toBe(0);
+    await database.close();
+  });
+
+  it("keeps uncached query preparation independent of historical segment count", async () => {
+    const store = new SegmentIdReadCountingStore();
+    const database = new MinnowDatabase(store, {
+      autoCollect: false,
+      autoCompact: false,
+      rowsPerBlock: 1,
+    });
+    await database.createTable({
+      name: "historical_segments",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 0; value < 96; value += 1) {
+      await database.insert("historical_segments", { value });
+    }
+    expect((await database.compactTable("historical_segments")).compacted).toBe(true);
+    const sql = "SELECT COUNT(*) AS total FROM historical_segments";
+    expect((await database.query(sql, { memoize: false })).rows).toEqual([{ total: 96 }]);
+    store.segmentTableIdReads = 0;
+
+    expect((await database.query(sql, { memoize: false })).rows).toEqual([{ total: 96 }]);
+    expect(store.segmentTableIdReads).toBe(0);
+
+    // The derived maps live exactly as long as the epoch-gated state: a later commit must build
+    // a fresh view and serve the new row, then repeated preparation is O(current visible shape)
+    // again instead of O(all historical records).
+    await database.insert("historical_segments", { value: 96 });
+    store.segmentTableIdReads = 0;
+    expect((await database.query(sql, { memoize: false })).rows).toEqual([{ total: 97 }]);
+    store.segmentTableIdReads = 0;
+    expect((await database.query(sql, { memoize: false })).rows).toEqual([{ total: 97 }]);
+    expect(store.segmentTableIdReads).toBe(0);
+    await database.close();
+  });
+
   it("reports buffer pool stats and compacts a fragmented table in the background", async () => {
     const store = new LeaseCountingStore();
     const database = new MinnowDatabase(store, { rowsPerBlock: 4 });
@@ -8265,7 +9951,7 @@ describe("prepared-input cache and shared read lease", () => {
     let after = 50;
     for (let attempt = 0; attempt < 200 && after >= 50; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-      after = (await database.listVisibleSegments("fragmented")).length;
+      after = (await allVisibleSegments(database, "fragmented")).length;
     }
     expect(after).toBeLessThan(50);
     // Results stay exact across the background rewrite.
@@ -8285,7 +9971,7 @@ describe("prepared-input cache and shared read lease", () => {
     }
     await optOut.query("SELECT SUM(value) AS total FROM fragmented");
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect((await optOut.listVisibleSegments("fragmented")).length).toBe(50);
+    expect((await allVisibleSegments(optOut, "fragmented")).length).toBe(50);
   });
 
   it("folds a keyed table's deltas from the write path, with no read to trigger it", async () => {
@@ -8307,7 +9993,7 @@ describe("prepared-input cache and shared read lease", () => {
     let visible = 41;
     for (let attempt = 0; attempt < 300 && visible >= 41; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-      visible = (await database.listVisibleSegments("accounts")).length;
+      visible = (await allVisibleSegments(database, "accounts")).length;
     }
     // The job planned at the 32-delta threshold folded those; at most the later few remain.
     expect(visible).toBeLessThan(20);
@@ -8353,7 +10039,7 @@ describe("prepared-input cache and shared read lease", () => {
     expect(result.rowCount).toBe(rows);
     // The fold publishes the table as bounded level-one partitions: 60k rows at the default
     // 16,384-row target is four, each a separate segment.
-    const visible = await database.listVisibleSegments("wide");
+    const visible = await allVisibleSegments(database, "wide");
     expect(visible.length).toBe(Math.ceil(rows / 16_384));
     expect(visible.map((segment) => segment.id)).toEqual(result.outputSegmentIds);
     expect(visible.every((segment) => segment.rowCount <= 16_384)).toBe(true);

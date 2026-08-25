@@ -11,11 +11,13 @@ npm install @minnowdb/core
 - Joins, CTEs, window functions, grouping sets, upserts, `RETURNING`, triggers, exact decimals,
   JSON/JSONB, arrays, enums, sequences, and savepoints.
 - Compressed column storage, secondary indexes, full-text search, and snapshot reads.
-- Atomic writes across tabs through IndexedDB or OPFS.
+- Atomic writes across tabs through IndexedDB or OPFS, strict durability by default, and explicit
+  origin-eviction persistence policy.
 - A ready-made worker client with the same everyday database API.
 - TypeScript schema declarations and metadata-only migrations, including SQL domains and
   composite primary/foreign keys.
-- Batch writes, live queries, snapshots, compaction, and configurable query memory.
+- Batch writes, pull-driven query cursors, live queries, snapshots, compaction, and configurable
+  query memory.
 
 Use [the PostgreSQL compatibility page](https://minnowdb.com/docs/sql/feature-matrix/) for the
 exact SQL surface. Use [the documentation](https://minnowdb.com/docs/) for installation, storage,

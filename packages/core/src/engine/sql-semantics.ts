@@ -1,3 +1,10 @@
+import { dateMilliseconds } from "../date-value.js";
+import { assertWellFormedString } from "../block-format/unicode.js";
+import {
+  MAX_SQL_NESTING_DEPTH,
+  MAX_SQL_PATTERN_CHARACTERS,
+  MAX_SQL_PATTERN_MATCH_STEPS,
+} from "./cache-limits.js";
 import {
   collatedDomainCompare,
   enumDomainCompare,
@@ -35,8 +42,8 @@ export function compareSqlValues(left: unknown, right: unknown): number {
   if (enumOrder !== undefined) return enumOrder;
   const exact = exactNumericCompare(left, right);
   if (exact !== undefined) return exact;
-  const a = left instanceof Date ? left.getTime() : left;
-  const b = right instanceof Date ? right.getTime() : right;
+  const a = left instanceof Date ? dateMilliseconds(left) : left;
+  const b = right instanceof Date ? dateMilliseconds(right) : right;
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;
@@ -62,7 +69,7 @@ export function encodeSqlEqualityValue(value: unknown): readonly unknown[] {
   if (typeof value === "boolean") return [1, value];
   if (typeof value === "number") return [2, String(value === 0 ? 0 : value)];
   if (typeof value === "string") return [3, externalSqlTextValue(value)];
-  if (value instanceof Date) return [4, value.getTime()];
+  if (value instanceof Date) return [4, dateMilliseconds(value)];
   throw new TypeError("Query produced an unsupported value");
 }
 
@@ -78,81 +85,476 @@ export function roundSqlNumber(value: number, precision = 0): number {
   return rounded === 0 ? 0 : rounded;
 }
 
-const likeCache = new Map<string, RegExp>();
+/** A whole-string SQL pattern matcher. Unlike RegExp, test never coerces its input. */
+export interface SqlPatternMatcher {
+  test(value: string): boolean;
+}
 
-/** Compiles SQL LIKE (% = any run, _ = one codepoint) into a bounded cached RegExp. */
+interface WeightedPatternMatcher extends SqlPatternMatcher {
+  readonly retainedSize: number;
+}
+
+type PatternCacheEntry = readonly [matcher: WeightedPatternMatcher, retainedSize: number];
+
+const MAX_PATTERN_CACHE_ENTRIES = 128;
+const MAX_PATTERN_CACHE_RETAINED_SIZE = 64 * 1024;
+const likeCache = new Map<string, PatternCacheEntry>();
+const similarCache = new Map<string, PatternCacheEntry>();
+let likeCacheRetainedSize = 0;
+let similarCacheRetainedSize = 0;
+
+function cachedPattern(
+  cache: Map<string, PatternCacheEntry>,
+  key: string,
+): WeightedPatternMatcher | undefined {
+  const entry = cache.get(key);
+  if (entry === undefined) return undefined;
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry[0];
+}
+
+function retainPattern(
+  cache: Map<string, PatternCacheEntry>,
+  key: string,
+  matcher: WeightedPatternMatcher,
+  retainedSize: number,
+  setRetainedSize: (size: number) => void,
+): void {
+  const entrySize = key.length + matcher.retainedSize;
+  if (entrySize > MAX_PATTERN_CACHE_RETAINED_SIZE) return;
+  while (
+    cache.size >= MAX_PATTERN_CACHE_ENTRIES ||
+    retainedSize + entrySize > MAX_PATTERN_CACHE_RETAINED_SIZE
+  ) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    const removed = cache.get(oldest);
+    cache.delete(oldest);
+    retainedSize -= removed?.[1] ?? 0;
+  }
+  cache.set(key, [matcher, entrySize]);
+  setRetainedSize(retainedSize + entrySize);
+}
+
+function throwPatternWorkLimit(): never {
+  throw new RangeError(
+    `SQL pattern match exceeds ${String(MAX_SQL_PATTERN_MATCH_STEPS)} deterministic steps`,
+  );
+}
+
+/** Strings are literals; 0 is `%` (many) and 1 is `_` (one). */
+type LikeToken = string | 0 | 1;
+
+function exactSingleCharacter(value: string, label: string): string {
+  assertBoundedPattern(value, label, 2);
+  const characters = value[Symbol.iterator]();
+  const first = characters.next();
+  if (first.done === true || characters.next().done !== true) {
+    throw new TypeError(`${label.replace(" escape", " ESCAPE")} takes one character`);
+  }
+  return first.value;
+}
+
+function tokenizeLike(pattern: string, escape: string | undefined): LikeToken[] {
+  const tokens: LikeToken[] = [];
+  let escaped = false;
+  for (const character of pattern) {
+    if (escaped) {
+      tokens.push(character);
+      escaped = false;
+    } else if (escape !== undefined && character === escape) {
+      escaped = true;
+    } else if (character === "%") {
+      if (tokens.at(-1) !== 0) tokens.push(0);
+    } else if (character === "_") tokens.push(1);
+    else tokens.push(character);
+  }
+  if (escaped) throw new TypeError("LIKE pattern ends with a dangling escape character");
+  return tokens;
+}
+
+/** Unicode simple-case approximation used consistently by row and vector LIKE execution. */
+function simpleCaseFold(character: string): string {
+  const upper = character.toUpperCase();
+  const codePoints = upper[Symbol.iterator]();
+  return codePoints.next().done !== true && codePoints.next().done === true ? upper : character;
+}
+
+function likeCharactersEqual(left: string, right: string, caseInsensitive: boolean): boolean {
+  return left === right || (caseInsensitive && simpleCaseFold(left) === simpleCaseFold(right));
+}
+
+function literalLikeMatcher(
+  tokens: readonly LikeToken[],
+  caseInsensitive: boolean,
+): WeightedPatternMatcher | undefined {
+  if (tokens.includes(1)) return undefined;
+  const leading = tokens[0] === 0;
+  const trailing = tokens.at(-1) === 0;
+  const begin = leading ? 1 : 0;
+  const end = trailing ? tokens.length - 1 : tokens.length;
+  if (tokens.slice(begin, end).some((token) => typeof token !== "string")) return undefined;
+  const body = tokens
+    .slice(begin, end)
+    .map((token) => (typeof token === "string" ? token : ""))
+    .join("");
+  if (!caseInsensitive) {
+    const test = (value: string): boolean => {
+      if (typeof value !== "string") throw new TypeError("LIKE input must be a string");
+      if (leading && trailing) return value.includes(body);
+      if (leading) return value.endsWith(body);
+      if (trailing) return value.startsWith(body);
+      return value === body;
+    };
+    return { test, retainedSize: tokens.length * 16 + body.length * 2 };
+  }
+
+  const needle = Array.from(body, simpleCaseFold);
+  const prefix = new Uint32Array(needle.length);
+  for (let index = 1, matched = 0; index < needle.length; index += 1) {
+    while (matched > 0 && needle[index] !== needle[matched]) matched = prefix[matched - 1] ?? 0;
+    if (needle[index] === needle[matched]) matched += 1;
+    prefix[index] = matched;
+  }
+  const test = (value: string): boolean => {
+    if (typeof value !== "string") throw new TypeError("LIKE input must be a string");
+    if (needle.length === 0) return leading || trailing || value.length === 0;
+    let matched = 0;
+    let position = 0;
+    let matchedAtEnd = false;
+    for (const rawCharacter of value) {
+      matchedAtEnd = false;
+      const character = simpleCaseFold(rawCharacter);
+      while (matched > 0 && character !== needle[matched]) matched = prefix[matched - 1] ?? 0;
+      if (character === needle[matched]) matched += 1;
+      position += 1;
+      if (matched === needle.length) {
+        const startsAt = position - needle.length;
+        if (leading && trailing) return true;
+        if (!leading && startsAt === 0) {
+          if (trailing) return true;
+          matchedAtEnd = true;
+        } else if (leading && !trailing) matchedAtEnd = true;
+        matched = prefix[matched - 1] ?? 0;
+      }
+    }
+    return matchedAtEnd;
+  };
+  return {
+    test,
+    retainedSize: tokens.length * 16 + body.length * 2 + prefix.byteLength,
+  };
+}
+
+function generalLikeMatcher(
+  tokens: readonly LikeToken[],
+  caseInsensitive: boolean,
+): WeightedPatternMatcher {
+  const test = (value: string): boolean => {
+    if (typeof value !== "string") throw new TypeError("LIKE input must be a string");
+    let remaining = MAX_SQL_PATTERN_MATCH_STEPS;
+    let tokenIndex = 0;
+    let valueIndex = 0;
+    let manyIndex = -1;
+    let retryValueIndex = 0;
+    while (valueIndex < value.length) {
+      if (--remaining < 0) throwPatternWorkLimit();
+      const token = tokens[tokenIndex];
+      if (token === 0) {
+        manyIndex = tokenIndex;
+        tokenIndex += 1;
+        retryValueIndex = valueIndex;
+        continue;
+      }
+      const codePoint = value.codePointAt(valueIndex);
+      if (codePoint === undefined) break;
+      const character = String.fromCodePoint(codePoint);
+      if (
+        token === 1 ||
+        (typeof token === "string" && likeCharactersEqual(token, character, caseInsensitive))
+      ) {
+        tokenIndex += 1;
+        valueIndex += character.length;
+        continue;
+      }
+      if (manyIndex < 0) return false;
+      const retryCodePoint = value.codePointAt(retryValueIndex);
+      if (retryCodePoint === undefined) return false;
+      retryValueIndex += String.fromCodePoint(retryCodePoint).length;
+      valueIndex = retryValueIndex;
+      tokenIndex = manyIndex + 1;
+    }
+    while (tokens[tokenIndex] === 0) {
+      if (--remaining < 0) throwPatternWorkLimit();
+      tokenIndex += 1;
+    }
+    return tokenIndex === tokens.length;
+  };
+  return { test, retainedSize: tokens.length * 16 };
+}
+
+/** Compiles SQL LIKE without exposing input to the host regular-expression engine. */
 export function compileLikePattern(
   pattern: string,
   caseInsensitive = false,
   escape?: string,
-): RegExp {
-  const key = JSON.stringify([caseInsensitive, escape ?? null, pattern]);
-  const cached = likeCache.get(key);
+): SqlPatternMatcher {
+  assertBoundedPattern(pattern, "LIKE pattern");
+  const exactEscape =
+    escape === undefined ? undefined : exactSingleCharacter(escape, "LIKE escape");
+  const key = JSON.stringify([caseInsensitive, exactEscape ?? null, pattern]);
+  const cached = cachedPattern(likeCache, key);
   if (cached !== undefined) return cached;
-  let source = "^";
-  let escaped = false;
-  for (const character of pattern) {
-    if (escaped) {
-      source += escapeRegExp(character);
-      escaped = false;
-      continue;
-    }
-    if (escape !== undefined && character === escape) {
-      escaped = true;
-      continue;
-    }
-    if (character === "%") source += "[\\s\\S]*";
-    else if (character === "_") source += "[\\s\\S]";
-    else source += escapeRegExp(character);
-  }
-  if (escaped) throw new TypeError("LIKE pattern ends with a dangling escape character");
-  source += "$";
-  const regExp = new RegExp(source, caseInsensitive ? "iu" : "u");
-  if (likeCache.size >= 128) likeCache.clear();
-  likeCache.set(key, regExp);
-  return regExp;
+  const tokens = tokenizeLike(pattern, exactEscape);
+  const matcher =
+    literalLikeMatcher(tokens, caseInsensitive) ?? generalLikeMatcher(tokens, caseInsensitive);
+  retainPattern(likeCache, key, matcher, likeCacheRetainedSize, (size) => {
+    likeCacheRetainedSize = size;
+  });
+  return matcher;
 }
 
-const similarCache = new Map<string, RegExp>();
+type CharacterMatcher = (character: string) => boolean;
+const ANY_CHARACTER: CharacterMatcher = () => true;
 
-/** PostgreSQL SIMILAR TO: SQL wildcards plus the SQL regular-expression operators, whole-string. */
-export function compileSimilarPattern(pattern: string, escape = "\\"): RegExp {
-  if (Array.from(escape).length !== 1) throw new TypeError("SIMILAR TO ESCAPE takes one character");
-  const key = JSON.stringify([escape, pattern]);
-  const cached = similarCache.get(key);
-  if (cached !== undefined) return cached;
-  let source = "^(?:";
-  let escaped = false;
-  let inClass = false;
-  for (const character of pattern) {
-    if (escaped) {
-      source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
-      escaped = false;
-      continue;
-    }
-    if (character === escape) {
-      escaped = true;
-      continue;
-    }
-    if (character === "[") inClass = true;
-    if (character === "]") inClass = false;
-    if (!inClass && character === "%") source += "[\\s\\S]*";
-    else if (!inClass && character === "_") source += "[\\s\\S]";
-    else if (inClass || "|*+()[]".includes(character)) source += character;
-    else source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+/** Compact compile-time state: epsilon targets followed by an optional [target, predicate]. */
+type NfaState = [epsilon: number[], transition?: [target: number, matches: CharacterMatcher]];
+type NfaFragment = [start: number, end: number];
+
+/** Parses SIMILAR TO directly into an NFA, avoiding an allocation-heavy intermediate AST. */
+class SimilarCompiler {
+  readonly #characters: string[];
+  readonly states: NfaState[] = [];
+  #index = 0;
+
+  constructor(
+    pattern: string,
+    readonly escape: string,
+  ) {
+    this.#characters = Array.from(pattern);
   }
-  if (escaped) throw new TypeError("SIMILAR TO pattern ends with its escape character");
-  try {
-    const compiled = new RegExp(`${source})$`, "u");
-    similarCache.set(key, compiled);
-    return compiled;
-  } catch {
-    throw new TypeError(`Invalid SIMILAR TO pattern: ${pattern}`);
+
+  compile(): NfaFragment {
+    const fragment = this.#alternative(0);
+    if (this.#index !== this.#characters.length) {
+      throw new TypeError("SIMILAR TO pattern has an unmatched closing parenthesis");
+    }
+    return fragment;
+  }
+
+  #state(): number {
+    this.states.push([[]]);
+    return this.states.length - 1;
+  }
+
+  #empty(): NfaFragment {
+    const start = this.#state();
+    const end = this.#state();
+    this.states[start]?.[0].push(end);
+    return [start, end];
+  }
+
+  #consume(matches: CharacterMatcher): NfaFragment {
+    const start = this.#state();
+    const end = this.#state();
+    const state = this.states[start];
+    if (state !== undefined) state[1] = [end, matches];
+    return [start, end];
+  }
+
+  #repeat(fragment: NfaFragment, plus: boolean): NfaFragment {
+    const start = this.#state();
+    const end = this.#state();
+    this.states[start]?.[0].push(fragment[0]);
+    if (!plus) this.states[start]?.[0].push(end);
+    this.states[fragment[1]]?.[0].push(fragment[0], end);
+    return [start, end];
+  }
+
+  #alternative(depth: number): NfaFragment {
+    const first = this.#sequence(depth);
+    if (this.#characters[this.#index] !== "|" || this.#characters[this.#index] === this.escape) {
+      return first;
+    }
+    const start = this.#state();
+    const end = this.#state();
+    this.states[start]?.[0].push(first[0]);
+    this.states[first[1]]?.[0].push(end);
+    while (this.#characters[this.#index] === "|" && this.#characters[this.#index] !== this.escape) {
+      this.#index += 1;
+      const next = this.#sequence(depth);
+      this.states[start]?.[0].push(next[0]);
+      this.states[next[1]]?.[0].push(end);
+    }
+    return [start, end];
+  }
+
+  #sequence(depth: number): NfaFragment {
+    let result: NfaFragment | undefined;
+    for (;;) {
+      const character = this.#characters[this.#index];
+      if (
+        character === undefined ||
+        ((character === "|" || character === ")") && character !== this.escape)
+      ) {
+        return result ?? this.#empty();
+      }
+      let fragment = this.#atom(depth);
+      const quantifier = this.#characters[this.#index];
+      if ((quantifier === "*" || quantifier === "+") && quantifier !== this.escape) {
+        this.#index += 1;
+        fragment = this.#repeat(fragment, quantifier === "+");
+        const repeated = this.#characters[this.#index];
+        if ((repeated === "*" || repeated === "+") && repeated !== this.escape) {
+          throw new TypeError("SIMILAR TO pattern repeats a quantifier");
+        }
+      }
+      if (result === undefined) result = fragment;
+      else {
+        this.states[result[1]]?.[0].push(fragment[0]);
+        result = [result[0], fragment[1]];
+      }
+    }
+  }
+
+  #atom(depth: number): NfaFragment {
+    const character = this.#characters[this.#index];
+    if (character === undefined) return this.#empty();
+    this.#index += 1;
+    if (character === this.escape) {
+      const literal = this.#characters[this.#index];
+      if (literal === undefined) {
+        throw new TypeError("SIMILAR TO pattern ends with its escape character");
+      }
+      this.#index += 1;
+      return this.#consume((candidate) => candidate === literal);
+    }
+    if (character === "*" || character === "+") {
+      throw new TypeError("SIMILAR TO quantifier has no preceding expression");
+    }
+    if (character === "(") {
+      if (depth >= MAX_SQL_NESTING_DEPTH) {
+        throw new RangeError(`SIMILAR TO nesting exceeds ${String(MAX_SQL_NESTING_DEPTH)} levels`);
+      }
+      const child = this.#alternative(depth + 1);
+      if (this.#characters[this.#index] !== ")") {
+        throw new TypeError("SIMILAR TO pattern has an unmatched opening parenthesis");
+      }
+      this.#index += 1;
+      return child;
+    }
+    if (character === "[") return this.#consume(this.#characterClass());
+    if (character === "%") return this.#repeat(this.#consume(ANY_CHARACTER), false);
+    if (character === "_") return this.#consume(ANY_CHARACTER);
+    return this.#consume((candidate) => candidate === character);
+  }
+
+  #characterClass(): CharacterMatcher {
+    let source = "[";
+    let closed = false;
+    let hasMember = false;
+    while (this.#index < this.#characters.length) {
+      const character = this.#characters[this.#index] ?? "";
+      this.#index += 1;
+      if (character === this.escape) {
+        const literal = this.#characters[this.#index];
+        if (literal === undefined) {
+          throw new TypeError("SIMILAR TO pattern ends with its escape character");
+        }
+        this.#index += 1;
+        source += ["\\", "]", "^", "-"].includes(literal) ? `\\${literal}` : literal;
+        hasMember = true;
+        continue;
+      }
+      if (character === "]") {
+        closed = true;
+        break;
+      }
+      source += character;
+      if (character !== "^" || source.length > 2) hasMember = true;
+    }
+    if (!closed) throw new TypeError("SIMILAR TO pattern has an unterminated character class");
+    if (!hasMember) throw new TypeError("SIMILAR TO pattern has an empty character class");
+    source += "]";
+    let expression: RegExp;
+    try {
+      // The host expression is deliberately limited to one character class and one codepoint.
+      // It cannot contain repetition, grouping, or alternation, so backtracking work is constant.
+      expression = new RegExp(`^(?:${source})$`, "u");
+    } catch {
+      throw new TypeError("SIMILAR TO pattern has an invalid character class");
+    }
+    return (candidate) => expression.test(candidate);
   }
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function nfaMatcher(pattern: string, escape: string): WeightedPatternMatcher {
+  const compiler = new SimilarCompiler(pattern, escape);
+  const fragment = compiler.compile();
+  const { states } = compiler;
+  const test = (value: string): boolean => {
+    if (typeof value !== "string") throw new TypeError("SIMILAR TO input must be a string");
+    let remaining = MAX_SQL_PATTERN_MATCH_STEPS;
+    const marks = new Uint32Array(states.length);
+    const stack: number[] = [];
+    let active: number[] = [];
+    let next: number[] = [];
+    let generation = 1;
+    const addClosure = (seed: number, output: number[]): void => {
+      stack.push(seed);
+      while (stack.length > 0) {
+        if (--remaining < 0) throwPatternWorkLimit();
+        const stateIndex = stack.pop();
+        if (stateIndex === undefined || marks[stateIndex] === generation) continue;
+        marks[stateIndex] = generation;
+        output.push(stateIndex);
+        for (const target of states[stateIndex]?.[0] ?? []) stack.push(target);
+      }
+    };
+    addClosure(fragment[0], active);
+    for (const character of value) {
+      generation += 1;
+      next.length = 0;
+      for (const stateIndex of active) {
+        if (--remaining < 0) throwPatternWorkLimit();
+        const transition = states[stateIndex]?.[1];
+        if (transition?.[1](character) === true) addClosure(transition[0], next);
+      }
+      if (next.length === 0) return false;
+      [active, next] = [next, active];
+    }
+    return active.includes(fragment[1]);
+  };
+  // State objects, epsilon arrays, transition objects, and matcher closures all cost materially
+  // more than their integer payload. A conservative model keeps large compiled patterns out of
+  // the cache instead of pretending their Uint32-sized indexes are the whole retained graph.
+  return { test, retainedSize: states.length * 32 };
+}
+
+/** PostgreSQL SIMILAR TO compiled to a Thompson NFA with bounded deterministic work. */
+export function compileSimilarPattern(pattern: string, escape = "\\"): SqlPatternMatcher {
+  assertBoundedPattern(pattern, "SIMILAR TO pattern");
+  const exactEscape = exactSingleCharacter(escape, "SIMILAR TO escape");
+  const key = JSON.stringify([exactEscape, pattern]);
+  const cached = cachedPattern(similarCache, key);
+  if (cached !== undefined) return cached;
+  const matcher = nfaMatcher(pattern, exactEscape);
+  retainPattern(similarCache, key, matcher, similarCacheRetainedSize, (size) => {
+    similarCacheRetainedSize = size;
+  });
+  return matcher;
+}
+
+function assertBoundedPattern(
+  value: string,
+  label: string,
+  limit = MAX_SQL_PATTERN_CHARACTERS,
+): void {
+  if (value.length > limit) {
+    throw new RangeError(`${label} exceeds ${String(limit)} characters`);
+  }
+  assertWellFormedString(value, label);
 }
 
 /** Defines an own enumerable result-column property, including the special name `__proto__`. */

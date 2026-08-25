@@ -24,7 +24,16 @@
  * Adding to this shape is safe and welcome. Removing from it silently narrows what every future
  * fixture proves, so treat a deletion here as a decision to stop protecting that surface.
  */
-import type { MinnowDatabase } from "../engine/database.js";
+import { MinnowDatabase } from "../engine/database.js";
+import { MemoryBlockStore } from "./memory.js";
+
+/** Stable clock and ID source shared by the fixture writer and its writer-shape regression. */
+export const FORMAT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
+
+export function createFormatFixtureId(): () => string {
+  let nextId = 0;
+  return () => `fixture-${String(nextId++).padStart(6, "0")}`;
+}
 
 /** Deterministic pseudo-randomness, so a regenerated fixture differs only when the format does. */
 function mulberry32(seed: number): () => number {
@@ -189,3 +198,29 @@ export const FIXTURE_QUERIES: readonly string[] = [
   // A join, which reads two layouts at once.
   "SELECT r.region, COUNT(*) AS n FROM records r JOIN keyless k ON r.region = k.label GROUP BY r.region ORDER BY r.region",
 ];
+
+/** Builds the exact deterministic writer artifact frozen by the current-version fixture. */
+export async function createFormatFixtureArtifact(): Promise<{
+  bytes: Uint8Array;
+  expectations: Array<{ sql: string; rows: unknown }>;
+}> {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, {
+    rowsPerBlock: 64,
+    autoCompact: false,
+    autoCollect: false,
+    now: () => new Date(FORMAT_FIXTURE_CREATED_AT),
+    createId: createFormatFixtureId(),
+  });
+  try {
+    await buildFixtureDatabase(database);
+    const expectations: Array<{ sql: string; rows: unknown }> = [];
+    for (const sql of FIXTURE_QUERIES) {
+      const result = await database.query(sql, { memoize: false });
+      expectations.push({ sql, rows: result.rows });
+    }
+    return { bytes: await database.exportSnapshot(), expectations };
+  } finally {
+    await database.close();
+  }
+}

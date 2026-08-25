@@ -9,8 +9,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
-import { MinnowDatabase, type DatabaseRow } from "./database.js";
+import { MAX_TRANSACTION_SAVEPOINTS, MinnowDatabase, type DatabaseRow } from "./database.js";
 import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import { allSegmentRecords, allTransactionRecords } from "./storage-test-helpers.js";
 
 const tables = new Map<string, DatabaseRow[]>([
   [
@@ -35,6 +36,17 @@ function run(sql: string): DatabaseRow[] {
 
 function value(sql: string): unknown {
   return run(sql)[0]?.v;
+}
+
+async function payloadStats(store: MemoryBlockStore) {
+  const stats = await store.getStorageStats();
+  return {
+    physicalBytes: stats.physicalBytes,
+    liveBlockCount: stats.liveBlockCount,
+    obsoleteBlockCount: stats.obsoleteBlockCount,
+    liveBlockBytes: stats.liveBlockBytes,
+    obsoleteBlockBytes: stats.obsoleteBlockBytes,
+  };
 }
 
 describe("character strings", () => {
@@ -591,8 +603,8 @@ describe("statement transactions", () => {
       "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL, email TEXT UNIQUE)",
     );
     await database.execute("INSERT INTO t VALUES (1, 10, 'one@example.test')");
-    const baselineBlocks = await store.listBlockIds();
-    const baselineSegments = await store.listSegments();
+    const baselineStats = await payloadStats(store);
+    const baselineSegments = await allSegmentRecords(store);
 
     await database.execute("BEGIN");
     await database.execute("SAVEPOINT outer_mark");
@@ -606,8 +618,8 @@ describe("statement transactions", () => {
 
     await database.execute("ROLLBACK TO SAVEPOINT outer_mark");
     expect(await rows(database)).toEqual([{ id: 1, n: 10 }]);
-    expect(await store.listBlockIds()).toEqual(baselineBlocks);
-    expect(await store.listSegments()).toEqual(baselineSegments);
+    expect(await payloadStats(store)).toEqual(baselineStats);
+    expect(await allSegmentRecords(store)).toEqual(baselineSegments);
     await expect(database.execute("RELEASE inner_mark")).rejects.toThrow(
       "Savepoint does not exist",
     );
@@ -623,6 +635,31 @@ describe("statement transactions", () => {
       { id: 1, n: 10 },
       { id: 3, n: 30 },
     ]);
+  });
+
+  it("bounds retained savepoints and reuses capacity after release and rollback", async () => {
+    const database = await counted();
+    await database.execute("BEGIN");
+    for (let index = 0; index < MAX_TRANSACTION_SAVEPOINTS; index += 1) {
+      await database.execute(`SAVEPOINT mark_${String(index)}`);
+    }
+    await expect(database.execute("SAVEPOINT refused")).rejects.toThrow(
+      `more than ${String(MAX_TRANSACTION_SAVEPOINTS)} savepoints`,
+    );
+
+    // RELEASE removes the named marker and everything nested inside it, so the refused request
+    // neither allocated a checkpoint nor consumed capacity.
+    await database.execute(`RELEASE SAVEPOINT mark_${String(MAX_TRANSACTION_SAVEPOINTS - 2)}`);
+    await database.execute("SAVEPOINT replacement_one");
+    await database.execute("SAVEPOINT replacement_two");
+    await expect(database.execute("SAVEPOINT refused_again")).rejects.toThrow(
+      `more than ${String(MAX_TRANSACTION_SAVEPOINTS)} savepoints`,
+    );
+
+    // ROLLBACK TO keeps its named marker but releases every later checkpoint.
+    await database.execute("ROLLBACK TO SAVEPOINT replacement_one");
+    await database.execute("SAVEPOINT replacement_after_rollback");
+    await database.execute("ROLLBACK");
   });
 
   it("rolls back a transaction left open, rather than holding the scope forever", async () => {
@@ -654,7 +691,7 @@ describe("statement transactions", () => {
 
     const reopened = new MinnowDatabase(store);
     expect((await reopened.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 1 }]);
-    expect((await store.listTransactions()).every((record) => record.status !== "active")).toBe(
+    expect((await allTransactionRecords(store)).every((record) => record.status !== "active")).toBe(
       true,
     );
     await reopened.close();
@@ -932,17 +969,14 @@ describe("views", () => {
     await expect(database.execute("DROP TABLE orders")).resolves.toMatchObject({ dropped: true });
   });
 
-  it("catches a cycle between views rather than recursing", async () => {
+  it("rejects a cycle between views before changing the catalog", async () => {
     const database = await seeded();
     await database.execute("CREATE VIEW a AS SELECT id, total FROM orders");
     await database.execute("CREATE VIEW b AS SELECT id, total FROM a");
-    // Neither definition is recursive on its own; redefining one over the other closes a loop.
-    await database.execute("CREATE OR REPLACE VIEW a AS SELECT id, total FROM b");
-    await expect(database.query("SELECT * FROM a")).rejects.toThrow(
-      "A view cannot be defined in terms of itself",
-    );
-    // And the loop is recoverable: redefining either side makes both readable again.
-    await database.execute("CREATE OR REPLACE VIEW a AS SELECT id, total FROM orders");
+    await expect(
+      database.execute("CREATE OR REPLACE VIEW a AS SELECT id, total FROM b"),
+    ).rejects.toThrow("View dependency cycle");
+    expect((await database.query("SELECT COUNT(*) AS n FROM a")).rows).toEqual([{ n: 3 }]);
     expect((await database.query("SELECT COUNT(*) AS n FROM b")).rows).toEqual([{ n: 3 }]);
   });
 

@@ -13,7 +13,11 @@ export type BatchValue = boolean | number | string | Date | null;
 /** One row. A missing property is SQL omission; an explicit `null` remains SQL NULL. */
 export type BatchRow = Readonly<Record<string, BatchValue>>;
 
-/** The columnar form: one array per column, all of the same length, aligned by index. */
+/**
+ * The columnar form: one ordinary readonly array per column, all of the same length and aligned by
+ * index. The engine reads these arrays without copying while the asynchronous write is active;
+ * callers must not mutate them or use changing accessor/proxy values until the write settles.
+ */
 export interface ColumnarBatch {
   columns: Readonly<Record<string, readonly BatchValue[]>>;
   /**

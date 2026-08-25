@@ -1,4 +1,5 @@
-import { IndexedDbBlockStore, WriteConflictError } from "@minnowdb/core/storage";
+import { WriteConflictError, type BlockStore } from "@minnowdb/core/storage/contracts";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
 import {
   MinnowDatabase,
@@ -7,8 +8,28 @@ import {
   type BatchValue,
   type QueryResult,
   type SnapshotSession,
+  type VisibleSegment,
+  type VisibleSegmentPageCursor,
 } from "@minnowdb/core";
-import { TransactionManager } from "../src/transactions/index.js";
+import { TransactionManager } from "@minnowdb/core/transactions";
+
+async function allVisibleSegments(
+  database: MinnowDatabase,
+  tableName: string,
+  version?: number,
+): Promise<VisibleSegment[]> {
+  const records: VisibleSegment[] = [];
+  let cursor: VisibleSegmentPageCursor | null = null;
+  do {
+    const page = await database.listVisibleSegmentPage(
+      tableName,
+      cursor === null ? (version === undefined ? {} : { version }) : { cursor },
+    );
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
 
 interface BrowserTransactionResult {
   competingCommits: {
@@ -110,6 +131,32 @@ declare global {
   }
 }
 
+async function manifestBlockIds(
+  store: Pick<BlockStore, "listManifestBlockPage">,
+  version: number | null,
+): Promise<string[]> {
+  if (version === null) return [];
+  const ids: string[] = [];
+  let afterBlockId: string | null = null;
+  do {
+    const page = await store.listManifestBlockPage({ version, afterBlockId, limit: 1_024 });
+    ids.push(...page.records.map(({ blockId }) => blockId));
+    afterBlockId = page.nextCursor;
+  } while (afterBlockId !== null);
+  return ids;
+}
+
+async function transactionStates(store: IndexedDbBlockStore) {
+  const states: Array<"active" | "committed" | "aborted"> = [];
+  let cursor: string | null = null;
+  do {
+    const page = await store.listTransactionPage(cursor, 1_024);
+    states.push(...page.records.map(({ status }) => status));
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return states;
+}
+
 window.runTransactionBrowserTest = async () => {
   const databaseName = `minnow-transactions-${crypto.randomUUID()}`;
   const firstStore = await IndexedDbBlockStore.open({ name: databaseName });
@@ -128,6 +175,8 @@ window.runTransactionBrowserTest = async () => {
   await loser.rebase();
   await loser.commit();
   const finalManifest = await firstStore.getCurrentManifest();
+  const finalBlockIds = await manifestBlockIds(firstStore, finalManifest?.version ?? null);
+  const stableBlockIds = await manifestBlockIds(firstStore, stable.version);
   const leaseManager = new TransactionManager(firstStore);
   const leased = await leaseManager.openLeasedSnapshot({ ownerId: "browser-test", ttlMs: 1_000 });
   const originalLease = await firstStore.getLease(leased.leaseId);
@@ -136,6 +185,16 @@ window.runTransactionBrowserTest = async () => {
   const leaseRenewed = renewedLease?.revision === (originalLease?.revision ?? -1) + 1;
   await leased.release();
   const leaseReleased = (await firstStore.getLease(leased.leaseId)) === undefined;
+  // Row-ID counters belong to declared tables. Reserving against an arbitrary string used to
+  // leave immortal counter records behind; the stores now reject that corruption-prone shape.
+  await firstStore.addTable({
+    managed: false,
+    id: "browser-table",
+    name: "browser_table",
+    columns: [{ id: "browser-id", name: "id", type: "number", nullable: false }],
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
   const rowRanges = await Promise.all([
     firstStore.reserveRowIds("browser-table", 4),
     secondStore.reserveRowIds("browser-table", 4),
@@ -153,8 +212,7 @@ window.runTransactionBrowserTest = async () => {
   const recoveryTransaction = await new TransactionManager(recoveryStore).begin();
   await recoveryTransaction.stageBlock("saved", Uint8Array.of(3));
   const recoveredManifest = await recoveryTransaction.commit();
-  const recoveredBlockIds =
-    (await recoveryStore.getManifest(recoveredManifest.version))?.blockIds ?? [];
+  const recoveredBlockIds = await manifestBlockIds(recoveryStore, recoveredManifest.version);
   const lostResponseRecovered =
     recoveredBlockIds.includes("saved") && recoveryTransaction.status === "committed";
   recoveryStore.close();
@@ -165,6 +223,14 @@ window.runTransactionBrowserTest = async () => {
   // ID generator are injected so "stale" and "live" are decided by the cutoff, not by wall time.
   const staleName = `minnow-stale-${crypto.randomUUID()}`;
   const staleStore = await IndexedDbBlockStore.open({ name: staleName });
+  await staleStore.addTable({
+    managed: false,
+    id: "orphan-table",
+    name: "orphan_table",
+    columns: [{ id: "probe", name: "probe", type: "number", nullable: false }],
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
   const committedTransaction = await new TransactionManager(staleStore).begin();
   await committedTransaction.stageBlock("committed", Uint8Array.of(6));
   await committedTransaction.commit();
@@ -184,6 +250,11 @@ window.runTransactionBrowserTest = async () => {
     rowIdStart: 1n,
     rowIdEndExclusive: 2n,
     columnBlockIds: { probe: ["orphan"] },
+    kind: "insert",
+    level: 0,
+    logicalOrder: 0,
+    commitOrdinal: 0,
+    rowIdSpans: [],
     createdAt: recoveryClock.toISOString(),
   });
   recoveryClock = new Date("2026-01-01T01:00:00.000Z");
@@ -196,11 +267,11 @@ window.runTransactionBrowserTest = async () => {
   const orphanBlockRemoved = (await staleStore.getBlock("orphan")) === undefined;
   const orphanSegmentRemoved = (await staleStore.getSegment("orphan-segment")) === undefined;
   const livePendingRetained = (await staleStore.getBlock("live-pending")) !== undefined;
-  const staleRecords = await staleStore.listTransactions();
+  const staleRecords = await transactionStates(staleStore);
   const persistedStates = {
-    active: staleRecords.filter((record) => record.status === "active").length,
-    committed: staleRecords.filter((record) => record.status === "committed").length,
-    aborted: staleRecords.filter((record) => record.status === "aborted").length,
+    active: staleRecords.filter((status) => status === "active").length,
+    committed: staleRecords.filter((status) => status === "committed").length,
+    aborted: staleRecords.filter((status) => status === "aborted").length,
   };
   await liveTransaction.abort();
   staleStore.close();
@@ -291,13 +362,13 @@ window.runTransactionBrowserTest = async () => {
   const compaction = await database.compactTable("events");
   const bufferedRows = (await database.readTable("events")).length;
   const oldSnapshotRows = (await database.readTable("events", buffered.version)).length;
-  const compactedVisibleSegments = (await database.listVisibleSegments("events")).length;
+  const compactedVisibleSegments = (await allVisibleSegments(database, "events")).length;
   const tableNames = (await database.listTables()).map((table) => table.name);
-  const visibleSegments = (await database.listVisibleSegments("people")).length;
+  const visibleSegments = (await allVisibleSegments(database, "people")).length;
   const mutationCompaction = await database.compactTable("people", { maxBlocksPerStep: 1 });
   const mutationRows = await database.readTable("people");
   const mutationHistoricalRows = await database.readTable("people", batch.version);
-  const mutationVisibleSegments = (await database.listVisibleSegments("people")).length;
+  const mutationVisibleSegments = (await allVisibleSegments(database, "people")).length;
   const compactedAggregate = summarizeAggregate(await database.query(aggregateSql));
 
   await database.createTable({
@@ -321,13 +392,13 @@ window.runTransactionBrowserTest = async () => {
     maxWriteAmplification: 64,
     outputCompression: "raw",
   });
-  const l2VisibleIds = (await database.listVisibleSegments("l2_events")).map(
+  const l2VisibleIds = (await allVisibleSegments(database, "l2_events")).map(
     (segment) => segment.id,
   );
   const l2Table = await libraryStore.getTableByName("l2_events");
   if (l2Table === undefined) throw new Error("L2 browser table is missing");
   const l2VisibleIdSet = new Set(l2VisibleIds);
-  const l2Segments = (await libraryStore.listSegments(l2Table.id))
+  const l2Segments = (await libraryStore.listTableSegmentPage(l2Table.id, null, 1_024)).records
     .filter((segment) => l2VisibleIdSet.has(segment.id))
     .sort((left, right) => (left.partitionOrdinal ?? -1) - (right.partitionOrdinal ?? -1));
   const l2CurrentRows = await database.readTable("l2_events");
@@ -471,7 +542,7 @@ window.runTransactionBrowserTest = async () => {
   const reopenedLibraryStore = await IndexedDbBlockStore.open({ name: libraryName });
   const reopenedDatabase = new MinnowDatabase(reopenedLibraryStore);
   const reopenedL2Rows = await reopenedDatabase.readTable("l2_events");
-  const reopenedL2Ids = (await reopenedDatabase.listVisibleSegments("l2_events")).map(
+  const reopenedL2Ids = (await allVisibleSegments(reopenedDatabase, "l2_events")).map(
     (segment) => segment.id,
   );
   const reopenedAggregate = summarizeAggregate(await reopenedDatabase.query(aggregateSql));
@@ -489,8 +560,8 @@ window.runTransactionBrowserTest = async () => {
       fulfilled,
       conflicts,
       finalVersion: finalManifest?.version,
-      finalBlockIds: finalManifest?.blockIds ?? [],
-      stableBlockIds: stable.listBlockIds(),
+      finalBlockIds,
+      stableBlockIds,
     },
     lostResponseRecovered,
     leases: { renewed: leaseRenewed, released: leaseReleased },
@@ -587,7 +658,7 @@ window.runTransactionBrowserTest = async () => {
       },
       l2Compaction: {
         sourceSegments: [firstL2.sourceSegmentCount, secondL2.sourceSegmentCount],
-        levels: l2Segments.map((segment) => segment.level ?? 0),
+        levels: l2Segments.map((segment) => segment.level),
         ordinals: l2Segments.map((segment) => segment.partitionOrdinal ?? -1),
         currentValues: l2CurrentRows.map((row) => Number(row.value)),
         historicalRows: l2HistoricalRows.length,

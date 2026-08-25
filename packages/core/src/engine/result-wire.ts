@@ -1,3 +1,4 @@
+import { dateMilliseconds } from "../date-value.js";
 import type { QueryResult, QueryRow, QueryValue } from "./query.js";
 
 /**
@@ -155,7 +156,7 @@ function encodeColumn(name: string, rows: readonly QueryRow[]): WireResultColumn
         nulls ??= new Uint8Array(rowCount);
         nulls[index] = 1;
       } else if (value instanceof Date) {
-        values[index] = value.getTime();
+        values[index] = dateMilliseconds(value);
       } else {
         return encodeMixed(name, rows);
       }

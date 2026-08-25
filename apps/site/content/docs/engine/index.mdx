@@ -8,7 +8,7 @@ else — SQL, batch writes, the catalog, and maintenance.
 
 ```ts
 import { MinnowDatabase } from "@minnowdb/core";
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 
 const store = await IndexedDbBlockStore.open({ name: "shop" });
 const db = new MinnowDatabase(store, {
@@ -98,22 +98,28 @@ follow the tab into the grave.
 
 ## Options
 
-| Option                     | Default       | What it does                                                                                                                                                                        |
-| -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `compression`              | `"gzip"`      | Block encoding. `"raw"` writes faster; `gzip` usually uses about half the storage and can make a cold read faster because the browser fetches fewer bytes.                          |
-| `rowsPerBlock`             | `65536`       | How many rows Minnow aims to put in each block. Smaller blocks can help narrow reads but add more work to broad scans.                                                              |
-| `bufferPoolBytes`          | 64 MiB        | Space kept for decoded blocks and reusable query work. `0` disables the cache. Cached data is tied to the exact block or table version, so an old entry is never used for new data. |
-| `ftsAutoIndexRows`         | `4096`        | Row count above which `MATCH` can schedule a background index build for a column that does not have one yet.                                                                        |
-| `maxCommitRetries`         | `8`           | How many times a write retries after another tab publishes first.                                                                                                                   |
-| `spillOwnerLeaseMs`        | `60000`       | How long temporary query files stay claimed between renewals while a query is running.                                                                                              |
-| `transactionIdleTimeoutMs` | `30000`       | How long an untouched `BEGIN` transaction may remain open before Minnow rolls it back. This prevents an abandoned transaction from keeping storage alive forever.                   |
-| `autoCompact`              | `true`        | Whether Minnow combines fragmented tables in the background; see [compaction](/docs/storage/maintenance).                                                                           |
-| `autoCollect`              | `autoCompact` | Whether Minnow removes replaced blocks and old versions in the background; see [garbage collection](/docs/storage/maintenance#garbage-collection).                                  |
-| `compaction`               | `{}`          | Defaults for every compaction job, including background work. `partitionRows` defaults to 16,384. See [partitioned folds](/docs/storage/maintenance#partitioned-folds).             |
+| Option                        | Default  | What it does                                                                                                                                                                                                |
+| ----------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `compression`                 | `"gzip"` | Block encoding. `"raw"` writes faster; `gzip` usually uses about half the storage and can make a cold read faster because the browser fetches fewer bytes.                                                  |
+| `rowsPerBlock`                | `65536`  | Maximum rows in an ordinary write block, up to the format ceiling of 1,048,576. Smaller blocks can help narrow reads but add more work to broad scans.                                                      |
+| `targetBlockBytes`            | 2 MiB    | Target uncompressed bytes in each ordinary write block. Every column uses the same row boundaries. One value may exceed the target, up to the format's 64 MiB hard limit.                                   |
+| `bufferPoolBytes`             | 64 MiB   | Space kept for decoded blocks and reusable query work. `0` disables the cache. Cached data is tied to the exact block or table version, so an old entry is never used for new data.                         |
+| `ftsAutoIndexRows`            | `4096`   | Row count above which `MATCH` can schedule a background index build for a column that does not have one yet.                                                                                                |
+| `maxCommitRetries`            | `8`      | How many times a write retries after another tab publishes first.                                                                                                                                           |
+| `spillOwnerLeaseMs`           | `60000`  | How long temporary query files stay claimed between renewals while a query is running.                                                                                                                      |
+| `transactionOwnerLeaseMs`     | `30000`  | Durable active-writer deadline, renewed while a live write scope waits or works. Expired crashed writers are atomically aborted and reclaimed by collection.                                                |
+| `transactionIdleTimeoutMs`    | `30000`  | How long an untouched `BEGIN` transaction may remain open before Minnow rolls it back. This prevents an abandoned transaction from keeping storage alive forever.                                           |
+| `autoCompact`                 | `true`   | Whether Minnow combines fragmented tables in the background; see [compaction](/docs/storage/maintenance).                                                                                                   |
+| `autoCollect`                 | `true`   | Whether Minnow removes replaced blocks, abandoned state, and old versions in the background; independent of `autoCompact`. See [garbage collection](/docs/storage/maintenance#garbage-collection).          |
+| `autoCollectDebtLimitCommits` | `4096`   | Maximum commits allowed to accumulate behind collection. At the ceiling, a writer assists collection before starting and refuses atomically with `MaintenanceBacklogError` if the store is still unhealthy. |
+| `executionMemoryBudgetBytes`  | 64 MiB   | Default modeled memory ceiling for every statement and internal query path. Eligible work spills; `null` explicitly opts into unbounded mode.                                                               |
+| `compaction`                  | `{}`     | Defaults for every compaction job, including background work. `partitionRows` defaults to 16,384. See [partitioned folds](/docs/storage/maintenance#partitioned-folds).                                     |
 
-The stock worker accepts the options that can be copied in its startup message: `compression`,
-`rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and `bufferPoolBytes`. It uses defaults for
-the others. A [custom worker entry](/docs/engine/workers#custom-worker-entries) can construct
+The stock worker accepts the cloneable options in its startup message, including `compression`,
+block sizing, retry and buffer limits, `executionMemoryBudgetBytes`, `transactionOwnerLeaseMs`,
+`transactionIdleTimeoutMs`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
+Function-valued seams remain worker-side. A
+[custom worker entry](/docs/engine/workers#custom-worker-entries) can construct
 `MinnowDatabase` with the full option set.
 
 ## Errors
@@ -122,7 +128,7 @@ Errors are classes, so they can be caught by kind rather than by matching a mess
 
 ```ts
 import { SqlCompileError, UniqueConstraintError } from "@minnowdb/core";
-import { WriteConflictError } from "@minnowdb/core/storage";
+import { WriteConflictError } from "@minnowdb/core/storage/contracts";
 ```
 
 `SqlCompileError` carries the `offset` and `length` of the offending span, which is what the

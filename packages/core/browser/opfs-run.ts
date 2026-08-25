@@ -8,8 +8,8 @@
  * its locks and loses nothing acknowledged, and that a fresh worker replays a log that has
  * crossed a checkpoint boundary.
  */
-import { MinnowDatabaseClient } from "../src/engine/client.js";
-import { UniqueConstraintError } from "../src/engine/errors.js";
+import { MinnowDatabaseClient } from "@minnowdb/core/client";
+import { UniqueConstraintError } from "@minnowdb/core";
 
 interface OpfsTestResult {
   /** One worker over the OPFS store: create, insert, read back. */
@@ -39,7 +39,7 @@ interface OpfsTestResult {
 }
 
 function spawn(): Worker {
-  return new Worker(new URL("../src/engine/worker.ts", import.meta.url), { type: "module" });
+  return new Worker(new URL("./published-worker.ts", import.meta.url), { type: "module" });
 }
 
 function uniqueName(prefix: string): string {

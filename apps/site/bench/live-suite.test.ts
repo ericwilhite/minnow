@@ -5,7 +5,7 @@
  * This proves the measurement itself — that it counts the right notifications, verifies the row
  * counts, and never credits a subscription the commit could not have affected.
  */
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { describe, expect, it } from "vitest";
 import { createMinnowDriver } from "./engines/minnow";
 import type { DatasetRecord } from "./protocol";

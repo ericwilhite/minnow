@@ -4,29 +4,29 @@ description: The durable adapter — options, durability, quota, and what it sto
 ---
 
 ```ts
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 
 const store = await IndexedDbBlockStore.open({
   name: "shop",
-  durability: "relaxed",
+  durability: "strict",
 });
 ```
 
-| Option                | Default     | Effect                                                                                                               |
-| --------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------- |
-| `name`                | —           | The IndexedDB database name. Two stores with the same name are the same database.                                    |
-| `durability`          | `"relaxed"` | `"strict"` flushes to disk per commit.                                                                               |
-| `uniqueKeyCacheBytes` | 8 MiB       | Maximum modeled memory for the optional complete key-membership cache. `0` disables it; point probes remain correct. |
-| `indexedDB`           | the global  | An `IDBFactory` to use instead, for tests.                                                                           |
+| Option                | Default    | Effect                                                                                                               |
+| --------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------- |
+| `name`                | —          | The IndexedDB database name. Two stores with the same name are the same database.                                    |
+| `durability`          | `"strict"` | `"relaxed"` allows the browser to defer the final disk flush for more write throughput.                              |
+| `uniqueKeyCacheBytes` | 8 MiB      | Maximum modeled memory for the optional complete key-membership cache. `0` disables it; point probes remain correct. |
+| `indexedDB`           | the global | An `IDBFactory` to use instead, for tests.                                                                           |
 
 ## Durability
 
-`relaxed` lets the browser batch flushes to disk. A commit is still atomic and still ordered — a
-tab that closes, crashes, or is killed loses nothing committed — but a power loss can lose the
-most recent commits, because the operating system had not written them yet.
+`strict`, the default, requests a disk flush for every commit. It costs write throughput, but an
+acknowledged commit is not intentionally left only in an operating-system cache.
 
-`strict` pays a real flush per commit. It is measurably slower on write-heavy work, and it is the
-right choice when data must survive the machine losing power rather than the tab going away.
+`relaxed` keeps the same atomic commit boundaries while allowing the browser to batch final disk
+flushes. It is an explicit performance choice for rebuildable or remotely synchronized data: a
+machine or storage-device power loss may lose an acknowledged suffix of commits.
 
 ## Quota
 
@@ -34,12 +34,17 @@ Browsers give an origin a share of free disk, not a fixed number, and evict from
 has not visited when space runs low.
 
 ```ts
+import { ensureOriginPersistence } from "@minnowdb/core/storage/persistence";
+
 const { quota, usage } = await navigator.storage.estimate();
-await navigator.storage.persist(); // ask to be exempt from eviction
+await ensureOriginPersistence("required");
 ```
 
-`persist()` prompts or silently grants depending on the browser and how engaged the user is with
-the site. Ask before writing a lot, and handle a refusal by writing less rather than by failing.
+Persistence may be granted silently, denied, or require a user gesture depending on the browser.
+`"required"` fails before the application opens its store when the browser cannot protect the
+origin from automatic quota eviction. Use `"request"` to receive a status instead, or
+`"best-effort"` to check without prompting. No browser API prevents the user from deliberately
+clearing site data, so export irreplaceable data or synchronize it elsewhere too.
 
 `getLogicalStorageBytes()` reports what this database occupies, which is the number to show a user
 and the one to watch before a bulk load:
@@ -50,22 +55,109 @@ await store.getLogicalStorageBytes();
 
 ## What it creates
 
-One IndexedDB database with nine object stores: `blocks`, `manifests`, `segments`, `transactions`,
-`catalog`, `leases`, `temp`, `gc`, and `statistics`. Block payloads are stored as `Uint8Array`
-values keyed by block id; everything else is small structured records.
+One IndexedDB database with ten object stores: `blocks`, `manifests`, `segments`, `transactions`,
+`catalog`, `leases`, `temp`, `gc`, `statistics`, and `snapshotHeaders`. Block payloads are stored as
+`Uint8Array` values keyed by block id. Manifest membership is interval provenance beside each
+block, so snapshot export can cursor the captured version without constructing a descriptor array;
+integrity checks cross-check that provenance against the payload store.
 
-Manifests are stored as a checkpoint every 32 commits with deltas in between, so publishing a
-commit writes work proportional to the blocks that changed rather than to the database's total
-size. Reads resolve a version by walking back to the nearest checkpoint.
+A resumable snapshot import keeps one scalar identity/progress marker in `catalog` until the final
+transaction publishes the manifest pointer and deletes the live marker atomically. Its header
+contains only per-kind counts and byte totals. Canonical metadata is carried as one semantic item
+per frame in `snapshotHeaders`; block frames carry one raw block. Metadata frames are at most
+4 MiB, one append accepts at most 64 frames and 16 MiB of metadata, and block payloads retain the
+normal block-size ceiling. No browser must clone database-sized metadata as one IndexedDB value.
+While the marker exists, ordinary catalog writes through the adapter abort; final publication also
+rechecks both the marker identity and the still-empty current-manifest pointer before it publishes
+anything.
 
-Unique keys use a hash-partitioned base plus a bounded tail of recent changes. Small and bulk-loaded
-tables can keep complete membership in memory to avoid repeated reads; the cache drops itself at
-`uniqueKeyCacheBytes`, after which writes probe only the relevant persistent partitions. The limit
-also works in a worker store descriptor:
+An application can inspect that state with `inspectInterruptedImport()`. Retrying the same snapshot
+continues it; `abortInterruptedImport(identity)` atomically verifies the marker and clears the
+still-unpublished target, including staged payloads, metadata frames, and any unrelated low-level
+writes made while the marker blocked normal engine use. A mismatched identity or a database that
+has since published refuses the abort without deleting anything.
+
+Once an import owner's bounded lease expires, a different snapshot may claim the still-empty
+target. That takeover first clears every staged block, table, segment, transaction, provenance
+record, metadata frame, and resource ledger in the same transaction that installs the new marker.
+If any part of that transaction fails, the old import remains intact and resumable.
+
+The importer writes blocks, tables, segments, transactions, UNIQUE generations, and posting
+generations in bounded frame batches and keeps durable cursors in the marker. Finish validates the
+staged stores with sequential cursors and then publishes the manifest summary, current pointer,
+catalog epoch, and completed replay identity atomically. An exact retry after a lost final response
+compares every payload byte and finishes as a no-op; a later commit removes the bounded completed
+identity record.
+
+Only one live snapshot export is admitted. Its backup lease is indexed by expiry and protects the
+captured manifest; an expired session is reclaimed before another begins. This bounds both durable
+pins and the adapter's descriptor cache even when a caller abandons an iterator.
+
+Each manifest is a fixed-size summary. Block membership is stored once as ordered interval
+provenance — the version that added the block and, when retired, the version that removed it.
+Publishing therefore writes work proportional to the changed blocks, never a periodic copy of all
+live block ids. Version membership checks are point reads, snapshot and maintenance scans are
+cursor-paged, and deleting an old manifest summary does not erase the provenance GC needs to finish
+reclaiming its retired blocks.
+
+UNIQUE membership uses immutable lexical generations plus at most 16 ordered commit tails. Every
+base or tail part is capped at 2,048 tokens and a conservative 2 MiB retained-size model. The
+seventeenth tail is folded by a bounded k-way merge into a new generation; the old generation and
+tails disappear in the same commit. Builds require globally strict lexical input, append the same
+bounded parts under an expiring owner, and publish by switching the namespace generation pointer
+in the same catalog transaction.
+
+Point and bulk probes seek only the predecessor parts for their requested tokens and retain one
+decoded part at a time. Small and bulk-loaded tables can still use the optional complete
+membership cache; it drops itself at `uniqueKeyCacheBytes`, after which persistent probes remain
+authoritative. The limit also works in a worker store descriptor:
 
 ```ts
 { store: { kind: "indexeddb", name: "shop", uniqueKeyCacheBytes: 4 * 1024 * 1024 } }
 ```
+
+## Hard growth ceilings
+
+IndexedDB quota failures otherwise arrive late and vary by browser. The adapter therefore applies
+fixed admission ceilings before the transaction that would cross them. A refusal throws
+`StorageResourceLimitError` and leaves the journal, catalog, manifest pointer, and payload stores
+unchanged. Expired owners and bounded terminal-history pages are reclaimed before admission where
+that is safe.
+
+| Durable resource                                         |                Ceiling |
+| -------------------------------------------------------- | ---------------------: |
+| Live reader/backup leases                                |                  4,096 |
+| Active transactions                                      |                  4,096 |
+| Globally staged transaction blocks / segments            |        65,536 / 65,536 |
+| Globally staged transaction payload bytes                |                512 MiB |
+| Catalog table/view records, including a pending table    |                  4,096 |
+| Catalog table/view metadata bytes                        |                 64 MiB |
+| Manifest summaries / metadata bytes                      |        65,536 / 64 MiB |
+| Segment records / metadata bytes                         |    1,048,576 / 512 MiB |
+| Active temp owners                                       |                  1,024 |
+| Temp runs per owner / total                              |         1,024 / 65,536 |
+| Temp pages per owner / total                             |       16,384 / 262,144 |
+| Temp bytes per owner / total                             |        512 MiB / 1 GiB |
+| Active compaction jobs / GC jobs                         |              1,024 / 1 |
+| Active UNIQUE / full-text / secondary-index builds       |      1,024 / 128 / 128 |
+| Staged accelerator bytes / entries across all builds     |     1 GiB / 16,777,216 |
+| Terminal transaction / compaction / completed-GC records | 65,536 / 4,096 / 1,024 |
+| Oldest pinned-manifest lag                               |         4,096 versions |
+| Retired blocks / bytes held by live pins                 |       65,536 / 512 MiB |
+| Total retained obsolete block history                    |                  1 GiB |
+
+These are corruption and unbounded-growth fuses, not suggested operating targets. Normal
+maintenance should keep the counts far below them. When a pin or backlog reaches a ceiling, let
+the owning read/export finish, run maintenance, or reduce write pressure before retrying.
+
+The byte columns are exact accounting units, not estimates of IndexedDB's browser-specific
+physical allocation. Catalog and segment ledgers charge the canonical UTF-8 record-wire bytes.
+Each manifest is charged as the canonical summary it will retain after pruning: an unpruned
+summary reserves the exact 24-byte UTC `prunedAt` tombstone spelling up front. Pruning can
+therefore replace a summary at the 64 MiB ceiling without needing one more byte to make the record
+collectable. The checked ledgers are updated in the same IndexedDB transaction as their records;
+full integrity mode recomputes them from the underlying stores and reports a mismatch as
+corruption.
 
 ## Multiple tabs
 
@@ -73,6 +165,29 @@ Several tabs may open the same database at once. Readers never block writers; co
 conflict, rebase, and retry. No coordination channel is involved — correctness comes from the
 storage transactions themselves, so it holds even when `BroadcastChannel` is unavailable or a
 message is lost.
+
+When a newer build requests an IndexedDB schema version, every Minnow connection closes itself on
+the browser's `versionchange` event so it cannot strand the open. If a non-cooperating connection
+blocks the open, `open()` rejects with `IndexedDbSchemaUpgradeBlockedError` instead of waiting
+forever. The error carries the database name and old/requested versions; close the older tab and
+retry. A request that already reported this error is marked abandoned, so it cannot wake later and
+silently upgrade or rebuild the database after its caller has moved on.
+
+## Schema compatibility and recovery
+
+IndexedDB schema 1 is Minnow's first and only initial native layout. There are no pre-contract
+schemas or compatibility branches. Future schema changes must add one
+ordered migration for every integer version between the database and the current build. All of
+those migrations run inside the browser's single `versionchange` transaction: either the complete
+chain and its data changes commit, or the old database remains byte-for-byte logical state. A
+frozen schema-1 database is opened, written, and checked in CI, and the migration registry refuses
+to load if a schema bump omitted or reordered a step.
+
+A build older than the database throws `StorageFormatVersionError` and leaves every store, index,
+and record untouched; it never downgrades or recreates the database. Malformed current-schema
+metadata is `StorageCorruptionError`, also without automatic deletion. Use snapshots or remote
+synchronization for recovery from genuine corruption or browser storage loss; no local adapter can
+reconstruct the only copy of bytes that are gone.
 
 One caveat worth knowing: a browser may throttle or suspend a background tab's IndexedDB activity.
 A long compaction in a hidden tab can simply stop making progress until it is foregrounded, which

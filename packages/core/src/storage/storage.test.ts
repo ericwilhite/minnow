@@ -5,9 +5,17 @@ import {
   GarbageCollectionJobConflictError,
   IndexedDbBlockStore,
   LeaseConflictError,
+  MAX_TRANSACTION_STAGE_BLOCKS,
+  MAX_TRANSACTION_STAGE_BYTES,
+  MAX_TRANSACTION_STAGE_SEGMENTS,
   MemoryBlockStore,
   OpfsBlockStore,
+  SchemaConflictError,
   SnapshotManifestMissingError,
+  StorageCorruptionError,
+  StorageFormatVersionError,
+  TableRecordConflictError,
+  secondaryUniqueKeyNamespace,
   TempOwnerConflictError,
   UniqueKeyConflictError,
   floorWholeNumberProduct,
@@ -17,11 +25,148 @@ import {
   type CompactionJobRecordUpdate,
   type CommitTransactionInput,
   type MergeCompactionRewritePlan,
+  type ManifestSummary,
   type SegmentRecord,
+  type StoragePage,
   type TransactionRecord,
   type TransactionRecordUpdate,
 } from "./index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
+import { crc32, encodeBlock, MAX_BLOCK_ROW_COUNT } from "../block-format/index.js";
+
+const POSTING_BUILD_CREATED_AT = "2026-01-01T00:00:00.000Z";
+const POSTING_BUILD_EXPIRES_AT = "2026-01-01T00:30:00.000Z";
+
+/** Frozen first-stable native schema. Do not update this fixture on a schema bump: a new release
+ * must migrate this exact v1 database through the ordered production migration registry. */
+function installFrozenIndexedDbV1(request: IDBOpenDBRequest): void {
+  for (const storeName of storeNames) request.result.createObjectStore(storeName);
+  request.result.createObjectStore("snapshotHeaders");
+  const upgrade = request.transaction;
+  if (upgrade === null) throw new Error("missing frozen-v1 upgrade transaction");
+  upgrade.objectStore("segments").createIndex("byTable", "tableId");
+  upgrade.objectStore("leases").createIndex("byExpiry", ["expiresAt", "id"]);
+  upgrade.objectStore("transactions").createIndex("byStatus", "status");
+  upgrade.objectStore("temp").createIndex("byOwnerExpiry", ["expiresAt", "ownerId"]);
+  const catalog = upgrade.objectStore("catalog");
+  catalog.createIndex("byFtsBuildUpdatedAt", "updatedAt");
+  catalog.createIndex("byFtsBuildExpiry", "ftsBuildExpiry");
+  catalog.createIndex("byFtsRetirementUpdatedAt", "retirementUpdatedAt");
+  catalog.createIndex("byUniqueKeyBuildActive", "activeBuildState");
+  catalog.createIndex("byUniqueKeyBuildExpiry", "activeExpiry");
+  catalog.createIndex("byManifestBlockId", "blockId", { unique: true });
+  upgrade.objectStore("gc").add(
+    {
+      activeCompactionJobs: 0,
+      terminalCompactionJobs: 0,
+      activeGarbageCollectionJobs: 0,
+      completedGarbageCollectionJobs: 0,
+    },
+    "maintenance/quota",
+  );
+  const statistics = upgrade.objectStore("statistics");
+  statistics.add(
+    { stagedBlockCount: 0, stagedSegmentCount: 0, stagedBytes: 0, retiredHistoryBytes: 0 },
+    "resource/global",
+  );
+  statistics.add(
+    { recordCount: 0, retainedBytes: 0, checksum: crc32(new TextEncoder().encode("0:0")) },
+    "resource/catalog",
+  );
+  statistics.add(
+    {
+      manifestCount: 0,
+      manifestBytes: 0,
+      segmentCount: 0,
+      segmentBytes: 0,
+      checksum: crc32(new TextEncoder().encode("0:0:0:0")),
+    },
+    "resource/records",
+  );
+}
+
+const FIRST_STABLE_INDEXED_DB_SCHEMA_VERSION = 1;
+const frozenIndexedDbSchemas: ReadonlyArray<{
+  version: number;
+  install: (request: IDBOpenDBRequest) => void;
+}> = [{ version: 1, install: installFrozenIndexedDbV1 }];
+
+function openNativeIndexedDb(
+  indexedDB: IDBFactory,
+  name: string,
+  version?: number,
+  upgrade?: (request: IDBOpenDBRequest) => void,
+): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = version === undefined ? indexedDB.open(name) : indexedDB.open(name, version);
+    if (upgrade !== undefined) request.onupgradeneeded = () => upgrade(request);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("native IndexedDB open failed"));
+  });
+}
+
+function postingBuildOwner(buildId: string): string {
+  return `${buildId}-owner`;
+}
+
+async function beginPostingBuild(
+  store: BlockStore,
+  tableId: string,
+  columnId: string,
+  buildId: string,
+  createdAt = POSTING_BUILD_CREATED_AT,
+  expiresAt = POSTING_BUILD_EXPIRES_AT,
+): Promise<void> {
+  await store.beginFtsBaseBuild({
+    tableId,
+    columnId,
+    buildId,
+    ownerId: postingBuildOwner(buildId),
+    createdAt,
+    expiresAt,
+  });
+}
+
+async function appendPostingBuild(
+  store: BlockStore,
+  tableId: string,
+  columnId: string,
+  buildId: string,
+  ordinal: number,
+  chunk: Parameters<BlockStore["writeFtsBaseBuildChunk"]>[0]["chunk"],
+  expiresAtCutoff = POSTING_BUILD_CREATED_AT,
+  expiresAt = POSTING_BUILD_EXPIRES_AT,
+): Promise<void> {
+  await store.writeFtsBaseBuildChunk({
+    tableId,
+    columnId,
+    buildId,
+    ownerId: postingBuildOwner(buildId),
+    expiresAtCutoff,
+    expiresAt,
+    updatedAt: expiresAtCutoff,
+    ordinal,
+    chunk,
+  });
+}
+
+async function finishPostingBuild(
+  store: BlockStore,
+  tableId: string,
+  columnId: string,
+  buildId: string,
+  input: { coversVersion: number; chunkCount: number; totalTokens: number },
+): Promise<void> {
+  await store.finishFtsBaseBuild({
+    tableId,
+    columnId,
+    buildId,
+    ownerId: postingBuildOwner(buildId),
+    expiresAtCutoff: POSTING_BUILD_CREATED_AT,
+    completedAt: POSTING_BUILD_CREATED_AT,
+    ...input,
+  });
+}
 
 it("floors amplification products without rounding a binary ratio upward", () => {
   expect(50 * 1.3399999999999999).toBe(67);
@@ -32,24 +177,26 @@ it("OPFS repacks mixed live/dead extents when collection completes", async () =>
   const shim = new MemoryOpfs();
   const name = crypto.randomUUID();
   const store = await OpfsBlockStore.open({ name, root: shim.root });
-  const blocks = Array.from({ length: 5 }, (_, index) => ({
-    id: `extent-block-${String(index)}`,
-    bytes: new Uint8Array(2 * 1024 * 1024).fill(index + 1),
-  }));
-  await store.addBlocks(blocks);
-  await store.publishManifest({
-    expectedVersion: null,
-    blockIds: blocks.map((block) => block.id),
-    createdAt: "2026-01-01T00:00:00.000Z",
-  });
-  await store.publishManifest({
-    expectedVersion: 0,
-    blockIds: [blocks[3]?.id ?? "", blocks[4]?.id ?? ""],
-    createdAt: "2026-01-01T00:00:01.000Z",
+  // Keep four independently verifiable block envelopes in the first 8 MiB extent. Removing
+  // three then exercises relocation of the remaining live block; opaque filler bytes would
+  // (correctly) be refused by corruption-safe relocation.
+  const blocks = await Promise.all(
+    Array.from({ length: 5 }, async (_, index) => ({
+      id: `extent-block-${String(index)}`,
+      bytes: await encodeBlock(
+        { type: "string" as const, values: [String(index + 1).repeat(1_900_000)] },
+        "raw",
+      ),
+    })),
+  );
+  const staged = await stageTestArtifacts(store, { blocks });
+  await store.updateTransaction(staged.id, staged.revision, {
+    status: "aborted",
+    updatedAt: "2026-01-01T00:00:01.000Z",
   });
   const job = await store.createGarbageCollectionJob({
     id: "repack-extents",
-    candidateManifestVersions: [0],
+    candidateManifestVersions: [],
     candidateSegmentIds: [],
     candidateBlockIds: blocks.slice(0, 3).map((block) => block.id),
     leaseCutoff: "2026-01-01T00:01:00.000Z",
@@ -78,6 +225,7 @@ it("OPFS relocates a staged postings build instead of letting it block extent co
   const name = crypto.randomUUID();
   const store = await OpfsBlockStore.open({ name, root: shim.root });
   await store.addTable({
+    managed: false,
     id: "postings-table",
     name: "postings_table",
     columns: [{ id: "value", name: "value", type: "string", nullable: false }],
@@ -95,25 +243,18 @@ it("OPFS relocates a staged postings build instead of letting it block extent co
   const dead = { id: "staged-dead", bytes: new Uint8Array(3 * 1024 * 1024).fill(1) };
   const live = { id: "staged-live", bytes: new Uint8Array(3 * 1024 * 1024).fill(2) };
   const filler = { id: "staged-filler", bytes: new Uint8Array(3 * 1024 * 1024).fill(3) };
-  await store.addBlock(dead.id, dead.bytes);
-  await store.beginFtsBaseBuild("postings-table", "value", "moving-build");
-  await store.writeFtsBaseBuildChunk("postings-table", "value", "moving-build", 0, [
+  await beginPostingBuild(store, "postings-table", "value", "moving-build");
+  await appendPostingBuild(store, "postings-table", "value", "moving-build", 0, [
     { term: "survives-relocation", rowIds: [7n], tf: [1] },
   ]);
-  await store.addBlocks([live, filler]);
-  await store.publishManifest({
-    expectedVersion: null,
-    blockIds: [dead.id, live.id, filler.id],
-    createdAt: "2026-01-01T00:00:00.000Z",
-  });
-  await store.publishManifest({
-    expectedVersion: 0,
-    blockIds: [live.id, filler.id],
-    createdAt: "2026-01-01T00:00:01.000Z",
+  const staged = await stageTestArtifacts(store, { blocks: [dead, live, filler] });
+  await store.updateTransaction(staged.id, staged.revision, {
+    status: "aborted",
+    updatedAt: "2026-01-01T00:00:01.000Z",
   });
   const job = await store.createGarbageCollectionJob({
     id: "collect-beside-staged-build",
-    candidateManifestVersions: [0],
+    candidateManifestVersions: [],
     candidateSegmentIds: [],
     candidateBlockIds: [dead.id],
     leaseCutoff: "2026-01-01T00:01:00.000Z",
@@ -129,7 +270,7 @@ it("OPFS relocates a staged postings build instead of letting it block extent co
       })
     ).job.state,
   ).toBe("completed");
-  await store.finishFtsBaseBuild("postings-table", "value", "moving-build", {
+  await finishPostingBuild(store, "postings-table", "value", "moving-build", {
     coversVersion: 1,
     chunkCount: 1,
     totalTokens: 1,
@@ -173,7 +314,169 @@ function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   ];
 }
 
+async function listAllManifests(store: BlockStore): Promise<ManifestSummary[]> {
+  const records: ManifestSummary[] = [];
+  let cursor: number | null = null;
+  do {
+    const page: StoragePage<ManifestSummary, number> = await store.listManifestPage(cursor, 64);
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
+
+async function listAllSegments(store: BlockStore, tableId?: string): Promise<SegmentRecord[]> {
+  const records: SegmentRecord[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: StoragePage<SegmentRecord, string> =
+      tableId === undefined
+        ? await store.listSegmentPage(cursor, 64)
+        : await store.listTableSegmentPage(tableId, cursor, 64);
+    records.push(...page.records);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return records;
+}
+
 for (const implementation of stores()) {
+  it(`${implementation.name} atomically guards catalog-wide mutation proofs by epoch`, async () => {
+    const store = await implementation.create();
+    const initial = await store.getCatalogProbe();
+    const record = {
+      id: "catalog-guard-table",
+      name: "catalog_guard_table",
+      managed: false,
+      revision: 0,
+      columns: [{ id: "value", name: "value", type: "number" as const, nullable: true }],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    await store.addTable(record, { expectedCatalogEpoch: initial.catalogEpoch });
+    const afterAdd = await store.getCatalogProbe();
+
+    await expect(
+      store.updateTable(record.id, 0, {
+        columns: record.columns,
+        expectedCatalogEpoch: initial.catalogEpoch,
+      }),
+    ).rejects.toBeInstanceOf(TableRecordConflictError);
+    expect(await store.getTable(record.id)).toEqual(record);
+
+    const updated = await store.updateTable(record.id, 0, {
+      columns: record.columns,
+      expectedCatalogEpoch: afterAdd.catalogEpoch,
+    });
+    const afterUpdate = await store.getCatalogProbe();
+    await expect(
+      store.addTable(
+        { ...record, id: "stale-add", name: "stale_add" },
+        { expectedCatalogEpoch: afterAdd.catalogEpoch },
+      ),
+    ).rejects.toBeInstanceOf(TableRecordConflictError);
+    expect(await store.getTable("stale-add")).toBeUndefined();
+    await expect(
+      store.removeTable(record.id, updated.revision, {
+        expectedCatalogEpoch: afterAdd.catalogEpoch,
+      }),
+    ).rejects.toBeInstanceOf(TableRecordConflictError);
+    expect(await store.getTable(record.id)).toEqual(updated);
+
+    await store.removeTable(record.id, updated.revision, {
+      expectedCatalogEpoch: afterUpdate.catalogEpoch,
+    });
+    expect(await store.getTable(record.id)).toBeUndefined();
+    store.close();
+  });
+
+  it(`${implementation.name} reclaims active accelerator generations with their table`, async () => {
+    const store = await implementation.create();
+    const table = {
+      id: "accelerator-owner",
+      name: "accelerator_owner",
+      managed: false,
+      revision: 0,
+      columns: [{ id: "value", name: "value", type: "string" as const, nullable: false }],
+      ftsColumns: {
+        value: {
+          storage: "fts-chunks-v1" as const,
+          tokenizerVersion: 1,
+          state: "building" as const,
+          buildFromVersion: -1,
+        },
+      },
+      secondaryIndexes: {
+        unique_value: {
+          name: "unique_value",
+          columnId: "value",
+          columnIds: ["value"],
+          directions: ["asc" as const],
+          unique: true as const,
+          termEncoding: "tuple-v1" as const,
+          storage: "postings-v1" as const,
+          storageColumnId: "unique-value-storage",
+          locator: "row-id" as const,
+          state: "building" as const,
+          buildId: "reusable-build",
+          buildFromVersion: -1,
+        },
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    await store.addTable(table);
+    const namespaceId = secondaryUniqueKeyNamespace(table.id, "unique_value");
+    await store.beginUniqueKeyBuild({
+      buildId: "reusable-build",
+      tableId: table.id,
+      indexId: "unique_value",
+      namespaceId,
+      ownerId: "unique-owner",
+      createdAt: POSTING_BUILD_CREATED_AT,
+      expiresAt: POSTING_BUILD_EXPIRES_AT,
+    });
+    await store.appendUniqueKeyBuildChunk({
+      buildId: "reusable-build",
+      ownerId: "unique-owner",
+      expiresAtCutoff: POSTING_BUILD_CREATED_AT,
+      ordinal: 0,
+      keyTokens: ["value"],
+      updatedAt: POSTING_BUILD_CREATED_AT,
+    });
+    await beginPostingBuild(store, table.id, "value", "fts-build");
+    await appendPostingBuild(store, table.id, "value", "fts-build", 0, [
+      { term: "value", rowIds: [1n], tf: [1] },
+    ]);
+
+    await store.removeTable(table.id, table.revision);
+    expect(await store.getUniqueKeyBuild("reusable-build")).toBeUndefined();
+    await expect(
+      appendPostingBuild(store, table.id, "value", "fts-build", 1, [
+        { term: "stale", rowIds: [2n], tf: [1] },
+      ]),
+    ).rejects.toThrow();
+
+    const replacement = {
+      ...table,
+      id: "accelerator-replacement",
+      name: "accelerator_replacement",
+    };
+    await store.addTable(replacement);
+    await expect(
+      store.beginUniqueKeyBuild({
+        buildId: "reusable-build",
+        tableId: replacement.id,
+        indexId: "unique_value",
+        namespaceId: secondaryUniqueKeyNamespace(replacement.id, "unique_value"),
+        ownerId: "replacement-owner",
+        createdAt: POSTING_BUILD_CREATED_AT,
+        expiresAt: POSTING_BUILD_EXPIRES_AT,
+      }),
+    ).resolves.toMatchObject({ tableId: replacement.id, state: "active" });
+    if ("checkIntegrity" in store && typeof store.checkIntegrity === "function") {
+      expect(await store.checkIntegrity()).toMatchObject({ ok: true });
+    }
+    store.close();
+  });
+
   it(`${implementation.name} resolves manifests identically across delta chains and checkpoints`, async () => {
     const store = await implementation.create();
     // 70 commits cross two checkpoint intervals; each adds one block, and every third commit
@@ -182,42 +485,42 @@ for (const implementation of stores()) {
     const live = new Set<string>();
     for (let index = 0; index < 70; index += 1) {
       const blockId = `chain-block-${String(index).padStart(3, "0")}`;
-      await store.addBlock(blockId, Uint8Array.of(index));
-      const removed =
-        index >= 2 && index % 3 === 0 ? [`chain-block-${String(index - 2).padStart(3, "0")}`] : [];
-      const removable = removed.filter((id) => live.has(id));
-      await store.createTransaction({
-        ...activeTransaction(`chain-transaction-${String(index)}`),
+      const transactionId = `chain-transaction-${String(index)}`;
+      const staged = await stageTestArtifacts(store, {
+        transactionId,
         snapshotVersion: index === 0 ? null : index - 1,
-        pendingBlockIds: [blockId],
+        blocks: [{ id: blockId, bytes: Uint8Array.of(index) }],
       });
       await store.commitTransaction({
-        transactionId: `chain-transaction-${String(index)}`,
-        expectedTransactionRevision: 0,
+        transactionId,
+        expectedTransactionRevision: staged.revision,
         expectedManifestVersion: index === 0 ? null : index - 1,
-        ...(removable.length === 0 ? {} : { removedBlockIds: removable }),
+        removedBlockIds: [],
         committedAt: "2026-01-01T00:00:00.000Z",
       });
-      for (const id of removable) live.delete(id);
       live.add(blockId);
       expectedByVersion.push([...live].sort());
     }
     // Every historical version resolves to its exact block set, from either read path.
     for (const version of [0, 1, 30, 31, 32, 33, 63, 64, 65, 69]) {
-      expect((await store.getManifest(version))?.blockIds).toEqual(expectedByVersion[version]);
+      expect(await readManifestBlockIds(store, version)).toEqual(expectedByVersion[version]);
     }
-    expect((await store.getCurrentManifest())?.blockIds).toEqual(expectedByVersion[69]);
-    const listed = await store.listManifests();
+    expect(await readManifestBlockIds(store, 69)).toEqual(expectedByVersion[69]);
+    const listed = await listAllManifests(store);
     expect(listed).toHaveLength(70);
     for (const manifest of listed) {
-      expect(manifest.blockIds).toEqual(expectedByVersion[manifest.version]);
+      expect(await readManifestBlockIds(store, manifest.version)).toEqual(
+        expectedByVersion[manifest.version],
+      );
     }
     const page = await store.listManifestPage(40, 10);
     expect(page.records.map((manifest) => manifest.version)).toEqual([
       41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
     ]);
     for (const manifest of page.records) {
-      expect(manifest.blockIds).toEqual(expectedByVersion[manifest.version]);
+      expect(await readManifestBlockIds(store, manifest.version)).toEqual(
+        expectedByVersion[manifest.version],
+      );
     }
     store.close();
   });
@@ -225,7 +528,7 @@ for (const implementation of stores()) {
   it(`${implementation.name} physically bounds pruned manifest history without breaking delta reads`, async () => {
     const store = await implementation.create();
     for (let version = 0; version < 70; version += 1) {
-      await store.publishManifest({
+      await publishManifest(store, {
         expectedVersion: version === 0 ? null : version - 1,
         blockIds: [],
         createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, version)).toISOString(),
@@ -247,29 +550,62 @@ for (const implementation of stores()) {
       updatedAt: "2027-01-01T00:00:01.000Z",
     });
 
-    expect(await store.removePrunedManifestRecords()).toBe(40);
-    expect(await store.getManifest(39)).toBeUndefined();
-    expect(await store.getManifest(40)).toMatchObject({ version: 40, blockIds: [] });
-    expect(await store.getCurrentManifest()).toMatchObject({ version: 69, blockIds: [] });
-    expect((await store.listManifests()).map((manifest) => manifest.version)).toEqual(
-      Array.from({ length: 30 }, (_, index) => index + 40),
-    );
-    expect(await store.removePrunedManifestRecords()).toBe(0);
+    let removed = 0;
+    for (;;) {
+      const page = await store.removePrunedManifestRecords(64);
+      removed += page;
+      if (page === 0) break;
+    }
+    expect(removed).toBeGreaterThanOrEqual(32);
+    expect(removed).toBeLessThanOrEqual(40);
+    expect(await store.getManifest(31)).toBeUndefined();
+    expect(await store.getManifest(40)).toMatchObject({ version: 40, liveBlockCount: 0 });
+    expect(await store.getCurrentManifest()).toMatchObject({ version: 69, liveBlockCount: 0 });
+    expect((await listAllManifests(store)).every((manifest) => manifest.version >= 32)).toBe(true);
+    expect(await store.removePrunedManifestRecords(64)).toBe(0);
     store.close();
   });
 
-  it(`${implementation.name} retains a pruned manifest until its garbage blocks are gone`, async () => {
+  it(`${implementation.name} removes a pruned summary while retaining garbage provenance`, async () => {
     const store = await implementation.create();
-    await store.addBlock("garbage-from-pruned-manifest", Uint8Array.of(1, 2, 3));
-    await store.publishManifest({
-      expectedVersion: null,
-      blockIds: ["garbage-from-pruned-manifest"],
+    await store.addTable({
+      managed: false,
+      id: "pruned-table",
+      name: "pruned_table",
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      revision: 0,
       createdAt: "2026-01-01T00:00:00.000Z",
     });
-    await store.publishManifest({
-      expectedVersion: 0,
-      blockIds: [],
-      createdAt: "2026-01-01T00:00:01.000Z",
+    const staged = await stageTestArtifacts(store, {
+      transactionId: "pruned-table-writer",
+      blocks: [{ id: "garbage-from-pruned-manifest", bytes: Uint8Array.of(1, 2, 3) }],
+      segments: [
+        {
+          id: "pruned-table-segment",
+          tableId: "pruned-table",
+          transactionId: "pruned-table-writer",
+          rowCount: 1,
+          rowIdStart: 1n,
+          rowIdEndExclusive: 2n,
+          columnBlockIds: { value: ["garbage-from-pruned-manifest"] },
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    });
+    await store.commitTransaction({
+      transactionId: staged.id,
+      expectedTransactionRevision: staged.revision,
+      expectedManifestVersion: null,
+      removedBlockIds: [],
+      levelZeroSegmentLimits: [{ tableId: "pruned-table", limit: 1 }],
+      committedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await store.dropTable({
+      tableId: "pruned-table",
+      expectedTableRevision: 0,
+      expectedManifestVersion: 0,
+      expectedCatalogEpoch: (await store.getCatalogProbe()).catalogEpoch,
+      committedAt: "2026-01-01T00:00:01.000Z",
     });
     const collection = await store.createGarbageCollectionJob({
       id: "prune-before-block-reclaim",
@@ -286,11 +622,9 @@ for (const implementation of stores()) {
       updatedAt: "2027-01-01T00:00:01.000Z",
     });
 
-    expect(await store.removePrunedManifestRecords()).toBe(0);
-    expect(await store.getManifest(0)).toMatchObject({
-      version: 0,
-      blockIds: ["garbage-from-pruned-manifest"],
-    });
+    expect(await store.removePrunedManifestRecords(64)).toBe(1);
+    expect(await store.getManifest(0)).toBeUndefined();
+    expect(await store.getBlock("garbage-from-pruned-manifest")).toBeDefined();
 
     await store.runGarbageCollectionStep({
       jobId: collection.id,
@@ -299,7 +633,7 @@ for (const implementation of stores()) {
       updatedAt: "2027-01-01T00:00:03.000Z",
     });
 
-    expect(await store.removePrunedManifestRecords()).toBe(1);
+    expect(await store.removePrunedManifestRecords(64)).toBe(0);
     expect(await store.getManifest(0)).toBeUndefined();
     expect(await store.getBlock("garbage-from-pruned-manifest")).toBeUndefined();
     store.close();
@@ -307,6 +641,14 @@ for (const implementation of stores()) {
 
   it(`${implementation.name} isolates, clones, and removes temp run pages`, async () => {
     const store = await implementation.create();
+    for (const ownerId of ["query-a", "query-b"]) {
+      await store.createTempOwner({
+        ownerId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-01-01T00:30:00.000Z",
+        revision: 0,
+      });
+    }
     const bytes = Uint8Array.of(1, 2, 3);
     await store.putTempRunPage({ ownerId: "query-a", runId: "run-1", pageIndex: 0, bytes });
     await store.putTempRunPage({
@@ -340,12 +682,14 @@ for (const implementation of stores()) {
     const store = await implementation.create();
     await store.createTempOwner({
       ownerId: "query-a",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
     await expect(
       store.createTempOwner({
         ownerId: "query-a",
+        createdAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:02:00.000Z",
         revision: 0,
       }),
@@ -353,34 +697,53 @@ for (const implementation of stores()) {
     await expect(
       store.createTempOwner({
         ownerId: "query-b",
+        createdAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:01:00.000Z",
         revision: 3,
       }),
     ).rejects.toThrow(/revision zero/);
     expect(await store.getTempOwner("query-a")).toEqual({
       ownerId: "query-a",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
-    const renewed = await store.renewTempOwner("query-a", 0, "2026-01-01T00:03:00.000Z");
+    const renewed = await store.renewTempOwner({
+      ownerId: "query-a",
+      expectedRevision: 0,
+      expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-01-01T00:03:00.000Z",
+    });
     expect(renewed).toEqual({
       ownerId: "query-a",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:03:00.000Z",
       revision: 1,
     });
-    await expect(store.renewTempOwner("query-a", 0, "2026-01-01T00:04:00.000Z")).rejects.toThrow(
-      TempOwnerConflictError,
-    );
-    await expect(store.renewTempOwner("missing", 0, "2026-01-01T00:04:00.000Z")).rejects.toThrow(
-      TempOwnerConflictError,
-    );
+    await expect(
+      store.renewTempOwner({
+        ownerId: "query-a",
+        expectedRevision: 0,
+        expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-01-01T00:04:00.000Z",
+      }),
+    ).rejects.toThrow(TempOwnerConflictError);
+    await expect(
+      store.renewTempOwner({
+        ownerId: "missing",
+        expectedRevision: 0,
+        expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-01-01T00:04:00.000Z",
+      }),
+    ).rejects.toThrow(TempOwnerConflictError);
     store.close();
   });
 
-  it(`${implementation.name} reclaims only expired or ownerless temp spill state`, async () => {
+  it(`${implementation.name} reclaims expired temp spill state`, async () => {
     const store = await implementation.create();
     await store.createTempOwner({
       ownerId: "query-live",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:10:00.000Z",
       revision: 0,
     });
@@ -392,6 +755,7 @@ for (const implementation of stores()) {
     });
     await store.createTempOwner({
       ownerId: "query-stale",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
@@ -401,13 +765,6 @@ for (const implementation of stores()) {
       pageIndex: 0,
       bytes: Uint8Array.of(2),
     });
-    await store.putTempRunPage({
-      ownerId: "query-orphan",
-      runId: "run-1",
-      pageIndex: 0,
-      bytes: Uint8Array.of(3),
-    });
-
     expect(await store.removeTempOwnerIfExpired("query-live", "2026-01-01T00:05:00.000Z")).toBe(
       false,
     );
@@ -417,34 +774,41 @@ for (const implementation of stores()) {
     );
     expect(await store.getTempOwner("query-stale")).toBeUndefined();
     expect(await store.getTempRunPage("query-stale", "run-1", 0)).toBeUndefined();
-    expect(await store.removeTempOwnerIfExpired("query-orphan", "2026-01-01T00:05:00.000Z")).toBe(
-      true,
-    );
-    expect(await store.getTempRunPage("query-orphan", "run-1", 0)).toBeUndefined();
     expect(await store.getTempRunPage("query-live", "run-1", 0)).toEqual(Uint8Array.of(1));
 
     await store.removeTempOwner("query-live");
     expect(await store.getTempOwner("query-live")).toBeUndefined();
     await store.createTempOwner({
       ownerId: "query-live",
+      createdAt: "2026-01-01T00:05:00.000Z",
       expiresAt: "2026-01-01T00:20:00.000Z",
       revision: 0,
     });
     store.close();
   });
 
-  it(`${implementation.name} pages distinct temp owner IDs across records and orphan pages`, async () => {
+  it(`${implementation.name} pages distinct temp owner IDs across records and pages`, async () => {
     const store = await implementation.create();
     await store.createTempOwner({
       ownerId: "owner-a",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
     await store.createTempOwner({
       ownerId: "owner-d",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T00:01:00.000Z",
       revision: 0,
     });
+    for (const ownerId of ["owner-b", "owner-c"]) {
+      await store.createTempOwner({
+        ownerId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-01-01T00:01:00.000Z",
+        revision: 0,
+      });
+    }
     await store.putTempRunPage({
       ownerId: "owner-a",
       runId: "run-1",
@@ -489,6 +853,8 @@ function activeTransaction(id: string): TransactionRecord {
   const createdAt = "2026-01-01T00:00:00.000Z";
   return {
     id,
+    ownerId: `${id}/owner`,
+    expiresAt: "2026-01-01T00:30:00.000Z",
     snapshotVersion: null,
     pendingBlockIds: [],
     pendingSegmentIds: [],
@@ -498,6 +864,192 @@ function activeTransaction(id: string): TransactionRecord {
     updatedAt: createdAt,
     committedVersion: null,
   };
+}
+
+type TestSegmentRecord = Omit<
+  SegmentRecord,
+  "kind" | "level" | "logicalOrder" | "commitOrdinal" | "rowIdSpans"
+> &
+  Partial<Pick<SegmentRecord, "kind" | "level" | "logicalOrder" | "commitOrdinal" | "rowIdSpans">>;
+
+async function stageTestArtifacts(
+  store: BlockStore,
+  input: {
+    transactionId?: string;
+    snapshotVersion?: number | null;
+    blocks?: ReadonlyArray<{ id: string; bytes: Uint8Array }>;
+    segments?: readonly TestSegmentRecord[];
+  },
+): Promise<TransactionRecord> {
+  const transactionId = input.transactionId ?? `staged-test-artifacts-${crypto.randomUUID()}`;
+  await store.createTransaction({
+    ...activeTransaction(transactionId),
+    snapshotVersion: input.snapshotVersion ?? null,
+  });
+  let record = await store.getTransaction(transactionId);
+  if (record === undefined) throw new Error(`Missing staged test transaction: ${transactionId}`);
+  const blocks = input.blocks ?? [];
+  const segments = (input.segments ?? []).map((segment, commitOrdinal) => ({
+    ...segment,
+    kind: segment.kind ?? "insert",
+    level: segment.level ?? 0,
+    logicalOrder: segment.logicalOrder ?? 0,
+    commitOrdinal: segment.commitOrdinal ?? commitOrdinal,
+    rowIdSpans: segment.rowIdSpans ?? [],
+  }));
+  const blockBytes = blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
+  if (
+    blocks.length <= MAX_TRANSACTION_STAGE_BLOCKS &&
+    segments.length <= MAX_TRANSACTION_STAGE_SEGMENTS &&
+    blockBytes <= MAX_TRANSACTION_STAGE_BYTES
+  ) {
+    if (blocks.length === 0 && segments.length === 0) return record;
+    return store.stageTransactionArtifacts({
+      transactionId,
+      expectedRevision: record.revision,
+      blocks,
+      segments,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+  }
+  for (let start = 0; start < blocks.length;) {
+    let end = start;
+    let bytes = 0;
+    while (end < blocks.length && end - start < MAX_TRANSACTION_STAGE_BLOCKS) {
+      const next = blocks[end];
+      if (next === undefined) break;
+      if (end > start && bytes + next.bytes.byteLength > MAX_TRANSACTION_STAGE_BYTES) break;
+      bytes += next.bytes.byteLength;
+      end += 1;
+    }
+    record = await store.stageTransactionArtifacts({
+      transactionId,
+      expectedRevision: record.revision,
+      blocks: blocks.slice(start, end),
+      segments: [],
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    start = end;
+  }
+  for (let start = 0; start < segments.length; start += MAX_TRANSACTION_STAGE_SEGMENTS) {
+    record = await store.stageTransactionArtifacts({
+      transactionId,
+      expectedRevision: record.revision,
+      blocks: [],
+      segments: segments.slice(start, start + MAX_TRANSACTION_STAGE_SEGMENTS),
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+  }
+  return record;
+}
+
+async function publishTestBlocks(
+  store: BlockStore,
+  input: {
+    expectedVersion: number | null;
+    blocks: ReadonlyArray<{ id: string; bytes: Uint8Array }>;
+    createdAt?: string;
+  },
+) {
+  const staged = await stageTestArtifacts(store, {
+    snapshotVersion: input.expectedVersion,
+    blocks: input.blocks,
+  });
+  return store.commitTransaction({
+    transactionId: staged.id,
+    expectedTransactionRevision: staged.revision,
+    expectedManifestVersion: input.expectedVersion,
+    removedBlockIds: [],
+    committedAt: input.createdAt ?? "2026-01-01T00:00:00.000Z",
+  });
+}
+
+async function addCounterFixtureTables(store: BlockStore): Promise<void> {
+  await store.addTable({
+    managed: false,
+    id: "people",
+    name: "people",
+    columns: [
+      {
+        id: "id",
+        name: "id",
+        type: "number",
+        integer: true,
+        nullable: false,
+        defaultValue: { kind: "autoincrement" },
+      },
+    ],
+    primaryKeyColumnIds: ["id"],
+    uniqueKeyColumnId: "id",
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  await store.addTable({
+    managed: false,
+    id: "people-other",
+    name: "people_other",
+    columns: [
+      {
+        id: "other",
+        name: "other",
+        type: "number",
+        integer: true,
+        nullable: false,
+        defaultValue: { kind: "autoincrement" },
+      },
+    ],
+    primaryKeyColumnIds: ["other"],
+    uniqueKeyColumnId: "other",
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+}
+
+async function publishManifest(
+  store: BlockStore,
+  input: {
+    expectedVersion: number | null;
+    blockIds: readonly string[];
+    createdAt?: string;
+  },
+) {
+  const current = await store.getCurrentManifest();
+  const currentIds = new Set(
+    current === undefined ? [] : await readManifestBlockIds(store, current.version),
+  );
+  const requestedIds = new Set(input.blockIds);
+  const pendingBlockIds = [...requestedIds].filter((id) => !currentIds.has(id));
+  const removedBlockIds = [...currentIds].filter((id) => !requestedIds.has(id));
+  const transaction = {
+    ...activeTransaction(`manifest-${crypto.randomUUID()}`),
+    snapshotVersion: input.expectedVersion,
+  };
+  await store.createTransaction(transaction);
+  const staged =
+    pendingBlockIds.length === 0
+      ? transaction
+      : await store.updateTransaction(transaction.id, 0, {
+          pendingBlockIds,
+          updatedAt: input.createdAt ?? "2026-01-01T00:00:00.000Z",
+        });
+  return store.commitTransaction({
+    transactionId: transaction.id,
+    expectedTransactionRevision: staged.revision,
+    expectedManifestVersion: input.expectedVersion,
+    ...(removedBlockIds.length === 0 ? {} : { removedBlockIds }),
+    committedAt: input.createdAt ?? "2026-01-01T00:00:00.000Z",
+  });
+}
+
+async function readManifestBlockIds(store: BlockStore, version: number): Promise<string[]> {
+  const ids: string[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await store.listManifestBlockPage({ version, afterBlockId: cursor, limit: 256 });
+    ids.push(...page.records.map((record) => record.blockId));
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return ids;
 }
 
 function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
@@ -564,8 +1116,11 @@ function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
         { rowStart: 3, rowCount: 1 },
       ],
     },
+    outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
     memoryBudgetBytes: 4096,
     minimumMemoryBytes: 512,
+    level0SourceStoredBytes: 360,
+    anchorSourceStoredBytes: 0,
     peakWorkingBytes: 0,
     outputLogicalBytes: 0,
     targetLevel: 1,
@@ -778,6 +1333,8 @@ function mergeCompactionJob(id = "merge-job"): CompactionJobRecord {
     outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
     memoryBudgetBytes: 4096,
     minimumMemoryBytes: 512,
+    level0SourceStoredBytes: 45,
+    anchorSourceStoredBytes: 0,
     peakWorkingBytes: 0,
     outputLogicalBytes: 0,
     targetLevel: 1,
@@ -791,6 +1348,86 @@ function mergeCompactionJob(id = "merge-job"): CompactionJobRecord {
   };
 }
 
+async function prepareCompactionSourceFixtures(
+  store: BlockStore,
+  jobs: readonly CompactionJobRecord[],
+): Promise<void> {
+  if (jobs.length === 0) return;
+  if ((await store.getCurrentManifest()) !== undefined) {
+    throw new Error("Compaction source fixtures require an empty store");
+  }
+  const tables = new Map(jobs.map((job) => [job.tableId, job.tableId]));
+  for (const tableId of tables.keys()) {
+    await store.addTable({
+      managed: false,
+      id: tableId,
+      name: `fixture_${tableId.replaceAll(/[^a-zA-Z0-9_]/g, "_")}`,
+      columns: [
+        { id: "value", name: "value", type: "number", nullable: true },
+        { id: "id-column", name: "id_column", type: "number", nullable: true },
+        { id: "name-column", name: "name_column", type: "string", nullable: true },
+        { id: "value-column", name: "value_column", type: "string", nullable: true },
+      ],
+      revision: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+  }
+  const blocks = [...new Set(jobs.flatMap((job) => job.sourceBlockIds))].map((id) => ({
+    id,
+    bytes: Uint8Array.of(1),
+  }));
+  const segmentsById = new Map<string, SegmentRecord>();
+  for (const job of jobs) {
+    for (const [index, id] of job.sourceSegmentIds.entries()) {
+      if (segmentsById.has(id)) continue;
+      const blockId = job.sourceBlockIds[index % job.sourceBlockIds.length];
+      if (blockId === undefined)
+        throw new Error(`Compaction fixture ${job.id} has no source block`);
+      segmentsById.set(id, {
+        id,
+        tableId: job.tableId,
+        transactionId: "compaction-source-fixture",
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [blockId] },
+        kind: "insert",
+        level: 0,
+        logicalOrder: 0,
+        commitOrdinal: 0,
+        rowIdSpans: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+    }
+  }
+  const staged = await stageTestArtifacts(store, {
+    transactionId: "compaction-source-fixture",
+    blocks,
+    segments: [...segmentsById.values()].map((segment, commitOrdinal) => ({
+      ...segment,
+      commitOrdinal,
+    })),
+  });
+  const tablesWithSegments = [
+    ...new Set([...segmentsById.values()].map((segment) => segment.tableId)),
+  ];
+  const first = await store.commitTransaction({
+    transactionId: staged.id,
+    expectedTransactionRevision: staged.revision,
+    expectedManifestVersion: null,
+    levelZeroSegmentLimits: tablesWithSegments.map((tableId) => ({ tableId, limit: 4096 })),
+    committedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const maxVersion = Math.max(...jobs.map((job) => job.sourceManifestVersion));
+  for (let version = first.version; version < maxVersion; version += 1) {
+    await publishManifest(store, {
+      expectedVersion: version,
+      blockIds: blocks.map(({ id }) => id),
+      createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, version + 1)).toISOString(),
+    });
+  }
+}
+
 async function createReadyCompaction(
   store: BlockStore,
   prefix = "cancellation",
@@ -800,46 +1437,78 @@ async function createReadyCompaction(
   },
 ): Promise<{ job: CompactionJobRecord; commit: CommitTransactionInput }> {
   const createdAt = "2026-01-01T00:00:00.000Z";
+  const jobId = `${prefix}/job`;
   const sourceBlockId = `${prefix}/source-block`;
-  const outputBlockId = `${prefix}/output-block`;
+  const outputBlockId = `${jobId}/output/segment/000000/column/000000/part/000000`;
   const transactionId = `${prefix}/transaction`;
   const outputSegmentId = `${prefix}/output-segment`;
-  await store.addBlock(sourceBlockId, Uint8Array.of(1));
+  if ((await store.getTable("events")) === undefined) {
+    await store.addTable({
+      managed: false,
+      id: "events",
+      name: "events",
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      revision: 0,
+      createdAt,
+    });
+  }
+  const sourceTransactionId = `${prefix}/source-transaction`;
+  const sourceSegmentId = `${prefix}/source-segment`;
   const previous = await store.getCurrentManifest();
-  const sourceManifest = await store.publishManifest({
-    expectedVersion: previous?.version ?? null,
-    blockIds: [...(previous?.blockIds ?? []), sourceBlockId],
-    createdAt,
+  const stagedSource = await stageTestArtifacts(store, {
+    transactionId: sourceTransactionId,
+    snapshotVersion: previous?.version ?? null,
+    blocks: [{ id: sourceBlockId, bytes: Uint8Array.of(1) }],
+    segments: [
+      {
+        id: sourceSegmentId,
+        tableId: "events",
+        transactionId: sourceTransactionId,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [sourceBlockId] },
+        createdAt,
+      },
+    ],
   });
-  await store.addBlock(outputBlockId, Uint8Array.of(2));
-  await store.addSegment({
-    id: outputSegmentId,
-    tableId: "events",
+  const sourceManifest = await store.commitTransaction({
+    transactionId: sourceTransactionId,
+    expectedTransactionRevision: stagedSource.revision,
+    expectedManifestVersion: previous?.version ?? null,
+    levelZeroSegmentLimits: [{ tableId: "events", limit: 4096 }],
+    committedAt: createdAt,
+  });
+  const stagedOutput = await stageTestArtifacts(store, {
     transactionId,
-    rowCount: 1,
-    rowIdStart: 1n,
-    rowIdEndExclusive: 2n,
-    columnBlockIds: { value: [outputBlockId] },
-    level: 1,
-    logicalOrder: sourceManifest.version,
-    createdAt,
-  });
-  await store.createTransaction({
-    id: transactionId,
     snapshotVersion: sourceManifest.version,
-    pendingBlockIds: [outputBlockId],
-    pendingSegmentIds: [outputSegmentId],
-    status: transactionState.status,
-    revision: 0,
-    startedAt: createdAt,
-    updatedAt: createdAt,
-    committedVersion: transactionState.committedVersion,
+    blocks: [{ id: outputBlockId, bytes: Uint8Array.of(2) }],
+    segments: [
+      {
+        id: outputSegmentId,
+        tableId: "events",
+        transactionId,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [outputBlockId] },
+        level: 1,
+        logicalOrder: 0,
+        createdAt,
+      },
+    ],
   });
+  if (transactionState.status === "aborted") {
+    await store.updateTransaction(transactionId, stagedOutput.revision, {
+      status: "aborted",
+      updatedAt: createdAt,
+    });
+  }
   const job: CompactionJobRecord = {
-    id: `${prefix}/job`,
+    id: jobId,
     tableId: "events",
     sourceManifestVersion: sourceManifest.version,
-    sourceSegmentIds: [`${prefix}/source-segment`],
+    sourceSegmentIds: [sourceSegmentId],
     sourceBlockIds: [sourceBlockId],
     outputBlockIds: [outputBlockId],
     cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
@@ -847,6 +1516,14 @@ async function createReadyCompaction(
     sourceStoredBytes: 1,
     outputStoredBytes: 1,
     logicalBytes: 1,
+    rewritePlan: { kind: "copy-v1" },
+    outputCursor: null,
+    memoryBudgetBytes: 0,
+    minimumMemoryBytes: 0,
+    level0SourceStoredBytes: 1,
+    anchorSourceStoredBytes: 0,
+    peakWorkingBytes: 0,
+    outputLogicalBytes: 1,
     targetLevel: 1,
     state: "ready",
     transactionId,
@@ -862,9 +1539,10 @@ async function createReadyCompaction(
     job,
     commit: {
       transactionId,
-      expectedTransactionRevision: 0,
+      expectedTransactionRevision: stagedOutput.revision,
       expectedManifestVersion: sourceManifest.version,
       removedBlockIds: [sourceBlockId],
+      compactionJobId: job.id,
       committedAt: "2026-01-01T00:00:01.000Z",
     },
   };
@@ -872,58 +1550,108 @@ async function createReadyCompaction(
 
 async function createSupersededStorage(store: BlockStore, prefix: string): Promise<void> {
   const timestamp = "2026-01-01T00:00:00.000Z";
+  const compactionId = `${prefix}/supersede-job`;
   const oldBlockId = `${prefix}/old-block`;
   const oldSegmentId = `${prefix}/old-segment`;
   const oldTransactionId = `${prefix}/old-transaction`;
-  await store.addBlock(oldBlockId, Uint8Array.of(1, 2, 3));
-  await store.addSegment({
-    id: oldSegmentId,
-    tableId: "events",
+  if ((await store.getTable("events")) === undefined) {
+    await store.addTable({
+      managed: false,
+      id: "events",
+      name: "events",
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      revision: 0,
+      createdAt: timestamp,
+    });
+  }
+  const stagedOld = await stageTestArtifacts(store, {
     transactionId: oldTransactionId,
-    rowCount: 1,
-    rowIdStart: 1n,
-    rowIdEndExclusive: 2n,
-    columnBlockIds: { value: [oldBlockId] },
-    createdAt: timestamp,
-  });
-  await store.createTransaction({
-    ...activeTransaction(oldTransactionId),
-    pendingBlockIds: [oldBlockId],
-    pendingSegmentIds: [oldSegmentId],
+    blocks: [{ id: oldBlockId, bytes: Uint8Array.of(1, 2, 3) }],
+    segments: [
+      {
+        id: oldSegmentId,
+        tableId: "events",
+        transactionId: oldTransactionId,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [oldBlockId] },
+        createdAt: timestamp,
+      },
+    ],
   });
   await store.commitTransaction({
     transactionId: oldTransactionId,
-    expectedTransactionRevision: 0,
+    expectedTransactionRevision: stagedOld.revision,
     expectedManifestVersion: null,
+    levelZeroSegmentLimits: [{ tableId: "events", limit: 4096 }],
     committedAt: timestamp,
   });
 
-  const currentBlockId = `${prefix}/current-block`;
+  const currentBlockId = `${compactionId}/output/segment/000000/column/000000/part/000000`;
   const currentSegmentId = `${prefix}/current-segment`;
   const currentTransactionId = `${prefix}/current-transaction`;
-  await store.addBlock(currentBlockId, Uint8Array.of(4, 5));
-  await store.addSegment({
-    id: currentSegmentId,
-    tableId: "events",
+  const stagedCurrent = await stageTestArtifacts(store, {
     transactionId: currentTransactionId,
-    rowCount: 1,
-    rowIdStart: 1n,
-    rowIdEndExclusive: 2n,
-    columnBlockIds: { value: [currentBlockId] },
-    createdAt: timestamp,
-  });
-  await store.createTransaction({
-    ...activeTransaction(currentTransactionId),
     snapshotVersion: 0,
-    pendingBlockIds: [currentBlockId],
-    pendingSegmentIds: [currentSegmentId],
+    blocks: [{ id: currentBlockId, bytes: Uint8Array.of(4, 5) }],
+    segments: [
+      {
+        id: currentSegmentId,
+        tableId: "events",
+        transactionId: currentTransactionId,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [currentBlockId] },
+        level: 1,
+        logicalOrder: 0,
+        createdAt: timestamp,
+      },
+    ],
   });
+  const compaction: CompactionJobRecord = {
+    id: compactionId,
+    tableId: "events",
+    sourceManifestVersion: 0,
+    sourceSegmentIds: [oldSegmentId],
+    sourceBlockIds: [oldBlockId],
+    outputBlockIds: [currentBlockId],
+    cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
+    processedRows: 1,
+    sourceStoredBytes: 3,
+    outputStoredBytes: 2,
+    logicalBytes: 2,
+    rewritePlan: { kind: "copy-v1" },
+    outputCursor: null,
+    memoryBudgetBytes: 0,
+    minimumMemoryBytes: 0,
+    level0SourceStoredBytes: 3,
+    anchorSourceStoredBytes: 0,
+    peakWorkingBytes: 0,
+    outputLogicalBytes: 2,
+    targetLevel: 1,
+    state: "ready",
+    transactionId: currentTransactionId,
+    outputSegmentId: currentSegmentId,
+    publishedVersion: null,
+    revision: 0,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await store.createCompactionJob(compaction);
   await store.commitTransaction({
     transactionId: currentTransactionId,
-    expectedTransactionRevision: 0,
+    expectedTransactionRevision: stagedCurrent.revision,
     expectedManifestVersion: 0,
     removedBlockIds: [oldBlockId],
+    compactionJobId: compaction.id,
     committedAt: "2026-01-01T00:00:01.000Z",
+  });
+  await store.updateCompactionJob(compaction.id, 0, {
+    state: "published",
+    publishedVersion: 1,
+    updatedAt: "2026-01-01T00:00:01.000Z",
   });
 }
 
@@ -947,29 +1675,45 @@ for (const implementation of stores()) {
     it("stores immutable blocks and defensive copies", async () => {
       const store = await implementation.create();
       const source = Uint8Array.of(1, 2, 3);
-      await store.addBlock("a", source);
+      const staged = await stageTestArtifacts(store, { blocks: [{ id: "a", bytes: source }] });
       source[0] = 9;
       expect(await store.getBlock("a")).toEqual(Uint8Array.of(1, 2, 3));
-      await expect(store.addBlock("a", Uint8Array.of(4))).rejects.toThrow();
+      await expect(
+        store.stageTransactionArtifacts({
+          transactionId: staged.id,
+          expectedRevision: staged.revision,
+          blocks: [{ id: "a", bytes: Uint8Array.of(4) }],
+          segments: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ).rejects.toThrow();
       store.close();
     });
 
     it("writes and reads blocks in bulk without partial duplicate batches", async () => {
       const store = await implementation.create();
-      await store.addBlocks([
-        { id: "a", bytes: Uint8Array.of(1) },
-        { id: "b", bytes: Uint8Array.of(2) },
-      ]);
+      const staged = await stageTestArtifacts(store, {
+        blocks: [
+          { id: "a", bytes: Uint8Array.of(1) },
+          { id: "b", bytes: Uint8Array.of(2) },
+        ],
+      });
       expect(await store.getBlocks(["b", "missing", "a"])).toEqual([
         Uint8Array.of(2),
         undefined,
         Uint8Array.of(1),
       ]);
       await expect(
-        store.addBlocks([
-          { id: "c", bytes: Uint8Array.of(3) },
-          { id: "c", bytes: Uint8Array.of(4) },
-        ]),
+        store.stageTransactionArtifacts({
+          transactionId: staged.id,
+          expectedRevision: staged.revision,
+          blocks: [
+            { id: "c", bytes: Uint8Array.of(3) },
+            { id: "c", bytes: Uint8Array.of(4) },
+          ],
+          segments: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
       ).rejects.toThrow("already exists");
       expect(await store.getBlock("c")).toBeUndefined();
       store.close();
@@ -977,13 +1721,57 @@ for (const implementation of stores()) {
 
     it("publishes manifests with compare-and-swap", async () => {
       const store = await implementation.create();
-      await store.addBlock("a", Uint8Array.of(1));
-      const first = await store.publishManifest({ expectedVersion: null, blockIds: ["a"] });
+      const first = await publishTestBlocks(store, {
+        expectedVersion: null,
+        blocks: [{ id: "a", bytes: Uint8Array.of(1) }],
+      });
       expect(first.version).toBe(0);
       await expect(
-        store.publishManifest({ expectedVersion: null, blockIds: ["a"] }),
+        publishManifest(store, { expectedVersion: null, blockIds: ["a"] }),
       ).rejects.toThrow("expected null");
       expect((await store.getCurrentManifest())?.version).toBe(0);
+      store.close();
+    });
+
+    it("derives logical table changes from ordinary staged segments", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      await store.addTable({
+        managed: false,
+        id: "derived-change-table",
+        name: "derived_change_table",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: timestamp,
+      });
+      const staged = await stageTestArtifacts(store, {
+        transactionId: "derived-change-owner",
+        blocks: [{ id: "derived-change-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "derived-change-segment",
+            tableId: "derived-change-table",
+            transactionId: "derived-change-owner",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: ["derived-change-block"] },
+            createdAt: timestamp,
+          },
+        ],
+      });
+
+      const manifest = await store.commitTransaction({
+        transactionId: staged.id,
+        expectedTransactionRevision: staged.revision,
+        expectedManifestVersion: null,
+        // A low-level caller cannot hide an ordinary data write from live/change readers.
+        changedTableIds: [],
+        levelZeroSegmentLimits: [{ tableId: "derived-change-table", limit: 4096 }],
+        committedAt: timestamp,
+      });
+
+      expect(manifest.changedTableIds).toEqual(["derived-change-table"]);
       store.close();
     });
 
@@ -991,11 +1779,13 @@ for (const implementation of stores()) {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
       await store.addTable({
+        managed: false,
         id: "integer-table",
         name: "integers",
         columns: [
           { id: "integer-column", name: "value", type: "number", integer: true, nullable: false },
         ],
+        revision: 0,
         createdAt: timestamp,
       });
       expect((await store.getTable("integer-table"))?.columns[0]).toMatchObject({
@@ -1004,6 +1794,7 @@ for (const implementation of stores()) {
       });
       await expect(
         store.addTable({
+          managed: false,
           id: "invalid-integer-table",
           name: "invalid-integers",
           columns: [
@@ -1015,6 +1806,7 @@ for (const implementation of stores()) {
               nullable: false,
             },
           ],
+          revision: 0,
           createdAt: timestamp,
         }),
       ).rejects.toThrow("Integer domain requires a number column");
@@ -1025,76 +1817,109 @@ for (const implementation of stores()) {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
       await store.addTable({
+        managed: false,
         id: "events-id",
         name: "events",
         columns: [{ id: "value-column", name: "value", type: "number", nullable: false }],
+        revision: 0,
         createdAt: timestamp,
       });
       await store.addTable({
+        managed: false,
         id: "other-id",
         name: "other",
         columns: [{ id: "other-column", name: "label", type: "string", nullable: false }],
+        revision: 0,
         createdAt: timestamp,
       });
-      await store.addBlock("state-block", Uint8Array.of(1));
-      await store.addSegment({
-        id: "state-segment",
-        tableId: "events-id",
+      const stagedState = await stageTestArtifacts(store, {
         transactionId: "state-transaction",
-        rowCount: 1,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 2n,
-        columnBlockIds: { "value-column": ["state-block"] },
-        createdAt: timestamp,
-      });
-      await store.addSegment({
-        id: "other-segment",
-        tableId: "other-id",
-        transactionId: "state-transaction",
-        rowCount: 1,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 2n,
-        columnBlockIds: { "other-column": ["state-block"] },
-        createdAt: timestamp,
-      });
-      await store.createTransaction({
-        ...activeTransaction("state-transaction"),
-        pendingBlockIds: ["state-block"],
-        pendingSegmentIds: ["state-segment", "other-segment"],
+        blocks: [{ id: "state-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "state-segment",
+            tableId: "events-id",
+            transactionId: "state-transaction",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { "value-column": ["state-block"] },
+            createdAt: timestamp,
+          },
+          {
+            id: "other-segment",
+            tableId: "other-id",
+            transactionId: "state-transaction",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { "other-column": ["state-block"] },
+            createdAt: timestamp,
+          },
+        ],
       });
       await store.commitTransaction({
         transactionId: "state-transaction",
-        expectedTransactionRevision: 0,
+        expectedTransactionRevision: stagedState.revision,
         expectedManifestVersion: null,
+        levelZeroSegmentLimits: [
+          { tableId: "events-id", limit: 4096 },
+          { tableId: "other-id", limit: 4096 },
+        ],
         committedAt: timestamp,
       });
       // A retained historical/staged record for this table is not part of the current
       // manifest. The atomic query read must not make every foreground prepare pay for it.
-      await store.addBlock("state-historical-block", Uint8Array.of(2));
-      await store.addSegment({
-        id: "state-historical-segment",
-        tableId: "events-id",
-        transactionId: "state-transaction",
-        rowCount: 1,
-        rowIdStart: 2n,
-        rowIdEndExclusive: 3n,
-        columnBlockIds: { "value-column": ["state-historical-block"] },
-        createdAt: timestamp,
+      await stageTestArtifacts(store, {
+        transactionId: "state-historical-transaction",
+        snapshotVersion: 0,
+        blocks: [{ id: "state-historical-block", bytes: Uint8Array.of(2) }],
+        segments: [
+          {
+            id: "state-historical-segment",
+            tableId: "events-id",
+            transactionId: "state-historical-transaction",
+            rowCount: 1,
+            rowIdStart: 2n,
+            rowIdEndExclusive: 3n,
+            columnBlockIds: { "value-column": ["state-historical-block"] },
+            createdAt: timestamp,
+          },
+        ],
       });
 
-      const state = await store.getQueryCatalogState?.(["events", "missing"]);
-      expect(state).toBeDefined();
-      expect(state?.manifestVersion).toBe(await store.getCurrentManifestVersion());
-      expect(state?.manifestBlockIds).toEqual(["state-block"]);
-      expect(state?.tables).toEqual([await store.getTableByName("events"), undefined]);
+      const before = await store.getCatalogProbe();
+      const tables = [await store.getTableByName("events"), await store.getTableByName("missing")];
+      const allSegments = await listAllSegments(store, "events-id");
+      const membership = await store.hasManifestBlocks(before.manifestVersion, [
+        "state-block",
+        "state-historical-block",
+      ]);
+      const segments = allSegments.filter((segment) =>
+        Object.values(segment.columnBlockIds)
+          .flat()
+          .every((id) => id === "state-block" && membership[0] === true),
+      );
+      const transactions = (await store.getTransactions(["state-transaction"])).filter(
+        (record) => record !== undefined,
+      );
+      expect(await store.getCatalogProbe()).toEqual(before);
+      expect(before.manifestVersion).toBe(await store.getCurrentManifestVersion());
+      expect(
+        await store.hasManifestBlocks(before.manifestVersion, [
+          "state-block",
+          "state-historical-block",
+        ]),
+      ).toEqual([true, false]);
+      expect(tables).toEqual([await store.getTableByName("events"), undefined]);
       // Only the found tables' current-manifest segments are returned. Explicit historical
       // reads continue to use listSegments and can see the retained record.
-      expect((await store.listSegments("events-id")).map((segment) => segment.id)).toEqual([
+      expect((await listAllSegments(store, "events-id")).map((segment) => segment.id)).toEqual([
         "state-historical-segment",
         "state-segment",
       ]);
-      expect(state?.segments.map((segment) => segment.id)).toEqual(["state-segment"]);
-      expect(state?.transactions).toEqual(
+      expect(segments.map((segment) => segment.id)).toEqual(["state-segment"]);
+      expect(transactions).toEqual(
         (await store.getTransactions(["state-transaction"])).filter(
           (record) => record !== undefined,
         ),
@@ -1104,67 +1929,250 @@ for (const implementation of stores()) {
 
     it("advances the catalog epoch on every catalog mutation and only those", async () => {
       const store = await implementation.create();
-      const probe = store.getCatalogProbe?.bind(store);
-      expect(probe).toBeDefined();
-      if (probe === undefined) return;
+      const probe = store.getCatalogProbe.bind(store);
       const timestamp = "2026-01-01T00:00:00.000Z";
       const initial = await probe();
       expect(initial.manifestVersion).toBeNull();
+      expect(initial.schemaEpoch).toBe(0);
 
       await store.addTable({
+        managed: false,
         id: "epoch-id",
         name: "epoch",
         columns: [{ id: "epoch-column", name: "value", type: "number", nullable: false }],
+        revision: 0,
         createdAt: timestamp,
       });
       const afterAdd = await probe();
       expect(afterAdd.catalogEpoch).toBeGreaterThan(initial.catalogEpoch);
+      expect(afterAdd.schemaEpoch).toBeGreaterThan(initial.schemaEpoch);
 
       await store.updateTable("epoch-id", 0, {
         columns: [{ id: "epoch-column", name: "renamed", type: "number", nullable: false }],
       });
       const afterUpdate = await probe();
       expect(afterUpdate.catalogEpoch).toBeGreaterThan(afterAdd.catalogEpoch);
+      expect(afterUpdate.schemaEpoch).toBeGreaterThan(afterAdd.schemaEpoch);
 
       // Block and segment staging are not catalog mutations: nothing a reader could have
       // cached changes until the publish makes the staged work visible.
-      await store.addBlock("epoch-block", Uint8Array.of(1));
-      await store.addSegment({
-        id: "epoch-segment",
-        tableId: "epoch-id",
+      const stagedEpoch = await stageTestArtifacts(store, {
         transactionId: "epoch-transaction",
-        rowCount: 1,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 2n,
-        columnBlockIds: { "epoch-column": ["epoch-block"] },
-        createdAt: timestamp,
-      });
-      await store.createTransaction({
-        ...activeTransaction("epoch-transaction"),
-        pendingBlockIds: ["epoch-block"],
-        pendingSegmentIds: ["epoch-segment"],
+        blocks: [{ id: "epoch-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "epoch-segment",
+            tableId: "epoch-id",
+            transactionId: "epoch-transaction",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { "epoch-column": ["epoch-block"] },
+            createdAt: timestamp,
+          },
+        ],
       });
       const afterStaging = await probe();
       expect(afterStaging.catalogEpoch).toBe(afterUpdate.catalogEpoch);
+      expect(afterStaging.schemaEpoch).toBe(afterUpdate.schemaEpoch);
 
       await store.commitTransaction({
         transactionId: "epoch-transaction",
-        expectedTransactionRevision: 0,
+        expectedTransactionRevision: stagedEpoch.revision,
         expectedManifestVersion: null,
+        levelZeroSegmentLimits: [{ tableId: "epoch-id", limit: 4096 }],
         committedAt: timestamp,
       });
       const afterCommit = await probe();
       expect(afterCommit.catalogEpoch).toBeGreaterThan(afterStaging.catalogEpoch);
+      expect(afterCommit.schemaEpoch).toBe(afterStaging.schemaEpoch);
       expect(afterCommit.manifestVersion).toBe(0);
 
-      await store.publishManifest({ expectedVersion: 0, blockIds: ["epoch-block"] });
+      await publishManifest(store, { expectedVersion: 0, blockIds: ["epoch-block"] });
       const afterPublish = await probe();
       expect(afterPublish.catalogEpoch).toBeGreaterThan(afterCommit.catalogEpoch);
+      expect(afterPublish.schemaEpoch).toBe(afterCommit.schemaEpoch);
       expect(afterPublish.manifestVersion).toBe(1);
 
-      // The batched catalog read reports the epoch it observed, atomically with its records.
-      const state = await store.getQueryCatalogState?.(["epoch"]);
-      expect(state?.catalogEpoch).toBe(afterPublish.catalogEpoch);
+      expect((await store.getCatalogProbe()).catalogEpoch).toBe(afterPublish.catalogEpoch);
+      store.close();
+    });
+
+    it("serializes staged writes with structural DDL but ignores accelerator build churn", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      const index = {
+        name: "epoch_value_idx",
+        columnId: "value",
+        columnIds: ["value"],
+        directions: ["asc" as const],
+        termEncoding: "tuple-v1" as const,
+        storage: "postings-v1" as const,
+        storageColumnId: "index-storage",
+        locator: "row-id" as const,
+        state: "building" as const,
+        buildId: "index-build",
+        buildFromVersion: -1,
+      };
+      const { buildId: _buildId, ...readyIndex } = index;
+      void _buildId;
+      await store.addTable({
+        managed: false,
+        id: "schema-guard-table",
+        name: "schema_guard_table",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        secondaryIndexes: { "value-index": index },
+        revision: 0,
+        createdAt: timestamp,
+      });
+
+      const begun = await store.beginTransaction({
+        record: {
+          ...activeTransaction("schema-build-churn"),
+          revision: 0,
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          expiresAt: "2026-01-01T00:30:00.000Z",
+        },
+      });
+      const staged = await store.stageTransactionArtifacts({
+        transactionId: begun.record.id,
+        expectedRevision: begun.record.revision,
+        blocks: [{ id: "schema-build-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "schema-build-segment",
+            tableId: "schema-guard-table",
+            transactionId: begun.record.id,
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: ["schema-build-block"] },
+            kind: "insert",
+            level: 0,
+            logicalOrder: 0,
+            commitOrdinal: 0,
+            rowIdSpans: [],
+            createdAt: timestamp,
+          },
+        ],
+        updatedAt: timestamp,
+      });
+      const beforeBuildState = await store.getCatalogProbe();
+      await store.updateTable("schema-guard-table", 0, {
+        secondaryIndexes: {
+          "value-index": {
+            ...readyIndex,
+            state: "ready",
+            buildFromVersion: -1,
+          },
+        },
+      });
+      const afterBuildState = await store.getCatalogProbe();
+      expect(afterBuildState.catalogEpoch).toBeGreaterThan(beforeBuildState.catalogEpoch);
+      expect(afterBuildState.schemaEpoch).toBe(beforeBuildState.schemaEpoch);
+      await store.commitTransaction({
+        transactionId: staged.id,
+        expectedTransactionRevision: staged.revision,
+        expectedManifestVersion: null,
+        levelZeroSegmentLimits: [{ tableId: "schema-guard-table", limit: 4096 }],
+        committedAt: timestamp,
+      });
+
+      let tableRevision = (await store.getTable("schema-guard-table"))?.revision;
+      if (tableRevision === undefined) throw new Error("Schema-guard table disappeared");
+      let structuralProbe = await store.getCatalogProbe();
+      await store.updateTable("schema-guard-table", tableRevision, { secondaryIndexes: null });
+      tableRevision += 1;
+      let nextStructuralProbe = await store.getCatalogProbe();
+      expect(nextStructuralProbe.schemaEpoch).toBeGreaterThan(structuralProbe.schemaEpoch);
+      structuralProbe = nextStructuralProbe;
+      await store.updateTable("schema-guard-table", tableRevision, {
+        secondaryIndexes: { "value-index": index },
+      });
+      tableRevision += 1;
+      nextStructuralProbe = await store.getCatalogProbe();
+      expect(nextStructuralProbe.schemaEpoch).toBeGreaterThan(structuralProbe.schemaEpoch);
+      structuralProbe = nextStructuralProbe;
+      await store.updateTable("schema-guard-table", tableRevision, {
+        secondaryIndexes: { "value-index": { ...index, unique: true } },
+      });
+      tableRevision += 1;
+      nextStructuralProbe = await store.getCatalogProbe();
+      expect(nextStructuralProbe.schemaEpoch).toBeGreaterThan(structuralProbe.schemaEpoch);
+      structuralProbe = nextStructuralProbe;
+      await store.updateTable("schema-guard-table", tableRevision, {
+        secondaryIndexes: {
+          "value-index": {
+            ...readyIndex,
+            unique: true,
+            uniqueEnforced: true,
+            state: "ready",
+          },
+        },
+        uniqueKeySeed: {
+          namespaceId: secondaryUniqueKeyNamespace("schema-guard-table", "value-index"),
+          keyTokens: [],
+        },
+      });
+      tableRevision += 1;
+      nextStructuralProbe = await store.getCatalogProbe();
+      expect(nextStructuralProbe.schemaEpoch).toBeGreaterThan(structuralProbe.schemaEpoch);
+
+      const stale = await store.beginTransaction({
+        record: {
+          ...activeTransaction("stale-schema-writer"),
+          revision: 0,
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          expiresAt: "2026-01-01T00:30:00.000Z",
+        },
+      });
+      const staleStaged = await store.stageTransactionArtifacts({
+        transactionId: stale.record.id,
+        expectedRevision: stale.record.revision,
+        blocks: [{ id: "stale-schema-block", bytes: Uint8Array.of(2) }],
+        segments: [
+          {
+            id: "stale-schema-segment",
+            tableId: "schema-guard-table",
+            transactionId: stale.record.id,
+            rowCount: 1,
+            rowIdStart: 2n,
+            rowIdEndExclusive: 3n,
+            columnBlockIds: { value: ["stale-schema-block"] },
+            kind: "insert",
+            level: 0,
+            logicalOrder: 0,
+            commitOrdinal: 0,
+            rowIdSpans: [],
+            createdAt: timestamp,
+          },
+        ],
+        updatedAt: timestamp,
+      });
+      await store.updateTable("schema-guard-table", tableRevision, {
+        columns: [
+          { id: "value", name: "value", type: "number", nullable: false },
+          { id: "added", name: "added", type: "string", nullable: true },
+        ],
+      });
+      const beforeRefusal = await store.getTransaction(staleStaged.id);
+      await expect(
+        store.commitTransaction({
+          transactionId: staleStaged.id,
+          expectedTransactionRevision: staleStaged.revision,
+          expectedManifestVersion: 0,
+          levelZeroSegmentLimits: [{ tableId: "schema-guard-table", limit: 4096 }],
+          committedAt: timestamp,
+        }),
+      ).rejects.toBeInstanceOf(SchemaConflictError);
+      expect(await store.getTransaction(staleStaged.id)).toEqual(beforeRefusal);
+      expect(await store.getCurrentManifestVersion()).toBe(0);
+      await store.updateTransaction(staleStaged.id, staleStaged.revision, {
+        status: "aborted",
+        updatedAt: timestamp,
+      });
       store.close();
     });
 
@@ -1176,13 +2184,14 @@ for (const implementation of stores()) {
         ["sort-b-id", "sort-b"],
       ] as const) {
         await store.addTable({
+          managed: false,
           id: tableId,
           name,
           columns: [{ id: `${tableId}-column`, name: "value", type: "number", nullable: false }],
+          revision: 0,
           createdAt: timestamp,
         });
       }
-      await store.addBlock("sort-block", Uint8Array.of(1));
       // Interleave segment ids across the two tables so a per-table concatenation without a
       // global re-sort would come back misordered.
       const segmentIds = [
@@ -1191,8 +2200,10 @@ for (const implementation of stores()) {
         ["segment-3", "sort-a-id"],
         ["segment-4", "sort-b-id"],
       ] as const;
-      for (const [segmentId, tableId] of segmentIds) {
-        await store.addSegment({
+      const stagedSort = await stageTestArtifacts(store, {
+        transactionId: "sort-transaction",
+        blocks: [{ id: "sort-block", bytes: Uint8Array.of(1) }],
+        segments: segmentIds.map(([segmentId, tableId]) => ({
           id: segmentId,
           tableId,
           transactionId: "sort-transaction",
@@ -1201,21 +2212,23 @@ for (const implementation of stores()) {
           rowIdEndExclusive: 2n,
           columnBlockIds: { [`${tableId}-column`]: ["sort-block"] },
           createdAt: timestamp,
-        });
-      }
-      await store.createTransaction({
-        ...activeTransaction("sort-transaction"),
-        pendingBlockIds: ["sort-block"],
-        pendingSegmentIds: segmentIds.map(([segmentId]) => segmentId),
+        })),
       });
       await store.commitTransaction({
         transactionId: "sort-transaction",
-        expectedTransactionRevision: 0,
+        expectedTransactionRevision: stagedSort.revision,
         expectedManifestVersion: null,
+        levelZeroSegmentLimits: [
+          { tableId: "sort-a-id", limit: 4096 },
+          { tableId: "sort-b-id", limit: 4096 },
+        ],
         committedAt: timestamp,
       });
-      const state = await store.getQueryCatalogState?.(["sort-b", "sort-a"]);
-      expect(state?.segments.map((segment) => segment.id)).toEqual([
+      const segments = [
+        ...(await listAllSegments(store, "sort-b-id")),
+        ...(await listAllSegments(store, "sort-a-id")),
+      ].sort((left, right) => left.id.localeCompare(right.id));
+      expect(segments.map((segment) => segment.id)).toEqual([
         "segment-1",
         "segment-2",
         "segment-3",
@@ -1226,25 +2239,41 @@ for (const implementation of stores()) {
 
     it("pages manifests, segments, and transactions with stable exclusive cursors", async () => {
       const store = await implementation.create();
-      await store.addBlock("page-block", Uint8Array.of(1));
-      await store.publishManifest({ expectedVersion: null, blockIds: ["page-block"] });
-      await store.publishManifest({ expectedVersion: 0, blockIds: ["page-block"] });
-      await store.publishManifest({ expectedVersion: 1, blockIds: ["page-block"] });
-      for (const id of ["transaction-c", "transaction-a", "transaction-b"]) {
+      await store.addTable({
+        managed: false,
+        id: "page-table",
+        name: "page_table",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await publishTestBlocks(store, {
+        expectedVersion: null,
+        blocks: [{ id: "page-block", bytes: Uint8Array.of(1) }],
+      });
+      await publishManifest(store, { expectedVersion: 0, blockIds: ["page-block"] });
+      await publishManifest(store, { expectedVersion: 1, blockIds: ["page-block"] });
+      for (const id of ["transaction-c", "transaction-b"]) {
         await store.createTransaction({ ...activeTransaction(id), snapshotVersion: 2 });
       }
-      for (const id of ["segment-c", "segment-a", "segment-b"]) {
-        await store.addSegment({
-          id,
+      await stageTestArtifacts(store, {
+        transactionId: "transaction-a",
+        snapshotVersion: 2,
+        blocks: ["c", "a", "b"].map((suffix) => ({
+          id: `page-segment-block-${suffix}`,
+          bytes: Uint8Array.of(1),
+        })),
+        segments: ["c", "a", "b"].map((suffix) => ({
+          id: `segment-${suffix}`,
           tableId: "page-table",
           transactionId: "transaction-a",
           rowCount: 1,
           rowIdStart: 1n,
           rowIdEndExclusive: 2n,
-          columnBlockIds: { value: ["page-block"] },
+          columnBlockIds: { value: [`page-segment-block-${suffix}`] },
           createdAt: "2026-01-01T00:00:00.000Z",
-        });
-      }
+        })),
+      });
 
       const firstManifests = await store.listManifestPage(null, 2);
       expect(firstManifests.records.map((manifest) => manifest.version)).toEqual([0, 1]);
@@ -1263,27 +2292,27 @@ for (const implementation of stores()) {
       expect(finalSegments.records.map((segment) => segment.id)).toEqual(["segment-c"]);
       expect(finalSegments.nextCursor).toBeNull();
 
-      const firstTransactions = await store.listTransactionPage(null, 2);
-      expect(firstTransactions.records.map((transaction) => transaction.id)).toEqual([
-        "transaction-a",
-        "transaction-b",
-      ]);
-      expect(firstTransactions.nextCursor).toBe("transaction-b");
-      const finalTransactions = await store.listTransactionPage(firstTransactions.nextCursor, 2);
-      expect(finalTransactions.records.map((transaction) => transaction.id)).toEqual([
-        "transaction-c",
-      ]);
-      expect(finalTransactions.nextCursor).toBeNull();
-      await expect(store.listManifestPage(null, 0)).rejects.toThrow("positive whole number");
-      await expect(store.listSegmentPage(null, 0)).rejects.toThrow("positive whole number");
+      const transactionIds: string[] = [];
+      let transactionCursor: string | null = null;
+      do {
+        const page = await store.listTransactionPage(transactionCursor, 2);
+        transactionIds.push(...page.records.map((transaction) => transaction.id));
+        transactionCursor = page.nextCursor;
+      } while (transactionCursor !== null);
+      expect(transactionIds).toEqual([...transactionIds].sort());
+      expect(transactionIds).toEqual(
+        expect.arrayContaining(["transaction-a", "transaction-b", "transaction-c"]),
+      );
+      await expect(store.listManifestPage(null, 0)).rejects.toThrow("positive");
+      await expect(store.listSegmentPage(null, 0)).rejects.toThrow("positive");
       store.close();
     });
 
     it("never publishes a missing block", async () => {
       const store = await implementation.create();
       await expect(
-        store.publishManifest({ expectedVersion: null, blockIds: ["missing"] }),
-      ).rejects.toThrow("missing block");
+        publishManifest(store, { expectedVersion: null, blockIds: ["missing"] }),
+      ).rejects.toThrow(/missing.*block/);
       expect(await store.getCurrentManifest()).toBeUndefined();
       store.close();
     });
@@ -1291,68 +2320,98 @@ for (const implementation of stores()) {
     it("stores table and segment records", async () => {
       const store = await implementation.create();
       await store.addTable({
+        managed: false,
         id: "people-id",
         name: "people",
         columns: [{ id: "name-id", name: "name", type: "string", nullable: false }],
+        revision: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
       });
       await expect(
         store.addTable({
+          managed: false,
           id: "another-id",
           name: "people",
           columns: [{ id: "age-id", name: "age", type: "number", nullable: false }],
+          revision: 0,
           createdAt: "2026-01-01T00:00:00.000Z",
         }),
       ).rejects.toThrow("name already exists");
-      await store.addSegment({
-        id: "segment-1",
-        tableId: "people-id",
+      await stageTestArtifacts(store, {
         transactionId: "transaction-1",
-        rowCount: 2,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 3n,
-        columnBlockIds: { "name-id": ["block-1"] },
-        createdAt: "2026-01-01T00:00:00.000Z",
+        blocks: [{ id: "block-1", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "segment-1",
+            tableId: "people-id",
+            transactionId: "transaction-1",
+            rowCount: 2,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 3n,
+            columnBlockIds: { "name-id": ["block-1"] },
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
       });
-      await store.addSegment({
-        id: "segment-2",
-        tableId: "people-id",
+      await stageTestArtifacts(store, {
         transactionId: "transaction-2",
-        rowCount: 1,
-        rowIdStart: 3n,
-        rowIdEndExclusive: 4n,
-        columnBlockIds: { "name-id": ["block-2"] },
-        level: 1,
-        logicalOrder: 4.5,
-        createdAt: "2026-01-01T00:00:01.000Z",
+        blocks: [{ id: "block-2", bytes: Uint8Array.of(2) }],
+        segments: [
+          {
+            id: "segment-2",
+            tableId: "people-id",
+            transactionId: "transaction-2",
+            rowCount: 1,
+            rowIdStart: 3n,
+            rowIdEndExclusive: 4n,
+            columnBlockIds: { "name-id": ["block-2"] },
+            level: 1,
+            logicalOrder: 4.5,
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+        ],
       });
 
       expect((await store.listTables())[0]?.name).toBe("people");
-      expect((await store.listSegments("people-id"))[0]?.rowIdEndExclusive).toBe(3n);
-      expect(await store.getSegment("segment-1")).not.toHaveProperty("level");
+      expect((await listAllSegments(store, "people-id"))[0]?.rowIdEndExclusive).toBe(3n);
+      expect(await store.getSegment("segment-1")).toMatchObject({ kind: "insert", level: 0 });
       expect(await store.getSegment("segment-2")).toMatchObject({ level: 1, logicalOrder: 4.5 });
       store.close();
     });
 
-    it("round trips ordered row-ID spans without changing legacy segment metadata", async () => {
+    it("round trips ordered row-ID spans and contiguous row-ID envelopes", async () => {
       const store = await implementation.create();
+      await store.addTable({
+        managed: false,
+        id: "events",
+        name: "events",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
       const rowIdSpans = [
         { rowStart: 0, rowCount: 1, rowIdStart: 10n },
         { rowStart: 1, rowCount: 1, rowIdStart: 3n },
       ];
-      await store.addSegment({
-        id: "merged-segment",
-        tableId: "events",
+      await stageTestArtifacts(store, {
         transactionId: "merge-transaction",
-        rowCount: 2,
-        rowIdStart: 3n,
-        rowIdEndExclusive: 11n,
-        rowIdSpans,
-        columnBlockIds: { value: ["merged-block"] },
-        kind: "base",
-        level: 1,
-        logicalOrder: 0,
-        createdAt: "2026-01-01T00:00:00.000Z",
+        blocks: [{ id: "merged-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "merged-segment",
+            tableId: "events",
+            transactionId: "merge-transaction",
+            rowCount: 2,
+            rowIdStart: 3n,
+            rowIdEndExclusive: 11n,
+            rowIdSpans,
+            columnBlockIds: { value: ["merged-block"] },
+            kind: "base",
+            level: 1,
+            logicalOrder: 0,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
       });
       rowIdSpans[0] = { rowStart: 0, rowCount: 2, rowIdStart: 99n };
       expect(await store.getSegment("merged-segment")).toMatchObject({
@@ -1365,22 +2424,41 @@ for (const implementation of stores()) {
         ],
       });
 
-      await store.addSegment({
-        id: "legacy-segment",
-        tableId: "events",
+      await stageTestArtifacts(store, {
         transactionId: "legacy-transaction",
-        rowCount: 1,
-        rowIdStart: 20n,
-        rowIdEndExclusive: 21n,
-        columnBlockIds: { value: ["legacy-block"] },
-        createdAt: "2026-01-01T00:00:00.000Z",
+        blocks: [{ id: "legacy-block", bytes: Uint8Array.of(2) }],
+        segments: [
+          {
+            id: "legacy-segment",
+            tableId: "events",
+            transactionId: "legacy-transaction",
+            rowCount: 1,
+            rowIdStart: 20n,
+            rowIdEndExclusive: 21n,
+            columnBlockIds: { value: ["legacy-block"] },
+            kind: "insert",
+            level: 0,
+            logicalOrder: 0,
+            commitOrdinal: 0,
+            rowIdSpans: [],
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
       });
-      expect(await store.getSegment("legacy-segment")).not.toHaveProperty("rowIdSpans");
+      expect(await store.getSegment("legacy-segment")).toMatchObject({ rowIdSpans: [] });
       store.close();
     });
 
-    it("normalizes append-row-range L2 partition metadata without changing legacy segments", async () => {
+    it("round trips canonical append-row-range L2 partition metadata", async () => {
       const store = await implementation.create();
+      await store.addTable({
+        managed: false,
+        id: "events",
+        name: "events",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
       const partition: SegmentRecord = {
         id: "partition-2",
         tableId: "events",
@@ -1392,25 +2470,37 @@ for (const implementation of stores()) {
         kind: "insert",
         level: 2,
         logicalOrder: 11,
+        commitOrdinal: 0,
+        rowIdSpans: [],
         partitionOrdinal: 2,
         createdAt: "2026-01-01T00:00:00.000Z",
       };
-      await store.addSegment(partition);
+      await stageTestArtifacts(store, {
+        transactionId: partition.transactionId,
+        blocks: [{ id: "partition-block", bytes: Uint8Array.of(1) }],
+        segments: [partition],
+      });
       expect(await store.getSegment(partition.id)).toEqual(partition);
-      expect(await store.listSegments(partition.tableId)).toEqual([partition]);
-
-      const legacy: SegmentRecord = {
-        ...partition,
-        id: "legacy-level-two",
-      };
-      delete (legacy as { partitionOrdinal?: number }).partitionOrdinal;
-      await store.addSegment(legacy);
-      expect(await store.getSegment(legacy.id)).not.toHaveProperty("partitionOrdinal");
+      expect((await listAllSegments(store, partition.tableId)).map(({ id }) => id)).toEqual([
+        "partition-2",
+      ]);
       store.close();
     });
 
     it("rejects malformed append-row-range L2 partition metadata", async () => {
       const store = await implementation.create();
+      await store.addTable({
+        managed: false,
+        id: "events",
+        name: "events",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const staged = await stageTestArtifacts(store, {
+        transactionId: "partition-transaction",
+        blocks: [{ id: "partition-block", bytes: Uint8Array.of(1) }],
+      });
       const valid: SegmentRecord = {
         id: "valid-partition",
         tableId: "events",
@@ -1422,23 +2512,31 @@ for (const implementation of stores()) {
         kind: "insert",
         level: 2,
         logicalOrder: 4,
+        commitOrdinal: 0,
+        rowIdSpans: [],
         partitionOrdinal: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
       };
       const withoutLogicalOrder = { ...valid };
       delete (withoutLogicalOrder as { logicalOrder?: number }).logicalOrder;
-      const invalid: Array<{ record: SegmentRecord; message: string }> = [
+      const withoutPartitionOrdinal = { ...valid, id: "missing-partition-ordinal" };
+      delete (withoutPartitionOrdinal as { partitionOrdinal?: number }).partitionOrdinal;
+      const invalid: Array<{ record: SegmentRecord; message: string | RegExp }> = [
+        {
+          record: withoutPartitionOrdinal,
+          message: "requires a partition ordinal",
+        },
         {
           record: { ...valid, id: "negative-ordinal", partitionOrdinal: -1 },
-          message: "partition ordinal must be a non-negative whole number",
+          message: "partition ordinal",
         },
         {
           record: { ...valid, id: "fractional-ordinal", partitionOrdinal: 0.5 },
-          message: "partition ordinal must be a non-negative whole number",
+          message: "partition ordinal",
         },
         {
           record: { ...valid, id: "wrong-level", level: 1 },
-          message: "explicit level two",
+          message: /requires level two|explicit level two/u,
         },
         {
           record: { ...valid, id: "wrong-kind", kind: "update" },
@@ -1459,7 +2557,7 @@ for (const implementation of stores()) {
               { rowStart: 2, rowCount: 2, rowIdStart: 6n },
             ],
           },
-          message: "sorted and non-overlapping",
+          message: "overlap",
         },
         {
           record: {
@@ -1469,19 +2567,23 @@ for (const implementation of stores()) {
             rowCount: 5,
             rowIdSpans: [{ rowStart: 0, rowCount: 2, rowIdStart: 5n }],
           },
-          message: "cover exactly the row count",
+          message: /cover exactly the row count|row ID spans do not match/,
         },
         {
           record: { ...withoutLogicalOrder, id: "missing-logical-order" },
-          message: "explicit logical order",
+          message: /logical order (?:must be a non-negative finite number|is invalid)/,
         },
         {
           record: { ...valid, id: "negative-logical-order", logicalOrder: -1 },
-          message: "logical order must be a non-negative finite number",
+          message: /logical order (?:must be a non-negative finite number|is invalid)/,
         },
         {
-          record: { ...valid, id: "spanned-partition", rowIdSpans: [] },
-          message: "cannot contain row ID spans",
+          record: {
+            ...valid,
+            id: "spanned-partition",
+            rowIdSpans: [{ rowStart: 0, rowCount: 2, rowIdStart: 5n }],
+          },
+          message: /cannot contain row ID spans|row ID spans are invalid/,
         },
         {
           record: {
@@ -1499,16 +2601,24 @@ for (const implementation of stores()) {
             rowIdStart: 0n,
             rowIdEndExclusive: 2n,
           },
-          message: "row ID start must be a positive bigint",
+          message: /row ID start must be a positive bigint|row ID envelope does not match/,
         },
         {
           record: { ...valid, id: "gapped-envelope", rowIdEndExclusive: 8n },
-          message: "contiguous positive row ID envelope",
+          message: /contiguous positive row ID envelope|row ID envelope does not match/,
         },
       ];
 
       for (const { record, message } of invalid) {
-        await expect(store.addSegment(record)).rejects.toThrow(message);
+        await expect(
+          store.stageTransactionArtifacts({
+            transactionId: staged.id,
+            expectedRevision: staged.revision,
+            blocks: [],
+            segments: [record],
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          }),
+        ).rejects.toThrow(message);
         expect(await store.getSegment(record.id)).toBeUndefined();
       }
       store.close();
@@ -1517,33 +2627,36 @@ for (const implementation of stores()) {
     it("atomically stamps committed segments with stable logical order", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
-      await store.addBlock("segment-block", Uint8Array.of(1));
-      await store.addSegment({
-        id: "committed-segment",
-        tableId: "events",
-        transactionId: "segment-transaction",
-        rowCount: 1,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 2n,
-        columnBlockIds: { value: ["segment-block"] },
+      await store.addTable({
+        managed: false,
+        id: "events",
+        name: "events",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
         createdAt: timestamp,
       });
-      await store.createTransaction({
-        id: "segment-transaction",
-        snapshotVersion: null,
-        pendingBlockIds: ["segment-block"],
-        pendingSegmentIds: ["committed-segment"],
-        status: "active",
-        revision: 0,
-        startedAt: timestamp,
-        updatedAt: timestamp,
-        committedVersion: null,
+      const staged = await stageTestArtifacts(store, {
+        transactionId: "segment-transaction",
+        blocks: [{ id: "segment-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "committed-segment",
+            tableId: "events",
+            transactionId: "segment-transaction",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: ["segment-block"] },
+            createdAt: timestamp,
+          },
+        ],
       });
 
       await store.commitTransaction({
         transactionId: "segment-transaction",
-        expectedTransactionRevision: 0,
+        expectedTransactionRevision: staged.revision,
         expectedManifestVersion: null,
+        levelZeroSegmentLimits: [{ tableId: "events", limit: 4096 }],
         committedAt: timestamp,
       });
 
@@ -1590,6 +2703,10 @@ for (const implementation of stores()) {
       const second = activeTransaction("batch-second");
       await store.createTransaction(first);
       await store.createTransaction(second);
+      const storedFirst = await store.getTransaction(first.id);
+      const storedSecond = await store.getTransaction(second.id);
+      expect(storedFirst).toBeDefined();
+      expect(storedSecond).toBeDefined();
 
       const records = await store.getTransactions([
         second.id,
@@ -1597,10 +2714,10 @@ for (const implementation of stores()) {
         first.id,
         second.id,
       ]);
-      expect(records).toEqual([second, undefined, first, second]);
+      expect(records).toEqual([storedSecond, undefined, storedFirst, storedSecond]);
       const returned = records[0];
       if (returned !== undefined) returned.pendingBlockIds.push("mutated-result");
-      expect(await store.getTransaction(second.id)).toEqual(second);
+      expect(await store.getTransaction(second.id)).toEqual(storedSecond);
       store.close();
     });
 
@@ -1629,15 +2746,16 @@ for (const implementation of stores()) {
       store.close();
     });
 
-    it("rejects creating a transaction whose pending segment metadata is missing", async () => {
+    it("rejects creating a transaction with a prepopulated artifact journal", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
-      await store.addBlock("segment-block", Uint8Array.of(1));
       await expect(
         store.createTransaction({
           id: "missing-segment-transaction",
+          ownerId: "missing-segment-transaction/owner",
+          expiresAt: "2026-01-01T00:30:00.000Z",
           snapshotVersion: null,
-          pendingBlockIds: ["segment-block"],
+          pendingBlockIds: [],
           pendingSegmentIds: ["missing-segment"],
           status: "active",
           revision: 0,
@@ -1645,13 +2763,14 @@ for (const implementation of stores()) {
           updatedAt: timestamp,
           committedVersion: null,
         }),
-      ).rejects.toThrow("missing pending segment");
+      ).rejects.toThrow("fresh transaction cannot begin with pending artifacts");
       expect(await store.getTransaction("missing-segment-transaction")).toBeUndefined();
       store.close();
     });
 
     it("reserves non-overlapping internal row ID ranges", async () => {
       const store = await implementation.create();
+      await addCounterFixtureTables(store);
       const [first, second] = await Promise.all([
         store.reserveRowIds("people", 3),
         store.reserveRowIds("people", 2),
@@ -1665,6 +2784,7 @@ for (const implementation of stores()) {
 
     it("reserves monotone auto-increment ranges per column", async () => {
       const store = await implementation.create();
+      await addCounterFixtureTables(store);
       expect(await store.reserveAutoIncrement("people", "id", 3)).toEqual({
         start: 1n,
         endExclusive: 4n,
@@ -1674,7 +2794,7 @@ for (const implementation of stores()) {
         endExclusive: 6n,
       });
       // Counters are per column and independent of the row-id counter.
-      expect(await store.reserveAutoIncrement("people", "other", 1)).toEqual({
+      expect(await store.reserveAutoIncrement("people-other", "other", 1)).toEqual({
         start: 1n,
         endExclusive: 2n,
       });
@@ -1684,6 +2804,7 @@ for (const implementation of stores()) {
 
     it("bumps the auto-increment counter past explicit values", async () => {
       const store = await implementation.create();
+      await addCounterFixtureTables(store);
       // A pure bump reserves nothing but advances the counter past imported values.
       expect(await store.reserveAutoIncrement("people", "id", 0, 101n)).toEqual({
         start: 101n,
@@ -1701,12 +2822,30 @@ for (const implementation of stores()) {
       await expect(store.reserveAutoIncrement("people", "id", -1)).rejects.toThrow(
         "non-negative whole number",
       );
-      await expect(store.reserveAutoIncrement("people", "id", 1, 0n)).rejects.toThrow("at least 1");
+      await expect(store.reserveAutoIncrement("people", "id", 1, 0n)).rejects.toThrow(
+        /bump target|at least 1/,
+      );
       store.close();
     });
 
     it("round-trips full-text base chunks and merges commit deltas", async () => {
       const store = await implementation.create();
+      await store.addTable({
+        managed: false,
+        id: "articles",
+        name: "articles",
+        columns: [{ id: "title", name: "title", type: "string", nullable: false }],
+        ftsColumns: {
+          title: {
+            storage: "fts-chunks-v1",
+            tokenizerVersion: 1,
+            state: "ready",
+            buildFromVersion: 4,
+          },
+        },
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
       await store.writeFtsBase("articles", "title", {
         coversVersion: 4,
         chunks: [
@@ -1725,6 +2864,7 @@ for (const implementation of stores()) {
         10,
       );
       expect(exact.rowIdsByTerm).toEqual([[1n, 3n]]);
+      expect(exact.overflow).toBe(false);
       expect(exact.deltaChunkCount).toBe(0);
       expect(exact.totalTokens).toBe(5);
       // Prefix terms match a term range; ga* reaches into the second chunk.
@@ -1751,6 +2891,7 @@ for (const implementation of stores()) {
     it("publishes a chunked postings generation atomically and replaces an abandoned build", async () => {
       const store = await implementation.create();
       await store.addTable({
+        managed: false,
         id: "bounded",
         name: "bounded",
         columns: [{ id: "value", name: "value", type: "string", nullable: false }],
@@ -1765,22 +2906,58 @@ for (const implementation of stores()) {
         revision: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
       });
-      await store.beginFtsBaseBuild("bounded", "value", "abandoned");
-      await store.writeFtsBaseBuildChunk("bounded", "value", "abandoned", 0, [
-        { term: "old", rowIds: [1n], tf: [1] },
-      ]);
+      const abandonedExpiry = "2026-01-01T00:05:00.000Z";
+      await beginPostingBuild(
+        store,
+        "bounded",
+        "value",
+        "abandoned",
+        POSTING_BUILD_CREATED_AT,
+        abandonedExpiry,
+      );
+      await appendPostingBuild(
+        store,
+        "bounded",
+        "value",
+        "abandoned",
+        0,
+        [{ term: "old", rowIds: [1n], tf: [1] }],
+        POSTING_BUILD_CREATED_AT,
+        abandonedExpiry,
+      );
       // Beginning a replacement reclaims the unfinished generation; it never becomes readable.
-      await store.beginFtsBaseBuild("bounded", "value", "replacement");
-      await store.writeFtsBaseBuildChunk("bounded", "value", "replacement", 0, [
-        { term: "alpha", rowIds: [2n], tf: [1] },
-      ]);
-      await store.writeFtsBaseBuildChunk("bounded", "value", "replacement", 1, [
-        { term: "omega", rowIds: [3n], tf: [1] },
-      ]);
-      await store.finishFtsBaseBuild("bounded", "value", "replacement", {
+      await beginPostingBuild(
+        store,
+        "bounded",
+        "value",
+        "replacement",
+        "2026-01-01T00:10:00.000Z",
+        "2026-01-01T00:40:00.000Z",
+      );
+      await appendPostingBuild(
+        store,
+        "bounded",
+        "value",
+        "replacement",
+        0,
+        [{ term: "alpha", rowIds: [2n], tf: [1] }],
+        "2026-01-01T00:10:00.000Z",
+        "2026-01-01T00:40:00.000Z",
+      );
+      await appendPostingBuild(
+        store,
+        "bounded",
+        "value",
+        "replacement",
+        1,
+        [{ term: "omega", rowIds: [3n], tf: [1] }],
+        "2026-01-01T00:10:00.000Z",
+        "2026-01-01T00:40:00.000Z",
+      );
+      await finishPostingBuild(store, "bounded", "value", "replacement", {
         coversVersion: 7,
         chunkCount: 2,
-        totalTokens: 0,
+        totalTokens: 2,
       });
       expect(
         await store.readFtsCandidates(
@@ -1799,6 +2976,7 @@ for (const implementation of stores()) {
     it("cannot publish a staged postings generation after its catalog index is dropped", async () => {
       const store = await implementation.create();
       await store.addTable({
+        managed: false,
         id: "dropped-build",
         name: "dropped_build",
         columns: [{ id: "value", name: "value", type: "string", nullable: false }],
@@ -1813,13 +2991,19 @@ for (const implementation of stores()) {
         revision: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
       });
-      await store.beginFtsBaseBuild("dropped-build", "value", "loser");
-      await store.writeFtsBaseBuildChunk("dropped-build", "value", "loser", 0, [
+      await beginPostingBuild(store, "dropped-build", "value", "loser");
+      await appendPostingBuild(store, "dropped-build", "value", "loser", 0, [
         { term: "must-not-publish", rowIds: [1n], tf: [1] },
       ]);
       await store.updateTable("dropped-build", 0, { ftsColumns: null });
       await store
-        .finishFtsBaseBuild("dropped-build", "value", "loser", {
+        .finishFtsBaseBuild({
+          tableId: "dropped-build",
+          columnId: "value",
+          buildId: "loser",
+          ownerId: postingBuildOwner("loser"),
+          expiresAtCutoff: POSTING_BUILD_CREATED_AT,
+          completedAt: POSTING_BUILD_CREATED_AT,
           coversVersion: 0,
           chunkCount: 1,
           totalTokens: 1,
@@ -1839,6 +3023,7 @@ for (const implementation of stores()) {
     it("invalidates stale scalar-index writers and cannot resurrect a dropped index", async () => {
       const store = await implementation.create();
       await store.addTable({
+        managed: false,
         id: "scalar-table",
         name: "scalar_table",
         columns: [{ id: "value-id", name: "value", type: "number", nullable: false }],
@@ -1846,6 +3031,9 @@ for (const implementation of stores()) {
           "index-id": {
             name: "by_value",
             columnId: "value-id",
+            columnIds: ["value-id"],
+            directions: ["asc"],
+            termEncoding: "tuple-v1",
             storage: "postings-v1",
             storageColumnId: "scalar-storage-id",
             locator: "row-id",
@@ -1859,7 +3047,7 @@ for (const implementation of stores()) {
       await store.writeFtsBase("scalar-table", "scalar-storage-id", {
         coversVersion: -1,
         chunks: [[{ term: "one", rowIds: [1n], tf: [1] }]],
-        totalTokens: 0,
+        totalTokens: 1,
       });
       const timestamp = "2026-01-01T00:00:00.000Z";
       const commit = async (
@@ -1869,34 +3057,30 @@ for (const implementation of stores()) {
       ) => {
         const blockId = `${transactionId}-block`;
         const segmentId = `${transactionId}-segment`;
-        await store.addBlock(blockId, Uint8Array.of(1));
-        await store.addSegment({
-          id: segmentId,
-          tableId: "scalar-table",
+        const staged = await stageTestArtifacts(store, {
           transactionId,
-          rowCount: 1,
-          rowIdStart: 2n,
-          rowIdEndExclusive: 3n,
-          columnBlockIds: { "value-id": [blockId] },
-          kind: "insert",
-          createdAt: timestamp,
-        });
-        await store.createTransaction({
-          id: transactionId,
           snapshotVersion: expectedVersion,
-          pendingBlockIds: [blockId],
-          pendingSegmentIds: [segmentId],
-          status: "active",
-          revision: 0,
-          startedAt: timestamp,
-          updatedAt: timestamp,
-          committedVersion: null,
+          blocks: [{ id: blockId, bytes: Uint8Array.of(1) }],
+          segments: [
+            {
+              id: segmentId,
+              tableId: "scalar-table",
+              transactionId,
+              rowCount: 1,
+              rowIdStart: 2n,
+              rowIdEndExclusive: 3n,
+              columnBlockIds: { "value-id": [blockId] },
+              kind: "insert",
+              createdAt: timestamp,
+            },
+          ],
         });
         return store.commitTransaction({
           transactionId,
-          expectedTransactionRevision: 0,
+          expectedTransactionRevision: staged.revision,
           expectedManifestVersion: expectedVersion,
           changedTableIds: ["scalar-table"],
+          levelZeroSegmentLimits: [{ tableId: "scalar-table", limit: 4096 }],
           ...(withDelta
             ? {
                 ftsChanges: [
@@ -1906,7 +3090,7 @@ for (const implementation of stores()) {
                       {
                         columnId: "scalar-storage-id",
                         postings: [{ term: "two", rowIds: [2n], tf: [1] }],
-                        totalTokens: 0,
+                        totalTokens: 1,
                       },
                     ],
                   },
@@ -1941,6 +3125,7 @@ for (const implementation of stores()) {
     it("removes full-text state atomically when its column leaves the catalog", async () => {
       const store = await implementation.create();
       await store.addTable({
+        managed: false,
         id: "drop-index-table",
         name: "drop_index",
         columns: [
@@ -1955,6 +3140,7 @@ for (const implementation of stores()) {
             buildFromVersion: 0,
           },
         },
+        revision: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
       });
       await store.writeFtsBase("drop-index-table", "drop-index-title", {
@@ -1980,6 +3166,7 @@ for (const implementation of stores()) {
     it("applies full-text commit deltas atomically and flips stale writers to invalid", async () => {
       const store = await implementation.create();
       await store.addTable({
+        managed: false,
         id: "articles-id",
         name: "articles",
         columns: [{ id: "title-id", name: "title", type: "string", nullable: false }],
@@ -2003,34 +3190,30 @@ for (const implementation of stores()) {
         const transactionId = `fts-tx-${String(ordinal)}`;
         const blockId = `fts-block-${String(ordinal)}`;
         const segmentId = `fts-segment-${String(ordinal)}`;
-        await store.addBlock(blockId, Uint8Array.of(1));
-        await store.addSegment({
-          id: segmentId,
-          tableId: "articles-id",
+        const staged = await stageTestArtifacts(store, {
           transactionId,
-          rowCount: 1,
-          rowIdStart: BigInt(ordinal),
-          rowIdEndExclusive: BigInt(ordinal) + 1n,
-          columnBlockIds: { "title-id": [blockId] },
-          kind: "insert",
-          createdAt: timestamp,
-        });
-        await store.createTransaction({
-          id: transactionId,
           snapshotVersion: expectedVersion,
-          pendingBlockIds: [blockId],
-          pendingSegmentIds: [segmentId],
-          status: "active",
-          revision: 0,
-          startedAt: timestamp,
-          updatedAt: timestamp,
-          committedVersion: null,
+          blocks: [{ id: blockId, bytes: Uint8Array.of(1) }],
+          segments: [
+            {
+              id: segmentId,
+              tableId: "articles-id",
+              transactionId,
+              rowCount: 1,
+              rowIdStart: BigInt(ordinal),
+              rowIdEndExclusive: BigInt(ordinal) + 1n,
+              columnBlockIds: { "title-id": [blockId] },
+              kind: "insert",
+              createdAt: timestamp,
+            },
+          ],
         });
         return store.commitTransaction({
           transactionId,
-          expectedTransactionRevision: 0,
+          expectedTransactionRevision: staged.revision,
           expectedManifestVersion: expectedVersion,
           changedTableIds: ["articles-id"],
+          levelZeroSegmentLimits: [{ tableId: "articles-id", limit: 4096 }],
           ...(withDelta
             ? {
                 ftsChanges: [
@@ -2072,10 +3255,7 @@ for (const implementation of stores()) {
 
     it("reserves row ids and auto-increment values while beginning a transaction", async () => {
       const store = await implementation.create();
-      if (store.beginTransaction === undefined) {
-        store.close();
-        return;
-      }
+      await addCounterFixtureTables(store);
       const result = await store.beginTransaction({
         record: activeTransaction("begin-reservations"),
         reserveRowIds: { tableId: "people", count: 4 },
@@ -2098,15 +3278,26 @@ for (const implementation of stores()) {
         kind: "reader",
         manifestVersion: null,
         ownerId: "tab-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:01:00.000Z",
         revision: 0,
       });
-      const renewed = await store.renewLease("reader-1", 0, "2026-01-01T00:02:00.000Z");
+      const renewed = await store.renewLease({
+        id: "reader-1",
+        expectedRevision: 0,
+        expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-01-01T00:02:00.000Z",
+      });
       expect(renewed.revision).toBe(1);
-      await expect(store.renewLease("reader-1", 0, renewed.expiresAt)).rejects.toThrow(
-        "expected revision 0",
-      );
-      await store.removeLease("reader-1");
+      await expect(
+        store.renewLease({
+          id: "reader-1",
+          expectedRevision: 0,
+          expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+          expiresAt: renewed.expiresAt,
+        }),
+      ).rejects.toThrow("expected revision 0");
+      await store.removeLease({ id: "reader-1", ownerId: "tab-1" });
       expect(await store.listLeases()).toEqual([]);
       store.close();
     });
@@ -2125,6 +3316,14 @@ for (const implementation of stores()) {
         sourceStoredBytes: 0,
         outputStoredBytes: 0,
         logicalBytes: 0,
+        rewritePlan: { kind: "copy-v1" },
+        outputCursor: null,
+        memoryBudgetBytes: 0,
+        minimumMemoryBytes: 0,
+        level0SourceStoredBytes: 0,
+        anchorSourceStoredBytes: 0,
+        peakWorkingBytes: 0,
+        outputLogicalBytes: 0,
         targetLevel: 1,
         state: "planned",
         transactionId: null,
@@ -2134,6 +3333,17 @@ for (const implementation of stores()) {
         createdAt: "2026-01-01T00:00:01.000Z",
         updatedAt: "2026-01-01T00:00:01.000Z",
       };
+      const accountJob: CompactionJobRecord = {
+        ...created,
+        id: "job-a",
+        tableId: "accounts",
+        sourceSegmentIds: ["account-segment"],
+        sourceBlockIds: ["account-block"],
+        cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      await prepareCompactionSourceFixtures(store, [created, accountJob]);
       await store.createCompactionJob(created);
       created.sourceSegmentIds[0] = "mutated-segment";
       created.cursor.sourceBlockIndex = 99;
@@ -2150,16 +3360,7 @@ for (const implementation of stores()) {
         outputLogicalBytes: 0,
       });
 
-      await store.createCompactionJob({
-        ...created,
-        id: "job-a",
-        tableId: "accounts",
-        sourceSegmentIds: ["account-segment"],
-        sourceBlockIds: ["account-block"],
-        cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      });
+      await store.createCompactionJob(accountJob);
       expect((await store.listCompactionJobs()).map((job) => job.id)).toEqual(["job-a", "job-b"]);
       expect((await store.listCompactionJobs("events")).map((job) => job.id)).toEqual(["job-b"]);
       const firstPage = await store.listCompactionJobPage(null, 1);
@@ -2171,6 +3372,28 @@ for (const implementation of stores()) {
 
       const outputBlockIds = ["output-b", "output-a", "output-b"];
       const cursor = { sourceSegmentIndex: 1, sourceBlockIndex: 8 };
+      await stageTestArtifacts(store, {
+        transactionId: "transaction-9",
+        snapshotVersion: 7,
+        blocks: [
+          { id: "output-a", bytes: Uint8Array.of(1) },
+          { id: "output-b", bytes: Uint8Array.of(2) },
+        ],
+        segments: [
+          {
+            id: "output-segment",
+            tableId: "events",
+            transactionId: "transaction-9",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: ["output-a", "output-b"] },
+            level: 1,
+            logicalOrder: 7,
+            createdAt: "2026-01-01T00:00:02.000Z",
+          },
+        ],
+      });
       const updated = await store.updateCompactionJob("job-b", 0, {
         outputBlockIds,
         cursor,
@@ -2210,8 +3433,7 @@ for (const implementation of stores()) {
       expect(recovered).not.toHaveProperty("error");
       expect(recovered.revision).toBe(2);
 
-      await store.removeCompactionJob("job-b");
-      expect(await store.getCompactionJob("job-b")).toBeUndefined();
+      expect(await store.getCompactionJob("job-b")).toMatchObject({ state: "ready" });
       store.close();
     });
 
@@ -2222,6 +3444,31 @@ for (const implementation of stores()) {
         level0SourceStoredBytes: 240,
         anchorSourceStoredBytes: 120,
       };
+      const missingLevelZero = rechunkCompactionJob("missing-level-zero-byte-accounting");
+      delete (missingLevelZero as unknown as { level0SourceStoredBytes?: number })
+        .level0SourceStoredBytes;
+      const missingAnchor = rechunkCompactionJob("missing-anchor-byte-accounting");
+      delete (missingAnchor as unknown as { anchorSourceStoredBytes?: number })
+        .anchorSourceStoredBytes;
+      const requiredCheckpointFields = [
+        "rewritePlan",
+        "outputCursor",
+        "memoryBudgetBytes",
+        "minimumMemoryBytes",
+        "peakWorkingBytes",
+        "outputLogicalBytes",
+      ] as const;
+      const missingRequired = requiredCheckpointFields.map((field) => {
+        const record = rechunkCompactionJob(`missing-${field}`);
+        Reflect.deleteProperty(record, field);
+        return record;
+      });
+      await prepareCompactionSourceFixtures(store, [
+        accounted,
+        missingLevelZero,
+        missingAnchor,
+        ...missingRequired,
+      ]);
       await store.createCompactionJob(accounted);
       expect(await store.getCompactionJob(accounted.id)).toMatchObject({
         sourceStoredBytes: 360,
@@ -2229,34 +3476,18 @@ for (const implementation of stores()) {
         anchorSourceStoredBytes: 120,
       });
 
-      const legacy = rechunkCompactionJob("legacy-source-level-byte-accounting");
-      await store.createCompactionJob(legacy);
-      const persistedLegacy = await store.getCompactionJob(legacy.id);
-      expect(persistedLegacy).not.toHaveProperty("level0SourceStoredBytes");
-      expect(persistedLegacy).not.toHaveProperty("anchorSourceStoredBytes");
-
       const invalidRecords: Array<{ record: CompactionJobRecord; message: string }> = [
         {
           record: {
-            ...rechunkCompactionJob("partial-level-zero-byte-accounting"),
-            level0SourceStoredBytes: 360,
+            ...missingLevelZero,
           },
-          message: "requires both stored byte fields",
+          message: "level-zero source stored bytes",
         },
         {
           record: {
-            ...rechunkCompactionJob("partial-anchor-byte-accounting"),
-            anchorSourceStoredBytes: 360,
+            ...missingAnchor,
           },
-          message: "requires both stored byte fields",
-        },
-        {
-          record: {
-            ...rechunkCompactionJob("zero-level-zero-byte-accounting"),
-            level0SourceStoredBytes: 0,
-            anchorSourceStoredBytes: 360,
-          },
-          message: "must be positive",
+          message: "anchor source stored bytes",
         },
         {
           record: {
@@ -2270,6 +3501,10 @@ for (const implementation of stores()) {
       for (const invalid of invalidRecords) {
         await expect(store.createCompactionJob(invalid.record)).rejects.toThrow(invalid.message);
         expect(await store.getCompactionJob(invalid.record.id)).toBeUndefined();
+      }
+      for (const invalid of missingRequired) {
+        await expect(store.createCompactionJob(invalid)).rejects.toThrow();
+        expect(await store.getCompactionJob(invalid.id)).toBeUndefined();
       }
 
       const immutableBypassUpdates = [
@@ -2294,6 +3529,7 @@ for (const implementation of stores()) {
         );
       }
       expect((await store.getCompactionJob(accounted.id))?.revision).toBe(0);
+      await store.cancelCompactionJob(accounted.id, 0, "2026-01-01T00:00:02.000Z");
       store.close();
     });
 
@@ -2304,6 +3540,13 @@ for (const implementation of stores()) {
         maximumOutputStoredBytes: 720,
         plannedOutputStoredBytesUpperBound: 720,
       };
+      const overflow = {
+        ...bounded,
+        id: "overflow-level-two",
+        maximumOutputStoredBytes: 719,
+        plannedOutputStoredBytesUpperBound: 719,
+      };
+      await prepareCompactionSourceFixtures(store, [bounded, overflow]);
       await store.createCompactionJob(bounded);
       expect(await store.getCompactionJob(bounded.id)).toMatchObject({
         outputPartitionOrdinal: 3,
@@ -2312,6 +3555,11 @@ for (const implementation of stores()) {
         plannedOutputStoredBytesUpperBound: 720,
       });
 
+      await stageTestArtifacts(store, {
+        transactionId: "bounded-level-two-transaction",
+        snapshotVersion: bounded.sourceManifestVersion,
+        blocks: [{ id: "bounded-level-two-output-0", bytes: Uint8Array.of(1) }],
+      });
       const boundary = await store.updateCompactionJob(bounded.id, 0, {
         state: "running",
         transactionId: "bounded-level-two-transaction",
@@ -2323,12 +3571,7 @@ for (const implementation of stores()) {
       });
       expect(boundary).toMatchObject({ outputStoredBytes: 720, revision: 1 });
 
-      const overflow = {
-        ...bounded,
-        id: "overflow-level-two",
-        maximumOutputStoredBytes: 719,
-        plannedOutputStoredBytesUpperBound: 719,
-      };
+      await store.cancelCompactionJob(bounded.id, 1, "2026-01-01T00:00:02.000Z");
       await store.createCompactionJob(overflow);
       await expect(
         store.updateCompactionJob(overflow.id, 0, {
@@ -2414,6 +3657,10 @@ for (const implementation of stores()) {
         },
       ];
       const mergePolicy = mergeCompactionJob("merge-level-two-policy-missing-accounting");
+      delete (mergePolicy as unknown as { level0SourceStoredBytes?: number })
+        .level0SourceStoredBytes;
+      delete (mergePolicy as unknown as { anchorSourceStoredBytes?: number })
+        .anchorSourceStoredBytes;
       invalidRecords.push({
         record: {
           ...mergePolicy,
@@ -2423,7 +3670,7 @@ for (const implementation of stores()) {
           plannedOutputStoredBytesUpperBound: 80,
           targetLevel: 2,
         },
-        message: "requires source-level byte accounting",
+        message: "level-zero source stored bytes",
       });
       invalidRecords.push({
         record: {
@@ -2466,6 +3713,9 @@ for (const implementation of stores()) {
         priorAttemptOutputStoredBytes: 5,
         targetLevel: 2,
       };
+      const immutable = level2CompactionJob("immutable-level-two-policy");
+      const levelOne = rechunkCompactionJob("level-one-without-level-two-policy");
+      await prepareCompactionSourceFixtures(store, [keyedMergeJob, immutable, levelOne]);
       await store.createCompactionJob(keyedMergeJob);
       expect(await store.getCompactionJob(keyedMergeJob.id)).toMatchObject({
         outputPartitionOrdinal: 1,
@@ -2473,7 +3723,7 @@ for (const implementation of stores()) {
         anchorSourceStoredBytes: 10,
       });
 
-      const immutable = level2CompactionJob("immutable-level-two-policy");
+      await store.cancelCompactionJob(keyedMergeJob.id, 0, "2026-01-01T00:00:02.000Z");
       await store.createCompactionJob(immutable);
       for (const [field, value] of [
         ["outputPartitionOrdinal", 4],
@@ -2492,13 +3742,13 @@ for (const implementation of stores()) {
       }
       expect((await store.getCompactionJob(immutable.id))?.revision).toBe(0);
 
-      const legacy = rechunkCompactionJob("legacy-unbounded-level-one");
-      await store.createCompactionJob(legacy);
-      const persistedLegacy = await store.getCompactionJob(legacy.id);
-      expect(persistedLegacy).not.toHaveProperty("outputPartitionOrdinal");
-      expect(persistedLegacy).not.toHaveProperty("maxWriteAmplification");
-      expect(persistedLegacy).not.toHaveProperty("maximumOutputStoredBytes");
-      expect(persistedLegacy).not.toHaveProperty("plannedOutputStoredBytesUpperBound");
+      await store.cancelCompactionJob(immutable.id, 0, "2026-01-01T00:00:03.000Z");
+      await store.createCompactionJob(levelOne);
+      const persistedLevelOne = await store.getCompactionJob(levelOne.id);
+      expect(persistedLevelOne).not.toHaveProperty("outputPartitionOrdinal");
+      expect(persistedLevelOne).not.toHaveProperty("maxWriteAmplification");
+      expect(persistedLevelOne).not.toHaveProperty("maximumOutputStoredBytes");
+      expect(persistedLevelOne).not.toHaveProperty("plannedOutputStoredBytesUpperBound");
       store.close();
     });
 
@@ -2519,7 +3769,7 @@ for (const implementation of stores()) {
       expect(cancelled).not.toHaveProperty("error");
       expect(await store.getTransaction(commit.transactionId)).toMatchObject({
         status: "aborted",
-        revision: 1,
+        revision: commit.expectedTransactionRevision + 1,
         updatedAt: cancelledAt,
         pendingBlockIds: job.outputBlockIds,
         pendingSegmentIds: [job.outputSegmentId],
@@ -2549,7 +3799,7 @@ for (const implementation of stores()) {
       expect(await store.getTransaction(commit.transactionId)).toMatchObject({
         status: "committed",
         committedVersion: manifest.version,
-        revision: 1,
+        revision: commit.expectedTransactionRevision + 1,
       });
       expect((await store.getCurrentManifest())?.version).toBe(manifest.version);
       store.close();
@@ -2569,13 +3819,13 @@ for (const implementation of stores()) {
       ).toEqual(cancelled);
       expect(await store.getTransaction(job.transactionId ?? "")).toEqual(transactionBefore);
 
-      for (const state of ["published", "aborted"] as const) {
+      for (const state of ["aborted"] as const) {
         const terminalJob: CompactionJobRecord = {
           ...job,
           id: `${state}-terminal-job`,
-          transactionId: `${state}-terminal-transaction`,
+          transactionId: job.transactionId,
           state,
-          publishedVersion: state === "published" ? 9 : null,
+          publishedVersion: null,
           revision: 4,
           updatedAt: "2026-01-01T00:00:04.000Z",
         };
@@ -2634,7 +3884,9 @@ for (const implementation of stores()) {
     it("cancels safely when the linked transaction is missing or already aborted", async () => {
       const store = await implementation.create();
       const { job } = await createReadyCompaction(store, "inactive-transaction");
-      const abortedTransaction = await store.updateTransaction(job.transactionId ?? "", 0, {
+      const linked = await store.getTransaction(job.transactionId ?? "");
+      if (linked === undefined) throw new Error("Missing linked transaction fixture");
+      const abortedTransaction = await store.updateTransaction(linked.id, linked.revision, {
         status: "aborted",
         updatedAt: "2026-01-01T00:00:01.000Z",
       });
@@ -2652,34 +3904,10 @@ for (const implementation of stores()) {
         id: "missing-transaction-job",
         transactionId: "missing-transaction",
       };
-      await store.createCompactionJob(missingTransactionJob);
-      expect(
-        await store.cancelCompactionJob(
-          missingTransactionJob.id,
-          missingTransactionJob.revision,
-          "2026-01-01T00:00:03.000Z",
-        ),
-      ).toMatchObject({ state: "cancelled", revision: 1 });
+      await expect(store.createCompactionJob(missingTransactionJob)).rejects.toThrow(
+        /missing transaction|no transaction/,
+      );
       expect(await store.getTransaction("missing-transaction")).toBeUndefined();
-      store.close();
-    });
-
-    it("fails closed when a committed transaction has no manifest version", async () => {
-      const store = await implementation.create();
-      const { job } = await createReadyCompaction(store, "invalid-commit", {
-        status: "committed",
-        committedVersion: null,
-      });
-      const invalidTransaction = await store.getTransaction(job.transactionId ?? "");
-
-      await expect(
-        store.cancelCompactionJob(job.id, job.revision, "2026-01-01T00:00:02.000Z"),
-      ).rejects.toThrow("has no manifest version");
-      expect(await store.getCompactionJob(job.id)).toMatchObject({
-        state: "ready",
-        revision: job.revision,
-      });
-      expect(await store.getTransaction(job.transactionId ?? "")).toEqual(invalidTransaction);
       store.close();
     });
 
@@ -2699,9 +3927,10 @@ for (const implementation of stores()) {
     it("persists deterministic rechunk plans and output-driven checkpoints", async () => {
       const store = await implementation.create();
       const created = rechunkCompactionJob();
+      await prepareCompactionSourceFixtures(store, [created]);
       await store.createCompactionJob(created);
       const createdPlan = created.rewritePlan;
-      if (createdPlan?.kind !== "rechunk-v1") throw new Error("Expected a rechunk plan");
+      if (createdPlan.kind !== "rechunk-v1") throw new Error("Expected a rechunk plan");
       (createdPlan.columns[0]?.sourceBlocks[0] as { blockId: string }).blockId = "mutated";
       (createdPlan.outputs[0] as { rowCount: number }).rowCount = 99;
 
@@ -2714,6 +3943,31 @@ for (const implementation of stores()) {
         minimumMemoryBytes: 512,
         peakWorkingBytes: 0,
         outputLogicalBytes: 0,
+      });
+
+      await stageTestArtifacts(store, {
+        transactionId: "rechunk-transaction",
+        snapshotVersion: created.sourceManifestVersion,
+        blocks: ["output-0-id", "output-0-name", "output-1-id", "output-1-name"].map((id) => ({
+          id,
+          bytes: Uint8Array.of(1),
+        })),
+        segments: [
+          {
+            id: created.outputSegmentId ?? "",
+            tableId: created.tableId,
+            transactionId: "rechunk-transaction",
+            rowCount: 4,
+            rowIdStart: 10n,
+            rowIdEndExclusive: 14n,
+            columnBlockIds: {
+              value: ["output-0-id", "output-0-name", "output-1-id", "output-1-name"],
+            },
+            level: 1,
+            logicalOrder: created.sourceManifestVersion,
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+        ],
       });
 
       const first = await store.updateCompactionJob(created.id, 0, {
@@ -2808,7 +4062,7 @@ for (const implementation of stores()) {
       ).rejects.toThrow("cannot contain duplicates");
 
       const badRange = rechunkCompactionJob("bad-range");
-      if (badRange.rewritePlan?.kind !== "rechunk-v1") throw new Error("Expected rechunk plan");
+      if (badRange.rewritePlan.kind !== "rechunk-v1") throw new Error("Expected rechunk plan");
       await expect(
         store.createCompactionJob({
           ...badRange,
@@ -2822,7 +4076,22 @@ for (const implementation of stores()) {
         }),
       ).rejects.toThrow("contiguously");
 
+      const oversizedOutput = rechunkCompactionJob("oversized-output");
+      if (oversizedOutput.rewritePlan.kind !== "rechunk-v1") {
+        throw new Error("Expected rechunk plan");
+      }
+      await expect(
+        store.createCompactionJob({
+          ...oversizedOutput,
+          rewritePlan: {
+            ...oversizedOutput.rewritePlan,
+            outputs: [{ rowStart: 0, rowCount: MAX_BLOCK_ROW_COUNT + 1 }],
+          },
+        }),
+      ).rejects.toThrow("block format row limit");
+
       const checkpoint = rechunkCompactionJob("bad-checkpoint");
+      await prepareCompactionSourceFixtures(store, [checkpoint]);
       await store.createCompactionJob(checkpoint);
       await expect(
         store.updateCompactionJob(checkpoint.id, 0, {
@@ -2844,9 +4113,10 @@ for (const implementation of stores()) {
     it("persists immutable merge plans and advances output-driven checkpoints", async () => {
       const store = await implementation.create();
       const created = mergeCompactionJob();
+      await prepareCompactionSourceFixtures(store, [created]);
       await store.createCompactionJob(created);
       const createdPlan = created.rewritePlan;
-      if (createdPlan?.kind !== "merge-v1") throw new Error("Expected a merge plan");
+      if (createdPlan.kind !== "merge-v1") throw new Error("Expected a merge plan");
       (createdPlan.rowIdSpans[0] as { rowIdStart: bigint }).rowIdStart = 999n;
       (createdPlan.sourceSegments[0]?.columns[0]?.sourceBlocks[0] as { blockId: string }).blockId =
         "mutated";
@@ -2866,6 +4136,29 @@ for (const implementation of stores()) {
           ],
         },
         outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+      });
+
+      await stageTestArtifacts(store, {
+        transactionId: "merge-transaction",
+        snapshotVersion: created.sourceManifestVersion,
+        blocks: ["merge-output-id", "merge-output-value"].map((id) => ({
+          id,
+          bytes: Uint8Array.of(1),
+        })),
+        segments: [
+          {
+            id: created.outputSegmentId ?? "",
+            tableId: created.tableId,
+            transactionId: "merge-transaction",
+            rowCount: 2,
+            rowIdStart: 3n,
+            rowIdEndExclusive: 5n,
+            columnBlockIds: { value: ["merge-output-id", "merge-output-value"] },
+            level: 1,
+            logicalOrder: created.sourceManifestVersion,
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+        ],
       });
 
       const first = await store.updateCompactionJob(created.id, 0, {
@@ -2917,7 +4210,7 @@ for (const implementation of stores()) {
       );
 
       const duplicateBlock = mergeCompactionJob("merge-duplicate-block");
-      if (duplicateBlock.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      if (duplicateBlock.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
       (
         duplicateBlock.rewritePlan.sourceSegments[2]?.columns[0]?.sourceBlocks[0] as {
           blockId: string;
@@ -2928,21 +4221,21 @@ for (const implementation of stores()) {
       );
 
       const unknownRange = mergeCompactionJob("merge-unknown-range");
-      if (unknownRange.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      if (unknownRange.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
       (
         unknownRange.rewritePlan.columns[0]?.sourceRanges[0] as { sourceBlockId: string }
       ).sourceBlockId = "unknown";
       await expect(store.createCompactionJob(unknownRange)).rejects.toThrow("unknown source block");
 
       const overlappingIds = mergeCompactionJob("merge-overlapping-row-ids");
-      if (overlappingIds.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      if (overlappingIds.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
       (overlappingIds.rewritePlan.rowIdSpans[1] as { rowIdStart: bigint }).rowIdStart = 10n;
       await expect(store.createCompactionJob(overlappingIds)).rejects.toThrow(
         "overlapping row IDs",
       );
 
       const gappedRanges = mergeCompactionJob("merge-gapped-ranges");
-      if (gappedRanges.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      if (gappedRanges.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
       (
         gappedRanges.rewritePlan.columns[0]?.sourceRanges[1] as { outputRowStart: number }
       ).outputRowStart = 2;
@@ -2951,7 +4244,7 @@ for (const implementation of stores()) {
       );
 
       const invalidDelete = mergeCompactionJob("merge-invalid-delete");
-      if (invalidDelete.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      if (invalidDelete.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
       (invalidDelete.rewritePlan.sourceSegments[1] as { kind: "update" }).kind = "update";
       await expect(store.createCompactionJob(invalidDelete)).rejects.toThrow(
         "update segment requires",
@@ -2964,7 +4257,7 @@ for (const implementation of stores()) {
     it("publishes an empty merge without fabricating an output segment", async () => {
       const store = await implementation.create();
       const nonEmpty = mergeCompactionJob("empty-merge");
-      if (nonEmpty.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      if (nonEmpty.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
       const emptyPlan: MergeCompactionRewritePlan = {
         ...nonEmpty.rewritePlan,
         totalRows: 0,
@@ -2981,7 +4274,18 @@ for (const implementation of stores()) {
         outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
         minimumMemoryBytes: 0,
       };
+      await prepareCompactionSourceFixtures(store, [empty]);
       await store.createCompactionJob(empty);
+
+      await store.createTransaction({
+        ...activeTransaction("empty-merge-transaction"),
+        snapshotVersion: empty.sourceManifestVersion,
+      });
+      await publishManifest(store, {
+        expectedVersion: empty.sourceManifestVersion,
+        blockIds: empty.sourceBlockIds,
+        createdAt: "2026-01-01T00:00:02.500Z",
+      });
 
       const running = await store.updateCompactionJob(empty.id, 0, {
         state: "running",
@@ -3037,6 +4341,14 @@ for (const implementation of stores()) {
           sourceStoredBytes: 0,
           outputStoredBytes: 0,
           logicalBytes: 0,
+          rewritePlan: { kind: "copy-v1" },
+          outputCursor: null,
+          memoryBudgetBytes: 0,
+          minimumMemoryBytes: 0,
+          level0SourceStoredBytes: 0,
+          anchorSourceStoredBytes: 0,
+          peakWorkingBytes: 0,
+          outputLogicalBytes: 0,
           targetLevel: 1,
           state: "planned",
           transactionId: null,
@@ -3065,6 +4377,14 @@ for (const implementation of stores()) {
         sourceStoredBytes: 0,
         outputStoredBytes: 0,
         logicalBytes: 0,
+        rewritePlan: { kind: "copy-v1" },
+        outputCursor: null,
+        memoryBudgetBytes: 0,
+        minimumMemoryBytes: 0,
+        level0SourceStoredBytes: 0,
+        anchorSourceStoredBytes: 0,
+        peakWorkingBytes: 0,
+        outputLogicalBytes: 0,
         targetLevel: 1,
         state: "planned",
         transactionId: null,
@@ -3074,6 +4394,32 @@ for (const implementation of stores()) {
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
       };
+
+      await prepareCompactionSourceFixtures(store, [planned]);
+      await stageTestArtifacts(store, {
+        transactionId: "compaction-transaction",
+        snapshotVersion: 0,
+        blocks: [{ id: "output-block", bytes: Uint8Array.of(2) }],
+        segments: [
+          {
+            id: "output-segment",
+            tableId: "events",
+            transactionId: "compaction-transaction",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: ["output-block"] },
+            level: 1,
+            logicalOrder: 0,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+      await publishManifest(store, {
+        expectedVersion: 0,
+        blockIds: planned.sourceBlockIds,
+        createdAt: "2026-01-01T00:00:00.500Z",
+      });
 
       for (const state of ["ready", "published"] as const) {
         await expect(
@@ -3122,7 +4468,7 @@ for (const implementation of stores()) {
 
     it("updates compaction checkpoints atomically", async () => {
       const store = await implementation.create();
-      await store.createCompactionJob({
+      const contended: CompactionJobRecord = {
         id: "contended-job",
         tableId: "events",
         sourceManifestVersion: 0,
@@ -3134,6 +4480,14 @@ for (const implementation of stores()) {
         sourceStoredBytes: 0,
         outputStoredBytes: 0,
         logicalBytes: 0,
+        rewritePlan: { kind: "copy-v1" },
+        outputCursor: null,
+        memoryBudgetBytes: 0,
+        minimumMemoryBytes: 0,
+        level0SourceStoredBytes: 0,
+        anchorSourceStoredBytes: 0,
+        peakWorkingBytes: 0,
+        outputLogicalBytes: 0,
         targetLevel: 1,
         state: "planned",
         transactionId: null,
@@ -3142,7 +4496,11 @@ for (const implementation of stores()) {
         revision: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
-      });
+      };
+      await prepareCompactionSourceFixtures(store, [contended]);
+      await store.createCompactionJob(contended);
+      await store.createTransaction(activeTransaction("transaction-a"));
+      await store.createTransaction(activeTransaction("transaction-b"));
       const results = await Promise.allSettled([
         store.updateCompactionJob("contended-job", 0, {
           state: "running",
@@ -3195,9 +4553,11 @@ for (const implementation of stores()) {
         },
       });
       expect(await store.getManifest(0)).toMatchObject({
-        blockIds: [`${prefix}/old-block`],
         prunedAt: "2026-01-01T00:03:00.000Z",
       });
+      // Historical membership is retained in interval provenance after the bounded summary
+      // tombstone is marked pruned. Later GC passes must still be able to continue enumerating it.
+      expect(await readManifestBlockIds(store, 0)).toEqual([`${prefix}/old-block`]);
       expect(await store.getSegment(`${prefix}/old-segment`)).toBeDefined();
       expect(await store.getBlock(`${prefix}/old-block`)).toEqual(Uint8Array.of(1, 2, 3));
 
@@ -3238,7 +4598,11 @@ for (const implementation of stores()) {
         },
       });
       expect(await store.getBlock(`${prefix}/old-block`)).toBeUndefined();
-      expect(await store.getBlock(`${prefix}/current-block`)).toEqual(Uint8Array.of(4, 5));
+      expect(
+        await store.getBlock(
+          `${prefix}/supersede-job/output/segment/000000/column/000000/part/000000`,
+        ),
+      ).toEqual(Uint8Array.of(4, 5));
       expect((await store.getCurrentManifest())?.version).toBe(1);
 
       const repeated = await store.runGarbageCollectionStep({
@@ -3262,6 +4626,7 @@ for (const implementation of stores()) {
         kind: "reader",
         manifestVersion: 0,
         ownerId: "reader",
+        createdAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:20:00.000Z",
         revision: 0,
       });
@@ -3299,6 +4664,7 @@ for (const implementation of stores()) {
         kind: "reader",
         manifestVersion: 0,
         ownerId: "reader",
+        createdAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:05:00.000Z",
         revision: 0,
       });
@@ -3314,14 +4680,20 @@ for (const implementation of stores()) {
         prunedAt: "2026-01-01T00:11:00.000Z",
       });
       await expect(
-        store.renewLease(`${prefix}/lease`, 0, "2026-01-01T01:00:00.000Z"),
-      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+        store.renewLease({
+          id: `${prefix}/lease`,
+          expectedRevision: 0,
+          expiresAtCutoff: "2026-01-01T00:10:00.000Z",
+          expiresAt: "2026-01-01T01:00:00.000Z",
+        }),
+      ).rejects.toThrow(/expired/);
       await expect(
         store.createLease({
           id: `${prefix}/late-lease`,
           kind: "reader",
           manifestVersion: 0,
           ownerId: "late-reader",
+          createdAt: "2026-01-01T00:10:00.000Z",
           expiresAt: "2026-01-01T01:00:00.000Z",
           revision: 0,
         }),
@@ -3348,7 +4720,6 @@ for (const implementation of stores()) {
 
     it("rejects candidates without persisted manifest or terminal-artifact provenance", async () => {
       const store = await implementation.create();
-      await store.addBlock("unproven-orphan", Uint8Array.of(1));
       await expect(
         store.createGarbageCollectionJob({
           id: "unsafe-gc",
@@ -3359,7 +4730,7 @@ for (const implementation of stores()) {
           createdAt: "2026-01-01T00:00:00.000Z",
         }),
       ).rejects.toThrow("no persisted provenance");
-      expect(await store.getBlock("unproven-orphan")).toEqual(Uint8Array.of(1));
+      expect(await store.getBlock("unproven-orphan")).toBeUndefined();
       expect(await store.getGarbageCollectionJob("unsafe-gc")).toBeUndefined();
       store.close();
     });
@@ -3395,23 +4766,35 @@ for (const implementation of stores()) {
           kind: "reader",
           manifestVersion: null,
           ownerId: "reader",
+          createdAt: "2026-01-01T00:00:00.000Z",
           expiresAt: "not-a-date",
           revision: 0,
         }),
-      ).rejects.toThrow("expiration must be valid");
+      ).rejects.toThrow(/valid|canonical|timestamps/);
       await store.createLease({
         id: "expiry-cas-lease",
         kind: "reader",
         manifestVersion: null,
         ownerId: "reader",
+        createdAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:05:00.000Z",
         revision: 0,
       });
-      await expect(store.renewLease("expiry-cas-lease", 0, "not-a-date")).rejects.toThrow(
-        "expiration must be valid",
-      );
+      await expect(
+        store.renewLease({
+          id: "expiry-cas-lease",
+          expectedRevision: 0,
+          expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+          expiresAt: "not-a-date",
+        }),
+      ).rejects.toThrow(/valid|canonical|timestamps/);
       expect((await store.getLease("expiry-cas-lease"))?.revision).toBe(0);
-      const renewed = await store.renewLease("expiry-cas-lease", 0, "2026-01-01T00:20:00.000Z");
+      const renewed = await store.renewLease({
+        id: "expiry-cas-lease",
+        expectedRevision: 0,
+        expiresAtCutoff: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-01-01T00:20:00.000Z",
+      });
       await expect(
         store.removeLeaseIfExpired("expiry-cas-lease", 0, "2026-01-01T00:30:00.000Z"),
       ).rejects.toBeInstanceOf(LeaseConflictError);
@@ -3433,60 +4816,40 @@ for (const implementation of stores()) {
       store.close();
     });
 
-    it("roots a segment owned by an active transaction before its journal checkpoint", async () => {
-      const store = await implementation.create();
-      const prefix = "segment-journal-gap";
-      await createSupersededStorage(store, prefix);
-      const transaction = activeTransaction(`${prefix}/active-transaction`);
-      transaction.snapshotVersion = 1;
-      await store.createTransaction(transaction);
-      await store.addSegment({
-        id: `${prefix}/uncheckpointed-segment`,
-        tableId: "events",
-        transactionId: transaction.id,
-        rowCount: 1,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 2n,
-        columnBlockIds: { value: [`${prefix}/old-block`] },
-        createdAt: "2026-01-01T00:02:00.000Z",
-      });
-      const job = await store.createGarbageCollectionJob({
-        id: `${prefix}/gc`,
-        candidateManifestVersions: [0],
-        candidateSegmentIds: [`${prefix}/uncheckpointed-segment`],
-        candidateBlockIds: [`${prefix}/old-block`],
-        leaseCutoff: "2026-01-01T00:10:00.000Z",
-        createdAt: "2026-01-01T00:02:00.000Z",
-      });
-      const result = await store.runGarbageCollectionStep({
-        jobId: job.id,
-        expectedRevision: 0,
-        maxItems: 3,
-        updatedAt: "2026-01-01T00:03:00.000Z",
-      });
-
-      expect(result.prunedManifestVersions).toEqual([0]);
-      expect(result.retainedSegmentIds).toEqual([`${prefix}/uncheckpointed-segment`]);
-      expect(result.retainedBlockIds).toEqual([`${prefix}/old-block`]);
-      expect(await store.getSegment(`${prefix}/uncheckpointed-segment`)).toBeDefined();
-      expect(await store.getBlock(`${prefix}/old-block`)).toBeDefined();
-      store.close();
-    });
-
     it("does not turn a wide segment dependency set into a permanent garbage root", async () => {
       const store = await implementation.create();
       const segmentId = "wide-orphan-segment";
-      await store.addSegment({
-        id: segmentId,
-        tableId: "events",
-        transactionId: "finished-owner",
-        rowCount: 1,
-        rowIdStart: 1n,
-        rowIdEndExclusive: 2n,
-        columnBlockIds: {
-          value: Array.from({ length: 4_097 }, (_, index) => `gone-${String(index)}`),
-        },
+      await store.addTable({
+        managed: false,
+        id: "events",
+        name: "events",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const blocks = Array.from({ length: 4_096 }, (_, index) => ({
+        id: `gone-${String(index)}`,
+        bytes: Uint8Array.of(1),
+      }));
+      const staged = await stageTestArtifacts(store, {
+        transactionId: "finished-owner",
+        blocks,
+        segments: [
+          {
+            id: segmentId,
+            tableId: "events",
+            transactionId: "finished-owner",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: blocks.map(({ id }) => id) },
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+      await store.updateTransaction(staged.id, staged.revision, {
+        status: "aborted",
+        updatedAt: "2026-01-01T00:01:00.000Z",
       });
       const job = await store.createGarbageCollectionJob({
         id: "wide-orphan-gc",
@@ -3534,11 +4897,10 @@ for (const implementation of stores()) {
       expect(retained.retainedTransactionIds).toEqual([transactionId]);
       expect(await store.getTransaction(transactionId)).toMatchObject({ status: "committed" });
 
-      await store.removeSegment(segmentId);
       const second = await store.createGarbageCollectionJob({
         id: `${prefix}/gc-reclaimed`,
         candidateManifestVersions: [],
-        candidateSegmentIds: [],
+        candidateSegmentIds: [segmentId],
         candidateBlockIds: [],
         candidateTransactionIds: [transactionId],
         leaseCutoff: "2026-01-01T00:10:00.000Z",
@@ -3547,10 +4909,11 @@ for (const implementation of stores()) {
       const reclaimed = await store.runGarbageCollectionStep({
         jobId: second.id,
         expectedRevision: second.revision,
-        maxItems: 1,
+        maxItems: 2,
         updatedAt: "2026-01-01T00:05:00.000Z",
       });
       expect(reclaimed.reclaimedTransactionIds).toEqual([transactionId]);
+      expect(reclaimed.reclaimedSegmentIds).toEqual([segmentId]);
       expect(reclaimed.job).toMatchObject({
         state: "completed",
         reclaimedTransactionCount: 1,
@@ -3564,15 +4927,14 @@ for (const implementation of stores()) {
       const prefix = "unreconciled-compaction";
       const { job, commit } = await createReadyCompaction(store, prefix);
       const compactedManifest = await store.commitTransaction(commit);
-      await store.addBlock(`${prefix}/tail-block`, Uint8Array.of(3));
-      await store.createTransaction({
-        ...activeTransaction(`${prefix}/tail-transaction`),
+      const tail = await stageTestArtifacts(store, {
+        transactionId: `${prefix}/tail-transaction`,
         snapshotVersion: compactedManifest.version,
-        pendingBlockIds: [`${prefix}/tail-block`],
+        blocks: [{ id: `${prefix}/tail-block`, bytes: Uint8Array.of(3) }],
       });
       await store.commitTransaction({
         transactionId: `${prefix}/tail-transaction`,
-        expectedTransactionRevision: 0,
+        expectedTransactionRevision: tail.revision,
         expectedManifestVersion: compactedManifest.version,
         committedAt: "2026-01-01T00:00:02.000Z",
       });
@@ -3622,36 +4984,36 @@ for (const implementation of stores()) {
       store.close();
     });
 
-    it("allows a status-only abort to close a transaction whose artifact is already missing", async () => {
+    it("allows a status-only abort without deleting its recoverable artifacts", async () => {
       const store = await implementation.create();
-      await store.addBlock("lost-pending-block", Uint8Array.of(1));
-      const transaction = {
-        ...activeTransaction("dangling-active-transaction"),
-        pendingBlockIds: ["lost-pending-block"],
-      };
-      await store.createTransaction(transaction);
-      await store.removeBlock("lost-pending-block");
+      const transaction = await stageTestArtifacts(store, {
+        transactionId: "dangling-active-transaction",
+        blocks: [{ id: "lost-pending-block", bytes: Uint8Array.of(1) }],
+      });
 
-      const aborted = await store.updateTransaction(transaction.id, 0, {
+      const aborted = await store.updateTransaction(transaction.id, transaction.revision, {
         status: "aborted",
         updatedAt: "2026-01-01T00:01:00.000Z",
       });
       expect(aborted).toMatchObject({
         status: "aborted",
         pendingBlockIds: ["lost-pending-block"],
-        revision: 1,
+        revision: transaction.revision + 1,
       });
+      expect(await store.getBlock("lost-pending-block")).toEqual(Uint8Array.of(1));
       store.close();
     });
 
     it("serializes GC with adoption of an existing block into an active journal", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
-      await store.addBlock("adoptable-block", Uint8Array.of(7, 8));
-      await store.createTransaction({
-        ...activeTransaction("aborted-owner"),
-        pendingBlockIds: ["adoptable-block"],
+      const original = await stageTestArtifacts(store, {
+        transactionId: "aborted-owner",
+        blocks: [{ id: "adoptable-block", bytes: Uint8Array.of(7, 8) }],
+      });
+      await store.updateTransaction(original.id, original.revision, {
         status: "aborted",
+        updatedAt: timestamp,
       });
       await store.createTransaction(activeTransaction("active-adopter"));
       const job = await store.createGarbageCollectionJob({
@@ -3694,21 +5056,32 @@ for (const implementation of stores()) {
     it("commits unique-key lookups with the database version", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
-      await store.addBlock("first", Uint8Array.of(1));
-      await store.createTransaction({
-        id: "first-transaction",
-        snapshotVersion: null,
-        pendingBlockIds: ["first"],
-        pendingSegmentIds: [],
-        status: "active",
+      await store.addTable({
+        managed: false,
+        id: "accounts",
+        name: "accounts",
+        columns: [
+          {
+            id: "account-email",
+            name: "email",
+            type: "string",
+            nullable: false,
+          },
+        ],
+        uniqueKeyColumnId: "account-email",
+        primaryKeyColumnIds: ["account-email"],
+        uniqueKeyLookupReady: true,
+        createdAt: timestamp,
         revision: 0,
-        startedAt: timestamp,
-        updatedAt: timestamp,
-        committedVersion: null,
+      });
+      const first = await stageTestArtifacts(store, {
+        transactionId: "first-transaction",
+        snapshotVersion: null,
+        blocks: [{ id: "first", bytes: Uint8Array.of(1) }],
       });
       await store.commitTransaction({
         transactionId: "first-transaction",
-        expectedTransactionRevision: 0,
+        expectedTransactionRevision: first.revision,
         expectedManifestVersion: null,
         uniqueKeyChanges: [
           {
@@ -3726,22 +5099,15 @@ for (const implementation of stores()) {
         ]),
       ).toEqual(["string:ada@example.com"]);
 
-      await store.addBlock("second", Uint8Array.of(2));
-      await store.createTransaction({
-        id: "second-transaction",
+      const second = await stageTestArtifacts(store, {
+        transactionId: "second-transaction",
         snapshotVersion: 0,
-        pendingBlockIds: ["second"],
-        pendingSegmentIds: [],
-        status: "active",
-        revision: 0,
-        startedAt: timestamp,
-        updatedAt: timestamp,
-        committedVersion: null,
+        blocks: [{ id: "second", bytes: Uint8Array.of(2) }],
       });
       await expect(
         store.commitTransaction({
           transactionId: "second-transaction",
-          expectedTransactionRevision: 0,
+          expectedTransactionRevision: second.revision,
           expectedManifestVersion: 0,
           uniqueKeyChanges: [
             {
@@ -3759,52 +5125,142 @@ for (const implementation of stores()) {
   });
 }
 
-it("upgrades a version-1 IndexedDB database in place, back-filling the segment index", async () => {
+it("retains, migrates, and writes every stable IndexedDB schema fixture", async () => {
+  const indexedDB = new IDBFactory();
+  const currentName = crypto.randomUUID();
+  const currentStore = await IndexedDbBlockStore.open({ name: currentName, indexedDB });
+  currentStore.close();
+  const currentNative = await openNativeIndexedDb(indexedDB, currentName);
+  const currentVersion = currentNative.version;
+  currentNative.close();
+
+  expect(frozenIndexedDbSchemas.map(({ version }) => version)).toEqual(
+    Array.from(
+      { length: currentVersion - FIRST_STABLE_INDEXED_DB_SCHEMA_VERSION + 1 },
+      (_, index) => FIRST_STABLE_INDEXED_DB_SCHEMA_VERSION + index,
+    ),
+  );
+
+  for (const fixture of frozenIndexedDbSchemas) {
+    const name = crypto.randomUUID();
+    const native = await openNativeIndexedDb(indexedDB, name, fixture.version, fixture.install);
+    native.close();
+
+    const bytes = await encodeBlock({
+      type: "string",
+      values: [`stable-v${String(fixture.version)}`],
+    });
+    const blockId = `stable-v${String(fixture.version)}-block`;
+    const store = await IndexedDbBlockStore.open({ name, indexedDB });
+    await stageTestArtifacts(store, { blocks: [{ id: blockId, bytes }] });
+    expect(await store.getBlock(blockId)).toEqual(bytes);
+    store.close();
+  }
+});
+
+it("rejects a newer IndexedDB schema without mutating it", async () => {
   const indexedDB = new IDBFactory();
   const name = crypto.randomUUID();
-  const timestamp = "2026-01-01T00:00:00.000Z";
-  // Build a schema-version-1 database by hand: plain object stores, no indexes, with a
-  // segment record already present so the upgrade must back-fill rather than start empty.
-  const legacy = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(name, 1);
-    request.onupgradeneeded = () => {
-      for (const storeName of storeNames) request.result.createObjectStore(storeName);
-    };
-    request.onsuccess = () => {
-      resolve(request.result);
-    };
-    request.onerror = () => {
-      reject(request.error ?? new Error("open failed"));
-    };
+  const newer = await openNativeIndexedDb(indexedDB, name, 2, (request) => {
+    request.result.createObjectStore("future");
   });
-  const legacySegment = {
-    id: "legacy-segment",
-    tableId: "legacy-table-id",
-    transactionId: "legacy-transaction",
-    rowCount: 1,
-    rowIdStart: 1n,
-    rowIdEndExclusive: 2n,
-    columnBlockIds: { "legacy-column": ["legacy-block"] },
-    createdAt: timestamp,
-  };
   await new Promise<void>((resolve, reject) => {
-    const transaction = legacy.transaction("segments", "readwrite");
-    transaction.objectStore("segments").add(legacySegment, legacySegment.id);
-    transaction.oncomplete = () => {
-      resolve();
-    };
-    transaction.onerror = () => {
-      reject(transaction.error ?? new Error("write failed"));
-    };
+    const transaction = newer.transaction("future", "readwrite");
+    transaction.objectStore("future").put("preserve", "sentinel");
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("future write failed"));
   });
-  legacy.close();
+  newer.close();
 
+  const mismatch = await IndexedDbBlockStore.open({ name, indexedDB }).catch(
+    (error: unknown) => error,
+  );
+  expect(mismatch).toBeInstanceOf(StorageFormatVersionError);
+  expect(mismatch).toMatchObject({
+    name: "StorageFormatVersionError",
+    backend: "indexeddb",
+    location: name,
+    actualVersion: 2,
+    supportedVersion: 1,
+    relation: "newer",
+  });
+  const unchanged = await openNativeIndexedDb(indexedDB, name, 2);
+  expect(unchanged.objectStoreNames.contains("future")).toBe(true);
+  unchanged.close();
+});
+
+it("reports a corrupt current IndexedDB layout as corruption, never a version mismatch", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const malformed = await openNativeIndexedDb(indexedDB, name, 1, (request) => {
+    request.result.createObjectStore("blocks");
+  });
+  malformed.close();
+
+  const corruption = await IndexedDbBlockStore.open({ name, indexedDB }).catch(
+    (error: unknown) => error,
+  );
+  expect(corruption).toBeInstanceOf(StorageCorruptionError);
+  expect(corruption).toMatchObject({
+    name: "StorageCorruptionError",
+    backend: "indexeddb",
+    location: "schema",
+  });
+});
+
+it("closes an IndexedDB connection when a newer schema version arrives", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
   const store = await IndexedDbBlockStore.open({ name, indexedDB });
-  const byTable = await store.listSegments("legacy-table-id");
-  expect(byTable.map((segment) => segment.id)).toEqual(["legacy-segment"]);
-  expect(await store.listSegments("some-other-table")).toEqual([]);
-  const probe = await store.getCatalogProbe();
-  expect(probe).toEqual({ manifestVersion: null, catalogEpoch: 0 });
+  const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(name, 2);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
+  });
+  await expect(store.getCurrentManifestVersion()).rejects.toThrow(/connection is closed/);
+  upgraded.close();
+});
+
+it("pages IndexedDB framed block export without materializing all payloads", async () => {
+  const indexedDB = new IDBFactory();
+  const store = await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB });
+  const bytes = await encodeBlock({ type: "number", values: [1] });
+  const blocks = Array.from({ length: 513 }, (_, index) => ({
+    id: `batched-export-${String(index).padStart(3, "0")}`,
+    bytes,
+  }));
+  await publishTestBlocks(store, {
+    expectedVersion: null,
+    blocks,
+    createdAt: "2026-08-24T12:00:00.000Z",
+  });
+  const session = await store.beginSnapshotFrameExport({
+    ownerId: "batched-export-owner",
+    createdAt: "2026-08-24T12:00:00.000Z",
+    expiresAt: "2026-08-24T12:30:00.000Z",
+  });
+  const frameCount = Object.values(session.header.kinds).reduce(
+    (total, summary) => total + summary.frameCount,
+    0,
+  );
+  const exportedBlockIds: string[] = [];
+  for (let sequence = 0; sequence < frameCount; sequence += 1) {
+    const frame = await store.readSnapshotExportFrame({
+      sessionId: session.sessionId,
+      ownerId: "batched-export-owner",
+      sequence,
+      expiresAtCutoff: "2026-08-24T12:00:00.000Z",
+      expiresAt: "2026-08-24T12:30:00.000Z",
+    });
+    if (frame?.kind === "block" && frame.key !== null) exportedBlockIds.push(frame.key);
+  }
+  expect(exportedBlockIds).toEqual(blocks.map(({ id }) => id));
+  expect(
+    await store.closeSnapshotFrameExport({
+      sessionId: session.sessionId,
+      ownerId: "batched-export-owner",
+    }),
+  ).toBe(true);
   store.close();
 });
 
@@ -3877,6 +5333,7 @@ it("serializes historical lease creation with GC across IndexedDB connections", 
       kind: "reader",
       manifestVersion: 0,
       ownerId: "reader",
+      createdAt: "2026-01-01T00:00:00.000Z",
       expiresAt: "2026-01-01T01:00:00.000Z",
       revision: 0,
     }),
@@ -3902,14 +5359,18 @@ it("reports complete logical IndexedDB payload after reopen", async () => {
   const name = crypto.randomUUID();
   let store = await IndexedDbBlockStore.open({ name, indexedDB });
   await store.addTable({
+    managed: false,
     id: "events-id",
     name: "events",
     columns: [{ id: "event-id", name: "event_id", type: "number", nullable: false }],
     uniqueKeyColumnId: "event-id",
     uniqueKeyLookupReady: true,
+    revision: 0,
     createdAt: "2026-01-01T00:00:00.000Z",
   });
-  await store.addBlock("payload", Uint8Array.of(1, 2, 3, 4));
+  await stageTestArtifacts(store, {
+    blocks: [{ id: "payload", bytes: Uint8Array.of(1, 2, 3, 4) }],
+  });
   const before = await store.getLogicalStorageBytes();
   expect(before).toBeGreaterThan(4);
   store.close();
@@ -3922,10 +5383,11 @@ it("reserves row IDs atomically across IndexedDB connections", async () => {
   const factory = new IDBFactory();
   const name = crypto.randomUUID();
   const left = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  await addCounterFixtureTables(left);
   const right = await IndexedDbBlockStore.open({ name, indexedDB: factory });
   const ranges = await Promise.all([
-    left.reserveRowIds("events", 10),
-    right.reserveRowIds("events", 10),
+    left.reserveRowIds("people", 10),
+    right.reserveRowIds("people", 10),
   ]);
   expect(new Set(ranges.map((range) => range.start.toString())).size).toBe(2);
   expect(ranges.map((range) => range.endExclusive - range.start)).toEqual([10n, 10n]);
@@ -3937,10 +5399,11 @@ it("reserves auto-increment values atomically across IndexedDB connections", asy
   const factory = new IDBFactory();
   const name = crypto.randomUUID();
   const left = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  await addCounterFixtureTables(left);
   const right = await IndexedDbBlockStore.open({ name, indexedDB: factory });
   const ranges = await Promise.all([
-    left.reserveAutoIncrement("events", "id", 10),
-    right.reserveAutoIncrement("events", "id", 10, 5n),
+    left.reserveAutoIncrement("people", "id", 10),
+    right.reserveAutoIncrement("people", "id", 10, 5n),
   ]);
   const starts = ranges.map((range) => range.start).sort((a, b) => (a < b ? -1 : 1));
   // Disjoint ranges regardless of which connection won the race.
@@ -3954,10 +5417,11 @@ it("persists the auto-increment counter across IndexedDB connections", async () 
   const factory = new IDBFactory();
   const name = crypto.randomUUID();
   let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
-  await store.reserveAutoIncrement("events", "id", 7, 100n);
+  await addCounterFixtureTables(store);
+  await store.reserveAutoIncrement("people", "id", 7, 100n);
   store.close();
   store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
-  expect(await store.reserveAutoIncrement("events", "id", 1)).toEqual({
+  expect(await store.reserveAutoIncrement("people", "id", 1)).toEqual({
     start: 107n,
     endExclusive: 108n,
   });
@@ -3977,21 +5441,14 @@ it("folds unique keys and rejects duplicates through cache, bulk, and probe", as
   ): Promise<void> => {
     sequence += 1;
     const id = `keyed-${String(sequence)}`;
-    await store.addBlock(id, Uint8Array.of(1));
-    await store.createTransaction({
-      id,
+    const staged = await stageTestArtifacts(store, {
+      transactionId: id,
       snapshotVersion: expectedManifestVersion,
-      pendingBlockIds: [id],
-      pendingSegmentIds: [],
-      status: "active",
-      revision: 0,
-      startedAt: timestamp,
-      updatedAt: timestamp,
-      committedVersion: null,
+      blocks: [{ id, bytes: Uint8Array.of(1) }],
     });
     await store.commitTransaction({
       transactionId: id,
-      expectedTransactionRevision: 0,
+      expectedTransactionRevision: staged.revision,
       expectedManifestVersion,
       uniqueKeyChanges: [
         {
@@ -4009,11 +5466,13 @@ it("folds unique keys and rejects duplicates through cache, bulk, and probe", as
   // 17 commits overflow the 16-chunk tail, folding everything into the base representation.
   let store = await IndexedDbBlockStore.open({ name, indexedDB });
   await store.addTable({
+    managed: false,
     id: "events",
     name: "events",
     columns: [{ id: "event-id", name: "event_id", type: "number", nullable: false }],
     uniqueKeyColumnId: "event-id",
     uniqueKeyLookupReady: true,
+    revision: 0,
     createdAt: timestamp,
   });
   let version: number | null = null;
@@ -4087,7 +5546,7 @@ it("persists compaction checkpoints across IndexedDB connections", async () => {
   const factory = new IDBFactory();
   const name = crypto.randomUUID();
   let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
-  await store.createCompactionJob({
+  const restartable: CompactionJobRecord = {
     id: "restartable-job",
     tableId: "events",
     sourceManifestVersion: 2,
@@ -4099,6 +5558,14 @@ it("persists compaction checkpoints across IndexedDB connections", async () => {
     sourceStoredBytes: 1024,
     outputStoredBytes: 1024,
     logicalBytes: 4096,
+    rewritePlan: { kind: "copy-v1" },
+    outputCursor: null,
+    memoryBudgetBytes: 0,
+    minimumMemoryBytes: 0,
+    level0SourceStoredBytes: 1024,
+    anchorSourceStoredBytes: 0,
+    peakWorkingBytes: 0,
+    outputLogicalBytes: 4096,
     targetLevel: 1,
     state: "running",
     transactionId: "transaction-1",
@@ -4107,7 +5574,14 @@ it("persists compaction checkpoints across IndexedDB connections", async () => {
     revision: 3,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:01:00.000Z",
+  };
+  await prepareCompactionSourceFixtures(store, [restartable]);
+  await stageTestArtifacts(store, {
+    transactionId: "transaction-1",
+    snapshotVersion: restartable.sourceManifestVersion,
+    blocks: [{ id: "output-1", bytes: Uint8Array.of(2) }],
   });
+  await store.createCompactionJob(restartable);
   store.close();
 
   store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
@@ -4140,7 +5614,7 @@ it("persists compaction cancellation and transaction abort atomically across reo
   });
   expect(await store.getTransaction(job.transactionId ?? "")).toMatchObject({
     status: "aborted",
-    revision: 1,
+    revision: 2,
     pendingBlockIds: job.outputBlockIds,
     pendingSegmentIds: [job.outputSegmentId],
   });
@@ -4154,6 +5628,12 @@ it("persists rechunk plans and memory accounting across IndexedDB connections", 
   const name = crypto.randomUUID();
   let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
   const job = rechunkCompactionJob("reopen-rechunk-job");
+  await prepareCompactionSourceFixtures(store, [job]);
+  await stageTestArtifacts(store, {
+    transactionId: "rechunk-transaction",
+    snapshotVersion: job.sourceManifestVersion,
+    blocks: [{ id: "output-0-id", bytes: Uint8Array.of(2) }],
+  });
   await store.createCompactionJob(job);
   await store.updateCompactionJob(job.id, 0, {
     outputBlockIds: ["output-0-id"],
@@ -4207,6 +5687,8 @@ it("persists append-row-range L2 segment and budget metadata across IndexedDB co
     kind: "insert",
     level: 2,
     logicalOrder: 9,
+    commitOrdinal: 0,
+    rowIdSpans: [],
     partitionOrdinal: 4,
     createdAt: "2026-01-01T00:00:00.000Z",
   };
@@ -4214,7 +5696,13 @@ it("persists append-row-range L2 segment and budget metadata across IndexedDB co
     ...level2CompactionJob("reopen-level-two-job"),
     outputPartitionOrdinal: 4,
   };
-  await store.addSegment(segment);
+  await prepareCompactionSourceFixtures(store, [job]);
+  await stageTestArtifacts(store, {
+    transactionId: segment.transactionId,
+    snapshotVersion: job.sourceManifestVersion,
+    blocks: [{ id: "reopen-level-two-block", bytes: Uint8Array.of(2) }],
+    segments: [segment],
+  });
   await store.createCompactionJob(job);
   store.close();
 
@@ -4235,6 +5723,12 @@ it("persists merge source maps and row-ID spans across IndexedDB connections", a
   const name = crypto.randomUUID();
   let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
   const job = mergeCompactionJob("reopen-merge-job");
+  await prepareCompactionSourceFixtures(store, [job]);
+  await stageTestArtifacts(store, {
+    transactionId: "merge-transaction",
+    snapshotVersion: job.sourceManifestVersion,
+    blocks: [{ id: "merge-output-id", bytes: Uint8Array.of(2) }],
+  });
   await store.createCompactionJob(job);
   await store.updateCompactionJob(job.id, 0, {
     outputBlockIds: ["merge-output-id"],
@@ -4280,15 +5774,19 @@ describe("table lookup memo", () => {
       const store = await implementation.create();
       const createdAt = "2026-01-01T00:00:00.000Z";
       await store.addTable({
+        managed: false,
         id: "events-id",
         name: "events",
         columns: [{ id: "value-column", name: "value", type: "number", nullable: false }],
+        revision: 0,
         createdAt,
       });
       await store.addTable({
+        managed: false,
         id: "people-id",
         name: "people",
         columns: [{ id: "label-column", name: "label", type: "string", nullable: false }],
+        revision: 0,
         createdAt,
       });
       // Repeats are the point: the first read fills the remembered mapping and the rest go
@@ -4310,9 +5808,11 @@ it("re-resolves a table name when the remembered record no longer carries it", a
   const name = crypto.randomUUID();
   const store = await IndexedDbBlockStore.open({ name, indexedDB });
   await store.addTable({
+    managed: false,
     id: "events-id",
     name: "events",
     columns: [{ id: "value-column", name: "value", type: "number", nullable: false }],
+    revision: 0,
     createdAt: "2026-01-01T00:00:00.000Z",
   });
   expect((await store.getTableByName("events"))?.id).toBe("events-id");

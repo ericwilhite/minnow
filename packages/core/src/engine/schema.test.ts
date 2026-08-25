@@ -8,6 +8,7 @@ import {
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { toCatalog, type Catalog } from "./catalog.js";
 import { MinnowDatabase } from "./database.js";
+import { allVisibleSegments } from "./storage-test-helpers.js";
 import {
   column,
   declaredForeignKeys,
@@ -532,7 +533,9 @@ describe("column defaults", () => {
       name: "notes",
       columns: [idRecord, statusRecord],
       uniqueKeyColumnId: "c1",
+      managed: false,
       createdAt: "2026-01-01T00:00:00.000Z",
+      revision: 0,
     };
     const current = [notesRecord];
     const idColumn = column.number().unique().autoIncrement();
@@ -772,7 +775,9 @@ describe("enum columns", () => {
         name: "machines",
         columns: [keyRecord, stateRecord],
         uniqueKeyColumnId: "c1",
+        managed: false,
         createdAt: "2026-01-01T00:00:00.000Z",
+        revision: 0,
       },
     ];
     const key = column.string().unique();
@@ -1110,9 +1115,9 @@ describe("migration planning rejections", () => {
     await database.migrate(schema([people]));
     const record = await store.getTableByName("people");
     if (record === undefined) throw new Error("missing record");
-    await store.updateTable(record.id, record.revision ?? 0, { columns: record.columns });
+    await store.updateTable(record.id, record.revision, { columns: record.columns });
     await expect(
-      store.updateTable(record.id, record.revision ?? 0, { columns: record.columns }),
+      store.updateTable(record.id, record.revision, { columns: record.columns }),
     ).rejects.toThrow(TableRecordConflictError);
     store.close();
   });
@@ -1174,9 +1179,9 @@ describe.each(paths)("declared constraints via $name", ({ open }) => {
     expect(record?.foreignKeys).toEqual([
       {
         name: "children_parent_id_fkey",
-        column: "parent_id",
+        columns: ["parent_id"],
         parentTable: "parents",
-        parentColumn: "id",
+        parentColumns: ["id"],
         onDelete: "restrict",
       },
     ]);
@@ -1393,19 +1398,6 @@ describe("constraint migration safety", () => {
     store.close();
   });
 
-  it("rejects a check the engine cannot compile, at migration time", async () => {
-    const store = new MemoryBlockStore();
-    const database = new MinnowDatabase(store);
-    await expect(
-      database.migrate(
-        schema([
-          table("t", { id: column.number().unique() }, { checks: [{ name: "bad", sql: "nope(" }] }),
-        ]),
-      ),
-    ).rejects.toThrow();
-    store.close();
-  });
-
   it("rejects malformed check declarations at table definition", () => {
     expect(() =>
       table("t", { id: column.number().unique() }, { checks: [{ name: "a", sql: "  " }] }),
@@ -1422,6 +1414,32 @@ describe("constraint migration safety", () => {
         },
       ),
     ).toThrow("Duplicate CHECK in table t: a");
+    expect(() =>
+      table("t", { id: column.number().unique() }, { checks: [{ name: "bad", sql: "nope(" }] }),
+    ).toThrow();
+    expect(() =>
+      table(
+        "t",
+        { id: column.number().unique(), parent_id: column.number() },
+        { checks: [{ name: "known", sql: "missing > 0" }] },
+      ),
+    ).toThrow("CHECK known names an unknown column: missing");
+    expect(() =>
+      table(
+        "t",
+        { id: column.number().unique(), parent_id: column.number() },
+        {
+          foreignKeys: [
+            {
+              name: "same_name",
+              columns: ["parent_id"],
+              references: { table: "t", columns: ["id"] },
+            },
+          ],
+          checks: [{ name: "same_name", sql: "parent_id >= 0" }],
+        },
+      ),
+    ).toThrow("Duplicate constraint in table t: same_name");
   });
 });
 
@@ -1695,14 +1713,20 @@ describe("catalog introspection", () => {
     expect(children.foreignKeys).toEqual([
       {
         name: "children_parent_id_fkey",
-        column: "parent_id",
+        columns: ["parent_id"],
         parentTable: "parents",
-        parentColumn: "id",
+        parentColumns: ["id"],
         onDelete: "cascade",
       },
     ]);
     expect(children.checks).toEqual([{ name: "positive_id", sql: "id > 0" }]);
-    expect(children.triggers).toEqual([{ name: "audit", event: "insert", timing: "after" }]);
+    expect(children.triggers).toHaveLength(1);
+    expect(children.triggers[0]).toMatchObject({
+      name: "audit",
+      event: "insert",
+      timing: "after",
+    });
+    expect(children.triggers[0]?.id.length).toBeGreaterThan(0);
 
     // Derived facts a planner would otherwise have to decode from a default spec.
     expect(parents.columns.find(({ name }) => name === "id")?.isAutoIncrementing).toBe(true);
@@ -2042,9 +2066,9 @@ describe("adding a column with a backfill", () => {
 
   it("does not rewrite the stored segments", async () => {
     const { database, store } = await seeded();
-    const before = await database.listVisibleSegments("notes");
+    const before = await allVisibleSegments(database, "notes");
     await database.migrate(after("archived"));
-    const after2 = await database.listVisibleSegments("notes");
+    const after2 = await allVisibleSegments(database, "notes");
     expect(after2.map(({ id }) => id)).toEqual(before.map(({ id }) => id));
     // The new column owns no blocks in the old segment: the value is substituted, not stored.
     expect(Object.keys(after2[0]?.columnBlockIds ?? {})).toHaveLength(2);
@@ -2390,22 +2414,9 @@ describe("dropping columns and tables", () => {
       "FOREIGN KEY children_parent_id_fkey still uses this column: children.parent_id",
     );
     // And the CHECK guards its own column the same way.
-    await expect(
-      database.migrate(
-        schema([
-          table("parents", { id: column.number().unique() }),
-          table(
-            "children",
-            {
-              id: column.number().unique(),
-              parent_id: column.number().references("parents", "id"),
-            },
-            { checks: [{ name: "positive", sql: "qty > 0" }] },
-          ),
-        ]),
-        { allowDestructive: true },
-      ),
-    ).rejects.toThrow("CHECK positive still uses this column: children.qty");
+    await expect(database.dropColumn("children", "qty")).rejects.toThrow(
+      "CHECK positive still uses this column: children.qty",
+    );
     store.close();
   });
 

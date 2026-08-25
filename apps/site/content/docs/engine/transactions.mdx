@@ -10,8 +10,7 @@ adapter's transaction API.
 
 ### Batch write scopes
 
-A write scope stages any number of mutations across any number of tables and publishes them as one
-commit:
+A write scope stages multiple mutations across multiple tables and publishes them as one commit:
 
 ```ts
 const { result, version } = await db.write(async (tx) => {
@@ -27,6 +26,19 @@ transaction callback to Minnow's SQL transaction statements; see the
 
 Everything inside becomes visible at once, including to other tabs: nobody observes the stock
 decremented without the shipment. If the callback throws, nothing is published.
+
+Large writes are encoded and persisted with backpressure instead of retaining every encoded block
+in memory. One adapter call carries at most 64 blocks, 64 segment records, and 64 MiB of payload;
+one unpublished transaction may journal at most 4,096 pending blocks and 4,096 pending segments.
+Exceeding the transaction-wide limit fails the write before publication. Split a larger ingestion
+into several commits. A database also admits at most 64 pending write calls, and a buffered writer
+at most 64 unawaited `add()` calls, so a producer must await writes when it reaches backpressure.
+
+The scope durably pins its pre-scope version from the start. While its first bounded write batch is
+still process-local, a renewable reader lease owns that pin. If another stage persists a recovery
+journal, ownership passes without a gap to the renewable transaction record. Compaction and
+garbage collection therefore cannot remove the base snapshot while user code is idle between
+statements, and a crashed scope leaves only deadline-bounded metadata behind.
 
 A scope ends with its callback, so a thrown error or forgotten branch cannot leave it open. SQL
 transactions are available too, with a 30-second idle rollback to protect against a caller that
@@ -59,7 +71,8 @@ COMMIT;
 
 `ROLLBACK TO` keeps the named marker and removes markers created after it. `RELEASE` removes the
 named marker and its nested markers. Reusing a name shadows the older marker. A second `BEGIN`
-does not nest; use a savepoint instead.
+does not nest; use a savepoint instead. A transaction may hold at most 64 savepoints, whose
+retained rollback state may total at most 8 MiB. Release markers that are no longer needed.
 
 ### A failed scope stays failed
 
@@ -103,12 +116,13 @@ transaction it reads through.
 Readers never block writers and writers never block readers. One database runs its plain writes
 — `insertBatch`, `updateBatch`, `deleteBatch`, `upsertBatch` and the statements that become them —
 one after another, so they never conflict with each other however many are in flight. Writers in
-different tabs, and write scopes, do conflict when they touch the same data, and the loser rebases
-onto the winner's version and retries — up to `maxCommitRetries`, eight by default. Past that you
-get a `WriteConflictError` to handle yourself.
+different tabs do conflict when they touch the same data. A plain one-statement write restarts from
+a fresh snapshot — up to `maxCommitRetries`, eight by default — so its predicates, constraints,
+foreign-key proofs, and trigger bodies are recomputed rather than rebasing stale derived values.
+Past that you get a `WriteConflictError` to handle yourself.
 
 ```ts
-import { WriteConflictError } from "@minnowdb/core/storage";
+import { WriteConflictError } from "@minnowdb/core/storage/contracts";
 
 try {
   await db.write(async (tx) => {
@@ -121,8 +135,17 @@ try {
 }
 ```
 
-Retrying is safe because a scope's callback runs again from the top against the new version, so
-a read-modify-write inside it re-reads.
+An explicit `db.write()` scope or SQL transaction does not replay application code. A concurrent
+data commit surfaces `WriteConflictError`, nothing from the losing scope publishes, and the caller
+may rerun the complete operation after deciding that its side effects are safe to repeat.
+
+Structural catalog changes have a separate monotonic schema epoch. A transaction captures it when
+it begins and verifies it in the same atomic step that publishes data. This prevents work staged
+under an old column/default/trigger/view definition from committing after the new definition is
+visible. A plain statement restarts and validates under the new schema; an explicit write scope
+fails with `SchemaConflictError` and publishes nothing. Ordinary data commits and accelerator
+build-state changes do not advance the structural epoch, so they do not create spurious schema
+conflicts.
 
 ## Durability
 
@@ -130,6 +153,7 @@ Durability ends at a committed write in the durable store. Nothing depends on a 
 firing, because they do not reliably fire — a tab that vanishes loses only writes that had not
 committed.
 
-The IndexedDB and OPFS stores default to `relaxed` durability, which lets the browser batch flushes to
-disk. For data that must survive a power loss rather than a tab closing, open the store with
-`durability: "strict"` and pay the flush per commit.
+The IndexedDB and OPFS stores default to `strict` durability: an acknowledged commit pays the
+adapter's final flush before it resolves. Open a store with `durability: "relaxed"` only when more
+write throughput is worth the possibility that a machine or device power loss drops an
+acknowledged suffix of commits. Atomicity and corruption checks remain enabled in both modes.

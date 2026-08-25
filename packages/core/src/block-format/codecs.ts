@@ -2,8 +2,19 @@ import type { Compression } from "./types.js";
 
 export interface CompressionCodec {
   readonly id: Compression;
-  compress(bytes: Uint8Array): Promise<Uint8Array>;
+  compress(bytes: Uint8Array, maximumOutputLength?: number): Promise<Uint8Array>;
   decompress(bytes: Uint8Array, expectedLength: number): Promise<Uint8Array>;
+}
+
+/** A caller's explicit compressed-output ceiling was reached before an output join/allocation. */
+export class CompressionOutputLimitError extends RangeError {
+  constructor(
+    readonly byteLength: number,
+    readonly maximumOutputLength: number,
+  ) {
+    super("Compressed payload exceeds caller output ceiling");
+    this.name = "CompressionOutputLimitError";
+  }
 }
 
 export interface CompressionMemoryBound {
@@ -22,8 +33,14 @@ export interface CompressionMemoryBound {
  */
 export const rawCodec: CompressionCodec = {
   id: "raw",
-  compress(bytes) {
-    return Promise.resolve(bytes);
+  async compress(bytes, maximumOutputLength) {
+    if (maximumOutputLength !== undefined) {
+      assertCallerOutputLength(maximumOutputLength);
+      if (bytes.byteLength > maximumOutputLength) {
+        throw new CompressionOutputLimitError(bytes.byteLength, maximumOutputLength);
+      }
+    }
+    return bytes;
   },
   decompress(bytes, expectedLength) {
     if (bytes.byteLength !== expectedLength) throw new Error("Raw payload length mismatch");
@@ -74,23 +91,29 @@ async function transform(
   stream: CompressionStream | DecompressionStream,
   maximumOutputLength = Number.POSITIVE_INFINITY,
   boundErrorMessage = "Decompressed payload exceeds declared length",
+  outputLimitError?: (byteLength: number) => Error,
 ) {
   const write = (async () => {
     const writer = stream.writable.getWriter();
     await writer.write(new Uint8Array(bytes));
     await writer.close();
   })();
-  const [, result] = await Promise.all([
+  const [writeResult, readResult] = await Promise.allSettled([
     write,
-    readBounded(stream.readable, maximumOutputLength, boundErrorMessage),
+    readBounded(stream.readable, maximumOutputLength, boundErrorMessage, outputLimitError),
   ]);
-  return result;
+  // A reader-side bound failure intentionally cancels the writer. Preserve that precise error
+  // instead of racing it against the writer rejection caused by the cancellation.
+  if (readResult.status === "rejected") throw readResult.reason;
+  if (writeResult.status === "rejected") throw writeResult.reason;
+  return readResult.value;
 }
 
 async function readBounded(
   readable: ReadableStream<Uint8Array>,
   maximumLength: number,
   boundErrorMessage: string,
+  outputLimitError?: (byteLength: number) => Error,
 ): Promise<Uint8Array> {
   const reader = readable.getReader();
   const chunks: Uint8Array[] = [];
@@ -100,8 +123,13 @@ async function readBounded(
     if (done) break;
     length += value.byteLength;
     if (length > maximumLength) {
-      await reader.cancel(boundErrorMessage);
-      throw new Error(boundErrorMessage);
+      const error = outputLimitError?.(length) ?? new Error(boundErrorMessage);
+      try {
+        await reader.cancel(error);
+      } catch {
+        // Cancellation is cleanup. The deterministic bound error remains the operation result.
+      }
+      throw error;
     }
     chunks.push(value);
   }
@@ -116,13 +144,21 @@ async function readBounded(
 
 export const gzipCodec: CompressionCodec = {
   id: "gzip",
-  async compress(bytes) {
+  async compress(bytes, maximumOutputLength) {
     const { maximumOutputBytes } = getCompressionMemoryBound("gzip", bytes.byteLength);
+    if (maximumOutputLength !== undefined) assertCallerOutputLength(maximumOutputLength);
+    const outputLimit = Math.min(maximumOutputBytes, maximumOutputLength ?? maximumOutputBytes);
+    const callerLimited = outputLimit < maximumOutputBytes;
     return transform(
       bytes,
       new CompressionStream("gzip"),
-      maximumOutputBytes,
-      "Gzip payload exceeds compression bound",
+      outputLimit,
+      callerLimited
+        ? "Compressed payload exceeds caller output ceiling"
+        : "Gzip payload exceeds compression bound",
+      callerLimited
+        ? (byteLength) => new CompressionOutputLimitError(byteLength, outputLimit)
+        : undefined,
     );
   },
   async decompress(bytes, expectedLength) {
@@ -131,6 +167,12 @@ export const gzipCodec: CompressionCodec = {
     return output;
   },
 };
+
+function assertCallerOutputLength(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError("Invalid compression output ceiling");
+  }
+}
 
 export function getCodec(id: Compression): CompressionCodec {
   switch (id) {

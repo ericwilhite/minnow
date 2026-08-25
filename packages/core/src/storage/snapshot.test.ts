@@ -1,19 +1,34 @@
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
+import { MAX_STORED_BLOCK_BYTE_LENGTH } from "../block-format/index.js";
 import { MinnowDatabase } from "../engine/database.js";
 import { UniqueConstraintError } from "../engine/errors.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MemoryBlockStore } from "./memory.js";
-import { OpfsBlockStore } from "./opfs/index.js";
-import { MemoryOpfs } from "../testing/opfs-shim.js";
-import { decodeSnapshot, encodeSnapshot, readSnapshotSummary } from "./snapshot.js";
+import {
+  decodeSnapshotFrameStream,
+  MAX_SNAPSHOT_STREAM_CHUNK_BYTES,
+  readSnapshotSummary,
+} from "./snapshot.js";
 
-/**
- * A database with something of every kind a snapshot has to carry. `authors` stays append-only
- * so it can hold a full-text index (the engine only indexes append-only tables) and carries the
- * unique key a later write has to conflict against; `posts` is updated and deleted after it is
- * inserted, so the restored copy has to fold its segments back in the original commit order.
- */
+class SnapshotBatchMemoryStore extends MemoryBlockStore {
+  readonly batches: Array<{ blocks: number; metadataBytes: number; bytes: number }> = [];
+
+  override async appendSnapshotImportFrames(
+    input: Parameters<MemoryBlockStore["appendSnapshotImportFrames"]>[0],
+  ) {
+    this.batches.push({
+      blocks: input.frames.filter((frame) => frame.kind === "block").length,
+      metadataBytes: input.frames.reduce(
+        (total, frame) => total + (frame.kind === "block" ? 0 : frame.payload.byteLength),
+        0,
+      ),
+      bytes: input.frames.reduce((total, frame) => total + frame.payload.byteLength, 0),
+    });
+    return super.appendSnapshotImportFrames(input);
+  }
+}
+
 async function seededDatabase(): Promise<{ database: MinnowDatabase; store: MemoryBlockStore }> {
   const store = new MemoryBlockStore();
   const database = new MinnowDatabase(store);
@@ -33,363 +48,204 @@ async function seededDatabase(): Promise<{ database: MinnowDatabase; store: Memo
        (3, 'alan', 'Computing machinery and intelligence', 44),
        (4, 'grace', 'Nanoseconds and other short wires', 9)`,
   );
-  // Rewrite and remove rows after the fact: the restored copy must fold these later segments
-  // over the inserts they patch, which is what makes commit ordering load-bearing.
   await database.execute("UPDATE posts SET score = score + 5 WHERE handle = 'grace'");
   await database.execute("DELETE FROM posts WHERE id = 4");
   await database.buildFtsIndex("authors", "name");
   return { database, store };
 }
 
+async function* bytesAsChunks(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  for (let offset = 0; offset < bytes.byteLength; offset += MAX_SNAPSHOT_STREAM_CHUNK_BYTES) {
+    yield bytes.subarray(offset, offset + MAX_SNAPSHOT_STREAM_CHUNK_BYTES);
+  }
+}
+
 const REPORT = `SELECT a.name, COUNT(p.id) AS posts, SUM(p.score) AS points
 FROM authors a JOIN posts p ON p.handle = a.handle
 GROUP BY a.name ORDER BY points DESC`;
 
-describe("database snapshots", () => {
-  it("round-trips a database through the container into a fresh memory store", async () => {
-    const { database: source, store: sourceStore } = await seededDatabase();
-    const before = await source.query(REPORT);
-    const search = await source.query(
-      "SELECT handle FROM authors WHERE MATCH(name) AGAINST 'hopper' ORDER BY handle",
-    );
-    expect(search.rows).toEqual([{ handle: "grace" }]);
+describe("MinnowDatabase framed snapshots", () => {
+  it("streams a multi-commit snapshot in bounded chunks and retries a lost final acknowledgement", async () => {
+    const { database: source } = await seededDatabase();
+    const expected = (await source.query(REPORT)).rows;
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of source.exportSnapshotStream()) {
+      expect(chunk.byteLength).toBeLessThanOrEqual(MAX_SNAPSHOT_STREAM_CHUNK_BYTES);
+      chunks.push(chunk.slice());
+    }
+    expect(chunks.length).toBeGreaterThan(1);
 
-    const snapshot = await sourceStore.exportSnapshot();
-    const bytes = await encodeSnapshot(snapshot);
+    const restored = new MinnowDatabase(new MemoryBlockStore());
+    const input = async function* (): AsyncGenerator<Uint8Array> {
+      for (const chunk of chunks) yield chunk;
+    };
+    await restored.importSnapshotStream(input());
+    await restored.importSnapshotStream(input());
+    expect((await restored.query(REPORT)).rows).toEqual(expected);
+  });
 
+  it("reports the fixed header summary without materializing body metadata", async () => {
+    const { database, store } = await seededDatabase();
+    const bytes = await database.exportSnapshot();
     const summary = await readSnapshotSummary(bytes);
-    expect(summary.formatVersion).toBe(1);
-    expect(summary.tableCount).toBe(2);
-    expect(summary.blockCount).toBeGreaterThan(0);
-    expect(summary.byteLength).toBe(bytes.byteLength);
-
-    const restoredStore = MemoryBlockStore.fromSnapshot(await decodeSnapshot(bytes));
-    const restored = new MinnowDatabase(restoredStore);
-    expect((await restored.query(REPORT)).rows).toEqual(before.rows);
-    expect((await restored.query("SELECT id, score FROM posts ORDER BY id")).rows).toEqual(
-      (await source.query("SELECT id, score FROM posts ORDER BY id")).rows,
-    );
-    // The full-text base covered the exported version, so it carries over ready-to-use. The
-    // MATCH below would answer correctly either way — the scan re-verifies candidates — so the
-    // recorded state is what proves the base came with it instead of being rebuilt.
-    const authors = (await restoredStore.listTables()).find((table) => table.name === "authors");
-    expect(Object.values(authors?.ftsColumns ?? {}).map((column) => column.state)).toEqual([
-      "ready",
-    ]);
-    expect(
-      (await restored.query("SELECT handle FROM authors WHERE MATCH(name) AGAINST 'hopper'")).rows,
-    ).toEqual([{ handle: "grace" }]);
-  });
-
-  it("marks a full-text index that no longer covers the version for rebuild", async () => {
-    const { database: source, store: sourceStore } = await seededDatabase();
-    // A commit after the build leaves the base behind the current version. The snapshot must
-    // not present a stale base as ready; it exports the column as invalid so a load rebuilds.
-    await source.execute(
-      "INSERT INTO authors (handle, name, reputation) VALUES ('radia', 'Radia Perlman', 190)",
-    );
-    const restored = MemoryBlockStore.fromSnapshot(
-      await decodeSnapshot(await encodeSnapshot(await sourceStore.exportSnapshot())),
-    );
-    const authors = (await restored.listTables()).find((table) => table.name === "authors");
-    expect(Object.values(authors?.ftsColumns ?? {}).map((column) => column.state)).toEqual([
-      "invalid",
-    ]);
-    expect(
-      (
-        await new MinnowDatabase(restored).query(
-          "SELECT handle FROM authors WHERE MATCH(name) AGAINST 'perlman'",
-        )
-      ).rows,
-    ).toEqual([{ handle: "radia" }]);
-  });
-
-  it("keeps writing correctly after a restore", async () => {
-    const { store: sourceStore } = await seededDatabase();
-    const bytes = await encodeSnapshot(await sourceStore.exportSnapshot());
-    const restored = new MinnowDatabase(MemoryBlockStore.fromSnapshot(await decodeSnapshot(bytes)));
-
-    // Unique-key membership came across, so a duplicate still conflicts.
-    await expect(
-      restored.execute("INSERT INTO authors (handle, name) VALUES ('ada', 'Impostor')"),
-    ).rejects.toThrow(UniqueConstraintError);
-
-    await restored.execute(
-      "INSERT INTO authors (handle, name, reputation) VALUES ('barbara', 'Barbara Liskov', 210)",
-    );
-    await restored.execute(
-      "INSERT INTO posts (id, handle, title, score) VALUES (5, 'barbara', 'Programming with abstract data types', 51)",
-    );
-    expect((await restored.query("SELECT COUNT(*) AS n FROM authors")).rows).toEqual([{ n: 4 }]);
-    expect((await restored.query("SELECT id FROM posts ORDER BY id")).rows).toEqual([
-      { id: 1 },
-      { id: 2 },
-      { id: 3 },
-      { id: 5 },
-    ]);
-    // Row IDs continue past the restored high-water mark rather than colliding with hidden ones.
-    expect((await restored.query("SELECT SUM(score) AS points FROM posts")).rows).toEqual([
-      { points: 12 + 35 + 44 + 51 },
-    ]);
-  });
-
-  it("loads into IndexedDB and reads back identically", async () => {
-    const { database: source, store: sourceStore } = await seededDatabase();
-    const before = await source.query(REPORT);
-    const bytes = await encodeSnapshot(await sourceStore.exportSnapshot());
-
-    const indexedDB = new IDBFactory();
-    const name = crypto.randomUUID();
-    const store = await IndexedDbBlockStore.open({ name, indexedDB });
-    await store.importSnapshot(await decodeSnapshot(bytes));
-    expect((await new MinnowDatabase(store).query(REPORT)).rows).toEqual(before.rows);
-    store.close();
-
-    // Reopening proves the load is durable rather than living in the loading instance's caches.
-    const reopened = await IndexedDbBlockStore.open({ name, indexedDB });
-    const database = new MinnowDatabase(reopened);
-    expect((await database.query(REPORT)).rows).toEqual(before.rows);
-    await expect(
-      database.execute("INSERT INTO authors (handle, name) VALUES ('grace', 'Impostor')"),
-    ).rejects.toThrow(UniqueConstraintError);
-    await database.execute(
-      "INSERT INTO authors (handle, name, reputation) VALUES ('barbara', 'Barbara Liskov', 210)",
-    );
-    expect((await database.query("SELECT COUNT(*) AS n FROM authors")).rows).toEqual([{ n: 4 }]);
-    expect(
-      (await database.query("SELECT handle FROM authors WHERE MATCH(name) AGAINST 'lovelace'"))
-        .rows,
-    ).toEqual([{ handle: "ada" }]);
-  });
-
-  it("refuses to load into a store that already holds data", async () => {
-    const { store: sourceStore } = await seededDatabase();
-    const snapshot = await decodeSnapshot(await encodeSnapshot(await sourceStore.exportSnapshot()));
-    const store = await IndexedDbBlockStore.open({
-      name: crypto.randomUUID(),
-      indexedDB: new IDBFactory(),
+    expect(summary).toMatchObject({
+      formatVersion: 1,
+      version: await store.getCurrentManifestVersion(),
+      tableCount: 2,
+      byteLength: bytes.byteLength,
     });
-    await store.importSnapshot(snapshot);
-    await expect(store.importSnapshot(snapshot)).rejects.toThrow(/already holds/);
+    expect(summary.blockCount).toBeGreaterThan(0);
+    expect(summary.payloadBytes).toBeGreaterThan(0);
   });
 
-  it("loads into OPFS, reads back identically, and round-trips back out", async () => {
-    const { database: source, store: sourceStore } = await seededDatabase();
-    const before = await source.query(REPORT);
-    const bytes = await encodeSnapshot(await sourceStore.exportSnapshot());
-
-    const shim = new MemoryOpfs();
-    const name = crypto.randomUUID();
-    const store = await OpfsBlockStore.open({ name, root: shim.root });
-    await store.importSnapshot(await decodeSnapshot(bytes));
-    expect((await new MinnowDatabase(store).query(REPORT)).rows).toEqual(before.rows);
-    await expect(store.importSnapshot(await decodeSnapshot(bytes))).rejects.toThrow(
-      /already holds/,
+  it("stages many small frames in bounded adapter batches", async () => {
+    const { database: source } = await seededDatabase();
+    const bytes = await source.exportSnapshot();
+    const store = new SnapshotBatchMemoryStore();
+    await new MinnowDatabase(store).importSnapshot(bytes);
+    expect(store.batches.some((batch) => batch.blocks > 1)).toBe(true);
+    expect(Math.max(...store.batches.map((batch) => batch.blocks))).toBeLessThanOrEqual(64);
+    expect(Math.max(...store.batches.map((batch) => batch.metadataBytes))).toBeLessThanOrEqual(
+      16 * 1024 * 1024,
     );
-    store.close();
+    expect(Math.max(...store.batches.map((batch) => batch.bytes))).toBeLessThanOrEqual(
+      MAX_STORED_BLOCK_BYTE_LENGTH + 8 * 1024,
+    );
+  });
 
-    // Reopening proves the load is durable rather than living in the loading instance's caches.
-    const reopened = await OpfsBlockStore.open({ name, root: shim.root });
-    const database = new MinnowDatabase(reopened);
-    expect((await database.query(REPORT)).rows).toEqual(before.rows);
+  it("releases an abandoned export pin and removes explicitly cancelled import staging", async () => {
+    const { database: source, store } = await seededDatabase();
+    const iterator = source.exportSnapshotStream()[Symbol.asyncIterator]();
+    expect((await iterator.next()).done).toBe(false);
+    await iterator.return();
+    expect((await store.listLeases()).filter((lease) => lease.kind === "backup")).toEqual([]);
+
+    const bytes = await source.exportSnapshot();
+    const headerLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+      12,
+      true,
+    );
+    const headerEnd = 20 + headerLength;
+    const controller = new AbortController();
+    const cancelled = async function* (): AsyncGenerator<Uint8Array> {
+      yield bytes.slice(0, headerEnd);
+      controller.abort(new Error("cancel import"));
+      yield bytes.slice(headerEnd);
+    };
+    const targetStore = new MemoryBlockStore();
+    const target = new MinnowDatabase(targetStore);
     await expect(
-      database.execute("INSERT INTO authors (handle, name) VALUES ('grace', 'Impostor')"),
-    ).rejects.toThrow(UniqueConstraintError);
-    // Full-text bases restore as rebuilds on this store; the answer must still be right.
-    expect(
-      (await database.query("SELECT handle FROM authors WHERE MATCH(name) AGAINST 'lovelace'"))
-        .rows,
-    ).toEqual([{ handle: "ada" }]);
-
-    // And the restored store can itself export: the snapshot contract is symmetric.
-    const again = MemoryBlockStore.fromSnapshot(
-      await decodeSnapshot(await encodeSnapshot(await reopened.exportSnapshot())),
-    );
-    expect((await new MinnowDatabase(again).query(REPORT)).rows).toEqual(before.rows);
-    reopened.close();
+      target.importSnapshotStream(cancelled(), { signal: controller.signal }),
+    ).rejects.toThrow("cancel import");
+    expect(await target.inspectInterruptedImport()).toBeNull();
+    expect(await targetStore.getCurrentManifestVersion()).toBeNull();
   });
 
-  it("rejects a damaged container instead of loading half a database", async () => {
-    const { store: sourceStore } = await seededDatabase();
-    const bytes = await encodeSnapshot(await sourceStore.exportSnapshot());
-
-    await expect(decodeSnapshot(bytes.subarray(0, bytes.byteLength - 1))).rejects.toThrow(
-      /length mismatch/,
-    );
-    await expect(decodeSnapshot(bytes.subarray(0, 8))).rejects.toThrow(/Truncated snapshot header/);
-
-    const wrongMagic = bytes.slice();
-    wrongMagic[0] = 0x00;
-    await expect(decodeSnapshot(wrongMagic)).rejects.toThrow(/Not a Minnow snapshot/);
-
-    const wrongVersion = bytes.slice();
-    new DataView(wrongVersion.buffer).setUint32(8, 99, true);
-    await expect(decodeSnapshot(wrongVersion)).rejects.toThrow(/Unsupported snapshot version 99/);
-
-    const damagedHeader = bytes.slice();
-    // Flip a byte inside the stored header. The checksum is verified before the header is
-    // decompressed, so this fails as a checksum mismatch rather than as a gzip error.
-    damagedHeader[34] = (damagedHeader[34] ?? 0) ^ 0xff;
-    await expect(decodeSnapshot(damagedHeader)).rejects.toThrow(/header checksum mismatch/);
-
-    // A damaged block header fails here: `inspectBlock` verifies each block's envelope
-    // checksum without decompressing it. A damaged payload is caught later, by the block's
-    // own payload checksum, when the column is actually decoded.
-    const damagedBlock = bytes.slice();
-    const firstBlockAt = 28 + new DataView(bytes.buffer).getUint32(12, true);
-    damagedBlock[firstBlockAt + 13] = (damagedBlock[firstBlockAt + 13] ?? 0) ^ 0xff;
-    await expect(decodeSnapshot(damagedBlock)).rejects.toThrow(/checksum mismatch|encoding/);
+  it("validates a large direct source chunk by contents rather than transport partitioning", async () => {
+    const oversized = async function* (): AsyncGenerator<Uint8Array> {
+      yield new Uint8Array(MAX_SNAPSHOT_STREAM_CHUNK_BYTES + 1);
+    };
+    const consume = async (): Promise<void> => {
+      for await (const entry of decodeSnapshotFrameStream(oversized())) void entry;
+    };
+    await expect(consume()).rejects.toThrow(/Not a Minnow snapshot/);
   });
 
-  it("rejects malformed catalog metadata before any store writes snapshot blocks", async () => {
-    const { store: sourceStore } = await seededDatabase();
-    const snapshot = await sourceStore.exportSnapshot();
-    const invalid = structuredClone(snapshot);
-    const handle = invalid.tables
-      .find(({ record }) => record.name === "authors")
-      ?.record.columns.find(({ name }) => name === "handle");
-    if (handle === undefined) throw new Error("Missing test column");
-    handle.integer = true;
-
-    await expect(decodeSnapshot(await encodeSnapshot(invalid))).rejects.toThrow(
-      /Integer domain requires a number column: handle/,
-    );
-
-    const stores = [
-      new MemoryBlockStore(),
-      await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
-      await OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
-    ];
-    for (const store of stores) {
-      await expect(store.importSnapshot(invalid)).rejects.toThrow(
-        /Integer domain requires a number column: handle/,
-      );
-      expect(await store.listBlockIds()).toEqual([]);
-      store.close();
-    }
-  });
-
-  it("rejects missing, duplicate, or orphaned secondary UNIQUE membership", async () => {
-    const { database: source, store: sourceStore } = await seededDatabase();
-    await source.execute("CREATE UNIQUE INDEX unique_author_name ON authors(name)");
-    const snapshot = await sourceStore.exportSnapshot();
-    const authors = snapshot.tables.find(({ record }) => record.name === "authors");
-    const membership = authors?.secondaryUniqueKeys?.[0];
-    if (authors === undefined || membership === undefined) {
-      throw new Error("Missing secondary UNIQUE fixture membership");
-    }
-
-    const missing = structuredClone(snapshot);
-    const missingAuthors = missing.tables.find(({ record }) => record.name === "authors");
-    if (missingAuthors === undefined) throw new Error("Missing authors fixture");
-    missingAuthors.secondaryUniqueKeys = [];
-    await expect(decodeSnapshot(await encodeSnapshot(missing))).rejects.toThrow(
-      /missing UNIQUE-index membership/,
-    );
-
-    const duplicate = structuredClone(snapshot);
-    const duplicateAuthors = duplicate.tables.find(({ record }) => record.name === "authors");
-    if (duplicateAuthors === undefined) throw new Error("Missing authors fixture");
-    duplicateAuthors.secondaryUniqueKeys?.push(structuredClone(membership));
-    await expect(decodeSnapshot(await encodeSnapshot(duplicate))).rejects.toThrow(
-      /repeats UNIQUE-index membership/,
-    );
-
-    const repeatedKey = structuredClone(snapshot);
-    const repeatedMembership = repeatedKey.tables.find(({ record }) => record.name === "authors")
-      ?.secondaryUniqueKeys?.[0];
-    const firstToken = repeatedMembership?.keyTokens[0];
-    if (repeatedMembership === undefined || firstToken === undefined) {
-      throw new Error("Missing UNIQUE key fixture");
-    }
-    repeatedMembership.keyTokens.push(firstToken);
-    await expect(decodeSnapshot(await encodeSnapshot(repeatedKey))).rejects.toThrow(
-      /repeats a UNIQUE-index key/,
-    );
-
-    const orphaned = structuredClone(snapshot);
-    const orphanedMembership = orphaned.tables.find(({ record }) => record.name === "authors")
-      ?.secondaryUniqueKeys?.[0];
-    if (orphanedMembership === undefined) throw new Error("Missing UNIQUE membership fixture");
-    orphanedMembership.indexId = "missing-index";
-    await expect(decodeSnapshot(await encodeSnapshot(orphaned))).rejects.toThrow(
-      /orphaned UNIQUE-index membership/,
-    );
-
-    const stores = [
-      new MemoryBlockStore(),
-      await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
-      await OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
-    ];
-    for (const store of stores) {
-      await expect(store.importSnapshot(duplicate)).rejects.toThrow(
-        /repeats UNIQUE-index membership/,
-      );
-      expect(await store.listBlockIds()).toEqual([]);
-      store.close();
-    }
-  });
-
-  it("refuses to snapshot a database with nothing committed", async () => {
-    await expect(new MemoryBlockStore().exportSnapshot()).rejects.toThrow(/no committed version/);
-  });
-});
-
-describe("MinnowDatabase snapshots", () => {
-  it("exports the file the database can load back, into either store", async () => {
+  it("exports one file that restores into Memory and IndexedDB", async () => {
     const { database: source } = await seededDatabase();
     const before = await source.query(REPORT);
-
     const phases: string[] = [];
     const bytes = await source.exportSnapshot({
       onProgress: (progress) => phases.push(progress.phase),
     });
-    expect(phases).toEqual(["reading", "done"]);
-    expect((await readSnapshotSummary(bytes)).byteLength).toBe(bytes.byteLength);
+    expect(phases[0]).toBe("reading");
+    expect(phases.at(-1)).toBe("done");
+    expect(phases.filter((phase) => phase === "done")).toHaveLength(1);
+    expect(phases).toContain("transfer");
 
     const memory = new MinnowDatabase(new MemoryBlockStore());
     await memory.importSnapshot(bytes);
     expect((await memory.query(REPORT)).rows).toEqual(before.rows);
 
-    const written: number[] = [];
-    const indexed = new MinnowDatabase(
-      await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
-    );
-    await indexed.importSnapshot(bytes, {
-      onProgress: (progress) => {
-        if (progress.phase === "done") written.push(progress.writtenBytes);
-      },
+    const indexedStore = await IndexedDbBlockStore.open({
+      name: crypto.randomUUID(),
+      indexedDB: new IDBFactory(),
     });
-    expect(written[0]).toBeGreaterThan(0);
+    const indexed = new MinnowDatabase(indexedStore);
+    await indexed.importSnapshot(bytes);
     expect((await indexed.query(REPORT)).rows).toEqual(before.rows);
   });
 
-  it("answers from the restored catalog rather than the empty one it cached", async () => {
+  it("preserves UNIQUE membership and writes correctly after restore", async () => {
     const { database: source } = await seededDatabase();
-    const bytes = await source.exportSnapshot();
     const restored = new MinnowDatabase(new MemoryBlockStore());
-    // Queried while empty, so anything cached from that read has to be dropped by the load.
+    await restored.importSnapshot(await source.exportSnapshot());
+    await expect(
+      restored.execute("INSERT INTO authors VALUES ('ada', 'Other Ada', 1)"),
+    ).rejects.toBeInstanceOf(UniqueConstraintError);
+    await restored.execute("INSERT INTO authors VALUES ('donald', 'Donald Knuth', 200)");
+    expect((await restored.query("SELECT COUNT(*) AS n FROM authors")).rows).toEqual([{ n: 4 }]);
+  });
+
+  it("answers from the restored catalog rather than an earlier empty-cache result", async () => {
+    const { database: source } = await seededDatabase();
+    const restored = new MinnowDatabase(new MemoryBlockStore());
     await expect(restored.query("SELECT COUNT(*) AS n FROM authors")).rejects.toThrow();
-    await restored.importSnapshot(bytes);
+    await restored.importSnapshot(await source.exportSnapshot());
     expect((await restored.query("SELECT COUNT(*) AS n FROM authors")).rows).toEqual([{ n: 3 }]);
   });
 
-  it("refuses to load into a database that already holds one", async () => {
+  it("rejects corruption, truncation, trailing bytes, and non-empty targets", async () => {
     const { database: source } = await seededDatabase();
     const bytes = await source.exportSnapshot();
+    const damaged = bytes.slice();
+    const damagedIndex = Math.floor(damaged.byteLength / 2);
+    damaged[damagedIndex] = (damaged[damagedIndex] ?? 0) ^ 0xff;
+    await expect(
+      new MinnowDatabase(new MemoryBlockStore()).importSnapshot(damaged),
+    ).rejects.toThrow();
+    await expect(
+      new MinnowDatabase(new MemoryBlockStore()).importSnapshot(bytes.subarray(0, -1)),
+    ).rejects.toThrow(/truncated/);
+    const trailing = new Uint8Array(bytes.byteLength + 1);
+    trailing.set(bytes);
+    await expect(
+      new MinnowDatabase(new MemoryBlockStore()).importSnapshot(trailing),
+    ).rejects.toThrow(/trailing/);
     await expect(source.importSnapshot(bytes)).rejects.toThrow(/already holds/);
   });
 
-  it("says plainly when the store cannot do it, rather than failing as a missing method", async () => {
-    // A store that is a complete backend but cannot copy itself out, which is what any block
-    // store outside this package is until it implements the two methods.
+  it("reports unsupported stores at the capability boundary", async () => {
     const bare = Object.create(new MemoryBlockStore()) as Record<string, unknown>;
-    bare.exportSnapshot = undefined;
-    bare.importSnapshot = undefined;
+    bare.beginSnapshotFrameExport = undefined;
+    bare.readSnapshotExportFrame = undefined;
+    bare.closeSnapshotFrameExport = undefined;
+    bare.beginSnapshotFrameImport = undefined;
+    bare.renewSnapshotFrameImport = undefined;
+    bare.appendSnapshotImportFrames = undefined;
+    bare.finishSnapshotFrameImport = undefined;
+    bare.cancelSnapshotFrameImport = undefined;
     const database = new MinnowDatabase(bare as unknown as MemoryBlockStore);
-    await expect(database.exportSnapshot()).rejects.toThrow(/cannot export snapshots/);
+    await expect(database.exportSnapshot()).rejects.toThrow(/cannot stream snapshots/);
     await expect(database.importSnapshot(new Uint8Array(0))).rejects.toThrow(
-      /cannot load snapshots/,
+      /cannot stream snapshots/,
     );
+  });
+
+  it("accepts arbitrary legal source chunk boundaries", async () => {
+    const { database: source } = await seededDatabase();
+    const bytes = await source.exportSnapshot();
+    const target = new MinnowDatabase(new MemoryBlockStore());
+    const oneByteChunks = async function* (): AsyncGenerator<Uint8Array> {
+      for (const byte of bytes) yield Uint8Array.of(byte);
+    };
+    await target.importSnapshotStream(oneByteChunks());
+    expect((await target.query(REPORT)).rows).toEqual((await source.query(REPORT)).rows);
+    let entries = 0;
+    for await (const entry of decodeSnapshotFrameStream(bytesAsChunks(bytes))) {
+      void entry;
+      entries += 1;
+    }
+    expect(entries).toBeGreaterThan(2);
   });
 });

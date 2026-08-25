@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { type CompactionJobRecord, type SegmentRecord } from "../storage/types.js";
 import { MinnowDatabase } from "./database.js";
+import { allVisibleSegments } from "./storage-test-helpers.js";
 import { seedFor } from "../testing/seeds.js";
 
 function mulberry32(seed: number): () => number {
@@ -40,7 +41,7 @@ async function visibleRecords(
   store: MemoryBlockStore,
   tableName: string,
 ): Promise<SegmentRecord[]> {
-  const visible = await database.listVisibleSegments(tableName);
+  const visible = await allVisibleSegments(database, tableName);
   const records: SegmentRecord[] = [];
   for (const segment of visible) {
     const record = await store.getSegment(segment.id);
@@ -51,11 +52,9 @@ async function visibleRecords(
 }
 
 function rowIdsOf(segment: SegmentRecord): bigint[] {
-  const kind = segment.kind ?? "insert";
+  const kind = segment.kind;
   if (kind === "update" || kind === "delete") return [];
-  const spans = segment.rowIdSpans ?? [
-    { rowStart: 0, rowCount: segment.rowCount, rowIdStart: segment.rowIdStart },
-  ];
+  const spans = segment.rowIdSpans;
   const ids: bigint[] = [];
   for (const span of spans) {
     for (let offset = 0; offset < span.rowCount; offset += 1) {
@@ -79,14 +78,14 @@ function assertPartitionLayout(
   while (index < records.length && (records[index]?.level ?? 0) === 1) {
     const partition = records[index];
     if (partition === undefined) break;
-    const kind = partition.kind ?? "insert";
+    const kind = partition.kind;
     expect(kind === "base" || kind === "insert").toBe(true);
     expect(partition.partitionOrdinal).toBeUndefined();
     expect(Number.isFinite(partition.logicalOrder)).toBe(true);
-    expect(partition.logicalOrder ?? -1).toBeGreaterThanOrEqual(0);
+    expect(partition.logicalOrder).toBeGreaterThanOrEqual(0);
     const previous = partitions[partitions.length - 1];
     if (previous !== undefined) {
-      expect(partition.logicalOrder ?? -1).toBeGreaterThan(previous.logicalOrder ?? -1);
+      expect(partition.logicalOrder).toBeGreaterThan(previous.logicalOrder);
     }
     if (maxPartitionRows !== undefined) {
       expect(partition.rowCount).toBeLessThanOrEqual(maxPartitionRows);
@@ -95,7 +94,7 @@ function assertPartitionLayout(
     index += 1;
   }
   const level0 = records.slice(index);
-  for (const segment of level0) expect(segment.level ?? 0).toBe(0);
+  for (const segment of level0) expect(segment.level).toBe(0);
   const seen = new Set<bigint>();
   for (const record of records) {
     for (const rowId of rowIdsOf(record)) {
@@ -301,8 +300,8 @@ describe("partitioned folds of a keyed table", () => {
       if (previous === undefined) {
         // The new tail partition: only the appended rows, ordered behind every old partition.
         expect(partition.rowCount).toBe(6);
-        expect(partition.logicalOrder ?? -1).toBeGreaterThan(
-          Math.max(...partitions.map((old) => old.logicalOrder ?? -1)),
+        expect(partition.logicalOrder).toBeGreaterThan(
+          Math.max(...partitions.map((old) => old.logicalOrder)),
         );
         continue;
       }
@@ -331,7 +330,7 @@ describe("partitioned folds of a keyed table", () => {
     await database.updateBatch("items", { keys: [second], changes: { amount: [2] } });
     reference.set(first, { ...requiredRow(reference, first), amount: 1 });
     reference.set(second, { ...requiredRow(reference, second), amount: 2 });
-    const deltas = (await database.listVisibleSegments("items")).slice(partitions.length);
+    const deltas = (await allVisibleSegments(database, "items")).slice(partitions.length);
     expect(deltas).toHaveLength(2);
 
     const result = await database.compactTable("items", {
@@ -346,8 +345,8 @@ describe("partitioned folds of a keyed table", () => {
       partitions[9]?.id,
       ...deltas.map((segment) => segment.id),
     ]);
-    expect(job.rewritePlan?.kind).toBe("merge-v1");
-    if (job.rewritePlan?.kind !== "merge-v1") throw new Error("Expected a merge plan");
+    expect(job.rewritePlan.kind).toBe("merge-v1");
+    if (job.rewritePlan.kind !== "merge-v1") throw new Error("Expected a merge plan");
     expect(job.rewritePlan.partitions).toEqual([
       { rowStart: 0, rowCount: PARTITION_ROWS, logicalOrder: partitions[2]?.logicalOrder },
       {
@@ -479,7 +478,7 @@ describe("partitioned folds of a keyed table", () => {
     const untouched = await visibleRecords(reopened, store, "items");
     expect(untouched.map((segment) => segment.id)).toEqual([
       ...resumed.map((segment) => segment.id),
-      ...(await reopened.listVisibleSegments("items")).slice(resumed.length).map((s) => s.id),
+      ...(await allVisibleSegments(reopened, "items")).slice(resumed.length).map((s) => s.id),
     ]);
     await expectContents(reopened, reference, order, "after the cancelled attempt");
     const retried = await reopened.compactTable("items", {
@@ -563,7 +562,7 @@ describe("partitioned folds of a keyed table", () => {
     });
     if (result.jobId === undefined) throw new Error("Expected a fold job");
     const job = await requiredJob(store, result.jobId);
-    if (job.rewritePlan?.kind !== "merge-v1" || job.rewritePlan.partitions === undefined) {
+    if (job.rewritePlan.kind !== "merge-v1" || job.rewritePlan.partitions === undefined) {
       throw new Error("Expected a partitioned merge plan");
     }
     expect(partitions.length).toBeGreaterThan(1);
@@ -636,7 +635,7 @@ describe("partitioned rechunk folds of a keyless table", () => {
       PARTITION_ROWS,
     ).partitions;
     expect(initial.map((partition) => partition.rowCount)).toEqual([16, 16, 16, 16, 16, 16, 4]);
-    expect(initial.every((partition) => (partition.kind ?? "insert") === "insert")).toBe(true);
+    expect(initial.every((partition) => partition.kind === "insert")).toBe(true);
 
     await append(26);
     const tail = await database.compactTable("events", {
@@ -826,7 +825,7 @@ describe("partitioned folds under the background loop", () => {
       const currentRecords = await visibleRecords(database, store, "items");
       const visible = currentRecords.length;
       const deltas = currentRecords.filter((segment) => {
-        const kind = segment.kind ?? "insert";
+        const kind = segment.kind;
         return kind !== "insert" && kind !== "base";
       }).length;
       const due = visible >= 48 || deltas >= 32;

@@ -1,31 +1,25 @@
 /**
- * Every database an earlier build wrote must still read.
- *
- * This is the one guarantee a browser database cannot recover from breaking. The data lives in
- * the user's own IndexedDB, so it survives every deploy — there is no migration window, no
- * maintenance mode, and no way to reach back and rewrite it. If a format change makes yesterday's
- * blocks unreadable, the first anyone hears is a user whose application will not open.
- *
- * `packages/core/format-fixtures/` holds one snapshot per released format version, each frozen by
- * the build that produced it, together with the answers that build gave to a fixed set of
- * queries. This runs all of them against the current engine. Two things can fail here, and they
- * mean different things:
- *
- *   - a fixture no longer opens, or answers differently → the change breaks existing databases
- *   - no fixture covers the current version pair → the change is unprotected, freeze it first
- *
- * The second is the one that matters most, because it fires *before* the damage. When it does,
- * check out the previous release, run `npm run fixture:format`, commit the fixture, and only then
- * make the format change.
+ * Golden compatibility tests for the v1 storage contract. There was no pre-v1 persisted-data
+ * contract, so the corpus intentionally starts with block format 2 and framed snapshot format 1.
+ * From this lock onward, every shipped format stays readable and keeps answering the same fixed
+ * queries. A new writer format must add a fixture before changing these bytes.
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { BLOCK_FORMAT_VERSION } from "../block-format/index.js";
+import { BLOCK_FORMAT_VERSION, inspectBlock } from "../block-format/index.js";
 import { MinnowDatabase } from "../engine/database.js";
 import { MemoryBlockStore } from "./memory.js";
-import { decodeSnapshot, SNAPSHOT_FORMAT_VERSION } from "./snapshot.js";
-import { buildFixtureDatabase, FIXTURE_QUERIES } from "./fixture-shape.js";
+import {
+  decodeSnapshotFrameStream,
+  readSnapshotSummary,
+  SNAPSHOT_FORMAT_VERSION,
+} from "./snapshot.js";
+import {
+  buildFixtureDatabase,
+  createFormatFixtureArtifact,
+  FIXTURE_QUERIES,
+} from "./fixture-shape.js";
 
 const FIXTURE_DIRECTORY = new URL("../../format-fixtures/", import.meta.url);
 
@@ -69,7 +63,27 @@ function normalize(rows: unknown): unknown {
 
 const fixtures = loadFixtures();
 
-describe("format compatibility with databases earlier builds wrote", () => {
+async function restoreFixture(bytes: Uint8Array): Promise<MinnowDatabase> {
+  const database = new MinnowDatabase(new MemoryBlockStore());
+  await database.importSnapshot(bytes);
+  return database;
+}
+
+async function fixtureBlockPayloads(bytes: Uint8Array): Promise<Uint8Array[]> {
+  const payloads: Uint8Array[] = [];
+  for await (const entry of decodeSnapshotFrameStream(
+    (async function* (): AsyncGenerator<Uint8Array> {
+      yield bytes;
+    })(),
+  )) {
+    if (entry.type === "frame" && entry.frame.kind === "block") {
+      payloads.push(entry.frame.payload);
+    }
+  }
+  return payloads;
+}
+
+describe("v1 format compatibility", () => {
   it("has a fixture for the format versions this build writes", () => {
     // The ratchet. A format change with no fixture behind it means the previous format is no
     // longer represented anywhere, and nothing will notice when it stops being readable.
@@ -98,10 +112,28 @@ describe("format compatibility with databases earlier builds wrote", () => {
     }
   });
 
+  it("keeps the current v1 writer byte-for-byte identical to its frozen fixture", async () => {
+    const frozen = fixtures.find(
+      ({ manifest }) =>
+        manifest.blockFormatVersion === BLOCK_FORMAT_VERSION &&
+        manifest.snapshotFormatVersion === SNAPSHOT_FORMAT_VERSION,
+    );
+    if (frozen === undefined) throw new Error("Current format fixture is missing");
+    const generated = await createFormatFixtureArtifact();
+    expect(generated.bytes).toEqual(frozen.bytes);
+    expect(normalize(generated.expectations)).toEqual(normalize(frozen.manifest.expectations));
+  });
+
   for (const fixture of fixtures) {
+    it(`keeps ${fixture.stem}'s canonical framed header`, async () => {
+      const summary = await readSnapshotSummary(fixture.bytes);
+      expect(summary.formatVersion).toBe(fixture.manifest.snapshotFormatVersion);
+      expect(summary.blockCount).toBeGreaterThan(0);
+      expect(summary.byteLength).toBe(fixture.bytes.byteLength);
+    });
+
     it(`reads ${fixture.stem} and answers exactly as that build did`, async () => {
-      const snapshot = await decodeSnapshot(fixture.bytes);
-      const database = new MinnowDatabase(MemoryBlockStore.fromSnapshot(snapshot));
+      const database = await restoreFixture(fixture.bytes);
 
       const failures: string[] = [];
       for (const expectation of fixture.manifest.expectations) {
@@ -129,8 +161,7 @@ describe("format compatibility with databases earlier builds wrote", () => {
       // Reading an old database is half the guarantee. An application that opens one goes on to
       // write to it, so the restored catalog -- row-id counters, unique-key membership, segment
       // ordering -- has to be sound rather than merely readable.
-      const snapshot = await decodeSnapshot(fixture.bytes);
-      const database = new MinnowDatabase(MemoryBlockStore.fromSnapshot(snapshot));
+      const database = await restoreFixture(fixture.bytes);
 
       const before = (await database.query("SELECT COUNT(*) AS n FROM records", { memoize: false }))
         .rows[0] as { n: number };
@@ -201,26 +232,20 @@ describe("format compatibility with databases earlier builds wrote", () => {
   it("rejects a block whose version it does not know", async () => {
     // The other half of the contract: an unknown *future* version must be refused clearly rather
     // than misread. A user who downgrades the application should see a plain error.
-    const snapshot = await decodeSnapshot(fixtures[0]?.bytes ?? new Uint8Array());
-    expect(snapshot.blocks.length).toBeGreaterThan(0);
+    const blocks = await fixtureBlockPayloads(fixtures[0]?.bytes ?? new Uint8Array());
+    expect(blocks.length).toBeGreaterThan(0);
     // Every block, not just the first: which block a given query happens to open depends on the
     // table and the pruning, and a tampered block the read never reaches proves nothing.
-    const store = MemoryBlockStore.fromSnapshot({
-      ...snapshot,
-      blocks: snapshot.blocks.map(({ id, bytes }) => {
-        const tampered = bytes.slice();
-        // The version sits at byte 8, little-endian uint16 -- see the block header layout. It is
-        // checked before the envelope checksum, so this reads back as a version error rather
-        // than as the corruption the edit also causes.
-        new DataView(tampered.buffer).setUint16(8, BLOCK_FORMAT_VERSION + 1, true);
-        return { id, bytes: tampered };
-      }),
-    });
-    const database = new MinnowDatabase(store);
-    // A query that has to decode column payloads. `COUNT(*)` would not: it answers from segment
-    // metadata without opening a single block, so it reads a tampered database quite happily.
-    await expect(
-      database.query("SELECT note, noise, amount FROM records ORDER BY id", { memoize: false }),
-    ).rejects.toThrow(/Unsupported block version/);
+    for (const bytes of blocks) {
+      const tampered = bytes.slice();
+      // The version sits at byte 8, little-endian uint16. It is checked before the envelope
+      // checksum, so a downgrade gets a version error rather than a misleading corruption error.
+      new DataView(tampered.buffer, tampered.byteOffset, tampered.byteLength).setUint16(
+        8,
+        BLOCK_FORMAT_VERSION + 1,
+        true,
+      );
+      expect(() => inspectBlock(tampered)).toThrow(/Unsupported block version/);
+    }
   });
 });

@@ -6,7 +6,7 @@ import {
   type SimpleDataType,
   type SqlDomain,
   type TableRecord,
-} from "../storage/index.js";
+} from "../storage/types.js";
 import { externalSqlDomainValue } from "./sql-domains.js";
 
 /**
@@ -41,11 +41,9 @@ export interface CatalogColumn {
 
 export interface CatalogForeignKey {
   readonly name: string;
-  readonly column: string;
-  readonly columns?: readonly string[];
+  readonly columns: readonly string[];
   readonly parentTable: string;
-  readonly parentColumn: string;
-  readonly parentColumns?: readonly string[];
+  readonly parentColumns: readonly string[];
   readonly onDelete: "restrict" | "cascade" | "set null";
 }
 
@@ -56,6 +54,8 @@ export interface CatalogCheck {
 }
 
 export interface CatalogTrigger {
+  /** Immutable durable identity; stable until this exact trigger is dropped. */
+  readonly id: string;
   readonly name: string;
   readonly event: "insert" | "update" | "delete";
   readonly timing: "before" | "after";
@@ -146,13 +146,13 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
         name: record.name,
         sql: record.view.sql,
         columns,
-        managed: record.view.managed === true,
+        managed: record.view.managed,
       });
       continue;
     }
     tables.push({
       name: record.name,
-      managed: record.managed === true,
+      managed: record.managed,
       columns,
       ...(record.uniqueKeyColumnId === undefined ||
       record.columns.find((column) => column.id === record.uniqueKeyColumnId)?.hidden === true
@@ -178,7 +178,8 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
               }))
               .sort((left, right) => left.name.localeCompare(right.name)),
           }),
-      triggers: (record.triggers ?? []).map(({ name, event, timing }) => ({
+      triggers: (record.triggers ?? []).map(({ id, name, event, timing }) => ({
+        id,
         name,
         event,
         timing,

@@ -69,10 +69,94 @@ test("the console reopens an existing database instead of rebuilding it", async 
     }),
   ).toEqual([620, 620]);
 
+  expect(
+    await page.evaluate(
+      () =>
+        new Promise<number>((resolve, reject) => {
+          const request = indexedDB.open("minnow-playground");
+          request.addEventListener(
+            "success",
+            () => {
+              resolve(request.result.version);
+              request.result.close();
+            },
+            { once: true },
+          );
+          request.addEventListener(
+            "error",
+            () => reject(request.error ?? new Error("Could not inspect playground schema")),
+            { once: true },
+          );
+        }),
+    ),
+  ).toBe(1);
+
   await page.reload();
   await expect(page.getByText("this database was already on your machine")).toBeVisible({
     timeout: 60_000,
   });
+});
+
+test("the playground never erases a newer IndexedDB schema during a downgrade", async ({
+  page,
+}) => {
+  await page.goto("/docs/");
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open("minnow-playground", 2);
+        request.addEventListener(
+          "upgradeneeded",
+          () => {
+            request.result.createObjectStore("future-v2-sentinel");
+          },
+          { once: true },
+        );
+        request.addEventListener(
+          "success",
+          () => {
+            request.result.close();
+            resolve();
+          },
+          { once: true },
+        );
+        request.addEventListener(
+          "error",
+          () => reject(request.error ?? new Error("Could not seed newer playground database")),
+          { once: true },
+        );
+      }),
+  );
+
+  await page.goto("/");
+  await expect(page.getByText(/The playground could not start:/)).toBeVisible({
+    timeout: 60_000,
+  });
+
+  const untouched = await page.evaluate(
+    () =>
+      new Promise<{ version: number; hasFutureSentinel: boolean }>((resolve, reject) => {
+        const request = indexedDB.open("minnow-playground");
+        request.addEventListener(
+          "success",
+          () => {
+            const database = request.result;
+            resolve({
+              version: database.version,
+              hasFutureSentinel: database.objectStoreNames.contains("future-v2-sentinel"),
+            });
+            database.close();
+          },
+          { once: true },
+        );
+        request.addEventListener(
+          "error",
+          () => reject(request.error ?? new Error("Could not inspect newer playground database")),
+          { once: true },
+        );
+      }),
+  );
+  expect(untouched).toEqual({ version: 2, hasFutureSentinel: true });
 });
 
 test("the TypeScript tab checks a snippet against the schema and runs it", async ({ page }) => {

@@ -11,7 +11,10 @@ import type {
   UpdateBatchInput,
   UpdateBatchResult,
 } from "@minnowdb/core";
-import type { SnapshotExportProgress, SnapshotLoadProgress } from "@minnowdb/core/storage";
+import type {
+  SnapshotExportProgress,
+  SnapshotLoadProgress,
+} from "@minnowdb/core/storage/snapshots";
 
 /**
  * The slice of the database the devtools drive. `MinnowDatabase` and `MinnowDatabaseClient`

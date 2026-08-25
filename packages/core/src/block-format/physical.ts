@@ -8,6 +8,11 @@ import type {
 } from "./types.js";
 
 export const MAX_PHYSICAL_COLUMN_BYTE_LENGTH = 64 * 1024 * 1024;
+/**
+ * Hard row ceiling for one physical block. Bitmap columns otherwise fit 268 million rows under
+ * the byte limit, which would require an unsafe decoded JS array even for a valid block.
+ */
+export const MAX_BLOCK_ROW_COUNT = 1_048_576;
 const MAX_DATETIME_MILLISECONDS = 8_640_000_000_000_000;
 
 interface PreparedPhysicalRange<T extends LogicalType> {
@@ -26,7 +31,7 @@ export function physicalBitmapByteLength(rowCount: number): number {
   return Math.ceil(rowCount / 8);
 }
 
-/** Returns the exact encoded byte length for a version-zero physical column. */
+/** Returns the exact encoded byte length for the canonical v2 physical column. */
 export function physicalColumnByteLength(
   type: LogicalType,
   rowCount: number,
@@ -349,7 +354,7 @@ function preparePhysicalColumn<T extends LogicalType>(
     }
     const rangeRowCount = range.end - range.start;
     rowCount = checkedAdd(rowCount, rangeRowCount, "row count");
-    if (rowCount > 0xffffffff) throw new RangeError("Too many rows in one physical column");
+    assertBlockRowCount(rowCount);
     const sourceValidityLength = physicalBitmapByteLength(column.rowCount);
     const sourceValidity = column.bytes.subarray(0, sourceValidityLength);
 
@@ -526,7 +531,14 @@ function assertContinuation(bytes: Uint8Array, index: number, end: number): void
 
 function assertRowCount(rowCount: number): void {
   assertNonnegativeSafeInteger(rowCount, "row count");
-  if (rowCount > 0xffffffff) throw new RangeError("Too many rows in one physical column");
+  if (rowCount > MAX_BLOCK_ROW_COUNT) {
+    throw new RangeError("Physical column exceeds maximum row count");
+  }
+}
+
+/** Validates the shared persisted-block row ceiling without allocating a physical payload. */
+export function assertBlockRowCount(rowCount: number): void {
+  assertRowCount(rowCount);
 }
 
 function assertLogicalType(type: unknown): asserts type is LogicalType {

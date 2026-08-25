@@ -9,7 +9,7 @@ adapters follow the same rules. A React Native store, an object store such as R2
 filesystem, or an encrypted wrapper can do the same.
 
 ```ts
-import type { BlockStore } from "@minnowdb/core/storage";
+import type { BlockStore } from "@minnowdb/core/storage/contracts";
 
 class MyBlockStore implements BlockStore {
   // ...
@@ -32,8 +32,8 @@ const db = new MinnowDatabase(new MyBlockStore());
 | `FtsIndexStore`     | Full-text and secondary postings bases, deltas, and candidate reads.   |
 | `TempSpillStore`    | Query spill pages and their owner leases.                              |
 
-The TSDoc in `@minnowdb/core/storage` explains the exact order of operations, the error types, and
-which changes must happen together. The guide below gives the friendlier overview.
+The TSDoc in `@minnowdb/core/storage/contracts` explains the exact order of operations, the error
+types, and which changes must happen together. The guide below gives the friendlier overview.
 
 ## The rules
 
@@ -43,10 +43,48 @@ segments mapping blocks to tables, transactions, leases, jobs, counters, keys. B
 published blocks never change and a version is just a set of block ids, readers hold versions
 open while writers commit — the concurrency story is the data model, not locks you invent.
 
-**Each operation is all or nothing.** A method that resolves has happened; one that rejects has
-not. `commitTransaction` is the heart of the interface: it checks the expected version, publishes
+**Each operation is all or nothing.** A local adapter method that resolves has happened; one that
+rejects has not. `commitTransaction` is the heart of the interface: it checks the expected version, publishes
 the new version, finishes its segments, updates keys and full-text data, and marks the transaction
 complete in one saved step. A crash cannot leave half of that change visible.
+
+OPFS follower RPC has one explicit transport-loss exception. `OpfsUncertainOutcomeError` means a
+leader changed after receiving the named mutation but before its reply arrived, so the whole
+operation may have committed. Preserve that class and its `method` field across any wrapper or
+worker boundary; inspect or reopen the database instead of blindly retrying. An ordinary `Error`
+still means no effect and must never be used to hide an uncertain outcome.
+
+Artifact journaling has the same required boundary. `stageTransactionArtifacts` saves new blocks
+and segments and appends their IDs to the active transaction in one operation.
+`rollbackTransactionArtifacts` compare-and-swaps the journal back to the exact saved set and
+deletes only the proven difference in that same operation. The adapter validates that the
+duplicate-free retained and removed sets are disjoint and exactly partition the current journal
+before changing anything. There is no sequential
+fallback: a crash between a record update and byte deletion would otherwise create either an
+uncollectable orphan or a journal pointing at missing data.
+
+Keep each staging call within the exported `MAX_TRANSACTION_STAGE_BLOCKS`,
+`MAX_TRANSACTION_STAGE_SEGMENTS`, and `MAX_TRANSACTION_STAGE_BYTES` limits, and refuse a durable
+journal above `MAX_TRANSACTION_PENDING_BLOCKS` or `MAX_TRANSACTION_PENDING_SEGMENTS`. Check these
+bounds before opening a write transaction. The engine splits larger writes into resumable batches;
+the ceilings prevent one caller or abandoned transaction from creating an unbounded storage
+transaction or control record.
+
+Transaction liveness is part of that boundary. Persist `ownerId` and `expiresAt` with the
+transaction itself. `renewTransaction` may extend only a matching, still-active owner whose old
+deadline is strictly after the supplied cutoff, and it must not change the transaction's data
+revision. `abortTransactionIfExpired` atomically checks owner, status, and deadline before moving
+the record to `aborted`. Renewal and abort must have one winner; an expired owner can never be
+resurrected. The collector treats only the successfully aborted journal as reclaimable provenance.
+
+Schema serialization is part of commit too. `getCatalogProbe()` atomically returns the current
+manifest version, broad catalog epoch, and structural schema epoch. `beginTransaction()` copies
+that structural epoch into `schemaEpochGuard`; `commitTransaction()` and `writeTransaction()` must
+compare it in the same transaction that publishes the manifest and throw `SchemaConflictError`
+before any mutation when it differs. Advance the structural epoch for table/view/column/default,
+trigger, and write-semantic index changes. Do not advance it for ordinary manifests or
+accelerator build progress such as building/ready/invalid stamps: those do not change row
+validation, and treating them as schema DDL would make unrelated writers conflict.
 
 Catalog cleanup follows the same rule. When `updateTable` removes a column or secondary index,
 that operation also deletes all of its postings base chunks, staged generations, and commit
@@ -80,18 +118,43 @@ manifests, segments, blocks, then terminal transactions; a committed transaction
 only after its manifest is pruned and no segment or unfinished compaction names it, while an
 aborted one waits for every pending artifact to disappear. Adapters must apply that whole step
 as one operation. `removePrunedManifestRecords` then deletes only markers that no readable version
-needs **and whose unused blocks are all gone**. That marker remembers unfinished work between
-small collection passes, so deleting it early can strand part of a large cleanup. A
-file-backed adapter may delete immutable block payloads after logging the resolved step, as the
-toolkit example does.
+needs. Block discovery does not depend on those bounded summaries:
+`listRetiredManifestBlockPage` walks the independent, ID-ordered provenance intervals for blocks
+retired through a version. Payload and provenance are removed atomically only after no readable
+version, transaction, or maintenance job roots them, so a small pass can resume after the summary
+is gone without stranding bytes. A file-backed adapter may delete immutable block payloads after
+logging the resolved step, as the toolkit example does.
 
 Maintenance discovery must also stay bounded. `listManifestPage`, `listSegmentPage`,
 `listTransactionPage`, and `listCompactionJobPage` use exclusive cursors so the engine can sweep
 old metadata without materializing the database's complete history. Return records sorted by the
-cursor field and reject a non-positive page limit, matching the interface contract.
+cursor field and reject a non-positive or storage-unsafe page limit, matching the interface
+contract. `listManifestBlockPage` and `listRetiredManifestBlockPage` page exact block membership
+and retired provenance independently of summary pruning. Do not add a whole-history fallback for
+an old unpaged API: the v1 contract begins with these cursor boundaries.
+
+**Global growth ceilings are atomic admission rules.** The exported `MAX_*` storage constants
+bound live owners, staged journals and accelerator builds, catalog table/view records, manifest
+summaries, segment records, temporary spill, retained terminal metadata, pinned retired history,
+and total obsolete payload bytes. Sweep safely expired owners first, then either save the record
+and its accounting together or throw `StorageResourceLimitError` before either changes. Catalog
+accounting includes a transaction-owned pending table. Charge catalog and segment records by
+their exact canonical wire bytes; charge an unpruned manifest for the exact bytes of its eventual
+24-byte UTC tombstone too, so pruning cannot deadlock at the byte ceiling. Treat a negative,
+overflowing, over-limit, or checksum-invalid durable ledger as corruption, not as an empty ledger.
+
+**Control records have fixed structural bounds too.** Validate them before I/O with the exported
+helpers and constants: database names stop at 256 characters; storage IDs and catalog names at
+1,024; and posting terms at 65,536. Tables stop at 1,024 columns, indexes, or
+constraints, 256 triggers, and 4,096 enum values; one table record stops at 1,048,576 characters
+and 65,536 walked entries. Persist only well-formed Unicode, finite or safe numeric counters,
+canonical unsigned 64-bit row IDs, and exact 24-character UTC timestamps. Required v1 fields are
+not defaults: for example, a level-two segment has a stable `partitionOrdinal`, and a persisted
+compaction checkpoint carries its full rewrite plan, cursors, source levels, and memory accounting.
+Missing pre-v1 fields are corruption, not a reason to infer state and continue.
 
 **Conflicts use the exported error classes.** Version-check failures throw
-`WriteConflictError`, `TransactionRecordConflictError`, `UniqueKeyConflictError`,
+`SchemaConflictError`, `WriteConflictError`, `TransactionRecordConflictError`, `UniqueKeyConflictError`,
 `UniqueIndexCoverageError`, or the matching exported class directly. The engine uses those classes
 to decide when to retry, and the worker client recreates them on the main thread.
 
@@ -102,18 +165,26 @@ space frees.
 **Nothing is shared.** Copy bytes and records in both directions; the engine may reuse the
 buffers it hands you and mutate the records you return.
 
-**An optional shortcut still has to be all or nothing.** `getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
-`stageTransactionArtifacts`, `writeTransaction`, `moveLease`, `putTempRunPages`, and the
-snapshot pair are optional so an adapter that can do something in one atomic step may say so.
-Callers trust a present method completely and fall back to sequential calls otherwise — never
-implement one as the sequential calls in a trench coat.
+**An optional shortcut still has to be all or nothing.** `writeTransaction`, `moveLease`,
+`putTempRunPages`, and the framed snapshot session methods are optional so an adapter that can do
+something in one atomic step may say so. `getCatalogProbe` and `beginTransaction` are required:
+schema-dependent writes need one coherent catalog proof, and `CREATE TABLE … AS SELECT` needs a
+transaction-owned table reservation that sequential calls cannot emulate safely.
+Callers trust a present fused method completely and fall back to the required atomic primitives
+where that fallback exists — never implement one as the sequential calls in a trench coat. Framed
+snapshot support is different: the export and import session families are each complete
+capabilities, and an absent family means that direction is unavailable rather than unbounded.
 
-`getQueryCatalogState` returns the named tables plus only the segments and transactions reachable
-from the current manifest version returned in the same atomic read. Include that manifest's exact
-block IDs too, so the engine can pin the already-resolved snapshot instead of reading it again. Do
-not return staged or superseded history: current-version query preparation must not grow with
-retained time-travel history. Explicit historical reads use the paged segment and transaction
-methods instead.
+`getCatalogProbe` returns the manifest version, catalog epoch, and structural schema epoch from one
+coherent read. The engine may reuse cached catalog pages only while the first two remain unchanged;
+writers retain the schema epoch until commit. Current and historical query
+preparation use `listTableSegmentPage`, `getTransactions`, and version-scoped manifest-membership
+reads; no query shortcut may return every segment, transaction, or block ID in a retained history.
+
+Each snapshot direction is one complete capability: begin/read/close frame export, and
+begin/renew/append/finish/cancel frame import. Do not expose a partial family. Export must pin one
+version and page all six frame kinds; import must compare same-sequence replay bytes and publish
+only after the footer totals and rolling checksum match. See [Snapshots](/docs/storage/snapshots).
 
 **Tabs are plural and mortal.** Several connections may open one database; readers never block
 writers; a connection can die between any two operations without corrupting anything. How you
@@ -179,20 +250,23 @@ deliberately **not** required by the interface: the engine never imports it, the
 requires it, and an adapter that stores records another way is equally valid. It exists because
 the hardest parts of an adapter are often the same.
 
-| Export                         | What it is                                                                                                                                                                                                   |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `RecordCore`                   | The in-memory record engine behind the memory and OPFS adapters: one synchronous method per operation, with validation, conflict errors, safe copies, and `dump()`/`load()` for checkpoints.                 |
-| `WalWriter`, `replayWalFrames` | Checksummed write-ahead-log frames over one held file handle. Replay stops at the first torn frame, which is exactly what a crash can leave.                                                                 |
-| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length }`, with sealing, live-byte accounting, fragmentation detection, and a read-handle cache.                          |
-| `encodeRecordJson` and friends | The JSON codec (bigints included) and the checksummed, versioned envelopes for checkpoints and immutable chunks.                                                                                             |
-| `SyncFileHandle`               | The small file interface used by these tools: positioned read, write, truncate, and flush. A browser `FileSystemSyncAccessHandle` already has this shape; a Node file descriptor can be wrapped to match it. |
+| Export                         | What it is                                                                                                                                                                                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RecordCore`                   | The in-memory record engine behind the memory and OPFS adapters: one synchronous method per operation, with validation, conflict errors, safe copies, and `dump()`/`load()` for checkpoints.                                                      |
+| `WalWriter`, `replayWalFrames` | Checksummed write-ahead-log frames over one held file handle. Replay stops at the first torn frame, which is exactly what a crash can leave.                                                                                                      |
+| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length, checksum }`, with sealing, full-payload recovery checks, live-byte accounting, fragmentation detection, and a read-handle cache.                       |
+| `encodeRecordJson` and friends | The JSON codec (bigints included) and the checksummed, versioned envelopes for checkpoints and immutable chunks.                                                                                                                                  |
+| `SyncFileHandle`               | The small file interface used by these tools: positioned read, write, truncate, and flush. A browser `FileSystemSyncAccessHandle` already has this shape; a Node file descriptor can be wrapped to match it.                                      |
+| `readFully`, `writeFully`      | Complete a positioned transfer across permitted short reads or writes. They reject invalid or overflowing ranges before I/O, throw on EOF, zero progress, or an invalid byte count, and avoid copying on both the one-call fast path and retries. |
 
 Wrapping `RecordCore` obligates you to two things. **One writer at a time** — its methods
 validate and then mutate synchronously, so calls must never interleave (a promise-chain queue,
 a leader, or a process-wide lock all work). **Durability is yours** — the core is memory:
 log each change, save checkpoints with `dump()` (serialize the result immediately because its
 arrays still refer to the live state), and replay the log on open. For any single-log design,
-write and flush the checkpoint before resetting the log — never the other way around.
+flush every payload the checkpoint references, then write and flush the checkpoint before
+resetting the log — never the other way around. Use `readFully` and `writeFully` for every
+sync-handle transfer; the platform is allowed to return fewer bytes than requested.
 
 A shared test checks that these parts work together:
 [`toolkit-example.test.ts`](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/storage/toolkit/toolkit-example.test.ts)
@@ -203,19 +277,22 @@ to see where your storage system fits.
 
 For running your adapter in plain Node tests, `MemoryOpfs` from `@minnowdb/core/testing` is an
 in-memory origin-private file system with the behaviour that matters in storage tests:
-exclusive sync-access locks that throw the real `DOMException`s, and injectable write faults
-for quota and crash suites.
+exclusive sync-access locks that throw the real `DOMException`s, injectable write faults, and
+deterministic short-transfer limits for quota, crash, and partial-I/O suites.
 
-## What the optional methods buy
+## What the fused methods buy
 
-The engine works over the required surface alone, at a cost: without `getCatalogProbe` it
-cannot cache catalog state at all, and without the batched transaction methods every commit
-spends extra round trips. `writeTransaction` is the one that matters most for writes: it
+The required surface includes `getCatalogProbe`, `beginTransaction`,
+`stageTransactionArtifacts`, and `rollbackTransactionArtifacts`. `writeTransaction` is the
+optional fusion that matters most for writes: it
 begins (or continues) a transaction, stages its blocks and segments, and commits, all in one
 storage transaction, so a point update or delete costs one durable commit instead of three and
 an insert two (its row ids are reserved by `beginTransaction` first). `moveLease` re-pins the
 engine's shared reader lease to each new version in place, which saves a lease create and a
-later remove on the first read after every commit. Implement the probe first (it is the single
-most valuable), then `writeTransaction` and `beginTransaction`, then `moveLease` and
-`stageTransactionArtifacts`; add `putTempRunPages` when your storage system charges per call, and
-the snapshot pair when your store should be exportable.
+later remove on the first read after every commit. Implement the required probe and transaction
+begin first, then `writeTransaction` and `moveLease`; add
+`putTempRunPages` when your storage system charges per call, and framed snapshot sessions when your
+store should be exportable. Snapshot support means the complete export/import session family, not
+one database-sized record helper. `stageTransactionArtifacts` and
+`rollbackTransactionArtifacts` are correctness boundaries every adapter must implement, not
+performance options.

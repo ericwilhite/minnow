@@ -1,3 +1,4 @@
+import { dateMilliseconds } from "../date-value.js";
 import { compareSqlStrings, compareSqlValues } from "./sql-semantics.js";
 
 /**
@@ -51,7 +52,7 @@ export interface SortKeyTerm {
 
 /** Unwraps a datetime to the number the comparisons use; every other value passes through. */
 export function comparableSortValue(value: unknown): unknown {
-  return value instanceof Date ? value.getTime() : value;
+  return value instanceof Date ? dateMilliseconds(value) : value;
 }
 
 /**

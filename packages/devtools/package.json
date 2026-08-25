@@ -31,6 +31,7 @@
     "dist",
     "!dist/**/*.test.*",
     "!dist/**/*.spec.*",
+    "!dist/**/*.map",
     "!dist/*.tsbuildinfo"
   ],
   "dependencies": {

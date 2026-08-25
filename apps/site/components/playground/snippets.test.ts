@@ -3,13 +3,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { beforeAll, describe, expect, it } from "vitest";
+import * as core from "@minnowdb/core";
 import { MinnowDatabase } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { createKysely } from "@minnowdb/kysely";
+import * as coreClient from "@minnowdb/core/client";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
+import { createKysely, search } from "@minnowdb/kysely";
 import { sql } from "kysely";
 import { retailBatches, retailDefinition, retailSchema } from "@/lib/dataset/retail";
 import { playgroundDeclarations } from "./declarations";
-import { runSnippet } from "./run";
+import { runSnippet, unsupportedRuntimeImports } from "./run";
+import { PLAYGROUND_RUNTIME_MODULES, type PlaygroundRuntimeModule } from "./runtime-modules";
 import { snippets } from "./snippets";
 
 /**
@@ -25,7 +28,7 @@ import { snippets } from "./snippets";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bundle = JSON.parse(
   readFileSync(path.join(here, "../../public/playground-types.json"), "utf8"),
-) as { paths: Record<string, string[]>; files: Record<string, string> };
+) as { paths: Record<string, string[]>; files: Record<string, string>; runtimeModules: string[] };
 
 /**
  * The console's compiler options. `Bundler` resolution is deliberately absent: the editor's
@@ -96,14 +99,39 @@ function diagnose(code: string): string[] {
 describe("the console's declarations", () => {
   it("resolve every package a snippet may import", () => {
     const probe = [
-      'import { createKysely } from "@minnowdb/kysely";',
+      'import { createKysely, search } from "@minnowdb/kysely";',
       'import { sql } from "kysely";',
       'import { MinnowDatabase, column, schema, table } from "@minnowdb/core";',
-      'import { MemoryBlockStore } from "@minnowdb/core/storage";',
       'import { MinnowDatabaseClient } from "@minnowdb/core/client";',
-      "void [createKysely, sql, MinnowDatabase, column, schema, table, MemoryBlockStore, MinnowDatabaseClient];",
+      "void [createKysely, search, sql, MinnowDatabase, column, schema, table, MinnowDatabaseClient];",
     ].join("\n");
     expect(diagnose(probe)).toEqual([]);
+  });
+
+  it("records exactly the modules the Run button can execute", () => {
+    expect(bundle.runtimeModules).toEqual([...PLAYGROUND_RUNTIME_MODULES].sort());
+  });
+
+  it("rejects value imports that have declarations but no runtime module", () => {
+    const compilerOptions = { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext };
+    const valueImport = ts.transpileModule(
+      'import { MemoryBlockStore } from "@minnowdb/core/storage/memory"; void MemoryBlockStore;',
+      { compilerOptions },
+    ).outputText;
+    const typeImport = ts.transpileModule(
+      'import type { MemoryBlockStore } from "@minnowdb/core/storage/memory"; void 0;',
+      { compilerOptions },
+    ).outputText;
+    expect(unsupportedRuntimeImports(valueImport, PLAYGROUND_RUNTIME_MODULES)).toEqual([
+      "@minnowdb/core/storage/memory",
+    ]);
+    expect(unsupportedRuntimeImports(typeImport, PLAYGROUND_RUNTIME_MODULES)).toEqual([]);
+    expect(
+      unsupportedRuntimeImports(
+        'const module = await import("@minnowdb/core/storage/opfs"); void module;',
+        PLAYGROUND_RUNTIME_MODULES,
+      ),
+    ).toEqual(["@minnowdb/core/storage/opfs"]);
   });
 
   it("type the two names the console hands a snippet", () => {
@@ -119,6 +147,23 @@ describe("the console's declarations", () => {
   it("reject a column the playground's schema does not have", () => {
     expect(diagnose('db.selectFrom("orders").select(["nmae"]);').join(" ")).toMatch(/nmae/);
     expect(diagnose('db.selectFrom("ordrs").selectAll();').join(" ")).toMatch(/ordrs/);
+  });
+
+  it("infers the complete aggregate sample without output generics", () => {
+    const aggregate = snippets.find(({ id }) => id === "revenue-by-month");
+    if (aggregate === undefined) throw new Error("Missing revenue aggregate snippet");
+    expect(
+      diagnose(
+        `${aggregate.code}\nconst inferred: { month: Date; orders: number; revenue: number } = rows[0]!;\nvoid inferred;`,
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps explicit row generics at the arbitrary raw-SQL boundary only", () => {
+    for (const snippet of snippets) {
+      if (snippet.id !== "raw-sql") expect(snippet.code).not.toMatch(/sql\s*</u);
+    }
+    expect(snippets.find(({ id }) => id === "raw-sql")?.code).toMatch(/sql\s*</u);
   });
 });
 
@@ -140,8 +185,15 @@ describe("running every snippet", () => {
     for (const batch of retailBatches({ scale: 0.05 })) {
       await engine.insertBatch(batch.table, batch.rows);
     }
+    const modules = {
+      kysely: { sql },
+      "@minnowdb/kysely": { createKysely, search },
+      "@minnowdb/core": core,
+      "@minnowdb/core/client": coreClient,
+    } satisfies Record<PlaygroundRuntimeModule, unknown>;
+    expect(Object.keys(modules).sort()).toEqual([...PLAYGROUND_RUNTIME_MODULES].sort());
     scope = {
-      modules: { kysely: { sql }, "@minnowdb/kysely": { createKysely }, "@minnowdb/core": {} },
+      modules,
       globals: {
         db: createKysely({ driver: engine, schema: retailDefinition }),
         database: engine,

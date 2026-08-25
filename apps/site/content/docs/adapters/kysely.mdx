@@ -22,7 +22,7 @@ the query interface, so keep the explicit migration call:
 ```ts
 import { createKysely } from "@minnowdb/kysely";
 import { MinnowDatabase, column, schema, table } from "@minnowdb/core";
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 
 const orders = table("orders", {
   order_id: column.integer().unique().autoIncrement(),
@@ -90,12 +90,131 @@ The catalog fills `order_id`, `total`, and `status` when the statement executes;
 hide generated parameters in the compiled query. `INSERT ... SELECT` may omit default-bearing
 target columns for the same reason: the engine evaluates their stored SQL once per selected row.
 
+## Inferred function results
+
+Kysely normally uses portable driver unions for numeric aggregates because it cannot know which
+database will execute a query. Schema-derived Minnow columns carry that missing information, so
+the adapter infers Minnow's actual JavaScript boundary without output generics:
+
+```ts
+const totals = await db
+  .selectFrom("orders")
+  .select((eb) => [
+    eb.fn.countAll().as("orders"), // number
+    eb.fn.sum("order_id").as("id_total"), // number | null
+    eb.fn.sum("total").as("revenue"), // string | null: total is exact NUMERIC
+  ])
+  .execute();
+```
+
+`count()` and `countAll()` infer `number`. `sum()` and `avg()` infer `number | null` for ordinary
+numeric columns and lossless `string | null` for exact `NUMERIC` / `DECIMAL`; `min()` and `max()`
+also include the empty-input NULL. Use `eb.fn.coalesce(aggregate, eb.val(fallback))` when the query
+wants a non-null fallback—the result narrows without a generic. The generic `fn` and `fn.agg`
+entry points also know Minnow's supported fixed-return functions and aggregates, so calls such as
+`eb.fn("round", ...)`, `eb.fn("date_trunc", ...)`, and `eb.fn.agg("count", ...)` infer their
+results. `coalesce`, `nullif`, `greatest`, and `least` infer from their arguments. Nullable scalar
+inputs are carried into the result where the SQL function propagates NULL. `eb.cast(value, target)`
+also needs no output generic for Minnow's supported targets: integer and floating targets infer
+`number`, exact numeric and string-backed logical domains infer `string`, boolean infers `boolean`,
+and date/time-stamp targets infer `Date`.
+
+These conditional overloads leave ordinary Kysely database maps unchanged. When constructing
+Kysely manually, use `InferKyselyDatabase<typeof appSchema>` so the DB map retains Minnow's type
+metadata.
+
+An arbitrary function name or raw SQL string is the deliberate boundary. TypeScript does not
+parse their SQL semantics, so give Kysely the result type there:
+
+```ts
+import { sql } from "kysely";
+
+const row = await sql<{ orders: number }>`SELECT COUNT(*) AS orders FROM orders`.execute(db);
+```
+
+Do not add an output generic to a schema-derived `count`, numeric aggregate, known Minnow function,
+or supported cast—the adapter already has enough information to infer it.
+
 `MinnowDatabaseClient` works in the same position, so moving the engine to a worker changes only
 how `database` is constructed. Both implement `MinnowSqlDriver` structurally.
+
+## Full-text search
+
+Use `search.match` and `search.rank` when a Kysely query needs Minnow's full-text SQL:
+
+```ts
+import { search } from "@minnowdb/kysely";
+
+const query = "copper";
+const products = await db
+  .selectFrom("products")
+  .select((eb) => [
+    "name",
+    "brand",
+    "list_price",
+    search.rank(eb, ["name", "brand"], query).as("rank"),
+  ])
+  .where((eb) => search.match(eb, ["name", "brand"], query))
+  .orderBy("rank", "desc")
+  .limit(10)
+  .execute();
+```
+
+The non-empty column list is checked against the tables and aliases visible at that point in the
+query. A misspelled or out-of-scope column is a compile error, the rank is inferred as a number,
+and the search text is a bound parameter rather than SQL text. Any SQL column type is valid;
+Minnow searches numbers and dates through their canonical text form too.
+
+Search stays inside the SQL engine. Small tables scan immediately, large append-only tables get
+automatic persisted indexes, and `BM25` uses whole-column term statistics. See
+[Full-text search](/docs/sql/full-text-search) for prefix queries, index behavior, and tuning.
+
+## Live queries
+
+`createKyselyLiveQueries` wraps an ordinary selectable query without changing its inferred row
+type. Use the callable directly or through Kysely's `$call`:
+
+```ts
+import { createKyselyLiveQueries } from "@minnowdb/kysely";
+
+const live = createKyselyLiveQueries({ driver: database });
+const openOrders = db
+  .selectFrom("orders")
+  .select(["order_id", "total"])
+  .where("status", "=", "open")
+  .$call(live);
+
+const unsubscribe = openOrders.subscribe(() => {
+  const snapshot = openOrders.getSnapshot();
+  if (snapshot.status === "ready") render(snapshot.rows);
+});
+```
+
+The wrapper compiles the statement once for dependency tracking, then executes through Kysely so
+result plugins and mapped row names survive. It also provides typed keyed changes and ordered,
+bounded windows. See [Live queries](/docs/extensions/live-queries) for those forms and the
+adapter-neutral contract another query library can implement.
+
+## Streaming
+
+Kysely's standard `.stream(chunkSize)` pulls from Minnow's query cursor:
+
+```ts
+for await (const order of db.selectFrom("orders").select(["order_id", "total"]).stream(1000)) {
+  consume(order);
+}
+```
+
+Directly streamable scans honor backpressure through the vector executor and worker boundary.
+Blocking SQL remains correct through the engine's materialized/spill path. The
+[cursor and export guide](/docs/extensions/exports) explains the boundary.
 
 ## Supported Kysely operations
 
 - Reads, inserts, updates, deletes, and their `$n` parameters.
+- Type-safe `MATCH` predicates and `BM25` ranking expressions.
+- Typed live queries, keyed changes, and ordered bounded windows.
+- `.stream(chunkSize)` over direct and worker-backed query cursors.
 - `RETURNING` rows and Kysely's affected-row counts.
 - `db.transaction().execute(...)` through Minnow's `BEGIN`, `COMMIT`, and `ROLLBACK`.
 - Raw SQL savepoints inside that transaction.
@@ -116,7 +235,6 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
 - Transaction access modes and isolation levels are rejected; Minnow has one snapshot model.
 - The engine accepts `SAVEPOINT`, `ROLLBACK TO`, and `RELEASE`; Kysely's dialect interface
   exposes one top-level transaction rather than a nested transaction helper.
-- Streaming is rejected because Minnow returns a completed result set.
 - Parameters must be `boolean`, `number`, `string`, `Date`, or `null`; BigInt, byte arrays, and
   driver-native PostgreSQL objects have no Minnow parameter representation. Exact decimals accept
   numbers or strings as inputs and return lossless strings. JSON/JSONB, UUID, arrays, `TIME`,

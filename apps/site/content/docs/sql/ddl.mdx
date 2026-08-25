@@ -37,13 +37,20 @@ CREATE TABLE order_items (
 Primary-key components are immutable. Composite identity uses an internal scalar locator, so it
 does not add tuple comparison work to ordinary scans.
 
-`CREATE TABLE IF NOT EXISTS` leaves an existing table of that name alone, and `CREATE TABLE …
-AS SELECT` takes both its columns and its first rows from a query:
+`CREATE TABLE IF NOT EXISTS` leaves an existing table of that name alone. Concurrent callers
+converge on the one atomically admitted catalog object instead of leaking a duplicate-name race.
+`CREATE TABLE … AS SELECT` takes both its columns and its first rows from a query:
 
 ```sql
 CREATE TABLE completed_orders AS
 SELECT order_id, customer_id, total FROM orders WHERE status = 'completed'
 ```
+
+The target stays invisible while query blocks are staged and publishes with its rows in one
+atomic commit; a conflict, quota refusal, crash, or query error leaves no empty table behind.
+Single-scan queries stream into bounded storage batches. Query shapes that require a complete
+result (for example, a global sort) may spill, but their retained result is capped at 64 MiB (or
+the database's lower query-memory budget) and fail before the target publishes.
 
 A `CHECK` constraint is a row condition over the table's own columns, and it runs on every path
 that writes a row — insert, upsert, and update, which is checked against the row as it will be
@@ -60,6 +67,10 @@ CREATE TABLE orders (
 
 A constraint fails only when it evaluates to false, so SQL's unknown passes: a NULL column
 satisfies `CHECK (total >= 0)` unless the column is also `NOT NULL`.
+Minnow parses every CHECK and resolves all of its column references before admitting the table;
+it cannot refer to another relation. Named CHECK, FOREIGN KEY, and UNIQUE constraints share one
+per-table namespace, so reusing a constraint name across kinds is rejected before the catalog
+changes.
 
 A `FOREIGN KEY` references another table's primary row identity. Scalar and composite references
 use the same ordered columns as the parent key:

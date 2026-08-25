@@ -62,7 +62,8 @@ export const SETUP_SNIPPET = `import { MinnowDatabaseClient } from "@minnowdb/co
 import { createKysely } from "@minnowdb/kysely";
 import { retailDefinition } from "./schema";
 
-const worker = new Worker(new URL("@minnowdb/core/worker", import.meta.url), {
+// db-worker.ts contains: import "@minnowdb/core/worker";
+const worker = new Worker(new URL("./db-worker.ts", import.meta.url), {
   type: "module",
 });
 const database = new MinnowDatabaseClient(worker, {

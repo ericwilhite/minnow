@@ -31,7 +31,8 @@ complete server dialect, or direct file analysis matters more.
 - **Control over memory and threading.** Run the engine in a worker, set an execution budget, and
   spill large sorts and grouped results to storage.
 - **Native Kysely types.** `@minnowdb/kysely` derives its full database type from the same schema
-  declaration Minnow migrates, including defaults and exact numeric boundaries.
+  declaration Minnow migrates, including defaults, exact numeric boundaries, and driver-specific
+  aggregate and built-in function results without redundant output generics.
 
 Minnow does not provide a server, replication, multi-device sync, or compatibility with another
 database's file format.
@@ -43,15 +44,15 @@ Download size affects cold starts, and Wasm engines also compile a module before
 | Engine           | Download (gzip) | Raw     | Wasm compile step |
 | ---------------- | --------------- | ------- | ----------------- |
 | IndexedDB        | 0               | 0       | No                |
-| Dexie 4.4.5      | 30 KB           | 96 KB   | No                |
-| **Minnow**       | **220 KB**      | 832 KB  | No                |
+| **Minnow**       | **277 KB**      | 1.0 MB  | No                |
 | SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes               |
 | PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes               |
-| DuckDB-Wasm 1.33 | 8.1 MB          | 36.7 MB | Yes               |
 
-These values use identical esbuild settings and include the Wasm modules and packed runtime data
-each package downloads. Minnow's number includes every storage adapter; unused adapters can
-tree-shake from an application bundle.
+The Minnow, SQLite Wasm, and PGlite values come from the repository's reproducible size script.
+It uses identical esbuild settings and includes the Wasm modules and packed runtime data each
+package downloads. IndexedDB is built into the browser. Minnow's number includes the engine and
+its larger durable adapter, OPFS; an IndexedDB build is slightly smaller, and unused adapters stay
+out of the application bundle.
 
 ## IndexedDB
 
@@ -130,8 +131,8 @@ adapter ships with the project.
 
 ## Minnow's limits
 
-- Minnow is in 0.x, so minor releases can include breaking changes and the stored block format may
-  change.
+- Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Block format 2,
+  snapshot format 1, and native OPFS layout 5 are separately versioned and locked.
 - Its SQL dialect is an embedded PostgreSQL subset, not the PostgreSQL server.
 - `UPDATE` and `DELETE` require row identity: a primary key or one inline unique column.
 - Secondary indexes support scalar and composite left-prefix equality, `IN`, range filtering, and
@@ -139,6 +140,6 @@ adapter ships with the project.
 - The engine runs in browsers, not Node.js.
 - There is no replication, server process, or multi-device sync.
 
-Try Minnow in the [live SQL and Kysely console](/#console). The
+Try Minnow in the [live SQL and TypeScript console](/#console). The
 [benchmarks](/benchmarks) run Minnow, SQLite Wasm, and PGlite on your machine and verify every
 answer before reporting a time.

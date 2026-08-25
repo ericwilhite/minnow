@@ -5,7 +5,13 @@
       "path": "packages/core"
     },
     {
+      "path": "packages/export"
+    },
+    {
       "path": "packages/kysely"
+    },
+    {
+      "path": "packages/react"
     },
     {
       "path": "packages/devtools"

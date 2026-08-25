@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
-import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { retailBatches, retailDefinition } from "../../lib/dataset/retail";
 import { sampleQueries } from "./queries";
 

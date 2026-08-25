@@ -38,13 +38,18 @@ export interface BlockMetadata {
 
 export interface BlockDescription {
   formatVersion: number;
+  headerLength: number;
+  metadataLength: number;
   type: LogicalType;
   compression: Compression;
   rowCount: number;
   nullCount: number;
   encodedLength: number;
   storedLength: number;
+  /** CRC32 of the uncompressed physical column bytes. */
   checksum: number;
+  /** CRC32 of the stored payload bytes, independently verifiable without decompression. */
+  storedChecksum: number;
   metadata: BlockMetadata;
 }
 
@@ -54,8 +59,8 @@ export interface DecodedBlock<T extends LogicalType = LogicalType> {
 }
 
 /**
- * An uncompressed physical column payload. `bytes` uses the version-zero
- * column encoding documented in `docs/BLOCK_FORMAT.md`.
+ * An uncompressed physical column payload. `bytes` uses the canonical v2 column encoding
+ * documented in `apps/site/content/docs/reference/architecture.mdx`.
  */
 export interface PhysicalColumnPayload<T extends LogicalType = LogicalType> {
   type: T;

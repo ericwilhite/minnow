@@ -225,25 +225,10 @@ describe("block format properties", () => {
           corrupted[offset] = ((corrupted[offset] ?? 0) ^ flip) & 0xff;
           if (corrupted[offset] === encoded[offset]) return; // no change, nothing to detect
 
-          let detected = false;
-          let values: unknown[] | undefined;
-          try {
-            values = (await decodeBlock(corrupted)).column.values;
-          } catch {
-            detected = true;
-          }
-          if (detected) return;
-          // Not every byte changes the meaning -- padding and unused bits exist. What must never
-          // happen is a decode that succeeds *and* reports different values.
-          expect(values?.length).toBe(column.values.length);
-          for (let index = 0; index < column.values.length; index += 1) {
-            if (!sameValue(column.values[index], values?.[index])) {
-              throw new Error(
-                `corrupting byte ${String(offset)} changed row ${String(index)} without being ` +
-                  `detected: wrote ${show(column.values[index])}, read ${show(values?.[index])}`,
-              );
-            }
-          }
+          // The v2 envelope covers every fixed/header metadata byte and independently checksums
+          // every stored payload byte. Even semantically unused bitmap padding is canonical and
+          // covered, so no changed byte is accepted.
+          await expect(decodeBlock(corrupted)).rejects.toThrow();
         },
       ),
       { numRuns: RUNS },

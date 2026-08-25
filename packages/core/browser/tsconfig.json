@@ -4,5 +4,5 @@
     "noEmit": true,
     "composite": false
   },
-  "include": ["run.ts", "worker-run.ts", "opfs-run.ts"]
+  "include": ["run.ts", "worker-run.ts", "opfs-run.ts", "published-worker.ts"]
 }

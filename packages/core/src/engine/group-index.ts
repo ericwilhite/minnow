@@ -6,7 +6,6 @@ const INITIAL_KEY_CAPACITY = 32;
 const INDEX_FIELDS = 4;
 const UINT32_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 const INITIAL_SCRATCH_CAPACITY = 64;
-const REPLACEMENT_CHARACTER_BYTES = [0xef, 0xbf, 0xbd] as const;
 
 // Every probe encodes its key into this shared scratch arena instead of allocating a fresh buffer
 // per row. Encoding is synchronous and the bytes are consumed before the next probe begins, so a
@@ -276,8 +275,9 @@ function writeGroupKey(key: GroupIndexKey, offset: number): number {
     scratchView.setFloat64(offset + 1, key === 0 ? 0 : key, true);
     return offset + 1 + Float64Array.BYTES_PER_ELEMENT;
   }
-  // A UTF-16 code unit never expands past three UTF-8 bytes, and a surrogate pair yields four
-  // across two units, so reserving three bytes per unit lets the encode loop skip bounds checks.
+  // A code unit never expands past three UTF-8 bytes. Reserving the one conservative bound keeps
+  // this query hot path single-pass and branch-light; oversized scratch is reclaimed before the
+  // next key operation.
   const bound = safeSum(
     offset + 5,
     safeProduct(key.length, 3, "Encoded group key"),
@@ -293,8 +293,8 @@ function writeGroupKey(key: GroupIndexKey, offset: number): number {
 }
 
 /**
- * Encodes `value` as UTF-8 at `offset`, which the caller has already sized. Unpaired surrogates
- * become U+FFFD, matching `TextEncoder` so two distinct strings never collapse to one key.
+ * Encodes `value` as UTF-8 in one pass. Isolated surrogates fail before the encoded bytes can
+ * participate in a lookup or insertion.
  */
 function writeUtf8(value: string, offset: number): number {
   let write = offset;
@@ -325,11 +325,9 @@ function writeUtf8(value: string, offset: number): number {
       }
     }
     if (code >= 0xd800 && code <= 0xdfff) {
-      scratch[write] = REPLACEMENT_CHARACTER_BYTES[0];
-      scratch[write + 1] = REPLACEMENT_CHARACTER_BYTES[1];
-      scratch[write + 2] = REPLACEMENT_CHARACTER_BYTES[2];
-      write += 3;
-      continue;
+      throw new TypeError(
+        `String value contains an unpaired surrogate at UTF-16 index ${String(index)}`,
+      );
     }
     scratch[write] = 0xe0 | (code >>> 12);
     scratch[write + 1] = 0x80 | ((code >>> 6) & 0x3f);

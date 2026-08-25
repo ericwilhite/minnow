@@ -12,7 +12,14 @@
  * matter what order they accumulate in. Keep it that way: never feed it a running float.
  */
 
+import { assertWellFormedString } from "../block-format/unicode.js";
+import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_PATTERN_CHARACTERS } from "./cache-limits.js";
 import { externalSqlDomainValue } from "./sql-domains.js";
+import {
+  MAX_FTS_QUERY_TERMS,
+  MAX_FTS_TOKENS_PER_DOCUMENT,
+  MAX_INDEXED_STRING_CHARACTERS,
+} from "../storage/types.js";
 
 export const FTS_TOKENIZER_VERSION = 1;
 
@@ -21,9 +28,9 @@ const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 
 const MAX_TOKEN_LENGTH = 32;
-const MAX_TOKENS_PER_DOCUMENT = 4096;
 
 const TOKEN_RUN = /[\p{L}\p{N}]+/gu;
+const QUERY_WHITESPACE = /\s/u;
 // Script_Extensions rather than Script: shared marks like the katakana prolonged sound mark
 // (U+30FC, script Common) must stay inside the kana run they extend.
 const CJK =
@@ -52,7 +59,7 @@ export interface FtsStats {
 }
 
 function pushToken(tokens: string[], token: string): void {
-  if (tokens.length >= MAX_TOKENS_PER_DOCUMENT) return;
+  if (tokens.length >= MAX_FTS_TOKENS_PER_DOCUMENT) return;
   tokens.push(token.length > MAX_TOKEN_LENGTH ? token.slice(0, MAX_TOKEN_LENGTH) : token);
 }
 
@@ -86,11 +93,17 @@ function emitRun(tokens: string[], run: string): void {
 
 /** Tokenizes one cell's text: NFKC, locale-independent lowercase, letter/number runs. */
 export function tokenize(text: string): string[] {
+  if (text.length > MAX_INDEXED_STRING_CHARACTERS) {
+    throw new RangeError(
+      `Full-text values cannot exceed ${String(MAX_INDEXED_STRING_CHARACTERS)} characters`,
+    );
+  }
+  assertWellFormedString(text, "Full-text value");
   const tokens: string[] = [];
   const normalized = text.normalize("NFKC").toLowerCase();
   for (const match of normalized.matchAll(TOKEN_RUN)) {
     emitRun(tokens, match[0]);
-    if (tokens.length >= MAX_TOKENS_PER_DOCUMENT) break;
+    if (tokens.length >= MAX_FTS_TOKENS_PER_DOCUMENT) break;
   }
   return tokens;
 }
@@ -101,14 +114,29 @@ export function tokenize(text: string): string[] {
  * query matches nothing.
  */
 export function tokenizeQuery(query: string): FtsQueryTerm[] {
+  if (query.length > MAX_SQL_PATTERN_CHARACTERS) {
+    throw new RangeError(
+      `Full-text queries cannot exceed ${String(MAX_SQL_PATTERN_CHARACTERS)} characters`,
+    );
+  }
+  assertWellFormedString(query, "Full-text query");
   const terms: FtsQueryTerm[] = [];
-  for (const chunk of query.split(/\s+/)) {
-    if (chunk.length === 0) continue;
-    const prefix = chunk.endsWith("*");
-    const tokens = tokenize(prefix ? chunk.slice(0, -1) : chunk);
-    tokens.forEach((term, index) => {
+  let cursor = 0;
+  while (cursor < query.length) {
+    while (cursor < query.length && QUERY_WHITESPACE.test(query[cursor] ?? "")) cursor += 1;
+    const start = cursor;
+    while (cursor < query.length && !QUERY_WHITESPACE.test(query[cursor] ?? "")) cursor += 1;
+    if (cursor === start) continue;
+    const prefix = query[cursor - 1] === "*";
+    const tokens = tokenize(query.slice(start, prefix ? cursor - 1 : cursor));
+    for (let index = 0; index < tokens.length; index += 1) {
+      const term = tokens[index];
+      if (term === undefined) continue;
       terms.push({ term, prefix: prefix && index === tokens.length - 1 });
-    });
+      // Every caller rejects above 32. Stop before adversarial whitespace can allocate a terms
+      // array proportional to the input; the 33rd item is all validation needs to see.
+      if (terms.length > MAX_FTS_QUERY_TERMS) return terms;
+    }
   }
   return terms;
 }
@@ -121,8 +149,6 @@ export function termMatches(token: string, term: FtsQueryTerm): boolean {
  * Compile-time cap on query terms: the columnar fast path packs per-term presence into one
  * 32-bit mask per dictionary entry.
  */
-export const FTS_MAX_QUERY_TERMS = 32;
-
 const queryTermsCache = new Map<string, FtsQueryTerm[]>();
 
 /** Tokenized query terms with the same bounded caching scheme as the LIKE pattern cache. */
@@ -130,6 +156,7 @@ export function cachedQueryTerms(query: string): FtsQueryTerm[] {
   const cached = queryTermsCache.get(query);
   if (cached !== undefined) return cached;
   const terms = tokenizeQuery(query);
+  if (query.length > MAX_CACHEABLE_TEXT_CHARACTERS) return terms;
   if (queryTermsCache.size >= 128) queryTermsCache.clear();
   queryTermsCache.set(query, terms);
   return terms;
@@ -137,8 +164,8 @@ export function cachedQueryTerms(query: string): FtsQueryTerm[] {
 
 /** Compile-time validation shared by the SQL parser and the DSL expression builder. */
 export function validateFtsQuery(query: string): void {
-  if (cachedQueryTerms(query).length > FTS_MAX_QUERY_TERMS) {
-    throw new TypeError(`Full-text queries support at most ${String(FTS_MAX_QUERY_TERMS)} terms`);
+  if (cachedQueryTerms(query).length > MAX_FTS_QUERY_TERMS) {
+    throw new TypeError(`Full-text queries support at most ${String(MAX_FTS_QUERY_TERMS)} terms`);
   }
 }
 
@@ -327,7 +354,8 @@ export function ftsBm25Row(
 export function renderDocumentValue(value: unknown): string | undefined {
   value = externalSqlDomainValue(value);
   if (value === null || value === undefined || typeof value === "boolean") return undefined;
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) return dateIsoString(value);
   if (typeof value === "number") return String(value);
   return typeof value === "string" ? value : undefined;
 }
+import { dateIsoString } from "../date-value.js";

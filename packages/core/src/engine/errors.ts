@@ -6,7 +6,7 @@
 type ErrorValue = boolean | number | string | Date;
 
 function formatValue(value: ErrorValue): string {
-  return value instanceof Date ? value.toISOString() : String(value);
+  return value instanceof Date ? dateIsoString(value) : String(value);
 }
 
 export class UniqueConstraintError extends Error {
@@ -67,6 +67,45 @@ export class CompactionJobCancelledError extends Error {
   }
 }
 
+/** Refuses more growth after automatic collection repeatedly fails at a generous debt limit. */
+export class MaintenanceBacklogError extends Error {
+  override readonly name = "MaintenanceBacklogError";
+
+  constructor(
+    readonly pendingCommits: number,
+    readonly causeMessage: string | null,
+  ) {
+    super(
+      `Automatic storage collection could not keep up after ${String(pendingCommits)} commits${
+        causeMessage === null ? "" : `: ${causeMessage}`
+      }`,
+    );
+  }
+}
+
+/**
+ * A paged visible-segment scan cannot continue after its table is dropped or replaced. Segment
+ * metadata for a dropped table is removed immediately, so returning an empty or partial page
+ * would silently misrepresent the captured scan.
+ */
+export class VisibleSegmentCursorStaleError extends Error {
+  override readonly name = "VisibleSegmentCursorStaleError";
+
+  constructor(
+    readonly tableName: string,
+    readonly capturedTableId: string,
+    readonly currentTableId: string | null,
+  ) {
+    super(
+      `Visible segment cursor for ${tableName} is stale: captured table ${capturedTableId}; ${
+        currentTableId === null
+          ? "the table no longer exists"
+          : `current table is ${currentTableId}`
+      }`,
+    );
+  }
+}
+
 /**
  * SQL that failed to compile, located in the text the caller passed. `offset` and `length` are
  * character positions into that exact string — leading whitespace included — so an editor can
@@ -89,3 +128,4 @@ export class SqlCompileError extends TypeError {
     super(message);
   }
 }
+import { dateIsoString } from "../date-value.js";

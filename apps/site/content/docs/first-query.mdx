@@ -13,7 +13,7 @@ Everything below runs in a browser tab. Nothing is sent anywhere.
 
 ```ts
 import { MinnowDatabase } from "@minnowdb/core";
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 
 const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }));
 ```

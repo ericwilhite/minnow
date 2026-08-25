@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { inspectBlock } from "../block-format/index.js";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { allSegmentRecords } from "./storage-test-helpers.js";
 
 /** Large enough to clear the 4 KiB floor where compression can begin repaying its CPU cost. */
 const ROWS_PER_BLOCK = 16_384;
@@ -32,8 +33,9 @@ async function codecsPerBlock(
   columnName: string,
 ): Promise<{ codecs: string[]; storedBytes: number }> {
   const table = (await store.listTables()).find((candidate) => candidate.name === "t");
-  const columnId = table?.columns.find((column) => column.name === columnName)?.id ?? "";
-  const segments = await store.listSegments(table?.id);
+  if (table === undefined) throw new Error("missing table t");
+  const columnId = table.columns.find((column) => column.name === columnName)?.id ?? "";
+  const segments = await allSegmentRecords(store, table.id);
   const codecs: string[] = [];
   let storedBytes = 0;
   for (const segment of segments) {

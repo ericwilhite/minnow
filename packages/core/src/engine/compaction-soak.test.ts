@@ -85,7 +85,7 @@ describe("compaction over a long mutation history", () => {
 
     /** Blocks the live manifest points at: the table's real read footprint. */
     const liveBlocks = async (): Promise<number> =>
-      (await store.getCurrentManifest())?.blockIds.length ?? 0;
+      (await store.getCurrentManifest())?.liveBlockCount ?? 0;
 
     const checkContents = async (afterOperation: number): Promise<void> => {
       const rows = (

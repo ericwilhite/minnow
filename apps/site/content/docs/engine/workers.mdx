@@ -4,12 +4,18 @@ description: The shipped worker entry, the main-thread client, and bundler setup
 ---
 
 Minnow ships both sides of the worker setup: a ready-made worker entry (`@minnowdb/core/worker`)
-and a main-thread client (`@minnowdb/core/client`). Your app contributes one line — the `new
-  Worker(...)` call — because that's the only line your bundler needs to see.
+and a main-thread client (`@minnowdb/core/client`). Your app contributes a one-line local worker
+module and the `new Worker(...)` call so its bundler can discover the worker as a separate entry.
 
 ## Quick start
 
 ```ts
+// db-worker.ts
+import "@minnowdb/core/worker";
+```
+
+```ts
+// database.ts
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { column, schema, table } from "@minnowdb/core";
 
@@ -20,7 +26,7 @@ const people = table("people", {
 const appSchema = schema([people]);
 
 const client = new MinnowDatabaseClient(
-  new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
+  new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" }),
   { store: { kind: "indexeddb", name: "app-db" } },
 );
 await client.migrate(appSchema);
@@ -46,10 +52,11 @@ const { rows } = await client.query("SELECT name, score FROM people ORDER BY sco
 
 ## Why you construct the Worker
 
-A worker needs a script URL at runtime, and bundlers only rewrite
-`new Worker(new URL("…", import.meta.url), { type: "module" })` correctly when that exact
-expression appears in _your_ code — buried inside a library, it breaks differently under every
-bundler. Keeping it in your code also keeps lifecycle ownership honest (you decide when the worker
+A worker needs a script URL at runtime. Bundlers rewrite
+`new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })` when that exact
+relative expression appears in _your_ code; a bare package name in `new URL()` is not a portable
+module resolver, and an expression buried inside a library cannot be analyzed reliably. Keeping
+the construction in your code also keeps lifecycle ownership honest (you decide when the worker
 starts and stops) and satisfies `worker-src` content-security policies from your own origin.
 
 ## What changes across the boundary
@@ -70,6 +77,17 @@ starts and stops) and satisfies `worker-src` content-security policies from your
   Only the cost of a large result crossing changes: structured-cloning 20,000 row objects is
   several times slower than rebuilding them from columns. Live-query change events take the same
   path.
+- **Cursors transfer one page per pull.** `client.queryCursor()` keeps scan work in the worker,
+  applies backpressure across the RPC handle, and reconstructs only the current columnar page on
+  the main thread. See [Cursors and exports](/docs/extensions/exports).
+- **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and
+  256 stateful handle lifecycles, including handles still opening or durably settling. Await
+  requests and close cursors, snapshots, buffered writers, and live-query handles when they are
+  no longer needed. Overload fails immediately instead of retaining an unbounded message queue.
+- **Abandoned write callbacks roll back.** A worker write handle with no session RPC for
+  `transactionIdleTimeoutMs` (30 seconds by default) is removed and rolled back. Each query,
+  execute, or batch call restarts the full interval after it finishes; a slow call in flight never
+  expires. A later call on an expired handle fails instead of publishing its staged data.
 - **Functions can't cross.** Construction options like `now`, `createId`, or a custom store need
   a custom entry (below).
 
@@ -77,7 +95,7 @@ Client adapters can wrap the same worker client because it implements `MinnowSql
 [Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker
 boundary.
 
-## Buffered writers and live queries
+## Buffered writers and low-level live queries
 
 Stateful handles proxy transparently — the writer's age timer runs on the worker's clock, and
 live-query callbacks arrive as events:
@@ -100,23 +118,28 @@ await live.close();
 await client.close({ terminateWorker: true });
 ```
 
+For inferred rows, keyed changes, framework subscriptions, and Kysely composition, use the typed
+[live-query wrapper](/docs/extensions/live-queries). It uses the observer-only worker handle so the
+adapter executes each invalidated query once.
+
 ## Bundler setups
 
-**Vite and webpack 5** understand the quick-start pattern as written — they resolve the package
-subpath and emit a separate worker chunk. Nothing else needed.
+**Vite and webpack 5** understand the quick-start pattern as written: the relative URL identifies
+your one-line wrapper, and its package import resolves to Minnow's published worker entry. They
+emit it as a separate worker chunk.
 
 **esbuild** (and Parcel 2 by default) doesn't rewrite `new URL` worker expressions. Bundle the
 worker entry separately and point at the output:
 
 ```ts
-// worker.ts — your one-line worker entry, bundled separately:
+// db-worker.ts — your one-line worker entry, bundled separately:
 import "@minnowdb/core/worker";
 
-// esbuild app.ts worker.ts --bundle --format=esm --outdir=dist --splitting
+// esbuild app.ts db-worker.ts --bundle --format=esm --outdir=dist --splitting
 
 // app.ts:
 const client = new MinnowDatabaseClient(
-  new Worker(new URL("./worker.js", import.meta.url), { type: "module" }),
+  new Worker(new URL("./db-worker.js", import.meta.url), { type: "module" }),
 );
 ```
 
@@ -125,10 +148,10 @@ vendored files:
 
 ```ts
 // db-worker.js — served from your origin:
-import "https://cdn.example.com/@minnowdb/core/dist/worker.js";
+import "https://cdn.example.com/@minnowdb/core/dist/engine/worker.js";
 
 // main page:
-import { MinnowDatabaseClient } from "https://cdn.example.com/@minnowdb/core/dist/client.js";
+import { MinnowDatabaseClient } from "https://cdn.example.com/@minnowdb/core/dist/engine/client.js";
 const client = new MinnowDatabaseClient(
   new Worker(new URL("./db-worker.js", import.meta.url), { type: "module" }),
 );
@@ -137,27 +160,34 @@ const client = new MinnowDatabaseClient(
 ## Custom worker entries
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
-`opfs`, or `memory`) plus `compression`, `rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and
-`bufferPoolBytes`. It loads each storage adapter only when its descriptor asks for it, so a
+`opfs`, or `memory`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`,
+`spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, and `bufferPoolBytes`.
+It loads each storage adapter only when its descriptor asks for it, so a
 bundler splits the adapters into their own chunks and the worker downloads the store it opens,
 not the other two. For anything a message can't carry — a custom `BlockStore`, deterministic
 `now`/`createId` — write your own entry:
 
 ```ts
 // my-worker.ts
-import { MinnowDatabase, exposeDatabase } from "@minnowdb/core";
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+import { MinnowDatabase } from "@minnowdb/core";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
+import { exposeDatabase } from "@minnowdb/core/worker-host";
 
 const store = await IndexedDbBlockStore.open({ name: "app-db", durability: "strict" });
-exposeDatabase(new MinnowDatabase(store, { compression: "gzip" }), self, {
+const databaseOptions = { compression: "gzip", transactionIdleTimeoutMs: 30_000 } as const;
+exposeDatabase(new MinnowDatabase(store, databaseOptions), self, {
+  // Keep the custom host's abandoned-handle deadline aligned with its database.
+  writeHandleIdleTimeoutMs: databaseOptions.transactionIdleTimeoutMs,
   onDispose: () => store.close(),
 });
 ```
 
 `exposeDatabase()` speaks the same protocol as the stock entry, so the main-thread code doesn't
 change. On disposal it closes the engine before calling `onDispose`, so the hook only owns the
-injected store. Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe
-RPC where each handle answers a fixed list of methods — never arbitrary property access.
+injected store. Its `writeHandleIdleTimeoutMs` option defaults to 30 seconds; pass the same value
+as the constructed database's `transactionIdleTimeoutMs` when you customize either deadline.
+Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe RPC where
+each handle answers a fixed list of methods — never arbitrary property access.
 
 > The worker changes where work runs, not the rules: the durable store stays authoritative, and
 > durability still ends at a committed storage write. See [Architecture](/docs/reference/architecture).

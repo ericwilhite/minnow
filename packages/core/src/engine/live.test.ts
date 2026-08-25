@@ -7,8 +7,15 @@ import {
 } from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
-import { LiveQuerySet, type LiveQueryHintChannel, type LiveQueryInput } from "./live.js";
-import { type QueryResult } from "./query.js";
+import {
+  LiveQueryLimitError,
+  LiveQuerySet,
+  MAX_LIVE_QUERY_GROUPS,
+  MAX_LIVE_QUERY_SETS_PER_DATABASE,
+  type LiveQueryHintChannel,
+  type LiveQueryInput,
+} from "./live.js";
+import { bindPlanParameters, compileQuery, type QueryResult } from "./query.js";
 
 /** A deterministic in-process stand-in for BroadcastChannel. */
 function createChannelPair(): [LiveQueryHintChannel, LiveQueryHintChannel] {
@@ -31,7 +38,11 @@ function createChannelPair(): [LiveQueryHintChannel, LiveQueryHintChannel] {
  */
 function createRaceHost(): {
   host: {
-    currentVersion(): Promise<number | null>;
+    currentProbe(): Promise<{
+      manifestVersion: number | null;
+      catalogEpoch: number;
+      schemaEpoch: number;
+    }>;
     manifestPage(
       afterVersion: number | null,
       limit: number,
@@ -40,18 +51,28 @@ function createRaceHost(): {
     execute(query: LiveQueryInput): Promise<QueryResult>;
   };
   commit(): void;
+  executions(query: LiveQueryInput): number;
   blockNextExecute(query: LiveQueryInput): { started: Promise<void>; release(): void };
 } {
   const tableId = "table-1";
   let version = 1;
   let value = 1;
   const manifests: Manifest[] = [
-    { version: 1, previousVersion: null, createdAt: "", blockIds: [], changedTableIds: [tableId] },
+    {
+      version: 1,
+      previousVersion: null,
+      createdAt: "",
+      liveBlockCount: 0,
+      liveBlockBytes: 0,
+      changedTableIds: [tableId],
+    },
   ];
   const blocks = new Map<LiveQueryInput, { started: () => void; gate: Promise<void> }>();
+  const executions = new Map<LiveQueryInput, number>();
   return {
     host: {
-      currentVersion: () => Promise.resolve(version),
+      currentProbe: () =>
+        Promise.resolve({ manifestVersion: version, catalogEpoch: version, schemaEpoch: 0 }),
       manifestPage: (afterVersion, limit) =>
         Promise.resolve({
           records: manifests
@@ -61,6 +82,7 @@ function createRaceHost(): {
         }),
       dependencyTableIds: () => Promise.resolve(new Set([tableId])),
       execute: async (query) => {
+        executions.set(query, (executions.get(query) ?? 0) + 1);
         const snapshot = value;
         const block = blocks.get(query);
         if (block !== undefined) {
@@ -78,10 +100,12 @@ function createRaceHost(): {
         version,
         previousVersion: version - 1,
         createdAt: "",
-        blockIds: [],
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
         changedTableIds: [tableId],
       });
     },
+    executions: (query) => executions.get(query) ?? 0,
     blockNextExecute: (query) => {
       let started!: () => void;
       const startedPromise = new Promise<void>((resolve) => {
@@ -118,6 +142,63 @@ async function seeded(store: MemoryBlockStore): Promise<MinnowDatabase> {
 }
 
 describe("live queries", () => {
+  it("rejects a polling interval that would spin or be truncated", () => {
+    const race = createRaceHost();
+    expect(() => new LiveQuerySet(race.host, { pollIntervalMs: 0 })).toThrow(/positive whole/);
+    expect(() => new LiveQuerySet(race.host, { pollIntervalMs: 1.5 })).toThrow(/positive whole/);
+    expect(() => new LiveQuerySet(race.host, { maxGroups: MAX_LIVE_QUERY_GROUPS + 1 })).toThrow(
+      /group limit/,
+    );
+  });
+
+  it("bounds opening groups and subscriptions and reuses capacity after close", async () => {
+    const race = createRaceHost();
+    const live = new LiveQuerySet(race.host, { maxGroups: 1, maxSubscriptions: 1 });
+    const first = await live.subscribe("A", { onChange: () => undefined });
+    await expect(live.subscribe("A", { onChange: () => undefined })).rejects.toBeInstanceOf(
+      LiveQueryLimitError,
+    );
+    first.close();
+    const block = race.blockNextExecute("B");
+    const opening = live.subscribe("B", { onChange: () => undefined });
+    await block.started;
+    await expect(live.subscribe("C", { onChange: () => undefined })).rejects.toBeInstanceOf(
+      LiveQueryLimitError,
+    );
+    block.release();
+    const second = await opening;
+    second.close();
+    await expect(live.subscribe("C", { onChange: () => undefined })).resolves.toBeDefined();
+    live.close();
+  });
+
+  it("bounds database-wide live sets, reuses closed capacity, and releases all on close", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    let closed = 0;
+    const sets = Array.from({ length: MAX_LIVE_QUERY_SETS_PER_DATABASE }, () =>
+      database.liveQueries({
+        onClosed: () => {
+          closed += 1;
+        },
+      }),
+    );
+    expect(() => database.liveQueries()).toThrow(LiveQueryLimitError);
+
+    sets[0]?.close();
+    expect(closed).toBe(1);
+    const replacement = database.liveQueries({
+      onClosed: () => {
+        closed += 1;
+      },
+    });
+    expect(replacement).toBeInstanceOf(LiveQuerySet);
+
+    await database.close();
+    expect(closed).toBe(MAX_LIVE_QUERY_SETS_PER_DATABASE + 1);
+    expect(() => database.liveQueries()).toThrow("Database is closed");
+  });
+
   it("does not register a subscription that finishes opening after the set closes", async () => {
     const race = createRaceHost();
     const live = new LiveQuerySet(race.host);
@@ -226,7 +307,7 @@ describe("live queries", () => {
     store.close();
   });
 
-  it("widens to every subscription when a commit carries no change set", async () => {
+  it("derives an exact change set when a low-level caller omits the commit hint", async () => {
     const store = new MemoryBlockStore();
     const database = await seeded(store);
     const stripping = new Proxy(store, {
@@ -259,11 +340,15 @@ describe("live queries", () => {
       onChange: (result) => changes.push(result),
     });
 
-    // The write touches the unrelated table, but its manifest lacks a change set, so the sweep
-    // conservatively re-runs everything rather than risking staleness.
+    // changedTableIds is only a caller hint. The store derives the durable set from staged
+    // segments, so omitting it cannot hide a changed table or force a database-wide re-run.
     await legacyWriter.insertBatch("other", { columns: { value: [3] } });
+    const other = await store.getTableByName("other");
+    const current = await store.getCurrentManifest();
+    expect(current?.changedTableIds).toEqual([other?.id]);
     await live.refresh();
-    expect(live.stats.reruns).toBe(1);
+    expect(live.stats.reruns).toBe(0);
+    expect(live.stats.rerunsAvoided).toBe(1);
     expect(changes).toHaveLength(1);
     expect(live.stats.lastSweepMs).toBeGreaterThanOrEqual(0);
     live.close();
@@ -463,6 +548,245 @@ describe("live queries", () => {
     await refreshPromise;
 
     expect(events).toEqual(["change", "complete"]);
+    live.close();
+  });
+
+  it("deduplicates equal subscriptions during initial delivery and every sweep", async () => {
+    const race = createRaceHost();
+    const live = new LiveQuerySet(race.host);
+    const block = race.blockNextExecute("shared");
+    const left: QueryResult[] = [];
+    const right: QueryResult[] = [];
+    const leftOpening = live.subscribe("shared", { onChange: (result) => left.push(result) });
+    await block.started;
+    const rightOpening = live.subscribe("shared", { onChange: (result) => right.push(result) });
+    block.release();
+    const [leftSubscription, rightSubscription] = await Promise.all([leftOpening, rightOpening]);
+
+    expect(race.executions("shared")).toBe(1);
+    expect(left).toEqual(right);
+    race.commit();
+    await live.refresh();
+    expect(race.executions("shared")).toBe(2);
+    expect(left).toHaveLength(2);
+    expect(right).toHaveLength(2);
+    expect(live.stats.sharedExecutions).toBeGreaterThan(0);
+
+    leftSubscription.close();
+    rightSubscription.close();
+    live.close();
+  });
+
+  it("never deduplicates typed plans whose values only collide under JSON serialization", async () => {
+    const date = new Date("2024-01-02T03:04:05.000Z");
+    const text = date.toISOString();
+    const dateQuery: LiveQueryInput = {
+      kind: "typed-query",
+      plan: bindPlanParameters(compileQuery("SELECT ? AS value"), [date]),
+    };
+    const textQuery: LiveQueryInput = {
+      kind: "typed-query",
+      plan: bindPlanParameters(compileQuery("SELECT ? AS value"), [text]),
+    };
+    // JSON.stringify turns Date into this exact string, which used to merge these two groups.
+    expect(JSON.stringify(dateQuery.plan)).toBe(JSON.stringify(textQuery.plan));
+    let executions = 0;
+    const live = new LiveQuerySet({
+      currentProbe: () =>
+        Promise.resolve({ manifestVersion: null, catalogEpoch: 0, schemaEpoch: 0 }),
+      manifestPage: () => Promise.resolve({ records: [], nextCursor: null }),
+      dependencyTableIds: () => Promise.resolve(new Set()),
+      execute: (query) => {
+        executions += 1;
+        return Promise.resolve({
+          columns: ["kind"],
+          rows: [{ kind: query === dateQuery ? "date" : "text" }],
+        });
+      },
+    });
+    const dateResults: QueryResult[] = [];
+    const textResults: QueryResult[] = [];
+    await Promise.all([
+      live.subscribe(dateQuery, { onChange: (result) => dateResults.push(result) }),
+      live.subscribe(textQuery, { onChange: (result) => textResults.push(result) }),
+    ]);
+    expect(executions).toBe(2);
+    expect(dateResults[0]?.rows).toEqual([{ kind: "date" }]);
+    expect(textResults[0]?.rows).toEqual([{ kind: "text" }]);
+    live.close();
+  });
+
+  it("uses exact equality after a 32-bit digest collision", async () => {
+    // These two values collide under this module's complete FNV digest (column and row markers
+    // included). The digest may reject inequality quickly, but can never prove equality.
+    const values = ["srborjp0s6132n", "i7khstlux91r3m"];
+    let version = 1;
+    const manifests: Manifest[] = [
+      {
+        version,
+        previousVersion: null,
+        createdAt: "",
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: ["table"],
+      },
+    ];
+    const live = new LiveQuerySet({
+      currentProbe: () =>
+        Promise.resolve({ manifestVersion: version, catalogEpoch: version, schemaEpoch: 0 }),
+      manifestPage: (after, limit) =>
+        Promise.resolve({
+          records: manifests.filter((manifest) => manifest.version > (after ?? -1)).slice(0, limit),
+          nextCursor: null,
+        }),
+      dependencyTableIds: () => Promise.resolve(new Set(["table"])),
+      execute: () =>
+        Promise.resolve({ columns: ["v"], rows: [{ v: values[version - 1] ?? null }] }),
+    });
+    const changes: QueryResult[] = [];
+    await live.subscribe("collision", { onChange: (result) => changes.push(result) });
+    version = 2;
+    manifests.push({
+      version,
+      previousVersion: 1,
+      createdAt: "",
+      liveBlockCount: 0,
+      liveBlockBytes: 0,
+      changedTableIds: ["table"],
+    });
+    await live.refresh();
+    expect(changes.map((result) => result.rows[0]?.v)).toEqual(values);
+    live.close();
+  });
+
+  it("keeps a failed group dirty so refresh retries without another commit", async () => {
+    const race = createRaceHost();
+    let fail = false;
+    const host = {
+      ...race.host,
+      execute: async (query: LiveQueryInput): Promise<QueryResult> => {
+        if (fail) {
+          fail = false;
+          throw new Error("transient read");
+        }
+        return race.host.execute(query);
+      },
+    };
+    const live = new LiveQuerySet(host);
+    const changes: QueryResult[] = [];
+    const errors: unknown[] = [];
+    await live.subscribe("retry", {
+      onChange: (result) => changes.push(result),
+      onError: (error) => errors.push(error),
+    });
+    race.commit();
+    fail = true;
+    await live.refresh();
+    expect(errors).toHaveLength(1);
+    expect(changes).toHaveLength(1);
+    await live.refresh();
+    expect(changes.at(-1)?.rows).toEqual([{ v: 2 }]);
+    live.close();
+  });
+
+  it("observes selectively without executing inside the live set", async () => {
+    const race = createRaceHost();
+    const live = new LiveQuerySet(race.host);
+    const invalidations: Array<{ manifestVersion: number | null; initial: boolean }> = [];
+    await live.observe("observed", {
+      onInvalidate: ({ manifestVersion, initial }) =>
+        invalidations.push({ manifestVersion, initial }),
+    });
+    expect(race.executions("observed")).toBe(0);
+    expect(invalidations).toEqual([{ manifestVersion: 1, initial: true }]);
+    race.commit();
+    await live.refresh();
+    expect(race.executions("observed")).toBe(0);
+    expect(invalidations).toEqual([
+      { manifestVersion: 1, initial: true },
+      { manifestVersion: 2, initial: false },
+    ]);
+    live.close();
+  });
+
+  it("re-resolves view dependencies after a catalog-only replacement", async () => {
+    const store = new MemoryBlockStore();
+    const database = await seeded(store);
+    await database.execute("CREATE VIEW watched AS SELECT value FROM events");
+    const live = database.liveQueries();
+    const changes: QueryResult[] = [];
+    await live.subscribe("SELECT SUM(value) AS total FROM watched", {
+      onChange: (result) => changes.push(result),
+    });
+    expect(changes[0]?.rows).toEqual([{ total: 6 }]);
+
+    await database.execute("CREATE OR REPLACE VIEW watched AS SELECT value FROM other");
+    await live.refresh();
+    expect(changes.at(-1)?.rows).toEqual([{ total: 1 }]);
+    await database.insertBatch("other", { columns: { value: [4] } });
+    await live.refresh();
+    expect(changes.at(-1)?.rows).toEqual([{ total: 5 }]);
+    live.close();
+    store.close();
+  });
+
+  it("refuses to index dependencies from a continuously changing catalog", async () => {
+    let epoch = 0;
+    let dependencyReads = 0;
+    let executions = 0;
+    const live = new LiveQuerySet({
+      currentProbe: () => {
+        epoch += 1;
+        return Promise.resolve({ manifestVersion: null, catalogEpoch: epoch, schemaEpoch: epoch });
+      },
+      manifestPage: () => Promise.resolve({ records: [], nextCursor: null }),
+      dependencyTableIds: () => {
+        dependencyReads += 1;
+        return Promise.resolve(new Set([`table-${String(dependencyReads)}`]));
+      },
+      execute: () => {
+        executions += 1;
+        return Promise.resolve({ columns: ["id"], rows: [{ id: 1 }] });
+      },
+    });
+    await expect(
+      live.subscribe("SELECT id FROM changing", { onChange: () => undefined }),
+    ).rejects.toThrow("Catalog kept changing");
+    expect(dependencyReads).toBe(8);
+    expect(executions).toBe(0);
+    live.close();
+  });
+
+  it("does not re-resolve dependencies or execute for physical catalog churn", async () => {
+    let catalogEpoch = 0;
+    let dependencyReads = 0;
+    let executions = 0;
+    const changes: QueryResult[] = [];
+    const live = new LiveQuerySet({
+      currentProbe: () => Promise.resolve({ manifestVersion: null, catalogEpoch, schemaEpoch: 0 }),
+      manifestPage: () => Promise.resolve({ records: [], nextCursor: null }),
+      dependencyTableIds: () => {
+        dependencyReads += 1;
+        return Promise.resolve(new Set(["table-1"]));
+      },
+      execute: () => {
+        executions += 1;
+        return Promise.resolve({ columns: ["id"], rows: [{ id: 1 }] });
+      },
+    });
+    await live.subscribe("SELECT id FROM stable", {
+      onChange: (result) => changes.push(result),
+    });
+    expect({ dependencyReads, executions }).toEqual({ dependencyReads: 1, executions: 1 });
+    const sweeps = live.stats.sweeps;
+
+    // Index build-state and other physical catalog records move catalogEpoch, but not the
+    // structural epoch. They cannot change dependency identity or a query result.
+    catalogEpoch += 1;
+    await live.refresh();
+    expect({ dependencyReads, executions }).toEqual({ dependencyReads: 1, executions: 1 });
+    expect(live.stats.sweeps).toBe(sweeps);
+    expect(changes).toHaveLength(1);
     live.close();
   });
 

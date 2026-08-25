@@ -27,15 +27,20 @@ Kysely compiles double-quoted identifiers, `$1` parameters, transactions, schema
 `RETURNING` with its PostgreSQL compiler. Minnow checks the generated SQL against its supported
 profile and executes it normally.
 
-The [Kysely guide](/docs/adapters/kysely) covers inferred schema types, defaults, generated SQL,
-introspection, transactions, workers, and embedded-database boundaries.
+The [Kysely guide](/docs/adapters/kysely) covers inferred schema types, typed full-text search, live
+queries, streaming, defaults, generated SQL, introspection, transactions, workers, and
+embedded-database boundaries.
 
 ## Build another adapter
 
 Adapters target two small structural interfaces from `@minnowdb/core`:
 
-- `MinnowSqlExecutor` provides `query()` and `execute()`.
+- `MinnowSqlExecutor` provides `query()`, `queryCursor()`, and `execute()`.
 - `MinnowSqlDriver` adds `introspect()` for schema-aware tools.
 
 The [extending guide](/docs/reference/extending) documents those interfaces, statement
 transactions, catalog introspection, and the machine-readable SQL compatibility profiles.
+
+Typed live-query adapters additionally target the framework-neutral `LiveQuerySource` and
+`LiveQueryManager` contracts. The [live-query guide](/docs/extensions/live-queries) explains why
+the callable wrapper scales beyond Kysely even though Kysely's `$call` method does not.

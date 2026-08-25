@@ -1,20 +1,40 @@
 import {
+  BlockReadBatchTooLargeError,
+  CompactionBacklogError,
   CompactionJobConflictError,
   GarbageCollectionJobConflictError,
+  IndexedDbSchemaUpgradeBlockedError,
   LeaseConflictError,
+  LeaseExpiredError,
+  LeaseOwnerConflictError,
+  PostingBuildConflictError,
   SnapshotManifestMissingError,
+  SnapshotImportConflictError,
+  SchemaConflictError,
+  StorageResourceLimitError,
+  TableInUseError,
   TableRecordConflictError,
   TempOwnerConflictError,
   TransactionRecordConflictError,
+  UniqueKeyBuildConflictError,
   UniqueKeyConflictError,
   UniqueIndexCoverageError,
   WriteConflictError,
+  StorageCorruptionError,
+  StorageFormatVersionError,
+  OpfsUncertainOutcomeError,
   type CompactionJobRecord,
   type GarbageCollectionJobRecord,
-  type SnapshotLoadProgress,
-} from "../storage/index.js";
+  type StorageIntegrityMode,
+  type StorageIntegrityReport,
+  type StorageStats,
+  type InterruptedSnapshotImport,
+  type InterruptedSnapshotImportAbortResult,
+} from "../storage/types.js";
+import { MAX_SNAPSHOT_STREAM_CHUNK_BYTES, type SnapshotLoadProgress } from "../storage/snapshot.js";
 import {
   parseRpcResponse,
+  MAX_DATABASE_RPC_IN_FLIGHT,
   protocolVersion,
   type SerializedError,
 } from "../worker-protocol/index.js";
@@ -41,8 +61,10 @@ import type {
   ExecuteResult,
   GarbageCollectionProgress,
   GarbageCollectionResult,
+  MaintenanceStatus,
   InsertBatchResult,
   QueryOptions,
+  QueryCursorOptions,
   QuerySpillCleanupOptions,
   QuerySpillCleanupResult,
   ReadTableOptions,
@@ -53,17 +75,26 @@ import type {
   UpdateBatchInput,
   UpdateBatchResult,
   UpsertBatchResult,
-  VisibleSegment,
+  VisibleSegmentPage,
+  VisibleSegmentPageOptions,
 } from "./database.js";
 import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
+  MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
   UniqueConstraintError,
+  VisibleSegmentCursorStaleError,
 } from "./errors.js";
-import type { LiveQueryInput, LiveQueryStats, LiveQuerySubscribeOptions } from "./live.js";
+import type {
+  LiveQueryInput,
+  LiveQueryInvalidation,
+  LiveQueryObserveOptions,
+  LiveQueryStats,
+  LiveQuerySubscribeOptions,
+} from "./live.js";
 import { QueryMemoryBudgetError } from "./memory.js";
 import type { CompiledQuery, CompiledStatement, QueryResult, QueryValue } from "./query.js";
 import { decodeQueryResult } from "./result-wire.js";
@@ -73,7 +104,8 @@ import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "
 
 /**
  * Main-thread async proxy of the full database API, talking to a worker that runs
- * `@minnowdb/core/worker` (or a custom entry built on exposeDatabase()). Construction
+ * `@minnowdb/core/worker` (or a custom entry built on
+ * `exposeDatabase()` from `@minnowdb/core/worker-host`). Construction
  * sends the init frame immediately; because the channel is ordered, calls may be issued without
  * awaiting ready(). Everything here stays deliberately light — the heavy engine modules are
  * imported as types only, so a main-thread bundle carries the proxy, not the executor.
@@ -86,7 +118,7 @@ import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "
 
 /** The slice of Worker (or MessagePort) the client needs. */
 export interface ClientTransport {
-  postMessage(message: unknown): void;
+  postMessage(message: unknown, options?: { transfer: ArrayBuffer[] }): void;
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
   addEventListener(type: "error" | "messageerror", listener: () => void): void;
   removeEventListener?(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
@@ -127,6 +159,7 @@ export interface ClientMigrationResult {
 
 interface EventRoute {
   onChange?: (result: QueryResult) => void;
+  onInvalidate?: (invalidation: LiveQueryInvalidation) => void;
   onError?: (error: unknown) => void;
   onComplete?: () => void;
   /** Payload shape is the handle's own; only snapshot loads emit these today. */
@@ -138,7 +171,22 @@ interface EventRoute {
  * database is tens of round trips, small enough that no single structured clone is long enough
  * to be felt as a dropped frame.
  */
-const SNAPSHOT_CHUNK_BYTES = 4 * 1024 * 1024;
+const SNAPSHOT_CHUNK_BYTES = MAX_SNAPSHOT_STREAM_CHUNK_BYTES;
+const MAX_SNAPSHOT_BYTE_ARRAY_LENGTH = 0xffffffff;
+
+async function* clientSnapshotChunks(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  for (let offset = 0; offset < bytes.byteLength; offset += SNAPSHOT_CHUNK_BYTES) {
+    yield bytes.subarray(offset, offset + SNAPSHOT_CHUNK_BYTES);
+  }
+}
+
+function throwIfClientSnapshotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("Snapshot operation was aborted", { cause: signal.reason });
+  error.name = "AbortError";
+  throw error;
+}
 
 interface PendingCall {
   resolve: (value: unknown) => void;
@@ -149,21 +197,37 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
   [
     UniqueConstraintError,
     MissingKeyError,
+    CompactionBacklogError,
     CompactionMemoryBudgetError,
     CompactionWriteAmplificationError,
     CompactionJobCancelledError,
+    MaintenanceBacklogError,
     SqlCompileError,
     QueryMemoryBudgetError,
+    VisibleSegmentCursorStaleError,
+    BlockReadBatchTooLargeError,
     WriteConflictError,
+    SchemaConflictError,
     UniqueKeyConflictError,
     UniqueIndexCoverageError,
     TableRecordConflictError,
     CompactionJobConflictError,
     GarbageCollectionJobConflictError,
+    IndexedDbSchemaUpgradeBlockedError,
     SnapshotManifestMissingError,
+    SnapshotImportConflictError,
+    TableInUseError,
     TransactionRecordConflictError,
     LeaseConflictError,
+    LeaseExpiredError,
+    LeaseOwnerConflictError,
+    StorageResourceLimitError,
     TempOwnerConflictError,
+    UniqueKeyBuildConflictError,
+    PostingBuildConflictError,
+    StorageCorruptionError,
+    StorageFormatVersionError,
+    OpfsUncertainOutcomeError,
   ].map((constructor) => [constructor.name, constructor]),
 );
 
@@ -307,6 +371,10 @@ export class MinnowDatabaseClient {
     return (await this.#call("deleteBatch", [tableName, input])) as DeleteBatchResult;
   }
 
+  async delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult> {
+    return (await this.#call("delete", [tableName, key])) as DeleteBatchResult;
+  }
+
   bufferedWriter(tableName: string, options: BufferedWriterOptions = {}): ClientBufferedWriter {
     const handleId = crypto.randomUUID();
     const { onError, ...wireOptions } = options;
@@ -339,6 +407,52 @@ export class MinnowDatabaseClient {
     return decodeQueryResult(
       await this.#call("query", options === undefined ? [sql] : [sql, options]),
     );
+  }
+
+  /** Pulls one transferred columnar page at a time, preserving worker backpressure. */
+  queryCursor(
+    sql: string,
+    options: QueryCursorOptions = {},
+  ): AsyncIterableIterator<QueryResult, undefined> {
+    const call = this.#call.bind(this);
+    const invoke = this._invoke.bind(this);
+    const handleId = crypto.randomUUID();
+    const { signal, onStats, ...wireOptions } = options;
+    if (onStats !== undefined) {
+      throw new TypeError("Query cursor onStats callbacks are not available across a worker");
+    }
+    async function* batches(): AsyncGenerator<QueryResult, undefined> {
+      let opened = false;
+      let closing: Promise<unknown> | undefined;
+      const close = (): Promise<unknown> => {
+        if (!opened) return Promise.resolve();
+        closing ??= invoke(handleId, "close", []).catch(() => undefined);
+        return closing;
+      };
+      const onAbort = (): void => {
+        void close();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        signal?.throwIfAborted();
+        await call("queryCursorOpen", [handleId, sql, wireOptions]);
+        opened = true;
+        if (signal?.aborted === true) {
+          await close();
+          signal.throwIfAborted();
+        }
+        for (;;) {
+          const next = (await invoke(handleId, "next", [])) as
+            { done: true } | { done: false; batch: unknown };
+          if (next.done) return undefined;
+          yield decodeQueryResult(next.batch);
+        }
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        await close();
+      }
+    }
+    return batches();
   }
 
   async run<TRow>(query: {
@@ -445,31 +559,58 @@ export class MinnowDatabaseClient {
    * database; `onProgress` reports each slice as it lands.
    */
   async exportSnapshot(options: SnapshotExportOptions = {}): Promise<Uint8Array> {
-    options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
-    const opened = (await this.#call("exportSnapshotOpen", [])) as {
-      handleId: string;
-      byteLength: number;
-    };
-    const totalBytes = opened.byteLength;
-    const bytes = new Uint8Array(totalBytes);
-    try {
-      let offset = 0;
-      while (offset < totalBytes) {
-        const chunk = (await this._invoke(opened.handleId, "read", [
-          offset,
-          Math.min(SNAPSHOT_CHUNK_BYTES, totalBytes - offset),
-        ])) as Uint8Array;
-        // A slice that came back empty would loop forever; the export is over either way.
-        if (chunk.byteLength === 0) throw new Error("Snapshot transfer returned no bytes");
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-        options.onProgress?.({ phase: "transfer", transferredBytes: offset, totalBytes });
+    const chunks: Uint8Array[] = [];
+    let byteLength = 0;
+    for await (const chunk of this.exportSnapshotStream(options)) {
+      byteLength += chunk.byteLength;
+      if (!Number.isSafeInteger(byteLength) || byteLength > MAX_SNAPSHOT_BYTE_ARRAY_LENGTH) {
+        throw new RangeError("Snapshot exceeds the byte-array API's 4 GiB limit");
       }
+      chunks.push(chunk);
+    }
+    const bytes = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  }
+
+  /** Pulls at most one bounded worker chunk at a time; closing releases the worker-side pin. */
+  async *exportSnapshotStream(
+    options: SnapshotExportOptions = {},
+  ): AsyncGenerator<Uint8Array, void, void> {
+    throwIfClientSnapshotAborted(options.signal);
+    options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
+    const opened = (await this.#call("exportSnapshotOpen", [])) as { handleId: string };
+    let transferredBytes = 0;
+    let succeeded = false;
+    try {
+      for (;;) {
+        throwIfClientSnapshotAborted(options.signal);
+        const next = (await this._invoke(opened.handleId, "read", [])) as
+          { done: true } | { done: false; chunk: Uint8Array };
+        if (next.done) break;
+        throwIfClientSnapshotAborted(options.signal);
+        if (!(next.chunk instanceof Uint8Array) || next.chunk.byteLength === 0) {
+          throw new Error("Snapshot transfer returned an invalid chunk");
+        }
+        yield next.chunk;
+        transferredBytes += next.chunk.byteLength;
+        options.onProgress?.({ phase: "transfer", transferredBytes, totalBytes: 0 });
+      }
+      succeeded = true;
     } finally {
       await this._invoke(opened.handleId, "close", []).catch(() => undefined);
+      if (succeeded) {
+        options.onProgress?.({
+          phase: "done",
+          transferredBytes,
+          totalBytes: transferredBytes,
+        });
+      }
     }
-    options.onProgress?.({ phase: "done", transferredBytes: totalBytes, totalBytes });
-    return bytes;
   }
 
   /**
@@ -478,6 +619,14 @@ export class MinnowDatabaseClient {
    * multi-megabyte restore can be shown moving rather than as a frozen tab.
    */
   async importSnapshot(bytes: Uint8Array, options: SnapshotImportOptions = {}): Promise<void> {
+    await this.importSnapshotStream(clientSnapshotChunks(bytes), options);
+  }
+
+  /** Uploads with one acknowledged worker chunk in flight; cancellation leaves resumable state. */
+  async importSnapshotStream(
+    source: AsyncIterable<Uint8Array>,
+    options: SnapshotImportOptions = {},
+  ): Promise<void> {
     const handleId = crypto.randomUUID();
     const { onProgress } = options;
     this.#events.set(handleId, {
@@ -490,16 +639,26 @@ export class MinnowDatabaseClient {
           }),
     });
     try {
+      throwIfClientSnapshotAborted(options.signal);
       await this.#call("importSnapshotOpen", [handleId]);
-      for (let offset = 0; offset < bytes.byteLength; offset += SNAPSHOT_CHUNK_BYTES) {
-        // Copied, not viewed: structured clone copies the buffer behind a typed array, so a
-        // subarray would post the whole file on every write.
-        await this._invoke(handleId, "write", [bytes.slice(offset, offset + SNAPSHOT_CHUNK_BYTES)]);
+      for await (const input of source) {
+        throwIfClientSnapshotAborted(options.signal);
+        if (!(input instanceof Uint8Array)) {
+          throw new TypeError("Snapshot stream chunks must be Uint8Array values");
+        }
+        for (let offset = 0; offset < input.byteLength; offset += SNAPSHOT_CHUNK_BYTES) {
+          // Copy the bounded window: cloning a subarray would otherwise transfer its whole backing
+          // file on every request.
+          const chunk = input.slice(offset, offset + SNAPSHOT_CHUNK_BYTES);
+          await this.#post("rpc-call", handleId, "write", [chunk], [chunk.buffer]);
+          throwIfClientSnapshotAborted(options.signal);
+        }
       }
       await this._invoke(handleId, "finish", []);
     } catch (error) {
-      // The handle survives a failed write; drop it rather than leaving the chunks in the worker.
-      await this._invoke(handleId, "close", []).catch(() => undefined);
+      await this._invoke(handleId, options.signal?.aborted === true ? "cancel" : "close", []).catch(
+        () => undefined,
+      );
       throw error;
     } finally {
       this.#events.delete(handleId);
@@ -511,6 +670,33 @@ export class MinnowDatabaseClient {
     return (await this.#call("bufferPoolStats", [])) as BufferPoolStats;
   }
 
+  async maintenanceStatus(): Promise<MaintenanceStatus> {
+    return (await this.#call("maintenanceStatus", [])) as MaintenanceStatus;
+  }
+
+  async checkIntegrity(
+    options: {
+      mode?: StorageIntegrityMode;
+      maxIssues?: number;
+    } = {},
+  ): Promise<StorageIntegrityReport> {
+    return (await this.#call("checkIntegrity", [options])) as StorageIntegrityReport;
+  }
+
+  async storageStats(): Promise<StorageStats> {
+    return (await this.#call("storageStats", [])) as StorageStats;
+  }
+
+  async inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null> {
+    return (await this.#call("inspectInterruptedImport", [])) as InterruptedSnapshotImport | null;
+  }
+
+  async abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult> {
+    return (await this.#call("abortInterruptedImport", [
+      identity,
+    ])) as InterruptedSnapshotImportAbortResult;
+  }
+
   liveQueries(options: ClientLiveQueryOptions = {}): ClientLiveQuerySet {
     const handleId = crypto.randomUUID();
     const created = this.#call("liveQueries", [handleId, options]);
@@ -519,11 +705,14 @@ export class MinnowDatabaseClient {
 
   // --- Maintenance ------------------------------------------------------------------------------
 
-  async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {
+  async listVisibleSegmentPage(
+    tableName: string,
+    options?: VisibleSegmentPageOptions,
+  ): Promise<VisibleSegmentPage> {
     return (await this.#call(
-      "listVisibleSegments",
-      version === undefined ? [tableName] : [tableName, version],
-    )) as VisibleSegment[];
+      "listVisibleSegmentPage",
+      options === undefined ? [tableName] : [tableName, options],
+    )) as VisibleSegmentPage;
   }
 
   async cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult> {
@@ -652,8 +841,15 @@ export class MinnowDatabaseClient {
     handleId: string | null,
     method: string,
     args: unknown[],
+    transfer?: ArrayBuffer[],
+    bypassLimit = kind === "rpc-init" || method === "dispose",
   ): Promise<unknown> {
     if (this.#fatal !== undefined) throw this.#fatal;
+    if (!bypassLimit && this.#pending.size >= MAX_DATABASE_RPC_IN_FLIGHT) {
+      throw new RangeError(
+        `A database worker connection cannot hold more than ${String(MAX_DATABASE_RPC_IN_FLIGHT)} in-flight requests`,
+      );
+    }
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject });
@@ -661,6 +857,7 @@ export class MinnowDatabaseClient {
         kind === "rpc-init"
           ? { version: protocolVersion, requestId, kind, payload: args[0] }
           : { version: protocolVersion, requestId, kind, handleId, method, args },
+        transfer === undefined ? undefined : { transfer },
       );
     });
   }
@@ -672,7 +869,9 @@ export class MinnowDatabaseClient {
       const route = this.#events.get(response.handleId);
       if (route === undefined) return;
       if (response.event === "change") route.onChange?.(decodeQueryResult(response.payload));
-      else if (response.event === "error") {
+      else if (response.event === "invalidate") {
+        route.onInvalidate?.(response.payload as LiveQueryInvalidation);
+      } else if (response.event === "error") {
         route.onError?.(rehydrateError(response.payload as SerializedError));
       } else if (response.event === "progress") route.onProgress?.(response.payload);
       else if (response.event === "complete") {
@@ -814,6 +1013,42 @@ export class ClientLiveQuerySet {
     });
     try {
       const created = (await this.client._invoke(this.handleId, "subscribe", [
+        subscriptionId,
+        query,
+      ])) as { dependencyTableIds: string[] };
+      this.#subscriptionIds.add(subscriptionId);
+      return new ClientLiveSubscription(
+        this.client,
+        subscriptionId,
+        created.dependencyTableIds,
+        () => this.#subscriptionIds.delete(subscriptionId),
+        state,
+      );
+    } catch (error) {
+      this.client._unrouteEvents(subscriptionId);
+      throw error;
+    }
+  }
+
+  /** Registers dependency observation while leaving execution/result mapping to an adapter. */
+  async observe(
+    query: LiveQueryInput,
+    options: LiveQueryObserveOptions,
+  ): Promise<ClientLiveSubscription> {
+    await this.#created;
+    const subscriptionId = crypto.randomUUID();
+    const state = { completed: false };
+    this.client._routeEvents(subscriptionId, {
+      onInvalidate: options.onInvalidate.bind(options),
+      ...(options.onError === undefined ? {} : { onError: options.onError.bind(options) }),
+      onComplete: () => {
+        state.completed = true;
+        this.#subscriptionIds.delete(subscriptionId);
+        options.onComplete?.();
+      },
+    });
+    try {
+      const created = (await this.client._invoke(this.handleId, "observe", [
         subscriptionId,
         query,
       ])) as { dependencyTableIds: string[] };

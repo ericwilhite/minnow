@@ -1,4 +1,4 @@
-import { OpfsBlockStore, deleteOpfsDatabase } from "@minnowdb/core/storage";
+import { OpfsBlockStore, deleteOpfsDatabase } from "@minnowdb/core/storage/opfs";
 import type { EngineDriver } from "./session";
 import { createMinnowDriver, datasetStorageName } from "./minnow";
 

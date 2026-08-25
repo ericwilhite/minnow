@@ -1,4 +1,12 @@
 import type { SqlDomain } from "../storage/types.js";
+import { assertWellFormedString } from "../block-format/unicode.js";
+import { dateIsoString } from "../date-value.js";
+import {
+  MAX_SQL_SCALAR_RESULT_CHARACTERS,
+  MAX_SQL_NUMERIC_DIGITS,
+  MAX_SQL_STRUCTURED_VALUE_DEPTH,
+  MAX_SQL_STRUCTURED_VALUE_ITEMS,
+} from "./cache-limits.js";
 
 /** Internal string encodings for PostgreSQL value domains carried by string vectors. */
 const PREFIX = "\u0000minnow-domain:";
@@ -34,23 +42,27 @@ interface DecimalParts {
   scale: number;
 }
 
-const powersOfTen: bigint[] = [1n];
 function pow10(exponent: number): bigint {
   if (!Number.isSafeInteger(exponent) || exponent < 0 || exponent > 100_000) {
     throw new RangeError(`Decimal scale is outside the supported range: ${String(exponent)}`);
   }
-  for (let index = powersOfTen.length; index <= exponent; index += 1) {
-    powersOfTen.push((powersOfTen[index - 1] ?? 1n) * 10n);
-  }
-  return powersOfTen[exponent] ?? 1n;
+  // Retaining every intermediate power up to 100,000 consumes quadratic memory in the number
+  // of decimal digits. Native exponentiation constructs only the requested result.
+  return 10n ** BigInt(exponent);
 }
 
 function decimalParts(value: string | number): DecimalParts {
   const source = String(value).trim();
+  assertBoundedDomainString(source, "NUMERIC value");
   const match = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/.exec(source);
   if (match === null) throw new TypeError(`Invalid NUMERIC value: ${String(value)}`);
   const fraction = match[3] ?? match[4] ?? "";
   const digits = `${match[2] ?? "0"}${fraction}`.replace(/^0+(?=\d)/, "");
+  if (digits.length > MAX_SQL_NUMERIC_DIGITS) {
+    throw new RangeError(
+      `NUMERIC value exceeds ${String(MAX_SQL_NUMERIC_DIGITS)} significant digits`,
+    );
+  }
   const exponent = Number(match[5] ?? 0);
   if (!Number.isSafeInteger(exponent)) throw new RangeError(`Invalid NUMERIC exponent: ${source}`);
   let coefficient = BigInt(digits || "0") * (match[1] === "-" ? -1n : 1n);
@@ -132,7 +144,11 @@ export function exactNumericValue(
       throw new RangeError(`NUMERIC(${String(precision)}, ${String(declaredScale)}) overflow`);
     }
   }
-  return NUMERIC + formatDecimal(normalizeDecimal(adjusted));
+  return boundedTaggedDomainValue(
+    NUMERIC,
+    formatDecimal(normalizeDecimal(adjusted)),
+    "NUMERIC value",
+  );
 }
 
 export function exactNumericBinary(
@@ -175,7 +191,11 @@ export function exactNumericBinary(
     }
     result = { coefficient, scale };
   }
-  return NUMERIC + formatDecimal(normalizeDecimal(result));
+  return boundedTaggedDomainValue(
+    NUMERIC,
+    formatDecimal(normalizeDecimal(result)),
+    "NUMERIC result",
+  );
 }
 
 export function exactNumericCompare(left: unknown, right: unknown): number | undefined {
@@ -195,24 +215,130 @@ export function exactNumericCompare(left: unknown, right: unknown): number | und
   return ac === bc ? 0 : ac < bc ? -1 : 1;
 }
 
-function canonicalJson(value: unknown): string {
-  const normalize = (item: unknown): unknown => {
-    if (item === null || typeof item === "boolean" || typeof item === "string") return item;
-    if (typeof item === "number") {
-      if (!Number.isFinite(item)) throw new TypeError("JSON numbers must be finite");
-      return item;
+interface JsonEncodingState {
+  readonly active: Set<object>;
+  readonly pieces: string[];
+  items: number;
+  length: number;
+}
+
+/**
+ * Serializes a JSON value while bounding traversal, nesting, and output before concatenation.
+ * Canonical mode sorts object names directly in the wire text (including integer-looking names,
+ * which JavaScript object enumeration would otherwise silently reorder).
+ */
+export function boundedJsonText(value: unknown, canonical: boolean, label = "JSON value"): string {
+  const state: JsonEncodingState = { active: new Set(), pieces: [], items: 0, length: 0 };
+  encodeBoundedJson(value, canonical, label, 0, state);
+  return state.pieces.join("");
+}
+
+function encodeBoundedJson(
+  value: unknown,
+  canonical: boolean,
+  label: string,
+  depth: number,
+  state: JsonEncodingState,
+): void {
+  state.items += 1;
+  if (state.items > MAX_SQL_STRUCTURED_VALUE_ITEMS) {
+    throw new RangeError(
+      `${label} cannot exceed ${String(MAX_SQL_STRUCTURED_VALUE_ITEMS)} values and names`,
+    );
+  }
+  if (depth > MAX_SQL_STRUCTURED_VALUE_DEPTH) {
+    throw new RangeError(`${label} cannot exceed ${String(MAX_SQL_STRUCTURED_VALUE_DEPTH)} levels`);
+  }
+  if (value === null) {
+    appendJsonPiece(state, "null", label);
+    return;
+  }
+  if (typeof value === "boolean") {
+    appendJsonPiece(state, value ? "true" : "false", label);
+    return;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("JSON numbers must be finite");
+    appendJsonPiece(state, JSON.stringify(value), label);
+    return;
+  }
+  if (typeof value === "string") {
+    assertBoundedDomainString(value, label);
+    appendJsonPiece(state, JSON.stringify(value), label);
+    return;
+  }
+  if (value instanceof Date) {
+    const timestamp = dateIsoString(value);
+    appendJsonPiece(state, JSON.stringify(timestamp), label);
+    return;
+  }
+  if (typeof value !== "object") throw new TypeError(`${label} cannot be represented as JSON`);
+  const object = value;
+  if (state.active.has(object)) throw new TypeError(`${label} cannot contain a cycle`);
+  state.active.add(object);
+  try {
+    if (Array.isArray(value)) {
+      appendJsonPiece(state, "[", label);
+      for (let index = 0; index < value.length; index += 1) {
+        if (index > 0) appendJsonPiece(state, ",", label);
+        encodeBoundedJson(value[index], canonical, label, depth + 1, state);
+      }
+      appendJsonPiece(state, "]", label);
+      return;
     }
-    if (Array.isArray(item)) return item.map(normalize);
-    if (typeof item === "object") {
-      return Object.fromEntries(
-        Object.keys(item as Record<string, unknown>)
-          .sort()
-          .map((key) => [key, normalize((item as Record<string, unknown>)[key])]),
-      );
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`${label} accepts only JSON objects, arrays, and scalar values`);
     }
-    throw new TypeError("Value cannot be represented as JSON");
-  };
-  return JSON.stringify(normalize(value));
+    const record = value as Record<string, unknown>;
+    // Object.keys() would allocate one array slot per property before the item cap can fire.
+    // Plain JSON objects need no prototype walk, so collect at most the admitted count instead.
+    const keys: string[] = [];
+    for (const key in record) {
+      if (!Object.hasOwn(record, key)) continue;
+      if (keys.length >= MAX_SQL_STRUCTURED_VALUE_ITEMS - state.items) {
+        throw new RangeError(
+          `${label} cannot exceed ${String(MAX_SQL_STRUCTURED_VALUE_ITEMS)} values and names`,
+        );
+      }
+      keys.push(key);
+    }
+    if (canonical) keys.sort();
+    appendJsonPiece(state, "{", label);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index] ?? "";
+      state.items += 1;
+      if (state.items > MAX_SQL_STRUCTURED_VALUE_ITEMS) {
+        throw new RangeError(
+          `${label} cannot exceed ${String(MAX_SQL_STRUCTURED_VALUE_ITEMS)} values and names`,
+        );
+      }
+      assertBoundedDomainString(key, `${label} object name`);
+      if (index > 0) appendJsonPiece(state, ",", label);
+      appendJsonPiece(state, JSON.stringify(key), label);
+      appendJsonPiece(state, ":", label);
+      encodeBoundedJson(record[key], canonical, label, depth + 1, state);
+    }
+    appendJsonPiece(state, "}", label);
+  } finally {
+    state.active.delete(object);
+  }
+}
+
+function appendJsonPiece(state: JsonEncodingState, piece: string, label: string): void {
+  const next = state.length + piece.length;
+  if (!Number.isSafeInteger(next) || next > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  state.length = next;
+  state.pieces.push(piece);
+}
+
+function assertBoundedDomainString(value: string, label: string): void {
+  if (value.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  assertWellFormedString(value, label);
 }
 
 export function jsonDomainValue(value: unknown, binary: boolean): string | null {
@@ -225,19 +351,25 @@ export function jsonDomainValue(value: unknown, binary: boolean): string | null 
         ? JSON_VALUE
         : undefined;
     const source = prefix === undefined ? value : value.slice(prefix.length);
+    assertBoundedDomainString(source, "JSON value");
     try {
       parsed = JSON.parse(source);
     } catch {
       throw new TypeError("Invalid JSON value");
     }
   }
-  const text = binary ? canonicalJson(parsed) : JSON.stringify(parsed);
-  return (binary ? JSONB_VALUE : JSON_VALUE) + text;
+  const text = boundedJsonText(parsed, binary, binary ? "JSONB value" : "JSON value");
+  return boundedTaggedDomainValue(
+    binary ? JSONB_VALUE : JSON_VALUE,
+    text,
+    binary ? "JSONB value" : "JSON value",
+  );
 }
 
 export function uuidDomainValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError("UUID accepts a string value");
+  assertBoundedDomainString(value, "UUID value");
   const source = (
     value.startsWith(UUID_VALUE) ? value.slice(UUID_VALUE.length) : value
   ).toLowerCase();
@@ -250,6 +382,7 @@ export function uuidDomainValue(value: unknown): string | null {
 export function timeDomainValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError("TIME accepts a string value");
+  assertBoundedDomainString(value, "TIME value");
   const source = value.startsWith(TIME_VALUE) ? value.slice(TIME_VALUE.length) : value;
   const match = /^(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,6})?)?$/.exec(source);
   const hours = match?.[1];
@@ -269,8 +402,26 @@ export function timeDomainValue(value: unknown): string | null {
 
 export function intervalDomainValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (typeof value === "string" && value.startsWith(INTERVAL_VALUE)) return value;
   if (typeof value !== "string") throw new TypeError("INTERVAL accepts a string value");
+  assertBoundedDomainString(value, "INTERVAL value");
+  if (value.startsWith(INTERVAL_VALUE)) {
+    const source = value.slice(INTERVAL_VALUE.length);
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(source) as unknown;
+    } catch {
+      throw new TypeError("Invalid tagged INTERVAL value");
+    }
+    if (
+      !Array.isArray(decoded) ||
+      decoded.length !== 3 ||
+      !decoded.every((part) => Number.isSafeInteger(part)) ||
+      JSON.stringify(decoded) !== source
+    ) {
+      throw new TypeError("Invalid tagged INTERVAL value");
+    }
+    return value;
+  }
   const source = value.trim();
   let months = 0;
   let days = 0;
@@ -310,11 +461,19 @@ export function intervalDomainValue(value: unknown): string | null {
   ) {
     throw new TypeError(`Invalid INTERVAL value: ${value}`);
   }
-  return INTERVAL_VALUE + JSON.stringify([months, days, microseconds]);
+  return boundedTaggedDomainValue(
+    INTERVAL_VALUE,
+    JSON.stringify([months, days, microseconds]),
+    "INTERVAL value",
+  );
 }
 
 export function arrayDomainValue(values: readonly unknown[]): string {
-  return ARRAY_VALUE + canonicalJson(values.map(externalSqlDomainValue));
+  return boundedTaggedDomainValue(
+    ARRAY_VALUE,
+    boundedJsonText(values.map(externalSqlDomainValue), true, "ARRAY value"),
+    "ARRAY value",
+  );
 }
 
 export function enumDomainValue(
@@ -324,12 +483,37 @@ export function enumDomainValue(
 ): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError(`Enum ${name} accepts a string value`);
-  const source = value.startsWith(ENUM_VALUE)
-    ? (JSON.parse(value.slice(ENUM_VALUE.length)) as [string, number, string])[2]
-    : value;
+  assertBoundedDomainString(value, `Enum ${name} value`);
+  let source = value;
+  // Enum labels are arbitrary strings. Prefer an exact declared label before recognizing the
+  // internal tag namespace, so a legal label can begin with that prefix just like ordinary TEXT.
+  if (!values.includes(value) && value.startsWith(ENUM_VALUE)) {
+    const encoded = value.slice(ENUM_VALUE.length);
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(encoded) as unknown;
+    } catch {
+      throw new TypeError(`Invalid tagged enum ${name} value`);
+    }
+    if (
+      !Array.isArray(decoded) ||
+      decoded.length !== 3 ||
+      decoded[0] !== name ||
+      !Number.isSafeInteger(decoded[1]) ||
+      typeof decoded[2] !== "string" ||
+      JSON.stringify(decoded) !== encoded
+    ) {
+      throw new TypeError(`Invalid tagged enum ${name} value`);
+    }
+    source = decoded[2];
+  }
   const index = values.indexOf(source);
   if (index === -1) throw new TypeError(`${source} is not a value of enum ${name}`);
-  return ENUM_VALUE + JSON.stringify([name, index, source]);
+  return boundedTaggedDomainValue(
+    ENUM_VALUE,
+    boundedJsonText([name, index, source], false, `Enum ${name} value`),
+    `Enum ${name} value`,
+  );
 }
 
 export function enumDomainCompare(left: unknown, right: unknown): number | undefined {
@@ -360,6 +544,7 @@ export function normalizeSqlDomainValue(domain: SqlDomain, value: unknown): stri
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError("ARRAY columns accept JSON array text");
   const source = value.startsWith(ARRAY_VALUE) ? value.slice(ARRAY_VALUE.length) : value;
+  assertBoundedDomainString(source, "ARRAY value");
   let parsed: unknown;
   try {
     parsed = JSON.parse(source);
@@ -367,10 +552,17 @@ export function normalizeSqlDomainValue(domain: SqlDomain, value: unknown): stri
     throw new TypeError("Invalid ARRAY value");
   }
   if (!Array.isArray(parsed)) throw new TypeError("ARRAY value must be an array");
-  return arrayDomainValue(parsed);
+  // JSON array text contains ordinary JSON strings. Do not interpret a string that happens to
+  // begin with Minnow's internal domain prefix as an already-tagged SQL scalar.
+  return boundedTaggedDomainValue(
+    ARRAY_VALUE,
+    boundedJsonText(parsed, true, "ARRAY value"),
+    "ARRAY value",
+  );
 }
 
 const collators = new Map<string, Intl.Collator>();
+const MAX_COLLATOR_CACHE_ENTRIES = 64;
 
 export function collatedDomainValue(value: unknown, collation: unknown): string | null {
   if (value === null || value === undefined) return null;
@@ -378,15 +570,24 @@ export function collatedDomainValue(value: unknown, collation: unknown): string 
   if (typeof value !== "string" || typeof collation !== "string") {
     throw new TypeError("COLLATE requires a string value and collation name");
   }
+  assertBoundedDomainString(value, "COLLATE value");
+  assertBoundedDomainString(collation, "COLLATE name");
   const locale = collation === "POSIX" ? "C" : collation;
-  if (locale !== "C" && !collators.has(locale)) {
-    try {
-      collators.set(locale, new Intl.Collator(locale, { usage: "sort", sensitivity: "variant" }));
-    } catch {
-      throw new TypeError(`Unsupported collation: ${collation}`);
-    }
+  if (locale !== "C") collatorFor(locale, collation);
+  return boundedTaggedDomainValue(
+    COLLATION_VALUE,
+    boundedJsonText([locale, value], false, "COLLATE value"),
+    "COLLATE value",
+  );
+}
+
+function boundedTaggedDomainValue(prefix: string, value: string, label: string): string {
+  // The prefix is an internal physical tag and is removed at the JavaScript boundary. Limit the
+  // user-visible payload, while the fixed tag adds only a few bounded bytes in storage.
+  if (value.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
   }
-  return COLLATION_VALUE + JSON.stringify([locale, value]);
+  return prefix + value;
 }
 
 export function collatedDomainCompare(left: unknown, right: unknown): number | undefined {
@@ -406,7 +607,28 @@ export function collatedDomainCompare(left: unknown, right: unknown): number | u
   const leftValue = a?.[1] ?? (left as string);
   const rightValue = b?.[1] ?? (right as string);
   if (locale === "C") return leftValue === rightValue ? 0 : leftValue < rightValue ? -1 : 1;
-  return (collators.get(locale) ?? new Intl.Collator(locale)).compare(leftValue, rightValue);
+  return collatorFor(locale, locale).compare(leftValue, rightValue);
+}
+
+function collatorFor(locale: string, displayName: string): Intl.Collator {
+  const cached = collators.get(locale);
+  if (cached !== undefined) {
+    collators.delete(locale);
+    collators.set(locale, cached);
+    return cached;
+  }
+  let created: Intl.Collator;
+  try {
+    created = new Intl.Collator(locale, { usage: "sort", sensitivity: "variant" });
+  } catch {
+    throw new TypeError(`Unsupported collation: ${displayName}`);
+  }
+  if (collators.size >= MAX_COLLATOR_CACHE_ENTRIES) {
+    const oldest = collators.keys().next().value;
+    if (oldest !== undefined) collators.delete(oldest);
+  }
+  collators.set(locale, created);
+  return created;
 }
 
 export function externalSqlDomainValue(value: unknown): unknown {

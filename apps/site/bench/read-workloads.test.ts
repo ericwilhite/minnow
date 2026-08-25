@@ -3,7 +3,8 @@
  * checks them. Oracle and baseline rows are projected into canonical tuples, and expected row
  * counts are part of correctness. This covers every definition tagged OLTP, independent of its id.
  */
-import { compileQuery, executeQuery, type DatabaseRow } from "@minnowdb/core";
+import type { DatabaseRow } from "@minnowdb/core";
+import { compileQuery, executeQuery } from "@minnowdb/core/query";
 import { describe, expect, it } from "vitest";
 import { generateEntityBatch, getScenario } from "./benchmark";
 import { buildReferenceQueryContext, referenceQueryDefinitions } from "./worker/reference-suite";

@@ -85,6 +85,19 @@ export interface CollectionPassSummary {
   readonly retainedTransactions: number;
 }
 
+async function collectStoragePages<Item, Cursor>(
+  read: (cursor: Cursor | null) => Promise<{ records: Item[]; nextCursor: Cursor | null }>,
+): Promise<Item[]> {
+  const records: Item[] = [];
+  let cursor: Cursor | null = null;
+  for (;;) {
+    const page = await read(cursor);
+    records.push(...page.records);
+    if (page.nextCursor === null) return records;
+    cursor = page.nextCursor;
+  }
+}
+
 interface PendingOperation<T = unknown> {
   readonly label: string;
   readonly run: () => Promise<T>;
@@ -135,6 +148,15 @@ export class DeterministicScheduler {
       await Promise.resolve();
       const pending = this.#pending.length;
       if (pending === 0) {
+        // Production maintenance deliberately yields through a timer between bounded pages.
+        // A microtask-only poll can therefore declare deadlock while the next scheduled store
+        // call is merely waiting for its event-loop turn. Let timers advance before counting an
+        // empty turn; the chosen storage completion order remains seeded and deterministic.
+        await nextEventLoopTurn();
+        if (this.#pending.length > 0) {
+          emptyTurns = 0;
+          continue;
+        }
         emptyTurns++;
         if (emptyTurns > 100) {
           throw new Error("Deterministic simulator deadlocked with no scheduled storage operation");
@@ -163,6 +185,21 @@ export class DeterministicScheduler {
     this.#trace.push({ sequence: this.#sequence, operation, outcome });
     if (this.#trace.length > this.#traceLimit) this.#trace.shift();
   }
+}
+
+function nextEventLoopTurn(): Promise<void> {
+  if (typeof MessageChannel === "undefined") {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(undefined);
+  });
 }
 
 /** Wraps every asynchronous BlockStore entry point in the deterministic completion scheduler. */
@@ -403,30 +440,22 @@ export async function runSimulation(
   await drive(scheduler, sweeper.close());
 
   const rows = sortedRows(model);
-  const [
-    blockIds,
-    segments,
-    transactions,
-    manifests,
-    currentManifest,
-    leases,
-    compactions,
-    storageBytes,
-  ] = await Promise.all([
-    base.listBlockIds(),
-    base.listSegments(),
-    base.listTransactions(),
-    base.listManifests(),
-    base.getCurrentManifest(),
-    base.listLeases(),
-    base.listCompactionJobs(),
-    base.getLogicalStorageBytes(),
-  ]);
+  const [segments, transactions, manifests, currentManifest, leases, compactions, storageBytes] =
+    await Promise.all([
+      collectStoragePages((cursor: string | null) => base.listSegmentPage(cursor, 256)),
+      collectStoragePages((cursor: string | null) => base.listTransactionPage(cursor, 256)),
+      collectStoragePages((cursor: number | null) => base.listManifestPage(cursor, 256)),
+      base.getCurrentManifest(),
+      base.listLeases(),
+      base.listCompactionJobs(),
+      base.getLogicalStorageBytes(),
+    ]);
+  const blockCount = currentManifest?.liveBlockCount ?? 0;
   const blockLimit = plan.keySpace * 16 + 64;
   const segmentLimit = plan.keySpace + 16;
   const transactionLimit = segmentLimit + 16;
   if (
-    blockIds.length > blockLimit ||
+    blockCount > blockLimit ||
     segments.length > segmentLimit ||
     transactions.length > transactionLimit
   ) {
@@ -439,12 +468,12 @@ export async function runSimulation(
       return counts;
     }, {});
     throw new Error(
-      `Storage did not compact to a bound: ${String(blockIds.length)}/${String(blockLimit)} blocks, ` +
+      `Storage did not compact to a bound: ${String(blockCount)}/${String(blockLimit)} live blocks, ` +
         `${String(segments.length)}/${String(segmentLimit)} segments, ` +
         `${String(transactions.length)}/${String(transactionLimit)} transactions; ` +
         `${JSON.stringify(transactionStates)} transaction states, ` +
         `${JSON.stringify(compactionStates)} compaction states, ` +
-        `${String(currentManifest?.blockIds.length ?? 0)} current blocks, compaction stopped at ${compactionStop}, ` +
+        `${String(currentManifest?.liveBlockCount ?? 0)} current blocks, compaction stopped at ${compactionStop}, ` +
         `${String(manifests.length)} manifests (${String(manifests.filter((manifest) => manifest.prunedAt !== undefined).length)} pruned) remain after ${String(maintenanceCompactions)} compactions ` +
         `and ${String(collectionPasses)} collection passes; collection tail ${JSON.stringify(collectionTail)}`,
     );
@@ -469,7 +498,7 @@ export async function runSimulation(
     collectionPasses,
     collectionTail,
     rows,
-    blockCount: blockIds.length,
+    blockCount,
     segmentCount: segments.length,
     transactionCount: transactions.length,
     manifestCount: manifests.length,
@@ -603,8 +632,6 @@ function validateSteps(steps: readonly unknown[], clients: number, keySpace: num
     "afterBlockWrite",
     "beforeBlockRead",
     "afterBlockRead",
-    "beforeManifestCommit",
-    "afterManifestCommit",
     "beforeTransactionCommit",
     "afterTransactionCommit",
   ]);

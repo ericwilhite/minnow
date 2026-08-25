@@ -15,7 +15,8 @@
   ],
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true",
-    "build": "tsc -b --force && npm run build --workspace @minnowdb/site",
+    "clean": "node scripts/clean-output.mjs",
+    "build": "npm run clean && tsc -b --force && npm run build --workspace @minnowdb/site",
     "site:dev": "npm run dev --workspace @minnowdb/site",
     "site:build": "npm run build --workspace @minnowdb/site",
     "typecheck": "tsc -b --force --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit",
