@@ -9383,7 +9383,7 @@ function decodeExpiryPageCursor(
     typeof value[0] !== "string" ||
     typeof value[1] !== "string" ||
     value[1].length === 0 ||
-    new Date(Date.parse(value[0])).toISOString() !== value[0]
+    dateIsoString(new Date(Date.parse(value[0]))) !== value[0]
   ) {
     throw new TypeError(`${label} cursor is invalid`);
   }
@@ -9965,7 +9965,7 @@ function validStoredTimestamp(value: unknown, location: string): string {
 
 function canonicalStoredTimestamp(value: unknown, location: string): string {
   const timestamp = validStoredTimestamp(value, location);
-  if (new Date(Date.parse(timestamp)).toISOString() !== timestamp) {
+  if (dateIsoString(new Date(Date.parse(timestamp))) !== timestamp) {
     throw corruption(location, "timestamp is not canonical UTC ISO-8601");
   }
   return timestamp;
@@ -10008,7 +10008,7 @@ function asOptionalCounter(value: unknown, location: string): bigint | undefined
 
 function storageKeyLocation(key: IDBValidKey): string {
   if (typeof key === "string" || typeof key === "number") return String(key);
-  if (key instanceof Date) return key.toISOString();
+  if (key instanceof Date) return dateIsoString(key);
   if (Array.isArray(key)) return `[${key.map(storageKeyLocation).join(",")}]`;
   if (key instanceof ArrayBuffer) return `binary:${String(key.byteLength)}`;
   return `binary:${String(key.byteLength)}`;
@@ -14325,7 +14325,7 @@ function validateBoundedLeaseExpiration(
 
 function canonicalInputTimestamp(value: string, label: string): string {
   const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+  if (!Number.isFinite(timestamp) || dateIsoString(new Date(timestamp)) !== value) {
     throw new TypeError(`${label} must be canonical UTC ISO-8601`);
   }
   return value;
@@ -14342,7 +14342,10 @@ function validateBoundedExpiration(
   if (!Number.isFinite(cutoff) || !Number.isFinite(expiry)) {
     throw new TypeError(`${label} timestamps must be valid`);
   }
-  if (new Date(cutoff).toISOString() !== cutoffAt || new Date(expiry).toISOString() !== expiresAt) {
+  if (
+    dateIsoString(new Date(cutoff)) !== cutoffAt ||
+    dateIsoString(new Date(expiry)) !== expiresAt
+  ) {
     throw new TypeError(`${label} timestamps must be canonical UTC ISO-8601`);
   }
   if (expiry <= cutoff) throw new RangeError(`${label} expiration must be after its cutoff`);
@@ -14665,11 +14668,11 @@ function decodeFtsBaseBuildMarker(value: unknown): FtsBaseBuildMarker | undefine
   const expiresAt = Date.parse(value.expiresAt);
   if (
     !Number.isFinite(updatedAt) ||
-    new Date(updatedAt).toISOString() !== value.updatedAt ||
+    dateIsoString(new Date(updatedAt)) !== value.updatedAt ||
     !Number.isFinite(createdAt) ||
-    new Date(createdAt).toISOString() !== value.createdAt ||
+    dateIsoString(new Date(createdAt)) !== value.createdAt ||
     !Number.isFinite(expiresAt) ||
-    new Date(expiresAt).toISOString() !== value.expiresAt ||
+    dateIsoString(new Date(expiresAt)) !== value.expiresAt ||
     expiresAt <= createdAt
   ) {
     return undefined;
@@ -14751,7 +14754,7 @@ function decodeFtsRetirementMarker(value: unknown): FtsRetirementMarker | undefi
   const updatedAt = Date.parse(value.retirementUpdatedAt);
   if (
     !Number.isFinite(updatedAt) ||
-    new Date(updatedAt).toISOString() !== value.retirementUpdatedAt
+    dateIsoString(new Date(updatedAt)) !== value.retirementUpdatedAt
   ) {
     return undefined;
   }

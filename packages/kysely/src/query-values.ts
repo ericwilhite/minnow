@@ -1,8 +1,11 @@
 import type { QueryValue } from "@minnowdb/core";
+import { copyDate } from "./date-value.js";
 
 /** Validates and snapshots Kysely's unknown parameter array at the adapter boundary. */
 export function kyselyQueryValues(parameters: readonly unknown[]): QueryValue[] {
-  return parameters.map((value, index) => {
+  const values: QueryValue[] = [];
+  for (let index = 0; index < parameters.length; index += 1) {
+    const value = parameters[index];
     if (
       value === null ||
       typeof value === "boolean" ||
@@ -10,11 +13,13 @@ export function kyselyQueryValues(parameters: readonly unknown[]): QueryValue[] 
       typeof value === "string" ||
       value instanceof Date
     ) {
-      return value instanceof Date ? new Date(value.getTime()) : value;
+      values.push(value instanceof Date ? copyDate(value) : value);
+      continue;
     }
     throw new TypeError(
       `Kysely parameter ${String(index + 1)} has unsupported type ${typeof value}; ` +
         "Minnow accepts boolean, number, string, Date, or null",
     );
-  });
+  }
+  return values;
 }

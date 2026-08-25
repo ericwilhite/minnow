@@ -1,4 +1,5 @@
 import type { QueryValue } from "@minnowdb/core";
+import { dateIsoString, dateMilliseconds } from "../date-value.js";
 
 /** The four logical column types, mirrored from the catalog. */
 export type ColumnType = "boolean" | "number" | "string" | "datetime";
@@ -40,8 +41,10 @@ function quoteString(value: string): string {
  */
 export function toDateOnly(value: QueryValue): string {
   const date = value instanceof Date ? value : new Date(String(value));
-  if (!Number.isFinite(date.getTime())) throw new TypeError(`Not a date: ${String(value)}`);
-  return date.toISOString().slice(0, 10);
+  if (!Number.isFinite(dateMilliseconds(date))) {
+    throw new TypeError(`Not a date: ${String(value)}`);
+  }
+  return dateIsoString(date).slice(0, 10);
 }
 
 /** Whether a cursor can address this type exactly. Day-granular datetimes cannot. */

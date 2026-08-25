@@ -35,7 +35,7 @@ export function createFormatFixtureId(): () => string {
   return () => `fixture-${String(nextId++).padStart(6, "0")}`;
 }
 
-/** Deterministic pseudo-randomness, so a regenerated fixture differs only when the format does. */
+/** Deterministic pseudo-randomness, so a regenerated fixture's logical payload is stable. */
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -199,7 +199,7 @@ export const FIXTURE_QUERIES: readonly string[] = [
   "SELECT r.region, COUNT(*) AS n FROM records r JOIN keyless k ON r.region = k.label GROUP BY r.region ORDER BY r.region",
 ];
 
-/** Builds the exact deterministic writer artifact frozen by the current-version fixture. */
+/** Builds the deterministic logical writer artifact frozen by the current-version fixture. */
 export async function createFormatFixtureArtifact(): Promise<{
   bytes: Uint8Array;
   expectations: Array<{ sql: string; rows: unknown }>;

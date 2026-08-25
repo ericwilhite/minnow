@@ -2191,6 +2191,23 @@ describe("OPFS write-ahead log crash shapes", () => {
     reopened.close();
   });
 
+  it("fails closed on a complete checksum-invalid WAL frame", async () => {
+    const shim = new MemoryOpfs();
+    const store = await OpfsBlockStore.open({ name: "corrupt-wal", root: shim.root });
+    await store.addTable(table("durable"));
+    store._crashForTests();
+
+    const path = "minnowdb/corrupt-wal/wal";
+    const wal = shim.readFileBytes(path);
+    if (wal === undefined || wal.byteLength === 0) throw new Error("Expected WAL bytes");
+    wal[wal.byteLength - 1] = (wal[wal.byteLength - 1] ?? 0) ^ 0xff;
+    shim.writeFileBytes(path, wal);
+
+    await expect(OpfsBlockStore.open({ name: "corrupt-wal", root: shim.root })).rejects.toThrow(
+      /WAL frame checksum mismatch/,
+    );
+  });
+
   it("recovers everything acknowledged before a death with no shutdown", async () => {
     const shim = new MemoryOpfs();
     const store = await OpfsBlockStore.open({ name: "db", root: shim.root });

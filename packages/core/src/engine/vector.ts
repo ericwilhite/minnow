@@ -4023,7 +4023,7 @@ class ResultSink {
           : typeof first === "number"
             ? first
             : first instanceof Date
-              ? first.getTime()
+              ? dateMilliseconds(first)
               : undefined;
   }
 
@@ -4656,7 +4656,7 @@ function createGroupState(
  * string a row genuinely holds.
  */
 function distinctKey(value: unknown): unknown {
-  return value instanceof Date ? `\0d${String(value.getTime())}` : value;
+  return value instanceof Date ? `\0d${String(dateMilliseconds(value))}` : value;
 }
 
 /**
@@ -5128,7 +5128,7 @@ function detectPrimitiveComparison(predicate: BoundPredicate): PrimitiveComparis
       return { source: column.source, vector, operator, value };
     }
     if (vector.kind === "datetime" && value instanceof Date) {
-      return { source: column.source, vector, operator, value: value.getTime() };
+      return { source: column.source, vector, operator, value: dateMilliseconds(value) };
     }
     if (
       vector.kind === "boolean" &&
@@ -5171,7 +5171,7 @@ function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | und
       members.add(value);
     } else {
       if (!(value instanceof Date)) return undefined;
-      members.add(value.getTime());
+      members.add(dateMilliseconds(value));
     }
   }
   if (members.size === 0) return undefined;
@@ -5752,7 +5752,7 @@ function comparisonValue(
 }
 
 function comparable(value: unknown): unknown {
-  return value instanceof Date ? value.getTime() : value;
+  return value instanceof Date ? dateMilliseconds(value) : value;
 }
 
 function groupKey(value: unknown): GroupIndexKey {
@@ -5805,8 +5805,8 @@ function compareValues(left: unknown, right: unknown): number {
   if (enumOrder !== undefined) return enumOrder;
   const exact = exactNumericCompare(left, right);
   if (exact !== undefined) return exact;
-  const a = left instanceof Date ? left.getTime() : left;
-  const b = right instanceof Date ? right.getTime() : right;
+  const a = left instanceof Date ? dateMilliseconds(left) : left;
+  const b = right instanceof Date ? dateMilliseconds(right) : right;
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;

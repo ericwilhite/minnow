@@ -121,7 +121,7 @@ The WAL and either checkpoint are each capped at 256 MiB. The log is folded into
 before approaching that bound; a database whose validated metadata cannot fit is refused rather
 than opened or partially checkpointed. Relaxed payload writes are flushed first, then the new
 checkpoint is written and flushed, and only then is the log reset. A crash at any moment therefore
-leaves either a torn tail frame — detectably invalid, invisible — or a torn slot with the other
+leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
 slot and the un-reset log still holding everything. Opening the database is the recovery; there is
 no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
 from the fully validated current layout. A recognized but unsupported envelope or checkpoint

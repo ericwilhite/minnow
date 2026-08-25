@@ -110,6 +110,7 @@ import {
   validateFtsOrderedReadLimits,
   uniqueKeyBuildChunkRetainedBytes,
 } from "../types.js";
+import { dateIsoString } from "../../date-value.js";
 import {
   decodeSnapshotMetadataItems,
   encodeSnapshotMetadataPage,
@@ -935,7 +936,7 @@ export class OpfsLeader {
 
     await this.#validateRecoveredSnapshotFrameSessions();
 
-    const recoveryCutoff = new Date().toISOString();
+    const recoveryCutoff = dateIsoString(new Date());
     this.#core.validatePinnedRetiredLimits(recoveryCutoff);
     if (
       this.#snapshotFrameExport !== undefined &&
@@ -5139,7 +5140,7 @@ function validateRelocations(value: unknown, label: string, blocks: boolean): vo
 function requireTimestamp(value: unknown, label: string): asserts value is string {
   requireString(value, label);
   const milliseconds = Date.parse(value);
-  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+  if (!Number.isFinite(milliseconds) || dateIsoString(new Date(milliseconds)) !== value) {
     throw new Error(`Invalid ${label}`);
   }
 }

@@ -2,15 +2,15 @@
  * The workspace's versions.
  *
  * Every published package shares a major version, and moves independently inside it. A major is
- * the compatibility line: `@minnowdb/kysely@2.x` works with `@minnowdb/core@2.x`, whichever
- * minors the two happen to be on, because the adapter is built on the engine's published
- * primitives and a change that breaks that contract is by definition a major one. Below that
- * line each package releases at its own pace, so a fix to the devtools console does not have to
- * drag the engine's version along with it.
+ * the compatibility line: `@minnowdb/kysely@2.x` works with later `@minnowdb/core@2.x` releases
+ * at or above its declared dependency floor. The adapter is built on the engine's published
+ * primitives, and a change that breaks that cross-package contract is by definition a major one.
+ * Below that line each package releases at its own pace, so a fix to the devtools console does not
+ * have to drag the engine's version along with it.
  *
- * That invariant is what this script writes and checks. Internal dependencies are ranges of the
- * form `>=0.3.0 <1.0.0`: the floor is the sibling this package was built against, and the ceiling
- * is the compatibility line, so npm refuses a mixed-major install on its own.
+ * That invariant is what this script writes and checks. Internal dependencies use a floor at the
+ * sibling release this package was built against and a ceiling at the next shared major, so npm
+ * refuses an incompatible engine version on its own.
  *
  *   npm run version:check                      verify the workspace agrees with itself
  *   npm run version:set -- minor @minnowdb/core  move one package inside the shared major
@@ -239,7 +239,12 @@ function resolveVersion(argument: string, current: string): string {
  * A textual edit rather than a rewrite of the parsed object: package.json files are read by
  * people and diffed in review, and JSON.stringify would reorder nothing but reformat plenty.
  */
-function writeManifest(entry: WorkspacePackage, version: string | undefined, major: number): void {
+function writeManifest(
+  entry: WorkspacePackage,
+  version: string | undefined,
+  major: number,
+  updateDependencies: boolean,
+): void {
   let text = readFileSync(entry.file, "utf8");
   if (version !== undefined) {
     text = text.replace(
@@ -247,15 +252,17 @@ function writeManifest(entry: WorkspacePackage, version: string | undefined, maj
       (_match, prefix: string, suffix: string) => `${prefix}${version}${suffix}`,
     );
   }
-  for (const [name] of internalDependencies(entry.manifest)) {
-    const sibling = siblingVersions.get(name);
-    if (sibling === undefined) continue;
-    const dependency = new RegExp(`^(\\s*"${name.replace("/", "\\/")}":\\s*")[^"]*(",?)$`, "m");
-    text = text.replace(
-      dependency,
-      (_match, prefix: string, suffix: string) =>
-        `${prefix}${dependencyRange(sibling, major)}${suffix}`,
-    );
+  if (updateDependencies) {
+    for (const [name] of internalDependencies(entry.manifest)) {
+      const sibling = siblingVersions.get(name);
+      if (sibling === undefined) continue;
+      const dependency = new RegExp(`^(\\s*"${name.replace("/", "\\/")}":\\s*")[^"]*(",?)$`, "m");
+      text = text.replace(
+        dependency,
+        (_match, prefix: string, suffix: string) =>
+          `${prefix}${dependencyRange(sibling, major)}${suffix}`,
+      );
+    }
   }
   writeFileSync(entry.file, text);
 }
@@ -321,7 +328,10 @@ function set(argument: string, packageName: string | undefined): number {
     }
   }
 
-  // Every dependency range is rewritten against where the packages end up, not where they were.
+  // A released package's floor records the siblings that release was built against. Do not
+  // silently change an unchanged published manifest: the publisher keys on version and would not
+  // publish those new bytes. Moved packages and private workspace manifests follow the versions
+  // selected by this command.
   siblingVersions.clear();
   for (const entry of published) {
     siblingVersions.set(
@@ -331,7 +341,8 @@ function set(argument: string, packageName: string | undefined): number {
   }
 
   for (const entry of packages) {
-    writeManifest(entry, moved.get(entry.relativePath), major);
+    const next = moved.get(entry.relativePath);
+    writeManifest(entry, next, major, next !== undefined || !isPublished(entry));
   }
 
   const engineVersion = siblingVersions.get(ENGINE) ?? "";
@@ -363,9 +374,7 @@ function set(argument: string, packageName: string | undefined): number {
     );
   }
   console.log(
-    wholeWorkspace
-      ? `Commit the result, then tag the release: git tag v${siblingVersions.get(ENGINE) ?? ""}`
-      : `Commit the result, then tag it: git tag ${packageName ?? ""}@${moved.get(target?.relativePath ?? "") ?? ""}`,
+    "Commit the result. After publication succeeds, the release workflow tags each published package.",
   );
   return 0;
 }

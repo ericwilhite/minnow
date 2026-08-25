@@ -1,4 +1,5 @@
 import type { QueryCursorOptions, QueryResult, QueryRow, QueryValue } from "@minnowdb/core";
+import { dateIsoString, dateMilliseconds } from "./date-value.js";
 
 /** Structural source implemented by both MinnowDatabase and MinnowDatabaseClient. */
 export interface QueryCursorSource {
@@ -35,8 +36,10 @@ function sameColumns(left: readonly string[], right: readonly string[]): boolean
 function csvScalar(value: QueryValue, nullValue: string): string {
   if (value === null) return nullValue;
   if (value instanceof Date) {
-    if (!Number.isFinite(value.getTime())) throw new RangeError("Cannot export an invalid Date");
-    return value.toISOString();
+    if (!Number.isFinite(dateMilliseconds(value))) {
+      throw new RangeError("Cannot export an invalid Date");
+    }
+    return dateIsoString(value);
   }
   if (typeof value === "number" && Object.is(value, -0)) return "-0";
   return String(value);
@@ -61,8 +64,10 @@ function jsonScalar(value: QueryValue): string {
     return Object.is(value, -0) ? "-0" : String(value);
   }
   if (value instanceof Date) {
-    if (!Number.isFinite(value.getTime())) throw new RangeError("Cannot export an invalid Date");
-    return JSON.stringify(value.toISOString());
+    if (!Number.isFinite(dateMilliseconds(value))) {
+      throw new RangeError("Cannot export an invalid Date");
+    }
+    return JSON.stringify(dateIsoString(value));
   }
   return JSON.stringify(value);
 }
@@ -117,8 +122,10 @@ export function streamCsv(
   sql: string,
   options: CsvStreamOptions = {},
 ): ReadableStream<Uint8Array> {
-  const delimiter = options.delimiter ?? ",";
+  const delimiterInput: unknown = options.delimiter;
+  const delimiter = delimiterInput === undefined ? "," : delimiterInput;
   if (
+    typeof delimiter !== "string" ||
     !isSingleCodePoint(delimiter) ||
     delimiter === '"' ||
     delimiter === "\r" ||
@@ -126,8 +133,18 @@ export function streamCsv(
   ) {
     throw new RangeError("CSV delimiter must be one character other than a quote or newline");
   }
-  const newline = options.newline ?? "\r\n";
-  const nullValue = options.nullValue ?? "";
+  const newlineOption: unknown = options.newline;
+  const newlineInput = newlineOption === undefined ? "\r\n" : newlineOption;
+  if (newlineInput !== "\n" && newlineInput !== "\r\n") {
+    throw new RangeError("CSV newline must be LF or CRLF");
+  }
+  const newline = newlineInput;
+  const nullValueInput: unknown = options.nullValue;
+  const nullValue = nullValueInput === undefined ? "" : nullValueInput;
+  if (typeof nullValue !== "string") throw new TypeError("CSV nullValue must be a string");
+  if (options.header !== undefined && typeof options.header !== "boolean") {
+    throw new TypeError("CSV header must be a boolean");
+  }
   const includeHeader = options.header !== false;
   const {
     header: _header,

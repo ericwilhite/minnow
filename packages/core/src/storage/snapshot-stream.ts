@@ -4,7 +4,7 @@ import {
   crc32Continue,
   MAX_STORED_BLOCK_BYTE_LENGTH,
 } from "../block-format/index.js";
-import { dateMilliseconds } from "../date-value.js";
+import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import {
   MAX_SNAPSHOT_FRAME_ITEMS,
   MAX_SNAPSHOT_METADATA_FRAME_BYTES,
@@ -63,7 +63,7 @@ function safeWhole(value: unknown, label: string): number {
 function canonicalTimestamp(value: unknown, label: string): string {
   if (typeof value !== "string") throw new TypeError(`${label} must be a string`);
   const date = new Date(value);
-  if (!Number.isFinite(date.getTime()) || date.toISOString() !== value) {
+  if (!Number.isFinite(dateMilliseconds(date)) || dateIsoString(date) !== value) {
     throw new TypeError(`${label} must be a canonical UTC timestamp`);
   }
   return value;

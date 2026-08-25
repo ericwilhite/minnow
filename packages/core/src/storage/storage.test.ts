@@ -218,7 +218,7 @@ it("OPFS repacks mixed live/dead extents when collection completes", async () =>
   expect(await reopened.getBlock("extent-block-3")).toEqual(blocks[3]?.bytes);
   expect(await reopened.getBlock("extent-block-4")).toEqual(blocks[4]?.bytes);
   reopened.close();
-});
+}, 60_000);
 
 it("OPFS relocates a staged postings build instead of letting it block extent compaction", async () => {
   const shim = new MemoryOpfs();

@@ -33,7 +33,10 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Run the gate
-        run: npm run benchmark:gate | tee gate.txt
+        # An explicit Bash shell enables pipefail, so tee cannot turn a failed benchmark into a
+        # green job. Capture stderr too: the regression summary belongs in the uploaded artifact.
+        shell: bash
+        run: npm run benchmark:gate 2>&1 | tee gate.txt
       - name: Upload the timing table
         if: always()
         uses: actions/upload-artifact@v7

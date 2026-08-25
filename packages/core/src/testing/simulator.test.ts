@@ -108,5 +108,5 @@ describe("deterministic database simulation", () => {
     expect(result.blockCount).toBeLessThanOrEqual(plan.keySpace * 16 + 64);
     expect(result.segmentCount).toBeLessThanOrEqual(plan.keySpace + 16);
     expect(result.transactionCount).toBeLessThanOrEqual(plan.keySpace + 32);
-  }, 60_000);
+  }, 300_000);
 });

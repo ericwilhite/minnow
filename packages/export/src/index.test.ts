@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { MinnowDatabase, type QueryResult } from "@minnowdb/core";
 import { streamCsv, streamNdjson, type QueryCursorSource } from "./index.js";
@@ -69,6 +69,63 @@ describe("streaming exports", () => {
       "NDJSON cannot represent NaN",
     );
     expect(returned).toBe(true);
+
+    batches[0] = { columns: ["value"], rows: [{ value: new Date(Number.NaN) }] };
+    returned = false;
+    await expect(text(streamNdjson(source, "SELECT"))).rejects.toThrow(
+      "Cannot export an invalid Date",
+    );
+    expect(returned).toBe(true);
+  });
+
+  it("serializes a Date without invoking cursor-controlled methods", async () => {
+    const value = new Date("2026-08-25T12:34:56.789Z");
+    Object.defineProperties(value, {
+      getTime: {
+        value: () => {
+          throw new Error("cursor getTime must not run");
+        },
+      },
+      toISOString: {
+        value: () => {
+          throw new Error("cursor toISOString must not run");
+        },
+      },
+    });
+    const source: QueryCursorSource = {
+      async *queryCursor() {
+        yield { columns: ["at"], rows: [{ at: value }] };
+        return undefined;
+      },
+    };
+
+    await expect(text(streamCsv(source, "SELECT"))).resolves.toBe(
+      "at\r\n2026-08-25T12:34:56.789Z\r\n",
+    );
+  });
+
+  it("keeps using captured Date intrinsics after the prototype changes", async () => {
+    const value = new Date("2026-08-25T12:34:56.789Z");
+    const getTime = vi.spyOn(Date.prototype, "getTime").mockImplementation(() => {
+      throw new Error("mutated Date.prototype.getTime must not run");
+    });
+    const toISOString = vi.spyOn(Date.prototype, "toISOString").mockImplementation(() => {
+      throw new Error("mutated Date.prototype.toISOString must not run");
+    });
+    try {
+      const source: QueryCursorSource = {
+        async *queryCursor() {
+          yield { columns: ["at"], rows: [{ at: value }] };
+          return undefined;
+        },
+      };
+      await expect(text(streamNdjson(source, "SELECT"))).resolves.toBe(
+        '{"at":"2026-08-25T12:34:56.789Z"}\n',
+      );
+    } finally {
+      getTime.mockRestore();
+      toISOString.mockRestore();
+    }
   });
 
   it("cancels the underlying cursor when the readable stream is cancelled", async () => {
@@ -95,5 +152,35 @@ describe("streaming exports", () => {
     expect(new TextDecoder().decode((await reader.read()).value)).toBe("id\r\n0\r\n");
     await reader.cancel();
     expect(returned).toBe(true);
+  });
+
+  it("validates CSV options at the JavaScript boundary before opening a cursor", () => {
+    let opened = false;
+    const source: QueryCursorSource = {
+      async *queryCursor() {
+        opened = true;
+        yield { columns: [], rows: [] };
+        return undefined;
+      },
+    };
+    expect(() => streamCsv(source, "SELECT", { delimiter: "ab" })).toThrow(
+      "CSV delimiter must be one character",
+    );
+    expect(() => streamCsv(source, "SELECT", { delimiter: null as unknown as string })).toThrow(
+      "CSV delimiter must be one character",
+    );
+    expect(() => streamCsv(source, "SELECT", { newline: "\r" as "\n" })).toThrow(
+      "CSV newline must be LF or CRLF",
+    );
+    expect(() => streamCsv(source, "SELECT", { newline: null as unknown as "\n" })).toThrow(
+      "CSV newline must be LF or CRLF",
+    );
+    expect(() => streamCsv(source, "SELECT", { nullValue: null as unknown as string })).toThrow(
+      "CSV nullValue must be a string",
+    );
+    expect(() => streamCsv(source, "SELECT", { header: "yes" as unknown as boolean })).toThrow(
+      "CSV header must be a boolean",
+    );
+    expect(opened).toBe(false);
   });
 });

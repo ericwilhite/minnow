@@ -5,6 +5,7 @@ import {
   type SnapshotSummary,
 } from "@minnowdb/core/storage/snapshots";
 import type { ConfirmLayer, ConfirmRequest } from "../confirm.js";
+import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { el, iconButton, icons } from "../dom.js";
 import type { SnapshotTarget } from "../target.js";
 
@@ -46,7 +47,7 @@ function percent(done: number, total: number): string {
  * rather than the time zone of whoever clicked.
  */
 export function snapshotFileName(summary: SnapshotSummary, at: Date): string {
-  const day = (Number.isFinite(at.getTime()) ? at : new Date(0)).toISOString().slice(0, 10);
+  const day = dateIsoString(Number.isFinite(dateMilliseconds(at)) ? at : new Date(0)).slice(0, 10);
   return `minnow-v${String(summary.version)}-${day}${SNAPSHOT_EXTENSION}`;
 }
 

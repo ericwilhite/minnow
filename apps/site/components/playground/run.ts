@@ -42,7 +42,7 @@ export function unsupportedRuntimeImports(compiled: string, allowed: readonly st
  */
 export function toRunnableBody(compiled: string): string {
   return compiled
-    .replace(IMPORT, (whole, clause: string | undefined, _quote, specifier: string) => {
+    .replace(IMPORT, (_whole, clause: string | undefined, _quote, specifier: string) => {
       if (clause === undefined) return `__require(${JSON.stringify(specifier)});`;
       return `const ${binding(clause)} = __require(${JSON.stringify(specifier)});`;
     })

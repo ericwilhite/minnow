@@ -61,7 +61,8 @@ machines: https://minnowdb.com/llms.txt
   the store;
   this prevents automatic quota eviction when granted, not deliberate site-data clearing.
 - All `@minnowdb/*` packages share a major version and move independently inside it. Install them
-  on the same major; npm refuses a mixed-major set.
+  on the same major. Engine-dependent adapters declare ranges that make npm reject an incompatible
+  core; the structurally typed React hook has no core runtime dependency.
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
   statement that writes, rather than writing.
 - `db.queryCursor(sql, { params, batchRows, signal })` pulls bounded result pages. Single-table,

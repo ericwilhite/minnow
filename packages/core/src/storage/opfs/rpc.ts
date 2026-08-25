@@ -24,6 +24,7 @@ import {
   WriteConflictError,
   SchemaConflictError,
 } from "../types.js";
+import { dateIsoString } from "../../date-value.js";
 
 /**
  * The follower↔leader message vocabulary. Leadership traffic (`leader`, `ping`, `bid`, `yield`,
@@ -257,7 +258,7 @@ export async function fingerprintStoreRequest(
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", digestInput));
       return ["bytes", value.constructor.name, byteLength, hex(digest)];
     }
-    if (value instanceof Date) return ["date", value.toISOString()];
+    if (value instanceof Date) return ["date", dateIsoString(value)];
     if (Array.isArray(value)) {
       return Promise.all(value.map((item) => normalize(item, depth + 1)));
     }

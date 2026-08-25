@@ -8,10 +8,11 @@ import { readFully, writeFully, type SyncFileHandle } from "./sync-file.js";
  * Frame layout, little-endian: `u32 magic | u32 payloadLength | u32 crc32(payload) | payload`.
  * An append is one complete synchronous transfer at the tail — normally one microsecond-scale
  * write on a held handle, with retries if the platform reports a short transfer. The only
- * artifact a crash can leave is a torn final frame, which fails its checksum and reads as "not
- * written". Frames carry a global sequence number inside the
- * payload; the file is truncated to zero only after a checkpoint covering every frame has
- * been flushed, so replay is always newest-checkpoint-plus-tail.
+ * artifact a crash can leave is a truncated final frame, which reads as "not written". A
+ * complete frame with foreign marker or checksum-invalid bytes is corruption and fails closed.
+ * Frames carry a global sequence number inside the payload; the file is truncated to zero only
+ * after a checkpoint covering every frame has been flushed, so replay is always
+ * newest-checkpoint-plus-tail.
  */
 
 const FRAME_MAGIC = 0x4c574e4d; // "MNWL"
@@ -84,8 +85,11 @@ export class WalWriter {
   /** Empties the log after a flushed checkpoint has covered every frame in it. */
   reset(): void {
     this.#handle.truncate(0);
-    this.#handle.flush();
+    // truncate() already changed the handle's logical file position. Keep the writer aligned
+    // with it even if the durability flush is refused; a later append must start at zero rather
+    // than leave a sparse, unreplayable gap after the checkpoint.
     this.#offset = 0;
+    this.#handle.flush();
   }
 
   flush(): void {
@@ -98,9 +102,10 @@ export class WalWriter {
 }
 
 /**
- * Reads every whole, checksum-valid frame from the handle's current content, in order,
- * stopping at the first torn or foreign bytes. Returns the payloads and the byte offset where
- * appending should resume (the end of the last valid frame — a torn tail is overwritten).
+ * Reads every whole, checksum-valid frame from the handle's current content, in order. A
+ * truncated final frame is ignored; complete foreign or corrupt bytes are rejected. Returns the
+ * payloads and the byte offset where appending should resume (the end of the last valid frame —
+ * a truncated tail is overwritten).
  */
 export function replayWalFrames(handle: SyncFileHandle): {
   payloads: unknown[];
@@ -120,8 +125,8 @@ export function replayWalFrames(handle: SyncFileHandle): {
 }
 
 /**
- * Streams checksum-valid frames with O(max-frame) memory. A torn final frame is ignored, but
- * a complete header claiming an excessive payload is corruption and fails closed.
+ * Streams checksum-valid frames with O(max-frame) memory. A truncated final frame is ignored;
+ * complete foreign or checksum-invalid bytes are corruption and fail closed.
  */
 export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWalFrame> {
   const size = handle.getSize();
@@ -133,7 +138,9 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
   let offset = 0;
   while (offset + FRAME_HEADER_BYTES <= size) {
     readFully(handle, header, offset, "reading a WAL frame header for recovery");
-    if (headerView.getUint32(0, true) !== FRAME_MAGIC) break;
+    if (headerView.getUint32(0, true) !== FRAME_MAGIC) {
+      throw new Error(`WAL frame marker mismatch at offset ${String(offset)}`);
+    }
     const length = headerView.getUint32(4, true);
     const checksum = headerView.getUint32(8, true);
     if (length > MAX_WAL_FRAME_BYTES) {
@@ -151,7 +158,9 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
       offset + FRAME_HEADER_BYTES,
       "reading a WAL frame payload for recovery",
     );
-    if (crc32(payloadBytes) !== checksum) break;
+    if (crc32(payloadBytes) !== checksum) {
+      throw new Error(`WAL frame checksum mismatch at offset ${String(offset)}`);
+    }
     yield { payload: decodeRecordJson(payloadBytes), frameEnd: end };
     offset = end;
   }

@@ -16,7 +16,7 @@
  * the first place — a trusted publisher can only be configured for a package that exists.
  */
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -46,6 +46,7 @@ function publishable(): Publishable[] {
   return readdirSync(path.join(repoRoot, "packages"), { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => path.join(repoRoot, "packages", entry.name, "package.json"))
+    .filter((file) => existsSync(file))
     .map((file) => JSON.parse(readFileSync(file, "utf8")) as Manifest)
     .filter(
       (manifest): manifest is Manifest & Publishable =>
@@ -82,7 +83,7 @@ function packedFiles(name: string): string[] {
 
 function refuseStrayFiles(entry: Publishable): void {
   const stray = packedFiles(entry.name).filter((file) =>
-    /\.(test|spec)\.|\.tsbuildinfo$/.test(file),
+    /\.(test|spec)\.|\.tsbuildinfo$|\.map$/.test(file),
   );
   if (stray.length > 0) {
     throw new Error(
@@ -143,7 +144,7 @@ for (const entry of pending) {
   const tagged = run("git", ["tag", tag]);
   if (tagged.status !== 0) {
     console.error(`Could not tag ${tag}: ${tagged.stderr.trim()}`);
-    continue;
+    process.exit(tagged.status);
   }
   if (!inCI) {
     console.log(`Tagged ${tag}. Push it with \`git push origin ${tag}\`.`);
@@ -154,7 +155,10 @@ for (const entry of pending) {
   // second copy of the site build inside npm's publish environment, failed, and took the tag with
   // it. The tags for 0.1.1 were lost to exactly that.
   const pushed = run("git", ["push", "--no-verify", "origin", tag]);
-  if (pushed.status !== 0) console.error(`Could not push ${tag}: ${pushed.stderr.trim()}`);
+  if (pushed.status !== 0) {
+    console.error(`Could not push ${tag}: ${pushed.stderr.trim()}`);
+    process.exit(pushed.status);
+  }
 }
 
 console.log(`Published ${String(pending.length)} package${pending.length === 1 ? "" : "s"}.`);

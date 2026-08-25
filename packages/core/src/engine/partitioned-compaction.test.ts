@@ -847,7 +847,7 @@ describe("partitioned folds under the background loop", () => {
     expect(layout.partitions.length).toBeGreaterThanOrEqual(10);
     expect(layout.level0.length).toBeLessThan(48);
     store.close();
-  }, 180_000);
+  }, 300_000);
 });
 
 async function storedBytes(

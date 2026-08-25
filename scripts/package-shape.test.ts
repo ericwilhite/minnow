@@ -1,9 +1,21 @@
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repoRoot = join(import.meta.dirname, "..");
-const publicPackages = ["core", "devtools", "export", "kysely", "react"] as const;
+const packagesRoot = join(repoRoot, "packages");
+const publicPackages = readdirSync(packagesRoot, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name)
+  .filter((name) => existsSync(join(packagesRoot, name, "package.json")))
+  .filter((name) => {
+    const manifest = JSON.parse(readFileSync(join(packagesRoot, name, "package.json"), "utf8")) as {
+      private?: boolean;
+    };
+    return manifest.private !== true;
+  })
+  .sort();
 
 async function filesUnder(directory: string, prefix = ""): Promise<string[]> {
   const files: string[] = [];
@@ -69,6 +81,7 @@ describe("published package shape", () => {
     ) as { files?: string[] };
     expect(manifest.files).toContain("!dist/storage/fixture-shape.*");
     expect(manifest.files).toContain("!dist/engine/storage-test-helpers.*");
+    expect(manifest.files).toContain("!dist/testing/seeds.*");
   });
 
   it("boots browser tests through published package subpaths", async () => {

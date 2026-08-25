@@ -5,9 +5,10 @@
  * than what is measured here.
  *
  * Each query's minnow/engine time ratio must stay at or below the checked-in threshold in
- * packages/core/perf-baseline.json. Thresholds pin the current ratios with headroom, so the
- * gate catches regressions rather than machine differences; a missing baseline bootstraps one
- * from the current run. Run with --update to rewrite thresholds after intentional changes.
+ * packages/core/perf-baseline.json. Thresholds pin the current ratios with headroom, separately
+ * for each OS/architecture/Node-major profile, so the gate catches regressions rather than host
+ * differences. Run with --update to add or rewrite the current runtime's thresholds after an
+ * intentional change.
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -20,6 +21,15 @@ import {
 } from "../packages/core/src/engine/database.js";
 import { MinnowDialect } from "../packages/kysely/src/dialect.js";
 import { Kysely } from "kysely";
+import {
+  PERFORMANCE_ENGINES,
+  parsePerformanceBaseline,
+  runtimePerformanceProfile,
+  selectPerformanceThresholds,
+  updatedPerformanceBaseline,
+  type PerformanceEngine,
+  type PerformanceThresholds,
+} from "./lib/performance-baseline.mts";
 
 async function allVisibleSegments(
   database: MinnowDatabase,
@@ -40,6 +50,13 @@ async function allVisibleSegments(
 
 const BASELINE_PATH = new URL("../packages/core/perf-baseline.json", import.meta.url);
 const ROWS = 200_000;
+const update = process.argv.includes("--update");
+const profile = runtimePerformanceProfile();
+const baselineFile = existsSync(BASELINE_PATH)
+  ? parsePerformanceBaseline(JSON.parse(readFileSync(BASELINE_PATH, "utf8")), ROWS)
+  : undefined;
+// Reject an unknown runtime before spending minutes building and loading the benchmark corpus.
+selectPerformanceThresholds(baselineFile, profile, [], update);
 // Give V8 enough executions to tier allocation-heavy grouped/DISTINCT kernels before sampling.
 // Two left that shape bimodal between fresh processes (about 17ms or 27ms) even though its
 // steady-state cost was unchanged, turning the release gate into a coin flip.
@@ -855,18 +872,18 @@ function pgliteRunner(query: PerfQuery): () => Promise<unknown> {
   return () => pglite.query(sql, params);
 }
 
-type EngineName = "sqlite" | "pglite";
-const ENGINES: readonly EngineName[] = ["sqlite", "pglite"];
+type EngineName = PerformanceEngine;
+const ENGINES: readonly EngineName[] = PERFORMANCE_ENGINES;
 
-interface Baseline {
-  rows: number;
-  thresholds: Record<string, Partial<Record<EngineName, number>>>;
-}
-
-const update = process.argv.includes("--update");
-const baseline: Baseline | undefined = existsSync(BASELINE_PATH)
-  ? (JSON.parse(readFileSync(BASELINE_PATH, "utf8")) as Baseline)
-  : undefined;
+const workloadNames = [
+  "bulk-ingest",
+  ...QUERIES.map(({ name }) => name),
+  ...MUTATIONS.map(({ name }) => name),
+  "settle-after-updates",
+  ...SETTLED_QUERIES.map(({ name }) => name),
+  "bulk-delete",
+];
+const baseline = selectPerformanceThresholds(baselineFile, profile, workloadNames, update);
 
 interface Result {
   name: string;
@@ -1019,7 +1036,7 @@ const versus = (minnowMs: number, engineMs: number): string => {
   return ratio <= 1 ? `${(1 / ratio).toFixed(1)}x faster` : `${ratio.toFixed(1)}x slower`;
 };
 const failures: string[] = [];
-const newThresholds: Baseline["thresholds"] = {};
+const newThresholds: PerformanceThresholds = {};
 for (const result of results) {
   const minnowMs = result.minnow.median;
   const line: string[] = [result.name.padEnd(20), minnowMs.toFixed(2).padStart(11)];
@@ -1036,7 +1053,7 @@ for (const result of results) {
     newThresholds[result.name][engine] = Number(
       thresholdFor(result.minnow, result.engine[engine]).toPrecision(3),
     );
-    const threshold = baseline?.thresholds[result.name]?.[engine];
+    const threshold = update ? undefined : baseline?.[result.name]?.[engine];
     const flag = threshold !== undefined && ratio > threshold ? "!" : " ";
     line.push(
       `${engineMs.toFixed(2).padStart(10)} ${versus(minnowMs, engineMs).padStart(11)}${flag}`,
@@ -1051,16 +1068,16 @@ for (const result of results) {
   console.log(line.join(""));
 }
 
-if (baseline === undefined || update) {
+if (update) {
   writeFileSync(
     BASELINE_PATH,
-    `${JSON.stringify({ rows: ROWS, thresholds: newThresholds }, null, 2)}\n`,
+    `${JSON.stringify(
+      updatedPerformanceBaseline(baselineFile, ROWS, profile, newThresholds),
+      null,
+      2,
+    )}\n`,
   );
-  console.log(
-    baseline === undefined
-      ? "\nBaseline bootstrapped — commit packages/core/perf-baseline.json."
-      : "\nBaseline updated.",
-  );
+  console.log(`\nBaseline profile ${profile} updated.`);
 }
 if (failures.length > 0) {
   console.error(`\n${String(failures.length)} performance regression(s):`);

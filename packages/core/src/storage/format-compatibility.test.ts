@@ -2,19 +2,34 @@
  * Golden compatibility tests for the v1 storage contract. There was no pre-v1 persisted-data
  * contract, so the corpus intentionally starts with block format 2 and framed snapshot format 1.
  * From this lock onward, every shipped format stays readable and keeps answering the same fixed
- * queries. A new writer format must add a fixture before changing these bytes.
+ * queries. A new writer format must add a fixture before changing the Minnow-owned framing or
+ * logical payload.
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { BLOCK_FORMAT_VERSION, inspectBlock } from "../block-format/index.js";
+import {
+  BLOCK_FORMAT_VERSION,
+  crc32,
+  decodePhysicalBlock,
+  inspectBlock,
+} from "../block-format/index.js";
 import { MinnowDatabase } from "../engine/database.js";
 import { MemoryBlockStore } from "./memory.js";
 import {
   decodeSnapshotFrameStream,
+  encodeSnapshotFrameStreamFooter,
+  encodeSnapshotFrameStreamHeader,
+  extendSnapshotFrameStreamChecksum,
   readSnapshotSummary,
   SNAPSHOT_FORMAT_VERSION,
+  snapshotFrameEnvelopeParts,
 } from "./snapshot.js";
+import {
+  SNAPSHOT_FRAME_KINDS,
+  type SnapshotFrame,
+  type SnapshotFrameStreamHeader,
+} from "./types.js";
 import {
   buildFixtureDatabase,
   createFormatFixtureArtifact,
@@ -83,6 +98,101 @@ async function fixtureBlockPayloads(bytes: Uint8Array): Promise<Uint8Array[]> {
   return payloads;
 }
 
+/**
+ * Native CompressionStream implementations are free to emit different valid deflate streams.
+ * Strip only those native bytes and their derived sizes/checksums; every Minnow-owned envelope
+ * field, frame, ordering decision, and uncompressed physical payload remains byte-comparable.
+ */
+async function canonicalBlockPayload(bytes: Uint8Array): Promise<Uint8Array> {
+  const physical = await decodePhysicalBlock(bytes);
+  const description = physical.description;
+  if (description.compression === "raw") return bytes;
+
+  // Preserve the complete block envelope and metadata. Replace only the native gzip stream with
+  // the verified logical payload, then canonicalize the stored length/checksum fields derived
+  // from that stream. The retained codec ID means changing gzip/raw policy still changes this
+  // artifact even though the comparison payload is deliberately not itself a decodable block.
+  const payloadOffset = description.headerLength + description.metadataLength;
+  const canonical = new Uint8Array(payloadOffset + physical.column.bytes.byteLength);
+  canonical.set(bytes.subarray(0, payloadOffset));
+  canonical.set(physical.column.bytes, payloadOffset);
+  const view = new DataView(canonical.buffer);
+  view.setUint32(32, physical.column.bytes.byteLength, true);
+  view.setUint32(40, description.checksum, true);
+  view.setUint32(4, crc32(canonical.subarray(8, payloadOffset)), true);
+  return canonical;
+}
+
+function concatenate(chunks: readonly Uint8Array[]): Uint8Array {
+  const byteLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+async function canonicalWriterArtifact(bytes: Uint8Array): Promise<Uint8Array> {
+  let header: SnapshotFrameStreamHeader | undefined;
+  const frames: SnapshotFrame[] = [];
+  for await (const entry of decodeSnapshotFrameStream(
+    (async function* (): AsyncGenerator<Uint8Array> {
+      yield bytes;
+    })(),
+  )) {
+    if (entry.type === "header") {
+      header = entry.header;
+      continue;
+    }
+    if (entry.type === "footer") continue;
+    const { frame } = entry;
+    const payload =
+      frame.kind === "block" ? await canonicalBlockPayload(frame.payload) : frame.payload;
+    frames.push({
+      ...frame,
+      payload,
+      checksum: crc32(payload),
+    });
+  }
+  if (header === undefined) throw new Error("Snapshot header is missing");
+
+  const kinds = Object.fromEntries(
+    SNAPSHOT_FRAME_KINDS.map((kind) => [
+      kind,
+      {
+        frameCount: header.kinds[kind].frameCount,
+        itemCount: header.kinds[kind].itemCount,
+        storedBytes: frames
+          .filter((frame) => frame.kind === kind)
+          .reduce((total, frame) => total + frame.payload.byteLength, 0),
+      },
+    ]),
+  ) as SnapshotFrameStreamHeader["kinds"];
+  const canonicalHeader: SnapshotFrameStreamHeader = { ...header, kinds };
+  const chunks: Uint8Array[] = [encodeSnapshotFrameStreamHeader(canonicalHeader)];
+  let checksum = 0;
+  let itemCount = 0;
+  let storedBytes = 0;
+  for (const frame of frames) {
+    const parts = snapshotFrameEnvelopeParts(frame);
+    chunks.push(...parts);
+    checksum = extendSnapshotFrameStreamChecksum(checksum, parts);
+    itemCount += frame.itemCount;
+    storedBytes += frame.payload.byteLength;
+  }
+  chunks.push(
+    encodeSnapshotFrameStreamFooter({
+      frameCount: frames.length,
+      itemCount,
+      storedBytes,
+      checksum,
+    }),
+  );
+  return concatenate(chunks);
+}
+
 describe("v1 format compatibility", () => {
   it("has a fixture for the format versions this build writes", () => {
     // The ratchet. A format change with no fixture behind it means the previous format is no
@@ -112,7 +222,7 @@ describe("v1 format compatibility", () => {
     }
   });
 
-  it("keeps the current v1 writer byte-for-byte identical to its frozen fixture", async () => {
+  it("keeps the current v1 writer canonical across native gzip encoders", async () => {
     const frozen = fixtures.find(
       ({ manifest }) =>
         manifest.blockFormatVersion === BLOCK_FORMAT_VERSION &&
@@ -120,7 +230,9 @@ describe("v1 format compatibility", () => {
     );
     if (frozen === undefined) throw new Error("Current format fixture is missing");
     const generated = await createFormatFixtureArtifact();
-    expect(generated.bytes).toEqual(frozen.bytes);
+    expect(await canonicalWriterArtifact(generated.bytes)).toEqual(
+      await canonicalWriterArtifact(frozen.bytes),
+    );
     expect(normalize(generated.expectations)).toEqual(normalize(frozen.manifest.expectations));
   });
 

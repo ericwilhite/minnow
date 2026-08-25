@@ -302,6 +302,9 @@ describe("byte-bounded ordinary write blocks", () => {
 
     await database.insert("dated", { at: shadowed, label: "first" });
     expect(await database.readTable("dated")).toEqual([{ at: new Date(1234), label: "first" }]);
+    expect(
+      (await database.query("SELECT label FROM dated WHERE at = ?", { params: [shadowed] })).rows,
+    ).toEqual([{ label: "first" }]);
     await expect(
       database.insert("dated", { at: new Date(1234), label: "duplicate" }),
     ).rejects.toThrow(/Duplicate value/);
@@ -320,10 +323,32 @@ describe("byte-bounded ordinary write blocks", () => {
       const database = new MinnowDatabase(store, { compression: "raw", autoCompact: false });
       await database.execute("CREATE TABLE prototype_dated (at TIMESTAMP PRIMARY KEY, label TEXT)");
       await database.insert("prototype_dated", { at: new Date(1234), label: "first" });
+      await database.insert("prototype_dated", { at: new Date(5678), label: "second" });
 
       expect(await database.readTable("prototype_dated")).toEqual([
         { at: new Date(1234), label: "first" },
+        { at: new Date(5678), label: "second" },
       ]);
+      expect(
+        (
+          await database.query("SELECT label FROM prototype_dated WHERE at = ?", {
+            params: [new Date(1234)],
+          })
+        ).rows,
+      ).toEqual([{ label: "first" }]);
+      expect(
+        (
+          await database.query("SELECT label FROM prototype_dated WHERE at IN (?, ?)", {
+            params: [new Date(1234), new Date(5678)],
+          })
+        ).rows,
+      ).toEqual([{ label: "first" }, { label: "second" }]);
+      expect(
+        (await database.query("SELECT DISTINCT at FROM prototype_dated ORDER BY at")).rows,
+      ).toEqual([{ at: new Date(1234) }, { at: new Date(5678) }]);
+      expect(
+        (await database.query("SELECT at FROM prototype_dated ORDER BY at DESC LIMIT 1")).rows,
+      ).toEqual([{ at: new Date(5678) }]);
       await expect(
         database.insert("prototype_dated", { at: new Date(1234), label: "duplicate" }),
       ).rejects.toThrow(/Duplicate value/);

@@ -100,7 +100,10 @@ const fixture = {
   },
 };
 const target = fileURLToPath(
-  new URL("../packages/core/format-fixtures/opfs-layout5.json", import.meta.url),
+  new URL(
+    `../packages/core/format-fixtures/opfs-layout${String(LOG_FORMAT_VERSION)}.json`,
+    import.meta.url,
+  ),
 );
 await writeFile(target, `${JSON.stringify(fixture, null, 2)}\n`);
 console.log(`Wrote ${target}`);

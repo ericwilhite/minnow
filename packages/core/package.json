@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A columnar SQL database for the browser: PostgreSQL-style SQL over durable IndexedDB or OPFS data, with no server or WebAssembly module.",
   "license": "MIT",
   "author": "Eric Wilhite",
@@ -124,6 +124,7 @@
     "!dist/**/*.map",
     "!dist/storage/fixture-shape.*",
     "!dist/engine/storage-test-helpers.*",
+    "!dist/testing/seeds.*",
     "!dist/*.tsbuildinfo",
     "sql-feature-matrix.json",
     "postgres-feature-profile.json"

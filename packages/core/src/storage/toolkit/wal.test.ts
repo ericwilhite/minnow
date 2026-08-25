@@ -165,8 +165,11 @@ describe("WAL frames", () => {
     const intactLength = writer.byteLength;
     writer.append({ seq: 2, op: "b" }, false);
     const fullLength = writer.byteLength;
+    const fullWal = shim.readFileBytes("wal");
+    if (fullWal === undefined) throw new Error("Expected complete WAL bytes");
 
     for (let cut = intactLength; cut < fullLength; cut += 1) {
+      writeFully(handle, fullWal, 0, "restoring WAL before torn-tail test");
       handle.truncate(cut);
       const { payloads, endOffset } = replayWalFrames(handle);
       expect(payloads).toEqual([{ seq: 1, op: "a" }]);
@@ -186,6 +189,45 @@ describe("WAL frames", () => {
     writer.append({ seq: 2 }, false);
     expect(replayWalFrames(handle).payloads).toEqual([{ seq: 2 }]);
     handle.close();
+  });
+
+  it("resumes from zero after a reset flush is refused", async () => {
+    const shim = new MemoryOpfs();
+    const handle = await walHandle(shim);
+    const writer = new WalWriter(handle, 0);
+    writer.append({ seq: 1 }, false);
+    shim.setWriteFault((path, phase) => {
+      if (path === "wal" && phase === "flush") {
+        throw new DOMException("The flush was refused", "QuotaExceededError");
+      }
+    });
+    expect(() => writer.reset()).toThrow(expect.objectContaining({ name: "QuotaExceededError" }));
+    expect(writer.byteLength).toBe(0);
+
+    shim.setWriteFault(null);
+    writer.append({ seq: 2 }, true);
+    expect(replayWalFrames(handle).payloads).toEqual([{ seq: 2 }]);
+    handle.close();
+  });
+
+  it("rejects complete WAL corruption instead of silently rolling state back", async () => {
+    for (const corruption of ["marker", "checksum"] as const) {
+      const shim = new MemoryOpfs();
+      const handle = await walHandle(shim);
+      new WalWriter(handle, 0).append({ seq: 1, op: "durable" }, true);
+      handle.close();
+      const bytes = shim.readFileBytes("wal");
+      if (bytes === undefined) throw new Error("Expected WAL bytes");
+      const offset = corruption === "marker" ? 0 : bytes.byteLength - 1;
+      bytes[offset] = (bytes[offset] ?? 0) ^ 0xff;
+      shim.writeFileBytes("wal", bytes);
+
+      const reopened = await walHandle(shim);
+      expect(() => replayWalFrames(reopened)).toThrow(
+        corruption === "marker" ? /marker mismatch/ : /checksum mismatch/,
+      );
+      reopened.close();
+    }
   });
 
   it("rejects an oversized frame from a sparse WAL before allocating its payload", () => {

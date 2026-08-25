@@ -168,7 +168,7 @@ describe("RecordCore hardening", () => {
       {
         transactionId: "ordinal-owner",
         expectedRevision: 0,
-        blocks: segments.map((segment, index) => ({
+        blocks: segments.map((_, index) => ({
           id: `ordinal-block-${String(index)}`,
           bytes: new Uint8Array(0),
         })),

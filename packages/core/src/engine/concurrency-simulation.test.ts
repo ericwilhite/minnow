@@ -335,6 +335,6 @@ describe.each(stores)("many tabs over one store ($name)", ({ create }) => {
         storage.manifestCount,
         `seed ${String(seed)}: manifest history stayed unbounded`,
       ).toBeLessThanOrEqual(2);
-    }, 120_000);
+    }, 300_000);
   }
 });

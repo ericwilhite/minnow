@@ -764,7 +764,9 @@ export function validateTableRecordBounds(record: TableRecord): void {
       entries += value.length;
       for (const item of value) stack.push(item);
     } else if (value instanceof Date) {
-      if (!Number.isFinite(value.getTime())) throw new TypeError("A table record date is invalid");
+      if (!Number.isFinite(dateMilliseconds(value))) {
+        throw new TypeError("A table record date is invalid");
+      }
     } else if (value !== null && typeof value === "object") {
       if (seen.has(value)) throw new TypeError("A table record cannot contain cycles or aliases");
       seen.add(value);
@@ -6371,7 +6373,7 @@ function validTimestamp(value: unknown, label: string): string {
     throw new TypeError(`${label} must be canonical UTC ISO-8601`);
   }
   const milliseconds = Date.parse(timestamp);
-  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== timestamp) {
+  if (!Number.isFinite(milliseconds) || dateIsoString(new Date(milliseconds)) !== timestamp) {
     throw new TypeError(`${label} must be canonical UTC ISO-8601`);
   }
   return timestamp;

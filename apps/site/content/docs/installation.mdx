@@ -31,9 +31,9 @@ npm install @minnowdb/react @minnowdb/export
 | `@minnowdb/react`  | React external-store hook for live-query snapshots.                       |
 | `@minnowdb/export` | Streaming CSV and NDJSON over direct or worker query cursors.             |
 
-Every `@minnowdb` package in one application must use the same major version. npm selects a
-compatible engine version from each package's dependency range. See
-[Versioning](/docs/reference/versioning).
+Keep every `@minnowdb` package in one application on the same major version. Engine-dependent
+adapters declare the compatible core range for npm; the React hook is structurally typed and has
+no core runtime dependency. See [Versioning](/docs/reference/versioning).
 
 ## Open a database
 

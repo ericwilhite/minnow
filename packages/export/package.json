@@ -35,6 +35,6 @@
     "!dist/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@minnowdb/core": ">=0.3.0 <1.0.0"
+    "@minnowdb/core": ">=0.4.0 <1.0.0"
   }
 }

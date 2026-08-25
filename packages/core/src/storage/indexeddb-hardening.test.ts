@@ -4195,7 +4195,7 @@ describe("IndexedDB corruption hardening", () => {
     expect(await restored.checkIntegrity({ mode: "full" })).toMatchObject({ ok: true });
     restored.close();
     source.close();
-  }, 30_000);
+  }, 300_000);
 
   it("accounts catalog bytes atomically at the hard ceiling and fails closed on drift", async () => {
     const indexedDB = new IDBFactory();

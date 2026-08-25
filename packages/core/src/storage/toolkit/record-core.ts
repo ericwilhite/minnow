@@ -150,6 +150,7 @@ import {
   SchemaConflictError,
   WriteConflictError,
 } from "../types.js";
+import { dateIsoString } from "../../date-value.js";
 import {
   assertWellFormedString,
   crc32,
@@ -7976,7 +7977,7 @@ export function validateLeaseExpiration(expiresAt: string): void {
 
 function isCanonicalTimestamp(value: string): boolean {
   const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+  return Number.isFinite(timestamp) && dateIsoString(new Date(timestamp)) === value;
 }
 
 function validateCanonicalTimestamp(value: unknown, label: string): number {

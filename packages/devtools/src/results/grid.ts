@@ -1,4 +1,5 @@
 import type { QueryRow, QueryValue } from "@minnowdb/core";
+import { dateIsoString } from "../date-value.js";
 import { el, iconButton, icons } from "../dom.js";
 
 export interface GridColumn {
@@ -62,7 +63,7 @@ const loadThresholdRows = 20;
 function formatValue(value: QueryValue): { text: string; className: string } {
   if (value === null) return { text: "NULL", className: "cell null" };
   if (typeof value === "number") return { text: String(value), className: "cell number" };
-  if (value instanceof Date) return { text: value.toISOString(), className: "cell" };
+  if (value instanceof Date) return { text: dateIsoString(value), className: "cell" };
   if (typeof value === "boolean") return { text: String(value), className: "cell boolean" };
   return { text: value, className: "cell" };
 }

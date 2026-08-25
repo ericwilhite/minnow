@@ -1,4 +1,5 @@
 import type { QueryValue } from "@minnowdb/core";
+import { dateIsoString, dateMilliseconds } from "./date-value.js";
 import type { ColumnType } from "./sql/literal.js";
 
 export type ParseResult = { ok: true; value: QueryValue } | { ok: false; message: string };
@@ -33,7 +34,7 @@ export function parseInput(text: string, type: ColumnType, nullable: boolean): P
     }
     case "datetime": {
       const value = new Date(trimmed);
-      return Number.isFinite(value.getTime())
+      return Number.isFinite(dateMilliseconds(value))
         ? { ok: true, value }
         : { ok: false, message: `Not a date: ${trimmed}` };
     }
@@ -45,14 +46,14 @@ export function parseInput(text: string, type: ColumnType, nullable: boolean): P
 /** The text an editor starts with for an existing value; the inverse of `parseInput`. */
 export function formatForInput(value: QueryValue): string {
   if (value === null) return "";
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) return dateIsoString(value);
   return String(value);
 }
 
 /** How a value reads inside a confirmation, where NULL has to be distinguishable from "NULL". */
 export function describeValue(value: QueryValue): string {
   if (value === null) return "NULL";
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) return dateIsoString(value);
   if (typeof value === "string") return `'${value}'`;
   return String(value);
 }

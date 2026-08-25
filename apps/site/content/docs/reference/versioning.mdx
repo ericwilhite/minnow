@@ -3,9 +3,11 @@ title: Versioning
 description: One major across every package, what a version change means, and how a release is cut.
 ---
 
-Every Minnow package shares a major version and moves independently inside it. The major is the
-compatibility line: any `@minnowdb/kysely@0.x` works with any `@minnowdb/core@0.x`, whichever
-minors the two happen to be on. The same rule covers the React, export, and devtools packages.
+Every Minnow package shares a major version and moves independently inside it. Each adapter names
+the oldest engine it can use and accepts later engines inside that shared major. For example, the
+current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.4.0 up to, but not including,
+1.0.0. The same rule covers the export and devtools packages; the React hook is structurally typed
+and has no engine runtime dependency.
 
 ```bash
 npm install @minnowdb/core @minnowdb/kysely
@@ -16,7 +18,7 @@ APIs from working is a major change, so each package depends on its siblings by 
 the major and stops at it:
 
 ```json
-"dependencies": { "@minnowdb/core": ">=0.1.0 <1.0.0" }
+"dependencies": { "@minnowdb/core": ">=0.4.0 <1.0.0" }
 ```
 
 The ceiling is the compatibility line, and npm refuses a mixed-major install on its own. The floor
@@ -28,7 +30,8 @@ it. Below the major, a fix to the console does not drag the engine's version alo
 
 Minnow is in 0.x, and the usual 0.x rule applies: **breaking changes can land in a minor
 release.** Pin exact versions in an application, and read the release notes before moving from
-`0.1` to `0.2`.
+`0.1` to `0.2`. The smaller API used between Minnow's own packages remains compatible inside the
+shared major; that is what lets an older adapter accept a newer engine.
 
 A change is breaking when it is one of these:
 
@@ -53,9 +56,11 @@ the stored payload. Permanent raw vectors freeze every Minnow-owned byte for all
 types. A future writer uses a new format number and retains the format-2 reader rather than
 changing those bytes in place.
 
-Snapshot format 1 is locked with block format 2 embedded inside it. Its raw fixture freezes the
-file framing, canonical header, checksums, and payload order. An incompatible snapshot writer must
-use a new snapshot format number and keep the format-1 reader.
+Snapshot format 1 is locked with block format 2 embedded inside it. Its fixture freezes the file
+framing, canonical header, payload order, and logical block bytes. Native `CompressionStream`
+implementations may produce different valid gzip streams, so compressed payload sizes and their
+derived stored-byte checksums are compared after decompression. An incompatible snapshot writer
+must use a new snapshot format number and keep the format-1 reader.
 
 IndexedDB schema 1 is its first locked native layout; no pre-contract schema readers or recreation
 policy ship. Every future integer schema version must add one ordered migration to the explicit
@@ -91,7 +96,8 @@ change that would make either kind unreadable fails in CI rather than in an appl
 
 ## How a release is cut
 
-One command writes the versions, the dependency ranges between them, and the lockfile:
+One command writes the release version, its current sibling dependency floors, the private site
+manifest, and the lockfile:
 
 ```bash
 npm run version:set -- minor @minnowdb/core   # one package, inside the shared major
@@ -101,13 +107,14 @@ npm run version:set -- major                  # every package to the next major,
 Then commit and push. That is the whole release:
 
 ```bash
-npm run check:release   # optional locally; CI runs the same gate
-git commit -am "Release core 0.3.0" && git push
+npm run check:release   # fullest local gate; CI splits release checks across workflows
+# Stage the reviewed changes, then:
+git commit -m "Release core 0.4.0" && git push
 ```
 
 Publishing is driven by the versions in the manifests, not by a tag or a command. When that
 commit's CI run goes green, `.github/workflows/release.yml` publishes every package whose version
-npm does not already have and tags each one `@minnowdb/core@0.3.0`. A push that changes no version
+npm does not already have and tags each one `@minnowdb/core@0.4.0`. A push that changes no version
 publishes nothing, and a rerun after a failure is safe, because the registry decides what has
 already shipped.
 
@@ -146,7 +153,7 @@ the home page and the benchmarks are not archived — they always run the curren
 An archive is the same site built from the tag with a base path:
 
 ```bash
-git worktree add ../minnow-v0.1 v0.1.0
+git worktree add ../minnow-v0.1 '@minnowdb/core@0.1.0'
 cd ../minnow-v0.1 && npm ci
 SITE_BASE_PATH=/v0.1 npm run site:build
 ```
