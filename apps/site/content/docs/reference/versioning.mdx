@@ -133,13 +133,15 @@ code, and `files` has to exclude them.
 
 ## Where each version's documentation lives
 
-The documentation describes the engine, so it is versioned with `@minnowdb/core`: `v0.1` while
-Minnow is in 0.x, where a minor can break things, and `v1`, `v2` from 1.0 onwards.
+The documentation describes the engine, so it is listed by compatibility line: `0.x`, `1.x`,
+`2.x`, and so on. The unprefixed site always documents the current line. A minor release inside
+0.x can still break a pre-1.0 API, but there is no separate archive for every experimental minor.
+The final 0.x documentation is frozen only when 1.x replaces it.
 
-| URL                        | What it serves                                                |
-| -------------------------- | ------------------------------------------------------------- |
-| `minnowdb.com/docs/…`      | The current release. A link written here never goes stale.    |
-| `minnowdb.com/v0.1/docs/…` | 0.1.x, frozen at its tag, for as long as it is worth keeping. |
+| URL                      | What it serves                                                |
+| ------------------------ | ------------------------------------------------------------- |
+| `minnowdb.com/docs/…`    | The current major line. A link written here follows releases. |
+| `minnowdb.com/v0/docs/…` | The final 0.x documentation, frozen when 1.x is published.    |
 
 The picker at the top of the docs sidebar moves between them and keeps you on the same page. It
 reads [`/versions.json`](/versions.json) from the site's root rather than the copy compiled into
@@ -147,18 +149,20 @@ the build, so an archived version still lists releases that did not exist when i
 
 Everything under an archived prefix is versioned with it: its search index, its
 [markdown and llms.txt](/docs/reference/agents), and every link between its pages. Archived pages
-also carry `noindex`, so a search engine offers the current documentation first. The console on
-the home page and the benchmarks are not archived — they always run the current release.
+also carry `noindex`, so a search engine offers the current documentation first. The unprefixed
+console and benchmarks always run the current release.
 
-An archive is the same site built from the tag with a base path:
+An archive is the same site built from the final tag in that major line with a base path:
 
 ```bash
-git worktree add ../minnow-v0.1 '@minnowdb/core@0.1.0'
-cd ../minnow-v0.1 && npm ci
-SITE_BASE_PATH=/v0.1 npm run site:build
+previous_core_tag=$(git tag --list '@minnowdb/core@*' --sort=-version:refname | head -n 1)
+git worktree add ../minnow-v0 "$previous_core_tag"
+cd ../minnow-v0 && npm ci
+SITE_BASE_PATH=/v0 npm run site:build
 ```
 
-`apps/site/out/` is then deployed at that prefix, and the version is added to the `archived` list
-in `apps/site/public/versions.json` on `main`. On Vercel that means a project of its own, with the
-main site rewriting `/v0.1/:path*` to it — a static export has no server to route with, so the
-prefix has to come from the platform.
+Before building the new major, copy that frozen `apps/site/out/` into
+`apps/site/public/v0/` on `main` and add the exact final version to the `archived` list in
+`apps/site/public/versions.json`. The next static export carries the archive with it, so the one
+Vercel project serves both `/docs/…` and `/v0/docs/…`. Repeat once per major line; do not add an
+entry until its files are present in the same deployment.

@@ -5,9 +5,9 @@ import versionsJson from "@/public/versions.json";
  *
  * The current release is served unprefixed: minnowdb.com/docs/... is always the docs for the
  * version on npm today, so a link written anywhere keeps pointing at documentation that matches
- * the package a reader is about to install. Older releases are the same site built from their tag
- * with `SITE_BASE_PATH` set, published under that prefix — minnowdb.com/v0.1/docs/... — which
- * makes every path inside them versioned, including their own llms.txt and search index.
+ * the package a reader is about to install. At a major boundary, the previous line is built from
+ * its final tag with `SITE_BASE_PATH` set and committed under the next site's public directory —
+ * minnowdb.com/v0/docs/... — so one Vercel project serves current and frozen documentation.
  *
  * public/versions.json is the list of what exists, and it is served at /versions.json — the site
  * root, not this build's base path — so that an archived build, frozen at a tag that predates
@@ -15,11 +15,11 @@ import versionsJson from "@/public/versions.json";
  * The copy compiled into the build is the fallback for when that fetch fails.
  */
 export interface DocsVersion {
-  /** What the picker shows, e.g. `v0.1`. */
+  /** What the picker shows, e.g. `0.x`. */
   label: string;
   /** The full version this documentation was built from, e.g. `0.1.0`. */
   version: string;
-  /** Where it is published, with both slashes: `/` for the current release, `/v0.1/` otherwise. */
+  /** Where it is published, with both slashes: `/` for current, `/v0/` for an archived major. */
   path: string;
 }
 
@@ -50,8 +50,8 @@ export const versionsUrl = "/versions.json";
 /** The version this build documents. */
 export const buildVersion: DocsVersion = isArchived
   ? (buildTimeVersions.archived.find((entry) => entry.path === `${basePath}/`) ?? {
-      label: basePath.replace("/", ""),
-      version: basePath.replace("/v", ""),
+      label: `${basePath.replace("/v", "")}.x`,
+      version: buildTimeVersions.current.version,
       path: `${basePath}/`,
     })
   : buildTimeVersions.current;

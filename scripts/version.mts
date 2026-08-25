@@ -75,16 +75,17 @@ function dependencyRange(siblingVersion: string, major: number): string {
   return `>=${siblingVersion} <${String(major + 1)}.0.0`;
 }
 
-/**
- * Which documentation a release belongs to. In 0.x a minor can break things, so each minor gets
- * its own documentation; from 1.0 the major is the line that matters.
- */
+/** Which major compatibility line a documentation build belongs to. */
 function docsLabel(version: string): string {
   const parsed = parseVersion(version);
   if (parsed === undefined) return version;
-  return parsed.major === 0
-    ? `v${String(parsed.major)}.${String(parsed.minor)}`
-    : `v${String(parsed.major)}`;
+  return `${String(parsed.major)}.x`;
+}
+
+/** Where a frozen major line is served after the next major replaces it at the site root. */
+function docsArchivePath(version: string): string {
+  const parsed = parseVersion(version);
+  return parsed === undefined ? `/${version}/` : `/v${String(parsed.major)}/`;
 }
 
 function readManifest(file: string): Manifest {
@@ -197,11 +198,51 @@ function check(): number {
   // The site publishes this file, and the picker in the docs sidebar reads it. A version left
   // behind here is a reader told they are on a release that no longer exists.
   const engineVersion = versions.get(ENGINE);
-  const documented = readDocsVersions().current;
+  const docsVersions = readDocsVersions();
+  const documented = docsVersions.current;
   if (engineVersion !== undefined && documented.version !== engineVersion) {
     problems.push(
       `apps/site/public/versions.json: the current docs claim ${documented.version}, and ${ENGINE} is on ${engineVersion}`,
     );
+  }
+  if (engineVersion !== undefined && documented.label !== docsLabel(engineVersion)) {
+    problems.push(
+      `apps/site/public/versions.json: the current docs label is "${documented.label}", and major ${String(major)} must be listed as "${docsLabel(engineVersion)}"`,
+    );
+  }
+  if (documented.path !== "/") {
+    problems.push(
+      `apps/site/public/versions.json: the current docs must be served at "/", not "${documented.path}"`,
+    );
+  }
+
+  const documentedMajors = new Set<number>();
+  if (engineVersion !== undefined)
+    documentedMajors.add(parseVersion(engineVersion)?.major ?? major);
+  for (const archived of docsVersions.archived) {
+    const archivedVersion = parseVersion(archived.version);
+    if (archivedVersion === undefined) {
+      problems.push(
+        `apps/site/public/versions.json: archived docs version "${archived.version}" is not semantic`,
+      );
+      continue;
+    }
+    if (documentedMajors.has(archivedVersion.major)) {
+      problems.push(
+        `apps/site/public/versions.json: major ${String(archivedVersion.major)} is listed more than once`,
+      );
+    }
+    documentedMajors.add(archivedVersion.major);
+    if (archived.label !== docsLabel(archived.version)) {
+      problems.push(
+        `apps/site/public/versions.json: ${archived.version} must be labeled "${docsLabel(archived.version)}"`,
+      );
+    }
+    if (archived.path !== docsArchivePath(archived.version)) {
+      problems.push(
+        `apps/site/public/versions.json: ${archived.version} must be served at "${docsArchivePath(archived.version)}"`,
+      );
+    }
   }
 
   if (problems.length > 0) {
@@ -367,10 +408,12 @@ function set(argument: string, packageName: string | undefined): number {
     if (next !== undefined) console.log(`${entry.manifest.name ?? ""} -> ${next}`);
   }
   if (docsLabel(engineVersion) !== previous.label) {
+    const archivePath = docsArchivePath(previous.version).replace(/\/$/, "");
     console.log(
       `The docs at / now document ${docsLabel(engineVersion)}. To keep ${previous.label} readable, ` +
-        `build it from its tag with SITE_BASE_PATH=/${previous.label}, deploy it there, and add ` +
-        "it to the `archived` list in apps/site/public/versions.json.",
+        `build @minnowdb/core@${previous.version} with SITE_BASE_PATH=${archivePath}, copy its ` +
+        `static output into apps/site/public${archivePath}, and add it to the \`archived\` list ` +
+        "in apps/site/public/versions.json before publishing the new major.",
     );
   }
   console.log(

@@ -43,7 +43,7 @@ const developmentHeaders = [
 
 /**
  * Where this build is published. Empty for the current release, which is always served at the
- * root, and `/v0.1` for an archived one built from that release's tag — every path it emits,
+ * root, and `/v0` for an archived major line built from its final release tag — every path it emits,
  * including its search index and its llms.txt, is then versioned with it.
  */
 const basePath = process.env.SITE_BASE_PATH ?? "";

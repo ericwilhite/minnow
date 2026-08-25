@@ -18,7 +18,7 @@ import {
  * The list starts as the one compiled into this build and is replaced by the site root's
  * /versions.json when that is reachable, so an archived build offers releases that did not exist
  * when it was frozen. Switching versions is a full navigation rather than a client route change:
- * every other version is a different deployment.
+ * archived major lines are frozen static builds under their own prefix.
  */
 export function VersionPicker() {
   const pathname = usePathname();
