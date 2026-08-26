@@ -5753,7 +5753,7 @@ function validateSnapshotFrameExportState(
   requireStorageId(value.sessionId, "snapshot frame export session id");
   requireStorageId(value.ownerId, "snapshot frame export owner id");
   requireStorageId(value.ledgerId, "snapshot frame export ledger id");
-  validateSnapshotLifetime(
+  validateSnapshotStateLifetime(
     value.createdAt as string,
     value.expiresAt as string,
     "Snapshot frame export",
@@ -5837,7 +5837,7 @@ function validateSnapshotFrameImportState(
   requireStorageId(value.identity, "snapshot frame import identity");
   requireStorageId(value.ownerId, "snapshot frame import owner id");
   requireStorageId(value.ledgerId, "snapshot frame import ledger id");
-  validateSnapshotLifetime(
+  validateSnapshotStateLifetime(
     value.createdAt as string,
     value.expiresAt as string,
     "Snapshot frame import",
@@ -5907,6 +5907,19 @@ function validateSnapshotLifetime(createdAt: string, expiresAt: string, label: s
   requireTimestamp(expiresAt, `${label} expiration`);
   const lifetime = Date.parse(expiresAt) - Date.parse(createdAt);
   if (lifetime <= 0 || lifetime > MAX_SNAPSHOT_SESSION_TTL_MS) {
+    throw new RangeError(`${label} expiration interval is invalid`);
+  }
+}
+
+/**
+ * A durable state keeps the session's original creation time while a valid renewal moves its
+ * expiry forward. The renewal WAL input carries the bounded cutoff-to-expiry interval, so state
+ * validation must not mistake a session older than one TTL for one lease longer than the TTL.
+ */
+function validateSnapshotStateLifetime(createdAt: string, expiresAt: string, label: string): void {
+  requireTimestamp(createdAt, `${label} creation time`);
+  requireTimestamp(expiresAt, `${label} expiration`);
+  if (Date.parse(expiresAt) <= Date.parse(createdAt)) {
     throw new RangeError(`${label} expiration interval is invalid`);
   }
 }

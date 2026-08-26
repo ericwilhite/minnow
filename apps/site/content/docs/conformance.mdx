@@ -29,7 +29,8 @@ SQL results are one part of database correctness. Separate suites cover:
 - concurrent writes, crashes, compaction, and garbage collection;
 - stored block and snapshot compatibility;
 - storage faults and quota failures;
-- IndexedDB, OPFS, workers, and published packages in Chromium, Firefox, and WebKit;
+- IndexedDB, OPFS, workers, and package entry points in Chromium, Firefox, and WebKit;
+- every packed library installed in an isolated TypeScript/Vite consumer and run in Chromium;
 - memory and storage convergence;
 - seeded performance regression checks.
 
@@ -46,6 +47,7 @@ npm run test:simulator:full
 npm run benchmark:gate
 npm run soak:memory
 npm run test:browser
+npm run test:consumer
 npm run check:release
 ```
 

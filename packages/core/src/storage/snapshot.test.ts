@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import { MAX_STORED_BLOCK_BYTE_LENGTH } from "../block-format/index.js";
 import { MinnowDatabase } from "../engine/database.js";
 import { UniqueConstraintError } from "../engine/errors.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MemoryBlockStore } from "./memory.js";
+import { OpfsBlockStore } from "./opfs/index.js";
 import {
   decodeSnapshotFrameStream,
   MAX_SNAPSHOT_STREAM_CHUNK_BYTES,
@@ -98,13 +100,13 @@ describe("MinnowDatabase framed snapshots", () => {
     expect(summary.payloadBytes).toBeGreaterThan(0);
   });
 
-  it("stages many small frames in bounded adapter batches", async () => {
+  it("stages frames in batches accepted by every adapter", async () => {
     const { database: source } = await seededDatabase();
     const bytes = await source.exportSnapshot();
     const store = new SnapshotBatchMemoryStore();
     await new MinnowDatabase(store).importSnapshot(bytes);
-    expect(store.batches.some((batch) => batch.blocks > 1)).toBe(true);
-    expect(Math.max(...store.batches.map((batch) => batch.blocks))).toBeLessThanOrEqual(64);
+    expect(store.batches.some((batch) => batch.blocks === 1)).toBe(true);
+    expect(Math.max(...store.batches.map((batch) => batch.blocks))).toBe(1);
     expect(Math.max(...store.batches.map((batch) => batch.metadataBytes))).toBeLessThanOrEqual(
       16 * 1024 * 1024,
     );
@@ -174,6 +176,25 @@ describe("MinnowDatabase framed snapshots", () => {
     const indexed = new MinnowDatabase(indexedStore);
     await indexed.importSnapshot(bytes);
     expect((await indexed.query(REPORT)).rows).toEqual(before.rows);
+  });
+
+  it("restores a multi-block snapshot into OPFS across renewed batches", async () => {
+    const { database: source } = await seededDatabase();
+    const bytes = await source.exportSnapshot();
+    const expected = (await source.query(REPORT)).rows;
+    const store = await OpfsBlockStore.open({
+      name: "snapshot-high-level-import",
+      root: new MemoryOpfs().root,
+    });
+    let now = Date.parse("2026-08-25T00:00:00.000Z");
+    const restored = new MinnowDatabase(store, {
+      // Every batch extends the lease by one millisecond. Durable state retains the original
+      // creation time, so this catches validators that confuse total age with renewal length.
+      now: () => new Date(now++),
+    });
+    await restored.importSnapshot(bytes);
+    expect((await restored.query(REPORT)).rows).toEqual(expected);
+    await restored.close();
   });
 
   it("preserves UNIQUE membership and writes correctly after restore", async () => {

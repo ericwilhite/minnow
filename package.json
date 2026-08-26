@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -26,6 +26,7 @@
     "test:browser": "npm run test:browser:library && npm run test:browser:site",
     "test:browser:library": "tsc -b packages/core --force && playwright test --config playwright.library.config.ts",
     "test:browser:site": "tsc -b packages/core --force && playwright test --config playwright.site.config.ts",
+    "test:consumer": "npm run clean && tsc -b --force && vite-node scripts/consumer-smoke.mts",
     "test:sql:logic": "vite-node scripts/sql-logic-test.mts",
     "test:sql:fetch": "vite-node scripts/fetch-sqllogictest.mts",
     "test:sql:prepare-standard": "vite-node scripts/prepare-sqllogictest-standard.mts",
@@ -38,7 +39,7 @@
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "check": "npm run version:check && npm run format && npm run typecheck && npm run lint && npm run build && npm run test:coverage && npm run test:sql:standard",
-    "check:release": "npm run check && npm run test:sql:full && npm run test:simulator:full && npm run benchmark:gate && npm run test:browser",
+    "check:release": "npm run check && npm run test:sql:full && npm run test:simulator:full && npm run benchmark:gate && npm run test:browser && npm run test:consumer",
     "version:check": "vite-node scripts/version.mts check",
     "version:set": "vite-node scripts/version.mts set",
     "release:publish": "vite-node scripts/publish-packages.mts",

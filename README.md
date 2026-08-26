@@ -73,6 +73,7 @@ npm test               # unit tests and the standard SQLLogicTest profile
 npm run check          # format, types, lint, build, coverage, and SQL tests
 npm run test:sql:full  # full supported SQLLogicTest profile
 npm run test:browser   # library and site tests in real browsers
+npm run test:consumer  # install packed libraries in a clean Vite app and run it
 npm run site:dev       # docs, live console, and browser benchmarks
 ```
 

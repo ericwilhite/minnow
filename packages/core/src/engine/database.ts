@@ -11283,6 +11283,7 @@ export class MinnowDatabase {
     let writtenBytes = 0;
     let batchBytes = 0;
     let metadataBatchBytes = 0;
+    let batchBlockCount = 0;
     const batch: SnapshotFrame[] = [];
     const flush = async (): Promise<void> => {
       if (batch.length === 0 || identity === undefined) return;
@@ -11297,6 +11298,7 @@ export class MinnowDatabase {
       });
       batchBytes = 0;
       metadataBatchBytes = 0;
+      batchBlockCount = 0;
       writtenBytes = session.stagedBytes;
       options.onProgress?.({ phase: "blocks", writtenBytes, totalBytes });
     };
@@ -11331,6 +11333,7 @@ export class MinnowDatabase {
             batch.length > 0 &&
             (batch.length >= MAX_SNAPSHOT_FRAME_BATCH_ITEMS ||
               batchBytes + entry.frame.payload.byteLength > MAX_SNAPSHOT_FRAME_BATCH_BYTES ||
+              (entry.frame.kind === "block" && batchBlockCount > 0) ||
               (entry.frame.kind !== "block" &&
                 metadataBatchBytes + entry.frame.payload.byteLength >
                   MAX_SNAPSHOT_METADATA_BATCH_BYTES))
@@ -11347,6 +11350,8 @@ export class MinnowDatabase {
               [metadataBatchBytes, entry.frame.payload.byteLength],
               "Snapshot import metadata batch bytes",
             );
+          } else {
+            batchBlockCount += 1;
           }
           continue;
         }

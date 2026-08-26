@@ -28,6 +28,7 @@ after generated declarations or asynchronous signatures change.
 | `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit    | Storage or browser-runtime changes |
 | `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                           | Docs, examples, and site changes   |
 | `npm run test:browser`         | Both browser runners, in sequence                                               | Cross-browser regression checks    |
+| `npm run test:consumer`        | Packed libraries installed, typed, bundled, and run outside the workspace       | Package and public-entry changes   |
 | `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                  | Query-executor performance changes |
 | `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages   | Dependency or public-entry changes |
 | `npm run check`                | Format, types, lint, build, coverage, and fast SQLLogicTest                     | The local merge gate               |
@@ -62,8 +63,15 @@ application it starts.
   `packages/**`, so the dataset generator, the oracles, and the suite definitions are checked on
   every unit run.
 - **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
-  cannot prove, and drive a database through a real module worker: the published entry booting,
+  cannot prove, and drive a database through a real module worker: the package entry booting,
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.
+- **The packed-consumer test** builds every public package, installs the resulting tarballs in an
+  OS-temporary Vite application outside the npm workspace, and resolves every exported entry with
+  that application's TypeScript configuration. Chromium then runs the emitted worker against
+  IndexedDB, migrates and queries through Kysely, observes a live update, streams exports, mounts
+  the React and devtools adapters, exports a snapshot, restores it into OPFS, and reopens it. The
+  Minnow archives and direct tool and peer versions are pinned to the build; npm resolves their
+  ordinary transitive dependencies into a private temporary cache as it would for a new project.
 - **Site browser tests** execute the public examples and drive the benchmarks page itself: one
   case runs a suite end to end in each browser and asserts it verified against the oracles,
   another asserts the `/benchmarks` route is cross-origin isolated. Documentation cannot drift
