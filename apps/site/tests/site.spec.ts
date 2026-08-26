@@ -360,6 +360,27 @@ benchmarkTest(
   async ({ page }) => {
     await page.goto("/benchmarks/");
 
+    // The first run compares the two durable Minnow stores with SQLite, without the result-memo
+    // variants or secondary indexes changing what the storage engines themselves cost.
+    await expect(page.getByRole("checkbox", { name: /^Minnow281 KB/ })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: /Minnow \(OPFS\)/ })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: /SQLite/ })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: /Minnow \(cached\)/ })).not.toBeChecked();
+    await expect(page.getByRole("checkbox", { name: /PGlite/ })).not.toBeChecked();
+    await expect(page.getByRole("button", { name: "Primary keys only" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect(page.getByRole("button", { name: "+ 81 FK indexes" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    const scaleButtons = page.getByRole("group", { name: "Dataset" }).getByRole("button", {
+      name: /^\d+×$/,
+    });
+    await expect(scaleButtons).toHaveText(["1×", "2×", "5×", "10×"]);
+    await expect(page.getByRole("button", { name: "5×" })).toHaveAttribute("aria-pressed", "true");
+
     // Some WebKit builds (notably Playwright's Linux port) expose no OPFS inside dedicated
     // workers, persistent context or not; this run asserts the OPFS column's success, so probe
     // from a real worker and skip honestly where the API does not exist.
@@ -386,15 +407,10 @@ benchmarkTest(
     // WebAssembly builds. Reads alone, so the assertions below name one section's tables rather
     // than matching the write suite's too.
     await page.getByRole("checkbox", { name: /SQLite/ }).uncheck();
-    await page.getByRole("checkbox", { name: /Minnow \(OPFS\)/ }).check();
+    await page.getByRole("checkbox", { name: /Minnow \(cached\)/ }).check();
     await page.getByRole("checkbox", { name: /Minnow \(OPFS, cached\)/ }).check();
     await page.getByRole("checkbox", { name: /Writes/ }).uncheck();
-    await page.getByRole("button", { name: "0.1×" }).click();
-    await expect(page.getByRole("button", { name: "Primary keys only" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "+ 81 FK indexes" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    await page.getByRole("button", { name: "1×" }).click();
     await page.getByRole("button", { name: "Run", exact: true }).click();
 
     const failure = page.locator(".text-red-500");

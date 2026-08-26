@@ -1,7 +1,12 @@
-import { createElement } from "react";
+import { createElement, Suspense } from "react";
 import { renderToString } from "react-dom/server";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
-import { useLiveQuery, type LiveExternalStore } from "./index.js";
+import {
+  useLiveQuery,
+  useSuspenseLiveQuery,
+  type LiveExternalStore,
+  type RefreshableLiveExternalStore,
+} from "./index.js";
 
 describe("useLiveQuery", () => {
   it("uses the stable server snapshot without starting a subscription", () => {
@@ -45,5 +50,31 @@ describe("useLiveQuery", () => {
     }
 
     expect(renderToString(createElement(Result))).toContain("A-1");
+  });
+
+  it("suspends a cold query and starts one cached refresh", () => {
+    type Snapshot =
+      | { readonly status: "loading"; readonly rows: readonly [] }
+      | { readonly status: "ready"; readonly rows: readonly [{ readonly id: 1 }] };
+    const refresh = vi.fn(() => new Promise<void>(() => undefined));
+    const store: RefreshableLiveExternalStore<Snapshot> = {
+      getSnapshot: () => ({ status: "loading", rows: [] }),
+      subscribe: () => () => undefined,
+      refresh,
+    };
+    function Result(): ReturnType<typeof createElement> {
+      const snapshot = useSuspenseLiveQuery(store);
+      expectTypeOf(snapshot.status).toEqualTypeOf<"ready">();
+      return createElement("span", null, snapshot.status);
+    }
+    const rendered = renderToString(
+      createElement(
+        Suspense,
+        { fallback: createElement("span", null, "cold") },
+        createElement(Result),
+      ),
+    );
+    expect(rendered).toContain("cold");
+    expect(refresh).toHaveBeenCalledOnce();
   });
 });

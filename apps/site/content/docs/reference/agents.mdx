@@ -63,7 +63,9 @@ machines: https://minnowdb.com/llms.txt
 - All `@minnowdb/*` packages share a major version and move independently inside it. Install them
   on the same major. Engine-dependent adapters declare ranges that make npm reject an incompatible
   core; the structurally typed React hook has no core runtime dependency.
-- `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
+- `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns, columnDomains }`.
+  `columnDomains` is positionally aligned with `columns`; use it to generically parse declared or
+  aliased JSON/JSONB text. It throws on a
   statement that writes, rather than writing.
 - `db.queryCursor(sql, { params, batchRows, signal })` pulls bounded result pages. Single-table,
   unordered scans stream directly; blocking sorts, groups, joins, and derived sources page the
@@ -86,9 +88,13 @@ machines: https://minnowdb.com/llms.txt
   cannot be updated.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers. `NUMERIC` and
   `DECIMAL` are exact and return decimal strings; use `DOUBLE PRECISION` only when approximation
-  is intended. JSON/JSONB, UUID, arrays, `TIME`, intervals, and enum values also return strings at
-  the JavaScript boundary.
+  is intended. JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enum values also return
+  strings at the JavaScript boundary. `DATE` is canonical `YYYY-MM-DD` calendar text, not a
+  JavaScript `Date`.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
+- Use `db.upsertBatch(table, rows, { conflictWhere: { column, operator, value } })` when an
+  existing target row must satisfy a guard before replacement. Inserts still land; inspect
+  `skippedRowCount` for rejected conflicts.
 - On teardown, `await db.close()` before `store.close()` for a direct engine. For a worker,
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
   This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
@@ -125,7 +131,7 @@ machines: https://minnowdb.com/llms.txt
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form, and
   https://minnowdb.com/postgres-feature-profile.json before assuming PostgreSQL behavior. They
   list the tracked supported and rejected forms plus deliberate differences and extensions.
-- Supported PostgreSQL forms include exact NUMERIC/DECIMAL, JSON/JSONB, UUID, arrays, TIME,
+- Supported PostgreSQL forms include exact NUMERIC/DECIMAL, JSON/JSONB, UUID, arrays, DATE, TIME,
   intervals, enums, sequences, multiple/composite keys, savepoints, filtered upserts, correlated
   NOT IN, equality-correlated LATERAL, STRING_AGG, SIMILAR TO, COLLATE, and constant JSON_TABLE.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,

@@ -53,6 +53,7 @@ const functionSchema = schema([
     amount: column.number(),
     exact_amount: column.numeric({ precision: 12, scale: 2 }),
     happened_at: column.datetime(),
+    calendar_day: column.date(),
     label: column.string().nullable(),
     payload: column.string(),
   }),
@@ -123,6 +124,8 @@ function inferredMinnowFunctions(db: Kysely<FunctionDatabase>): void {
         ])
         .as("rounded"),
       builder.fn("date_trunc", [builder.val("month"), "happened_at"]).as("month"),
+      builder.fn("date_trunc", [builder.val("month"), "calendar_day"]).as("calendar_month"),
+      builder.fn("current_date").as("today"),
       builder.fn("upper", ["label"]).as("upper_label"),
       builder.fn("json_value", ["payload", builder.val("$.name")]).as("json_name"),
       builder.fn("coalesce", ["label", builder.val("unknown")]).as("coalesced_label"),
@@ -146,6 +149,8 @@ function inferredMinnowFunctions(db: Kysely<FunctionDatabase>): void {
       exact_average: string | null;
       rounded: number;
       month: Date;
+      calendar_month: Date;
+      today: string;
       upper_label: string | null;
       json_name: string | null;
       coalesced_label: string;
@@ -156,7 +161,7 @@ function inferredMinnowFunctions(db: Kysely<FunctionDatabase>): void {
       aggregate_sum: string | null;
       text_amount: string;
       numeric_amount: string;
-      date_amount: Date;
+      date_amount: string;
       nullable_text: string | null;
     }>
   >();
@@ -306,6 +311,7 @@ describe("schema-derived Kysely types", () => {
           amount: 2,
           exact_amount: 1.25,
           happened_at: january,
+          calendar_day: "2026-01-19",
           label: "minnow",
           payload: '{"name":"Minnow"}',
         },
@@ -313,6 +319,7 @@ describe("schema-derived Kysely types", () => {
           amount: 4,
           exact_amount: 2.75,
           happened_at: new Date("2026-02-01T00:00:00.000Z"),
+          calendar_day: "2026-02-01",
           label: null,
           payload: "{}",
         },
@@ -381,6 +388,7 @@ describe("schema-derived Kysely types", () => {
       .selectFrom("events")
       .select((builder) => [
         builder.fn("date_trunc", [builder.val("month"), "happened_at"]).as("month"),
+        builder.fn("date_trunc", [builder.val("month"), "calendar_day"]).as("calendar_month"),
         builder.fn("upper", ["label"]).as("upper_label"),
         builder.fn("json_value", ["payload", builder.val("$.name")]).as("json_name"),
         builder.fn("coalesce", ["label", builder.val("unknown")]).as("coalesced_label"),
@@ -389,11 +397,13 @@ describe("schema-derived Kysely types", () => {
         builder.fn("least", ["label", builder.val("zzzz")]).as("least_label"),
         builder.cast("amount", "text").as("text_amount"),
         builder.cast("amount", "numeric").as("numeric_amount"),
+        builder.cast("happened_at", "date").as("date_amount"),
       ])
       .where("amount", "=", 2);
     expectTypeOf<Awaited<ReturnType<typeof scalar.execute>>>().toEqualTypeOf<
       Array<{
         month: Date;
+        calendar_month: Date;
         upper_label: string | null;
         json_name: string | null;
         coalesced_label: string;
@@ -402,10 +412,12 @@ describe("schema-derived Kysely types", () => {
         least_label: string;
         text_amount: string;
         numeric_amount: string;
+        date_amount: string;
       }>
     >();
     expect(await scalar.executeTakeFirstOrThrow()).toEqual({
       month: new Date("2026-01-01T00:00:00.000Z"),
+      calendar_month: new Date("2026-01-01T00:00:00.000Z"),
       upper_label: "MINNOW",
       json_name: "Minnow",
       coalesced_label: "minnow",
@@ -414,6 +426,7 @@ describe("schema-derived Kysely types", () => {
       least_label: "minnow",
       text_amount: "2",
       numeric_amount: "2",
+      date_amount: "2026-01-19",
     });
 
     await db.destroy();

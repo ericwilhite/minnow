@@ -1,5 +1,7 @@
 import { dateMilliseconds } from "../date-value.js";
+import type { SqlDomain } from "../storage/types.js";
 import type { QueryResult, QueryRow, QueryValue } from "./query.js";
+import { unknownColumnDomains } from "./query.js";
 
 /**
  * The shape a query result takes on the worker channel. A result is rows of objects at the
@@ -34,6 +36,7 @@ export type WireResultColumn =
 export interface WireQueryResult {
   readonly kind: "columnar-result";
   readonly columns: string[];
+  readonly columnDomains: Array<SqlDomain | null>;
   readonly rowCount: number;
   readonly values: WireResultColumn[];
 }
@@ -45,7 +48,7 @@ export interface EncodedQueryResult {
 }
 
 export function encodeQueryResult(result: QueryResult): EncodedQueryResult {
-  return encodeRows(result.columns, result.rows);
+  return encodeRows(result.columns, result.rows, result.columnDomains);
 }
 
 /**
@@ -54,7 +57,8 @@ export function encodeQueryResult(result: QueryResult): EncodedQueryResult {
  */
 export function encodeQueryRows(rows: readonly QueryRow[]): EncodedQueryResult {
   const first = rows[0];
-  return encodeRows(first === undefined ? [] : Object.keys(first), rows);
+  const columns = first === undefined ? [] : Object.keys(first);
+  return encodeRows(columns, rows, unknownColumnDomains(columns));
 }
 
 export function decodeQueryResult(payload: unknown): QueryResult {
@@ -62,6 +66,10 @@ export function decodeQueryResult(payload: unknown): QueryResult {
     throw new TypeError("Expected a columnar query result frame");
   }
   const columns = [...payload.columns];
+  if (payload.values.length !== columns.length || payload.columnDomains.length !== columns.length) {
+    throw new TypeError("Columnar result frame metadata is not aligned");
+  }
+  const columnDomains = structuredClone(payload.columnDomains);
   const rows: QueryRow[] = [];
   for (let index = 0; index < payload.rowCount; index += 1) rows.push({});
   // Column by column: each fill loop stores one property name into every row, which the engine
@@ -71,7 +79,7 @@ export function decodeQueryResult(payload: unknown): QueryResult {
     if (column === undefined) throw new TypeError("Columnar result frame is missing a column");
     fillColumn(rows, name, column);
   }
-  return { columns, rows };
+  return { columns, columnDomains, rows };
 }
 
 export function isWireQueryResult(value: unknown): value is WireQueryResult {
@@ -80,12 +88,20 @@ export function isWireQueryResult(value: unknown): value is WireQueryResult {
     value !== null &&
     (value as { kind?: unknown }).kind === "columnar-result" &&
     Array.isArray((value as { columns?: unknown }).columns) &&
+    Array.isArray((value as { columnDomains?: unknown }).columnDomains) &&
     Array.isArray((value as { values?: unknown }).values) &&
     typeof (value as { rowCount?: unknown }).rowCount === "number"
   );
 }
 
-function encodeRows(columns: readonly string[], rows: readonly QueryRow[]): EncodedQueryResult {
+function encodeRows(
+  columns: readonly string[],
+  rows: readonly QueryRow[],
+  columnDomains: ReadonlyArray<SqlDomain | null>,
+): EncodedQueryResult {
+  if (columnDomains.length !== columns.length) {
+    throw new TypeError("Query result column domains must align with the result columns");
+  }
   const transfer: ArrayBuffer[] = [];
   const values = columns.map((name) => {
     const column = encodeColumn(name, rows);
@@ -99,7 +115,13 @@ function encodeRows(columns: readonly string[], rows: readonly QueryRow[]): Enco
     return column;
   });
   return {
-    payload: { kind: "columnar-result", columns: [...columns], rowCount: rows.length, values },
+    payload: {
+      kind: "columnar-result",
+      columns: [...columns],
+      columnDomains: structuredClone([...columnDomains]),
+      rowCount: rows.length,
+      values,
+    },
     transfer,
   };
 }

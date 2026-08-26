@@ -46,6 +46,44 @@ server rendering. Observation starts with the first subscriber and stops after t
 duplicate subscriptions are independent leases. Keep the live manager and query stable across
 renders so a render does not create a new database subscription.
 
+## Suspense and stale-while-revalidate
+
+For a Suspense boundary, use the dedicated hook:
+
+```tsx
+import { Suspense } from "react";
+import { useSuspenseLiveQuery } from "@minnowdb/react";
+
+function OpenOrders() {
+  const snapshot = useSuspenseLiveQuery(query);
+  if (snapshot.status === "error") return <p>Could not refresh this view.</p>;
+  return <OrderList rows={snapshot.rows} />;
+}
+
+function Page() {
+  return (
+    <Suspense fallback={<p>Loading…</p>}>
+      <OpenOrders />
+    </Suspense>
+  );
+}
+```
+
+It calls the store's `refresh()` once per cold load and throws that shared promise until the query
+settles. Its return type excludes the `loading` snapshot. The equivalent lower-level call is
+`useLiveQuery(query, { suspense: true })`; a store used this way must implement `refresh()`.
+
+When switching between stable query objects, keep the last settled snapshot on screen while the
+new one loads:
+
+```tsx
+const snapshot = useLiveQuery(query, { staleWhileRevalidate: true });
+```
+
+The stale value is local to that hook instance and disappears as soon as the new store publishes
+`ready` or `error`. The options compose, so `{ suspense: true, staleWhileRevalidate: true }` keeps
+settled UI during a switch but still suspends on the first-ever load.
+
 `useLiveQuery` is generic over the store snapshot, so keyed changes require no second hook:
 
 ```tsx

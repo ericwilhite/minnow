@@ -122,8 +122,8 @@ the start of it. The status bar always says which it is using.
 
 A cursor needs a total order it can address exactly, so the explorer counts from the start instead
 when the table has no unique key, when the sort column is nullable (no comparison matches NULL), or
-when it is a datetime (the engine's date literals carry no time of day). Both give the same rows;
-one just gets slower the further in you go.
+when it is a datetime (the explorer deliberately renders its filter and cursor values at day
+precision). Both give the same rows; one just gets slower the further in you go.
 
 **Counting.** `COUNT(*)` scans the whole table, so it runs alongside the first page rather than
 delaying it. While it runs, the status bar says how many rows are loaded.

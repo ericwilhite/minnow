@@ -90,7 +90,7 @@ function createRaceHost(): {
           block.started();
           await block.gate;
         }
-        return { columns: ["v"], rows: [{ v: snapshot }] };
+        return { columns: ["v"], columnDomains: [null], rows: [{ v: snapshot }] };
       },
     },
     commit: () => {
@@ -600,6 +600,7 @@ describe("live queries", () => {
         executions += 1;
         return Promise.resolve({
           columns: ["kind"],
+          columnDomains: [null],
           rows: [{ kind: query === dateQuery ? "date" : "text" }],
         });
       },
@@ -641,7 +642,11 @@ describe("live queries", () => {
         }),
       dependencyTableIds: () => Promise.resolve(new Set(["table"])),
       execute: () =>
-        Promise.resolve({ columns: ["v"], rows: [{ v: values[version - 1] ?? null }] }),
+        Promise.resolve({
+          columns: ["v"],
+          columnDomains: [null],
+          rows: [{ v: values[version - 1] ?? null }],
+        }),
     });
     const changes: QueryResult[] = [];
     await live.subscribe("collision", { onChange: (result) => changes.push(result) });
@@ -746,7 +751,7 @@ describe("live queries", () => {
       },
       execute: () => {
         executions += 1;
-        return Promise.resolve({ columns: ["id"], rows: [{ id: 1 }] });
+        return Promise.resolve({ columns: ["id"], columnDomains: [null], rows: [{ id: 1 }] });
       },
     });
     await expect(
@@ -771,7 +776,7 @@ describe("live queries", () => {
       },
       execute: () => {
         executions += 1;
-        return Promise.resolve({ columns: ["id"], rows: [{ id: 1 }] });
+        return Promise.resolve({ columns: ["id"], columnDomains: [null], rows: [{ id: 1 }] });
       },
     });
     await live.subscribe("SELECT id FROM stable", {

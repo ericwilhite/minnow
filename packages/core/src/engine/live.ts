@@ -160,6 +160,7 @@ function digestResult(result: QueryResult): number {
     mixByte(0xff);
   };
   for (const column of result.columns) mixString(column);
+  for (const domain of result.columnDomains) mixString(JSON.stringify(domain));
   for (const row of result.rows) {
     for (const column of result.columns) {
       const value = row[column] ?? null;
@@ -198,6 +199,9 @@ function sameResult(left: QueryResult, right: QueryResult): boolean {
   }
   for (let index = 0; index < left.columns.length; index += 1) {
     if (left.columns[index] !== right.columns[index]) return false;
+    if (JSON.stringify(left.columnDomains[index]) !== JSON.stringify(right.columnDomains[index])) {
+      return false;
+    }
   }
   for (let rowIndex = 0; rowIndex < left.rows.length; rowIndex += 1) {
     const leftRow = left.rows[rowIndex];
@@ -229,7 +233,11 @@ function cloneRow(row: QueryRow, columns: readonly string[]): QueryRow {
 
 function cloneResult(result: QueryResult): QueryResult {
   const columns = [...result.columns];
-  return { columns, rows: result.rows.map((row) => cloneRow(row, columns)) };
+  return {
+    columns,
+    columnDomains: structuredClone(result.columnDomains),
+    rows: result.rows.map((row) => cloneRow(row, columns)),
+  };
 }
 
 /** Type-tagged, length-delimited structural identity. Unlike JSON, it preserves Date vs string,

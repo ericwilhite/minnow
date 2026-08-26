@@ -15,6 +15,7 @@ const NUMERIC = `${PREFIX}numeric:`;
 const JSON_VALUE = `${PREFIX}json:`;
 const JSONB_VALUE = `${PREFIX}jsonb:`;
 const UUID_VALUE = `${PREFIX}uuid:`;
+const DATE_VALUE = `${PREFIX}date:`;
 const TIME_VALUE = `${PREFIX}time:`;
 const INTERVAL_VALUE = `${PREFIX}interval:`;
 const ARRAY_VALUE = `${PREFIX}array:`;
@@ -379,6 +380,42 @@ export function uuidDomainValue(value: unknown): string | null {
   return UUID_VALUE + source;
 }
 
+/** Canonical, zoneless SQL DATE value. No JavaScript time zone participates in validation. */
+export function dateDomainValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  let source: string;
+  if (value instanceof Date) {
+    if (!Number.isFinite(value.getTime())) throw new TypeError("DATE accepts a valid Date value");
+    source = dateIsoString(value).slice(0, 10);
+  } else if (typeof value === "string") {
+    assertBoundedDomainString(value, "DATE value");
+    source = value.startsWith(DATE_VALUE) ? value.slice(DATE_VALUE.length) : value;
+  } else {
+    throw new TypeError("DATE accepts a YYYY-MM-DD string value");
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(source);
+  const year = Number(match?.[1]);
+  const month = Number(match?.[2]);
+  const day = Number(match?.[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (
+    match === null ||
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > (days[month - 1] ?? 0)
+  ) {
+    throw new TypeError(`Invalid DATE value: ${String(value)}`);
+  }
+  return DATE_VALUE + source;
+}
+
+export function isDateDomainValue(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith(DATE_VALUE);
+}
+
 export function timeDomainValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError("TIME accepts a string value");
@@ -538,6 +575,7 @@ export function normalizeSqlDomainValue(domain: SqlDomain, value: unknown): stri
   if (domain.kind === "json") return jsonDomainValue(value, false);
   if (domain.kind === "jsonb") return jsonDomainValue(value, true);
   if (domain.kind === "uuid") return uuidDomainValue(value);
+  if (domain.kind === "date") return dateDomainValue(value);
   if (domain.kind === "time") return timeDomainValue(value);
   if (domain.kind === "interval") return intervalDomainValue(value);
   if (domain.kind === "enum") return enumDomainValue(value, domain.name, domain.values);
@@ -634,7 +672,7 @@ function collatorFor(locale: string, displayName: string): Intl.Collator {
 export function externalSqlDomainValue(value: unknown): unknown {
   if (typeof value !== "string") return value;
   if (value.startsWith(TEXT_VALUE)) return value.slice(TEXT_VALUE.length);
-  for (const prefix of [NUMERIC, JSON_VALUE, JSONB_VALUE, UUID_VALUE, TIME_VALUE]) {
+  for (const prefix of [NUMERIC, JSON_VALUE, JSONB_VALUE, UUID_VALUE, DATE_VALUE, TIME_VALUE]) {
     if (value.startsWith(prefix)) return value.slice(prefix.length);
   }
   if (value.startsWith(INTERVAL_VALUE)) {

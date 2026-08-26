@@ -18,6 +18,7 @@ describe("query result cache helpers", () => {
     const at = new Date(0);
     const result = {
       columns: ["__proto__", "at"],
+      columnDomains: [null, null],
       rows: [
         Object.fromEntries([
           ["__proto__", "kept"],
@@ -34,6 +35,7 @@ describe("query result cache helpers", () => {
     // A Date under the special name is replaced as an own property, not assigned through the setter.
     const dated = copyQueryResult({
       columns: ["__proto__"],
+      columnDomains: [null],
       rows: [Object.fromEntries([["__proto__", at]])],
     });
     expect(Object.hasOwn(dated.rows[0] ?? {}, "__proto__")).toBe(true);
@@ -45,6 +47,7 @@ describe("query result cache helpers", () => {
   it("copies rows independently of the cached originals", () => {
     const result = {
       columns: ["n", "s"],
+      columnDomains: [null, null],
       rows: [
         { n: 1, s: "a" },
         { n: 2, s: null },

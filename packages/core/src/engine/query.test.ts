@@ -93,6 +93,7 @@ describe("public SQL queries", () => {
       ),
     ).toEqual({
       columns: ["order_id", "doubled"],
+      columnDomains: [null, null],
       rows: [
         { order_id: 4, doubled: 60 },
         { order_id: 2, doubled: 40 },
@@ -104,6 +105,7 @@ describe("public SQL queries", () => {
       ),
     ).toEqual({
       columns: ["segment", "status", "order_count", "revenue"],
+      columnDomains: [null, null, null, null],
       rows: [
         { segment: "business", status: "pending", order_count: 1, revenue: 5 },
         { segment: "business", status: "paid", order_count: 2, revenue: 40.13 },
@@ -127,6 +129,7 @@ describe("public SQL queries", () => {
     const single = await database.query("SELECT DISTINCT * FROM pairs ORDER BY a, b");
     expect(single).toEqual({
       columns: ["a", "b"],
+      columnDomains: [null, null],
       rows: [
         { a: 1, b: "x" },
         { a: 1, b: "z" },
@@ -165,6 +168,7 @@ describe("public SQL queries", () => {
     );
     expect(joined).toEqual({
       columns: ["p.a", "p.b", "t.a", "t.tag"],
+      columnDomains: [null, null, null, null],
       rows: [{ "p.a": 1, "p.b": "x", "t.a": 1, "t.tag": "t" }],
     });
   });
@@ -237,7 +241,7 @@ describe("public SQL queries", () => {
       executionMemoryBudgetBytes: 49,
       spillToStorage: false,
     });
-    expect(exact).toEqual({ columns: ["count"], rows: [{ count: 0 }] });
+    expect(exact).toEqual({ columns: ["count"], columnDomains: [null], rows: [{ count: 0 }] });
   });
 
   it("implements left joins and SQL null comparison semantics", () => {
@@ -297,7 +301,11 @@ describe("public SQL queries", () => {
       ["empty", []],
     ]);
     const plan = compileQuery("SELECT value FROM t ORDER BY id");
-    const expected = { columns: ["value"], rows: values.map((value) => ({ value })) };
+    const expected = {
+      columns: ["value"],
+      columnDomains: [null],
+      rows: values.map((value) => ({ value })),
+    };
     expect(executeQuery(plan, input)).toEqual(expected);
     expect(executeRowQuery(plan, input)).toEqual(expected);
   });
@@ -428,6 +436,7 @@ describe("public SQL queries", () => {
     const plan = compileQuery("SELECT '--;/*' AS marker FROM events;");
     expect(executeQuery(plan, new Map([["events", [{ value: 1 }]]]))).toEqual({
       columns: ["marker"],
+      columnDomains: [null],
       rows: [{ marker: "--;/*" }],
     });
     // The same markers outside a literal are comments (E161, T351), and skipping one leaves the
@@ -447,8 +456,16 @@ describe("public SQL queries", () => {
   it("executes an already materialized prepared plan repeatedly", () => {
     const plan = compileQuery("SELECT COUNT(*) AS count FROM rows");
     const prepared = createPreparedQuery(plan, new Map([["rows", [{ value: 1 }, { value: 2 }]]]));
-    expect(prepared.execute()).toEqual({ columns: ["count"], rows: [{ count: 2 }] });
-    expect(prepared.execute()).toEqual({ columns: ["count"], rows: [{ count: 2 }] });
+    expect(prepared.execute()).toEqual({
+      columns: ["count"],
+      columnDomains: [null],
+      rows: [{ count: 2 }],
+    });
+    expect(prepared.execute()).toEqual({
+      columns: ["count"],
+      columnDomains: [null],
+      rows: [{ count: 2 }],
+    });
   });
 
   it("isolates every prepared result from caller mutations", () => {
@@ -474,6 +491,7 @@ describe("public SQL queries", () => {
 
     expect(prepared.execute()).toEqual({
       columns: ["id", "happened"],
+      columnDomains: [null, null],
       rows: [
         { id: 1, happened: new Date("2025-01-01T00:00:00.000Z") },
         { id: 2, happened: new Date("2025-01-02T00:00:00.000Z") },
@@ -949,6 +967,7 @@ describe("public SQL queries", () => {
       ),
     ).toEqual({
       columns: ["kind", "count", "total"],
+      columnDomains: [null, null, null],
       rows: [
         { kind: "business", count: 2, total: 60 },
         { kind: "personal", count: 1, total: 40 },
@@ -981,6 +1000,7 @@ describe("public SQL queries", () => {
       ),
     ).toEqual({
       columns: ["category", "count", "total"],
+      columnDomains: [null, null, null],
       rows: [
         { category: "a", count: 2, total: 40 },
         { category: "b", count: 2, total: 60 },
@@ -1040,6 +1060,7 @@ describe("public SQL queries", () => {
           "SELECT kind, active, COUNT(*) AS count, SUM(balance) AS total FROM accounts GROUP BY kind, active ORDER BY kind, active";
         const historical = {
           columns: ["kind", "active", "count", "total"],
+          columnDomains: [null, null, null, null],
           rows: [
             { kind: "business", active: false, count: 1, total: 20 },
             { kind: "personal", active: true, count: 1, total: 10 },
@@ -1048,6 +1069,7 @@ describe("public SQL queries", () => {
         };
         const current = {
           columns: ["kind", "active", "count", "total"],
+          columnDomains: [null, null, null, null],
           rows: [
             { kind: "business", active: true, count: 2, total: 55 },
             { kind: "personal", active: true, count: 1, total: 40 },
@@ -1069,6 +1091,7 @@ describe("public SQL queries", () => {
           await database.query("SELECT account_id, opened FROM accounts ORDER BY account_id"),
         ).toEqual({
           columns: ["account_id", "opened"],
+          columnDomains: [null, null],
           rows: [
             { account_id: "a", opened: new Date("2025-02-01T00:00:00.000Z") },
             { account_id: "b", opened: new Date("2025-01-02T00:00:00.000Z") },
@@ -1126,7 +1149,11 @@ describe("public SQL queries", () => {
     ]);
 
     const unicodeLike = compileQuery("SELECT '😀' LIKE '_' AS one, '😀' LIKE '__' AS two");
-    const unicodeResult = { columns: ["one", "two"], rows: [{ one: true, two: false }] };
+    const unicodeResult = {
+      columns: ["one", "two"],
+      columnDomains: [null, null],
+      rows: [{ one: true, two: false }],
+    };
     expect(executeRowQuery(unicodeLike, new Map())).toEqual(unicodeResult);
     expect(executeQuery(unicodeLike, new Map())).toEqual(unicodeResult);
   });
@@ -1341,7 +1368,7 @@ describe("scalar functions", () => {
     );
     expect(() =>
       executeRowQuery(compileQuery("SELECT DATE_TRUNC('day', amount) AS d FROM rows"), tables),
-    ).toThrow("DATE_TRUNC requires a datetime value");
+    ).toThrow("DATE_TRUNC requires a date or datetime value");
   });
 
   it("keeps SQL NULL semantics for literal IN lists on the hashed membership path", () => {
@@ -1536,6 +1563,7 @@ describe("window functions over shared and private rows", () => {
     const aliasOf = (index: number): string => inner.select[index]?.alias ?? "";
     const make = () => ({
       columns: inner.select.map((item) => item.alias),
+      columnDomains: inner.select.map(() => null),
       rows: [
         { [aliasOf(0)]: 1, [aliasOf(1)]: "west", [aliasOf(2)]: 5 },
         { [aliasOf(0)]: 2, [aliasOf(1)]: "west", [aliasOf(2)]: 7 },

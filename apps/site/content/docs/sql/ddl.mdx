@@ -163,7 +163,8 @@ add validation and semantics without widening hot scan vectors:
 | exact decimal      | `NUMERIC(p, s)`, `DECIMAL(p, s)`             | decimal `string`                  |
 | string             | `VARCHAR(n)`, `TEXT`, `CHAR(n)`              | `string`                          |
 | boolean            | `BOOLEAN`                                    | `boolean`                         |
-| datetime           | `TIMESTAMP`, `DATE`                          | `Date`                            |
+| calendar date      | `DATE`                                       | canonical `YYYY-MM-DD` `string`   |
+| datetime           | `TIMESTAMP`                                  | `Date`                            |
 | time of day        | `TIME`                                       | canonical `string`                |
 | JSON               | `JSON`, `JSONB`                              | JSON `string`                     |
 | UUID               | `UUID`                                       | lowercase `string`                |

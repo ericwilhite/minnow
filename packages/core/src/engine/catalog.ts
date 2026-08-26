@@ -45,6 +45,8 @@ export interface CatalogForeignKey {
   readonly parentTable: string;
   readonly parentColumns: readonly string[];
   readonly onDelete: "restrict" | "cascade" | "set null";
+  /** Whether writes and parent deletes enforce this relationship. */
+  readonly enforced: boolean;
 }
 
 export interface CatalogCheck {
@@ -161,7 +163,10 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
       ...(record.primaryKeyColumnIds === undefined
         ? {}
         : { primaryKeyColumnIds: [...record.primaryKeyColumnIds] }),
-      foreignKeys: (record.foreignKeys ?? []).map((key) => ({ ...key })),
+      foreignKeys: (record.foreignKeys ?? []).map((key) => ({
+        ...key,
+        enforced: key.enforced !== false,
+      })),
       checks: (record.checks ?? []).map((check) => ({ ...check })),
       ...(record.secondaryIndexes === undefined
         ? {}

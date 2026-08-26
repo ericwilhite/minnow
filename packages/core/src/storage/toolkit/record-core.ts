@@ -122,6 +122,7 @@ import {
   updateTransactionRecord,
   updateGarbageCollectionPlanningRecord,
   validateTableColumns,
+  validateTableForeignKey,
   validateSecondaryIndexes,
   secondaryIndexColumnIds,
   secondaryIndexWriteContractChanged,
@@ -1737,22 +1738,7 @@ export class RecordCore {
           `FOREIGN KEY ${key.name} references a missing table: ${key.parentTable}`,
         );
       }
-      const addressIds = parent.primaryKeyColumnIds?.length
-        ? parent.primaryKeyColumnIds
-        : parent.uniqueKeyColumnId === undefined
-          ? []
-          : [parent.uniqueKeyColumnId];
-      const addressNames = addressIds.map(
-        (id) => parent.columns.find((column) => column.id === id)?.name ?? "",
-      );
-      if (
-        addressNames.length !== key.parentColumns.length ||
-        addressNames.some((name, index) => name !== key.parentColumns[index])
-      ) {
-        throw new TypeError(
-          `FOREIGN KEY ${key.name} must reference the parent primary or unique key`,
-        );
-      }
+      validateTableForeignKey(record, key, parent);
     }
   }
 
@@ -1796,6 +1782,7 @@ export class RecordCore {
       secondaryIndexes: previousSecondary,
       triggers: previousTriggers,
       view: previousView,
+      foreignKeys: previousForeignKeys,
       ...base
     } = record;
     let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
@@ -1837,6 +1824,7 @@ export class RecordCore {
     }
     const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
     const nextView = update.view === undefined ? previousView : update.view;
+    const nextForeignKeys = update.foreignKeys ?? previousForeignKeys;
     validateTableView(nextView ?? undefined);
     const updated: TableRecord = {
       ...base,
@@ -1850,10 +1838,12 @@ export class RecordCore {
       ...(nextTriggers === null || nextTriggers === undefined
         ? {}
         : { triggers: structuredClone(nextTriggers) }),
+      ...(nextForeignKeys === undefined ? {} : { foreignKeys: structuredClone(nextForeignKeys) }),
       ...(nextView === null || nextView === undefined ? {} : { view: structuredClone(nextView) }),
       revision: safeWholeIncrement(expectedRevision, "Table revision"),
     };
     validateSecondaryIndexes(updated);
+    this.#assertTableForeignKeys(updated);
     this.#assertTableTriggerOwnership(updated);
     let autoIncrementCounter: { key: string; next: bigint } | undefined;
     if (update.autoIncrementSeed !== undefined) {
@@ -6949,22 +6939,7 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
           `FOREIGN KEY ${key.name} references a missing table: ${key.parentTable}`,
         );
       }
-      const addressIds = parent.primaryKeyColumnIds?.length
-        ? parent.primaryKeyColumnIds
-        : parent.uniqueKeyColumnId === undefined
-          ? []
-          : [parent.uniqueKeyColumnId];
-      const addressNames = addressIds.map(
-        (id) => parent.columns.find((column) => column.id === id)?.name ?? "",
-      );
-      if (
-        addressNames.length !== key.parentColumns.length ||
-        addressNames.some((name, index) => name !== key.parentColumns[index])
-      ) {
-        throw new TypeError(
-          `FOREIGN KEY ${key.name} must reference the parent primary or unique key`,
-        );
-      }
+      validateTableForeignKey(table, key, parent);
     }
   }
   const terminalTransactionCount = state.transactions.filter(

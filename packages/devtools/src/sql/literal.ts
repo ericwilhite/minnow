@@ -5,9 +5,9 @@ import { dateIsoString, dateMilliseconds } from "../date-value.js";
 export type ColumnType = "boolean" | "number" | "string" | "datetime";
 
 /**
- * The engine has no bound parameters, so every filter value the explorer sends is text inside the
- * statement. This module is the only place that turns a value into that text; nothing else in the
- * package concatenates a value into SQL. Keeping it in one tested function is what stops an
+ * Explorer targets accept complete query text, so every filter value the explorer sends is text
+ * inside the statement. This module is the only place that turns a value into that text; nothing
+ * else in the package concatenates a value into SQL. Keeping it in one tested function stops an
  * apostrophe in a name from turning into a syntax error — or into a different query.
  */
 export function sqlLiteral(value: QueryValue, type: ColumnType): string {
@@ -35,9 +35,9 @@ function quoteString(value: string): string {
 }
 
 /**
- * `DATE '2026-08-12'` is the only datetime literal the engine parses — it appends midnight UTC
- * itself and rejects anything carrying a time. Comparisons against a datetime column are therefore
- * day-granular, which callers must account for rather than discover.
+ * The explorer deliberately renders datetime filters as `DATE '2026-08-12'`, so it drops the time
+ * and compares at midnight UTC even though the SQL engine also accepts precise TIMESTAMP literals.
+ * Callers must account for that day-granular explorer behavior rather than discover it.
  */
 export function toDateOnly(value: QueryValue): string {
   const date = value instanceof Date ? value : new Date(String(value));

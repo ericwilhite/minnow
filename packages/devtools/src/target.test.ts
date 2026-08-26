@@ -13,9 +13,9 @@ import {
 function stubTarget(): DevtoolsTarget {
   return {
     listTables: async () => [],
-    query: async () => ({ columns: [], rows: [] }),
+    query: async () => ({ columns: [], columnDomains: [], rows: [] }),
     explain: async () => "",
-    execute: async () => ({ kind: "rows", result: { columns: [], rows: [] } }),
+    execute: async () => ({ kind: "rows", result: { columns: [], columnDomains: [], rows: [] } }),
   };
 }
 

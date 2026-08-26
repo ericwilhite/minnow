@@ -283,8 +283,7 @@ describe("datetime functions", () => {
     // execution's value rather than diffing two.
     const once = (sql: string): unknown => executeQuery(compileQuery(sql), tables).rows[0]?.v;
     const date = once("SELECT CURRENT_DATE AS v");
-    expect(date).toBeInstanceOf(Date);
-    expect((date as Date).toISOString()).toMatch(/T00:00:00\.000Z$/);
+    expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(once("SELECT CURRENT_TIMESTAMP AS v")).toBeInstanceOf(Date);
     expect(once("SELECT LOCALTIMESTAMP AS v")).toBeInstanceOf(Date);
     expect(
@@ -988,7 +987,7 @@ describe("views", () => {
       view: "big",
       dropped: true,
     });
-    await expect(database.query("SELECT * FROM big")).rejects.toThrow("Table not found: big");
+    await expect(database.query("SELECT * FROM big")).rejects.toThrow("Unknown table: big");
     await expect(database.execute("DROP VIEW big")).rejects.toThrow("View not found: big");
     await expect(database.execute("DROP VIEW IF EXISTS big")).resolves.toMatchObject({
       dropped: false,

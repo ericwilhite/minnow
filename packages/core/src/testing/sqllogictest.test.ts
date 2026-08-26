@@ -335,6 +335,7 @@ describe("SQLLogicTest runner", () => {
     const result = await database.query("SELECT 1 + 2, 3 + 4");
     expect(result).toEqual({
       columns: ["expression", "expression_2"],
+      columnDomains: [null, null],
       rows: [{ expression: 3, expression_2: 7 }],
     });
     await database.close();
@@ -351,6 +352,7 @@ describe("SQLLogicTest runner", () => {
     await database.execute("INSERT INTO items VALUES (1, 'one'), (2, 'two')");
     await expect(database.query("SELECT id, name FROM items ORDER BY id")).resolves.toEqual({
       columns: ["id", "name"],
+      columnDomains: [null, null],
       rows: [
         { id: 1, name: "one" },
         { id: 2, name: "two" },
@@ -364,7 +366,12 @@ describe("SQLLogicTest runner", () => {
 });
 
 function fakeDatabase(
-  results: Record<string, Awaited<ReturnType<SqlLogicDatabase["query"]>>>,
+  results: Record<
+    string,
+    Omit<Awaited<ReturnType<SqlLogicDatabase["query"]>>, "columnDomains"> & {
+      columnDomains?: Awaited<ReturnType<SqlLogicDatabase["query"]>>["columnDomains"];
+    }
+  >,
 ): SqlLogicDatabase & {
   executeSpy: ReturnType<typeof vi.fn<SqlLogicDatabase["execute"]>>;
   closeSpy: ReturnType<typeof vi.fn<SqlLogicDatabase["close"]>>;
@@ -379,7 +386,10 @@ function fakeDatabase(
     query: vi.fn(async (sql: string) => {
       const result = results[sql];
       if (result === undefined) throw new Error(`unexpected query: ${sql}`);
-      return result;
+      return {
+        ...result,
+        columnDomains: result.columnDomains ?? result.columns.map(() => null),
+      };
     }),
     close: closeSpy,
     executeSpy,

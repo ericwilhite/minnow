@@ -28,7 +28,12 @@ export interface WireColumn {
   readonly sqlDomain?: SqlDomain;
   readonly defaultSpec?: ColumnDefault;
   readonly renamedFromName?: string;
-  readonly reference?: { table: string; column: string; onDelete: ReferentialAction };
+  readonly reference?: {
+    table: string;
+    column: string;
+    onDelete: ReferentialAction;
+    enforced?: boolean;
+  };
   readonly enumValues?: readonly string[];
   /** Already frozen by planning, so the wire carries a value and never a generator. */
   readonly backfillValue?: boolean | number | string | Date;
@@ -70,6 +75,11 @@ export type WireMigrationStep =
       tableName: string;
       columnName: string;
       defaultValue: ColumnDefault | null;
+    }
+  | {
+      kind: "alter-foreign-keys";
+      tableName: string;
+      foreignKeys: Extract<MigrationStep, { kind: "alter-foreign-keys" }>["foreignKeys"];
     }
   | { kind: "replace-view"; view: WireView }
   | { kind: "drop-view"; viewName: string };
@@ -192,7 +202,9 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
     ...(wire.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(wire.sqlDomain) }),
     ...(wire.defaultSpec === undefined ? {} : { defaultSpec: wire.defaultSpec }),
     ...(wire.renamedFromName === undefined ? {} : { renamedFromName: wire.renamedFromName }),
-    ...(wire.reference === undefined ? {} : { reference: wire.reference }),
+    ...(wire.reference === undefined
+      ? {}
+      : { reference: { ...wire.reference, enforced: wire.reference.enforced !== false } }),
     ...(wire.enumValues === undefined ? {} : { enumValues: wire.enumValues }),
     ...(wire.backfillValue === undefined ? {} : { backfillValue: wire.backfillValue }),
   });

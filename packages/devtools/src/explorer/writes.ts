@@ -38,8 +38,8 @@ export interface CellEdit {
 
 /**
  * Writes go through the keyed batch API rather than generated SQL. It is exact — one named key,
- * one named column — it reports how many rows it actually touched, and it sidesteps the day-only
- * precision of the engine's date literals, so a datetime is written to the millisecond.
+ * one named column — it reports how many rows it actually touched, and it sidesteps the explorer's
+ * day-only SQL literal encoder, so a datetime is written to the millisecond.
  */
 export async function applyCellEdit(target: EditableTarget, edit: CellEdit): Promise<number> {
   const result = await target.updateBatch(edit.table.name, {

@@ -16,6 +16,9 @@ export default function BenchmarksPage() {
           There are no published numbers on this page. Pick the engines, the suites, and the dataset
           size, and all three databases are built and measured here, in your browser, on your
           machine — which is the only place a browser database&rsquo;s performance means anything.
+          The initial selection compares Minnow on IndexedDB and OPFS with SQLite using primary keys
+          only at 5× scale; 1×, 2×, 5×, and 10× are available, while cached repeats, secondary
+          indexes, and PGlite are opt-in.
         </p>
         <p className="mt-3 text-fd-muted-foreground">
           Reads and writes stay split by OLTP and OLAP throughout, because a blended score hides the

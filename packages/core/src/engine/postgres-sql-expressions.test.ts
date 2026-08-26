@@ -119,7 +119,7 @@ describe("PostgreSQL value domains and predicates", () => {
         "SELECT j.a, j.label FROM JSON_TABLE('[]', '$[*]' " +
           "COLUMNS (a INTEGER PATH '$.a', label TEXT PATH '$.label')) AS j",
       ),
-    ).resolves.toEqual({ columns: ["a", "label"], rows: [] });
+    ).resolves.toEqual({ columns: ["a", "label"], columnDomains: [null, null], rows: [] });
     await database.close();
   });
 

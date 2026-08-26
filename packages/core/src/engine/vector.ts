@@ -31,6 +31,7 @@ import {
   parseQuantified,
   quantifiedComparison,
   scalarFunctionValue,
+  unknownColumnDomains,
 } from "./query.js";
 import { jsonValueOf } from "./sql-json.js";
 import {
@@ -47,6 +48,7 @@ import {
 } from "./fts.js";
 import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
 import { ByteJoinIndex } from "./join-index.js";
+import { UnknownTableError } from "./errors.js";
 import {
   QueryMemoryBudgetError,
   QueryMemoryContext,
@@ -54,16 +56,14 @@ import {
   type QueryMemoryUsage,
 } from "./memory.js";
 import {
-  compareSqlStrings,
+  compareSqlValues,
   compileSimilarPattern,
   defineSqlResultProperty,
 } from "./sql-semantics.js";
 import {
   exactNumericBinary,
-  exactNumericCompare,
-  collatedDomainCompare,
-  enumDomainCompare,
   externalSqlDomainValue,
+  isDateDomainValue,
   isExactNumeric,
   protectedSqlTextValue,
 } from "./sql-domains.js";
@@ -1067,7 +1067,7 @@ function bindPlan(
   const sources = [plan.base, ...plan.joins];
   const sourceTables = sources.map((source) => {
     const table = tables.get(source.table);
-    if (table === undefined) throw new TypeError(`Unknown table: ${source.table}`);
+    if (table === undefined) throw new UnknownTableError(source.table);
     return table;
   });
   const sourceAliases = sources.map((source) => source.alias);
@@ -2003,7 +2003,11 @@ async function executeBoundPlanBatches(
       }
       if (rows.length > 0) {
         emitted += rows.length;
-        await consume({ columns: [...columns], rows });
+        await consume({
+          columns: [...columns],
+          columnDomains: unknownColumnDomains(columns),
+          rows,
+        });
       }
     } finally {
       pageMemory.close();
@@ -2107,7 +2111,8 @@ async function executeBoundPlanWithSortSpill(
       start += length;
     }
 
-    if (runs.length === 0) return { columns, rows: [] };
+    if (runs.length === 0)
+      return { columns, columnDomains: unknownColumnDomains(columns), rows: [] };
     let active = runs;
     while (active.length > 1) {
       const merged: SpillRun[] = [];
@@ -2150,7 +2155,7 @@ async function executeBoundPlanWithSortSpill(
       }
     }
     if (offset > 0) rows.splice(0, Math.min(offset, rows.length));
-    return { columns, rows };
+    return { columns, columnDomains: unknownColumnDomains(columns), rows };
   } finally {
     await store.removeOwner(ownerId);
   }
@@ -2358,7 +2363,8 @@ async function executeBoundPlanWithHashSpill(
       }
     }
 
-    if (runs.length === 0) return { columns, rows: [] };
+    if (runs.length === 0)
+      return { columns, columnDomains: unknownColumnDomains(columns), rows: [] };
     const finalRun = await mergeAllSpillRuns(
       store,
       ownerId,
@@ -2445,7 +2451,7 @@ async function readFinalSpillRun(
       rows.push(row);
     }
   }
-  return { columns: [...columns], rows };
+  return { columns: [...columns], columnDomains: unknownColumnDomains(columns), rows };
 }
 
 const hashScratch = new DataView(new ArrayBuffer(8));
@@ -2817,7 +2823,7 @@ function finishResult(
     rows.length = Math.min(plan.limit, rows.length);
   }
   const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
-  return { columns, rows };
+  return { columns, columnDomains: unknownColumnDomains(columns), rows };
 }
 
 /** Source indexes a bound expression reads, for pre-join predicate placement. */
@@ -5062,6 +5068,7 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
     const rowIndex = batch.rowsBySource[source]?.[row] ?? -1;
     const prefix = multiple ? `${plan.sourceAliases[source] ?? ""}.` : "";
     for (const [name, vector] of table.columns) {
+      if (name.startsWith("\0")) continue;
       const outputName = multiple ? prefix + name : name;
       const value = vectorValue(vector, rowIndex);
       if (outputName === "__proto__") defineSqlResultProperty(result, outputName, value);
@@ -5074,9 +5081,9 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
 function wildcardColumnNames(plan: BoundPlan): string[] {
   const multiple = plan.sourceTables.length > 1;
   return plan.sourceTables.flatMap((table, source) =>
-    [...table.columns.keys()].map((name) =>
-      multiple ? `${plan.sourceAliases[source] ?? ""}.${name}` : name,
-    ),
+    [...table.columns.keys()]
+      .filter((name) => !name.startsWith("\0"))
+      .map((name) => (multiple ? `${plan.sourceAliases[source] ?? ""}.${name}` : name)),
   );
 }
 
@@ -5752,7 +5759,12 @@ function comparisonValue(
 }
 
 function comparable(value: unknown): unknown {
-  return value instanceof Date ? dateMilliseconds(value) : value;
+  if (value instanceof Date) return dateMilliseconds(value);
+  if (isDateDomainValue(value)) {
+    const external = externalSqlDomainValue(value);
+    return typeof external === "string" ? Date.parse(`${external}T00:00:00.000Z`) : value;
+  }
+  return value;
 }
 
 function groupKey(value: unknown): GroupIndexKey {
@@ -5799,25 +5811,7 @@ function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
 }
 
 function compareValues(left: unknown, right: unknown): number {
-  const collated = collatedDomainCompare(left, right);
-  if (collated !== undefined) return collated;
-  const enumOrder = enumDomainCompare(left, right);
-  if (enumOrder !== undefined) return enumOrder;
-  const exact = exactNumericCompare(left, right);
-  if (exact !== undefined) return exact;
-  const a = left instanceof Date ? dateMilliseconds(left) : left;
-  const b = right instanceof Date ? dateMilliseconds(right) : right;
-  if (a === b) return 0;
-  if (a === null || a === undefined) return -1;
-  if (b === null || b === undefined) return 1;
-  if (typeof a === "number" && typeof b === "number") {
-    if (Number.isNaN(a)) return Number.isNaN(b) ? 0 : 1;
-    if (Number.isNaN(b)) return -1;
-    return a - b;
-  }
-  if (typeof a === "string" && typeof b === "string") return compareSqlStrings(a, b);
-  if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
-  throw new TypeError("Values must have comparable SQL types");
+  return compareSqlValues(left, right);
 }
 
 function numeric(value: unknown): number {

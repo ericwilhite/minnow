@@ -23,6 +23,9 @@ import type {
 } from "@/bench/protocol";
 import type { BenchWorker } from "@/bench/worker-client";
 import {
+  DEFAULT_COLUMNS,
+  DEFAULT_SCALE,
+  DEFAULT_SECONDARY_INDEXES,
   ENGINES,
   SCALES,
   SUITES,
@@ -53,10 +56,11 @@ interface Results {
 export function BenchRunner() {
   const worker = useRef<BenchWorker | undefined>(undefined);
   const running = useRef<string | undefined>(undefined);
-  const [columns, setColumns] = useState<ColumnId[]>(["minnow", "minnow-cached", "sqlite"]);
+  const [columns, setColumns] = useState<ColumnId[]>([...DEFAULT_COLUMNS]);
   const [suites, setSuites] = useState<string[]>(["write", "reference", "live"]);
-  const [scale, setScale] = useState(0.5);
-  const [secondaryIndexes, setSecondaryIndexes] = useState<SecondaryIndexMode>("foreign-keys");
+  const [scale, setScale] = useState(DEFAULT_SCALE);
+  const [secondaryIndexes, setSecondaryIndexes] =
+    useState<SecondaryIndexMode>(DEFAULT_SECONDARY_INDEXES);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [results, setResults] = useState<Results>({});
 
@@ -262,6 +266,7 @@ export function BenchRunner() {
               <button
                 key={choice.scale}
                 type="button"
+                aria-pressed={choice.scale === scale}
                 disabled={busy || !needsDataset}
                 onClick={() => {
                   setScale(choice.scale);

@@ -11,6 +11,7 @@ import {
   exactNumericCompare,
   externalSqlDomainValue,
   externalSqlTextValue,
+  isDateDomainValue,
 } from "./sql-domains.js";
 
 /**
@@ -42,8 +43,24 @@ export function compareSqlValues(left: unknown, right: unknown): number {
   if (enumOrder !== undefined) return enumOrder;
   const exact = exactNumericCompare(left, right);
   if (exact !== undefined) return exact;
-  const a = left instanceof Date ? dateMilliseconds(left) : left;
-  const b = right instanceof Date ? dateMilliseconds(right) : right;
+  const temporal = (value: unknown): number | undefined => {
+    if (value instanceof Date) return dateMilliseconds(value);
+    if (!isDateDomainValue(value)) return undefined;
+    const external = externalSqlDomainValue(value);
+    return typeof external === "string" ? Date.parse(`${external}T00:00:00.000Z`) : undefined;
+  };
+  const temporalLeft = temporal(left);
+  const temporalRight = temporal(right);
+  if (temporalLeft !== undefined || temporalRight !== undefined) {
+    const comparableLeft = temporalLeft ?? (typeof left === "number" ? left : undefined);
+    const comparableRight = temporalRight ?? (typeof right === "number" ? right : undefined);
+    if (comparableLeft === undefined || comparableRight === undefined) {
+      throw new TypeError("Values must have comparable SQL types");
+    }
+    return comparableLeft - comparableRight;
+  }
+  const a = left;
+  const b = right;
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;

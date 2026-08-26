@@ -151,10 +151,11 @@ SELECT month FROM months
 ```
 
 A CTE can name its own output columns, as `months(month)` does above; a recursive one takes those
-names before its step runs, which is how the step reads `month` back. `DATE '2025-01-01'` and
-`TIMESTAMP '2025-01-01 09:30:00'` are both literals, read as UTC — the way every datetime in a
-Minnow database is stored — and `INTERVAL '1 month'` added to or subtracted from a datetime does
-calendar arithmetic, so 31 January plus a month is the end of February.
+names before its step runs, which is how the step reads `month` back. `DATE '2025-01-01'` is a
+zoneless calendar date returned as `YYYY-MM-DD`; `TIMESTAMP '2025-01-01 09:30:00'` is an instant
+read as UTC, the way every datetime in a Minnow database is stored. `INTERVAL '1 month'` added to
+or subtracted from either does calendar arithmetic, so 31 January plus a month is the end of
+February.
 
 ## Window functions
 

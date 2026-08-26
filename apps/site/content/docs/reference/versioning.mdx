@@ -5,7 +5,7 @@ description: One major across every package, what a version change means, and ho
 
 Every Minnow package shares a major version and moves independently inside it. Each adapter names
 the oldest engine it can use and accepts later engines inside that shared major. For example, the
-current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.4.0 up to, but not including,
+current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.5.0 up to, but not including,
 1.0.0. The same rule covers the export and devtools packages; the React hook is structurally typed
 and has no engine runtime dependency.
 
@@ -18,12 +18,12 @@ APIs from working is a major change, so each package depends on its siblings by 
 the major and stops at it:
 
 ```json
-"dependencies": { "@minnowdb/core": ">=0.4.0 <1.0.0" }
+"dependencies": { "@minnowdb/core": ">=0.5.0 <1.0.0" }
 ```
 
 The ceiling is the compatibility line, and npm refuses a mixed-major install on its own. The floor
 is the sibling release this package was built against — when the devtools start using something
-the engine added in 0.4.0, their next release says `>=0.4.0` and npm resolves an engine that has
+the engine added in 0.5.0, their next release says `>=0.5.0` and npm resolves an engine that has
 it. Below the major, a fix to the console does not drag the engine's version along with it.
 
 ## What 0.x means
@@ -44,6 +44,30 @@ A change is breaking when it is one of these:
 
 From 1.0 onwards these move the major version — every package's, together — and minor releases
 stay additive.
+
+## Moving from 0.4 to 0.5
+
+The 0.5 release keeps the stored block, snapshot, IndexedDB, and OPFS formats unchanged. It changes
+these public boundaries:
+
+- Every `QueryResult` and cursor page now includes `columnDomains`, positionally aligned with
+  `columns`. Use those domains to parse logical string values such as JSON/JSONB without knowing
+  whether a column came from the schema or an aliased expression.
+- `DATE` and `CURRENT_DATE` return canonical `YYYY-MM-DD` strings. `TIMESTAMP` values continue to
+  return JavaScript `Date` objects. The schema DSL adds `column.date()`, and the Kysely adapter
+  reflects the same distinction.
+- `upsert()` and `upsertBatch()` accept a `conflictWhere` guard and report skipped conflicts in
+  `skippedRowCount`. A skipped conflict is a successful no-op, not an error.
+- Missing-table failures are `UnknownTableError` instances with a `tableName`; do not match their
+  messages.
+- Foreign keys may be catalog-only with `{ enforced: false }`. They are visible through
+  `introspect()` but never validate rows or perform delete actions.
+- `@minnowdb/react` adds cold-start Suspense and stale-while-revalidate options, plus
+  `useSuspenseLiveQuery()`.
+
+The new result metadata and `DATE` boundary are intentional pre-1.0 API changes. Code that builds a
+`QueryResult` itself must add `columnDomains`; code that treated SQL `DATE` as a JavaScript `Date`
+must switch to the calendar string.
 
 ## The block format has its own version
 
@@ -109,12 +133,12 @@ Then commit and push. That is the whole release:
 ```bash
 npm run check:release   # fullest local gate; CI splits release checks across workflows
 # Stage the reviewed changes, then:
-git commit -m "Release core 0.4.0" && git push
+git commit -m "Release core 0.5.0 and adapters" && git push
 ```
 
 Publishing is driven by the versions in the manifests, not by a tag or a command. When that
 commit's CI run goes green, `.github/workflows/release.yml` publishes every package whose version
-npm does not already have and tags each one `@minnowdb/core@0.4.0`. A push that changes no version
+npm does not already have and tags each one, such as `@minnowdb/core@0.5.0`. A push that changes no version
 publishes nothing, and a rerun after a failure is safe, because the registry decides what has
 already shipped.
 

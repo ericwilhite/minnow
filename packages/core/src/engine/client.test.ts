@@ -22,6 +22,7 @@ import { MinnowDatabase } from "./database.js";
 import {
   MaintenanceBacklogError,
   SqlCompileError,
+  UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
@@ -1625,6 +1626,50 @@ describe("MinnowDatabaseClient", () => {
     await client.close();
   });
 
+  it("preserves domains, guarded upserts, and typed missing-table errors across the worker", async () => {
+    const client = connect();
+    await client.migrate(
+      schema([
+        table("worker_guarded", {
+          id: column.integer().unique(),
+          payload: column.jsonb(),
+          synced: column.boolean(),
+        }),
+      ]),
+    );
+    await client.insert("worker_guarded", {
+      id: 1,
+      payload: JSON.stringify({ value: 1 }),
+      synced: false,
+    });
+    const guarded = await client.upsert(
+      "worker_guarded",
+      { id: 1, payload: JSON.stringify({ value: 2 }), synced: true },
+      { conflictWhere: { column: "synced", operator: "=", value: true } },
+    );
+    expect(guarded).toMatchObject({
+      requestedRowCount: 1,
+      rowCount: 0,
+      skippedRowCount: 1,
+      segmentId: null,
+    });
+    const result = await client.query(
+      "SELECT payload, JSON_OBJECT('id', id) AS projection FROM worker_guarded",
+    );
+    expect(result).toEqual({
+      columns: ["payload", "projection"],
+      columnDomains: [{ kind: "jsonb" }, { kind: "json" }],
+      rows: [{ payload: JSON.stringify({ value: 1 }), projection: JSON.stringify({ id: 1 }) }],
+    });
+    const error = await client
+      .insert("worker_missing", { id: 1 })
+      .then(() => undefined)
+      .catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(UnknownTableError);
+    expect(error).toMatchObject({ tableName: "worker_missing" });
+    await client.close();
+  });
+
   it("round-trips the mutation, diagnostics, maintenance, and observer RPC surface", async () => {
     const client = connect();
     await client.createTable({
@@ -2121,7 +2166,7 @@ describe("MinnowDatabaseClient", () => {
     expect(Object.is(result.rows[2]?.score, -0)).toBe(true);
     expect(Object.getPrototypeOf(result.rows[0])).toBe(Object.prototype);
     const empty = await client.query("SELECT id FROM mixed WHERE id > 10");
-    expect(empty).toEqual({ columns: ["id"], rows: [] });
+    expect(empty).toEqual({ columns: ["id"], columnDomains: [null], rows: [] });
     await client.close();
   });
 

@@ -18,7 +18,7 @@ and benchmarks that run in your browser.
 ## Why Minnow
 
 - **PostgreSQL-style SQL.** Use familiar joins, CTEs, window functions, grouping sets, upserts,
-  `RETURNING`, triggers, exact decimals, JSON/JSONB, arrays, enums, sequences, savepoints, and
+  `RETURNING`, triggers, exact decimals, JSON/JSONB, zoneless DATE, arrays, enums, sequences, savepoints, and
   more. The [PostgreSQL compatibility guide](https://minnowdb.com/docs/sql/feature-matrix/) lists
   exact matches, differences, extensions, and exclusions.
 - **Fast analytical reads over application data.** Compressed column blocks let a query read only
@@ -29,7 +29,7 @@ and benchmarks that run in your browser.
   query reads one stable snapshot, even when another tab commits at the same time;
   origin-persistence policy is explicit for applications that cannot accept automatic quota
   eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 278 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 281 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so tables
@@ -40,7 +40,7 @@ and benchmarks that run in your browser.
   sorts and aggregates keep large working sets under a configurable budget.
 - **Search and reactive views.** Full-text search uses `MATCH` and BM25 without index DDL. Live
   queries refresh after relevant commits, including commits from other tabs, with typed Kysely,
-  keyed-change, bounded-window, and React adapters.
+  keyed-change, bounded-window, and Suspense/SWR-friendly React adapters.
 - **Portable and extensible.** Snapshots move a committed database between stores. The public
   storage interface includes a shared test kit for custom adapters.
 

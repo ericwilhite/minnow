@@ -35,6 +35,7 @@ export interface ColumnReferenceSpec {
   readonly table: string;
   readonly column: string;
   readonly onDelete: ReferentialAction;
+  readonly enforced: boolean;
 }
 
 /** A row condition every write must satisfy (E141-06); `sql` is a boolean expression. */
@@ -49,6 +50,8 @@ export interface TableForeignKey<TColumnName extends string = string> {
   readonly columns: readonly TColumnName[];
   readonly references: { readonly table: string; readonly columns: readonly string[] };
   readonly onDelete?: ReferentialAction;
+  /** False keeps the relationship in the catalog without validating or cascading rows. */
+  readonly enforced?: boolean;
 }
 
 /**
@@ -130,13 +133,15 @@ export interface ColumnBuilder<
     this: ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>,
     table: string,
     column: string,
-    options?: { onDelete?: Exclude<ReferentialAction, "set null"> },
+    options?:
+      | { onDelete?: Exclude<ReferentialAction, "set null">; enforced?: true }
+      | { enforced: false; onDelete?: never },
   ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>;
   references(
     this: ColumnBuilder<TValue, true, TUnique, THasDefault, TInput>,
     table: string,
     column: string,
-    options: { onDelete: "set null" },
+    options: { onDelete: "set null"; enforced?: true },
   ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>;
   /** Declares a literal SQL default. Omission or SQL `DEFAULT` invokes it; NULL does not. */
   default(value: TInput): ColumnBuilder<TValue, TNullable, TUnique, true, TInput>;
@@ -265,16 +270,20 @@ function createColumn<
     references: (
       table: string,
       referencedColumn: string,
-      options: { onDelete?: ReferentialAction } = {},
+      options: { onDelete?: ReferentialAction; enforced?: boolean } = {},
     ) => {
       validateSchemaName(table, "Referenced table");
       validateSchemaName(referencedColumn, "Referenced column");
+      if (options.enforced === false && options.onDelete !== undefined) {
+        throw new TypeError("An informational FOREIGN KEY cannot declare ON DELETE behavior");
+      }
       return createColumn<TType, TValue, TInput>(type, {
         ...state,
         reference: {
           table,
           column: referencedColumn,
           onDelete: options.onDelete ?? "restrict",
+          enforced: options.enforced !== false,
         },
       });
     },
@@ -384,6 +393,8 @@ export const column = {
   json: () => createColumn("string", { sqlDomain: { kind: "json" } }),
   jsonb: () => createColumn("string", { sqlDomain: { kind: "jsonb" } }),
   uuid: () => createColumn("string", { sqlDomain: { kind: "uuid" } }),
+  /** A zoneless calendar date, represented publicly as canonical `YYYY-MM-DD` text. */
+  date: () => createColumn("string", { sqlDomain: { kind: "date" } }),
   time: () => createColumn("string", { sqlDomain: { kind: "time" } }),
   interval: () => createColumn("string", { sqlDomain: { kind: "interval" } }),
   /** JSON array text at the JavaScript boundary, with the SQL element type retained in metadata. */
@@ -629,6 +640,11 @@ export function table(
   const foreignKeyNames = new Set<string>();
   for (const key of foreignKeys) {
     validateSchemaName(key.name, "FOREIGN KEY");
+    if (key.enforced === false && key.onDelete !== undefined) {
+      throw new TypeError(
+        `Informational FOREIGN KEY ${key.name} cannot declare ON DELETE behavior`,
+      );
+    }
     if (foreignKeyNames.has(key.name)) {
       throw new TypeError(`Duplicate FOREIGN KEY in table ${name}: ${key.name}`);
     }
@@ -759,6 +775,7 @@ export function declaredForeignKeys(definition: AnyTable): Array<{
   parentTable: string;
   parentColumns: string[];
   onDelete: ReferentialAction;
+  enforced: boolean;
 }> {
   const keys: ReturnType<typeof declaredForeignKeys> = [];
   for (const [columnName, columnDefinition] of Object.entries(definition.columns)) {
@@ -770,6 +787,7 @@ export function declaredForeignKeys(definition: AnyTable): Array<{
       parentTable: reference.table,
       parentColumns: [reference.column],
       onDelete: reference.onDelete,
+      enforced: reference.enforced,
     });
   }
   for (const key of definition.foreignKeys) {
@@ -781,6 +799,7 @@ export function declaredForeignKeys(definition: AnyTable): Array<{
       parentTable: key.references.table,
       parentColumns,
       onDelete: key.onDelete ?? "restrict",
+      enforced: key.enforced !== false,
     });
   }
   return keys;
@@ -1011,6 +1030,12 @@ export type MigrationStep =
       columnName: string;
       defaultValue: ColumnDefault | null;
     }
+  /** Informational relationships are catalog-only and may change without scanning stored rows. */
+  | {
+      kind: "alter-foreign-keys";
+      tableName: string;
+      foreignKeys: ReturnType<typeof declaredForeignKeys>;
+    }
   /**
    * A view is derived and disposable: nothing is stored under it, so replacing its body loses no
    * data and needs none of the proofs a table alteration needs. `replace` covers both creating a
@@ -1196,13 +1221,17 @@ function backfillsEqual(left: unknown, right: unknown): boolean {
 }
 
 /**
- * Constraints on an existing table cannot change through a metadata-only step. Attaching a
- * FOREIGN KEY or CHECK to a table that already holds rows would claim something about those rows
+ * Enforced constraints on an existing table cannot change through a metadata-only step. Attaching
+ * a FOREIGN KEY or CHECK to a table that already holds rows would claim something about those rows
  * that nobody has verified, and no validation scan exists; dropping one is refused for the mirror
- * reason, so that a constraint never disappears because a schema file drifted. Both get the same
- * discipline every other unprovable change gets: an explicit error naming the fix.
+ * reason, so that a constraint never disappears because a schema file drifted. Informational
+ * foreign keys are catalog metadata only, so adding, dropping, or remapping one is safe.
  */
-function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable): void {
+function planConstraintChanges(
+  record: CatalogTable,
+  definition: AnyTable,
+  steps: MigrationStep[],
+): void {
   const describeKey = (key: {
     columns: readonly string[];
     parentTable: string;
@@ -1212,17 +1241,32 @@ function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable):
     `${key.columns.join(",")} -> ${key.parentTable}.` +
     `${key.parentColumns.join(",")} ON DELETE ${key.onDelete}`;
 
+  const declaredList = declaredForeignKeys(definition);
   const existingKeys = new Map(record.foreignKeys.map((key) => [key.name, key]));
-  const declaredKeys = new Map(declaredForeignKeys(definition).map((key) => [key.name, key]));
+  const declaredKeys = new Map(declaredList.map((key) => [key.name, key]));
+  let informationalChanged = false;
   for (const [name, declared] of declaredKeys) {
     const existing = existingKeys.get(name);
     if (existing === undefined) {
+      if (!declared.enforced) {
+        informationalChanged = true;
+        continue;
+      }
       throw new TypeError(
         `FOREIGN KEY cannot be added after creation: ${definition.name}.${declared.columns.join(",")}. ` +
           `Existing rows are not known to satisfy it; recreate the table to add a relation.`,
       );
     }
+    if (existing.enforced !== declared.enforced) {
+      throw new TypeError(
+        `FOREIGN KEY enforcement cannot change: ${definition.name}.${declared.columns.join(",")}`,
+      );
+    }
     if (describeKey(existing) !== describeKey(declared)) {
+      if (!declared.enforced) {
+        informationalChanged = true;
+        continue;
+      }
       throw new TypeError(
         `FOREIGN KEY cannot change: ${definition.name}.${declared.columns.join(",")} is ` +
           `${describeKey(existing)}, schema says ${describeKey(declared)}`,
@@ -1231,11 +1275,22 @@ function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable):
   }
   for (const name of existingKeys.keys()) {
     if (!declaredKeys.has(name)) {
+      if (existingKeys.get(name)?.enforced === false) {
+        informationalChanged = true;
+        continue;
+      }
       throw new TypeError(
         `FOREIGN KEY cannot be dropped: ${definition.name} still has ${name}. ` +
           `Declare the relation, or recreate the table without it.`,
       );
     }
+  }
+  if (informationalChanged) {
+    steps.push({
+      kind: "alter-foreign-keys",
+      tableName: definition.name,
+      foreignKeys: declaredList,
+    });
   }
 
   const existingChecks = new Map(record.checks.map((check) => [check.name, check.sql]));
@@ -1480,7 +1535,7 @@ export function planMigration(
     ) {
       throw new TypeError(`Primary key order cannot change: ${tableDefinition.name}`);
     }
-    assertConstraintsUnchanged(record, tableDefinition);
+    planConstraintChanges(record, tableDefinition, steps);
   }
   if (options.schemaOwnsDatabase === true) {
     const declaredTables = new Set(definition.tables.map(({ name }) => name));

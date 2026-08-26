@@ -71,13 +71,44 @@ The full set:
 | Call                                    | Effect                                               |
 | --------------------------------------- | ---------------------------------------------------- |
 | `insertBatch(table, input)`             | Append rows. A duplicate key throws.                 |
-| `upsertBatch(table, input)`             | Insert, replacing any row with the same key.         |
+| `upsertBatch(table, input, options?)`   | Insert, replacing an allowed row with the same key.  |
 | `updateBatch(table, { keys, changes })` | Change named columns on rows addressed by key.       |
 | `deleteBatch(table, { keys })`          | Remove rows by key.                                  |
 | `insert` / `upsert` / `update`          | Single-row convenience wrappers over the same paths. |
 
 Each returns what it did — `rowCount`, `blockCount`, `storedBytes`, and the published `version` —
 which is enough to drive a progress bar over a large load without a second query.
+
+`upsertBatch` and `upsert` accept the same target-row guard as SQL's
+`ON CONFLICT ... DO UPDATE ... WHERE`:
+
+```ts
+const result = await db.upsertBatch("orders", incoming, {
+  conflictWhere: { column: "_synced", operator: "=", value: true },
+});
+```
+
+Fresh keys are always inserted. A conflicting key updates only when its existing row satisfies
+the predicate. The result distinguishes `requestedRowCount`, written `rowCount`, and
+`skippedRowCount`; an entirely skipped batch writes no blocks and returns `segmentId: null`. The
+guard stays on the columnar batch path and is re-evaluated if another tab commits first.
+
+## Query results
+
+Every query and cursor page returns aligned column metadata beside its rows:
+
+```ts
+const result = await db.query("SELECT payload, JSON_OBJECT('id', order_id) AS summary FROM orders");
+
+result.columns; // ["payload", "summary"]
+result.columnDomains; // [{ kind: "jsonb" }, { kind: "json" }]
+result.rows; // JSON values remain validated JSON text
+```
+
+`columnDomains[index]` describes `columns[index]`. It is `null` for an ordinary primitive and a
+`SqlDomain` for `json`, `jsonb`, `uuid`, `date`, `time`, `numeric`, arrays, intervals, enums, and
+collated text. Domains are inferred for both declared columns and ad-hoc projections, so a generic
+consumer can parse JSON without knowing which query produced the alias.
 
 One batch is one commit. To make several land together, wrap them in a
 [write scope](/docs/engine/transactions).
@@ -127,13 +158,15 @@ Function-valued seams remain worker-side. A
 Errors are classes, so they can be caught by kind rather than by matching a message:
 
 ```ts
-import { SqlCompileError, UniqueConstraintError } from "@minnowdb/core";
+import { SqlCompileError, UniqueConstraintError, UnknownTableError } from "@minnowdb/core";
 import { WriteConflictError } from "@minnowdb/core/storage/contracts";
 ```
 
 `SqlCompileError` carries the `offset` and `length` of the offending span, which is what the
 devtools editor underlines. `WriteConflictError` means a writer in another tab, or a write scope,
 committed first; the engine retries these itself up to `maxCommitRetries` before surfacing one.
+`UnknownTableError` carries `tableName`, including across the worker boundary, so schema self-heal
+can use `instanceof` instead of matching error text.
 
 ## Closing
 

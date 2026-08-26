@@ -31,8 +31,8 @@ complete server dialect, or direct file analysis matters more.
 - **Control over memory and threading.** Run the engine in a worker, set an execution budget, and
   spill large sorts and grouped results to storage.
 - **Native Kysely types.** `@minnowdb/kysely` derives its full database type from the same schema
-  declaration Minnow migrates, including defaults, exact numeric boundaries, and driver-specific
-  aggregate and built-in function results without redundant output generics.
+  declaration Minnow migrates, including defaults, exact numeric and calendar-date boundaries,
+  and driver-specific aggregate and built-in function results without redundant output generics.
 
 Minnow does not provide a server, replication, multi-device sync, or compatibility with another
 database's file format.
@@ -44,7 +44,7 @@ Download size affects cold starts, and Wasm engines also compile a module before
 | Engine           | Download (gzip) | Raw     | Wasm compile step |
 | ---------------- | --------------- | ------- | ----------------- |
 | IndexedDB        | 0               | 0       | No                |
-| **Minnow**       | **278 KB**      | 1.0 MB  | No                |
+| **Minnow**       | **281 KB**      | 1.0 MB  | No                |
 | SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes               |
 | PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes               |
 

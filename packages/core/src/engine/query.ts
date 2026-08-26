@@ -55,10 +55,12 @@ import {
   arrayDomainValue,
   boundedJsonText,
   collatedDomainValue,
+  dateDomainValue,
   exactNumericBinary,
   exactNumericValue,
   externalSqlDomainValue,
   intervalDomainValue,
+  isDateDomainValue,
   isExactNumeric,
   isSqlDomainValue,
   jsonDomainValue,
@@ -81,7 +83,27 @@ export type QueryRow = Record<string, QueryValue>;
 
 export interface QueryResult {
   columns: string[];
+  /** Logical SQL domain for each output column, positionally aligned with `columns`. */
+  columnDomains: Array<SqlDomain | null>;
   rows: QueryRow[];
+}
+
+/** Domain metadata for an execution path that has no catalog-backed type information. */
+export function unknownColumnDomains(columns: readonly string[]): null[] {
+  return columns.map(() => null);
+}
+
+function withColumnDomains(
+  result: QueryResult,
+  domains?: ReadonlyArray<SqlDomain | null>,
+): QueryResult {
+  const columnDomains = domains ?? unknownColumnDomains(result.columns);
+  if (columnDomains.length !== result.columns.length) {
+    throw new TypeError(
+      `Query result column domains must align with the result columns (${String(columnDomains.length)} domains for ${String(result.columns.length)} columns)`,
+    );
+  }
+  return { ...result, columnDomains: [...columnDomains] };
 }
 
 export interface PreparedQuery {
@@ -303,6 +325,7 @@ function castValue(value: unknown, target: string): unknown {
   if (target === "json") return jsonDomainValue(value, false);
   if (target === "jsonb") return jsonDomainValue(value, true);
   if (target === "uuid") return uuidDomainValue(value);
+  if (target === "date") return dateDomainValue(value);
   if (target === "time") return timeDomainValue(value);
   if (target === "interval") return intervalDomainValue(value);
   if (target === "string") {
@@ -349,8 +372,9 @@ function castValue(value: unknown, target: string): unknown {
   }
   if (target === "datetime") {
     if (value instanceof Date) return value;
-    if (typeof value === "string" || typeof value === "number") {
-      const parsed = new Date(value);
+    const external = externalSqlDomainValue(value);
+    if (typeof external === "string" || typeof external === "number") {
+      const parsed = new Date(external);
       if (Number.isFinite(dateMilliseconds(parsed))) return parsed;
       throw new TypeError(`Cannot cast this value to a datetime: ${String(value)}`);
     }
@@ -760,11 +784,24 @@ export function intervalLiteral(text: string): { months: number; milliseconds: n
  * does not exist in the target month clamps to that month's last day, which is what both SQLite
  * and PostgreSQL do with 31 January plus a month.
  */
-export function dateAddValue(value: unknown, months: unknown, milliseconds: unknown): Date | null {
+export function dateAddValue(
+  value: unknown,
+  months: unknown,
+  milliseconds: unknown,
+): Date | string | null {
   if (value === null || value === undefined) return null;
-  if (!(value instanceof Date)) throw new TypeError("Date arithmetic requires a datetime value");
+  const calendarDate = isDateDomainValue(value);
+  const external = externalSqlDomainValue(value);
+  const input =
+    value instanceof Date
+      ? value
+      : calendarDate && typeof external === "string"
+        ? new Date(`${external}T00:00:00.000Z`)
+        : undefined;
+  if (input === undefined) throw new TypeError("Date arithmetic requires a date or datetime value");
   const monthCount = Number(months ?? 0);
-  const shifted = copyDate(value);
+  const millisecondCount = Number(milliseconds ?? 0);
+  const shifted = copyDate(input);
   if (monthCount !== 0) {
     const day = dateUtcDate(shifted);
     setDateUtcDate(shifted, 1);
@@ -772,7 +809,10 @@ export function dateAddValue(value: unknown, months: unknown, milliseconds: unkn
     const lastDay = new Date(Date.UTC(dateUtcFullYear(shifted), dateUtcMonth(shifted) + 1, 0));
     setDateUtcDate(shifted, Math.min(day, dateUtcDate(lastDay)));
   }
-  return new Date(dateMilliseconds(shifted) + Number(milliseconds ?? 0));
+  const result = new Date(dateMilliseconds(shifted) + millisecondCount);
+  return calendarDate && millisecondCount % 86_400_000 === 0
+    ? dateDomainValue(dateIsoString(result).slice(0, 10))
+    : result;
 }
 
 export function dateTruncValue(unit: unknown, value: unknown): Date | null {
@@ -782,11 +822,18 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
     );
   }
   if (value === null || value === undefined) return null;
-  if (!(value instanceof Date)) throw new TypeError("DATE_TRUNC requires a datetime value");
+  const external = externalSqlDomainValue(value);
+  const input =
+    value instanceof Date
+      ? value
+      : isDateDomainValue(value) && typeof external === "string"
+        ? new Date(`${external}T00:00:00.000Z`)
+        : undefined;
+  if (input === undefined) throw new TypeError("DATE_TRUNC requires a date or datetime value");
   const normalized = unit.toLowerCase();
-  const year = dateUtcFullYear(value);
-  const month = dateUtcMonth(value);
-  const day = dateUtcDate(value);
+  const year = dateUtcFullYear(input);
+  const month = dateUtcMonth(input);
+  const day = dateUtcDate(input);
   switch (normalized) {
     case "year":
       return new Date(Date.UTC(year, 0, 1));
@@ -802,18 +849,18 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
     case "day":
       return new Date(Date.UTC(year, month, day));
     case "hour":
-      return new Date(Date.UTC(year, month, day, dateUtcHours(value)));
+      return new Date(Date.UTC(year, month, day, dateUtcHours(input)));
     case "minute":
-      return new Date(Date.UTC(year, month, day, dateUtcHours(value), dateUtcMinutes(value)));
+      return new Date(Date.UTC(year, month, day, dateUtcHours(input), dateUtcMinutes(input)));
     default:
       return new Date(
         Date.UTC(
           year,
           month,
           day,
-          dateUtcHours(value),
-          dateUtcMinutes(value),
-          dateUtcSeconds(value),
+          dateUtcHours(input),
+          dateUtcMinutes(input),
+          dateUtcSeconds(input),
         ),
       );
   }
@@ -1181,7 +1228,6 @@ const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
   ["TIMESTAMP", "datetime"],
   ["TIMESTAMPTZ", "datetime"],
   ["DATETIME", "datetime"],
-  ["DATE", "datetime"],
 ]);
 
 const clauseKeywords = new Set([
@@ -1342,6 +1388,8 @@ export interface ForeignKeyDefinition {
   parentColumn?: string;
   parentColumns?: string[];
   onDelete: "restrict" | "cascade" | "set null";
+  /** False is reserved for schema/catalog declarations; SQL-created keys are enforced. */
+  enforced?: boolean;
 }
 
 export interface UniqueConstraintDefinition {
@@ -2530,7 +2578,13 @@ export function inferBlockSchema(
         ...(scale === undefined ? {} : { scale }),
       };
     }
-    if (target === "json" || target === "jsonb" || target === "uuid" || target === "time") {
+    if (
+      target === "json" ||
+      target === "jsonb" ||
+      target === "uuid" ||
+      target === "date" ||
+      target === "time"
+    ) {
       return { kind: target };
     }
     if (target === "interval") return { kind: "interval" };
@@ -2554,10 +2608,30 @@ export function inferBlockSchema(
       return outcomes.map(inferDomain).find((domain) => domain !== undefined);
     }
     if (expression.kind !== "call") return undefined;
+    if (expression.name === "CURRENT_DATE") return { kind: "date" };
     if (expression.name === "CAST") {
       const target = expression.arguments[1];
       return target?.kind === "literal" && typeof target.value === "string"
         ? castDomain(target.value)
+        : undefined;
+    }
+    if (
+      expression.name === "JSON_ARRAYAGG" ||
+      expression.name === "JSON_QUERY" ||
+      expression.name === "JSON_OBJECT" ||
+      expression.name === "JSON_ARRAY"
+    ) {
+      return { kind: "json" };
+    }
+    if (expression.name === "GEN_RANDOM_UUID") return { kind: "uuid" };
+    if (expression.name === "DATE_ADD") {
+      const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
+      const milliseconds = expression.arguments[2];
+      return input?.kind === "date" &&
+        milliseconds?.kind === "literal" &&
+        typeof milliseconds.value === "number" &&
+        milliseconds.value % 86_400_000 === 0
+        ? input
         : undefined;
     }
     if (
@@ -2693,9 +2767,11 @@ export function inferBlockSchema(
     }
     if (expression.name === "JSON_EXISTS" || expression.name === "IS_JSON") return "boolean";
     if (expression.name === "DATE_TRUNC") return "datetime";
-    if (expression.name === "CURRENT_DATE" || expression.name === "CURRENT_TIMESTAMP") {
-      return "datetime";
+    if (expression.name === "DATE_ADD") {
+      return inferDomain(expression)?.kind === "date" ? "string" : "datetime";
     }
+    if (expression.name === "CURRENT_DATE") return "string";
+    if (expression.name === "CURRENT_TIMESTAMP") return "datetime";
     // LOCALTIME is the statement clock's canonical 'HH:MM:SS' text; explicit TIME values use
     // the same public representation while carrying a logical domain internally.
     if (expression.name === "LOCALTIME") return "string";
@@ -2793,6 +2869,26 @@ export function inferBlockSchema(
   });
 }
 
+/** Best-effort logical domains for a public result without making execution a new typecheck. */
+export function inferResultColumnDomains(
+  plan: CompiledQuery,
+  schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
+): Array<SqlDomain | null> {
+  try {
+    return inferBlockSchema(plan, schemas).map(({ sqlDomain }) => sqlDomain ?? null);
+  } catch {
+    return plan.select.flatMap((item) => {
+      try {
+        return inferBlockSchema({ ...plan, select: [item] }, schemas).map(
+          ({ sqlDomain }) => sqlDomain ?? null,
+        );
+      } catch {
+        return [null];
+      }
+    });
+  }
+}
+
 /** Whether a final result can contain one of the engine's tagged string-domain values. */
 export function queryResultNeedsExternalization(
   plan: CompiledQuery,
@@ -2813,7 +2909,7 @@ export function queryResultNeedsExternalization(
           target?.kind === "literal" &&
           typeof target.value === "string" &&
           (target.value.startsWith("numeric:") ||
-            ["json", "jsonb", "uuid", "time", "interval"].includes(target.value))
+            ["json", "jsonb", "uuid", "date", "time", "interval"].includes(target.value))
         ) {
           return true;
         }
@@ -3038,23 +3134,27 @@ export function createPreparedColumnarQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
   memory: QueryMemoryContext = new QueryMemoryContext(),
-  options: {
+  preparedOptions: {
     ftsStats?: ReadonlyMap<string, FtsStats>;
     /** False only when catalog-backed schema inference proves every output is already public. */
     outputNeedsExternalization?: boolean;
+    /** Catalog-inferred logical domains, positionally aligned with the visible output. */
+    outputColumnDomains?: ReadonlyArray<SqlDomain | null>;
   } = {},
 ): PreparedQuery {
   plan = resolveStatementDatetimes(plan);
   const ties = withTiesPlan(plan);
   if (ties.plan !== plan) {
     return trimPreparedResults(
-      createPreparedColumnarQuery(ties.plan, tables, memory, options),
+      createPreparedColumnarQuery(ties.plan, tables, memory, preparedOptions),
       ties.trim,
     );
   }
   const columnarColumns = (tableName: string): readonly string[] | undefined => {
     const table = tables.get(tableName);
-    return table === undefined ? undefined : [...table.columns.keys()];
+    return table === undefined
+      ? undefined
+      : [...table.columns.keys()].filter((name) => !name.startsWith("\0"));
   };
   plan = expandSourceColumnAliases(plan, columnarColumns);
   plan = expandNaturalJoins(plan, columnarColumns);
@@ -3066,13 +3166,32 @@ export function createPreparedColumnarQuery(
   try {
     prepared = prepareVectorQuery(plan, tables, {
       memoryContext: memory,
-      ...(options.ftsStats === undefined ? {} : { ftsStats: options.ftsStats }),
+      ...(preparedOptions.ftsStats === undefined ? {} : { ftsStats: preparedOptions.ftsStats }),
     });
   } catch (error) {
     memory.close();
     throw error;
   }
-  const outputNeedsExternalization = options.outputNeedsExternalization;
+  const outputNeedsExternalization = preparedOptions.outputNeedsExternalization;
+  let outputColumnDomains = preparedOptions.outputColumnDomains;
+  if (outputColumnDomains === undefined) {
+    try {
+      const schemas = new Map<string, SqlColumnSchema[]>(
+        [...tables].map(([name, table]) => [
+          name,
+          [...table.columns].map(([columnName, vector]) => ({
+            name: columnName,
+            type: vector.kind,
+          })),
+        ]),
+      );
+      outputColumnDomains = inferResultColumnDomains(plan, schemas);
+    } catch {
+      // This low-level schema-less entry point may not have enough source information. Known
+      // expression domains (including JSON constructors) are still inferred whenever it does.
+      outputColumnDomains = undefined;
+    }
+  }
   return {
     sql: plan.sql,
     tables: [plan.base.table, ...plan.joins.map((join) => join.table)],
@@ -3081,19 +3200,27 @@ export function createPreparedColumnarQuery(
     },
     execute() {
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
-      return markExternalizationState(prepared.execute(), outputNeedsExternalization);
+      return markExternalizationState(
+        withColumnDomains(prepared.execute(), outputColumnDomains),
+        outputNeedsExternalization,
+      );
     },
     async executeAsync(options) {
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
       return markExternalizationState(
-        await prepared.executeAsync(options),
+        withColumnDomains(await prepared.executeAsync(options), outputColumnDomains),
         outputNeedsExternalization,
       );
     },
     executeBatches(options, consume) {
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
       return prepared.executeBatches(options, (batch) =>
-        consume(markExternalizationState(batch, outputNeedsExternalization)),
+        consume(
+          markExternalizationState(
+            withColumnDomains(batch, outputColumnDomains),
+            outputNeedsExternalization,
+          ),
+        ),
       );
     },
     close() {
@@ -3159,6 +3286,7 @@ function createPreparedRowQuery(
         options.signal?.throwIfAborted();
         await consume({
           columns: [...result.columns],
+          columnDomains: [...result.columnDomains],
           rows: result.rows.slice(start, start + options.batchRows),
         });
       }
@@ -3281,7 +3409,7 @@ export function combineUnionResults(
       op === "intersect" ? membership.has(encode(row)) : !membership.has(encode(row)),
     );
   }
-  return { columns: [...columns], rows: combined };
+  return { columns: [...columns], columnDomains: [...first.columnDomains], rows: combined };
 }
 
 function encodeRowKey(columns: readonly string[]): (row: QueryRow) => string {
@@ -3504,10 +3632,18 @@ export function resolveStatementDatetimes(
 ): CompiledQuery {
   if (plan.usesStatementDatetime !== true) return plan;
   const iso = dateIsoString(now);
-  const values = new Map<string, QueryValue>([
-    ["CURRENT_DATE", new Date(`${iso.slice(0, 10)}T00:00:00.000Z`)],
-    ["CURRENT_TIMESTAMP", copyDate(now)],
-    ["LOCALTIME", iso.slice(11, 19)],
+  const values = new Map<string, Expression>([
+    [
+      "CURRENT_DATE",
+      {
+        kind: "literal",
+        value: dateDomainValue(iso.slice(0, 10)),
+        internalSqlValue: true,
+        sqlDomain: { kind: "date" },
+      },
+    ],
+    ["CURRENT_TIMESTAMP", { kind: "literal", value: copyDate(now) }],
+    ["LOCALTIME", { kind: "literal", value: iso.slice(11, 19) }],
   ]);
   const resolved = clonePlanTree(plan);
   const substitute = (expression: Expression): Expression => {
@@ -3516,7 +3652,12 @@ export function resolveStatementDatetimes(
       return expression;
     }
     if (expression.kind === "call" && values.has(expression.name)) {
-      return { kind: "literal", value: values.get(expression.name) ?? null };
+      const value = values.get(expression.name);
+      return value === undefined
+        ? { kind: "literal", value: null }
+        : value.kind === "literal"
+          ? { ...value }
+          : value;
     }
     if (expression.kind === "window") {
       // A window's own clauses are positions mapChildExpressions cannot rebuild; the plan is
@@ -4133,6 +4274,7 @@ export function applyWindowFunctions(
   }
   return {
     columns: [...result.columns, ...windows.map((window) => window.alias)],
+    columnDomains: [...result.columnDomains, ...windows.map(() => null)],
     rows,
   };
 }
@@ -4335,7 +4477,27 @@ function executeRowQueryInternal(
     plan.select[0]?.expression.kind === "wildcard"
       ? Object.keys(rows[0] ?? {})
       : plan.select.map((item) => item.alias);
-  return ties.trim({ columns, rows });
+  const schemas = new Map<string, SqlColumnSchema[]>(
+    [...tables].map(([name, tableRows]) => {
+      const names = [...new Set(tableRows.flatMap((row) => Object.keys(row)))];
+      return [
+        name,
+        names.map((columnName) => {
+          const value = tableRows.map((row) => row[columnName]).find((entry) => entry !== null);
+          const type: SqlColumnType =
+            value instanceof Date
+              ? "datetime"
+              : typeof value === "boolean"
+                ? "boolean"
+                : typeof value === "number"
+                  ? "number"
+                  : "string";
+          return { name: columnName, type };
+        }),
+      ];
+    }),
+  );
+  return ties.trim({ columns, columnDomains: inferResultColumnDomains(plan, schemas), rows });
 }
 
 /** Matches the vector executor's deliberately inexpensive modeled result-payload accounting. */
@@ -5068,7 +5230,7 @@ export function evaluateBooleanExpression(
   throw new TypeError("Boolean conditions require boolean operands");
 }
 
-function comparisonHolds(
+export function comparisonHolds(
   operator: PredicateOperator,
   leftValue: unknown,
   rightValue: unknown,
@@ -5243,7 +5405,12 @@ export function expressionAliases(expression: Expression): Set<string> {
 }
 
 function comparable(value: unknown): unknown {
-  return value instanceof Date ? dateMilliseconds(value) : value;
+  if (value instanceof Date) return dateMilliseconds(value);
+  if (isDateDomainValue(value)) {
+    const external = externalSqlDomainValue(value);
+    return typeof external === "string" ? Date.parse(`${external}T00:00:00.000Z`) : value;
+  }
+  return value;
 }
 
 /**
@@ -5341,7 +5508,9 @@ export function externalizeQueryResult(result: QueryResult): QueryResult {
     }
     rows[rowIndex] = output;
   }
-  const externalized = changed ? { columns: [...result.columns], rows } : result;
+  const externalized = changed
+    ? { columns: [...result.columns], columnDomains: [...result.columnDomains], rows }
+    : result;
   // Public TEXT is allowed to begin with the private tag prefix, so externalization is not
   // byte-idempotent. Record the boundary crossing: a wrapper such as executeQuery(query()) must
   // not interpret the now-public bytes a second time.
@@ -6093,7 +6262,7 @@ class Parser {
       }
       return `numeric:${precision === undefined ? "" : String(precision)}:${scale === undefined ? "" : String(scale)}`;
     }
-    if (["JSON", "JSONB", "UUID", "TIME", "INTERVAL"].includes(word)) {
+    if (["JSON", "JSONB", "UUID", "DATE", "TIME", "INTERVAL"].includes(word)) {
       return word.toLowerCase();
     }
     if (word === "DOUBLE") {
@@ -6132,7 +6301,7 @@ class Parser {
         },
       };
     }
-    if (["JSON", "JSONB", "UUID", "TIME", "INTERVAL"].includes(word)) {
+    if (["JSON", "JSONB", "UUID", "DATE", "TIME", "INTERVAL"].includes(word)) {
       return { type: "string", sqlDomain: { kind: word.toLowerCase() as "json" } };
     }
     if (word === "DOUBLE") {
@@ -8012,9 +8181,12 @@ class Parser {
       };
     }
     if (upper === "DATE" && this.#peek().kind === "string") {
-      const date = new Date(`${this.#take("string").text}T00:00:00.000Z`);
-      if (!Number.isFinite(dateMilliseconds(date))) throw new TypeError("Invalid DATE literal");
-      return { kind: "literal", value: date };
+      return {
+        kind: "literal",
+        value: dateDomainValue(this.#take("string").text),
+        internalSqlValue: true,
+        sqlDomain: { kind: "date" },
+      };
     }
     if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
       return { kind: "literal", value: timestampLiteral(this.#take("string").text) };
@@ -9533,6 +9705,10 @@ export function transparentProjectionSource(
 export function projectResultColumns(result: QueryResult, aliases: readonly string[]): QueryResult {
   return copyQueryResultExternalization(result, {
     columns: [...aliases],
+    columnDomains: aliases.map((alias) => {
+      const position = result.columns.indexOf(alias);
+      return position < 0 ? null : (result.columnDomains[position] ?? null);
+    }),
     rows: result.rows.map((row) => {
       const projected: QueryRow = {};
       for (const alias of aliases) projected[alias] = row[alias] ?? null;

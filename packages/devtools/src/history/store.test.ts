@@ -19,7 +19,7 @@ function memoryStorage(initial?: string): HistoryStorage & { readonly written: (
   };
 }
 
-const result = { columns: ["n"], rows: [{ n: 1 }] };
+const result = { columns: ["n"], columnDomains: [null], rows: [{ n: 1 }] };
 
 describe("createHistoryStore", () => {
   it("keeps the newest run first", () => {

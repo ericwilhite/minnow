@@ -9,6 +9,15 @@ function formatValue(value: ErrorValue): string {
   return value instanceof Date ? dateIsoString(value) : String(value);
 }
 
+/** A database operation named a table that is not present in the current catalog. */
+export class UnknownTableError extends TypeError {
+  override readonly name = "UnknownTableError";
+
+  constructor(readonly tableName: string) {
+    super(`Unknown table: ${tableName}`);
+  }
+}
+
 export class UniqueConstraintError extends Error {
   override readonly name = "UniqueConstraintError";
 

@@ -30,7 +30,8 @@ const db = createKysely({
 `Kysely` themselves. It preserves nullable/default insert optionality, enum literals, logical SQL
 domain boundary types, primary-key update safety, composite keys, and read-only view columns.
 Exact `NUMERIC` results are lossless strings, while inserts, updates, and predicates accept native
-numbers or strings. Schema-derived databases also infer `count()` and `countAll()` results as
+numbers or strings. Zoneless `DATE` columns and casts use canonical `YYYY-MM-DD` strings;
+timestamps remain `Date`. Schema-derived databases also infer `count()` and `countAll()` results as
 Minnow's runtime `number`, infer `sum()` and `avg()` from the selected numeric domain, and infer
 the fixed return types of Minnow built-ins such as `round` and `date_trunc` without explicit
 generics. Value-returning functions such as `coalesce`, `nullif`, `greatest`, and `least` infer from
@@ -47,7 +48,7 @@ PostgreSQL SQL with visible `DEFAULT` slots and no hidden generated parameters.
 
 The dialect supports reads, inserts, updates, deletes, `RETURNING`, transactions, schema DDL,
 streaming, typed live queries, and catalog introspection, including Minnow's exact numeric, JSON,
-UUID, time, interval, array, and enum types. Minnow is an embedded database, so it does not provide
+UUID, date, time, interval, array, and enum types. Minnow is an embedded database, so it does not provide
 PostgreSQL schemas, configurable isolation levels, roles, or grants. The adapter supports Kysely
 0.29.x.
 

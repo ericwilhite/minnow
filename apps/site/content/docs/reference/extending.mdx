@@ -85,7 +85,7 @@ for (const table of catalog.tables) {
   table.uniqueKeyColumnId; // scalar identity, when present
   table.primaryKeyColumnIds; // ordered scalar or composite primary identity
   table.columns; // { id, name, type, integer?, sqlDomain?, nullable, defaultValue?, enumValues?, isAutoIncrementing }
-  table.foreignKeys; // scalar column fields plus columns?/parentColumns? for composite keys
+  table.foreignKeys; // { name, columns, parentTable, parentColumns, onDelete, enforced }
   table.checks; // { name, sql }
   table.triggers; // { id, name, event, timing }; id is immutable until that trigger is dropped
 }

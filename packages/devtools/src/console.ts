@@ -82,6 +82,7 @@ function returnedResult(result: ExecuteResult): QueryResult | undefined {
   if (!("returnedRows" in result)) return undefined;
   return {
     columns: Object.keys(result.returnedRows[0] ?? {}),
+    columnDomains: Object.keys(result.returnedRows[0] ?? {}).map(() => null),
     rows: result.returnedRows,
   };
 }

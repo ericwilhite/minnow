@@ -1327,6 +1327,14 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     },
   ],
   ["type.time", { oracles: ["sqlite"], reason: "SQLite has no TIME literal" }],
+  [
+    "type.date",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite has no native DATE type; PostgreSQL clients materialize DATE as midnight Date while Minnow preserves zoneless YYYY-MM-DD text",
+    },
+  ],
 
   ["predicate.match", { oracles: ["sqlite", "pglite"], reason: "MATCH is a Minnow extension" }],
   [

@@ -1050,10 +1050,15 @@ function foldExpression(expression: Expression): Expression {
               : targetWord === "json" ||
                   targetWord === "jsonb" ||
                   targetWord === "uuid" ||
+                  targetWord === "date" ||
                   targetWord === "time" ||
                   targetWord === "interval"
                 ? ({ kind: targetWord } as const)
-                : undefined;
+                : expression.name === "JSON_QUERY" ||
+                    expression.name === "JSON_OBJECT" ||
+                    expression.name === "JSON_ARRAY"
+                  ? ({ kind: "json" } as const)
+                  : undefined;
           return {
             kind: "literal",
             value: folded,

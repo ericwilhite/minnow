@@ -1162,6 +1162,12 @@
       "notes": "A time of day without a time zone, returned as canonical text."
     },
     {
+      "id": "type.date",
+      "status": "supported",
+      "example": "SELECT CAST('2026-08-26' AS DATE) AS day",
+      "notes": "A calendar date without a time zone, returned as canonical YYYY-MM-DD text."
+    },
+    {
       "id": "ddl.sequence",
       "status": "supported",
       "example": "CREATE SEQUENCE order_ids",

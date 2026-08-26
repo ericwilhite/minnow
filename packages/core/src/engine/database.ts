@@ -25,6 +25,7 @@ import {
   MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
+  UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
@@ -61,7 +62,7 @@ import {
   planAlignedWriteBlockRanges as writeBlockRanges,
   type WriteColumnValues,
 } from "./write-block-planner.js";
-import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
+import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_PARAMETERS } from "./cache-limits.js";
 import {
   fillColumnDefaults,
   patchAutoIncrementValues,
@@ -187,12 +188,14 @@ import {
   hasAggregate,
   createRecursiveCteState,
   compileStatement,
+  comparisonHolds,
   createPreparedColumnarQuery,
   evaluateJoinedRowExpression,
   evaluateRowExpression,
   externalizeQueryResult,
   expressionColumnNames,
   inferBlockSchema,
+  inferResultColumnDomains,
   isDefaultInsertValue,
   referencedColumns,
   childExpressions,
@@ -213,6 +216,7 @@ import {
   subqueryResolutionSteps,
   topLevelFtsMatchConjuncts,
   transparentProjectionSource,
+  unknownColumnDomains,
   validateDefaultExpression,
   windowOutputDomain,
   windowOutputType,
@@ -255,6 +259,7 @@ import { encodeSqlEqualityValue } from "./sql-semantics.js";
 import {
   externalSqlDomainValue,
   externalSqlTextValue,
+  isDateDomainValue,
   isSqlDomainValue,
   normalizeSqlDomainValue,
   protectedSqlTextValue,
@@ -700,9 +705,25 @@ export interface InsertBatchResult {
   generatedColumns?: Record<string, BatchValue[]>;
 }
 
-export interface UpsertBatchResult extends InsertBatchResult {
+export interface UpsertBatchResult extends Omit<InsertBatchResult, "segmentId"> {
+  segmentId: string | null;
+  /** Input rows considered by the statement, including conflicts rejected by `conflictWhere`. */
+  requestedRowCount: number;
   insertedRowCount: number;
   updatedRowCount: number;
+  skippedRowCount: number;
+}
+
+export interface UpsertConflictWhere {
+  /** Column of the existing conflicting row to test. */
+  column: string;
+  operator: ComparisonOperator;
+  value: BatchValue;
+}
+
+export interface UpsertOptions {
+  /** SQL `ON CONFLICT DO UPDATE ... WHERE` semantics over the existing target row. */
+  conflictWhere?: UpsertConflictWhere;
 }
 
 export interface UpdateBatchInput {
@@ -1062,6 +1083,7 @@ export {
   MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
+  UnknownTableError,
   TableInUseError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
@@ -1265,7 +1287,11 @@ function externalizeExecuteResult(result: ExecuteResult): ExecuteResult {
   const columns = [...new Set(result.returnedRows.flatMap((row) => Object.keys(row)))];
   return {
     ...result,
-    returnedRows: externalizeQueryResult({ columns, rows: result.returnedRows }).rows,
+    returnedRows: externalizeQueryResult({
+      columns,
+      columnDomains: unknownColumnDomains(columns),
+      rows: result.returnedRows,
+    }).rows,
   };
 }
 
@@ -2079,6 +2105,11 @@ export class MinnowDatabase {
     );
     const foreignKeys = await Promise.all(
       (input.foreignKeys ?? []).map(async (key, keyIndex) => {
+        if (key.enforced === false && key.onDelete !== "restrict") {
+          throw new TypeError(
+            `Informational FOREIGN KEY ${key.name} cannot declare ON DELETE actions`,
+          );
+        }
         const childNames = key.columns ?? [key.column];
         const children = childNames.map((columnName) => {
           const column = columns.find((candidate) => candidate.name === columnName);
@@ -2167,6 +2198,7 @@ export class MinnowDatabase {
           parentTable: key.parentTable,
           parentColumns: parentNames,
           onDelete: key.onDelete,
+          ...(key.enforced === false ? { enforced: false } : {}),
         };
       }),
     );
@@ -2631,7 +2663,7 @@ export class MinnowDatabase {
         }
         if (table?.view !== undefined) throw new TypeError(`${tableName} is a view, not a table`);
         if (options.ifExists === true) return false;
-        throw new Error(`Table not found: ${tableName}`);
+        throw new UnknownTableError(tableName);
       }
       pinnedTableId ??= table.id;
       if (table.id !== pinnedTableId) {
@@ -2778,7 +2810,7 @@ export class MinnowDatabase {
           throw new TableRecordConflictError(pinnedTableId, 0, null);
         }
         if (options.ifExists === true) return false;
-        throw new Error(`Table not found: ${tableName}`);
+        throw new UnknownTableError(tableName);
       }
       pinnedTableId ??= table.id;
       if (table.id !== pinnedTableId) {
@@ -2868,12 +2900,13 @@ export class MinnowDatabase {
           ? batchKeys(table, batch)
           : undefined;
       const current = await this.store.getTable(table.id);
-      if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
+      if (current === undefined) throw new UnknownTableError(tableName);
       const result = await this.#writeBatch(current, batch, "insert", keys, autoIncrement);
       return { result, batch, generated, autoIncrement, rowCount };
     });
     const { result, batch, generated, autoIncrement, rowCount } = completed;
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
+    if (result.segmentId === null) throw new Error("An insert did not create a segment");
     return {
       tableName: result.tableName,
       segmentId: result.segmentId,
@@ -2944,13 +2977,18 @@ export class MinnowDatabase {
     return this.insertBatch(tableName, [row]);
   }
 
-  upsertBatch(tableName: string, input: InsertBatchInput): Promise<UpsertBatchResult> {
-    return this.#withWriteReservation(() => this.#upsertBatchReserved(tableName, input));
+  upsertBatch(
+    tableName: string,
+    input: InsertBatchInput,
+    options: UpsertOptions = {},
+  ): Promise<UpsertBatchResult> {
+    return this.#withWriteReservation(() => this.#upsertBatchReserved(tableName, input, options));
   }
 
   async #upsertBatchReserved(
     tableName: string,
     input: InsertBatchInput,
+    options: UpsertOptions,
   ): Promise<UpsertBatchResult> {
     const completed = await this.#runWrite(async () => {
       const table = await this.#findTable(tableName);
@@ -2958,25 +2996,53 @@ export class MinnowDatabase {
       if (keyColumn === undefined) {
         throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
       }
-      const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
+      const { batch, generated, autoIncrement } = await this.#fillDefaults(table, input);
       const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
       const keys = deferred ? undefined : batchKeys(table, batch);
       const current = await this.store.getTable(table.id);
-      if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
-      const result = await this.#writeBatch(current, batch, "upsert", keys, autoIncrement);
-      return { result, batch, generated, autoIncrement, rowCount };
+      if (current === undefined) throw new UnknownTableError(tableName);
+      const result = await this.#writeBatch(
+        current,
+        batch,
+        "upsert",
+        keys,
+        autoIncrement,
+        options.conflictWhere,
+      );
+      return { result, batch, generated, autoIncrement };
     });
-    const { result, batch, generated, autoIncrement, rowCount } = completed;
+    const { result, batch, generated, autoIncrement } = completed;
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
+    if (result.acceptedRowIndexes.length !== result.requestedRowCount) {
+      for (const [name, values] of generated) {
+        generated.set(
+          name,
+          result.acceptedRowIndexes.map((index) => values[index] ?? null),
+        );
+      }
+    }
     return {
-      ...result,
-      rowCount,
+      tableName: result.tableName,
+      segmentId: result.segmentId,
+      requestedRowCount: result.requestedRowCount,
+      rowCount: result.rowCount,
+      insertedRowCount: result.insertedRowCount,
+      updatedRowCount: result.updatedRowCount,
+      skippedRowCount: result.skippedRowCount,
+      blockCount: result.blockCount,
+      storedBytes: result.storedBytes,
+      version: result.version,
+      metrics: result.metrics,
       ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
     };
   }
 
-  async upsert(tableName: string, row: BatchRow): Promise<UpsertBatchResult> {
-    return this.upsertBatch(tableName, [row]);
+  async upsert(
+    tableName: string,
+    row: BatchRow,
+    options: UpsertOptions = {},
+  ): Promise<UpsertBatchResult> {
+    return this.upsertBatch(tableName, [row], options);
   }
 
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
@@ -2996,7 +3062,7 @@ export class MinnowDatabase {
       const normalizedInput = normalizeDomainUpdate(table, input);
       const keys = validateUpdateBatch(table, keyColumn, normalizedInput);
       const current = await this.store.getTable(table.id);
-      if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
+      if (current === undefined) throw new UnknownTableError(tableName);
       const currentKey = getUniqueKeyColumn(current);
       if (currentKey?.id !== keyColumn.id) {
         throw new TypeError(`Table unique key changed during update: ${tableName}`);
@@ -3375,8 +3441,10 @@ export class MinnowDatabase {
         columnBlockIds[column.id] = blockIds;
       }
       const checks = table.checks ?? [];
-      const changedForeignKey = (table.foreignKeys ?? []).some((key) =>
-        foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
+      const changedForeignKey = (table.foreignKeys ?? []).some(
+        (key) =>
+          key.enforced !== false &&
+          foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
       );
       const preImages = await this.#triggerPreImages(
         table,
@@ -3535,17 +3603,19 @@ export class MinnowDatabase {
     kind: "insert" | "upsert",
     keys: Map<string, Exclude<BatchValue, null>> | undefined,
     autoIncrement?: AutoIncrementFill,
-  ): Promise<UpsertBatchResult> {
+    conflictWhere?: UpsertConflictWhere,
+  ): Promise<UpsertBatchResult & { acceptedRowIndexes: number[] }> {
     await this.#assertCompactionCapacity(table);
     const started = performance.now();
-    const rowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
-    const logicalBytes = estimateBatchBytes(input);
+    const requestedRowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
+    let rowCount = requestedRowCount;
+    let logicalBytes = estimateBatchBytes(input);
     const {
       transaction,
       rowIds: reservedRowIds,
       autoIncrementValues,
     } = await this.#transactions.beginWithReservation(
-      { tableId: table.id, count: rowCount },
+      { tableId: table.id, count: requestedRowCount },
       autoIncrement === undefined
         ? undefined
         : {
@@ -3558,11 +3628,21 @@ export class MinnowDatabase {
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
     const blockStager = new BoundedWriteBlockStager(transaction);
     let resolvedKeys = keys;
-    const segmentId = this.#createId();
+    let segmentId: string | null = null;
     const columnBlockIds: Record<string, string[]> = {};
     let storedBytes = 0;
     let blockCount = 0;
-    let counts: { inserted: number; updated: number };
+    let counts: { inserted: number; updated: number } | undefined;
+    let skippedRowCount = 0;
+    let acceptedRowIndexes = Array.from({ length: requestedRowCount }, (_, index) => index);
+    let upsertFirings:
+      | {
+          inserts: number[];
+          updates: number[];
+          skipped: number[];
+          oldImages: Array<Record<string, BatchValue> | undefined>;
+        }
+      | undefined;
     let encodeMs = 0;
     let stageMs = 0;
     let commitMs = 0;
@@ -3589,6 +3669,77 @@ export class MinnowDatabase {
         }
         resolvedKeys = batchKeys(table, input);
       }
+      const normalizedConflictWhere =
+        kind === "upsert" && conflictWhere !== undefined
+          ? normalizeUpsertConflictWhere(table, conflictWhere)
+          : undefined;
+      const upsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
+      if (upsertKeyColumn !== undefined) {
+        upsertFirings = await this.#upsertTriggerFirings(
+          table,
+          upsertKeyColumn,
+          input,
+          rowCount,
+          (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+          normalizedConflictWhere,
+          normalizedConflictWhere !== undefined,
+        );
+      }
+      if (normalizedConflictWhere !== undefined) {
+        if (upsertFirings === undefined) {
+          throw new Error("Upsert conflict classification is missing");
+        }
+        const classifiedFirings = upsertFirings;
+        acceptedRowIndexes = [...classifiedFirings.inserts, ...classifiedFirings.updates].sort(
+          (left, right) => left - right,
+        );
+        skippedRowCount = classifiedFirings.skipped.length;
+        input = selectBatchRows(input, acceptedRowIndexes);
+        rowCount = acceptedRowIndexes.length;
+        logicalBytes = estimateBatchBytes(input);
+        resolvedKeys = batchKeys(table, input);
+        counts = {
+          inserted: classifiedFirings.inserts.length,
+          updated: classifiedFirings.updates.length,
+        };
+        const acceptedPosition = new Map(
+          acceptedRowIndexes.map((original, position) => [original, position] as const),
+        );
+        upsertFirings = {
+          inserts: classifiedFirings.inserts.map((index) => acceptedPosition.get(index) ?? -1),
+          updates: classifiedFirings.updates.map((index) => acceptedPosition.get(index) ?? -1),
+          skipped: [],
+          oldImages: acceptedRowIndexes.map((index) => classifiedFirings.oldImages[index]),
+        };
+        if (rowCount === 0) {
+          await transaction.abort();
+          const version = transaction.snapshotVersion;
+          if (version === null) throw new Error("An existing table has no catalog version");
+          return {
+            tableName: table.name,
+            segmentId: null,
+            requestedRowCount,
+            rowCount: 0,
+            insertedRowCount: 0,
+            updatedRowCount: 0,
+            skippedRowCount,
+            acceptedRowIndexes,
+            blockCount: 0,
+            storedBytes: 0,
+            version,
+            metrics: createWriteMetrics({
+              logicalBytes: 0,
+              storedBytes: 0,
+              encodeMs: 0,
+              stageMs: 0,
+              commitMs: 0,
+              totalMs: performance.now() - started,
+              retries: 0,
+              rows: 0,
+            }),
+          };
+        }
+      }
       if (resolvedKeys !== undefined) {
         transaction.setUniqueKeyChanges({
           tableId: table.id,
@@ -3607,11 +3758,19 @@ export class MinnowDatabase {
       // generated values are patched also covers an auto-incremented referencing column, and
       // registering this batch's key membership first permits valid self-references.
       await assertForeignKeys();
-      counts =
-        kind === "insert" && resolvedKeys !== undefined
-          ? { inserted: resolvedKeys.size, updated: 0 }
-          : await this.#classifyKeys(table, transaction.snapshotVersion, kind, resolvedKeys);
-      const rowIds = reservedRowIds ?? (await this.store.reserveRowIds(table.id, rowCount));
+      if (normalizedConflictWhere === undefined) {
+        counts =
+          kind === "insert" && resolvedKeys !== undefined
+            ? { inserted: resolvedKeys.size, updated: 0 }
+            : await this.#classifyKeys(table, transaction.snapshotVersion, kind, resolvedKeys);
+      }
+      if (counts === undefined) throw new Error("Write classification is missing");
+      const reserved = reservedRowIds ?? (await this.store.reserveRowIds(table.id, rowCount));
+      const rowIds = {
+        start: reserved.start,
+        endExclusive: reserved.start + BigInt(rowCount),
+      };
+      segmentId = this.#createId();
       // Insert batches maintain any active full-text index by tokenizing their own rows into a
       // commit delta. Other mutation kinds emit nothing on purpose: the store's stale-writer
       // rule then flips the index to "invalid" (keyed histories are unindexable) and the scan
@@ -3728,11 +3887,6 @@ export class MinnowDatabase {
       ): BatchValue => (source === "new" ? (input.columns[column]?.[rowIndex] ?? null) : null);
       // Upserts fire per-row: INSERT triggers for fresh keys, UPDATE triggers (with the
       // replaced row as OLD) for conflicting ones — ON CONFLICT DO UPDATE semantics.
-      const upsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
-      const upsertFirings =
-        upsertKeyColumn === undefined
-          ? undefined
-          : await this.#upsertTriggerFirings(table, upsertKeyColumn, input, rowCount);
       stageSecondaryUniqueInsertChanges(
         transaction,
         table,
@@ -3785,12 +3939,15 @@ export class MinnowDatabase {
           return {
             tableName: table.name,
             segmentId,
+            requestedRowCount,
             rowCount,
             blockCount,
             storedBytes,
             version: manifest.version,
             insertedRowCount: counts.inserted,
             updatedRowCount: counts.updated,
+            skippedRowCount,
+            acceptedRowIndexes,
             metrics: createWriteMetrics({
               logicalBytes,
               storedBytes,
@@ -3810,7 +3967,7 @@ export class MinnowDatabase {
           const stagedDerivations =
             kind === "insert"
               ? (table.triggers ?? []).some((trigger) => trigger.event === "insert")
-              : upsertFirings !== undefined;
+              : upsertFirings !== undefined || conflictWhere !== undefined;
           if (stagedDerivations) throw new StaleTriggerDerivationsError(error);
           retries += 1;
           const snapshot = await transaction.rebase();
@@ -3872,6 +4029,7 @@ export class MinnowDatabase {
     });
     return externalizeQueryResult({
       columns: columns.map(({ name }) => name),
+      columnDomains: columns.map(({ sqlDomain }) => sqlDomain ?? null),
       rows,
     }).rows;
   }
@@ -3977,6 +4135,7 @@ export class MinnowDatabase {
       let resolvedPlan = plan;
       let ftsStats: Map<string, FtsStats> | undefined;
       let outputNeedsExternalization = true;
+      let outputColumnDomains: Array<SqlDomain | null> = [];
       const prepareAtSnapshot = async (
         snapshot: LeasedSnapshot,
         realTables: Map<string, TableRecord>,
@@ -4036,6 +4195,7 @@ export class MinnowDatabase {
           options.spillPageRows,
         );
         outputNeedsExternalization = queryResultNeedsExternalization(resolvedPlan, typedSchemas);
+        outputColumnDomains = inferResultColumnDomains(resolvedPlan, typedSchemas);
       };
       if (options.version !== undefined) {
         // Explicit time travel keeps the per-call lease and version-anchored reads.
@@ -4058,6 +4218,7 @@ export class MinnowDatabase {
         {
           ...(ftsStats === undefined ? {} : { ftsStats }),
           outputNeedsExternalization,
+          outputColumnDomains,
         },
       );
     } catch (error) {
@@ -4095,7 +4256,7 @@ export class MinnowDatabase {
         const realTables = new Map<string, TableRecord>();
         names.forEach((name, index) => {
           const table = state.tables[index];
-          if (table === undefined) throw new Error(`Table not found: ${name}`);
+          if (table === undefined) throw new UnknownTableError(name);
           realTables.set(table.name, table);
         });
         const segmentsByTable = new Map<string, SegmentRecord[]>();
@@ -4406,7 +4567,11 @@ export class MinnowDatabase {
           try {
             const frontierTable = derivedColumnarTable(
               reference,
-              { columns: [...state.columns], rows: state.frontier },
+              {
+                columns: [...state.columns],
+                columnDomains: schema.map(({ sqlDomain }) => sqlDomain ?? null),
+                rows: state.frontier,
+              },
               schema,
             );
             state.absorb(
@@ -4433,7 +4598,11 @@ export class MinnowDatabase {
           source.table,
           derivedColumnarTable(
             source.table,
-            { columns: [...state.columns], rows: state.rows },
+            {
+              columns: [...state.columns],
+              columnDomains: schema.map(({ sqlDomain }) => sqlDomain ?? null),
+              rows: state.rows,
+            },
             schema,
           ),
         );
@@ -4595,7 +4764,7 @@ export class MinnowDatabase {
         continue;
       }
       const table = realTables.get(source.table);
-      if (table === undefined) throw new TypeError(`Unknown table: ${source.table}`);
+      if (table === undefined) throw new UnknownTableError(source.table);
       const requestedColumns = columns.get(table.name) ?? [];
       inputs.set(
         table.name,
@@ -4769,6 +4938,7 @@ export class MinnowDatabase {
       cursor.signal.throwIfAborted();
       await cursor.consume({
         columns: [...result.columns],
+        columnDomains: [...result.columnDomains],
         rows: result.rows.slice(start, start + cursor.batchRows),
       });
     }
@@ -5749,7 +5919,7 @@ export class MinnowDatabase {
       const proof = await this.#stableCatalogProof();
       const tables = proof.records;
       const table = tables.find((record) => record.name === tableName);
-      if (table === undefined) throw new TypeError(`Table not found: ${tableName}`);
+      if (table === undefined) throw new UnknownTableError(tableName);
       if (table.view !== undefined)
         throw new TypeError(`Cannot create a trigger on view ${tableName}`);
       pinnedTableId ??= table.id;
@@ -5783,7 +5953,7 @@ export class MinnowDatabase {
           throw new TypeError("Trigger bodies support INSERT, UPDATE, and DELETE statements");
         }
         const target = tables.find((record) => record.name === compiled.table);
-        if (target === undefined) throw new TypeError(`Table not found: ${compiled.table}`);
+        if (target === undefined) throw new UnknownTableError(compiled.table);
         if (target.view !== undefined) {
           throw new TypeError(`Trigger bodies cannot write to views: ${compiled.table}`);
         }
@@ -5871,10 +6041,17 @@ export class MinnowDatabase {
     batch: ColumnarBatch,
     rowCount: number,
     readRows?: (sql: string, params: QueryValue[]) => Promise<QueryResult>,
+    conflictWhere?: {
+      column: TableColumnRecord;
+      operator: ComparisonOperator;
+      value: BatchValue;
+    },
+    force = false,
   ): Promise<
     | {
         inserts: number[];
         updates: number[];
+        skipped: number[];
         oldImages: Array<Record<string, BatchValue> | undefined>;
       }
     | undefined
@@ -5882,18 +6059,30 @@ export class MinnowDatabase {
     const fires = (table.triggers ?? []).some(
       (trigger) => trigger.event === "insert" || trigger.event === "update",
     );
-    if (!fires || rowCount === 0) return undefined;
+    if ((!fires && !force) || rowCount === 0) return undefined;
     const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
     const keyValues = batch.columns[keyColumn.name] ?? [];
-    const params = keyValues.filter((value): value is Exclude<BatchValue, null> => value !== null);
-    const placeholders = params.map(() => "?").join(", ");
-    const sql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
-    const result =
-      readRows === undefined
-        ? await this.query(sql, { params, memoize: false })
-        : await readRows(sql, params);
+    const distinct = new Map<string, Exclude<BatchValue, null>>();
+    for (const value of keyValues) {
+      if (value !== null) distinct.set(keyToken(keyColumn.type, value), value);
+    }
+    const params = [...distinct.values()];
+    const rows: QueryRow[] = [];
+    // Each value also contributes a comma token, so the parser's token cap is reached before
+    // its parameter cap. A fixed 1,024-key window stays comfortably inside both limits.
+    const keyWindowSize = Math.min(MAX_SQL_PARAMETERS, 1_024);
+    for (let start = 0; start < params.length; start += keyWindowSize) {
+      const window = params.slice(start, start + keyWindowSize);
+      const placeholders = window.map(() => "?").join(", ");
+      const sql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
+      const result =
+        readRows === undefined
+          ? await this.query(sql, { params: window, memoize: false })
+          : await readRows(sql, window);
+      rows.push(...result.rows);
+    }
     const byToken = new Map(
-      result.rows.map((row) => {
+      rows.map((row) => {
         const key = row[keyColumn.name];
         return [
           key === null || key === undefined ? "" : keyToken(keyColumn.type, key),
@@ -5903,31 +6092,44 @@ export class MinnowDatabase {
     );
     const inserts: number[] = [];
     const updates: number[] = [];
+    const skipped: number[] = [];
     const oldImages: Array<Record<string, BatchValue> | undefined> = [];
-    const seenInBatch = new Map<string, number>();
+    const currentByToken = new Map(byToken);
     for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
       const key = keyValues[rowIndex] ?? null;
       const token = key === null ? "" : keyToken(keyColumn.type, key);
-      const earlier = seenInBatch.get(token);
-      const old =
-        earlier === undefined
-          ? byToken.get(token)
-          : Object.fromEntries(
-              table.columns.map((column) => [
-                column.name,
-                batch.columns[column.name]?.[earlier] ?? null,
-              ]),
-            );
+      const old = currentByToken.get(token);
       if (old === undefined) {
         inserts.push(rowIndex);
         oldImages.push(undefined);
       } else {
-        updates.push(rowIndex);
         oldImages.push(old);
+        const rawLeft =
+          conflictWhere === undefined ? null : (old[conflictWhere.column.name] ?? null);
+        const left =
+          conflictWhere?.column.sqlDomain === undefined
+            ? rawLeft
+            : normalizeSqlDomainValue(conflictWhere.column.sqlDomain, rawLeft);
+        if (
+          conflictWhere !== undefined &&
+          !comparisonHolds(conflictWhere.operator, left, conflictWhere.value)
+        ) {
+          skipped.push(rowIndex);
+          continue;
+        }
+        updates.push(rowIndex);
       }
-      seenInBatch.set(token, rowIndex);
+      currentByToken.set(
+        token,
+        Object.fromEntries(
+          table.columns.map((column) => [
+            column.name,
+            batch.columns[column.name]?.[rowIndex] ?? null,
+          ]),
+        ),
+      );
     }
-    return { inserts, updates, oldImages };
+    return { inserts, updates, skipped, oldImages };
   }
 
   /** Fires INSERT and UPDATE triggers for one upsert batch at one timing, per the plan. */
@@ -5938,6 +6140,7 @@ export class MinnowDatabase {
     firings: {
       inserts: number[];
       updates: number[];
+      skipped: number[];
       oldImages: Array<Record<string, BatchValue> | undefined>;
     },
     timing: "before" | "after",
@@ -6875,8 +7078,10 @@ export class MinnowDatabase {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
     }
     const sessionChecks = table.checks ?? [];
-    const changedForeignKey = (table.foreignKeys ?? []).some((key) =>
-      foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
+    const changedForeignKey = (table.foreignKeys ?? []).some(
+      (key) =>
+        key.enforced !== false &&
+        foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
     );
     const preImages = await this.#triggerPreImages(
       table,
@@ -7570,7 +7775,15 @@ export class MinnowDatabase {
       // The remaining metadata-only steps share one catalog/manifest CAS. Physical drops ran
       // above because segment rewriting and payload retirement have a stronger atomic boundary.
       const columns = applyColumnSteps(record, steps, this.#createId);
-      if (JSON.stringify(columns) === JSON.stringify(record.columns)) {
+      const foreignKeyStep = steps.find((step) => step.kind === "alter-foreign-keys");
+      const foreignKeys =
+        foreignKeyStep?.kind === "alter-foreign-keys"
+          ? foreignKeyStep.foreignKeys.map((key) => ({ ...key }))
+          : record.foreignKeys;
+      if (
+        JSON.stringify(columns) === JSON.stringify(record.columns) &&
+        JSON.stringify(foreignKeys ?? []) === JSON.stringify(record.foreignKeys ?? [])
+      ) {
         if (changed) alteredTables.push(tableName);
         continue;
       }
@@ -7580,6 +7793,7 @@ export class MinnowDatabase {
       assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
       const updated = await this.store.updateTable(record.id, record.revision, {
         columns,
+        ...(foreignKeyStep === undefined ? {} : { foreignKeys }),
         ...(autoIncrementSeed === undefined ? {} : { autoIncrementSeed }),
         expectedManifestVersion: { value: proof.manifestVersion },
         expectedCatalogEpoch: proof.catalogEpoch,
@@ -7745,6 +7959,7 @@ export class MinnowDatabase {
     transaction?: DatabaseTransaction,
   ): Promise<void> {
     for (const key of table.foreignKeys ?? []) {
+      if (key.enforced === false) continue;
       const childNames = foreignKeyColumns(key);
       const parentNames = foreignKeyParentColumns(key);
       if (childNames.length > 1) {
@@ -7924,7 +8139,9 @@ export class MinnowDatabase {
     cascadeBudget: number,
   ): Promise<void> {
     if (keys.length === 0) return;
-    const children = await this.#childForeignKeys(parent.name);
+    const children = (await this.#childForeignKeys(parent.name)).filter(
+      ({ key }) => key.enforced !== false,
+    );
     if (children.length === 0) return;
     if (cascadeBudget < 0) {
       throw new Error(`Referential cascade depth exceeded at table: ${parent.name}`);
@@ -8392,7 +8609,15 @@ export class MinnowDatabase {
           { params: keys },
         );
         const currentByKey = new Map(
-          selected.rows.map((row) => [keyToken(row[keyColumn.name] ?? null), row] as const),
+          selected.rows.map((row) => {
+            const value = keyColumn.hidden
+              ? compositeKeyValue(
+                  primaryKeyColumns(table),
+                  primaryKeyColumns(table).map(({ name }) => row[name] ?? null),
+                )
+              : (row[keyColumn.name] ?? null);
+            return [keyToken(value), row] as const;
+          }),
         );
         const updateKeys: QueryValue[] = [];
         const changes: Record<string, BatchValue[]> = Object.fromEntries(
@@ -8858,7 +9083,11 @@ export class MinnowDatabase {
           transaction.limitLevelZeroSegments(pendingTable.id, MAX_LEVEL_ZERO_SEGMENTS);
           const stageRows = async (rows: readonly QueryRow[]): Promise<void> => {
             if (rows.length === 0) return;
-            const batchResult = { columns: tableColumns.map(({ name }) => name), rows: [...rows] };
+            const batchResult = {
+              columns: tableColumns.map(({ name }) => name),
+              columnDomains: tableColumns.map(({ sqlDomain }) => sqlDomain ?? null),
+              rows: [...rows],
+            };
             if (queryResultRetainedBytes(batchResult) > executionMemoryBudgetBytes) {
               throw new QueryMemoryBudgetError(
                 "CREATE TABLE AS result batch",
@@ -9025,8 +9254,7 @@ export class MinnowDatabase {
           const record = proof.records.find(
             (candidate) => candidate.name === addColumnStatement.table,
           );
-          if (record === undefined)
-            throw new TypeError(`Unknown table: ${addColumnStatement.table}`);
+          if (record === undefined) throw new UnknownTableError(addColumnStatement.table);
           if (record.view !== undefined)
             throw new TypeError(`${addColumnStatement.table} is a view, not a table`);
           pinnedTableId ??= record.id;
@@ -9612,7 +9840,7 @@ export class MinnowDatabase {
     }
     if (rowCounts.size === tables.length) plan = chooseJoinOrder(plan, rowCounts);
     const baseTable = tables.find((table) => table.name === plan.base.table);
-    if (baseTable === undefined) throw new TypeError(`Unknown table: ${plan.base.table}`);
+    if (baseTable === undefined) throw new UnknownTableError(plan.base.table);
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
     const projectedBaseColumns =
       requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
@@ -9743,6 +9971,7 @@ export class MinnowDatabase {
           prepared = createPreparedColumnarQuery(plan, inputTables, memory, {
             ...(ftsStats === undefined ? {} : { ftsStats }),
             outputNeedsExternalization: queryResultNeedsExternalization(plan, typedSchemas),
+            outputColumnDomains: inferResultColumnDomains(plan, typedSchemas),
           });
           if (cursor !== undefined) {
             const emission = { happened: false };
@@ -9758,10 +9987,18 @@ export class MinnowDatabase {
               },
             );
             if (!emission.happened) {
-              await cursor.consume({ columns: [...columns], rows: [] });
+              await cursor.consume({
+                columns: [...columns],
+                columnDomains: inferResultColumnDomains(plan, typedSchemas),
+                rows: [],
+              });
             }
             options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
-            return { columns: [...columns], rows: [] };
+            return {
+              columns: [...columns],
+              columnDomains: inferResultColumnDomains(plan, typedSchemas),
+              rows: [],
+            };
           }
           if (!attempt.spill) {
             try {
@@ -10183,7 +10420,8 @@ export class MinnowDatabase {
         startRow > 0 || limit !== undefined
           ? combined.slice(startRow, limit === undefined ? undefined : startRow + limit)
           : combined;
-      return { columns: plan.select.map((item) => item.alias), rows };
+      const columns = plan.select.map((item) => item.alias);
+      return { columns, columnDomains: unknownColumnDomains(columns), rows };
     } finally {
       root.close();
     }
@@ -15197,7 +15435,7 @@ export class MinnowDatabase {
     }
     const table = tables.find((candidate) => candidate.name === tableName);
     if (table === undefined || table.view !== undefined) {
-      throw new TypeError(`Unknown table: ${tableName}`);
+      throw new UnknownTableError(tableName);
     }
     if (indexColumns.length === 0) throw new TypeError("An index needs at least one column");
     const duplicate = indexColumns.find(
@@ -17854,7 +18092,7 @@ export class MinnowDatabase {
   async #findTable(name: string): Promise<TableRecord> {
     validateName(name, "Table");
     const table = await this.store.getTableByName(name);
-    if (table === undefined) throw new Error(`Table not found: ${name}`);
+    if (table === undefined) throw new UnknownTableError(name);
     // Reads resolve a view into its query before reaching here, so a view arriving at this
     // point is a write, a DDL statement, or a path that forgot to rewrite: all of them errors.
     if (table.view !== undefined) throw new TypeError(`${name} is a view, not a table`);
@@ -19349,32 +19587,82 @@ function compositeKeyValue(
 /** Canonicalizes logical PostgreSQL domains before validation and primitive block encoding. */
 function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
-    const domain = column.sqlDomain;
-    if (domain === undefined) continue;
     const values = input.columns[column.name];
     if (values === undefined) continue;
-    (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
-      normalizeSqlDomainValue(domain, value),
-    );
+    if (column.sqlDomain !== undefined || column.type === "datetime") {
+      (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
+        normalizeColumnLogicalValue(column, value),
+      );
+    }
   }
 }
 
+function normalizeColumnLogicalValue(column: TableColumnRecord, value: BatchValue): BatchValue {
+  if (column.sqlDomain !== undefined) return normalizeSqlDomainValue(column.sqlDomain, value);
+  if (column.type === "datetime" && isDateDomainValue(value)) {
+    const external = externalSqlDomainValue(value);
+    if (typeof external !== "string") throw new TypeError("Invalid DATE value");
+    return new Date(`${external}T00:00:00.000Z`);
+  }
+  return value;
+}
+
+function selectBatchRows(input: ColumnarBatch, indexes: readonly number[]): ColumnarBatch {
+  return {
+    columns: Object.fromEntries(
+      Object.entries(input.columns).map(([name, values]) => [
+        name,
+        indexes.map((index) => values[index] ?? null),
+      ]),
+    ),
+    ...(input.omitted === undefined
+      ? {}
+      : {
+          omitted: Object.fromEntries(
+            Object.entries(input.omitted).map(([name, values]) => [
+              name,
+              indexes.map((index) => values[index] ?? false),
+            ]),
+          ),
+        }),
+    rowCount: indexes.length,
+  };
+}
+
+function normalizeUpsertConflictWhere(
+  table: TableRecord,
+  predicate: UpsertConflictWhere,
+): { column: TableColumnRecord; operator: ComparisonOperator; value: BatchValue } {
+  const operators: readonly ComparisonOperator[] = ["=", "!=", "<>", ">", ">=", "<", "<="];
+  if (!operators.includes(predicate.operator)) {
+    throw new TypeError(`Unsupported upsert conflict operator: ${predicate.operator}`);
+  }
+  const column = visibleTableColumns(table).find(({ name }) => name === predicate.column);
+  if (column === undefined) {
+    throw new TypeError(`Unknown upsert conflict column: ${table.name}.${predicate.column}`);
+  }
+  const value = normalizeColumnLogicalValue(column, predicate.value);
+  if (value !== null) validateValue({ ...column, nullable: true }, value, 0);
+  return { column, operator: predicate.operator, value };
+}
+
 function normalizeDomainUpdate(table: TableRecord, input: UpdateBatchInput): UpdateBatchInput {
-  if (!table.columns.some((column) => column.sqlDomain !== undefined)) return input;
+  if (!table.columns.some((column) => column.sqlDomain !== undefined || column.type === "datetime"))
+    return input;
   let changed = false;
   const changes: Record<string, readonly BatchValue[]> = { ...input.changes };
   for (const [name, values] of Object.entries(input.changes)) {
-    const domain = table.columns.find((column) => column.name === name)?.sqlDomain;
-    if (domain === undefined) continue;
+    const column = table.columns.find((candidate) => candidate.name === name);
+    if (column === undefined || (column.sqlDomain === undefined && column.type !== "datetime"))
+      continue;
     changed = true;
-    changes[name] = values.map((value) => normalizeSqlDomainValue(domain, value));
+    changes[name] = values.map((value) => normalizeColumnLogicalValue(column, value));
   }
   const key = getUniqueKeyColumn(table);
-  const keyDomain = key?.sqlDomain;
   const keys =
-    keyDomain === undefined
+    key === undefined || (key.sqlDomain === undefined && key.type !== "datetime")
       ? input.keys
-      : input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value));
+      : input.keys.map((value) => normalizeColumnLogicalValue(key, value));
   return changed || keys !== input.keys ? { keys, changes } : input;
 }
 
@@ -20742,6 +21030,15 @@ function columnVectorKeyToken(type: SimpleDataType, vector: ColumnVector, row: n
   throw new Error("Column vector type mismatch");
 }
 
+function normalizedDatetimeLiteral(value: QueryValue): Date | undefined {
+  if (value instanceof Date) return Number.isFinite(dateMilliseconds(value)) ? value : undefined;
+  if (!isDateDomainValue(value)) return undefined;
+  const external = externalSqlDomainValue(value);
+  if (typeof external !== "string") return undefined;
+  const date = new Date(`${external}T00:00:00.000Z`);
+  return Number.isFinite(dateMilliseconds(date)) ? date : undefined;
+}
+
 function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[] {
   if (plan.joins.length > 0 || plan.base.table !== table.name) return [];
   const output: ZonePredicate[] = [];
@@ -20759,11 +21056,13 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     comparisons.has(operator as ComparisonOperator) ? (operator as ComparisonOperator) : undefined;
   const literalValue = (column: TableColumnRecord, expression: Expression): number | undefined => {
     if (expression.kind !== "literal") return undefined;
+    const datetime =
+      column.type === "datetime" ? normalizedDatetimeLiteral(expression.value) : undefined;
     const value =
       column.type === "datetime"
-        ? expression.value instanceof Date
-          ? dateMilliseconds(expression.value)
-          : undefined
+        ? datetime === undefined
+          ? undefined
+          : dateMilliseconds(datetime)
         : typeof expression.value === "number"
           ? expression.value
           : undefined;
@@ -20803,11 +21102,13 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     const literal = leftColumn === undefined ? predicate.left : predicate.right;
     const column = leftColumn ?? rightColumn;
     if (column === undefined || literal.kind !== "literal") continue;
+    const datetime =
+      column.type === "datetime" ? normalizedDatetimeLiteral(literal.value) : undefined;
     const value =
       column.type === "datetime"
-        ? literal.value instanceof Date
-          ? dateMilliseconds(literal.value)
-          : undefined
+        ? datetime === undefined
+          ? undefined
+          : dateMilliseconds(datetime)
         : typeof literal.value === "number"
           ? literal.value
           : undefined;
@@ -20847,9 +21148,15 @@ function secondaryIndexPredicates(
     expression: Expression,
   ): BatchValue | undefined => {
     if (expression.kind !== "literal" || expression.value === null) return undefined;
+    let value = expression.value;
+    if (column.type === "datetime" && isDateDomainValue(value)) {
+      const datetime = normalizedDatetimeLiteral(value);
+      if (datetime === undefined) return undefined;
+      value = datetime;
+    }
     try {
-      secondaryIndexTerm(column.type, expression.value);
-      return expression.value;
+      secondaryIndexTerm(column.type, value);
+      return value;
     } catch {
       return undefined;
     }

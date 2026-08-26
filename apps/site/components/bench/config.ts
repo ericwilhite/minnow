@@ -27,13 +27,17 @@ export interface EngineChoice {
 export type ColumnId =
   "minnow" | "minnow-cached" | "minnow-opfs" | "minnow-opfs-cached" | "sqlite" | "pglite";
 
+export const DEFAULT_COLUMNS: readonly ColumnId[] = ["minnow", "minnow-opfs", "sqlite"];
+export const DEFAULT_SECONDARY_INDEXES: SecondaryIndexMode = "none";
+export const DEFAULT_SCALE = 5;
+
 export const ENGINES: readonly EngineChoice[] = [
   {
     id: "minnow",
     engine: "minnow",
     label: "Minnow",
     note: "This engine. Columnar blocks on IndexedDB, plain JavaScript.",
-    download: "278 KB",
+    download: "281 KB",
   },
   {
     id: "minnow-cached",
@@ -154,10 +158,10 @@ export interface ScaleChoice {
 /**
  * The ceiling is deliberate. At scale 10 the dataset costs about 18 MB of IndexedDB for Minnow,
  * 77 MB for SQLite and 143 MB for PGlite, and PGlite alone takes a minute or more to load it —
- * which is a reasonable thing to ask of a release capture and an unreasonable thing to do to
- * somebody who clicked a link.
+ * large enough to expose the engines' storage and execution trade-offs while remaining practical
+ * for a deliberate browser run.
  */
-export const SCALES: readonly ScaleChoice[] = [0.1, 0.5, 1, 2, 5].map((scale) => ({
+export const SCALES: readonly ScaleChoice[] = [1, 2, 5, 10].map((scale) => ({
   scale,
   label: `${String(scale)}×`,
   rows: relationalTotalRows(scale),

@@ -305,7 +305,11 @@ describe("vector query execution", () => {
     // slot, which is what lets a numeric term compare as typed values rather than references.
     const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 87 });
     expect(prepared.memoryUsage).toEqual({ budgetBytes: 87, usedBytes: 17, peakBytes: 17 });
-    expect(prepared.execute()).toEqual({ columns: ["id"], rows: [{ id: 1 }, { id: 2 }] });
+    expect(prepared.execute()).toEqual({
+      columns: ["id"],
+      columnDomains: [null],
+      rows: [{ id: 1 }, { id: 2 }],
+    });
     expect(prepared.memoryUsage).toEqual({ budgetBytes: 87, usedBytes: 17, peakBytes: 87 });
     prepared.close();
     expect(prepared.memoryUsage).toEqual({ budgetBytes: 87, usedBytes: 0, peakBytes: 87 });
@@ -350,6 +354,7 @@ describe("vector query execution", () => {
     ]);
     const expected = {
       columns: ["category", "count", "max_label"],
+      columnDomains: [null, null, null],
       rows: [
         { category: "a", count: 1, max_label: "one" },
         { category: "b", count: 1, max_label: "two" },
@@ -434,7 +439,11 @@ describe("vector query execution", () => {
       ["rows", [{ label: "a" }, { label: "bb" }, { label: "ccc" }]],
     ]);
     const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 166 });
-    expect(exact.execute()).toEqual({ columns: ["maximum"], rows: [{ maximum: "ccc" }] });
+    expect(exact.execute()).toEqual({
+      columns: ["maximum"],
+      columnDomains: [null],
+      rows: [{ maximum: "ccc" }],
+    });
     expect(exact.memoryUsage).toEqual({ budgetBytes: 166, usedBytes: 19, peakBytes: 166 });
     exact.close();
 
@@ -511,6 +520,7 @@ describe("vector query execution", () => {
 
     const expected = {
       columns: ["left_label", "right_label"],
+      columnDomains: [null, null],
       rows: [
         { left_label: "finite", right_label: "finite-match" },
         { left_label: "not-a-number", right_label: null },
@@ -596,6 +606,7 @@ describe("vector query execution", () => {
   it("preserves projected columns for an empty row input", () => {
     expect(executeQuery(compileQuery("SELECT value FROM rows"), new Map([["rows", []]]))).toEqual({
       columns: ["value"],
+      columnDomains: [null],
       rows: [],
     });
   });
@@ -623,7 +634,7 @@ describe("vector query execution", () => {
           ],
         ]),
       ),
-    ).toEqual({ columns: ["id"], rows: [{ id: 1 }, { id: 2 }] });
+    ).toEqual({ columns: ["id"], columnDomains: [null], rows: [{ id: 1 }, { id: 2 }] });
   });
 
   it("preserves row-executor grouping for non-finite arithmetic", () => {
@@ -713,6 +724,7 @@ describe("vector query execution", () => {
     );
     expect(prepared.execute()).toEqual({
       columns: ["l.id", "l.label", "r.id", "r.value"],
+      columnDomains: [null, null, null, null],
       rows: [{ "l.id": 1, "l.label": "left", "r.id": null, "r.value": null }],
     });
   });
@@ -735,6 +747,7 @@ describe("vector query execution", () => {
     returned.setUTCFullYear(2040);
     expect(prepared.execute()).toEqual({
       columns: ["happened"],
+      columnDomains: [null],
       rows: [{ happened: new Date("2025-01-01T00:00:00.000Z") }],
     });
   });
@@ -750,6 +763,7 @@ describe("vector query execution", () => {
       ),
     ).toEqual({
       columns: ["l.id", "l.label", "r.id", "r.value"],
+      columnDomains: [null, null, null, null],
       rows: [{ "l.id": 1, "l.label": "left", "r.id": null, "r.value": null }],
     });
   });
@@ -892,6 +906,7 @@ describe("vector query execution", () => {
 
     expect(prepared.execute()).toEqual({
       columns: ["rows", "values", "total", "average", "minimum", "maximum"],
+      columnDomains: [null, null, null, null, null, null],
       rows: [{ rows: 0, values: 0, total: null, average: null, minimum: null, maximum: null }],
     });
   });

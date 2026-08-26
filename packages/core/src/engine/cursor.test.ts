@@ -108,7 +108,7 @@ describe("queryCursor", () => {
     for await (const batch of database.queryCursor("SELECT id FROM events WHERE id < 0")) {
       empty.push(batch);
     }
-    expect(empty).toEqual([{ columns: ["id"], rows: [] }]);
+    expect(empty).toEqual([{ columns: ["id"], columnDomains: [null], rows: [] }]);
     await database.close();
   });
 

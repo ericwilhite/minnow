@@ -14,9 +14,10 @@ for await (const batch of database.queryCursor(
 }
 ```
 
-Each page has the same `columns` and `rows` shape as `query()`. Empty results yield one empty page,
-so exporters can still write a header. Breaking out of the loop, calling `return()`, or aborting the
-optional `signal` releases the scan and its snapshot lease.
+Each page has the same `columns`, `columnDomains`, and `rows` shape as `query()`. Empty results
+yield one empty page, so exporters can still write a header and inspect domains. Breaking out of
+the loop, calling `return()`, or aborting the optional `signal` releases the scan and its snapshot
+lease.
 
 An unordered, ungrouped single-table SELECT emits directly from vector scan batches. The producer
 waits for the consumer before scanning onward and keeps one pending page at most. A blocking plan

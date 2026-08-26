@@ -141,7 +141,12 @@ type MinnowFixedScalarFunction =
 type MinnowFixedScalarFunctionSpelling =
   MinnowFixedScalarFunction | Uppercase<MinnowFixedScalarFunction>;
 
-type MinnowFixedScalarBaseOutput<TName extends MinnowFixedScalarFunctionSpelling> =
+type MinnowFixedScalarBaseOutput<
+  DB,
+  TB extends keyof DB,
+  TName extends MinnowFixedScalarFunctionSpelling,
+  RE,
+> =
   Uppercase<TName> extends
     | "ROUND"
     | "LENGTH"
@@ -159,11 +164,17 @@ type MinnowFixedScalarBaseOutput<TName extends MinnowFixedScalarFunctionSpelling
     | "CURRVAL"
     | "RANDOM"
     ? number
-    : Uppercase<TName> extends "DATE_TRUNC" | "DATE_ADD" | "CURRENT_DATE" | "CURRENT_TIMESTAMP"
-      ? Date
-      : Uppercase<TName> extends "JSON_EXISTS"
-        ? SqlBool
-        : string;
+    : Uppercase<TName> extends "CURRENT_DATE"
+      ? string
+      : Uppercase<TName> extends "CURRENT_TIMESTAMP" | "DATE_TRUNC"
+        ? Date
+        : Uppercase<TName> extends "DATE_ADD"
+          ? Date extends Exclude<ExtractTypeFromReferenceExpression<DB, TB, RE>, null>
+            ? Date
+            : string
+          : Uppercase<TName> extends "JSON_EXISTS"
+            ? SqlBool
+            : string;
 
 type MinnowAlwaysNonNullScalarFunction =
   | "CURRENT_DATE"
@@ -221,7 +232,7 @@ type MinnowFixedScalarOutput<
   RE,
 > =
   HasMinnowColumns<DB> extends true
-    ? | MinnowFixedScalarBaseOutput<TName>
+    ? | MinnowFixedScalarBaseOutput<DB, TB, TName, RE>
       | (Uppercase<TName> extends MinnowAlwaysNullableScalarFunction
           ? null
           : Uppercase<TName> extends MinnowAlwaysNonNullScalarFunction
@@ -284,16 +295,17 @@ type MinnowCastBaseOutput<TDataType extends MinnowCastDataType> = TDataType exte
   ? boolean
   : TDataType extends "integer" | "smallint" | "bigint" | "real" | "double precision"
     ? number
-    : TDataType extends
-          | "date"
-          | "datetime"
-          | `datetime(${number})`
-          | "timestamp"
-          | `timestamp(${number})`
-          | "timestamptz"
-          | `timestamptz(${number})`
-      ? Date
-      : string;
+    : TDataType extends "date"
+      ? string
+      : TDataType extends
+            | "datetime"
+            | `datetime(${number})`
+            | "timestamp"
+            | `timestamp(${number})`
+            | "timestamptz"
+            | `timestamptz(${number})`
+        ? Date
+        : string;
 
 type MinnowCastOutput<DB, TB extends keyof DB, RE, TDataType extends MinnowCastDataType> =
   HasMinnowColumns<DB> extends true

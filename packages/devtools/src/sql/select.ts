@@ -33,9 +33,9 @@ export type PagingMode = "keyset" | "offset";
 
 /**
  * A cursor can only address a row exactly when three things hold: the table has a unique key to
- * break ties, the sort column compares exactly (datetimes do not — the engine's only datetime
- * literal is day-granular), and the sort column has no NULLs, since every comparison against NULL
- * is unknown and would silently drop those rows from every page after the first.
+ * break ties, the sort column compares exactly (datetimes do not because the explorer's literal
+ * encoder is intentionally day-granular), and the sort column has no NULLs, since every comparison
+ * against NULL is unknown and would silently drop those rows from every page after the first.
  */
 export function pagingMode(table: TableInfo, sort?: Sort): PagingMode {
   const key = table.uniqueKey;

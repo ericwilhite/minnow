@@ -18,6 +18,7 @@ import { typedTable } from "@minnowdb/core/schema";
 const people = table("people", {
   name: column.string().unique(),
   score: column.number(),
+  birthday: column.date().nullable(),
   joined: column.datetime().nullable(),
 });
 const appSchema = schema([people]);
@@ -28,7 +29,7 @@ await database.migrate(appSchema);
 const peopleRows = typedTable(database, people);
 await peopleRows.insert([{ name: "Ada", score: 10 }]); // joined pads to null
 const rows = await peopleRows.rows();
-// Array<{ name: string; score: number; joined: Date | null }>
+// Array<{ name: string; score: number; birthday: string | null; joined: Date | null }>
 ```
 
 The four physical storage builders are `column.boolean()`, `column.number()`, `column.string()`,
@@ -40,13 +41,15 @@ and `column.datetime()`. The DSL also retains the SQL domain layered over that s
 | `column.numeric({ precision, scale })`    | `string`                  | `string \| number`            |
 | `column.json()` / `column.jsonb()`        | `string`                  | `string`                      |
 | `column.uuid()` / `time()` / `interval()` | `string`                  | `string`                      |
+| `column.date()`                           | `string` (`YYYY-MM-DD`)   | `string` (`YYYY-MM-DD`)       |
 | `column.array("text")`                    | JSON array text           | JSON array text               |
 | `column.enum([...])`                      | The values' literal union | The values' literal union     |
 | `column.sqlEnum("mood", [...])`           | The values' literal union | The values' literal union     |
 
 `NUMERIC` selects as a decimal string so no precision is lost, while writes may use a decimal
 string or a finite number. JSON/JSONB and arrays use their JSON text representation at the
-JavaScript boundary, matching direct SQL and the Kysely adapter.
+JavaScript boundary, matching direct SQL and the Kysely adapter. `column.date()` is a zoneless
+calendar date: it validates canonical `YYYY-MM-DD` text and never adds a time or UTC offset.
 
 The column modifiers are:
 
@@ -71,6 +74,9 @@ The column modifiers are:
   unique key. `migrate()` creates it as a real constraint, so a write naming a parent row that
   does not exist is rejected. `onDelete` is `"restrict"` (the default), `"cascade"`, or
   `"set null"`; the last requires a nullable column.
+- **`.references(table, column, { enforced: false })`** — records the relationship in catalog
+  introspection without validating child writes or acting on parent deletes. Informational keys
+  cannot specify `onDelete` because they never perform a referential action.
 
 The complete select, insert, and update types are available as `InferRow<T>`, `InferInsertRow<T>`,
 and `InferUpdateChanges<T>`. Defaults and nullable columns are optional on insert; primary-key
@@ -130,8 +136,7 @@ child may be listed before its parent.
 
 ### Relations and row conditions
 
-A declared relation is enforced, not decorative. The same is true of `checks`, the third argument
-to `table()`:
+A relation is enforced by default. The same is true of `checks`, the third argument to `table()`:
 
 ```ts
 const parents = table("parents", {
@@ -171,6 +176,25 @@ Each check is a boolean SQL expression over the table's own columns, compiled wh
 declared — so invalid SQL, an unknown column, or a reference to another relation fails before
 `migrate()` can change the catalog. CHECK and FOREIGN KEY names share the table's constraint
 namespace; a duplicate name across kinds is rejected at declaration time.
+
+### Informational relationships
+
+Use an informational foreign key for a display relationship that may legitimately dangle—for
+example, a ticket whose customer is outside the current authorization or synchronization window:
+
+```ts
+const tickets = table("tickets", {
+  id: column.integer().unique(),
+  customer_id: column.integer().references("customers", "id", { enforced: false }),
+});
+```
+
+Minnow still validates that the child and parent key domains line up, and `introspect()` returns
+the relationship with `enforced: false`. It does not reject a missing customer, cascade a delete,
+or set the child to NULL. Informational relationships may be added, removed, or remapped on an
+existing table as metadata-only migration steps; changing between enforced and informational is
+rejected. A composite entry in `table(..., { foreignKeys })` accepts the same `enforced: false`
+flag.
 
 ### Composite primary and foreign keys
 
@@ -314,11 +338,12 @@ deterministic steps:
   time, and folding it into the blocks is
   [compaction](/docs/storage/maintenance#compaction)'s job, on its own schedule.
 
-Column storage types, SQL domains, primary-key membership/order, foreign keys, checks, and frozen
-backfills cannot be changed in place. `migrate()` rejects those changes because a catalog-only
-edit cannot prove or preserve their meaning. Enum restrictions are the exception: their set may
-widen, never narrow. Secondary indexes, triggers, named enum-type objects, and sequences remain
-SQL/Kysely migration concerns; the schema DSL does not claim ownership of them.
+Column storage types, SQL domains, primary-key membership/order, enforced foreign keys, checks,
+and frozen backfills cannot be changed in place. `migrate()` rejects those changes because a
+catalog-only edit cannot prove or preserve their meaning. Informational foreign keys are metadata
+and may change; enum restrictions are the other exception, with sets that may widen but never
+narrow. Secondary indexes, triggers, named enum-type objects, and sequences remain SQL/Kysely
+migration concerns; the schema DSL does not claim ownership of them.
 
 ### Proven rather than assumed
 
@@ -370,7 +395,7 @@ Rejected outright, rather than attempted:
 - unique-key changes
 - non-nullable column additions **without a backfill**
 - removing enum values, or tightening a string column into an enum
-- adding, changing, or dropping a FOREIGN KEY or CHECK on an existing table
+- adding, changing, or dropping an enforced FOREIGN KEY or CHECK on an existing table
 
 Type and identity changes need a deliberate table replacement. A new or changed constraint also
 needs proof about existing rows, and there is no validation scan. Declare constraints when you

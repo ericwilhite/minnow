@@ -38,6 +38,7 @@ export function copyQueryResult(result: QueryResult): QueryResult {
   const columns = result.columns;
   const copy = {
     columns: [...columns],
+    columnDomains: structuredClone(result.columnDomains),
     rows: result.rows.map((row) => {
       const copy: QueryRow = { ...row };
       for (const name of columns) {

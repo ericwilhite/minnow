@@ -81,7 +81,7 @@ columnar and skips the parser entirely.
 ### Query
 
 ```ts
-const { rows, columns } = await db.query(
+const { rows, columns, columnDomains } = await db.query(
   `SELECT c.name, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
    FROM customers c
    JOIN orders o ON o.customer_id = c.customer_id
@@ -94,8 +94,9 @@ const { rows, columns } = await db.query(
 ```
 
 `rows` are plain objects — numbers are numbers, `TIMESTAMP` columns come back as `Date`. `columns`
-carries the result's names and types, which is what a grid needs to render without inspecting
-values.
+carries the result names; positionally aligned `columnDomains` carries logical types such as
+JSON/JSONB, UUID, exact numeric, and DATE. A grid can render headers without inspecting values,
+and a generic consumer can parse JSON text without knowing the query in advance.
 
 </Step>
 

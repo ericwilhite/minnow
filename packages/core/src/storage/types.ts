@@ -155,7 +155,7 @@ export type SimpleDataType = (typeof simpleDataTypes)[number];
 /** PostgreSQL logical domains layered over the four stable physical block encodings. */
 export type SqlDomain =
   | { kind: "numeric"; precision?: number; scale?: number }
-  | { kind: "json" | "jsonb" | "uuid" | "time" | "interval" }
+  | { kind: "json" | "jsonb" | "uuid" | "date" | "time" | "interval" }
   | { kind: "array"; element: string }
   | { kind: "enum"; name: string; values: string[] };
 
@@ -538,6 +538,16 @@ export function secondaryIndexWriteContractChanged(
   });
 }
 
+export interface TableForeignKeyRecord {
+  name: string;
+  columns: string[];
+  parentTable: string;
+  parentColumns: string[];
+  onDelete: "restrict" | "cascade" | "set null";
+  /** False records relationship metadata without write/delete enforcement. Absent means true. */
+  enforced?: boolean;
+}
+
 export interface TableRecord {
   id: string;
   name: string;
@@ -553,13 +563,7 @@ export interface TableRecord {
   /** BEFORE/AFTER triggers on this table, fired by the committing writer in its transaction. */
   triggers?: TriggerRecord[];
   /** FOREIGN KEY constraints. Column tuples are always explicit, including scalar keys. */
-  foreignKeys?: Array<{
-    name: string;
-    columns: string[];
-    parentTable: string;
-    parentColumns: string[];
-    onDelete: "restrict" | "cascade" | "set null";
-  }>;
+  foreignKeys?: TableForeignKeyRecord[];
   /**
    * Row-level CHECK constraints (E141-06), each the text of a boolean expression over this
    * table's own columns. Text rather than a compiled form because the record crosses the worker
@@ -592,6 +596,87 @@ export interface TableRecord {
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution. */
   revision: number;
+}
+
+/**
+ * Validates one relationship against its child and parent records. This is shared by every
+ * storage adapter and snapshot restore path so informational relationships cannot bypass the
+ * same structural and domain checks as enforced foreign keys.
+ */
+export function validateTableForeignKey(
+  childTable: TableRecord,
+  key: TableForeignKeyRecord,
+  parentTable: TableRecord,
+): void {
+  if (
+    typeof key.name !== "string" ||
+    key.name.length === 0 ||
+    typeof key.parentTable !== "string" ||
+    key.parentTable.length === 0 ||
+    !Array.isArray(key.columns) ||
+    !Array.isArray(key.parentColumns) ||
+    key.columns.length === 0 ||
+    key.columns.some((column) => typeof column !== "string" || column.length === 0) ||
+    key.parentColumns.some((column) => typeof column !== "string" || column.length === 0) ||
+    new Set(key.columns).size !== key.columns.length ||
+    new Set(key.parentColumns).size !== key.parentColumns.length ||
+    !["restrict", "cascade", "set null"].includes(key.onDelete) ||
+    (key.enforced !== undefined && typeof key.enforced !== "boolean")
+  ) {
+    throw new TypeError("FOREIGN KEY metadata is invalid");
+  }
+  if (key.parentTable !== parentTable.name) {
+    throw new TypeError(`FOREIGN KEY ${key.name} resolved to the wrong parent table`);
+  }
+  if (key.enforced === false && key.onDelete !== "restrict") {
+    throw new TypeError(`Informational FOREIGN KEY ${key.name} cannot declare ON DELETE actions`);
+  }
+  const children = key.columns.map((name) =>
+    childTable.columns.find((column) => column.name === name && column.hidden !== true),
+  );
+  if (children.some((column) => column === undefined)) {
+    throw new TypeError(`FOREIGN KEY ${key.name} names a column this table does not have`);
+  }
+  const addressIds = parentTable.primaryKeyColumnIds?.length
+    ? parentTable.primaryKeyColumnIds
+    : parentTable.uniqueKeyColumnId === undefined
+      ? []
+      : [parentTable.uniqueKeyColumnId];
+  const parents = addressIds.map((id) =>
+    parentTable.columns.find((column) => column.id === id && column.hidden !== true),
+  );
+  const addressNames = parents.map((column) => column?.name ?? "");
+  if (
+    addressNames.length !== key.parentColumns.length ||
+    addressNames.some((name, index) => name !== key.parentColumns[index])
+  ) {
+    throw new TypeError(`FOREIGN KEY ${key.name} must reference the parent primary or unique key`);
+  }
+  if (children.length !== parents.length) {
+    throw new TypeError(
+      `FOREIGN KEY ${key.name} has ${String(children.length)} child columns for ${String(parents.length)} parent columns`,
+    );
+  }
+  children.forEach((child, index) => {
+    const parent = parents[index];
+    if (child === undefined || parent === undefined) {
+      throw new TypeError(`FOREIGN KEY ${key.name} is missing a key column`);
+    }
+    if (child.type !== parent.type) {
+      throw new TypeError(`FOREIGN KEY ${key.name} compares ${child.type} with ${parent.type}`);
+    }
+    if ((child.integer === true) !== (parent.integer === true)) {
+      throw new TypeError(
+        `FOREIGN KEY ${key.name} compares an integer domain with an approximate number domain`,
+      );
+    }
+    if (JSON.stringify(child.sqlDomain ?? null) !== JSON.stringify(parent.sqlDomain ?? null)) {
+      throw new TypeError(`FOREIGN KEY ${key.name} compares different SQL value domains`);
+    }
+    if (key.onDelete === "set null" && !child.nullable) {
+      throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
+    }
+  });
 }
 
 const catalogRecordTextEncoder = new TextEncoder();
@@ -739,6 +824,11 @@ export function validateTableRecordBounds(record: TableRecord): void {
     );
   }
   const constraintNames = new Set<string>();
+  for (const key of record.foreignKeys ?? []) {
+    if (key.enforced !== undefined && typeof key.enforced !== "boolean") {
+      throw new TypeError(`FOREIGN KEY enforcement is invalid: ${key.name}`);
+    }
+  }
   for (const constraintName of namedConstraints) {
     validateCatalogName(constraintName, "Constraint name");
     if (constraintNames.has(constraintName)) {
@@ -3458,6 +3548,8 @@ export interface CatalogMutationOptions {
 /** Atomic replacement fields for one catalog record. */
 export interface TableRecordUpdate extends CatalogMutationOptions {
   columns?: TableColumnRecord[];
+  /** Replaces the complete relationship catalog. */
+  foreignKeys?: TableRecord["foreignKeys"];
   /** Replaces the full-text index state map; null clears it. */
   ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
   /** Replaces the secondary-index state map; null clears it. */

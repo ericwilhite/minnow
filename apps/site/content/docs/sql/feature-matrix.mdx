@@ -27,8 +27,8 @@ PostgreSQL grammar. These supported features have narrower limits:
 - `JSON_TABLE` supports constant documents with `$` and `$[*]` row paths.
 - `CREATE SEQUENCE` supports `NEXTVAL` and session-local `CURRVAL`, without sequence options.
 - enums support declaration, validation, and declaration-order comparison, without `ALTER TYPE`.
-- exact `NUMERIC`, JSON/JSONB, UUID, arrays, `TIME`, intervals, and enums keep their full values
-  internally and return strings at the JavaScript boundary.
+- exact `NUMERIC`, JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enums keep their full
+  values internally and return strings at the JavaScript boundary.
 
 Minnow deliberately excludes three PostgreSQL server or storage-model features:
 

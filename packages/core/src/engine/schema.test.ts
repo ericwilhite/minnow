@@ -1470,6 +1470,7 @@ describe("constraint wire round trip", () => {
       table: "parents",
       column: "id",
       onDelete: "set null",
+      enforced: true,
     });
     expect(declaredForeignKeys(children)).toEqual(declaredForeignKeys(declared));
   });
@@ -1717,6 +1718,7 @@ describe("catalog introspection", () => {
         parentTable: "parents",
         parentColumns: ["id"],
         onDelete: "cascade",
+        enforced: true,
       },
     ]);
     expect(children.checks).toEqual([{ name: "positive_id", sql: "id > 0" }]);

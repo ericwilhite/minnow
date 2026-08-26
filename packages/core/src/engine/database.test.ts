@@ -1905,8 +1905,8 @@ async function createMutationCompactionFixture(
   const table = await store.getTableByName(tableName);
   if (table === undefined) throw new Error(`Expected mutation table ${tableName}`);
   const initialSegment = await requiredSegment(store, inserted.segmentId);
-  const upsertSegment = await requiredSegment(store, upserted.segmentId);
-  const resurrectionSegment = await requiredSegment(store, resurrectedA.segmentId);
+  const upsertSegment = await requiredSegment(store, upserted.segmentId ?? "");
+  const resurrectionSegment = await requiredSegment(store, resurrectedA.segmentId ?? "");
   const initialRowIds = expandSegmentRowIds(initialSegment);
   const upsertRowIds = expandSegmentRowIds(upsertSegment);
   const resurrectionRowIds = expandSegmentRowIds(resurrectionSegment);
@@ -2443,7 +2443,7 @@ for (const implementation of implementations()) {
       // The catalog no longer knows the table, and neither does a query.
       expect((await store.listTables()).map((table) => table.name)).toEqual(["kept"]);
       await expect(database.query("SELECT COUNT(*) AS n FROM notes")).rejects.toThrow(
-        "Table not found: notes",
+        "Unknown table: notes",
       );
       // Its segments go with it, so nothing points at a table that is not there.
       expect(await tableSegmentRecords(store, notesId)).toEqual([]);
@@ -2466,7 +2466,7 @@ for (const implementation of implementations()) {
       expect((await database.query("SELECT COUNT(*) AS n FROM notes")).rows).toEqual([{ n: 0 }]);
 
       expect(await database.dropTable("missing", { ifExists: true })).toBe(false);
-      await expect(database.dropTable("missing")).rejects.toThrow("Table not found: missing");
+      await expect(database.dropTable("missing")).rejects.toThrow("Unknown table: missing");
     });
 
     it("refuses to drop a table another table's trigger writes to", async () => {
@@ -4513,6 +4513,7 @@ it("prepares append and compacted snapshots directly into stable vectors", async
     ),
   ).toEqual({
     columns: ["active", "score", "label", "recordedAt"],
+    columnDomains: [null, null, null, null],
     rows: [
       {
         active: false,
@@ -4581,6 +4582,7 @@ it("replays keyed mutations into typed vectors without changing historical resul
     await database.query("SELECT email, active, score, seenAt FROM vector_accounts ORDER BY email"),
   ).toEqual({
     columns: ["email", "active", "score", "seenAt"],
+    columnDomains: [null, null, null, null],
     rows: [
       {
         email: "a@example.com",
@@ -4604,6 +4606,7 @@ it("replays keyed mutations into typed vectors without changing historical resul
     ),
   ).toEqual({
     columns: ["email", "active", "score", "seenAt"],
+    columnDomains: [null, null, null, null],
     rows: [
       {
         email: "a@example.com",
@@ -5936,7 +5939,7 @@ for (const implementation of implementations()) {
         note: ["a3", "e"],
       },
     });
-    const postMergeUpsertSegment = await requiredSegment(store, postMergeUpsert.segmentId);
+    const postMergeUpsertSegment = await requiredSegment(store, postMergeUpsert.segmentId ?? "");
     const postMergeCandidateIds = expandSegmentRowIds(postMergeUpsertSegment);
     const secondExpectedRowIds = [
       requiredItem(fixture.expectedRowIds, 0, "B row ID after first merge"),
@@ -6209,7 +6212,7 @@ it("rebases a mutation merge across later IndexedDB deltas without absorbing the
     },
   });
   const laterCandidateIds = expandSegmentRowIds(
-    await requiredSegment(writerStore, laterUpsert.segmentId),
+    await requiredSegment(writerStore, laterUpsert.segmentId ?? ""),
   );
   const expectedRows: DatabaseRow[] = [
     { email: "b@example.com", score: 21, active: true, note: null },
@@ -6639,7 +6642,7 @@ for (const implementation of implementations()) {
     if (deleted.segmentId === null) throw new Error("Expected a bounded delete segment");
     const later = await database.upsert(tableName, { email: "a@example.com", score: 2 });
     const laterRowId = requiredItem(
-      expandSegmentRowIds(await requiredSegment(store, later.segmentId)),
+      expandSegmentRowIds(await requiredSegment(store, later.segmentId ?? "")),
       0,
       "bounded later upsert row ID",
     );
@@ -6763,7 +6766,7 @@ it("rebases a bounded IndexedDB mutation prefix without absorbing its existing o
     columns: { email: ["b@example.com", "c@example.com"], score: [20, 3] },
   });
   const upsertRowIds = expandSegmentRowIds(
-    await requiredSegment(compactorStore, upserted.segmentId),
+    await requiredSegment(compactorStore, upserted.segmentId ?? ""),
   );
   const tailUpdate = await compactor.update(tableName, "a@example.com", { score: 10 });
   const sourceVersion = tailUpdate.version;
@@ -6780,7 +6783,7 @@ it("rebases a bounded IndexedDB mutation prefix without absorbing its existing o
   await assertPersistedCompactionSelection(
     compactorStore,
     jobId,
-    [inserted.segmentId, upserted.segmentId],
+    [inserted.segmentId, upserted.segmentId ?? ""],
     null,
   );
   const concurrentDelete = await writer.deleteBatch(tableName, { keys: ["c@example.com"] });
@@ -8058,6 +8061,7 @@ it("answers metadata-only queries without loading a data block", async () => {
 
   expect(await database.query("SELECT COUNT(*) AS count FROM events")).toEqual({
     columns: ["count"],
+    columnDomains: [null],
     rows: [{ count: 3 }],
   });
   expect(store.blockReadCalls).toBe(0);
@@ -8104,6 +8108,7 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   store.blockIdsRead = [];
   expect(await database.query("SELECT label FROM pruned_metrics WHERE score = 7")).toEqual({
     columns: ["label"],
+    columnDomains: [null],
     rows: [{ label: "seven" }],
   });
   const firstReadIds = store.blockIdsRead.flat();
@@ -8119,7 +8124,11 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
     await database.query(
       "SELECT label FROM pruned_metrics WHERE DATE '2026-01-07' <= recordedAt ORDER BY label",
     ),
-  ).toEqual({ columns: ["label"], rows: [{ label: "eight" }, { label: "seven" }] });
+  ).toEqual({
+    columns: ["label"],
+    columnDomains: [null],
+    rows: [{ label: "eight" }, { label: "seven" }],
+  });
   // The surviving label block decoded during the first query is served from the decoded-block
   // cache, so only the new predicate column's blocks reach the store.
   expect(store.blockIdsRead.flat()).toEqual(segment.columnBlockIds[recordedAtColumn.id] ?? []);
@@ -8128,6 +8137,7 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   store.blockIdsRead = [];
   expect(await database.query("SELECT score FROM pruned_metrics WHERE label = 'seven'")).toEqual({
     columns: ["score"],
+    columnDomains: [null],
     rows: [{ score: 7 }],
   });
   // Full scan over both columns (4 blocks each), minus the score and label blocks already in
@@ -8426,6 +8436,7 @@ it("indexeddb folds unique-key chunk tails into base records and keeps conflict 
   expect(upserted).toMatchObject({ insertedRowCount: 1, updatedRowCount: 1 });
   expect(await database.query("SELECT COUNT(*) AS n FROM folded")).toEqual({
     columns: ["n"],
+    columnDomains: [null],
     rows: [{ n: 21 }],
   });
   store.close();
@@ -8451,7 +8462,7 @@ it("shares one visibility catalog across multi-table query preparation", async (
     await database.query(
       "SELECT COUNT(*) AS count FROM left_rows l JOIN right_rows r ON r.id = l.id",
     ),
-  ).toEqual({ columns: ["count"], rows: [{ count: 2 }] });
+  ).toEqual({ columns: ["count"], columnDomains: [null], rows: [{ count: 2 }] });
   expect(store.transactionListCalls).toBe(0);
   expect(store.transactionGetCalls).toBe(0);
   expect(store.transactionBatchCalls).toBe(0);
@@ -9542,6 +9553,7 @@ it("executes the extended SQL surface through the stored query path", async () =
     ),
   ).toEqual({
     columns: ["region", "amount"],
+    columnDomains: [null, null],
     rows: [
       { region: "east", amount: 8 },
       { region: "west", amount: 10 },
@@ -9551,13 +9563,18 @@ it("executes the extended SQL surface through the stored query path", async () =
     await database.query(
       "SELECT region FROM orders WHERE region LIKE 'w%' AND EXISTS (SELECT region FROM targets WHERE goal > 5)",
     ),
-  ).toEqual({ columns: ["region"], rows: [{ region: "west" }, { region: "west" }] });
+  ).toEqual({
+    columns: ["region"],
+    columnDomains: [null],
+    rows: [{ region: "west" }, { region: "west" }],
+  });
   expect(
     await database.query(
       "SELECT region, amount, CASE WHEN amount >= 8 THEN 'high' ELSE 'low' END AS band FROM orders ORDER BY amount LIMIT 2 OFFSET 1",
     ),
   ).toEqual({
     columns: ["region", "amount", "band"],
+    columnDomains: [null, null, null],
     rows: [
       { region: null, amount: 5, band: "low" },
       { region: "east", amount: 8, band: "high" },
@@ -9565,23 +9582,32 @@ it("executes the extended SQL surface through the stored query path", async () =
   });
   expect(
     await database.query("SELECT region FROM orders INTERSECT SELECT region FROM targets"),
-  ).toEqual({ columns: ["region"], rows: [{ region: "west" }] });
+  ).toEqual({ columns: ["region"], columnDomains: [null], rows: [{ region: "west" }] });
   expect(
     await database.query(
       "SELECT o.region, t.goal FROM orders o JOIN targets t ON t.region = o.region AND t.goal > o.amount",
     ),
-  ).toEqual({ columns: ["region", "goal"], rows: [{ region: "west", goal: 9 }] });
+  ).toEqual({
+    columns: ["region", "goal"],
+    columnDomains: [null, null],
+    rows: [{ region: "west", goal: 9 }],
+  });
   expect(
     await database.query(
       "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM orders UNION ALL SELECT v * 2 FROM n WHERE v < 20) SELECT v FROM n ORDER BY v",
     ),
-  ).toEqual({ columns: ["v"], rows: [{ v: 3 }, { v: 6 }, { v: 12 }, { v: 24 }] });
+  ).toEqual({
+    columns: ["v"],
+    columnDomains: [null],
+    rows: [{ v: 3 }, { v: 6 }, { v: 12 }, { v: 24 }],
+  });
   expect(
     await database.query(
       "SELECT region, amount, SUM(amount) OVER (PARTITION BY region) AS total FROM orders WHERE region = 'west' ORDER BY amount",
     ),
   ).toEqual({
     columns: ["region", "amount", "total"],
+    columnDomains: [null, null, null],
     rows: [
       { region: "west", amount: 3, total: 13 },
       { region: "west", amount: 10, total: 13 },
@@ -10183,9 +10209,7 @@ describe("prepared-input cache and shared read lease", () => {
     await writer.insertBatch("seed", { columns: { value: [1] } });
     // Warm the reader's cache, and prove a missing-table miss does not stick.
     expect((await reader.query("SELECT value FROM seed")).rows).toEqual([{ value: 1 }]);
-    await expect(reader.query("SELECT label FROM labels")).rejects.toThrow(
-      "Table not found: labels",
-    );
+    await expect(reader.query("SELECT label FROM labels")).rejects.toThrow("Unknown table: labels");
     await writer.createTable({
       name: "labels",
       columns: [{ name: "label", type: "string" }],

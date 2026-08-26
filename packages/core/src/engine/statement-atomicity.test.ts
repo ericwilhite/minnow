@@ -355,7 +355,7 @@ describe("SQL statement atomicity", () => {
     await db.createView("drop_view", "SELECT id FROM drop_source");
     await expect(db.dropColumn("drop_view", "id")).rejects.toThrow("is a view, not a table");
     await expect(db.dropColumn("missing_table", "id", { ifExists: true })).resolves.toBe(false);
-    await expect(db.dropColumn("missing_table", "id")).rejects.toThrow("Table not found");
+    await expect(db.dropColumn("missing_table", "id")).rejects.toThrow("Unknown table");
     await expect(db.dropColumn("drop_source", "missing")).rejects.toThrow("Column not found");
 
     await db.createTable({

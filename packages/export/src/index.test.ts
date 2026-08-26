@@ -45,6 +45,7 @@ describe("streaming exports", () => {
     const batches: QueryResult[] = [
       {
         columns: ["id", "at", "name"],
+        columnDomains: [null, null, null],
         rows: [{ id: -0, at: new Date(0), name: "Minnow" }],
       },
     ];
@@ -63,14 +64,18 @@ describe("streaming exports", () => {
     );
     expect(returned).toBe(true);
 
-    batches[0] = { columns: ["value"], rows: [{ value: Number.NaN }] };
+    batches[0] = { columns: ["value"], columnDomains: [null], rows: [{ value: Number.NaN }] };
     returned = false;
     await expect(text(streamNdjson(source, "SELECT"))).rejects.toThrow(
       "NDJSON cannot represent NaN",
     );
     expect(returned).toBe(true);
 
-    batches[0] = { columns: ["value"], rows: [{ value: new Date(Number.NaN) }] };
+    batches[0] = {
+      columns: ["value"],
+      columnDomains: [null],
+      rows: [{ value: new Date(Number.NaN) }],
+    };
     returned = false;
     await expect(text(streamNdjson(source, "SELECT"))).rejects.toThrow(
       "Cannot export an invalid Date",
@@ -94,7 +99,7 @@ describe("streaming exports", () => {
     });
     const source: QueryCursorSource = {
       async *queryCursor() {
-        yield { columns: ["at"], rows: [{ at: value }] };
+        yield { columns: ["at"], columnDomains: [null], rows: [{ at: value }] };
         return undefined;
       },
     };
@@ -115,7 +120,7 @@ describe("streaming exports", () => {
     try {
       const source: QueryCursorSource = {
         async *queryCursor() {
-          yield { columns: ["at"], rows: [{ at: value }] };
+          yield { columns: ["at"], columnDomains: [null], rows: [{ at: value }] };
           return undefined;
         },
       };
@@ -136,7 +141,7 @@ describe("streaming exports", () => {
         return {
           next: async () => ({
             done: false as const,
-            value: { columns: ["id"], rows: [{ id: page++ }] },
+            value: { columns: ["id"], columnDomains: [null], rows: [{ id: page++ }] },
           }),
           return: async () => {
             returned = true;
@@ -159,7 +164,7 @@ describe("streaming exports", () => {
     const source: QueryCursorSource = {
       async *queryCursor() {
         opened = true;
-        yield { columns: [], rows: [] };
+        yield { columns: [], columnDomains: [], rows: [] };
         return undefined;
       },
     };

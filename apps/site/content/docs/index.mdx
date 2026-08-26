@@ -38,7 +38,7 @@ const { rows } = await db.query(`
 ## Why use Minnow
 
 - **PostgreSQL-style SQL.** Use familiar parameters, joins, CTEs, window functions, grouping sets,
-  upserts, `RETURNING`, triggers, exact decimals, JSON/JSONB, arrays, enums, sequences, and
+  upserts, `RETURNING`, triggers, exact decimals, JSON/JSONB, zoneless DATE, arrays, enums, sequences, and
   savepoints. The [feature matrix](/docs/sql/feature-matrix) names the exact supported forms and
   every deliberate difference.
 - **Fast scans over local application data.** Minnow stores compressed columns, reads only the
@@ -54,7 +54,7 @@ const { rows } = await db.query(`
   storage when they exceed the configured execution budget; pull-driven cursors transfer one
   bounded page at a time.
 - **Reactive, typed views.** Kysely live queries preserve inferred rows and result plugins, with
-  keyed changes, ordered windows, and a React external-store hook.
+  keyed changes, ordered windows, and Suspense/SWR-friendly React hooks.
 
 ## Choose how you query
 

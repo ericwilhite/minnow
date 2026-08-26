@@ -25,7 +25,7 @@ describe("sqlLiteral", () => {
     expect(sqlLiteral(false, "boolean")).toBe("FALSE");
   });
 
-  it("writes a datetime as the engine's only date literal, which is day-granular", () => {
+  it("writes a datetime as the explorer's day-granular date literal", () => {
     expect(sqlLiteral(new Date("2026-08-12T18:40:00Z"), "datetime")).toBe("DATE '2026-08-12'");
     expect(() => sqlLiteral("not a date", "datetime")).toThrow(TypeError);
   });

@@ -150,6 +150,11 @@
       "reason": "Minnow returns arrays as canonical JSON text at the JavaScript boundary while PostgreSQL clients commonly return native arrays."
     },
     {
+      "id": "type.date",
+      "classification": "different",
+      "reason": "Minnow returns zoneless DATE values as canonical YYYY-MM-DD text while PostgreSQL clients commonly materialize them as midnight Date objects."
+    },
+    {
       "id": "json.query",
       "classification": "different",
       "reason": "The JSON value agrees, but Minnow returns compact JSON text while PostgreSQL's text rendering includes spaces."

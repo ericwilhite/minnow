@@ -159,6 +159,7 @@ import {
   type StageTransactionArtifactsInput,
   type StoragePage,
   type TableRecord,
+  validateTableForeignKey,
   type TableRecordUpdate,
   TableInUseError,
   TableRecordConflictError,
@@ -12599,7 +12600,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
       if (isRecord(foreignKey)) {
         assertKnownFields(
           foreignKey,
-          ["name", "columns", "parentTable", "parentColumns", "onDelete"],
+          ["name", "columns", "parentTable", "parentColumns", "onDelete", "enforced"],
           `${location}/foreignKeys/${String(index)}`,
         );
       }
@@ -12614,6 +12615,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
         foreignKey.parentColumns.length === 0 ||
         foreignKey.columns.length !== foreignKey.parentColumns.length ||
         !["restrict", "cascade", "set null"].includes(String(foreignKey.onDelete)) ||
+        (foreignKey.enforced !== undefined && typeof foreignKey.enforced !== "boolean") ||
         foreignKey.parentColumns.some((columnName) => !isCatalogName(columnName))
       ) {
         throw corruption(
@@ -15540,22 +15542,7 @@ async function assertTableForeignKeysInTransaction(
     if (parent === undefined) {
       throw new TypeError(`FOREIGN KEY ${key.name} references a missing table: ${key.parentTable}`);
     }
-    const addressIds = parent.primaryKeyColumnIds?.length
-      ? parent.primaryKeyColumnIds
-      : parent.uniqueKeyColumnId === undefined
-        ? []
-        : [parent.uniqueKeyColumnId];
-    const addressNames = addressIds.map(
-      (id) => parent.columns.find((column) => column.id === id)?.name ?? "",
-    );
-    if (
-      addressNames.length !== key.parentColumns.length ||
-      addressNames.some((name, index) => name !== key.parentColumns[index])
-    ) {
-      throw new TypeError(
-        `FOREIGN KEY ${key.name} must reference the parent primary or unique key`,
-      );
-    }
+    validateTableForeignKey(record, key, parent);
   }
 }
 

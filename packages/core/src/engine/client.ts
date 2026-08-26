@@ -75,6 +75,7 @@ import type {
   UpdateBatchInput,
   UpdateBatchResult,
   UpsertBatchResult,
+  UpsertOptions,
   VisibleSegmentPage,
   VisibleSegmentPageOptions,
 } from "./database.js";
@@ -85,6 +86,7 @@ import {
   MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
+  UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
@@ -197,6 +199,7 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
   [
     UniqueConstraintError,
     MissingKeyError,
+    UnknownTableError,
     CompactionBacklogError,
     CompactionMemoryBudgetError,
     CompactionWriteAmplificationError,
@@ -346,13 +349,21 @@ export class MinnowDatabaseClient {
     return (await this.#call("insert", [tableName, row])) as InsertBatchResult;
   }
 
-  async upsertBatch(tableName: string, input: InsertBatchInput): Promise<UpsertBatchResult> {
+  async upsertBatch(
+    tableName: string,
+    input: InsertBatchInput,
+    options: UpsertOptions = {},
+  ): Promise<UpsertBatchResult> {
     const batch = toColumnarBatch(input);
-    return (await this.#call("upsertBatch", [tableName, batch])) as UpsertBatchResult;
+    return (await this.#call("upsertBatch", [tableName, batch, options])) as UpsertBatchResult;
   }
 
-  async upsert(tableName: string, row: BatchRow): Promise<UpsertBatchResult> {
-    return (await this.#call("upsert", [tableName, row])) as UpsertBatchResult;
+  async upsert(
+    tableName: string,
+    row: BatchRow,
+    options: UpsertOptions = {},
+  ): Promise<UpsertBatchResult> {
+    return (await this.#call("upsert", [tableName, row, options])) as UpsertBatchResult;
   }
 
   async updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
