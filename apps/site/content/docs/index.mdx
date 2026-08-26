@@ -32,7 +32,8 @@ const { rows } = await db.query(`
   Minnow is in 0.x, so minor releases can include API and SQL breaking changes. The separately
   versioned block-format 2, snapshot-format 1, and native OPFS-layout 5 bytes are locked; an
   incompatible future writer must use a new format number. Pin exact package versions. The
-  [versioning guide](/docs/reference/versioning) explains the policy.
+  [versioning guide](/docs/reference/versioning) explains the policy, and the
+  [changelog](/docs/changelog) lists breaking changes and migrations.
 </Callout>
 
 ## Why use Minnow
@@ -86,3 +87,4 @@ the full PostgreSQL server, see the [comparison guide](/docs/comparison).
 - **[Extensions](/docs/extensions/live-queries)** — live queries, React, cursors, CSV, and NDJSON.
 - **[Workers and engine options](/docs/engine)** — keep work off the main thread and tune memory.
 - **[Storage](/docs/storage)** — IndexedDB, OPFS, memory, snapshots, and custom adapters.
+- **[Changelog](/docs/changelog)** — release notes, migrations, and storage compatibility.

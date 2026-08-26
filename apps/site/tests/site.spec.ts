@@ -349,6 +349,7 @@ test("the docs navigation covers every section", async ({ page }) => {
     await expect(sidebar.getByText(section, { exact: true }).first()).toBeVisible();
   }
   await expect(sidebar.getByText("TypeScript clients", { exact: true })).toHaveCount(0);
+  await expect(sidebar.getByText("Changelog", { exact: true })).toBeVisible();
 
   await page.goto("/docs/adapters/");
   await expect(page.locator("h1")).toHaveText("Client adapters");
@@ -481,6 +482,7 @@ test("every docs page is published as markdown, with indexes above it", async ({
   const listed = await index.text();
   expect(listed).toContain("](/docs/sql/select.md)");
   expect(listed).toContain("](/docs/adapters/kysely.md)");
+  expect(listed).toContain("](/docs/changelog.md)");
   expect(listed).not.toContain("](/docs/client/");
   expect(listed).not.toContain("](https://minnowdb.com");
 
@@ -498,6 +500,14 @@ test("every docs page is published as markdown, with indexes above it", async ({
     "| `mutation.update-keyless` | unsupported | `UPDATE rows SET amount = 1` |",
   );
   expect(text).not.toMatch(/<[A-Z]/);
+
+  const changelog = await request.get("/docs/changelog.md");
+  expect(changelog.ok()).toBe(true);
+  const releases = await changelog.text();
+  expect(releases).toContain("# Changelog");
+  expect(releases).toContain("## 0.5.0 — August 26, 2026");
+  expect(releases).toContain("`@minnowdb/core@0.5.0`");
+  expect(releases).toContain("No stored format changed");
 
   const postgresProfile = await request.get("/postgres-feature-profile.json");
   expect(postgresProfile.ok()).toBe(true);

@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const versionsFile = path.join(repoRoot, "apps/site/public/versions.json");
+const changelogFile = path.join(repoRoot, "apps/site/content/docs/changelog.mdx");
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/;
 const DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "peerDependencies"] as const;
 /** The package the docs describe, and the one the private manifests follow. */
@@ -214,6 +215,22 @@ function check(): number {
     problems.push(
       `apps/site/public/versions.json: the current docs must be served at "/", not "${documented.path}"`,
     );
+  }
+
+  // A package version is not releasable until a reader can find its notes. Checking every
+  // current published version also catches an adapter-only release where the engine does not
+  // move and a core-version heading alone would be insufficient.
+  const changelog = readFileSync(changelogFile, "utf8");
+  if (engineVersion !== undefined && !changelog.includes(`## ${engineVersion} —`)) {
+    problems.push(
+      `apps/site/content/docs/changelog.mdx: add a "## ${engineVersion} — …" release heading`,
+    );
+  }
+  for (const [name, version] of versions) {
+    const release = `\`${name}@${version}\``;
+    if (!changelog.includes(release)) {
+      problems.push(`apps/site/content/docs/changelog.mdx: add release notes naming ${release}`);
+    }
   }
 
   const documentedMajors = new Set<number>();
@@ -417,7 +434,7 @@ function set(argument: string, packageName: string | undefined): number {
     );
   }
   console.log(
-    "Commit the result. After publication succeeds, the release workflow tags each published package.",
+    "Add the published versions and migration notes to apps/site/content/docs/changelog.mdx, then commit the result. After publication succeeds, the release workflow tags each published package.",
   );
   return 0;
 }

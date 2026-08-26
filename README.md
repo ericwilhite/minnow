@@ -13,7 +13,8 @@ and benchmarks that run in your browser.
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
 > changes. The separately versioned block-format 2, snapshot-format 1, and native OPFS-layout 5
 > bytes are locked; an incompatible future writer must use a new format number. Pin exact package versions. See
-> [Versioning](https://minnowdb.com/docs/reference/versioning/).
+> [Versioning](https://minnowdb.com/docs/reference/versioning/) and the
+> [Changelog](https://minnowdb.com/docs/changelog/).
 
 ## Why Minnow
 
@@ -78,7 +79,8 @@ npm run site:dev       # docs, live console, and browser benchmarks
 ```
 
 See [Testing and benchmarks](https://minnowdb.com/docs/reference/testing/) for the complete test
-map and [Versioning](https://minnowdb.com/docs/reference/versioning/) for release commands.
+map, [Versioning](https://minnowdb.com/docs/reference/versioning/) for release commands, and the
+[Changelog](https://minnowdb.com/docs/changelog/) for release notes and migrations.
 
 ## License
 

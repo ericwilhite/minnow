@@ -26,6 +26,8 @@
 - Write public documentation in clear, simple language. This includes the README.
 - The docs site (`apps/site`) is the single source of truth for all user documentation: guides,
   API reference, and the SQL feature matrix page. Do not create parallel docs directories.
+- Every published package version must appear in `apps/site/content/docs/changelog.mdx`, with its
+  migration and stored-format impact. `npm run version:check` enforces the version entries.
 - Benchmarks are not published numbers. `/benchmarks` runs the suites live in the visitor's
   browser from `apps/site/bench`, so there are no capture files to regenerate and no results to
   keep in step with the code.
@@ -84,6 +86,6 @@ What the suites do and do not cover:
   resolver cannot follow fails in Vitest rather than in a browser. The SQL feature matrix is a
   fixture the engine is tested against, so that page cannot drift. `generate-llms.mjs` fails the
   build on a component it cannot render as markdown, and `npm run version:check` fails on a
-  version claim that no longer matches the manifests.
+  version claim that no longer matches the manifests or changelog.
 - **Not covered.** Every sentence of prose, every capability claim, every number in the README,
   and the rules block. Those are yours to keep true.

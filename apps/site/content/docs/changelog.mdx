@@ -1,0 +1,131 @@
+---
+title: Changelog
+description: Release notes, migration steps, and storage compatibility for every Minnow release.
+---
+
+Release notes are listed newest first. Each entry names the packages published from that release
+commit; an omitted package did not change. Minnow is still in 0.x, so read the migration section
+before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
+compatibility policy and release process.
+
+## 0.5.0 — August 26, 2026
+
+Published packages: `@minnowdb/core@0.5.0`, `@minnowdb/devtools@0.2.2`,
+`@minnowdb/kysely@0.3.0`, and `@minnowdb/react@0.2.0`.
+
+### Added
+
+- `upsert()` and `upsertBatch()` accept a `conflictWhere` guard. Inserts still land, conflicting
+  updates only replace a row when the existing row passes the predicate, and
+  `skippedRowCount` reports successful no-ops. The columnar batch path keeps its bounded memory
+  and parameter-free execution.
+- Every query result and cursor page carries `columnDomains`, positionally aligned with `columns`.
+  Declared columns and aliased expressions such as `JSON_OBJECT` / `jsonBuildObject` now expose
+  the same JSON, JSONB, UUID, DATE, array, enum, and other logical-domain metadata.
+- Missing tables throw the exported `UnknownTableError`, including through the worker client. Its
+  `tableName` is stable for recovery code; matching error messages is unnecessary.
+- The schema DSL adds `column.date()` for zoneless calendar dates. SQL `DATE`, `CURRENT_DATE`, and
+  casts to DATE use canonical `YYYY-MM-DD` strings, while timestamps remain JavaScript `Date`
+  objects. Kysely infers the same boundary.
+- Foreign keys accept `{ enforced: false }` for catalog-only relationships. They appear in
+  `introspect()` but never reject a missing parent, cascade a delete, or create an index.
+- `@minnowdb/react` adds cold-start Suspense, `useSuspenseLiveQuery()`, and
+  `staleWhileRevalidate` support when switching stable query stores.
+
+### Migration
+
+- Code that constructs a `QueryResult` or cursor page itself must add a `columnDomains` array with
+  one domain or `null` per result column.
+- Code that treated SQL `DATE` or `CURRENT_DATE` as a JavaScript `Date` must use the canonical
+  calendar string. `TIMESTAMP` behavior did not change.
+- Replace missing-table message matching with `error instanceof UnknownTableError` and read
+  `error.tableName`.
+
+The other additions are opt-in. Existing foreign keys remain enforced, existing React calls keep
+returning loading snapshots, and unguarded upserts keep their previous behavior.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5
+remain readable and writable without a data migration.
+
+## 0.4.1 — August 26, 2026
+
+Published package: `@minnowdb/core@0.4.1`.
+
+- Fixed multi-block snapshot restore into OPFS so renewed import batches retain a valid owner
+  lease for the complete restore.
+- Added a packed-consumer gate that installs the actual npm tarballs outside the workspace, checks
+  every public entry point, builds a worker application, and exercises migrations, SQL, Kysely,
+  live queries, exports, snapshots, React, and devtools in a browser.
+- No public API or stored format changed.
+
+## 0.4.0 — August 25, 2026
+
+Published packages: `@minnowdb/core@0.4.0`, `@minnowdb/devtools@0.2.1`,
+`@minnowdb/export@0.1.0`, `@minnowdb/kysely@0.2.0`, and `@minnowdb/react@0.1.0`.
+
+- Established Minnow's first locked persistence contracts: block format 2, snapshot format 1,
+  IndexedDB schema 1, and OPFS layout 5, with frozen fixtures and reopen-and-continue tests.
+- Added streamed, resumable snapshots; durable writer and snapshot leases; bounded query spill,
+  maintenance backpressure, and explicit origin-persistence policy.
+- Added typed, keyed, and ordered-window live queries, the React external-store binding, and
+  streaming CSV/NDJSON exports.
+- Expanded the Kysely adapter with schema-derived database types, Minnow function typing, search,
+  cursors, and live-query wrappers.
+- Hardened IndexedDB and OPFS recovery, transaction atomicity, SQL limits, package tree shaking,
+  and the public custom-storage contract.
+
+This release deliberately stopped interpreting unsupported pre-contract storage prototypes as
+current data. Preserve experimental data with the build that can open it before moving it through
+a supported export path. The versioning and storage guides describe the locked formats that begin
+with 0.4.
+
+## 0.3.0 — August 24, 2026
+
+Published packages: `@minnowdb/core@0.3.0`, `@minnowdb/devtools@0.2.0`, and
+`@minnowdb/kysely@0.1.0`.
+
+- Introduced the Kysely dialect as the supported typed query-builder integration.
+- Added durable secondary indexes for selective filters and ordered reads.
+- Expanded PostgreSQL-style SQL coverage and bounded planner, metadata, and history work.
+- Retired `@minnowdb/client`; applications using it should move to direct SQL or
+  `@minnowdb/kysely`.
+
+## 0.2.1 — August 21, 2026
+
+Published packages: `@minnowdb/core@0.2.1`, `@minnowdb/client@0.2.0`, and
+`@minnowdb/devtools@0.1.3`.
+
+- Made the core SQL engine the typed client's execution path instead of maintaining a parallel
+  query implementation.
+- Hardened SQL compilation, worker behavior, and the final `@minnowdb/client` release.
+
+## 0.2.0 — August 21, 2026
+
+Published packages: `@minnowdb/core@0.2.0`, `@minnowdb/client@0.1.2`, and
+`@minnowdb/devtools@0.1.2`.
+
+- Added the OPFS block store and made storage adapters independently tree-shakeable.
+- Moved worker results over columnar frames and added typed-query result memoization.
+- Added bounded background compaction and garbage collection, partitioned folds, and explicit
+  memory/performance soaks.
+- Folded the TypeScript console into the home-page playground over the same worker database as
+  the SQL console.
+
+## 0.1.1 — August 18, 2026
+
+Published packages: `@minnowdb/core@0.1.1`, `@minnowdb/client@0.1.1`, and
+`@minnowdb/devtools@0.1.1`.
+
+- Corrected package documentation and release tagging so the installed package and repository
+  tag describe the same build.
+- No engine behavior or stored format changed.
+
+## 0.1.0 — August 18, 2026
+
+Published packages: `@minnowdb/core@0.1.0`, `@minnowdb/client@0.1.0`, and
+`@minnowdb/devtools@0.1.0`.
+
+Initial experimental release of the browser-local columnar SQL engine, IndexedDB storage, worker
+client, typed client, and embeddable devtools.
