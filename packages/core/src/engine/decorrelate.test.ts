@@ -108,6 +108,15 @@ describe("correlated subquery decorrelation", () => {
     ).toEqual([{ amount: 10 }, { amount: 6 }]);
   });
 
+  it("answers correlated IN over non-equality predicates", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.region IN " +
+          "(SELECT q.region FROM rows q WHERE q.amount < r.amount)",
+      ),
+    ).toEqual([{ amount: 10 }]);
+  });
+
   it("decorrelates equality LATERAL sources into a hash join", () => {
     const plan = compileQuery(
       "SELECT r.amount, x.label FROM rows r, " +
@@ -122,6 +131,23 @@ describe("correlated subquery decorrelation", () => {
     expect(executeRowQuery(plan, tables).rows).toEqual([
       { amount: 10, label: "West Coast" },
       { amount: 6, label: "West Coast" },
+    ]);
+  });
+
+  it("decorrelates range-correlated LATERAL sources into a general join", () => {
+    expect(
+      run(
+        "SELECT r.amount AS outer_amount, x.amount AS inner_amount FROM rows r, " +
+          "LATERAL (SELECT q.amount FROM rows q WHERE q.amount < r.amount) x " +
+          "ORDER BY outer_amount, inner_amount",
+      ),
+    ).toEqual([
+      { outer_amount: 6, inner_amount: 3 },
+      { outer_amount: 8, inner_amount: 3 },
+      { outer_amount: 8, inner_amount: 6 },
+      { outer_amount: 10, inner_amount: 3 },
+      { outer_amount: 10, inner_amount: 6 },
+      { outer_amount: 10, inner_amount: 8 },
     ]);
   });
 
@@ -201,6 +227,21 @@ describe("correlated subquery decorrelation", () => {
     ]);
   });
 
+  it("answers range-correlated NOT IN with empty-set and NULL semantics", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE 'west' NOT IN " +
+          "(SELECT q.region FROM rows q WHERE q.amount < r.amount)",
+      ),
+    ).toEqual([{ amount: 6 }, { amount: 3 }]);
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE 'north' NOT IN " +
+          "(SELECT q.region FROM rows q WHERE q.amount < r.amount)",
+      ),
+    ).toEqual([{ amount: 6 }, { amount: 3 }, { amount: 8 }]);
+  });
+
   it("answers correlated scalar aggregates in the select list", () => {
     expect(
       run(
@@ -210,6 +251,60 @@ describe("correlated subquery decorrelation", () => {
       { amount: 10, a: 8 },
       { amount: 6, a: 8 },
     ]);
+  });
+
+  it("answers grouped correlated scalars determined by grouping keys", () => {
+    expect(
+      run(
+        "SELECT r.region AS g, COUNT(*) AS c, " +
+          "(SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional " +
+          "FROM rows r GROUP BY r.region ORDER BY g NULLS LAST",
+      ),
+    ).toEqual([
+      { g: "east", c: 1, regional: 3 },
+      { g: "west", c: 2, regional: 8 },
+      { g: null, c: 1, regional: null },
+    ]);
+  });
+
+  it("answers scalar aggregates over non-equality correlations", () => {
+    expect(
+      run(
+        "SELECT r.amount, (SELECT COUNT(*) FROM rows q WHERE q.amount < r.amount) AS c " +
+          "FROM rows r ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, c: 0 },
+      { amount: 6, c: 1 },
+      { amount: 8, c: 2 },
+      { amount: 10, c: 3 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.amount > " +
+          "(SELECT AVG(q.amount) FROM rows q WHERE q.amount < r.amount)",
+      ),
+    ).toEqual([{ amount: 10 }, { amount: 6 }, { amount: 8 }]);
+  });
+
+  it("combines equality and range correlation for scalar aggregates", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.amount > " +
+          "(SELECT AVG(q.amount) FROM rows q " +
+          "WHERE q.region = r.region AND q.amount < r.amount)",
+      ),
+    ).toEqual([{ amount: 10 }]);
+  });
+
+  it("builds probe tuples from multiple outer sources", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r JOIN dims d ON d.region = r.region WHERE r.amount > " +
+          "(SELECT COUNT(*) FROM rows q " +
+          "WHERE q.amount < r.amount AND q.region <> d.region)",
+      ),
+    ).toEqual([{ amount: 10 }, { amount: 6 }]);
   });
 
   it("orders by a correlated scalar via the hidden select-item desugar", () => {
@@ -222,25 +317,56 @@ describe("correlated subquery decorrelation", () => {
     ).toEqual([{ amount: 3 }, { amount: 6 }, { amount: 10 }]);
   });
 
-  it("rejects correlated subqueries outside supported positions", () => {
+  it("rejects correlated scalar subqueries outside supported positions", () => {
     expect(() =>
       compileQuery(
         "SELECT r.region AS g, COUNT(*) AS c FROM rows r GROUP BY r.region HAVING COUNT(*) > (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region)",
       ),
     ).toThrow("top-level WHERE");
-    expect(() =>
-      compileQuery(
-        "SELECT r.region FROM rows r WHERE r.amount > 100 OR EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
-      ),
-    ).toThrow("top-level WHERE");
   });
 
-  it("rejects correlated subqueries combined with SELECT *", () => {
-    expect(() =>
-      compileQuery(
+  it("answers correlated EXISTS nested inside boolean expressions", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.amount > 100 OR " +
+          "EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
+      ),
+    ).toEqual([{ amount: 10 }, { amount: 6 }]);
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.amount = 3 OR " +
+          "NOT EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
+      ),
+    ).toEqual([{ amount: 3 }, { amount: 8 }]);
+  });
+
+  it("answers non-equality correlated EXISTS nested below OR", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.amount = 3 OR " +
+          "EXISTS (SELECT q.amount FROM rows q WHERE q.amount < r.amount)",
+      ),
+    ).toEqual([{ amount: 10 }, { amount: 6 }, { amount: 3 }, { amount: 8 }]);
+  });
+
+  it("hides decorrelation columns from SELECT *", () => {
+    expect(
+      run(
         "SELECT * FROM rows r WHERE EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
       ),
-    ).toThrow("SELECT *");
+    ).toEqual([
+      { region: "west", amount: 10 },
+      { region: "west", amount: 6 },
+    ]);
+    expect(
+      run(
+        "SELECT DISTINCT * FROM rows r WHERE " +
+          "EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
+      ),
+    ).toEqual([
+      { region: "west", amount: 10 },
+      { region: "west", amount: 6 },
+    ]);
   });
 
   it("rejects a correlated scalar subquery without an aggregate", () => {

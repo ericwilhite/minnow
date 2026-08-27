@@ -10,6 +10,7 @@ import { OpfsBlockStore } from "./index.js";
 
 interface NativeFixture {
   layoutFormatVersion: number;
+  writerPackageVersion: string;
   files: Record<string, string>;
   expectations: {
     tables: string[];
@@ -38,6 +39,25 @@ function loadFixtures(): Fixture[] {
 
 const fixtures = loadFixtures();
 const FIRST_STABLE_OPFS_LAYOUT_VERSION = 5;
+const currentPackageVersion = (
+  JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
+
+function packageVersionTuple(version: string): [number, number, number] {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/u.exec(version);
+  if (match === null) throw new TypeError(`Invalid fixture package version: ${version}`);
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function comparePackageVersions(left: string, right: string): number {
+  const leftParts = packageVersionTuple(left);
+  const rightParts = packageVersionTuple(right);
+  return (
+    leftParts[0] - rightParts[0] || leftParts[1] - rightParts[1] || leftParts[2] - rightParts[2]
+  );
+}
 
 function decodeBase64(base64: string): Uint8Array {
   return Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
@@ -73,6 +93,12 @@ describe("frozen native OPFS layout", () => {
         .map(({ fixture }) => fixture.layoutFormatVersion)
         .sort((left, right) => left - right),
     ).toEqual(expectedVersions);
+    for (const { stem, fixture } of fixtures) {
+      expect(
+        comparePackageVersions(fixture.writerPackageVersion, currentPackageVersion),
+        `${stem} claims a writer newer than this package`,
+      ).toBeLessThanOrEqual(0);
+    }
   });
 
   it("has a fixture for the layout this build writes", () => {
@@ -102,7 +128,7 @@ describe("frozen native OPFS layout", () => {
   });
 
   for (const { stem, fixture } of fixtures) {
-    it(`reopens ${stem}'s checkpoint, WAL tail, and extent bytes`, async () => {
+    it(`reopens ${stem} from @minnowdb/core@${fixture.writerPackageVersion}`, async () => {
       const store = await OpfsBlockStore.open({
         name: "native-fixture",
         root: hydrate(fixture).root,
@@ -118,7 +144,7 @@ describe("frozen native OPFS layout", () => {
       store.close();
     });
 
-    it(`continues writing and recovering from ${stem}`, async () => {
+    it(`continues current writes and recovery from ${stem} written by @minnowdb/core@${fixture.writerPackageVersion}`, async () => {
       const shim = hydrate(fixture);
       const store = await OpfsBlockStore.open({ name: "native-fixture", root: shim.root });
       await store.addTable(table("after-fixture"));

@@ -6,6 +6,7 @@ import {
   type InsertBatchInput,
 } from "./batch.js";
 import { ArtifactCache } from "./artifact-cache.js";
+import { throwIfAborted } from "./cancellation.js";
 import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writer.js";
 export {
   attachLifecycleFlush,
@@ -22,6 +23,7 @@ import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
+  DatabaseReadBacklogError,
   MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
@@ -29,6 +31,7 @@ import {
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
+export { DatabaseReadBacklogError } from "./errors.js";
 import {
   BLOCK_HEADER_LENGTH,
   buildPhysicalColumnFromRanges,
@@ -367,14 +370,6 @@ export const MAX_TRANSACTION_SAVEPOINT_BYTES = 8 * 1024 * 1024;
 export const MAX_DATABASE_PENDING_WRITES = 64;
 /** Concurrent direct reads retained by one database instance. Reads still execute in parallel. */
 export const MAX_DATABASE_ACTIVE_READS = 256;
-
-export class DatabaseReadBacklogError extends Error {
-  override readonly name = "DatabaseReadBacklogError";
-
-  constructor(readonly limit = MAX_DATABASE_ACTIVE_READS) {
-    super(`A database cannot retain more than ${String(limit)} active reads; await a read`);
-  }
-}
 /** Commits tolerated while collection fails before foreground writes assist and backpressure. */
 const AUTO_COLLECT_MAX_DEBT_COMMITS = 4_096;
 /** Failed background passes retry without another write, with bounded exponential backoff. */
@@ -553,6 +548,14 @@ interface SegmentVisibilityCatalog {
   readonly segmentsByTable: ReadonlyMap<string, readonly SegmentRecord[]>;
   /** One staged writer exposed as a synthetic post-snapshot commit inside a transaction scope. */
   readonly overlayTransactionId?: string;
+}
+
+/** Exact current-layout counters retained between local commits for cheap maintenance checks. */
+interface AutoCompactionHint {
+  readonly version: number | null;
+  readonly visible: number;
+  readonly levelZero: number;
+  readonly deltas: number;
 }
 
 interface ZonePredicate {
@@ -854,6 +857,11 @@ export interface MaintenanceStatus {
 
 export interface QueryOptions {
   /**
+   * Stops a read between bounded execution or storage batches. An abort never returns a partial
+   * result and releases any reader lease and temporary spill owner before the promise rejects.
+   */
+  readonly signal?: AbortSignal;
+  /**
    * Called once with what this execution cost, before the result is returned. Additive and
    * optional: the engine can report its own memory because it reserves before it allocates,
    * which is not something the storage layer or a caller could measure from outside.
@@ -892,8 +900,6 @@ export interface QueryOptions {
 export interface QueryCursorOptions extends QueryOptions {
   /** Maximum rows in one yielded result batch. Defaults to the vector scan batch size. */
   readonly batchRows?: number;
-  /** Cancels the scan and releases its snapshot lease. */
-  readonly signal?: AbortSignal;
 }
 
 export interface DeleteBatchInput {
@@ -1363,6 +1369,8 @@ export interface StatementWriter extends WriteSession {
 
 /** The extra entry point held by BEGIN so already-compiled statements are not parsed twice. */
 interface TransactionStatementWriter extends StatementWriter {
+  /** Snapshot-only scalar projection; undefined keeps the ordinary row-shaped fallback. */
+  queryFirstColumn(plan: CompiledQuery): Promise<QueryValue[] | undefined>;
   executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
   checkpoint(): TransactionCheckpoint;
   checkpointRetainedBytes(): number;
@@ -1576,6 +1584,7 @@ class QueryBatchChannel {
 interface QueryBatchCursorExecution {
   readonly batchRows: number;
   readonly signal: AbortSignal;
+  readonly consumeFirstColumn?: (values: readonly QueryValue[]) => Promise<void>;
   readonly consume: (batch: QueryResult) => Promise<void>;
 }
 
@@ -1721,6 +1730,8 @@ export class MinnowDatabase {
   readonly #droppingTables = new Set<string>();
   /** Per table: the visible segment count a failed auto-compaction must see before retrying. */
   readonly #autoCompactionBackoff = new Map<string, number>();
+  /** Exact current-layout counters; local commits advance them without rescanning history. */
+  readonly #autoCompactionHints = new Map<string, AutoCompactionHint>();
   /** Data commits per table since its last write-path auto-compaction check. */
   readonly #commitsSinceCompactionCheck = new Map<string, number>();
   /** The compaction step in flight per table, so steps on one table run one at a time. */
@@ -1943,6 +1954,7 @@ export class MinnowDatabase {
     this.#autoCompactionsRequested.clear();
     this.#idleCompactionTableIds.clear();
     this.#autoCompactionBackoff.clear();
+    this.#autoCompactionHints.clear();
     this.#commitsSinceCompactionCheck.clear();
     this.#artifactCache.clear();
   }
@@ -2369,7 +2381,7 @@ export class MinnowDatabase {
 
   async #withReadReservation<T>(run: () => Promise<T>): Promise<T> {
     if (this.#activeReadReservations >= MAX_DATABASE_ACTIVE_READS) {
-      throw new DatabaseReadBacklogError();
+      throw new DatabaseReadBacklogError(MAX_DATABASE_ACTIVE_READS);
     }
     this.#activeReadReservations += 1;
     try {
@@ -2380,7 +2392,9 @@ export class MinnowDatabase {
   }
 
   async #queryWithReadReservation(sql: string, options: QueryOptions): Promise<QueryResult> {
+    throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
+    throwIfAborted(options.signal);
     // An open statement transaction routes through its session, which owns the reservation for
     // the actual execution. Avoid charging the same query twice at this public boundary.
     return this.#openTransaction === undefined
@@ -2861,6 +2875,7 @@ export class MinnowDatabase {
         this.#afterCommit(manifest);
         for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
         this.#autoCompactionBackoff.delete(table.id);
+        this.#autoCompactionHints.delete(table.id);
         this.#commitsSinceCompactionCheck.delete(table.id);
         this.#idleCompactionTableIds.delete(table.id);
         const postingPrefix = `${table.id}/`;
@@ -3080,6 +3095,11 @@ export class MinnowDatabase {
       keys: [key],
       changes: Object.fromEntries(Object.entries(changes).map(([name, value]) => [name, [value]])),
     });
+  }
+
+  /** Deletes one row by the table's unique key. */
+  async delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult> {
+    return this.deleteBatch(tableName, { keys: [key] });
   }
 
   deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
@@ -4107,12 +4127,14 @@ export class MinnowDatabase {
     probe?: CatalogProbe,
   ): Promise<PreparedQuery> {
     options = this.#effectiveQueryOptions(options);
+    throwIfAborted(options.signal);
     // The ORDER-BY-expression desugar's wrapper is projection-only: prepare the inner block
     // directly (no derived materialization) and project each result to the visible aliases,
     // so `.search()` costs the same whether or not the caller also selects the score.
     const wrapper = transparentProjectionSource(plan);
     if (wrapper !== undefined) {
       const prepared = await this.#prepareCompiledPlan(wrapper.inner, options, probe);
+      throwIfAborted(options.signal);
       return {
         sql: prepared.sql,
         tables: prepared.tables,
@@ -4141,6 +4163,7 @@ export class MinnowDatabase {
         realTables: Map<string, TableRecord>,
         visibility: SegmentVisibilityCatalog,
       ): Promise<void> => {
+        throwIfAborted(options.signal);
         const typedSchemas = new Map<string, SqlColumnSchema[]>(
           [...realTables.values()].map((table) => [
             table.name,
@@ -4160,6 +4183,7 @@ export class MinnowDatabase {
         );
         const resolution = subqueryResolutionSteps(expandedPlan);
         for (const step of resolution.steps) {
+          throwIfAborted(options.signal);
           step.substitute(
             await this.#executeBlockCached(
               step.block,
@@ -4172,13 +4196,16 @@ export class MinnowDatabase {
               options.spillToStorage !== false,
               options.spillToStorage === true,
               options.spillPageRows,
+              options.signal,
             ),
           );
+          throwIfAborted(options.signal);
         }
         resolvedPlan = resolution.plan;
         // Index-served BM25 statistics, computed against the same catalog snapshot the pruner
         // reads, so a pruned scoring scan always carries exact corpus numbers.
         ftsStats = await this.#ftsIndexStats(resolvedPlan, realTables, snapshot, visibility);
+        throwIfAborted(options.signal);
         columnarTables = await this.#prepareBlockInputs(
           resolvedPlan,
           snapshot,
@@ -4193,15 +4220,19 @@ export class MinnowDatabase {
           options.spillToStorage !== false,
           options.spillToStorage === true,
           options.spillPageRows,
+          options.signal,
         );
+        throwIfAborted(options.signal);
         outputNeedsExternalization = queryResultNeedsExternalization(resolvedPlan, typedSchemas);
         outputColumnDomains = inferResultColumnDomains(resolvedPlan, typedSchemas);
       };
       if (options.version !== undefined) {
         // Explicit time travel keeps the per-call lease and version-anchored reads.
         const realTables = await this.#findRealBlockTables(plan);
+        throwIfAborted(options.signal);
         await this.#withLeasedSnapshot(options.version, async (snapshot) => {
           const visibility = await this.#blockSegmentVisibility(realTables);
+          throwIfAborted(options.signal);
           await prepareAtSnapshot(snapshot, realTables, visibility);
         });
       } else {
@@ -4211,6 +4242,7 @@ export class MinnowDatabase {
           probe,
         );
       }
+      throwIfAborted(options.signal);
       return createPreparedColumnarQuery(
         chooseJoinOrder(resolvedPlan, columnarTables),
         columnarTables,
@@ -4539,10 +4571,13 @@ export class MinnowDatabase {
     allowSpill = true,
     forceSpill = false,
     spillPageRows?: number,
+    signal?: AbortSignal,
   ): Promise<Map<string, ColumnarTable>> {
+    throwIfAborted(signal);
     const inputs = new Map<string, ColumnarTable>(extraInputs ?? []);
     const sources = [block.base, ...block.joins];
     for (const source of sources) {
+      throwIfAborted(signal);
       if (inputs.has(source.table)) continue;
       if (source.recursive !== undefined) {
         const { reference, base, step, all } = source.recursive;
@@ -4557,10 +4592,12 @@ export class MinnowDatabase {
           allowSpill,
           forceSpill,
           spillPageRows,
+          signal,
         );
         typedSchemas.set(reference, schema);
         const state = createRecursiveCteState(baseResult, all);
         while (state.frontier.length > 0) {
+          throwIfAborted(signal);
           // Each iteration's inputs release with its own context, so only the accumulated rows
           // and the final columnar table hold memory across the fixpoint loop.
           const iterationMemory = memory.createChild();
@@ -4587,6 +4624,7 @@ export class MinnowDatabase {
                 allowSpill,
                 forceSpill,
                 spillPageRows,
+                signal,
               ),
             );
           } finally {
@@ -4612,6 +4650,7 @@ export class MinnowDatabase {
         const results: QueryResult[] = [];
         let schema: SqlColumnSchema[] | undefined;
         for (const member of source.union.blocks) {
+          throwIfAborted(signal);
           const { result, schema: memberSchema } = await this.#executeBlockWithSchemaCached(
             member,
             snapshot,
@@ -4623,6 +4662,7 @@ export class MinnowDatabase {
             allowSpill,
             forceSpill,
             spillPageRows,
+            signal,
           );
           if (schema === undefined) schema = memberSchema;
           else {
@@ -4659,6 +4699,7 @@ export class MinnowDatabase {
           realTables,
           cacheResults,
         );
+        throwIfAborted(signal);
         const columnarKey =
           innerKey === undefined
             ? undefined
@@ -4683,6 +4724,7 @@ export class MinnowDatabase {
           allowSpill,
           forceSpill,
           spillPageRows,
+          signal,
         );
         const windowed = applyWindowFunctions(inner, source.windowed.windows, {
           copyRows: cacheResults,
@@ -4715,6 +4757,7 @@ export class MinnowDatabase {
         realTables,
         cacheResults,
       );
+      throwIfAborted(signal);
       const columnarKey = derivedKey === undefined ? undefined : `ctd|${derivedKey}`;
       if (columnarKey !== undefined) {
         const hit = this.#cacheGet(columnarKey) as
@@ -4736,6 +4779,7 @@ export class MinnowDatabase {
         allowSpill,
         forceSpill,
         spillPageRows,
+        signal,
       );
       typedSchemas.set(source.table, schema);
       const derivedTable = derivedColumnarTable(source.table, result, schema);
@@ -4758,6 +4802,7 @@ export class MinnowDatabase {
     const onlyRealSource =
       sources.length === 1 && sources[0]?.derived === undefined ? block : undefined;
     for (const source of sources) {
+      throwIfAborted(signal);
       if (source.derived !== undefined || inputs.has(source.table)) continue;
       if (source.table === DUAL_TABLE) {
         inputs.set(DUAL_TABLE, columnarTableFromRows(DUAL_TABLE, dualTableRows()));
@@ -4776,6 +4821,7 @@ export class MinnowDatabase {
           onlyRealSource,
         ),
       );
+      throwIfAborted(signal);
     }
     return inputs;
   }
@@ -4794,6 +4840,7 @@ export class MinnowDatabase {
   }
 
   async #queryUnreserved(sql: string, options: QueryOptions): Promise<QueryResult> {
+    throwIfAborted(options.signal);
     const open = this.#openTransaction;
     if (open !== undefined) {
       // Read-your-writes: inside BEGIN … COMMIT a read sees the pre-scope snapshot plus what
@@ -4827,6 +4874,7 @@ export class MinnowDatabase {
           options,
           probe,
         );
+    throwIfAborted(options.signal);
     return externalizeQueryResult(result);
   }
 
@@ -4901,7 +4949,8 @@ export class MinnowDatabase {
     options: QueryOptions,
     cursor: QueryBatchCursorExecution,
   ): Promise<void> {
-    options = this.#effectiveQueryOptions(options);
+    options = this.#effectiveQueryOptions({ ...options, signal: cursor.signal });
+    cursor.signal.throwIfAborted();
     // A transaction's staged overlay has its own executor. Keep its read-your-writes semantics
     // and page the materialized result; native scan batching is for durable snapshots.
     if (this.#openTransaction === undefined) {
@@ -4956,16 +5005,23 @@ export class MinnowDatabase {
     options: QueryOptions,
     probe: () => Promise<CatalogProbe>,
   ): Promise<QueryResult> {
+    throwIfAborted(options.signal);
     const before = await probe();
+    throwIfAborted(options.signal);
     const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
       QueryResult | undefined;
-    if (cached !== undefined) return copyQueryResult(cached);
+    if (cached !== undefined) {
+      options.onStats?.({ peakMemoryBytes: 0 });
+      return copyQueryResult(cached);
+    }
     const result = await this.#queryCompiled(plan, options, before);
+    throwIfAborted(options.signal);
     const bytes = queryResultRetainedBytes(result);
     if (bytes <= RESULT_MEMO_MAX_BYTES) {
       // Cache only when the epoch did not move during execution: the result is then exactly
       // that epoch's answer. A moved epoch simply skips the cache — never mis-files.
       const after = await probe();
+      throwIfAborted(options.signal);
       if (after.catalogEpoch === before.catalogEpoch) {
         this.#cachePut(
           `${key}\u0001${String(before.catalogEpoch)}`,
@@ -5156,10 +5212,13 @@ export class MinnowDatabase {
     probe?: CatalogProbe,
   ): Promise<QueryResult> {
     options = this.#effectiveQueryOptions(options);
+    throwIfAborted(options.signal);
     // One freshness probe per query: read here unless the caller already has one, and handed
     // to the view lookup and the catalog state below, which would otherwise probe again each.
     probe ??= await this.store.getCatalogProbe();
+    throwIfAborted(options.signal);
     plan = await this.#applyCatalogRewrites(plan, probe);
+    throwIfAborted(options.signal);
     const spillPageRows =
       options.spillPageRows === undefined
         ? undefined
@@ -5178,6 +5237,7 @@ export class MinnowDatabase {
       }
     }
     const prepared = await this.#prepareCompiledPlan(plan, options, probe);
+    throwIfAborted(options.signal);
     // Read the peak before close(): closing releases the context and zeroes what it tracked.
     const report = (result: QueryResult): QueryResult => {
       options.onStats?.({ peakMemoryBytes: prepared.memoryUsage.peakBytes });
@@ -5185,10 +5245,16 @@ export class MinnowDatabase {
     };
     try {
       const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
-      if (!spill) return report(prepared.execute());
+      if (!spill) {
+        const result = prepared.execute();
+        throwIfAborted(options.signal);
+        return report(result);
+      }
       if (options.spillToStorage !== true) {
         try {
-          return report(prepared.execute());
+          const result = prepared.execute();
+          throwIfAborted(options.signal);
+          return report(result);
         } catch (error) {
           if (!(error instanceof QueryMemoryBudgetError)) throw error;
         }
@@ -5197,11 +5263,36 @@ export class MinnowDatabase {
         await prepared.executeAsync({
           ...(spillPageRows === undefined ? {} : { spillPageRows }),
           spillStore: this.#leasedSpillStore(),
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
         }),
       );
     } finally {
       prepared.close();
     }
+  }
+
+  /**
+   * Streams a one-column snapshot projection into bounded pages. DELETE uses this before its
+   * first staged write: selection keeps all ordinary pruning/predicate semantics without
+   * retaining every QueryRow object until the key array is complete. Undefined means the shape
+   * or physical history needs the established row-shaped executor.
+   */
+  async #queryCompiledFirstColumn(
+    plan: CompiledQuery,
+    probe: CatalogProbe,
+  ): Promise<QueryValue[] | undefined> {
+    const options = this.#effectiveQueryOptions({ memoize: false });
+    plan = await this.#applyCatalogRewrites(plan, probe);
+    const values: QueryValue[] = [];
+    const streamed = await this.#queryStreamed(plan, options, undefined, probe, {
+      batchRows: 2_048,
+      signal: new AbortController().signal,
+      consumeFirstColumn: async (batch) => {
+        values.push(...batch);
+      },
+      consume: async () => undefined,
+    });
+    return streamed === undefined ? undefined : values;
   }
 
   /**
@@ -5601,11 +5692,15 @@ export class MinnowDatabase {
    * one, so a table that cannot be compacted today costs one attempt, not one per query.
    */
   #maybeScheduleAutoCompaction(table: TableRecord, segments: readonly SegmentRecord[]): void {
+    this.#maybeScheduleAutoCompactionFromHint(table, autoCompactionHint(null, segments));
+  }
+
+  #maybeScheduleAutoCompactionFromHint(table: TableRecord, hint: AutoCompactionHint): void {
     if (this.#closed) return;
     if (!this.#autoCompact) return;
     if (this.#droppingTables.has(table.id)) return;
-    if (!autoCompactionDue(segments)) return;
-    if (segments.length < (this.#autoCompactionBackoff.get(table.id) ?? 0)) return;
+    if (!autoCompactionDueHint(hint)) return;
+    if (hint.visible < (this.#autoCompactionBackoff.get(table.id) ?? 0)) return;
     if (this.#autoCompactionsInFlight.has(table.id)) {
       // A final burst can cross the threshold while the prior fold is still planning or
       // running. Remember it: otherwise no later commit or scan may arrive to trigger the fold
@@ -5619,7 +5714,7 @@ export class MinnowDatabase {
         else {
           this.#autoCompactionBackoff.set(
             table.id,
-            Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, segments.length * 2)),
+            Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, hint.visible * 2)),
           );
         }
       })
@@ -5629,7 +5724,7 @@ export class MinnowDatabase {
         // segments waiting for a segment count the idle database can never reach.
         this.#autoCompactionBackoff.set(
           table.id,
-          Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, segments.length * 2)),
+          Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, hint.visible * 2)),
         );
       })
       .finally(() => {
@@ -5653,6 +5748,10 @@ export class MinnowDatabase {
     // no useful work for this preflight to do, so avoid a full segment/owner/manifest scan on
     // every write and let the commit return the identical CompactionBacklogError at the CAS.
     if (!this.#autoCompact) return;
+    const hintVersion =
+      transaction?.snapshotVersion ?? (await this.store.getCurrentManifestVersion());
+    const hint = this.#autoCompactionHints.get(table.id);
+    if (hint?.version === hintVersion && hint.levelZero < MAX_LEVEL_ZERO_SEGMENTS) return;
     let segments = await this.#currentVisibleSegments(table);
     let levelZero = 0;
     for (const segment of segments) {
@@ -5724,9 +5823,11 @@ export class MinnowDatabase {
       const version = await this.store.getCurrentManifestVersion();
       segments = await this.#visibleSegmentRecords(table, new Snapshot(this.store, version));
       if ((await this.store.getCurrentManifestVersion()) === version) {
+        this.#autoCompactionHints.set(table.id, autoCompactionHint(version, segments));
         return segments;
       }
     }
+    this.#autoCompactionHints.delete(table.id);
     return segments;
   }
 
@@ -5737,6 +5838,7 @@ export class MinnowDatabase {
   #afterCommit(manifest: ManifestSummary, transaction?: DatabaseTransaction): void {
     if (this.#closed) return;
     const contribution = transaction?.committedCatalogContribution;
+    this.#advanceAutoCompactionHints(manifest, contribution?.segments);
     const initial = contribution?.initialCatalogProbe;
     const contributedTableIds = new Set(
       contribution?.segments.map((segment) => segment.tableId) ?? [],
@@ -5842,14 +5944,56 @@ export class MinnowDatabase {
   }
 
   /** Counts one physical rewrite version once in this engine, including lost-ack recovery. */
-  #afterCompactionCommit(manifest: ManifestSummary): void {
+  #afterCompactionCommit(manifest: ManifestSummary, tableId: string): void {
     if (this.#accountedCompactionVersions.has(manifest.version)) return;
     this.#accountedCompactionVersions.add(manifest.version);
     if (this.#accountedCompactionVersions.size > 128) {
       const oldest = this.#accountedCompactionVersions.values().next().value;
       if (oldest !== undefined) this.#accountedCompactionVersions.delete(oldest);
     }
+    // A fold replaces source segments with a different physical layout. Its manifest is
+    // logically unchanged and therefore carries no changed-table ID, so invalidate explicitly;
+    // #runAutoCompaction's stable post-fold probe seeds the replacement counters.
+    this.#autoCompactionHints.delete(tableId);
     this.#afterCommit(manifest);
+  }
+
+  /** Advances exact local hints, or discards them when a commit's provenance is incomplete. */
+  #advanceAutoCompactionHints(
+    manifest: ManifestSummary,
+    contributedSegments: readonly SegmentRecord[] | undefined,
+  ): void {
+    for (const [tableId, hint] of this.#autoCompactionHints) {
+      if (hint.version !== manifest.previousVersion) {
+        // Another database committed since this instance last proved the layout.
+        this.#autoCompactionHints.delete(tableId);
+        continue;
+      }
+      this.#autoCompactionHints.set(tableId, { ...hint, version: manifest.version });
+    }
+    const additionsByTable = new Map<string, SegmentRecord[]>();
+    for (const segment of contributedSegments ?? []) {
+      const additions = additionsByTable.get(segment.tableId);
+      if (additions === undefined) additionsByTable.set(segment.tableId, [segment]);
+      else additions.push(segment);
+    }
+    for (const tableId of manifest.changedTableIds) {
+      const hint = this.#autoCompactionHints.get(tableId);
+      if (hint === undefined) continue;
+      const additions = additionsByTable.get(tableId);
+      if (additions === undefined) {
+        // DDL and future write paths without an exact segment contribution fail closed.
+        this.#autoCompactionHints.delete(tableId);
+        continue;
+      }
+      const contribution = autoCompactionHint(manifest.version, additions);
+      this.#autoCompactionHints.set(tableId, {
+        version: manifest.version,
+        visible: hint.visible + contribution.visible,
+        levelZero: hint.levelZero + contribution.levelZero,
+        deltas: hint.deltas + contribution.deltas,
+      });
+    }
   }
 
   /**
@@ -5886,6 +6030,12 @@ export class MinnowDatabase {
     try {
       const table = await this.store.getTable(tableId);
       if (table === undefined) return;
+      const version = await this.store.getCurrentManifestVersion();
+      const hint = this.#autoCompactionHints.get(tableId);
+      if (hint?.version === version) {
+        this.#maybeScheduleAutoCompactionFromHint(table, hint);
+        return;
+      }
       this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
     } catch {
       // Deliberately silent: the next commit or scan checks again.
@@ -6634,6 +6784,16 @@ export class MinnowDatabase {
             ? this.#queryCompiled(plan, {}, probe)
             : this.#sessionQueryPlan(transaction, await this.#applyCatalogRewrites(plan));
         }),
+      queryFirstColumn: (plan) =>
+        this.#withReadReservation(async () => {
+          // A staged overlay can add, replace, or remove keys without changing the pinned
+          // manifest. Keep that case on the read-your-writes row executor; before the first
+          // stage, the transaction's exact catalog probe makes the streamed snapshot safe.
+          const probe = transaction.initialCatalogProbe;
+          return transaction.stagedWorkCount === 0 && probe !== undefined
+            ? this.#queryCompiledFirstColumn(plan, probe)
+            : undefined;
+        }),
       executeStatement: (statement) => {
         open();
         return guarded(() => this.runStatement(statement, { writer }));
@@ -6708,10 +6868,12 @@ export class MinnowDatabase {
     options: QueryOptions = {},
   ): Promise<QueryResult> {
     options = this.#effectiveQueryOptions(options);
+    throwIfAborted(options.signal);
     const bound = bindPlanParameters(this.#compileCached(sql), options.params);
     // The same catalog rewrites a read outside a scope gets: a scope that could not see a view
     // would make the scope's reads a different language from everyone else's.
     const plan = await this.#applyCatalogRewrites(bound);
+    throwIfAborted(options.signal);
     return this.#sessionQueryPlan(transaction, plan, options);
   }
 
@@ -6722,12 +6884,15 @@ export class MinnowDatabase {
     options: QueryOptions = {},
   ): Promise<QueryResult> {
     options = this.#effectiveQueryOptions(options);
+    throwIfAborted(options.signal);
     const names = collectRealTableNames(plan);
     const tables = await Promise.all(names.map((name) => this.#findTable(name)));
+    throwIfAborted(options.signal);
     const realTables = new Map(tables.map((table) => [table.name, table] as const));
     const pendingIds = new Set(transaction.pendingSegmentIds);
     const pendingBlocks = new Set(transaction.pendingBlockIds);
     const ourRecord = await this.store.getTransaction(transaction.id);
+    throwIfAborted(options.signal);
     // Pinned to the scope's own snapshot, not the current manifest: the documented contract
     // is "the pre-scope snapshot plus everything this scope staged", and #assertKeysExist
     // already validates against transaction.snapshotVersion — reading the current version
@@ -6755,6 +6920,7 @@ export class MinnowDatabase {
         getBlocks: async (blockIds: readonly string[]) => {
           const blocks: Array<Uint8Array | undefined> = [];
           for (let start = 0; start < blockIds.length; start += 64) {
+            throwIfAborted(options.signal);
             const window = blockIds.slice(start, start + 64);
             const committedIds: string[] = [];
             const committedIndexes: number[] = [];
@@ -6778,6 +6944,7 @@ export class MinnowDatabase {
               this.#getBlocksWindowed(committedIds),
               Promise.all(stagedIds.map((blockId) => transaction.getBlock(blockId))),
             ]);
+            throwIfAborted(options.signal);
             const ordered = new Array<Uint8Array | undefined>(window.length);
             committedIndexes.forEach((index, offset) => {
               ordered[index] = committed[offset];
@@ -6796,10 +6963,12 @@ export class MinnowDatabase {
       const transactionRecords = new Map<string, TransactionRecord>();
       const deferredSegments = transaction.deferredSegments;
       for (const table of tables) {
+        throwIfAborted(options.signal);
         const segments = [
           ...(await listTableSegmentsPaged(this.store, table.id)),
           ...deferredSegments.filter((segment) => segment.tableId === table.id),
         ];
+        throwIfAborted(options.signal);
         // Staged segments sort after every committed one; commitOrdinal keeps their
         // staging order (the journal's id list is sorted, so it cannot).
         const doctored = segments.map((segment) =>
@@ -6811,6 +6980,7 @@ export class MinnowDatabase {
         for (const record of await this.#transactionRecordsForSegments(doctored)) {
           transactionRecords.set(record.id, record);
         }
+        throwIfAborted(options.signal);
       }
       if (ourRecord !== undefined) {
         transactionRecords.set(transaction.id, {
@@ -6838,6 +7008,7 @@ export class MinnowDatabase {
     options: QueryOptions = {},
   ): Promise<QueryResult> {
     options = this.#effectiveQueryOptions(options);
+    throwIfAborted(options.signal);
     plan = expandFtsColumns(plan, (name) => searchableFtsColumns(realTables.get(name)));
     const typedSchemas = new Map<string, SqlColumnSchema[]>(
       [...realTables.values()].map((table) => [
@@ -6857,9 +7028,15 @@ export class MinnowDatabase {
       options.spillPageRows === undefined
         ? undefined
         : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
+    const report = (result: QueryResult): QueryResult => {
+      throwIfAborted(options.signal);
+      options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
+      return result;
+    };
     try {
       const resolution = subqueryResolutionSteps(plan);
       for (const step of resolution.steps) {
+        throwIfAborted(options.signal);
         step.substitute(
           await this.#executeBlock(
             step.block,
@@ -6873,40 +7050,47 @@ export class MinnowDatabase {
             allowSpill,
             forceSpill,
             spillPageRows,
+            options.signal,
           ),
         );
       }
       const wrapper = transparentProjectionSource(resolution.plan);
       if (wrapper !== undefined) {
-        return projectResultColumns(
-          await this.#executeBlock(
-            wrapper.inner,
-            snapshot,
-            visibility,
-            memory,
-            realTables,
-            typedSchemas,
-            undefined,
-            cacheResults,
-            allowSpill,
-            forceSpill,
-            spillPageRows,
+        return report(
+          projectResultColumns(
+            await this.#executeBlock(
+              wrapper.inner,
+              snapshot,
+              visibility,
+              memory,
+              realTables,
+              typedSchemas,
+              undefined,
+              cacheResults,
+              allowSpill,
+              forceSpill,
+              spillPageRows,
+              options.signal,
+            ),
+            wrapper.aliases,
           ),
-          wrapper.aliases,
         );
       }
-      return await this.#executeBlock(
-        resolution.plan,
-        snapshot,
-        visibility,
-        memory,
-        realTables,
-        typedSchemas,
-        undefined,
-        cacheResults,
-        allowSpill,
-        forceSpill,
-        spillPageRows,
+      return report(
+        await this.#executeBlock(
+          resolution.plan,
+          snapshot,
+          visibility,
+          memory,
+          realTables,
+          typedSchemas,
+          undefined,
+          cacheResults,
+          allowSpill,
+          forceSpill,
+          spillPageRows,
+          options.signal,
+        ),
       );
     } finally {
       memory.close();
@@ -9594,6 +9778,33 @@ export class MinnowDatabase {
       having: [],
       orderBy: [],
     };
+    if (statement.kind === "delete" && returningColumns === undefined) {
+      const internalWriter = options.writer as StatementWriter &
+        Partial<Pick<TransactionStatementWriter, "queryFirstColumn">>;
+      if (internalWriter.queryFirstColumn !== undefined) {
+        const selectedKeys = await internalWriter.queryFirstColumn(plan);
+        if (selectedKeys !== undefined) {
+          const keys = selectedKeys as BatchValue[];
+          if (keyColumn.type === "string" && keyColumn.sqlDomain === undefined) {
+            for (let index = 0; index < keys.length; index += 1) {
+              keys[index] = storedSqlValueFromExecution(keyColumn, keys[index] ?? null);
+            }
+          }
+          if (keys.some((key) => key === null)) {
+            throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
+          }
+          if (keys.length === 0) {
+            return { kind: "delete", table: table.name, rowCount: 0 };
+          }
+          const deleted = await internalWriter.deleteBatch(table.name, { keys });
+          return {
+            kind: "delete",
+            table: table.name,
+            rowCount: deleted.rowCount,
+          };
+        }
+      }
+    }
     let rows: QueryResult["rows"];
     if (options.writer !== undefined) {
       // Inside a scope the rows to touch are the ones the scope can see, which includes what it
@@ -9741,6 +9952,7 @@ export class MinnowDatabase {
     cursor?: QueryBatchCursorExecution,
   ): Promise<QueryResult | undefined> {
     options = this.#effectiveQueryOptions(options);
+    throwIfAborted(options.signal);
     const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
     const uniqueTableNames = [...new Set(tableNames)];
     if (options.version === undefined) {
@@ -9799,6 +10011,7 @@ export class MinnowDatabase {
     visibility: SegmentVisibilityCatalog,
     cursor?: QueryBatchCursorExecution,
   ): Promise<QueryResult | undefined> {
+    throwIfAborted(options.signal);
     // Copy-on-write: expansion clones only full-text plans, leaving the compile cache's copy
     // untouched.
     plan = expandFtsColumns(plan, (tableName) =>
@@ -9825,7 +10038,9 @@ export class MinnowDatabase {
     const visibleByTable = new Map<string, SegmentRecord[]>();
     const rowCounts = new Map<string, { rowCount: number }>();
     for (const table of tables) {
+      throwIfAborted(options.signal);
       const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+      throwIfAborted(options.signal);
       visibleByTable.set(table.name, segments);
       if (
         segments.every((segment) => {
@@ -9867,6 +10082,7 @@ export class MinnowDatabase {
         snapshot,
         visibility,
       );
+      throwIfAborted(options.signal);
       if (planContainsFts(plan, "bm25") && ftsStats === undefined) return undefined;
       // The streamed scan honors the same index pruning as the materialized path; a budgeted
       // MATCH query must not silently pay the full scan just because it streams.
@@ -9880,12 +10096,14 @@ export class MinnowDatabase {
         plan,
         snapshot,
       );
+      throwIfAborted(options.signal);
       const indexed = await this.#secondaryIndexPrunedSegments(
         freshBaseTable,
         ftsSegments,
         plan,
         snapshot,
       );
+      throwIfAborted(options.signal);
       const baseSegments = indexed.segments;
       // Zone-map elimination composes after index pruning: whole row groups whose statistics
       // reject the plan's predicates never stream at all.
@@ -9896,6 +10114,7 @@ export class MinnowDatabase {
         baseSegments,
         snapshot,
       );
+      throwIfAborted(options.signal);
       const baseView = this.#streamedViewFactory(
         baseTable,
         projectedBaseColumns,
@@ -9941,6 +10160,7 @@ export class MinnowDatabase {
                 buildView,
                 buildTable.name,
                 partitionedShape.buildKeyName,
+                options.signal,
               );
             }
           }
@@ -9950,12 +10170,15 @@ export class MinnowDatabase {
       const runStreamedExecution = async (attempt: {
         spill: boolean;
       }): Promise<QueryResult | undefined> => {
+        throwIfAborted(options.signal);
         const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
         let prepared: PreparedQuery | undefined;
         try {
           const streamed = await baseView.create(memory);
+          throwIfAborted(options.signal);
           const inputTables = new Map<string, ColumnarTable>([[baseTable.name, streamed.table]]);
           for (const table of tables) {
+            throwIfAborted(options.signal);
             if (table.name === baseTable.name) continue;
             const requestedColumns = columns.get(table.name) ?? [];
             inputTables.set(
@@ -9967,6 +10190,7 @@ export class MinnowDatabase {
                 visibility,
               ),
             );
+            throwIfAborted(options.signal);
           }
           prepared = createPreparedColumnarQuery(plan, inputTables, memory, {
             ...(ftsStats === undefined ? {} : { ftsStats }),
@@ -9980,6 +10204,14 @@ export class MinnowDatabase {
                 batchRows: cursor.batchRows,
                 signal: cursor.signal,
                 loadScanWindow: streamed.load,
+                ...(cursor.consumeFirstColumn === undefined
+                  ? {}
+                  : {
+                      consumeFirstColumn: async (values: readonly QueryValue[]) => {
+                        emission.happened = true;
+                        await cursor.consumeFirstColumn?.(values);
+                      },
+                    }),
               },
               async (batch) => {
                 emission.happened = true;
@@ -10004,6 +10236,7 @@ export class MinnowDatabase {
             try {
               const streamedResult = await prepared.executeAsync({
                 loadScanWindow: streamed.load,
+                ...(options.signal === undefined ? {} : { signal: options.signal }),
               });
               options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
               return streamedResult;
@@ -10016,6 +10249,7 @@ export class MinnowDatabase {
             ...(spillPageRows === undefined ? {} : { spillPageRows }),
             spillStore: this.#leasedSpillStore(),
             loadScanWindow: streamed.load,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
           return spilledResult;
@@ -10334,7 +10568,9 @@ export class MinnowDatabase {
     },
     buildTableName: string,
     buildKeyName: string,
+    signal?: AbortSignal,
   ): Promise<QueryResult> {
+    throwIfAborted(signal);
     // One partition should fit in an eighth of the budget: the resident partition briefly
     // exists twice (boxed rows, then their vectors) and shares the budget with both streamed
     // windows and the accumulating result.
@@ -10346,6 +10582,7 @@ export class MinnowDatabase {
     try {
       const combined: QueryRow[] = [];
       for (let partition = 0; partition < partitions; partition += 1) {
+        throwIfAborted(signal);
         if (combined.length >= wantedRows) break;
         const passMemory = root.createChild();
         let prepared: PreparedQuery | undefined;
@@ -10355,6 +10592,7 @@ export class MinnowDatabase {
           const collectMemory = passMemory.createChild();
           const buildScanMemory = collectMemory.createChild();
           const build = await buildView.create(buildScanMemory);
+          throwIfAborted(signal);
           let buildRows: DatabaseRow[] = [];
           const buildColumns = [...build.table.columns.entries()];
           // Small steps keep the collection windows a minor budget term next to the resident
@@ -10362,8 +10600,10 @@ export class MinnowDatabase {
           // consumed length clamps to the returned resident end.
           const step = 1_024;
           for (let start = 0; start < build.table.rowCount;) {
+            throwIfAborted(signal);
             let length = Math.min(step, build.table.rowCount - start);
             const residentEnd = await build.load(start, length);
+            throwIfAborted(signal);
             if (typeof residentEnd === "number" && residentEnd > start) {
               length = Math.min(length, residentEnd - start);
             }
@@ -10395,13 +10635,17 @@ export class MinnowDatabase {
           const buildInput = columnarTableFromRows(buildTableName, buildRows, undefined, false);
           buildRows = [];
           const streamedBase = await baseView.create(passMemory);
+          throwIfAborted(signal);
           const inputTables = new Map<string, ColumnarTable>([
             [buildTableName, buildInput],
             [streamedBase.table.name, streamedBase.table],
           ]);
           prepared = createPreparedColumnarQuery(strippedPlan, inputTables, passMemory);
           collectMemory.close();
-          const result = await prepared.executeAsync({ loadScanWindow: streamedBase.load });
+          const result = await prepared.executeAsync({
+            loadScanWindow: streamedBase.load,
+            ...(signal === undefined ? {} : { signal }),
+          });
           for (const row of result.rows) {
             if (combined.length >= wantedRows) break;
             root.tally(
@@ -11080,8 +11324,11 @@ export class MinnowDatabase {
     allowSpill = true,
     forceSpill = false,
     spillPageRows?: number,
+    signal?: AbortSignal,
   ): Promise<QueryResult> {
+    throwIfAborted(signal);
     const ftsStats = await this.#ftsIndexStats(block, realTables, snapshot, visibility);
+    throwIfAborted(signal);
     const inputs = await this.#prepareBlockInputs(
       block,
       snapshot,
@@ -11094,7 +11341,9 @@ export class MinnowDatabase {
       allowSpill,
       forceSpill,
       spillPageRows,
+      signal,
     );
+    throwIfAborted(signal);
     const prepared = createPreparedColumnarQuery(
       block,
       inputs,
@@ -11103,11 +11352,15 @@ export class MinnowDatabase {
     );
     try {
       if (!allowSpill || memory.usage.budgetBytes === Number.MAX_SAFE_INTEGER) {
-        return prepared.execute();
+        const result = prepared.execute();
+        throwIfAborted(signal);
+        return result;
       }
       if (!forceSpill) {
         try {
-          return prepared.execute();
+          const result = prepared.execute();
+          throwIfAborted(signal);
+          return result;
         } catch (error) {
           if (!(error instanceof QueryMemoryBudgetError)) throw error;
         }
@@ -11115,6 +11368,7 @@ export class MinnowDatabase {
       return await prepared.executeAsync({
         spillStore: this.#leasedSpillStore(),
         ...(spillPageRows === undefined ? {} : { spillPageRows }),
+        ...(signal === undefined ? {} : { signal }),
       });
     } finally {
       prepared.close();
@@ -11139,7 +11393,9 @@ export class MinnowDatabase {
     allowSpill = true,
     forceSpill = false,
     spillPageRows?: number,
+    signal?: AbortSignal,
   ): Promise<QueryResult> {
+    throwIfAborted(signal);
     const key = await this.#blockResultCacheKey(
       block,
       snapshot,
@@ -11147,6 +11403,7 @@ export class MinnowDatabase {
       realTables,
       cacheResults,
     );
+    throwIfAborted(signal);
     if (key !== undefined) {
       const cached = this.#cacheGet(key) as QueryResult | undefined;
       if (cached !== undefined) return cached;
@@ -11163,7 +11420,9 @@ export class MinnowDatabase {
       allowSpill,
       forceSpill,
       spillPageRows,
+      signal,
     );
+    throwIfAborted(signal);
     if (key !== undefined) this.#cachePut(key, result, queryResultRetainedBytes(result));
     return result;
   }
@@ -11185,7 +11444,9 @@ export class MinnowDatabase {
     allowSpill = true,
     forceSpill = false,
     spillPageRows?: number,
+    signal?: AbortSignal,
   ): Promise<{ result: QueryResult; schema: SqlColumnSchema[] }> {
+    throwIfAborted(signal);
     const key = await this.#blockResultCacheKey(
       block,
       snapshot,
@@ -11193,6 +11454,7 @@ export class MinnowDatabase {
       realTables,
       cacheResults,
     );
+    throwIfAborted(signal);
     const schemaKey = key === undefined ? undefined : `s${key}`;
     if (schemaKey !== undefined) {
       const cached = this.#cacheGet(schemaKey) as
@@ -11211,7 +11473,9 @@ export class MinnowDatabase {
       allowSpill,
       forceSpill,
       spillPageRows,
+      signal,
     );
+    throwIfAborted(signal);
     const schema = inferBlockSchema(block, typedSchemas);
     const entry = { result, schema };
     if (schemaKey !== undefined) {
@@ -14187,7 +14451,7 @@ export class MinnowDatabase {
           `Compaction manifest is missing: ${String(linkedTransaction.committedVersion)}`,
         );
       }
-      this.#afterCompactionCommit(recoveredManifest);
+      this.#afterCompactionCommit(recoveredManifest, table.id);
       return this.#publishedCompactionProgress(table, job);
     }
     const rewritePlan = job.rewritePlan;
@@ -14386,7 +14650,7 @@ export class MinnowDatabase {
         let publicationConflict: WriteConflictError | undefined;
         try {
           manifest = await transaction.commit();
-          this.#afterCompactionCommit(manifest);
+          this.#afterCompactionCommit(manifest, table.id);
           break;
         } catch (error) {
           if (!(error instanceof WriteConflictError)) throw error;
@@ -19848,7 +20112,10 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
  * (level one and above) are the folded state, not fragmentation, and do not count — a large
  * keyed table is many partitions by design.
  */
-function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
+function autoCompactionHint(
+  version: number | null,
+  segments: readonly SegmentRecord[],
+): AutoCompactionHint {
   let levelZero = 0;
   let deltas = 0;
   for (const segment of segments) {
@@ -19856,7 +20123,20 @@ function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
     const kind = segment.kind;
     if (kind !== "insert" && kind !== "base") deltas += 1;
   }
-  return levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
+  return {
+    version,
+    visible: segments.length,
+    levelZero,
+    deltas,
+  };
+}
+
+function autoCompactionDueHint(hint: AutoCompactionHint): boolean {
+  return hint.levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || hint.deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
+}
+
+function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
+  return autoCompactionDueHint(autoCompactionHint(null, segments));
 }
 
 /** A macrotask boundary, so background work lets queued queries and writes run between steps. */

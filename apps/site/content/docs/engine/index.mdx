@@ -18,9 +18,8 @@ const db = new MinnowDatabase(store, {
 ```
 
 When the engine [runs in a worker](/docs/engine/workers), `MinnowDatabaseClient` offers the same
-query, write, migration, live-query, snapshot, and maintenance calls on the main thread. The
-direct `createView`, `dropView`, and `buildFtsIndex` helpers stay on `MinnowDatabase`; migrations
-manage views in a worker, and full-text indexes still build automatically.
+query, write, catalog, index, migration, live-query, snapshot, and maintenance calls on the main
+thread, including the direct view, secondary-index, and full-text-index helpers.
 
 ## Catalog
 

@@ -37,9 +37,12 @@ comma/CROSS-join groups keep the streamed base fixed, then choose connected sour
 
 **Decorrelation.** A correlated `EXISTS` or `NOT EXISTS` subquery is rewritten into a semi-join or
 anti-join rather than executed once per outer row; both equality and range comparisons take this
-path. Correlated scalar aggregates and `IN` use equality-key joins. Forms whose `NULL` semantics
-cannot be preserved, such as correlated `NOT IN`, are rejected rather than run row by row — see
-the [feature matrix](/docs/sql/feature-matrix).
+path, including `EXISTS` nested inside a larger boolean expression. Correlated scalar aggregates
+and `IN` use equality-key joins directly or first aggregate by distinct outer probe values for a
+range comparison. Correlated `NOT IN` carries explicit empty-set and NULL flags alongside its
+anti-join, including for range comparisons. Top-level correlated `ANY` becomes a semi-join on a
+true comparison; `ALL` becomes an anti-join on false or unknown comparisons. See the
+[feature matrix](/docs/sql/feature-matrix).
 
 **Top-N.** `ORDER BY … LIMIT n` keeps only the best `n` rows as it scans instead of sorting the
 whole input, while `n` is under a tenth of the rows scanned. A page deeper than that keeps every
@@ -68,7 +71,8 @@ const elapsed = performance.now() - start;
 ```
 
 `onStats` reports what an execution actually cost, including peak modeled memory — something the
-engine can report because it reserves before it allocates:
+engine can report because it reserves before it allocates. It works through
+`MinnowDatabaseClient` too; the callback stays on the page and receives an ordered worker event:
 
 ```ts
 await db.query(sql, {

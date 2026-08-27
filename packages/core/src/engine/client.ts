@@ -64,6 +64,7 @@ import type {
   MaintenanceStatus,
   InsertBatchResult,
   QueryOptions,
+  QueryExecutionStats,
   QueryCursorOptions,
   QuerySpillCleanupOptions,
   QuerySpillCleanupResult,
@@ -84,6 +85,8 @@ import {
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   MaintenanceBacklogError,
+  DatabaseReadBacklogError,
+  LiveQueryLimitError,
   MissingKeyError,
   SqlCompileError,
   UnknownTableError,
@@ -166,6 +169,7 @@ interface EventRoute {
   onComplete?: () => void;
   /** Payload shape is the handle's own; only snapshot loads emit these today. */
   onProgress?: (progress: unknown) => void;
+  onStats?: (stats: QueryExecutionStats) => void;
 }
 
 /**
@@ -193,6 +197,12 @@ function throwIfClientSnapshotAborted(signal: AbortSignal | undefined): void {
 interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
+  cleanup?: () => void;
+}
+
+interface RpcCallControls {
+  signal?: AbortSignal | undefined;
+  onStats?: ((stats: QueryExecutionStats) => void) | undefined;
 }
 
 const errorRegistry = new Map<string, new (...args: never[]) => Error>(
@@ -205,6 +215,8 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     CompactionWriteAmplificationError,
     CompactionJobCancelledError,
     MaintenanceBacklogError,
+    DatabaseReadBacklogError,
+    LiveQueryLimitError,
     SqlCompileError,
     QueryMemoryBudgetError,
     VisibleSegmentCursorStaleError,
@@ -319,6 +331,47 @@ export class MinnowDatabaseClient {
     await this.#call("createTable", [input]);
   }
 
+  async createView(
+    name: string,
+    sql: string,
+    options: { orReplace?: boolean; managed?: boolean } = {},
+  ): Promise<void> {
+    await this.#call("createView", [name, sql, options]);
+  }
+
+  async dropView(name: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    return (await this.#call("dropView", [name, options])) as boolean;
+  }
+
+  async dropColumn(
+    tableName: string,
+    columnName: string,
+    options: { ifExists?: boolean } = {},
+  ): Promise<boolean> {
+    return (await this.#call("dropColumn", [tableName, columnName, options])) as boolean;
+  }
+
+  async dropTable(tableName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    return (await this.#call("dropTable", [tableName, options])) as boolean;
+  }
+
+  async createIndex(
+    indexName: string,
+    tableName: string,
+    requestedColumns: string | ReadonlyArray<{ name: string; direction: "asc" | "desc" }>,
+    options: { unique?: boolean } = {},
+  ): Promise<void> {
+    await this.#call("createIndex", [indexName, tableName, requestedColumns, options]);
+  }
+
+  async dropIndex(indexName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    return (await this.#call("dropIndex", [indexName, options])) as boolean;
+  }
+
+  async buildFtsIndex(tableName: string, columnName: string): Promise<void> {
+    await this.#call("buildFtsIndex", [tableName, columnName]);
+  }
+
   /** The published catalog; see `MinnowDatabase.introspect()`. */
   async introspect(): Promise<Catalog> {
     return (await this.#call("introspect", [])) as Catalog;
@@ -415,8 +468,9 @@ export class MinnowDatabaseClient {
    * datetimes) and are rebuilt into row objects here; see `result-wire.ts`.
    */
   async query(sql: string, options?: QueryOptions): Promise<QueryResult> {
+    const { signal, onStats, ...wireOptions } = options ?? {};
     return decodeQueryResult(
-      await this.#call("query", options === undefined ? [sql] : [sql, options]),
+      await this.#call("query", [sql, wireOptions, onStats !== undefined], { signal, onStats }),
     );
   }
 
@@ -427,11 +481,10 @@ export class MinnowDatabaseClient {
   ): AsyncIterableIterator<QueryResult, undefined> {
     const call = this.#call.bind(this);
     const invoke = this._invoke.bind(this);
+    const routeEvents = this._routeEvents.bind(this);
+    const unrouteEvents = this._unrouteEvents.bind(this);
     const handleId = crypto.randomUUID();
     const { signal, onStats, ...wireOptions } = options;
-    if (onStats !== undefined) {
-      throw new TypeError("Query cursor onStats callbacks are not available across a worker");
-    }
     async function* batches(): AsyncGenerator<QueryResult, undefined> {
       let opened = false;
       let closing: Promise<unknown> | undefined;
@@ -444,9 +497,10 @@ export class MinnowDatabaseClient {
         void close();
       };
       signal?.addEventListener("abort", onAbort, { once: true });
+      if (onStats !== undefined) routeEvents(handleId, { onStats });
       try {
         signal?.throwIfAborted();
-        await call("queryCursorOpen", [handleId, sql, wireOptions]);
+        await call("queryCursorOpen", [handleId, sql, wireOptions, onStats !== undefined]);
         opened = true;
         if (signal?.aborted === true) {
           await close();
@@ -461,6 +515,7 @@ export class MinnowDatabaseClient {
       } finally {
         signal?.removeEventListener("abort", onAbort);
         await close();
+        unrouteEvents(handleId);
       }
     }
     return batches();
@@ -538,8 +593,17 @@ export class MinnowDatabaseClient {
     ): Promise<StagedWriteResult> =>
       this._invoke(opened.handleId, "stage", [op, tableName, input]) as Promise<StagedWriteResult>;
     const session: ClientWriteSession = {
-      query: async (sql, options) =>
-        decodeQueryResult(await this._invoke(opened.handleId, "query", [sql, options])),
+      query: async (sql, options = {}) => {
+        const { signal, onStats, ...wireOptions } = options;
+        return decodeQueryResult(
+          await this._invokeControlled(
+            opened.handleId,
+            "query",
+            [sql, wireOptions, onStats !== undefined],
+            { signal, onStats },
+          ),
+        );
+      },
       execute: (sql, params) =>
         this._invoke(
           opened.handleId,
@@ -833,6 +897,17 @@ export class MinnowDatabaseClient {
   }
 
   /** @internal */
+  async _invokeControlled(
+    handleId: string,
+    method: string,
+    args: unknown[],
+    controls: RpcCallControls,
+  ): Promise<unknown> {
+    if (this.#closed) throw new Error("Database client is closed");
+    return this.#post("rpc-call", handleId, method, args, undefined, false, controls);
+  }
+
+  /** @internal */
   _routeEvents(handleId: string, route: EventRoute): void {
     this.#events.set(handleId, route);
   }
@@ -842,9 +917,9 @@ export class MinnowDatabaseClient {
     this.#events.delete(handleId);
   }
 
-  async #call(method: string, args: unknown[]): Promise<unknown> {
+  async #call(method: string, args: unknown[], controls: RpcCallControls = {}): Promise<unknown> {
     if (this.#closed) throw new Error("Database client is closed");
-    return this.#post("rpc-call", null, method, args);
+    return this.#post("rpc-call", null, method, args, undefined, false, controls);
   }
 
   async #post(
@@ -854,8 +929,10 @@ export class MinnowDatabaseClient {
     args: unknown[],
     transfer?: ArrayBuffer[],
     bypassLimit = kind === "rpc-init" || method === "dispose",
+    controls: RpcCallControls = {},
   ): Promise<unknown> {
     if (this.#fatal !== undefined) throw this.#fatal;
+    controls.signal?.throwIfAborted();
     if (!bypassLimit && this.#pending.size >= MAX_DATABASE_RPC_IN_FLIGHT) {
       throw new RangeError(
         `A database worker connection cannot hold more than ${String(MAX_DATABASE_RPC_IN_FLIGHT)} in-flight requests`,
@@ -863,13 +940,37 @@ export class MinnowDatabaseClient {
     }
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
-      this.#pending.set(requestId, { resolve, reject });
-      this.#transport.postMessage(
-        kind === "rpc-init"
-          ? { version: protocolVersion, requestId, kind, payload: args[0] }
-          : { version: protocolVersion, requestId, kind, handleId, method, args },
-        transfer === undefined ? undefined : { transfer },
-      );
+      const onAbort = (): void => {
+        try {
+          this.#transport.postMessage({ version: protocolVersion, requestId, kind: "rpc-cancel" });
+        } catch {
+          // The original RPC still owns completion. A transport failure also reaches #fail via
+          // its error event; throwing from an AbortSignal listener would only be unhandled noise.
+        }
+      };
+      const cleanup = (): void => {
+        controls.signal?.removeEventListener("abort", onAbort);
+        if (controls.onStats !== undefined) this.#events.delete(requestId);
+      };
+      controls.signal?.addEventListener("abort", onAbort, { once: true });
+      if (controls.onStats !== undefined) {
+        this.#events.set(requestId, { onStats: controls.onStats });
+      }
+      this.#pending.set(requestId, { resolve, reject, cleanup });
+      try {
+        this.#transport.postMessage(
+          kind === "rpc-init"
+            ? { version: protocolVersion, requestId, kind, payload: args[0] }
+            : { version: protocolVersion, requestId, kind, handleId, method, args },
+          transfer === undefined ? undefined : { transfer },
+        );
+      } catch (error) {
+        this.#pending.delete(requestId);
+        cleanup();
+        reject(
+          error instanceof Error ? error : new Error("Database request failed", { cause: error }),
+        );
+      }
     });
   }
 
@@ -885,7 +986,9 @@ export class MinnowDatabaseClient {
       } else if (response.event === "error") {
         route.onError?.(rehydrateError(response.payload as SerializedError));
       } else if (response.event === "progress") route.onProgress?.(response.payload);
-      else if (response.event === "complete") {
+      else if (response.event === "stats") {
+        route.onStats?.(response.payload as QueryExecutionStats);
+      } else if (response.event === "complete") {
         this.#events.delete(response.handleId);
         route.onComplete?.();
       }
@@ -894,6 +997,7 @@ export class MinnowDatabaseClient {
     const pending = this.#pending.get(response.requestId);
     if (pending === undefined) return;
     this.#pending.delete(response.requestId);
+    pending.cleanup?.();
     if (response.kind === "rpc-result") pending.resolve(response.result);
     else pending.reject(rehydrateError(response.error));
   }
@@ -903,7 +1007,10 @@ export class MinnowDatabaseClient {
     const pending = [...this.#pending.values()];
     this.#pending.clear();
     this.#events.clear();
-    for (const call of pending) call.reject(error);
+    for (const call of pending) {
+      call.cleanup?.();
+      call.reject(error);
+    }
   }
 }
 
@@ -914,7 +1021,7 @@ export class MinnowDatabaseClient {
 /** The scope handed to the client `write()`; mirrors the in-worker WriteSession. */
 export interface ClientWriteSession {
   /** Read-your-writes: observes the pre-scope snapshot plus everything staged so far. */
-  query(sql: string, options?: { params?: QueryValue[] }): Promise<QueryResult>;
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;

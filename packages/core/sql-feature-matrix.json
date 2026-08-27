@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "description": "Executable PostgreSQL compatibility examples for MinnowDatabase. postgres-feature-profile.json records differences, extensions, and embedded exclusions.",
   "features": [
     {
@@ -20,7 +20,8 @@
     {
       "id": "select.distinct",
       "status": "supported",
-      "example": "SELECT DISTINCT region FROM rows"
+      "example": "SELECT DISTINCT region FROM rows",
+      "notes": "Plain projections and SELECT DISTINCT * are supported. DISTINCT combined with grouping, HAVING, or aggregate/window expressions is rejected."
     },
     {
       "id": "select.scalar-subquery",
@@ -127,7 +128,7 @@
       "id": "group-by.rollup",
       "status": "supported",
       "example": "SELECT region, SUM(amount) AS total FROM rows GROUP BY ROLLUP(region)",
-      "notes": "ROLLUP/CUBE/GROUPING SETS desugar into a UNION ALL of grouped blocks. The GROUPING() marker is deliberately unsupported, so rollup NULLs and data NULLs are indistinguishable. SQLite itself has none of these."
+      "notes": "ROLLUP/CUBE/GROUPING SETS desugar into a UNION ALL of grouped blocks. GROUPING() distinguishes rolled-up columns from data NULLs. SQLite itself has none of these."
     },
     {
       "id": "group-by.grouping-sets",
@@ -245,7 +246,7 @@
       "id": "mutation.update-keyed",
       "status": "supported",
       "example": "UPDATE keyed SET score = score + 1 WHERE score > 0",
-      "notes": "Requires a unique-key table; read-then-mutate, not serializable."
+      "notes": "Requires a unique-key table. A standalone statement reads and publishes inside one retryable write scope; an explicit transaction stages it with the transaction's other statements."
     },
     {
       "id": "mutation.delete-keyed",
@@ -316,7 +317,7 @@
       "id": "predicate.quantified",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > ALL (SELECT amount FROM dims)",
-      "notes": "ANY/SOME/ALL with full three-valued logic; correlated forms are rejected. SQLite itself has no quantified comparisons."
+      "notes": "ANY/SOME/ALL use full three-valued logic. Correlated forms are supported as top-level WHERE predicates. SQLite itself has no quantified comparisons."
     },
     {
       "id": "predicate.ilike",
@@ -387,30 +388,67 @@
       "id": "subquery.correlated",
       "status": "supported",
       "example": "SELECT region FROM rows r WHERE amount > (SELECT AVG(amount) FROM rows q WHERE q.region = r.region)",
-      "notes": "Equality-correlated subqueries decorrelate into derived-table joins at compile time; both executors run plain joins."
+      "notes": "Correlated subqueries decorrelate into derived-table joins at compile time; both executors run plain joins."
     },
     {
       "id": "subquery.correlated-exists",
       "status": "supported",
       "example": "SELECT amount FROM rows r WHERE EXISTS (SELECT region FROM dims d WHERE d.region = r.region)",
-      "notes": "EXISTS joins the subquery's distinct correlation keys; NOT EXISTS becomes a left join checked with IS NULL."
+      "notes": "Top-level EXISTS and NOT EXISTS lower to semi-joins and anti-joins. Nested boolean forms use hidden per-probe match flags."
     },
     {
       "id": "subquery.correlated-select",
       "status": "supported",
       "example": "SELECT r.region, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r",
-      "notes": "Correlated scalar aggregates decorrelate in the select list too, outside grouped queries."
+      "notes": "Correlated scalar aggregates decorrelate in the select list. In a grouped query, their outer references must be GROUP BY columns and the scalar cannot sit inside an outer aggregate."
+    },
+    {
+      "id": "subquery.correlated-select-grouped",
+      "status": "supported",
+      "example": "SELECT r.region, COUNT(*) AS c, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r GROUP BY r.region",
+      "notes": "The decorrelated value is functionally determined by the outer grouping keys and is carried as an internal group key."
+    },
+    {
+      "id": "subquery.correlated-scalar-non-equi",
+      "status": "supported",
+      "example": "SELECT r.amount, (SELECT COUNT(*) FROM rows q WHERE q.amount < r.amount) AS lower_count FROM rows r",
+      "notes": "Non-equality scalar aggregates group inner rows once per distinct outer probe tuple, then join the result back by equality."
+    },
+    {
+      "id": "subquery.correlated-exists-expression",
+      "status": "supported",
+      "example": "SELECT r.amount FROM rows r WHERE r.amount > 100 OR EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
+      "notes": "Correlated EXISTS and NOT EXISTS remain set-at-a-time when nested below OR, NOT, or CASE."
     },
     {
       "id": "subquery.correlated-non-equi",
       "status": "supported",
       "example": "SELECT r.amount FROM rows r WHERE EXISTS (SELECT q.amount FROM rows q WHERE q.amount < r.amount)",
-      "notes": "Non-equality EXISTS and NOT EXISTS correlations lower to semi-joins and anti-joins; correlated scalar aggregates and IN remain equality-only."
+      "notes": "Non-equality EXISTS and NOT EXISTS correlations lower to semi-joins and anti-joins. Scalar aggregates use distinct outer probes."
+    },
+    {
+      "id": "subquery.correlated-in-non-equi",
+      "status": "supported",
+      "example": "SELECT r.amount FROM rows r WHERE r.region IN (SELECT q.region FROM rows q WHERE q.amount < r.amount)",
+      "notes": "A range-correlated IN predicate lowers to a semi-join carrying both its correlation and membership comparisons."
     },
     {
       "id": "subquery.correlated-not-in",
       "status": "supported",
-      "example": "SELECT region FROM rows r WHERE region NOT IN (SELECT d.region FROM dims d WHERE d.region = r.region)"
+      "example": "SELECT region FROM rows r WHERE region NOT IN (SELECT d.region FROM dims d WHERE d.region = r.region)",
+      "notes": "Correlated NOT IN preserves empty-set and NULL semantics rather than treating it as a simple anti-join."
+    },
+    {
+      "id": "subquery.correlated-not-in-non-equi",
+      "status": "supported",
+      "example": "SELECT r.amount FROM rows r WHERE 'north' NOT IN (SELECT q.region FROM rows q WHERE q.amount < r.amount)",
+      "notes": "Range correlation uses an anti-join for exact matches plus per-probe total and non-NULL counts."
+    },
+    {
+      "id": "subquery.correlated-quantified",
+      "status": "supported",
+      "example": "SELECT r.amount FROM rows r WHERE r.amount > ALL (SELECT q.amount FROM rows q WHERE q.region = r.region)",
+      "notes": "At top-level WHERE, correlated ANY lowers to a semi-join on true comparisons and ALL to an anti-join on false or unknown comparisons."
     },
     {
       "id": "cte.recursive",
@@ -456,13 +494,13 @@
       "id": "aggregate.filter",
       "status": "supported",
       "example": "SELECT region, COUNT(*) FILTER (WHERE amount > 5) AS big FROM rows GROUP BY region",
-      "notes": "Desugars into a CASE inside the aggregate, so it works with every aggregate and DISTINCT."
+      "notes": "Desugars into a CASE inside COUNT/SUM/AVG/MIN/MAX and preserves DISTINCT. JSON_ARRAYAGG does not support FILTER."
     },
     {
       "id": "window.aggregate-over",
       "status": "supported",
       "example": "SELECT SUM(amount) OVER (PARTITION BY region) AS total FROM rows",
-      "notes": "Default frame only: whole partition without OVER ordering, running with peers when ordered."
+      "notes": "Without explicit framing, the default is the whole partition when unordered and a peer-aware running frame when ordered. ROWS, RANGE, GROUPS, and exclusions are tracked separately below."
     },
     {
       "id": "window.in-expression",
@@ -569,7 +607,7 @@
       "id": "trigger.create-after",
       "status": "supported",
       "example": "CREATE TRIGGER keyed_audit AFTER INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END",
-      "notes": "AFTER and BEFORE row triggers on INSERT/UPDATE/DELETE, executed atomically inside the triggering commit with NEW/OLD references. Bodies: INSERT ... VALUES into keyless tables; UPDATE/DELETE against keyed tables. One cascade level is allowed; deeper chains error at write time."
+      "notes": "AFTER and BEFORE row triggers on INSERT/UPDATE/DELETE execute atomically with NEW/OLD references. Bodies support parameter-free INSERT ... VALUES into keyless tables and UPDATE/DELETE against keyed tables; ON CONFLICT and RETURNING are rejected. One cascade level is allowed."
     },
     {
       "id": "trigger.create-before",
@@ -1117,7 +1155,13 @@
       "id": "from.lateral",
       "status": "supported",
       "example": "SELECT x.amount FROM rows r, LATERAL (SELECT amount FROM dims WHERE dims.region = r.region) x",
-      "notes": "Equality-correlated derived sources become set-at-a-time joins. Correlated grouping, ordering, and LIMIT remain unsupported."
+      "notes": "Equality and range-correlated derived sources become set-at-a-time joins. Correlated grouping, ordering, and LIMIT remain unsupported."
+    },
+    {
+      "id": "from.lateral-non-equi",
+      "status": "supported",
+      "example": "SELECT x.amount FROM rows r, LATERAL (SELECT q.amount FROM rows q WHERE q.amount < r.amount) x",
+      "notes": "Non-equality correlation lowers to an ordinary general join rather than executing the derived source once per outer row."
     },
     {
       "id": "aggregate.string-agg",
@@ -1184,7 +1228,7 @@
       "id": "ddl.create-view",
       "status": "supported",
       "example": "CREATE VIEW west AS SELECT region, amount FROM rows WHERE region = 'west'",
-      "notes": "The catalog stores the query text and the schema inferred from it, so a view answers the same questions a table does and reads expand it into the query it stands for — anywhere a read runs, including inside a write scope. A view is never a write target. CREATE OR REPLACE redefines one; a view stacked on it follows the new definition, and a cycle two redefinitions close is caught on the next read rather than recursed."
+      "notes": "The catalog stores the query text and inferred schema, so reads expand a view anywhere a table can be read, including inside a write scope. A view is never a write target. CREATE OR REPLACE redefines one; dependent views follow it and cycles are rejected on read. CREATE VIEW column-name lists are not supported."
     },
     {
       "id": "ddl.drop-view",

@@ -1287,6 +1287,14 @@ describe("schema statements", () => {
         )
       ).rows,
     ).toEqual([{ total: "0.3" }]);
+    const shiftedRange =
+      "SELECT id FROM money WHERE amount + CAST(? AS NUMERIC) BETWEEN ? AND ? ORDER BY id";
+    expect(
+      (await database.query(shiftedRange, { params: [0.1, 0.2, 0.2], memoize: false })).rows,
+    ).toEqual([{ id: 1 }]);
+    expect(
+      (await database.query(shiftedRange, { params: [0.1, 0.3, 0.3], memoize: false })).rows,
+    ).toEqual([{ id: 2 }]);
     expect(
       (
         await database.query(

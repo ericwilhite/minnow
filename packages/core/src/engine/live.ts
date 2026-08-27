@@ -1,4 +1,5 @@
 import { type CatalogProbe, type Manifest, type StoragePage } from "../storage/types.js";
+import { LiveQueryLimitError } from "./errors.js";
 import { type CompiledQuery, type QueryResult, type QueryRow, type QueryValue } from "./query.js";
 
 /**
@@ -37,20 +38,7 @@ export const MAX_LIVE_QUERY_GROUPS = 4_096;
 export const MAX_LIVE_QUERY_SUBSCRIPTIONS = 16_384;
 export const MAX_LIVE_QUERY_SETS_PER_DATABASE = 256;
 
-export class LiveQueryLimitError extends Error {
-  override readonly name = "LiveQueryLimitError";
-
-  constructor(
-    readonly resource: "set" | "group" | "subscription",
-    readonly limit: number,
-  ) {
-    super(
-      resource === "set"
-        ? `A database cannot retain more than ${String(limit)} live-query sets`
-        : `A live-query set cannot retain more than ${String(limit)} ${resource} records`,
-    );
-  }
-}
+export { LiveQueryLimitError } from "./errors.js";
 
 export interface LiveQuerySubscribeOptions {
   onChange(result: QueryResult): void;

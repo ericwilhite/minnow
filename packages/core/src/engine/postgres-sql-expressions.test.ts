@@ -183,12 +183,31 @@ describe("quantified comparisons", () => {
     ).toEqual([]);
   });
 
-  it("rejects correlated quantified subqueries explicitly", () => {
-    expect(() =>
-      compileQuery(
-        "SELECT r.id FROM rows r WHERE r.amount > ALL (SELECT q.amount FROM rows q WHERE q.region = r.region)",
+  it("decorrelates quantified subqueries with empty-set and NULL semantics", () => {
+    expect(
+      run(
+        "SELECT r.id FROM rows r WHERE r.amount = ANY " +
+          "(SELECT q.amount FROM rows q WHERE q.region = r.region) ORDER BY r.id",
       ),
-    ).toThrow("top-level WHERE");
+    ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(
+      run(
+        "SELECT r.id FROM rows r WHERE r.amount > ALL " +
+          "(SELECT q.amount FROM rows q WHERE q.region = r.region) ORDER BY r.id",
+      ),
+    ).toEqual([{ id: 4 }]);
+    expect(
+      run(
+        "SELECT r.id FROM rows r WHERE 'z' > ALL " +
+          "(SELECT q.region FROM rows q WHERE q.amount < r.amount) ORDER BY r.id",
+      ),
+    ).toEqual([{ id: 2 }, { id: 3 }, { id: 4 }]);
+    expect(
+      run(
+        "SELECT r.id FROM rows r WHERE r.region = ALL " +
+          "(SELECT q.region FROM rows q WHERE q.amount < 0) ORDER BY r.id",
+      ),
+    ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }]);
   });
 });
 

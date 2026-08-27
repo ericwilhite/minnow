@@ -13,7 +13,8 @@ and benchmarks that run in your browser.
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
 > changes. The separately versioned block-format 2, snapshot-format 1, and native OPFS-layout 5
 > bytes are locked; an incompatible future writer must use a new format number. Pin exact package versions. See
-> [Versioning](https://minnowdb.com/docs/reference/versioning/) and the
+> [Versioning](https://minnowdb.com/docs/reference/versioning/), the
+> [v1 support policy](https://minnowdb.com/docs/reference/support/), and the
 > [Changelog](https://minnowdb.com/docs/changelog/).
 
 ## Why Minnow
@@ -30,7 +31,7 @@ and benchmarks that run in your browser.
   query reads one stable snapshot, even when another tab commits at the same time;
   origin-persistence policy is explicit for applications that cannot accept automatic quota
   eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 281 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 284 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so tables
@@ -79,7 +80,8 @@ npm run site:dev       # docs, live console, and browser benchmarks
 ```
 
 See [Testing and benchmarks](https://minnowdb.com/docs/reference/testing/) for the complete test
-map, [Versioning](https://minnowdb.com/docs/reference/versioning/) for release commands, and the
+map, [Versioning](https://minnowdb.com/docs/reference/versioning/) for release commands, the
+[v1 support policy](https://minnowdb.com/docs/reference/support/) for the 1.x contract, and the
 [Changelog](https://minnowdb.com/docs/changelog/) for release notes and migrations.
 
 ## License

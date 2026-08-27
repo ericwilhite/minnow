@@ -1,3 +1,5 @@
+/* eslint-disable no-restricted-imports -- Node-only test reads fixture provenance; this file is not shipped. */
+import { readFileSync } from "node:fs";
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import {
@@ -36,6 +38,25 @@ import { crc32, encodeBlock, MAX_BLOCK_ROW_COUNT } from "../block-format/index.j
 
 const POSTING_BUILD_CREATED_AT = "2026-01-01T00:00:00.000Z";
 const POSTING_BUILD_EXPIRES_AT = "2026-01-01T00:30:00.000Z";
+const currentPackageVersion = (
+  JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
+
+function packageVersionTuple(version: string): [number, number, number] {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/u.exec(version);
+  if (match === null) throw new TypeError(`Invalid fixture package version: ${version}`);
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function comparePackageVersions(left: string, right: string): number {
+  const leftParts = packageVersionTuple(left);
+  const rightParts = packageVersionTuple(right);
+  return (
+    leftParts[0] - rightParts[0] || leftParts[1] - rightParts[1] || leftParts[2] - rightParts[2]
+  );
+}
 
 /** Frozen first-stable native schema. Do not update this fixture on a schema bump: a new release
  * must migrate this exact v1 database through the ordered production migration registry. */
@@ -88,8 +109,9 @@ function installFrozenIndexedDbV1(request: IDBOpenDBRequest): void {
 const FIRST_STABLE_INDEXED_DB_SCHEMA_VERSION = 1;
 const frozenIndexedDbSchemas: ReadonlyArray<{
   version: number;
+  writerPackageVersion: string;
   install: (request: IDBOpenDBRequest) => void;
-}> = [{ version: 1, install: installFrozenIndexedDbV1 }];
+}> = [{ version: 1, writerPackageVersion: "0.3.0", install: installFrozenIndexedDbV1 }];
 
 function openNativeIndexedDb(
   indexedDB: IDBFactory,
@@ -5142,6 +5164,10 @@ it("retains, migrates, and writes every stable IndexedDB schema fixture", async 
   );
 
   for (const fixture of frozenIndexedDbSchemas) {
+    expect(
+      comparePackageVersions(fixture.writerPackageVersion, currentPackageVersion),
+      `IndexedDB schema ${String(fixture.version)} claims a writer newer than this package`,
+    ).toBeLessThanOrEqual(0);
     const name = crypto.randomUUID();
     const native = await openNativeIndexedDb(indexedDB, name, fixture.version, fixture.install);
     native.close();

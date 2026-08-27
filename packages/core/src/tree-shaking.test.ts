@@ -22,14 +22,15 @@ const CLIENT_MARKER = "Database client is closed";
 const KEYED_LIVE_MARKER = "Live query window maxRows must be a positive whole number";
 const TYPED_TABLE_MARKER = "Upsert requires a unique key:";
 const DATABASE_MARKER = "A database cannot queue more than";
-// Result-domain metadata, DATE, guarded upserts, and typed catalog errors intentionally expand
-// the complete engine surface. Pin the measured compressed output with <1% headroom too.
-const COMPLETE_ENTRY_RAW_BUDGET = 684 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 198 * 1024;
-// The v1 hardening pass measured 1007.6 KiB raw / 277.5 KiB gzip. These added contracts remain
-// close to that baseline while keeping the durable adapter and complete engine explicitly capped.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1020 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 282 * 1024;
+// Result-domain metadata, DATE, guarded upserts, typed catalog errors, bounded cancellation,
+// exact-NUMERIC dictionary predicates, maintenance hints, and set-at-a-time correlated SQL
+// intentionally expand the complete engine surface. Measured: 697.6 KiB raw / 200.3 KiB gzip.
+// Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 702 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 202 * 1024;
+// Measured with the larger durable adapter: 1032.2 KiB raw / 283.9 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1038 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 286 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

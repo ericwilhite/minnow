@@ -95,6 +95,13 @@ it("validates every RPC request boundary", () => {
       args: [],
     }),
   ).toMatchObject({ kind: "rpc-call", method: "query" });
+  expect(
+    parseRpcRequest({
+      kind: "rpc-cancel",
+      version: protocolVersion,
+      requestId: "one",
+    }),
+  ).toEqual({ kind: "rpc-cancel", version: protocolVersion, requestId: "one" });
 });
 
 it("rejects malformed RPC responses and serializes only cloneable error state", () => {

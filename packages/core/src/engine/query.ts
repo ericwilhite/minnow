@@ -14,6 +14,54 @@ import {
 } from "../date-value.js";
 import type { DatabaseRow } from "./database.js";
 import type { ColumnDefault, SqlDomain } from "../storage/types.js";
+import type {
+  AggregateName,
+  BinaryOperator,
+  ComparisonOperator,
+  CompiledQuery,
+  Expression,
+  FtsStats,
+  JoinPlan,
+  Predicate,
+  PredicateOperator,
+  QueryResult,
+  QueryRow,
+  QueryValue,
+  RecursiveCte,
+  ScalarFunctionName,
+  SelectItem,
+  SelectTail,
+  SetOperator,
+  TableSource,
+  WindowFrame,
+  WindowFrameBound,
+  WindowFrameExclusion,
+  WindowSpec,
+} from "../plan/model.js";
+export type {
+  AggregateName,
+  BinaryOperator,
+  ComparisonOperator,
+  CompiledQuery,
+  Expression,
+  JoinPlan,
+  Predicate,
+  PredicateOperator,
+  QueryResult,
+  QueryRow,
+  QueryValue,
+  RecursiveCte,
+  ScalarFunctionName,
+  SelectItem,
+  SelectTail,
+  SetOperator,
+  TableSource,
+  WindowFrame,
+  WindowFrameBound,
+  WindowFrameExclusion,
+  WindowFunctionName,
+  WindowSpec,
+} from "../plan/model.js";
 import { assertWellFormedString, wellFormedUtf8ByteLength } from "../block-format/unicode.js";
 import {
   MAX_SQL_NESTING_DEPTH,
@@ -31,7 +79,6 @@ import {
   renderDocumentValue,
   tokenize as ftsTokenize,
   validateFtsQuery,
-  type FtsStats,
 } from "./fts.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
@@ -78,16 +125,6 @@ import {
   type PreparedVectorQuery,
 } from "./vector.js";
 
-export type QueryValue = boolean | number | string | Date | null;
-export type QueryRow = Record<string, QueryValue>;
-
-export interface QueryResult {
-  columns: string[];
-  /** Logical SQL domain for each output column, positionally aligned with `columns`. */
-  columnDomains: Array<SqlDomain | null>;
-  rows: QueryRow[];
-}
-
 /** Domain metadata for an execution path that has no catalog-backed type information. */
 export function unknownColumnDomains(columns: readonly string[]): null[] {
   return columns.map(() => null);
@@ -132,59 +169,6 @@ export interface QueryExecutionOptions {
    */
   readonly executionMemoryBudgetBytes?: number;
 }
-
-export type BinaryOperator = "+" | "-" | "*" | "/" | "%" | "||";
-export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
-export type AggregateName =
-  "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG" | "STRING_AGG";
-export type ScalarFunctionName =
-  | "ROUND"
-  | "COALESCE"
-  | "DATE_TRUNC"
-  | "DATE_ADD"
-  | "UPPER"
-  | "LOWER"
-  | "LENGTH"
-  | "ABS"
-  | "TRIM"
-  | "LTRIM"
-  | "RTRIM"
-  | "SUBSTR"
-  | "REPLACE"
-  | "INSTR"
-  | "NULLIF"
-  | "GREATEST"
-  | "LEAST"
-  | "FLOOR"
-  | "CEIL"
-  | "MOD"
-  | "POWER"
-  | "SQRT"
-  | "EXTRACT"
-  | "CAST"
-  | "OCTET_LENGTH"
-  | "LPAD"
-  | "RPAD"
-  | "OVERLAY"
-  | "CURRENT_DATE"
-  | "CURRENT_TIMESTAMP"
-  | "LOCALTIME"
-  | "GROUPING"
-  | "JSON_VALUE"
-  | "JSON_QUERY"
-  | "JSON_EXISTS"
-  | "JSON_OBJECT"
-  | "JSON_ARRAY"
-  | "IS_JSON"
-  | "ARRAY"
-  /** Optimizer-only, prefix-free equality key for hashable multi-column decorrelation. */
-  | "MINNOW_TUPLE_KEY"
-  /** Parser-produced wrapper carrying one explicit collation through ordering/comparison. */
-  | "MINNOW_COLLATE"
-  | "NEXTVAL"
-  | "CURRVAL"
-  | "RANDOM"
-  | "GEN_RANDOM_UUID";
 
 export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "ROUND",
@@ -866,129 +850,6 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
   }
 }
 
-export type Expression =
-  | { kind: "literal"; value: QueryValue; internalSqlValue?: true; sqlDomain?: SqlDomain }
-  /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
-  | { kind: "parameter"; index: number }
-  | { kind: "column"; reference: string }
-  /**
-   * `*`, or `alias.*` when `table` is set (E051-07). A qualified wildcard names one source and
-   * may sit beside other select items; every executor entry expands it into that source's
-   * columns, so past the entry only a bare wildcard — the whole-row projection — survives.
-   */
-  | { kind: "wildcard"; table?: string }
-  | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
-  | {
-      kind: "call";
-      name: AggregateName | ScalarFunctionName;
-      arguments: Expression[];
-      distinct?: boolean;
-      aggregateOrderBy?: Array<{
-        expression: Expression;
-        direction: "asc" | "desc";
-        nulls?: "first" | "last";
-      }>;
-    }
-  | { kind: "list"; items: Expression[] }
-  | { kind: "subquery"; block: CompiledQuery }
-  | {
-      kind: "condition";
-      operator: PredicateOperator;
-      left: Expression;
-      right: Expression;
-      /** LIKE/ILIKE escape character, from LIKE ... ESCAPE 'c'. */
-      escape?: string;
-    }
-  | { kind: "logical"; operator: "and" | "or"; left: Expression; right: Expression }
-  | { kind: "not"; operand: Expression }
-  | { kind: "exists"; block: CompiledQuery; negated: boolean }
-  | {
-      kind: "case";
-      branches: Array<{ when: Expression; then: Expression }>;
-      otherwise?: Expression;
-    }
-  | {
-      kind: "window";
-      name: WindowFunctionName;
-      partitionBy: Expression[];
-      orderBy: Array<{
-        expression: Expression;
-        direction: "asc" | "desc";
-        nulls?: "first" | "last";
-      }>;
-      argument?: Expression;
-      /** LAG/LEAD row distance; parsed as a literal non-negative integer, defaulting to 1. */
-      offset?: number;
-      /** LAG/LEAD default when the offset row falls outside the partition; NULL when absent. */
-      fallback?: QueryValue;
-      frame?: WindowFrame;
-    }
-  | {
-      kind: "fts";
-      op: "match" | "bm25";
-      /**
-       * Column references forming the document, or "*" for every searchable column of the
-       * single scan source. "*" stays unexpanded through compilation (both front ends emit the
-       * identical node — plan parity), and the engine expands it against the catalog at
-       * prepare time via expandFtsColumns.
-       */
-      columns: Expression[] | "*";
-      query: string;
-      /** Placeholder used by parameterized SQL; replaced with `query` before execution. */
-      queryParameter?: number;
-      /**
-       * Corpus statistics for BM25, annotated by the executor onto its cloned plan before
-       * evaluation; never set by compilation.
-       */
-      stats?: FtsStats;
-    };
-
-export type WindowFunctionName =
-  | "ROW_NUMBER"
-  | "RANK"
-  | "DENSE_RANK"
-  | "PERCENT_RANK"
-  | "CUME_DIST"
-  | "NTILE"
-  | "LAG"
-  | "LEAD"
-  | "FIRST_VALUE"
-  | "LAST_VALUE"
-  | "NTH_VALUE"
-  | AggregateName;
-
-export interface WindowFrameBound {
-  kind: "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
-  /** Row distance for preceding/following bounds (ROWS unit only). */
-  offset?: number;
-}
-
-/** How a frame's rows are excluded around the current row (T612). */
-export type WindowFrameExclusion = "no-others" | "current-row" | "group" | "ties";
-
-/** An explicit frame clause; absent means the SQL default for the window's ordering. */
-export interface WindowFrame {
-  unit: "rows" | "range" | "groups";
-  start: WindowFrameBound;
-  end: WindowFrameBound;
-  /** Rows excluded around the current row; absent means EXCLUDE NO OTHERS. */
-  exclude?: WindowFrameExclusion;
-}
-
-export interface WindowSpec {
-  alias: string;
-  name: WindowFunctionName;
-  partitionAliases: string[];
-  orderAliases: Array<{ alias: string; direction: "asc" | "desc"; nulls?: "first" | "last" }>;
-  /** Hidden inner alias of an aggregate window's argument; absent for COUNT(*) and rankings. */
-  argumentAlias?: string;
-  /** LAG/LEAD row distance. */
-  offset?: number;
-  /** LAG/LEAD default when the offset row falls outside the partition. */
-  fallback?: QueryValue;
-  frame?: WindowFrame;
-}
-
 /** The output column type of one window: rankings and most aggregates count, MIN/MAX carry. */
 export function windowOutputType(
   window: WindowSpec,
@@ -1038,151 +899,8 @@ export function windowOutputDomain(
   return undefined;
 }
 
-export interface SelectItem {
-  expression: Expression;
-  alias: string;
-}
-
-export interface TableSource {
-  table: string;
-  alias: string;
-  /** A parenthesized SELECT or expanded CTE body; `table` is then a unique synthetic name. */
-  derived?: CompiledQuery;
-  /** A top-level set operation; members combine positionally under the first member's schema. */
-  union?: { blocks: CompiledQuery[]; ops: SetOperator[] };
-  recursive?: RecursiveCte;
-  /** A window-function desugar: the inner block executes, then window columns append. */
-  windowed?: { block: CompiledQuery; windows: WindowSpec[] };
-  /**
-   * `FROM t AS y(a, b)`: positional new names for a base table's columns (E051-09). Every
-   * executor entry turns the source into a derived projection, so past that point the rename
-   * is an ordinary select list and nothing else has to know about it.
-   */
-  columnAliases?: string[];
-  /** Parser marker for a derived source allowed to reference sources to its left. */
-  lateral?: true;
-}
-
-export interface JoinPlan extends TableSource {
-  kind: "inner" | "left" | "semi" | "anti";
-  left: Expression;
-  right: Expression;
-  /** General ON condition for non-equi or multi-key joins; left/right are inert placeholders. */
-  on?: Expression;
-  /** Parser marker: FULL OUTER JOIN. Assembly desugars it into a union of two left joins. */
-  full?: boolean;
-  /**
-   * Parser marker: NATURAL JOIN. Every execution entry replaces it with the equality
-   * conjunction over the columns this source shares with the ones before it, so no executor
-   * ever sees the marker (F401-01).
-   */
-  natural?: boolean;
-}
-
-export type SetOperator =
-  "union" | "union all" | "intersect" | "intersect all" | "except" | "except all";
-
-/**
- * A WITH RECURSIVE source: the base block seeds the working set, then the step block re-executes
- * with `reference` bound to the previous iteration's new rows (linear delta recursion) until no
- * new rows appear. UNION deduplicates against everything seen; UNION ALL appends raw.
- */
-export interface RecursiveCte {
-  reference: string;
-  base: CompiledQuery;
-  step: CompiledQuery;
-  all: boolean;
-}
-
 const MAX_RECURSIVE_ITERATIONS = 10_000;
 const MAX_RECURSIVE_ROWS = 1_000_000;
-
-export type PredicateOperator =
-  | ComparisonOperator
-  | `${ComparisonOperator} ANY`
-  | `${ComparisonOperator} ALL`
-  | "IN"
-  | "NOT IN"
-  | "IS NULL"
-  | "IS NOT NULL"
-  | "LIKE"
-  | "NOT LIKE"
-  | "ILIKE"
-  | "NOT ILIKE"
-  | "SIMILAR TO"
-  | "NOT SIMILAR TO"
-  | "IS DISTINCT FROM"
-  | "IS NOT DISTINCT FROM"
-  | "IS TRUE";
-
-export interface Predicate {
-  left: Expression;
-  operator: PredicateOperator;
-  right: Expression;
-  /** LIKE/ILIKE escape character, carried from the parsed condition. */
-  escape?: string;
-}
-
-export interface CompiledQuery {
-  sql: string;
-  base: TableSource;
-  joins: JoinPlan[];
-  select: SelectItem[];
-  predicates: Predicate[];
-  groupBy: Expression[];
-  having: Predicate[];
-  orderBy: Array<{
-    expression: Expression;
-    direction: "asc" | "desc";
-    /**
-     * Explicit NULL placement, absolute regardless of direction. Absent keeps PostgreSQL's
-     * default: NULLS LAST for ASC and NULLS FIRST for DESC.
-     */
-    nulls?: "first" | "last";
-  }>;
-  limit?: number;
-  offset?: number;
-  /**
-   * SELECT DISTINCT * awaiting expansion: the wildcard's columns are unknown until input
-   * schemas exist, so every executor entry expands this into a concrete select list plus a
-   * matching GROUP BY exactly once (see expandDistinctWildcard), like MATCH(*).
-   */
-  distinctWildcard?: boolean;
-  /** Parameter slots for LIMIT ? / OFFSET ?; binding resolves them into limit/offset. */
-  limitParameter?: number;
-  offsetParameter?: number;
-  /**
-   * FETCH FIRST n ROWS WITH TIES (F866): rows tying with the last retained row under the
-   * ORDER BY are kept too. The limit cannot be pushed into a scan then, so every execution
-   * entry runs the query unlimited and trims the ordered result.
-   */
-  limitWithTies?: boolean;
-  /**
-   * Number of `?`/`$n` placeholders in the whole statement; set only on the top-level plan.
-   * A plan with placeholders must pass through bindPlanParameters before it prepares.
-   */
-  parameterCount?: number;
-  /**
-   * CURRENT_DATE / CURRENT_TIMESTAMP / LOCALTIME appear somewhere in the statement. Every
-   * executor entry replaces them with one instant per execution, and results never memoize,
-   * because the answer depends on the clock rather than on the data.
-   */
-  usesStatementDatetime?: boolean;
-  /** NEXTVAL/CURRVAL appear in this parsed statement and need connection-local resolution. */
-  usesSequenceCalls?: boolean;
-  /** RANDOM/GEN_RANDOM_UUID appear and make result memoization unsafe. */
-  usesVolatileFunctions?: boolean;
-}
-
-/** ORDER BY / LIMIT / OFFSET tail of a select or set operation. */
-export interface SelectTail {
-  orderBy: CompiledQuery["orderBy"];
-  limit?: number;
-  offset?: number;
-  limitParameter?: number;
-  offsetParameter?: number;
-  limitWithTies?: boolean;
-}
 
 type RowContext = Record<string, DatabaseRow | undefined>;
 
@@ -2508,7 +2226,11 @@ export function inferBlockSchema(
   schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
 ): SqlColumnSchema[] {
   const sources = [plan.base, ...plan.joins];
-  const multipleSources = sources.length > 1;
+  const multipleSources =
+    sources.filter((source) => {
+      const schema = schemas.get(source.table);
+      return schema === undefined || schema.some((column) => !column.name.startsWith("\0"));
+    }).length > 1;
   const wildcardSchema = (source: TableSource): SqlColumnSchema[] =>
     (schemas.get(source.table) ?? [])
       .filter((column) => !column.name.startsWith("\0"))
@@ -4448,10 +4170,12 @@ function executeRowQueryInternal(
     // own output aliases.
     const orderSources =
       plan.select[0]?.expression.kind === "wildcard"
-        ? [plan.base, ...plan.joins].map((source) => ({
-            alias: source.alias,
-            columns: rowTableColumnNames(tables.get(source.table) ?? []),
-          }))
+        ? [plan.base, ...plan.joins].flatMap((source) => {
+            const columns = rowTableColumnNames(tables.get(source.table) ?? []).filter(
+              (name) => !name.startsWith("\0"),
+            );
+            return columns.length === 0 ? [] : [{ alias: source.alias, columns }];
+          })
         : [];
     const sortColumns = plan.orderBy.map(({ expression, direction, nulls }) => ({
       outputName: orderOutputName(expression, plan.select, orderSources),
@@ -4661,13 +4385,14 @@ function project(
   group?: RowContext[],
 ): QueryRow {
   if (select[0]?.expression.kind === "wildcard") {
-    const aliases = Object.keys(context);
+    const aliases = Object.keys(context).filter((alias) =>
+      Object.keys(context[alias] ?? {}).some((name) => !name.startsWith("\0")),
+    );
     return Object.fromEntries(
       aliases.flatMap((alias) =>
-        Object.entries(context[alias] ?? {}).map(([name, value]) => [
-          aliases.length === 1 ? name : `${alias}.${name}`,
-          value,
-        ]),
+        Object.entries(context[alias] ?? {})
+          .filter(([name]) => !name.startsWith("\0"))
+          .map(([name, value]) => [aliases.length === 1 ? name : `${alias}.${name}`, value]),
       ),
     );
   }
@@ -8878,8 +8603,8 @@ export interface SelectBlockParts {
 /**
  * GROUPING SETS desugar: one grouped block per set, combined with UNION ALL. A grouped column
  * absent from a member's set projects as NULLIF(expr, expr) — always NULL, but carrying the
- * expression's type through schema inference. The GROUPING() marker function is deliberately
- * unsupported, so rollup NULLs and data NULLs are indistinguishable; the docs call this out.
+ * expression's type through schema inference. GROUPING() becomes one constant bitmask per member
+ * block, distinguishing columns aggregated away by the set from data NULLs.
  */
 function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
   const { groupingSets, limit, offset, limitParameter, offsetParameter, ...blockParts } = parts;
@@ -9193,19 +8918,20 @@ export function expandDistinctWildcard(
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (plan.distinctWildcard !== true) return plan;
-  const sources = [plan.base, ...plan.joins];
-  const multiple = sources.length > 1;
-  const select: SelectItem[] = sources.flatMap((source) => {
-    const columns = columnsOf(source.table);
-    if (columns === undefined || columns.length === 0) {
+  const shaped = [plan.base, ...plan.joins].map((source) => ({
+    source,
+    columns: sourceWildcardColumns(source, columnsOf),
+  }));
+  const visible = shaped.filter(({ columns }) => (columns?.length ?? 0) > 0);
+  const multiple = visible.length > 1;
+  const select: SelectItem[] = visible.flatMap(({ source, columns }) => {
+    if (columns === undefined) {
       throw new TypeError(`SELECT DISTINCT * requires known columns for: ${source.table}`);
     }
-    return columns
-      .filter((name) => !name.startsWith("\0"))
-      .map((name) => {
-        const output = multiple ? `${source.alias}.${name}` : name;
-        return { expression: { kind: "column" as const, reference: output }, alias: output };
-      });
+    return columns.map((name) => {
+      const output = multiple ? `${source.alias}.${name}` : name;
+      return { expression: { kind: "column" as const, reference: output }, alias: output };
+    });
   });
   const { distinctWildcard, ...rest } = plan;
   void distinctWildcard;
@@ -9308,10 +9034,12 @@ export function withTiesPlan(plan: CompiledQuery): {
   const limit = plan.limit;
   if (plan.limitWithTies !== true || limit === undefined) return { plan, trim: (result) => result };
   if (plan.orderBy.length === 0) throw new TypeError("FETCH ... WITH TIES requires ORDER BY");
-  const sources = [plan.base, ...plan.joins].map((source) => ({
-    alias: source.alias,
-    columns: source.derived?.select.map((item) => item.alias) ?? [],
-  }));
+  const sources = [plan.base, ...plan.joins].flatMap((source) => {
+    const columns = source.derived?.select
+      .map((item) => item.alias)
+      .filter((name) => !name.startsWith("\0"));
+    return columns?.length === 0 ? [] : [{ alias: source.alias, columns: columns ?? [] }];
+  });
   // orderOutputName throws when a sort key has no output column, which is the same failure the
   // executors report; nothing here has to re-check it.
   const keys = plan.orderBy.map(({ expression }) =>
@@ -9505,7 +9233,9 @@ export function expandQualifiedWildcards(
   const expandBlock = (block: CompiledQuery): void => {
     forEachNestedBlock(block, expandBlock);
     const sources = [block.base, ...block.joins];
-    const multiple = sources.length > 1;
+    const multiple =
+      sources.filter((source) => (sourceWildcardColumns(source, columnsOf)?.length ?? 0) > 0)
+        .length > 1;
     block.select = block.select.flatMap((item) => {
       if (item.expression.kind !== "wildcard" || item.expression.table === undefined) return [item];
       const table = item.expression.table;
@@ -9606,9 +9336,9 @@ function assembleOrderByExpressionBlock(
       throw new TypeError("Window functions are only allowed in the select list");
     }
     // A bare literal is almost always a SQL ordinal (ORDER BY 2); sorting by a constant would
-    // silently do nothing, so reject it the way the engine always has.
+    // silently do nothing. Valid ordinals have already resolved; a remaining literal is invalid.
     if (order.expression.kind === "literal") {
-      throw new TypeError("ORDER BY ordinals are not supported; name the column or alias");
+      throw new TypeError("ORDER BY position is outside the select list");
     }
   }
   const selectSignatures = new Map(

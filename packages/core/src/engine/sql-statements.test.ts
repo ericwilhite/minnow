@@ -36,6 +36,47 @@ describe("RETURNING in SQL statements", () => {
   });
 });
 
+describe("DELETE selection", () => {
+  it("streams unique keys through mutation history and falls back for staged overlays", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      compression: "raw",
+      rowsPerBlock: 256,
+      executionMemoryBudgetBytes: 256_000,
+      autoCompact: false,
+      autoCollect: false,
+    });
+    await database.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, label TEXT)");
+    await database.insertBatch("events", {
+      columns: {
+        id: Array.from({ length: 4_096 }, (_, index) => index),
+        label: Array.from({ length: 4_096 }, (_, index) => `event-${String(index)}`),
+      },
+    });
+    // The key-only scan must replay existing deltas, not read the base blocks in isolation.
+    await database.updateBatch("events", {
+      keys: [700, 2_000, 3_500],
+      changes: { label: ["changed-a", "changed-b", "changed-c"] },
+    });
+    const deleted = await database.execute(
+      "DELETE FROM events WHERE id BETWEEN ? AND ?",
+      [512, 3_583],
+    );
+    expect(deleted).toMatchObject({ kind: "delete", rowCount: 3_072 });
+    expect((await database.query("SELECT COUNT(*) AS n FROM events")).rows).toEqual([{ n: 1_024 }]);
+
+    await database.write(async (transaction) => {
+      await transaction.insertBatch("events", {
+        columns: { id: [5_000], label: ["staged"] },
+      });
+      // Once the scope has staged data, SQL mutation selection keeps the overlay executor so
+      // this statement sees both the new row and committed rows.
+      const scoped = await transaction.execute("DELETE FROM events WHERE id >= 4090");
+      expect(scoped).toMatchObject({ kind: "delete", rowCount: 7 });
+    });
+    expect((await database.query("SELECT COUNT(*) AS n FROM events")).rows).toEqual([{ n: 1_018 }]);
+  });
+});
+
 describe("INSERT defaults", () => {
   it("evaluates SQL defaults per omitted row and preserves explicit NULL", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());

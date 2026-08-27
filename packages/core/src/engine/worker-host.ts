@@ -67,6 +67,11 @@ export interface DatabaseInitPayload {
   options?: WireDatabaseOptions;
 }
 
+interface RpcCallContext {
+  readonly requestId: string;
+  readonly signal: AbortSignal;
+}
+
 /**
  * The staged-mutation ops a client may name inside a "stage" call. The op arrives as wire data,
  * so it must be checked against this list before indexing into the session — otherwise any
@@ -77,6 +82,57 @@ type StageOp = (typeof stageOps)[number];
 
 function isStageOp(value: unknown): value is StageOp {
   return typeof value === "string" && (stageOps as readonly string[]).includes(value);
+}
+
+/**
+ * Root methods whose arguments and results are already structured-clone-safe. `satisfies` makes
+ * a removed or renamed database method a compile error, while the runtime guard below fails
+ * closed if a caller supplies a malformed database object through the manual host seam.
+ */
+const directRootMethods = [
+  "createTable",
+  "createView",
+  "dropView",
+  "dropColumn",
+  "dropTable",
+  "createIndex",
+  "dropIndex",
+  "buildFtsIndex",
+  "introspect",
+  "listTables",
+  "insertBatch",
+  "insert",
+  "upsertBatch",
+  "upsert",
+  "updateBatch",
+  "update",
+  "deleteBatch",
+  "delete",
+  "runStatement",
+  "explain",
+  "execute",
+  "listVisibleSegmentPage",
+  "cleanupQuerySpill",
+  "compactTable",
+  "compactTableStep",
+  "resumeCompactionJob",
+  "listCompactionJobs",
+  "cancelCompactionJob",
+  "collectGarbage",
+  "collectGarbageStep",
+  "resumeGarbageCollectionJob",
+  "bufferPoolStats",
+  "maintenanceStatus",
+  "checkIntegrity",
+  "storageStats",
+  "inspectInterruptedImport",
+  "abortInterruptedImport",
+  "listGarbageCollectionJobs",
+] as const satisfies ReadonlyArray<keyof MinnowDatabase>;
+type DirectRootMethod = (typeof directRootMethods)[number];
+
+function isDirectRootMethod(value: string): value is DirectRootMethod {
+  return (directRootMethods as readonly string[]).includes(value);
 }
 
 /**
@@ -201,6 +257,12 @@ function snapshotQueueError(value: unknown): Error {
   return value instanceof Error ? value : new Error("Snapshot transfer failed", { cause: value });
 }
 
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
 /** The slice of DedicatedWorkerGlobalScope (or MessagePort) the host needs. */
 export interface RpcScope {
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
@@ -266,12 +328,15 @@ type Handle =
 export const MAX_WORKER_HANDLES_PER_CONNECTION = 256;
 const DEFAULT_WRITE_HANDLE_IDLE_TIMEOUT_MS = 30_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** Shared by RPC methods that do not expose cancellation, avoiding one controller per call. */
+const passiveRpcSignal = new AbortController().signal;
 
 class DatabaseRpcServer {
   readonly #handles = new Map<string, Handle>();
   readonly #reservedHandleIds = new Set<string>();
   readonly #openingHandlePromises = new Set<Promise<unknown>>();
   readonly #settlingWritePromises = new Set<Promise<unknown>>();
+  readonly #requestAborts = new Map<string, AbortController>();
   #disposed = false;
   #inFlightRpcCount = 0;
   #inFlightRpcDrain: Promise<void> | undefined;
@@ -301,6 +366,12 @@ class DatabaseRpcServer {
       this.scope.postMessage(rpcResult(request.requestId, { ready: true }));
       return;
     }
+    if (request.kind === "rpc-cancel") {
+      this.#requestAborts
+        .get(request.requestId)
+        ?.abort(abortError("Database request was cancelled"));
+      return;
+    }
     const bypassLimit = request.method === "dispose";
     if (!bypassLimit && this.#inFlightRpcCount >= MAX_DATABASE_RPC_IN_FLIGHT) {
       this.scope.postMessage(
@@ -314,12 +385,18 @@ class DatabaseRpcServer {
       return;
     }
     if (!bypassLimit) this.#inFlightRpcCount += 1;
+    const abort = request.method === "query" ? new AbortController() : undefined;
+    if (abort !== undefined) this.#requestAborts.set(request.requestId, abort);
+    const context: RpcCallContext = {
+      requestId: request.requestId,
+      signal: abort?.signal ?? passiveRpcSignal,
+    };
     try {
       if (this.#disposed) throw new Error("Database connection is disposed");
       const result =
         request.handleId === null
-          ? await this.#callRoot(request.method, request.args)
-          : await this.#callHandle(request.handleId, request.method, request.args);
+          ? await this.#callRoot(request.method, request.args, context)
+          : await this.#callHandle(request.handleId, request.method, request.args, context);
       if (result instanceof ColumnarResult) {
         this.scope.postMessage(rpcResult(request.requestId, result.encoded.payload), {
           transfer: result.encoded.transfer,
@@ -344,6 +421,7 @@ class DatabaseRpcServer {
     } catch (error) {
       this.scope.postMessage(rpcFailure(request.requestId, error));
     } finally {
+      if (abort !== undefined) this.#requestAborts.delete(request.requestId);
       if (!bypassLimit) this.#inFlightRpcCount -= 1;
       if (this.#inFlightRpcCount === 0 && this.#resolveInFlightRpcDrain !== undefined) {
         const resolve = this.#resolveInFlightRpcDrain;
@@ -354,53 +432,59 @@ class DatabaseRpcServer {
     }
   }
 
-  async #callRoot(method: string, args: unknown[]): Promise<unknown> {
+  async #callRoot(method: string, args: unknown[], context: RpcCallContext): Promise<unknown> {
     const database = this.database as unknown as Record<
       string,
       (...forwarded: unknown[]) => Promise<unknown>
     >;
+    if (isDirectRootMethod(method)) {
+      const operation = database[method];
+      if (operation === undefined) {
+        throw new Error(`Database root method is unavailable: ${method}`);
+      }
+      return operation.apply(this.database, args);
+    }
     switch (method) {
-      case "createTable":
-      case "introspect":
-      case "listTables":
-      case "insertBatch":
-      case "insert":
-      case "upsertBatch":
-      case "upsert":
-      case "updateBatch":
-      case "update":
-      case "deleteBatch":
-      case "delete":
-      case "runStatement":
-      case "explain":
-      case "execute":
-      case "listVisibleSegmentPage":
-      case "cleanupQuerySpill":
-      case "compactTable":
-      case "compactTableStep":
-      case "resumeCompactionJob":
-      case "listCompactionJobs":
-      case "cancelCompactionJob":
-      case "collectGarbage":
-      case "collectGarbageStep":
-      case "resumeGarbageCollectionJob":
-      case "bufferPoolStats":
-      case "maintenanceStatus":
-      case "checkIntegrity":
-      case "storageStats":
-      case "inspectInterruptedImport":
-      case "abortInterruptedImport":
-      case "listGarbageCollectionJobs":
-        return database[method]?.(...args);
       case "query": {
-        const [sql, options] = args as [string, QueryOptions | undefined];
-        return new ColumnarResult(encodeQueryResult(await this.database.query(sql, options)));
+        const [sql, options, reportStats = false] = args as [
+          string,
+          QueryOptions | undefined,
+          boolean | undefined,
+        ];
+        return new ColumnarResult(
+          encodeQueryResult(
+            await this.database.query(sql, {
+              ...options,
+              signal: context.signal,
+              ...(reportStats
+                ? {
+                    onStats: (stats) => {
+                      this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
+                    },
+                  }
+                : {}),
+            }),
+          ),
+        );
       }
       case "queryCursorOpen": {
         const handleId = this.#claimHandleId(args[0]);
-        const [sql, options] = args.slice(1) as [string, QueryCursorOptions | undefined];
+        const [sql, options, reportStats = false] = args.slice(1) as [
+          string,
+          QueryCursorOptions | undefined,
+          boolean | undefined,
+        ];
         try {
-          const iterator = this.database.queryCursor(sql, options);
+          const iterator = this.database.queryCursor(sql, {
+            ...options,
+            ...(reportStats
+              ? {
+                  onStats: (stats) => {
+                    this.scope.postMessage(rpcEvent(handleId, "stats", stats));
+                  },
+                }
+              : {}),
+          });
           this.#publishHandle(handleId, { type: "query-cursor", iterator });
         } catch (error) {
           this.#releaseHandleId(handleId);
@@ -627,13 +711,18 @@ class DatabaseRpcServer {
     return opening;
   }
 
-  async #callHandle(handleId: string, method: string, args: unknown[]): Promise<unknown> {
+  async #callHandle(
+    handleId: string,
+    method: string,
+    args: unknown[],
+    context: RpcCallContext,
+  ): Promise<unknown> {
     const handle = this.#handles.get(handleId);
     if (handle === undefined) throw new Error(`Unknown handle: ${handleId}`);
     if (handle.type === "write") {
       this.#beginWriteHandleCall(handle);
       try {
-        return await this.#callWriteHandle(handleId, handle, method, args);
+        return await this.#callWriteHandle(handleId, handle, method, args, context);
       } finally {
         this.#endWriteHandleCall(handleId, handle);
       }
@@ -686,11 +775,28 @@ class DatabaseRpcServer {
     handle: Extract<Handle, { type: "write" }>,
     method: string,
     args: unknown[],
+    context: RpcCallContext,
   ): Promise<unknown> {
     if (method === "query") {
-      const [sql, options] = args as [string, { params?: unknown } | undefined];
+      const [sql, options, reportStats = false] = args as [
+        string,
+        QueryOptions | undefined,
+        boolean | undefined,
+      ];
       return new ColumnarResult(
-        encodeQueryResult(await handle.session.query(sql, options as never)),
+        encodeQueryResult(
+          await handle.session.query(sql, {
+            ...options,
+            signal: context.signal,
+            ...(reportStats
+              ? {
+                  onStats: (stats) => {
+                    this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
+                  },
+                }
+              : {}),
+          }),
+        ),
       );
     }
     if (method === "execute") {

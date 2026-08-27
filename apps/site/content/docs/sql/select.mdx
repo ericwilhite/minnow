@@ -52,8 +52,8 @@ An `ON` clause that carries more than its equality still hashes on that equality
 = a.order_id AND b.product_id > a.product_id` builds on the order and applies the rest to the
 pairs it finds, rather than comparing every row with every row.
 
-Equality-correlated `LATERAL` derived sources are decorrelated into the same set-at-a-time join
-path. Correlated lateral queries do not support grouping, `HAVING`, ordering, or `LIMIT`.
+Equality and range-correlated `LATERAL` derived sources are decorrelated into the same set-at-a-time
+join path. Correlated lateral queries do not support grouping, `HAVING`, ordering, or `LIMIT`.
 
 ## Aggregation
 
@@ -106,11 +106,18 @@ WHERE rank <= 3
 
 A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXISTS` all work.
 Correlated `EXISTS` and `NOT EXISTS`, including range comparisons such as `inner.amount <
-outer.amount`, decorrelate into semi-joins and anti-joins rather than executing per row.
+outer.amount`, decorrelate into semi-joins and anti-joins rather than executing per row. When an
+`EXISTS` is nested below `OR`, `NOT`, or `CASE`, a hidden per-probe match flag preserves the
+boolean expression without multiplying outer rows.
 
-Correlated scalar aggregates, `IN`, and `NOT IN` require equality correlation. `NOT IN` preserves
-its empty-set and NULL behavior during decorrelation. Correlated scalar/`IN` range predicates and
-correlated `EXISTS` nested below `OR` remain explicit boundaries rather than per-row execution.
+Correlated scalar aggregates, `IN`, and `NOT IN` support equality and range comparisons. Range
+aggregates group the inner rows once for each distinct outer probe tuple and join those results
+back by equality. `NOT IN` carries per-probe counts to preserve its empty-set and NULL behavior.
+Correlated `ANY`/`ALL` work as top-level `WHERE` predicates with their empty-set and NULL behavior
+intact. A correlated scalar in a grouped select list may reference the outer grouping columns; it
+cannot be nested inside an outer aggregate or reference an ungrouped outer column. Nesting a
+correlated quantified comparison inside a larger boolean expression remains an explicit boundary
+rather than falling back to per-row execution.
 
 Constant JSON documents can also produce rows:
 

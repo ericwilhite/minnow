@@ -4,7 +4,6 @@ import { basename, resolve } from "node:path";
 
 import {
   parseSqlLogicTest,
-  type SqlLogicQuery,
   type SqlLogicRecord,
 } from "../packages/core/src/testing/sqllogictest.js";
 import { ensureSqlLogicCorpus, sqlLogicCorpusManifest } from "./lib/sqllogictest-corpus.mts";
@@ -64,17 +63,6 @@ for (const sourcePath of sourcePaths) {
   const fullIncluded: SqlLogicRecord[] = [];
   const fileExcluded: typeof excluded = [];
   for (const record of records) {
-    const reason = unsupportedReason(record);
-    if (reason !== undefined) {
-      fileExcluded.push({
-        source: manifestEntry.path,
-        line: record.location.line,
-        kind: record.kind,
-        scope: "all-profiles",
-        reason,
-      });
-      continue;
-    }
     fullIncluded.push(record);
     const standardReason = standardOnlyReason(record);
     if (standardReason === undefined) standardIncluded.push(record);
@@ -184,19 +172,6 @@ function writeSelectedFile(
   const output = header + (serialized.endsWith("\n\n") ? serialized.slice(0, -1) : serialized);
   writeFileSync(path, output);
   return createHash("sha256").update(output).digest("hex");
-}
-
-function unsupportedReason(record: SqlLogicRecord): string | undefined {
-  if (record.kind !== "query") return undefined;
-  const query: SqlLogicQuery = record;
-  const sql = query.sql.toUpperCase();
-  if (/\(\s*SELECT\s+COUNT\(\*\)\s+FROM\s+T1\s+AS\s+X\s+WHERE\s+X\./u.test(sql)) {
-    return "correlated scalar aggregates over non-equality predicates are not implemented";
-  }
-  if (sql.includes("EXISTS(") && /\sOR\s/u.test(sql)) {
-    return "correlated EXISTS nested below OR is not implemented";
-  }
-  return undefined;
 }
 
 function standardOnlyReason(record: SqlLogicRecord): string | undefined {

@@ -18,6 +18,31 @@ export class UnknownTableError extends TypeError {
   }
 }
 
+/** Refuses another read before one database instance retains an unbounded request backlog. */
+export class DatabaseReadBacklogError extends Error {
+  override readonly name = "DatabaseReadBacklogError";
+
+  constructor(readonly limit = 256) {
+    super(`A database cannot retain more than ${String(limit)} active reads; await a read`);
+  }
+}
+
+/** A live-query owner reached one of its documented resident-resource ceilings. */
+export class LiveQueryLimitError extends Error {
+  override readonly name = "LiveQueryLimitError";
+
+  constructor(
+    readonly resource: "set" | "group" | "subscription",
+    readonly limit: number,
+  ) {
+    super(
+      resource === "set"
+        ? `A database cannot retain more than ${String(limit)} live-query sets`
+        : `A live-query set cannot retain more than ${String(limit)} ${resource} records`,
+    );
+  }
+}
+
 export class UniqueConstraintError extends Error {
   override readonly name = "UniqueConstraintError";
 

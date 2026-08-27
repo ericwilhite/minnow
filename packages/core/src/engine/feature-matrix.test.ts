@@ -113,7 +113,7 @@ describe("SQL feature matrix conformance", () => {
       // than optimization, so those plans have no runnable unoptimized form. They are named
       // here rather than caught by a bare try, so a feature that stops running unoptimized for
       // any other reason fails instead of quietly opting itself out.
-      if (!feature.id.startsWith("subquery.correlated") && feature.id !== "from.lateral") {
+      if (!feature.id.startsWith("subquery.correlated") && !feature.id.startsWith("from.lateral")) {
         const raw = bindPlanParameters(
           compileQuery(feature.example, { optimize: false }),
           feature.params,

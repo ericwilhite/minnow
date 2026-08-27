@@ -16,9 +16,10 @@ import {
   rpcFailure,
   type RpcResponse,
 } from "../worker-protocol/index.js";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { MinnowDatabaseClient, type ClientTransport } from "./client.js";
 import { MinnowDatabase } from "./database.js";
+import * as engineErrors from "./errors.js";
 import {
   MaintenanceBacklogError,
   SqlCompileError,
@@ -90,6 +91,10 @@ function connect(): MinnowDatabaseClient {
   return new MinnowDatabaseClient(clientSide, { store: { kind: "memory" } });
 }
 
+type MethodNames<T> = {
+  [Name in keyof T]-?: T[Name] extends (...args: never[]) => unknown ? Name : never;
+}[keyof T];
+
 function exposeRaw(
   database: MinnowDatabase,
   options: ExposeDatabaseOptions = {},
@@ -136,6 +141,16 @@ function exportedStorageErrorConstructors(): Array<readonly [string, StorageErro
   for (const [name, value] of Object.entries(storageTypes)) {
     if (typeof value === "function" && value.prototype instanceof Error) {
       constructors.push([name, value as StorageErrorConstructor]);
+    }
+  }
+  return constructors.sort(([left], [right]) => left.localeCompare(right));
+}
+
+function exportedEngineErrorConstructors(): Array<readonly [string, StorageErrorConstructor]> {
+  const constructors: Array<readonly [string, StorageErrorConstructor]> = [];
+  for (const [name, value] of Object.entries(engineErrors)) {
+    if (typeof value === "function" && value.prototype instanceof Error) {
+      constructors.push([name, value]);
     }
   }
   return constructors.sort(([left], [right]) => left.localeCompare(right));
@@ -1472,18 +1487,18 @@ describe("MinnowDatabaseClient", () => {
       },
     });
     const batches = [];
+    const stats: Array<{ peakMemoryBytes: number }> = [];
     for await (const batch of client.queryCursor(
       "SELECT id, name, joined FROM people ORDER BY id",
-      { batchRows: 2 },
+      { batchRows: 2, onStats: (report) => stats.push(report) },
     )) {
       batches.push(batch);
     }
     expect(batches.map(({ rows }) => rows.length)).toEqual([2, 2, 1]);
     expect(batches.flatMap(({ rows }) => rows).map(({ id }) => id)).toEqual([1, 2, 3, 4, 5]);
     expect(batches[0]?.rows[0]?.joined).toEqual(new Date(1));
-    expect(() => client.queryCursor("SELECT id FROM people", { onStats: () => undefined })).toThrow(
-      /not available across a worker/,
-    );
+    expect(stats).toHaveLength(1);
+    expect(stats[0]?.peakMemoryBytes).toBeGreaterThanOrEqual(0);
     await client.close();
   });
 
@@ -1551,12 +1566,71 @@ describe("MinnowDatabaseClient", () => {
       { id: 2, name: "Grace", joined: new Date("2024-06-07T08:09:10Z") },
     ]);
     expect(inserted.rowCount).toBe(2);
-    const result = await client.query("SELECT name, joined FROM people ORDER BY name");
+    const stats: Array<{ peakMemoryBytes: number }> = [];
+    const result = await client.query("SELECT name, joined FROM people ORDER BY name", {
+      onStats: (report) => stats.push(report),
+    });
     expect(result.rows.map((row) => row.name)).toEqual(["Ada", "Grace"]);
     expect(result.rows[0]?.joined).toBeInstanceOf(Date);
     expect((result.rows[0]?.joined as Date).toISOString()).toBe("2024-01-02T03:04:05.000Z");
+    expect(stats).toHaveLength(1);
+    expect(stats[0]?.peakMemoryBytes).toBeGreaterThan(0);
     const tables = await client.listTables();
     expect(tables.map(({ name }) => name)).toEqual(["people"]);
+    await client.close();
+  });
+
+  it("cancels an ordinary query across the worker boundary and keeps the connection usable", async () => {
+    class CancellableDatabase extends MinnowDatabase {
+      readonly started: Promise<void>;
+      #markStarted!: () => void;
+      #pauseNextQuery = true;
+
+      constructor() {
+        super(new MemoryBlockStore(), { autoCollect: false, autoCompact: false });
+        this.started = new Promise((resolve) => {
+          this.#markStarted = resolve;
+        });
+      }
+
+      override async query(
+        ...args: Parameters<MinnowDatabase["query"]>
+      ): ReturnType<MinnowDatabase["query"]> {
+        if (this.#pauseNextQuery) {
+          this.#pauseNextQuery = false;
+          this.#markStarted();
+          const signal = args[1]?.signal;
+          if (signal === undefined) throw new Error("Worker query did not receive a signal");
+          await new Promise<void>((_resolve, reject) => {
+            const abort = (): void =>
+              reject(
+                signal.reason instanceof Error
+                  ? signal.reason
+                  : new Error("Query was aborted", { cause: signal.reason }),
+              );
+            signal.addEventListener("abort", abort, { once: true });
+            if (signal.aborted) abort();
+          });
+        }
+        return super.query(...args);
+      }
+    }
+
+    const boundary = createBoundary();
+    const database = new CancellableDatabase();
+    exposeDatabase(database, boundary.workerSide);
+    const client = new MinnowDatabaseClient(boundary.clientSide, { store: { kind: "memory" } });
+    await client.ready();
+    const controller = new AbortController();
+    const pending = client.query("SELECT 1 AS n", { signal: controller.signal });
+    await database.started;
+    controller.abort(new Error("stop query"));
+    const cancelled = await pending.catch((error: unknown) => error);
+    expect(cancelled).toMatchObject({
+      name: "AbortError",
+      message: "Database request was cancelled",
+    });
+    expect((await client.query("SELECT 2 AS n")).rows).toEqual([{ n: 2 }]);
     await client.close();
   });
 
@@ -1694,6 +1768,11 @@ describe("MinnowDatabaseClient", () => {
     });
     await client.deleteBatch("rpc_surface", { keys: [3] });
     await client.delete("rpc_surface", 2);
+    expect(await client.query("SELECT id, value FROM rpc_surface ORDER BY id")).toEqual({
+      columns: ["id", "value"],
+      columnDomains: [null, null],
+      rows: [{ id: 1, value: "first" }],
+    });
     const statementResult = await client.runStatement(
       compileStatement("INSERT INTO rpc_surface (id, value) VALUES (4, 'four')"),
     );
@@ -1777,6 +1856,61 @@ describe("MinnowDatabaseClient", () => {
     await client.close({ terminateWorker: false });
   });
 
+  it("keeps every public database method available on the worker client", () => {
+    type MissingClientMethods = Exclude<
+      MethodNames<MinnowDatabase>,
+      MethodNames<MinnowDatabaseClient>
+    >;
+    expectTypeOf<MissingClientMethods>().toEqualTypeOf<never>();
+  });
+
+  it("mirrors the direct catalog and index helpers across the worker boundary", async () => {
+    const client = connect();
+    await client.createTable({
+      name: "worker_ddl",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "body", type: "string" },
+        { name: "obsolete", type: "string", nullable: true },
+      ],
+    });
+    await client.insertBatch("worker_ddl", [
+      { id: 1, body: "hello worker", obsolete: null },
+      { id: 2, body: "goodbye worker", obsolete: "remove me" },
+    ]);
+
+    await client.createView("worker_ddl_view", "SELECT id, body FROM worker_ddl WHERE id = 1");
+    expect(await client.query("SELECT * FROM worker_ddl_view")).toMatchObject({
+      rows: [{ id: 1, body: "hello worker" }],
+    });
+
+    await client.createIndex("worker_ddl_by_body", "worker_ddl", "body");
+    expect(
+      (await client.introspect()).tables
+        .find((table) => table.name === "worker_ddl")
+        ?.indexes?.map((index) => index.name),
+    ).toEqual(["worker_ddl_by_body"]);
+    await client.buildFtsIndex("worker_ddl", "body");
+    expect(
+      await client.query("SELECT id FROM worker_ddl WHERE MATCH(body) AGAINST 'hello' ORDER BY id"),
+    ).toMatchObject({ rows: [{ id: 1 }] });
+
+    await expect(client.dropIndex("worker_ddl_by_body")).resolves.toBe(true);
+    await expect(client.dropIndex("worker_ddl_by_body", { ifExists: true })).resolves.toBe(false);
+    await expect(client.dropView("worker_ddl_view")).resolves.toBe(true);
+    await expect(client.dropView("worker_ddl_view", { ifExists: true })).resolves.toBe(false);
+    await expect(client.dropColumn("worker_ddl", "obsolete")).resolves.toBe(true);
+    expect(
+      (await client.introspect()).tables
+        .find((table) => table.name === "worker_ddl")
+        ?.columns.map((column) => column.name),
+    ).toEqual(["id", "body"]);
+    await expect(client.dropTable("worker_ddl")).resolves.toBe(true);
+    await expect(client.dropTable("worker_ddl", { ifExists: true })).resolves.toBe(false);
+    await client.close();
+  });
+
   it("issues calls without awaiting ready because the channel is ordered", async () => {
     const client = connect();
     await createPeopleTable(client);
@@ -1852,6 +1986,53 @@ describe("MinnowDatabaseClient", () => {
     expect(typed.tableName).toBe("people");
     expect(typed.columnName).toBe("id");
     expect(typed.value).toBe(1);
+  });
+
+  it("rehydrates every exported engine error with its prototype and fields", async () => {
+    let listener: ((event: MessageEvent<unknown>) => void) | undefined;
+    let nextError: Error | undefined;
+    const respond = (response: RpcResponse): void => {
+      queueMicrotask(() =>
+        listener?.({ data: structuredClone(response) } as MessageEvent<unknown>),
+      );
+    };
+    const transport: ClientTransport = {
+      postMessage: (message) => {
+        const request = message as { kind: string; requestId: string; method?: string };
+        if (request.kind === "rpc-init" || request.method === "dispose") {
+          respond({
+            version: protocolVersion,
+            requestId: request.requestId,
+            kind: "rpc-result",
+            result: {},
+          });
+          return;
+        }
+        const error = nextError;
+        nextError = undefined;
+        respond(rpcFailure(request.requestId, error ?? new Error("Missing error fixture")));
+      },
+      addEventListener: (type, next) => {
+        if (type === "message") listener = next;
+      },
+    };
+    const client = new MinnowDatabaseClient(transport, { store: { kind: "memory" } });
+    await client.ready();
+
+    const constructors = exportedEngineErrorConstructors();
+    expect(constructors.length).toBeGreaterThan(0);
+    for (const [exportName, constructor] of constructors) {
+      const original = createStorageErrorFixture(constructor);
+      nextError = original;
+      const rehydrated = await client.listTables().catch((error: unknown) => error);
+      expect(rehydrated, exportName).toBeInstanceOf(constructor);
+      expect(rehydrated, exportName).toMatchObject({
+        name: original.name,
+        message: original.message,
+        ...Object.fromEntries(Object.entries(original)),
+      });
+    }
+    await client.close();
   });
 
   it("rehydrates every exported storage error with its prototype and fields", async () => {
@@ -2265,10 +2446,16 @@ describe("MinnowDatabaseClient", () => {
       });
       await tx.updateBatch("people", { keys: [1], changes: { name: ["Countess"] } });
       // Read-your-writes across the channel: the staged rows are visible in-scope only.
-      expect((await tx.query("SELECT name FROM people ORDER BY name")).rows).toEqual([
-        { name: "Countess" },
-        { name: "Grace" },
-      ]);
+      const stats: Array<{ peakMemoryBytes: number }> = [];
+      expect(
+        (
+          await tx.query("SELECT name FROM people ORDER BY name", {
+            onStats: (report) => stats.push(report),
+          })
+        ).rows,
+      ).toEqual([{ name: "Countess" }, { name: "Grace" }]);
+      expect(stats).toHaveLength(1);
+      expect(stats[0]?.peakMemoryBytes).toBeGreaterThan(0);
       expect((await client.query("SELECT COUNT(*) AS n FROM people")).rows).toEqual([{ n: 1 }]);
       return staged.rowCount;
     });
@@ -2464,6 +2651,18 @@ describe("MinnowDatabaseClient", () => {
     expect(closeCalls).toBe(1);
     expect(disposed).toBe(true);
     await expect(client.listTables()).rejects.toThrow(/closed/);
+  });
+
+  it("fails closed when a whitelisted database implementation is unavailable", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    Object.defineProperty(database, "delete", { value: undefined });
+    const boundary = exposeRaw(database);
+    const response = await boundary.call(null, "delete", ["items", 1]);
+    expect(response.kind).toBe("rpc-failure");
+    if (response.kind === "rpc-failure") {
+      expect(response.error.message).toBe("Database root method is unavailable: delete");
+    }
+    await database.close();
   });
 
   it("forwards page-visibility reports to the host's onVisibility seam", async () => {

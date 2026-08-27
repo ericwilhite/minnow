@@ -8,6 +8,53 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased
+
+### Added
+
+- Correlated scalar aggregates, `IN`, `NOT IN`, `ANY`, and `ALL` now support non-equality
+  comparisons, `LATERAL` accepts range correlation, grouped select lists accept scalars determined
+  by their grouping keys, and correlated `EXISTS` / `NOT EXISTS` work inside larger boolean
+  expressions. The full pinned SQLLogicTest profile now runs all 10,708 selected upstream records
+  with no capability exclusions.
+- Ordinary `query()` calls now accept `QueryOptions.signal`. Direct, cursor, and write-session
+  reads stop between bounded execution/storage batches, return no partial result, and release
+  reader and spill ownership before rejecting.
+- `MinnowDatabaseClient` now supports `signal` and `onStats` for ordinary queries, cursor queries,
+  and write-session reads. Controls stay on the main thread; cancellation and stats cross as
+  structured-clone-safe protocol frames/events. The worker protocol is now version 3 so a stale
+  worker fails early instead of silently ignoring cancellation.
+- The worker client now rehydrates every exported engine error, including
+  `DatabaseReadBacklogError` and `LiveQueryLimitError`, with stable `instanceof` behavior.
+- Direct databases and worker clients now share the same single-row `delete()` helper. The worker
+  host fails closed if a whitelisted implementation is missing instead of returning a successful
+  `undefined` result.
+- `MinnowDatabaseClient` now mirrors the direct catalog and index helpers: `createView`,
+  `dropView`, `dropColumn`, `dropTable`, `createIndex`, `dropIndex`, and `buildFtsIndex`.
+- Exact `NUMERIC` arithmetic filters now reuse a bounded, dictionary-owned comparison table
+  across executions instead of reparsing and recomputing the same distinct values for every row.
+- Automatic maintenance now advances exact per-table layout counters from local commits, avoiding
+  a growing segment-catalog scan before every write while still re-proving the layout after a
+  commit from another database instance.
+- `DELETE` statements without `RETURNING` now collect their unique-key projection through the
+  vector executor's scalar batches, avoiding a retained result object for every matched row.
+- Release checks now classify every public package subpath by audience, snapshot every exported
+  TypeScript declaration with type-versus-runtime reachability, resolve packed tarballs in Bundler
+  and NodeNext modes, and enforce coverage floors per published package. Frozen storage fixtures
+  now record the exact `@minnowdb/core` version that wrote them.
+
+### Migration
+
+No existing call changes. The query controls, single-row delete, and worker catalog/index helpers
+are additive. Code that previously wrapped an ordinary worker query in a cursor only to gain
+cancellation can pass `signal` directly. Deploy the client and worker from the same build, and
+replace any independently cached version 2 worker asset when upgrading.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5
+remain readable and writable without a data migration.
+
 ## 0.5.0 — August 26, 2026
 
 Published packages: `@minnowdb/core@0.5.0`, `@minnowdb/devtools@0.2.2`,

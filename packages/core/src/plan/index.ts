@@ -7,9 +7,9 @@
  * Exposing them here lets an external builder produce plans the engine treats as indistinguishable
  * from parsed SQL.
  *
- * This module re-exports rather than owns: the plan types still live beside the parser that
- * produces them. Splitting them into a leaf module of their own is the next step, and it will not
- * change this entry point.
+ * The recursive logical model lives in the dependency-light `model` leaf; executable assembly
+ * and validation stay with the compiler. This entry point keeps that distinction invisible to
+ * consumers.
  */
 export {
   assembleSelectBlock,
@@ -19,20 +19,22 @@ export {
   splitCondition,
   validateLimit,
   validateOffset,
-  type AggregateName,
-  type CompiledQuery,
   type CompiledStatement,
-  type Expression,
-  type JoinPlan,
-  type Predicate,
-  type PredicateOperator,
-  type QueryResult,
-  type QueryRow,
-  type QueryValue,
-  type SelectItem,
-  type SetOperator,
-  type TableSource,
-  type WindowFunctionName,
 } from "../engine/query.js";
+export type {
+  AggregateName,
+  CompiledQuery,
+  Expression,
+  JoinPlan,
+  Predicate,
+  PredicateOperator,
+  QueryResult,
+  QueryRow,
+  QueryValue,
+  SelectItem,
+  SetOperator,
+  TableSource,
+  WindowFunctionName,
+} from "./model.js";
 export { optimizePlan, renderPlan } from "../engine/optimizer.js";
 export { validateFtsQuery } from "../engine/fts.js";

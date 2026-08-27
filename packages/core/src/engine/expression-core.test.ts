@@ -209,12 +209,12 @@ describe("features SQLite cannot arbitrate", () => {
     expect(executeQuery(except, bags).rows.map((row) => row.v)).toEqual([1, 3]);
   });
 
-  it("rejects correlated select-list scalars under grouping", () => {
+  it("rejects a correlated select-list scalar nested inside an outer aggregate", () => {
     expect(() =>
       compileQuery(
         "SELECT r.region AS g, SUM((SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region)) AS s FROM rows r GROUP BY r.region",
       ),
-    ).toThrow("not supported with grouping");
+    ).toThrow("cannot be nested inside an aggregate");
   });
 });
 

@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { encodeBlock } from "../packages/core/src/block-format/index.ts";
@@ -90,8 +90,12 @@ const files = Object.fromEntries(
     return [path, Buffer.from(bytes).toString("base64")];
   }),
 );
+const { version: writerPackageVersion } = JSON.parse(
+  await readFile(new URL("../packages/core/package.json", import.meta.url), "utf8"),
+) as { version: string };
 const fixture = {
   layoutFormatVersion: LOG_FORMAT_VERSION,
+  writerPackageVersion,
   files,
   expectations: {
     tables: ["checkpoint-b", "data", "wal-tail"],

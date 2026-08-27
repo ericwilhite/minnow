@@ -14,25 +14,25 @@ after generated declarations or asynchronous signatures change.
 
 ## Choose the smallest runner that proves the change
 
-| Command                        | What it runs                                                                    | Use it for                         |
-| ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
-| `npm test`                     | Vitest plus the committed fast SQLLogicTest profile                             | Normal implementation work         |
-| `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                | A focused inner loop               |
-| `npm run test:sql:standard`    | 4,205 result-checked upstream queries; committed, offline, about ten seconds    | Every SQL or optimizer change      |
-| `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations    | Before a release                   |
-| `npm run test:coverage`        | Vitest with the coverage floors enforced                                        | Before pushing                     |
-| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures               | Hunting bugs rather than pinning   |
-| `npm run simulate`             | One replayable deterministic concurrency, fault, and storage simulation         | Storage and transaction changes    |
-| `npm run test:simulator:full`  | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints | Before a release                   |
-| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture                 | Before changing a format version   |
-| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit    | Storage or browser-runtime changes |
-| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                           | Docs, examples, and site changes   |
-| `npm run test:browser`         | Both browser runners, in sequence                                               | Cross-browser regression checks    |
-| `npm run test:consumer`        | Packed libraries installed, typed, bundled, and run outside the workspace       | Package and public-entry changes   |
-| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                  | Query-executor performance changes |
-| `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages   | Dependency or public-entry changes |
-| `npm run check`                | Format, types, lint, build, coverage, and fast SQLLogicTest                     | The local merge gate               |
-| `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners            | Release candidates                 |
+| Command                        | What it runs                                                                     | Use it for                         |
+| ------------------------------ | -------------------------------------------------------------------------------- | ---------------------------------- |
+| `npm test`                     | Vitest plus the committed fast SQLLogicTest profile                              | Normal implementation work         |
+| `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                 | A focused inner loop               |
+| `npm run test:sql:standard`    | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds | Every SQL or optimizer change      |
+| `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations     | Before a release                   |
+| `npm run test:coverage`        | Vitest with the coverage floors enforced                                         | Before pushing                     |
+| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures                | Hunting bugs rather than pinning   |
+| `npm run simulate`             | One replayable deterministic concurrency, fault, and storage simulation          | Storage and transaction changes    |
+| `npm run test:simulator:full`  | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints  | Before a release                   |
+| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture                  | Before changing a format version   |
+| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit     | Storage or browser-runtime changes |
+| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                            | Docs, examples, and site changes   |
+| `npm run test:browser`         | Both browser runners, in sequence                                                | Cross-browser regression checks    |
+| `npm run test:consumer`        | Packed libraries installed, typed, bundled, and run outside the workspace        | Package and public-entry changes   |
+| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                   | Query-executor performance changes |
+| `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages    | Dependency or public-entry changes |
+| `npm run check`                | Format, types, lint, build, coverage, and fast SQLLogicTest                      | The local merge gate               |
+| `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners             | Release candidates                 |
 
 Install the browser binaries once before using a browser runner:
 
@@ -67,11 +67,20 @@ application it starts.
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.
 - **The packed-consumer test** builds every public package, installs the resulting tarballs in an
   OS-temporary Vite application outside the npm workspace, and resolves every exported entry with
-  that application's TypeScript configuration. Chromium then runs the emitted worker against
+  both Bundler and NodeNext TypeScript resolution. Chromium then runs the emitted worker against
   IndexedDB, migrates and queries through Kysely, observes a live update, streams exports, mounts
   the React and devtools adapters, exports a snapshot, restores it into OPFS, and reopens it. The
   Minnow archives and direct tool and peer versions are pinned to the build; npm resolves their
   ordinary transitive dependencies into a private temporary cache as it would for a new project.
+- **The public API contract** assigns every package subpath a stable audience and snapshots the
+  declaration syntax exported by every typed entry point, including whether each name is
+  type-only or available at runtime. `npm run api:check` fails on an unclassified subpath or an
+  added, removed, or changed public declaration; `npm run api:report` prints the surface for
+  review. After classifying compatibility and documenting the release impact,
+  `npm run api:update` records an intentional surface. Coverage has a separate non-regression
+  floor for every published package, so the core suite cannot hide a drop in devtools or an
+  adapter. The [v1 support policy](/docs/reference/support#public-api-contract) defines the
+  audiences and guarantee.
 - **Site browser tests** execute the public examples and drive the benchmarks page itself: one
   case runs a suite end to end in each browser and asserts it verified against the oracles,
   another asserts the `/benchmarks` route is cross-origin isolated. Documentation cannot drift
@@ -113,10 +122,10 @@ npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select
 npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select5.test --trace --trace-from 800
 ```
 
-It runs 1,822 statements and 4,205 queries, checking 219,677 scalar results across 6,029 source
+It runs 1,822 statements and 6,345 queries, checking 385,389 scalar results across 8,169 source
 records. The fast set includes representative five-table and seventeen-table join-order families
 that guard against pathological Cartesian work. On the development machine used to measure it,
-the whole profile took about ten seconds. That makes the broad suite part of
+the whole profile took about fifteen seconds. That makes the broad suite part of
 `npm test`, `npm run check`, and every pull request, instead of a suite agents discover only after
 they finish a change.
 
@@ -126,13 +135,11 @@ The supported full profile adds the exhaustive multi-way join families:
 npm run test:sql:full
 ```
 
-It is fully runnable locally, reports progress every 500 records, and contains 8,568 of the five
-selected upstream files' 10,708 records: 1,822 statements, 6,744 queries, and 4,927,952 checked
-scalar results. The remaining 2,140 are
-not hidden: `standard-exclusions.json` records the source file, source line, scope, and reason for
-every one. They currently cover non-equality correlated scalar aggregates and correlated
-`EXISTS` below `OR`. A further 2,539 supported exhaustive-join records move from
-the fast profile to the full one solely because of runtime.
+It is fully runnable locally, reports progress every 500 records, and contains all 10,708 records
+from the five selected upstream files: 1,822 statements, 8,884 queries, and 5,093,664 checked
+scalar results. There are no all-profile exclusions. `standard-exclusions.json` still records the
+2,539 supported exhaustive-join records that move from the fast profile to the full one solely
+because of runtime.
 
 The corpus is pinned to immutable revision
 `572273bf5076176e17f47aea75115a225e70fef8`. `upstream.json` records its URL, date, 115,244,234-byte
@@ -194,15 +201,17 @@ blocks unreadable, the first anyone hears is a user whose application will not o
 
 `packages/core/format-fixtures/` holds one frozen database per released block/snapshot pair — a
 framed snapshot, which carries the raw block bytes verbatim, plus the answers that build gave to a
-fixed set of queries. `format-compatibility.test.ts` reproduces the current writer byte for byte,
-opens every fixture, checks the answers still hold, and checks that writes into a restored
-database still work. Frozen raw vectors independently cover every block-format-2 physical type.
+fixed set of queries. Each manifest records the exact `@minnowdb/core` version that wrote it.
+`format-compatibility.test.ts` rejects a fixture that claims a future writer, reproduces the
+current writer byte for byte, opens every fixture, checks the answers still hold, and checks that
+writes into a restored database still work. Frozen raw vectors independently cover every
+block-format-2 physical type.
 
 The directory also holds one native fixture for every locked OPFS layout. The test requires a
-fixture for the current writer, then reopens each fixture's format marker, checkpoint, WAL tail,
-and packed extent through the current adapter before committing and recovering another write. That
-catches both a control-layout break and an accidentally dropped old reader that a portable snapshot
-alone cannot see.
+fixture for the current writer and checks its recorded package version, then reopens each fixture's
+format marker, checkpoint, WAL tail, and packed extent through the current adapter before
+committing and recovering another write. That catches both a control-layout break and an
+accidentally dropped old reader that a portable snapshot alone cannot see.
 
 It also fails when the current `BLOCK_FORMAT_VERSION` or `SNAPSHOT_FORMAT_VERSION` has no fixture
 behind it. That failure is the useful one, because it fires _before_ the damage:
@@ -379,7 +388,10 @@ allowed to finish, timed against SQLite and PGlite with the same updates. Their 
 with history, so the ratio is the engine's own cost of having been written to — a read that
 slows down as a table is used, or maintenance that stops keeping up, moves one of these numbers.
 `settle-after-updates` times the updates and the settle itself, once, so a fold or a collection
-pass that grows expensive shows up too.
+pass that grows expensive shows up too. Its waiter checks active jobs first, reads segment
+visibility only between jobs, and measures the full storage footprint only after the table is no
+longer due for a fold. This keeps the observer from competing with the maintenance it times; the
+sample ends only after ten consecutive 50ms observations see no job and the same footprint.
 
 ## Update the performance-gate baseline
 

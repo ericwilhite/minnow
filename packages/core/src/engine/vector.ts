@@ -5,6 +5,7 @@ import {
   MAX_TEMP_RUN_PAGES_PER_BATCH,
 } from "../storage/types.js";
 import type { DatabaseRow } from "./database.js";
+import { throwIfAborted } from "./cancellation.js";
 import type {
   AggregateName,
   BinaryOperator,
@@ -189,11 +190,15 @@ function boundedSpillPageRows(value: number | undefined): number {
 async function writeSpillPages(
   store: QuerySpillStore,
   pages: Array<{ ownerId: string; runId: string; pageIndex: number; bytes: Uint8Array }>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  throwIfAborted(signal);
   const batched = store.putPages?.bind(store);
   if (batched === undefined) {
     for (const page of pages) {
+      throwIfAborted(signal);
       await store.putPage(page.ownerId, page.runId, page.pageIndex, page.bytes);
+      throwIfAborted(signal);
     }
     return;
   }
@@ -209,13 +214,17 @@ async function writeSpillPages(
         batchBytes + page.bytes.byteLength > MAX_TEMP_RUN_BATCH_BYTES)
     ) {
       await batched(batch);
+      throwIfAborted(signal);
       batch = [];
       batchBytes = 0;
     }
     batch.push(page);
     batchBytes += page.bytes.byteLength;
   }
-  if (batch.length > 0) await batched(batch);
+  if (batch.length > 0) {
+    await batched(batch);
+    throwIfAborted(signal);
+  }
 }
 
 async function writeSpillRowPages(
@@ -226,6 +235,7 @@ async function writeSpillRowPages(
   columns: readonly string[],
   rows: readonly QueryRow[],
   pageRows: number,
+  signal?: AbortSignal,
 ): Promise<number> {
   let pending: Array<{
     ownerId: string;
@@ -236,12 +246,13 @@ async function writeSpillRowPages(
   let pendingBytes = 0;
   let pageCount = 0;
   for (const bytes of encodeSpillRowPages(columns, rows, pageRows)) {
+    throwIfAborted(signal);
     if (
       pending.length > 0 &&
       (pending.length === SPILL_WRITE_BATCH_PAGES ||
         pendingBytes + bytes.byteLength > MAX_TEMP_RUN_BATCH_BYTES)
     ) {
-      await writeSpillPages(store, pending);
+      await writeSpillPages(store, pending, signal);
       pending = [];
       pendingBytes = 0;
     }
@@ -249,13 +260,15 @@ async function writeSpillRowPages(
     pendingBytes += bytes.byteLength;
     pageCount += 1;
   }
-  await writeSpillPages(store, pending);
+  await writeSpillPages(store, pending, signal);
   return pageCount;
 }
 
 export interface AsyncQueryExecutionOptions {
   readonly spillStore?: QuerySpillStore;
   readonly spillPageRows?: number;
+  /** Stops before the next execution or spill-storage batch. */
+  readonly signal?: AbortSignal;
   /**
    * Makes the scan-source window [start, start + length) resident before each batch. Supplied by
    * a streaming preparation whose scan-source vectors hold only a sliding window; the executor
@@ -270,8 +283,10 @@ export interface AsyncQueryExecutionOptions {
 export interface QueryBatchExecutionOptions extends AsyncQueryExecutionOptions {
   /** Maximum result rows handed to the consumer at once. */
   readonly batchRows: number;
-  /** Stops before the next scan batch and is checked after every awaited storage read. */
-  readonly signal?: AbortSignal;
+}
+
+interface InternalQueryBatchExecutionOptions extends QueryBatchExecutionOptions {
+  readonly consumeFirstColumn?: (values: readonly QueryValue[]) => void | Promise<void>;
 }
 
 export interface PrepareVectorQueryOptions {
@@ -384,6 +399,8 @@ interface BoundPredicate {
   readonly dictionaryEquality?: DictionaryEquality;
   /** Dictionary-level LIKE against a literal pattern: one match pass per dictionary. */
   readonly dictionaryLike?: DictionaryLike;
+  /** Exact-NUMERIC arithmetic/comparison evaluated once per distinct dictionary value. */
+  readonly dictionaryNumeric?: DictionaryNumericComparison;
   /** Unboxed comparison of a bare numeric/datetime/boolean column against a literal. */
   readonly primitive?: PrimitiveComparison;
   /** Unboxed membership of a bare numeric/datetime column in a literal list. */
@@ -435,6 +452,21 @@ interface DictionaryLike {
   readonly caseInsensitive: boolean;
   readonly escape?: string;
   readonly negated: boolean;
+  readonly cache: { dictionary: readonly string[] | undefined; matches: Uint8Array };
+}
+
+interface DictionaryNumericExpression {
+  readonly source: number;
+  readonly vector: StringVector;
+  readonly signature: string;
+  evaluate(value: string): unknown;
+}
+
+interface DictionaryNumericComparison {
+  readonly expression: DictionaryNumericExpression;
+  readonly operator: ComparisonOperator;
+  readonly target: unknown;
+  readonly signature: string;
   readonly cache: { dictionary: readonly string[] | undefined; matches: Uint8Array };
 }
 
@@ -610,12 +642,17 @@ export function prepareVectorQuery(
       },
       async executeAsync(executionOptions = {}) {
         if (closed) throw new Error("Prepared vector query is closed");
+        throwIfAborted(executionOptions.signal);
         const canSpillSort = bound.orderBy.length > 0 && !bound.grouped && !bound.sourceOrdered;
         // An unordered grouped plan spills too: the empty ordering makes the pairwise merge a
         // stable concatenation, and partition-wise accumulation bounds peak group state.
         const canSpillHash = bound.grouped && bound.groupBy.length > 0;
         if (executionOptions.spillStore === undefined || (!canSpillSort && !canSpillHash)) {
-          if (executionOptions.loadScanWindow === undefined) return this.execute();
+          if (executionOptions.loadScanWindow === undefined) {
+            const result = this.execute();
+            throwIfAborted(executionOptions.signal);
+            return result;
+          }
           const executionMemory = retainedMemory.createChild();
           try {
             return await executeBoundPlanAsync(bound, executionMemory, executionOptions);
@@ -1110,6 +1147,8 @@ function bindPlan(
     if (dictionaryEquality !== undefined) return { ...bound, dictionaryEquality };
     const dictionaryLike = detectDictionaryLike(bound);
     if (dictionaryLike !== undefined) return { ...bound, dictionaryLike };
+    const dictionaryNumeric = detectDictionaryNumericComparison(bound);
+    if (dictionaryNumeric !== undefined) return { ...bound, dictionaryNumeric };
     const primitive = detectPrimitiveComparison(bound);
     if (primitive !== undefined) return { ...bound, primitive };
     const primitiveIn = detectPrimitiveInList(bound);
@@ -1118,7 +1157,13 @@ function bindPlan(
   const predicates = plan.predicates.map((predicate) => {
     const bound = bindPredicate(predicate);
     if (bound.primitive !== undefined || bound.primitiveIn !== undefined) return bound;
-    if (bound.dictionaryEquality !== undefined || bound.dictionaryLike !== undefined) return bound;
+    if (
+      bound.dictionaryEquality !== undefined ||
+      bound.dictionaryLike !== undefined ||
+      bound.dictionaryNumeric !== undefined
+    ) {
+      return bound;
+    }
     const branches = disjunctiveNormalForm(predicate);
     if (branches === undefined) return bound;
     return {
@@ -1177,10 +1222,12 @@ function bindPlan(
 
   // A wildcard select projects the materialized columns of each source, so ORDER BY resolves
   // against those same names.
-  const orderSources = sources.map((source, index) => ({
-    alias: source.alias,
-    columns: [...(sourceTables[index]?.columns.keys() ?? [])],
-  }));
+  const orderSources = sources.flatMap((source, index) => {
+    const columns = [...(sourceTables[index]?.columns.keys() ?? [])].filter(
+      (name) => !name.startsWith("\0"),
+    );
+    return columns.length === 0 ? [] : [{ alias: source.alias, columns }];
+  });
   const orderBy = plan.orderBy.map(({ expression, direction, nulls }) => ({
     outputName: orderOutputName(expression, plan.select, orderSources),
     direction,
@@ -1855,12 +1902,19 @@ function createDirectLookup(
   };
 }
 
+interface ScanResultSink {
+  readonly size: number;
+  tryAddBatch(batch: BatchRows): boolean;
+  add(batch: BatchRows, row: number): void;
+  finish(): QueryRow[];
+}
+
 function runScanBatch(
   plan: BoundPlan,
   start: number,
   length: number,
   groups: GroupAccumulator,
-  output: ResultSink,
+  output: ScanResultSink,
   memory: QueryMemoryContext,
 ): boolean {
   const batchMemory = memory.createChild();
@@ -1912,17 +1966,20 @@ async function executeBoundPlanAsync(
   memory: QueryMemoryContext,
   options: AsyncQueryExecutionOptions,
 ): Promise<QueryResult> {
+  throwIfAborted(options.signal);
   const metadataCount = executeMetadataCount(plan, memory);
   if (metadataCount !== undefined) return metadataCount;
   const groups = new GroupAccumulator(plan, memory);
   const output = new ResultSink(plan, memory, options.loadScanWindow === undefined);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows;) {
+    throwIfAborted(options.signal);
     let length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
     // The loader answers synchronously when the batch is already resident — the common case,
     // every batch but the first per block — so the scan loop only pays await on real slides.
     const loaded = options.loadScanWindow?.(start, length);
     const residentEnd = typeof loaded === "number" || loaded === undefined ? loaded : await loaded;
+    throwIfAborted(options.signal);
     if (typeof residentEnd === "number" && residentEnd > start) {
       length = Math.min(length, residentEnd - start);
     }
@@ -1944,6 +2001,7 @@ async function executeBoundPlanAsync(
     const ranges = narrowed.ranges ?? [{ begin: narrowed.begin, end: narrowed.end }];
     for (const range of ranges) {
       for (let row = range.begin; row < range.end; row += DEFAULT_BATCH_ROWS) {
+        throwIfAborted(options.signal);
         const rows = Math.min(DEFAULT_BATCH_ROWS, range.end - row);
         if (runScanBatch(plan, row, rows, groups, output, memory)) {
           stopped = true;
@@ -1955,6 +2013,7 @@ async function executeBoundPlanAsync(
     if (stopped) break;
     start = windowEnd;
   }
+  throwIfAborted(options.signal);
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
 }
@@ -1973,24 +2032,47 @@ async function executeBoundPlanBatches(
   const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
   const { limit, offset, ...unbounded } = plan;
   const scanPlan: BoundPlan = unbounded;
+  const consumeFirstColumn = (options as InternalQueryBatchExecutionOptions).consumeFirstColumn;
+  const firstExpression =
+    consumeFirstColumn === undefined ? undefined : scanPlan.select[0]?.expression;
   let skipped = 0;
   let emitted = 0;
   const scanRows = scanPlan.sourceTables[scanPlan.scanSource]?.rowCount ?? 0;
   const step = Math.min(DEFAULT_BATCH_ROWS, options.batchRows);
   for (let start = 0; start < scanRows && (limit === undefined || emitted < limit);) {
-    options.signal?.throwIfAborted();
+    throwIfAborted(options.signal);
     let length = Math.min(step, scanRows - start);
     const loaded = options.loadScanWindow?.(start, length);
     const residentEnd = typeof loaded === "number" || loaded === undefined ? loaded : await loaded;
-    options.signal?.throwIfAborted();
+    throwIfAborted(options.signal);
     if (typeof residentEnd === "number" && residentEnd > start) {
       length = Math.min(length, residentEnd - start);
     }
     const pageMemory = memory.createChild();
     try {
       const groups = new GroupAccumulator(scanPlan, pageMemory);
-      const output = new ResultSink(scanPlan, pageMemory, options.loadScanWindow === undefined);
+      const values: QueryValue[] = [];
+      const output: ScanResultSink =
+        firstExpression === undefined
+          ? new ResultSink(scanPlan, pageMemory, options.loadScanWindow === undefined)
+          : {
+              get size() {
+                return values.length;
+              },
+              tryAddBatch: () => false,
+              add: (batch, row) => {
+                values.push(
+                  asQueryValue(evaluateBatchExpression(scanPlan, firstExpression, batch, row)),
+                );
+              },
+              finish: () => [],
+            };
       runScanBatch(scanPlan, start, length, groups, output, pageMemory);
+      if (firstExpression !== undefined && consumeFirstColumn !== undefined) {
+        if (values.length > 0) await consumeFirstColumn(values);
+        start += length;
+        continue;
+      }
       let rows = output.finish();
       const remainingOffset = Math.max(0, (offset ?? 0) - skipped);
       if (remainingOffset > 0) {
@@ -2031,6 +2113,7 @@ async function executeBoundPlanWithSortSpill(
   memory: QueryMemoryContext,
   options: AsyncQueryExecutionOptions,
 ): Promise<QueryResult> {
+  throwIfAborted(options.signal);
   const store = required(options.spillStore, "Query spill store is missing");
   const pageRows = boundedSpillPageRows(options.spillPageRows);
   const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
@@ -2041,10 +2124,12 @@ async function executeBoundPlanWithSortSpill(
     const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
     const scanBatchRows = Math.min(DEFAULT_BATCH_ROWS, pageRows);
     for (let start = 0; start < scanRows;) {
+      throwIfAborted(options.signal);
       let length = Math.min(scanBatchRows, scanRows - start);
       const loadedSort = options.loadScanWindow?.(start, length);
       const residentEnd =
         typeof loadedSort === "number" || loadedSort === undefined ? loadedSort : await loadedSort;
+      throwIfAborted(options.signal);
       if (typeof residentEnd === "number" && residentEnd > start) {
         length = Math.min(length, residentEnd - start);
       }
@@ -2071,6 +2156,7 @@ async function executeBoundPlanWithSortSpill(
           0,
           memory,
           async (batch) => {
+            throwIfAborted(options.signal);
             const outputMemory = memory.createChild();
             try {
               const rows: QueryRow[] = [];
@@ -2098,12 +2184,14 @@ async function executeBoundPlanWithSortSpill(
                 columns,
                 rows,
                 pageRows,
+                options.signal,
               );
               runs.push({ id: runId, pageCount });
             } finally {
               outputMemory.close();
             }
           },
+          options.signal,
         );
       } finally {
         batchMemory.close();
@@ -2115,8 +2203,10 @@ async function executeBoundPlanWithSortSpill(
       return { columns, columnDomains: unknownColumnDomains(columns), rows: [] };
     let active = runs;
     while (active.length > 1) {
+      throwIfAborted(options.signal);
       const merged: SpillRun[] = [];
       for (let index = 0; index < active.length; index += 2) {
+        throwIfAborted(options.signal);
         const left = required(active[index], "Left spill run is missing");
         const right = active[index + 1];
         if (right === undefined) {
@@ -2135,10 +2225,12 @@ async function executeBoundPlanWithSortSpill(
             plan.orderBy,
             pageRows,
             memory,
+            options.signal,
           ),
         );
         await store.removeRun(ownerId, left.id);
         await store.removeRun(ownerId, right.id);
+        throwIfAborted(options.signal);
       }
       active = merged;
     }
@@ -2147,7 +2239,9 @@ async function executeBoundPlanWithSortSpill(
     const offset = plan.offset ?? 0;
     const limit = plan.limit === undefined ? Number.MAX_SAFE_INTEGER : plan.limit + offset;
     for (let pageIndex = 0; pageIndex < finalRun.pageCount && rows.length < limit; pageIndex += 1) {
+      throwIfAborted(options.signal);
       const bytes = await store.getPage(ownerId, finalRun.id, pageIndex);
+      throwIfAborted(options.signal);
       if (bytes === undefined) throw new Error("Query spill page is missing");
       for (const row of decodeSpillRows(columns, bytes)) {
         if (rows.length === limit) break;
@@ -2166,6 +2260,7 @@ async function executeBoundPlanWithHashSpill(
   memory: QueryMemoryContext,
   options: AsyncQueryExecutionOptions,
 ): Promise<QueryResult> {
+  throwIfAborted(options.signal);
   const store = required(options.spillStore, "Query spill store is missing");
   const pageRows = boundedSpillPageRows(options.spillPageRows);
   const partitionCount = 64;
@@ -2182,10 +2277,12 @@ async function executeBoundPlanWithHashSpill(
     // page size while staying coarse enough to amortize partition-page write transactions.
     const scanChunkRows = Math.min(DEFAULT_BATCH_ROWS, HASH_SPILL_SCAN_CHUNK_ROWS);
     for (let start = 0; start < scanRows;) {
+      throwIfAborted(options.signal);
       let length = Math.min(scanChunkRows, scanRows - start);
       const loadedHash = options.loadScanWindow?.(start, length);
       const residentEnd =
         typeof loadedHash === "number" || loadedHash === undefined ? loadedHash : await loadedHash;
+      throwIfAborted(options.signal);
       if (typeof residentEnd === "number" && residentEnd > start) {
         length = Math.min(length, residentEnd - start);
       }
@@ -2215,6 +2312,7 @@ async function executeBoundPlanWithHashSpill(
           // Each surviving row spills its evaluated group keys and aggregate arguments, so the
           // partition phase never re-reads source vectors and the scan source may be windowed.
           async (batch) => {
+            throwIfAborted(options.signal);
             for (let row = 0; row < batch.length; row += 1) {
               if (
                 !plan.predicates.every((predicate) =>
@@ -2259,6 +2357,7 @@ async function executeBoundPlanWithHashSpill(
               partitionBuffers.set(partition, rows);
             }
           },
+          options.signal,
         );
         const flush: Array<{
           ownerId: string;
@@ -2274,7 +2373,7 @@ async function executeBoundPlanWithHashSpill(
               (flush.length === SPILL_WRITE_BATCH_PAGES ||
                 flushBytes + bytes.byteLength > MAX_TEMP_RUN_BATCH_BYTES)
             ) {
-              await writeSpillPages(store, flush);
+              await writeSpillPages(store, flush, options.signal);
               flush.length = 0;
               flushBytes = 0;
             }
@@ -2289,7 +2388,7 @@ async function executeBoundPlanWithHashSpill(
             partitionPages[partition] = pageIndex + 1;
           }
         }
-        await writeSpillPages(store, flush);
+        await writeSpillPages(store, flush, options.signal);
       } finally {
         batchMemory.close();
       }
@@ -2298,13 +2397,16 @@ async function executeBoundPlanWithHashSpill(
 
     const runs: SpillRun[] = [];
     for (let partition = 0; partition < partitionCount; partition += 1) {
+      throwIfAborted(options.signal);
       const sourcePageCount = partitionPages[partition] ?? 0;
       if (sourcePageCount === 0) continue;
       const partitionMemory = memory.createChild();
       try {
         const groups = new ByteGroupIndex<GroupState>(partitionMemory);
         for (let pageIndex = 0; pageIndex < sourcePageCount; pageIndex += 1) {
+          throwIfAborted(options.signal);
           const bytes = await store.getPage(ownerId, `partition-${String(partition)}`, pageIndex);
+          throwIfAborted(options.signal);
           if (bytes === undefined) throw new Error("Query hash spill page is missing");
           const pageMemory = partitionMemory.createChild();
           try {
@@ -2355,6 +2457,7 @@ async function executeBoundPlanWithHashSpill(
           columns,
           rows,
           pageRows,
+          options.signal,
         );
         runs.push({ id: runId, pageCount });
       } finally {
@@ -2374,6 +2477,7 @@ async function executeBoundPlanWithHashSpill(
       pageRows,
       () => `merge-${String(runSequence++)}`,
       memory,
+      options.signal,
     );
     const spillOffset = plan.offset ?? 0;
     const result = await readFinalSpillRun(
@@ -2382,6 +2486,7 @@ async function executeBoundPlanWithHashSpill(
       finalRun,
       columns,
       plan.limit === undefined ? undefined : plan.limit + spillOffset,
+      options.signal,
     );
     if (spillOffset > 0) result.rows.splice(0, Math.min(spillOffset, result.rows.length));
     return result;
@@ -2399,11 +2504,14 @@ async function mergeAllSpillRuns(
   pageRows: number,
   nextRunId: () => string,
   memory: QueryMemoryContext,
+  signal?: AbortSignal,
 ): Promise<SpillRun> {
   let active = [...runs];
   while (active.length > 1) {
+    throwIfAborted(signal);
     const merged: SpillRun[] = [];
     for (let index = 0; index < active.length; index += 2) {
+      throwIfAborted(signal);
       const left = required(active[index], "Left spill run is missing");
       const right = active[index + 1];
       if (right === undefined) {
@@ -2422,10 +2530,12 @@ async function mergeAllSpillRuns(
           orderBy,
           pageRows,
           memory,
+          signal,
         ),
       );
       await store.removeRun(ownerId, left.id);
       await store.removeRun(ownerId, right.id);
+      throwIfAborted(signal);
     }
     active = merged;
   }
@@ -2438,11 +2548,14 @@ async function readFinalSpillRun(
   run: SpillRun,
   columns: readonly string[],
   requestedLimit?: number,
+  signal?: AbortSignal,
 ): Promise<QueryResult> {
   const rows: QueryRow[] = [];
   const limit = requestedLimit ?? Number.MAX_SAFE_INTEGER;
   for (let pageIndex = 0; pageIndex < run.pageCount && rows.length < limit; pageIndex += 1) {
+    throwIfAborted(signal);
     const bytes = await store.getPage(ownerId, run.id, pageIndex);
+    throwIfAborted(signal);
     if (bytes === undefined) {
       throw new Error(`Query spill page is missing: ${run.id}/${String(pageIndex)}`);
     }
@@ -2494,15 +2607,18 @@ async function spillJoinedBatches(
   joinIndex: number,
   memory: QueryMemoryContext,
   consume: (batch: BatchRows) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  throwIfAborted(signal);
   const join = plan.joins[joinIndex];
   if (join === undefined) {
     await consume(batch);
     return;
   }
   for (const joined of joinBatches(plan, batch, join, memory)) {
+    throwIfAborted(signal);
     try {
-      await spillJoinedBatches(plan, joined, joinIndex + 1, memory, consume);
+      await spillJoinedBatches(plan, joined, joinIndex + 1, memory, consume, signal);
     } finally {
       joined.memory?.close();
     }
@@ -2544,10 +2660,11 @@ async function mergeSpillRuns(
   orderBy: BoundPlan["orderBy"],
   pageRows: number,
   memory: QueryMemoryContext,
+  signal?: AbortSignal,
 ): Promise<SpillRun> {
   const mergeMemory = memory.createChild();
-  const leftReader = createSpillRunReader(store, ownerId, left, columns, mergeMemory);
-  const rightReader = createSpillRunReader(store, ownerId, right, columns, mergeMemory);
+  const leftReader = createSpillRunReader(store, ownerId, left, columns, mergeMemory, signal);
+  const rightReader = createSpillRunReader(store, ownerId, right, columns, mergeMemory, signal);
   let outputPage: QueryRow[] = [];
   let outputMemory = mergeMemory.createChild();
   let pageIndex = 0;
@@ -2561,15 +2678,18 @@ async function mergeSpillRuns(
       columns,
       outputPage,
       pageRows,
+      signal,
     );
     outputPage = [];
     outputMemory.close();
     outputMemory = mergeMemory.createChild();
   };
   try {
+    throwIfAborted(signal);
     let leftRow = await leftReader.next();
     let rightRow = await rightReader.next();
     while (leftRow !== undefined || rightRow !== undefined) {
+      throwIfAborted(signal);
       if (
         rightRow === undefined ||
         (leftRow !== undefined && compareOrderedRows(leftRow, rightRow, orderBy) <= 0)
@@ -2601,6 +2721,7 @@ function createSpillRunReader(
   run: SpillRun,
   columns: readonly string[],
   memory: QueryMemoryContext,
+  signal?: AbortSignal,
 ): { next(): Promise<QueryRow | undefined>; close(): void } {
   let pageIndex = 0;
   let rows: QueryRow[] = [];
@@ -2608,9 +2729,11 @@ function createSpillRunReader(
   let pageReservation: QueryMemoryReservation | undefined;
   return {
     async next() {
+      throwIfAborted(signal);
       while (rowIndex >= rows.length) {
         if (pageIndex >= run.pageCount) return undefined;
         const bytes = await store.getPage(ownerId, run.id, pageIndex);
+        throwIfAborted(signal);
         if (bytes === undefined) throw new Error("Query spill page is missing");
         pageReservation?.release();
         pageReservation = memory.reserve(spillRowsModeledBytes(bytes), "Spill input page");
@@ -3192,6 +3315,45 @@ function filterDictionaryLike(
   return kept;
 }
 
+/** Compacts the selection using a match table computed once per exact-NUMERIC dictionary. */
+function filterDictionaryNumeric(
+  fast: DictionaryNumericComparison,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number | undefined {
+  const vector = fast.expression.vector;
+  if (fast.cache.dictionary !== vector.dictionary) {
+    const matches = dictionaryNumericMatches(fast, vector.dictionary);
+    if (matches === undefined) return undefined;
+    fast.cache.dictionary = vector.dictionary;
+    fast.cache.matches = matches;
+  }
+  const matches = fast.cache.matches;
+  const rows = batch.rowsBySource[fast.expression.source];
+  const codes = vector.codes;
+  const validity = vector.validity;
+  const windowStart = vector.window?.start ?? 0;
+  const slots = codes.length;
+  const vectorLength = vector.length;
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = selection[index] ?? 0;
+    const sourceRow = rows?.[row] ?? -1;
+    if (sourceRow < 0 || sourceRow >= vectorLength) continue;
+    const slot = sourceRow - windowStart;
+    if (slot < 0 || slot >= slots) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+    if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
+    const code = codes[slot] ?? NULL_STRING_CODE;
+    if (code === NULL_STRING_CODE || matches[code] !== 1) continue;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
 // The per-batch selection scratch: batches are bounded by DEFAULT_BATCH_ROWS, spills may use
 // larger pages, so the scratch grows to the largest batch seen and is trivially small.
 let selectionScratch = new Uint32Array(DEFAULT_BATCH_ROWS);
@@ -3218,6 +3380,9 @@ function applyPredicateKernel(
   }
   if (predicate.dictionaryLike !== undefined) {
     return filterDictionaryLike(predicate.dictionaryLike, batch, selection, survivors);
+  }
+  if (predicate.dictionaryNumeric !== undefined) {
+    return filterDictionaryNumeric(predicate.dictionaryNumeric, batch, selection, survivors);
   }
   if (predicate.disjunction !== undefined) {
     return filterDisjunction(plan, predicate.disjunction, batch, selection, survivors);
@@ -3407,7 +3572,7 @@ function consumeJoinedBatches(
   batch: BatchRows,
   joinIndex: number,
   groups: GroupAccumulator,
-  output: ResultSink,
+  output: ScanResultSink,
   memory: QueryMemoryContext,
   prefiltered = false,
 ): boolean {
@@ -4539,7 +4704,7 @@ function consumeBatch(
   plan: BoundPlan,
   batch: BatchRows,
   groups: GroupAccumulator,
-  output: ResultSink,
+  output: ScanResultSink,
   memory: QueryMemoryContext,
   prefiltered = false,
 ): void {
@@ -5062,7 +5227,10 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
     }
     return result;
   }
-  const multiple = plan.sourceTables.length > 1;
+  const multiple =
+    plan.sourceTables.filter((table) =>
+      [...table.columns.keys()].some((name) => !name.startsWith("\0")),
+    ).length > 1;
   for (let source = 0; source < plan.sourceTables.length; source += 1) {
     const table = required(plan.sourceTables[source], "Wildcard source table is missing");
     const rowIndex = batch.rowsBySource[source]?.[row] ?? -1;
@@ -5079,7 +5247,10 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
 }
 
 function wildcardColumnNames(plan: BoundPlan): string[] {
-  const multiple = plan.sourceTables.length > 1;
+  const multiple =
+    plan.sourceTables.filter((table) =>
+      [...table.columns.keys()].some((name) => !name.startsWith("\0")),
+    ).length > 1;
   return plan.sourceTables.flatMap((table, source) =>
     [...table.columns.keys()]
       .filter((name) => !name.startsWith("\0"))
@@ -5301,6 +5472,147 @@ function dictionaryLikeMatches(
   return matches;
 }
 
+const exactNumericDictionaryCache = new WeakMap<readonly string[], boolean>();
+const dictionaryNumericCache = new WeakMap<readonly string[], Map<string, Uint8Array>>();
+
+function isExactNumericDictionary(dictionary: readonly string[]): boolean {
+  const cached = exactNumericDictionaryCache.get(dictionary);
+  if (cached !== undefined) return cached;
+  const exact = dictionary.every((value) => isExactNumeric(value));
+  exactNumericDictionaryCache.set(dictionary, exact);
+  return exact;
+}
+
+function dictionaryNumericMatches(
+  comparison: DictionaryNumericComparison,
+  dictionary: readonly string[],
+): Uint8Array | undefined {
+  // An ordinary TEXT dictionary must retain the generic evaluator, including its error and
+  // coercion behavior. Physical NUMERIC dictionaries contain only validated internal tags.
+  if (!isExactNumericDictionary(dictionary)) return undefined;
+  let comparisons = dictionaryNumericCache.get(dictionary);
+  if (comparisons === undefined) {
+    comparisons = new Map();
+    dictionaryNumericCache.set(dictionary, comparisons);
+  }
+  let matches = comparisons.get(comparison.signature);
+  if (matches === undefined) {
+    matches = new Uint8Array(dictionary.length);
+    for (let code = 0; code < dictionary.length; code += 1) {
+      matches[code] = comparisonValue(
+        comparison.operator,
+        comparison.expression.evaluate(dictionary[code] ?? ""),
+        comparison.target,
+      )
+        ? 1
+        : 0;
+    }
+    // The dictionary owns this cache weakly. Bound the number of query shapes retained by one
+    // high-cardinality NUMERIC column, matching the dictionary LIKE cache above.
+    if (comparisons.size >= 32) comparisons.clear();
+    comparisons.set(comparison.signature, matches);
+  }
+  return matches;
+}
+
+function constantBoundExpressionValue(
+  expression: BoundExpression,
+): { readonly value: unknown } | undefined {
+  if (expression.kind === "literal") return { value: expression.value };
+  if (expression.kind === "binary") {
+    const left = constantBoundExpressionValue(expression.left);
+    const right = constantBoundExpressionValue(expression.right);
+    if (left === undefined || right === undefined) return undefined;
+    try {
+      return { value: binaryValue(expression.operator, left.value, right.value) };
+    } catch {
+      return undefined;
+    }
+  }
+  // CAST is the only scalar wrapper needed by exact-NUMERIC arithmetic. Keeping the constant
+  // folder deliberately narrow avoids changing error timing for general scalar expressions.
+  if (expression.kind !== "call" || expression.name !== "CAST") return undefined;
+  const values: unknown[] = [];
+  for (const argument of expression.arguments) {
+    const constant = constantBoundExpressionValue(argument);
+    if (constant === undefined) return undefined;
+    values.push(constant.value);
+  }
+  try {
+    return { value: scalarFunctionValue(expression.name, values) };
+  } catch {
+    return undefined;
+  }
+}
+
+function numericComparisonConstant(expression: BoundExpression): number | string | undefined {
+  const constant = constantBoundExpressionValue(expression)?.value;
+  if (typeof constant === "number" && Number.isFinite(constant)) return constant;
+  return isExactNumeric(constant) ? constant : undefined;
+}
+
+function dictionaryNumericExpression(
+  expression: BoundExpression,
+): DictionaryNumericExpression | undefined {
+  if (expression.kind === "column" && expression.vector.kind === "string") {
+    return {
+      source: expression.source,
+      vector: expression.vector,
+      signature: expression.signature,
+      evaluate: (value) => value,
+    };
+  }
+  if (expression.kind !== "binary") return undefined;
+  const sides = [
+    { column: expression.left, constant: expression.right, columnFirst: true },
+    { column: expression.right, constant: expression.left, columnFirst: false },
+  ];
+  for (const { column, constant, columnFirst } of sides) {
+    if (column.kind !== "column" || column.vector.kind !== "string") continue;
+    const value = numericComparisonConstant(constant);
+    if (value === undefined) continue;
+    return {
+      source: column.source,
+      vector: column.vector,
+      signature: expression.signature,
+      evaluate: columnFirst
+        ? (dictionaryValue) => binaryValue(expression.operator, dictionaryValue, value)
+        : (dictionaryValue) => binaryValue(expression.operator, value, dictionaryValue),
+    };
+  }
+  return undefined;
+}
+
+/** Detects exact-NUMERIC dictionary arithmetic compared with a constant. */
+function detectDictionaryNumericComparison(
+  predicate: BoundPredicate,
+): DictionaryNumericComparison | undefined {
+  if (!primitiveOperators.has(predicate.operator)) return undefined;
+  const comparison = predicate.operator as ComparisonOperator;
+  const sides = [
+    { expression: predicate.left, target: predicate.right, operator: comparison },
+    {
+      expression: predicate.right,
+      target: predicate.left,
+      operator: reverseComparisonOperator(comparison),
+    },
+  ];
+  for (const { expression, target, operator } of sides) {
+    const numeric = dictionaryNumericExpression(expression);
+    if (numeric === undefined) continue;
+    const value = numericComparisonConstant(target);
+    if (value === undefined) continue;
+    return {
+      expression: numeric,
+      operator,
+      target: value,
+      signature: `${numeric.signature}\u0001${operator}\u0001${target.signature}`,
+      cache: { dictionary: undefined, matches: new Uint8Array(0) },
+    };
+  }
+  return undefined;
+}
+
 function stringCodeAt(vector: StringVector, rowIndex: number): number | undefined {
   if (rowIndex < 0 || rowIndex >= vector.length) return undefined;
   const window = vector.window;
@@ -5509,6 +5821,24 @@ function evaluateBatchPredicate(
     }
     const matched = like.cache.matches[code] === 1;
     return like.negated ? !matched : matched;
+  }
+  const dictionaryNumeric = predicate.dictionaryNumeric;
+  if (dictionaryNumeric !== undefined) {
+    const vector = dictionaryNumeric.expression.vector;
+    if (dictionaryNumeric.cache.dictionary !== vector.dictionary) {
+      const matches = dictionaryNumericMatches(dictionaryNumeric, vector.dictionary);
+      if (matches !== undefined) {
+        dictionaryNumeric.cache.dictionary = vector.dictionary;
+        dictionaryNumeric.cache.matches = matches;
+      }
+    }
+    if (dictionaryNumeric.cache.dictionary === vector.dictionary) {
+      const code = stringCodeAt(
+        vector,
+        batch.rowsBySource[dictionaryNumeric.expression.source]?.[row] ?? -1,
+      );
+      return code !== undefined && dictionaryNumeric.cache.matches[code] === 1;
+    }
   }
   if (
     predicate.operator === "IS TRUE" ||

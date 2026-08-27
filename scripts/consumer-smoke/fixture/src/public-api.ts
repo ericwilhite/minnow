@@ -28,9 +28,9 @@ import type * as Devtools from "@minnowdb/devtools";
 import type * as Export from "@minnowdb/export";
 import type * as Kysely from "@minnowdb/kysely";
 import type * as ReactAdapter from "@minnowdb/react";
-import postgresFeatureProfile from "@minnowdb/core/postgres-feature-profile.json";
-import corePackage from "@minnowdb/core/package.json";
-import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json";
+import postgresFeatureProfile from "@minnowdb/core/postgres-feature-profile.json" with { type: "json" };
+import corePackage from "@minnowdb/core/package.json" with { type: "json" };
+import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
 
 export type InstalledPublicApis = readonly [
   typeof Core,

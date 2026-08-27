@@ -45,6 +45,13 @@ A change is breaking when it is one of these:
 From 1.0 onwards these move the major version — every package's, together — and minor releases
 stay additive.
 
+Every published subpath participates in that rule, including low-level extension, testing, worker,
+and JSON metadata entry points. `scripts/api-contract.policy.json` assigns each one an audience;
+the label explains its intended caller and does not weaken its compatibility guarantee.
+`npm run api:check` fails on an unclassified subpath, a declaration change, or a change from
+type-only to runtime reachability. See the [v1 support policy](/docs/reference/support) for the full
+contract and release-candidate checklist.
+
 ## Release notes
 
 The [changelog](/docs/changelog) is the release-by-release record. Each entry names the exact
@@ -97,8 +104,10 @@ snapshot before upgrading.
 Every released block/snapshot pair keeps a frozen database in
 `packages/core/format-fixtures/`, opened and queried on every test run. Native OPFS layouts keep a
 separate frozen file tree in the same directory. The native test enumerates every layout fixture,
-requires one for the current writer, and reopens and continues writing each supported older tree. A
-change that would make either kind unreadable fails in CI rather than in an application. See
+requires one for the current writer, and reopens and continues writing each supported older tree.
+Every fixture records the exact `@minnowdb/core` package version that wrote it, so the suite proves
+which released writer the compatibility case represents and rejects impossible future provenance.
+A change that would make either kind unreadable fails in CI rather than in an application. See
 [Testing](/docs/reference/testing) for how that suite works.
 
 ## How a release is cut

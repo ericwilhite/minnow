@@ -47,8 +47,9 @@ const { rows } = await client.query("SELECT name, score FROM people ORDER BY sco
 - Storage access, decoding, planning, and execution all run in the worker; the main thread holds
   only the proxy.
 - The raw layer is there too: `client.query(sql)`, `client.insertBatch(...)`,
-  `client.createTable(...)` — the everyday database API. Direct view helpers and manual full-text
-  index building stay on `MinnowDatabase`; migrations manage views and indexes build themselves.
+  `client.createTable(...)`, `client.createView(...)`, `client.createIndex(...)`, and
+  `client.buildFtsIndex(...)` — the everyday database API, including the direct catalog and index
+  helpers.
 
 ## Why you construct the Worker
 
@@ -82,6 +83,12 @@ starts and stops) and satisfies `worker-src` content-security policies from your
 - **Cursors transfer one page per pull.** `client.queryCursor()` keeps scan work in the worker,
   applies backpressure across the RPC handle, and reconstructs only the current columnar page on
   the main thread. See [Cursors and exports](/docs/extensions/exports).
+- **Query controls stay local.** `signal` and `onStats` are functions/objects that cannot be
+  structured-cloned, so the client removes them from the options frame. Abort becomes a small
+  cancellation frame; stats return as an ordered event before the result. Ordinary queries,
+  cursor queries, and reads inside `client.write()` support the same controls as the direct
+  engine. Cancellation requires protocol version 3; deploy the client and worker from the same
+  package build so a cached older worker cannot outlive its client.
 - **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and
   256 stateful handle lifecycles, including handles still opening or durably settling. Await
   requests and close cursors, snapshots, buffered writers, and live-query handles when they are
@@ -92,6 +99,25 @@ starts and stops) and satisfies `worker-src` content-security policies from your
   expires. A later call on an expired handle fails instead of publishing its staged data.
 - **Functions can't cross.** Construction options like `now`, `createId`, or a custom store need
   a custom entry (below).
+
+Cancel a read with the same `QueryOptions.signal` on either side of the boundary:
+
+```ts
+const controller = new AbortController();
+
+const pending = client.query("SELECT * FROM events ORDER BY created_at", {
+  signal: controller.signal,
+  onStats: ({ peakMemoryBytes }) => console.log({ peakMemoryBytes }),
+});
+
+controller.abort();
+await pending; // rejects with an AbortError
+```
+
+Cancellation is checked between bounded execution and storage batches. It returns no partial
+result, releases the reader lease, and removes the query's temporary spill owner before rejecting.
+It cannot preempt JavaScript in the middle of one synchronous batch; keep the engine in a worker
+when a large batch must not share the UI thread.
 
 Client adapters can wrap the same worker client because it implements `MinnowSqlDriver`. The
 [Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker

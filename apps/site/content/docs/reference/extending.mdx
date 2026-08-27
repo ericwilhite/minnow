@@ -187,15 +187,14 @@ language cannot leave either list quietly out of date.
 
 Generators should account for these narrower supported forms:
 
-| Boundary                                  | Rule                                                                   |
-| ----------------------------------------- | ---------------------------------------------------------------------- |
-| keyless `UPDATE` / `DELETE`               | rows need scalar or composite identity                                 |
-| correlated scalar/`IN` range predicates   | equality correlation only; range correlation is available for `EXISTS` |
-| correlated `EXISTS` below `OR`            | keep correlation as a top-level conjunct                               |
-| correlated `LATERAL` grouping/order/limit | use the supported equality-correlated projection/join shape            |
-| correlated `JSON_TABLE` documents         | only constant documents with `$` and `$[*]` row paths                  |
-| enum/sequence evolution                   | no `ALTER TYPE`, sequence options, or `ALTER SEQUENCE`                 |
-| server/session commands                   | no schemas, `GRANT`, or configurable isolation levels                  |
+| Boundary                                  | Rule                                                    |
+| ----------------------------------------- | ------------------------------------------------------- |
+| keyless `UPDATE` / `DELETE`               | rows need scalar or composite identity                  |
+| nested correlated `ANY` / `ALL`           | keep the quantified comparison as a top-level predicate |
+| correlated `LATERAL` grouping/order/limit | use the supported correlated projection/join shape      |
+| correlated `JSON_TABLE` documents         | only constant documents with `$` and `$[*]` row paths   |
+| enum/sequence evolution                   | no `ALTER TYPE`, sequence options, or `ALTER SEQUENCE`  |
+| server/session commands                   | no schemas, `GRANT`, or configurable isolation levels   |
 
 Each rejected form raises an explicit error. Supported entries with a scoped boundary carry that
 boundary in their matrix note.

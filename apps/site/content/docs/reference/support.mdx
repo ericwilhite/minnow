@@ -1,0 +1,108 @@
+---
+title: v1 support policy
+description: The API, browser, storage, performance, and release guarantees Minnow 1.x makes.
+---
+
+Minnow 1.0 turns the existing correctness work into a public contract. This page defines that
+contract and the release-candidate checklist. It does not turn every possible workload or browser
+environment into a promise.
+
+## Public API contract
+
+Every subpath in a published package's `exports` map is stable for the 1.x line. Removing an
+export, narrowing an accepted input, changing a documented default, or changing whether a name is
+available as a runtime value requires 2.0. Additive exports and backward-compatible overloads can
+ship in a minor release.
+
+The machine-readable `scripts/api-contract.policy.json` assigns every subpath one audience:
+
+| Audience        | Intended use                                                          |
+| --------------- | --------------------------------------------------------------------- |
+| **Application** | Normal application imports and optional adapters.                     |
+| **Extension**   | Stable building blocks for storage, query, plan, and worker adapters. |
+| **Testing**     | Stable conformance, fault-injection, simulation, and fixture tools.   |
+| **Runtime**     | Side-effect-only worker entry points.                                 |
+| **Metadata**    | JSON feature profiles and package metadata.                           |
+
+Audience is not a stability ladder. Extension and testing entry points receive the same 1.x
+compatibility guarantee as application entry points. A surface that cannot carry that guarantee
+must remain unexported until it can.
+
+`npm run api:check` compares every typed entry point with the reviewed declaration snapshot,
+including type-only versus runtime reachability. It also fails when a package adds an unclassified
+subpath or the policy names one that no longer exists. Run `npm run api:report` to review the
+current surface. `npm run api:update` is a compatibility decision, not an automatic fix for a
+failing check.
+
+## Browser support
+
+Minnow supports the current stable Chrome, Edge, Firefox, and Safari releases at the time a Minnow
+version is published. The engine requires `CompressionStream` and `DecompressionStream`.
+IndexedDB is the general durable adapter. OPFS additionally requires a dedicated worker and
+synchronous access handles; Safari 16.4 or newer provides those handles, but Safari private
+browsing does not provide OPFS. Applications that need that environment must use IndexedDB or
+memory instead.
+
+The release gate runs the library and public site in the Chromium, Firefox, and WebKit versions
+pinned by the workspace's Playwright lockfile. Before a stable release, the same release candidate
+is also exercised in current stable desktop Safari and iOS Safari. Playwright WebKit is useful
+cross-browser coverage, but it is not presented as a substitute for that Safari check.
+
+Embedded webviews, browser extensions with restricted storage, private modes other than the named
+Safari limitation, and browsers older than the current stable line are best-effort. Feature
+detection must fail clearly; it must not silently select a less durable store.
+
+## Stored-data compatibility
+
+Package versions and stored formats move independently. A 1.x reader keeps every format that a
+released 1.x writer could create, or ships an explicit conversion that preserves acknowledged
+data. Unknown future native formats are rejected without mutation.
+
+Frozen block/snapshot, IndexedDB, and OPFS fixtures carry the exact Minnow package version that
+wrote them. Current tests open every released fixture, check its expected answers, continue
+writing, close, and reopen it. A fixture that claims a future writer version fails the suite. The
+format version cannot advance until its old-writer fixture is committed.
+
+See [Versioning](/docs/reference/versioning) for the byte contracts and
+[Testing](/docs/reference/testing#format-compatibility) for the fixture workflow.
+
+## Performance envelope
+
+1.0 does not promise a universal row limit or latency number: browser hardware, quota, engine,
+storage adapter, query shape, and competing tabs matter too much for one number to be honest.
+Instead, releases promise bounded execution where an API documents a memory, batch, cursor,
+subscription, or compilation limit, and regression coverage for the workloads Minnow publishes.
+
+The checked performance envelope includes:
+
+- a seeded 200,000-row Node gate for reads, mutations, exact numerics, the Kysely path, and settled
+  performance after repeated writes;
+- browser OLTP point/range reads and 1–100 row writes;
+- browser OLAP scans, joins, windows, aggregates, and 10,000–100,000 row writes;
+- IndexedDB, OPFS, direct-engine, worker-client, and live-query paths; and
+- memory soaks covering queries, writes with maintenance, live-query churn, and repeated
+  snapshot import/export.
+
+The Node gate is a regression alarm against a reviewed baseline, not a published comparison with
+other engines. The [benchmarks page](/benchmarks) runs verified workloads on the visitor's own
+browser and keeps each operation visible instead of reducing them to a marketing score.
+
+## 1.0 release-candidate checklist
+
+A commit is a 1.0 release candidate only when all of these are true:
+
+- the [SQL feature matrix](/docs/sql/feature-matrix), API reference, installation requirements,
+  agent rules, changelog, and package summaries describe the same behavior;
+- every package export has a reviewed audience and declaration snapshot, with no unexplained API
+  diff;
+- every stored format has an old-writer fixture with package-version provenance, and all reopen,
+  recovery, quota, fault, and interrupted-import tests pass;
+- `npm run check:release` passes from a clean install, including the full supported SQLLogicTest
+  corpus, long simulator, packed-consumer, performance, and browser gates;
+- the current stable desktop and iOS Safari checks pass for IndexedDB, workers, snapshots, and the
+  supported OPFS path; and
+- the security reporting path is live and the release notes name migration and stored-format
+  impact, even when both are "none."
+
+See [Testing and benchmarks](/docs/reference/testing) for the individual commands and what each
+one proves.

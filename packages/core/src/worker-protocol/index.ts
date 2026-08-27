@@ -1,4 +1,4 @@
-export const protocolVersion = 2 as const;
+export const protocolVersion = 3 as const;
 /** Outstanding request/response pairs retained by either side of one database RPC connection. */
 export const MAX_DATABASE_RPC_IN_FLIGHT = 256;
 
@@ -93,6 +93,12 @@ export type RpcRequest =
       handleId: string | null;
       method: string;
       args: unknown[];
+    }
+  | {
+      version: typeof protocolVersion;
+      /** The request whose work should stop. Cancellation has no response frame of its own. */
+      requestId: string;
+      kind: "rpc-cancel";
     };
 
 export type RpcResponse =
@@ -167,7 +173,13 @@ export function rpcEvent(handleId: string, event: string, payload: unknown): Rpc
 export function parseRpcRequest(value: unknown): RpcRequest | null {
   if (typeof value !== "object" || value === null) return null;
   const candidate = value as Partial<RpcRequest> & { kind?: unknown };
-  if (candidate.kind !== "rpc-init" && candidate.kind !== "rpc-call") return null;
+  if (
+    candidate.kind !== "rpc-init" &&
+    candidate.kind !== "rpc-call" &&
+    candidate.kind !== "rpc-cancel"
+  ) {
+    return null;
+  }
   if (candidate.version !== protocolVersion) throw new Error("Unsupported protocol version");
   if (typeof candidate.requestId !== "string" || candidate.requestId.length === 0) {
     throw new TypeError("Request ID must be a non-empty string");

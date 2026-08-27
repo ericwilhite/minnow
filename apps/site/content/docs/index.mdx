@@ -49,8 +49,8 @@ const { rows } = await db.query(`
   one stable version, even while another tab commits.
 - **No server or Wasm setup.** Minnow is plain JavaScript. There is no database process, Wasm
   module, compile delay, `SharedArrayBuffer`, or special response header to configure.
-- **Works off the UI thread.** The worker client exposes the same query, write, migration,
-  snapshot, and maintenance calls as the direct engine.
+- **Works off the UI thread.** The worker client exposes the same query, write, catalog, index,
+  migration, snapshot, and maintenance calls as the direct engine.
 - **Handles larger working sets.** Queries run in batches. Sorts and grouped results can spill to
   storage when they exceed the configured execution budget; pull-driven cursors transfer one
   bounded page at a time.

@@ -13,6 +13,7 @@ import {
   executeQuery,
   executeRowQuery,
 } from "./query.js";
+import { exactNumericValue } from "./sql-domains.js";
 import { createColumnarTable, type QuerySpillStore } from "./vector.js";
 
 class TestSpillStore implements QuerySpillStore {
@@ -21,6 +22,7 @@ class TestSpillStore implements QuerySpillStore {
   maxBatchPages = 0;
   maxBatchBytes = 0;
   maxPageBytes = 0;
+  removedOwners = 0;
 
   async putPage(ownerId: string, runId: string, pageIndex: number, bytes: Uint8Array) {
     this.putCount += 1;
@@ -56,6 +58,7 @@ class TestSpillStore implements QuerySpillStore {
   }
 
   async removeOwner(ownerId: string) {
+    this.removedOwners += 1;
     const prefix = `${ownerId}/`;
     for (const key of this.pages.keys()) if (key.startsWith(prefix)) this.pages.delete(key);
   }
@@ -140,6 +143,37 @@ describe("vector query execution", () => {
     expect(spill.maxBatchPages).toBeLessThanOrEqual(MAX_TEMP_RUN_PAGES_PER_BATCH);
     expect(spill.maxBatchBytes).toBeLessThanOrEqual(MAX_TEMP_RUN_BATCH_BYTES);
     expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(150_000);
+    prepared.close();
+  });
+
+  it("cancels between spill batches and removes the temporary owner", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
+      id: index,
+      bucket: index % 11,
+    }));
+    const prepared = createPreparedQuery(
+      compileQuery("SELECT id, bucket FROM rows ORDER BY bucket, id DESC"),
+      new Map([["rows", rows]]),
+      { executionMemoryBudgetBytes: 150_000 },
+    );
+    const controller = new AbortController();
+    class CancellingSpillStore extends TestSpillStore {
+      override async putPages(pages: Parameters<TestSpillStore["putPages"]>[0]): Promise<void> {
+        await super.putPages(pages);
+        controller.abort(new Error("cancel spill"));
+      }
+    }
+    const spill = new CancellingSpillStore();
+    await expect(
+      prepared.executeAsync({
+        spillStore: spill,
+        spillPageRows: 64,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow("cancel spill");
+    expect(spill.putCount).toBeGreaterThan(0);
+    expect(spill.removedOwners).toBe(1);
+    expect(spill.pages.size).toBe(0);
     prepared.close();
   });
 
@@ -571,6 +605,61 @@ describe("vector query execution", () => {
       validity: Uint8Array.of(0b0000_0101),
       values: Float64Array.of(firstDate.getTime(), 0, secondDate.getTime()),
     });
+  });
+
+  it("evaluates exact-NUMERIC arithmetic predicates once per dictionary value", () => {
+    const rows: DatabaseRow[] = [
+      { id: 1, amount: null },
+      { id: 2, amount: exactNumericValue("1.25") },
+      { id: 3, amount: exactNumericValue("2.25") },
+      { id: 4, amount: exactNumericValue("4.25") },
+      { id: 5, amount: exactNumericValue("4.250000") },
+      { id: 6, amount: exactNumericValue("4.26") },
+    ];
+    const table = createColumnarTable(
+      "exact_rows",
+      new Map([
+        ["id", { type: "number" as const, values: rows.map(({ id }) => id ?? null) }],
+        ["amount", { type: "string" as const, values: rows.map(({ amount }) => amount ?? null) }],
+      ]),
+    );
+    for (const [sql, ids] of [
+      [
+        "SELECT id FROM exact_rows WHERE amount + CAST(0.5 AS NUMERIC) BETWEEN 2.75 AND 4.75 ORDER BY id",
+        [3, 4, 5],
+      ],
+      ["SELECT id FROM exact_rows WHERE amount + CAST(0.5 AS NUMERIC) > 4.75 ORDER BY id", [6]],
+      [
+        "SELECT id FROM exact_rows WHERE 4.75 >= amount + CAST(0.5 AS NUMERIC) AND 2.75 <= amount + CAST(0.5 AS NUMERIC) ORDER BY id",
+        [3, 4, 5],
+      ],
+    ] as const) {
+      const plan = compileQuery(sql);
+      const expected = {
+        columns: ["id"],
+        columnDomains: [null],
+        rows: ids.map((id) => ({ id })),
+      };
+      const prepared = createPreparedColumnarQuery(plan, new Map([["exact_rows", table]]));
+      expect(prepared.execute()).toEqual(expected);
+      // A second execution uses the bound predicate table without changing the result.
+      expect(prepared.execute()).toEqual(expected);
+      prepared.close();
+    }
+  });
+
+  it("keeps ordinary TEXT-to-NUMERIC errors on the generic predicate path", () => {
+    const plan = compileQuery("SELECT id FROM text_rows WHERE value > CAST(2 AS NUMERIC)");
+    const table = createColumnarTable(
+      "text_rows",
+      new Map([
+        ["id", { type: "number" as const, values: [1] }],
+        ["value", { type: "string" as const, values: ["not numeric"] }],
+      ]),
+    );
+    const prepared = createPreparedColumnarQuery(plan, new Map([["text_rows", table]]));
+    expect(() => prepared.execute()).toThrow("Invalid NUMERIC value");
+    prepared.close();
   });
 
   it("rejects malformed and logically mistyped columnar inputs", () => {

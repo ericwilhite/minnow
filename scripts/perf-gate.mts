@@ -659,20 +659,20 @@ const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
   // Wait for the background loops to finish: no active job, the table folded, and the store's
   // footprint no longer moving. A history that does not settle is a failure of the gate, not a
   // slow sample: maintenance has to keep up with a thousand updates.
-  const footprint = async (): Promise<string> => {
+  const footprint = async (visibleSegments: number): Promise<string> => {
     const stats = await settledStore.getStorageStats();
     return JSON.stringify([
-      (await allVisibleSegments(settled, "data_settled")).length,
+      visibleSegments,
       stats.liveBlockCount + stats.obsoleteBlockCount,
       stats.manifestCount,
     ]);
   };
-  let previous = await footprint();
+  let previous: string | undefined;
   let quiet = 0;
   const deadline = performance.now() + 60_000;
   while (quiet < 10) {
     if (performance.now() > deadline) {
-      throw new Error(`data_settled did not settle within a minute: ${previous}`);
+      throw new Error(`data_settled did not settle within a minute: ${previous ?? "active"}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
     const activeCompaction = (await settled.listCompactionJobs()).some(
@@ -681,9 +681,17 @@ const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
     const activeCollection = (await settled.listGarbageCollectionJobs()).some(
       (job) => job.state === "planned" || job.state === "running",
     );
-    const due = (await allVisibleSegments(settled, "data_settled")).length >= 32;
-    const current = await footprint();
-    quiet = !activeCompaction && !activeCollection && !due && current === previous ? quiet + 1 : 0;
+    if (activeCompaction || activeCollection) {
+      quiet = 0;
+      continue;
+    }
+    const visibleSegments = (await allVisibleSegments(settled, "data_settled")).length;
+    if (visibleSegments >= 32) {
+      quiet = 0;
+      continue;
+    }
+    const current = await footprint(visibleSegments);
+    quiet = current === previous ? quiet + 1 : 0;
     previous = current;
   }
   settleMs.minnow = performance.now() - started;

@@ -68,6 +68,36 @@ async function streamText(stream: ReadableStream<Uint8Array>): Promise<string> {
   return new Response(stream).text();
 }
 
+async function verifyWorkerApiParity(client: MinnowDatabaseClient): Promise<void> {
+  await client.createTable({
+    name: "worker_api_parity",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "body", type: "string" },
+      { name: "obsolete", type: "string", nullable: true },
+    ],
+  });
+  await client.insert("worker_api_parity", {
+    id: 1,
+    body: "worker API parity",
+    obsolete: null,
+  });
+  await client.createView("worker_api_parity_view", "SELECT id, body FROM worker_api_parity");
+  await client.createIndex("worker_api_parity_body", "worker_api_parity", "body");
+  await client.buildFtsIndex("worker_api_parity", "body");
+  await client.dropIndex("worker_api_parity_body");
+  await client.dropView("worker_api_parity_view");
+  await client.dropColumn("worker_api_parity", "obsolete");
+
+  const deleted = await client.delete("worker_api_parity", 1);
+  const remaining = await client.query("SELECT id FROM worker_api_parity");
+  if (deleted.deletedRowCount !== 1 || remaining.rows.length !== 0) {
+    throw new Error("The worker single-row delete API did not remove its row");
+  }
+  await client.dropTable("worker_api_parity");
+}
+
 async function reactProbe(rowCount: number): Promise<string> {
   const node = document.createElement("div");
   document.body.append(node);
@@ -105,6 +135,7 @@ async function runConsumerSmoke(): Promise<SmokeResult> {
   try {
     indexedDbClient = createClient("indexeddb", indexedDbName);
     await indexedDbClient.ready();
+    await verifyWorkerApiParity(indexedDbClient);
     const migration = await indexedDbClient.migrate(appSchema);
     await indexedDbClient.execute(
       "INSERT INTO items (id, name, score) VALUES ($1, $2, $3), ($4, $5, $6)",

@@ -22,7 +22,9 @@ page stays aligned with the engine.
 This is a form-by-form compatibility guide, not a claim that Minnow contains the complete
 PostgreSQL grammar. These supported features have narrower limits:
 
-- `LATERAL` supports equality-correlated projections and joins, without correlated grouping,
+- grouped correlated scalar select items may reference grouping keys, but cannot sit inside an
+  outer aggregate; correlated `ANY`/`ALL` work as top-level `WHERE` predicates.
+- `LATERAL` supports equality and range-correlated projections and joins, without correlated grouping,
   ordering, or `LIMIT`.
 - `JSON_TABLE` supports constant documents with `$` and `$[*]` row paths.
 - `CREATE SEQUENCE` supports `NEXTVAL` and session-local `CURRVAL`, without sequence options.

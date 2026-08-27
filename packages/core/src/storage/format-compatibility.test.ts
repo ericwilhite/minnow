@@ -41,6 +41,7 @@ const FIXTURE_DIRECTORY = new URL("../../format-fixtures/", import.meta.url);
 interface FixtureManifest {
   blockFormatVersion: number;
   snapshotFormatVersion: number;
+  writerPackageVersion: string;
   expectations: Array<{ sql: string; rows: unknown }>;
 }
 
@@ -77,6 +78,26 @@ function normalize(rows: unknown): unknown {
 }
 
 const fixtures = loadFixtures();
+
+function packageVersionTuple(version: string): [number, number, number] {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/u.exec(version);
+  if (match === null) throw new TypeError(`Invalid fixture package version: ${version}`);
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+const currentPackageVersion = (
+  JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
+
+function comparePackageVersions(left: string, right: string): number {
+  const leftParts = packageVersionTuple(left);
+  const rightParts = packageVersionTuple(right);
+  return (
+    leftParts[0] - rightParts[0] || leftParts[1] - rightParts[1] || leftParts[2] - rightParts[2]
+  );
+}
 
 async function restoreFixture(bytes: Uint8Array): Promise<MinnowDatabase> {
   const database = new MinnowDatabase(new MemoryBlockStore());
@@ -216,6 +237,10 @@ describe("v1 format compatibility", () => {
     // reporting green.
     expect(fixtures.length).toBeGreaterThan(0);
     for (const fixture of fixtures) {
+      expect(
+        comparePackageVersions(fixture.manifest.writerPackageVersion, currentPackageVersion),
+        `${fixture.stem} claims a writer newer than this package`,
+      ).toBeLessThanOrEqual(0);
       expect(fixture.manifest.expectations.length, `${fixture.stem} has no expectations`).toBe(
         FIXTURE_QUERIES.length,
       );
@@ -244,7 +269,7 @@ describe("v1 format compatibility", () => {
       expect(summary.byteLength).toBe(fixture.bytes.byteLength);
     });
 
-    it(`reads ${fixture.stem} and answers exactly as that build did`, async () => {
+    it(`reads ${fixture.stem} from @minnowdb/core@${fixture.manifest.writerPackageVersion}`, async () => {
       const database = await restoreFixture(fixture.bytes);
 
       const failures: string[] = [];
@@ -269,7 +294,7 @@ describe("v1 format compatibility", () => {
       }
     });
 
-    it(`accepts writes into ${fixture.stem} after loading it`, async () => {
+    it(`accepts current writes after loading ${fixture.stem} from @minnowdb/core@${fixture.manifest.writerPackageVersion}`, async () => {
       // Reading an old database is half the guarantee. An application that opens one goes on to
       // write to it, so the restored catalog -- row-id counters, unique-key membership, segment
       // ordering -- has to be sound rather than merely readable.

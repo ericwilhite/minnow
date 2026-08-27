@@ -69,8 +69,8 @@ See [Storage](/docs/storage) for the availability, durability, and performance t
 ## Run it in a worker
 
 Most interactive applications should put the engine in a worker so query execution does not
-compete with rendering. `MinnowDatabaseClient` exposes the same query, cursor, write, migration,
-live-query, snapshot, and maintenance calls on the main thread.
+compete with rendering. `MinnowDatabaseClient` exposes the same query, cursor, write, catalog,
+index, migration, live-query, snapshot, and maintenance calls on the main thread.
 
 The [worker guide](/docs/engine/workers) includes the ready-made worker entry and bundler setup.
 
@@ -81,7 +81,8 @@ Firefox, Safari, and Edge support IndexedDB in a window or worker. OPFS requires
 unavailable in Safari private browsing.
 
 Minnow targets browsers. It does not ship a Node.js engine build. Use `MemoryBlockStore` or
-`fake-indexeddb` for Node-based tests.
+`fake-indexeddb` for Node-based tests. The [v1 support policy](/docs/reference/support#browser-support)
+defines the tested browser line, OPFS qualification, and release-candidate checks.
 
 ## Package entry points
 

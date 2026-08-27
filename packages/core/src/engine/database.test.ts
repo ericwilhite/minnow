@@ -3849,7 +3849,7 @@ for (const implementation of implementations()) {
       store.close();
     });
 
-    it("supports single-row inserts and upserts", async () => {
+    it("supports single-row inserts, upserts, and deletes", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store);
       await database.createTable({
@@ -3864,6 +3864,9 @@ for (const implementation of implementations()) {
       const result = await database.upsert("settings", { name: "theme", value: "dark" });
       expect(result.updatedRowCount).toBe(1);
       expect(await database.readTable("settings")).toEqual([{ name: "theme", value: "dark" }]);
+      const deleted = await database.delete("settings", "theme");
+      expect(deleted).toMatchObject({ requestedKeyCount: 1, deletedRowCount: 1 });
+      expect(await database.readTable("settings")).toEqual([]);
       store.close();
     });
 
@@ -9878,10 +9881,10 @@ describe("prepared-input cache and shared read lease", () => {
     }
   });
 
-  it("collapses repeated catalog reads into probes while the epoch holds", async () => {
+  it("collapses repeated catalog reads and reloads after each changed epoch", async () => {
     const { store, database } = await seededStore();
     await database.query("SELECT COUNT(*) AS orders FROM orders");
-    const catalogReadsAfterFirst = store.catalogStateCalls;
+    const catalogReadsAfterFirst = store.queryCatalogStateCalls;
     for (let round = 0; round < 5; round += 1) {
       await database.query("SELECT COUNT(*) AS orders FROM orders");
       await database.query("SELECT region, SUM(amount) AS total FROM orders GROUP BY region");
@@ -9889,11 +9892,24 @@ describe("prepared-input cache and shared read lease", () => {
     // Every repeat is served by the (version, epoch) probe plus the cached state: both
     // statements read the same table set, so no further catalog read happens at all until
     // something actually changes.
-    expect(store.catalogStateCalls).toBe(catalogReadsAfterFirst);
+    expect(store.queryCatalogStateCalls).toBe(catalogReadsAfterFirst);
+    // A local commit moves the epoch, so the next query reloads once and later repeats reuse it.
     await database.insertBatch("orders", { columns: { region: ["south"], amount: [11] } });
-    const after = await database.query("SELECT COUNT(*) AS orders FROM orders");
-    expect(after.rows).toEqual([{ orders: 7 }]);
-    expect(store.catalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
+    const afterLocal = await database.query("SELECT COUNT(*) AS orders FROM orders");
+    expect(afterLocal.rows).toEqual([{ orders: 7 }]);
+    expect(store.queryCatalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
+    const catalogReadsAfterLocal = store.queryCatalogStateCalls;
+    await database.query("SELECT COUNT(*) AS orders FROM orders");
+    expect(store.queryCatalogStateCalls).toBe(catalogReadsAfterLocal);
+
+    // A different instance has no process-local contribution to share. Its epoch change makes
+    // the first database discard the cached state and rebuild it before answering.
+    const external = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+    await external.insertBatch("orders", { columns: { region: ["north"], amount: [13] } });
+    const afterExternal = await database.query("SELECT COUNT(*) AS orders FROM orders");
+    expect(afterExternal.rows).toEqual([{ orders: 8 }]);
+    expect(store.queryCatalogStateCalls).toBeGreaterThan(catalogReadsAfterLocal);
+    await external.close();
   });
 
   it("keeps warm result-cache identity work independent of visible segment count", async () => {

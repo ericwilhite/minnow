@@ -54,6 +54,19 @@ class CollectionFaultStore extends MemoryBlockStore {
   }
 }
 
+class SegmentCatalogCountingStore extends MemoryBlockStore {
+  tableSegmentPageReads = 0;
+
+  override listTableSegmentPage(
+    tableId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[0],
+    afterId: Parameters<MemoryBlockStore["listTableSegmentPage"]>[1],
+    limit: Parameters<MemoryBlockStore["listTableSegmentPage"]>[2],
+  ): ReturnType<MemoryBlockStore["listTableSegmentPage"]> {
+    this.tableSegmentPageReads += 1;
+    return super.listTableSegmentPage(tableId, afterId, limit);
+  }
+}
+
 afterEach(() => vi.useRealTimers());
 
 const REGIONS = ["west", "east", "north", "south"] as const;
@@ -218,6 +231,47 @@ async function expectContents(database: MinnowDatabase, reference: Map<number, R
 }
 
 describe("background maintenance", () => {
+  it("reuses exact local layout hints and reproves them after an external commit", async () => {
+    const store = new SegmentCatalogCountingStore();
+    const database = new MinnowDatabase(store, { autoCollect: false });
+    await database.createTable({
+      name: "hint_items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    await database.insert("hint_items", { id: 1, amount: 0 });
+    store.tableSegmentPageReads = 0;
+
+    // These commits remain below the delta-fold threshold. Their exact segment contribution
+    // advances the hint established by the insert preflight, so both the capacity preflight and
+    // periodic maintenance checks stay O(1) instead of rescanning a growing catalog.
+    for (let amount = 1; amount <= 24; amount += 1) {
+      await database.update("hint_items", 1, { amount });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.tableSegmentPageReads).toBe(0);
+
+    // A second connection's commit is not part of the first connection's local contribution.
+    // The manifest-version mismatch must discard the hint and restore the full proof before the
+    // next write skips the hard level-zero capacity preflight.
+    const external = new MinnowDatabase(store, {
+      autoCollect: false,
+      autoCompact: false,
+    });
+    await external.update("hint_items", 1, { amount: 25 });
+    store.tableSegmentPageReads = 0;
+    await database.update("hint_items", 1, { amount: 26 });
+    expect(store.tableSegmentPageReads).toBeGreaterThan(0);
+    expect((await database.query("SELECT amount FROM hint_items WHERE id = 1")).rows).toEqual([
+      { amount: 26 },
+    ]);
+    await external.close();
+    await database.close();
+  });
+
   it("retries a failed collection on a timer without another committed write", async () => {
     const store = new CollectionFaultStore();
     const database = new MinnowDatabase(store, {

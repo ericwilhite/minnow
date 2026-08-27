@@ -1,0 +1,171 @@
+{
+  "schemaVersion": 1,
+  "description": "Every published package subpath is part of the same semver contract. Audience tiers distinguish ordinary application APIs from stable specialist surfaces; they do not weaken compatibility guarantees.",
+  "packages": [
+    {
+      "name": "@minnowdb/core",
+      "entries": [
+        {
+          "subpath": ".",
+          "audience": "application",
+          "description": "Everyday database, schema, catalog, error, and structural driver APIs."
+        },
+        {
+          "subpath": "./block-format",
+          "audience": "extension",
+          "description": "Versioned block inspection, validation, encoding, and codec tools."
+        },
+        {
+          "subpath": "./client",
+          "audience": "application",
+          "description": "Main-thread client for a worker-hosted database."
+        },
+        {
+          "subpath": "./live",
+          "audience": "application",
+          "description": "Typed, keyed, windowed, and low-level live-query APIs."
+        },
+        {
+          "subpath": "./package.json",
+          "audience": "metadata",
+          "description": "Published package identity and export metadata."
+        },
+        {
+          "subpath": "./plan",
+          "audience": "extension",
+          "description": "Logical plan construction, validation, optimization, and rendering."
+        },
+        {
+          "subpath": "./postgres-feature-profile.json",
+          "audience": "metadata",
+          "description": "Machine-readable PostgreSQL compatibility classifications."
+        },
+        {
+          "subpath": "./query",
+          "audience": "extension",
+          "description": "SQL compilation, binding, standalone execution, and plan inspection."
+        },
+        {
+          "subpath": "./schema",
+          "audience": "application",
+          "description": "Schema DSL, typed tables, catalog projection, and migration planning."
+        },
+        {
+          "subpath": "./schema-wire",
+          "audience": "extension",
+          "description": "Structured-clone-safe schema serialization for workers and tooling."
+        },
+        {
+          "subpath": "./sql-feature-matrix.json",
+          "audience": "metadata",
+          "description": "Machine-readable SQL support, rejection, and example matrix."
+        },
+        {
+          "subpath": "./storage",
+          "audience": "application",
+          "description": "Durable and memory adapters plus the complete shared storage contract."
+        },
+        {
+          "subpath": "./storage/contracts",
+          "audience": "extension",
+          "description": "Adapter-independent storage interfaces, records, limits, and errors."
+        },
+        {
+          "subpath": "./storage/indexeddb",
+          "audience": "application",
+          "description": "IndexedDB adapter without other adapter implementations."
+        },
+        {
+          "subpath": "./storage/memory",
+          "audience": "application",
+          "description": "In-memory adapter for tests, demos, and ephemeral databases."
+        },
+        {
+          "subpath": "./storage/opfs",
+          "audience": "application",
+          "description": "Worker-only OPFS adapter and database deletion helper."
+        },
+        {
+          "subpath": "./storage/persistence",
+          "audience": "application",
+          "description": "Origin-persistence request and enforcement policy."
+        },
+        {
+          "subpath": "./storage/snapshots",
+          "audience": "application",
+          "description": "Portable snapshot summaries, framing, streaming, and validation."
+        },
+        {
+          "subpath": "./storage/toolkit",
+          "audience": "extension",
+          "description": "Reusable record, WAL, extent, and synchronous-file adapter building blocks."
+        },
+        {
+          "subpath": "./testing",
+          "audience": "testing",
+          "description": "Storage conformance, fault injection, simulation, and SQLLogicTest tools."
+        },
+        {
+          "subpath": "./transactions",
+          "audience": "extension",
+          "description": "Low-level leased snapshots, transactions, checkpoints, and recovery."
+        },
+        {
+          "subpath": "./worker",
+          "audience": "runtime",
+          "description": "Side-effect-only ready-made dedicated-worker entry."
+        },
+        {
+          "subpath": "./worker-host",
+          "audience": "extension",
+          "description": "Manual worker exposure and stock database-worker attachment."
+        },
+        {
+          "subpath": "./worker-protocol",
+          "audience": "extension",
+          "description": "Versioned worker request, response, event, and error frames."
+        }
+      ]
+    },
+    {
+      "name": "@minnowdb/devtools",
+      "entries": [
+        {
+          "subpath": ".",
+          "audience": "application",
+          "description": "Embeddable SQL console, data browser, and custom element."
+        }
+      ]
+    },
+    {
+      "name": "@minnowdb/export",
+      "entries": [
+        {
+          "subpath": ".",
+          "audience": "application",
+          "description": "Backpressure-aware CSV and NDJSON query streams."
+        }
+      ]
+    },
+    {
+      "name": "@minnowdb/kysely",
+      "entries": [
+        {
+          "subpath": ".",
+          "audience": "application",
+          "description": "Kysely dialect, schema inference, search, cursors, and live-query wrappers."
+        }
+      ]
+    },
+    {
+      "name": "@minnowdb/react",
+      "entries": [
+        {
+          "subpath": ".",
+          "audience": "application",
+          "description": "React external-store hooks for live query snapshots."
+        }
+      ]
+    }
+  ]
+}

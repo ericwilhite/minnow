@@ -20,6 +20,8 @@ import {
   MAX_FTS_TOKENS_PER_DOCUMENT,
   MAX_INDEXED_STRING_CHARACTERS,
 } from "../storage/types.js";
+import type { FtsStats } from "../plan/model.js";
+export type { FtsStats } from "../plan/model.js";
 
 export const FTS_TOKENIZER_VERSION = 1;
 
@@ -40,22 +42,6 @@ const CJK =
 export interface FtsQueryTerm {
   readonly term: string;
   readonly prefix: boolean;
-}
-
-/**
- * Corpus statistics for one (columns, query) signature — O(#query terms) integers. Every row of
- * the corpus counts as a document (an all-null document has length 0): this definition is what
- * lets a persisted index serve exact statistics without a scan, since the document count is
- * just the table's row count. All producers — the row executor, the columnar scan, and the
- * postings index — must share it, or BM25 scores drift between paths.
- */
-export interface FtsStats {
-  /** Every row of the corpus, including all-null documents. */
-  docCount: number;
-  /** Total tokens across all documents. */
-  totalTokens: number;
-  /** Documents containing each query term, aligned with the query's term order. */
-  dfByTerm: number[];
 }
 
 function pushToken(tokens: string[], token: string): void {

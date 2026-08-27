@@ -79,6 +79,12 @@ describe("committed SQLLogicTest corpus", () => {
     }
   });
 
+  it("runs every selected source record in the full profile", () => {
+    expect(ledger.allProfileExcludedRecords).toBe(0);
+    expect(ledger.fullIncludedRecords).toBe(ledger.sourceRecords);
+    expect(ledger.exclusions.every(({ scope }) => scope === "standard-only")).toBe(true);
+  });
+
   it.each(ledger.sources)("pins generated subsets for $source", async (source) => {
     const upstreamSource = upstream.standardSources.find((entry) => entry.path === source.source);
     expect(upstreamSource?.sha256).toBe(source.sourceSha256);

@@ -1,5 +1,6 @@
 {
   "layoutFormatVersion": 5,
+  "writerPackageVersion": "0.3.0",
   "files": {
     "minnowdb/native-fixture/format.json": "eyJmb3JtYXRWZXJzaW9uIjo1fQ==",
     "minnowdb/native-fixture/wal": "TU5XTPgAAAC+Nq4aeyJzZXEiOjYsIm9wIjoiYWRkVGFibGUiLCJyZWNvcmQiOnsiaWQiOiJmaXh0dXJlLXdhbC10YWlsIiwibmFtZSI6IndhbC10YWlsIiwibWFuYWdlZCI6ZmFsc2UsImNvbHVtbnMiOlt7ImlkIjoidmFsdWUiLCJuYW1lIjoidmFsdWUiLCJ0eXBlIjoic3RyaW5nIiwibnVsbGFibGUiOnRydWV9XSwicmV2aXNpb24iOjAsImNyZWF0ZWRBdCI6IjIwMjYtMDgtMjRUMTI6MDA6MDAuMDAwWiJ9LCJleHBlY3RlZENhdGFsb2dFcG9jaCI6bnVsbH0=",

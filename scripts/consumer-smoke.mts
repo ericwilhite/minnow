@@ -245,7 +245,8 @@ try {
   console.log("Installed every tarball outside the workspace.");
 
   run(binary(consumerRoot, "tsc"), ["--project", "tsconfig.json"], consumerRoot);
-  console.log("Resolved every public entry point with the consumer TypeScript configuration.");
+  run(binary(consumerRoot, "tsc"), ["--project", "tsconfig.nodenext.json"], consumerRoot);
+  console.log("Resolved every public entry point with Bundler and NodeNext TypeScript consumers.");
 
   run(binary(consumerRoot, "vite"), ["build"], consumerRoot);
   console.log("Built the consumer application and its package worker with Vite.");

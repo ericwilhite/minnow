@@ -1311,6 +1311,7 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     },
   ],
   ["from.lateral", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
+  ["from.lateral-non-equi", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
   ["aggregate.string-agg", { oracles: ["sqlite"], reason: "SQLite spells it GROUP_CONCAT" }],
   ["json.table", { oracles: ["sqlite"], reason: "SQLite has no SQL/JSON JSON_TABLE syntax" }],
   ["predicate.similar-to", { oracles: ["sqlite"], reason: "SQLite has no SIMILAR TO" }],
@@ -1380,6 +1381,10 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ["group-by.grouping-sets", { oracles: ["sqlite"], reason: "SQLite has no GROUPING SETS" }],
   ["predicate.boolean-test", { oracles: ["sqlite"], reason: "SQLite has no IS UNKNOWN" }],
   ["predicate.quantified", { oracles: ["sqlite"], reason: "SQLite has no ALL/ANY quantifiers" }],
+  [
+    "subquery.correlated-quantified",
+    { oracles: ["sqlite"], reason: "SQLite has no ALL/ANY quantifiers" },
+  ],
   ["predicate.ilike", { oracles: ["sqlite"], reason: "SQLite has no ILIKE" }],
   ["where.between-symmetric", { oracles: ["sqlite"], reason: "SQLite has no BETWEEN SYMMETRIC" }],
   ["set.intersect-all", { oracles: ["sqlite"], reason: "SQLite has no INTERSECT ALL" }],

@@ -134,11 +134,11 @@ machines: https://minnowdb.com/llms.txt
   list the tracked supported and rejected forms plus deliberate differences and extensions.
 - Supported PostgreSQL forms include exact NUMERIC/DECIMAL, JSON/JSONB, UUID, arrays, DATE, TIME,
   intervals, enums, sequences, multiple/composite keys, savepoints, filtered upserts, correlated
-  NOT IN, equality-correlated LATERAL, STRING_AGG, SIMILAR TO, COLLATE, and constant JSON_TABLE.
+  NOT IN, range-correlated LATERAL, STRING_AGG, SIMILAR TO, COLLATE, and constant JSON_TABLE.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
-  non-equality correlation in scalar subqueries or `IN`, correlated `EXISTS` below `OR`, correlated
-  LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution, and sequence
-  options. Check each supported entry's note before assuming every PostgreSQL variant.
+  nested correlated `ANY`/`ALL`, correlated LATERAL grouping/order/limit, correlated JSON_TABLE
+  documents, enum evolution, and sequence options. Check each supported entry's note before
+  assuming every PostgreSQL variant.
 ```
 
 ## Why those rules
