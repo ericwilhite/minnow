@@ -30,6 +30,16 @@ const people = table("people", {
   joined: column.datetime().nullable(),
 });
 
+const generatedRows = table("generated_rows", {
+  id: column.integer().unique(),
+  field_id: column.string(),
+  ticket_number: column.integer(),
+  version: column.integer(),
+  offline_key: column
+    .string()
+    .generatedSql("field_id || ':' || CAST(ticket_number AS TEXT) || ':' || CAST(version AS TEXT)"),
+});
+
 const orders = table("orders", {
   order_id: column.number().unique(),
   person: column.string().references("people", "name"),
@@ -74,6 +84,39 @@ describe("schema DSL", () => {
       score?: number;
       joined?: Date | null;
     }>();
+  });
+
+  it("excludes generated columns from insert and update types", () => {
+    expectTypeOf<InferRow<typeof generatedRows>>().toEqualTypeOf<{
+      id: number;
+      field_id: string;
+      ticket_number: number;
+      version: number;
+      offline_key: string;
+    }>();
+    expectTypeOf<InferInsertRow<typeof generatedRows>>().toExtend<{
+      id: number;
+      field_id: string;
+      ticket_number: number;
+      version: number;
+    }>();
+    expectTypeOf<InferUpdateChanges<typeof generatedRows>>().toEqualTypeOf<{
+      field_id?: string;
+      ticket_number?: number;
+      version?: number;
+    }>();
+    expect(generatedRows.columns.offline_key.isGenerated).toBe(true);
+    const badInsert: InferInsertRow<typeof generatedRows> = {
+      id: 1,
+      field_id: "field",
+      ticket_number: 2,
+      version: 3,
+      // @ts-expect-error callers cannot provide generated values
+      offline_key: "wrong",
+    };
+    // @ts-expect-error callers cannot update generated values
+    const badUpdate: InferUpdateChanges<typeof generatedRows> = { offline_key: "wrong" };
+    expect([badInsert, badUpdate]).toHaveLength(2);
   });
 
   it("rejects invalid table and schema definitions explicitly", () => {
@@ -689,6 +732,92 @@ describe("column defaults", () => {
       { id: 2, status: "QUEUED" },
     ]);
     store.close();
+  });
+});
+
+describe("stored generated columns", () => {
+  const ordinary = table("offline_rows", {
+    id: column.integer().unique(),
+    field_id: column.string(),
+    version: column.integer(),
+    offline_key: column.string(),
+  });
+  const generated = table("offline_rows", {
+    id: column.integer().unique(),
+    field_id: column.string(),
+    version: column.integer(),
+    offline_key: column.string().generatedSql("field_id || ':' || CAST(version AS TEXT)"),
+  });
+
+  it("creates, writes, updates, introspects, and wire-round-trips a generated column", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(schema([generated]));
+    const inserted = await database.insertBatch("offline_rows", [
+      { id: 1, field_id: "field", version: 2 },
+    ]);
+    expect(inserted.generatedColumns).toEqual({ offline_key: ["field:2"] });
+    const updated = await database.updateBatch("offline_rows", {
+      keys: [1],
+      changes: { version: [3] },
+    });
+    expect(updated.generatedColumns).toEqual({ offline_key: ["field:3"] });
+    expect((await database.query("SELECT * FROM offline_rows")).rows).toEqual([
+      { id: 1, field_id: "field", version: 3, offline_key: "field:3" },
+    ]);
+    expect(
+      (await database.listTables())[0]?.columns.find(({ name }) => name === "offline_key"),
+    ).toMatchObject({
+      generatedValue: { kind: "stored", sql: "field_id || ':' || CAST(version AS TEXT)" },
+    });
+
+    const restored = deserializeSchema(serializeSchema(schema([generated])));
+    expect(restored.tables[0]?.columns.offline_key?.generatedSpec).toEqual({
+      kind: "stored",
+      sql: "field_id || ':' || CAST(version AS TEXT)",
+    });
+    await expect(database.dropColumn("offline_rows", "field_id")).rejects.toThrow(
+      "Generated column offline_key still uses this column",
+    );
+  });
+
+  it("adopts a matching application-maintained column and refuses stale rows", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(schema([ordinary]));
+    await database.insertBatch("offline_rows", [
+      { id: 1, field_id: "field", version: 2, offline_key: "field:2" },
+    ]);
+    const adopted = await database.migrate(schema([generated]));
+    expect(adopted.steps).toEqual([
+      {
+        kind: "alter-generated",
+        tableName: "offline_rows",
+        columnName: "offline_key",
+        generatedValue: { kind: "stored", sql: "field_id || ':' || CAST(version AS TEXT)" },
+      },
+    ]);
+    expect((await database.migrate(schema([generated]))).steps).toEqual([]);
+
+    const stale = new MinnowDatabase(new MemoryBlockStore());
+    await stale.migrate(schema([ordinary]));
+    await stale.insertBatch("offline_rows", [
+      { id: 1, field_id: "field", version: 2, offline_key: "stale" },
+    ]);
+    await expect(stale.migrate(schema([generated]))).rejects.toThrow(
+      "Generated column cannot be adopted",
+    );
+  });
+
+  it("rejects adding a generated column to a populated table without a rewrite", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const before = table("offline_rows", {
+      id: column.integer().unique(),
+      field_id: column.string(),
+      version: column.integer(),
+    });
+    await database.migrate(schema([before]));
+    await expect(database.migrate(schema([generated]))).rejects.toThrow(
+      "Generated columns cannot be added to an existing table without rewriting its rows",
+    );
   });
 });
 

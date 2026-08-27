@@ -1294,12 +1294,22 @@ it("bounds and incrementally merges transaction full-text deltas without partial
       columns: [
         {
           columnId: "body",
-          postings: [{ term: "shared", rowIds: [BigInt(index + 1)], tf: [1] }],
+          postings: [{ term: "shared", rowIds: [BigInt(100 - index)], tf: [1] }],
           totalTokens: 1,
         },
       ],
     });
   }
+  transaction.setFtsChanges({
+    tableId: "fts-delta-table",
+    columns: [
+      {
+        columnId: "body",
+        postings: [{ term: "shared", rowIds: [50n], tf: [3] }],
+        totalTokens: 3,
+      },
+    ],
+  });
   expect(transaction.stagedWorkCount).toBe(1);
   const version = (await transaction.commit()).version;
   const candidates = await store.readFtsCandidates(

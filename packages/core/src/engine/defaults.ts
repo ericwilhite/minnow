@@ -67,6 +67,17 @@ export async function fillColumnDefaults(
     const omitted = input.omitted?.[column.name];
     const isOmitted = (index: number): boolean =>
       provided === undefined || omitted?.[index] === true;
+    if (column.generatedValue !== undefined) {
+      if (provided !== undefined) {
+        for (let index = 0; index < rowCount; index += 1) {
+          if (!isOmitted(index)) {
+            throw new TypeError(`Generated column cannot be assigned: ${column.name}`);
+          }
+        }
+      }
+      columns[column.name] = new Array<BatchValue>(rowCount).fill(null);
+      continue;
+    }
     if (defaultValue === undefined) {
       if (provided === undefined || omitted?.some(Boolean) === true) {
         const values =

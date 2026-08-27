@@ -13,7 +13,7 @@ import {
   setDateUtcMonth,
 } from "../date-value.js";
 import type { DatabaseRow } from "./database.js";
-import type { ColumnDefault, SqlDomain } from "../storage/types.js";
+import type { ColumnDefault, ColumnGenerated, SqlDomain } from "../storage/types.js";
 import type {
   AggregateName,
   BinaryOperator,
@@ -83,13 +83,7 @@ import {
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 import { stringArgument } from "./sql-semantics.js";
-import {
-  jsonAtPath,
-  jsonConstructor,
-  jsonIsValid,
-  jsonValueOf,
-  parseJsonPath,
-} from "./sql-json.js";
+import { jsonAtPath, jsonConstructor, jsonIsValid, parseJsonPath } from "./sql-json.js";
 import { optimizePlan } from "./optimizer.js";
 import {
   compareSqlValues as compareValues,
@@ -112,6 +106,7 @@ import {
   isSqlDomainValue,
   jsonDomainValue,
   normalizeSqlDomainValue,
+  preservedJsonDomainValue,
   protectedSqlTextValue,
   timeDomainValue,
   uuidDomainValue,
@@ -408,7 +403,7 @@ export function scalarFunctionValue(
   }
   if (name === "JSON_ARRAY" || name === "JSON_OBJECT") {
     // These build from every argument, so a NULL first one is data, not an early exit.
-    return jsonConstructor(name, values);
+    return preservedJsonDomainValue(jsonConstructor(name, values));
   }
   if (name === "ARRAY") return arrayDomainValue(values);
   if (name === "MINNOW_COLLATE") return collatedDomainValue(values[0], values[1]);
@@ -520,7 +515,7 @@ export function scalarFunctionValue(
       const found = jsonAtPath(first, values[1], "JSON_QUERY");
       if (!found.found || found.value === undefined) return null;
       // JSON_QUERY returns JSON text, so a selected string keeps its quotes.
-      return JSON.stringify(found.value);
+      return preservedJsonDomainValue(JSON.stringify(found.value));
     }
 
     case "LPAD":
@@ -1181,6 +1176,7 @@ export type CompiledStatement =
         sqlDomain?: SqlDomain;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
+        generatedValue?: ColumnGenerated;
         enumValues?: readonly string[];
         backfill?: Exclude<QueryValue, null>;
       }>;
@@ -1277,6 +1273,7 @@ export type CompiledStatement =
         sqlDomain?: SqlDomain;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
+        generatedValue?: ColumnGenerated;
         enumValues?: readonly string[];
         backfill?: Exclude<QueryValue, null>;
       };
@@ -4565,7 +4562,7 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (expression.name === "JSON_ARRAYAGG") {
           return values.length === 0
             ? null
-            : JSON.stringify(values.map((value) => jsonValueOf(value ?? null)));
+            : preservedJsonDomainValue(jsonConstructor("JSON_ARRAY", values));
         }
         if (expression.name === "MIN")
           return values.reduce<unknown>(
@@ -5573,6 +5570,7 @@ class Parser {
       sqlDomain?: SqlDomain;
       nullable?: boolean;
       defaultValue?: ColumnDefault;
+      generatedValue?: ColumnGenerated;
     }> = [];
     const checks: Array<{ name: string; sql: string }> = [];
     const foreignKeys: ForeignKeyDefinition[] = [];
@@ -5646,11 +5644,16 @@ class Parser {
       const columnType = this.#columnType();
       let nullable = true;
       let defaultValue: ColumnDefault | undefined;
+      let generatedValue: ColumnGenerated | undefined;
       for (;;) {
         if (this.#isKeyword("DEFAULT")) {
           // PostgreSQL-compatible variable-free scalar expression, retained in the catalog.
           this.#keyword("DEFAULT");
           defaultValue = this.#columnDefault();
+          continue;
+        }
+        if (this.#isKeyword("GENERATED")) {
+          generatedValue = this.#generatedColumn();
           continue;
         }
         if (this.#isKeyword("CHECK")) {
@@ -5696,6 +5699,7 @@ class Parser {
         ...columnType,
         ...(nullable ? { nullable: true } : {}),
         ...(defaultValue === undefined ? {} : { defaultValue }),
+        ...(generatedValue === undefined ? {} : { generatedValue }),
       });
       if (!this.#punctuation(",")) break;
     }
@@ -5719,6 +5723,28 @@ class Parser {
         if (!declared.has(column)) {
           throw new TypeError(
             `CHECK ${check.name} refers to a column this table has no: ${column}`,
+          );
+        }
+      }
+    }
+    for (const column of columns) {
+      if (column.defaultValue !== undefined && column.generatedValue !== undefined) {
+        throw new TypeError(`Generated column ${column.name} cannot also have a DEFAULT`);
+      }
+      if (column.generatedValue === undefined) continue;
+      for (const reference of expressionColumnNames(
+        compileCheckExpression(column.generatedValue.sql, `generated ${table}.${column.name}`),
+      )) {
+        const referencedName = reference.split(".").at(-1) ?? reference;
+        const referenced = columns.find(({ name }) => name === referencedName);
+        if (referenced === undefined) {
+          throw new TypeError(
+            `Generated column ${column.name} refers to a column this table has no: ${referencedName}`,
+          );
+        }
+        if (referenced === column || referenced.generatedValue !== undefined) {
+          throw new TypeError(
+            `Generated column ${column.name} cannot reference a generated column: ${referencedName}`,
           );
         }
       }
@@ -5852,6 +5878,23 @@ class Parser {
     const sql = this.text.slice(start, this.#peek().start).trim();
     if (sql.length === 0) throw new TypeError("DEFAULT requires an expression");
     return columnDefaultFor(expression, sql);
+  }
+
+  /** GENERATED [ALWAYS] AS (expression) STORED. */
+  #generatedColumn(): ColumnGenerated {
+    this.#keyword("GENERATED");
+    if (this.#isKeyword("ALWAYS")) this.#keyword("ALWAYS");
+    this.#keyword("AS");
+    const open = this.#peek();
+    this.#expectPunctuation("(");
+    const expression = this.#expression();
+    const close = this.#peek();
+    this.#expectPunctuation(")");
+    this.#keyword("STORED");
+    if (hasAggregate(expression) || containsWindow(expression) || containsParameter(expression)) {
+      throw new TypeError("Generated columns take an immutable row expression");
+    }
+    return { kind: "stored", sql: this.text.slice(open.start + 1, close.start).trim() };
   }
 
   /** DROP VIEW [IF EXISTS] name (F031-16). */

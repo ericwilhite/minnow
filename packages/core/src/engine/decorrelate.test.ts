@@ -39,6 +39,25 @@ const tables = new Map<string, DatabaseRow[]>([
       { g: "poisoned", v: 4 },
     ],
   ],
+  [
+    "scope_parents",
+    [
+      { id: 1, tenant: "a", all_access: true },
+      { id: 2, tenant: "a", all_access: false },
+      { id: 3, tenant: "a", all_access: false },
+      { id: 4, tenant: "b", all_access: false },
+      { id: 5, tenant: "b", all_access: null },
+    ],
+  ],
+  [
+    "scope_children",
+    [
+      { parent_id: 2, tenant: "a", scope: "read" },
+      { parent_id: 2, tenant: "a", scope: "read" },
+      { parent_id: 3, tenant: "a", scope: "write" },
+      { parent_id: 4, tenant: "b", scope: "read" },
+    ],
+  ],
 ]);
 
 function run(sql: string): DatabaseRow[] {
@@ -338,6 +357,32 @@ describe("correlated subquery decorrelation", () => {
           "NOT EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
       ),
     ).toEqual([{ amount: 3 }, { amount: 8 }]);
+  });
+
+  it("supports the multi-key all-access OR EXISTS auth-scope shape", () => {
+    const plan = compileQuery(
+      "SELECT p.id FROM scope_parents p WHERE p.all_access = true OR EXISTS (" +
+        "SELECT c.parent_id FROM scope_children c " +
+        "WHERE c.parent_id = p.id AND c.tenant = p.tenant AND c.scope = 'read') ORDER BY p.id",
+    );
+    expect(plan.joins.at(-1)?.kind).toBe("left");
+    expect(executeQuery(plan, tables).rows).toEqual([{ id: 1 }, { id: 2 }, { id: 4 }]);
+    expect(executeRowQuery(plan, tables).rows).toEqual([{ id: 1 }, { id: 2 }, { id: 4 }]);
+  });
+
+  it("preserves correlated EXISTS below NOT and CASE", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE NOT (EXISTS " +
+          "(SELECT d.region FROM dims d WHERE d.region = r.region))",
+      ),
+    ).toEqual([{ amount: 3 }, { amount: 8 }]);
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE CASE WHEN EXISTS " +
+          "(SELECT d.region FROM dims d WHERE d.region = r.region) THEN true ELSE r.amount = 3 END",
+      ),
+    ).toEqual([{ amount: 10 }, { amount: 6 }, { amount: 3 }]);
   });
 
   it("answers non-equality correlated EXISTS nested below OR", () => {

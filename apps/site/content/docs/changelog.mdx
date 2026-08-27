@@ -8,7 +8,9 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## Unreleased
+## 0.6.0 — August 27, 2026
+
+Published packages: `@minnowdb/core@0.6.0` and `@minnowdb/kysely@0.4.0`.
 
 ### Added
 
@@ -17,6 +19,23 @@ compatibility policy and release process.
   by their grouping keys, and correlated `EXISTS` / `NOT EXISTS` work inside larger boolean
   expressions. The full pinned SQLLogicTest profile now runs all 10,708 selected upstream records
   with no capability exclusions.
+- Transaction posting changes now merge by sorted row locator instead of assuming later write
+  batches have larger locators. A zero-row delete followed by indexed multi-row writes in one
+  reconcile transaction therefore commits without tripping full-text/secondary-posting
+  validation.
+- `@minnowdb/kysely` adds `resultDecoding: { numeric: "number", json: "parse" }`. It consumes
+  aligned domain metadata for buffered, streamed, and mutation `RETURNING` rows, and its inferred
+  select types follow the chosen mode. The lossless string boundary remains the default.
+- Nested `JSON_OBJECT`, `JSON_ARRAY`, `JSON_ARRAYAGG`, and `JSON_QUERY` results now embed as JSON
+  values inside outer constructors. Ordinary text that happens to contain JSON remains escaped as
+  a string.
+- SQL adds stored `GENERATED ALWAYS AS (...) STORED` columns, and the schema DSL adds
+  `.generatedSql(expression)`. The engine recomputes them on every write, keeps callers from
+  assigning them, maintains indexes over them, and excludes them from inferred insert/update
+  inputs.
+- Mutation results with `RETURNING` now expose `returnedColumns` and
+  `returnedColumnDomains`, aligned with `returnedRows`, so adapters can apply the same logical
+  domain handling as ordinary queries and cursor pages.
 - Ordinary `query()` calls now accept `QueryOptions.signal`. Direct, cursor, and write-session
   reads stop between bounded execution/storage batches, return no partial result, and release
   reader and spill ownership before rejecting.
@@ -45,15 +64,22 @@ compatibility policy and release process.
 
 ### Migration
 
-No existing call changes. The query controls, single-row delete, and worker catalog/index helpers
-are additive. Code that previously wrapped an ordinary worker query in a cursor only to gain
-cancellation can pass `signal` directly. Deploy the client and worker from the same build, and
-replace any independently cached version 2 worker asset when upgrading.
+No existing call changes. The query controls, single-row delete, worker catalog/index helpers,
+generated columns, result decoding, and returned-row metadata are additive. Code that previously
+wrapped an ordinary worker query in a cursor only to gain cancellation can pass `signal` directly.
+Deploy the client and worker from the same build, and replace any independently cached version 2
+worker asset when upgrading.
+
+An existing application-maintained column can adopt `.generatedSql()` only when every stored
+value already equals the expression; migration scans and verifies the rows. Adding a new generated
+column to an existing table is refused because it would require a physical rewrite. Create it with
+the table, or backfill an ordinary column first and adopt generation in a later migration.
 
 ### Storage compatibility
 
-No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5
-remain readable and writable without a data migration.
+No byte or native-store format changed. Generated expressions use an optional catalog field; old
+catalogs need no migration. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout
+5 remain readable and writable without a data migration.
 
 ## 0.5.0 — August 26, 2026
 

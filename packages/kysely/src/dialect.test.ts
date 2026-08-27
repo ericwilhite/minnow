@@ -1,12 +1,20 @@
 import { Kysely, sql, type Insertable, type Selectable, type Updateable } from "kysely";
 import { Migrator, type MigrationProvider } from "kysely/migration";
 import { beforeEach, describe, expect, expectTypeOf, it } from "vitest";
-import { MinnowDatabase, column, schema, table, view, type MinnowSqlDriver } from "@minnowdb/core";
+import {
+  MinnowDatabase,
+  column,
+  schema,
+  table,
+  view,
+  type ExecuteResult,
+  type MinnowSqlDriver,
+} from "@minnowdb/core";
 import type { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { MinnowDialect } from "./dialect.js";
 import { createKysely } from "./create-kysely.js";
-import type { InferKyselyDatabase } from "./schema.js";
+import type { InferKyselyDatabase, MinnowJsonValue } from "./schema.js";
 
 interface PersonTable {
   id: number;
@@ -59,6 +67,24 @@ const functionSchema = schema([
   }),
 ]);
 
+const decodedSchema = schema([
+  table("decoded_values", {
+    id: column.integer().unique(),
+    amount: column.numeric({ precision: 12, scale: 2 }),
+    document: column.jsonb().nullable(),
+  }),
+]);
+
+const generatedSchema = schema([
+  table("generated_values", {
+    id: column.integer().unique(),
+    source: column.string(),
+    derived: column.string().generatedSql("upper(source)"),
+  }),
+]);
+
+type GeneratedDatabase = InferKyselyDatabase<typeof generatedSchema>;
+
 type FunctionDatabase = InferKyselyDatabase<typeof functionSchema>;
 
 function invalidDerivedWritesAreRejected(): void {
@@ -68,6 +94,29 @@ function invalidDerivedWritesAreRejected(): void {
   const viewInsert: Insertable<DeclaredDatabase["open_orders"]> = {};
   // @ts-expect-error a view column accepts no insert value
   viewInsert.id = 1;
+  const generatedInsert: Insertable<GeneratedDatabase["generated_values"]> = {
+    id: 1,
+    source: "value",
+  };
+  // @ts-expect-error generated columns accept no inserted value
+  generatedInsert.derived = "VALUE";
+  const generatedUpdate: Updateable<GeneratedDatabase["generated_values"]> = { source: "next" };
+  // @ts-expect-error generated columns accept no updated value
+  generatedUpdate.derived = "NEXT";
+}
+
+function inferredDecodedResults(driver: MinnowSqlDriver): void {
+  const db = createKysely({
+    driver,
+    schema: decodedSchema,
+    resultDecoding: { numeric: "number", json: "parse" },
+  });
+  const query = db.selectFrom("decoded_values").selectAll();
+  expectTypeOf<Awaited<ReturnType<typeof query.execute>>>().toEqualTypeOf<
+    Array<{ id: number; amount: number; document: MinnowJsonValue | null }>
+  >();
+  void db;
+  void query;
 }
 
 function portableKyselyCountRemainsPortable(db: Kysely<TestDatabase>): void {
@@ -179,8 +228,10 @@ function inferredMinnowFunctions(db: Kysely<FunctionDatabase>): void {
 describe("schema-derived Kysely types", () => {
   it("derives select, insert, and update shapes without a second DB interface", () => {
     expect(invalidDerivedWritesAreRejected).toBeTypeOf("function");
+    expect(inferredDecodedResults).toBeTypeOf("function");
     expect(inferredMinnowFunctions).toBeTypeOf("function");
     expect(portableKyselyFunctionsRemainPortable).toBeTypeOf("function");
+    expect(generatedSchema.tables[0]?.columns.derived.isGenerated).toBe(true);
     expectTypeOf<Selectable<DeclaredDatabase["orders"]>>().toEqualTypeOf<{
       id: number;
       total: string;
@@ -659,6 +710,111 @@ describe("MinnowDialect", () => {
       { name: "tags", dataType: "text[]" },
       { name: "feeling", dataType: "mood" },
     ]);
+  });
+
+  it("optionally decodes NUMERIC, JSON, and JSONB results in buffered and streamed reads", async () => {
+    interface NativeDomains {
+      domain_values: {
+        id: number;
+        amount: number | null;
+        document: { name: string } | null;
+        details: string[] | null;
+      };
+    }
+    interface LosslessDomains {
+      domain_values: {
+        id: number;
+        amount: string | null;
+        document: string | null;
+        details: string | null;
+      };
+    }
+    await database.execute(
+      "CREATE TABLE domain_values (id INTEGER PRIMARY KEY, amount NUMERIC(12, 2), document JSON, details JSONB)",
+    );
+    await database.execute(
+      "INSERT INTO domain_values VALUES " +
+        '(1, 12.50, \'{"name":"Ada"}\', \'["compiler"]\'), ' +
+        '(2, 9.25, \'{"name":"Grace"}\', \'["cobol","navy"]\'), ' +
+        "(3, NULL, NULL, NULL)",
+    );
+
+    const lossless = new Kysely<LosslessDomains>({
+      dialect: new MinnowDialect({ driver: database }),
+    });
+    expect(await lossless.selectFrom("domain_values").selectAll().orderBy("id").execute()).toEqual([
+      { id: 1, amount: "12.5", document: '{"name":"Ada"}', details: '["compiler"]' },
+      {
+        id: 2,
+        amount: "9.25",
+        document: '{"name":"Grace"}',
+        details: '["cobol","navy"]',
+      },
+      { id: 3, amount: null, document: null, details: null },
+    ]);
+
+    const native = new Kysely<NativeDomains>({
+      dialect: new MinnowDialect({
+        driver: database,
+        resultDecoding: { numeric: "number", json: "parse" },
+      }),
+    });
+    expect(await native.selectFrom("domain_values").selectAll().orderBy("id").execute()).toEqual([
+      { id: 1, amount: 12.5, document: { name: "Ada" }, details: ["compiler"] },
+      { id: 2, amount: 9.25, document: { name: "Grace" }, details: ["cobol", "navy"] },
+      { id: 3, amount: null, document: null, details: null },
+    ]);
+    const streamed = [];
+    for await (const row of native
+      .selectFrom("domain_values")
+      .selectAll()
+      .orderBy("id")
+      .stream(1)) {
+      streamed.push(row);
+    }
+    expect(streamed).toEqual([
+      { id: 1, amount: 12.5, document: { name: "Ada" }, details: ["compiler"] },
+      { id: 2, amount: 9.25, document: { name: "Grace" }, details: ["cobol", "navy"] },
+      { id: 3, amount: null, document: null, details: null },
+    ]);
+    expect(
+      await native
+        .deleteFrom("domain_values")
+        .where("id", "=", 1)
+        .returningAll()
+        .executeTakeFirstOrThrow(),
+    ).toEqual({ id: 1, amount: 12.5, document: { name: "Ada" }, details: ["compiler"] });
+
+    let includeDomain = false;
+    const compatibilityDriver: MinnowSqlDriver = {
+      query: database.query.bind(database),
+      queryCursor: database.queryCursor.bind(database),
+      introspect: database.introspect.bind(database),
+      execute: async (): Promise<ExecuteResult> => ({
+        kind: "insert",
+        table: "domain_values",
+        rowCount: 1,
+        returnedRows: [{ amount: includeDomain ? "1e400" : "2" }],
+        returnedColumns: ["amount"],
+        ...(includeDomain ? { returnedColumnDomains: [{ kind: "numeric" }] } : {}),
+      }),
+    };
+    const compatibility = new Kysely<NativeDomains>({
+      dialect: new MinnowDialect({
+        driver: compatibilityDriver,
+        resultDecoding: { numeric: "number" },
+      }),
+    });
+    expect((await sql<{ amount: unknown }>`SELECT 1`.execute(compatibility)).rows).toEqual([
+      { amount: "2" },
+    ]);
+    includeDomain = true;
+    await expect(sql<{ amount: number }>`SELECT 1`.execute(compatibility)).rejects.toThrow(
+      "NUMERIC result cannot be represented as a finite number: 1e400",
+    );
+    await compatibility.destroy();
+    await native.destroy();
+    await lossless.destroy();
   });
 
   it("runs Kysely migrations on its reserved single connection", async () => {

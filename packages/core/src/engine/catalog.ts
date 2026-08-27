@@ -2,6 +2,7 @@ import {
   secondaryIndexColumnIds,
   secondaryIndexDirections,
   type ColumnDefault,
+  type ColumnGenerated,
   type SecondaryIndexState,
   type SimpleDataType,
   type SqlDomain,
@@ -31,6 +32,8 @@ export interface CatalogColumn {
   readonly nullable: boolean;
   /** Filled for omitted or SQL DEFAULT insert slots; never applied at read time. */
   readonly defaultValue?: ColumnDefault;
+  /** Stored expression maintained by the engine; callers cannot assign this column. */
+  readonly generatedValue?: ColumnGenerated;
   /** String columns only: the closed set of values writes may draw from. */
   readonly enumValues?: readonly string[];
   /** Derived from the default spec, because a planner should not have to decode one. */
@@ -127,6 +130,7 @@ function toCatalogColumn(column: TableRecord["columns"][number]): CatalogColumn 
     ...(column.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(column.sqlDomain) }),
     nullable: column.nullable,
     ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+    ...(column.generatedValue === undefined ? {} : { generatedValue: column.generatedValue }),
     ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
     ...(column.backfill === undefined
       ? {}

@@ -23,14 +23,14 @@ const KEYED_LIVE_MARKER = "Live query window maxRows must be a positive whole nu
 const TYPED_TABLE_MARKER = "Upsert requires a unique key:";
 const DATABASE_MARKER = "A database cannot queue more than";
 // Result-domain metadata, DATE, guarded upserts, typed catalog errors, bounded cancellation,
-// exact-NUMERIC dictionary predicates, maintenance hints, and set-at-a-time correlated SQL
-// intentionally expand the complete engine surface. Measured: 697.6 KiB raw / 200.3 KiB gzip.
-// Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 702 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 202 * 1024;
-// Measured with the larger durable adapter: 1032.2 KiB raw / 283.9 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1038 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 286 * 1024;
+// exact-NUMERIC dictionary predicates, maintenance hints, set-at-a-time correlated SQL, nested
+// JSON provenance, and stored generated columns intentionally expand the complete engine surface.
+// Measured: 707.7 KiB raw / 202.8 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 713 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 205 * 1024;
+// Measured with the larger durable adapter: 1041.8 KiB raw / 286.2 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1049 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 289 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

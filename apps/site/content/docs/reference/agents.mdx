@@ -92,6 +92,10 @@ machines: https://minnowdb.com/llms.txt
   is intended. JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enum values also return
   strings at the JavaScript boundary. `DATE` is canonical `YYYY-MM-DD` calendar text, not a
   JavaScript `Date`.
+- Use a column builder's `.generatedSql("expression")` or SQL `GENERATED ALWAYS AS (...) STORED` for a
+  value derived from sibling columns. Omit it from inserts and updates; Minnow recomputes it.
+  Adding a new generated column to an existing table is refused, while adopting generation on an
+  existing column scans and verifies its values.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
 - Use `db.upsertBatch(table, rows, { conflictWhere: { column, operator, value } })` when an
   existing target row must satisfy a guard before replacement. Inserts still land; inspect
@@ -116,6 +120,9 @@ machines: https://minnowdb.com/llms.txt
   Preserve `InferKyselyDatabase` when constructing Kysely manually. Only arbitrary function names
   and raw SQL strings need an explicit result type. All aggregates except `count` include `null`
   for empty input; use inferred `fn.coalesce()` when the query supplies a fallback.
+- Set Kysely's `resultDecoding: { numeric: "number", json: "parse" }` when native Float64 and
+  parsed JSON results are preferred to core's lossless strings. The option covers buffered,
+  streamed, and `RETURNING` rows; omit numeric decoding when decimal precision must remain exact.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
   With Kysely, use `search.match(eb, columns, query)` and `search.rank(eb, columns, query)` so the

@@ -34,7 +34,7 @@ import {
   scalarFunctionValue,
   unknownColumnDomains,
 } from "./query.js";
-import { jsonValueOf } from "./sql-json.js";
+import { jsonConstructor } from "./sql-json.js";
 import {
   bm25DocumentScore,
   cachedQueryTerms,
@@ -66,6 +66,7 @@ import {
   externalSqlDomainValue,
   isDateDomainValue,
   isExactNumeric,
+  preservedJsonDomainValue,
   protectedSqlTextValue,
 } from "./sql-domains.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
@@ -5153,9 +5154,10 @@ function evaluateFinalExpression(
   if (expression.name === "COUNT") return count;
   if (count === 0) return null;
   if (expression.name === "JSON_ARRAYAGG") {
-    return JSON.stringify(
-      (required(group.lists, "JSON aggregate list state is missing")[aggregateIndex] ?? []).map(
-        jsonValueOf,
+    return preservedJsonDomainValue(
+      jsonConstructor(
+        "JSON_ARRAY",
+        required(group.lists, "JSON aggregate list state is missing")[aggregateIndex] ?? [],
       ),
     );
   }

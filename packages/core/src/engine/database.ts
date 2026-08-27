@@ -87,6 +87,7 @@ import {
   type BlockWrite,
   BlockReadBatchTooLargeError,
   type ColumnDefault,
+  type ColumnGenerated,
   validateColumnDefault,
   validateEnumValues,
   type FtsColumnDelta,
@@ -271,6 +272,7 @@ import { toCatalog, type Catalog } from "./catalog.js";
 import {
   applyColumnSteps,
   assertColumnDroppable,
+  compileGeneratedColumnExpression,
   declaredForeignKeys,
   isDestructiveStep,
   planMigration,
@@ -593,6 +595,8 @@ export interface ColumnDefinition {
   nullable?: boolean;
   /** Fills omitted or SQL DEFAULT slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
+  /** Stored expression over sibling columns; callers cannot assign this column. */
+  generatedValue?: ColumnGenerated;
   /** String columns only: the closed set of values writes must draw from. */
   enumValues?: readonly string[];
   /** What rows written before this column existed read as, instead of NULL. */
@@ -746,6 +750,8 @@ export interface UpdateBatchResult {
   storedBytes: number;
   version: number;
   metrics: WriteMetrics;
+  /** Recomputed generated-column vectors in input key order. */
+  generatedColumns?: Record<string, BatchValue[]>;
 }
 
 export interface WriteMetrics {
@@ -1271,33 +1277,58 @@ export type ExecuteResult =
   | { kind: "drop-view"; view: string; dropped: boolean }
   | { kind: "create-trigger"; table: string; name: string }
   | { kind: "drop-trigger"; name: string }
-  | {
+  | ({
       kind: "insert";
       table: string;
       rowCount: number;
       /** Absent when the statement affected no rows (an INSERT ... SELECT of an empty set). */
       version?: number;
-      returnedRows?: QueryRow[];
-    }
-  | { kind: "update"; table: string; rowCount: number; version?: number; returnedRows?: QueryRow[] }
-  | {
+    } & ReturningExecuteFields)
+  | ({ kind: "update"; table: string; rowCount: number; version?: number } & ReturningExecuteFields)
+  | ({
       kind: "delete";
       table: string;
       rowCount: number;
       version?: number | null;
-      returnedRows?: QueryRow[];
-    };
+    } & ReturningExecuteFields);
+
+interface ReturningExecuteFields {
+  returnedRows?: QueryRow[];
+  /** RETURNING projection order; present with returnedRows, including for an empty result. */
+  returnedColumns?: string[];
+  /** Logical domains aligned with returnedColumns. */
+  returnedColumnDomains?: Array<SqlDomain | null>;
+}
+
+function returningExecuteFields(
+  table: TableRecord,
+  columns: readonly string[],
+  rows: QueryRow[],
+): Required<ReturningExecuteFields> {
+  return {
+    returnedRows: rows,
+    returnedColumns: [...columns],
+    returnedColumnDomains: columns.map(
+      (name) => table.columns.find((column) => column.name === name)?.sqlDomain ?? null,
+    ),
+  };
+}
 
 function externalizeExecuteResult(result: ExecuteResult): ExecuteResult {
   if (!("returnedRows" in result) || !Array.isArray(result.returnedRows)) return result;
-  const columns = [...new Set(result.returnedRows.flatMap((row) => Object.keys(row)))];
+  const columns = result.returnedColumns ?? [
+    ...new Set(result.returnedRows.flatMap((row) => Object.keys(row))),
+  ];
+  const columnDomains = result.returnedColumnDomains ?? unknownColumnDomains(columns);
   return {
     ...result,
     returnedRows: externalizeQueryResult({
       columns,
-      columnDomains: unknownColumnDomains(columns),
+      columnDomains,
       rows: result.returnedRows,
     }).rows,
+    returnedColumns: [...columns],
+    returnedColumnDomains: structuredClone(columnDomains),
   };
 }
 
@@ -2021,6 +2052,9 @@ export class MinnowDatabase {
         ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
         nullable: column.nullable ?? false,
         ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+        ...(column.generatedValue === undefined
+          ? {}
+          : { generatedValue: structuredClone(column.generatedValue) }),
         ...(column.enumValues === undefined
           ? {}
           : { enumValues: validateEnumValues(column.enumValues, columnName) }),
@@ -2084,6 +2118,19 @@ export class MinnowDatabase {
       throw new TypeError(`Unique key cannot be nullable: ${uniqueKeyColumn.name}`);
     }
     for (const column of columns) {
+      if (column.generatedValue !== undefined) {
+        if (column.defaultValue !== undefined || column.backfill !== undefined) {
+          throw new TypeError(
+            `A generated column cannot also have a default or backfill: ${name}.${column.name}`,
+          );
+        }
+        compileGeneratedColumnExpression(name, column.name, column.generatedValue.sql, columns);
+        if (column === uniqueKeyColumn || compositePrimaryColumns.includes(column)) {
+          throw new TypeError(
+            `Generated columns cannot be row-addressing keys: ${name}.${column.name}`,
+          );
+        }
+      }
       if (column.defaultValue !== undefined) {
         validateColumnDefault(
           { ...column, isUniqueKey: column === uniqueKeyColumn },
@@ -2314,6 +2361,9 @@ export class MinnowDatabase {
               : { sqlDomain: structuredClone(column.sqlDomain) }),
             nullable: column.nullable,
             ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+            ...(column.generatedValue === undefined
+              ? {}
+              : { generatedValue: column.generatedValue }),
             ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
           })),
           ...(uniqueKey === undefined ? {} : { uniqueKey }),
@@ -2954,6 +3004,7 @@ export class MinnowDatabase {
       Object.values(pivoted.columns).find((values) => values.length > 0)?.length ??
       0;
     normalizeDomainBatch(table, filled.batch);
+    fillStoredGeneratedColumns(table, filled.batch, inputRowCount, filled.generated);
     for (const name of filled.generated.keys()) {
       const column = table.columns.find((candidate) => candidate.name === name);
       const values = filled.batch.columns[name];
@@ -3075,6 +3126,7 @@ export class MinnowDatabase {
         throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
       }
       const normalizedInput = normalizeDomainUpdate(table, input);
+      rejectGeneratedUpdateAssignments(table, normalizedInput);
       const keys = validateUpdateBatch(table, keyColumn, normalizedInput);
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new UnknownTableError(tableName);
@@ -3393,19 +3445,13 @@ export class MinnowDatabase {
   ): Promise<UpdateBatchResult> {
     await this.#assertCompactionCapacity(table);
     const started = performance.now();
-    const logicalBytes =
-      estimateValuesBytes(input.keys) +
-      Object.values(input.changes).reduce(
-        (total, values) => total + estimateValuesBytes(values),
-        0,
-      );
+    let logicalBytes: number;
     // Deferred: the record rides the single-shot commit below unless trigger rows stage first.
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
     const blockStager = new BoundedWriteBlockStager(transaction);
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const changedColumns = Object.keys(input.changes).sort();
     let storedBytes = 0;
     let blockCount = 0;
     let encodeMs = 0;
@@ -3415,6 +3461,40 @@ export class MinnowDatabase {
 
     try {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, keys);
+      const checks = table.checks ?? [];
+      let changedForeignKey = (table.foreignKeys ?? []).some(
+        (key) =>
+          key.enforced !== false &&
+          foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
+      );
+      const preImages = await this.#triggerPreImages(
+        table,
+        keyColumn,
+        input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
+        "update",
+        (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+        checks.length > 0 ||
+          changedForeignKey ||
+          tableGeneratedExpressions(table).length > 0 ||
+          secondaryIndexUpdateNeedsPreImages(table, input) ||
+          readyUniqueSecondaryIndexes(table).some(({ columns }) =>
+            columns.some((column) => input.changes[column.name] !== undefined),
+          ),
+      );
+      input = applyStoredGeneratedUpdateChanges(table, input, preImages);
+      validateUpdateBatch(table, keyColumn, input);
+      changedForeignKey = (table.foreignKeys ?? []).some(
+        (key) =>
+          key.enforced !== false &&
+          foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
+      );
+      logicalBytes =
+        estimateValuesBytes(input.keys) +
+        Object.values(input.changes).reduce(
+          (total, values) => total + estimateValuesBytes(values),
+          0,
+        );
+      const changedColumns = Object.keys(input.changes).sort();
       const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
       const plannedColumns = columns.map((column) =>
         writeColumnValues(
@@ -3460,25 +3540,6 @@ export class MinnowDatabase {
         }
         columnBlockIds[column.id] = blockIds;
       }
-      const checks = table.checks ?? [];
-      const changedForeignKey = (table.foreignKeys ?? []).some(
-        (key) =>
-          key.enforced !== false &&
-          foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
-      );
-      const preImages = await this.#triggerPreImages(
-        table,
-        keyColumn,
-        input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
-        "update",
-        (sql, params) => this.#sessionQuery(transaction, sql, { params }),
-        checks.length > 0 ||
-          changedForeignKey ||
-          secondaryIndexUpdateNeedsPreImages(table, input) ||
-          readyUniqueSecondaryIndexes(table).some(({ columns }) =>
-            columns.some((column) => input.changes[column.name] !== undefined),
-          ),
-      );
       stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
       const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
       if (secondaryDeltas.length > 0) {
@@ -3573,6 +3634,18 @@ export class MinnowDatabase {
             blockCount,
             storedBytes,
             version: manifest.version,
+            ...(tableGeneratedExpressions(table).length === 0
+              ? {}
+              : {
+                  generatedColumns: Object.fromEntries(
+                    tableGeneratedExpressions(table).map(({ column }) => [
+                      column.name,
+                      (input.changes[column.name] ?? []).map(
+                        (value) => externalSqlDomainValue(value) as BatchValue,
+                      ),
+                    ]),
+                  ),
+                }),
             metrics: createWriteMetrics({
               logicalBytes,
               storedBytes,
@@ -6436,6 +6509,7 @@ export class MinnowDatabase {
       derivedRows.length,
     );
     normalizeDomainBatch(target, filled.batch);
+    fillStoredGeneratedColumns(target, filled.batch, derivedRows.length, filled.generated);
     fillCompositePrimaryKey(target, filled.batch, derivedRows.length);
     validateBatch(target, filled.batch, filled.autoIncrement?.column.name);
     if (filled.autoIncrement !== undefined && filled.autoIncrement.missingIndexes.length > 0) {
@@ -7248,6 +7322,7 @@ export class MinnowDatabase {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
     }
     input = normalizeDomainUpdate(table, input);
+    rejectGeneratedUpdateAssignments(table, input);
     const keys = validateUpdateBatch(table, keyColumn, input);
     // Read-your-writes membership: keys staged by this scope pass, keys the scope removed
     // fail, and everything else checks against the committed snapshot as usual.
@@ -7262,7 +7337,7 @@ export class MinnowDatabase {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
     }
     const sessionChecks = table.checks ?? [];
-    const changedForeignKey = (table.foreignKeys ?? []).some(
+    let changedForeignKey = (table.foreignKeys ?? []).some(
       (key) =>
         key.enforced !== false &&
         foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
@@ -7275,10 +7350,18 @@ export class MinnowDatabase {
       (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
       sessionChecks.length > 0 ||
         changedForeignKey ||
+        tableGeneratedExpressions(table).length > 0 ||
         secondaryIndexUpdateNeedsPreImages(table, input) ||
         readyUniqueSecondaryIndexes(table).some(({ columns }) =>
           columns.some((column) => input.changes[column.name] !== undefined),
         ),
+    );
+    input = applyStoredGeneratedUpdateChanges(table, input, preImages);
+    validateUpdateBatch(table, keyColumn, input);
+    changedForeignKey = (table.foreignKeys ?? []).some(
+      (key) =>
+        key.enforced !== false &&
+        foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
     );
     stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
     const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
@@ -7395,7 +7478,23 @@ export class MinnowDatabase {
       "after",
       cascadeBudget,
     );
-    return { tableName: table.name, segmentId, rowCount: input.keys.length };
+    return {
+      tableName: table.name,
+      segmentId,
+      rowCount: input.keys.length,
+      ...(tableGeneratedExpressions(table).length === 0
+        ? {}
+        : {
+            generatedColumns: Object.fromEntries(
+              tableGeneratedExpressions(table).map(({ column }) => [
+                column.name,
+                (input.changes[column.name] ?? []).map(
+                  (value) => externalSqlDomainValue(value) as BatchValue,
+                ),
+              ]),
+            ),
+          }),
+    };
   }
 
   async #sessionDelete(
@@ -7815,6 +7914,9 @@ export class MinnowDatabase {
             ...(columnDefinition.defaultSpec === undefined
               ? {}
               : { defaultValue: columnDefinition.defaultSpec }),
+            ...(columnDefinition.generatedSpec === undefined
+              ? {}
+              : { generatedValue: columnDefinition.generatedSpec }),
             ...(columnDefinition.enumValues === undefined
               ? {}
               : { enumValues: columnDefinition.enumValues }),
@@ -7953,6 +8055,40 @@ export class MinnowDatabase {
                 `Cannot rename ${record.name}.${step.from}: trigger ${trigger.name} references it`,
               );
             }
+          }
+        }
+      }
+      // Adopting generation on an existing physical column is metadata-only only when every
+      // stored value already equals the declared expression. This supports migrations from an
+      // application-maintained column without silently blessing stale historical rows.
+      for (const step of steps) {
+        if (step.kind !== "alter-generated" || step.generatedValue === null) continue;
+        const target = record.columns.find(({ name }) => name === step.columnName);
+        if (target === undefined) continue;
+        const expression = compileGeneratedColumnExpression(
+          record.name,
+          target.name,
+          step.generatedValue.sql,
+          record.columns,
+        );
+        const rows = (
+          await this.query(`SELECT * FROM ${quoteSqlIdentifier(record.name)}`, { memoize: false })
+        ).rows;
+        for (const [rowIndex, row] of rows.entries()) {
+          const expected = normalizeGeneratedColumnValue(
+            target,
+            evaluateRowExpression(expression, record.name, generatedEvaluationRow(record, row)),
+            rowIndex,
+          );
+          const actual = normalizeGeneratedColumnValue(target, row[target.name] ?? null, rowIndex);
+          const equal =
+            expected instanceof Date && actual instanceof Date
+              ? dateMilliseconds(expected) === dateMilliseconds(actual)
+              : Object.is(expected, actual);
+          if (!equal) {
+            throw new TypeError(
+              `Generated column cannot be adopted: ${record.name}.${target.name} differs from its expression at row ${String(rowIndex)}`,
+            );
           }
         }
       }
@@ -8626,6 +8762,12 @@ export class MinnowDatabase {
       statement.rows.length,
     );
     normalizeDomainBatch(table, filledProposed.batch);
+    fillStoredGeneratedColumns(
+      table,
+      filledProposed.batch,
+      statement.rows.length,
+      filledProposed.generated,
+    );
     fillCompositePrimaryKey(table, filledProposed.batch, statement.rows.length);
     const proposed = filledProposed.batch;
     // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
@@ -8709,9 +8851,16 @@ export class MinnowDatabase {
       // and UUID defaults twice and could even change which row conflicts.
       const columns = visibleTableColumns(table).map(({ name }) => name);
       const deferredAutoIncrement = new Set(filledProposed.autoIncrement?.missingIndexes ?? []);
+      const generatedColumns = new Set(
+        table.columns.flatMap((column) =>
+          column.generatedValue === undefined ? [] : [column.name],
+        ),
+      );
       const rows: InsertValue[][] = Array.from({ length: statement.rows.length }, (_, rowIndex) =>
         columns.map((name) =>
-          name === filledProposed.autoIncrement?.column.name && deferredAutoIncrement.has(rowIndex)
+          generatedColumns.has(name) ||
+          (name === filledProposed.autoIncrement?.column.name &&
+            deferredAutoIncrement.has(rowIndex))
             ? { default: true }
             : (proposed.columns[name]?.[rowIndex] ?? null),
         ),
@@ -8842,6 +8991,7 @@ export class MinnowDatabase {
       if (freshRows.length > 0) {
         const columns: Record<string, BatchValue[]> = {};
         for (const column of table.columns) {
+          if (column.generatedValue !== undefined) continue;
           columns[column.name] = freshRows.map(
             (rowIndex) => proposed.columns[column.name]?.[rowIndex] ?? null,
           );
@@ -8884,7 +9034,9 @@ export class MinnowDatabase {
       table: statement.table,
       rowCount: outcome.affectedRows.length,
       ...(version === null || version === undefined ? {} : { version }),
-      ...(outcome.returnedRows === undefined ? {} : { returnedRows: outcome.returnedRows }),
+      ...(outcome.returnedRows === undefined || returningColumns === undefined
+        ? {}
+        : returningExecuteFields(table, returningColumns, outcome.returnedRows)),
     };
   }
 
@@ -8922,14 +9074,19 @@ export class MinnowDatabase {
       statement.rows.length,
     );
     normalizeDomainBatch(table, filled.batch);
+    fillStoredGeneratedColumns(table, filled.batch, statement.rows.length, filled.generated);
     fillCompositePrimaryKey(table, filled.batch, statement.rows.length);
     const columns = visibleTableColumns(table).map(({ name }) => name);
     const deferredAutoIncrement = new Set(filled.autoIncrement?.missingIndexes ?? []);
+    const generatedColumns = new Set(
+      table.columns.flatMap((column) => (column.generatedValue === undefined ? [] : [column.name])),
+    );
     const materializedRows: InsertValue[][] = Array.from(
       { length: statement.rows.length },
       (_, rowIndex) =>
         columns.map((name) =>
-          name === filled.autoIncrement?.column.name && deferredAutoIncrement.has(rowIndex)
+          generatedColumns.has(name) ||
+          (name === filled.autoIncrement?.column.name && deferredAutoIncrement.has(rowIndex))
             ? { default: true }
             : (filled.batch.columns[name]?.[rowIndex] ?? null),
         ),
@@ -9459,6 +9616,11 @@ export class MinnowDatabase {
           if (record.columns.some(({ name }) => name === added.name)) {
             throw new TypeError(`Column already exists: ${addColumnStatement.table}.${added.name}`);
           }
+          if (added.generatedValue !== undefined) {
+            throw new TypeError(
+              "ALTER TABLE cannot add a generated column without rewriting existing rows",
+            );
+          }
           if (added.defaultValue !== undefined) {
             validateColumnDefault(
               {
@@ -9620,11 +9782,20 @@ export class MinnowDatabase {
       return this.#mergeConflictingInsertRows(statement, options);
     }
     if (statement.kind === "insert" && statement.rows.length === 0) {
+      const table = await this.#findTable(statement.table);
+      const returningColumns =
+        options.returning === undefined
+          ? undefined
+          : options.returning === "*"
+            ? visibleTableColumns(table).map(({ name }) => name)
+            : [...options.returning];
       return {
         kind: "insert",
         table: statement.table,
         rowCount: 0,
-        ...(options.returning === undefined ? {} : { returnedRows: [] }),
+        ...(returningColumns === undefined
+          ? {}
+          : returningExecuteFields(table, returningColumns, [])),
       };
     }
     if (statement.kind === "insert") {
@@ -9695,20 +9866,24 @@ export class MinnowDatabase {
         ...(returningColumns === undefined
           ? {}
           : {
-              returnedRows: statement.rows.map((row, rowIndex) =>
-                Object.fromEntries(
-                  returningColumns.map((name) => {
-                    const column = table.columns.find((candidate) => candidate.name === name);
-                    const position = statement.columns.indexOf(name);
-                    const inserted = position < 0 ? undefined : row[position];
-                    const value =
-                      generated[name]?.[rowIndex] ??
-                      input.columns[name]?.[rowIndex] ??
-                      (inserted === undefined || isDefaultInsertValue(inserted)
-                        ? null
-                        : boundInsertValue(inserted));
-                    return [name, executionSqlValueFromInput(column, value)];
-                  }),
+              ...returningExecuteFields(
+                table,
+                returningColumns,
+                statement.rows.map((row, rowIndex) =>
+                  Object.fromEntries(
+                    returningColumns.map((name) => {
+                      const column = table.columns.find((candidate) => candidate.name === name);
+                      const position = statement.columns.indexOf(name);
+                      const inserted = position < 0 ? undefined : row[position];
+                      const value =
+                        generated[name]?.[rowIndex] ??
+                        input.columns[name]?.[rowIndex] ??
+                        (inserted === undefined || isDefaultInsertValue(inserted)
+                          ? null
+                          : boundInsertValue(inserted));
+                      return [name, executionSqlValueFromInput(column, value)];
+                    }),
+                  ),
                 ),
               ),
             }),
@@ -9835,7 +10010,9 @@ export class MinnowDatabase {
           kind: "delete",
           table: table.name,
           rowCount: 0,
-          ...(returnedRows === undefined ? {} : { returnedRows }),
+          ...(returnedRows === undefined || returningColumns === undefined
+            ? {}
+            : returningExecuteFields(table, returningColumns, returnedRows)),
         };
       }
       const deleted: { deletedRowCount?: number; rowCount?: number; version?: number | null } =
@@ -9849,7 +10026,9 @@ export class MinnowDatabase {
         ...(deleted.version === undefined || deleted.version === null
           ? {}
           : { version: deleted.version }),
-        ...(returnedRows === undefined ? {} : { returnedRows }),
+        ...(returnedRows === undefined || returningColumns === undefined
+          ? {}
+          : returningExecuteFields(table, returningColumns, returnedRows)),
       };
     }
     if (keys.length === 0) {
@@ -9857,7 +10036,9 @@ export class MinnowDatabase {
         kind: "update",
         table: table.name,
         rowCount: 0,
-        ...(returningColumns === undefined ? {} : { returnedRows: [] }),
+        ...(returningColumns === undefined
+          ? {}
+          : returningExecuteFields(table, returningColumns, [])),
       };
     }
     const changes: Record<string, Array<BatchValue | null>> = {};
@@ -9883,7 +10064,12 @@ export class MinnowDatabase {
         returnedChanges[assignment.column] = executionValues;
       }
     }
-    const updated: { updatedRowCount?: number; rowCount?: number; version?: number | null } =
+    const updated: {
+      updatedRowCount?: number;
+      rowCount?: number;
+      version?: number | null;
+      generatedColumns?: Record<string, BatchValue[]>;
+    } =
       options.writer === undefined
         ? await this.updateBatch(table.name, { keys, changes })
         : await options.writer.updateBatch(table.name, { keys, changes });
@@ -9896,7 +10082,9 @@ export class MinnowDatabase {
                 name,
                 returnedChanges !== undefined && name in returnedChanges
                   ? (returnedChanges[name]?.[index] ?? null)
-                  : (row[name] ?? null),
+                  : updated.generatedColumns?.[name] !== undefined
+                    ? (updated.generatedColumns[name][index] ?? null)
+                    : (row[name] ?? null),
               ]),
             ),
           );
@@ -9907,7 +10095,9 @@ export class MinnowDatabase {
       ...(updated.version === undefined || updated.version === null
         ? {}
         : { version: updated.version }),
-      ...(returnedRows === undefined ? {} : { returnedRows }),
+      ...(returnedRows === undefined || returningColumns === undefined
+        ? {}
+        : returningExecuteFields(table, returningColumns, returnedRows)),
     };
   }
 
@@ -18614,7 +18804,8 @@ function assertTriggerBodyTargetSchema(
           column !== undefined &&
           isDefaultInsertValue(value) &&
           !column.nullable &&
-          column.defaultValue === undefined
+          column.defaultValue === undefined &&
+          column.generatedValue === undefined
         ) {
           throw new TypeError(
             `Trigger body INSERT uses DEFAULT for a non-nullable column without a default: ${column.name}`,
@@ -18622,8 +18813,22 @@ function assertTriggerBodyTargetSchema(
         }
       }
     }
+    for (const [index, column] of insertColumns.entries()) {
+      if (column.generatedValue === undefined) continue;
+      for (const row of compiled.rows) {
+        const value = row[index];
+        if (value === undefined || !isDefaultInsertValue(value)) {
+          throw new TypeError(`Trigger body INSERT assigns generated column: ${column.name}`);
+        }
+      }
+    }
     for (const column of columns) {
-      if (!provided.has(column.name) && !column.nullable && column.defaultValue === undefined) {
+      if (
+        !provided.has(column.name) &&
+        !column.nullable &&
+        column.defaultValue === undefined &&
+        column.generatedValue === undefined
+      ) {
         throw new TypeError(
           `Trigger body INSERT omits a non-nullable column without a default: ${column.name}`,
         );
@@ -18653,6 +18858,9 @@ function assertTriggerBodyTargetSchema(
         throw new TypeError(
           `Trigger body UPDATE assignment column does not exist: ${assignment.column}`,
         );
+      }
+      if (assignedColumn.generatedValue !== undefined) {
+        throw new TypeError(`Trigger body UPDATE assigns generated column: ${assignment.column}`);
       }
       if (
         assignedColumn.id === target.uniqueKeyColumnId ||
@@ -18833,6 +19041,10 @@ function visibleSegmentManifestVersion(value: unknown, label: string): number | 
  */
 const compiledChecks = new Map<string, ReadonlyArray<{ name: string; expression: Expression }>>();
 const COMPILED_CHECK_CACHE_LIMIT = 64;
+const compiledGeneratedColumns = new Map<
+  string,
+  ReadonlyArray<{ column: TableColumnRecord; expression: Expression }>
+>();
 
 function tableChecks(table: TableRecord): ReadonlyArray<{ name: string; expression: Expression }> {
   const key = `${table.id}/${String(table.revision)}`;
@@ -18856,6 +19068,120 @@ function tableChecks(table: TableRecord): ReadonlyArray<{ name: string; expressi
   }
   compiledChecks.set(key, compiled);
   return compiled;
+}
+
+function tableGeneratedExpressions(
+  table: TableRecord,
+): ReadonlyArray<{ column: TableColumnRecord; expression: Expression }> {
+  const key = `${table.id}/${String(table.revision)}`;
+  const cached = compiledGeneratedColumns.get(key);
+  if (cached !== undefined) return cached;
+  const compiled = table.columns.flatMap((column) =>
+    column.generatedValue === undefined
+      ? []
+      : [
+          {
+            column,
+            expression: compileGeneratedColumnExpression(
+              table.name,
+              column.name,
+              column.generatedValue.sql,
+              table.columns,
+            ),
+          },
+        ],
+  );
+  if (compiledGeneratedColumns.size >= COMPILED_CHECK_CACHE_LIMIT) {
+    const oldest = compiledGeneratedColumns.keys().next().value;
+    if (oldest !== undefined) compiledGeneratedColumns.delete(oldest);
+  }
+  compiledGeneratedColumns.set(key, compiled);
+  return compiled;
+}
+
+function normalizeGeneratedColumnValue(
+  column: TableColumnRecord,
+  value: BatchValue,
+  rowIndex: number,
+): BatchValue {
+  const stored =
+    column.sqlDomain === undefined
+      ? storedSqlValueFromExecution(column, value)
+      : (normalizeSqlDomainValue(column.sqlDomain, value) as BatchValue);
+  validateValue(column, stored, rowIndex);
+  return stored;
+}
+
+/** Computes every stored generated column after defaults/domains have produced the base row. */
+function fillStoredGeneratedColumns(
+  table: TableRecord,
+  batch: ColumnarBatch,
+  rowCount: number,
+  generated?: Map<string, BatchValue[]>,
+): void {
+  for (const { column, expression } of tableGeneratedExpressions(table)) {
+    const values = new Array<BatchValue>(rowCount);
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      const row = batchRowAt(table, batch, rowIndex);
+      const value = evaluateRowExpression(expression, table.name, row);
+      values[rowIndex] = normalizeGeneratedColumnValue(column, value, rowIndex);
+    }
+    (batch.columns as Record<string, readonly BatchValue[]>)[column.name] = values;
+    generated?.set(
+      column.name,
+      values.map((value) => externalSqlDomainValue(value) as BatchValue),
+    );
+  }
+}
+
+function rejectGeneratedUpdateAssignments(table: TableRecord, input: UpdateBatchInput): void {
+  for (const column of table.columns) {
+    if (column.generatedValue !== undefined && input.changes[column.name] !== undefined) {
+      throw new TypeError(`Generated column cannot be assigned: ${column.name}`);
+    }
+  }
+}
+
+function generatedEvaluationRow(
+  table: TableRecord,
+  source: Record<string, BatchValue>,
+): Record<string, BatchValue> {
+  const row: Record<string, BatchValue> = {};
+  for (const column of table.columns) {
+    const value = source[column.name] ?? null;
+    row[column.name] =
+      column.sqlDomain === undefined
+        ? executionSqlValueFromStorage(column, value)
+        : normalizeSqlDomainValue(column.sqlDomain, value);
+  }
+  return row;
+}
+
+function applyStoredGeneratedUpdateChanges(
+  table: TableRecord,
+  input: UpdateBatchInput,
+  preImages: ReadonlyArray<Record<string, BatchValue> | undefined>,
+): UpdateBatchInput {
+  const generated = tableGeneratedExpressions(table);
+  if (generated.length === 0) return input;
+  const changes: Record<string, readonly BatchValue[]> = { ...input.changes };
+  for (const { column, expression } of generated) {
+    changes[column.name] = input.keys.map((_, rowIndex) => {
+      const old = preImages[rowIndex];
+      if (old === undefined)
+        throw new Error(`Generated-column pre-image is missing: ${table.name}`);
+      const row = generatedEvaluationRow(table, old);
+      for (const [name, values] of Object.entries(input.changes)) {
+        row[name] = values[rowIndex] ?? null;
+      }
+      return normalizeGeneratedColumnValue(
+        column,
+        evaluateRowExpression(expression, table.name, row),
+        rowIndex,
+      );
+    });
+  }
+  return { keys: input.keys, changes };
 }
 
 /**

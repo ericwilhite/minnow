@@ -14,31 +14,59 @@ import type {
   StringReference,
   ValueExpressionOrList,
 } from "kysely";
+import type { MinnowResultDecoding } from "./driver.js";
 
 type Simplify<T> = { [K in keyof T]: T[K] } & {};
 type ColumnMetadata<TColumn> = TColumn extends {
-  readonly "~types"?: infer TMetadata extends { readonly select: unknown; readonly input: unknown };
+  readonly "~types"?: infer TMetadata extends {
+    readonly select: unknown;
+    readonly input: unknown;
+    readonly domain: unknown;
+    readonly generated: boolean;
+  };
 }
   ? NonNullable<TMetadata>
   : never;
 
-type SelectValue<TColumn> = TColumn extends { readonly isNullable: infer TNullable }
-  ? TNullable extends true
-    ? ColumnMetadata<TColumn>["select"] | null
+export type MinnowJsonValue =
+  null | boolean | number | string | MinnowJsonValue[] | { [name: string]: MinnowJsonValue };
+
+type DecodedSelectValue<
+  TColumn,
+  TDecoding extends MinnowResultDecoding | undefined,
+> = ColumnMetadata<TColumn>["domain"] extends "numeric"
+  ? TDecoding extends { readonly numeric: "number" }
+    ? number
     : ColumnMetadata<TColumn>["select"]
+  : ColumnMetadata<TColumn>["domain"] extends "json" | "jsonb"
+    ? TDecoding extends { readonly json: "parse" }
+      ? MinnowJsonValue
+      : ColumnMetadata<TColumn>["select"]
+    : ColumnMetadata<TColumn>["select"];
+
+type SelectValue<TColumn, TDecoding extends MinnowResultDecoding | undefined> = TColumn extends {
+  readonly isNullable: infer TNullable;
+}
+  ? TNullable extends true
+    ? DecodedSelectValue<TColumn, TDecoding> | null
+    : DecodedSelectValue<TColumn, TDecoding>
   : never;
 
 type InsertValue<TColumn> = TColumn extends {
   readonly isNullable: infer TNullable;
   readonly hasDefault: infer THasDefault;
 }
-  ? | ColumnMetadata<TColumn>["input"]
-    | (TNullable extends true ? null | undefined : never)
-    | (THasDefault extends true ? undefined : never)
+  ? ColumnMetadata<TColumn>["generated"] extends true
+    ? never
+    : | ColumnMetadata<TColumn>["input"]
+      | (TNullable extends true ? null | undefined : never)
+      | (THasDefault extends true ? undefined : never)
   : never;
 
 type UpdateValue<TColumn> = TColumn extends { readonly isNullable: infer TNullable }
-  ? ColumnMetadata<TColumn>["input"] | (TNullable extends true ? null : never)
+  ? ColumnMetadata<TColumn>["generated"] extends true
+    ? never
+    : ColumnMetadata<TColumn>["input"] | (TNullable extends true ? null : never)
   : never;
 
 /**
@@ -46,11 +74,16 @@ type UpdateValue<TColumn> = TColumn extends { readonly isNullable: infer TNullab
  * Minnow keeps the SQL parameter boundary alongside those channels so exact NUMERIC columns can
  * select as lossless strings while naturally accepting either strings or numbers in predicates.
  */
-export type MinnowColumnType<TSelect, TInsert, TUpdate, TOperand> = ColumnType<
+export type MinnowColumnType<
   TSelect,
   TInsert,
-  TUpdate
-> & { readonly __minnow_operand__: TOperand };
+  TUpdate,
+  TOperand,
+  TDecoding extends MinnowResultDecoding | undefined = undefined,
+> = ColumnType<TSelect, TInsert, TUpdate> & {
+  readonly __minnow_operand__: TOperand;
+  readonly __minnow_result_decoding__?: TDecoding;
+};
 
 export type MinnowOperandType<DB, TB extends keyof DB, RE extends StringReference<DB, TB>> =
   ExtractTypeFromStringReference<DB, TB, RE> extends {
@@ -78,6 +111,15 @@ type HasMinnowColumns<DB> = [
 ] extends [never]
   ? false
   : true;
+
+type DatabaseResultDecoding<DB> =
+  DatabaseColumnType<DB> extends {
+    readonly __minnow_result_decoding__?: infer TDecoding;
+  }
+    ? TDecoding
+    : undefined;
+
+type DecodesJson<DB> = DatabaseResultDecoding<DB> extends { readonly json: "parse" } ? true : false;
 
 /** Keep Kysely's portable union unless this DB contains schema-derived Minnow columns. */
 type MinnowCountOutput<DB> = HasMinnowColumns<DB> extends true ? number : number | string | bigint;
@@ -174,7 +216,11 @@ type MinnowFixedScalarBaseOutput<
             : string
           : Uppercase<TName> extends "JSON_EXISTS"
             ? SqlBool
-            : string;
+            : Uppercase<TName> extends "JSON_QUERY" | "JSON_OBJECT" | "JSON_ARRAY"
+              ? DecodesJson<DB> extends true
+                ? MinnowJsonValue
+                : string
+              : string;
 
 type MinnowAlwaysNonNullScalarFunction =
   | "CURRENT_DATE"
@@ -260,7 +306,9 @@ type MinnowAggregateFunctionOutput<
         ? MinnowNumericAggregateOutput<DB, TB, RE, never>
         : Uppercase<TName> extends "MIN" | "MAX"
           ? ExtractTypeFromReferenceExpression<DB, TB, RE> | null
-          : string | null
+          : Uppercase<TName> extends "JSON_ARRAYAGG"
+            ? (DecodesJson<DB> extends true ? MinnowJsonValue[] : string) | null
+            : string | null
     : unknown;
 
 type MinnowCastDataType =
@@ -307,29 +355,49 @@ type MinnowCastBaseOutput<TDataType extends MinnowCastDataType> = TDataType exte
         ? Date
         : string;
 
+type MinnowDecodedCastBaseOutput<DB, TDataType extends MinnowCastDataType> = TDataType extends
+  "json" | "jsonb"
+  ? DecodesJson<DB> extends true
+    ? MinnowJsonValue
+    : string
+  : TDataType extends
+        "numeric" | `numeric(${number}, ${number})` | "decimal" | `decimal(${number}, ${number})`
+    ? DatabaseResultDecoding<DB> extends { readonly numeric: "number" }
+      ? number
+      : string
+    : MinnowCastBaseOutput<TDataType>;
+
 type MinnowCastOutput<DB, TB extends keyof DB, RE, TDataType extends MinnowCastDataType> =
   HasMinnowColumns<DB> extends true
-    ? | MinnowCastBaseOutput<TDataType>
+    ? | MinnowDecodedCastBaseOutput<DB, TDataType>
       | (null extends ExtractTypeFromReferenceExpression<DB, TB, RE> ? null : never)
     : unknown;
 
 /** One schema-declared table in Kysely's select/insert/update column format. */
-export type InferKyselyTable<TTable extends AnyTable> = Simplify<{
+export type InferKyselyTable<
+  TTable extends AnyTable,
+  TDecoding extends MinnowResultDecoding | undefined = undefined,
+> = Simplify<{
   [K in keyof TTable["columns"]]: MinnowColumnType<
-    SelectValue<TTable["columns"][K]>,
+    SelectValue<TTable["columns"][K], TDecoding>,
     InsertValue<TTable["columns"][K]>,
     K extends PrimaryKeyKeys<TTable> ? never : UpdateValue<TTable["columns"][K]>,
-    UpdateValue<TTable["columns"][K]>
+    UpdateValue<TTable["columns"][K]>,
+    TDecoding
   >;
 }>;
 
 /** Views select normally, while their columns accept no insert or update value. */
-export type InferKyselyView<TView extends AnyView> = Simplify<{
+export type InferKyselyView<
+  TView extends AnyView,
+  TDecoding extends MinnowResultDecoding | undefined = undefined,
+> = Simplify<{
   [K in keyof TView["columns"]]: MinnowColumnType<
-    SelectValue<TView["columns"][K]>,
+    SelectValue<TView["columns"][K], TDecoding>,
     never,
     never,
-    UpdateValue<TView["columns"][K]>
+    UpdateValue<TView["columns"][K]>,
+    TDecoding
   >;
 }>;
 
@@ -338,11 +406,14 @@ export type InferKyselyView<TView extends AnyView> = Simplify<{
  * columns become optional inserts, enum literals stay narrow, logical SQL domains keep their
  * boundary types, primary keys are read-only on update, and views are read-only.
  */
-export type InferKyselyDatabase<TSchema extends SchemaDefinition<readonly AnyTable[]>> = Simplify<
+export type InferKyselyDatabase<
+  TSchema extends SchemaDefinition<readonly AnyTable[]>,
+  TDecoding extends MinnowResultDecoding | undefined = undefined,
+> = Simplify<
   {
-    [TTable in TSchema["tables"][number] as TTable["name"]]: InferKyselyTable<TTable>;
+    [TTable in TSchema["tables"][number] as TTable["name"]]: InferKyselyTable<TTable, TDecoding>;
   } & {
-    [TView in TSchema["views"][number] as TView["name"]]: InferKyselyView<TView>;
+    [TView in TSchema["views"][number] as TView["name"]]: InferKyselyView<TView, TDecoding>;
   }
 >;
 

@@ -881,9 +881,11 @@ export class DatabaseTransaction {
 
   /**
    * Attaches one batch's full-text deltas; applied atomically with the publish. A second
-   * batch for the same table merges per column — postings re-sorted by term (each batch's
-   * reserved row ids are strictly above the last, so rowIds stay ascending within a term)
-   * and token totals summed — so a scope can insert into one FTS table any number of times.
+   * batch for the same table merges per column — postings stay sorted by term and row ID,
+   * duplicate row locators collapse to their greatest term frequency, and token totals are
+   * summed — so a scope can mutate one indexed table any number of times. Secondary indexes
+   * use stable hashed key locators rather than reserved row IDs, so operation order does not
+   * imply locator order.
    */
   setFtsChanges(changes: FtsChanges): void {
     this.#assertActive();
@@ -921,6 +923,7 @@ export class DatabaseTransaction {
         });
         continue;
       }
+      let duplicateTokens = 0;
       for (const posting of column.postings) {
         const held = present.postings.get(posting.term);
         if (held === undefined) {
@@ -930,11 +933,20 @@ export class DatabaseTransaction {
             tf: [...posting.tf],
           });
         } else {
-          for (const rowId of posting.rowIds) held.rowIds.push(rowId);
-          for (const tf of posting.tf) held.tf.push(tf);
+          const merged = mergeFtsPostingRows(held, posting);
+          duplicateTokens = safeWholeNumberSum(
+            [
+              duplicateTokens,
+              postingTokenCount(held) + postingTokenCount(posting) - postingTokenCount(merged),
+            ],
+            "Duplicate posting token count",
+          );
+          present.postings.set(posting.term, merged);
         }
       }
-      present.totalTokens = tokenTotals.get(column.columnId) ?? present.totalTokens;
+      const totalTokens = tokenTotals.get(column.columnId) ?? present.totalTokens;
+      if (duplicateTokens > totalTokens) throw new Error("Posting token merge is inconsistent");
+      present.totalTokens = totalTokens - duplicateTokens;
     }
   }
 
@@ -1867,6 +1879,50 @@ function safeWholeNumberSum(values: readonly number[], label: string): number {
     throw new RangeError(`${label} exceeds the safe integer range`);
   }
   return total;
+}
+
+/** Linear merge of two canonical postings for one term. */
+function mergeFtsPostingRows(left: FtsPosting, right: FtsPosting): FtsPosting {
+  if (left.term !== right.term)
+    throw new TypeError("Posting terms differ during transaction merge");
+  const rowIds: bigint[] = [];
+  const tf: number[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  const push = (rowId: bigint, frequency: number): void => {
+    const previous = rowIds[rowIds.length - 1];
+    if (previous === rowId) {
+      tf[tf.length - 1] = Math.max(tf[tf.length - 1] ?? 1, frequency);
+      return;
+    }
+    rowIds.push(rowId);
+    tf.push(frequency);
+  };
+  while (leftIndex < left.rowIds.length && rightIndex < right.rowIds.length) {
+    const leftRowId = left.rowIds[leftIndex] ?? 0n;
+    const rightRowId = right.rowIds[rightIndex] ?? 0n;
+    if (leftRowId <= rightRowId) {
+      push(leftRowId, left.tf[leftIndex] ?? 1);
+      leftIndex += 1;
+    }
+    if (rightRowId <= leftRowId) {
+      push(rightRowId, right.tf[rightIndex] ?? 1);
+      rightIndex += 1;
+    }
+  }
+  while (leftIndex < left.rowIds.length) {
+    push(left.rowIds[leftIndex] ?? 0n, left.tf[leftIndex] ?? 1);
+    leftIndex += 1;
+  }
+  while (rightIndex < right.rowIds.length) {
+    push(right.rowIds[rightIndex] ?? 0n, right.tf[rightIndex] ?? 1);
+    rightIndex += 1;
+  }
+  return { term: left.term, rowIds, tf };
+}
+
+function postingTokenCount(posting: FtsPosting): number {
+  return safeWholeNumberSum(posting.tf, "Posting token count");
 }
 
 function requiredCompactionJobId(id: string | null): string {

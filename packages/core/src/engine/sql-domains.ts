@@ -367,6 +367,33 @@ export function jsonDomainValue(value: unknown, binary: boolean): string | null 
   );
 }
 
+/** Returns the JSON document carried by an internal JSON/JSONB scalar, if any. */
+export function jsonDomainDocument(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (value.startsWith(JSONB_VALUE)) return value.slice(JSONB_VALUE.length);
+  if (value.startsWith(JSON_VALUE)) return value.slice(JSON_VALUE.length);
+  return undefined;
+}
+
+/**
+ * Tags already-constructed JSON without parsing and re-stringifying it. The validation parse
+ * rejects malformed documents, while retaining duplicate object names and the constructor's
+ * exact member order for embedding in an outer JSON value.
+ */
+export function preservedJsonDomainValue(document: string, binary = false): string {
+  assertBoundedDomainString(document, binary ? "JSONB value" : "JSON value");
+  try {
+    JSON.parse(document);
+  } catch {
+    throw new TypeError("Invalid JSON value");
+  }
+  return boundedTaggedDomainValue(
+    binary ? JSONB_VALUE : JSON_VALUE,
+    document,
+    binary ? "JSONB value" : "JSON value",
+  );
+}
+
 export function uuidDomainValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError("UUID accepts a string value");

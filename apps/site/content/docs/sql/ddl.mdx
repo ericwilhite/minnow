@@ -262,6 +262,35 @@ expression itself is plain structured-clone-safe data, so it persists and crosse
 boundary. Defaults fill only omitted or SQL `DEFAULT` slots at write time; adding or changing one
 never rewrites rows already stored.
 
+## Stored generated columns
+
+A stored generated column derives from other columns in the same row and is recomputed on every
+insert, upsert, and update:
+
+```sql
+CREATE TABLE offline_rows (
+  id INTEGER PRIMARY KEY,
+  field_id TEXT NOT NULL,
+  ticket_number INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  offline_key TEXT GENERATED ALWAYS AS (
+    field_id || ':' || CAST(ticket_number AS TEXT) || ':' || CAST(version AS TEXT)
+  ) STORED NOT NULL
+)
+```
+
+Callers omit `offline_key`; assigning it in an `INSERT`, `UPDATE`, trigger body, or conflict update
+is rejected. The expression may use immutable scalar operators and functions over ordinary
+sibling columns. It cannot use parameters, aggregates, windows, subqueries, volatile functions,
+another generated column, or a column from another table. Generated columns may be indexed and
+returned normally, but cannot be a primary key or the single unique row-addressing key.
+
+The schema DSL spells the same declaration `.generatedSql(expression)`. A new table stores the
+expression immediately. Adding a new generated column to an existing table is refused because it
+would require rewriting old rows. To move from an application-maintained column, keep the column
+name and type and add `.generatedSql(...)`; `migrate()` scans the existing rows and adopts the
+expression only when every stored value already matches it.
+
 ## Evolving a table
 
 ```sql

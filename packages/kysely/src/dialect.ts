@@ -8,7 +8,7 @@ import {
   type QueryCompiler,
 } from "kysely";
 import { MinnowQueryCompiler } from "./compiler.js";
-import { MinnowKyselyDriver } from "./driver.js";
+import { MinnowKyselyDriver, type MinnowResultDecoding } from "./driver.js";
 import { MinnowKyselyIntrospector } from "./introspector.js";
 
 export interface MinnowDialectConfig {
@@ -16,6 +16,8 @@ export interface MinnowDialectConfig {
   readonly driver: MinnowSqlDriver;
   /** Enables type inference and multi-row empty-object INSERT normalization. */
   readonly schema?: SchemaDefinition<readonly AnyTable[]>;
+  /** Optional logical-domain decoding. Omitted values retain Minnow's lossless text boundary. */
+  readonly resultDecoding?: MinnowResultDecoding;
 }
 
 class MinnowKyselyAdapter extends DialectAdapterBase {
@@ -42,10 +44,12 @@ class MinnowKyselyAdapter extends DialectAdapterBase {
 export class MinnowDialect implements Dialect {
   readonly #driver: MinnowSqlDriver;
   readonly #schema: SchemaDefinition<readonly AnyTable[]> | undefined;
+  readonly #resultDecoding: MinnowResultDecoding;
 
   constructor(config: MinnowDialectConfig) {
     this.#driver = config.driver;
     this.#schema = config.schema;
+    this.#resultDecoding = config.resultDecoding ?? {};
   }
 
   createAdapter(): DialectAdapter {
@@ -53,7 +57,7 @@ export class MinnowDialect implements Dialect {
   }
 
   createDriver(): Driver {
-    return new MinnowKyselyDriver(this.#driver);
+    return new MinnowKyselyDriver(this.#driver, this.#resultDecoding);
   }
 
   createIntrospector(): DatabaseIntrospector {

@@ -66,6 +66,10 @@ The column modifiers are:
   operators Minnow implements, including `CURRENT_TIMESTAMP`, `random()`, `gen_random_uuid()`,
   and `nextval(...)`. It rejects column references, parameters, aggregates, windows, subqueries,
   and a result type that does not match the column. `RETURNING` echoes the generated values.
+- **`.generatedSql(expression)`** — stores an immutable expression over ordinary sibling columns
+  and recomputes it on every insert, upsert, and update. Generated columns are omitted from
+  inferred insert/update inputs and cannot be row-addressing keys. The expression cannot use
+  parameters, aggregates, windows, subqueries, volatile functions, or another generated column.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
   rather than a drop-and-add.
 - **`.backfill(value)`** — what rows written before this column existed read as, instead of NULL.
@@ -121,7 +125,7 @@ const notes = table("notes", {
   body: column.string(),
 });
 await database.migrate(schema([notes]));
-// Inferred insert types make generated columns optional:
+// Inferred insert types make defaulted columns optional:
 const noteRows = typedTable(database, notes);
 await noteRows.insert([{ body: "hello" }]);
 ```
@@ -130,6 +134,26 @@ await noteRows.insert([{ body: "hello" }]);
 The SQL text remains catalog metadata and crosses the worker boundary unchanged. `CURRENT_*`
 uses one statement timestamp; volatile functions such as `gen_random_uuid()` run separately for
 each omitted row.
+
+For a composite value maintained from sibling columns, declare a stored generated column instead
+of repeating the calculation at every write site:
+
+```ts
+const rows = table("offline_rows", {
+  id: column.integer().unique(),
+  field_id: column.string(),
+  ticket_number: column.integer(),
+  version: column.integer(),
+  offline_key: column
+    .string()
+    .generatedSql("field_id || ':' || CAST(ticket_number AS TEXT) || ':' || CAST(version AS TEXT)"),
+});
+```
+
+`offline_key` appears in `InferRow`, but not in `InferInsertRow` or `InferUpdateChanges`. Creating
+the table stores the expression immediately. An existing application-maintained column can adopt
+the expression only after `migrate()` scans and verifies every value. Adding a brand-new generated
+column to an existing table is refused because that would require rewriting its rows.
 
 Declaration order does not matter: `migrate()` creates a table after the tables it references, so a
 child may be listed before its parent.
@@ -342,14 +366,14 @@ Column storage types, SQL domains, primary-key membership/order, enforced foreig
 and frozen backfills cannot be changed in place. `migrate()` rejects those changes because a
 catalog-only edit cannot prove or preserve their meaning. Informational foreign keys are metadata
 and may change; enum restrictions are the other exception, with sets that may widen but never
-narrow. Secondary indexes, triggers, named enum-type objects, and sequences remain SQL/Kysely
+narrow. A matching ordinary column may also adopt or drop a stored generated expression under the
+proof below. Secondary indexes, triggers, named enum-type objects, and sequences remain SQL/Kysely
 migration concerns; the schema DSL does not claim ownership of them.
 
 ### Proven rather than assumed
 
-Two changes are earned rather than declared. Both read block headers only — the same
-checksum-verified statistics that drive data skipping — so they cost one header read per
-block, with nothing decompressed or decoded:
+Three changes are earned rather than declared. The first two read only the same checksum-verified
+block statistics that drive data skipping:
 
 - **Tightening a column to NOT NULL.** Every block records its own null count. If any visible row
   holds NULL the migration is refused and nothing is applied; otherwise the column tightens with no
@@ -358,6 +382,10 @@ block, with nothing decompressed or decoded:
 - **Adopting `.autoIncrement()`.** The counter is seeded past the largest key already stored, taken
   from each block's numeric zone map, so a generated id can never collide with one already written.
   Dropping the generator is free — writes simply stop being filled.
+- **Adopting `.generatedSql()`.** Every existing value is compared with the declared expression.
+  Unlike the two header-only proofs above, this scans and decodes the table. A mismatch refuses
+  the migration without changing the catalog. Dropping generation is metadata-only; the stored
+  values remain ordinary values and future writes stop recomputing them.
 
 ## Dropping things
 

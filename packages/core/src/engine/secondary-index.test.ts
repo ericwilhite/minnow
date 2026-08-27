@@ -1067,6 +1067,36 @@ describe("secondary-index SQL", () => {
     }
   });
 
+  it("sorts hashed index locators across an update and insert in one write scope", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { autoCompact: false });
+    try {
+      await database.execute(
+        "CREATE TABLE reconciled_rows (id INTEGER PRIMARY KEY, ticket_date VARCHAR)",
+      );
+      await database.execute("INSERT INTO reconciled_rows VALUES (2, '2026-08-27')");
+      await database.execute("CREATE INDEX reconciled_by_ticket ON reconciled_rows(ticket_date)");
+      await database.execute("DELETE FROM reconciled_rows WHERE id = -1");
+      await database.execute("BEGIN");
+      await database.execute("UPDATE reconciled_rows SET ticket_date = '2026-08-27' WHERE id = 2");
+      await database.execute("INSERT INTO reconciled_rows VALUES (3, '2026-08-27')");
+      await expect(database.execute("COMMIT")).resolves.toMatchObject({
+        kind: "transaction",
+        action: "commit",
+      });
+      expect(
+        (
+          await database.query(
+            "SELECT id FROM reconciled_rows WHERE ticket_date = '2026-08-27' ORDER BY id",
+          )
+        ).rows,
+      ).toEqual([{ id: 2 }, { id: 3 }]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
   it("preserves numeric, boolean, datetime, and Unicode comparison order", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store, { rowsPerBlock: 2 });

@@ -10,9 +10,12 @@ import {
 } from "../storage/types.js";
 import { type Catalog, type CatalogColumn, type CatalogTable } from "./catalog.js";
 import {
+  childExpressions,
   compileCheckExpression,
   expressionColumns,
+  hasAggregate,
   validateDefaultExpression,
+  type Expression,
   type QueryValue,
 } from "./query.js";
 import { externalSqlDomainValue, normalizeSqlDomainValue } from "./sql-domains.js";
@@ -26,6 +29,75 @@ import { externalSqlDomainValue, normalizeSqlDomainValue } from "./sql-domains.j
  */
 
 export type SchemaColumnType = "boolean" | "number" | "string" | "datetime";
+
+const volatileGeneratedFunctions = new Set([
+  "CURRENT_DATE",
+  "CURRENT_TIMESTAMP",
+  "LOCALTIME",
+  "RANDOM",
+  "GEN_RANDOM_UUID",
+  "NEXTVAL",
+  "CURRVAL",
+]);
+
+/** Compiles and validates one immutable, row-local generated-column expression. */
+export function compileGeneratedColumnExpression(
+  tableName: string,
+  columnName: string,
+  sql: string,
+  columns: ReadonlyArray<{
+    readonly name: string;
+    readonly generatedValue?: { readonly kind: "stored"; readonly sql: string };
+  }>,
+): Expression {
+  if (sql.length === 0 || sql.trim() !== sql) {
+    throw new TypeError(
+      `Generated SQL must be a trimmed non-empty expression: ${tableName}.${columnName}`,
+    );
+  }
+  const expression = compileCheckExpression(sql, `generated ${tableName}.${columnName}`);
+  if (hasAggregate(expression)) {
+    throw new TypeError(
+      `Generated column ${tableName}.${columnName} must be an immutable expression over sibling columns`,
+    );
+  }
+  const inspect = (node: Expression): void => {
+    if (node.kind === "subquery" || node.kind === "exists") {
+      throw new TypeError(
+        `Generated column ${tableName}.${columnName} must be an immutable expression over sibling columns`,
+      );
+    }
+    if (node.kind === "call" && volatileGeneratedFunctions.has(node.name)) {
+      throw new TypeError(
+        `Generated column ${tableName}.${columnName} cannot call volatile function ${node.name}`,
+      );
+    }
+    childExpressions(node).forEach(inspect);
+  };
+  inspect(expression);
+  for (const reference of expressionColumns(expression)) {
+    const pieces = reference.split(".");
+    const referencedName = pieces.at(-1) ?? reference;
+    const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
+    if (qualifier !== undefined && qualifier !== tableName) {
+      throw new TypeError(
+        `Generated column ${tableName}.${columnName} references another table: ${reference}`,
+      );
+    }
+    const referenced = columns.find(({ name }) => name === referencedName);
+    if (referenced === undefined) {
+      throw new TypeError(
+        `Generated column ${tableName}.${columnName} names an unknown column: ${referencedName}`,
+      );
+    }
+    if (referencedName === columnName || referenced.generatedValue !== undefined) {
+      throw new TypeError(
+        `Generated column ${tableName}.${columnName} cannot reference a generated column: ${referencedName}`,
+      );
+    }
+  }
+  return expression;
+}
 
 /** What a FOREIGN KEY does to child rows when the parent row is deleted (E141-04). */
 export type ReferentialAction = "restrict" | "cascade" | "set null";
@@ -82,19 +154,28 @@ export interface ColumnBuilder<
   TUnique extends boolean = false,
   THasDefault extends boolean = false,
   TInput extends SchemaValue = TValue,
+  TDomain extends SqlDomain["kind"] | undefined = undefined,
+  TGenerated extends boolean = false,
 > {
   readonly kind: "column";
   readonly type: SchemaColumnType;
   readonly isNullable: TNullable;
   readonly isUnique: TUnique;
   readonly hasDefault: THasDefault;
+  readonly isGenerated: TGenerated;
   /** Type-only metadata consumed by adapters; optional so it emits no runtime payload. */
-  readonly "~types"?: { readonly select: TValue; readonly input: TInput };
+  readonly "~types"?: {
+    readonly select: TValue;
+    readonly input: TInput;
+    readonly domain: TDomain;
+    readonly generated: TGenerated;
+  };
   /** True for exact SQL integer columns; ordinary number columns use Float64 semantics. */
   readonly integer: boolean;
   /** Logical SQL semantics layered over the stable string storage encoding. */
   readonly sqlDomain?: SqlDomain;
   readonly defaultSpec?: ColumnDefault;
+  readonly generatedSpec?: { readonly kind: "stored"; readonly sql: string };
   /** Present on `column.enum()` builders: the closed set of values writes must draw from. */
   readonly enumValues?: readonly string[];
   /** What rows written before this column existed read as; see `.backfill()`. */
@@ -102,13 +183,15 @@ export interface ColumnBuilder<
   readonly renamedFromName?: string;
   readonly reference?: ColumnReferenceSpec;
   /** Marks the column nullable; inserts may omit it and reads may return null. */
-  nullable(): ColumnBuilder<TValue, true, TUnique, THasDefault, TInput>;
+  nullable(): ColumnBuilder<TValue, true, TUnique, THasDefault, TInput, TDomain, TGenerated>;
   /** Marks the table's unique key; exactly one non-nullable column may carry it. */
   unique(
-    this: ColumnBuilder<TValue, false, TUnique, THasDefault, TInput>,
-  ): ColumnBuilder<TValue, TNullable, true, THasDefault, TInput>;
+    this: ColumnBuilder<TValue, false, TUnique, THasDefault, TInput, TDomain, TGenerated>,
+  ): ColumnBuilder<TValue, TNullable, true, THasDefault, TInput, TDomain, TGenerated>;
   /** Declares this column as the rename target of an existing catalog column. */
-  renamedFrom(name: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>;
+  renamedFrom(
+    name: string,
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput, TDomain, TGenerated>;
   /**
    * What rows written before this column existed read as, instead of NULL. Giving one is what
    * makes adding a non-nullable column possible: no stored byte is rewritten, and reads
@@ -119,9 +202,9 @@ export interface ColumnBuilder<
    * disagreeing. It cannot derive from other columns; that would need a value per row.
    */
   backfill(
-    this: ColumnBuilder<TValue, false, TUnique, THasDefault, TInput>,
+    this: ColumnBuilder<TValue, false, TUnique, THasDefault, TInput, TDomain, TGenerated>,
     value: TInput | (() => TInput),
-  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>;
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput, TDomain, TGenerated>;
   /**
    * Declares a FOREIGN KEY onto another table's unique key. `migrate()` creates it as a real
    * constraint, so a write naming a parent row that does not exist is rejected — the same
@@ -130,27 +213,35 @@ export interface ColumnBuilder<
    * `onDelete` defaults to `"restrict"`. `"set null"` requires a nullable column.
    */
   references(
-    this: ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>,
+    this: ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput, TDomain, TGenerated>,
     table: string,
     column: string,
     options?:
       | { onDelete?: Exclude<ReferentialAction, "set null">; enforced?: true }
       | { enforced: false; onDelete?: never },
-  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>;
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput, TDomain, TGenerated>;
   references(
-    this: ColumnBuilder<TValue, true, TUnique, THasDefault, TInput>,
+    this: ColumnBuilder<TValue, true, TUnique, THasDefault, TInput, TDomain, TGenerated>,
     table: string,
     column: string,
     options: { onDelete: "set null"; enforced?: true },
-  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput>;
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault, TInput, TDomain, TGenerated>;
   /** Declares a literal SQL default. Omission or SQL `DEFAULT` invokes it; NULL does not. */
-  default(value: TInput): ColumnBuilder<TValue, TNullable, TUnique, true, TInput>;
+  default(
+    value: TInput,
+  ): ColumnBuilder<TValue, TNullable, TUnique, true, TInput, TDomain, TGenerated>;
   /**
    * Declares a variable-free SQL default expression, such as `CURRENT_TIMESTAMP`,
    * `gen_random_uuid()`, or `nextval('orders_id_seq')`. The engine parses and type-checks it
    * before migration and evaluates it once per omitted row.
    */
-  defaultSql(sql: string): ColumnBuilder<TValue, TNullable, TUnique, true, TInput>;
+  defaultSql(
+    sql: string,
+  ): ColumnBuilder<TValue, TNullable, TUnique, true, TInput, TDomain, TGenerated>;
+  /** Declares a stored expression over sibling columns. Callers never insert or update it. */
+  generatedSql(
+    sql: string,
+  ): ColumnBuilder<TValue, TNullable, TUnique, false, TInput, TDomain, true>;
   /**
    * Generates monotonically increasing integers for omitted or SQL `DEFAULT` slots from a persistent
    * per-table counter that is atomic across tabs. Explicit values are allowed and bump the
@@ -158,8 +249,8 @@ export interface ColumnBuilder<
    */
   autoIncrement: TValue extends number
     ? (
-        this: ColumnBuilder<TValue, false, true, THasDefault, TInput>,
-      ) => ColumnBuilder<TValue, TNullable, TUnique, true, TInput>
+        this: ColumnBuilder<TValue, false, true, THasDefault, TInput, TDomain, TGenerated>,
+      ) => ColumnBuilder<TValue, TNullable, TUnique, true, TInput, TDomain, TGenerated>
     : never;
 }
 
@@ -176,9 +267,11 @@ interface AnyColumn {
   readonly isNullable: boolean;
   readonly isUnique: boolean;
   readonly hasDefault: boolean;
+  readonly isGenerated: boolean;
   readonly integer: boolean;
   readonly sqlDomain?: SqlDomain;
   readonly defaultSpec?: ColumnDefault;
+  readonly generatedSpec?: { readonly kind: "stored"; readonly sql: string };
   readonly enumValues?: readonly string[];
   readonly backfillValue?: SchemaValue | (() => SchemaValue);
   readonly renamedFromName?: string;
@@ -221,6 +314,8 @@ function createColumn<
   TType extends SchemaColumnType,
   TValue extends SchemaValue = ValueOf<TType>,
   TInput extends SchemaValue = TValue,
+  TDomain extends SqlDomain["kind"] | undefined = undefined,
+  TGenerated extends boolean = false,
 >(
   type: TType,
   state: {
@@ -231,19 +326,22 @@ function createColumn<
     renamedFromName?: string;
     reference?: ColumnReferenceSpec;
     defaultSpec?: ColumnDefault | undefined;
+    generatedSpec?: { readonly kind: "stored"; readonly sql: string };
     enumValues?: readonly string[];
     backfillValue?: TInput | (() => TInput);
   } = {},
-): ColumnBuilder<TValue, false, false, false, TInput> {
+): ColumnBuilder<TValue, false, false, false, TInput, TDomain, TGenerated> {
   const base = {
     kind: "column" as const,
     type,
     isNullable: (state.isNullable ?? false) as false,
     isUnique: (state.isUnique ?? false) as false,
     hasDefault: (state.defaultSpec !== undefined) as false,
+    isGenerated: (state.generatedSpec !== undefined) as TGenerated,
     integer: state.integer ?? false,
     ...(state.sqlDomain === undefined ? {} : { sqlDomain: state.sqlDomain }),
     ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
+    ...(state.generatedSpec === undefined ? {} : { generatedSpec: state.generatedSpec }),
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
     ...(state.reference === undefined ? {} : { reference: state.reference }),
     ...(state.enumValues === undefined ? {} : { enumValues: state.enumValues }),
@@ -252,21 +350,27 @@ function createColumn<
   return {
     ...base,
     nullable: () =>
-      createColumn<TType, TValue, TInput>(type, {
+      createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
         ...state,
         isNullable: true,
-      }) as unknown as ColumnBuilder<TValue, true, false, false, TInput>,
+      }) as unknown as ColumnBuilder<TValue, true, false, false, TInput, TDomain, TGenerated>,
     unique: () =>
-      createColumn<TType, TValue, TInput>(type, {
+      createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
         ...state,
         isUnique: true,
-      }) as unknown as ColumnBuilder<TValue, false, true, false, TInput>,
+      }) as unknown as ColumnBuilder<TValue, false, true, false, TInput, TDomain, TGenerated>,
     renamedFrom: (name: string) => {
       validateSchemaName(name, "Rename source");
-      return createColumn<TType, TValue, TInput>(type, { ...state, renamedFromName: name });
+      return createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
+        ...state,
+        renamedFromName: name,
+      });
     },
     backfill: (value: unknown) =>
-      createColumn<TType, TValue, TInput>(type, { ...state, backfillValue: value as TInput }),
+      createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
+        ...state,
+        backfillValue: value as TInput,
+      }),
     references: (
       table: string,
       referencedColumn: string,
@@ -277,7 +381,7 @@ function createColumn<
       if (options.enforced === false && options.onDelete !== undefined) {
         throw new TypeError("An informational FOREIGN KEY cannot declare ON DELETE behavior");
       }
-      return createColumn<TType, TValue, TInput>(type, {
+      return createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
         ...state,
         reference: {
           table,
@@ -288,30 +392,67 @@ function createColumn<
       });
     },
     default: ((value: unknown) => {
-      return createColumn<TType, TValue, TInput>(type, {
+      return createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
         ...state,
         defaultSpec: defaultSpecFromArg(type, value, state.sqlDomain),
       });
-    }) as unknown as ColumnBuilder<TValue, false, false, false, TInput>["default"],
+    }) as unknown as ColumnBuilder<
+      TValue,
+      false,
+      false,
+      false,
+      TInput,
+      TDomain,
+      TGenerated
+    >["default"],
     defaultSql: ((sql: string) => {
       const expression = sql.trim();
       if (expression.length === 0 || expression !== sql) {
         throw new TypeError("Default SQL must be a trimmed non-empty expression");
       }
-      return createColumn<TType, TValue, TInput>(type, {
+      return createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
         ...state,
         defaultSpec: { kind: "expression", sql: expression },
       });
-    }) as unknown as ColumnBuilder<TValue, false, false, false, TInput>["defaultSql"],
+    }) as unknown as ColumnBuilder<
+      TValue,
+      false,
+      false,
+      false,
+      TInput,
+      TDomain,
+      TGenerated
+    >["defaultSql"],
+    generatedSql: (sql: string) => {
+      const expression = sql.trim();
+      if (expression.length === 0 || expression !== sql) {
+        throw new TypeError("Generated SQL must be a trimmed non-empty expression");
+      }
+      if (state.defaultSpec !== undefined) {
+        throw new TypeError("A generated column cannot also have a default");
+      }
+      return createColumn<TType, TValue, TInput, TDomain, true>(type, {
+        ...state,
+        generatedSpec: { kind: "stored", sql: expression },
+      });
+    },
     autoIncrement: (() => {
       if (type !== "number") {
         throw new TypeError("Auto-increment requires a number column");
       }
-      return createColumn<TType, TValue, TInput>(type, {
+      return createColumn<TType, TValue, TInput, TDomain, TGenerated>(type, {
         ...state,
         defaultSpec: { kind: "autoincrement" },
       });
-    }) as unknown as ColumnBuilder<TValue, false, false, false, TInput>["autoIncrement"],
+    }) as unknown as ColumnBuilder<
+      TValue,
+      false,
+      false,
+      false,
+      TInput,
+      TDomain,
+      TGenerated
+    >["autoIncrement"],
   };
 }
 
@@ -360,6 +501,7 @@ export function columnFromState(
         | "renamedFromName"
         | "reference"
         | "defaultSpec"
+        | "generatedSpec"
         | "enumValues"
         | "backfillValue"
       >
@@ -373,6 +515,7 @@ export function columnFromState(
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
     ...(state.reference === undefined ? {} : { reference: state.reference }),
     ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
+    ...(state.generatedSpec === undefined ? {} : { generatedSpec: state.generatedSpec }),
     ...(state.enumValues === undefined ? {} : { enumValues: state.enumValues }),
     ...(state.backfillValue === undefined ? {} : { backfillValue: state.backfillValue }),
   });
@@ -388,27 +531,35 @@ export const column = {
   /** Exact decimal SQL NUMERIC. Selects return strings; writes accept strings or numbers. */
   numeric: (options: { precision?: number; scale?: number } = {}) => {
     const sqlDomain = validateSqlDomain({ kind: "numeric", ...options }, "numeric column");
-    return createColumn<"string", string, string | number>("string", { sqlDomain });
+    return createColumn<"string", string, string | number, "numeric">("string", { sqlDomain });
   },
-  json: () => createColumn("string", { sqlDomain: { kind: "json" } }),
-  jsonb: () => createColumn("string", { sqlDomain: { kind: "jsonb" } }),
-  uuid: () => createColumn("string", { sqlDomain: { kind: "uuid" } }),
+  json: () =>
+    createColumn<"string", string, string, "json">("string", { sqlDomain: { kind: "json" } }),
+  jsonb: () =>
+    createColumn<"string", string, string, "jsonb">("string", { sqlDomain: { kind: "jsonb" } }),
+  uuid: () =>
+    createColumn<"string", string, string, "uuid">("string", { sqlDomain: { kind: "uuid" } }),
   /** A zoneless calendar date, represented publicly as canonical `YYYY-MM-DD` text. */
-  date: () => createColumn("string", { sqlDomain: { kind: "date" } }),
-  time: () => createColumn("string", { sqlDomain: { kind: "time" } }),
-  interval: () => createColumn("string", { sqlDomain: { kind: "interval" } }),
+  date: () =>
+    createColumn<"string", string, string, "date">("string", { sqlDomain: { kind: "date" } }),
+  time: () =>
+    createColumn<"string", string, string, "time">("string", { sqlDomain: { kind: "time" } }),
+  interval: () =>
+    createColumn<"string", string, string, "interval">("string", {
+      sqlDomain: { kind: "interval" },
+    }),
   /** JSON array text at the JavaScript boundary, with the SQL element type retained in metadata. */
   array: (element: string) =>
-    createColumn("string", {
+    createColumn<"string", string, string, "array">("string", {
       sqlDomain: validateSqlDomain({ kind: "array", element }, "array column"),
     }),
   /** A named SQL enum domain, distinct from the lightweight `column.enum()` restriction. */
   sqlEnum: <const TValues extends readonly [string, ...string[]]>(
     name: string,
     values: TValues,
-  ): ColumnBuilder<TValues[number], false> => {
+  ): ColumnBuilder<TValues[number], false, false, false, TValues[number], "enum"> => {
     validateSchemaName(name, "Enum type");
-    return createColumn<"string", TValues[number]>("string", {
+    return createColumn<"string", TValues[number], TValues[number], "enum">("string", {
       sqlDomain: validateSqlDomain(
         { kind: "enum", name, values: validateEnumValues(values, name) },
         name,
@@ -576,6 +727,10 @@ export function table(
   if (uniqueEntry?.[1].isNullable === true) {
     throw new TypeError(`Table ${name} unique column must not be nullable: ${uniqueEntry[0]}`);
   }
+  const generatedColumns = entries.map(([columnName, definition]) => ({
+    name: columnName,
+    ...(definition.generatedSpec === undefined ? {} : { generatedValue: definition.generatedSpec }),
+  }));
   for (const [columnName, definition] of entries) {
     validateSchemaName(columnName, "Column");
     if (definition.integer && definition.type !== "number") {
@@ -605,6 +760,24 @@ export function table(
       throw new TypeError(
         `A nullable column needs no backfill: ${name}.${columnName}. Rows without it already read NULL.`,
       );
+    }
+    if (definition.generatedSpec !== undefined) {
+      if (definition.defaultSpec !== undefined || backfill !== undefined) {
+        throw new TypeError(
+          `A generated column cannot also have a default or backfill: ${name}.${columnName}`,
+        );
+      }
+      compileGeneratedColumnExpression(
+        name,
+        columnName,
+        definition.generatedSpec.sql,
+        generatedColumns,
+      );
+      if (definition.isUnique || primaryKey.includes(columnName)) {
+        throw new TypeError(
+          `Generated columns cannot be row-addressing keys: ${name}.${columnName}`,
+        );
+      }
     }
     if (definition.reference?.onDelete === "set null" && !definition.isNullable) {
       throw new TypeError(`ON DELETE SET NULL requires a nullable column: ${name}.${columnName}`);
@@ -853,6 +1026,9 @@ export function view<const TName extends string, TColumns extends Record<string,
     if (columnDefinition.defaultSpec !== undefined) {
       throw new TypeError(`A view column cannot have a default: ${name}.${columnName}`);
     }
+    if (columnDefinition.generatedSpec !== undefined) {
+      throw new TypeError(`A view column cannot be generated: ${name}.${columnName}`);
+    }
   }
   return { kind: "view", name, sql: definition.sql, columns: definition.columns };
 }
@@ -974,13 +1150,23 @@ type DefaultKeys<TTable extends AnyTable> = {
   [K in keyof TTable["columns"]]: TTable["columns"][K]["hasDefault"] extends true ? K : never;
 }[keyof TTable["columns"]];
 
-type OptionalInsertKeys<TTable extends AnyTable> = NullableKeys<TTable> | DefaultKeys<TTable>;
+type GeneratedKeys<TTable extends AnyTable> = {
+  [K in keyof TTable["columns"]]: TTable["columns"][K]["isGenerated"] extends true ? K : never;
+}[keyof TTable["columns"]];
+
+type OptionalInsertKeys<TTable extends AnyTable> = Exclude<
+  NullableKeys<TTable> | DefaultKeys<TTable>,
+  GeneratedKeys<TTable>
+>;
+type RequiredInsertKeys<TTable extends AnyTable> = Exclude<
+  keyof TTable["columns"],
+  OptionalInsertKeys<TTable> | GeneratedKeys<TTable>
+>;
 
 /** Insert rows require every non-nullable column and may omit nullable or default-bearing ones. */
-export type InferInsertRow<TTable extends AnyTable> = Omit<
-  { [K in keyof TTable["columns"]]: ColumnInputValue<TTable["columns"][K]> },
-  OptionalInsertKeys<TTable>
-> & {
+export type InferInsertRow<TTable extends AnyTable> = {
+  [K in RequiredInsertKeys<TTable>]: ColumnInputValue<TTable["columns"][K]>;
+} & {
   [K in OptionalInsertKeys<TTable>]?: ColumnInputValue<TTable["columns"][K]>;
 };
 
@@ -997,8 +1183,11 @@ export type PrimaryKeyKeys<TTable extends AnyTable> =
  * stays assignable under `exactOptionalPropertyTypes`.
  */
 export type InferUpdateChanges<TTable extends AnyTable> = {
-  [K in keyof TTable["columns"] as K extends PrimaryKeyKeys<TTable> ? never : K]?:
-    ColumnInputValue<TTable["columns"][K]> | undefined;
+  [
+    K in keyof TTable["columns"] as K extends PrimaryKeyKeys<TTable> | GeneratedKeys<TTable>
+      ? never
+      : K
+  ]?: ColumnInputValue<TTable["columns"][K]> | undefined;
 };
 
 // --- Migration planning -------------------------------------------------------------------------
@@ -1029,6 +1218,12 @@ export type MigrationStep =
       tableName: string;
       columnName: string;
       defaultValue: ColumnDefault | null;
+    }
+  | {
+      kind: "alter-generated";
+      tableName: string;
+      columnName: string;
+      generatedValue: { readonly kind: "stored"; readonly sql: string } | null;
     }
   /** Informational relationships are catalog-only and may change without scanning stored rows. */
   | {
@@ -1160,6 +1355,25 @@ export function assertColumnDroppable(record: CatalogTable, column: CatalogColum
       throw new TypeError(`CHECK ${check.name} still uses this column: ${where}`);
     }
   }
+  for (const dependent of record.columns) {
+    if (dependent.generatedValue === undefined) continue;
+    let referenced: readonly string[];
+    try {
+      referenced = expressionColumns(
+        compileCheckExpression(
+          dependent.generatedValue.sql,
+          `generated ${record.name}.${dependent.name}`,
+        ),
+      );
+    } catch {
+      throw new TypeError(
+        `Generated column ${dependent.name} cannot be re-read, so ${where} is not droppable`,
+      );
+    }
+    if (referenced.includes(column.name)) {
+      throw new TypeError(`Generated column ${dependent.name} still uses this column: ${where}`);
+    }
+  }
 }
 
 function assertColumnRenamable(
@@ -1181,6 +1395,18 @@ function assertColumnRenamable(
     const referenced = expressionColumns(compileCheckExpression(check.sql, check.name));
     if (referenced.includes(column.name)) {
       throw new TypeError(`CHECK ${check.name} prevents renaming ${where}`);
+    }
+  }
+  for (const dependent of record.columns) {
+    if (dependent.generatedValue === undefined) continue;
+    const referenced = expressionColumns(
+      compileCheckExpression(
+        dependent.generatedValue.sql,
+        `generated ${record.name}.${dependent.name}`,
+      ),
+    );
+    if (referenced.includes(column.name)) {
+      throw new TypeError(`Generated column ${dependent.name} prevents renaming ${where}`);
     }
   }
 }
@@ -1382,6 +1608,11 @@ export function planMigration(
         }
       }
       if (existing === undefined) {
+        if (columnDefinition.generatedSpec !== undefined) {
+          throw new TypeError(
+            `Generated columns cannot be added to an existing table without rewriting its rows: ${tableDefinition.name}.${columnName}`,
+          );
+        }
         const backfill = resolveBackfill(columnDefinition);
         if (!columnDefinition.isNullable && backfill === undefined) {
           throw new TypeError(
@@ -1496,13 +1727,23 @@ export function planMigration(
             columnName,
             enabled: isAuto,
           });
-          continue;
+        } else {
+          steps.push({
+            kind: "alter-default",
+            tableName: tableDefinition.name,
+            columnName,
+            defaultValue: columnDefinition.defaultSpec ?? null,
+          });
         }
+      }
+      const existingGenerated = existing.generatedValue;
+      const definedGenerated = columnDefinition.generatedSpec;
+      if (JSON.stringify(existingGenerated ?? null) !== JSON.stringify(definedGenerated ?? null)) {
         steps.push({
-          kind: "alter-default",
+          kind: "alter-generated",
           tableName: tableDefinition.name,
           columnName,
-          defaultValue: columnDefinition.defaultSpec ?? null,
+          generatedValue: definedGenerated ?? null,
         });
       }
     }
@@ -1849,6 +2090,14 @@ export function applyColumnSteps(
       if (target !== undefined) {
         if (step.defaultValue === null) delete target.defaultValue;
         else target.defaultValue = step.defaultValue;
+      }
+      continue;
+    }
+    if (step.kind === "alter-generated") {
+      const target = columns.find(({ name }) => name === step.columnName);
+      if (target !== undefined) {
+        if (step.generatedValue === null) delete target.generatedValue;
+        else target.generatedValue = step.generatedValue;
       }
     }
   }

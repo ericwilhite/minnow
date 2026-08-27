@@ -20,7 +20,7 @@ and benchmarks that run in your browser.
 ## Why Minnow
 
 - **PostgreSQL-style SQL.** Use familiar joins, CTEs, window functions, grouping sets, upserts,
-  `RETURNING`, triggers, exact decimals, JSON/JSONB, zoneless DATE, arrays, enums, sequences, savepoints, and
+  `RETURNING`, triggers, stored generated columns, exact decimals, nested JSON/JSONB, zoneless DATE, arrays, enums, sequences, savepoints, and
   more. The [PostgreSQL compatibility guide](https://minnowdb.com/docs/sql/feature-matrix/) lists
   exact matches, differences, extensions, and exclusions.
 - **Fast analytical reads over application data.** Compressed column blocks let a query read only
@@ -31,7 +31,7 @@ and benchmarks that run in your browser.
   query reads one stable snapshot, even when another tab commits at the same time;
   origin-persistence policy is explicit for applications that cannot accept automatic quota
   eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 284 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 286 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so tables

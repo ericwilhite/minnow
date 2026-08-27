@@ -275,7 +275,8 @@ describe("vector query execution", () => {
       "SELECT bucket, JSON_ARRAYAGG(value) AS values FROM rows GROUP BY bucket ORDER BY bucket",
     );
     const prepared = createPreparedQuery(plan, tables, {
-      executionMemoryBudgetBytes: 100_000,
+      // JSON results retain a short internal domain tag until the public result boundary.
+      executionMemoryBudgetBytes: 110_000,
     });
     expect(() => prepared.execute()).toThrow(QueryMemoryBudgetError);
     const spill = new TestSpillStore();
@@ -284,7 +285,7 @@ describe("vector query execution", () => {
     );
     expect(spill.putCount).toBeGreaterThan(0);
     expect(spill.pages.size).toBe(0);
-    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(100_000);
+    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(110_000);
     prepared.close();
   });
 

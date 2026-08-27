@@ -1,4 +1,4 @@
-import type { ColumnDefault, SqlDomain } from "../storage/types.js";
+import type { ColumnDefault, ColumnGenerated, SqlDomain } from "../storage/types.js";
 import {
   columnFromState,
   schema,
@@ -27,6 +27,7 @@ export interface WireColumn {
   readonly integer?: true;
   readonly sqlDomain?: SqlDomain;
   readonly defaultSpec?: ColumnDefault;
+  readonly generatedSpec?: ColumnGenerated;
   readonly renamedFromName?: string;
   readonly reference?: {
     table: string;
@@ -77,6 +78,12 @@ export type WireMigrationStep =
       defaultValue: ColumnDefault | null;
     }
   | {
+      kind: "alter-generated";
+      tableName: string;
+      columnName: string;
+      generatedValue: ColumnGenerated | null;
+    }
+  | {
       kind: "alter-foreign-keys";
       tableName: string;
       foreignKeys: Extract<MigrationStep, { kind: "alter-foreign-keys" }>["foreignKeys"];
@@ -105,6 +112,9 @@ function serializeColumn(
       ? {}
       : { sqlDomain: structuredClone(definition.sqlDomain) }),
     ...(definition.defaultSpec === undefined ? {} : { defaultSpec: { ...definition.defaultSpec } }),
+    ...(definition.generatedSpec === undefined
+      ? {}
+      : { generatedSpec: { ...definition.generatedSpec } }),
     ...(definition.renamedFromName === undefined
       ? {}
       : { renamedFromName: definition.renamedFromName }),
@@ -201,6 +211,7 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
     integer: wire.integer === true,
     ...(wire.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(wire.sqlDomain) }),
     ...(wire.defaultSpec === undefined ? {} : { defaultSpec: wire.defaultSpec }),
+    ...(wire.generatedSpec === undefined ? {} : { generatedSpec: wire.generatedSpec }),
     ...(wire.renamedFromName === undefined ? {} : { renamedFromName: wire.renamedFromName }),
     ...(wire.reference === undefined
       ? {}

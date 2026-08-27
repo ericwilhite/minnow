@@ -9,7 +9,7 @@ npm install @minnowdb/core
 
 - Direct SQL through `MinnowDatabase.query()` and `execute()`.
 - Joins, CTEs, window functions, grouping sets, upserts, `RETURNING`, triggers, exact decimals,
-  JSON/JSONB, zoneless DATE, arrays, enums, sequences, and savepoints.
+  nested JSON/JSONB, stored generated columns, zoneless DATE, arrays, enums, sequences, and savepoints.
 - Compressed column storage, secondary indexes, full-text search, and snapshot reads.
 - Atomic writes across tabs through IndexedDB or OPFS, strict durability by default, and explicit
   origin-eviction persistence policy.

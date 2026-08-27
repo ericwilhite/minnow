@@ -255,6 +255,85 @@ describe("CREATE TABLE", () => {
     ]);
   });
 
+  it("stores generated columns, recomputes them on every write, and indexes their values", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE offline_rows (" +
+        "id INTEGER PRIMARY KEY, field_id TEXT NOT NULL, ticket_number INTEGER NOT NULL, " +
+        "version INTEGER NOT NULL, offline_key TEXT " +
+        "GENERATED ALWAYS AS (field_id || ':' || CAST(ticket_number AS TEXT) || ':' || CAST(version AS TEXT)) STORED NOT NULL)",
+    );
+    await database.execute("CREATE INDEX offline_rows_key_idx ON offline_rows (offline_key)");
+
+    const inserted = await database.execute(
+      "INSERT INTO offline_rows (id, field_id, ticket_number, version) VALUES (1, 'field', 42, 3) RETURNING *",
+    );
+    expect(inserted).toMatchObject({
+      kind: "insert",
+      returnedRows: [
+        { id: 1, field_id: "field", ticket_number: 42, version: 3, offline_key: "field:42:3" },
+      ],
+    });
+    expect(
+      (await database.query("SELECT id FROM offline_rows WHERE offline_key = 'field:42:3'")).rows,
+    ).toEqual([{ id: 1 }]);
+
+    const updated = await database.execute(
+      "UPDATE offline_rows SET version = 4 WHERE id = 1 RETURNING offline_key",
+    );
+    expect(updated).toMatchObject({
+      kind: "update",
+      returnedRows: [{ offline_key: "field:42:4" }],
+    });
+    expect(
+      (await database.query("SELECT id FROM offline_rows WHERE offline_key = 'field:42:4'")).rows,
+    ).toEqual([{ id: 1 }]);
+    expect(
+      (await database.query("SELECT id FROM offline_rows WHERE offline_key = 'field:42:3'")).rows,
+    ).toEqual([]);
+
+    expect(
+      await database.execute(
+        "INSERT INTO offline_rows (id, field_id, ticket_number, version) VALUES " +
+          "(1, 'field', 42, 5), (2, 'other', 7, 1) " +
+          "ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version RETURNING id, offline_key",
+      ),
+    ).toMatchObject({
+      returnedRows: [
+        { id: 1, offline_key: "field:42:5" },
+        { id: 2, offline_key: "other:7:1" },
+      ],
+    });
+
+    await expect(
+      database.execute(
+        "INSERT INTO offline_rows (id, field_id, ticket_number, version, offline_key) VALUES (2, 'x', 1, 1, 'wrong')",
+      ),
+    ).rejects.toThrow("Generated column cannot be assigned: offline_key");
+    await expect(
+      database.execute("UPDATE offline_rows SET offline_key = 'wrong' WHERE id = 1"),
+    ).rejects.toThrow("Generated column cannot be assigned: offline_key");
+  });
+
+  it("rejects generated expressions that are volatile, cross-row, or chained", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await expect(
+      database.execute(
+        "CREATE TABLE volatile_generated (id INTEGER PRIMARY KEY, token TEXT GENERATED ALWAYS AS (gen_random_uuid()) STORED)",
+      ),
+    ).rejects.toThrow("cannot call volatile function");
+    await expect(
+      database.execute(
+        "CREATE TABLE aggregate_generated (id INTEGER PRIMARY KEY, total INTEGER GENERATED ALWAYS AS (SUM(id)) STORED)",
+      ),
+    ).rejects.toThrow("immutable row expression");
+    await expect(
+      database.execute(
+        "CREATE TABLE chained_generated (id INTEGER PRIMARY KEY, first INTEGER GENERATED ALWAYS AS (id + 1) STORED, second INTEGER GENERATED ALWAYS AS (first + 1) STORED)",
+      ),
+    ).rejects.toThrow("cannot reference a generated column");
+  });
+
   it("rejects unknown types and enforces additional UNIQUE constraints", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await expect(database.execute("CREATE TABLE bad (x NO_SUCH_TYPE)")).rejects.toThrow(

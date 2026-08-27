@@ -1,5 +1,5 @@
 import { stringArgument } from "./sql-semantics.js";
-import { externalSqlDomainValue } from "./sql-domains.js";
+import { externalSqlDomainValue, jsonDomainDocument } from "./sql-domains.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
 
 /**
@@ -135,7 +135,7 @@ export function jsonConstructor(
   }
   const members: string[] = [];
   for (let index = 0; index + 1 < values.length; index += 2) {
-    const rawKey = values[index];
+    const rawKey = externalSqlDomainValue(values[index]);
     if (rawKey === null || rawKey === undefined) {
       throw new TypeError("JSON_OBJECT keys cannot be NULL");
     }
@@ -148,11 +148,24 @@ export function jsonConstructor(
     // Build JSON text directly. WITHOUT UNIQUE KEYS is the default, so duplicate names must be
     // preserved; assigning through a JavaScript object would collapse them and mishandle
     // special names such as "__proto__".
-    const encodedKey = boundedJsonValue(key, "JSON_OBJECT key");
+    // Keys are always JSON strings. In particular, a JSON-domain expression used as a key is
+    // its document text, not a raw object member token as JSON-domain values are below.
+    const encodedKey = boundedJsonString(key, "JSON_OBJECT key");
     const encodedValue = boundedJsonValue(member ?? null, "JSON_OBJECT value");
     members.push(`${encodedKey}:${encodedValue}`);
   }
   return joinBoundedJson("{", members, "}", "JSON_OBJECT result");
+}
+
+function boundedJsonString(value: string, label: string): string {
+  if (value.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  return encoded;
 }
 
 function boundedJsonDocument(value: unknown, caller: string): string {
@@ -166,6 +179,15 @@ function boundedJsonDocument(value: unknown, caller: string): string {
 }
 
 function boundedJsonValue(value: unknown, label: string): string {
+  const domainDocument = jsonDomainDocument(value);
+  if (domainDocument !== undefined) {
+    if (domainDocument.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+      throw new RangeError(
+        `${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+      );
+    }
+    return domainDocument;
+  }
   const normalized = jsonValueOf(value);
   if (typeof normalized === "string" && normalized.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
     throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);

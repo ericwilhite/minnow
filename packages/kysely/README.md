@@ -23,20 +23,24 @@ await minnowDatabase.migrate(appSchema);
 const db = createKysely({
   driver: minnowDatabase,
   schema: appSchema,
+  resultDecoding: { numeric: "number", json: "parse" },
 });
 ```
 
 `InferKyselyDatabase<typeof appSchema>` is also exported for applications that construct
 `Kysely` themselves. It preserves nullable/default insert optionality, enum literals, logical SQL
 domain boundary types, primary-key update safety, composite keys, and read-only view columns.
-Exact `NUMERIC` results are lossless strings, while inserts, updates, and predicates accept native
-numbers or strings. Zoneless `DATE` columns and casts use canonical `YYYY-MM-DD` strings;
+Exact `NUMERIC` results are lossless strings by default, while inserts, updates, and predicates
+accept native numbers or strings. The optional `resultDecoding` shown above converts NUMERIC to
+finite JavaScript numbers and parses JSON/JSONB for buffered, streamed, and `RETURNING` rows; the
+inferred select types change with it. Zoneless `DATE` columns and casts use canonical `YYYY-MM-DD` strings;
 timestamps remain `Date`. Schema-derived databases also infer `count()` and `countAll()` results as
 Minnow's runtime `number`, infer `sum()` and `avg()` from the selected numeric domain, and infer
 the fixed return types of Minnow built-ins such as `round` and `date_trunc` without explicit
 generics. Value-returning functions such as `coalesce`, `nullif`, `greatest`, and `least` infer from
 their arguments, and `cast()` infers from its supported SQL target. Exact-numeric aggregates
-remain lossless strings; ordinary numeric aggregates are numbers, and every aggregate except
+remain lossless strings by default and become numbers with native numeric decoding; ordinary
+numeric aggregates are numbers, and every aggregate except
 `count` includes `null` for an empty input. Use Kysely's inferred `coalesce()` helper when a
 fallback removes that case. Arbitrary custom functions and raw SQL still need an output type
 because TypeScript cannot derive one from a function or SQL string it does not understand.
@@ -44,7 +48,9 @@ because TypeScript cannot derive one from a function or SQL string it does not u
 Pass the schema to `createKysely` (or `MinnowDialect`) for exact types and multi-row empty-object
 INSERT normalization. Literal and SQL-expression defaults remain catalog-owned and run inside
 Minnow for Kysely, raw SQL, batches, workers, and other tabs. Compiled queries contain ordinary
-PostgreSQL SQL with visible `DEFAULT` slots and no hidden generated parameters.
+PostgreSQL SQL with visible `DEFAULT` slots and no hidden generated parameters. Stored columns
+declared with `.generatedSql()` are omitted from Kysely insert/update inputs and recomputed by
+Minnow.
 
 The dialect supports reads, inserts, updates, deletes, `RETURNING`, transactions, schema DDL,
 streaming, typed live queries, and catalog introspection, including Minnow's exact numeric, JSON,

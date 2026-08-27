@@ -1008,8 +1008,8 @@
     {
       "id": "json.object",
       "status": "supported",
-      "example": "SELECT JSON_OBJECT('a' VALUE 1, 'missing' VALUE NULL) AS document",
-      "notes": "Defaults to NULL ON NULL and WITHOUT UNIQUE KEYS. NULL keys are rejected. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
+      "example": "SELECT JSON_OBJECT('a' VALUE 1, 'detail' VALUE JSON_OBJECT('name' VALUE 'Acme')) AS document",
+      "notes": "Defaults to NULL ON NULL and WITHOUT UNIQUE KEYS. NULL keys are rejected. JSON-producing arguments embed as documents rather than escaped strings; ordinary text remains a string. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
     },
     {
       "id": "json.array",
@@ -1027,6 +1027,12 @@
       "status": "supported",
       "example": "CREATE TABLE defaulted (id INTEGER PRIMARY KEY, tier TEXT DEFAULT 'basic')",
       "notes": "DEFAULT accepts a variable-free scalar expression. Omission or SQL DEFAULT invokes it; explicit NULL follows the column's independent nullability."
+    },
+    {
+      "id": "ddl.generated-column",
+      "status": "supported",
+      "example": "CREATE TABLE generated_value (base INTEGER, doubled INTEGER GENERATED ALWAYS AS (base * 2) STORED)",
+      "notes": "Stored generated columns recompute on every write and may be indexed, but cannot be caller-assigned or used as Minnow's row-addressing primary/unique key. Expressions are immutable and row-local."
     },
     {
       "id": "ddl.create-table-key-clause",
@@ -1190,8 +1196,8 @@
     {
       "id": "aggregate.json",
       "status": "supported",
-      "example": "SELECT JSON_ARRAYAGG(region) AS regions FROM rows",
-      "notes": "Supports DISTINCT, includes SQL NULL as JSON null, and returns NULL for empty input. FILTER, window use, aggregate-local ORDER BY, and explicit NULL/ABSENT clauses are not supported; input order is otherwise unspecified."
+      "example": "SELECT JSON_ARRAYAGG(JSON_OBJECT('region' VALUE region)) AS regions FROM rows",
+      "notes": "Supports DISTINCT, embeds JSON-producing inputs as documents, includes SQL NULL as JSON null, and returns NULL for empty input. FILTER, window use, aggregate-local ORDER BY, and explicit NULL/ABSENT clauses are not supported; input order is otherwise unspecified."
     },
     {
       "id": "type.array",

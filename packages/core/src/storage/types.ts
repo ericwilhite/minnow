@@ -197,6 +197,12 @@ export type ColumnDefault =
   | { kind: "expression"; sql: string }
   | { kind: "autoincrement" };
 
+/** A stored generated-column expression, evaluated from the row on every insert and update. */
+export interface ColumnGenerated {
+  readonly kind: "stored";
+  readonly sql: string;
+}
+
 export interface TableColumnRecord {
   id: string;
   name: string;
@@ -213,6 +219,8 @@ export interface TableColumnRecord {
   nullable: boolean;
   /** Fills omitted or SQL `DEFAULT` slots at insert time; explicit NULL is never replaced. */
   defaultValue?: ColumnDefault;
+  /** Recomputed from sibling columns on every insert and update; callers cannot assign it. */
+  generatedValue?: ColumnGenerated;
   /**
    * What rows written before this column existed read as, instead of NULL.
    *
@@ -332,6 +340,26 @@ export function validateTableColumns(columns: readonly TableColumnRecord[]): voi
         },
         column.defaultValue,
       );
+    }
+    if (column.generatedValue !== undefined) {
+      const generated: unknown = column.generatedValue;
+      if (
+        typeof generated !== "object" ||
+        generated === null ||
+        !("kind" in generated) ||
+        generated.kind !== "stored" ||
+        !("sql" in generated) ||
+        typeof generated.sql !== "string" ||
+        generated.sql.length === 0 ||
+        generated.sql.trim() !== generated.sql
+      ) {
+        throw new TypeError(`Generated SQL must be a trimmed non-empty expression: ${column.name}`);
+      }
+      if (column.defaultValue !== undefined || column.backfill !== undefined || column.hidden) {
+        throw new TypeError(
+          `Generated columns cannot have defaults, backfills, or hidden metadata: ${column.name}`,
+        );
+      }
     }
     if (column.backfill !== undefined) {
       const value = column.backfill;

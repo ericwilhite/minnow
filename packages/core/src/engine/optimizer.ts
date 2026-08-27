@@ -1254,6 +1254,34 @@ function decorrelateExistsExpression(
   const inner = exists.block;
   rejectGroupedInner(inner, "EXISTS");
   const keys = extractCorrelation(inner, scope, "EXISTS", true);
+  if (keys.every(({ operator }) => operator === "=")) {
+    const flagsAlias = nextAlias();
+    const flags: CompiledQuery = {
+      sql: "(nested correlated exists flags)",
+      base: inner.base,
+      joins: inner.joins,
+      select: [
+        ...keys.map((key, index) => ({
+          expression: key.inner,
+          alias: correlationKeyAlias(index),
+        })),
+        { expression: { kind: "literal", value: 1 }, alias: correlationMarkerAlias },
+      ],
+      predicates: inner.predicates,
+      // EXISTS only needs one flag per correlation tuple. This is the direct equality-key path
+      // used by auth scopes such as `all_access OR EXISTS (...)` and cannot multiply outer rows.
+      groupBy: keys.map((key) => key.inner),
+      having: [],
+      orderBy: [],
+    };
+    pushCorrelationJoin(block, flagsAlias, flags, keys, "left");
+    return {
+      kind: "condition",
+      operator: exists.negated ? "IS NULL" : "IS NOT NULL",
+      left: { kind: "column", reference: `${flagsAlias}.${correlationMarkerAlias}` },
+      right: { kind: "literal", value: null },
+    };
+  }
   const probes = outerProbeBlock(block, keys);
   const probesAlias = nextAlias();
   const innerRowsAlias = nextAlias();
@@ -1266,7 +1294,7 @@ function decorrelateExistsExpression(
       alias: correlationKeyAlias(index),
     })),
     predicates: inner.predicates,
-    groupBy: [],
+    groupBy: keys.map((key) => key.inner),
     having: [],
     orderBy: [],
   };

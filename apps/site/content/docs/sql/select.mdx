@@ -80,6 +80,25 @@ SQL `NULL` for an empty input. Filter its input in `WHERE`; aggregate-local orde
 `FILTER` are not supported for this aggregate. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`,
 and `CUBE`.
 
+JSON constructors retain JSON provenance until the result crosses the JavaScript boundary. A
+constructor used inside another constructor is embedded as a document, not quoted as text:
+
+```sql
+SELECT JSON_OBJECT(
+  'id' VALUE o.order_id,
+  'detail' VALUE JSON_OBJECT('status' VALUE o.status),
+  'items' VALUE JSON_ARRAYAGG(JSON_OBJECT('sku' VALUE p.sku))
+) AS document
+FROM orders o
+JOIN order_items i ON i.order_id = o.order_id
+JOIN products p ON p.product_id = i.product_id
+GROUP BY o.order_id, o.status
+```
+
+The same rule applies through `JSON_QUERY`. Ordinary text that happens to contain JSON remains a
+JSON string; cast it to `JSON`/`JSONB` or pass it through a JSON constructor when it should embed
+as a document.
+
 `STRING_AGG(value, delimiter ORDER BY expression)` skips NULL values, supports `DISTINCT`, and
 spills under the same query-memory bound as other grouped aggregates.
 

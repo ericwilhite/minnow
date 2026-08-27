@@ -1144,6 +1144,33 @@ describe("SQL/JSON", () => {
     );
   });
 
+  it("embeds nested JSON values without stringifying them again", () => {
+    expect(
+      json(
+        "SELECT JSON_OBJECT('id' VALUE 1, 'detail' VALUE " +
+          "JSON_OBJECT('name' VALUE 'Acme')) AS v",
+      ),
+    ).toBe('{"id":1,"detail":{"name":"Acme"}}');
+    expect(
+      json(
+        "SELECT JSON_OBJECT('outer' VALUE JSON_OBJECT('middle' VALUE " +
+          "JSON_ARRAY(JSON_OBJECT('leaf' VALUE 1)))) AS v",
+      ),
+    ).toBe('{"outer":{"middle":[{"leaf":1}]}}');
+    expect(json("SELECT JSON_OBJECT('tags' VALUE JSON_QUERY(doc, '$.tags')) AS v FROM docs")).toBe(
+      '{"tags":["x","y"]}',
+    );
+    expect(json("SELECT JSON_OBJECT('raw' VALUE '{\"name\":\"Acme\"}') AS v")).toBe(
+      '{"raw":"{\\"name\\":\\"Acme\\"}"}',
+    );
+    expect(
+      json("SELECT JSON_OBJECT('detail' VALUE JSON_OBJECT('a' VALUE 1, 'a' VALUE 2)) AS v"),
+    ).toBe('{"detail":{"a":1,"a":2}}');
+    expect(json("SELECT JSON_OBJECT(JSON_OBJECT('a' VALUE 1) VALUE 2) AS v")).toBe(
+      '{"{\\"a\\":1}":2}',
+    );
+  });
+
   it("aggregates values into JSON arrays with PostgreSQL null semantics", () => {
     expect(value("SELECT JSON_ARRAYAGG(region) AS v FROM rows")).toBe(
       '["west","west","east",null]',
@@ -1161,6 +1188,12 @@ describe("SQL/JSON", () => {
       { region: "west", amounts: "[10,6]" },
       { region: null, amounts: "[8]" },
     ]);
+    expect(
+      value(
+        "SELECT JSON_ARRAYAGG(JSON_OBJECT('amount' VALUE amount)) AS v " +
+          "FROM rows WHERE region = 'west'",
+      ),
+    ).toBe('[{"amount":10},{"amount":6}]');
   });
 
   it("rejects JSON_ARRAYAGG extensions that are not implemented", () => {
