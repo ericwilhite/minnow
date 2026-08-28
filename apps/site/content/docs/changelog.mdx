@@ -8,6 +8,35 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.4 — August 28, 2026
+
+Published packages: `@minnowdb/core@0.6.4`.
+
+### Added
+
+- One statement may now hold 16,384 tokens, up from 4,096. Compilation cost is linear in
+  tokens, so the ceiling costs nothing until a statement actually approaches it; the other
+  compilation limits — 1,048,576 characters of text, 4,096 parameter positions, 128 syntax
+  levels — are unchanged. Statements longer than 16,384 characters of text are still not
+  retained in the plan cache and recompile on each execution, so very large generated
+  statements remain better written as batches.
+
+### Fixed
+
+- A quoted table or alias qualifier before a wildcard — `SELECT "orders".* FROM orders` — now
+  compiles. It previously failed with `Expected identifier, found *`, while the unquoted
+  `orders.*` worked; query builders that quote every identifier, such as Kysely's
+  `selectAll("table")`, hit the broken form.
+
+### Migration
+
+Nothing to change. Both changes accept statements that previously threw `SqlCompileError`.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+layout 5 remain readable and writable without a data migration.
+
 ## 0.6.3 — August 28, 2026
 
 Published packages: `@minnowdb/core@0.6.3` and `@minnowdb/kysely@0.4.3`.

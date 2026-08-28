@@ -7,7 +7,7 @@ export const MAX_CACHEABLE_TEXT_CHARACTERS = 16 * 1024;
  * larger than ordinary application SQL while remaining small enough for deterministic refusal.
  */
 export const MAX_SQL_TEXT_CHARACTERS = 1024 * 1024;
-export const MAX_SQL_TOKENS = 4_096;
+export const MAX_SQL_TOKENS = 16_384;
 export const MAX_SQL_NESTING_DEPTH = 128;
 export const MAX_SQL_PARAMETERS = 4_096;
 

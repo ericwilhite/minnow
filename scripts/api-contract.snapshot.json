@@ -586,7 +586,7 @@
               "name": "MAX_SQL_TOKENS",
               "kind": "value",
               "declarations": [
-                "MAX_SQL_TOKENS = 4096"
+                "MAX_SQL_TOKENS = 16384"
               ]
             },
             {

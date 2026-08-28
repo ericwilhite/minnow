@@ -134,6 +134,13 @@ describe("basic query specification", () => {
       { id: 1, amount: 10 },
     ]);
     expect(() => run("SELECT x.* FROM rows r")).toThrow("Unknown table for x.*");
+    // A quoted alias qualifies a wildcard the same way builders like Kysely emit it.
+    expect(run('SELECT "r".* FROM rows r WHERE id = 3')).toEqual([
+      { id: 3, region: "east", amount: 3, label: "charlie" },
+    ]);
+    expect(run('SELECT "rows".* FROM rows WHERE id = 3')).toEqual([
+      { id: 3, region: "east", amount: 3, label: "charlie" },
+    ]);
   });
 
   it("renames a table's columns positionally", () => {

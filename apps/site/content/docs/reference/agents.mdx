@@ -82,7 +82,7 @@ machines: https://minnowdb.com/llms.txt
   cached on the statement text, so a parameterized statement is planned once and interpolation
   throws that work away on every call.
 - Treat Minnow's fixed SQL safety limits as input validation, not tuning: one statement is capped
-  at 1,048,576 characters, 4,096 tokens and parameter positions, and 128 syntax levels. Pattern,
+  at 1,048,576 characters, 16,384 tokens, 4,096 parameter positions, and 128 syntax levels. Pattern,
   JSON/array, numeric, scalar-result, and full-text inputs have their own documented ceilings in
   https://minnowdb.com/docs/sql/. Keep the 64 MiB execution budget unless the application has a
   measured reason to change it; `null` explicitly opts into unbounded execution memory.

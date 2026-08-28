@@ -7850,7 +7850,14 @@ class Parser {
     if (quotedIdentifier) {
       // A quoted identifier is always a plain reference — never a keyword, literal, or function.
       let reference = identifier;
-      if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
+      if (this.#punctuation(".")) {
+        // E051-07: `"alias".*` selects one source's columns, same as the unquoted form.
+        if (this.#peek().kind === "operator" && this.#peek().text === "*") {
+          this.#index += 1;
+          return { kind: "wildcard", table: identifier };
+        }
+        reference += `.${this.#identifier()}`;
+      }
       return { kind: "column", reference };
     }
     const upper = identifier.toUpperCase();
