@@ -16,7 +16,9 @@ import {
   type BufferedTableWriter,
   type BatchValue,
   type BufferedWriterOptions,
+  type ExecuteOptions,
   type QueryCursorOptions,
+  type QueryExecutionStats,
   type QueryOptions,
   type ReadTableOptions,
 } from "./database.js";
@@ -110,7 +112,6 @@ const directRootMethods = [
   "delete",
   "runStatement",
   "explain",
-  "execute",
   "listVisibleSegmentPage",
   "cleanupQuerySpill",
   "compactTable",
@@ -385,7 +386,10 @@ class DatabaseRpcServer {
       return;
     }
     if (!bypassLimit) this.#inFlightRpcCount += 1;
-    const abort = request.method === "query" ? new AbortController() : undefined;
+    const abort =
+      request.method === "query" || request.method === "execute"
+        ? new AbortController()
+        : undefined;
     if (abort !== undefined) this.#requestAborts.set(request.requestId, abort);
     const context: RpcCallContext = {
       requestId: request.requestId,
@@ -466,6 +470,25 @@ class DatabaseRpcServer {
             }),
           ),
         );
+      }
+      case "execute": {
+        const [sql, params, options, reportStats = false] = args as [
+          string,
+          readonly QueryValue[] | undefined,
+          ExecuteOptions | undefined,
+          boolean | undefined,
+        ];
+        return this.database.execute(sql, params, {
+          ...options,
+          signal: context.signal,
+          ...(reportStats
+            ? {
+                onStats: (stats: QueryExecutionStats) => {
+                  this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
+                },
+              }
+            : {}),
+        });
       }
       case "queryCursorOpen": {
         const handleId = this.#claimHandleId(args[0]);

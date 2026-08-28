@@ -1634,6 +1634,69 @@ describe("MinnowDatabaseClient", () => {
     await client.close();
   });
 
+  it("cancels a buffered execute across the worker boundary and forwards execute controls", async () => {
+    class CancellableExecuteDatabase extends MinnowDatabase {
+      readonly started: Promise<void>;
+      #markStarted!: () => void;
+      #pauseNextExecute = true;
+
+      constructor() {
+        super(new MemoryBlockStore(), { autoCollect: false, autoCompact: false });
+        this.started = new Promise((resolve) => {
+          this.#markStarted = resolve;
+        });
+      }
+
+      override async execute(
+        ...args: Parameters<MinnowDatabase["execute"]>
+      ): ReturnType<MinnowDatabase["execute"]> {
+        if (this.#pauseNextExecute) {
+          this.#pauseNextExecute = false;
+          this.#markStarted();
+          const signal = args[2]?.signal;
+          if (signal === undefined) throw new Error("Worker execute did not receive a signal");
+          await new Promise<void>((_resolve, reject) => {
+            const abort = (): void =>
+              reject(
+                signal.reason instanceof Error
+                  ? signal.reason
+                  : new Error("Execute was aborted", { cause: signal.reason }),
+              );
+            signal.addEventListener("abort", abort, { once: true });
+            if (signal.aborted) abort();
+          });
+        }
+        return super.execute(...args);
+      }
+    }
+
+    const boundary = createBoundary();
+    const database = new CancellableExecuteDatabase();
+    exposeDatabase(database, boundary.workerSide);
+    const client = new MinnowDatabaseClient(boundary.clientSide, { store: { kind: "memory" } });
+    await client.ready();
+    const controller = new AbortController();
+    const pending = client.execute("SELECT 1 AS n", undefined, { signal: controller.signal });
+    await database.started;
+    controller.abort(new Error("stop execute"));
+    const cancelled = await pending.catch((error: unknown) => error);
+    expect(cancelled).toMatchObject({
+      name: "AbortError",
+      message: "Database request was cancelled",
+    });
+    // The connection stays usable, and execute stats cross the channel as an event.
+    const stats: Array<{ peakMemoryBytes: number }> = [];
+    const result = await client.execute("SELECT 2 AS n", undefined, {
+      memoize: false,
+      onStats: (report) => stats.push(report),
+    });
+    if (result.kind !== "rows") throw new Error("expected a rows result");
+    expect(result.result.rows).toEqual([{ n: 2 }]);
+    expect(stats).toHaveLength(1);
+    expect(stats[0]?.peakMemoryBytes).toBeGreaterThanOrEqual(0);
+    await client.close();
+  });
+
   it("carries finite and explicit-unbounded memory defaults through worker initialization", async () => {
     const boundedBoundary = createBoundary();
     attachDatabaseWorker(boundedBoundary.workerSide);

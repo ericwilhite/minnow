@@ -58,6 +58,7 @@ import type {
   MigrateOptions,
   DeleteBatchInput,
   DeleteBatchResult,
+  ExecuteOptions,
   ExecuteResult,
   GarbageCollectionProgress,
   GarbageCollectionResult,
@@ -533,11 +534,16 @@ export class MinnowDatabaseClient {
     return (await this.#call("explain", [sql])) as string;
   }
 
-  async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
-    return (await this.#call(
-      "execute",
-      params === undefined ? [sql] : [sql, params],
-    )) as ExecuteResult;
+  async execute(
+    sql: string,
+    params?: readonly QueryValue[],
+    options: ExecuteOptions = {},
+  ): Promise<ExecuteResult> {
+    const { signal, onStats, ...wireOptions } = options;
+    return (await this.#call("execute", [sql, params, wireOptions, onStats !== undefined], {
+      signal,
+      onStats,
+    })) as ExecuteResult;
   }
 
   /** Executes a compiled statement from the typed mutation builders in the worker. */

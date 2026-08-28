@@ -45,11 +45,12 @@ await db.query(sql, {
 The engine can report its own peak because it reserves before it allocates — a measurement neither
 the storage layer nor a caller could take from outside. `MinnowDatabaseClient` routes the callback
 as a worker event, so the same option works without trying to clone the function. A result-memo hit
-reports a peak of `0` because it performs no new query execution.
+reports a peak of `0` because it performs no new query execution. A SELECT through
+`execute(sql, params, { onStats })` reports the same way.
 
 ## Cancelling a query
 
-`query()`, `queryCursor()`, and queries inside `write()` accept an `AbortSignal`:
+`query()`, `queryCursor()`, `execute()`, and queries inside `write()` accept an `AbortSignal`:
 
 ```ts
 const controller = new AbortController();
@@ -62,7 +63,9 @@ await result; // rejects; no partial QueryResult is returned
 The signal is checked between bounded scan, execution, and spill-storage batches. Cancellation
 releases the reader lease and removes temporary spill pages before rejection. The worker client
 sends a cancellation frame, so an ordinary materialized query does not need a cursor handle just
-to be cancellable.
+to be cancellable. A SELECT through `execute()` cancels exactly like a `query()`; any other
+statement checks the signal once before it starts running, so an already-aborted `execute()`
+never mutates anything, and a mutation that has begun publishes completely or fails.
 
 ## The buffer pool
 

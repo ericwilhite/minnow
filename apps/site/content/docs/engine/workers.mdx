@@ -86,9 +86,9 @@ starts and stops) and satisfies `worker-src` content-security policies from your
 - **Query controls stay local.** `signal` and `onStats` are functions/objects that cannot be
   structured-cloned, so the client removes them from the options frame. Abort becomes a small
   cancellation frame; stats return as an ordered event before the result. Ordinary queries,
-  cursor queries, and reads inside `client.write()` support the same controls as the direct
-  engine. Cancellation requires protocol version 3; deploy the client and worker from the same
-  package build so a cached older worker cannot outlive its client.
+  cursor queries, buffered `execute()` statements, and reads inside `client.write()` support the
+  same controls as the direct engine. Cancellation requires protocol version 3; deploy the client
+  and worker from the same package build so a cached older worker cannot outlive its client.
 - **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and
   256 stateful handle lifecycles, including handles still opening or durably settling. Await
   requests and close cursors, snapshots, buffered writers, and live-query handles when they are

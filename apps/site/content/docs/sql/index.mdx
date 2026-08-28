@@ -11,7 +11,7 @@ extensions.
 | Call                               | Use it for                                    | Returns                                  |
 | ---------------------------------- | --------------------------------------------- | ---------------------------------------- |
 | `query(sql, options?)`             | `SELECT`                                      | `{ rows, columns, columnDomains }`       |
-| `execute(sql, params?)`            | Any statement, including DDL and writes       | A result whose `kind` says what happened |
+| `execute(sql, params?, options?)`  | Any statement, including DDL and writes       | A result whose `kind` says what happened |
 | `explain(sql)`                     | Understanding a plan                          | The optimized plan as text               |
 | `runStatement(compiled, options?)` | Re-running a statement compiled ahead of time | Same as `execute`                        |
 
@@ -116,6 +116,11 @@ The kinds are `rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `cre
 `create-view`, `drop-view`, `create-trigger`, and `drop-trigger`.
 Row-writing kinds carry `rowCount` and the published `version`; `returnedRows` appears only when
 the statement had a `RETURNING` clause.
+
+`execute` also takes the engine controls a `query` does, as a third optional argument:
+`execute(sql, params?, { signal?, onStats?, memoize?, executionMemoryBudgetBytes? })`. A SELECT
+honors all of them through the query pipeline; every other statement checks `signal` once before
+it starts running, so an already-aborted `execute` never mutates anything.
 
 ## Compiling once, running many times
 

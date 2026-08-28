@@ -342,12 +342,35 @@ Directly streamable scans honor backpressure through the vector executor and wor
 Blocking SQL remains correct through the engine's materialized/spill path. The
 [cursor and export guide](/docs/extensions/exports) explains the boundary.
 
+## Cancellation
+
+Kysely's abortable execution options forward to the engine, for buffered queries as well as
+streams:
+
+```ts
+const controller = new AbortController();
+const pending = db
+  .selectFrom("orders")
+  .selectAll()
+  .execute({ signal: controller.signal });
+controller.abort(new Error("view closed"));
+await pending.catch(() => undefined); // rejects with the abort reason
+```
+
+The engine checks the signal between bounded execution and storage batches, so a cancelled
+buffered `SELECT` stops doing work — it returns no partial result and releases any reader lease
+and temporary spill state before the promise rejects. A mutation statement checks the signal
+once before it starts running: an already-aborted signal prevents the write entirely, but a
+mutation that has begun publishes completely or fails — the abort never leaves half a statement
+applied.
+
 ## Supported Kysely operations
 
 - Reads, inserts, updates, deletes, and their `$n` parameters.
 - Type-safe `MATCH` predicates and `BM25` ranking expressions.
 - Typed live queries, keyed changes, and ordered bounded windows.
 - `.stream(chunkSize)` over direct and worker-backed query cursors.
+- `AbortSignal` cancellation for buffered `.execute({ signal })` and for `.stream()`.
 - `RETURNING` rows and Kysely's affected-row counts.
 - `db.transaction().execute(...)` through Minnow's `BEGIN`, `COMMIT`, and `ROLLBACK`.
 - Controlled transactions: `db.startTransaction()` with `savepoint(name)`,

@@ -100,10 +100,14 @@ class MinnowKyselyConnection implements DatabaseConnection {
     this.#resultDecoding = resultDecoding;
   }
 
-  async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
+  async executeQuery<R>(
+    compiledQuery: CompiledQuery,
+    options?: AbortableOperationOptions,
+  ): Promise<QueryResult<R>> {
     const result = await this.#driver.execute(
       compiledQuery.sql,
       kyselyQueryValues(compiledQuery.parameters),
+      options?.signal === undefined ? undefined : { signal: options.signal },
     );
     const count = affectedRows(result);
     const returned = returnedResult(result);

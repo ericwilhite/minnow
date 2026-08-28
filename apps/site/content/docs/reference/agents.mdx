@@ -71,10 +71,12 @@ machines: https://minnowdb.com/llms.txt
 - `db.queryCursor(sql, { params, batchRows, signal })` pulls bounded result pages. Single-table,
   unordered scans stream directly; blocking sorts, groups, joins, and derived sources page the
   ordinary completed result. The worker transfers one columnar page per pull.
-- `db.execute(sql, params)` runs any statement. Check `result.kind` to see what happened
+- `db.execute(sql, params, options?)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
   `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`, `create-view`, `drop-view`,
   `create-trigger`, or `drop-trigger`) before reading `rowCount`, `version`, or `returnedRows`.
+  The optional third argument takes `{ signal?, onStats?, memoize?, executionMemoryBudgetBytes? }`:
+  a SELECT honors all of them; other statements check `signal` once before running.
 - Write PostgreSQL-style SQL and bind parameters with `$1`, `$2` by position. `?` in order is
   also accepted as a Minnow extension. Never concatenate values into SQL: compiled plans are
   cached on the statement text, so a parameterized statement is planned once and interpolation

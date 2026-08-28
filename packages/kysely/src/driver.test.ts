@@ -1,4 +1,4 @@
-import { MinnowDatabase } from "@minnowdb/core";
+import { MinnowDatabase, type MinnowSqlDriver } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { Kysely } from "kysely";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -264,5 +264,116 @@ describe("MinnowKyselyDriver", () => {
         { id: 2, name: "inserted" },
       ]);
     });
+  });
+});
+
+describe("buffered query cancellation", () => {
+  class AbortingStore extends MemoryBlockStore {
+    blockReads = 0;
+    abortAtRead = Number.POSITIVE_INFINITY;
+    readonly controller = new AbortController();
+
+    override async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+      this.blockReads += ids.length;
+      if (this.blockReads >= this.abortAtRead) {
+        this.controller.abort(new Error("stop buffered query"));
+      }
+      return super.getBlocks(ids);
+    }
+  }
+
+  interface EventsDatabase {
+    events: { id: number; label: string };
+  }
+
+  async function populatedStore(): Promise<AbortingStore> {
+    const store = new AbortingStore();
+    const writer = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 32 });
+    await writer.createTable({
+      name: "events",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number", integer: true },
+        { name: "label", type: "string" },
+      ],
+    });
+    await writer.insertBatch("events", {
+      columns: {
+        id: Array.from({ length: 5_000 }, (_, index) => index),
+        label: Array.from({ length: 5_000 }, (_, index) => `event-${String(index)}`),
+      },
+    });
+    await writer.close();
+    return store;
+  }
+
+  it("forwards the AbortSignal to a buffered execute and the engine stops work", async () => {
+    const store = await populatedStore();
+
+    // A cold database over the same store measures what a complete buffered scan reads.
+    store.blockReads = 0;
+    const complete = new MinnowDatabase(store);
+    const completeDb = new Kysely<EventsDatabase>({
+      dialect: new MinnowDialect({ driver: complete }),
+    });
+    expect(await completeDb.selectFrom("events").selectAll().execute()).toHaveLength(5_000);
+    const fullReads = store.blockReads;
+    await completeDb.destroy();
+    await complete.close();
+
+    // The engine's own promise is captured so the rejection is provably the engine stopping,
+    // not just Kysely racing ahead of a query that keeps running in the background.
+    store.blockReads = 0;
+    store.abortAtRead = 1;
+    const database = new MinnowDatabase(store);
+    let enginePromise: ReturnType<MinnowDatabase["execute"]> | undefined;
+    const spyingDriver: MinnowSqlDriver = {
+      query: database.query.bind(database),
+      queryCursor: database.queryCursor.bind(database),
+      introspect: database.introspect.bind(database),
+      execute: (sql, params, options) => {
+        const pending = database.execute(sql, params, options);
+        enginePromise = pending;
+        return pending;
+      },
+    };
+    const db = new Kysely<EventsDatabase>({
+      dialect: new MinnowDialect({ driver: spyingDriver }),
+    });
+    await expect(
+      db.selectFrom("events").selectAll().execute({ signal: store.controller.signal }),
+    ).rejects.toThrow("stop buffered query");
+    if (enginePromise === undefined) throw new Error("the driver never received the query");
+    await expect(enginePromise).rejects.toThrow("stop buffered query");
+    const readsAtRejection = store.blockReads;
+    expect(readsAtRejection).toBeGreaterThan(0);
+    expect(readsAtRejection).toBeLessThan(fullReads);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The engine stopped reading instead of finishing the scan in the background.
+    expect(store.blockReads).toBe(readsAtRejection);
+
+    // The database remains usable after the cancelled statement.
+    store.abortAtRead = Number.POSITIVE_INFINITY;
+    expect(
+      await db.selectFrom("events").select("id").where("id", "=", 7).executeTakeFirstOrThrow(),
+    ).toEqual({ id: 7 });
+    await db.destroy();
+    await database.close();
+  });
+
+  it("rejects an already-aborted buffered execute without touching storage", async () => {
+    const store = await populatedStore();
+    const database = new MinnowDatabase(store);
+    const db = new Kysely<EventsDatabase>({ dialect: new MinnowDialect({ driver: database }) });
+    const controller = new AbortController();
+    const reason = new Error("aborted before execution");
+    controller.abort(reason);
+    store.blockReads = 0;
+    await expect(
+      db.selectFrom("events").selectAll().execute({ signal: controller.signal }),
+    ).rejects.toThrow("aborted before execution");
+    expect(store.blockReads).toBe(0);
+    await db.destroy();
+    await database.close();
   });
 });

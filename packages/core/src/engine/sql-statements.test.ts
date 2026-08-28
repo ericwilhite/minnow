@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { QueryMemoryBudgetError } from "./memory.js";
 
 async function seeded(): Promise<MinnowDatabase> {
   const database = new MinnowDatabase(new MemoryBlockStore());
@@ -847,5 +848,118 @@ describe("ON CONFLICT", () => {
       { name: "existing", qty: 5 },
       { name: "fresh", qty: 5 },
     ]);
+  });
+});
+
+describe("execute engine controls", () => {
+  async function eventsDatabase(store: MemoryBlockStore, rowCount: number): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 32 });
+    await database.createTable({
+      name: "events",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number", integer: true },
+        { name: "label", type: "string" },
+      ],
+    });
+    await database.insertBatch("events", {
+      columns: {
+        id: Array.from({ length: rowCount }, (_, index) => index),
+        label: Array.from({ length: rowCount }, (_, index) => `event-${String(index)}`),
+      },
+    });
+    return database;
+  }
+
+  it("reports stats for buffered SELECTs and honors memoize", async () => {
+    const database = await eventsDatabase(new MemoryBlockStore(), 512);
+    const peaks: number[] = [];
+    const onStats = ({ peakMemoryBytes }: { peakMemoryBytes: number }): void => {
+      peaks.push(peakMemoryBytes);
+    };
+    const sql = "SELECT id, label FROM events ORDER BY label";
+    const first = await database.execute(sql, undefined, { onStats });
+    if (first.kind !== "rows") throw new Error("expected a rows result");
+    expect(first.result.rows).toHaveLength(512);
+    await database.execute(sql, undefined, { onStats });
+    await database.execute(sql, undefined, { onStats, memoize: false });
+    expect(peaks).toHaveLength(3);
+    expect(peaks[0]).toBeGreaterThan(0);
+    // A memo hit runs nothing and reports zero; memoize: false computes again.
+    expect(peaks[1]).toBe(0);
+    expect(peaks[2]).toBeGreaterThan(0);
+    await database.close();
+  });
+
+  it("applies an execution memory budget to buffered SELECTs", async () => {
+    const database = await eventsDatabase(new MemoryBlockStore(), 64);
+    await expect(
+      database.execute("SELECT id, label FROM events ORDER BY label", undefined, {
+        executionMemoryBudgetBytes: 1,
+        memoize: false,
+      }),
+    ).rejects.toBeInstanceOf(QueryMemoryBudgetError);
+    await database.close();
+  });
+
+  it("aborts a buffered SELECT between storage batches and stops reading", async () => {
+    class AbortingStore extends MemoryBlockStore {
+      blockReads = 0;
+      abortAtRead = Number.POSITIVE_INFINITY;
+      readonly controller = new AbortController();
+
+      override async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+        this.blockReads += ids.length;
+        if (this.blockReads >= this.abortAtRead) {
+          this.controller.abort(new Error("stop buffered select"));
+        }
+        return super.getBlocks(ids);
+      }
+    }
+    const store = new AbortingStore();
+    const writer = await eventsDatabase(store, 5_000);
+
+    // A cold database over the same store measures what a complete scan reads.
+    store.blockReads = 0;
+    const complete = new MinnowDatabase(store);
+    const full = await complete.execute("SELECT id, label FROM events", undefined, {
+      memoize: false,
+    });
+    if (full.kind !== "rows") throw new Error("expected a rows result");
+    expect(full.result.rows).toHaveLength(5_000);
+    const fullReads = store.blockReads;
+    await complete.close();
+
+    // Abort from inside the first storage read; the engine stops at the next batch boundary.
+    store.blockReads = 0;
+    store.abortAtRead = 1;
+    const database = new MinnowDatabase(store);
+    await expect(
+      database.execute("SELECT id, label FROM events", undefined, {
+        signal: store.controller.signal,
+        memoize: false,
+      }),
+    ).rejects.toThrow("stop buffered select");
+    const readsAtRejection = store.blockReads;
+    expect(readsAtRejection).toBeGreaterThan(0);
+    expect(readsAtRejection).toBeLessThan(fullReads);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Nothing kept reading in the background after the rejection.
+    expect(store.blockReads).toBe(readsAtRejection);
+    await database.close();
+    await writer.close();
+  });
+
+  it("checks the signal before a mutation runs", async () => {
+    const database = await seeded();
+    const controller = new AbortController();
+    const reason = new Error("stop before insert");
+    controller.abort(reason);
+    await expect(
+      database.execute("INSERT INTO people (name, score) VALUES ('Linus', 5)", undefined, {
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(reason);
+    expect((await database.query("SELECT count(*) AS n FROM people")).rows).toEqual([{ n: 2 }]);
   });
 });

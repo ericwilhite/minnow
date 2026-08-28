@@ -922,6 +922,17 @@ export interface QueryOptions {
   readonly spillPageRows?: number;
 }
 
+/**
+ * Engine controls honored by `execute()`. A SELECT runs through the query pipeline with all of
+ * them; every other statement checks `signal` before it starts running, so an already-aborted
+ * execute never mutates anything. Mutations are not stopped mid-statement — a write either
+ * publishes completely or fails — and only SELECT executions report stats.
+ */
+export type ExecuteOptions = Pick<
+  QueryOptions,
+  "signal" | "onStats" | "memoize" | "executionMemoryBudgetBytes"
+>;
+
 export interface QueryCursorOptions extends QueryOptions {
   /** Maximum rows in one yielded result batch. Defaults to the vector scan batch size. */
   readonly batchRows?: number;
@@ -8536,8 +8547,16 @@ export class MinnowDatabase {
    * read the matching keys at one snapshot and then apply the keyed mutation. The read and the
    * mutation are two steps, not one serializable transaction: a key changed by a competing writer
    * in between fails the statement explicitly rather than silently mutating other rows.
+   *
+   * `options` carries the engine controls a query takes: a SELECT honors all of them, and every
+   * other statement checks `signal` once before running (see `ExecuteOptions`).
    */
-  async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
+  async execute(
+    sql: string,
+    params?: readonly QueryValue[],
+    options: ExecuteOptions = {},
+  ): Promise<ExecuteResult> {
+    throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
     const statement = this.#compileStatementCached(sql);
     if (statement.kind === "transaction") {
@@ -8546,7 +8565,10 @@ export class MinnowDatabase {
     if (statement.kind === "select") {
       return {
         kind: "rows",
-        result: await this.query(statement.sql, params === undefined ? {} : { params }),
+        result: await this.query(statement.sql, {
+          ...options,
+          ...(params === undefined ? {} : { params }),
+        }),
       };
     }
     const open = this.#openTransaction;

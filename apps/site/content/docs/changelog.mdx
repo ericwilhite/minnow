@@ -8,6 +8,35 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.3 — August 28, 2026
+
+Published packages: `@minnowdb/core@0.6.3` and `@minnowdb/kysely@0.4.3`.
+
+### Added
+
+- `execute()` now takes the engine controls a query does, as a third optional argument:
+  `execute(sql, params?, { signal?, onStats?, memoize?, executionMemoryBudgetBytes? })`. A
+  SELECT honors all of them through the query pipeline — cancellation stops between bounded
+  batches with no partial result, and `onStats` reports peak modeled execution memory. Every
+  other statement checks `signal` once before it starts, so an already-aborted call never
+  mutates anything. The widening covers `MinnowDatabase`, `MinnowDatabaseClient` (the signal
+  and stats cross the worker channel exactly as `query`'s do), and the `MinnowSqlExecutor`
+  contract — a driver written against the two-argument form remains a valid implementation.
+- `@minnowdb/kysely` forwards Kysely's `AbortSignal` to buffered queries:
+  `.execute({ signal })` now cancels the engine's work instead of only detaching from it.
+  Streaming already forwarded the signal; buffered statements now do too.
+
+### Migration
+
+Nothing to change. The new `execute` argument is optional, and third-party `MinnowSqlDriver`
+implementations with the old two-argument `execute` still satisfy the interface — they simply
+ignore the controls.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+layout 5 remain readable and writable without a data migration.
+
 ## 0.6.2 — August 28, 2026
 
 Published packages: `@minnowdb/core@0.6.2` and `@minnowdb/kysely@0.4.2`.

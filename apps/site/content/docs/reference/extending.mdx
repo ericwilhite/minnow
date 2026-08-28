@@ -16,7 +16,7 @@ real adapter instead of a set of hooks that have never been used outside the eng
 | `MinnowSqlExecutor`                    | `@minnowdb/core`      | Structural `query` / `queryCursor` / `execute` boundary, direct or worker-backed.         |
 | `MinnowSqlDriver`                      | `@minnowdb/core`      | The SQL executor plus `introspect()` for schema-aware adapters.                           |
 | `LiveQuerySource` / `LiveQueryManager` | `@minnowdb/core/live` | Adapter-owned typed execution plus Minnow-owned durable invalidation.                     |
-| `execute(sql, params)`                 | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                     |
+| `execute(sql, params, options?)`       | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                     |
 | `introspect()`                         | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                              |
 | Statement transactions                 | `@minnowdb/core`      | `BEGIN`, savepoints, `COMMIT`, and `ROLLBACK` for adapter-owned control flow.             |
 | Plan construction                      | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.             |
@@ -43,6 +43,12 @@ layer that inlines literals instead defeats that cache, since every distinct val
 distinct key.
 
 Identifiers quote with double quotes, doubling an embedded quote: `"order id"`, `"say ""hi"""`.
+
+`execute` also takes an optional third argument with the engine controls a `query` does —
+`{ signal?, onStats?, memoize?, executionMemoryBudgetBytes? }`. A SELECT honors all of them, so an
+adapter can cancel a buffered statement or report its cost; every other statement checks `signal`
+once before running. A driver written against the two-argument `execute` is still a valid
+`MinnowSqlExecutor` — it simply ignores the controls.
 
 Use `queryCursor(sql, { params, batchRows, signal })` when an adapter exposes streaming. It returns
 query-result pages through the same structural interface on `MinnowDatabase` and
