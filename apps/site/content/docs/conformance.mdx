@@ -12,7 +12,9 @@ cannot pass in the docs while failing in the engine.
 - Every supported example runs through both query executors.
 - PostgreSQL-compatible reads are compared with PGlite. SQLite provides a second comparison where
   its syntax and behavior match.
-- PostgreSQL-compatible writes compare affected-row counts, `RETURNING`, and the final table.
+- PostgreSQL-compatible writes replay a seeded mutation script against both SQLite and PGlite,
+  comparing statement outcomes, affected-row counts, `RETURNING`, trigger effects, and the final
+  table after every statement.
 - Compatible DDL must parse in PostgreSQL and create the expected Minnow catalog.
 - Every excluded form must fail with its documented error.
 - SQLLogicTest adds thousands of database-neutral queries for joins, expressions, ordering, NULL

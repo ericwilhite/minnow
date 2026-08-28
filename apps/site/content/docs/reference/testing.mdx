@@ -59,9 +59,16 @@ application it starts.
 
 - **Unit and language tests** stay beside the source they exercise. They cover predictable
   behavior, supported SQL and mutations, comparisons with other engines, fault injection, and the
-  benchmark generator and answer-checking rules. `npm test` picks up `apps/site/bench` alongside
-  `packages/**`, so the dataset generator, the oracles, and the suite definitions are checked on
-  every unit run.
+  benchmark generator and answer-checking rules. Reads and writes are both checked
+  differentially: the read conformance suite diffs a generated query corpus against SQLite and
+  PGlite, and the mutation conformance suite replays a seeded script of inserts, updates,
+  deletes, upserts, and atomic write scopes against the same two oracles — comparing statement
+  outcomes, affected-row counts, `RETURNING` rows, trigger-written audit rows, and the full
+  table state after every step. The fixture's triggers are declared in each oracle's own dialect
+  (plpgsql trigger functions for PGlite) with identical bodies, and `MERGE` — which SQLite lacks
+  — runs verbatim on PGlite and as an equivalent statement pair on SQLite. `npm test` picks up
+  `apps/site/bench` alongside `packages/**`, so the dataset generator, the oracles, and the
+  suite definitions are checked on every unit run.
 - **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
   cannot prove, and drive a database through a real module worker: the package entry booting,
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.

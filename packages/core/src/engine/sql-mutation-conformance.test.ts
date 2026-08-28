@@ -1,14 +1,21 @@
 /**
  * Differential DML conformance harness — the mutation counterpart to sql-conformance.test.ts.
  * A seeded generator produces a script of INSERT / UPDATE / DELETE / upsert statements and
- * atomic write scopes; every step applies to both MinnowDatabase and SQLite (node:sqlite,
- * the reference oracle), with identical AFTER triggers installed on both engines. After every
- * step the full table state, the trigger-written audit trail, statement outcomes (success or
- * rejection), and affected-row counts must agree.
+ * atomic write scopes; every step applies to MinnowDatabase and to two independent oracles,
+ * SQLite (node:sqlite) and PGlite (real PostgreSQL), with equivalent AFTER triggers installed
+ * on all three engines. After every step the full table state, the trigger-written audit
+ * trail, statement outcomes (success or rejection), and affected-row counts must agree.
+ *
+ * The triggers are the one dialect split: PostgreSQL has no bare `CREATE TRIGGER … BEGIN … END`
+ * form, so the SQLite-flavored fixture triggers are translated into plpgsql trigger functions
+ * with the same body. Both spellings write the same audit rows, and the audit table is diffed
+ * like any other. MERGE (a PairStep) runs verbatim on Minnow and PGlite but is spelled as
+ * UPDATE + INSERT for SQLite; a PairStep compares outcomes and resulting state only, since the
+ * spellings report their affected rows differently.
  *
  * The script sticks to the shared semantic surface: quarter-valued amounts keep arithmetic
  * exact, unique keys collide deliberately to exercise conflict paths, and failed statements
- * must leave both engines untouched (per-statement atomicity on both sides).
+ * must leave every engine untouched (per-statement atomicity on all sides).
  */
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
@@ -89,6 +96,71 @@ function sqliteFixture(): DatabaseSync {
   database.exec(`CREATE TABLE audit ("action" TEXT, "item_id" REAL, "amount" REAL)`);
   for (const trigger of TRIGGERS) database.exec(trigger);
   return database;
+}
+
+/**
+ * TRIGGERS, translated: PostgreSQL spells a row trigger as a plpgsql function plus a
+ * `FOR EACH ROW EXECUTE FUNCTION` declaration, but the body — one audit INSERT reading NEW/OLD
+ * — is the same, so the audit trail stays comparable across all three engines.
+ */
+const PGLITE_TRIGGERS = [
+  `CREATE FUNCTION items_ins_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ` +
+    `INSERT INTO audit (action, item_id, amount) VALUES ('ins', NEW.id, NEW.amount); RETURN NULL; END $$`,
+  `CREATE TRIGGER items_ins AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION items_ins_audit()`,
+  `CREATE FUNCTION items_upd_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ` +
+    `INSERT INTO audit (action, item_id, amount) VALUES ('upd', NEW.id, NEW.amount); RETURN NULL; END $$`,
+  `CREATE TRIGGER items_upd AFTER UPDATE ON items FOR EACH ROW EXECUTE FUNCTION items_upd_audit()`,
+  `CREATE FUNCTION items_del_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ` +
+    `INSERT INTO audit (action, item_id, amount) VALUES ('del', OLD.id, OLD.amount); RETURN NULL; END $$`,
+  `CREATE TRIGGER items_del AFTER DELETE ON items FOR EACH ROW EXECUTE FUNCTION items_del_audit()`,
+];
+
+/** Rewrites `?` placeholders to PostgreSQL's `$n`; script strings never contain a literal `?`. */
+function positionalToNumbered(sql: string): string {
+  let index = 0;
+  return sql.replace(/\?/g, () => `$${String((index += 1))}`);
+}
+
+interface PgliteOracle {
+  run(
+    sql: string,
+    params?: QueryValue[],
+  ): Promise<{ rows: Array<Record<string, unknown>>; count: number }>;
+  exec(sql: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+async function pgliteFixture(): Promise<PgliteOracle> {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const database = await PGlite.create();
+  await database.exec(
+    `CREATE TABLE items ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "label" TEXT)`,
+  );
+  await database.exec(
+    `CREATE TABLE audit ("action" TEXT, "item_id" DOUBLE PRECISION, "amount" DOUBLE PRECISION)`,
+  );
+  for (const statement of PGLITE_TRIGGERS) await database.exec(statement);
+  // int8 and numeric arrive as numbers so counts and numeric math compare directly; the fixture
+  // has no datetime columns, so no timestamp parser is needed.
+  const parsers = {
+    20: (value: string) => Number(value),
+    1700: (value: string) => Number(value),
+  };
+  return {
+    run: async (sql, params) => {
+      const result = await database.query(positionalToNumbered(sql), (params ?? []) as unknown[], {
+        parsers,
+      });
+      return {
+        rows: result.rows as Array<Record<string, unknown>>,
+        count: result.affectedRows ?? 0,
+      };
+    },
+    exec: async (sql) => {
+      await database.exec(sql);
+    },
+    close: () => database.close(),
+  };
 }
 
 // --- Script steps -------------------------------------------------------------------------------
@@ -379,14 +451,14 @@ function keys(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): s
   return ordered ? mapped : [...mapped].sort();
 }
 
-function diffSummary(label: string, left: string[], right: string[]): string {
+function diffSummary(label: string, oracle: string, left: string[], right: string[]): string {
   const firstDiff = left.findIndex((key, index) => key !== right[index]);
   const at = firstDiff === -1 ? Math.min(left.length, right.length) : firstDiff;
   return [
     `${label}: ${String(left.length)} vs ${String(right.length)} rows`,
     `  first difference at row ${String(at)}:`,
     `    minnow: ${left[at] ?? "(missing)"}`,
-    `    sqlite: ${right[at] ?? "(missing)"}`,
+    `    ${oracle}: ${right[at] ?? "(missing)"}`,
   ].join("\n");
 }
 
@@ -402,25 +474,43 @@ function sqliteParams(params: QueryValue[] | undefined): Array<string | number |
 
 // --- The harness --------------------------------------------------------------------------------
 
-describe("DML conformance against SQLite", () => {
+describe("DML conformance against SQLite and PGlite", () => {
   it("agrees on state, triggers, outcomes, and row counts across a seeded mutation script", async () => {
     const script = buildScript();
     const minnow = await minnowFixture();
     const sqlite = sqliteFixture();
+    const pglite = await pgliteFixture();
     const failures: string[] = [];
+    let pgliteCompared = 0;
 
     const compareState = async (label: string): Promise<void> => {
       const stateSql = `SELECT id, region, amount, active, label FROM items ORDER BY id`;
       const minnowState = keys((await minnow.query(stateSql)).rows, true);
       const sqliteState = keys(sqlite.prepare(stateSql).all(), true);
       if (minnowState.join("\n") !== sqliteState.join("\n")) {
-        failures.push(`${label}\n${diffSummary("table state", minnowState, sqliteState)}`);
+        failures.push(
+          `${label}\n${diffSummary("table state", "sqlite", minnowState, sqliteState)}`,
+        );
+      }
+      const pgliteState = keys((await pglite.run(stateSql)).rows, true);
+      if (minnowState.join("\n") !== pgliteState.join("\n")) {
+        failures.push(
+          `${label}\n${diffSummary("table state", "pglite", minnowState, pgliteState)}`,
+        );
       }
       const auditSql = `SELECT action, item_id, amount FROM audit`;
       const minnowAudit = keys((await minnow.query(auditSql)).rows, false);
       const sqliteAudit = keys(sqlite.prepare(auditSql).all(), false);
       if (minnowAudit.join("\n") !== sqliteAudit.join("\n")) {
-        failures.push(`${label}\n${diffSummary("audit trail", minnowAudit, sqliteAudit)}`);
+        failures.push(
+          `${label}\n${diffSummary("audit trail", "sqlite", minnowAudit, sqliteAudit)}`,
+        );
+      }
+      const pgliteAudit = keys((await pglite.run(auditSql)).rows, false);
+      if (minnowAudit.join("\n") !== pgliteAudit.join("\n")) {
+        failures.push(
+          `${label}\n${diffSummary("audit trail", "pglite", minnowAudit, pgliteAudit)}`,
+        );
       }
     };
 
@@ -453,29 +543,51 @@ describe("DML conformance against SQLite", () => {
       } catch (error) {
         sqliteError = error;
       }
-      if ((minnowError === undefined) !== (sqliteError === undefined)) {
-        failures.push(
-          `${label}\n  outcome diverged: minnow ${
-            minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
-          }; sqlite ${
-            sqliteError === undefined ? "succeeded" : `threw: ${describeError(sqliteError)}`
-          }`,
-        );
-        return;
+      let pgliteError: unknown;
+      let pgliteCount: number | undefined;
+      let pgliteReturned: string[] | undefined;
+      try {
+        const result = await pglite.run(step.sql, step.params);
+        pgliteCount = returning ? result.rows.length : result.count;
+        if (returning) pgliteReturned = keys(result.rows, false);
+      } catch (error) {
+        pgliteError = error;
       }
-      if (minnowError !== undefined) return; // Both rejected; compareState confirms no damage.
-      if (minnowCount !== undefined && sqliteCount !== undefined && minnowCount !== sqliteCount) {
-        failures.push(
-          `${label}\n  affected rows diverged: minnow ${String(minnowCount)}, sqlite ${String(sqliteCount)}`,
-        );
-      }
-      if (
-        minnowReturned !== undefined &&
-        sqliteReturned !== undefined &&
-        minnowReturned.join("\n") !== sqliteReturned.join("\n")
-      ) {
-        failures.push(`${label}\n${diffSummary("RETURNING rows", minnowReturned, sqliteReturned)}`);
-      }
+      pgliteCompared += 1;
+      const compareOracle = (
+        oracle: string,
+        oracleError: unknown,
+        oracleCount: number | undefined,
+        oracleReturned: string[] | undefined,
+      ): void => {
+        if ((minnowError === undefined) !== (oracleError === undefined)) {
+          failures.push(
+            `${label}\n  outcome diverged: minnow ${
+              minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
+            }; ${oracle} ${
+              oracleError === undefined ? "succeeded" : `threw: ${describeError(oracleError)}`
+            }`,
+          );
+          return;
+        }
+        if (minnowError !== undefined) return; // Both rejected; compareState confirms no damage.
+        if (minnowCount !== undefined && oracleCount !== undefined && minnowCount !== oracleCount) {
+          failures.push(
+            `${label}\n  affected rows diverged: minnow ${String(minnowCount)}, ${oracle} ${String(oracleCount)}`,
+          );
+        }
+        if (
+          minnowReturned !== undefined &&
+          oracleReturned !== undefined &&
+          minnowReturned.join("\n") !== oracleReturned.join("\n")
+        ) {
+          failures.push(
+            `${label}\n${diffSummary("RETURNING rows", oracle, minnowReturned, oracleReturned)}`,
+          );
+        }
+      };
+      compareOracle("sqlite", sqliteError, sqliteCount, sqliteReturned);
+      compareOracle("pglite", pgliteError, pgliteCount, pgliteReturned);
     };
 
     const runPair = async (step: PairStep, label: string): Promise<void> => {
@@ -496,14 +608,29 @@ describe("DML conformance against SQLite", () => {
         sqlite.exec("ROLLBACK");
         sqliteError = error;
       }
-      if ((minnowError === undefined) !== (sqliteError === undefined)) {
-        failures.push(
-          `${label}\n  outcome diverged: minnow ${
-            minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
-          }; sqlite ${
-            sqliteError === undefined ? "succeeded" : `threw: ${describeError(sqliteError)}`
-          }`,
-        );
+      // PGlite speaks the Minnow spelling (MERGE) directly, so it runs verbatim. Affected-row
+      // reporting still differs between MERGE and its UPDATE + INSERT expansion, so a PairStep
+      // compares outcomes here and leaves the row-level evidence to compareState.
+      let pgliteError: unknown;
+      try {
+        await pglite.run(step.minnow.sql, step.minnow.params);
+      } catch (error) {
+        pgliteError = error;
+      }
+      pgliteCompared += 1;
+      for (const [oracle, oracleError] of [
+        ["sqlite", sqliteError],
+        ["pglite", pgliteError],
+      ] as const) {
+        if ((minnowError === undefined) !== (oracleError === undefined)) {
+          failures.push(
+            `${label}\n  outcome diverged: minnow ${
+              minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
+            }; ${oracle} ${
+              oracleError === undefined ? "succeeded" : `threw: ${describeError(oracleError)}`
+            }`,
+          );
+        }
       }
     };
 
@@ -556,7 +683,7 @@ describe("DML conformance against SQLite", () => {
         failures.push(`${label}\n  scope unexpectedly aborted: ${describeError(minnowError)}`);
         return;
       }
-      if (minnowError !== undefined) return; // Aborted scope: sqlite applies nothing either.
+      if (minnowError !== undefined) return; // Aborted scope: the oracles apply nothing either.
       sqlite.exec("BEGIN");
       try {
         for (const update of updates) {
@@ -573,6 +700,24 @@ describe("DML conformance against SQLite", () => {
         sqlite.exec("ROLLBACK");
         failures.push(`${label}\n  sqlite mirror transaction failed: ${describeError(error)}`);
       }
+      try {
+        await pglite.exec("BEGIN");
+        for (const update of updates) {
+          await pglite.run(`UPDATE items SET amount = ? WHERE id = ?`, [update.amount, update.id]);
+        }
+        for (const row of step.inserts) {
+          await pglite.run(
+            `INSERT INTO items (id, region, amount, active, label) VALUES (?, ?, ?, TRUE, ?)`,
+            [row.id, row.region, row.amount, row.label],
+          );
+        }
+        for (const id of deletes) await pglite.run(`DELETE FROM items WHERE id = ?`, [id]);
+        await pglite.exec("COMMIT");
+      } catch (error) {
+        await pglite.exec("ROLLBACK");
+        failures.push(`${label}\n  pglite mirror transaction failed: ${describeError(error)}`);
+      }
+      pgliteCompared += 1;
     };
 
     try {
@@ -596,6 +741,7 @@ describe("DML conformance against SQLite", () => {
       }
     } finally {
       sqlite.close();
+      await pglite.close();
     }
     expect(script.length).toBeGreaterThan(60);
     if (failures.length > 0) {
@@ -604,5 +750,9 @@ describe("DML conformance against SQLite", () => {
           failures.slice(0, 10).join("\n\n"),
       );
     }
-  }, 120_000);
+    // The PGlite leg is only worth something while it actually runs: every SQL statement, MERGE
+    // pair, and committed write scope must have been diffed against PostgreSQL as well. The floor
+    // sits after the failure report so a real divergence is read before a coverage shortfall.
+    expect(pgliteCompared).toBeGreaterThan(60);
+  }, 180_000);
 });
