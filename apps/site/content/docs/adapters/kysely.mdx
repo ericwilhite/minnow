@@ -349,10 +349,7 @@ streams:
 
 ```ts
 const controller = new AbortController();
-const pending = db
-  .selectFrom("orders")
-  .selectAll()
-  .execute({ signal: controller.signal });
+const pending = db.selectFrom("orders").selectAll().execute({ signal: controller.signal });
 controller.abort(new Error("view closed"));
 await pending.catch(() => undefined); // rejects with the abort reason
 ```
