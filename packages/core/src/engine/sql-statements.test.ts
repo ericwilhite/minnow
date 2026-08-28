@@ -852,7 +852,10 @@ describe("ON CONFLICT", () => {
 });
 
 describe("execute engine controls", () => {
-  async function eventsDatabase(store: MemoryBlockStore, rowCount: number): Promise<MinnowDatabase> {
+  async function eventsDatabase(
+    store: MemoryBlockStore,
+    rowCount: number,
+  ): Promise<MinnowDatabase> {
     const database = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 32 });
     await database.createTable({
       name: "events",

@@ -1,5 +1,10 @@
 import type { Catalog } from "./catalog.js";
-import type { ExecuteOptions, ExecuteResult, QueryCursorOptions, QueryOptions } from "./database.js";
+import type {
+  ExecuteOptions,
+  ExecuteResult,
+  QueryCursorOptions,
+  QueryOptions,
+} from "./database.js";
 import type { QueryResult, QueryValue } from "./query.js";
 
 /**
