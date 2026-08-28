@@ -555,10 +555,45 @@
       "notes": "ROWS frames take row-distance bounds; RANGE frames take UNBOUNDED and CURRENT ROW bounds, where CURRENT ROW spans the ordering peer group."
     },
     {
+      "id": "window.frame-range-offset",
+      "status": "unsupported",
+      "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS windowed FROM rows",
+      "error": "RANGE frames take only UNBOUNDED and CURRENT ROW bounds; use ROWS",
+      "notes": "A numeric RANGE offset bounds the frame by ordering-value distance, which the engine does not implement. ROWS frames take numeric offsets; RANGE frames take UNBOUNDED and CURRENT ROW bounds only."
+    },
+    {
+      "id": "window.distinct-aggregate",
+      "status": "unsupported",
+      "example": "SELECT SUM(DISTINCT amount) OVER (PARTITION BY region) AS total FROM rows",
+      "error": "DISTINCT window aggregates are not supported",
+      "notes": "An aggregate used as a window function cannot take DISTINCT; PostgreSQL rejects this form too. DISTINCT aggregates work in grouped aggregation, so aggregate in a grouped block and window over that."
+    },
+    {
+      "id": "window.outside-select",
+      "status": "unsupported",
+      "example": "SELECT amount FROM rows ORDER BY ROW_NUMBER() OVER (ORDER BY amount)",
+      "error": "Window functions are only allowed in the select list",
+      "notes": "PostgreSQL also evaluates window functions in ORDER BY; Minnow evaluates them only as select items. Alias the window in the select list and order by the alias."
+    },
+    {
       "id": "join.right",
       "status": "supported",
       "example": "SELECT r.region FROM rows r RIGHT JOIN dims d ON d.region = r.region",
-      "notes": "Desugars to the mirrored LEFT JOIN; supported as the sole join of a block."
+      "notes": "Desugars to the mirrored LEFT JOIN; supported as the sole join of a block, and not beside SELECT *."
+    },
+    {
+      "id": "join.right-multi",
+      "status": "unsupported",
+      "example": "SELECT r.region FROM rows r JOIN dims d ON d.region = r.region RIGHT JOIN dims e ON e.region = r.region",
+      "error": "RIGHT JOIN is only supported as the sole join",
+      "notes": "RIGHT JOIN desugars by swapping the two sides of a LEFT JOIN, which needs the block to hold exactly one join. Rewrite the block so the preserved side is on the left of a LEFT JOIN."
+    },
+    {
+      "id": "join.right-wildcard",
+      "status": "unsupported",
+      "example": "SELECT * FROM rows r RIGHT JOIN dims d ON d.region = r.region",
+      "error": "RIGHT JOIN cannot be combined with SELECT *",
+      "notes": "The desugaring swaps the two sources, which would reorder a wildcard's output columns. Name the output columns explicitly, or write the mirrored LEFT JOIN."
     },
     {
       "id": "join.non-equi",
@@ -758,7 +793,14 @@
       "id": "join.full",
       "status": "supported",
       "example": "SELECT r.amount AS amount, d.label AS label FROM rows r FULL JOIN dims d ON d.region = r.region",
-      "notes": "Desugars into a union of two left joins, so it must be the sole join, with an equality ON and no grouping or DISTINCT yet."
+      "notes": "Desugars into a union of two left joins, so it must be the sole join, with an equality ON, named output columns rather than SELECT *, and no grouping, DISTINCT, or window functions yet."
+    },
+    {
+      "id": "join.full-grouped",
+      "status": "unsupported",
+      "example": "SELECT r.region AS region, COUNT(*) AS matched FROM rows r FULL JOIN dims d ON d.region = r.region GROUP BY r.region",
+      "error": "FULL JOIN cannot be combined with grouping, DISTINCT, or window functions yet",
+      "notes": "FULL JOIN desugars into a union of two left joins, and grouping, DISTINCT, and window functions do not distribute over that union yet. Put the FULL JOIN in a derived table and group, deduplicate, or window in the outer block."
     },
     {
       "id": "order-by.ordinal",
@@ -1272,6 +1314,14 @@
       "setup": ["CREATE TABLE parents (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"],
       "example": "CREATE TABLE children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
       "notes": "Scalar and composite references target the parent's matching primary-key columns. Writes validate against their transaction; NULL references are satisfied. ON DELETE supports RESTRICT, CASCADE, and SET NULL atomically. Primary keys are immutable, so ON UPDATE has no action."
+    },
+    {
+      "id": "ddl.foreign-key-set-default",
+      "status": "unsupported",
+      "setup": ["CREATE TABLE default_parents (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"],
+      "example": "CREATE TABLE default_children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES default_parents(id) ON DELETE SET DEFAULT)",
+      "error": "SET DEFAULT is not supported; use SET NULL or CASCADE",
+      "notes": "SET DEFAULT would rewrite orphaned references to the column's default value at delete time; Minnow implements RESTRICT, CASCADE, and SET NULL. The statement is rejected at parse, before touching the catalog."
     }
   ]
 }

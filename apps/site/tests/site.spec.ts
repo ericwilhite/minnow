@@ -336,7 +336,7 @@ test("the SQL docs render and the feature matrix comes from the checked-in fixtu
   await expect(page.locator("h1")).toHaveText("PostgreSQL compatibility");
   // Counts are rendered from sql-feature-matrix.json, so they move when the engine's surface does.
   await expect(page.getByText(/\d+ checked forms · \d+ PostgreSQL compatible/)).toBeVisible();
-  await expect(page.getByText(/\d+ deliberate embedded-database exclusions/)).toBeVisible();
+  await expect(page.getByText(/\d+ excluded forms/)).toBeVisible();
   await expect(page.getByText("PostgreSQL compatible", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Unsupported", { exact: true }).first()).toBeVisible();
   await expect(page.locator("body")).toContainText("UPDATE requires a table with a unique key");

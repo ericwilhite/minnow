@@ -130,6 +130,9 @@ export class Snapshot {
 export class LeasedSnapshot extends Snapshot {
   #record: LeaseRecord;
   #released = false;
+  /** The record's ISO expiry, parsed once: expiry is checked before every batched block read. */
+  #expiresAtIso: string | undefined;
+  #expiresAtMs = Number.NaN;
 
   constructor(
     store: BlockStore,
@@ -149,7 +152,12 @@ export class LeasedSnapshot extends Snapshot {
   }
 
   get expiresAt(): Date {
-    return new Date(this.#record.expiresAt);
+    const iso = this.#record.expiresAt;
+    if (iso !== this.#expiresAtIso) {
+      this.#expiresAtIso = iso;
+      this.#expiresAtMs = Date.parse(iso);
+    }
+    return new Date(this.#expiresAtMs);
   }
 
   override async getBlock(id: string): Promise<Uint8Array | undefined> {

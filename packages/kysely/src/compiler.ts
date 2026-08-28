@@ -3,6 +3,7 @@ import {
   ColumnNode,
   DefaultInsertValueNode,
   InsertQueryNode,
+  MergeQueryNode,
   PostgresQueryCompiler,
   PrimitiveValueListNode,
   ValueListNode,
@@ -98,6 +99,15 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   }
 
   override compileQuery(node: RootOperationNode, queryId: QueryId): CompiledQuery {
+    // Minnow's MERGE reports an affected-row count but carries no returned rows, so a
+    // `mergeInto(...).returning(...)` would type-check and then silently yield []. Refuse it
+    // here, before execution, instead of returning nothing.
+    if (MergeQueryNode.is(node) && node.returning !== undefined) {
+      throw new TypeError(
+        "Minnow does not support RETURNING on MERGE statements. Remove .returning()/.returningAll() " +
+          "and read the affected-row count, or query the rows separately after the merge.",
+      );
+    }
     return super.compileQuery(normalizeInsert(node, this.#tables), queryId);
   }
 }

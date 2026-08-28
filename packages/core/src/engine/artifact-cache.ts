@@ -8,13 +8,31 @@ export interface ArtifactCacheStats {
   evictions: number;
 }
 
+/** One resident artifact on the recency list; `previous` is older, `next` is newer. */
+interface ArtifactCacheEntry {
+  key: string;
+  payload: unknown;
+  bytes: number;
+  previous: ArtifactCacheEntry | undefined;
+  next: ArtifactCacheEntry | undefined;
+}
+
 /**
  * Byte-bounded LRU for decoded blocks, vectors, derived results, and memoized query results.
  * Payloads are immutable by convention; callers own the byte estimates for their artifact type.
+ *
+ * Recency lives on an intrusive doubly-linked list rather than Map insertion order: a hit
+ * relinks four pointers instead of deleting and re-inserting the key, which re-hashed the
+ * long block-identity keys twice per touch and was the single hottest frame of a cached point
+ * lookup.
  */
 export class ArtifactCache {
   readonly #limitBytes: number;
-  readonly #entries = new Map<string, { payload: unknown; bytes: number }>();
+  readonly #entries = new Map<string, ArtifactCacheEntry>();
+  /** Least recently used end of the recency list. */
+  #oldest: ArtifactCacheEntry | undefined;
+  /** Most recently used end of the recency list. */
+  #newest: ArtifactCacheEntry | undefined;
   #usedBytes = 0;
   #hits = 0;
   #misses = 0;
@@ -31,6 +49,23 @@ export class ArtifactCache {
     return this.#limitBytes > 0;
   }
 
+  #unlink(entry: ArtifactCacheEntry): void {
+    if (entry.previous !== undefined) entry.previous.next = entry.next;
+    else this.#oldest = entry.next;
+    if (entry.next !== undefined) entry.next.previous = entry.previous;
+    else this.#newest = entry.previous;
+    entry.previous = undefined;
+    entry.next = undefined;
+  }
+
+  #appendNewest(entry: ArtifactCacheEntry): void {
+    entry.previous = this.#newest;
+    entry.next = undefined;
+    if (this.#newest !== undefined) this.#newest.next = entry;
+    this.#newest = entry;
+    this.#oldest ??= entry;
+  }
+
   get(key: string): unknown {
     if (!this.enabled) return undefined;
     const entry = this.#entries.get(key);
@@ -39,8 +74,10 @@ export class ArtifactCache {
       return undefined;
     }
     this.#hits += 1;
-    this.#entries.delete(key);
-    this.#entries.set(key, entry);
+    if (this.#newest !== entry) {
+      this.#unlink(entry);
+      this.#appendNewest(entry);
+    }
     return entry.payload;
   }
 
@@ -51,23 +88,44 @@ export class ArtifactCache {
     }
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
-      this.#entries.delete(key);
       this.#usedBytes -= existing.bytes;
+      existing.payload = payload;
+      existing.bytes = bytes;
+      this.#usedBytes += bytes;
+      if (this.#newest !== existing) {
+        this.#unlink(existing);
+        this.#appendNewest(existing);
+      }
+    } else {
+      const entry: ArtifactCacheEntry = {
+        key,
+        payload,
+        bytes,
+        previous: undefined,
+        next: undefined,
+      };
+      this.#entries.set(key, entry);
+      this.#appendNewest(entry);
+      this.#usedBytes += bytes;
     }
-    this.#entries.set(key, { payload, bytes });
-    this.#usedBytes += bytes;
-    for (const [oldestKey, entry] of this.#entries) {
-      if (this.#usedBytes <= this.#limitBytes) break;
-      if (oldestKey === key) continue;
-      this.#entries.delete(oldestKey);
-      this.#usedBytes -= entry.bytes;
-      this.#evictions += 1;
+    let oldest = this.#oldest;
+    while (this.#usedBytes > this.#limitBytes && oldest !== undefined) {
+      const next = oldest.next;
+      if (oldest.key !== key) {
+        this.#unlink(oldest);
+        this.#entries.delete(oldest.key);
+        this.#usedBytes -= oldest.bytes;
+        this.#evictions += 1;
+      }
+      oldest = next;
     }
   }
 
   /** Releases every retained payload while preserving lifetime counters for final diagnostics. */
   clear(): void {
     this.#entries.clear();
+    this.#oldest = undefined;
+    this.#newest = undefined;
     this.#usedBytes = 0;
   }
 

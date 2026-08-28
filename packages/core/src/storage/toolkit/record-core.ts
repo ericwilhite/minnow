@@ -158,6 +158,38 @@ import {
   MAX_STORED_BLOCK_BYTE_LENGTH,
 } from "../../block-format/index.js";
 
+/**
+ * A deep copy for the plain record shapes this core stores — objects, arrays, and primitives,
+ * bigint included. Every read and every job advance copies a record across this boundary, and
+ * `structuredClone` was a sixth of a settle phase's CPU; a value outside the plain shape
+ * (a typed array, a Date, a Map) falls back to `structuredClone` for that value, so the copy
+ * stays exact whatever the record carries.
+ */
+function cloneRecord<T>(value: T): T {
+  return cloneRecordValue(value) as T;
+}
+
+function cloneRecordValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    // Preserve structuredClone's rejection of uncloneable leaves instead of silently sharing.
+    return typeof value === "function" ? structuredClone(value) : value;
+  }
+  if (Array.isArray(value)) {
+    const copy = new Array<unknown>(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      copy[index] = cloneRecordValue(value[index]);
+    }
+    return copy;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return structuredClone(value);
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    copy[key] = cloneRecordValue((value as Record<string, unknown>)[key]);
+  }
+  return copy;
+}
+
 const postingTextEncoder = new TextEncoder();
 const RESOURCE_EXPIRY_SWEEP_ITEMS = 64;
 /** Leaves ample canonical-wire overhead below the 4 MiB metadata frame ceiling. */
@@ -1557,13 +1589,13 @@ export class RecordCore {
         MAX_ACTIVE_TEMP_OWNERS,
       );
     }
-    this.#tempOwners.set(record.ownerId, structuredClone(record));
+    this.#tempOwners.set(record.ownerId, cloneRecord(record));
   }
 
   getTempOwner(ownerId: string): TempOwnerRecord | undefined {
     validateId(ownerId);
     const record = this.#tempOwners.get(ownerId);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : cloneRecord(record);
   }
 
   renewTempOwner(input: RenewTempOwnerInput): TempOwnerRecord {
@@ -1591,7 +1623,7 @@ export class RecordCore {
       revision: safeWholeIncrement(record.revision, "Temp owner revision"),
     };
     this.#tempOwners.set(input.ownerId, renewed);
-    return structuredClone(renewed);
+    return cloneRecord(renewed);
   }
 
   listExpiredTempOwnerPage(
@@ -1709,7 +1741,7 @@ export class RecordCore {
 
   /** Applies a table whose complete admission checks already passed. */
   #installTableRecord(record: TableRecord): void {
-    this.#setTable(structuredClone(record));
+    this.#setTable(cloneRecord(record));
     this.#tableIdsByName.set(record.name, record.id);
     if (record.uniqueKeyColumnId !== undefined)
       this.#uniqueKeys.set(record.id, new OrderedStringSet());
@@ -1744,7 +1776,7 @@ export class RecordCore {
 
   getTable(id: string): TableRecord | undefined {
     const record = this.#tables.get(id);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : cloneRecord(record);
   }
 
   updateTable(id: string, expectedRevision: number, update: TableRecordUpdate): TableRecord {
@@ -1828,18 +1860,16 @@ export class RecordCore {
     validateTableView(nextView ?? undefined);
     const updated: TableRecord = {
       ...base,
-      columns: update.columns === undefined ? record.columns : structuredClone(update.columns),
-      ...(nextFts === null || nextFts === undefined
-        ? {}
-        : { ftsColumns: structuredClone(nextFts) }),
+      columns: update.columns === undefined ? record.columns : cloneRecord(update.columns),
+      ...(nextFts === null || nextFts === undefined ? {} : { ftsColumns: cloneRecord(nextFts) }),
       ...(nextSecondary === null || nextSecondary === undefined
         ? {}
-        : { secondaryIndexes: structuredClone(nextSecondary) }),
+        : { secondaryIndexes: cloneRecord(nextSecondary) }),
       ...(nextTriggers === null || nextTriggers === undefined
         ? {}
-        : { triggers: structuredClone(nextTriggers) }),
-      ...(nextForeignKeys === undefined ? {} : { foreignKeys: structuredClone(nextForeignKeys) }),
-      ...(nextView === null || nextView === undefined ? {} : { view: structuredClone(nextView) }),
+        : { triggers: cloneRecord(nextTriggers) }),
+      ...(nextForeignKeys === undefined ? {} : { foreignKeys: cloneRecord(nextForeignKeys) }),
+      ...(nextView === null || nextView === undefined ? {} : { view: cloneRecord(nextView) }),
       revision: safeWholeIncrement(expectedRevision, "Table revision"),
     };
     validateSecondaryIndexes(updated);
@@ -1910,7 +1940,7 @@ export class RecordCore {
     this.#setTable(updated);
     this.#catalogEpoch = nextCatalogEpoch;
     this.#schemaEpoch = nextSchemaEpoch;
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   removeTable(id: string, expectedRevision: number, options: CatalogMutationOptions = {}): void {
@@ -2032,7 +2062,7 @@ export class RecordCore {
     this.#deleteTableRecords(table);
     this.#catalogEpoch = nextCatalogEpoch;
     this.#schemaEpoch = nextSchemaEpoch;
-    return structuredClone(manifest);
+    return cloneRecord(manifest);
   }
 
   dropTableColumn(input: DropTableColumnInput): ManifestSummary {
@@ -2138,7 +2168,7 @@ export class RecordCore {
     this.#deleteFtsColumn(input.tableId, input.columnId);
     this.#catalogEpoch = nextCatalogEpoch;
     this.#schemaEpoch = nextSchemaEpoch;
-    return structuredClone(manifest);
+    return cloneRecord(manifest);
   }
 
   #assertTableNotInUse(id: string): void {
@@ -2227,7 +2257,7 @@ export class RecordCore {
     }
     validateFtsBaseInput(input, "Full-text base");
     const key = `${tableId}/${columnId}`;
-    this.#ftsBases.set(key, structuredClone(input));
+    this.#ftsBases.set(key, cloneRecord(input));
     const deltas = this.#ftsDeltas.get(key);
     if (deltas !== undefined) {
       for (const version of [...deltas.keys()]) {
@@ -2346,7 +2376,7 @@ export class RecordCore {
         continue;
       }
       deltas.set(version, {
-        postings: structuredClone(column.postings),
+        postings: cloneRecord(column.postings),
         totalTokens: column.totalTokens,
       });
       this.#ftsDeltas.set(key, deltas);
@@ -2372,7 +2402,7 @@ export class RecordCore {
       if (version <= coversVersion || version > upToVersion) continue;
       deltaChunkCount += 1;
       deltaTokens += delta.totalTokens;
-      chunkLists.push(structuredClone(delta.postings));
+      chunkLists.push(cloneRecord(delta.postings));
     }
     return { chunkLists, deltaChunkCount, deltaTokens };
   }
@@ -2628,7 +2658,7 @@ export class RecordCore {
     // the provenance index forever.
     for (const id of reclaimedBlockIds) this.#manifestBlocks.delete(id);
     for (const id of reclaimedTransactionIds) this.#transactions.delete(id);
-    this.#garbageCollectionJobs.set(updated.id, structuredClone(updated));
+    this.#garbageCollectionJobs.set(updated.id, cloneRecord(updated));
   }
 
   getTableByName(name: string): TableRecord | undefined {
@@ -2644,7 +2674,7 @@ export class RecordCore {
   listTables(): TableRecord[] {
     return [...this.#tables.values()]
       .sort((left, right) => left.name.localeCompare(right.name))
-      .map((record) => structuredClone(record));
+      .map((record) => cloneRecord(record));
   }
 
   getSegment(id: string): SegmentRecord | undefined {
@@ -2855,7 +2885,7 @@ export class RecordCore {
     this.#replaceSegments([desired, ...rebasedOldOwnerSegments]);
     this.#setTransaction(updatedOldOwner);
     this.#setTransaction(updatedReplacement);
-    return structuredClone(updatedReplacement);
+    return cloneRecord(updatedReplacement);
   }
 
   reserveRowIds(tableId: string, count: number): RowIdRange {
@@ -3015,7 +3045,7 @@ export class RecordCore {
         createdAt: input.createdAt,
         updatedAt: input.createdAt,
       };
-      if (deepRecordEqual(current.record, expected)) return structuredClone(current.record);
+      if (deepRecordEqual(current.record, expected)) return cloneRecord(current.record);
       throw new UniqueKeyBuildConflictError(input.buildId, "another live owner exists");
     }
     if (current?.record.state === "completed") {
@@ -3052,13 +3082,13 @@ export class RecordCore {
       { record, chunks: [], tokens: new Set(), completedInput: null },
       input.buildId,
     );
-    return structuredClone(record);
+    return cloneRecord(record);
   }
 
   getUniqueKeyBuild(buildId: string): UniqueKeyBuildRecord | undefined {
     validateId(buildId);
     const state = this.#uniqueKeyBuilds.get(buildId);
-    return state === undefined ? undefined : structuredClone(state.record);
+    return state === undefined ? undefined : cloneRecord(state.record);
   }
 
   renewUniqueKeyBuild(input: RenewUniqueKeyBuildInput): UniqueKeyBuildRecord {
@@ -3079,13 +3109,13 @@ export class RecordCore {
     ) {
       throw new UniqueKeyBuildConflictError(input.buildId, "ownership expired or changed");
     }
-    if (input.expiresAt <= state.record.expiresAt) return structuredClone(state.record);
+    if (input.expiresAt <= state.record.expiresAt) return cloneRecord(state.record);
     const next: UniqueKeyBuildState = {
       ...state,
       record: { ...state.record, expiresAt: input.expiresAt, updatedAt: input.updatedAt },
     };
     this.#setUniqueKeyBuild(next, input.buildId);
-    return structuredClone(next.record);
+    return cloneRecord(next.record);
   }
 
   appendUniqueKeyBuildChunk(input: AppendUniqueKeyBuildChunkInput): UniqueKeyBuildRecord {
@@ -3107,7 +3137,7 @@ export class RecordCore {
     }
     if (input.ordinal < state.record.nextOrdinal) {
       if (deepRecordEqual(state.chunks[input.ordinal], input.keyTokens)) {
-        return structuredClone(state.record);
+        return cloneRecord(state.record);
       }
       throw new UniqueKeyBuildConflictError(input.buildId, "chunk replay changed");
     }
@@ -3141,7 +3171,7 @@ export class RecordCore {
       completedInput: null,
     };
     this.#setUniqueKeyBuild(next, input.buildId);
-    return structuredClone(next.record);
+    return cloneRecord(next.record);
   }
 
   finishUniqueKeyBuild(input: FinishUniqueKeyBuildInput): TableRecord {
@@ -3157,7 +3187,7 @@ export class RecordCore {
       const table = this.#tables.get(state.record.tableId);
       if (table === undefined)
         throw new UniqueKeyBuildConflictError(input.buildId, "table was removed");
-      return structuredClone(table);
+      return cloneRecord(table);
     }
     if (
       state?.record.state !== "active" ||
@@ -3219,13 +3249,13 @@ export class RecordCore {
         record: completedRecord,
         chunks: [],
         tokens: state.tokens,
-        completedInput: structuredClone(input),
+        completedInput: cloneRecord(input),
       },
       input.buildId,
     );
     this.#catalogEpoch = nextCatalogEpoch;
     this.#schemaEpoch = nextSchemaEpoch;
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   abortUniqueKeyBuild(input: AbortUniqueKeyBuildInput): boolean {
@@ -3354,18 +3384,18 @@ export class RecordCore {
   getCurrentManifest(): Manifest | undefined {
     const manifest =
       this.#currentVersion === null ? undefined : this.#manifests.get(this.#currentVersion);
-    return manifest === undefined ? undefined : structuredClone(manifest);
+    return manifest === undefined ? undefined : cloneRecord(manifest);
   }
 
   getManifest(version: number): Manifest | undefined {
     const manifest = this.#manifests.get(version);
-    return manifest === undefined ? undefined : structuredClone(manifest);
+    return manifest === undefined ? undefined : cloneRecord(manifest);
   }
 
   listManifestPage(afterVersion: number | null, limit: number): StoragePage<Manifest, number> {
     validatePageLimit(limit);
     const records = boundedRecordPage(this.#manifests, afterVersion, limit).map((manifest) =>
-      structuredClone(manifest),
+      cloneRecord(manifest),
     );
     return {
       records,
@@ -3435,13 +3465,13 @@ export class RecordCore {
       this.#assertTableForeignKeys(pending.record);
     }
     const record: TransactionRecord = {
-      ...structuredClone(input.record),
+      ...cloneRecord(input.record),
       snapshotVersion: this.#currentVersion,
       schemaEpochGuard: this.#schemaEpoch,
       ...(pending === undefined
         ? {}
         : {
-            pendingTable: structuredClone(pending.record),
+            pendingTable: cloneRecord(pending.record),
             pendingTableNextRowId: pending.nextRowId,
             catalogEpochGuard: pending.expectedCatalogEpoch,
           }),
@@ -3498,7 +3528,7 @@ export class RecordCore {
       this.#nextAutoIncrement.set(autoCounterKey, autoIncrementValues.endExclusive);
     }
     return {
-      record: structuredClone(record),
+      record: cloneRecord(record),
       ...(rowIds === undefined ? {} : { rowIds }),
       ...(autoIncrementValues === undefined ? {} : { autoIncrementValues }),
     };
@@ -3506,7 +3536,7 @@ export class RecordCore {
 
   createTransaction(record: TransactionRecord): void {
     const normalized: TransactionRecord = {
-      ...structuredClone(record),
+      ...cloneRecord(record),
       ...(record.status === "active" && record.schemaEpochGuard === undefined
         ? { schemaEpochGuard: this.#schemaEpoch }
         : {}),
@@ -3550,7 +3580,7 @@ export class RecordCore {
 
   getTransaction(id: string): TransactionRecord | undefined {
     const record = this.#transactions.get(id);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : cloneRecord(record);
   }
 
   getTransactions(ids: readonly string[]): Array<TransactionRecord | undefined> {
@@ -3558,7 +3588,7 @@ export class RecordCore {
     for (const id of ids) validateId(id);
     return ids.map((id) => {
       const record = this.#transactions.get(id);
-      return record === undefined ? undefined : structuredClone(record);
+      return record === undefined ? undefined : cloneRecord(record);
     });
   }
 
@@ -3568,7 +3598,7 @@ export class RecordCore {
   ): StoragePage<TransactionRecord, string> {
     validatePageLimit(limit);
     const records = boundedRecordPage(this.#transactions, afterId, limit).map((record) =>
-      structuredClone(record),
+      cloneRecord(record),
     );
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
@@ -3593,7 +3623,7 @@ export class RecordCore {
       update.pendingSegmentIds !== undefined,
     );
     this.#setTransaction(updated);
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   renewTransaction(input: RenewTransactionInput): boolean {
@@ -3637,7 +3667,7 @@ export class RecordCore {
       updatedAt: input.updatedAt,
     });
     this.#setTransaction(updated);
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   /**
@@ -3668,7 +3698,7 @@ export class RecordCore {
     this.#assertTransactionResourceTransition(plan.updated, blockByteLengths);
     this.#replaceSegments(plan.segments);
     this.#setTransaction(plan.updated, blockByteLengths);
-    return structuredClone(plan.updated);
+    return cloneRecord(plan.updated);
   }
 
   /**
@@ -3885,7 +3915,7 @@ export class RecordCore {
     const updated = updateTransactionRecord(current, update);
     this.#replaceSegments([], input.removeSegmentIds);
     this.#setTransaction(updated);
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   #validateStagedSegment(
@@ -4023,7 +4053,7 @@ export class RecordCore {
         throw new WriteConflictError(input.expectedManifestVersion, this.#currentVersion);
       }
       base = {
-        ...structuredClone(input.transaction.record),
+        ...cloneRecord(input.transaction.record),
         snapshotVersion: input.expectedManifestVersion,
       };
       validateTransactionRuntimeRecord(base, "Transaction");
@@ -4540,7 +4570,7 @@ export class RecordCore {
         count: this.#ftsDeltas.get(`${changes.tableId}/${column.columnId}`)?.size ?? 0,
       })),
     );
-    return structuredClone({
+    return cloneRecord({
       ...manifest,
       ...(ftsDeltaCounts.length === 0 ? {} : { ftsDeltaCounts }),
     });
@@ -4569,18 +4599,18 @@ export class RecordCore {
     if (this.#leases.size >= MAX_ACTIVE_LEASES) {
       throw new StorageResourceLimitError("lease", this.#leases.size + 1, MAX_ACTIVE_LEASES);
     }
-    this.#leases.set(record.id, structuredClone(record));
+    this.#leases.set(record.id, cloneRecord(record));
   }
 
   getLease(id: string): LeaseRecord | undefined {
     const record = this.#leases.get(id);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : cloneRecord(record);
   }
 
   listLeases(): LeaseRecord[] {
     return [...this.#leases.values()]
       .sort((left, right) => left.id.localeCompare(right.id))
-      .map((record) => structuredClone(record));
+      .map((record) => cloneRecord(record));
   }
 
   listExpiredLeasePage(
@@ -4597,7 +4627,7 @@ export class RecordCore {
       "Lease page",
     );
     return {
-      records: page.records.map((record) => structuredClone(record)),
+      records: page.records.map((record) => cloneRecord(record)),
       nextCursor: page.nextCursor,
     };
   }
@@ -4623,7 +4653,7 @@ export class RecordCore {
       revision: safeWholeIncrement(record.revision, "Lease revision"),
     };
     this.#leases.set(input.id, renewed);
-    return structuredClone(renewed);
+    return cloneRecord(renewed);
   }
 
   moveLease(input: MoveLeaseInput): LeaseRecord {
@@ -4654,7 +4684,7 @@ export class RecordCore {
       revision: safeWholeIncrement(record.revision, "Lease revision"),
     };
     this.#leases.set(input.id, moved);
-    return structuredClone(moved);
+    return cloneRecord(moved);
   }
 
   removeLeaseIfExpired(id: string, expectedRevision: number, expiresAtCutoff: string): boolean {
@@ -4709,7 +4739,7 @@ export class RecordCore {
 
   getCompactionJob(id: string): CompactionJobRecord | undefined {
     const record = this.#compactionJobs.get(id);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : cloneRecord(record);
   }
 
   listCompactionJobs(tableId?: string): CompactionJobRecord[] {
@@ -4719,7 +4749,7 @@ export class RecordCore {
         (left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
-      .map((record) => structuredClone(record));
+      .map((record) => cloneRecord(record));
   }
 
   listCompactionJobPage(
@@ -4728,7 +4758,7 @@ export class RecordCore {
   ): StoragePage<CompactionJobRecord, string> {
     validatePageLimit(limit);
     const records = boundedRecordPage(this.#compactionJobs, afterId, limit).map((record) =>
-      structuredClone(record),
+      cloneRecord(record),
     );
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
@@ -4749,7 +4779,7 @@ export class RecordCore {
     this.#assertCompactionJobReferences(updated);
     this.#assertTerminalCompactionJobTransition(current, updated);
     this.#compactionJobs.set(id, updated);
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   #assertCompactionJobReferences(job: CompactionJobRecord): void {
@@ -4826,7 +4856,7 @@ export class RecordCore {
       throw new CompactionJobConflictError(id, expectedRevision, current?.revision ?? null);
     }
     if (isTerminalCompactionJob(current)) {
-      return structuredClone(current);
+      return cloneRecord(current);
     }
 
     const transaction =
@@ -4843,7 +4873,7 @@ export class RecordCore {
       });
       this.#assertTerminalCompactionJobTransition(current, published);
       this.#compactionJobs.set(id, published);
-      return structuredClone(published);
+      return cloneRecord(published);
     }
 
     const cancelled = updateCompactionJobRecord(current, {
@@ -4864,7 +4894,7 @@ export class RecordCore {
       this.#setTransaction(abortedTransaction);
     }
     this.#compactionJobs.set(id, cancelled);
-    return structuredClone(cancelled);
+    return cloneRecord(cancelled);
   }
 
   removeCompactionJob(id: string): boolean {
@@ -4947,7 +4977,7 @@ export class RecordCore {
     );
     this.#pruneOneCompletedGarbageCollectionJob();
     this.#garbageCollectionJobs.set(record.id, record);
-    return structuredClone(record);
+    return cloneRecord(record);
   }
 
   updateGarbageCollectionPlanning(
@@ -4971,12 +5001,12 @@ export class RecordCore {
       this.#roots,
     );
     this.#garbageCollectionJobs.set(updated.id, updated);
-    return structuredClone(updated);
+    return cloneRecord(updated);
   }
 
   getGarbageCollectionJob(id: string): GarbageCollectionJobRecord | undefined {
     const record = this.#garbageCollectionJobs.get(id);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : cloneRecord(record);
   }
 
   listGarbageCollectionJobs(): GarbageCollectionJobRecord[] {
@@ -4985,7 +5015,7 @@ export class RecordCore {
         (left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
-      .map((record) => structuredClone(record));
+      .map((record) => cloneRecord(record));
   }
 
   listGarbageCollectionJobPage(
@@ -4994,7 +5024,7 @@ export class RecordCore {
   ): StoragePage<GarbageCollectionJobRecord, string> {
     validatePageLimit(limit);
     const records = boundedRecordPage(this.#garbageCollectionJobs, afterId, limit).map((record) =>
-      structuredClone(record),
+      cloneRecord(record),
     );
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
@@ -5192,7 +5222,7 @@ export class RecordCore {
     reclaimedTransactionIds.forEach((id) => this.#transactions.delete(id));
     this.#garbageCollectionJobs.set(updated.id, updated);
     return {
-      job: structuredClone(updated),
+      job: cloneRecord(updated),
       prunedManifestVersions,
       alreadyPrunedManifestVersions,
       retainedManifestVersions,
@@ -5242,7 +5272,7 @@ export class RecordCore {
       });
       yield {
         kind: "table",
-        record: structuredClone(table),
+        record: cloneRecord(table),
         nextRowId: this.#nextRowIds.get(table.id) ?? 1n,
         autoIncrement,
       };
@@ -5287,7 +5317,7 @@ export class RecordCore {
       yield {
         kind: "transaction",
         record: {
-          ...structuredClone(record),
+          ...cloneRecord(record),
           pendingBlockIds: [],
           pendingSegmentIds: [],
         },
@@ -5473,7 +5503,7 @@ export class RecordCore {
     if (version === null) throw new Error("There is no committed version to snapshot");
     const manifest = this.#manifests.get(version);
     if (manifest === undefined) throw new SnapshotManifestMissingError(version);
-    return structuredClone(manifest);
+    return cloneRecord(manifest);
   }
 
   /** O(1) counters for diagnostics; callers never need to clone the full durable state. */
@@ -5621,7 +5651,7 @@ export class RecordCore {
             throw new Error("Snapshot tables are not in canonical ID order");
           }
           previousTableId = item.record.id;
-          const record = structuredClone(item.record);
+          const record = cloneRecord(item.record);
           validateTableRuntimeRecord(record, `Snapshot table ${item.record.id}`);
           if (trial.#tables.has(record.id) || trial.#tableIdsByName.has(record.name)) {
             throw new Error(`Snapshot repeats a table identity: ${record.id}`);
@@ -5674,7 +5704,7 @@ export class RecordCore {
           if (record.status !== "committed" || record.committedVersion === null) {
             throw new Error(`Snapshot transaction is not committed: ${record.id}`);
           }
-          trial.#setTransaction(structuredClone(record));
+          trial.#setTransaction(cloneRecord(record));
           break;
         }
         case "unique-generation": {
@@ -5744,7 +5774,7 @@ export class RecordCore {
             throw new Error(`Snapshot posting chunk is out of order: ${item.storageColumnId}`);
           }
           retainAcceleratorChunk(item);
-          const chunk = structuredClone(item.postings) as FtsPosting[];
+          const chunk = cloneRecord(item.postings) as FtsPosting[];
           if (
             posting.previousTerm !== undefined &&
             chunk[0] !== undefined &&
@@ -5930,7 +5960,7 @@ export class RecordCore {
 
   /** Replaces the whole record state with a dump's content. */
   load(state: RecordCoreState): void {
-    const cloned = structuredClone(state);
+    const cloned = cloneRecord(state);
     validateRecordCoreState(cloned, this.#physical);
     // A recovery candidate may intentionally discard an unpublished WAL suffix whose physical
     // blocks were already reclaimed. Clearing the old candidate state must therefore not need
@@ -8028,7 +8058,7 @@ export function validateTempRunPageIdentity(
 
 function emptyGarbageCollectionStep(job: GarbageCollectionJobRecord): GarbageCollectionStepResult {
   return {
-    job: structuredClone(job),
+    job: cloneRecord(job),
     prunedManifestVersions: [],
     alreadyPrunedManifestVersions: [],
     retainedManifestVersions: [],

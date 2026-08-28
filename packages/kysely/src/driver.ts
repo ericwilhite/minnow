@@ -1,11 +1,15 @@
 import type { ExecuteResult, MinnowSqlDriver, QueryValue } from "@minnowdb/core";
-import type {
-  CompiledQuery,
-  DatabaseConnection,
-  Driver,
-  AbortableOperationOptions,
-  QueryResult,
-  TransactionSettings,
+import {
+  IdentifierNode,
+  RawNode,
+  createQueryId,
+  type CompiledQuery,
+  type DatabaseConnection,
+  type Driver,
+  type AbortableOperationOptions,
+  type QueryCompiler,
+  type QueryResult,
+  type TransactionSettings,
 } from "kysely";
 import { kyselyQueryValues } from "./query-values.js";
 
@@ -132,10 +136,31 @@ class MinnowKyselyConnection implements DatabaseConnection {
   }
 }
 
-/** Kysely's single logical connection over a Minnow SQL driver. */
+/** `SAVEPOINT name`, `ROLLBACK TO name`, or `RELEASE name` with the name sanitized by Kysely. */
+function savepointCommand(command: string, savepointName: string): RawNode {
+  return RawNode.createWithChildren([
+    RawNode.createWithSql(`${command} `),
+    IdentifierNode.create(savepointName),
+  ]);
+}
+
+/**
+ * Kysely's single logical connection over a Minnow SQL driver.
+ *
+ * The engine binds an open SQL transaction to the database instance, so a statement that ran
+ * beside an open transaction would silently join it and roll back with it. `acquireConnection`
+ * therefore hands out the one connection through a FIFO mutex: each caller waits until the
+ * previous holder releases. Kysely acquires per statement outside transactions and holds the
+ * connection across a transaction or stream, so concurrent work queues instead of interleaving.
+ * The trade-off matches Kysely's own single-connection dialects: awaiting a `db`-level query
+ * inside a transaction callback deadlocks, because it waits for the connection the transaction
+ * holds. Use the transaction's own handle inside the callback.
+ */
 export class MinnowKyselyDriver implements Driver {
   readonly #driver: MinnowSqlDriver;
   readonly #connection: DatabaseConnection;
+  #queueTail: Promise<void> = Promise.resolve();
+  #releaseHolder: (() => void) | undefined;
 
   constructor(driver: MinnowSqlDriver, resultDecoding: MinnowResultDecoding = {}) {
     this.#driver = driver;
@@ -147,6 +172,13 @@ export class MinnowKyselyDriver implements Driver {
   }
 
   async acquireConnection(): Promise<DatabaseConnection> {
+    const previous = this.#queueTail;
+    let release!: () => void;
+    this.#queueTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    this.#releaseHolder = release;
     return this.#connection;
   }
 
@@ -171,7 +203,40 @@ export class MinnowKyselyDriver implements Driver {
     await this.#driver.execute("ROLLBACK");
   }
 
+  async savepoint(
+    connection: DatabaseConnection,
+    savepointName: string,
+    compileQuery: QueryCompiler["compileQuery"],
+  ): Promise<void> {
+    await connection.executeQuery(
+      compileQuery(savepointCommand("savepoint", savepointName), createQueryId()),
+    );
+  }
+
+  async rollbackToSavepoint(
+    connection: DatabaseConnection,
+    savepointName: string,
+    compileQuery: QueryCompiler["compileQuery"],
+  ): Promise<void> {
+    await connection.executeQuery(
+      compileQuery(savepointCommand("rollback to", savepointName), createQueryId()),
+    );
+  }
+
+  async releaseSavepoint(
+    connection: DatabaseConnection,
+    savepointName: string,
+    compileQuery: QueryCompiler["compileQuery"],
+  ): Promise<void> {
+    await connection.executeQuery(
+      compileQuery(savepointCommand("release", savepointName), createQueryId()),
+    );
+  }
+
   releaseConnection(): Promise<void> {
+    const release = this.#releaseHolder;
+    this.#releaseHolder = undefined;
+    release?.();
     return Promise.resolve();
   }
 

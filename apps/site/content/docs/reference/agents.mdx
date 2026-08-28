@@ -150,8 +150,12 @@ machines: https://minnowdb.com/llms.txt
   range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, and constant
   JSON_TABLE.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
-  correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution, and
-  sequence options. Check each supported entry's note before assuming every PostgreSQL variant.
+  correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution,
+  sequence options, `RIGHT JOIN` beside another join or `SELECT *`, `FULL JOIN` with grouping,
+  `DISTINCT`, window functions, or `SELECT *`, numeric `RANGE` frame offsets (use `ROWS`),
+  `DISTINCT` window aggregates, window functions outside the select list, and
+  `ON DELETE SET DEFAULT`. Check each supported entry's note before assuming every PostgreSQL
+  variant.
 ```
 
 ## Why those rules

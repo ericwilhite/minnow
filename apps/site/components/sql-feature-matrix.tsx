@@ -100,7 +100,7 @@ export function SqlFeatureMatrix({ status }: { status: "supported" | "unsupporte
       <p className="text-sm text-fd-muted-foreground">
         {status === "supported"
           ? `${String(selected.length)} checked forms · ${String(counts.compatible)} PostgreSQL compatible · ${String(counts.different)} different · ${String(counts.extension)} extensions`
-          : `${String(selected.length)} deliberate embedded-database exclusions`}
+          : `${String(selected.length)} excluded forms, each rejected with the recorded error`}
       </p>
       {selected.map((feature) => (
         <Feature key={feature.id} feature={feature} />

@@ -40,10 +40,15 @@ Minnow deliberately excludes three PostgreSQL server or storage-model features:
 - configurable transaction isolation levels;
 - roles and `GRANT` privileges.
 
+The excluded-forms list below also records the narrower forms the engine rejects — `RIGHT JOIN`
+and `FULL JOIN` beyond a sole equality join, numeric `RANGE` frame offsets, `DISTINCT` window
+aggregates, window functions outside the select list, and `ON DELETE SET DEFAULT` — each with the
+exact error it raises.
+
 ## Supported SQL
 
 <SqlFeatureMatrix status="supported" />
 
-## Deliberate exclusions
+## Excluded forms
 
 <SqlFeatureMatrix status="unsupported" />

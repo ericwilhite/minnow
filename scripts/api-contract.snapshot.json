@@ -8435,7 +8435,7 @@
               "name": "MinnowKyselyDriver",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class MinnowKyselyDriver implements Driver {\n    #private;\n    constructor(driver: MinnowSqlDriver, resultDecoding?: MinnowResultDecoding);\n    init(): Promise<void>;\n    acquireConnection(): Promise<DatabaseConnection>;\n    beginTransaction(connection: DatabaseConnection, settings: TransactionSettings): Promise<void>;\n    commitTransaction(): Promise<void>;\n    rollbackTransaction(): Promise<void>;\n    releaseConnection(): Promise<void>;\n    destroy(): Promise<void>;\n}"
+                "export declare class MinnowKyselyDriver implements Driver {\n    #private;\n    constructor(driver: MinnowSqlDriver, resultDecoding?: MinnowResultDecoding);\n    init(): Promise<void>;\n    acquireConnection(): Promise<DatabaseConnection>;\n    beginTransaction(connection: DatabaseConnection, settings: TransactionSettings): Promise<void>;\n    commitTransaction(): Promise<void>;\n    rollbackTransaction(): Promise<void>;\n    savepoint(connection: DatabaseConnection, savepointName: string, compileQuery: QueryCompiler[\"compileQuery\"]): Promise<void>;\n    rollbackToSavepoint(connection: DatabaseConnection, savepointName: string, compileQuery: QueryCompiler[\"compileQuery\"]): Promise<void>;\n    releaseSavepoint(connection: DatabaseConnection, savepointName: string, compileQuery: QueryCompiler[\"compileQuery\"]): Promise<void>;\n    releaseConnection(): Promise<void>;\n    destroy(): Promise<void>;\n}"
               ]
             },
             {

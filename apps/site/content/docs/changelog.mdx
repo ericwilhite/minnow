@@ -8,6 +8,59 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.2 — August 28, 2026
+
+Published packages: `@minnowdb/core@0.6.2` and `@minnowdb/kysely@0.4.2`.
+
+### Added
+
+- A keyed point-read fast path: a single-table `WHERE` that is a conjunction of
+  `column = value` equalities covering the table's unique key — scalar or composite — now
+  answers from cached decoded blocks without plan binding, streamed-view construction, or the
+  vector pipeline. On the performance gate this took a composite-key lookup from roughly 86x
+  slower than natively indexed SQLite to about 8x, and made scalar point lookups roughly ten
+  times faster than before, through the Kysely dialect as well. Any statement, parameter,
+  catalog, or physical-history condition the fast path cannot prove — a pending update or
+  delete delta, a cross-type comparison, a view, a domain-typed column — falls back to the
+  ordinary executor, which remains the authority on answers and errors. `db.explain` reports
+  eligibility.
+- The decoded-block artifact cache now keeps recency on an intrusive doubly-linked list
+  instead of re-inserting map keys, and reader-lease expiry checks no longer re-parse the
+  lease's ISO timestamp on every batched block read. Both are invisible except in time.
+- The storage toolkit's record normalization and the record core now deep-copy plain record
+  shapes directly instead of calling `structuredClone` per record, which was a sixth of a
+  settle phase's CPU under sustained point updates. Values outside the plain shape still fall
+  back to `structuredClone`, so copies stay exact.
+- Delete segments' key blocks are now written uncompressed: they hold only the doomed keys,
+  compaction folds them away, and a large range delete previously spent more time in gzip
+  than in the rest of the statement.
+- `@minnowdb/kysely` implements Kysely's savepoint driver hooks, so
+  `startTransaction()`, `savepoint()`, `rollbackToSavepoint()`, and `releaseSavepoint()` work
+  against the engine's existing `SAVEPOINT` support.
+- `@minnowdb/kysely` serializes its single logical connection through a FIFO mutex in the
+  driver itself rather than relying on Kysely's runtime to do so. Concurrent `db`-level work
+  queues behind an open transaction instead of ever joining it.
+- The SQL feature matrix now records seven runtime rejections that previously erred without a
+  tracked entry — non-sole `RIGHT JOIN` and `RIGHT JOIN` beside `SELECT *`, `FULL JOIN`
+  combined with grouping/`DISTINCT`/window functions, numeric `RANGE` frame offsets,
+  `DISTINCT` window aggregates, window functions outside the select list, and
+  `ON DELETE SET DEFAULT` — each pinned to its exact error by the conformance harness, with
+  the agent rules and SQL guides updated to match. No engine behavior changed.
+
+### Migration
+
+`mergeInto(...).returning(...)` through `@minnowdb/kysely` now throws at compile time instead
+of executing and silently returning no rows; read the affected-row count, or query the rows
+separately after the merge. Awaiting a `db`-level query inside a transaction callback waits for
+the transaction's connection (the same behavior as Kysely's other single-connection dialects) —
+use the transaction handle inside the callback. Everything else is additive or purely faster.
+
+### Storage compatibility
+
+No stored format changed. Delete-key blocks now record the `raw` codec, which every reader of
+block format 2 already handles; block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+layout 5 remain readable and writable without a data migration.
+
 ## 0.6.1 — August 28, 2026
 
 Published packages: `@minnowdb/core@0.6.1` and `@minnowdb/kysely@0.4.1`.

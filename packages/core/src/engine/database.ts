@@ -295,6 +295,15 @@ import {
   type QuerySpillStore,
   type VectorWindow,
 } from "./vector.js";
+import {
+  cachedPointReadTemplate,
+  equalRunRange,
+  pointReadTestHooks,
+  resolvePointReadShape,
+  valuesAreAscending,
+  type PointReadEquality,
+  type PointReadShape,
+} from "./point-read.js";
 
 // The on-disk format is little-endian; the bulk Float64 copy reads platform order.
 const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
@@ -305,6 +314,11 @@ const NULL_STRING_VECTOR_CODE = 0xffffffff;
 const COMPOSITE_KEY_COLUMN_NAME = "\u0000minnow_primary_key";
 const ENUM_TYPE_PREFIX = "\u0000minnow_enum_type:";
 const SEQUENCE_PREFIX = "\u0000minnow_sequence:";
+/**
+ * Candidate rows the point-read fast path will verify per statement before conceding that the
+ * shape is not selective enough and handing the scan back to the vectorized executor.
+ */
+const MAX_POINT_READ_CANDIDATES = 1_024;
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
 /** Persistent rebuild failure cannot let an accelerator append one durable delta per commit. */
@@ -3309,14 +3323,13 @@ export class MinnowDatabase {
         this.#targetBlockBytes,
       );
       for (const [part, { start, end }] of ranges.entries()) {
-        await blockStager.prepare(
-          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
-        );
+        await blockStager.prepare(maximumWriteBlockStoredBytes(plannedColumn, start, end, "raw"));
         const slice = values.slice(start, end);
         const encodeStarted = performance.now();
         const bytes = await this.#encodeColumnBlock(
           keyColumn.id,
           asColumnInput(keyColumn.type, slice),
+          "raw",
         );
         encodeMs += performance.now() - encodeStarted;
         const blockId = [
@@ -4929,7 +4942,31 @@ export class MinnowDatabase {
         await this.#duringTransaction(open, () => open.session.query(sql, options)),
       );
     }
-    const plan = bindPlanParameters(this.#compileCached(sql), options.params);
+    const compiled = this.#compileCached(sql);
+    // The keyed point-read fast path answers an eligible statement before parameter binding
+    // ever clones the plan. A shape, parameter, catalog, or physical-history condition it
+    // cannot prove falls through to the ordinary executor below, which owns all error
+    // reporting; the count check mirrors bind-time validation so a parameter-arity mistake
+    // still reports through the canonical path.
+    if (
+      !pointReadTestHooks.disabled &&
+      options.version === undefined &&
+      options.spillToStorage === undefined &&
+      options.spillPageRows === undefined &&
+      options.executionMemoryBudgetBytes === undefined &&
+      (compiled.parameterCount ?? 0) === (options.params?.length ?? 0)
+    ) {
+      const template = cachedPointReadTemplate(compiled);
+      if (template !== null) {
+        const shape = resolvePointReadShape(template, options.params ?? []);
+        if (shape !== undefined) {
+          const point = await this.#pointReadResult(shape, options);
+          throwIfAborted(options.signal);
+          if (point !== undefined) return externalizeQueryResult(point);
+        }
+      }
+    }
+    const plan = bindPlanParameters(compiled, options.params);
     // Result memoization is a pure cache over the freshness probe: the catalog epoch is part
     // of the key, so any commit or DDL changes the key and a hit can never be stale. Only
     // plain current-version queries memoize — explicit versions, budgets, and spill options
@@ -5356,6 +5393,241 @@ export class MinnowDatabase {
     } finally {
       prepared.close();
     }
+  }
+
+  /**
+   * The keyed point-read fast path: a single-table conjunction of column-equals-literal
+   * predicates covering the unique key names at most one row, so it is answered directly from
+   * cached decoded blocks — no plan binding, streamed view, or vector pipeline. Undefined means
+   * the statement, catalog, or physical history is not provably eligible and the ordinary
+   * executor (which owns all error reporting and general semantics) must run. Every literal
+   * must already match its column's storage type exactly; any coercion case falls back, so the
+   * fast path only ever reproduces what the ordinary path would answer.
+   */
+  async #pointReadResult(
+    shape: PointReadShape,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    pointReadTestHooks.attempted += 1;
+    const result = await this.#withSharedCatalogSnapshot(
+      [shape.table],
+      (snapshot, realTables, visibility) =>
+        this.#pointReadAtSnapshot(shape, snapshot, realTables, visibility, options),
+    );
+    if (result !== undefined) {
+      pointReadTestHooks.served += 1;
+      options.onStats?.({ peakMemoryBytes: 0 });
+    }
+    return result;
+  }
+
+  async #pointReadAtSnapshot(
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    realTables: Map<string, TableRecord>,
+    visibility: SegmentVisibilityCatalog,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    const table = realTables.get(shape.table);
+    if (table === undefined || table.view !== undefined) return undefined;
+    const columnByName = new Map(table.columns.map((column) => [column.name, column]));
+    const matchesStorageType = (
+      column: TableColumnRecord,
+      value: PointReadEquality["value"],
+    ): boolean =>
+      column.sqlDomain === undefined &&
+      column.hidden !== true &&
+      ((column.type === "number" && typeof value === "number") ||
+        (column.type === "string" && typeof value === "string") ||
+        (column.type === "boolean" && typeof value === "boolean") ||
+        (column.type === "datetime" && value instanceof Date));
+    const equalityColumns = new Map<string, TableColumnRecord>();
+    for (const equality of shape.equalities) {
+      const column = columnByName.get(equality.column);
+      if (column === undefined || !matchesStorageType(column, equality.value)) return undefined;
+      equalityColumns.set(column.name, column);
+    }
+    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
+    // per-row candidate verification cannot degrade into an unvectorized table scan.
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) return undefined;
+    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
+    if (keyComponents.length === 0) return undefined;
+    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
+      return undefined;
+    }
+    const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
+    for (const item of shape.select) {
+      const column = columnByName.get(item.column);
+      if (column === undefined || column.hidden === true || column.sqlDomain !== undefined) {
+        return undefined;
+      }
+      projected.push({ column, alias: item.alias });
+    }
+    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return undefined;
+    }
+    // The most selective searchable component wins nothing provable without statistics, so
+    // prefer a numeric component (zone-map pruning plus binary search) over a string one
+    // (per-block reverse dictionary), and fall back to any equality column on the key.
+    const searchColumn =
+      keyComponents.find(
+        (component) => component.type === "number" || component.type === "datetime",
+      ) ??
+      keyComponents.find((component) => component.type === "string") ??
+      keyComponents[0];
+    if (searchColumn === undefined) return undefined;
+    const searchEquality = shape.equalities.find(
+      (equality) => equality.column === searchColumn.name,
+    );
+    if (searchEquality === undefined) return undefined;
+    const searchTarget =
+      searchEquality.value instanceof Date
+        ? dateMilliseconds(searchEquality.value)
+        : searchEquality.value;
+    const neededColumns = [
+      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
+    ];
+    const rows: QueryRow[] = [];
+    let candidateBudget = MAX_POINT_READ_CANDIDATES;
+    for (const segment of segments) {
+      throwIfAborted(options.signal);
+      if (segment.rowCount === 0) continue;
+      const searchBlockIds = segment.columnBlockIds[searchColumn.id] ?? [];
+      if (searchBlockIds.length === 0) return undefined;
+      for (const column of neededColumns) {
+        if ((segment.columnBlockIds[column.id]?.length ?? 0) !== searchBlockIds.length) {
+          return undefined;
+        }
+      }
+      let blockIndexes = searchBlockIds.map((_, index) => index);
+      // A single block cannot be pruned, so skip the zone lookup entirely for the hot
+      // one-block OLTP table shape.
+      if (typeof searchTarget === "number" && searchBlockIds.length > 1) {
+        const descriptions = await this.#zoneDescriptions(searchBlockIds, snapshot);
+        blockIndexes = blockIndexes.filter((blockIndex) => {
+          const zone = descriptions.get(searchBlockIds[blockIndex] ?? "")?.metadata.zoneMap;
+          return zone === undefined || (zone.min <= searchTarget && searchTarget <= zone.max);
+        });
+      }
+      if (blockIndexes.length === 0) continue;
+      const searchBlocks = await this.#decodedBlocksThroughCache(
+        blockIndexes.map((blockIndex) => searchBlockIds[blockIndex] ?? ""),
+        snapshot,
+      );
+      for (const [position, blockIndex] of blockIndexes.entries()) {
+        throwIfAborted(options.signal);
+        const decoded = searchBlocks[position];
+        if (decoded === undefined) return undefined;
+        const blockId = searchBlockIds[blockIndex] ?? "";
+        const vector = this.#blockColumnVector(blockId, decoded);
+        if (vector.kind !== searchColumn.type) return undefined;
+        const candidates: number[] = [];
+        if (
+          (vector.kind === "number" || vector.kind === "datetime") &&
+          typeof searchTarget === "number"
+        ) {
+          if (decoded.description.nullCount === 0 && valuesAreAscending(vector.values)) {
+            const run = equalRunRange(vector.values, searchTarget);
+            for (let slot = run.begin; slot < run.end; slot += 1) candidates.push(slot);
+          } else {
+            for (let slot = 0; slot < vector.length; slot += 1) {
+              if (vector.values[slot] === searchTarget) {
+                // A null slot's backing value is unspecified; confirm through validity.
+                const value = vectorValue(vector, slot);
+                if (value !== null) candidates.push(slot);
+              }
+            }
+          }
+        } else if (vector.kind === "string" && typeof searchTarget === "string") {
+          const code = this.#dictionaryCode(blockId, vector, searchTarget);
+          if (code === undefined) continue;
+          for (let slot = 0; slot < vector.length; slot += 1) {
+            if (vector.codes[slot] === code) candidates.push(slot);
+          }
+        } else if (vector.kind === "boolean" && typeof searchTarget === "boolean") {
+          for (let slot = 0; slot < vector.length; slot += 1) {
+            if (vectorValue(vector, slot) === searchTarget) candidates.push(slot);
+          }
+        } else {
+          return undefined;
+        }
+        if (candidates.length === 0) continue;
+        candidateBudget -= candidates.length;
+        if (candidateBudget < 0) return undefined;
+        const remainingColumns = neededColumns.filter((column) => column.id !== searchColumn.id);
+        const rowBlockIds = remainingColumns.map(
+          (column) => segment.columnBlockIds[column.id]?.[blockIndex] ?? "",
+        );
+        const rowBlocks = await this.#decodedBlocksThroughCache(rowBlockIds, snapshot);
+        const vectors = new Map<string, ColumnVector>([[searchColumn.name, vector]]);
+        for (const [index, column] of remainingColumns.entries()) {
+          const block = rowBlocks[index];
+          if (block === undefined) return undefined;
+          const columnVector = this.#blockColumnVector(rowBlockIds[index] ?? "", block);
+          if (columnVector.kind !== column.type) return undefined;
+          vectors.set(column.name, columnVector);
+        }
+        for (const slot of candidates) {
+          let matches = true;
+          for (const equality of shape.equalities) {
+            const columnVector = vectors.get(equality.column);
+            if (columnVector === undefined) return undefined;
+            const stored = vectorValue(columnVector, slot);
+            const wanted = equality.value;
+            const equal =
+              wanted instanceof Date
+                ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
+                : stored === wanted;
+            if (!equal) {
+              matches = false;
+              break;
+            }
+          }
+          if (!matches) continue;
+          const row: QueryRow = {};
+          for (const item of projected) {
+            const columnVector = vectors.get(item.column.name);
+            if (columnVector === undefined) return undefined;
+            const value = vectorValue(columnVector, slot);
+            // A stored plain-text value in the protected NUL namespace crosses the result
+            // boundary through the ordinary executor's wrapping rules; reproducing them here
+            // is not worth the risk, so the whole statement falls back.
+            if (typeof value === "string" && value.charCodeAt(0) === 0) return undefined;
+            row[item.alias] = value;
+          }
+          rows.push(row);
+        }
+      }
+    }
+    return {
+      columns: shape.select.map((item) => item.alias),
+      columnDomains: shape.select.map(() => null),
+      rows,
+    };
+  }
+
+  /** The dictionary code for a value in one block's string vector, reverse-mapped and cached. */
+  #dictionaryCode(
+    blockId: string,
+    vector: ColumnVector & { kind: "string" },
+    value: string,
+  ): number | undefined {
+    let reverse = this.#cacheGet(`drd ${blockId}`) as Map<string, number> | undefined;
+    if (reverse === undefined) {
+      reverse = new Map<string, number>();
+      for (const [code, entry] of vector.dictionary.entries()) reverse.set(entry, code);
+      let bytes = 64;
+      for (const entry of vector.dictionary) bytes += 32 + entry.length;
+      this.#cachePut(`drd ${blockId}`, reverse, bytes);
+    }
+    return reverse.get(value);
   }
 
   /**
@@ -7613,13 +7885,12 @@ export class MinnowDatabase {
       this.#targetBlockBytes,
     );
     for (const [part, { start, end }] of ranges.entries()) {
-      await blockStager.prepare(
-        maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
-      );
+      await blockStager.prepare(maximumWriteBlockStoredBytes(plannedColumn, start, end, "raw"));
       const slice = values.slice(start, end);
       const bytes = await this.#encodeColumnBlock(
         keyColumn.id,
         asColumnInput(keyColumn.type, slice),
+        "raw",
       );
       const blockId = [
         "table",
@@ -8173,6 +8444,25 @@ export class MinnowDatabase {
     const table = reported.base.derived ?? reported.base.union ?? reported.base.windowed;
     if (table === undefined && reported.joins.length === 0) {
       const record = await this.#findTable(reported.base.table);
+      const pointTemplate = record.view === undefined ? cachedPointReadTemplate(reported) : null;
+      if (pointTemplate !== null) {
+        const keyColumn = getUniqueKeyColumn(record);
+        const keyComponents =
+          keyColumn === undefined
+            ? []
+            : keyColumn.hidden === true
+              ? primaryKeyColumns(record)
+              : [keyColumn];
+        const covered = new Set(pointTemplate.equalities.map((equality) => equality.column));
+        if (
+          keyComponents.length > 0 &&
+          keyComponents.every((component) => covered.has(component.name))
+        ) {
+          notes.push(
+            "key-covering equality answers as a point read when the visible history allows",
+          );
+        }
+      }
       if (zonePredicates(reported, record).length > 0) {
         notes.push("zone-map pruning applies to the unbudgeted scan");
       }
@@ -18498,10 +18788,20 @@ export class MinnowDatabase {
    * the codec each block actually used is recorded in the block itself, so a wrong guess costs
    * bytes and never correctness.
    */
-  async #encodeColumnBlock(columnId: string, input: ColumnInput): Promise<Uint8Array> {
+  async #encodeColumnBlock(
+    columnId: string,
+    input: ColumnInput,
+    /**
+     * "raw" for delete-key blocks: they hold only the doomed keys, compaction folds them away,
+     * and a 50k-key range delete otherwise spends more time in gzip than in the whole rest of
+     * the statement. The stored format carries the codec per block, so nothing changes on disk
+     * beyond the byte count.
+     */
+    preferred: Compression = this.#compression,
+  ): Promise<Uint8Array> {
     return this.#encodePreferredBlock(
       columnId,
-      this.#compression,
+      preferred,
       columnInputBytesBelow(input, GZIP_MINIMUM_INPUT_BYTES),
       (compression) => encodeBlock(input, compression),
     );

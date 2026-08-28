@@ -350,15 +350,23 @@ Blocking SQL remains correct through the engine's materialized/spill path. The
 - `.stream(chunkSize)` over direct and worker-backed query cursors.
 - `RETURNING` rows and Kysely's affected-row counts.
 - `db.transaction().execute(...)` through Minnow's `BEGIN`, `COMMIT`, and `ROLLBACK`.
-- Raw SQL savepoints inside that transaction.
+- Controlled transactions: `db.startTransaction()` with `savepoint(name)`,
+  `rollbackToSavepoint(name)`, and `releaseSavepoint(name)` mapped onto Minnow's `SAVEPOINT`,
+  `ROLLBACK TO`, and `RELEASE`. Raw SQL savepoints inside a transaction work too.
 - Kysely schema statements that stay inside Minnow's supported DDL profile.
 - `db.introspection`: tables, views, columns, nullability, defaults, auto-increment, and logical
   types. Exact `NUMERIC(p, s)`, JSON/JSONB, UUID, DATE, TIME, INTERVAL, arrays, and enum names are
   reported instead of being flattened to `text`.
 
-Minnow has one logical connection. Kysely serializes work through it and a transaction sees its
-own staged writes. `db.destroy()` releases Kysely but does not close the caller-owned Minnow
-database or worker client; close that driver separately when the application is done.
+Minnow has one logical connection, handed out through a first-in-first-out mutex: each statement
+waits for the previous holder to release, and a transaction or stream holds the connection until
+it commits, rolls back, or is disposed. A `db`-level query issued while a transaction is open
+therefore queues until the transaction ends instead of silently joining it — but for the same
+reason, _awaiting_ a `db`-level query inside the transaction callback deadlocks, because it waits
+for the connection the transaction holds. Use the callback's `trx` handle for every statement
+inside the transaction, exactly as with Kysely's other single-connection dialects. `db.destroy()`
+releases Kysely but does not close the caller-owned Minnow database or worker client; close that
+driver separately when the application is done.
 
 ## Limits
 
@@ -366,8 +374,11 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
 
 - `getSchemas()` returns an empty list. There are no catalogs or schemas to invent.
 - Transaction access modes and isolation levels are rejected; Minnow has one snapshot model.
-- The engine accepts `SAVEPOINT`, `ROLLBACK TO`, and `RELEASE`; Kysely's dialect interface
-  exposes one top-level transaction rather than a nested transaction helper.
+- Transactions do not nest: a second `BEGIN` inside an open transaction is rejected, so use
+  savepoints — through `db.startTransaction()` or raw SQL — for nested work.
+- `mergeInto(...).returning(...)` is rejected with an explicit error before execution: Minnow's
+  `MERGE` reports an affected-row count but returns no rows, and silently yielding `[]` would
+  hide that. `MERGE` without `RETURNING` executes normally.
 - Parameters must be `boolean`, `number`, `string`, `Date`, or `null`; BigInt, byte arrays, and
   driver-native PostgreSQL objects have no Minnow parameter representation. Exact decimals accept
   numbers or strings as inputs and return lossless strings by default. JSON/JSONB also return
@@ -382,6 +393,7 @@ schema declaration and `database.migrate(schema)`, which coordinates through Min
 
 ## Compatibility checks
 
-Adapter tests compile and execute DDL, inserts, queries, `RETURNING`, commits, rollbacks, and
+Adapter tests compile and execute DDL, inserts, queries, `RETURNING`, commits, rollbacks,
+nested savepoints, `MERGE`, connection serialization around open transactions, and
 introspection. Minnow's broader [SQL compatibility suite](/docs/conformance) compares supported
 PostgreSQL reads and writes with PGlite and checks every documented difference and exclusion.

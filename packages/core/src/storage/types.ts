@@ -19,6 +19,34 @@ export const storeNames = [
 
 export const MAX_MANIFEST_CHANGED_TABLE_IDS = 1_024;
 
+/**
+ * A deep copy for the plain record shapes this module validates — objects, arrays, and
+ * primitives, bigint included. Records cross this boundary on every catalog read and every
+ * compaction-job advance, and `structuredClone` here was a sixth of a settle phase's CPU; any
+ * value outside the plain shape falls back to `structuredClone` for that value, so the copy
+ * stays exact whatever arrives.
+ */
+function clonePlainRecord<T>(value: T): T {
+  return clonePlainValue(value) as T;
+}
+
+function clonePlainValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (Array.isArray(value)) {
+    const copy = new Array<unknown>(value.length);
+    for (let index = 0; index < value.length; index += 1)
+      copy[index] = clonePlainValue(value[index]);
+    return copy;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return structuredClone(value);
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    copy[key] = clonePlainValue((value as Record<string, unknown>)[key]);
+  }
+  return copy;
+}
+
 export function canonicalManifestChangedTableIds(ids: readonly string[]): string[] {
   if (ids.length > MAX_MANIFEST_CHANGED_TABLE_IDS) {
     throw new RangeError(
@@ -184,7 +212,7 @@ export function validateSqlDomain(domain: SqlDomain, context: string): SqlDomain
     }
     validateEnumValues(domain.values, domain.name);
   }
-  return structuredClone(domain);
+  return clonePlainRecord(domain);
 }
 
 /**
@@ -4345,7 +4373,7 @@ export function normalizeSegmentRecord(record: SegmentRecord): SegmentRecord {
   }
   if (record.partitionOrdinal === undefined) {
     if (level === 2) throw new TypeError("A level-two segment requires a partition ordinal");
-    return structuredClone(record);
+    return clonePlainRecord(record);
   }
 
   const partitionOrdinal = nonNegativeWholeNumber(
@@ -4374,7 +4402,7 @@ export function normalizeSegmentRecord(record: SegmentRecord): SegmentRecord {
     ) {
       throw new RangeError("A partitioned segment must have a contiguous positive row ID envelope");
     }
-    return structuredClone({ ...record, partitionOrdinal });
+    return clonePlainRecord({ ...record, partitionOrdinal });
   }
   // Keyed multi-range partition: a merged full-row base whose live rows keep their original
   // ids, described by positive, sorted, non-overlapping spans that sum to the row count.
@@ -4401,7 +4429,7 @@ export function normalizeSegmentRecord(record: SegmentRecord): SegmentRecord {
   if (spanRows !== rowCount) {
     throw new RangeError("Partitioned segment spans must cover exactly the row count");
   }
-  return structuredClone({ ...record, partitionOrdinal });
+  return clonePlainRecord({ ...record, partitionOrdinal });
 }
 
 export function updateTransactionRecord(
@@ -4898,7 +4926,7 @@ export function normalizeGarbageCollectionJobRecord(
   ) {
     throw new TypeError("A planned garbage collection job cannot contain progress");
   }
-  return structuredClone(normalized);
+  return clonePlainRecord(normalized);
 }
 
 export function advanceGarbageCollectionJobRecord(
@@ -5302,7 +5330,7 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
   }
   validateCompactionRewrite(normalized);
   validateCompactionJobState(normalized);
-  return structuredClone(normalized);
+  return clonePlainRecord(normalized);
 }
 
 export function updateCompactionJobRecord(

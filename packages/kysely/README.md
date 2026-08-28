@@ -52,11 +52,11 @@ PostgreSQL SQL with visible `DEFAULT` slots and no hidden generated parameters. 
 declared with `.generatedSql()` are omitted from Kysely insert/update inputs and recomputed by
 Minnow.
 
-The dialect supports reads, inserts, updates, deletes, `RETURNING`, transactions, schema DDL,
-streaming, typed live queries, and catalog introspection, including Minnow's exact numeric, JSON,
-UUID, date, time, interval, array, and enum types. Minnow is an embedded database, so it does not provide
-PostgreSQL schemas, configurable isolation levels, roles, or grants. The adapter supports Kysely
-0.29.x.
+The dialect supports reads, inserts, updates, deletes, `RETURNING`, transactions with nested
+savepoints, schema DDL, streaming, typed live queries, and catalog introspection, including
+Minnow's exact numeric, JSON, UUID, date, time, interval, array, and enum types. Minnow is an
+embedded database, so it does not provide PostgreSQL schemas, configurable isolation levels,
+roles, or grants. The adapter supports Kysely 0.29.x.
 
 `search.match(eb, columns, query)` and `search.rank(eb, columns, query)` expose Minnow's `MATCH`
 and BM25 SQL with checked, non-empty column lists, a bound query parameter, and an inferred numeric

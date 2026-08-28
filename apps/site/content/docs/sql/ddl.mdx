@@ -97,8 +97,9 @@ transaction, so a child inserted beside its parent in one scope sees it. A NULL 
 parent and is satisfied.
 
 `ON DELETE` takes `RESTRICT` (the default), `CASCADE`, and `SET NULL`, and the action runs inside
-the deleting transaction — a parent and its dependents publish together or not at all. `ON UPDATE`
-has nothing to act on, because primary-key columns cannot change.
+the deleting transaction — a parent and its dependents publish together or not at all.
+`ON DELETE SET DEFAULT` is rejected with an explicit error; use `SET NULL` or `CASCADE`.
+`ON UPDATE` has nothing to act on, because primary-key columns cannot change.
 
 A table without a row-addressing `PRIMARY KEY` or single inline `UNIQUE` column is append-only. That is a
 reasonable choice for an event log, and a mistake for anything a user edits, because the key

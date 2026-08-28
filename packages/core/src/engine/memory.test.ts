@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
 import { QueryMemoryBudgetError, QueryMemoryContext } from "./memory.js";
 import { MemoryBlockStore } from "../storage/index.js";
+import { pointReadTestHooks } from "./point-read.js";
 
 describe("query memory context", () => {
   it("tracks shared child reservations and peak bytes", () => {
@@ -97,11 +98,18 @@ describe("query memory context", () => {
       },
     });
     const peaks: number[] = [];
-    for (let run = 0; run < 3; run += 1) {
-      await database.query("SELECT id, label FROM data WHERE id = 12345", {
-        memoize: false,
-        onStats: (stats) => peaks.push(stats.peakMemoryBytes),
-      });
+    // The keyed point-read fast path would answer this without a scan; the invariant under
+    // test is the streamed scan's dictionary accounting, so force the ordinary executor.
+    pointReadTestHooks.disabled = true;
+    try {
+      for (let run = 0; run < 3; run += 1) {
+        await database.query("SELECT id, label FROM data WHERE id = 12345", {
+          memoize: false,
+          onStats: (stats) => peaks.push(stats.peakMemoryBytes),
+        });
+      }
+    } finally {
+      pointReadTestHooks.disabled = false;
     }
     expect(peaks).toHaveLength(3);
     // Stable across runs: a stale or recomputed size would show up as a differing peak.

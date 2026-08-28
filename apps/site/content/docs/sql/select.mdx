@@ -48,6 +48,12 @@ ORDER BY revenue DESC
 lookup table from the smaller side. Equality joins can use the unique-key lookup when one side has
 one.
 
+`RIGHT JOIN` must be the only join in its block and cannot be combined with `SELECT *` — both
+rejections come with explicit errors, and the mirrored `LEFT JOIN` is always available. `FULL
+JOIN` has the same two limits plus two more: it needs an equality `ON` condition, and it does not
+yet combine with grouping, `DISTINCT`, or window functions in the same block. Put the `FULL JOIN`
+in a derived table and group or window in the outer block.
+
 An `ON` clause that carries more than its equality still hashes on that equality — `ON b.order_id
 = a.order_id AND b.product_id > a.product_id` builds on the order and applies the rest to the
 pairs it finds, rather than comparing every row with every row.
@@ -205,7 +211,10 @@ FROM orders
 
 `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and the
 aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and explicit `ROWS` / `RANGE`
-frames.
+frames. Three limits carry explicit errors: `RANGE` frames take only `UNBOUNDED` and
+`CURRENT ROW` bounds, so a numeric offset needs a `ROWS` frame; a window aggregate does not take
+`DISTINCT`; and a window function runs only in the select list — to order by one, alias it there
+and `ORDER BY` the alias.
 
 A window runs after `GROUP BY` and `HAVING`, matching PostgreSQL, so it ranks the groups
 rather than the rows behind them and its `OVER` clause reads the group's own aggregates — that is
