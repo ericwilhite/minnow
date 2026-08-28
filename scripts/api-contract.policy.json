@@ -153,7 +153,12 @@
         {
           "subpath": ".",
           "audience": "application",
-          "description": "Kysely dialect, schema inference, search, cursors, and live-query wrappers."
+          "description": "Kysely dialect, schema inference, search, JSON projections, cursors, and live-query wrappers."
+        },
+        {
+          "subpath": "./helpers",
+          "audience": "application",
+          "description": "Typed Minnow-native JSON object and correlated row projection helpers."
         }
       ]
     },

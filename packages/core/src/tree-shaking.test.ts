@@ -25,12 +25,12 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // Result-domain metadata, DATE, guarded upserts, typed catalog errors, bounded cancellation,
 // exact-NUMERIC dictionary predicates, maintenance hints, set-at-a-time correlated SQL, nested
 // JSON provenance, and stored generated columns intentionally expand the complete engine surface.
-// Measured: 707.7 KiB raw / 202.8 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 713 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 205 * 1024;
-// Measured with the larger durable adapter: 1041.8 KiB raw / 286.2 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1049 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 289 * 1024;
+// Measured: 722.6 KiB raw / 206.3 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 724 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 208 * 1024;
+// Measured with the larger durable adapter: 1056.7 KiB raw / 289.7 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1058 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 291 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

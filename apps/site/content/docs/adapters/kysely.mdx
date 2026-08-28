@@ -111,6 +111,116 @@ The catalog fills `order_id`, `total`, and `status` when the statement executes;
 hide generated parameters in the compiled query. `INSERT ... SELECT` may omit default-bearing
 target columns for the same reason: the engine evaluates their stored SQL once per selected row.
 
+## Typed correlated subqueries
+
+Kysely carries every visible outer alias into an expression builder's nested `selectFrom`, so
+correlated references remain checked through multiple levels. The result row is inferred from the
+outer selection as usual:
+
+```ts
+const visibleOrders = await db
+  .selectFrom("orders as candidate")
+  .select("candidate.order_id")
+  .where((outer) =>
+    outer.or([
+      outer("candidate.status", "=", "open"),
+      outer.exists(
+        outer
+          .selectFrom("orders as sibling")
+          .select("sibling.order_id")
+          .whereRef("sibling.customer", "=", "candidate.customer")
+          .where((middle) =>
+            middle.exists(
+              middle
+                .selectFrom("orders as paid")
+                .select("paid.order_id")
+                .whereRef("paid.customer", "=", "sibling.customer")
+                .where("paid.total", ">", 0),
+            ),
+          ),
+      ),
+    ]),
+  )
+  .execute();
+// Array<{ order_id: number }>
+```
+
+`IN`, `NOT IN`, `eb.fn.any(subquery)`, and scalar query builders use the same nested scopes.
+Mutation predicates do too, including typed `RETURNING` rows:
+
+```ts
+const removed = await db
+  .deleteFrom("orders")
+  .where(
+    "orders.order_id",
+    "not in",
+    db.selectFrom("orders").select("order_id").where("status", "=", "open"),
+  )
+  .returning("orders.order_id")
+  .execute();
+// Array<{ order_id: number }>
+```
+
+The adapter compiles these builders to ordinary PostgreSQL SQL and passes it to Minnow's shared
+planner; it does not maintain a shallower subquery implementation of its own. Kysely has no
+first-class `ALL (subquery)` builder or correlated `selectNoFrom` on an expression builder. Those
+two SQL spellings use `sql<T>` with an explicit result type, while references interpolated from
+`eb.ref(...)` remain scope-checked.
+
+## Nested JSON projections
+
+Import Minnow's JSON helpers instead of the PostgreSQL-specific helpers. They keep Kysely's exact
+object, nullable-object, and object-array inference while emitting Minnow's SQL-standard
+`JSON_OBJECT` and `JSON_ARRAYAGG` forms:
+
+```ts
+import { jsonArrayFrom, jsonBuildObject, jsonObjectFrom } from "@minnowdb/kysely/helpers";
+
+const ordersWithRelated = await db
+  .selectFrom("orders as order")
+  .select((eb) => [
+    "order.order_id",
+    jsonBuildObject({
+      id: eb.ref("order.order_id"),
+      status: eb.ref("order.status"),
+    }).as("summary"),
+    jsonArrayFrom(
+      eb
+        .selectFrom("orders as related")
+        .select(["related.order_id as id", "related.total"])
+        .whereRef("related.customer", "=", "order.customer")
+        .orderBy("related.total", "desc")
+        .limit(5),
+    ).as("related"),
+    jsonObjectFrom(
+      eb
+        .selectFrom("orders as latest")
+        .select(["latest.order_id as id", "latest.status"])
+        .whereRef("latest.customer", "=", "order.customer")
+        .orderBy("latest.order_id", "desc")
+        .limit(1),
+    ).as("latest"),
+  ])
+  .execute();
+// Array<{
+//   order_id: number;
+//   summary: { id: number; status: "open" | "closed" };
+//   related: Array<{ id: number; total: number }>;
+//   latest: { id: number; status: "open" | "closed" } | null;
+// }>
+```
+
+`jsonArrayFrom` returns `[]` for no rows. `jsonObjectFrom` returns `null` for no row and raises the
+normal scalar-subquery cardinality error for more than one row; use ordering and a limit when the
+relationship is not unique. Ordering, limits, and offsets run independently for each correlated
+outer row, including when several JSON helpers are siblings in one select list.
+
+Row-to-object helpers require explicit named selections: select columns directly or alias computed
+expressions. They reject `selectAll()` because the helper must name each JSON key in emitted SQL.
+Enable `resultDecoding: { json: "parse" }` on `createKysely` or `MinnowDialect` so runtime values
+match the inferred object types; without it, Minnow's lossless JSON strings remain the database
+boundary. The same helpers are also exported from the package root.
+
 ## Inferred function results
 
 Kysely normally uses portable driver unions for numeric aggregates because it cannot know which

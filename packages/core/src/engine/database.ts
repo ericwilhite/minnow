@@ -258,7 +258,12 @@ import {
   type LiveQueryInput,
   type LiveQuerySetOptions,
 } from "./live.js";
-import { chooseJoinOrder, renderPlan } from "./optimizer.js";
+import {
+  chooseJoinOrder,
+  optimizePlan,
+  qualifyCorrelatedReferences,
+  renderPlan,
+} from "./optimizer.js";
 import { encodeSqlEqualityValue } from "./sql-semantics.js";
 import {
   externalSqlDomainValue,
@@ -1217,6 +1222,8 @@ interface CatalogFacts {
   childKeys: ReadonlyMap<string, readonly ChildForeignKey[]>;
   /** Physical table and column names to PostgreSQL logical-domain metadata. */
   domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>;
+  /** Physical table names to their visible columns, used for nested SQL name resolution. */
+  columns: ReadonlyMap<string, readonly string[]>;
 }
 
 /** Thrown into a held write scope to make it abort; never surfaces to a caller. */
@@ -5119,7 +5126,7 @@ export class MinnowDatabase {
     // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
     // result memoization — and only re-reads the view set when the catalog has actually moved.
     // A database with no views therefore pays one probe, not a catalog scan per query.
-    const { views, domains } = await this.#catalogFacts(probe);
+    const { views, domains, columns: catalogColumns } = await this.#catalogFacts(probe);
     let rewritten = plan.usesSequenceCalls === true ? await this.#resolveSequenceCalls(plan) : plan;
     if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
@@ -5136,6 +5143,8 @@ export class MinnowDatabase {
     if (domains.size > 0 && planReadsTable(rewritten, (name) => domains.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains);
     }
+    const qualified = qualifyCorrelatedReferences(rewritten, catalogColumns);
+    if (qualified !== rewritten) rewritten = optimizePlan(qualified);
     if (!aliased && !natural) return rewritten;
     // These two need column *order*, which only the records carry; both are rare enough that
     // reading the catalog for them is fine.
@@ -5250,7 +5259,12 @@ export class MinnowDatabase {
     const views = new Map<string, string>();
     const childKeys = new Map<string, ChildForeignKey[]>();
     const domains = new Map<string, ReadonlyMap<string, SqlDomain>>();
+    const columns = new Map<string, readonly string[]>();
     for (const table of await this.store.listTables()) {
+      columns.set(
+        table.name,
+        table.columns.filter(({ hidden }) => hidden !== true).map(({ name }) => name),
+      );
       const tableDomains = new Map(
         table.columns.flatMap((column) =>
           column.sqlDomain === undefined ? [] : [[column.name, column.sqlDomain] as const],
@@ -5264,7 +5278,7 @@ export class MinnowDatabase {
         else existing.push({ table, key });
       }
     }
-    const facts: CatalogFacts = { views, childKeys, domains };
+    const facts: CatalogFacts = { views, childKeys, domains, columns };
     this.#catalogCache = { epoch, facts };
     return facts;
   }
@@ -5356,6 +5370,7 @@ export class MinnowDatabase {
   ): Promise<QueryValue[] | undefined> {
     const options = this.#effectiveQueryOptions({ memoize: false });
     plan = await this.#applyCatalogRewrites(plan, probe);
+    if (!this.#canStreamPlanShape(plan, options)) return undefined;
     const values: QueryValue[] = [];
     const streamed = await this.#queryStreamed(plan, options, undefined, probe, {
       batchRows: 2_048,
@@ -9940,19 +9955,19 @@ export class MinnowDatabase {
         }
       }
     }
-    const plan: CompiledQuery = {
+    const plan = optimizePlan({
       sql: `(${statement.kind})`,
       base: { table: table.name, alias: table.name },
       joins: [],
       select: [...referenced].map((name) => ({
-        expression: { kind: "column", reference: name },
+        expression: { kind: "column" as const, reference: name },
         alias: name,
       })),
       predicates: statement.predicates,
       groupBy: [],
       having: [],
       orderBy: [],
-    };
+    });
     if (statement.kind === "delete" && returningColumns === undefined) {
       const internalWriter = options.writer as StatementWriter &
         Partial<Pick<TransactionStatementWriter, "queryFirstColumn">>;

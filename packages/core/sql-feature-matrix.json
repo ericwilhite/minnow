@@ -257,8 +257,8 @@
     {
       "id": "mutation.returning",
       "status": "supported",
-      "example": "DELETE FROM keyed WHERE name = 'x' RETURNING name, score",
-      "notes": "RETURNING works on INSERT, UPDATE, and DELETE; inserts echo written values, updates return post-update values, deletes the rows as read."
+      "example": "DELETE FROM keyed WHERE name = 'x' RETURNING keyed.name, keyed.score",
+      "notes": "RETURNING works on INSERT, UPDATE, and DELETE; inserts echo written values, updates return post-update values, and deletes return the rows as read. Columns and target.* may be target-qualified."
     },
     {
       "id": "mutation.upsert",
@@ -317,7 +317,7 @@
       "id": "predicate.quantified",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > ALL (SELECT amount FROM dims)",
-      "notes": "ANY/SOME/ALL use full three-valued logic. Correlated forms are supported as top-level WHERE predicates. SQLite itself has no quantified comparisons."
+      "notes": "ANY/SOME/ALL use full three-valued logic, including when a correlated form is nested below OR, NOT, CASE, or a select expression. SQLite itself has no quantified comparisons."
     },
     {
       "id": "predicate.ilike",
@@ -400,7 +400,19 @@
       "id": "subquery.correlated-select",
       "status": "supported",
       "example": "SELECT r.region, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r",
-      "notes": "Correlated scalar aggregates decorrelate in the select list. In a grouped query, their outer references must be GROUP BY columns and the scalar cannot sit inside an outer aggregate."
+      "notes": "Correlated scalar aggregates and single-row projections decorrelate in the select list. In a grouped query, their outer references must be GROUP BY columns and the scalar cannot sit inside an outer aggregate."
+    },
+    {
+      "id": "subquery.correlated-select-limit",
+      "status": "supported",
+      "example": "SELECT r.region, (SELECT q.amount FROM rows q WHERE q.region = r.region ORDER BY q.amount DESC LIMIT 1) AS peak FROM rows r",
+      "notes": "ORDER BY, LIMIT, and OFFSET apply independently to each distinct outer probe. Zero rows yield NULL and more than one unbounded row raises a scalar-cardinality error."
+    },
+    {
+      "id": "subquery.correlated-json-aggregate",
+      "status": "supported",
+      "example": "SELECT r.region, (SELECT JSON_ARRAYAGG(JSON_OBJECT('amount' VALUE q.amount) ORDER BY q.amount) FROM rows q WHERE q.region = r.region) AS amounts FROM rows r",
+      "notes": "JSON aggregate expressions use the same set-at-a-time decorrelation as numeric aggregates and preserve their JSON result domain."
     },
     {
       "id": "subquery.correlated-select-grouped",
@@ -418,7 +430,7 @@
       "id": "subquery.correlated-exists-expression",
       "status": "supported",
       "example": "SELECT r.amount FROM rows r WHERE r.amount > 100 OR EXISTS (SELECT d.region FROM dims d WHERE d.region = r.region)",
-      "notes": "Correlated EXISTS and NOT EXISTS remain set-at-a-time when nested below OR, NOT, or CASE."
+      "notes": "Correlated EXISTS and NOT EXISTS remain set-at-a-time below OR, NOT, or CASE and across deeper correlated EXISTS, IN, NOT IN, or scalar blocks. Generated aliases are unique across the complete plan tree."
     },
     {
       "id": "subquery.correlated-non-equi",
@@ -439,6 +451,12 @@
       "notes": "Correlated NOT IN preserves empty-set and NULL semantics rather than treating it as a simple anti-join."
     },
     {
+      "id": "subquery.correlated-membership-expression",
+      "status": "supported",
+      "example": "SELECT r.amount FROM rows r WHERE r.amount = 3 OR r.region NOT IN (SELECT q.region FROM rows q WHERE q.amount < r.amount)",
+      "notes": "Correlated IN and NOT IN retain true, false, and unknown results below OR, NOT, CASE, and in select expressions."
+    },
+    {
       "id": "subquery.correlated-not-in-non-equi",
       "status": "supported",
       "example": "SELECT r.amount FROM rows r WHERE 'north' NOT IN (SELECT q.region FROM rows q WHERE q.amount < r.amount)",
@@ -447,8 +465,8 @@
     {
       "id": "subquery.correlated-quantified",
       "status": "supported",
-      "example": "SELECT r.amount FROM rows r WHERE r.amount > ALL (SELECT q.amount FROM rows q WHERE q.region = r.region)",
-      "notes": "At top-level WHERE, correlated ANY lowers to a semi-join on true comparisons and ALL to an anti-join on false or unknown comparisons."
+      "example": "SELECT r.amount FROM rows r WHERE r.amount = 3 OR r.amount > ALL (SELECT q.amount FROM rows q WHERE q.region = r.region)",
+      "notes": "Top-level WHERE uses semi/anti joins. Nested expressions group true, false, unknown, and empty-set counts per distinct outer probe tuple."
     },
     {
       "id": "cte.recursive",
@@ -1197,7 +1215,7 @@
       "id": "aggregate.json",
       "status": "supported",
       "example": "SELECT JSON_ARRAYAGG(JSON_OBJECT('region' VALUE region)) AS regions FROM rows",
-      "notes": "Supports DISTINCT, embeds JSON-producing inputs as documents, includes SQL NULL as JSON null, and returns NULL for empty input. FILTER, window use, aggregate-local ORDER BY, and explicit NULL/ABSENT clauses are not supported; input order is otherwise unspecified."
+      "notes": "Supports DISTINCT and aggregate-local ORDER BY, embeds JSON-producing inputs as documents, includes SQL NULL as JSON null, and returns NULL for empty input. FILTER, window use, and explicit NULL/ABSENT clauses are not supported; input order is unspecified without ORDER BY."
     },
     {
       "id": "type.array",

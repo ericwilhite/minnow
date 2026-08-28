@@ -974,6 +974,7 @@ const aggregateNames = new Set<AggregateName>([
   "MAX",
   "JSON_ARRAYAGG",
   "STRING_AGG",
+  "MINNOW_SINGLE_VALUE",
 ]);
 /** Set functions the parser builds from COUNT/SUM rather than from their own accumulator. */
 const statisticalAggregates = new Set([
@@ -1929,7 +1930,14 @@ export function containsParameter(expression: Expression): boolean {
 }
 
 export function blockHasParameters(block: CompiledQuery): boolean {
-  if (block.limitParameter !== undefined || block.offsetParameter !== undefined) return true;
+  if (
+    block.limitParameter !== undefined ||
+    block.offsetParameter !== undefined ||
+    (block.limitValidationParameters?.length ?? 0) > 0 ||
+    (block.offsetValidationParameters?.length ?? 0) > 0
+  ) {
+    return true;
+  }
   const expressions: Expression[] = [];
   forEachBlockExpression(block, (expression) => expressions.push(expression));
   return (
@@ -2045,6 +2053,14 @@ function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
     block.offset = validateOffset(numeric(values[block.offsetParameter] ?? null));
     delete block.offsetParameter;
   }
+  for (const index of block.limitValidationParameters ?? []) {
+    validateLimit(numeric(values[index] ?? null));
+  }
+  for (const index of block.offsetValidationParameters ?? []) {
+    validateOffset(numeric(values[index] ?? null));
+  }
+  delete block.limitValidationParameters;
+  delete block.offsetValidationParameters;
   for (const item of block.select) item.expression = bindExpression(item.expression, values);
   for (const predicate of [...block.predicates, ...block.having]) {
     predicate.left = bindExpression(predicate.left, values);
@@ -2358,6 +2374,7 @@ export function inferBlockSchema(
       expression.name === "AVG" ||
       expression.name === "MIN" ||
       expression.name === "MAX" ||
+      expression.name === "MINNOW_SINGLE_VALUE" ||
       expression.name === "COALESCE" ||
       expression.name === "NULLIF" ||
       expression.name === "GREATEST" ||
@@ -4477,6 +4494,13 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (group === undefined)
           throw new TypeError(`${expression.name} requires grouped execution`);
         const argument = expression.arguments[0] ?? { kind: "wildcard" as const };
+        if (expression.name === "MINNOW_SINGLE_VALUE") {
+          if (group.length > 1) {
+            throw new TypeError(`A scalar subquery returned ${String(group.length)} rows`);
+          }
+          const row = group[0];
+          return row === undefined ? null : evaluate(argument, row);
+        }
         if (expression.name === "STRING_AGG") {
           const delimiter = expression.arguments[1];
           if (delimiter === undefined) throw new TypeError("STRING_AGG requires a delimiter");
@@ -4534,13 +4558,49 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
               .join(""),
           );
         }
+        if (expression.name === "JSON_ARRAYAGG") {
+          let members = group.map((row) => ({
+            value: argument.kind === "wildcard" ? 1 : evaluate(argument, row),
+            order: (expression.aggregateOrderBy ?? []).map((item) =>
+              evaluate(item.expression, row),
+            ),
+          }));
+          if (expression.distinct === true) {
+            const seen = new Set<unknown>();
+            members = members.filter(({ value }) => {
+              const key = value instanceof Date ? ` d${String(dateMilliseconds(value))}` : value;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          }
+          if ((expression.aggregateOrderBy?.length ?? 0) > 0) {
+            members.sort((left, right) => {
+              for (const [index, order] of (expression.aggregateOrderBy ?? []).entries()) {
+                const a = left.order[index];
+                const b = right.order[index];
+                const placed = nullOrder(a, b, order.nulls, order.direction);
+                if (placed !== undefined && placed !== 0) return placed;
+                const compared = compareValues(a, b);
+                if (compared !== 0) return order.direction === "desc" ? -compared : compared;
+              }
+              return 0;
+            });
+          }
+          return members.length === 0
+            ? null
+            : preservedJsonDomainValue(
+                jsonConstructor(
+                  "JSON_ARRAY",
+                  members.map(({ value }) => value),
+                ),
+              );
+        }
         let values =
           argument.kind === "wildcard"
             ? group.map(() => 1)
             : group.map((row) => evaluate(argument, row));
-        if (expression.name !== "JSON_ARRAYAGG") {
-          values = values.filter((value) => value !== null && value !== undefined);
-        }
+        values = values.filter((value) => value !== null && value !== undefined);
         if (expression.distinct === true) {
           const seen = new Set<unknown>();
           values = values.filter((value) => {
@@ -4559,11 +4619,6 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
                 const sum = sumNumericValues(values);
                 return exactNumericBinary("/", sum, values.length) ?? numeric(sum) / values.length;
               })();
-        if (expression.name === "JSON_ARRAYAGG") {
-          return values.length === 0
-            ? null
-            : preservedJsonDomainValue(jsonConstructor("JSON_ARRAY", values));
-        }
         if (expression.name === "MIN")
           return values.reduce<unknown>(
             (best, value) => (best === undefined || compareValues(value, best) < 0 ? value : best),
@@ -5072,6 +5127,13 @@ export function hasAggregate(expression: Expression): boolean {
     return true;
   }
   return childExpressions(expression).some(hasAggregate);
+}
+
+/** One root aggregate call, using the same canonical set as parsing and execution. */
+export function isAggregateCall(
+  expression: Expression,
+): expression is Extract<Expression, { kind: "call" }> & { name: AggregateName } {
+  return expression.kind === "call" && aggregateNames.has(expression.name as AggregateName);
 }
 
 function validateGrouping(plan: CompiledQuery): void {
@@ -6133,7 +6195,7 @@ class Parser {
         rows: [[]],
         defaultValues: true,
         ...this.#onConflictClause(table),
-        ...this.#returningClause(),
+        ...this.#returningClause(table),
       };
     }
     if (this.#isKeyword("SELECT")) {
@@ -6150,7 +6212,7 @@ class Parser {
         columns,
         rows: [],
         query,
-        ...this.#returningClause(),
+        ...this.#returningClause(table),
       };
     }
     this.#keyword("VALUES");
@@ -6175,7 +6237,7 @@ class Parser {
       columns,
       rows,
       ...this.#onConflictClause(table),
-      ...this.#returningClause(),
+      ...this.#returningClause(table),
     };
   }
 
@@ -6248,8 +6310,8 @@ class Parser {
     };
   }
 
-  /** RETURNING * or RETURNING col, ... — the engine's runStatement implements the semantics. */
-  #returningClause(): { returning?: string[] | "*" } {
+  /** RETURNING *, target.*, or [target.]col, ... — execution owns the row semantics. */
+  #returningClause(table: string): { returning?: string[] | "*" } {
     if (!this.#isKeyword("RETURNING")) return {};
     this.#keyword("RETURNING");
     if (this.#peek().text === "*") {
@@ -6258,7 +6320,22 @@ class Parser {
     }
     const columns: string[] = [];
     for (;;) {
-      columns.push(this.#identifier());
+      const first = this.#identifier();
+      if (this.#punctuation(".")) {
+        if (first !== table) {
+          throw new TypeError(`RETURNING qualifier must name the target table: ${table}`);
+        }
+        if (this.#peek().text === "*") {
+          this.#index += 1;
+          if (columns.length > 0 || this.#peek().text === ",") {
+            throw new TypeError("RETURNING target.* must be the only returned item");
+          }
+          return { returning: "*" };
+        }
+        columns.push(this.#identifier());
+      } else {
+        columns.push(first);
+      }
       if (!this.#punctuation(",")) break;
     }
     return { returning: columns };
@@ -6404,7 +6481,7 @@ class Parser {
       throw new TypeError("UPDATE assignments must set each column once");
     }
     const predicates = this.#mutationPredicates();
-    return { kind: "update", table, assignments, predicates, ...this.#returningClause() };
+    return { kind: "update", table, assignments, predicates, ...this.#returningClause(table) };
   }
 
   #deleteStatement(): CompiledStatement {
@@ -6412,7 +6489,7 @@ class Parser {
     this.#keyword("FROM");
     const table = this.#identifier();
     const predicates = this.#mutationPredicates();
-    return { kind: "delete", table, predicates, ...this.#returningClause() };
+    return { kind: "delete", table, predicates, ...this.#returningClause(table) };
   }
 
   #mutationPredicates(): Array<{
@@ -7607,10 +7684,17 @@ class Parser {
         const all = this.#isKeyword("ALL");
         this.#keyword(this.#isKeyword("ANY") ? "ANY" : all ? "ALL" : "SOME");
         this.#expectPunctuation("(");
+        // Kysely's fn.any(subquery) emits PostgreSQL's valid ANY((SELECT ...)) spelling.
+        let wrapped = 0;
+        while (this.#punctuation("(")) wrapped += 1;
         if (!this.#isKeyword("SELECT")) {
           throw new TypeError("ANY/ALL take a subquery");
         }
         const block = this.#selectBlock("(quantified subquery)");
+        while (wrapped > 0) {
+          this.#expectPunctuation(")");
+          wrapped -= 1;
+        }
         this.#expectPunctuation(")");
         return {
           kind: "condition",
@@ -8123,7 +8207,11 @@ class Parser {
       // (T626); MIN is one such choice and reuses its accumulator exactly.
       const name = (upper === "ANY_VALUE" ? "MIN" : (functionSpellings.get(upper) ?? upper)) as
         AggregateName | ScalarFunctionName;
-      if (name === "MINNOW_TUPLE_KEY" || name === "MINNOW_COLLATE") {
+      if (
+        name === "MINNOW_TUPLE_KEY" ||
+        name === "MINNOW_COLLATE" ||
+        name === "MINNOW_SINGLE_VALUE"
+      ) {
         throw new TypeError(`Unsupported function: ${identifier}`);
       }
       if (!aggregateNames.has(name as AggregateName) && !scalarFunctionNames.has(name))
@@ -8147,6 +8235,9 @@ class Parser {
         if (name === "STRING_AGG") {
           args.push(this.#expression());
           this.#expectPunctuation(",");
+          args.push(this.#expression());
+          if (this.#isKeyword("ORDER")) aggregateOrderBy = this.#orderByClause();
+        } else if (name === "JSON_ARRAYAGG") {
           args.push(this.#expression());
           if (this.#isKeyword("ORDER")) aggregateOrderBy = this.#orderByClause();
         } else {

@@ -18,7 +18,15 @@ export interface QueryResult {
 export type BinaryOperator = "+" | "-" | "*" | "/" | "%" | "||";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
 export type AggregateName =
-  "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG" | "STRING_AGG";
+  | "COUNT"
+  | "SUM"
+  | "AVG"
+  | "MIN"
+  | "MAX"
+  | "JSON_ARRAYAGG"
+  | "STRING_AGG"
+  /** Optimizer-only aggregate that enforces scalar-subquery cardinality. */
+  | "MINNOW_SINGLE_VALUE";
 export type ScalarFunctionName =
   | "ROUND"
   | "COALESCE"
@@ -255,6 +263,10 @@ export interface CompiledQuery {
   distinctWildcard?: boolean;
   limitParameter?: number;
   offsetParameter?: number;
+  /** Optimizer-relocated LIMIT placeholders that still need bind-time numeric/range validation. */
+  limitValidationParameters?: number[];
+  /** Optimizer-relocated OFFSET placeholders that still need bind-time numeric/range validation. */
+  offsetValidationParameters?: number[];
   limitWithTies?: boolean;
   parameterCount?: number;
   usesStatementDatetime?: boolean;

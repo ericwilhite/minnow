@@ -20,7 +20,7 @@ describe("RETURNING in SQL statements", () => {
   it("returns written, post-update, and deleted rows", async () => {
     const database = await seeded();
     const inserted = await database.execute(
-      "INSERT INTO people (name, score) VALUES (?, ?) RETURNING *",
+      "INSERT INTO people (name, score) VALUES (?, ?) RETURNING people.*",
       ["Linus", 5],
     );
     expect(inserted).toMatchObject({
@@ -28,10 +28,13 @@ describe("RETURNING in SQL statements", () => {
       returnedRows: [{ name: "Linus", score: 5 }],
     });
     const updated = await database.execute(
-      "UPDATE people SET score = score + 1 WHERE name = 'Ada' RETURNING name, score",
+      "UPDATE people SET score = score + 1 WHERE name = 'Ada' " +
+        "RETURNING people.name, people.score",
     );
     expect(updated).toMatchObject({ kind: "update", returnedRows: [{ name: "Ada", score: 11 }] });
-    const deleted = await database.execute("DELETE FROM people WHERE score > 20 RETURNING name");
+    const deleted = await database.execute(
+      "DELETE FROM people WHERE score > 20 RETURNING people.name",
+    );
     expect(deleted).toMatchObject({ kind: "delete", returnedRows: [{ name: "Grace" }] });
   });
 });
@@ -74,6 +77,114 @@ describe("DELETE selection", () => {
       expect(scoped).toMatchObject({ kind: "delete", rowCount: 7 });
     });
     expect((await database.query("SELECT COUNT(*) AS n FROM events")).rows).toEqual([{ n: 1_018 }]);
+  });
+
+  it("routes subquery predicates through resolved mutation selection", async () => {
+    const makeDatabase = async (): Promise<MinnowDatabase> => {
+      const database = new MinnowDatabase(new MemoryBlockStore());
+      await database.execute(
+        'CREATE TABLE "widgets" ("widgetKey" INTEGER UNIQUE, "retained" BOOLEAN)',
+      );
+      await database.execute('CREATE TABLE "keptKeys" ("keptKey" INTEGER UNIQUE)');
+      await database.execute(
+        'INSERT INTO "widgets" ("widgetKey", "retained") VALUES (1, false), (2, false)',
+      );
+      await database.execute('INSERT INTO "keptKeys" ("keptKey") VALUES (1)');
+      return database;
+    };
+
+    const notIn = await makeDatabase();
+    await expect(
+      notIn.execute(
+        'DELETE FROM "widgets" WHERE "widgetKey" NOT IN ' + '(SELECT "keptKey" FROM "keptKeys")',
+      ),
+    ).resolves.toMatchObject({ kind: "delete", rowCount: 1 });
+    expect((await notIn.query('SELECT "widgetKey" FROM "widgets"')).rows).toEqual([
+      { widgetKey: 1 },
+    ]);
+
+    const notExists = await makeDatabase();
+    await expect(
+      notExists.execute(
+        'DELETE FROM "widgets" WHERE NOT EXISTS (' +
+          'SELECT 1 FROM "keptKeys" WHERE "keptKeys"."keptKey" = "widgetKey")',
+      ),
+    ).resolves.toMatchObject({ kind: "delete", rowCount: 1 });
+    expect((await notExists.query('SELECT "widgetKey" FROM "widgets"')).rows).toEqual([
+      { widgetKey: 1 },
+    ]);
+
+    const returning = await makeDatabase();
+    await expect(
+      returning.execute(
+        'DELETE FROM "widgets" WHERE NOT EXISTS (' +
+          'SELECT 1 FROM "keptKeys" WHERE "keptKeys"."keptKey" = "widgetKey") ' +
+          'RETURNING "widgetKey"',
+      ),
+    ).resolves.toMatchObject({
+      kind: "delete",
+      rowCount: 1,
+      returnedRows: [{ widgetKey: 2 }],
+    });
+
+    const update = await makeDatabase();
+    await expect(
+      update.execute(
+        'UPDATE "widgets" SET "retained" = true WHERE EXISTS (' +
+          'SELECT 1 FROM "keptKeys" WHERE "keptKeys"."keptKey" = "widgetKey") ' +
+          'RETURNING "widgetKey", "retained"',
+      ),
+    ).resolves.toMatchObject({
+      kind: "update",
+      rowCount: 1,
+      returnedRows: [{ widgetKey: 1, retained: true }],
+    });
+  });
+});
+
+describe("nested correlated subqueries through the public API", () => {
+  it("runs sibling and nested EXISTS repeatedly through query and execute", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute('CREATE TABLE "aa" ("aaKey" INTEGER UNIQUE, "bbKey" INTEGER)');
+    await database.execute('CREATE TABLE "bb" ("bbKey" INTEGER UNIQUE, "ok" BOOLEAN)');
+    await database.execute('CREATE TABLE "cc" ("ccKey" INTEGER UNIQUE, "bbKey" INTEGER)');
+    await database.execute('INSERT INTO "aa" ("aaKey", "bbKey") VALUES (0, 1), (2, 2)');
+    await database.execute('INSERT INTO "bb" ("bbKey", "ok") VALUES (1, true), (2, true)');
+    await database.execute('INSERT INTO "cc" ("ccKey", "bbKey") VALUES (10, 1), (20, 2)');
+
+    const sql =
+      'SELECT "aaKey" FROM "aa" WHERE "aa"."aaKey" = 0 ' +
+      'OR EXISTS (SELECT 1 FROM "bb" ' +
+      'WHERE "bb"."bbKey" = "aa"."bbKey" AND "bb"."ok" = true) ' +
+      'OR EXISTS (SELECT 1 FROM "cc" WHERE "cc"."bbKey" = "aa"."bbKey" ' +
+      'AND EXISTS (SELECT 1 FROM "bb" ' +
+      'WHERE "bb"."bbKey" = "cc"."bbKey" AND "bb"."ok" = true)) ' +
+      'ORDER BY "aaKey"';
+    const expected = [{ aaKey: 0 }, { aaKey: 2 }];
+    expect((await database.query(sql)).rows).toEqual(expected);
+    await expect(database.execute(sql)).resolves.toMatchObject({
+      kind: "rows",
+      result: { rows: expected },
+    });
+    expect((await database.query(sql)).rows).toEqual(expected);
+  });
+
+  it("resolves unqualified outer names before nested decorrelation", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute('CREATE TABLE "widgets" ("widgetKey" INTEGER UNIQUE)');
+    await database.execute('CREATE TABLE "keptKeys" ("keptKey" INTEGER UNIQUE)');
+    await database.execute('INSERT INTO "widgets" ("widgetKey") VALUES (1), (2)');
+    await database.execute('INSERT INTO "keptKeys" ("keptKey") VALUES (1)');
+    expect(
+      (
+        await database.query(
+          'SELECT "widgetKey" FROM "widgets" WHERE EXISTS (' +
+            'SELECT 1 FROM "keptKeys" ' +
+            'WHERE "keptKeys"."keptKey" = "widgets"."widgetKey") OR EXISTS (' +
+            'SELECT 1 FROM "keptKeys" WHERE "keptKeys"."keptKey" = "widgetKey")',
+        )
+      ).rows,
+    ).toEqual([{ widgetKey: 1 }]);
   });
 });
 

@@ -27,6 +27,7 @@ import type * as WorkerProtocol from "@minnowdb/core/worker-protocol";
 import type * as Devtools from "@minnowdb/devtools";
 import type * as Export from "@minnowdb/export";
 import type * as Kysely from "@minnowdb/kysely";
+import type * as KyselyHelpers from "@minnowdb/kysely/helpers";
 import type * as ReactAdapter from "@minnowdb/react";
 import postgresFeatureProfile from "@minnowdb/core/postgres-feature-profile.json" with { type: "json" };
 import corePackage from "@minnowdb/core/package.json" with { type: "json" };
@@ -57,6 +58,7 @@ export type InstalledPublicApis = readonly [
   typeof Devtools,
   typeof Export,
   typeof Kysely,
+  typeof KyselyHelpers,
   typeof ReactAdapter,
 ];
 

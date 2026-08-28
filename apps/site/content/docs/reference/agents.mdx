@@ -127,6 +127,10 @@ machines: https://minnowdb.com/llms.txt
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
   With Kysely, use `search.match(eb, columns, query)` and `search.rank(eb, columns, query)` so the
   non-empty column list is checked against the query's visible tables and aliases.
+- With Kysely, import `jsonBuildObject`, `jsonArrayFrom`, and `jsonObjectFrom` from
+  `@minnowdb/kysely/helpers` instead of `kysely/helpers/postgres`. Enable
+  `resultDecoding: { json: "parse" }` and use explicit named selections in row-to-object
+  subqueries.
 - `CREATE INDEX name ON table(a, b DESC)` creates a durable scalar or composite accelerator.
   Leftmost equality/`IN` prefixes and the next range prune candidates. `CREATE UNIQUE INDEX`
   enforces additional candidate keys atomically; any NULL component does not conflict.
@@ -141,11 +145,13 @@ machines: https://minnowdb.com/llms.txt
   list the tracked supported and rejected forms plus deliberate differences and extensions.
 - Supported PostgreSQL forms include exact NUMERIC/DECIMAL, JSON/JSONB, UUID, arrays, DATE, TIME,
   intervals, enums, sequences, multiple/composite keys, savepoints, filtered upserts, correlated
-  NOT IN, range-correlated LATERAL, STRING_AGG, SIMILAR TO, COLLATE, and constant JSON_TABLE.
+  IN/NOT IN/ANY/ALL and EXISTS/NOT EXISTS at nested expression depth, correlated scalar JSON
+  projections with per-probe ordering/limits, subquery predicates in UPDATE/DELETE,
+  range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, and constant
+  JSON_TABLE.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
-  nested correlated `ANY`/`ALL`, correlated LATERAL grouping/order/limit, correlated JSON_TABLE
-  documents, enum evolution, and sequence options. Check each supported entry's note before
-  assuming every PostgreSQL variant.
+  correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution, and
+  sequence options. Check each supported entry's note before assuming every PostgreSQL variant.
 ```
 
 ## Why those rules

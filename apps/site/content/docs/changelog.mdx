@@ -8,6 +8,41 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.1 — August 28, 2026
+
+Published packages: `@minnowdb/core@0.6.1` and `@minnowdb/kysely@0.4.1`.
+
+### Added
+
+- Nested correlated subqueries now share plan-wide generated aliases and can carry an outer value
+  through a deeper scalar or boolean block. Sibling branches can combine correlated `EXISTS`,
+  `IN`, `NOT IN`, `ANY`, `ALL`, and scalar aggregates below `OR`, `NOT`, `CASE`, or select
+  expressions while retaining SQL's three-valued and empty-set behavior.
+- `UPDATE` and `DELETE` subquery predicates now use the same resolution and decorrelation pipeline
+  as `SELECT`; materialized subqueries automatically use the general mutation-selection executor.
+  Target-qualified mutation `RETURNING` columns and `target.*` are accepted for
+  PostgreSQL-builder compatibility.
+- Correlated scalar subqueries now accept JSON and composed aggregate expressions as well as
+  ordinary single-row projections. Per-probe `ORDER BY`, `LIMIT`, and `OFFSET` are preserved,
+  parameterized limits validate normally, and scalar cardinality errors remain deterministic.
+  `JSON_ARRAYAGG` also supports aggregate-local ordering in row, columnar, and spilled execution.
+- `@minnowdb/kysely` now exports fully typed `jsonBuildObject`, `jsonArrayFrom`, and
+  `jsonObjectFrom` helpers from its root and `/helpers` entry points. They emit Minnow-native
+  SQL-standard JSON constructors instead of PostgreSQL's opaque `json_build_object`, `json_agg`,
+  and `to_json` fragments.
+
+### Migration
+
+No existing call changes. The deeper correlated forms, mutation predicates, ordered JSON
+aggregation, and Kysely JSON projection helpers are additive. Row-to-object Kysely helpers require
+explicit named selections; enable `resultDecoding: { json: "parse" }` when their runtime values
+should match the inferred object types.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5
+remain readable and writable without a data migration.
+
 ## 0.6.0 — August 27, 2026
 
 Published packages: `@minnowdb/core@0.6.0` and `@minnowdb/kysely@0.4.0`.

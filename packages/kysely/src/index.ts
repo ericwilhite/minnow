@@ -4,6 +4,7 @@ export { MinnowKyselyDriver, type MinnowResultDecoding } from "./driver.js";
 export { MinnowKyselyIntrospector } from "./introspector.js";
 export { createKysely, type CreateKyselyConfig } from "./create-kysely.js";
 export { search, type KyselySearchColumn, type KyselySearchColumns } from "./search.js";
+export { jsonArrayFrom, jsonBuildObject, jsonObjectFrom } from "./helpers.js";
 export {
   createKyselyLiveQueries,
   type CreateKyselyLiveQueriesConfig,

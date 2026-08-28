@@ -37,12 +37,16 @@ comma/CROSS-join groups keep the streamed base fixed, then choose connected sour
 
 **Decorrelation.** A correlated `EXISTS` or `NOT EXISTS` subquery is rewritten into a semi-join or
 anti-join rather than executed once per outer row; both equality and range comparisons take this
-path, including `EXISTS` nested inside a larger boolean expression. Correlated scalar aggregates
-and `IN` use equality-key joins directly or first aggregate by distinct outer probe values for a
-range comparison. Correlated `NOT IN` carries explicit empty-set and NULL flags alongside its
-anti-join, including for range comparisons. Top-level correlated `ANY` becomes a semi-join on a
-true comparison; `ALL` becomes an anti-join on false or unknown comparisons. See the
-[feature matrix](/docs/sql/feature-matrix).
+path. Correlated scalar aggregate expressions and ordinary single-row projections join distinct
+outer probe values to the inner rows; per-probe window ranks implement their ordering, limits,
+and offsets before the grouped value joins back. Correlated `IN` uses equality-key joins directly
+or distinct probes for a range comparison. Correlated `NOT IN` carries explicit empty-set and NULL
+flags alongside its anti-join, including for range comparisons. Below `OR`, `NOT`,
+`CASE`, or a select expression, `IN`, `NOT IN`, `ANY`, and `ALL` group true, false, unknown, and
+empty-set state per distinct outer probe tuple. Generated aliases are unique across the complete
+plan tree. When an outer reference occurs only inside a deeper scalar or boolean expression,
+distinct outer probe tuples lift that reference into the nested plan before ordinary
+decorrelation. See the [feature matrix](/docs/sql/feature-matrix).
 
 **Top-N.** `ORDER BY … LIMIT n` keeps only the best `n` rows as it scans instead of sorting the
 whole input, while `n` is under a tenth of the rows scanned. A page deeper than that keeps every

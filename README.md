@@ -31,12 +31,13 @@ and benchmarks that run in your browser.
   query reads one stable snapshot, even when another tab commits at the same time;
   origin-persistence policy is explicit for applications that cannot accept automatic quota
   eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 286 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 290 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so tables
   and columns are declared once; Minnow-specific aggregate and built-in function results are
-  inferred without driver-output generics. Both paths use the same SQL engine.
+  inferred without driver-output generics. Typed JSON projection helpers build nested objects and
+  arrays, and both paths use the same SQL engine.
 - **Built for responsive applications.** A ready-made worker client keeps query work off the UI
   thread. Pull-driven cursors transfer one columnar page at a time; batch execution and spillable
   sorts and aggregates keep large working sets under a configurable budget.
@@ -54,7 +55,7 @@ queries. It does not provide a server, replication, or multi-device sync.
 | Package              | Purpose                                                                   |
 | -------------------- | ------------------------------------------------------------------------- |
 | `@minnowdb/core`     | SQL engine, schema management, workers, storage adapters, and snapshots.  |
-| `@minnowdb/kysely`   | Kysely dialect with typed search, streaming, and live-query wrappers.     |
+| `@minnowdb/kysely`   | Kysely dialect with typed JSON, search, streaming, and live-query tools.  |
 | `@minnowdb/react`    | React external-store hook for live queries.                               |
 | `@minnowdb/export`   | Streaming CSV and NDJSON over direct or worker cursors.                   |
 | `@minnowdb/devtools` | Optional SQL console and data browser for development and embedded demos. |

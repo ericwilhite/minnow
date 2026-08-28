@@ -58,6 +58,46 @@ const tables = new Map<string, DatabaseRow[]>([
       { parent_id: 4, tenant: "b", scope: "read" },
     ],
   ],
+  [
+    "aa",
+    [
+      { aaKey: 0, bbKey: 1 },
+      { aaKey: 2, bbKey: 2 },
+      { aaKey: 3, bbKey: 3 },
+      { aaKey: 4, bbKey: null },
+    ],
+  ],
+  [
+    "bb",
+    [
+      { bbKey: 1, ok: true },
+      { bbKey: 2, ok: false },
+      { bbKey: 3, ok: true },
+    ],
+  ],
+  [
+    "cc",
+    [
+      { ccKey: 10, bbKey: 1 },
+      { ccKey: 20, bbKey: 2 },
+    ],
+  ],
+  [
+    "owners",
+    [
+      { ownerKey: 1, name: "Alice" },
+      { ownerKey: 2, name: "Bob" },
+      { ownerKey: 3, name: "Cara" },
+    ],
+  ],
+  [
+    "pets",
+    [
+      { petKey: 10, ownerKey: 1, petName: "Rex" },
+      { petKey: 11, ownerKey: 1, petName: "Milo" },
+      { petKey: 12, ownerKey: 2, petName: "Zed" },
+    ],
+  ],
 ]);
 
 function run(sql: string): DatabaseRow[] {
@@ -286,6 +326,53 @@ describe("correlated subquery decorrelation", () => {
     ]);
   });
 
+  it("builds sibling correlated JSON array and object projections", () => {
+    expect(
+      run(
+        "SELECT o.ownerKey, " +
+          "COALESCE((SELECT JSON_ARRAYAGG(JSON_OBJECT('pet_id' VALUE a.pet_id, 'profile' VALUE a.profile)) " +
+          "FROM (SELECT p.petKey AS pet_id, JSON_OBJECT('name' VALUE p.petName) AS profile " +
+          "FROM pets p WHERE p.ownerKey = o.ownerKey ORDER BY p.petName LIMIT 2) AS a), JSON_ARRAY()) AS pets, " +
+          "(SELECT JSON_OBJECT('pet_id' VALUE x.pet_id, 'name' VALUE x.name) " +
+          "FROM (SELECT p.petKey AS pet_id, p.petName AS name FROM pets p " +
+          "WHERE p.ownerKey = o.ownerKey ORDER BY p.petName LIMIT 1) AS x) AS first_pet " +
+          "FROM owners o ORDER BY o.ownerKey",
+      ),
+    ).toEqual([
+      {
+        ownerKey: 1,
+        pets: '[{"pet_id":11,"profile":{"name":"Milo"}},{"pet_id":10,"profile":{"name":"Rex"}}]',
+        first_pet: '{"pet_id":11,"name":"Milo"}',
+      },
+      {
+        ownerKey: 2,
+        pets: '[{"pet_id":12,"profile":{"name":"Zed"}}]',
+        first_pet: '{"pet_id":12,"name":"Zed"}',
+      },
+      { ownerKey: 3, pets: "[]", first_pet: null },
+    ]);
+  });
+
+  it("enforces correlated scalar row cardinality after per-probe ordering and limits", () => {
+    expect(
+      run(
+        "SELECT o.ownerKey, (SELECT p.petName FROM pets p WHERE p.ownerKey = o.ownerKey " +
+          "ORDER BY p.petName LIMIT 1) AS first_pet FROM owners o ORDER BY o.ownerKey",
+      ),
+    ).toEqual([
+      { ownerKey: 1, first_pet: "Milo" },
+      { ownerKey: 2, first_pet: "Zed" },
+      { ownerKey: 3, first_pet: null },
+    ]);
+
+    const plan = compileQuery(
+      "SELECT o.ownerKey, (SELECT p.petName FROM pets p WHERE p.ownerKey = o.ownerKey) AS pet " +
+        "FROM owners o",
+    );
+    expect(() => executeQuery(plan, tables)).toThrow("A scalar subquery returned 2 rows");
+    expect(() => executeRowQuery(plan, tables)).toThrow("A scalar subquery returned 2 rows");
+  });
+
   it("answers scalar aggregates over non-equality correlations", () => {
     expect(
       run(
@@ -359,6 +446,180 @@ describe("correlated subquery decorrelation", () => {
     ).toEqual([{ amount: 3 }, { amount: 8 }]);
   });
 
+  it("keeps generated aliases unique across sibling and nested correlated EXISTS", () => {
+    const sql =
+      'SELECT "aaKey" FROM "aa" WHERE "aa"."aaKey" = 0 ' +
+      'OR EXISTS (SELECT 1 FROM "bb" WHERE "bb"."bbKey" = "aa"."bbKey" AND "bb"."ok" = true) ' +
+      'OR EXISTS (SELECT 1 FROM "cc" WHERE "cc"."bbKey" = "aa"."bbKey" ' +
+      'AND EXISTS (SELECT 1 FROM "bb" WHERE "bb"."bbKey" = "cc"."bbKey" AND "bb"."ok" = true)) ' +
+      'ORDER BY "aaKey"';
+    const plan = compileQuery(sql);
+    const aliases: string[] = [];
+    const collect = (block: typeof plan): void => {
+      for (const source of [block.base, ...block.joins]) {
+        if (source.alias.startsWith("corr_")) aliases.push(source.alias);
+        if (source.derived !== undefined) collect(source.derived);
+      }
+    };
+    collect(plan);
+    expect(new Set(aliases).size).toBe(aliases.length);
+    expect(run(sql)).toEqual([{ aaKey: 0 }, { aaKey: 3 }]);
+  });
+
+  it("decorrelates through deeper scopes without colliding with user corr aliases", () => {
+    expect(
+      run(
+        'SELECT "corr_1"."aaKey" FROM "aa" AS "corr_1" WHERE EXISTS (' +
+          'SELECT 1 FROM "cc" AS "corr_2" WHERE "corr_2"."bbKey" = "corr_1"."bbKey" ' +
+          'AND EXISTS (SELECT 1 FROM "bb" AS "corr_3" ' +
+          'WHERE "corr_3"."bbKey" = "corr_2"."bbKey" ' +
+          'AND EXISTS (SELECT 1 FROM "bb" AS "corr_4" ' +
+          'WHERE "corr_4"."bbKey" = "corr_3"."bbKey" AND "corr_4"."ok" = true))) ' +
+          'ORDER BY "corr_1"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 0 }]);
+  });
+
+  it("recurses through correlated EXISTS well beyond the former one-level shape", () => {
+    const depth = 12;
+    const nested = (level: number, parent: string): string => {
+      const alias = `b${String(level)}`;
+      const tail =
+        level === depth ? ` AND ${alias}.ok = true` : ` AND EXISTS (${nested(level + 1, alias)})`;
+      return `SELECT 1 FROM bb ${alias} WHERE ${alias}.bbKey = ${parent}.bbKey${tail}`;
+    };
+    expect(
+      run(`SELECT a.aaKey FROM aa a WHERE EXISTS (${nested(1, "a")}) ORDER BY a.aaKey`),
+    ).toEqual([{ aaKey: 0 }, { aaKey: 3 }]);
+  });
+
+  it("carries outer correlation through nested scalar subqueries", () => {
+    expect(
+      run(
+        'SELECT "aa"."aaKey" FROM "aa" WHERE EXISTS (' +
+          'SELECT 1 FROM "cc" WHERE "cc"."bbKey" = (SELECT "aa"."bbKey")) ' +
+          'ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 0 }, { aaKey: 2 }]);
+    expect(
+      run(
+        'SELECT "aa"."aaKey" FROM "aa" WHERE EXISTS (' +
+          'SELECT 1 FROM "cc" WHERE "cc"."bbKey" = (' +
+          'SELECT MAX("bb"."bbKey") FROM "bb" ' +
+          'WHERE "bb"."bbKey" = "aa"."bbKey" AND "bb"."ok" = true)) ' +
+          'ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 0 }]);
+  });
+
+  it("keeps NULL outer probes when correlation is nested in an expression", () => {
+    expect(
+      run(
+        'SELECT "aa"."aaKey" FROM "aa" WHERE EXISTS (' +
+          'SELECT 1 FROM "cc" WHERE "aa"."bbKey" IS NULL) ' +
+          'ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 4 }]);
+  });
+
+  it("decorrelates nested NOT IN below a sibling boolean branch", () => {
+    expect(
+      run(
+        'SELECT "aa"."aaKey" FROM "aa" WHERE "aa"."aaKey" = 3 OR EXISTS (' +
+          'SELECT 1 FROM "cc" WHERE "cc"."bbKey" = "aa"."bbKey" ' +
+          'AND "cc"."bbKey" NOT IN (' +
+          'SELECT "bb"."bbKey" FROM "bb" ' +
+          'WHERE "bb"."bbKey" = "cc"."bbKey" AND "bb"."ok" = false)) ' +
+          'ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 0 }, { aaKey: 3 }]);
+  });
+
+  it("preserves correlated IN and NOT IN below OR with empty-set and NULL semantics", () => {
+    expect(
+      run(
+        "SELECT p.g, p.v FROM probes p WHERE p.g = 'empty' OR p.v IN " +
+          "(SELECT m.v FROM members m WHERE m.g = p.g) ORDER BY p.g, p.v NULLS LAST",
+      ),
+    ).toEqual([
+      { g: "clean", v: 2 },
+      { g: "empty", v: null },
+    ]);
+    expect(
+      run(
+        "SELECT p.g, p.v FROM probes p WHERE p.g = 'empty' OR p.v NOT IN " +
+          "(SELECT m.v FROM members m WHERE m.g = p.g) ORDER BY p.g, p.v NULLS LAST",
+      ),
+    ).toEqual([
+      { g: "clean", v: 1 },
+      { g: "empty", v: null },
+    ]);
+  });
+
+  it("returns three-valued correlated ANY and ALL results from nested expression positions", () => {
+    expect(
+      run(
+        "SELECT p.g, p.v, " +
+          "p.v < ANY (SELECT m.v FROM members m WHERE m.g = p.g) AS any_match, " +
+          "p.v < ALL (SELECT m.v FROM members m WHERE m.g = p.g) AS all_match " +
+          "FROM probes p ORDER BY p.g, p.v NULLS LAST",
+      ),
+    ).toEqual([
+      { g: "clean", v: 1, any_match: true, all_match: true },
+      { g: "clean", v: 2, any_match: true, all_match: false },
+      { g: "clean", v: null, any_match: null, all_match: null },
+      { g: "empty", v: null, any_match: false, all_match: true },
+      { g: "poisoned", v: 1, any_match: true, all_match: null },
+      { g: "poisoned", v: 3, any_match: true, all_match: null },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, 'z' > ALL " +
+          "(SELECT q.region FROM rows q WHERE q.amount < r.amount) AS passes " +
+          "FROM rows r ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, passes: true },
+      { amount: 6, passes: true },
+      { amount: 8, passes: true },
+      { amount: 10, passes: null },
+    ]);
+  });
+
+  it("decorrelates scalar aggregates and EXISTS in select and OR expressions", () => {
+    expect(
+      run(
+        'SELECT "aa"."aaKey" FROM "aa" WHERE "aa"."aaKey" = 3 OR "aa"."bbKey" = (' +
+          'SELECT MAX("bb"."bbKey") FROM "bb" ' +
+          'WHERE "bb"."bbKey" = "aa"."bbKey" AND "bb"."ok" = true) ' +
+          'ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 0 }, { aaKey: 3 }]);
+    expect(
+      run(
+        'SELECT "aa"."aaKey", EXISTS (' +
+          'SELECT 1 FROM "bb" WHERE "bb"."bbKey" = "aa"."bbKey" AND "bb"."ok" = true' +
+          ') AS "allowed" FROM "aa" ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([
+      { aaKey: 0, allowed: true },
+      { aaKey: 2, allowed: false },
+      { aaKey: 3, allowed: true },
+      { aaKey: 4, allowed: false },
+    ]);
+  });
+
+  it("optimizes correlations inside an otherwise uncorrelated subquery", () => {
+    expect(
+      run(
+        'SELECT "aa"."aaKey" FROM "aa" WHERE "aa"."bbKey" IN (' +
+          'SELECT "cc"."bbKey" FROM "cc" WHERE EXISTS (' +
+          'SELECT 1 FROM "bb" WHERE "bb"."bbKey" = "cc"."bbKey" AND "bb"."ok" = true)) ' +
+          'ORDER BY "aa"."aaKey"',
+      ),
+    ).toEqual([{ aaKey: 0 }]);
+  });
+
   it("supports the multi-key all-access OR EXISTS auth-scope shape", () => {
     const plan = compileQuery(
       "SELECT p.id FROM scope_parents p WHERE p.all_access = true OR EXISTS (" +
@@ -414,12 +675,13 @@ describe("correlated subquery decorrelation", () => {
     ]);
   });
 
-  it("rejects a correlated scalar subquery without an aggregate", () => {
-    expect(() =>
-      compileQuery(
-        "SELECT r.region FROM rows r WHERE r.amount = (SELECT q.amount FROM rows q WHERE q.region = r.region)",
+  it("accepts a single-row correlated scalar subquery without an aggregate", () => {
+    expect(
+      run(
+        "SELECT r.region FROM rows r WHERE r.amount = " +
+          "(SELECT q.amount FROM rows q WHERE q.region = r.region ORDER BY q.amount DESC LIMIT 1)",
       ),
-    ).toThrow("exactly one aggregate");
+    ).toEqual([{ region: "west" }, { region: "east" }]);
   });
 
   it("leaves uncorrelated subqueries on the existing resolution path", () => {

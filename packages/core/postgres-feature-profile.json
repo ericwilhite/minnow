@@ -130,6 +130,11 @@
       "reason": "Minnow returns JSON text; PostgreSQL returns a native JSON value, and member order is unspecified without aggregate-local ORDER BY."
     },
     {
+      "id": "subquery.correlated-json-aggregate",
+      "classification": "different",
+      "reason": "Both engines accept the correlated JSON aggregate and agree on its JSON value, but Minnow returns JSON text while PostgreSQL returns a native JSON value."
+    },
+    {
       "id": "type.exact-numeric",
       "classification": "different",
       "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings; PGlite's default decoder returns this NUMERIC value as a number."

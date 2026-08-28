@@ -265,14 +265,15 @@ describe("vector query execution", () => {
     prepared.close();
   });
 
-  it("spills JSON_ARRAYAGG groups without dropping values or SQL nulls", async () => {
+  it("spills ordered JSON_ARRAYAGG groups without dropping values or SQL nulls", async () => {
     const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, id) => ({
       bucket: id % 400,
       value: id % 17 === 0 ? null : id,
     }));
     const tables = new Map([["rows", rows]]);
     const plan = compileQuery(
-      "SELECT bucket, JSON_ARRAYAGG(value) AS values FROM rows GROUP BY bucket ORDER BY bucket",
+      "SELECT bucket, JSON_ARRAYAGG(value ORDER BY value DESC) AS values " +
+        "FROM rows GROUP BY bucket ORDER BY bucket",
     );
     const prepared = createPreparedQuery(plan, tables, {
       // JSON results retain a short internal domain tag until the public result boundary.

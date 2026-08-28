@@ -1178,6 +1178,9 @@ describe("SQL/JSON", () => {
     expect(value("SELECT JSON_ARRAYAGG(DISTINCT region) AS v FROM rows")).toBe(
       '["west","east",null]',
     );
+    expect(value("SELECT JSON_ARRAYAGG(region ORDER BY amount) AS v FROM rows")).toBe(
+      '["east","west",null,"west"]',
+    );
     expect(value("SELECT JSON_ARRAYAGG(region) AS v FROM rows WHERE amount < 0")).toBeNull();
     expect(
       run(
@@ -1196,7 +1199,7 @@ describe("SQL/JSON", () => {
     ).toBe('[{"amount":10},{"amount":6}]');
   });
 
-  it("rejects JSON_ARRAYAGG extensions that are not implemented", () => {
+  it("rejects remaining JSON_ARRAYAGG extensions that are not implemented", () => {
     expect(() => compileQuery("SELECT JSON_ARRAYAGG(*) FROM rows")).toThrow(
       "requires a scalar value expression",
     );

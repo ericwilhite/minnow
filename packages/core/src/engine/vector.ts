@@ -1535,8 +1535,11 @@ function bindExpression(
         ? { source: argument.source, vector: argument.vector }
         : undefined;
     const rawNumber =
-      expression.name !== "JSON_ARRAYAGG" &&
-      expression.name !== "STRING_AGG" &&
+      (expression.name === "COUNT" ||
+        expression.name === "SUM" ||
+        expression.name === "AVG" ||
+        expression.name === "MIN" ||
+        expression.name === "MAX") &&
       argument.kind === "column" &&
       argument.vector.kind === "number"
         ? { source: argument.source, vector: argument.vector }
@@ -2340,6 +2343,15 @@ async function executeBoundPlanWithHashSpill(
                   spillRow[`a${String(index)}`] = JSON.stringify([
                     raw,
                     evaluateBatchExpression(plan, delimiter, batch, row),
+                    (spec.orderBy ?? []).map((order) =>
+                      encodeSpillValue(
+                        asQueryValue(evaluateBatchExpression(plan, order.expression, batch, row)),
+                      ),
+                    ),
+                  ]);
+                } else if (spec.name === "JSON_ARRAYAGG" && (spec.orderBy?.length ?? 0) > 0) {
+                  spillRow[`a${String(index)}`] = JSON.stringify([
+                    encodeSpillValue(asQueryValue(raw ?? null)),
                     (spec.orderBy ?? []).map((order) =>
                       encodeSpillValue(
                         asQueryValue(evaluateBatchExpression(plan, order.expression, batch, row)),
@@ -4964,6 +4976,24 @@ function updateAggregatesFromValues(
         decoded[1],
         encodedOrder.map(decodeSpillValue),
       );
+    } else if (
+      spec.name === "JSON_ARRAYAGG" &&
+      (spec.orderBy?.length ?? 0) > 0 &&
+      typeof value === "string"
+    ) {
+      const decoded: unknown = JSON.parse(value);
+      if (!Array.isArray(decoded) || decoded.length !== 2 || !Array.isArray(decoded[1])) {
+        throw new Error("Spilled JSON_ARRAYAGG input is invalid");
+      }
+      applyAggregateValue(
+        spec,
+        state,
+        index,
+        decodeSpillValue(decoded[0]),
+        memory,
+        undefined,
+        decoded[1].map(decodeSpillValue),
+      );
     } else {
       applyAggregateValue(spec, state, index, value, memory);
     }
@@ -4979,6 +5009,21 @@ function applyAggregateValue(
   delimiter?: unknown,
   orderValues: readonly QueryValue[] = [],
 ): void {
+  if (spec.name === "MINNOW_SINGLE_VALUE") {
+    const count = (state.counts[index] ?? 0) + 1;
+    state.counts[index] = count;
+    if (count > 1) {
+      throw new TypeError(`A scalar subquery returned ${String(count)} rows`);
+    }
+    replaceAggregateValue(
+      state,
+      index,
+      asQueryValue(value ?? null),
+      "Scalar subquery value",
+      memory,
+    );
+    return;
+  }
   if (spec.name === "JSON_ARRAYAGG") {
     const member = asQueryValue(value ?? null);
     if (spec.distinct === true && !firstOfItsKind(state, index, member, memory)) return;
@@ -4989,9 +5034,20 @@ function applyAggregateValue(
       list = [];
       lists[index] = list;
     }
-    list.push(member);
+    const retained =
+      (spec.orderBy?.length ?? 0) === 0
+        ? member
+        : JSON.stringify([
+            encodeSpillValue(member),
+            orderValues.map((orderValue) => encodeSpillValue(orderValue)),
+          ]);
+    list.push(retained);
     memory.tally(
-      safeMemorySum(QUERY_REFERENCE_BYTES, queryValuePayloadBytes(member), "JSON_ARRAYAGG member"),
+      safeMemorySum(
+        QUERY_REFERENCE_BYTES,
+        queryValuePayloadBytes(retained),
+        "JSON_ARRAYAGG member",
+      ),
       "JSON_ARRAYAGG member",
     );
     return;
@@ -5154,10 +5210,38 @@ function evaluateFinalExpression(
   if (expression.name === "COUNT") return count;
   if (count === 0) return null;
   if (expression.name === "JSON_ARRAYAGG") {
+    const retained =
+      required(group.lists, "JSON aggregate list state is missing")[aggregateIndex] ?? [];
+    const orderBy = plan.aggregates[aggregateIndex]?.orderBy ?? [];
+    const members = retained.map((encoded) => {
+      if (orderBy.length === 0) return { value: encoded, order: [] as QueryValue[] };
+      if (typeof encoded !== "string") throw new Error("JSON_ARRAYAGG member is invalid");
+      const pair: unknown = JSON.parse(encoded);
+      if (!Array.isArray(pair) || pair.length !== 2 || !Array.isArray(pair[1])) {
+        throw new Error("JSON_ARRAYAGG member is invalid");
+      }
+      return {
+        value: decodeSpillValue(pair[0]),
+        order: pair[1].map(decodeSpillValue),
+      };
+    });
+    if (orderBy.length > 0) {
+      members.sort((left, right) => {
+        for (const [index, order] of orderBy.entries()) {
+          const a = left.order[index];
+          const b = right.order[index];
+          const placed = nullOrder(a, b, order.nulls, order.direction);
+          if (placed !== undefined && placed !== 0) return placed;
+          const compared = compareValues(a, b);
+          if (compared !== 0) return order.direction === "desc" ? -compared : compared;
+        }
+        return 0;
+      });
+    }
     return preservedJsonDomainValue(
       jsonConstructor(
         "JSON_ARRAY",
-        required(group.lists, "JSON aggregate list state is missing")[aggregateIndex] ?? [],
+        members.map(({ value }) => value),
       ),
     );
   }

@@ -39,6 +39,7 @@ rules behind this table.
 | `@minnowdb/core/postgres-feature-profile.json`   | Metadata    | PostgreSQL compatibility classifications                        |
 | `@minnowdb/core/package.json`                    | Metadata    | Package identity and export metadata                            |
 | `@minnowdb/kysely`                               | Application | Optional Kysely dialect using its PostgreSQL compiler           |
+| `@minnowdb/kysely/helpers`                       | Application | Typed Minnow-native nested JSON projection helpers              |
 | `@minnowdb/react`                                | Application | React external-store hook for typed live queries                |
 | `@minnowdb/export`                               | Application | Backpressure-aware CSV and NDJSON query streams                 |
 | `@minnowdb/devtools`                             | Application | Embeddable database console and data browser                    |
@@ -230,6 +231,7 @@ The optional Kysely dialect. Installed separately with Kysely itself; see
 | Export                                                     | Description                                                                                                              |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `createKysely({ driver, schema, resultDecoding? })`        | Creates an inferred Kysely DB; decoding can convert NUMERIC to number and parse JSON/JSONB results.                      |
+| `jsonBuildObject / jsonArrayFrom / jsonObjectFrom`         | Fully typed JSON object and correlated row projections; also exported from `@minnowdb/kysely/helpers`.                   |
 | `search.match(eb, columns, query)` / `search.rank(…)`      | Type-safe, parameterized `MATCH` predicate and numeric `BM25` ranking expression; columns must be visible and non-empty. |
 | `createKyselyLiveQueries({ driver, ...options })`          | Callable typed live wrapper; supports `query.$call(live)`, `changes(query, { key })`, and ordered bounded `window()`.    |
 | `InferKyselyDatabase / InferKyselyTable / InferKyselyView` | Converts schema metadata to Kysely select, insert, update, and operand types.                                            |

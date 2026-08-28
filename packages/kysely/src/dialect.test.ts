@@ -1,4 +1,15 @@
-import { Kysely, sql, type Insertable, type Selectable, type Updateable } from "kysely";
+import {
+  ColumnNode,
+  Kysely,
+  SelectQueryNode,
+  SelectionNode,
+  TableNode,
+  sql,
+  type Expression,
+  type Insertable,
+  type Selectable,
+  type Updateable,
+} from "kysely";
 import { Migrator, type MigrationProvider } from "kysely/migration";
 import { beforeEach, describe, expect, expectTypeOf, it } from "vitest";
 import {
@@ -14,6 +25,7 @@ import type { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { MinnowDialect } from "./dialect.js";
 import { createKysely } from "./create-kysely.js";
+import { jsonArrayFrom, jsonBuildObject, jsonObjectFrom } from "./helpers.js";
 import type { InferKyselyDatabase, MinnowJsonValue } from "./schema.js";
 
 interface PersonTable {
@@ -80,6 +92,36 @@ const generatedSchema = schema([
     id: column.integer().unique(),
     source: column.string(),
     derived: column.string().generatedSql("upper(source)"),
+  }),
+]);
+
+const correlatedSchema = schema([
+  table("aa", {
+    aaKey: column.integer().unique(),
+    bbKey: column.integer(),
+  }),
+  table("bb", {
+    bbKey: column.integer().unique(),
+    ok: column.boolean(),
+  }),
+  table("cc", {
+    ccKey: column.integer().unique(),
+    bbKey: column.integer(),
+  }),
+  table("widgets", {
+    widgetKey: column.integer().unique(),
+  }),
+  table("keptKeys", {
+    keptKey: column.integer().unique(),
+  }),
+  table("owners", {
+    ownerKey: column.integer().unique(),
+    name: column.string(),
+  }),
+  table("pets", {
+    petKey: column.integer().unique(),
+    ownerKey: column.integer(),
+    petName: column.string(),
   }),
 ]);
 
@@ -224,6 +266,300 @@ function inferredMinnowFunctions(db: Kysely<FunctionDatabase>): void {
   void query;
   void explicit;
 }
+
+describe("typed correlated subqueries", () => {
+  it("compiles and executes nested EXISTS and DELETE subquery predicates", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(correlatedSchema);
+    const db = createKysely({ driver: database, schema: correlatedSchema });
+
+    await db
+      .insertInto("aa")
+      .values([
+        { aaKey: 1, bbKey: 10 },
+        { aaKey: 2, bbKey: 20 },
+      ])
+      .execute();
+    await db
+      .insertInto("bb")
+      .values([
+        { bbKey: 10, ok: true },
+        { bbKey: 20, ok: false },
+      ])
+      .execute();
+    await db.insertInto("cc").values({ ccKey: 100, bbKey: 10 }).execute();
+
+    const nestedExists = db
+      .selectFrom("aa")
+      .select("aa.aaKey")
+      .where((outer) =>
+        outer.or([
+          outer("aa.aaKey", "=", 0),
+          outer.exists(
+            outer
+              .selectFrom("bb")
+              .select("bb.bbKey")
+              .whereRef("bb.bbKey", "=", "aa.bbKey")
+              .where("bb.ok", "=", true),
+          ),
+          outer.exists(
+            outer
+              .selectFrom("cc")
+              .select("cc.ccKey")
+              .whereRef("cc.bbKey", "=", "aa.bbKey")
+              .where((middle) =>
+                middle.exists(
+                  middle
+                    .selectFrom("bb")
+                    .select("bb.bbKey")
+                    .whereRef("bb.bbKey", "=", "cc.bbKey")
+                    .where("bb.ok", "=", true),
+                ),
+              ),
+          ),
+        ]),
+      );
+    expectTypeOf<Awaited<ReturnType<typeof nestedExists.execute>>>().toEqualTypeOf<
+      Array<{ aaKey: number }>
+    >();
+    expect(nestedExists.compile()).toMatchObject({
+      sql: 'select "aa"."aaKey" from "aa" where ("aa"."aaKey" = $1 or exists (select "bb"."bbKey" from "bb" where "bb"."bbKey" = "aa"."bbKey" and "bb"."ok" = $2) or exists (select "cc"."ccKey" from "cc" where "cc"."bbKey" = "aa"."bbKey" and exists (select "bb"."bbKey" from "bb" where "bb"."bbKey" = "cc"."bbKey" and "bb"."ok" = $3)))',
+      parameters: [0, true, true],
+    });
+    expect(await nestedExists.execute()).toEqual([{ aaKey: 1 }]);
+
+    const nestedNotIn = db
+      .selectFrom("aa")
+      .select("aa.aaKey")
+      .where((outer) =>
+        outer.or([
+          outer("aa.aaKey", "=", 1),
+          outer(
+            "aa.bbKey",
+            "not in",
+            outer
+              .selectFrom("bb")
+              .select("bb.bbKey")
+              .whereRef("bb.bbKey", "=", "aa.bbKey")
+              .where("bb.ok", "=", true),
+          ),
+        ]),
+      );
+    expectTypeOf<Awaited<ReturnType<typeof nestedNotIn.execute>>>().toEqualTypeOf<
+      Array<{ aaKey: number }>
+    >();
+    expect(await nestedNotIn.execute()).toEqual([{ aaKey: 1 }, { aaKey: 2 }]);
+
+    const nestedAny = db
+      .selectFrom("aa")
+      .select("aa.aaKey")
+      .where((outer) =>
+        outer.or([
+          outer("aa.aaKey", "=", 2),
+          outer(
+            "aa.bbKey",
+            "=",
+            outer.fn.any(
+              outer
+                .selectFrom("bb")
+                .select("bb.bbKey")
+                .whereRef("bb.bbKey", "=", "aa.bbKey")
+                .where("bb.ok", "=", true),
+            ),
+          ),
+        ]),
+      );
+    expectTypeOf<Awaited<ReturnType<typeof nestedAny.execute>>>().toEqualTypeOf<
+      Array<{ aaKey: number }>
+    >();
+    expect(await nestedAny.execute()).toEqual([{ aaKey: 1 }, { aaKey: 2 }]);
+
+    await db
+      .insertInto("widgets")
+      .values([{ widgetKey: 1 }, { widgetKey: 2 }])
+      .execute();
+    await db.insertInto("keptKeys").values({ keptKey: 1 }).execute();
+
+    const notIn = db
+      .deleteFrom("widgets")
+      .where("widgets.widgetKey", "not in", db.selectFrom("keptKeys").select("keptKey"))
+      .returning("widgets.widgetKey");
+    expectTypeOf<Awaited<ReturnType<typeof notIn.execute>>>().toEqualTypeOf<
+      Array<{ widgetKey: number }>
+    >();
+    expect(notIn.compile()).toMatchObject({
+      sql: 'delete from "widgets" where "widgets"."widgetKey" not in (select "keptKey" from "keptKeys") returning "widgets"."widgetKey"',
+      parameters: [],
+    });
+    expect(await notIn.execute()).toEqual([{ widgetKey: 2 }]);
+
+    await db.insertInto("widgets").values({ widgetKey: 2 }).execute();
+    const notExists = db
+      .deleteFrom("widgets")
+      .where((outer) =>
+        outer.not(
+          outer.exists(
+            outer
+              .selectFrom("keptKeys")
+              .select("keptKeys.keptKey")
+              .whereRef("keptKeys.keptKey", "=", "widgets.widgetKey"),
+          ),
+        ),
+      )
+      .returning("widgets.widgetKey");
+    expectTypeOf<Awaited<ReturnType<typeof notExists.execute>>>().toEqualTypeOf<
+      Array<{ widgetKey: number }>
+    >();
+    expect(await notExists.execute()).toEqual([{ widgetKey: 2 }]);
+
+    await db.destroy();
+    store.close();
+  });
+});
+
+describe("JSON projection helpers", () => {
+  it("builds fully typed objects, arrays, and nullable objects with per-parent ordering", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(correlatedSchema);
+    const db = createKysely({
+      driver: database,
+      schema: correlatedSchema,
+      resultDecoding: { json: "parse" },
+    });
+
+    await db
+      .insertInto("owners")
+      .values([
+        { ownerKey: 1, name: "Alice" },
+        { ownerKey: 2, name: "Bob" },
+        { ownerKey: 3, name: "Cara" },
+      ])
+      .execute();
+    await db
+      .insertInto("pets")
+      .values([
+        { petKey: 10, ownerKey: 1, petName: "Rex" },
+        { petKey: 11, ownerKey: 1, petName: "Milo" },
+        { petKey: 12, ownerKey: 2, petName: "Zed" },
+      ])
+      .execute();
+
+    const projected = db
+      .selectFrom("owners")
+      .select((outer) => [
+        "owners.ownerKey",
+        jsonBuildObject({
+          id: outer.ref("owners.ownerKey"),
+          name: outer.ref("owners.name"),
+        }).as("owner"),
+        jsonArrayFrom(
+          outer
+            .selectFrom("pets")
+            .select((pet) => [
+              "pets.petKey as pet_id",
+              jsonBuildObject({ name: pet.ref("pets.petName") }).as("profile"),
+            ])
+            .whereRef("pets.ownerKey", "=", "owners.ownerKey")
+            .orderBy("pets.petName")
+            .limit(2),
+        ).as("pets"),
+        jsonArrayFrom(
+          outer
+            .selectFrom("pets")
+            .select("pets.petName")
+            .whereRef("pets.ownerKey", "=", "owners.ownerKey")
+            .orderBy("pets.petName"),
+        ).as("pet_names"),
+        jsonObjectFrom(
+          outer
+            .selectFrom("pets")
+            .select(["pets.petKey as pet_id", "pets.petName as name"])
+            .whereRef("pets.ownerKey", "=", "owners.ownerKey")
+            .orderBy("pets.petName")
+            .limit(1),
+        ).as("first_pet"),
+      ])
+      .orderBy("owners.ownerKey");
+
+    expectTypeOf<Awaited<ReturnType<typeof projected.execute>>>().toEqualTypeOf<
+      Array<{
+        ownerKey: number;
+        owner: { id: number; name: string };
+        pets: Array<{ pet_id: number; profile: { name: string } }>;
+        pet_names: Array<{ petName: string }>;
+        first_pet: { pet_id: number; name: string } | null;
+      }>
+    >();
+    const compiled = projected.compile();
+    expect(compiled.sql).toContain("JSON_OBJECT(");
+    expect(compiled.sql).toContain("JSON_ARRAYAGG(");
+    expect(compiled.sql).not.toContain("json_build_object");
+    expect(compiled.sql).not.toContain("json_agg");
+    expect(await projected.execute()).toEqual([
+      {
+        ownerKey: 1,
+        owner: { id: 1, name: "Alice" },
+        pets: [
+          { pet_id: 11, profile: { name: "Milo" } },
+          { pet_id: 10, profile: { name: "Rex" } },
+        ],
+        pet_names: [{ petName: "Milo" }, { petName: "Rex" }],
+        first_pet: { pet_id: 11, name: "Milo" },
+      },
+      {
+        ownerKey: 2,
+        owner: { id: 2, name: "Bob" },
+        pets: [{ pet_id: 12, profile: { name: "Zed" } }],
+        pet_names: [{ petName: "Zed" }],
+        first_pet: { pet_id: 12, name: "Zed" },
+      },
+      {
+        ownerKey: 3,
+        owner: { id: 3, name: "Cara" },
+        pets: [],
+        pet_names: [],
+        first_pet: null,
+      },
+    ]);
+
+    await db.destroy();
+    store.close();
+  });
+
+  it("requires explicit output names for row-to-object helpers", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(correlatedSchema);
+    const db = createKysely({ driver: database, schema: correlatedSchema });
+
+    expect(() =>
+      db
+        .selectFrom("owners")
+        .select((outer) => jsonArrayFrom(outer.selectFrom("pets").selectAll()).as("pets")),
+    ).toThrow("require explicit selections; selectAll() is not supported");
+    expect(() => jsonArrayFrom(sql<number>`1`)).toThrow("require a select query");
+    expect(() =>
+      jsonBuildObject({ missing: undefined } as unknown as Record<string, Expression<unknown>>),
+    ).toThrow("Missing JSON object expression: missing");
+
+    const columnSelection: Expression<{ petName: string }> = {
+      get expressionType() {
+        return undefined;
+      },
+      toOperationNode: () =>
+        SelectQueryNode.cloneWithSelections(
+          SelectQueryNode.createFrom([TableNode.create("pets")]),
+          [SelectionNode.create(ColumnNode.create("petName"))],
+        ),
+    };
+    expect(jsonObjectFrom(columnSelection).toOperationNode().kind).toBe("RawNode");
+
+    await db.destroy();
+    store.close();
+  });
+});
 
 describe("schema-derived Kysely types", () => {
   it("derives select, insert, and update shapes without a second DB interface", () => {

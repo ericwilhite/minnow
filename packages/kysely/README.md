@@ -62,6 +62,12 @@ PostgreSQL schemas, configurable isolation levels, roles, or grants. The adapter
 and BM25 SQL with checked, non-empty column lists, a bound query parameter, and an inferred numeric
 rank.
 
+`jsonBuildObject`, `jsonArrayFrom`, and `jsonObjectFrom` provide fully typed nested JSON
+projections using Minnow's native SQL. Import them from `@minnowdb/kysely/helpers` and enable
+`resultDecoding: { json: "parse" }`; row-to-object subqueries use explicit named selections.
+Nested correlated predicates and mutation subqueries compile through Kysely normally and use the
+same depth-independent planner as direct SQL.
+
 Full guide: [minnowdb.com/docs/adapters/kysely](https://minnowdb.com/docs/adapters/kysely/).
 
 ## License

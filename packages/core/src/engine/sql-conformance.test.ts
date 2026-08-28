@@ -1261,6 +1261,14 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
         "SQLite spells it JSON_GROUP_ARRAY; PGlite returns a native JSON array while Minnow intentionally returns JSON text, and member order is unspecified without aggregate-local ORDER BY",
     },
   ],
+  [
+    "subquery.correlated-json-aggregate",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite lacks the SQL-standard JSON constructor spelling; PGlite returns native JSON while Minnow intentionally returns JSON text",
+    },
+  ],
   // --- SQL/JSON --------------------------------------------------------------------------
   ["json.value", { oracles: ["sqlite"], reason: "SQLite spells it json_extract" }],
   [

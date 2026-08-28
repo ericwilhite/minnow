@@ -52,7 +52,10 @@ DELETE FROM orders WHERE placed_at < $1
 ```
 
 Any `WHERE` clause works. Minnow finds the matching rows and records the change. `SET` expressions
-can read the row's current values, as `total - $1` does above.
+can read the row's current values, as `total - $1` does above. Subquery predicates use the same
+resolution and decorrelation pipeline as `SELECT`, including `IN (SELECT ...)`, `NOT IN (SELECT
+...)`, and correlated `EXISTS` / `NOT EXISTS`. A mutation that still contains a materialized
+subquery takes the general selection executor instead of the streamed key-only path.
 
 <Callout title="The table needs a unique key">
   `UPDATE` and `DELETE` are rejected on a table with no `PRIMARY KEY`:
@@ -131,6 +134,9 @@ UPDATE products SET list_price = list_price * 1.05
 WHERE product_id = $1
 RETURNING product_id, name, list_price
 ```
+
+The target qualifier is optional for columns and `*`, so PostgreSQL-builder output such as
+`RETURNING products.product_id` and `RETURNING products.*` is equivalent.
 
 ```ts
 const result = await db.execute(sql, [productId]);

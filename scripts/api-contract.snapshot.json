@@ -285,7 +285,7 @@
               "name": "CompiledQuery",
               "kind": "type",
               "declarations": [
-                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
+                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
               ]
             },
             {
@@ -1738,7 +1738,7 @@
               "name": "AggregateName",
               "kind": "type",
               "declarations": [
-                "export type AggregateName = \"COUNT\" | \"SUM\" | \"AVG\" | \"MIN\" | \"MAX\" | \"JSON_ARRAYAGG\" | \"STRING_AGG\";"
+                "export type AggregateName = \"COUNT\" | \"SUM\" | \"AVG\" | \"MIN\" | \"MAX\" | \"JSON_ARRAYAGG\" | \"STRING_AGG\" | \"MINNOW_SINGLE_VALUE\";"
               ]
             },
             {
@@ -1752,7 +1752,7 @@
               "name": "CompiledQuery",
               "kind": "type",
               "declarations": [
-                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
+                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
               ]
             },
             {
@@ -1926,7 +1926,7 @@
               "name": "CompiledQuery",
               "kind": "type",
               "declarations": [
-                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
+                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
               ]
             },
             {
@@ -8341,6 +8341,27 @@
               ]
             },
             {
+              "name": "jsonArrayFrom",
+              "kind": "value",
+              "declarations": [
+                "export declare function jsonArrayFrom<O>(expression: Expression<O>): RawBuilder<Array<Simplify<ShallowDehydrateObject<O>>>>;"
+              ]
+            },
+            {
+              "name": "jsonBuildObject",
+              "kind": "value",
+              "declarations": [
+                "export declare function jsonBuildObject<O extends Record<string, Expression<unknown>>>(object: O): RawBuilder<Simplify<{\n    [K in keyof O]: O[K] extends Expression<infer V> ? ShallowDehydrateValue<V> : never;\n}>>;"
+              ]
+            },
+            {
+              "name": "jsonObjectFrom",
+              "kind": "value",
+              "declarations": [
+                "export declare function jsonObjectFrom<O>(expression: Expression<O>): RawBuilder<Simplify<ShallowDehydrateObject<O>> | null>;"
+              ]
+            },
+            {
               "name": "KyselyLiveQueries",
               "kind": "type",
               "declarations": [
@@ -8450,6 +8471,33 @@
               "kind": "value",
               "declarations": [
                 "search: {\n    readonly match: typeof match;\n    readonly rank: typeof rank;\n}"
+              ]
+            }
+          ]
+        },
+        {
+          "subpath": "./helpers",
+          "audience": "application",
+          "exports": [
+            {
+              "name": "jsonArrayFrom",
+              "kind": "value",
+              "declarations": [
+                "export declare function jsonArrayFrom<O>(expression: Expression<O>): RawBuilder<Array<Simplify<ShallowDehydrateObject<O>>>>;"
+              ]
+            },
+            {
+              "name": "jsonBuildObject",
+              "kind": "value",
+              "declarations": [
+                "export declare function jsonBuildObject<O extends Record<string, Expression<unknown>>>(object: O): RawBuilder<Simplify<{\n    [K in keyof O]: O[K] extends Expression<infer V> ? ShallowDehydrateValue<V> : never;\n}>>;"
+              ]
+            },
+            {
+              "name": "jsonObjectFrom",
+              "kind": "value",
+              "declarations": [
+                "export declare function jsonObjectFrom<O>(expression: Expression<O>): RawBuilder<Simplify<ShallowDehydrateObject<O>> | null>;"
               ]
             }
           ]
