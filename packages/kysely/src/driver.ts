@@ -149,6 +149,45 @@ function savepointCommand(command: string, savepointName: string): RawNode {
 }
 
 /**
+ * One acquisition of the driver's single logical connection. Kysely hands this exact object back
+ * to `releaseConnection` and the transaction hooks, so each hold can release itself exactly once:
+ * `beginTransaction` frees a hold it is about to strand (Kysely's controlled-transaction builder
+ * has no catch around BEGIN, so a thrown begin would otherwise leave the FIFO mutex held
+ * forever), and the later `releaseConnection` from a callback transaction's `finally` finds the
+ * hold already empty instead of freeing a successor's.
+ */
+class MinnowAcquiredConnection implements DatabaseConnection {
+  readonly #inner: MinnowKyselyConnection;
+  #release: (() => void) | undefined;
+
+  constructor(inner: MinnowKyselyConnection, release: () => void) {
+    this.#inner = inner;
+    this.#release = release;
+  }
+
+  executeQuery<R>(
+    compiledQuery: CompiledQuery,
+    options?: AbortableOperationOptions,
+  ): Promise<QueryResult<R>> {
+    return this.#inner.executeQuery(compiledQuery, options);
+  }
+
+  streamQuery<R>(
+    compiledQuery: CompiledQuery,
+    chunkSize: number,
+    options?: AbortableOperationOptions,
+  ): AsyncIterableIterator<QueryResult<R>> {
+    return this.#inner.streamQuery(compiledQuery, chunkSize, options);
+  }
+
+  release(): void {
+    const release = this.#release;
+    this.#release = undefined;
+    release?.();
+  }
+}
+
+/**
  * Kysely's single logical connection over a Minnow SQL driver.
  *
  * The engine binds an open SQL transaction to the database instance, so a statement that ran
@@ -162,9 +201,8 @@ function savepointCommand(command: string, savepointName: string): RawNode {
  */
 export class MinnowKyselyDriver implements Driver {
   readonly #driver: MinnowSqlDriver;
-  readonly #connection: DatabaseConnection;
+  readonly #connection: MinnowKyselyConnection;
   #queueTail: Promise<void> = Promise.resolve();
-  #releaseHolder: (() => void) | undefined;
 
   constructor(driver: MinnowSqlDriver, resultDecoding: MinnowResultDecoding = {}) {
     this.#driver = driver;
@@ -182,21 +220,33 @@ export class MinnowKyselyDriver implements Driver {
       release = resolve;
     });
     await previous;
-    this.#releaseHolder = release;
-    return this.#connection;
+    return new MinnowAcquiredConnection(this.#connection, release);
   }
 
   async beginTransaction(
     connection: DatabaseConnection,
     settings: TransactionSettings,
   ): Promise<void> {
-    void connection;
+    // A begin that throws strands its connection: `startTransaction()` never releases after a
+    // failed BEGIN, which would wedge the mutex for the life of the Kysely instance. No
+    // transaction opened, so freeing this hold is always sound; the release is one-shot, so the
+    // callback path's own `finally` release stays a no-op rather than freeing a successor.
+    const abandon = (error: unknown): never => {
+      if (connection instanceof MinnowAcquiredConnection) connection.release();
+      throw error;
+    };
     if (settings.accessMode !== undefined || settings.isolationLevel !== undefined) {
-      throw new TypeError(
-        "Minnow has one transaction mode; access mode and isolation settings are not supported",
+      abandon(
+        new TypeError(
+          "Minnow has one transaction mode; access mode and isolation settings are not supported",
+        ),
       );
     }
-    await this.#driver.execute("BEGIN");
+    try {
+      await this.#driver.execute("BEGIN");
+    } catch (error) {
+      abandon(error);
+    }
   }
 
   async commitTransaction(): Promise<void> {
@@ -204,7 +254,23 @@ export class MinnowKyselyDriver implements Driver {
   }
 
   async rollbackTransaction(): Promise<void> {
-    await this.#driver.execute("ROLLBACK");
+    try {
+      await this.#driver.execute("ROLLBACK");
+    } catch (error) {
+      // A failed COMMIT closes the engine transaction, so the documented recovery — catch, then
+      // `trx.rollback()` — meets a transaction that is already gone. That is the state ROLLBACK
+      // exists to reach; treating it as success lets the rollback command release its connection
+      // instead of wedging the instance. The engine's wording is matched by name and message
+      // because a worker client rehydrates the TypeError as a plain Error named "TypeError".
+      if (
+        error instanceof Error &&
+        error.name === "TypeError" &&
+        error.message.includes("ROLLBACK without an open transaction")
+      ) {
+        return;
+      }
+      throw error;
+    }
   }
 
   async savepoint(
@@ -237,10 +303,8 @@ export class MinnowKyselyDriver implements Driver {
     );
   }
 
-  releaseConnection(): Promise<void> {
-    const release = this.#releaseHolder;
-    this.#releaseHolder = undefined;
-    release?.();
+  releaseConnection(connection: DatabaseConnection): Promise<void> {
+    if (connection instanceof MinnowAcquiredConnection) connection.release();
     return Promise.resolve();
   }
 

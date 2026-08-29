@@ -8,6 +8,7 @@ import type {
   ComparisonOperatorExpression,
   ExtractTypeFromReferenceExpression,
   ExtractTypeFromStringReference,
+  KyselyTypeError,
   ReferenceExpression,
   SelectType,
   SqlBool,
@@ -183,44 +184,64 @@ type MinnowFixedScalarFunction =
 type MinnowFixedScalarFunctionSpelling =
   MinnowFixedScalarFunction | Uppercase<MinnowFixedScalarFunction>;
 
+type MinnowArithmeticScalarFunction = "ROUND" | "ABS" | "FLOOR" | "CEIL" | "MOD" | "POWER" | "SQRT";
+
+/**
+ * Whether one argument reference carries a Float64 or integer value. Exact NUMERIC columns cross
+ * the SQL boundary as lossless strings and the engine refuses them in arithmetic scalar
+ * functions, so typing that call `number` would promise a result the engine never produces. The
+ * operand brand decides for schema-derived columns — the select type turns `number` under
+ * result decoding, but the engine still sees the string boundary — and the extracted value type
+ * decides for plain columns and expression arguments.
+ */
+type MinnowArithmeticReady<DB, TB extends keyof DB, RE> =
+  RE extends StringReference<DB, TB>
+    ? [MinnowOperandType<DB, TB, RE>] extends [never]
+      ? [Exclude<ExtractTypeFromReferenceExpression<DB, TB, RE>, null>] extends [number]
+        ? true
+        : false
+      : [Exclude<MinnowOperandType<DB, TB, RE>, null>] extends [number]
+        ? true
+        : false
+    : [Exclude<ExtractTypeFromReferenceExpression<DB, TB, RE>, null>] extends [number]
+      ? true
+      : false;
+
 type MinnowFixedScalarBaseOutput<
   DB,
   TB extends keyof DB,
   TName extends MinnowFixedScalarFunctionSpelling,
   RE,
 > =
-  Uppercase<TName> extends
-    | "ROUND"
-    | "LENGTH"
-    | "ABS"
-    | "FLOOR"
-    | "CEIL"
-    | "MOD"
-    | "POWER"
-    | "SQRT"
-    | "INSTR"
-    | "EXTRACT"
-    | "OCTET_LENGTH"
-    | "GROUPING"
-    | "NEXTVAL"
-    | "CURRVAL"
-    | "RANDOM"
-    ? number
-    : Uppercase<TName> extends "CURRENT_DATE"
-      ? string
-      : Uppercase<TName> extends "CURRENT_TIMESTAMP" | "DATE_TRUNC"
-        ? Date
-        : Uppercase<TName> extends "DATE_ADD"
-          ? Date extends Exclude<ExtractTypeFromReferenceExpression<DB, TB, RE>, null>
-            ? Date
-            : string
-          : Uppercase<TName> extends "JSON_EXISTS"
-            ? SqlBool
-            : Uppercase<TName> extends "JSON_QUERY" | "JSON_OBJECT" | "JSON_ARRAY"
-              ? DecodesJson<DB> extends true
-                ? MinnowJsonValue
-                : string
-              : string;
+  Uppercase<TName> extends MinnowArithmeticScalarFunction
+    ? false extends MinnowArithmeticReady<DB, TB, RE>
+      ? KyselyTypeError<"This arithmetic function needs float or integer arguments; an exact NUMERIC column crosses the SQL boundary as a string. CAST the column to double precision first, or aggregate it with fn.sum/fn.avg.">
+      : number
+    : Uppercase<TName> extends
+          | "LENGTH"
+          | "INSTR"
+          | "EXTRACT"
+          | "OCTET_LENGTH"
+          | "GROUPING"
+          | "NEXTVAL"
+          | "CURRVAL"
+          | "RANDOM"
+      ? number
+      : Uppercase<TName> extends "CURRENT_DATE"
+        ? string
+        : Uppercase<TName> extends "CURRENT_TIMESTAMP" | "DATE_TRUNC"
+          ? Date
+          : Uppercase<TName> extends "DATE_ADD"
+            ? Date extends Exclude<ExtractTypeFromReferenceExpression<DB, TB, RE>, null>
+              ? Date
+              : string
+            : Uppercase<TName> extends "JSON_EXISTS"
+              ? SqlBool
+              : Uppercase<TName> extends "JSON_QUERY" | "JSON_OBJECT" | "JSON_ARRAY"
+                ? DecodesJson<DB> extends true
+                  ? MinnowJsonValue
+                  : string
+                : string;
 
 type MinnowAlwaysNonNullScalarFunction =
   | "CURRENT_DATE"

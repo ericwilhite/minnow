@@ -1,9 +1,11 @@
 import {
   ColumnNode,
+  HandleEmptyInListsPlugin,
   Kysely,
   SelectQueryNode,
   SelectionNode,
   TableNode,
+  replaceWithNoncontingentExpression,
   sql,
   type Expression,
   type Insertable,
@@ -1209,5 +1211,117 @@ describe("MinnowDialect", () => {
     expect((await database.query("SELECT COUNT(*) AS count FROM person")).rows).toEqual([
       { count: 0 },
     ]);
+  });
+});
+
+describe("compile-time refusals for unsupported PostgreSQL forms", () => {
+  // Kysely can build forms Minnow's engine refuses with a bare parse error ("Expected eof,
+  // found from"). The compiler knows which builder produced each node, so it refuses these
+  // before execution with the feature named and an alternative offered.
+  interface ProbeDatabase {
+    person: { id: number; name: string; doc: { a: number } | null };
+  }
+  const db = new Kysely<ProbeDatabase>({
+    dialect: new MinnowDialect({ driver: new MinnowDatabase(new MemoryBlockStore()) }),
+  });
+
+  it("names each unsupported query form instead of the engine's parse error", () => {
+    expect(() => db.selectFrom("person").distinctOn("name").selectAll().compile()).toThrow(
+      "Minnow does not support DISTINCT ON",
+    );
+    expect(() => db.selectFrom("person").selectAll().forUpdate().compile()).toThrow(
+      "row-locking clauses",
+    );
+    expect(() =>
+      db.updateTable("person").from("person as source").set({ name: "renamed" }).compile(),
+    ).toThrow("Minnow does not support UPDATE ... FROM");
+    expect(() => db.deleteFrom("person").using("person as source").compile()).toThrow(
+      "Minnow does not support DELETE ... USING",
+    );
+    expect(() =>
+      db
+        .insertInto("person")
+        .values({ id: 1, name: "n", doc: null })
+        .onConflict((conflict) => conflict.constraint("person_pkey").doNothing())
+        .compile(),
+    ).toThrow("Name the unique key's columns");
+    expect(() =>
+      db
+        .selectFrom("person")
+        .select((eb) => eb.ref("doc", "->").key("a").as("a"))
+        .compile(),
+    ).toThrow("Minnow does not support the -> and ->> JSON operators");
+    expect(() => db.selectFrom("person").selectAll().where("id", "in", []).compile()).toThrow(
+      "HandleEmptyInListsPlugin",
+    );
+    expect(() => db.withSchema("main").selectFrom("person").selectAll().compile()).toThrow(
+      "Minnow has no schemas",
+    );
+    expect(() => db.schema.alterTable("person").renameTo("people").compile()).toThrow("RENAME TO");
+    expect(() => db.schema.alterTable("person").renameColumn("name", "title").compile()).toThrow(
+      "RENAME COLUMN",
+    );
+  });
+
+  it("keeps the supported neighbors compiling", () => {
+    expect(() =>
+      db
+        .insertInto("person")
+        .values({ id: 1, name: "n", doc: null })
+        .onConflict((conflict) => conflict.column("id").doNothing())
+        .compile(),
+    ).not.toThrow();
+    expect(() => db.selectFrom("person").distinct().selectAll().compile()).not.toThrow();
+    expect(() =>
+      db.selectFrom("person").selectAll().where("id", "in", [1, 2]).compile(),
+    ).not.toThrow();
+    expect(() => db.schema.alterTable("person").addColumn("extra", "text").compile()).not.toThrow();
+    // Kysely's own remedy for empty lists resolves them before this compiler runs.
+    expect(() =>
+      db
+        .withPlugin(new HandleEmptyInListsPlugin({ strategy: replaceWithNoncontingentExpression }))
+        .selectFrom("person")
+        .selectAll()
+        .where("id", "in", [])
+        .compile(),
+    ).not.toThrow();
+  });
+});
+
+describe("arithmetic scalar functions over exact NUMERIC columns", () => {
+  it("rejects them at the type level instead of promising a number the engine refuses", () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const db = createKysely({ driver: database, schema: functionSchema });
+    const query = db.selectFrom("events").select((eb) => [
+      // A Float64 column stays a number.
+      eb.fn("round", ["amount"]).as("rounded"),
+      // An exact NUMERIC crosses the SQL boundary as a string; the engine refuses ROUND on it,
+      // so the inferred result is the refusal, not an unreachable number.
+      eb.fn("round", ["exact_amount"]).as("rejected"),
+      eb.fn("abs", ["exact_amount"]).as("rejected_abs"),
+      // A CAST to a float target is the documented path back to arithmetic.
+      eb.fn("round", [eb.cast<number>("exact_amount", "double precision")]).as("cast_first"),
+    ]);
+    type Row = Awaited<ReturnType<typeof query.execute>>[number];
+    expectTypeOf<Row["rounded"]>().toEqualTypeOf<number>();
+    expectTypeOf<Row["cast_first"]>().toEqualTypeOf<number>();
+    expectTypeOf<Row["rejected"]>().not.toExtend<number>();
+    expectTypeOf<Row["rejected_abs"]>().not.toExtend<number>();
+
+    // The refusal keys off the operand boundary, so numeric result decoding — which turns the
+    // select type into number while the engine still sees the string boundary — cannot
+    // reintroduce the unsound number.
+    const decoded = createKysely({
+      driver: database,
+      schema: functionSchema,
+      resultDecoding: { numeric: "number" },
+    });
+    const decodedQuery = decoded
+      .selectFrom("events")
+      .select((eb) => [eb.fn("round", ["exact_amount"]).as("rejected")]);
+    type DecodedRow = Awaited<ReturnType<typeof decodedQuery.execute>>[number];
+    expectTypeOf<DecodedRow["rejected"]>().not.toExtend<number>();
+    void query;
+    void decodedQuery;
   });
 });

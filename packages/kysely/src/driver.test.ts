@@ -1,6 +1,6 @@
 import { MinnowDatabase, type MinnowSqlDriver } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
-import { Kysely } from "kysely";
+import { Kysely, sql } from "kysely";
 import { beforeEach, describe, expect, it } from "vitest";
 import { MinnowDialect } from "./dialect.js";
 
@@ -218,6 +218,51 @@ describe("MinnowKyselyDriver", () => {
       await savepoint.releaseSavepoint("staged").execute();
       await trx.rollback().execute();
       expect(await db.selectFrom("person").select("id").execute()).toEqual([{ id: 1 }]);
+    });
+  });
+
+  describe("transaction failure recovery", () => {
+    it("recovers after a controlled transaction's settings are refused", async () => {
+      // Kysely's controlled-transaction builder has no catch around BEGIN, so a begin that
+      // throws while holding the connection would wedge the instance forever. The driver frees
+      // its hold before throwing, and the adapter keeps Kysely's own unreleasable runtime mutex
+      // out of the path by claiming multiple connections.
+      await expect(
+        db.startTransaction().setIsolationLevel("serializable").execute(),
+      ).rejects.toThrow("access mode and isolation settings are not supported");
+      await db.insertInto("person").values({ id: 41, name: "after" }).execute();
+      expect(await db.selectFrom("person").select("id").where("id", "=", 41).execute()).toEqual([
+        { id: 41 },
+      ]);
+    });
+
+    it("recovers after BEGIN itself is refused", async () => {
+      // A raw BEGIN binds an engine transaction to the database while releasing the Kysely
+      // connection, so the controlled BEGIN that follows is refused by the engine.
+      await sql`BEGIN`.execute(db);
+      await expect(db.startTransaction().execute()).rejects.toThrow(
+        "A transaction is already open",
+      );
+      await sql`ROLLBACK`.execute(db);
+      await db.insertInto("person").values({ id: 42, name: "after" }).execute();
+      expect(await db.selectFrom("person").select("id").where("id", "=", 42).execute()).toEqual([
+        { id: 42 },
+      ]);
+    });
+
+    it("treats rolling back an already-closed transaction as success", async () => {
+      // A failed COMMIT closes the engine transaction, so the documented recovery — catch, then
+      // trx.rollback() — meets a transaction that is already gone. Ending the engine transaction
+      // out from under the handle reproduces that state deterministically.
+      const trx = await db.startTransaction().execute();
+      await trx.insertInto("person").values({ id: 43, name: "inside" }).execute();
+      await sql`COMMIT`.execute(trx);
+      await trx.rollback().execute();
+      expect(trx.isRolledBack).toBe(true);
+      // The engine committed before the rollback attempt, and the instance keeps answering.
+      expect(await db.selectFrom("person").select("id").where("id", "=", 43).execute()).toEqual([
+        { id: 43 },
+      ]);
     });
   });
 

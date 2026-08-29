@@ -1749,3 +1749,69 @@ describe("numeric literals", () => {
     expect(value("SELECT +amount AS v FROM rows WHERE id = 3")).toBe(3);
   });
 });
+
+describe("uncorrelated subqueries over logical domains", () => {
+  // T694: an uncorrelated scalar or IN subquery executes separately and is substituted into the
+  // outer plan as literals. Those literals are internal values — a NUMERIC keeps its domain tag,
+  // protected text keeps its wrapper — and must be marked as such: an unmarked literal was
+  // re-protected as user text, which leaked the internal "\u0000minnow-domain:" encoding into
+  // results and made every equality and IN membership against a domain column match nothing.
+  async function domainDatabase(): Promise<MinnowDatabase> {
+    const db = new MinnowDatabase(new MemoryBlockStore());
+    await db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, amount NUMERIC(10,2))");
+    await db.execute("INSERT INTO n (id, amount) VALUES (1, '1.25'), (2, '9.75')");
+    return db;
+  }
+
+  it("returns external values and domain metadata from scalar subqueries", async () => {
+    const db = await domainDatabase();
+    const scalar = await db.query("SELECT (SELECT amount FROM n WHERE id = 1) AS amount");
+    expect(scalar.rows).toEqual([{ amount: "1.25" }]);
+    expect(scalar.columnDomains).toEqual([{ kind: "numeric", precision: 10, scale: 2 }]);
+
+    await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    await db.execute("INSERT INTO t (id, name) VALUES (1, 'n')");
+    const json = await db.query("SELECT (SELECT JSON_OBJECT('name' VALUE name) FROM t) AS doc");
+    expect(json.rows).toEqual([{ doc: '{"name":"n"}' }]);
+    expect(json.columnDomains).toEqual([{ kind: "json" }]);
+    const aggregated = await db.query(
+      "SELECT COALESCE((SELECT JSON_ARRAYAGG(JSON_OBJECT('name' VALUE name)) FROM t), JSON_ARRAY()) AS docs",
+    );
+    expect(aggregated.rows).toEqual([{ docs: '[{"name":"n"}]' }]);
+    await db.close();
+  });
+
+  it("matches domain columns against scalar and IN subquery results", async () => {
+    const db = await domainDatabase();
+    const equal = await db.query(
+      "SELECT id FROM n WHERE amount = (SELECT amount FROM n WHERE id = 1)",
+    );
+    expect(equal.rows).toEqual([{ id: 1 }]);
+    const membership = await db.query(
+      "SELECT id FROM n WHERE amount IN (SELECT amount FROM n WHERE id = 1)",
+    );
+    expect(membership.rows).toEqual([{ id: 1 }]);
+    const ordered = await db.query(
+      "SELECT id FROM n WHERE amount > (SELECT amount FROM n WHERE id = 1)",
+    );
+    expect(ordered.rows).toEqual([{ id: 2 }]);
+
+    await db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, tag UUID)");
+    await db.execute("INSERT INTO w (id, tag) VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')");
+    const uuid = await db.query("SELECT id FROM w WHERE tag = (SELECT tag FROM w WHERE id = 1)");
+    expect(uuid.rows).toEqual([{ id: 1 }]);
+    await db.close();
+  });
+
+  it("round-trips ordinary text that uses the internal namespace", async () => {
+    const db = await domainDatabase();
+    await db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, note TEXT)");
+    const tricky = "\u0000minnow-domain:numeric:looks-internal";
+    await db.execute("INSERT INTO s (id, note) VALUES (1, $1)", [tricky]);
+    const roundTrip = await db.query("SELECT (SELECT note FROM s) AS note");
+    expect(roundTrip.rows).toEqual([{ note: tricky }]);
+    const matched = await db.query("SELECT id FROM s WHERE note = (SELECT note FROM s)");
+    expect(matched.rows).toEqual([{ id: 1 }]);
+    await db.close();
+  });
+});

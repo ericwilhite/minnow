@@ -1732,6 +1732,26 @@ export interface SubqueryResolutionStep {
 }
 
 /**
+ * Wraps one value from an executed subquery block as a substituted literal. Block results are
+ * internal: domain values keep their tags and protected text keeps its wrapper. The literal must
+ * say so — an unmarked string literal is re-protected as user text at evaluation, which both
+ * leaks the internal tag into the outer result and makes equality against internal column
+ * values never match (T694: `WHERE amount = (SELECT amount ...)` on a NUMERIC column returned
+ * no rows). Carrying the block's column domain also keeps the outer result's domain metadata.
+ */
+function substitutedResultLiteral(
+  value: QueryValue | undefined,
+  sqlDomain: SqlDomain | null | undefined,
+): Expression {
+  return {
+    kind: "literal",
+    value: value ?? null,
+    ...(typeof value === "string" ? { internalSqlValue: true as const } : {}),
+    ...(sqlDomain === null || sqlDomain === undefined ? {} : { sqlDomain }),
+  };
+}
+
+/**
  * Clones a plan and returns its subquery sites in post-order: executing each step's block and
  * substituting its result leaves the returned plan free of subquery nodes. A scalar subquery must
  * select one column and return at most one row (empty is NULL); an IN subquery must select one
@@ -1757,10 +1777,12 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
           if (result.rows.length > 1) {
             throw new TypeError(`A scalar subquery returned ${String(result.rows.length)} rows`);
           }
-          replace({
-            kind: "literal",
-            value: result.rows[0]?.[result.columns[0] ?? ""] ?? null,
-          });
+          replace(
+            substitutedResultLiteral(
+              result.rows[0]?.[result.columns[0] ?? ""],
+              result.columnDomains[0],
+            ),
+          );
         },
       });
       return;
@@ -1832,10 +1854,9 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
             }
             expression.right = {
               kind: "list",
-              items: result.rows.map((row) => ({
-                kind: "literal",
-                value: row[result.columns[0] ?? ""] ?? null,
-              })),
+              items: result.rows.map((row) =>
+                substitutedResultLiteral(row[result.columns[0] ?? ""], result.columnDomains[0]),
+              ),
             };
           },
         });
@@ -1878,10 +1899,9 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
             }
             predicate.right = {
               kind: "list",
-              items: result.rows.map((row) => ({
-                kind: "literal",
-                value: row[result.columns[0] ?? ""] ?? null,
-              })),
+              items: result.rows.map((row) =>
+                substitutedResultLiteral(row[result.columns[0] ?? ""], result.columnDomains[0]),
+              ),
             };
           },
         });

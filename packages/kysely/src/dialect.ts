@@ -21,8 +21,13 @@ export interface MinnowDialectConfig {
 }
 
 class MinnowKyselyAdapter extends DialectAdapterBase {
+  // Minnow has one logical connection, but the driver serializes it through its own FIFO mutex.
+  // Claiming a single connection here would add Kysely's RuntimeDriver mutex in front of ours,
+  // and that lock only releases through releaseConnection — a `startTransaction()` whose BEGIN
+  // is refused never calls it, wedging the instance forever. The driver's mutex releases the
+  // hold when BEGIN throws, so it must be the only serializer.
   override get supportsMultipleConnections(): boolean {
-    return false;
+    return true;
   }
 
   override get supportsReturning(): boolean {

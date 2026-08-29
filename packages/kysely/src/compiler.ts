@@ -8,9 +8,18 @@ import {
   PrimitiveValueListNode,
   ValueListNode,
   ValuesNode,
+  type AlterTableNode,
   type CompiledQuery,
+  type DeleteQueryNode,
+  type JSONReferenceNode,
   type QueryId,
+  type OnConflictNode,
   type RootOperationNode,
+  type SchemableIdentifierNode,
+  type SelectModifier,
+  type SelectModifierNode,
+  type SelectQueryNode,
+  type UpdateQueryNode,
   type ValuesItemNode,
 } from "kysely";
 
@@ -89,7 +98,24 @@ function normalizeInsert(
   return normalizeEmptyValues(node, tableName, tables.get(tableName));
 }
 
-/** PostgreSQL SQL compilation with Kysely's empty-object inserts normalized to valid SQL. */
+const LOCKING_MODIFIERS: ReadonlySet<SelectModifier> = new Set([
+  "ForUpdate",
+  "ForNoKeyUpdate",
+  "ForShare",
+  "ForKeyShare",
+  "NoWait",
+  "SkipLocked",
+]);
+
+/**
+ * PostgreSQL SQL compilation with Kysely's empty-object inserts normalized to valid SQL.
+ *
+ * Kysely can build PostgreSQL forms Minnow's engine refuses, and the engine's refusal is a bare
+ * parse error ("Expected eof, found from") with no hint at the unsupported feature. This
+ * compiler knows which builder produced the node, so it refuses those forms before execution
+ * with the feature named and an alternative offered — the same treatment MERGE ... RETURNING
+ * already gets.
+ */
 export class MinnowQueryCompiler extends PostgresQueryCompiler {
   readonly #tables: ReadonlyMap<string, TableMetadata>;
 
@@ -109,5 +135,110 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
       );
     }
     return super.compileQuery(normalizeInsert(node, this.#tables), queryId);
+  }
+
+  protected override visitSelectQuery(node: SelectQueryNode): void {
+    if (node.distinctOn !== undefined) {
+      throw new TypeError(
+        "Minnow does not support DISTINCT ON. Group by the key, or rank rows with a window " +
+          "function and keep the first per key.",
+      );
+    }
+    super.visitSelectQuery(node);
+  }
+
+  protected override visitSelectModifier(node: SelectModifierNode): void {
+    if (node.modifier !== undefined && LOCKING_MODIFIERS.has(node.modifier)) {
+      throw new TypeError(
+        "Minnow does not support row-locking clauses such as FOR UPDATE: the engine has a " +
+          "single writer and snapshot reads, so remove the locking modifier.",
+      );
+    }
+    super.visitSelectModifier(node);
+  }
+
+  protected override visitUpdateQuery(node: UpdateQueryNode): void {
+    if (node.from !== undefined) {
+      throw new TypeError(
+        "Minnow does not support UPDATE ... FROM. Rewrite the update with a correlated " +
+          "subquery or WHERE ... IN (SELECT ...).",
+      );
+    }
+    super.visitUpdateQuery(node);
+  }
+
+  protected override visitDeleteQuery(node: DeleteQueryNode): void {
+    if (node.using !== undefined) {
+      throw new TypeError(
+        "Minnow does not support DELETE ... USING. Rewrite the delete with a correlated " +
+          "subquery or WHERE ... IN (SELECT ...).",
+      );
+    }
+    super.visitDeleteQuery(node);
+  }
+
+  protected override visitOnConflict(node: OnConflictNode): void {
+    if (node.constraint !== undefined || node.indexExpression !== undefined) {
+      throw new TypeError(
+        "Minnow supports ON CONFLICT only with an explicit column target. Name the unique " +
+          "key's columns instead of a constraint or index expression.",
+      );
+    }
+    super.visitOnConflict(node);
+  }
+
+  protected override visitJSONReference(node: JSONReferenceNode): void {
+    void node;
+    throw new TypeError(
+      "Minnow does not support the -> and ->> JSON operators. Use the SQL-standard forms — " +
+        "sql`JSON_VALUE(doc, '$.key')` or sql`JSON_QUERY(doc, '$.key')` — or the " +
+        "jsonArrayFrom/jsonObjectFrom/jsonBuildObject helpers from @minnowdb/kysely/helpers.",
+    );
+  }
+
+  protected override visitValueList(node: ValueListNode): void {
+    this.#refuseEmptyInList(node.values.length);
+    super.visitValueList(node);
+  }
+
+  protected override visitPrimitiveValueList(node: PrimitiveValueListNode): void {
+    this.#refuseEmptyInList(node.values.length);
+    super.visitPrimitiveValueList(node);
+  }
+
+  #refuseEmptyInList(length: number): void {
+    // Insert rows never reach this empty: normalizeInsert rewrites empty value objects first.
+    if (length === 0) {
+      throw new TypeError(
+        "An empty list compiles to IN (), which is not valid SQL. Add Kysely's " +
+          "HandleEmptyInListsPlugin to resolve empty lists before they compile.",
+      );
+    }
+  }
+
+  protected override visitSchemableIdentifier(node: SchemableIdentifierNode): void {
+    if (node.schema !== undefined) {
+      throw new TypeError(
+        "Minnow has no schemas or catalogs. Remove WithSchemaPlugin and schema-qualified " +
+          "names; every table lives in the single default namespace.",
+      );
+    }
+    super.visitSchemableIdentifier(node);
+  }
+
+  protected override visitAlterTable(node: AlterTableNode): void {
+    if (node.renameTo !== undefined) {
+      throw new TypeError(
+        "Minnow does not support ALTER TABLE ... RENAME TO. Create the new table, copy the " +
+          "rows with INSERT ... SELECT, and drop the old one.",
+      );
+    }
+    if (node.columnAlterations?.some((alteration) => alteration.kind === "RenameColumnNode")) {
+      throw new TypeError(
+        "Minnow does not support ALTER TABLE ... RENAME COLUMN. Add the new column, copy the " +
+          "values with UPDATE, and drop the old column.",
+      );
+    }
+    super.visitAlterTable(node);
   }
 }

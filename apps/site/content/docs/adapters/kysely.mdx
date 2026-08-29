@@ -245,7 +245,11 @@ their aggregates infer `number` instead. Use `eb.fn.coalesce(aggregate, eb.val(f
 wants a non-null fallback—the result narrows without a generic. The generic `fn` and `fn.agg`
 entry points also know Minnow's supported fixed-return functions and aggregates, so calls such as
 `eb.fn("round", ...)`, `eb.fn("date_trunc", ...)`, and `eb.fn.agg("count", ...)` infer their
-results. `coalesce`, `nullif`, `greatest`, and `least` infer from their arguments. Nullable scalar
+results. An arithmetic scalar function — `round`, `abs`, `floor`, `ceil`, `mod`, `power`,
+`sqrt` — over an exact `NUMERIC` column is a type error rather than a `number`, because the
+engine refuses string-boundary arguments there; `CAST` the column to `double precision` first,
+or aggregate it with `fn.sum`/`fn.avg`, which keep the lossless string boundary. `coalesce`,
+`nullif`, `greatest`, and `least` infer from their arguments. Nullable scalar
 inputs are carried into the result where the SQL function propagates NULL. `eb.cast(value, target)`
 also needs no output generic for Minnow's supported targets: integer and floating targets infer
 `number`, exact numeric infers the configured string/number boundary, other string-backed logical
@@ -404,8 +408,20 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
   numbers or strings as inputs and return lossless strings by default. JSON/JSONB also return
   strings by default; opt into native number/JSON results with `resultDecoding`. UUID, arrays,
   `DATE`, `TIME`, intervals, and enums cross this adapter as strings.
-- Kysely can generate PostgreSQL features outside Minnow's profile. Check the executable
-  [feature matrix](/docs/sql/feature-matrix); the engine rejects unsupported SQL explicitly.
+- Kysely can generate PostgreSQL features outside Minnow's profile. The adapter's compiler
+  refuses the forms Kysely's builders can produce before execution, naming the feature and an
+  alternative: `DISTINCT ON`, `UPDATE ... FROM`, `DELETE ... USING`, `ON CONFLICT` with a
+  constraint or index-expression target (name the unique key's columns instead), the `->` and
+  `->>` JSON operators (use the SQL-standard `JSON_VALUE` and `JSON_QUERY` forms through
+  Kysely's `sql` tag, or the JSON helpers), row-locking clauses such as `.forUpdate()`,
+  schema-qualified names including
+  `WithSchemaPlugin`, `ALTER TABLE ... RENAME`, and an empty `IN ()` list (add Kysely's
+  `HandleEmptyInListsPlugin`). Anything else outside the profile is rejected explicitly by the
+  engine; check the executable [feature matrix](/docs/sql/feature-matrix).
+- Rejected transaction settings are recoverable: a `startTransaction()` refused for an
+  isolation level or access mode releases its connection, and rolling back a transaction whose
+  engine transaction is already gone — the state a failed `COMMIT` leaves — succeeds instead of
+  wedging the instance.
 
 Kysely reserves the connection during a migration, so one `Kysely` instance cannot race itself.
 That does not coordinate migrations across tabs. For shared application startup, use Minnow's

@@ -8,6 +8,53 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.5 — August 28, 2026
+
+Published packages: `@minnowdb/core@0.6.5` and `@minnowdb/kysely@0.4.4`.
+
+### Fixed
+
+- Uncorrelated scalar and `IN` subqueries over logical-domain columns returned wrong results:
+  `WHERE amount = (SELECT amount ...)` and `WHERE amount IN (SELECT ...)` on `NUMERIC`, `UUID`,
+  JSON, and the other tagged domains matched no rows, and projecting such a subquery leaked the
+  engine's internal domain encoding into result values. The substituted subquery literal now
+  keeps its internal form and its column domain, so comparisons match, projected values are
+  clean, and the result's `columnDomains` metadata reports the domain — which also means the
+  Kysely driver's `resultDecoding` applies to scalar-subquery projections. Correlated
+  subqueries were unaffected.
+- A `startTransaction()` refused for an isolation level or access mode — or whose `BEGIN` the
+  engine refused — permanently wedged the Kysely instance: every later statement queued behind
+  a connection hold that was never released. The driver now frees its hold when a begin fails,
+  the adapter keeps Kysely's own unreleasable runtime mutex out of the path, and rolling back a
+  controlled transaction whose engine transaction already ended — the state a failed `COMMIT`
+  leaves — succeeds instead of wedging.
+
+### Added
+
+- `@minnowdb/kysely` refuses the PostgreSQL forms Kysely's builders can produce but Minnow does
+  not accept — `DISTINCT ON`, `UPDATE ... FROM`, `DELETE ... USING`, constraint-targeted
+  `ON CONFLICT`, `->`/`->>` JSON operators, row-locking clauses, schema-qualified names,
+  `ALTER TABLE ... RENAME`, and empty `IN ()` lists — at compile time with the feature named
+  and an alternative offered, instead of surfacing the engine's bare parse error.
+- `@minnowdb/kysely` types arithmetic scalar functions (`round`, `abs`, `floor`, `ceil`,
+  `mod`, `power`, `sqrt`) over exact `NUMERIC` columns as a compile-time refusal instead of a
+  `number` the engine never produces. The check keys off the SQL parameter boundary, so
+  enabling `resultDecoding: { numeric: "number" }` does not reintroduce the unsound `number`;
+  `CAST` to `double precision` first, or use the `fn.sum`/`fn.avg` aggregates.
+
+### Migration
+
+Nothing to change for correct programs. Statements that silently returned no rows or leaked
+tagged strings now return correct results. Kysely queries using the newly refused forms
+already failed at execution; they now fail at compile time with a clearer error. A
+`fn("round"/"abs"/...)` call over an exact `NUMERIC` column no longer typechecks — it always
+threw at runtime — so cast or aggregate instead.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+layout 5 remain readable and writable without a data migration.
+
 ## 0.6.4 — August 28, 2026
 
 Published packages: `@minnowdb/core@0.6.4`.

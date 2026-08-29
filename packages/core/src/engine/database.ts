@@ -11867,26 +11867,44 @@ export class MinnowDatabase {
       memory.createChild(),
       ftsStats === undefined ? {} : { ftsStats },
     );
+    // The columnar preparation only knows vector kinds, so a plain domain column projects with a
+    // null domain. Catalog-backed inference fills those in — at miss time, because executing the
+    // block registered its nested synthetic sources in typedSchemas — so a substituted scalar or
+    // IN subquery literal carries its domain to the outer result (T694).
+    const withCatalogColumnDomains = (result: QueryResult): QueryResult => {
+      if (!result.columnDomains.includes(null)) return result;
+      try {
+        const inferred = inferResultColumnDomains(block, typedSchemas);
+        result.columnDomains = result.columnDomains.map(
+          (domain, index) => domain ?? inferred[index] ?? null,
+        );
+      } catch {
+        // A shape this schema registry cannot type keeps its expression-level domains.
+      }
+      return result;
+    };
     try {
       if (!allowSpill || memory.usage.budgetBytes === Number.MAX_SAFE_INTEGER) {
         const result = prepared.execute();
         throwIfAborted(signal);
-        return result;
+        return withCatalogColumnDomains(result);
       }
       if (!forceSpill) {
         try {
           const result = prepared.execute();
           throwIfAborted(signal);
-          return result;
+          return withCatalogColumnDomains(result);
         } catch (error) {
           if (!(error instanceof QueryMemoryBudgetError)) throw error;
         }
       }
-      return await prepared.executeAsync({
-        spillStore: this.#leasedSpillStore(),
-        ...(spillPageRows === undefined ? {} : { spillPageRows }),
-        ...(signal === undefined ? {} : { signal }),
-      });
+      return withCatalogColumnDomains(
+        await prepared.executeAsync({
+          spillStore: this.#leasedSpillStore(),
+          ...(spillPageRows === undefined ? {} : { spillPageRows }),
+          ...(signal === undefined ? {} : { signal }),
+        }),
+      );
     } finally {
       prepared.close();
     }
