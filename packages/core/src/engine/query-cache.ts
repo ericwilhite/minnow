@@ -1,4 +1,5 @@
 import { copyDate, dateMilliseconds } from "../date-value.js";
+import { estimateValuesBytes } from "./byte-estimates.js";
 import { copyQueryResultExternalization, type QueryResult, type QueryRow } from "./query.js";
 import { defineSqlResultProperty } from "./sql-semantics.js";
 
@@ -56,16 +57,6 @@ export function queryResultRetainedBytes(result: QueryResult): number {
   let bytes = 64;
   for (const column of result.columns) bytes += 16 + column.length * 2;
   for (const row of result.rows) bytes += estimateValuesBytes(Object.values(row));
-  return bytes;
-}
-
-function estimateValuesBytes(values: readonly unknown[]): number {
-  let bytes = 0;
-  for (const value of values) {
-    if (typeof value === "string") bytes += 4 + value.length;
-    else if (typeof value === "number" || value instanceof Date) bytes += 8;
-    else bytes += 1;
-  }
   return bytes;
 }
 

@@ -20,6 +20,25 @@
 - Check for regressions.
 - Do not commit broken or unverified work.
 
+## Traps
+
+Facts about this repository that are easy to get wrong:
+
+- **Pushing runs the full local gate.** `.githooks/pre-push` (installed by `npm run prepare`,
+  via `core.hooksPath`) runs `npm run check` — including a full build — so a push takes minutes.
+  It checks the **working tree**, not the pushed commits: with several sessions sharing this
+  tree, a red gate may come from another session's in-flight edits, not yours. Escape hatch:
+  `git push --no-verify`, only when you know why the gate is red.
+- **`scripts/` is never type-checked.** No tsconfig includes it, and ESLint runs it without
+  type-aware rules. A type error in `scripts/*.mts` (or the root configs) surfaces only when
+  vite-node executes it. The same is true of `packages/core/browser/` and
+  `packages/core/browser-tests/` — Playwright transpiles those at runtime.
+- **Root `tsconfig.json` validates zero files.** It is `"files": []` plus project references.
+  `tsc --noEmit -p tsconfig.json` proves nothing; use `npm run typecheck`.
+- **`apps/site/public/versions.json` is a hand-maintained input**, not a generated file, even
+  though almost everything else in `public/` is generated and gitignored. `scripts/version.mts`
+  reads it as the source of truth; change it only through `npm run version:set`.
+
 ## Documentation
 
 - Update public documentation for every relevant change.

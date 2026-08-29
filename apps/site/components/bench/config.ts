@@ -198,9 +198,13 @@ export function estimateBytes(
   );
 }
 
+// Decimal units, matching what `navigator.storage.estimate()` reports. The one shared
+// implementation for the page — the estimate banner and the measured-results table must not
+// disagree on what "MB" means.
 export function formatBytes(bytes: number): string {
   if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
-  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(0)} MB`;
+  if (bytes >= 100_000_000) return `${(bytes / 1_000_000).toFixed(0)} MB`;
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
   return `${(bytes / 1_000).toFixed(0)} KB`;
 }
 

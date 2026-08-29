@@ -16,7 +16,7 @@ import type {
   WriteSuiteResult,
   WorkloadKind,
 } from "@/bench/protocol";
-import { formatBytes as formatStorage } from "@/bench/format";
+import { formatBytes as formatStorage } from "./config";
 import { ENGINES, formatMs, type EngineChoice } from "./config";
 
 const WORKLOADS: ReadonlyArray<{ kind: WorkloadKind; label: string; note: string }> = [

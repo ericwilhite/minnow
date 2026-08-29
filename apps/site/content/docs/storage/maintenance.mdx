@@ -19,12 +19,12 @@ await db.compactTable("orders");
 
 It runs automatically by default: a scan or a run of commits that finds a table past the
 threshold plans a fold and drives it to publication in small steps, yielding between them, and
-keeps going while the table is still due. To drive it yourself — a slice per idle callback, so it
-never holds the main thread:
+keeps going while the table is still due.
 
 Setting `autoCompact: false` transfers that responsibility to the caller. Small-write segments
 then accumulate, so scans become progressively slower and writes eventually meet the fixed
-segment-history ceiling unless the application drives `compactTable` or `compactTableStep`.
+segment-history ceiling unless the application drives `compactTable` or `compactTableStep`. To
+drive it yourself — a slice per idle callback, so it never holds the main thread:
 
 ```ts
 const db = new MinnowDatabase(store, { autoCompact: false });

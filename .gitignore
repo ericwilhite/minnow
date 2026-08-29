@@ -7,7 +7,6 @@ test-results/
 *.tsbuildinfo
 .DS_Store
 .dataset-cache/
-apps/site/.astro/
 apps/site/.next/
 apps/site/out/
 apps/site/.source/

@@ -6,6 +6,7 @@ import {
   type InsertBatchInput,
 } from "./batch.js";
 import { ArtifactCache } from "./artifact-cache.js";
+import { estimateBatchBytes, estimateRowBytes, estimateValuesBytes } from "./byte-estimates.js";
 import { throwIfAborted } from "./cancellation.js";
 import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writer.js";
 export {
@@ -24162,17 +24163,6 @@ function compactTableSkipped(
   };
 }
 
-function estimateRowBytes(row: Readonly<Record<string, BatchValue>>): number {
-  return estimateValuesBytes(Object.values(row));
-}
-
-function estimateBatchBytes(input: ColumnarBatch): number {
-  return Object.values(input.columns).reduce(
-    (total, values) => total + estimateValuesBytes(values),
-    0,
-  );
-}
-
 function writeColumnValues(type: LogicalType, values: readonly BatchValue[]): WriteColumnValues {
   const cached = type === "string" ? validatedStringByteLengths.get(values) : undefined;
   return {
@@ -24207,19 +24197,6 @@ function maximumWriteBlockStoredBytes(
     MAX_STORED_BLOCK_BYTE_LENGTH,
     BLOCK_HEADER_LENGTH + MAX_BLOCK_METADATA_BYTE_LENGTH + storedPayloadBytes,
   );
-}
-
-function estimateValuesBytes(values: readonly BatchValue[]): number {
-  let bytes = 0;
-  for (const value of values) {
-    // One byte per UTF-16 code unit approximates the UTF-8 payload (exact for ASCII) without
-    // encoding the string just to measure it — this estimate feeds metrics and flush
-    // thresholds, not the physical format.
-    if (typeof value === "string") bytes += 4 + value.length;
-    else if (typeof value === "number" || value instanceof Date) bytes += 8;
-    else bytes += 1;
-  }
-  return bytes;
 }
 
 function cacheableQueryInput(sql: string, params: readonly QueryValue[]): boolean {

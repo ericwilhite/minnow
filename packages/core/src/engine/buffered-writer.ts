@@ -1,5 +1,6 @@
 import { copyDate } from "../date-value.js";
 import type { BatchValue } from "./batch.js";
+import { estimateRowBytes } from "./byte-estimates.js";
 import type { InsertBatchResult, MinnowDatabase, UpsertBatchResult } from "./database.js";
 
 export interface BufferedWriterOptions {
@@ -219,14 +220,4 @@ function cloneRow(row: Readonly<Record<string, BatchValue>>): Readonly<Record<st
       value instanceof Date ? copyDate(value) : value,
     ]),
   );
-}
-
-function estimateRowBytes(row: Readonly<Record<string, BatchValue>>): number {
-  let bytes = 0;
-  for (const value of Object.values(row)) {
-    if (typeof value === "string") bytes += 4 + value.length;
-    else if (typeof value === "number" || value instanceof Date) bytes += 8;
-    else bytes += 1;
-  }
-  return bytes;
 }

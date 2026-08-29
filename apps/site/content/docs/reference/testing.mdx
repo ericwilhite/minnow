@@ -14,25 +14,26 @@ after generated declarations or asynchronous signatures change.
 
 ## Choose the smallest runner that proves the change
 
-| Command                        | What it runs                                                                     | Use it for                         |
-| ------------------------------ | -------------------------------------------------------------------------------- | ---------------------------------- |
-| `npm test`                     | Vitest plus the committed fast SQLLogicTest profile                              | Normal implementation work         |
-| `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                 | A focused inner loop               |
-| `npm run test:sql:standard`    | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds | Every SQL or optimizer change      |
-| `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations     | Before a release                   |
-| `npm run test:coverage`        | Vitest with the coverage floors enforced                                         | Before pushing                     |
-| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures                | Hunting bugs rather than pinning   |
-| `npm run simulate`             | One replayable deterministic concurrency, fault, and storage simulation          | Storage and transaction changes    |
-| `npm run test:simulator:full`  | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints  | Before a release                   |
-| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture                  | Before changing a format version   |
-| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit     | Storage or browser-runtime changes |
-| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                            | Docs, examples, and site changes   |
-| `npm run test:browser`         | Both browser runners, in sequence                                                | Cross-browser regression checks    |
-| `npm run test:consumer`        | Packed libraries installed, typed, bundled, and run outside the workspace        | Package and public-entry changes   |
-| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                   | Query-executor performance changes |
-| `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages    | Dependency or public-entry changes |
-| `npm run check`                | Format, types, lint, build, coverage, and fast SQLLogicTest                      | The local merge gate               |
-| `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners             | Release candidates                 |
+| Command                        | What it runs                                                                     | Use it for                          |
+| ------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------- |
+| `npm test`                     | Vitest plus the committed fast SQLLogicTest profile                              | Normal implementation work          |
+| `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                 | A focused inner loop                |
+| `npm run test:sql:standard`    | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds | Every SQL or optimizer change       |
+| `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations     | Before a release                    |
+| `npm run test:coverage`        | Vitest with the coverage floors enforced                                         | Before pushing                      |
+| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures                | Hunting bugs rather than pinning    |
+| `npm run simulate`             | One replayable deterministic concurrency, fault, and storage simulation          | Storage and transaction changes     |
+| `npm run test:simulator:full`  | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints  | Before a release                    |
+| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture                  | Before changing a format version    |
+| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit     | Storage or browser-runtime changes  |
+| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                            | Docs, examples, and site changes    |
+| `npm run test:browser`         | Both browser runners, in sequence                                                | Cross-browser regression checks     |
+| `npm run test:consumer`        | Packed libraries installed, typed, bundled, and run outside the workspace        | Package and public-entry changes    |
+| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                   | Query-executor performance changes  |
+| `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages    | Dependency or public-entry changes  |
+| `npm run api:check`            | The public API surface against the committed contract snapshot                   | Public-entry or declaration changes |
+| `npm run check`                | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest        | The local merge gate                |
+| `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners             | Release candidates                  |
 
 Install the browser binaries once before using a browser runner:
 
@@ -230,7 +231,7 @@ npm run fixture:format
 The native OPFS fixture has its own writer:
 
 ```bash
-npx vite-node scripts/write-opfs-format-fixture.mts
+npm run fixture:opfs-format
 ```
 
 Run the relevant writer on the build that still writes the old format, commit the fixture, and

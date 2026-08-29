@@ -51,13 +51,16 @@
     "soak": "vite-node scripts/soak.mts",
     "soak:memory": "NODE_OPTIONS=--expose-gc vite-node scripts/memory-soak.mts",
     "fixture:format": "vite-node scripts/write-format-fixture.mts",
+    "fixture:opfs-format": "vite-node scripts/write-opfs-format-fixture.mts",
     "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.5",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^4.1.10",
+    "esbuild": "^0.28.1",
     "eslint": "^10.8.1",
     "fake-indexeddb": "^6.2.5",
     "fast-check": "^4.9.0",

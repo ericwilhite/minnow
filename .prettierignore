@@ -3,9 +3,7 @@ coverage
 node_modules
 playwright-report
 test-results
-benchmarks/results/*.json
 scripts/api-contract.snapshot.json
-.astro
 # Generated into the site's public directory; see scripts/generate-llms.mjs.
 apps/site/public/docs
 apps/site/public/llms-full.txt
