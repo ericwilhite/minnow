@@ -540,11 +540,7 @@ export function arrayDomainValue(values: readonly unknown[]): string {
   );
 }
 
-function enumDomainValue(
-  value: unknown,
-  name: string,
-  values: readonly string[],
-): string | null {
+function enumDomainValue(value: unknown, name: string, values: readonly string[]): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") throw new TypeError(`Enum ${name} accepts a string value`);
   assertBoundedDomainString(value, `Enum ${name} value`);
