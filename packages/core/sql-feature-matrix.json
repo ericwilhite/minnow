@@ -676,7 +676,7 @@
         "CREATE TABLE stats (region TEXT UNIQUE, total REAL)",
         "INSERT INTO stats (region, total) VALUES ('east', 0), ('west', 0)"
       ],
-      "notes": "UPDATE and DELETE trigger bodies run against keyed tables, reading current state each firing. Touching the same target row twice in one firing is rejected."
+      "notes": "UPDATE and DELETE trigger bodies run against keyed tables, reading current state each firing. One body statement touching the same target row for two triggering rows in one firing is rejected; separate body statements may each touch that row."
     },
     {
       "id": "trigger.drop",
@@ -700,7 +700,7 @@
       "id": "expression.concat",
       "status": "supported",
       "example": "SELECT region || '-' || label AS tag FROM dims",
-      "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error."
+      "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error. One operand must be ordinary text, matching PostgreSQL's operator resolution: array and JSONB || are structural concatenation (see array.concat and json.concat), and two non-text domain operands have no || operator. A domain value concatenated with text renders in its Minnow text form."
     },
     {
       "id": "expression.modulo",
@@ -730,7 +730,7 @@
       "id": "expression.coalesce",
       "status": "supported",
       "example": "SELECT COALESCE(region, 'unknown') AS region_label FROM rows",
-      "notes": "Arguments evaluate left to right; the first non-NULL value wins. All non-NULL arguments must share one type."
+      "notes": "Arguments evaluate left to right; the first non-NULL value wins. Arguments are not type-checked: mixed-type arguments are accepted and return the first non-NULL value as-is, where PostgreSQL requires a common type."
     },
     {
       "id": "expression.date-trunc",
@@ -958,7 +958,7 @@
       "id": "datetime.localtime",
       "status": "supported",
       "example": "SELECT LOCALTIME IS NOT NULL AS ticking",
-      "notes": "The engine has no TIME type, so LOCALTIME reads as an 'HH:MM:SS' string, like SQLite's CURRENT_TIME."
+      "notes": "LOCALTIME reads as an 'HH:MM:SS' string of the current UTC time, like SQLite's CURRENT_TIME — Minnow has no session time zone, where PostgreSQL renders the session-local wall clock."
     },
     {
       "id": "predicate.row-comparison",
@@ -1075,7 +1075,7 @@
       "id": "json.array",
       "status": "supported",
       "example": "SELECT JSON_ARRAY(1, NULL, 2) AS document",
-      "notes": "Defaults to NULL ON NULL. The explicit NULL/ABSENT clause is not supported. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
+      "notes": "Defaults to NULL ON NULL, unlike PostgreSQL's ABSENT ON NULL default for JSON_ARRAY. The explicit NULL/ABSENT clause is not supported. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
     },
     {
       "id": "json.arrow",
@@ -1155,8 +1155,15 @@
     {
       "id": "type.interval",
       "status": "supported",
-      "example": "SELECT CAST('1 day' AS INTERVAL) AS span",
-      "notes": "Preserves separate month, day, and microsecond fields. Interval arithmetic is not yet exposed."
+      "example": "SELECT joined + INTERVAL '1 day' AS next_day FROM rows",
+      "notes": "Preserves separate month, day, and microsecond fields, and a date or datetime accepts + and - INTERVAL. Interval-valued arithmetic is not supported (see type.interval-arithmetic)."
+    },
+    {
+      "id": "type.interval-arithmetic",
+      "status": "unsupported",
+      "example": "SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total",
+      "error": "Date arithmetic requires a date or datetime value",
+      "notes": "PostgreSQL adds intervals into a combined interval and subtracts timestamps into an interval. Minnow's interval arithmetic only shifts a date or datetime by + or - INTERVAL, so an interval-valued result is refused."
     },
     {
       "id": "ddl.enum",
@@ -1263,7 +1270,14 @@
       "id": "json.table",
       "status": "supported",
       "example": "SELECT j.a FROM JSON_TABLE('{\"a\":1}', '$' COLUMNS (a INTEGER PATH '$.a')) AS j",
-      "notes": "Constant documents support $ and $[*] row paths. Correlated documents are not yet supported."
+      "notes": "Constant documents support $ and $[*] row paths. A document read from row data is refused (see json.table-correlated)."
+    },
+    {
+      "id": "json.table-correlated",
+      "status": "unsupported",
+      "example": "SELECT jt.v FROM (SELECT '[1,2]' AS document) AS d, JSON_TABLE(d.document, '$[*]' COLUMNS (v INTEGER PATH '$')) AS jt",
+      "error": "JSON_TABLE currently requires a constant document",
+      "notes": "PostgreSQL evaluates JSON_TABLE laterally against each source row's document. Minnow expands only constant documents, so a column-valued document is refused at compile time."
     },
     {
       "id": "predicate.similar-to",
@@ -1287,7 +1301,35 @@
       "id": "type.array",
       "status": "supported",
       "example": "SELECT ARRAY[1, 2] AS pair",
-      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. Subscripts and array operators are not yet supported."
+      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. Subscripts and array operators are not supported (see type.array-subscript, type.array-any, and array.concat)."
+    },
+    {
+      "id": "type.array-subscript",
+      "status": "unsupported",
+      "example": "SELECT (ARRAY[1, 2, 3])[1] AS first_element",
+      "error": "Array subscripts are not supported",
+      "notes": "PostgreSQL reads array elements with one-based subscripts and slices. Minnow arrays are opaque JSON text values; element access is refused at parse time."
+    },
+    {
+      "id": "type.array-any",
+      "status": "unsupported",
+      "example": "SELECT 2 = ANY(ARRAY[1, 2, 3]) AS found",
+      "error": "ANY/ALL take a subquery",
+      "notes": "PostgreSQL's ANY, ALL, and SOME accept an array operand as well as a subquery. Minnow implements only the subquery form, so the array variant is refused at compile time."
+    },
+    {
+      "id": "array.concat",
+      "status": "unsupported",
+      "example": "SELECT ARRAY[1, 2] || ARRAY[3] AS combined",
+      "error": "PostgreSQL array concatenation (||) is not supported",
+      "notes": "PostgreSQL's array || array and array || element are structural concatenation. Minnow refuses || whenever either operand is an array rather than inventing a text concatenation PostgreSQL does not have."
+    },
+    {
+      "id": "json.concat",
+      "status": "unsupported",
+      "example": "SELECT CAST('{\"a\":1}' AS JSONB) || CAST('{\"b\":2}' AS JSONB) AS merged",
+      "error": "PostgreSQL JSONB concatenation (||) is not supported",
+      "notes": "PostgreSQL's jsonb || jsonb merges documents structurally. Minnow refuses || whenever either operand is JSONB rather than inventing a text concatenation PostgreSQL does not have."
     },
     {
       "id": "type.time",
@@ -1318,7 +1360,7 @@
       "id": "ddl.create-view",
       "status": "supported",
       "example": "CREATE VIEW west AS SELECT region, amount FROM rows WHERE region = 'west'",
-      "notes": "The catalog stores the query text and inferred schema, so reads expand a view anywhere a table can be read, including inside a write scope. A view is never a write target. CREATE OR REPLACE redefines one; dependent views follow it and cycles are rejected on read. CREATE VIEW column-name lists are not supported."
+      "notes": "The catalog stores the query text and inferred schema, so reads expand a view anywhere a table can be read, including inside a write scope. A view is never a write target. CREATE OR REPLACE redefines one; dependent views follow it, and a definition that would create a cycle is rejected when the view is defined. CREATE VIEW column-name lists are not supported."
     },
     {
       "id": "ddl.drop-view",

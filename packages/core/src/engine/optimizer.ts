@@ -26,7 +26,7 @@ import {
   type QueryValue,
   type TableSource,
 } from "./query.js";
-import { isSqlDomainValue } from "./sql-domains.js";
+import { concatenatedSqlValue, isSqlDomainValue } from "./sql-domains.js";
 
 /**
  * Deterministic plan-to-plan rewrites over the shared compiled representation. Every rule
@@ -2594,7 +2594,13 @@ function foldBinary(
   if (leftValue === null || rightValue === null) return null;
   if (operator === "||") {
     if (typeof leftValue === "string" && typeof rightValue === "string") {
-      return leftValue + rightValue;
+      // Same helper the executors use, so folding cannot concatenate internal domain
+      // encodings. A refused shape stays unfolded and raises the same error at execution.
+      try {
+        return concatenatedSqlValue(leftValue, rightValue);
+      } catch {
+        return undefined;
+      }
     }
     return undefined;
   }

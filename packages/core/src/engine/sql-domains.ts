@@ -740,6 +740,46 @@ export function externalSqlDomainValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * The domain kind carried by an internal string value, or undefined for ordinary text. The
+ * protected-TEXT wrapper and collated text are both ordinary text to PostgreSQL's operator
+ * resolution, so they report no kind.
+ */
+function concatenationDomainKind(value: string): string | undefined {
+  if (!value.startsWith(PREFIX)) return undefined;
+  if (value.startsWith(TEXT_VALUE) || value.startsWith(COLLATION_VALUE)) return undefined;
+  const rest = value.slice(PREFIX.length);
+  const colon = rest.indexOf(":");
+  return colon === -1 ? undefined : rest.slice(0, colon);
+}
+
+/**
+ * SQL `||` over internal string values, shared by both executors and constant folding so the
+ * three paths cannot disagree. PostgreSQL resolves `||` to text concatenation only when one
+ * side is text: its array and JSONB `||` operators are structural concatenation, which this
+ * engine does not implement, and two non-text operands have no `||` operator at all. Refusing
+ * those shapes keeps `||` from inventing a text concatenation PostgreSQL does not have —
+ * and from ever concatenating internal domain encodings.
+ */
+export function concatenatedSqlValue(left: string, right: string): string {
+  const leftKind = concatenationDomainKind(left);
+  const rightKind = concatenationDomainKind(right);
+  for (const kind of [leftKind, rightKind]) {
+    if (kind === "array") {
+      throw new TypeError("PostgreSQL array concatenation (||) is not supported");
+    }
+    if (kind === "jsonb") {
+      throw new TypeError("PostgreSQL JSONB concatenation (||) is not supported");
+    }
+  }
+  if (leftKind !== undefined && rightKind !== undefined) {
+    throw new TypeError(`No || operator for ${leftKind} and ${rightKind} values`);
+  }
+  return protectedSqlTextValue(
+    String(externalSqlDomainValue(left)) + String(externalSqlDomainValue(right)),
+  );
+}
+
 export function isSqlDomainValue(value: unknown): value is string {
   return typeof value === "string" && value.startsWith(PREFIX);
 }

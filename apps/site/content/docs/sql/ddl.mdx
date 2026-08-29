@@ -194,8 +194,11 @@ scale: a bare `NUMERIC` column with no declared scale, and derived arithmetic su
 
 `JSON` validates a document and preserves object key order; `JSONB` canonicalizes object keys.
 UUID values validate and normalize. Arrays use canonical JSON at the JavaScript boundary. Minnow
-does not support array subscripts or PostgreSQL array operators. Intervals retain separate month,
-day, and microsecond fields; interval-to-interval arithmetic is unsupported.
+does not support array subscripts or PostgreSQL array operators — including `||`, which is
+refused on array and JSONB operands rather than concatenating their text, matching PostgreSQL's
+resolution of `||` to text concatenation only when one side is text. Intervals retain separate
+month, day, and microsecond fields, and a date or datetime accepts `+ INTERVAL` and
+`- INTERVAL`; interval-valued arithmetic such as interval-plus-interval is unsupported.
 
 Declare an enum before using it as a column type:
 

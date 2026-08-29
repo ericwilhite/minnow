@@ -62,6 +62,7 @@ import {
   defineSqlResultProperty,
 } from "./sql-semantics.js";
 import {
+  concatenatedSqlValue,
   exactNumericBinary,
   externalSqlDomainValue,
   isDateDomainValue,
@@ -6098,9 +6099,7 @@ function binaryValue(
     if (typeof left !== "string" || typeof right !== "string") {
       throw new TypeError("|| requires string operands");
     }
-    return protectedSqlTextValue(
-      String(externalSqlDomainValue(left)) + String(externalSqlDomainValue(right)),
-    );
+    return concatenatedSqlValue(left, right);
   }
   const exact = exactNumericBinary(operator, left, right);
   if (exact !== undefined) return exact;

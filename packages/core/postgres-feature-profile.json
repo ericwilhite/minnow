@@ -111,7 +111,7 @@
     {
       "id": "function.string-extended",
       "classification": "different",
-      "reason": "The bundled form includes INSTR; PostgreSQL spells that function strpos with reversed arguments."
+      "reason": "The bundled form includes INSTR; PostgreSQL has no INSTR and spells the same (string, substring) lookup STRPOS, with the arguments in the same order."
     },
     {
       "id": "function.trim-multi-character",
@@ -137,7 +137,7 @@
     {
       "id": "type.exact-numeric",
       "classification": "different",
-      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings; PGlite's default decoder returns this NUMERIC value as a number. A declared scale renders at exactly that scale as PostgreSQL does; a bare NUMERIC column, a derived arithmetic result, and a value cast or concatenated to text render canonically, without the trailing fractional zeros PostgreSQL preserves. A non-terminating AVG quotient renders at Minnow's internal precision, which keeps more fractional digits than PostgreSQL's rounding; the value agrees to every digit PostgreSQL renders."
+      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings, as PGlite's default decoder also does. A declared scale renders at exactly that scale as PostgreSQL does; a bare NUMERIC column, a derived arithmetic result, and a value cast or concatenated to text render canonically, without the trailing fractional zeros PostgreSQL preserves. A non-terminating quotient is computed to Minnow's internal 20-digit precision: PostgreSQL's rounding can disagree in the final rendered digit, and a declared scale above 20 pads zeros where PostgreSQL computes further digits."
     },
     {
       "id": "type.json-jsonb",
@@ -182,7 +182,7 @@
     {
       "id": "json.array",
       "classification": "different",
-      "reason": "The JSON value agrees, but Minnow returns compact JSON text while PostgreSQL's text rendering includes spaces."
+      "reason": "Minnow defaults JSON_ARRAY to NULL ON NULL, so a NULL argument becomes a JSON null where PostgreSQL's ABSENT ON NULL default drops it; Minnow also returns compact JSON text while PostgreSQL's rendering includes spaces."
     },
     {
       "id": "trigger.create-after",

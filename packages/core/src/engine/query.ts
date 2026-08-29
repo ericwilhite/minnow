@@ -102,6 +102,7 @@ import {
   arrayDomainValue,
   boundedJsonText,
   collatedDomainValue,
+  concatenatedSqlValue,
   dateDomainValue,
   exactNumericBinary,
   exactNumericValue,
@@ -4530,9 +4531,7 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (typeof left !== "string" || typeof right !== "string") {
           throw new TypeError("|| requires string operands");
         }
-        return protectedSqlTextValue(
-          String(externalSqlDomainValue(left)) + String(externalSqlDomainValue(right)),
-        );
+        return concatenatedSqlValue(left, right);
       }
       const exact = exactNumericBinary(expression.operator, left, right);
       if (exact !== undefined) return exact;
@@ -5183,6 +5182,11 @@ export function hasAggregate(expression: Expression): boolean {
     return true;
   }
   return childExpressions(expression).some(hasAggregate);
+}
+
+function hasWindow(expression: Expression): boolean {
+  if (expression.kind === "window") return true;
+  return childExpressions(expression).some(hasWindow);
 }
 
 /** One root aggregate call, using the same canonical set as parsing and execution. */
@@ -7776,6 +7780,11 @@ class Parser {
         continue;
       }
       const operator = this.#peek().text;
+      // A bracket after a complete expression is PostgreSQL's array subscript, which has no
+      // other reading in this grammar — name the missing feature instead of "Expected eof".
+      if (operator === "[") {
+        throw new TypeError("Array subscripts are not supported");
+      }
       // || and the JSON arrows share PostgreSQL's loosest "any other operator" level, applying
       // left-to-right to whole arithmetic terms: `'a' || d ->> 'k'` is `('a' || d) ->> 'k'`.
       const precedence =
@@ -9042,6 +9051,8 @@ export function assembleSelectBlock(
   if (distinct) {
     if (select.some((item) => hasAggregate(item.expression)))
       throw new TypeError("SELECT DISTINCT cannot be combined with aggregate functions");
+    if (select.some((item) => hasWindow(item.expression)))
+      throw new TypeError("SELECT DISTINCT cannot be combined with window functions");
     if (groupBy.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with GROUP BY");
     if (having.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
     if (select.some((item) => item.expression.kind === "wildcard")) {
