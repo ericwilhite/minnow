@@ -16,6 +16,9 @@ const FRAME = 1 / 60;
  * fish ends up. Left unseeded, the spread check below failed about one run in a hundred -- often
  * enough to go off in CI, rarely enough to look like an unrelated blip. Seeding turns the same
  * assertions into a fixed question with a fixed answer.
+ *
+ * Stream-identical copy of `mulberry32` in packages/core/src/testing/seeds.ts; the core exports
+ * map does not expose that module, so the site cannot import the canonical copy.
  */
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;

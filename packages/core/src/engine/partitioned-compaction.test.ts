@@ -13,18 +13,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { type CompactionJobRecord, type SegmentRecord } from "../storage/types.js";
 import { MinnowDatabase } from "./database.js";
 import { allVisibleSegments } from "./storage-test-helpers.js";
-import { seedFor } from "../testing/seeds.js";
-
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let mixed = state;
-    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
-    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
-  };
-}
+import { mulberry32, seedFor } from "../testing/seeds.js";
 
 interface Row {
   id: number;

@@ -20,6 +20,22 @@ import regressions from "../../regression-seeds.json" with { type: "json" };
 
 const registry = regressions as { readonly suites: Record<string, readonly number[]> };
 
+/**
+ * The seeded RNG every generative suite draws from. One implementation, so a seed recorded by one
+ * suite replays the same stream anywhere. Published modules cannot import this file — it is
+ * excluded from the tarball — so `testing/simulator.ts` carries its own stream-identical copy.
+ */
+export function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let mixed = state;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 /** Reads `MINNOW_SEED`, if this process was given one. Non-numeric values are a mistake, not a hint. */
 function overrideSeed(): number | undefined {
   const raw = process.env.MINNOW_SEED;

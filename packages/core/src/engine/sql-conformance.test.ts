@@ -27,7 +27,8 @@ import { describe, expect, it } from "vitest";
 import rawPostgresProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
-import { seedFor } from "../testing/seeds.js";
+import { mulberry32, seedFor } from "../testing/seeds.js";
+import { positionalToNumbered } from "../testing/oracle.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import {
   bindPlanParameters,
@@ -38,17 +39,6 @@ import {
 } from "./query.js";
 
 // --- Deterministic fixture ----------------------------------------------------------------------
-
-function mulberry32(seed: number): () => number {
-  let state = seed;
-  return () => {
-    state |= 0;
-    state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 const REGIONS = ["west", "east", "north", "south", null] as const;
 const LABELS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
@@ -973,12 +963,6 @@ function sqliteOracle(): Oracle {
       database.close();
     },
   };
-}
-
-/** Rewrites `?` placeholders to PostgreSQL's `$n`; corpus strings never contain `?`. */
-function positionalToNumbered(sql: string): string {
-  let index = 0;
-  return sql.replace(/\?/g, () => `$${String((index += 1))}`);
 }
 
 async function pgliteOracle(): Promise<Oracle> {

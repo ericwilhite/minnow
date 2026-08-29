@@ -26,6 +26,7 @@
  */
 import { MinnowDatabase } from "../engine/database.js";
 import { MemoryBlockStore } from "./memory.js";
+import { mulberry32 } from "../testing/seeds.js";
 
 /** Stable clock and ID source shared by the fixture writer and its writer-shape regression. */
 export const FORMAT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
@@ -33,18 +34,6 @@ export const FORMAT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
 export function createFormatFixtureId(): () => string {
   let nextId = 0;
   return () => `fixture-${String(nextId++).padStart(6, "0")}`;
-}
-
-/** Deterministic pseudo-randomness, so a regenerated fixture's logical payload is stable. */
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let mixed = state;
-    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
-    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
-  };
 }
 
 const REGIONS = ["west", "east", "north", "south"] as const;

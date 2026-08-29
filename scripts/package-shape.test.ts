@@ -82,6 +82,7 @@ describe("published package shape", () => {
     expect(manifest.files).toContain("!dist/storage/fixture-shape.*");
     expect(manifest.files).toContain("!dist/engine/storage-test-helpers.*");
     expect(manifest.files).toContain("!dist/testing/seeds.*");
+    expect(manifest.files).toContain("!dist/testing/oracle.*");
   });
 
   it("boots browser tests through published package subpaths", async () => {

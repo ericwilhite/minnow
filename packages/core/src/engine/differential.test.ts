@@ -1,24 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { type DatabaseRow } from "./database.js";
 import { compileQuery, executeQuery, executeRowQuery, type QueryRow } from "./query.js";
-import { seedsFor } from "../testing/seeds.js";
+import { mulberry32, seedsFor } from "../testing/seeds.js";
 
 /**
  * Seeded differential fuzzing: the columnar executor must agree with the row reference on a
  * randomized query corpus over randomized data, comparing results as column-equal multisets so
  * ordering ties cannot flake. Failures print the seed and SQL for exact reproduction.
  */
-
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let mixed = state;
-    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
-    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 interface Fuzzer {
   random(): number;

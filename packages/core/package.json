@@ -125,6 +125,7 @@
     "!dist/storage/fixture-shape.*",
     "!dist/engine/storage-test-helpers.*",
     "!dist/testing/seeds.*",
+    "!dist/testing/oracle.*",
     "!dist/*.tsbuildinfo",
     "sql-feature-matrix.json",
     "postgres-feature-profile.json"

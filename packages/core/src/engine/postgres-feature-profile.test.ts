@@ -4,6 +4,7 @@ import rawProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase, type ExecuteResult } from "./database.js";
+import { positionalToNumbered } from "../testing/oracle.js";
 
 type Classification = "compatible" | "different" | "extension" | "unsupported" | "inapplicable";
 
@@ -49,11 +50,6 @@ function writesData(id: string): boolean {
 
 function mutatesRows(id: string): boolean {
   return id.startsWith("mutation.");
-}
-
-function positionalToNumbered(sql: string): string {
-  let index = 0;
-  return sql.replace(/\?/g, () => `$${String((index += 1))}`);
 }
 
 async function createFixture(database: PGlite, schema: string): Promise<void> {

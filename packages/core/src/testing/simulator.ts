@@ -746,6 +746,9 @@ function summarizeCollection(result: GarbageCollectionResult): CollectionPassSum
   };
 }
 
+// Stream-identical copy of `mulberry32` in ./seeds.ts. This module ships in the tarball and
+// seeds.ts does not (it reads MINNOW_SEED and the unpublished regression-seeds.json), so the
+// published simulator cannot import the canonical copy.
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
