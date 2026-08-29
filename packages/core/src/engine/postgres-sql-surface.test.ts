@@ -10,7 +10,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MAX_TRANSACTION_SAVEPOINTS, MinnowDatabase, type DatabaseRow } from "./database.js";
-import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from "./query.js";
 import { allSegmentRecords, allTransactionRecords } from "./storage-test-helpers.js";
 
 const tables = new Map<string, DatabaseRow[]>([
@@ -1119,6 +1119,67 @@ describe("SQL/JSON", () => {
     expect(json("SELECT JSON_EXISTS(doc, '$.tags[5]') AS v FROM docs")).toBe(false);
   });
 
+  it("accesses members and elements with PostgreSQL's -> and ->>", () => {
+    // -> returns a JSON value, so a selected string keeps its quotes.
+    expect(json("SELECT doc -> 'name' AS v FROM docs")).toBe('"ada"');
+    expect(json("SELECT doc -> 'meta' AS v FROM docs")).toBe('{"score":9}');
+    expect(json("SELECT doc -> 'meta' -> 'score' AS v FROM docs")).toBe("9");
+    expect(json("SELECT doc -> 'tags' -> 1 AS v FROM docs")).toBe('"y"');
+    // ->> returns text: strings unquoted, other scalars as their JSON rendering, and
+    // objects and arrays serialized.
+    expect(json("SELECT doc ->> 'name' AS v FROM docs")).toBe("ada");
+    expect(json("SELECT doc ->> 'meta' AS v FROM docs")).toBe('{"score":9}');
+    expect(json("SELECT doc -> 'tags' ->> 0 AS v FROM docs")).toBe("x");
+    expect(json("SELECT doc ->> 'flag' AS v FROM docs")).toBe("true");
+    // Negative element positions count from the end; out of range selects nothing.
+    expect(json("SELECT doc -> 'tags' ->> -1 AS v FROM docs")).toBe("y");
+    expect(json("SELECT doc -> 'tags' ->> -3 AS v FROM docs")).toBeNull();
+    expect(json("SELECT doc -> 'tags' -> 5 AS v FROM docs")).toBeNull();
+    // A selected JSON null stays a JSON value under -> and becomes SQL NULL under ->>.
+    expect(json("SELECT doc -> 'none' AS v FROM docs")).toBe("null");
+    expect(json("SELECT doc ->> 'none' AS v FROM docs")).toBeNull();
+    expect(json("SELECT doc ->> 'nope' AS v FROM docs")).toBeNull();
+    // The json type's shape rules: a key of the wrong kind for the document selects nothing,
+    // and a scalar never reads as a one-element array the way jsonb has it.
+    expect(json("SELECT doc -> 'meta' -> 0 AS v FROM docs")).toBeNull();
+    expect(json("SELECT doc -> 'tags' ->> 'x' AS v FROM docs")).toBeNull();
+    expect(json("SELECT doc -> 'name' -> 0 AS v FROM docs")).toBeNull();
+    // A text key is always a member name, even when it spells an element position.
+    expect(json("SELECT doc -> 'tags' ->> '0' AS v FROM docs")).toBeNull();
+    // NULL on either side answers NULL.
+    expect(json("SELECT NULL -> 'a' AS v")).toBeNull();
+    expect(json("SELECT doc -> NULL AS v FROM docs")).toBeNull();
+    // The arrows share ||'s left-to-right level, so the arrow's document is the whole
+    // concatenation on its left — which is not JSON — exactly as PostgreSQL parses it.
+    expect(json("SELECT doc ->> 'name' || '!' AS v FROM docs")).toBe("ada!");
+    expect(() => json("SELECT 'k: ' || doc ->> 'name' AS v FROM docs")).toThrow(
+      "->> requires a JSON document",
+    );
+    // Usable anywhere an expression is, including predicates.
+    expect(
+      executeQuery(compileQuery("SELECT id FROM docs WHERE doc ->> 'name' = 'ada'"), documents)
+        .rows,
+    ).toEqual([{ id: 1 }]);
+    // Keys are expressions: parameters and columns work.
+    const bound = bindPlanParameters(compileQuery("SELECT doc ->> $1 AS v FROM docs"), ["name"]);
+    expect(executeQuery(bound, documents).rows).toEqual([{ v: "ada" }]);
+    // PostgreSQL's operators only exist on values parsed as json, so unlike the SQL/JSON
+    // functions a document that is not JSON is an error rather than an empty selection.
+    expect(() => json("SELECT plain -> 'a' AS v FROM docs")).toThrow("-> requires a JSON document");
+    expect(() => json("SELECT id -> 'a' AS v FROM docs")).toThrow("requires a string argument");
+    expect(() => json("SELECT doc -> 1.5 AS v FROM docs")).toThrow("array positions are integers");
+    expect(() => json("SELECT doc -> TRUE AS v FROM docs")).toThrow(
+      "keys are member names or array positions",
+    );
+    // The internal call the arrows compile to is not a callable function.
+    expect(() => compileQuery("SELECT MINNOW_JSON_GET('{}', 'a') AS v")).toThrow(
+      "Unsupported function",
+    );
+    expect(() => compileQuery("SELECT MINNOW_JSON_GET_TEXT('{}', 'a') AS v")).toThrow(
+      "Unsupported function",
+    );
+  });
+
   it("tests a value's JSON shape", () => {
     const ids = (sql: string): DatabaseRow[] => executeQuery(compileQuery(sql), documents).rows;
     expect(ids("SELECT id FROM docs WHERE doc IS JSON")).toEqual([{ id: 1 }]);
@@ -1322,7 +1383,7 @@ describe("schema statements", () => {
     await database.execute("INSERT INTO money VALUES (1, 0.1), (2, 0.2)");
     expect(
       (await database.query("SELECT SUM(amount) AS total, AVG(amount) AS mean FROM money")).rows,
-    ).toEqual([{ total: "0.3", mean: "0.15" }]);
+    ).toEqual([{ total: "0.3000000000", mean: "0.1500000000" }]);
     expect(
       (
         await database.query(
@@ -1352,17 +1413,17 @@ describe("schema statements", () => {
         )
       ).rows,
     ).toEqual([
-      { id: 1, running: "0.1" },
-      { id: 2, running: "0.3" },
+      { id: 1, running: "0.1000000000" },
+      { id: 2, running: "0.3000000000" },
     ]);
     await database.execute("CREATE INDEX money_amount_idx ON money (amount)");
     expect(
       (await database.query("SELECT amount FROM money WHERE amount > 0.15 ORDER BY amount")).rows,
-    ).toEqual([{ amount: "0.2" }]);
+    ).toEqual([{ amount: "0.2000000000" }]);
     await database.execute("CREATE TABLE copied_money AS SELECT amount FROM money");
     await database.execute("INSERT INTO copied_money VALUES (0.4)");
     expect((await database.query("SELECT SUM(amount) AS total FROM copied_money")).rows).toEqual([
-      { total: "0.7" },
+      { total: "0.7000000000" },
     ]);
     expect(
       (await database.listTables()).find(({ name }) => name === "copied_money")?.columns[0]
@@ -1370,11 +1431,44 @@ describe("schema statements", () => {
     ).toMatchObject({ kind: "numeric" });
     await database.execute("CREATE VIEW money_view AS SELECT amount FROM money");
     expect((await database.query("SELECT SUM(amount) AS total FROM money_view")).rows).toEqual([
-      { total: "0.3" },
+      { total: "0.3000000000" },
     ]);
     await expect(
       database.execute("INSERT INTO money VALUES (3, '100000000000000000000.00')"),
     ).rejects.toThrow("NUMERIC(30, 10) overflow");
+  });
+
+  it("renders NUMERIC results at the column's declared scale", async () => {
+    const database = await fresh();
+    await database.execute(
+      "CREATE TABLE scaled (id INTEGER PRIMARY KEY, price NUMERIC(10, 2), loose NUMERIC)",
+    );
+    await database.execute("INSERT INTO scaled VALUES (1, '1.50', '1.50'), (2, 7, 7)");
+    // A declared scale renders PostgreSQL-style: exactly that many fractional digits. The
+    // physical encoding stays canonical (trailing zeros stripped), so the scale is restored
+    // by padding at the result boundary — '1.50' round-trips and integers gain the scale.
+    expect((await database.query("SELECT price FROM scaled ORDER BY id")).rows).toEqual([
+      { price: "1.50" },
+      { price: "7.00" },
+    ]);
+    // Aggregates and CAST targets carry the declared scale, like PostgreSQL's display scale.
+    expect(
+      (
+        await database.query(
+          "SELECT MIN(price) AS low, CAST(2 AS NUMERIC(6, 3)) AS wide FROM scaled",
+        )
+      ).rows,
+    ).toEqual([{ low: "1.50", wide: "2.000" }]);
+    // Bare NUMERIC declares no scale, so values canonicalize — a documented difference from
+    // PostgreSQL, which preserves each inserted value's own scale.
+    expect((await database.query("SELECT loose FROM scaled ORDER BY id")).rows).toEqual([
+      { loose: "1.5" },
+      { loose: "7" },
+    ]);
+    // Derived arithmetic types as bare NUMERIC, so its results render canonically too.
+    expect(
+      (await database.query("SELECT price * 2 AS doubled FROM scaled WHERE id = 1")).rows,
+    ).toEqual([{ doubled: "3" }]);
   });
 
   it("keeps ordinary TEXT distinct from internal SQL-domain encodings", async () => {
@@ -1800,6 +1894,27 @@ describe("uncorrelated subqueries over logical domains", () => {
     await db.execute("INSERT INTO w (id, tag) VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')");
     const uuid = await db.query("SELECT id FROM w WHERE tag = (SELECT tag FROM w WHERE id = 1)");
     expect(uuid.rows).toEqual([{ id: 1 }]);
+    await db.close();
+  });
+
+  it("casts domain column values to numbers through their external text", async () => {
+    // T703: the number and boolean cast targets read the internal tagged string directly, so
+    // CAST(numeric_column AS DOUBLE PRECISION) — the documented route back to arithmetic —
+    // failed on the tag and leaked the internal encoding into its error message.
+    const db = await domainDatabase();
+    const casts = await db.query(
+      "SELECT CAST(amount AS DOUBLE PRECISION) AS dp, CAST(amount AS INTEGER) AS whole " +
+        "FROM n WHERE id = 1",
+    );
+    expect(casts.rows).toEqual([{ dp: 1.25, whole: 1 }]);
+    // The boolean refusal reads the external decimal text, not the internal tag.
+    await expect(
+      db.query("SELECT CAST(amount AS BOOLEAN) AS v FROM n WHERE id = 1"),
+    ).rejects.toThrow(/Cannot cast this string to a boolean: 1\.25/);
+    const rounded = await db.query(
+      "SELECT ROUND(CAST(amount AS DOUBLE PRECISION), 1) AS v FROM n WHERE id = 1",
+    );
+    expect(rounded.rows).toEqual([{ v: 1.3 }]);
     await db.close();
   });
 

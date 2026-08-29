@@ -86,6 +86,47 @@ export function jsonAtPath(
   return { found: true, value: current };
 }
 
+/**
+ * One step of PostgreSQL's `->`/`->>` access. A text key selects an object member; an integer
+ * key selects an array element, counting from the end when negative. The behaviour follows
+ * PostgreSQL's `json` type: a document of the wrong shape for the key selects nothing (NULL)
+ * rather than jsonb's scalar-as-one-element-array reading. Unlike the SQL/JSON functions, whose
+ * standard ON ERROR default swallows malformed documents, PostgreSQL's operators only exist on
+ * values already parsed as json, so a document that is not JSON is an error here.
+ */
+export function jsonArrowStep(
+  document: unknown,
+  key: unknown,
+  caller: string,
+): { found: boolean; value?: unknown } {
+  const source = boundedJsonDocument(document, caller);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new TypeError(`${caller} requires a JSON document`);
+  }
+  const step = externalSqlDomainValue(key);
+  if (typeof step === "number") {
+    if (!Number.isInteger(step)) {
+      throw new TypeError(`${caller} array positions are integers`);
+    }
+    if (!Array.isArray(parsed)) return { found: false };
+    const index = step < 0 ? parsed.length + step : step;
+    if (index < 0 || index >= parsed.length) return { found: false };
+    return { found: true, value: parsed[index] };
+  }
+  if (typeof step === "string") {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { found: false };
+    }
+    const members = parsed as Record<string, unknown>;
+    if (!Object.hasOwn(members, step)) return { found: false };
+    return { found: true, value: members[step] };
+  }
+  throw new TypeError(`${caller} keys are member names or array positions`);
+}
+
 /** Whether a value is JSON text of the requested shape (T825). */
 export function jsonIsValid(document: unknown, kind: string): boolean {
   document = externalSqlDomainValue(document);

@@ -608,9 +608,9 @@ describe("schema-derived Kysely types", () => {
     >();
 
     await db.insertInto("orders").values({ total: 12.5, status: "open" }).execute();
-    expect(await predicate.execute()).toEqual([{ id: 1, total: "12.5" }]);
+    expect(await predicate.execute()).toEqual([{ id: 1, total: "12.50" }]);
     expect(await db.selectFrom("orders").selectAll().execute()).toEqual([
-      { id: 1, total: "12.5", status: "open", note: null },
+      { id: 1, total: "12.50", status: "open", note: null },
     ]);
 
     const defaults = db
@@ -623,7 +623,7 @@ describe("schema-derived Kysely types", () => {
     });
     expect(await defaults.executeTakeFirstOrThrow()).toEqual({
       id: 2,
-      total: "0",
+      total: "0.00",
       status: "open",
       note: null,
     });
@@ -637,8 +637,8 @@ describe("schema-derived Kysely types", () => {
       parameters: [],
     });
     expect(await defaultBatch.execute()).toEqual([
-      { id: 3, total: "0", status: "open" },
-      { id: 4, total: "0", status: "open" },
+      { id: 3, total: "0.00", status: "open" },
+      { id: 4, total: "0.00", status: "open" },
     ]);
     await db.destroy();
     store.close();
@@ -749,8 +749,8 @@ describe("schema-derived Kysely types", () => {
       average: 3,
       minimum: 2,
       maximum: 4,
-      exact_sum: "4",
-      exact_average: "2",
+      exact_sum: "4.00",
+      exact_average: "2.00",
       rounded: 6,
       aggregate_count: 2,
     });
@@ -771,7 +771,7 @@ describe("schema-derived Kysely types", () => {
     expectTypeOf<Awaited<ReturnType<typeof derived.execute>>>().toEqualTypeOf<
       Array<{ exact_sum: string | null }>
     >();
-    expect(await derived.executeTakeFirstOrThrow()).toEqual({ exact_sum: "4" });
+    expect(await derived.executeTakeFirstOrThrow()).toEqual({ exact_sum: "4.00" });
 
     const scalar = db
       .selectFrom("events")
@@ -1050,6 +1050,57 @@ describe("MinnowDialect", () => {
     ]);
   });
 
+  it("compiles Kysely's JSON references to the -> and ->> operators and executes them", async () => {
+    interface JsonDatabase {
+      profiles: {
+        id: number;
+        document: { name: string; tags: string[]; meta: { score: number } } | null;
+      };
+    }
+    await database.execute("CREATE TABLE profiles (id INTEGER PRIMARY KEY, document JSON)");
+    await database.execute(
+      "INSERT INTO profiles VALUES " +
+        '(1, \'{"name":"Ada","tags":["x","y"],"meta":{"score":9}}\'), ' +
+        "(2, NULL)",
+    );
+    const json = new Kysely<JsonDatabase>({
+      dialect: new MinnowDialect({ driver: database }),
+    });
+
+    const compiled = json
+      .selectFrom("profiles")
+      .select((eb) => eb.ref("document", "->>").key("name").as("name"))
+      .compile();
+    expect(compiled.sql).toBe('select "document"->>\'name\' as "name" from "profiles"');
+
+    // Chained access: every step but the last stays JSON; the ref's operator ends the chain.
+    expect(
+      await json
+        .selectFrom("profiles")
+        .select((eb) => [
+          eb.ref("document", "->>").key("name").as("name"),
+          eb.ref("document", "->").key("tags").as("tags"),
+          eb.ref("document", "->>").key("tags").at(0).as("first_tag"),
+          eb.ref("document", "->>").key("tags").at(-1).as("last_tag"),
+          eb.ref("document", "->>").key("meta").key("score").as("score"),
+        ])
+        .orderBy("id")
+        .execute(),
+    ).toEqual([
+      { name: "Ada", tags: '["x","y"]', first_tag: "x", last_tag: "y", score: "9" },
+      { name: null, tags: null, first_tag: null, last_tag: null, score: null },
+    ]);
+
+    // The operators work in predicates, with parameters bound by Kysely.
+    expect(
+      await json
+        .selectFrom("profiles")
+        .select("id")
+        .where((eb) => eb(eb.ref("document", "->>").key("name"), "=", "Ada"))
+        .execute(),
+    ).toEqual([{ id: 1 }]);
+  });
+
   it("optionally decodes NUMERIC, JSON, and JSONB results in buffered and streamed reads", async () => {
     interface NativeDomains {
       domain_values: {
@@ -1081,7 +1132,7 @@ describe("MinnowDialect", () => {
       dialect: new MinnowDialect({ driver: database }),
     });
     expect(await lossless.selectFrom("domain_values").selectAll().orderBy("id").execute()).toEqual([
-      { id: 1, amount: "12.5", document: '{"name":"Ada"}', details: '["compiler"]' },
+      { id: 1, amount: "12.50", document: '{"name":"Ada"}', details: '["compiler"]' },
       {
         id: 2,
         amount: "9.25",
@@ -1245,12 +1296,6 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
         .onConflict((conflict) => conflict.constraint("person_pkey").doNothing())
         .compile(),
     ).toThrow("Name the unique key's columns");
-    expect(() =>
-      db
-        .selectFrom("person")
-        .select((eb) => eb.ref("doc", "->").key("a").as("a"))
-        .compile(),
-    ).toThrow("Minnow does not support the -> and ->> JSON operators");
     expect(() => db.selectFrom("person").selectAll().where("id", "in", []).compile()).toThrow(
       "HandleEmptyInListsPlugin",
     );

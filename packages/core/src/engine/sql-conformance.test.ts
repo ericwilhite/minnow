@@ -1294,6 +1294,24 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     { oracles: ["pglite"], reason: "PostgreSQL renders JSON text with spaces after separators" },
   ],
   [
+    "json.arrow",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "PGlite decodes the json result natively while Minnow intentionally returns JSON text, and SQLite's CAST has no JSON type; the ->> forms below diff the same access against PGlite by value",
+    },
+  ],
+  ["json.arrow-text", { oracles: ["sqlite"], reason: "SQLite's CAST has no JSON type" }],
+  ["json.arrow-index", { oracles: ["sqlite"], reason: "SQLite's CAST has no JSON type" }],
+  [
+    "json.arrow-untyped",
+    {
+      oracles: ["pglite"],
+      reason:
+        "PostgreSQL cannot resolve -> over an untyped string literal, which is what this Minnow extension accepts; SQLite diffs it",
+    },
+  ],
+  [
     "type.exact-numeric",
     {
       oracles: ["sqlite", "pglite"],
@@ -1586,6 +1604,60 @@ describe("SQL conformance against SQLite and PGlite", () => {
       );
     }
   }, 240_000);
+
+  it("renders declared-scale NUMERIC results exactly as PostgreSQL", async () => {
+    // The generated corpus compares NUMERIC values numerically (its oracle parses them into
+    // numbers), so it cannot see the rendered text. This case diffs the strings themselves:
+    // PGlite's default decoder leaves `numeric` as PostgreSQL's rendered text, and a column
+    // with a declared scale must display at exactly that scale on both engines. Write-time
+    // rounding (half away from zero) and scientific-notation input are diffed the same way.
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const { PGlite } = await import("@electric-sql/pglite");
+    const postgres = await PGlite.create();
+    const failures: string[] = [];
+    try {
+      const ddl =
+        "CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount NUMERIC(10, 2), rate NUMERIC(8, 3))";
+      const insert =
+        "INSERT INTO ledger VALUES " +
+        "(1, '1.50', '0.100'), (2, 7, 2), (3, '-3.1', '12.3456'), (4, '0.005', '1e2'), " +
+        "(5, NULL, '0')";
+      await database.execute(ddl);
+      await database.execute(insert);
+      await postgres.exec(ddl);
+      await postgres.exec(insert);
+      const queries = [
+        "SELECT id, amount, rate FROM ledger ORDER BY id",
+        "SELECT SUM(amount) AS total, MIN(amount) AS low, MAX(rate) AS high FROM ledger",
+        "SELECT COALESCE(amount, CAST(0 AS NUMERIC(10, 2))) AS amount FROM ledger WHERE id = 1",
+        "SELECT CAST(amount AS NUMERIC(12, 4)) AS wide FROM ledger WHERE id = 1",
+      ];
+      for (const sql of queries) {
+        const minnowRows = (await database.query(sql)).rows;
+        const postgresRows = (await postgres.query(sql)).rows;
+        if (JSON.stringify(minnowRows) !== JSON.stringify(postgresRows)) {
+          failures.push(
+            `${sql}\n  minnow:   ${JSON.stringify(minnowRows)}\n  postgres: ${JSON.stringify(postgresRows)}`,
+          );
+        }
+      }
+      const returning =
+        "INSERT INTO ledger (id, amount, rate) VALUES (6, '9.9', 8) RETURNING amount, rate";
+      const minnowReturned = (await database.execute(returning)) as {
+        returnedRows?: Array<Record<string, unknown>>;
+      };
+      const postgresReturned = await postgres.query(returning);
+      if (JSON.stringify(minnowReturned.returnedRows) !== JSON.stringify(postgresReturned.rows)) {
+        failures.push(
+          `${returning}\n  minnow:   ${JSON.stringify(minnowReturned.returnedRows)}\n` +
+            `  postgres: ${JSON.stringify(postgresReturned.rows)}`,
+        );
+      }
+    } finally {
+      await postgres.close();
+    }
+    expect(failures).toEqual([]);
+  }, 120_000);
 
   it("leaves no supported feature unaccounted for", () => {
     const unclassified = matrixFeatures

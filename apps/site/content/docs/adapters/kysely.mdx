@@ -221,6 +221,35 @@ Enable `resultDecoding: { json: "parse" }` on `createKysely` or `MinnowDialect` 
 match the inferred object types; without it, Minnow's lossless JSON strings remain the database
 boundary. The same helpers are also exported from the package root.
 
+Reading back into a stored document uses Kysely's JSON references, which compile to PostgreSQL's
+`->` and `->>` operators:
+
+```ts
+const names = await db
+  .selectFrom("profiles")
+  .select((eb) => [
+    eb.ref("document", "->>").key("name").as("name"),
+    eb.ref("document", "->>").key("tags").at(0).as("first_tag"),
+  ])
+  .where((eb) => eb(eb.ref("document", "->>").key("meta").key("score"), "=", "9"))
+  .execute();
+```
+
+`.key()` selects an object member and `.at()` an array element, counting from the end for a
+negative position. `->` returns a JSON value, `->>` returns text — with a selected JSON null as
+SQL `NULL` — and `->>` values cross this adapter as strings, so a numeric comparison casts or
+compares text as above. See the [SELECT guide](/docs/sql/select) for the operators' semantics.
+
+Typed traversal is driven by the column's TypeScript type, so it needs a declared document
+shape: a hand-written `Kysely<DB>` interface whose column is the object type, as in the example
+above. A schema-derived `createKysely` database types JSON columns as their lossless string
+boundary (or `MinnowJsonValue` with decoding), which offers no member names to traverse — write
+those reads with `sql<T>` and `JSON_VALUE`, or declare an interface for that table. Two
+accuracy notes on Kysely's inferred leaf types: a `->` result matches its inferred object type
+at runtime only with `resultDecoding: { json: "parse" }` (otherwise it is JSON text), and a
+`->>` result is always text at runtime even where the declared member is a number or array —
+treat it as a string, exactly as the comparison above does.
+
 ## Inferred function results
 
 Kysely normally uses portable driver unions for numeric aggregates because it cannot know which
@@ -411,10 +440,8 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
 - Kysely can generate PostgreSQL features outside Minnow's profile. The adapter's compiler
   refuses the forms Kysely's builders can produce before execution, naming the feature and an
   alternative: `DISTINCT ON`, `UPDATE ... FROM`, `DELETE ... USING`, `ON CONFLICT` with a
-  constraint or index-expression target (name the unique key's columns instead), the `->` and
-  `->>` JSON operators (use the SQL-standard `JSON_VALUE` and `JSON_QUERY` forms through
-  Kysely's `sql` tag, or the JSON helpers), row-locking clauses such as `.forUpdate()`,
-  schema-qualified names including
+  constraint or index-expression target (name the unique key's columns instead), row-locking
+  clauses such as `.forUpdate()`, schema-qualified names including
   `WithSchemaPlugin`, `ALTER TABLE ... RENAME`, and an empty `IN ()` list (add Kysely's
   `HandleEmptyInListsPlugin`). Anything else outside the profile is rejected explicitly by the
   engine; check the executable [feature matrix](/docs/sql/feature-matrix).

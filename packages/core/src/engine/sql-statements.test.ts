@@ -487,7 +487,7 @@ describe("CREATE TABLE", () => {
       returnedRows: [
         {
           id: "550e8400-e29b-41d4-a716-446655440000",
-          amount: "0.1",
+          amount: "0.1000000000",
           document: '{"a":1,"b":2}',
           choices: "[1,2]",
           at: "12:34:56",

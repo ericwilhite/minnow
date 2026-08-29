@@ -11,7 +11,6 @@ import {
   type AlterTableNode,
   type CompiledQuery,
   type DeleteQueryNode,
-  type JSONReferenceNode,
   type QueryId,
   type OnConflictNode,
   type RootOperationNode,
@@ -185,15 +184,6 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
       );
     }
     super.visitOnConflict(node);
-  }
-
-  protected override visitJSONReference(node: JSONReferenceNode): void {
-    void node;
-    throw new TypeError(
-      "Minnow does not support the -> and ->> JSON operators. Use the SQL-standard forms — " +
-        "sql`JSON_VALUE(doc, '$.key')` or sql`JSON_QUERY(doc, '$.key')` — or the " +
-        "jsonArrayFrom/jsonObjectFrom/jsonBuildObject helpers from @minnowdb/kysely/helpers.",
-    );
   }
 
   protected override visitValueList(node: ValueListNode): void {

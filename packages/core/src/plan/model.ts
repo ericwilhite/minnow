@@ -67,6 +67,10 @@ export type ScalarFunctionName =
   | "JSON_ARRAY"
   | "IS_JSON"
   | "ARRAY"
+  /** Parser-produced `->` JSON member/element access returning a JSON value. */
+  | "MINNOW_JSON_GET"
+  /** Parser-produced `->>` JSON member/element access returning text. */
+  | "MINNOW_JSON_GET_TEXT"
   /** Optimizer-only, prefix-free equality key for hashable multi-column decorrelation. */
   | "MINNOW_TUPLE_KEY"
   /** Parser-produced wrapper carrying one explicit collation through ordering/comparison. */

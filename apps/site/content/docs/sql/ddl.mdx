@@ -185,6 +185,13 @@ comparison, arithmetic, aggregates, windows, grouping, and sorting retain decima
 Division returns up to 20 fractional digits. Use an integer minor unit when that simpler boundary
 fits; use `DOUBLE PRECISION` only when approximation is intended.
 
+A column with a declared scale renders at exactly that scale, matching PostgreSQL: `1.5` in a
+`NUMERIC(10, 2)` column reads back as `'1.50'`, and so do aggregates, window aggregates, and
+`COALESCE` over it, plus `CAST(… AS NUMERIC(p, s))` results. Two shapes render canonically
+instead (trailing fractional zeros stripped), where PostgreSQL would keep each value's own
+scale: a bare `NUMERIC` column with no declared scale, and derived arithmetic such as
+`price * 2`, whose result type carries no scale.
+
 `JSON` validates a document and preserves object key order; `JSONB` canonicalizes object keys.
 UUID values validate and normalize. Arrays use canonical JSON at the JavaScript boundary. Minnow
 does not support array subscripts or PostgreSQL array operators. Intervals retain separate month,

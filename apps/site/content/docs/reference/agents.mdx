@@ -90,7 +90,9 @@ machines: https://minnowdb.com/llms.txt
   single inline `UNIQUE` form. A table without one can only be appended to. Primary-key components
   cannot be updated.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers. `NUMERIC` and
-  `DECIMAL` are exact and return decimal strings; use `DOUBLE PRECISION` only when approximation
+  `DECIMAL` are exact and return decimal strings, rendered at the column's declared scale like
+  PostgreSQL (`'1.50'` from `NUMERIC(10, 2)`); a bare `NUMERIC` and derived arithmetic render
+  canonically, without trailing fractional zeros. Use `DOUBLE PRECISION` only when approximation
   is intended. JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enum values also return
   strings at the JavaScript boundary. `DATE` is canonical `YYYY-MM-DD` calendar text, not a
   JavaScript `Date`.
@@ -149,8 +151,9 @@ machines: https://minnowdb.com/llms.txt
   intervals, enums, sequences, multiple/composite keys, savepoints, filtered upserts, correlated
   IN/NOT IN/ANY/ALL and EXISTS/NOT EXISTS at nested expression depth, correlated scalar JSON
   projections with per-probe ordering/limits, subquery predicates in UPDATE/DELETE,
-  range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, and constant
-  JSON_TABLE.
+  range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, constant
+  JSON_TABLE, and the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
+  a non-JSON document).
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
   correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution,
   sequence options, `RIGHT JOIN` beside another join or `SELECT *`, `FULL JOIN` with grouping,

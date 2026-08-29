@@ -105,6 +105,19 @@ The same rule applies through `JSON_QUERY`. Ordinary text that happens to contai
 JSON string; cast it to `JSON`/`JSONB` or pass it through a JSON constructor when it should embed
 as a document.
 
+PostgreSQL's `->` and `->>` operators read back into a document. A text key selects an object
+member; an integer key selects an array element, counting from the end when negative:
+
+```sql
+SELECT '{"sku": "A-1", "dims": {"w": 30, "h": 40}}' -> 'dims' ->> 'w' AS width
+```
+
+`->` returns a JSON value, so steps chain and a selected string keeps its quotes; `->>` returns
+text, with strings unquoted and a selected JSON null as SQL `NULL`. A key of the wrong kind for
+the document's shape — a member name against an array, a position against an object or scalar —
+selects `NULL`. The operators accept stored `JSON`/`JSONB` values and ordinary JSON text alike,
+but unlike `JSON_VALUE`'s quiet `NULL`, a document that is not JSON at all is an error.
+
 `STRING_AGG(value, delimiter ORDER BY expression)` skips NULL values, supports `DISTINCT`, and
 spills under the same query-memory bound as other grouped aggregates.
 

@@ -696,6 +696,34 @@ function collatorFor(locale: string, displayName: string): Intl.Collator {
   return created;
 }
 
+/**
+ * Renders one result value at the JavaScript boundary using its column's logical domain.
+ * A NUMERIC column with a declared scale displays PostgreSQL-style at exactly that scale:
+ * the physical encoding is canonical (trailing fractional zeros stripped), so the declared
+ * scale is restored by padding — never rounding — and a value carrying more fractional
+ * digits than the declaration keeps every digit it has. Every other domain, and every value
+ * without one, renders exactly as externalSqlDomainValue.
+ */
+export function externalSqlDomainColumnValue(
+  value: unknown,
+  domain: SqlDomain | null | undefined,
+): unknown {
+  if (
+    domain?.kind === "numeric" &&
+    domain.scale !== undefined &&
+    domain.scale > 0 &&
+    typeof value === "string" &&
+    value.startsWith(NUMERIC)
+  ) {
+    const text = value.slice(NUMERIC.length);
+    const dot = text.indexOf(".");
+    const fractionDigits = dot === -1 ? 0 : text.length - dot - 1;
+    if (fractionDigits >= domain.scale) return text;
+    return (dot === -1 ? `${text}.` : text) + "0".repeat(domain.scale - fractionDigits);
+  }
+  return externalSqlDomainValue(value);
+}
+
 export function externalSqlDomainValue(value: unknown): unknown {
   if (typeof value !== "string") return value;
   if (value.startsWith(TEXT_VALUE)) return value.slice(TEXT_VALUE.length);

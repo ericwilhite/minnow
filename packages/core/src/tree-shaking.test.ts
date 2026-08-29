@@ -24,14 +24,15 @@ const TYPED_TABLE_MARKER = "Upsert requires a unique key:";
 const DATABASE_MARKER = "A database cannot queue more than";
 // Result-domain metadata, DATE, guarded upserts, typed catalog errors, bounded cancellation,
 // exact-NUMERIC dictionary predicates, maintenance hints, set-at-a-time correlated SQL, nested
-// JSON provenance, stored generated columns, and the keyed point-read fast path intentionally
-// expand the complete engine surface.
-// Measured: 728.8 KiB raw / 208.4 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 731 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 210 * 1024;
-// Measured with the larger durable adapter: 1063.0 KiB raw / 291.8 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1065 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 293 * 1024;
+// JSON provenance, stored generated columns, the keyed point-read fast path, declared-scale
+// NUMERIC rendering, and the -> and ->> JSON operators intentionally expand the complete
+// engine surface.
+// Measured: 731.7 KiB raw / 209.2 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 734 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 211 * 1024;
+// Measured with the larger durable adapter: 1065.2 KiB raw / 292.7 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1068 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 295 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

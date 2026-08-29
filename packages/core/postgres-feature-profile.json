@@ -137,7 +137,7 @@
     {
       "id": "type.exact-numeric",
       "classification": "different",
-      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings; PGlite's default decoder returns this NUMERIC value as a number."
+      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings; PGlite's default decoder returns this NUMERIC value as a number. A declared scale renders at exactly that scale as PostgreSQL does; a bare NUMERIC column, a derived arithmetic result, and a value cast or concatenated to text render canonically, without the trailing fractional zeros PostgreSQL preserves. A non-terminating AVG quotient renders at Minnow's internal precision, which keeps more fractional digits than PostgreSQL's rounding; the value agrees to every digit PostgreSQL renders."
     },
     {
       "id": "type.json-jsonb",
@@ -163,6 +163,16 @@
       "id": "json.query",
       "classification": "different",
       "reason": "The JSON value agrees, but Minnow returns compact JSON text while PostgreSQL's text rendering includes spaces."
+    },
+    {
+      "id": "json.arrow",
+      "classification": "different",
+      "reason": "The JSON value agrees, but Minnow returns compact JSON text at the JavaScript boundary while PostgreSQL clients commonly decode the json result natively. Minnow's parameters carry JavaScript types, so an integer parameter key selects an array element directly where an untyped PostgreSQL placeholder resolves to the text-key operator and needs an explicit ::int cast. Minnow's JSON values also compare as their canonical text, so -> results are valid comparison operands where PostgreSQL has no json = json operator."
+    },
+    {
+      "id": "json.arrow-untyped",
+      "classification": "extension",
+      "reason": "PostgreSQL requires a json-typed document for -> and ->>; Minnow also accepts ordinary JSON text directly, as its SQL/JSON functions do."
     },
     {
       "id": "json.object",

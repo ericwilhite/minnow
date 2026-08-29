@@ -103,7 +103,7 @@ describe("Kysely live queries", () => {
     await db.insertInto("orders").values({ id: 1, status: "pending", total: 12.5 }).execute();
     await live.refresh();
     await until(() =>
-      expect(wrapped.getSnapshot().rows).toEqual([{ id: 1, status: "pending", total: "12.5" }]),
+      expect(wrapped.getSnapshot().rows).toEqual([{ id: 1, status: "pending", total: "12.50" }]),
     );
 
     // An unrelated commit advances the version but never executes the SELECT again.
@@ -199,8 +199,8 @@ describe("Kysely live queries", () => {
     expect(changed.changes).toEqual([
       {
         type: "update",
-        row: { id: 1, status: "pending", total: "10" },
-        previous: { id: 1, status: "pending", total: "1" },
+        row: { id: 1, status: "pending", total: "10.00" },
+        previous: { id: 1, status: "pending", total: "1.00" },
         index: 0,
       },
     ]);

@@ -1078,6 +1078,30 @@
       "notes": "Defaults to NULL ON NULL. The explicit NULL/ABSENT clause is not supported. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
     },
     {
+      "id": "json.arrow",
+      "status": "supported",
+      "example": "SELECT CAST('{\"a\": {\"b\": [5, 6]}}' AS JSON) -> 'a' -> 'b' -> 1 AS element",
+      "notes": "PostgreSQL's -> member/element access, chainable and usable anywhere an expression is. A text key selects an object member; an integer key selects an array element. The result is a JSON value, so a selected string keeps its quotes and a selected JSON null stays the document null. Behaviour follows the json type: a document of the wrong shape for the key selects NULL, without jsonb's scalar-as-one-element-array reading. A document that is not JSON is an error, matching the operators' typed-json requirement."
+    },
+    {
+      "id": "json.arrow-text",
+      "status": "supported",
+      "example": "SELECT CAST('{\"items\": [\"x\", \"y\"]}' AS JSON) -> 'items' ->> 0 AS first_item",
+      "notes": "->> returns text: strings unquoted, other scalars as their JSON rendering, objects and arrays serialized as compact JSON text, and a selected JSON null as SQL NULL."
+    },
+    {
+      "id": "json.arrow-index",
+      "status": "supported",
+      "example": "SELECT CAST('[\"x\", \"y\", \"z\"]' AS JSON) ->> -1 AS last_item",
+      "notes": "Negative element positions count from the end of the array; positions out of range in either direction select NULL."
+    },
+    {
+      "id": "json.arrow-untyped",
+      "status": "supported",
+      "example": "SELECT '{\"a\": {\"b\": [\"x\", \"y\"]}}' -> 'a' -> 'b' ->> 1 AS second_item",
+      "notes": "Like Minnow's SQL/JSON functions, the arrows accept ordinary JSON text and stored JSON/JSONB values directly; PostgreSQL requires a json-typed document to resolve the operator."
+    },
+    {
       "id": "ddl.create-table-if-not-exists",
       "status": "supported",
       "example": "CREATE TABLE IF NOT EXISTS made (a INTEGER)"

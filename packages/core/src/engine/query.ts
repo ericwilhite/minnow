@@ -83,7 +83,13 @@ import {
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 import { stringArgument } from "./sql-semantics.js";
-import { jsonAtPath, jsonConstructor, jsonIsValid, parseJsonPath } from "./sql-json.js";
+import {
+  jsonArrowStep,
+  jsonAtPath,
+  jsonConstructor,
+  jsonIsValid,
+  parseJsonPath,
+} from "./sql-json.js";
 import { optimizePlan } from "./optimizer.js";
 import {
   compareSqlValues as compareValues,
@@ -99,6 +105,7 @@ import {
   dateDomainValue,
   exactNumericBinary,
   exactNumericValue,
+  externalSqlDomainColumnValue,
   externalSqlDomainValue,
   intervalDomainValue,
   isDateDomainValue,
@@ -205,6 +212,8 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "JSON_ARRAY",
   "IS_JSON",
   "ARRAY",
+  "MINNOW_JSON_GET",
+  "MINNOW_JSON_GET_TEXT",
   "MINNOW_TUPLE_KEY",
   "MINNOW_COLLATE",
   "NEXTVAL",
@@ -315,14 +324,18 @@ function castValue(value: unknown, target: string): unknown {
     if (value instanceof Date) return protectedSqlTextValue(dateIsoString(value));
   }
   if (target === "number" || target === "number-integer") {
+    // Externalize first, exactly as the string and datetime targets do: a NUMERIC (or other
+    // domain) value is an internally tagged string, and CAST(numeric_column AS DOUBLE
+    // PRECISION) must read its decimal text, not fail on the tag (T703).
+    const external = externalSqlDomainValue(value);
     let parsed: number | undefined;
-    if (typeof value === "number") parsed = value;
-    else if (typeof value === "boolean") parsed = value ? 1 : 0;
-    else if (typeof value === "string") {
-      const text = value.trim();
+    if (typeof external === "number") parsed = external;
+    else if (typeof external === "boolean") parsed = external ? 1 : 0;
+    else if (typeof external === "string") {
+      const text = external.trim();
       const candidate = text === "" ? Number.NaN : Number(text);
       if (!Number.isFinite(candidate)) {
-        throw new TypeError(`Cannot cast this string to a number: ${value}`);
+        throw new TypeError(`Cannot cast this string to a number: ${text}`);
       }
       parsed = candidate;
     }
@@ -343,10 +356,13 @@ function castValue(value: unknown, target: string): unknown {
       throw new TypeError(`Only 0 and 1 cast to boolean, got ${String(value)}`);
     }
     if (typeof value === "string") {
-      const text = value.trim().toLowerCase();
+      const external = externalSqlDomainValue(value);
+      const text = typeof external === "string" ? external.trim().toLowerCase() : "";
       if (text === "true" || text === "t" || text === "1") return true;
       if (text === "false" || text === "f" || text === "0") return false;
-      throw new TypeError(`Cannot cast this string to a boolean: ${value}`);
+      throw new TypeError(
+        `Cannot cast this string to a boolean: ${typeof external === "string" ? external : value}`,
+      );
     }
   }
   if (target === "datetime") {
@@ -516,6 +532,23 @@ export function scalarFunctionValue(
       if (!found.found || found.value === undefined) return null;
       // JSON_QUERY returns JSON text, so a selected string keeps its quotes.
       return preservedJsonDomainValue(JSON.stringify(found.value));
+    }
+    case "MINNOW_JSON_GET": {
+      if (values[1] === null || values[1] === undefined) return null;
+      const found = jsonArrowStep(first, values[1], "->");
+      if (!found.found) return null;
+      // -> returns a JSON value: a selected string keeps its quotes, a JSON null is the
+      // one-character document "null" rather than SQL NULL, exactly as PostgreSQL has it.
+      return preservedJsonDomainValue(JSON.stringify(found.value));
+    }
+    case "MINNOW_JSON_GET_TEXT": {
+      if (values[1] === null || values[1] === undefined) return null;
+      const found = jsonArrowStep(first, values[1], "->>");
+      // ->> returns text: strings unquoted, other scalars as their JSON rendering, objects
+      // and arrays serialized, and a JSON null as SQL NULL.
+      if (!found.found || found.value === null || found.value === undefined) return null;
+      const value = found.value;
+      return protectedSqlTextValue(typeof value === "string" ? value : JSON.stringify(value));
     }
 
     case "LPAD":
@@ -2374,7 +2407,8 @@ export function inferBlockSchema(
       expression.name === "JSON_ARRAYAGG" ||
       expression.name === "JSON_QUERY" ||
       expression.name === "JSON_OBJECT" ||
-      expression.name === "JSON_ARRAY"
+      expression.name === "JSON_ARRAY" ||
+      expression.name === "MINNOW_JSON_GET"
     ) {
       return { kind: "json" };
     }
@@ -2515,6 +2549,8 @@ export function inferBlockSchema(
       expression.name === "JSON_OBJECT" ||
       expression.name === "JSON_ARRAY" ||
       expression.name === "ARRAY" ||
+      expression.name === "MINNOW_JSON_GET" ||
+      expression.name === "MINNOW_JSON_GET_TEXT" ||
       expression.name === "MINNOW_TUPLE_KEY" ||
       expression.name === "MINNOW_COLLATE" ||
       expression.name === "GEN_RANDOM_UUID"
@@ -5267,10 +5303,6 @@ function asQueryValue(value: unknown): QueryValue {
   throw new TypeError("Query produced an unsupported value");
 }
 
-function asExternalQueryValue(value: unknown): QueryValue {
-  return asQueryValue(externalSqlDomainValue(value));
-}
-
 const alreadyExternalResults = new WeakSet<QueryResult>();
 
 function markExternalizationState(
@@ -5301,10 +5333,13 @@ export function externalizeQueryResult(result: QueryResult): QueryResult {
     // Ordinary primitive results are already public values. Most queries never touch one of the
     // tagged PostgreSQL domains, so keep their row objects and avoid rebuilding a large result
     // set merely to discover that every value is unchanged.
-    for (const name of result.columns) {
+    for (let position = 0; position < result.columns.length; position += 1) {
+      const name = result.columns[position] ?? "";
       const value = row[name];
       if (value !== undefined && !isSqlDomainValue(value)) continue;
-      const external = asExternalQueryValue(value);
+      const external = asQueryValue(
+        externalSqlDomainColumnValue(value, result.columnDomains[position]),
+      );
       if (external === value) continue;
       if (output === row) output = { ...row };
       output[name] = external;
@@ -7741,17 +7776,35 @@ class Parser {
         continue;
       }
       const operator = this.#peek().text;
-      // || binds loosest, matching PostgreSQL: concatenation applies to whole arithmetic terms.
+      // || and the JSON arrows share PostgreSQL's loosest "any other operator" level, applying
+      // left-to-right to whole arithmetic terms: `'a' || d ->> 'k'` is `('a' || d) ->> 'k'`.
       const precedence =
         operator === "*" || operator === "/" || operator === "%"
           ? 20
           : operator === "+" || operator === "-"
             ? 10
-            : operator === "||"
+            : operator === "||" || operator === "->" || operator === "->>"
               ? 5
               : -1;
       if (precedence < minimumPrecedence) break;
       this.#index += 1;
+      if (operator === "->" || operator === "->>") {
+        const key = this.#additive(precedence + 1);
+        // A key fixed at compile time fails here rather than per row, like SQL/JSON paths.
+        if (key.kind === "literal" && typeof key.value === "number") {
+          if (!Number.isInteger(key.value)) {
+            throw new TypeError(`${operator} array positions are integers`);
+          }
+        } else if (key.kind === "literal" && typeof key.value === "boolean") {
+          throw new TypeError(`${operator} keys are member names or array positions`);
+        }
+        left = {
+          kind: "call",
+          name: operator === "->" ? "MINNOW_JSON_GET" : "MINNOW_JSON_GET_TEXT",
+          arguments: [left, key],
+        };
+        continue;
+      }
       // `placed_at + INTERVAL '1 month'`. An interval is not a value any column can hold, so it
       // never becomes an expression of its own: it is read here, where the thing it applies to is
       // already in hand, and folds into the date arithmetic DATE_ADD performs.
@@ -8237,7 +8290,9 @@ class Parser {
       if (
         name === "MINNOW_TUPLE_KEY" ||
         name === "MINNOW_COLLATE" ||
-        name === "MINNOW_SINGLE_VALUE"
+        name === "MINNOW_SINGLE_VALUE" ||
+        name === "MINNOW_JSON_GET" ||
+        name === "MINNOW_JSON_GET_TEXT"
       ) {
         throw new TypeError(`Unsupported function: ${identifier}`);
       }
@@ -10050,7 +10105,12 @@ function tokenize(sql: string): Token[] {
       index += 1;
       continue;
     }
-    if ([">=", "<=", "!=", "<>", "||"].includes(pair)) {
+    if (pair === "->" && sql[index + 2] === ">") {
+      push({ kind: "operator", text: "->>", start: index, end: index + 3 });
+      index += 3;
+      continue;
+    }
+    if ([">=", "<=", "!=", "<>", "||", "->"].includes(pair)) {
       push({ kind: "operator", text: pair, start: index, end: index + 2 });
       index += 2;
       continue;

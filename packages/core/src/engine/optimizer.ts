@@ -2527,7 +2527,8 @@ function foldExpression(expression: Expression): Expression {
                 ? ({ kind: targetWord } as const)
                 : expression.name === "JSON_QUERY" ||
                     expression.name === "JSON_OBJECT" ||
-                    expression.name === "JSON_ARRAY"
+                    expression.name === "JSON_ARRAY" ||
+                    expression.name === "MINNOW_JSON_GET"
                   ? ({ kind: "json" } as const)
                   : undefined;
           return {

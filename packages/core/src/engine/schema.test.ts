@@ -327,7 +327,7 @@ describe("SQL-domain and composite-key schema declarations", () => {
     await database.migrate(schema([after]));
     await database.execute("INSERT INTO prices (id, label) VALUES (2, 'new')");
     expect((await database.query("SELECT id, amount FROM prices ORDER BY id")).rows).toEqual([
-      { id: 1, amount: "0" },
+      { id: 1, amount: "0.00" },
       { id: 2, amount: "1.25" },
     ]);
     const amount = (await database.introspect()).tables[0]?.columns.find(
@@ -352,7 +352,7 @@ describe("SQL-domain and composite-key schema declarations", () => {
       "INSERT INTO domain_additions (id, amount, feeling) VALUES (1, 12.50, 'calm')",
     );
     expect((await database.query("SELECT amount, feeling FROM domain_additions")).rows).toEqual([
-      { amount: "12.5", feeling: "calm" },
+      { amount: "12.50", feeling: "calm" },
     ]);
     expect(
       (await database.introspect()).tables[0]?.columns.map(({ name, sqlDomain }) => ({
