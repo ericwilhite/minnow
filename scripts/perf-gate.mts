@@ -157,6 +157,12 @@ interface PerfQuery {
   readonly memoize?: boolean;
   /** Include Kysely's compilation and driver bridge instead of calling Minnow directly. */
   readonly kysely?: boolean;
+  /**
+   * Columns whose engines legitimately render the same decimal differently — SQLite's NUMERIC
+   * affinity stores REAL and returns a number, Minnow's declared-scale NUMERIC returns padded
+   * text. Listed columns compare as canonical decimal values; distinct values still differ.
+   */
+  readonly decimalColumns?: readonly string[];
 }
 
 const QUERIES: readonly PerfQuery[] = [
@@ -209,6 +215,16 @@ const QUERIES: readonly PerfQuery[] = [
     name: "exact-numeric-filter",
     sql: "SELECT COUNT(*) AS n FROM exact_data WHERE amount + CAST(? AS NUMERIC) BETWEEN ? AND ?",
     params: [0.5, 2500.75, 5000.75],
+  },
+  {
+    // A keyed lookup projecting a declared-scale NUMERIC column. Served by the point-read fast
+    // path since domain-typed projections externalize through the shared result boundary; if
+    // that eligibility regresses, this falls back to the full executor at roughly nine times
+    // the cost and trips here while the plain point lookups stay flat.
+    name: "exact-point-lookup",
+    sql: "SELECT amount FROM exact_data WHERE id = ?",
+    params: [12_347],
+    decimalColumns: ["amount"],
   },
   {
     // A declared composite primary key exercises the public components while its hidden tuple
@@ -294,15 +310,37 @@ function median(samples: number[]): number {
  * row order. The gate refuses to time a read until this check passes, so an optimization cannot
  * improve its number by returning fewer, different, or misordered rows.
  */
-function comparableRows(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): string[] {
+function comparableRows(
+  rows: ReadonlyArray<Record<string, unknown>>,
+  ordered: boolean,
+  decimalColumns?: readonly string[],
+): string[] {
   const comparable = rows.map((row) =>
     JSON.stringify(
       Object.keys(row)
         .sort()
-        .map((name) => [name, comparableValue(row[name])]),
+        .map((name) => [
+          name,
+          decimalColumns?.includes(name) === true
+            ? canonicalDecimal(row[name])
+            : comparableValue(row[name]),
+        ]),
     ),
   );
   return ordered ? comparable : comparable.sort();
+}
+
+/**
+ * A decimal's value with rendering differences removed: numbers print as JavaScript renders
+ * them, decimal text drops trailing fractional zeros. "2347.2500000000" and 2347.25 compare
+ * equal; "2347.25" and "2347.26" still differ. Anything non-decimal compares as itself.
+ */
+function canonicalDecimal(value: unknown): unknown {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) {
+    return value.includes(".") ? value.replace(/\.?0+$/, "") : value;
+  }
+  return comparableValue(value);
 }
 
 function comparableValue(value: unknown): unknown {
@@ -320,10 +358,11 @@ function assertQueryEquivalent(query: PerfQuery, minnowResult: unknown, sqliteRo
   if (!Array.isArray(actual) || !Array.isArray(sqliteRows)) {
     throw new Error(`${query.name}: performance correctness check did not receive row results`);
   }
-  const actualRows = comparableRows(actual, query.ordered === true);
+  const actualRows = comparableRows(actual, query.ordered === true, query.decimalColumns);
   const expectedRows = comparableRows(
     sqliteRows as Array<Record<string, unknown>>,
     query.ordered === true,
+    query.decimalColumns,
   );
   if (!isDeepStrictEqual(actualRows, expectedRows)) {
     throw new Error(
@@ -1048,7 +1087,8 @@ const newThresholds: PerformanceThresholds = {};
 for (const result of results) {
   const minnowMs = result.minnow.median;
   const line: string[] = [result.name.padEnd(20), minnowMs.toFixed(2).padStart(11)];
-  newThresholds[result.name] = {};
+  const shapeThresholds: Partial<Record<PerformanceEngine, number>> = {};
+  newThresholds[result.name] = shapeThresholds;
   for (const engine of ENGINES) {
     const engineMs = result.engine[engine].median;
     // The reported comparison is median against median -- the typical cost, which is what a
@@ -1058,7 +1098,7 @@ for (const result of results) {
     // Significant digits rather than fixed decimals: a memo hit against a re-executing engine
     // is a ratio of 0.00015, which two decimals would round to a threshold of zero that nothing
     // can satisfy.
-    newThresholds[result.name][engine] = Number(
+    shapeThresholds[engine] = Number(
       thresholdFor(result.minnow, result.engine[engine]).toPrecision(3),
     );
     const threshold = update ? undefined : baseline?.[result.name]?.[engine];

@@ -52,6 +52,10 @@
           "sqlite": 0.657,
           "pglite": 0.105
         },
+        "exact-point-lookup": {
+          "sqlite": 14.3,
+          "pglite": 0.0681
+        },
         "composite-key-lookup": {
           "sqlite": 10.8,
           "pglite": 0.0781
@@ -171,6 +175,10 @@
         "exact-numeric-filter": {
           "sqlite": 166,
           "pglite": 25.8
+        },
+        "exact-point-lookup": {
+          "sqlite": 150,
+          "pglite": 0.6
         },
         "composite-key-lookup": {
           "sqlite": 110,
