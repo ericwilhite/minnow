@@ -135,6 +135,11 @@
       "reason": "Both engines accept the correlated JSON aggregate and agree on its JSON value, but Minnow returns JSON text while PostgreSQL returns a native JSON value."
     },
     {
+      "id": "literal.scientific",
+      "classification": "different",
+      "reason": "PostgreSQL types every scientific-notation constant NUMERIC and renders it as text. Minnow evaluates it exactly but returns a number whenever Float64 holds the value with no rounding, keeping ordinary constants number-typed at the JavaScript boundary."
+    },
+    {
       "id": "type.exact-numeric",
       "classification": "different",
       "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings, as PGlite's default decoder also does. A declared scale renders at exactly that scale as PostgreSQL does; a bare NUMERIC column, a derived arithmetic result, and a value cast or concatenated to text render canonically, without the trailing fractional zeros PostgreSQL preserves. Division and AVG select their result scale the way PostgreSQL does, so quotient digits agree — including AVG over a column whose declared scale exceeds the selection. The canonical encoding does drop a stored value's display scale, so an explicit arithmetic quotient (such as SUM(v) / COUNT(v)) over a column declared with more than about twenty fractional digits can carry fewer digits than PostgreSQL, which floors the selection at the operand's display scale."

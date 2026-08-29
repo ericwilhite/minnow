@@ -80,6 +80,42 @@ describe("PostgreSQL value domains and predicates", () => {
     prepared.close();
   });
 
+  it("types numeric constants exactly, the way PostgreSQL's NUMERIC typing does", () => {
+    // Constant arithmetic folds in exact decimal space; a Float64-representable result comes
+    // back as an ordinary number (PostgreSQL's own cast when the value meets a float context).
+    expect(run("SELECT 0.1 + 0.2 AS q")).toEqual([{ q: 0.3 }]);
+    expect(run("SELECT (0.1 + 0.2) * 3 AS q")).toEqual([{ q: 0.9 }]);
+    expect(run("SELECT 0.1 + 0.2 - 0.3 AS q")).toEqual([{ q: 0 }]);
+    expect(run("SELECT 0.1 + 0.2 = 0.3 AS q")).toEqual([{ q: true }]);
+    // A value Float64 would round stays an exact-NUMERIC string, digits and quotient scale
+    // chosen as PostgreSQL chooses them — the written scale of 1.000… floors the selection.
+    expect(run("SELECT 1.000000000000000000000000 / 3 AS q")).toEqual([
+      { q: "0.333333333333333333333333" },
+    ]);
+    expect(run("SELECT -1.000000000000000000000000 / 6 AS q")).toEqual([
+      { q: "-0.166666666666666666666667" },
+    ]);
+    // Integer constants beyond 2^53 are exact instead of an error, like PostgreSQL's int8 and
+    // NUMERIC typing; scientific notation is a numeric constant.
+    expect(run("SELECT 9007199254740993 AS q")).toEqual([{ q: "9007199254740993" }]);
+    expect(run("SELECT 1000000000000000000000000000000000000000 / 3 AS q")).toEqual([
+      { q: "333333333333333333333333333333333333333" },
+    ]);
+    expect(run("SELECT 1e2 AS q")).toEqual([{ q: 100 }]);
+    expect(run("SELECT 2.5e-1 AS q")).toEqual([{ q: 0.25 }]);
+    // Float columns keep binary float semantics: a lone representable constant stays a plain
+    // number on the vectorized paths, and an exact constant meeting a float column computes
+    // exactly only when Float64 cannot spell it.
+    expect(run("SELECT amount * 1.1 AS q FROM rows WHERE id = 3")).toEqual([
+      { q: 3.3000000000000003 },
+    ]);
+    expect(run("SELECT amount + 1.000000000000000000000001 AS q FROM rows WHERE id = 3")).toEqual([
+      { q: "4.000000000000000000000001" },
+    ]);
+    // Division by zero stays NULL through the exact fold, matching execution.
+    expect(run("SELECT 0.1 / 0 AS q")).toEqual([{ q: null }]);
+  });
+
   it("constructs JSON, UUID, ARRAY, TIME, and INTERVAL domain values", () => {
     expect(
       run(

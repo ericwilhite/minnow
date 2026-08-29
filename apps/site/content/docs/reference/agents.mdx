@@ -93,9 +93,11 @@ machines: https://minnowdb.com/llms.txt
   `DECIMAL` are exact and return decimal strings, rendered at the column's declared scale like
   PostgreSQL (`'1.50'` from `NUMERIC(10, 2)`); a bare `NUMERIC` and derived arithmetic render
   canonically, without trailing fractional zeros. Use `DOUBLE PRECISION` only when approximation
-  is intended. JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enum values also return
-  strings at the JavaScript boundary. `DATE` is canonical `YYYY-MM-DD` calendar text, not a
-  JavaScript `Date`.
+  is intended. Numeric constants in SQL are exact, as in PostgreSQL: `0.1 + 0.2` is `0.3`, and a
+  constant or constant-arithmetic result Float64 cannot hold exactly (24-digit decimals, integers
+  beyond 2^53) comes back as a decimal string rather than a rounded number or an error.
+  JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enum values also return strings at the
+  JavaScript boundary. `DATE` is canonical `YYYY-MM-DD` calendar text, not a JavaScript `Date`.
 - Use a column builder's `.generatedSql("expression")` or SQL `GENERATED ALWAYS AS (...) STORED` for a
   value derived from sibling columns. Omit it from inserts and updates; Minnow recomputes it.
   Adding a new generated column to an existing table is refused, while adopting generation on an

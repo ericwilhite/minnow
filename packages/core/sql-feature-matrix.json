@@ -986,6 +986,24 @@
       "example": "SELECT 1_000 AS thousand"
     },
     {
+      "id": "literal.exact-decimal",
+      "status": "supported",
+      "example": "SELECT 1.000000000000000000000000 / 3 = CAST('0.333333333333333333333333' AS NUMERIC) AS exact_thirds",
+      "notes": "Decimal constants keep their exact digits, as PostgreSQL's NUMERIC typing does. Arithmetic among constants is exact — 0.1 + 0.2 is 0.3 — and a quotient's scale follows the operands' written scales. A result Float64 represents exactly is returned as a number; one it cannot hold is returned as an exact decimal string."
+    },
+    {
+      "id": "literal.big-integer",
+      "status": "supported",
+      "example": "SELECT 10000000000000000001 = CAST('10000000000000000001' AS NUMERIC) AS same",
+      "notes": "An integer constant beyond 2^53 stays exact instead of rounding or failing. A value Float64 cannot hold is returned as a decimal string, and writing one to an INTEGER or BIGINT column is rejected rather than silently rounded."
+    },
+    {
+      "id": "literal.scientific",
+      "status": "supported",
+      "example": "SELECT 2.5e-1 AS quarter",
+      "notes": "Scientific notation is a numeric constant, as in PostgreSQL. PostgreSQL renders every such constant as NUMERIC text; Minnow returns a number when Float64 holds the value exactly."
+    },
+    {
       "id": "limit.with-ties",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IS NOT NULL ORDER BY region DESC FETCH FIRST 1 ROWS WITH TIES",

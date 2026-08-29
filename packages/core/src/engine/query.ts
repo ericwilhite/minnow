@@ -104,7 +104,9 @@ import {
   collatedDomainValue,
   concatenatedSqlValue,
   dateDomainValue,
+  exactNumericAsNumber,
   exactNumericBinary,
+  exactNumericLiteral,
   exactNumericValue,
   externalSqlDomainColumnValue,
   externalSqlDomainValue,
@@ -1078,6 +1080,7 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   }
   let compiled: CompiledQuery;
   try {
+    resolvePlanExactNumericConstants(plan);
     compiled = options.optimize === false ? plan : optimizePlan(plan);
   } catch (error) {
     // Compile-time rewrites (for example decorrelation) reject unsupported shapes; those
@@ -1400,7 +1403,7 @@ export function compileCheckExpression(sql: string, name: string): Expression {
   if (hasAggregate(expression) || containsWindow(expression) || containsParameter(expression)) {
     throw new TypeError(`CHECK ${name} takes a row condition over this table's own columns`);
   }
-  return expression;
+  return resolveExactNumericConstants(expression);
 }
 
 interface DefaultExpressionTarget {
@@ -3640,6 +3643,132 @@ export function annotateAvgArgumentScales(
   };
   forEachBlockExpression(plan, annotate);
   return plan;
+}
+
+/**
+ * The exact fold of a constant arithmetic subtree, or undefined where none applies. PostgreSQL
+ * types every decimal constant — and every integer constant too large for its integer types —
+ * as NUMERIC, so arithmetic among constants happens in exact decimal space before any float8
+ * context sees the result: `0.1 + 0.2` is exactly 0.3. A subtree folds only when it is
+ * "seeded" by such a constant (one carrying exact digits); pure safe-integer arithmetic keeps
+ * its historical Float64 evaluation, including non-truncating division.
+ */
+function exactConstantFold(
+  expression: Expression,
+): { value: string | number | null; seeded: boolean } | undefined {
+  if (expression.kind === "literal") {
+    if (expression.exactText !== undefined) {
+      return { value: exactNumericLiteral(expression.exactText), seeded: true };
+    }
+    const value = expression.value;
+    if (typeof value === "string" && expression.sqlDomain?.kind === "numeric") {
+      return isExactNumeric(value) ? { value, seeded: true } : undefined;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) return { value, seeded: false };
+    if (value === null) return { value: null, seeded: false };
+    return undefined;
+  }
+  if (expression.kind !== "binary" || expression.operator === "||") return undefined;
+  const left = exactConstantFold(expression.left);
+  if (left === undefined) return undefined;
+  const right = exactConstantFold(expression.right);
+  if (right === undefined) return undefined;
+  const seeded = left.seeded || right.seeded;
+  if (left.value === null || right.value === null) return { value: null, seeded };
+  const folded = exactNumericBinary(expression.operator, left.value, right.value, 0, false);
+  return folded === undefined ? undefined : { value: folded, seeded };
+}
+
+/**
+ * Rewrites every seeded constant arithmetic subtree of this expression to its exact fold. A
+ * folded value demotes back to an ordinary number literal when Float64 represents it exactly —
+ * PostgreSQL's own cast when a numeric constant meets a float8 operand, and it keeps every
+ * number-typed fast path — and stays a tagged exact-NUMERIC literal when Float64 would round
+ * it. A fold that overflows its bounds is left unfolded for execution to report.
+ */
+function resolveExactNumericConstants(expression: Expression): Expression {
+  let folded: { value: string | number | null; seeded: boolean } | undefined;
+  try {
+    folded = exactConstantFold(expression);
+  } catch {
+    folded = undefined;
+  }
+  if (folded?.seeded === true) {
+    const value = folded.value;
+    if (value === null || typeof value === "number") return { kind: "literal", value };
+    const fits = exactNumericAsNumber(value);
+    if (fits !== undefined) return { kind: "literal", value: fits };
+    return { kind: "literal", value, internalSqlValue: true, sqlDomain: { kind: "numeric" } };
+  }
+  if (expression.kind === "subquery" || expression.kind === "exists") {
+    resolvePlanExactNumericConstants(expression.block);
+    return expression;
+  }
+  if (expression.kind === "window") {
+    return {
+      ...expression,
+      partitionBy: expression.partitionBy.map(resolveExactNumericConstants),
+      orderBy: expression.orderBy.map((order) => ({
+        ...order,
+        expression: resolveExactNumericConstants(order.expression),
+      })),
+      ...(expression.argument === undefined
+        ? {}
+        : { argument: resolveExactNumericConstants(expression.argument) }),
+    };
+  }
+  return mapChildExpressions(expression, resolveExactNumericConstants);
+}
+
+/** Applies `resolveExactNumericConstants` to every expression of a plan, nested blocks included. */
+function resolvePlanExactNumericConstants(plan: CompiledQuery): void {
+  mapBlockExpressions(plan, resolveExactNumericConstants);
+  forEachNestedBlock(plan, resolvePlanExactNumericConstants);
+}
+
+/**
+ * The statement counterpart of `resolvePlanExactNumericConstants`: every expression slot a
+ * mutation evaluates later. INSERT VALUES cells are absent because the parser evaluates them
+ * to values on the spot, resolving each expression first.
+ */
+function resolveStatementExactNumericConstants(statement: CompiledStatement): void {
+  const resolve = resolveExactNumericConstants;
+  if (statement.kind === "insert") {
+    const conflict = statement.onConflict;
+    if (conflict?.assignments !== undefined) {
+      for (const assignment of conflict.assignments) {
+        assignment.expression = resolve(assignment.expression);
+      }
+    }
+    if (conflict?.where !== undefined) conflict.where = resolve(conflict.where);
+    return;
+  }
+  if (statement.kind === "update" || statement.kind === "delete") {
+    if (statement.kind === "update") {
+      for (const assignment of statement.assignments) {
+        assignment.expression = resolve(assignment.expression);
+      }
+    }
+    for (const predicate of statement.predicates) {
+      predicate.left = resolve(predicate.left);
+      predicate.right = resolve(predicate.right);
+    }
+    return;
+  }
+  if (statement.kind === "merge") {
+    statement.on = resolve(statement.on);
+    for (const branch of statement.branches) {
+      if (branch.condition !== undefined) branch.condition = resolve(branch.condition);
+      if (branch.action.kind === "update") {
+        for (const assignment of branch.action.assignments) {
+          assignment.expression = resolve(assignment.expression);
+        }
+      }
+      if (branch.action.kind === "insert") {
+        branch.action.values = branch.action.values.map(resolve);
+      }
+    }
+  }
 }
 
 /**
@@ -6219,6 +6348,19 @@ class Parser {
     };
   }
 
+  /** A type name's precision, scale, or width: plain digits, as PostgreSQL requires there. */
+  #typeWidth(): number {
+    const token = this.#take("number");
+    if (!/^\d+$/.test(token.text)) {
+      throw new SqlCompileError(
+        `A type width must be an integer: ${token.text}`,
+        token.start,
+        token.end - token.start,
+      );
+    }
+    return Number(token.text);
+  }
+
   /** A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names. */
   #castTarget(): string {
     const word = this.#identifier().toUpperCase();
@@ -6226,8 +6368,8 @@ class Parser {
       let precision: number | undefined;
       let scale: number | undefined;
       if (this.#punctuation("(")) {
-        precision = Number(this.#take("number").text);
-        if (this.#punctuation(",")) scale = Number(this.#take("number").text);
+        precision = this.#typeWidth();
+        if (this.#punctuation(",")) scale = this.#typeWidth();
         else scale = 0;
         this.#expectPunctuation(")");
       }
@@ -6243,8 +6385,8 @@ class Parser {
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
     if (this.#punctuation("(")) {
-      this.#take("number");
-      if (this.#punctuation(",")) this.#take("number");
+      this.#typeWidth();
+      if (this.#punctuation(",")) this.#typeWidth();
       this.#expectPunctuation(")");
     }
     const integer =
@@ -6259,8 +6401,8 @@ class Parser {
       let precision: number | undefined;
       let scale: number | undefined;
       if (this.#punctuation("(")) {
-        precision = Number(this.#take("number").text);
-        scale = this.#punctuation(",") ? Number(this.#take("number").text) : 0;
+        precision = this.#typeWidth();
+        scale = this.#punctuation(",") ? this.#typeWidth() : 0;
         this.#expectPunctuation(")");
       }
       return {
@@ -6285,7 +6427,7 @@ class Parser {
     }
     // Character widths document intent and do not truncate values.
     if (this.#punctuation("(")) {
-      this.#take("number");
+      this.#typeWidth();
       if (this.#punctuation(",")) {
         throw new TypeError(`${word} takes one width`);
       }
@@ -6308,6 +6450,7 @@ class Parser {
           ? this.#updateStatement()
           : this.#deleteStatement();
     this.#take("eof");
+    resolveStatementExactNumericConstants(statement);
     return statement;
   }
 
@@ -6340,7 +6483,9 @@ class Parser {
       };
     }
     if (this.#isKeyword("SELECT")) {
-      const query = optimizePlan(this.#selectBlock("(insert select)"));
+      const insertSource = this.#selectBlock("(insert select)");
+      resolvePlanExactNumericConstants(insertSource);
+      const query = optimizePlan(insertSource);
       if (query.select.some((item) => item.expression.kind === "wildcard")) {
         throw new TypeError("INSERT ... SELECT requires an explicit select list");
       }
@@ -6600,7 +6745,9 @@ class Parser {
       throw new TypeError("MERGE does not support RETURNING; read the rows back with a SELECT");
     }
     this.#take("eof");
-    return { kind: "merge", table, alias, source, on, branches };
+    const statement: CompiledStatement = { kind: "merge", table, alias, source, on, branches };
+    resolveStatementExactNumericConstants(statement);
+    return statement;
   }
 
   #updateStatement(): CompiledStatement {
@@ -6670,7 +6817,7 @@ class Parser {
     if (hasAggregate(expression) || expressionColumns(expression).length > 0) {
       throw new TypeError(`${label} must be constant expressions`);
     }
-    return asQueryValue(evaluate(expression, {}));
+    return asQueryValue(evaluate(resolveExactNumericConstants(expression), {}));
   }
 
   #unionMember(sql: string): { block: CompiledQuery; parenthesized: boolean } {
@@ -7960,14 +8107,31 @@ class Parser {
     if (token.kind === "number") {
       this.#index += 1;
       const value = Number(token.text);
-      if (!token.text.includes(".") && !Number.isSafeInteger(value)) {
+      // A safe integer spelled as one is exactly itself; every other spelling — a decimal
+      // point, an exponent, or digits beyond 2^53 — is a numeric constant PostgreSQL would
+      // type NUMERIC. Keep its exact digits: as an annotation when Float64 holds the value,
+      // or as a tagged exact-NUMERIC literal when Float64 would round it.
+      if (!/[.eE]/.test(token.text) && Number.isSafeInteger(value)) {
+        return { kind: "literal", value };
+      }
+      let tagged: string;
+      try {
+        tagged = exactNumericLiteral(token.text);
+      } catch (error) {
         throw new SqlCompileError(
-          `Integer literal is outside the exact safe range: ${token.text}`,
+          error instanceof Error ? error.message : `Invalid number: ${token.text}`,
           token.start,
           token.end - token.start,
         );
       }
-      return { kind: "literal", value };
+      const fits = exactNumericAsNumber(tagged);
+      if (fits !== undefined) return { kind: "literal", value: fits, exactText: token.text };
+      return {
+        kind: "literal",
+        value: tagged,
+        internalSqlValue: true,
+        sqlDomain: { kind: "numeric" },
+      };
     }
     if (token.kind === "string") {
       this.#index += 1;
@@ -10039,13 +10203,14 @@ function defaultAlias(expression: Expression): string {
 }
 
 /**
- * Whether a numeric literal's digits are well formed: at most one decimal point (radix 10 only)
- * and underscores only between digits, never leading, trailing, or doubled (T662).
+ * Whether a numeric literal's digits are well formed: at most one decimal point and an optional
+ * exponent (radix 10 only), and underscores only between digits, never leading, trailing, or
+ * doubled (T662). Exponent digits are plain, as in PostgreSQL.
  */
 function validNumericLiteral(text: string, radix: number): boolean {
   const digits = radix === 16 ? "0-9a-fA-F" : radix === 8 ? "0-7" : radix === 2 ? "01" : "0-9";
   const group = `[${digits}]+(?:_[${digits}]+)*`;
-  const pattern = radix === 10 ? `^${group}(?:\\.${group})?$` : `^${group}$`;
+  const pattern = radix === 10 ? `^${group}(?:\\.${group})?(?:[eE][+-]?\\d+)?$` : `^${group}$`;
   return new RegExp(pattern).test(text);
 }
 
@@ -10112,6 +10277,15 @@ function tokenize(sql: string): Token[] {
       index += 1;
       // T662: underscores may separate digits.
       while (index < sql.length && /[\d._]/.test(sql[index] ?? "")) index += 1;
+      // Scientific notation: an exponent marker joins the token only when digits follow, so
+      // `1e2` is the numeric constant 100 while `SELECT 1 e` still reads `e` as an alias.
+      if (/[eE]/.test(sql[index] ?? "")) {
+        const signed = /[+-]/.test(sql[index + 1] ?? "") ? 1 : 0;
+        if (/\d/.test(sql[index + 1 + signed] ?? "")) {
+          index += 2 + signed;
+          while (index < sql.length && /\d/.test(sql[index] ?? "")) index += 1;
+        }
+      }
       const text = sql.slice(start, index);
       if (!validNumericLiteral(text, 10))
         throw new SqlCompileError(`Invalid number: ${text}`, start, index - start);

@@ -268,9 +268,11 @@ import {
 } from "./optimizer.js";
 import { encodeSqlEqualityValue } from "./sql-semantics.js";
 import {
+  exactNumericAsNumber,
   externalSqlDomainValue,
   externalSqlTextValue,
   isDateDomainValue,
+  isExactNumeric,
   isSqlDomainValue,
   normalizeSqlDomainValue,
   protectedSqlTextValue,
@@ -20552,7 +20554,14 @@ function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
     const values = input.columns[column.name];
     if (values === undefined) continue;
-    if (column.sqlDomain !== undefined || column.type === "datetime") {
+    if (
+      column.sqlDomain !== undefined ||
+      column.type === "datetime" ||
+      // A number column rewrites only when a tagged exact-NUMERIC constant actually reached it
+      // (a SQL literal like 0.1/3 evaluated exactly), so plain bulk loads never copy here.
+      (column.type === "number" &&
+        values.some((value) => typeof value === "string" && isExactNumeric(value)))
+    ) {
       (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
         normalizeColumnLogicalValue(column, value),
       );
@@ -20566,6 +20575,17 @@ function normalizeColumnLogicalValue(column: TableColumnRecord, value: BatchValu
     const external = externalSqlDomainValue(value);
     if (typeof external !== "string") throw new TypeError("Invalid DATE value");
     return new Date(`${external}T00:00:00.000Z`);
+  }
+  if (column.type === "number" && typeof value === "string" && isExactNumeric(value)) {
+    // PostgreSQL's assignment cast: an exact-NUMERIC value reaching a float column rounds to
+    // the nearest Float64. An integer column keeps its exactness guarantee instead — a value
+    // Float64 cannot hold exactly is rejected rather than silently rounded.
+    const exact = exactNumericAsNumber(value);
+    if (exact !== undefined) return exact;
+    if (column.integer === true) {
+      throw new TypeError(`${column.name} must be a safe integer`);
+    }
+    return Number(externalSqlDomainValue(value));
   }
   return value;
 }
@@ -20610,14 +20630,30 @@ function normalizeUpsertConflictWhere(
 }
 
 function normalizeDomainUpdate(table: TableRecord, input: UpdateBatchInput): UpdateBatchInput {
-  if (!table.columns.some((column) => column.sqlDomain !== undefined || column.type === "datetime"))
+  const numberColumnNeedsCast = (column: TableColumnRecord, values: readonly BatchValue[]) =>
+    column.type === "number" &&
+    values.some((value) => typeof value === "string" && isExactNumeric(value));
+  if (
+    !table.columns.some((column) => column.sqlDomain !== undefined || column.type === "datetime") &&
+    !Object.entries(input.changes).some(([name, values]) => {
+      const column = table.columns.find((candidate) => candidate.name === name);
+      return column !== undefined && numberColumnNeedsCast(column, values);
+    })
+  ) {
     return input;
+  }
   let changed = false;
   const changes: Record<string, readonly BatchValue[]> = { ...input.changes };
   for (const [name, values] of Object.entries(input.changes)) {
     const column = table.columns.find((candidate) => candidate.name === name);
-    if (column === undefined || (column.sqlDomain === undefined && column.type !== "datetime"))
+    if (
+      column === undefined ||
+      (column.sqlDomain === undefined &&
+        column.type !== "datetime" &&
+        !numberColumnNeedsCast(column, values))
+    ) {
       continue;
+    }
     changed = true;
     changes[name] = values.map((value) => normalizeColumnLogicalValue(column, value));
   }

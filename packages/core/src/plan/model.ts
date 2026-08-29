@@ -91,7 +91,19 @@ export interface FtsStats {
 }
 
 export type Expression =
-  | { kind: "literal"; value: QueryValue; internalSqlValue?: true; sqlDomain?: SqlDomain }
+  | {
+      kind: "literal";
+      value: QueryValue;
+      internalSqlValue?: true;
+      sqlDomain?: SqlDomain;
+      /**
+       * A numeric constant's exact source digits, kept when Float64 represents the value but
+       * not the spelling (`1.000000000000000000000000` is the number 1 with display scale 24).
+       * Constant folding reads these so seeded arithmetic runs in exact decimal space, the way
+       * PostgreSQL types every decimal constant NUMERIC before evaluating it.
+       */
+      exactText?: string;
+    }
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }
   | { kind: "column"; reference: string }

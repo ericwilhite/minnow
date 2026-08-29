@@ -1368,6 +1368,14 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ["literal.date", { oracles: ["sqlite"], reason: "SQLite has no DATE '…' literal" }],
   ["literal.timestamp", { oracles: ["sqlite"], reason: "SQLite has no TIMESTAMP '…' literal" }],
   [
+    "literal.scientific",
+    {
+      oracles: ["pglite"],
+      reason:
+        "PGlite renders every numeric constant as text while Minnow returns a Float64-representable value as a number",
+    },
+  ],
+  [
     "expression.round",
     { oracles: ["pglite"], reason: "PostgreSQL's two-argument ROUND takes numeric, not float8" },
   ],
@@ -1638,6 +1646,16 @@ describe("SQL conformance against SQLite and PGlite", () => {
         "SELECT CAST(5 AS NUMERIC) / 0.0003 AS q",
         "SELECT CAST(-2 AS NUMERIC) / 3 AS q",
         "SELECT CAST(0.00005 AS NUMERIC) / 3 AS q",
+        // Decimal constants carry their exact written digits, so constant arithmetic happens
+        // in exact decimal space and quotient scales follow the written scales, as PostgreSQL
+        // types bare constants NUMERIC. Integer constants beyond int8 are NUMERIC there too.
+        "SELECT 1.000000000000000000000000 / 3 AS q",
+        "SELECT -1.000000000000000000000000 / 6 AS q",
+        "SELECT 1000000000000000000000000000000000000000 / 3 AS q",
+        "SELECT 123456789.123456789123456789 * 2 AS q",
+        "SELECT 0.30000000000000000000000004 - 0.2 AS q",
+        "SELECT amount + 0.000000000000000000000001 AS q FROM ledger WHERE id = 1",
+        "SELECT rate * 1.000000000000000000000001 AS q FROM ledger WHERE id = 3",
       ];
       for (const sql of queries) {
         const minnowRows = (await database.query(sql)).rows;

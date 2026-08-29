@@ -25,14 +25,15 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // Result-domain metadata, DATE, guarded upserts, typed catalog errors, bounded cancellation,
 // exact-NUMERIC dictionary predicates, maintenance hints, set-at-a-time correlated SQL, nested
 // JSON provenance, stored generated columns, the keyed point-read fast path, declared-scale
-// NUMERIC rendering, and the -> and ->> JSON operators intentionally expand the complete
-// engine surface.
-// Measured: 731.7 KiB raw / 209.2 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 734 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 211 * 1024;
-// Measured with the larger durable adapter: 1065.2 KiB raw / 292.7 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1068 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 295 * 1024;
+// NUMERIC rendering, the -> and ->> JSON operators, exact numeric constants (PostgreSQL's
+// NUMERIC typing of decimal and big-integer literals, with compile-time exact folding), and
+// PostgreSQL quotient-scale selection intentionally expand the complete engine surface.
+// Measured: 736.4 KiB raw / 210.6 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 739 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 213 * 1024;
+// Measured with the larger durable adapter: 1069.9 KiB raw / 294.1 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1072 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 296 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

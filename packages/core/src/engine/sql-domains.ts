@@ -153,6 +153,34 @@ export function exactNumericValue(
 }
 
 /**
+ * Tags a SQL numeric constant with its exact digits, as written. Unlike `exactNumericValue`
+ * this does not canonicalize: trailing fractional zeros are PostgreSQL display scale, and
+ * division selects its result scale from the operands' scales, so a literal's digits are part
+ * of its meaning. The text is still validated and bounded.
+ */
+export function exactNumericLiteral(text: string): string {
+  decimalParts(text);
+  return boundedTaggedDomainValue(NUMERIC, text, "NUMERIC literal");
+}
+
+/**
+ * The Float64 holding this exact numeric value with no rounding, or undefined when no Float64
+ * does. A constant that fits stays an ordinary number so every number-typed path keeps running;
+ * only values Float64 would round stay tagged NUMERIC.
+ */
+export function exactNumericAsNumber(value: string): number | undefined {
+  const parts = taggedDecimalParts(value);
+  if (parts === undefined) return undefined;
+  const candidate = Number(value.slice(NUMERIC.length));
+  if (!Number.isFinite(candidate)) return undefined;
+  const roundTrip = normalizeDecimal(decimalParts(String(candidate)));
+  const exact = normalizeDecimal(parts);
+  return roundTrip.coefficient === exact.coefficient && roundTrip.scale === exact.scale
+    ? candidate
+    : undefined;
+}
+
+/**
  * The leading base-10000 digit of a decimal, aligned at the decimal point the way PostgreSQL's
  * NUMERIC digit array is: group k covers the decimal digits at 10^(4k)..10^(4k+3). `weight` is
  * the group index of the first nonzero group and `firstDigit` its value (1..9999); zero reports
@@ -191,6 +219,11 @@ export function exactNumericBinary(
   left: unknown,
   right: unknown,
   minimumQuotientScale = 0,
+  // Stored and returned values are canonical (trailing fractional zeros stripped). Constant
+  // folding keeps the computed scale instead: PostgreSQL carries display scale through each
+  // step — max for +, -, %, the operands' sum for *, the selected scale for / — and a later
+  // division selects its own scale from it, so folding must not strip what execution never sees.
+  canonicalize = true,
 ): string | null | undefined {
   const leftTagged = taggedDecimalParts(left);
   const rightTagged = taggedDecimalParts(right);
@@ -230,7 +263,7 @@ export function exactNumericBinary(
   }
   return boundedTaggedDomainValue(
     NUMERIC,
-    formatDecimal(normalizeDecimal(result)),
+    formatDecimal(canonicalize ? normalizeDecimal(result) : result),
     "NUMERIC result",
   );
 }

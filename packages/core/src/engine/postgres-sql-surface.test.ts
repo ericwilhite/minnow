@@ -1356,9 +1356,20 @@ describe("schema statements", () => {
     await expect(
       database.insertBatch("exact_ids", [{ id: 2, qty: 1.25, ratio: 1.5 }]),
     ).rejects.toThrow("qty[0] must be a safe integer");
-    await expect(database.query("SELECT 9007199254740993 AS rounded")).rejects.toThrow(
-      "Integer literal is outside the exact safe range",
-    );
+    // An integer literal beyond 2^53 is not an error: PostgreSQL types it exactly (int8 or
+    // NUMERIC), so it stays a tagged exact-NUMERIC constant rather than a rounded Float64.
+    const exact = await database.query("SELECT 9007199254740993 AS rounded");
+    expect(exact.rows).toEqual([{ rounded: "9007199254740993" }]);
+    // Writing that constant follows PostgreSQL's assignment casts, except that an integer
+    // column refuses a value Float64 cannot hold instead of silently rounding it. A float
+    // column takes the correctly rounded cast, exactly as PostgreSQL's float8 does.
+    await expect(
+      database.execute("INSERT INTO exact_ids VALUES (9007199254740993, 2, 1.5)"),
+    ).rejects.toThrow("id must be a safe integer");
+    await database.execute("INSERT INTO exact_ids VALUES (2, 3, 1.000000000000000000000000 / 3)");
+    expect((await database.query("SELECT ratio FROM exact_ids WHERE id = 2")).rows).toEqual([
+      { ratio: 0.3333333333333333 },
+    ]);
     await expect(database.query("SELECT CAST('9007199254740993' AS BIGINT)")).rejects.toThrow(
       "Integer cast is outside the exact safe range",
     );
