@@ -61,11 +61,13 @@ is recognized and not sorted again.
 **Keyed point reads.** A single-table `WHERE` that is a conjunction of `column = value`
 equalities covering the table's unique key — scalar or composite — names at most one row, so it
 skips the batch pipeline entirely and answers from cached decoded blocks: binary search over
-ascending key components, dictionary probes for string keys. Anything the fast path cannot prove
-— a pending update or delete delta, a cross-type comparison, a view, a domain-typed column —
-falls back to the ordinary executor, which stays the authority on answers and errors. `EXPLAIN`
-reports eligibility as `key-covering equality answers as a point read when the visible history
-allows`.
+ascending key components, dictionary probes for string keys. Projected columns may carry a
+logical domain — `NUMERIC`, `UUID`, `JSON`, `DATE`, enums, arrays — and render exactly as the
+ordinary executor renders them, declared-scale padding included. Anything the fast path cannot
+prove — a pending update or delete delta, a cross-type comparison, a view, a domain-typed
+column in the `WHERE` clause — falls back to the ordinary executor, which stays the authority
+on answers and errors. `EXPLAIN` reports eligibility as `key-covering equality answers as a
+point read when the visible history allows`.
 
 The query runner works on batches of column values rather than one row at a time, and
 scans stream block by block so a table is never required to be resident. When a hash table,

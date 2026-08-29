@@ -5467,12 +5467,14 @@ export class MinnowDatabase {
     if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
       return undefined;
     }
+    // A logical-domain projection is served too: the stored scalar is the tagged internal
+    // value the ordinary executor's pipeline carries for a bare column reference, and both
+    // paths cross the result boundary through the same externalizeQueryResult call, so
+    // reporting the column's domain below makes the answers identical by construction.
     const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
     for (const item of shape.select) {
       const column = columnByName.get(item.column);
-      if (column === undefined || column.hidden === true || column.sqlDomain !== undefined) {
-        return undefined;
-      }
+      if (column === undefined || column.hidden === true) return undefined;
       projected.push({ column, alias: item.alias });
     }
     const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
@@ -5607,10 +5609,16 @@ export class MinnowDatabase {
             const columnVector = vectors.get(item.column.name);
             if (columnVector === undefined) return undefined;
             const value = vectorValue(columnVector, slot);
-            // A stored plain-text value in the protected NUL namespace crosses the result
-            // boundary through the ordinary executor's wrapping rules; reproducing them here
-            // is not worth the risk, so the whole statement falls back.
-            if (typeof value === "string" && value.charCodeAt(0) === 0) return undefined;
+            if (typeof value === "string" && value.charCodeAt(0) === 0) {
+              // A domain column's stored scalar is expected here: it carries the internal
+              // tag and is stripped by the shared externalization boundary. Anything else in
+              // the NUL namespace — plain text crossing through the ordinary executor's
+              // wrapping rules, or an untagged value where a tag is required — is not
+              // provably reproduced, so the whole statement falls back.
+              if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) {
+                return undefined;
+              }
+            }
             row[item.alias] = value;
           }
           rows.push(row);
@@ -5619,7 +5627,7 @@ export class MinnowDatabase {
     }
     return {
       columns: shape.select.map((item) => item.alias),
-      columnDomains: shape.select.map(() => null),
+      columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
       rows,
     };
   }

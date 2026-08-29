@@ -1,7 +1,8 @@
 /**
  * Shape analysis for the keyed point-read fast path: a single-table conjunction of
- * column-equals-literal predicates that covers the table's unique key, projecting plain
- * columns. Such a statement addresses at most one row, so execution can skip parameter
+ * column-equals-literal predicates that covers the table's unique key, projecting bare
+ * columns — plain or logical-domain typed, since domain scalars externalize through the
+ * same result boundary. Such a statement addresses at most one row, so execution can skip parameter
  * binding, plan cloning, streamed-view construction, and the vector pipeline entirely and
  * answer from cached decoded blocks. Anything this module cannot prove eligible falls back to
  * the ordinary executor, which stays the authority on errors and semantics.
