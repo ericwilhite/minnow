@@ -81,16 +81,20 @@ try {
     const selectedRecords =
       stopAfter === undefined ? readRecords(file) : takeRecords(readRecords(file), stopAfter);
     const records = reportRecords(selectedRecords, file);
-    const statistics = await runSqlLogicTest(records, createDatabase(), {
-      onFailure: keepGoing
-        ? (failure) => {
-            failures.push(failure);
-            console.error(`FAIL ${failure.message}\n`);
-            if (failures.length >= maxFailures) throw failure;
-            return "continue";
+    const statistics = await runSqlLogicTest(
+      records,
+      createDatabase(),
+      keepGoing
+        ? {
+            onFailure: (failure) => {
+              failures.push(failure);
+              console.error(`FAIL ${failure.message}\n`);
+              if (failures.length >= maxFailures) throw failure;
+              return "continue";
+            },
           }
-        : undefined,
-    });
+        : {},
+    );
     addStatistics(total, statistics);
     if (!quiet) {
       console.log(

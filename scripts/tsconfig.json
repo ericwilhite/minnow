@@ -1,0 +1,23 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "noEmit": true,
+    // Scripts import package sources directly (e.g. ../packages/core/src/storage/types.ts).
+    "allowImportingTsExtensions": true,
+    // playwright.shared.mjs and clean-output.mjs are imported by files checked here.
+    "allowJs": true
+  },
+  // The root vitest/playwright configs have no project of their own, so they ride along here.
+  "include": [
+    "**/*.mts",
+    "**/*.ts",
+    "../vitest.config.ts",
+    "../playwright.library.config.ts",
+    "../playwright.site.config.ts"
+  ],
+  // The consumer fixture is a standalone app the smoke test compiles with its own tsconfigs
+  // against the packed tarballs; checking it here would resolve against the workspace instead.
+  "exclude": ["consumer-smoke/fixture"]
+}

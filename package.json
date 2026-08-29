@@ -19,7 +19,7 @@
     "build": "npm run clean && tsc -b --force && npm run build --workspace @minnowdb/site",
     "site:dev": "npm run dev --workspace @minnowdb/site",
     "site:build": "npm run build --workspace @minnowdb/site",
-    "typecheck": "tsc -b --force --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit",
+    "typecheck": "tsc -b --force --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit && tsc --noEmit --pretty false -p scripts && tsc --noEmit --pretty false -p packages/core/browser && tsc --noEmit --pretty false -p packages/core/browser-tests",
     "test": "npm run test:unit && npm run test:sql:standard",
     "test:unit": "vitest run",
     "test:coverage": "vitest run --coverage",

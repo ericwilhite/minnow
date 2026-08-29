@@ -4,6 +4,7 @@ import { basename, resolve } from "node:path";
 
 import {
   parseSqlLogicTest,
+  type SqlLogicQuery,
   type SqlLogicRecord,
 } from "../packages/core/src/testing/sqllogictest.js";
 import { ensureSqlLogicCorpus, sqlLogicCorpusManifest } from "./lib/sqllogictest-corpus.mts";

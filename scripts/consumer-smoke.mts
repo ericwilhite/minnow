@@ -202,7 +202,11 @@ async function browserSmoke(consumerRoot: string): Promise<unknown> {
       await page.goto(url);
       await page.locator("#status").waitFor({ state: "visible" });
       assert.equal(await page.locator("#status").textContent(), "ready");
-      const result = await page.evaluate(() => window.runConsumerSmoke());
+      // The fixture's main.ts declares this on Window, but the fixture is excluded from the
+      // scripts tsconfig (it compiles against the packed tarballs), so the type lives here.
+      const result = await page.evaluate(() =>
+        (window as unknown as { runConsumerSmoke: () => Promise<unknown> }).runConsumerSmoke(),
+      );
       assert.deepEqual(browserErrors, []);
       return result;
     } finally {

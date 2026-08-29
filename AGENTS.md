@@ -29,10 +29,13 @@ Facts about this repository that are easy to get wrong:
   It checks the **working tree**, not the pushed commits: with several sessions sharing this
   tree, a red gate may come from another session's in-flight edits, not yours. Escape hatch:
   `git push --no-verify`, only when you know why the gate is red.
-- **`scripts/` is never type-checked.** No tsconfig includes it, and ESLint runs it without
-  type-aware rules. A type error in `scripts/*.mts` (or the root configs) surfaces only when
-  vite-node executes it. The same is true of `packages/core/browser/` and
-  `packages/core/browser-tests/` — Playwright transpiles those at runtime.
+- **`scripts/` is type-checked by its own project, not `tsc -b`.** `scripts/tsconfig.json`
+  (noEmit) covers `scripts/**` and the root vitest/playwright configs, and `npm run typecheck`
+  runs it — plus `packages/core/browser` and `packages/core/browser-tests` — after the package
+  build, because scripts import the built declarations in `packages/*/dist`. Running
+  `tsc --noEmit -p scripts` before `tsc -b` fails on missing dists. ESLint still runs `scripts/`
+  without type-aware rules, and `scripts/consumer-smoke/fixture` is deliberately excluded: the
+  smoke test compiles it against the packed tarballs.
 - **Root `tsconfig.json` validates zero files.** It is `"files": []` plus project references.
   `tsc --noEmit -p tsconfig.json` proves nothing; use `npm run typecheck`.
 - **`apps/site/public/versions.json` is a hand-maintained input**, not a generated file, even
