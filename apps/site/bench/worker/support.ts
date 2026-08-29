@@ -1,10 +1,9 @@
 /// <reference lib="webworker" />
 /**
- * Cross-cutting worker plumbing: progress emission, cancellation, memory checkpoints
- * answered by the window, and small IndexedDB/arithmetic helpers.
+ * Cross-cutting worker plumbing: progress emission, cancellation, and small
+ * IndexedDB/arithmetic helpers.
  */
 import { protocolVersion, type ProgressResponse } from "@minnowdb/core/worker-protocol";
-import type { MemorySample } from "../memory-probe";
 import { engineIds } from "../protocol";
 import type { EngineId, WorkProgress } from "../protocol";
 
@@ -43,18 +42,6 @@ export function progress(requestId: string, value: WorkProgress): void {
     progress: value,
   };
   self.postMessage(response);
-}
-
-/**
- * Memory checkpoints answered by the window. A worker cannot read either memory API
- * itself, so the window replies to published checkpoints keyed by token.
- */
-const pendingMemorySamples = new Map<string, (sample: MemorySample) => void>();
-
-export function resolveMemorySample(token: string, sample: MemorySample): void {
-  const resolve = pendingMemorySamples.get(token);
-  pendingMemorySamples.delete(token);
-  resolve?.(sample);
 }
 
 export async function deleteDatabase(name: string): Promise<void> {

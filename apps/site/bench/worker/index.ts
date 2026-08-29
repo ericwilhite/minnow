@@ -8,14 +8,13 @@
  * an engine comparison, and now run as browser tests under packages/core.
  */
 import { failure, parseRequest, success } from "@minnowdb/core/worker-protocol";
-import type { MemorySample } from "../memory-probe";
 import { datasetCreate, datasetDelete, datasetList, validateCreatePayload } from "./datasets";
 import { runFeatureSuite, validateFeaturePayload } from "./feature-suite";
 import { runLiveSuite, validateLivePayload } from "./live-suite";
 import { runQuery, validateRunQueryPayload } from "./run-query";
 import { runReferenceSuite, validateReferencePayload } from "./reference-suite";
 import { runWriteSuite, validateWritePayload } from "./write-suite";
-import { cancelledRuns, getRequestId, resolveMemorySample } from "./support";
+import { cancelledRuns, getRequestId } from "./support";
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
   void runRequest(event.data);
@@ -27,13 +26,6 @@ async function runRequest(raw: unknown): Promise<void> {
     const request = parseRequest(raw);
     requestId = request.requestId;
     switch (request.operation) {
-      case "memorySample": {
-        const payload = request.payload as { token?: unknown; sample?: MemorySample };
-        if (typeof payload.token === "string" && payload.sample !== undefined) {
-          resolveMemorySample(payload.token, payload.sample);
-        }
-        return;
-      }
       case "cancelBenchmark": {
         const payload = request.payload as { requestId?: unknown };
         if (typeof payload.requestId === "string") cancelledRuns.add(payload.requestId);

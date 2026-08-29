@@ -1,15 +1,12 @@
 /**
  * Thin request/response client for the benchmark worker. Correlates responses by
- * requestId, forwards progress messages, and answers the worker's memory checkpoints —
- * neither memory API exists in a worker, so the worker delegates each sample to this
- * thread through the progress channel.
+ * requestId and forwards progress messages.
  */
 import {
   protocolVersion,
   type WorkerOperation,
   type WorkerResponse,
 } from "@minnowdb/core/worker-protocol";
-import { sampleMemory } from "./memory-probe";
 import type { WorkProgress } from "./protocol";
 
 interface PendingRequest {
@@ -80,18 +77,6 @@ export class BenchWorker {
 
   private receive(message: WorkerResponse): void {
     if (message.kind === "progress") {
-      const checkpoint = asMemoryCheckpoint(message.progress);
-      if (checkpoint !== undefined) {
-        void sampleMemory().then((sample) => {
-          this.worker.postMessage({
-            version: protocolVersion,
-            requestId: crypto.randomUUID(),
-            operation: "memorySample",
-            payload: { token: checkpoint.token, sample },
-          });
-        });
-        return;
-      }
       this.pending.get(message.requestId)?.onProgress?.(message.progress as WorkProgress);
       return;
     }
@@ -104,12 +89,4 @@ export class BenchWorker {
       request.resolve(message.result);
     }
   }
-}
-
-function asMemoryCheckpoint(progress: unknown): { token: string } | undefined {
-  if (typeof progress !== "object" || progress === null) return undefined;
-  const candidate = progress as { phase?: unknown; token?: unknown };
-  if (candidate.phase !== "memory-checkpoint" || typeof candidate.token !== "string")
-    return undefined;
-  return { token: candidate.token };
 }
