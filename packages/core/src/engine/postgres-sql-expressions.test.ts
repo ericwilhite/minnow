@@ -103,6 +103,10 @@ describe("PostgreSQL value domains and predicates", () => {
     ]);
     expect(run("SELECT 1e2 AS q")).toEqual([{ q: 100 }]);
     expect(run("SELECT 2.5e-1 AS q")).toEqual([{ q: 0.25 }]);
+    // A scientific literal that stays exact expands the way PostgreSQL parses it: full digits,
+    // display scale from the applied exponent — identical to the same value written out.
+    expect(run("SELECT 1e400 AS q")).toEqual([{ q: `1${"0".repeat(400)}` }]);
+    expect(run("SELECT 1.000000000000000001e3 AS q")).toEqual([{ q: "1000.000000000000001" }]);
     // Float columns keep binary float semantics: a lone representable constant stays a plain
     // number on the vectorized paths, and an exact constant meeting a float column computes
     // exactly only when Float64 cannot spell it.

@@ -35,21 +35,24 @@ const rows = await peopleRows.rows();
 The four physical storage builders are `column.boolean()`, `column.number()`, `column.string()`,
 and `column.datetime()`. The DSL also retains the SQL domain layered over that storage:
 
-| Builder                                   | Selected type             | Insert / update type          |
-| ----------------------------------------- | ------------------------- | ----------------------------- |
-| `column.integer()`                        | `number`                  | `number` (safe integers only) |
-| `column.numeric({ precision, scale })`    | `string`                  | `string \| number`            |
-| `column.json()` / `column.jsonb()`        | `string`                  | `string`                      |
-| `column.uuid()` / `time()` / `interval()` | `string`                  | `string`                      |
-| `column.date()`                           | `string` (`YYYY-MM-DD`)   | `string` (`YYYY-MM-DD`)       |
-| `column.array("text")`                    | JSON array text           | JSON array text               |
-| `column.enum([...])`                      | The values' literal union | The values' literal union     |
-| `column.sqlEnum("mood", [...])`           | The values' literal union | The values' literal union     |
+| Builder                                   | Selected type                                   | Insert / update type          |
+| ----------------------------------------- | ----------------------------------------------- | ----------------------------- |
+| `column.integer()`                        | `number`                                        | `number` (safe integers only) |
+| `column.numeric({ precision, scale })`    | `string`                                        | `string \| number`            |
+| `column.json()` / `column.jsonb()`        | `string` (`JsonShape<S>` with a declared shape) | `string`                      |
+| `column.uuid()` / `time()` / `interval()` | `string`                                        | `string`                      |
+| `column.date()`                           | `string` (`YYYY-MM-DD`)                         | `string` (`YYYY-MM-DD`)       |
+| `column.array("text")`                    | JSON array text                                 | JSON array text               |
+| `column.enum([...])`                      | The values' literal union                       | The values' literal union     |
+| `column.sqlEnum("mood", [...])`           | The values' literal union                       | The values' literal union     |
 
 `NUMERIC` selects as a decimal string so no precision is lost, while writes may use a decimal
 string or a finite number. JSON/JSONB and arrays use their JSON text representation at the
-JavaScript boundary, matching direct SQL and the Kysely adapter. `column.date()` is a zoneless
-calendar date: it validates canonical `YYYY-MM-DD` text and never adds a time or UTC offset.
+JavaScript boundary, matching direct SQL and the Kysely adapter. A JSON column may also declare
+its document's shape — `column.jsonb<{ name: string }>()` — a compile-time promise that leaves
+reads and writes JSON text but gives the [Kysely adapter](/docs/adapters/kysely) typed `->`/`->>`
+traversal. `column.date()` is a zoneless calendar date: it validates canonical `YYYY-MM-DD` text
+and never adds a time or UTC offset.
 
 The column modifiers are:
 

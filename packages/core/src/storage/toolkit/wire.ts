@@ -117,7 +117,7 @@ export function decodeChunk(bytes: Uint8Array): unknown {
 }
 
 /** The structural part of FtsPosting kept here to avoid coupling the low-level codec to storage. */
-interface PostingChunkEntry {
+export interface PostingChunkEntry {
   term: string;
   rowIds: bigint[];
   tf: number[];

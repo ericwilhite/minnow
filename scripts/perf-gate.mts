@@ -98,6 +98,8 @@ function iterationsFor(
   );
 }
 
+// Deterministic copy of `mulberry32` in packages/core/src/testing/seeds.ts; scripts import the
+// built dist, whose exports map does not expose that module, so the gate keeps its own copy.
 function mulberry32(seed: number): () => number {
   let state = seed;
   return () => {

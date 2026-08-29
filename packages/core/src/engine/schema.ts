@@ -148,6 +148,17 @@ type ValueOf<TType extends SchemaColumnType> = TType extends "boolean"
  */
 export type HasDefault<TValue> = TValue & { readonly __minnowHasDefault?: true };
 
+/**
+ * A JSON column's select value carrying a declared document shape. The value is still JSON
+ * text — the brand is an optional phantom property, so plain strings stay assignable in both
+ * directions — and adapters read the shape to offer typed traversal. The tuple wrapper keeps
+ * `never` and union shapes intact through inference.
+ */
+export type JsonShape<TShape> = string & { readonly __minnowJsonShape?: readonly [TShape] };
+
+/** A JSON column without a declared shape selects as exactly `string`, with no brand. */
+type JsonColumnValue<TShape> = [TShape] extends [never] ? string : JsonShape<TShape>;
+
 export interface ColumnBuilder<
   TValue extends SchemaValue,
   TNullable extends boolean,
@@ -533,10 +544,19 @@ export const column = {
     const sqlDomain = validateSqlDomain({ kind: "numeric", ...options }, "numeric column");
     return createColumn<"string", string, string | number, "numeric">("string", { sqlDomain });
   },
-  json: () =>
-    createColumn<"string", string, string, "json">("string", { sqlDomain: { kind: "json" } }),
-  jsonb: () =>
-    createColumn<"string", string, string, "jsonb">("string", { sqlDomain: { kind: "jsonb" } }),
+  /**
+   * JSON text at the JavaScript boundary. Optionally declare the document's shape —
+   * `column.json<{ name: string }>()` — for adapters to type `->`/`->>` traversal; the runtime
+   * value stays JSON text either way.
+   */
+  json: <TShape = never>() =>
+    createColumn<"string", JsonColumnValue<TShape>, string, "json">("string", {
+      sqlDomain: { kind: "json" },
+    }),
+  jsonb: <TShape = never>() =>
+    createColumn<"string", JsonColumnValue<TShape>, string, "jsonb">("string", {
+      sqlDomain: { kind: "jsonb" },
+    }),
   uuid: () =>
     createColumn<"string", string, string, "uuid">("string", { sqlDomain: { kind: "uuid" } }),
   /** A zoneless calendar date, represented publicly as canonical `YYYY-MM-DD` text. */

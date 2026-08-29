@@ -137,12 +137,12 @@
     {
       "id": "literal.scientific",
       "classification": "different",
-      "reason": "PostgreSQL types every scientific-notation constant NUMERIC and renders it as text. Minnow evaluates it exactly but returns a number whenever Float64 holds the value with no rounding, keeping ordinary constants number-typed at the JavaScript boundary."
+      "reason": "PostgreSQL types every scientific-notation constant NUMERIC and renders it as text. Minnow evaluates it exactly but returns a number whenever the value reads back identically from one, keeping ordinary constants number-typed at the JavaScript boundary; a constant that stays exact renders fully expanded, as PostgreSQL renders it."
     },
     {
       "id": "type.exact-numeric",
       "classification": "different",
-      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings, as PGlite's default decoder also does. A declared scale renders at exactly that scale as PostgreSQL does; a bare NUMERIC column, a derived arithmetic result, and a value cast or concatenated to text render canonically, without the trailing fractional zeros PostgreSQL preserves. Division and AVG select their result scale the way PostgreSQL does, so quotient digits agree — including AVG over a column whose declared scale exceeds the selection. The canonical encoding does drop a stored value's display scale, so an explicit arithmetic quotient (such as SUM(v) / COUNT(v)) over a column declared with more than about twenty fractional digits can carry fewer digits than PostgreSQL, which floors the selection at the operand's display scale."
+      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings, as PGlite's default decoder also does. A declared scale renders at exactly that scale as PostgreSQL does; a bare NUMERIC column, a derived arithmetic result, and a value cast or concatenated to text render canonically, without the trailing fractional zeros PostgreSQL preserves. Division and AVG select their result scale the way PostgreSQL does, so quotient digits agree — including AVG over a column whose declared scale exceeds the selection. The canonical encoding does drop a stored value's display scale, so an explicit arithmetic quotient (such as SUM(v) / COUNT(v)) over a column declared with more than about twenty fractional digits can carry fewer digits than PostgreSQL, which floors the selection at the operand's display scale. An arithmetic or comparison expression mixing a float column with a constant Float64 cannot represent stays exact, where PostgreSQL casts the constant to float8 and rounds it before evaluating."
     },
     {
       "id": "type.json-jsonb",

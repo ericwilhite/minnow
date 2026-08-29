@@ -69,6 +69,9 @@ function decimalParts(value: string | number): DecimalParts {
   let coefficient = BigInt(digits || "0") * (match[1] === "-" ? -1n : 1n);
   let scale = fraction.length - exponent;
   if (scale < 0) {
+    if (-scale > 100_000) {
+      throw new RangeError(`NUMERIC exponent is outside the supported range: ${source}`);
+    }
     coefficient *= pow10(-scale);
     scale = 0;
   }
@@ -156,17 +159,22 @@ export function exactNumericValue(
  * Tags a SQL numeric constant with its exact digits, as written. Unlike `exactNumericValue`
  * this does not canonicalize: trailing fractional zeros are PostgreSQL display scale, and
  * division selects its result scale from the operands' scales, so a literal's digits are part
- * of its meaning. The text is still validated and bounded.
+ * of its meaning. Scientific notation is the exception — PostgreSQL expands the exponent when
+ * it parses the literal, so `1.5e2` is `150` and `1e400` is the full digit string, and the
+ * display scale comes from that expansion. The text is still validated and bounded.
  */
 export function exactNumericLiteral(text: string): string {
-  decimalParts(text);
-  return boundedTaggedDomainValue(NUMERIC, text, "NUMERIC literal");
+  const parts = decimalParts(text);
+  const plain = /[eE]/.test(text) ? formatDecimal(parts) : text;
+  return boundedTaggedDomainValue(NUMERIC, plain, "NUMERIC literal");
 }
 
 /**
- * The Float64 holding this exact numeric value with no rounding, or undefined when no Float64
- * does. A constant that fits stays an ordinary number so every number-typed path keeps running;
- * only values Float64 would round stay tagged NUMERIC.
+ * The Float64 this exact numeric value reads back identically from — the nearest float's
+ * canonical rendering re-parses to the same decimal value, so `0.1` qualifies while
+ * `9007199254740993` does not — or undefined when the trip through a number would visibly
+ * round. A value that survives stays an ordinary number so every number-typed path keeps
+ * running; only visibly rounded values stay tagged NUMERIC.
  */
 export function exactNumericAsNumber(value: string): number | undefined {
   const parts = taggedDecimalParts(value);

@@ -1656,6 +1656,10 @@ describe("SQL conformance against SQLite and PGlite", () => {
         "SELECT 0.30000000000000000000000004 - 0.2 AS q",
         "SELECT amount + 0.000000000000000000000001 AS q FROM ledger WHERE id = 1",
         "SELECT rate * 1.000000000000000000000001 AS q FROM ledger WHERE id = 3",
+        // A scientific literal that stays exact expands at parse the way PostgreSQL expands
+        // it, so the rendered digit strings agree.
+        "SELECT 1e400 AS q",
+        "SELECT 1.000000000000000001e3 AS q",
       ];
       for (const sql of queries) {
         const minnowRows = (await database.query(sql)).rows;

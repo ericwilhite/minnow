@@ -8,6 +8,79 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.6 — August 29, 2026
+
+Published packages: `@minnowdb/core@0.6.6`, `@minnowdb/kysely@0.4.5`, and
+`@minnowdb/devtools@0.2.3`.
+
+### Fixed
+
+- Constant-folded `||` no longer corrupts domain values: concatenating a folded constant with
+  an array, JSONB, or other non-text-domain operand previously leaked the engine's internal
+  domain encoding into the result text, or crashed on intervals. The fold, the row executor,
+  and the vectorized executor now share one `||` implementation that refuses array and JSONB
+  operands and two non-text-domain operands the way PostgreSQL's operator resolution does, with
+  the feature named in the error.
+- `@minnowdb/devtools` now declares its `@lezer/highlight` dependency. Package managers with
+  strict resolution previously failed at editor mount because the dependency arrived only by
+  hoisting.
+
+### Added
+
+- SQL numeric constants are typed exactly, the way PostgreSQL's `NUMERIC` typing works:
+  `SELECT 0.1 + 0.2` is `0.3`, constant arithmetic folds in exact decimal space with quotient
+  scales following the written scales, integer literals beyond 2^53 parse instead of erroring,
+  and scientific notation parses and — when the value stays exact — renders fully expanded, as
+  PostgreSQL renders it. A result that reads back identically from a JavaScript number returns
+  as an ordinary number; one the number boundary would visibly round returns as an exact
+  decimal string. Exact constants assigned to float columns round the way PostgreSQL's
+  assignment cast does; integer columns reject values beyond the safe range. The feature
+  matrix gains `literal.exact-decimal`, `literal.big-integer`, and `literal.scientific`,
+  conformance-tested against PGlite and SQLite.
+- A JSON column can declare its document's shape — `column.json<Shape>()` and
+  `column.jsonb<Shape>()` — carried by the new `JsonShape<Shape>` branded select type. The
+  shape is a compile-time promise only: reads and writes stay JSON text and nothing validates
+  stored documents against it. The schema-derived Kysely database types
+  `eb.ref(column, "->"/"->>")` traversal from the declared shape — member names complete,
+  misspelled keys are compile errors, leaf types are inferred — and
+  `resultDecoding: { json: "parse" }` presents the declared shape itself instead of the wide
+  JSON union.
+- Keyed point reads now serve domain-typed projections — `NUMERIC`, dates, JSON, enums, and
+  the other tagged domains — from the fast path instead of falling back to the full pipeline,
+  about ten times faster for exact-match lookups on such columns. The performance gate gained
+  an exact-point-lookup workload to hold the line.
+- The feature matrix records the forms the engine refuses with named errors instead of
+  obscure failures: array subscripts, `ANY`/`ALL` over array values, `||` on array or JSONB
+  operands, interval-valued arithmetic such as interval-plus-interval, and correlated
+  `JSON_TABLE` documents.
+- `@minnowdb/core/storage/toolkit` exports `PostingChunkEntry`, the entry type
+  `encodePostingChunk` and `decodePostingChunk` already used in their public signatures.
+
+### Changed
+
+- `NUMERIC` division selects its result scale the way PostgreSQL's `select_div_scale` does:
+  at least sixteen significant digits, never fewer fractional digits than either operand,
+  rounded half away from zero and capped at 1000. `AVG` over a column whose declared scale
+  exceeds that selection computes real digits to the declared scale instead of padding zeros.
+  Quotient digit strings change accordingly.
+- The worker protocol's `WorkerOperation` union drops `"memorySample"`, a bench-only
+  operation whose handler no longer exists; sending it was already an error.
+
+### Migration
+
+Nothing to change for correct programs. Programs that compare quotient digit strings
+byte-for-byte will see PostgreSQL's scale selection (more digits in most divisions). SQL that
+previously leaked internal tags or crashed on `||` over arrays, JSONB, or intervals now fails
+with a named error. Integer literals beyond 2^53 and scientific notation now parse; extreme
+constant results that no JavaScript number can carry come back as exact decimal strings, a
+result-type change for expressions that previously errored. JSON shape declarations are
+optional and additive — schemas without them infer exactly as before.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+layout 5 remain readable and writable without a data migration.
+
 ## 0.6.5 — August 28, 2026
 
 Published packages: `@minnowdb/core@0.6.5` and `@minnowdb/kysely@0.4.4`.

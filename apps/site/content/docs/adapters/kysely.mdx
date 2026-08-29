@@ -241,14 +241,34 @@ SQL `NULL` — and `->>` values cross this adapter as strings, so a numeric comp
 compares text as above. See the [SELECT guide](/docs/sql/select) for the operators' semantics.
 
 Typed traversal is driven by the column's TypeScript type, so it needs a declared document
-shape: a hand-written `Kysely<DB>` interface whose column is the object type, as in the example
-above. A schema-derived `createKysely` database types JSON columns as their lossless string
-boundary (or `MinnowJsonValue` with decoding), which offers no member names to traverse — write
-those reads with `sql<T>` and `JSON_VALUE`, or declare an interface for that table. Two
-accuracy notes on Kysely's inferred leaf types: a `->` result matches its inferred object type
-at runtime only with `resultDecoding: { json: "parse" }` (otherwise it is JSON text), and a
-`->>` result is always text at runtime even where the declared member is a number or array —
-treat it as a string, exactly as the comparison above does.
+shape. A schema-derived `createKysely` database gets one from the column itself — pass the
+shape to `column.json<Shape>()` or `column.jsonb<Shape>()`:
+
+```ts
+interface ProfileDocument {
+  name: string;
+  tags: string[];
+  meta: { score: number };
+}
+
+const profiles = table("profiles", {
+  id: column.integer().unique(),
+  document: column.jsonb<ProfileDocument>().nullable(),
+});
+```
+
+The declared shape types `.key()` and `.at()` — member names complete, a misspelled key is a
+compile error, and leaf types are inferred — while the column itself still selects as JSON text
+(`JsonShape<ProfileDocument>`, a branded string), or as the declared shape itself under
+`resultDecoding: { json: "parse" }`. The shape is a compile-time promise, not a validator:
+writes still take JSON text, and no runtime check confirms stored documents match it. Without a
+declared shape, a JSON column types as its lossless string boundary (or `MinnowJsonValue` with
+decoding), which offers no member names to traverse — declare the shape, write those reads with
+`sql<T>` and `JSON_VALUE`, or hand-write a `Kysely<DB>` interface whose column is the object
+type. Two accuracy notes on Kysely's inferred leaf types: a `->` result matches its inferred
+object type at runtime only with `resultDecoding: { json: "parse" }` (otherwise it is JSON
+text), and a `->>` result is always text at runtime even where the declared member is a number
+or array — treat it as a string, exactly as the comparison above does.
 
 ## Inferred function results
 

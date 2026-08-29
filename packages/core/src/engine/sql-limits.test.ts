@@ -223,6 +223,7 @@ describe("SQL scalar allocation limits", () => {
       `\u0000minnow-domain:numeric:1${"0".repeat(100_000)}`,
     );
     expect(() => exactNumericValue("1".repeat(100_001))).toThrow(/100000 significant digits/);
+    expect(() => exactNumericValue("1e100001")).toThrow(/NUMERIC exponent is outside/);
   });
 
   it("does not reinterpret ordinary ARRAY strings as internal domain tags", () => {

@@ -97,8 +97,9 @@ export type Expression =
       internalSqlValue?: true;
       sqlDomain?: SqlDomain;
       /**
-       * A numeric constant's exact source digits, kept when Float64 represents the value but
-       * not the spelling (`1.000000000000000000000000` is the number 1 with display scale 24).
+       * A numeric constant's exact source digits, kept when the value survives the number
+       * boundary but the spelling carries more (`1.000000000000000000000000` is the number 1
+       * with display scale 24).
        * Constant folding reads these so seeded arithmetic runs in exact decimal space, the way
        * PostgreSQL types every decimal constant NUMERIC before evaluating it.
        */

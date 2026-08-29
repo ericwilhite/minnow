@@ -8,6 +8,8 @@ import type {
   ComparisonOperatorExpression,
   ExtractTypeFromReferenceExpression,
   ExtractTypeFromStringReference,
+  JSONOperatorWith$,
+  JSONPathBuilder,
   KyselyTypeError,
   ReferenceExpression,
   SelectType,
@@ -32,6 +34,27 @@ type ColumnMetadata<TColumn> = TColumn extends {
 export type MinnowJsonValue =
   null | boolean | number | string | MinnowJsonValue[] | { [name: string]: MinnowJsonValue };
 
+/**
+ * The document shape a schema declared with `column.json<Shape>()`, read from the phantom
+ * brand on the column's select value, or `never` when the column declared none. The `unknown`
+ * guard keeps an unbranded plain string from reading as a declared shape.
+ */
+type DeclaredJsonShape<TSelect> =
+  NonNullable<TSelect> extends { readonly __minnowJsonShape?: readonly [infer TShape] }
+    ? unknown extends TShape
+      ? never
+      : TShape
+    : never;
+
+/**
+ * What `eb.ref(column, "->")` traverses. A declared shape replaces the JSON-text brand so
+ * `.key()` sees the document's members; every other value — hand-written interfaces, undeclared
+ * Minnow columns, decoded documents — passes through to Kysely's own behavior.
+ */
+type MinnowJsonTraversalRoot<TValue> = [DeclaredJsonShape<TValue>] extends [never]
+  ? TValue
+  : DeclaredJsonShape<TValue> | Extract<TValue, null>;
+
 type DecodedSelectValue<
   TColumn,
   TDecoding extends MinnowResultDecoding | undefined,
@@ -41,7 +64,9 @@ type DecodedSelectValue<
     : ColumnMetadata<TColumn>["select"]
   : ColumnMetadata<TColumn>["domain"] extends "json" | "jsonb"
     ? TDecoding extends { readonly json: "parse" }
-      ? MinnowJsonValue
+      ? [DeclaredJsonShape<ColumnMetadata<TColumn>["select"]>] extends [never]
+        ? MinnowJsonValue
+        : DeclaredJsonShape<ColumnMetadata<TColumn>["select"]>
       : ColumnMetadata<TColumn>["select"]
     : ColumnMetadata<TColumn>["select"];
 
@@ -550,6 +575,11 @@ declare module "kysely" {
   }
 
   interface ExpressionBuilder<DB, TB extends keyof DB> {
+    /** JSON traversal rooted at the declared document shape when the schema carries one. */
+    ref<RE extends StringReference<DB, TB>>(
+      reference: RE,
+      op: JSONOperatorWith$,
+    ): JSONPathBuilder<MinnowJsonTraversalRoot<ExtractTypeFromReferenceExpression<DB, TB, RE>>>;
     <RE extends StringReference<DB, TB>, OP extends BinaryOperator>(
       lhs: RE,
       op: OP,

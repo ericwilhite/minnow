@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/kysely",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Run Kysely queries against Minnow's browser-local SQL engine.",
   "license": "MIT",
   "author": "Eric Wilhite",
@@ -39,7 +39,7 @@
     "!dist/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@minnowdb/core": ">=0.6.5 <1.0.0"
+    "@minnowdb/core": ">=0.6.6 <1.0.0"
   },
   "peerDependencies": {
     "kysely": ">=0.29.5 <0.30.0"

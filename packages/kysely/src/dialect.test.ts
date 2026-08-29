@@ -21,6 +21,7 @@ import {
   table,
   view,
   type ExecuteResult,
+  type JsonShape,
   type MinnowSqlDriver,
 } from "@minnowdb/core";
 import type { MinnowDatabaseClient } from "@minnowdb/core/client";
@@ -86,6 +87,21 @@ const decodedSchema = schema([
     id: column.integer().unique(),
     amount: column.numeric({ precision: 12, scale: 2 }),
     document: column.jsonb().nullable(),
+  }),
+]);
+
+interface ProfileDocument {
+  name: string;
+  tags: string[];
+  meta: { score: number };
+}
+
+const documentSchema = schema([
+  table("profiles", {
+    id: column.integer().unique(),
+    document: column.jsonb<ProfileDocument>().nullable(),
+    settings: column.json<{ theme: "light" | "dark" }>(),
+    payload: column.json(),
   }),
 ]);
 
@@ -161,6 +177,67 @@ function inferredDecodedResults(driver: MinnowSqlDriver): void {
   >();
   void db;
   void query;
+}
+
+function typedJsonTraversal(driver: MinnowSqlDriver): void {
+  const db = createKysely({ driver, schema: documentSchema });
+
+  // The select channel keeps the JSON-text boundary; only the declared columns carry the brand.
+  const rows = db.selectFrom("profiles").selectAll();
+  expectTypeOf<Awaited<ReturnType<typeof rows.execute>>>().toEqualTypeOf<
+    Array<{
+      id: number;
+      document: JsonShape<ProfileDocument> | null;
+      settings: JsonShape<{ theme: "light" | "dark" }>;
+      payload: string;
+    }>
+  >();
+
+  // A declared shape drives `.key()`/`.at()` member names and leaf types.
+  const traversed = db
+    .selectFrom("profiles")
+    .select((eb) => [
+      eb.ref("document", "->>").key("name").as("name"),
+      eb.ref("document", "->").key("meta").key("score").as("score"),
+      eb.ref("document", "->>").key("tags").at(0).as("first_tag"),
+      eb.ref("settings", "->>").key("theme").as("theme"),
+    ]);
+  expectTypeOf<Awaited<ReturnType<typeof traversed.execute>>>().toEqualTypeOf<
+    Array<{
+      name: string | null;
+      score: number | null;
+      first_tag: string | null;
+      theme: "light" | "dark";
+    }>
+  >();
+
+  void db.selectFrom("profiles").select((eb) =>
+    // @ts-expect-error the declared document shape has no such member
+    eb.ref("document", "->>").key("missing").as("missing"),
+  );
+  void db.selectFrom("profiles").select((eb) =>
+    // @ts-expect-error an undeclared JSON column still offers no member names
+    eb.ref("payload", "->>").key("name").as("name"),
+  );
+
+  // Result decoding presents the declared shape itself; undeclared columns keep the wide union.
+  const decoded = createKysely({
+    driver,
+    schema: documentSchema,
+    resultDecoding: { json: "parse" },
+  });
+  const decodedRows = decoded.selectFrom("profiles").selectAll();
+  expectTypeOf<Awaited<ReturnType<typeof decodedRows.execute>>>().toEqualTypeOf<
+    Array<{
+      id: number;
+      document: ProfileDocument | null;
+      settings: { theme: "light" | "dark" };
+      payload: MinnowJsonValue;
+    }>
+  >();
+  void rows;
+  void traversed;
+  void decodedRows;
 }
 
 function portableKyselyCountRemainsPortable(db: Kysely<TestDatabase>): void {
@@ -640,6 +717,56 @@ describe("schema-derived Kysely types", () => {
       { id: 3, total: "0.00", status: "open" },
       { id: 4, total: "0.00", status: "open" },
     ]);
+    await db.destroy();
+    store.close();
+  });
+
+  it("traverses declared JSON document shapes with -> and ->>", async () => {
+    expect(typedJsonTraversal).toBeTypeOf("function");
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(documentSchema);
+    const db = createKysely({ driver: database, schema: documentSchema });
+
+    await db
+      .insertInto("profiles")
+      .values([
+        {
+          id: 1,
+          document: JSON.stringify({ name: "Ada", tags: ["x", "y"], meta: { score: 9 } }),
+          settings: JSON.stringify({ theme: "dark" }),
+          payload: "{}",
+        },
+        { id: 2, document: null, settings: JSON.stringify({ theme: "light" }), payload: "{}" },
+      ])
+      .execute();
+
+    // The declared shape types the traversal; the runtime boundary stays JSON text, so the
+    // number-typed score leaf still reads back as text under ->>.
+    expect(
+      await db
+        .selectFrom("profiles")
+        .select((eb) => [
+          "id",
+          eb.ref("document", "->>").key("name").as("name"),
+          eb.ref("document", "->>").key("meta").key("score").as("score"),
+          eb.ref("settings", "->>").key("theme").as("theme"),
+        ])
+        .orderBy("id")
+        .execute(),
+    ).toEqual([
+      { id: 1, name: "Ada", score: "9", theme: "dark" },
+      { id: 2, name: null, score: null, theme: "light" },
+    ]);
+
+    expect(
+      await db
+        .selectFrom("profiles")
+        .select("id")
+        .where((eb) => eb(eb.ref("document", "->>").key("name"), "=", "Ada"))
+        .execute(),
+    ).toEqual([{ id: 1 }]);
+
     await db.destroy();
     store.close();
   });

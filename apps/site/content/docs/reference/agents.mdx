@@ -94,8 +94,9 @@ machines: https://minnowdb.com/llms.txt
   PostgreSQL (`'1.50'` from `NUMERIC(10, 2)`); a bare `NUMERIC` and derived arithmetic render
   canonically, without trailing fractional zeros. Use `DOUBLE PRECISION` only when approximation
   is intended. Numeric constants in SQL are exact, as in PostgreSQL: `0.1 + 0.2` is `0.3`, and a
-  constant or constant-arithmetic result Float64 cannot hold exactly (24-digit decimals, integers
-  beyond 2^53) comes back as a decimal string rather than a rounded number or an error.
+  constant or constant-arithmetic result that would not read back identically from a JavaScript
+  number (24-digit decimals, integers beyond 2^53) comes back as a decimal string rather than a
+  rounded number or an error.
   JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enum values also return strings at the
   JavaScript boundary. `DATE` is canonical `YYYY-MM-DD` calendar text, not a JavaScript `Date`.
 - Use a column builder's `.generatedSql("expression")` or SQL `GENERATED ALWAYS AS (...) STORED` for a
@@ -137,6 +138,10 @@ machines: https://minnowdb.com/llms.txt
   `@minnowdb/kysely/helpers` instead of `kysely/helpers/postgres`. Enable
   `resultDecoding: { json: "parse" }` and use explicit named selections in row-to-object
   subqueries.
+- Declare a JSON column's document shape in the schema — `column.jsonb<Shape>()` — so the derived
+  Kysely DB types `eb.ref(column, "->>")` traversal with `.key()` / `.at()`. The shape is a
+  compile-time promise only: reads and writes stay JSON text unless `json: "parse"` decoding is
+  set, and `->>` leaves are always text at runtime.
 - `CREATE INDEX name ON table(a, b DESC)` creates a durable scalar or composite accelerator.
   Leftmost equality/`IN` prefixes and the next range prune candidates. `CREATE UNIQUE INDEX`
   enforces additional candidate keys atomically; any NULL component does not conflict.
@@ -157,8 +162,9 @@ machines: https://minnowdb.com/llms.txt
   JSON_TABLE, and the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
   a non-JSON document).
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
-  correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution,
-  sequence options, `RIGHT JOIN` beside another join or `SELECT *`, `FULL JOIN` with grouping,
+  correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, array subscripts,
+  `ANY`/`ALL` over array values, `||` on array or JSONB operands, interval-valued arithmetic
+  such as interval-plus-interval, enum evolution, sequence options, `RIGHT JOIN` beside another join or `SELECT *`, `FULL JOIN` with grouping,
   `DISTINCT`, window functions, or `SELECT *`, numeric `RANGE` frame offsets (use `ROWS`),
   `DISTINCT` window aggregates, window functions outside the select list, and
   `ON DELETE SET DEFAULT`. Check each supported entry's note before assuming every PostgreSQL

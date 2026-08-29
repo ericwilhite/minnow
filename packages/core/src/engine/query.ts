@@ -3681,10 +3681,11 @@ function exactConstantFold(
 
 /**
  * Rewrites every seeded constant arithmetic subtree of this expression to its exact fold. A
- * folded value demotes back to an ordinary number literal when Float64 represents it exactly —
- * PostgreSQL's own cast when a numeric constant meets a float8 operand, and it keeps every
- * number-typed fast path — and stays a tagged exact-NUMERIC literal when Float64 would round
- * it. A fold that overflows its bounds is left unfolded for execution to report.
+ * folded value demotes back to an ordinary number literal when it reads back identically from
+ * a Float64 — PostgreSQL's own cast when a numeric constant meets a float8 operand, and it
+ * keeps every number-typed fast path — and stays a tagged exact-NUMERIC literal when the
+ * number boundary would visibly round it. A fold that overflows its bounds is left unfolded
+ * for execution to report.
  */
 function resolveExactNumericConstants(expression: Expression): Expression {
   let folded: { value: string | number | null; seeded: boolean } | undefined;
@@ -8109,8 +8110,8 @@ class Parser {
       const value = Number(token.text);
       // A safe integer spelled as one is exactly itself; every other spelling — a decimal
       // point, an exponent, or digits beyond 2^53 — is a numeric constant PostgreSQL would
-      // type NUMERIC. Keep its exact digits: as an annotation when Float64 holds the value,
-      // or as a tagged exact-NUMERIC literal when Float64 would round it.
+      // type NUMERIC. Keep its exact digits: as an annotation when the value reads back
+      // identically from a number, or as a tagged exact-NUMERIC literal when it would not.
       if (!/[.eE]/.test(token.text) && Number.isSafeInteger(value)) {
         return { kind: "literal", value };
       }

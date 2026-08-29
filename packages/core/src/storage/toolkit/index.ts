@@ -53,4 +53,5 @@ export {
   encodePostingChunk,
   encodeRecordJson,
   encodeSyncCheckpoint,
+  type PostingChunkEntry,
 } from "./wire.js";

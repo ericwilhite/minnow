@@ -5,7 +5,6 @@ export const MAX_DATABASE_RPC_IN_FLIGHT = 256;
 export type WorkerOperation =
   | "benchmark"
   | "cancelBenchmark"
-  | "memorySample"
   | "datasetList"
   | "datasetCreate"
   | "datasetDelete"
@@ -216,7 +215,6 @@ function isOperation(value: unknown): value is WorkerOperation {
   return [
     "benchmark",
     "cancelBenchmark",
-    "memorySample",
     "datasetList",
     "datasetCreate",
     "datasetDelete",

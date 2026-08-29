@@ -192,10 +192,14 @@ intended.
 Decimal constants in SQL are exact too, because PostgreSQL types every decimal constant
 `NUMERIC`: arithmetic among constants folds in exact decimal space, so `SELECT 0.1 + 0.2`
 is `0.3` and `1.000000000000000000000000 / 3` keeps twenty-four true digits, the quotient
-scale following the written scales. A result Float64 represents exactly is returned as an
-ordinary number — the same cast PostgreSQL applies when a numeric constant meets a float
-column — so `price * 1.1` still computes and returns binary floats. A result Float64 would
-round is returned as an exact decimal string instead.
+scale following the written scales. A result that reads back identically from a JavaScript
+number is returned as an ordinary number — the same cast PostgreSQL applies when a numeric
+constant meets a float column — so `price * 1.1` still computes and returns binary floats. A
+result the number boundary would visibly round is returned as an exact decimal string
+instead. That exactness also holds beside a float
+column: a constant Float64 cannot represent keeps exact semantics in arithmetic and
+comparisons where PostgreSQL would cast it to the float and round — a deliberate difference
+recorded in the feature profile.
 
 A column with a declared scale renders at exactly that scale, matching PostgreSQL: `1.5` in a
 `NUMERIC(10, 2)` column reads back as `'1.50'`, and so do aggregates, window aggregates, and

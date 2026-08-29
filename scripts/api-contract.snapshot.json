@@ -173,7 +173,7 @@
               "name": "column",
               "kind": "type-and-value",
               "declarations": [
-                "column: {\n    boolean: () => ColumnBuilder<boolean, false, false, false, boolean, undefined, false>;\n    number: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    integer: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    string: () => ColumnBuilder<string, false, false, false, string, undefined, false>;\n    datetime: () => ColumnBuilder<Date, false, false, false, Date, undefined, false>;\n    numeric: (options?: {\n        precision?: number;\n        scale?: number;\n    }) => ColumnBuilder<string, false, false, false, string | number, \"numeric\", false>;\n    json: () => ColumnBuilder<string, false, false, false, string, \"json\", false>;\n    jsonb: () => ColumnBuilder<string, false, false, false, string, \"jsonb\", false>;\n    uuid: () => ColumnBuilder<string, false, false, false, string, \"uuid\", false>;\n    date: () => ColumnBuilder<string, false, false, false, string, \"date\", false>;\n    time: () => ColumnBuilder<string, false, false, false, string, \"time\", false>;\n    interval: () => ColumnBuilder<string, false, false, false, string, \"interval\", false>;\n    array: (element: string) => ColumnBuilder<string, false, false, false, string, \"array\", false>;\n    sqlEnum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(name: string, values: TValues) => ColumnBuilder<TValues[number], false, false, false, TValues[number], \"enum\">;\n    enum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(values: TValues) => ColumnBuilder<TValues[number], false>;\n}"
+                "column: {\n    boolean: () => ColumnBuilder<boolean, false, false, false, boolean, undefined, false>;\n    number: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    integer: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    string: () => ColumnBuilder<string, false, false, false, string, undefined, false>;\n    datetime: () => ColumnBuilder<Date, false, false, false, Date, undefined, false>;\n    numeric: (options?: {\n        precision?: number;\n        scale?: number;\n    }) => ColumnBuilder<string, false, false, false, string | number, \"numeric\", false>;\n    json: <TShape = never>() => ColumnBuilder<JsonColumnValue<TShape>, false, false, false, string, \"json\", false>;\n    jsonb: <TShape = never>() => ColumnBuilder<JsonColumnValue<TShape>, false, false, false, string, \"jsonb\", false>;\n    uuid: () => ColumnBuilder<string, false, false, false, string, \"uuid\", false>;\n    date: () => ColumnBuilder<string, false, false, false, string, \"date\", false>;\n    time: () => ColumnBuilder<string, false, false, false, string, \"time\", false>;\n    interval: () => ColumnBuilder<string, false, false, false, string, \"interval\", false>;\n    array: (element: string) => ColumnBuilder<string, false, false, false, string, \"array\", false>;\n    sqlEnum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(name: string, values: TValues) => ColumnBuilder<TValues[number], false, false, false, TValues[number], \"enum\">;\n    enum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(values: TValues) => ColumnBuilder<TValues[number], false>;\n}"
               ]
             },
             {
@@ -440,6 +440,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare function isDestructiveStep(step: MigrationStep): step is Extract<MigrationStep, {\n    kind: \"drop-column\" | \"drop-table\";\n}>;"
+              ]
+            },
+            {
+              "name": "JsonShape",
+              "kind": "type",
+              "declarations": [
+                "export type JsonShape<TShape> = string & {\n    readonly __minnowJsonShape?: readonly [\n        TShape\n    ];\n};"
               ]
             },
             {
@@ -2072,7 +2079,7 @@
               "name": "column",
               "kind": "value",
               "declarations": [
-                "column: {\n    boolean: () => ColumnBuilder<boolean, false, false, false, boolean, undefined, false>;\n    number: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    integer: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    string: () => ColumnBuilder<string, false, false, false, string, undefined, false>;\n    datetime: () => ColumnBuilder<Date, false, false, false, Date, undefined, false>;\n    numeric: (options?: {\n        precision?: number;\n        scale?: number;\n    }) => ColumnBuilder<string, false, false, false, string | number, \"numeric\", false>;\n    json: () => ColumnBuilder<string, false, false, false, string, \"json\", false>;\n    jsonb: () => ColumnBuilder<string, false, false, false, string, \"jsonb\", false>;\n    uuid: () => ColumnBuilder<string, false, false, false, string, \"uuid\", false>;\n    date: () => ColumnBuilder<string, false, false, false, string, \"date\", false>;\n    time: () => ColumnBuilder<string, false, false, false, string, \"time\", false>;\n    interval: () => ColumnBuilder<string, false, false, false, string, \"interval\", false>;\n    array: (element: string) => ColumnBuilder<string, false, false, false, string, \"array\", false>;\n    sqlEnum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(name: string, values: TValues) => ColumnBuilder<TValues[number], false, false, false, TValues[number], \"enum\">;\n    enum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(values: TValues) => ColumnBuilder<TValues[number], false>;\n}"
+                "column: {\n    boolean: () => ColumnBuilder<boolean, false, false, false, boolean, undefined, false>;\n    number: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    integer: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    string: () => ColumnBuilder<string, false, false, false, string, undefined, false>;\n    datetime: () => ColumnBuilder<Date, false, false, false, Date, undefined, false>;\n    numeric: (options?: {\n        precision?: number;\n        scale?: number;\n    }) => ColumnBuilder<string, false, false, false, string | number, \"numeric\", false>;\n    json: <TShape = never>() => ColumnBuilder<JsonColumnValue<TShape>, false, false, false, string, \"json\", false>;\n    jsonb: <TShape = never>() => ColumnBuilder<JsonColumnValue<TShape>, false, false, false, string, \"jsonb\", false>;\n    uuid: () => ColumnBuilder<string, false, false, false, string, \"uuid\", false>;\n    date: () => ColumnBuilder<string, false, false, false, string, \"date\", false>;\n    time: () => ColumnBuilder<string, false, false, false, string, \"time\", false>;\n    interval: () => ColumnBuilder<string, false, false, false, string, \"interval\", false>;\n    array: (element: string) => ColumnBuilder<string, false, false, false, string, \"array\", false>;\n    sqlEnum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(name: string, values: TValues) => ColumnBuilder<TValues[number], false, false, false, TValues[number], \"enum\">;\n    enum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(values: TValues) => ColumnBuilder<TValues[number], false>;\n}"
               ]
             },
             {
@@ -2164,6 +2171,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function isDestructiveStep(step: MigrationStep): step is Extract<MigrationStep, {\n    kind: \"drop-column\" | \"drop-table\";\n}>;"
+              ]
+            },
+            {
+              "name": "JsonShape",
+              "kind": "type",
+              "declarations": [
+                "export type JsonShape<TShape> = string & {\n    readonly __minnowJsonShape?: readonly [\n        TShape\n    ];\n};"
               ]
             },
             {
@@ -7418,6 +7432,13 @@
               ]
             },
             {
+              "name": "PostingChunkEntry",
+              "kind": "type",
+              "declarations": [
+                "export interface PostingChunkEntry {\n    term: string;\n    rowIds: bigint[];\n    tf: number[];\n}"
+              ]
+            },
+            {
               "name": "readFully",
               "kind": "value",
               "declarations": [
@@ -8108,7 +8129,7 @@
               "name": "WorkerOperation",
               "kind": "type",
               "declarations": [
-                "export type WorkerOperation = \"benchmark\" | \"cancelBenchmark\" | \"memorySample\" | \"datasetList\" | \"datasetCreate\" | \"datasetDelete\" | \"runQuery\" | \"suiteReference\" | \"suiteWrite\" | \"suiteFeatureMatrix\" | \"suiteLive\";"
+                "export type WorkerOperation = \"benchmark\" | \"cancelBenchmark\" | \"datasetList\" | \"datasetCreate\" | \"datasetDelete\" | \"runQuery\" | \"suiteReference\" | \"suiteWrite\" | \"suiteFeatureMatrix\" | \"suiteLive\";"
               ]
             },
             {
