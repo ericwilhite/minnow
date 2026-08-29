@@ -192,6 +192,7 @@ import {
   compileQuery,
   hasAggregate,
   createRecursiveCteState,
+  annotateAvgArgumentScales,
   compileStatement,
   comparisonHolds,
   createPreparedColumnarQuery,
@@ -4328,6 +4329,9 @@ export class MinnowDatabase {
           options.signal,
         );
         throwIfAborted(options.signal);
+        // After input preparation, because executing the nested blocks registered their
+        // synthetic source schemas in typedSchemas — same reasoning as the domain inference.
+        resolvedPlan = annotateAvgArgumentScales(resolvedPlan, typedSchemas);
         outputNeedsExternalization = queryResultNeedsExternalization(resolvedPlan, typedSchemas);
         outputColumnDomains = inferResultColumnDomains(resolvedPlan, typedSchemas);
       };
@@ -10557,6 +10561,8 @@ export class MinnowDatabase {
         })),
       ]),
     );
+    // Streamed plans scan real tables only, so the catalog schemas resolve every AVG argument.
+    plan = annotateAvgArgumentScales(plan, typedSchemas);
     const columns = referencedColumns(plan, schemas);
     // Streaming must choose the scan/build orientation before creating its sliding base view.
     // Plain append histories have exact row counts in segment metadata; mutation histories keep
@@ -11870,6 +11876,9 @@ export class MinnowDatabase {
       signal,
     );
     throwIfAborted(signal);
+    // After input preparation, because executing this block's nested sources registered their
+    // synthetic schemas in typedSchemas, which is what resolves a derived column's domain.
+    block = annotateAvgArgumentScales(block, typedSchemas);
     const prepared = createPreparedColumnarQuery(
       block,
       inputs,

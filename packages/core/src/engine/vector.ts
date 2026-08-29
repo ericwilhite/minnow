@@ -508,6 +508,8 @@ interface AggregateSpec {
   readonly rawDatetime?: { source: number; vector: DateTimeVector };
   /** Set for any aggregate over a bare number column: read the typed vector directly. */
   readonly rawNumber?: { source: number; vector: NumberVector };
+  /** AVG over a declared-scale NUMERIC column: the internal division's minimum result scale. */
+  readonly avgScale?: number;
 }
 
 interface GroupState {
@@ -1572,6 +1574,9 @@ function bindExpression(
       ...(expression.distinct === true ? { distinct: true } : {}),
       ...(rawDatetime === undefined ? {} : { rawDatetime }),
       ...(rawNumber === undefined ? {} : { rawNumber }),
+      ...(expression.avgArgumentScale === undefined
+        ? {}
+        : { avgScale: expression.avgArgumentScale }),
     });
   }
   return {
@@ -5289,7 +5294,9 @@ function evaluateFinalExpression(
   if (expression.name === "SUM")
     return isExactNumeric(value) ? value : (group.sums[aggregateIndex] ?? 0);
   if (expression.name === "AVG") {
-    if (isExactNumeric(value)) return exactNumericBinary("/", value, count);
+    if (isExactNumeric(value)) {
+      return exactNumericBinary("/", value, count, plan.aggregates[aggregateIndex]?.avgScale);
+    }
     return (group.sums[aggregateIndex] ?? 0) / count;
   }
   // Raw-millisecond datetime extremes re-box into a Date only here, once per surviving group.

@@ -152,10 +152,45 @@ export function exactNumericValue(
   );
 }
 
+/**
+ * The leading base-10000 digit of a decimal, aligned at the decimal point the way PostgreSQL's
+ * NUMERIC digit array is: group k covers the decimal digits at 10^(4k)..10^(4k+3). `weight` is
+ * the group index of the first nonzero group and `firstDigit` its value (1..9999); zero reports
+ * both as 0, matching PostgreSQL's defaults when no nonzero digit exists.
+ */
+function nbaseLeading(parts: DecimalParts): { weight: number; firstDigit: number } {
+  const magnitude = parts.coefficient < 0n ? -parts.coefficient : parts.coefficient;
+  if (magnitude === 0n) return { weight: 0, firstDigit: 0 };
+  const fractionGroups = Math.ceil(parts.scale / 4);
+  const aligned = magnitude * pow10(fractionGroups * 4 - parts.scale);
+  const groups = Math.ceil(aligned.toString().length / 4);
+  return {
+    weight: groups - 1 - fractionGroups,
+    firstDigit: Number(aligned / pow10((groups - 1) * 4)),
+  };
+}
+
+/**
+ * PostgreSQL's `select_div_scale`: the fractional digits a NUMERIC quotient is computed and
+ * rounded to. The estimated quotient weight guarantees roughly sixteen significant digits, and
+ * the result never displays fewer fractional digits than either operand. `minimumScale` stands
+ * in for display scale the canonical encoding cannot carry: PostgreSQL floors this selection at
+ * each operand's dscale, which for an AVG over a declared-scale column is that declared scale.
+ */
+function quotientScale(a: DecimalParts, b: DecimalParts, minimumScale: number): number {
+  const leftLeading = nbaseLeading(a);
+  const rightLeading = nbaseLeading(b);
+  let estimatedWeight = leftLeading.weight - rightLeading.weight;
+  if (leftLeading.firstDigit <= rightLeading.firstDigit) estimatedWeight -= 1;
+  const scale = Math.max(16 - estimatedWeight * 4, a.scale, b.scale, minimumScale, 0);
+  return Math.min(scale, 1000);
+}
+
 export function exactNumericBinary(
   operator: "+" | "-" | "*" | "/" | "%",
   left: unknown,
   right: unknown,
+  minimumQuotientScale = 0,
 ): string | null | undefined {
   const leftTagged = taggedDecimalParts(left);
   const rightTagged = taggedDecimalParts(right);
@@ -179,9 +214,10 @@ export function exactNumericBinary(
       scale,
     };
   } else {
-    // PostgreSQL NUMERIC division is arbitrary precision. Twenty fractional digits gives a
-    // deterministic exact decimal rounding boundary without ever crossing binary Float64.
-    const scale = Math.max(20, a.scale, b.scale);
+    // PostgreSQL NUMERIC division computes to its selected result scale and rounds the final
+    // digit half away from zero; matching the scale selection keeps every rendered digit in
+    // agreement, deterministically and without ever crossing binary Float64.
+    const scale = quotientScale(a, b, minimumQuotientScale);
     const numerator = a.coefficient * pow10(scale + b.scale);
     const denominator = b.coefficient * pow10(a.scale);
     let coefficient = numerator / denominator;

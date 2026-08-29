@@ -1606,15 +1606,38 @@ describe("SQL conformance against SQLite and PGlite", () => {
         "INSERT INTO ledger VALUES " +
         "(1, '1.50', '0.100'), (2, 7, 2), (3, '-3.1', '12.3456'), (4, '0.005', '1e2'), " +
         "(5, NULL, '0')";
+      // A declared scale beyond division's significant-digit selection: the AVG quotient must
+      // compute real digits to that scale rather than padding zeros over a shorter quotient.
+      const fineDdl = "CREATE TABLE fine (id INTEGER PRIMARY KEY, v NUMERIC(30, 24))";
+      const fineInsert = "INSERT INTO fine VALUES (1, 0), (2, 1), (3, 1)";
       await database.execute(ddl);
       await database.execute(insert);
+      await database.execute(fineDdl);
+      await database.execute(fineInsert);
       await postgres.exec(ddl);
       await postgres.exec(insert);
+      await postgres.exec(fineDdl);
+      await postgres.exec(fineInsert);
       const queries = [
         "SELECT id, amount, rate FROM ledger ORDER BY id",
         "SELECT SUM(amount) AS total, MIN(amount) AS low, MAX(rate) AS high FROM ledger",
         "SELECT COALESCE(amount, CAST(0 AS NUMERIC(10, 2))) AS amount FROM ledger WHERE id = 1",
         "SELECT CAST(amount AS NUMERIC(12, 4)) AS wide FROM ledger WHERE id = 1",
+        // AVG over the declared scale, grouped and windowed: 24 true digits, not 20 padded.
+        "SELECT AVG(v) AS mean FROM fine",
+        "SELECT SUM(v) AS total FROM fine",
+        "SELECT id, AVG(v) OVER () AS mean FROM fine ORDER BY id",
+        // Division's result-scale selection at quotient weights above and below one, and its
+        // half-away-from-zero rounding of the final digit.
+        "SELECT CAST(2 AS NUMERIC) / 3 AS q",
+        "SELECT CAST(1 AS NUMERIC) / 6 AS q",
+        "SELECT CAST(1 AS NUMERIC) / 30000 AS q",
+        "SELECT CAST(1 AS NUMERIC) / 300000 AS q",
+        "SELECT CAST(200000000 AS NUMERIC) / 3 AS q",
+        "SELECT CAST(20000 AS NUMERIC) / 3 AS q",
+        "SELECT CAST(5 AS NUMERIC) / 0.0003 AS q",
+        "SELECT CAST(-2 AS NUMERIC) / 3 AS q",
+        "SELECT CAST(0.00005 AS NUMERIC) / 3 AS q",
       ];
       for (const sql of queries) {
         const minnowRows = (await database.query(sql)).rows;

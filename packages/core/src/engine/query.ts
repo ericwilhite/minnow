@@ -3592,6 +3592,57 @@ export function expandFtsColumns(
 }
 
 /**
+ * Annotates every `AVG(column)` in this block's expression positions with the argument column's
+ * declared NUMERIC scale, resolved against the given schemas. PostgreSQL floors an AVG's
+ * internal division scale at the summed values' display scale; the canonical NUMERIC encoding
+ * strips trailing fractional zeros, so without the annotation the divide cannot know the digits
+ * a declared scale above its own selection would render, and the display padding would fabricate
+ * zeros where PostgreSQL computes real digits. Runs where the catalog is known, per block —
+ * nested blocks execute through their own schema-aware entry. Copy-on-write: plans without an
+ * AVG pass through untouched, and the input is often the compile cache's own object.
+ */
+export function annotateAvgArgumentScales(
+  plan: CompiledQuery,
+  schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
+): CompiledQuery {
+  const containsAvg = (expression: Expression): boolean =>
+    (expression.kind === "call" && expression.name === "AVG") ||
+    childExpressions(expression).some(containsAvg);
+  const roots: Expression[] = [];
+  forEachBlockExpression(plan, (expression) => roots.push(expression));
+  if (!roots.some(containsAvg)) return plan;
+  plan = clonePlanTree(plan);
+  const sources = [plan.base, ...plan.joins];
+  const declaredScale = (reference: string): number | undefined => {
+    const parts = reference.split(".");
+    const matches =
+      parts.length === 2
+        ? sources
+            .filter(({ alias }) => alias === parts[0])
+            .flatMap((source) =>
+              (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[1]),
+            )
+        : sources.flatMap((source) =>
+            (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[0]),
+          );
+    const domain = matches.length === 1 ? matches[0]?.sqlDomain : undefined;
+    return domain?.kind === "numeric" ? domain.scale : undefined;
+  };
+  const annotate = (expression: Expression): void => {
+    if (expression.kind === "call" && expression.name === "AVG") {
+      const argument = expression.arguments[0];
+      if (argument?.kind === "column") {
+        const scale = declaredScale(argument.reference);
+        if (scale !== undefined && scale > 0) expression.avgArgumentScale = scale;
+      }
+    }
+    for (const child of childExpressions(expression)) annotate(child);
+  };
+  forEachBlockExpression(plan, annotate);
+  return plan;
+}
+
+/**
  * Aggregates the frame members named by position, for the frames whose rows are not contiguous.
  * EXCLUDE puts a hole in the middle of a frame, which the prefix sums the common path uses
  * cannot represent, so those positions walk their members instead.
@@ -3600,6 +3651,7 @@ function aggregateWindowMembers(
   window: WindowSpec,
   values: readonly unknown[],
   members: readonly number[],
+  avgScale?: number,
 ): unknown {
   const present = members.filter((member) => {
     const value = values[member];
@@ -3625,7 +3677,9 @@ function aggregateWindowMembers(
         if (next === null || next === undefined) throw new Error("Exact NUMERIC sum disappeared");
         total = next;
       }
-      return window.name === "SUM" ? total : exactNumericBinary("/", total, present.length);
+      return window.name === "SUM"
+        ? total
+        : exactNumericBinary("/", total, present.length, avgScale);
     }
     const total = present.reduce<number>((sum, member) => sum + numeric(values[member]), 0);
     return window.name === "SUM" ? total : total / present.length;
@@ -3659,6 +3713,7 @@ function applyAggregateWindow(
   window: WindowSpec,
   samePartition: (left: number, right: number) => boolean,
   sameOrderKeys: (left: number, right: number) => boolean,
+  avgScale?: number,
 ): void {
   const frame: WindowFrame = window.frame ?? {
     unit: "range",
@@ -3672,7 +3727,16 @@ function applyAggregateWindow(
     while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
       end += 1;
     }
-    applyAggregateWindowPartition(rows, indexes, window, frame, sameOrderKeys, start, end);
+    applyAggregateWindowPartition(
+      rows,
+      indexes,
+      window,
+      frame,
+      sameOrderKeys,
+      start,
+      end,
+      avgScale,
+    );
     start = end;
   }
 }
@@ -3685,6 +3749,7 @@ function applyAggregateWindowPartition(
   sameOrderKeys: (left: number, right: number) => boolean,
   start: number,
   end: number,
+  avgScale?: number,
 ): void {
   const size = end - start;
   // Peer-group bounds per position; with no OVER ordering the whole partition is one peer group.
@@ -3813,7 +3878,7 @@ function applyAggregateWindowPartition(
           member >= skip.from && member < skip.to && !(skip.keepCurrent && member === position);
         if (!dropped) members.push(member);
       }
-      value = aggregateWindowMembers(window, values, members);
+      value = aggregateWindowMembers(window, values, members, avgScale);
       const row = rows[indexes[start + position] ?? -1];
       if (row !== undefined) row[window.alias] = asQueryValue(value);
       continue;
@@ -3842,7 +3907,7 @@ function applyAggregateWindowPartition(
           prefixExact[high] ?? exactZero,
           prefixExact[low] ?? exactZero,
         );
-        value = window.name === "SUM" ? total : exactNumericBinary("/", total, nonNull);
+        value = window.name === "SUM" ? total : exactNumericBinary("/", total, nonNull, avgScale);
       } else {
         const total = (prefixSum?.[high] ?? 0) - (prefixSum?.[low] ?? 0);
         value = window.name === "SUM" ? total : total / nonNull;
@@ -4040,7 +4105,21 @@ export function applyWindowFunctions(
       continue;
     }
     if (window.name !== "ROW_NUMBER" && window.name !== "RANK" && window.name !== "DENSE_RANK") {
-      applyAggregateWindow(rows, indexes, window, samePartition, sameOrderKeys);
+      // PostgreSQL computes a window AVG's quotient to at least the summed values' display
+      // scale; canonical NUMERIC values no longer carry it, so read the argument column's
+      // declared scale from the inner result the way the summed dscale would have carried it.
+      const argumentDomain =
+        window.name === "AVG" && window.argumentAlias !== undefined
+          ? result.columnDomains[result.columns.indexOf(window.argumentAlias)]
+          : undefined;
+      applyAggregateWindow(
+        rows,
+        indexes,
+        window,
+        samePartition,
+        sameOrderKeys,
+        argumentDomain?.kind === "numeric" ? argumentDomain.scale : undefined,
+      );
       continue;
     }
     let rowNumber = 0;
@@ -4672,7 +4751,10 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
             ? null
             : (() => {
                 const sum = sumNumericValues(values);
-                return exactNumericBinary("/", sum, values.length) ?? numeric(sum) / values.length;
+                return (
+                  exactNumericBinary("/", sum, values.length, expression.avgArgumentScale) ??
+                  numeric(sum) / values.length
+                );
               })();
         if (expression.name === "MIN")
           return values.reduce<unknown>(

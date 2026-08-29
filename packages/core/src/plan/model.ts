@@ -108,6 +108,13 @@ export type Expression =
         direction: "asc" | "desc";
         nulls?: "first" | "last";
       }>;
+      /**
+       * AVG over a declared-scale NUMERIC column: the argument's declared scale, annotated by a
+       * schema-aware pass before execution. PostgreSQL floors its quotient scale at the summed
+       * operand's display scale; canonical NUMERIC encoding strips trailing zeros, so without
+       * this the internal division cannot know the digits the declared scale will render.
+       */
+      avgArgumentScale?: number;
     }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }

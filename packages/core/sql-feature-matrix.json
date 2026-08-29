@@ -1138,7 +1138,7 @@
       "id": "type.exact-numeric",
       "status": "supported",
       "example": "SELECT CAST(1.25 AS DECIMAL(12, 2)) AS amount",
-      "notes": "Exact through storage, arithmetic, comparison, aggregates, and windows. Division retains 20 fractional digits."
+      "notes": "Exact through storage, arithmetic, comparison, aggregates, and windows. Division selects its result scale the way PostgreSQL does: at least sixteen significant digits, never fewer fractional digits than either operand, rounded half away from zero."
     },
     {
       "id": "type.json-jsonb",

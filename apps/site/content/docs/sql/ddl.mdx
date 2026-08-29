@@ -182,8 +182,10 @@ a number column.
 
 Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
 comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.
-Division returns up to 20 fractional digits. Use an integer minor unit when that simpler boundary
-fits; use `DOUBLE PRECISION` only when approximation is intended.
+Division picks its result scale the way PostgreSQL does — at least sixteen significant digits,
+never fewer fractional digits than either operand, rounded half away from zero. Use an integer
+minor unit when that simpler boundary fits; use `DOUBLE PRECISION` only when approximation is
+intended.
 
 A column with a declared scale renders at exactly that scale, matching PostgreSQL: `1.5` in a
 `NUMERIC(10, 2)` column reads back as `'1.50'`, and so do aggregates, window aggregates, and
