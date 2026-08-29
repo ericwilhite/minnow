@@ -3,9 +3,9 @@
  * Cross-cutting worker plumbing: progress emission, cancellation, and small
  * IndexedDB/arithmetic helpers.
  */
-import { protocolVersion, type ProgressResponse } from "@minnowdb/core/worker-protocol";
+import { protocolVersion } from "@minnowdb/core/worker-protocol";
 import { engineIds } from "../protocol";
-import type { EngineId, WorkProgress } from "../protocol";
+import type { EngineId, ProgressResponse, WorkProgress } from "../protocol";
 
 export const cancelledRuns = new Set<string>();
 

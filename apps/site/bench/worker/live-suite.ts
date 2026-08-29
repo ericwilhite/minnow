@@ -47,6 +47,11 @@ const SEED_ROWS = 1_000;
 /** A notification that has not arrived by then is a defect, not a slow sample. */
 const NOTIFICATION_TIMEOUT_MS = 10_000;
 
+/**
+ * Deliberately three columns, not the write suite's four: this suite measures notification
+ * latency, so the watched table stays minimal and carries no `updated_at`. Changing the shape
+ * changes the published numbers.
+ */
 const COLUMNS = ["key_id", "payload_num", "payload_text"] as const;
 
 export interface LiveCaseDefinition {

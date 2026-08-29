@@ -1,50 +1,5 @@
 import { expect, it } from "vitest";
-import {
-  failure,
-  parseRequest,
-  parseRpcRequest,
-  parseRpcResponse,
-  protocolVersion,
-  serializeError,
-  success,
-} from "./index.js";
-
-it("accepts a versioned known operation", () => {
-  expect(
-    parseRequest({
-      version: protocolVersion,
-      requestId: "one",
-      operation: "benchmark",
-      payload: null,
-    }),
-  ).toMatchObject({ operation: "benchmark" });
-});
-
-it("rejects unknown versions and operations", () => {
-  expect(() => parseRequest({ version: 99, requestId: "one", operation: "benchmark" })).toThrow(
-    "version",
-  );
-  expect(() =>
-    parseRequest({ version: protocolVersion, requestId: "one", operation: "sql" }),
-  ).toThrow("operation");
-});
-
-it("rejects malformed worker requests and builds clone-safe responses", () => {
-  expect(() => parseRequest(null)).toThrow("object");
-  expect(() =>
-    parseRequest({ version: protocolVersion, requestId: "", operation: "benchmark" }),
-  ).toThrow("Request ID");
-  expect(success("request", { ok: true })).toEqual({
-    version: protocolVersion,
-    requestId: "request",
-    kind: "success",
-    result: { ok: true },
-  });
-  expect(failure("request", "lost")).toMatchObject({
-    kind: "failure",
-    error: { name: "Error", message: "lost" },
-  });
-});
+import { parseRpcRequest, parseRpcResponse, protocolVersion, serializeError } from "./index.js";
 
 it("validates every RPC request boundary", () => {
   expect(parseRpcRequest(null)).toBeNull();

@@ -4,6 +4,8 @@ import {
   encodeSingleScalarKey,
   equalsScratch,
   hashScratch,
+  safeDouble,
+  safeProduct,
 } from "./group-index.js";
 import { QueryMemoryContext, type QueryMemoryReservation } from "./memory.js";
 
@@ -213,20 +215,4 @@ function encodeJoinKey(value: unknown): number {
     return encodeSingleScalarKey(key);
   }
   throw new TypeError("Join keys must be SQL scalar values");
-}
-
-function safeDouble(value: number, label: string): number {
-  const doubled = value * 2;
-  if (!Number.isSafeInteger(doubled)) {
-    throw new RangeError(`${label} exceeds the safe integer range`);
-  }
-  return doubled;
-}
-
-function safeProduct(left: number, right: number, label: string): number {
-  const product = left * right;
-  if (!Number.isSafeInteger(product)) {
-    throw new RangeError(`${label} exceeds the safe integer range`);
-  }
-  return product;
 }

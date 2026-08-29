@@ -1,9 +1,90 @@
 /**
- * Data shapes exchanged between the pages and the benchmark worker for the dataset,
- * query, and suite operations. Types only, plus small constant tables — this module is
- * imported from both sides of the worker boundary and must stay free of heavy imports.
+ * The benchmark worker's wire contract: the versioned request/response envelopes and the
+ * data shapes for the dataset, query, and suite operations. This module is imported from
+ * both sides of the worker boundary and must stay free of heavy imports.
  */
+import { protocolVersion } from "@minnowdb/core/worker-protocol";
 import type { DurabilityMode } from "./benchmark";
+
+// --- Request/response envelopes -----------------------------------------------------------------
+//
+// The versioned envelope every benchmark-worker message travels in. Shares the engine's
+// protocol version so a stale worker bundle is rejected rather than misread.
+
+const workerOperations = [
+  "cancelBenchmark",
+  "datasetList",
+  "datasetCreate",
+  "datasetDelete",
+  "runQuery",
+  "suiteReference",
+  "suiteWrite",
+  "suiteFeatureMatrix",
+  "suiteLive",
+] as const;
+
+export type WorkerOperation = (typeof workerOperations)[number];
+
+export interface WorkerRequest<T = unknown> {
+  version: typeof protocolVersion;
+  requestId: string;
+  operation: WorkerOperation;
+  payload: T;
+}
+
+export interface SuccessResponse<T = unknown> {
+  version: typeof protocolVersion;
+  requestId: string;
+  kind: "success";
+  result: T;
+}
+
+export interface FailureResponse {
+  version: typeof protocolVersion;
+  requestId: string;
+  kind: "failure";
+  error: { name: string; message: string };
+}
+
+export interface ProgressResponse<T = unknown> {
+  version: typeof protocolVersion;
+  requestId: string;
+  kind: "progress";
+  progress: T;
+}
+
+export type WorkerResponse<T = unknown> = SuccessResponse<T> | FailureResponse | ProgressResponse;
+
+export function parseRequest(value: unknown): WorkerRequest {
+  if (typeof value !== "object" || value === null) throw new TypeError("Request must be an object");
+  const candidate = value as Partial<WorkerRequest>;
+  if (candidate.version !== protocolVersion) throw new Error("Unsupported protocol version");
+  if (typeof candidate.requestId !== "string" || candidate.requestId.length === 0) {
+    throw new TypeError("Request ID must be a non-empty string");
+  }
+  if (!isOperation(candidate.operation)) throw new Error("Unsupported worker operation");
+  return candidate as WorkerRequest;
+}
+
+export function success<T>(requestId: string, result: T): SuccessResponse<T> {
+  return { version: protocolVersion, requestId, kind: "success", result };
+}
+
+export function failure(requestId: string, error: unknown): FailureResponse {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  return {
+    version: protocolVersion,
+    requestId,
+    kind: "failure",
+    error: { name: normalized.name, message: normalized.message },
+  };
+}
+
+function isOperation(value: unknown): value is WorkerOperation {
+  return (workerOperations as readonly string[]).includes(String(value));
+}
+
+// --- Payloads and results -----------------------------------------------------------------------
 
 export type EngineId = "minnow" | "minnow-opfs" | "sqlite" | "pglite";
 export type WorkloadKind = "oltp" | "olap";
@@ -81,7 +162,7 @@ export interface DatasetListResult {
   datasets: DatasetRecord[];
 }
 
-/** Progress messages for dataset creation and suites; a superset of BenchmarkProgress. */
+/** Progress messages for dataset creation and suites. */
 export interface WorkProgress {
   phase: string;
   completed: number;

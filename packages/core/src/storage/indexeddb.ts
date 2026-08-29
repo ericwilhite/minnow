@@ -192,7 +192,9 @@ import {
   validateCatalogName,
   validateCanonicalManifestChangedTableIds,
   validateEnumValues,
+  validateFtsCandidateLimit,
   validateFtsOrderedReadLimits,
+  validateFtsReadVersion,
   validateFtsPostingQueries,
   validateStorageId,
   validateStorageDatabaseName,
@@ -2590,15 +2592,8 @@ export class IndexedDbBlockStore implements BlockStore {
     validateId(tableId, "Table ID");
     validateId(columnId, "Column ID");
     validateFtsPostingQueries(terms);
-    if (
-      !Number.isSafeInteger(maxRowIds) ||
-      maxRowIds < 1 ||
-      maxRowIds > MAX_FTS_CANDIDATE_ROW_IDS
-    ) {
-      throw new RangeError(
-        `Full-text candidate limit must be between 1 and ${String(MAX_FTS_CANDIDATE_ROW_IDS)}`,
-      );
-    }
+    validateFtsReadVersion(upToVersion);
+    validateFtsCandidateLimit(maxRowIds);
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
     const [rawToc, rawDeltaIndex] = await Promise.all([
@@ -2715,9 +2710,7 @@ export class IndexedDbBlockStore implements BlockStore {
   ) {
     validateId(tableId, "Table ID");
     validateId(columnId, "Column ID");
-    if (!Number.isSafeInteger(upToVersion) || upToVersion < 0) {
-      throw new RangeError("Full-text snapshot version must be a non-negative safe integer");
-    }
+    validateFtsReadVersion(upToVersion);
     validateFtsOrderedReadLimits(maxRowIds, maxRetainedBytes);
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
@@ -9150,20 +9143,15 @@ function assertIndexedDbSchemaMigrationRegistry(): void {
 function createCurrentIndexedDbSchema(database: IDBDatabase, upgrade: IDBTransaction): void {
   for (const storeName of storeNames) database.createObjectStore(storeName);
   database.createObjectStore(SNAPSHOT_HEADER_STORE);
-  upgrade.objectStore("segments").createIndex(SEGMENT_TABLE_INDEX, "tableId");
-  upgrade.objectStore("leases").createIndex(LEASE_EXPIRY_INDEX, ["expiresAt", "id"]);
-  upgrade.objectStore("transactions").createIndex(TRANSACTION_STATUS_INDEX, "status");
-  upgrade.objectStore("temp").createIndex(TEMP_OWNER_EXPIRY_INDEX, ["expiresAt", "ownerId"]);
-  upgrade.objectStore("catalog").createIndex(CATALOG_FTS_BUILD_UPDATED_INDEX, "updatedAt");
-  upgrade.objectStore("catalog").createIndex(CATALOG_FTS_BUILD_EXPIRY_INDEX, "ftsBuildExpiry");
-  upgrade
-    .objectStore("catalog")
-    .createIndex(CATALOG_FTS_RETIREMENT_UPDATED_INDEX, "retirementUpdatedAt");
-  upgrade.objectStore("catalog").createIndex(UNIQUE_KEY_BUILD_ACTIVE_INDEX, "activeBuildState");
-  upgrade.objectStore("catalog").createIndex(UNIQUE_KEY_BUILD_EXPIRY_INDEX, "activeExpiry");
-  upgrade.objectStore("catalog").createIndex(MANIFEST_BLOCK_ID_INDEX, "blockId", {
-    unique: true,
-  });
+  // Creation is driven by the same declaration validateCurrentIndexedDbSchema verifies
+  // against, so the two can never disagree about what the current schema is.
+  for (const [storeName, indexes] of Object.entries(indexedDbIndexSchema)) {
+    const store = upgrade.objectStore(storeName);
+    for (const index of indexes) {
+      const keyPath = typeof index.keyPath === "string" ? index.keyPath : [...index.keyPath];
+      store.createIndex(index.name, keyPath, { unique: index.unique ?? false });
+    }
+  }
   upgrade.objectStore("gc").add(emptyMaintenanceQuota(), MAINTENANCE_QUOTA_KEY);
   upgrade.objectStore("statistics").add(emptyResourceLedger(), RESOURCE_LEDGER_KEY);
   upgrade.objectStore("statistics").add(emptyCatalogResourceLedger(), CATALOG_RESOURCE_LEDGER_KEY);

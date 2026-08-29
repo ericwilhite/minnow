@@ -1,6 +1,6 @@
 import type { PGlite } from "@electric-sql/pglite";
 import { loadPglite } from "./vendored";
-import { generateEntityBatch, getScenario } from "../benchmark";
+import { commerceEntities, generateEntityBatch } from "../benchmark";
 import type { DatasetRecord, EngineMaterialization } from "../protocol";
 import {
   canonicalizeRow,
@@ -126,7 +126,7 @@ export const pgliteDriver: EngineDriver = {
     let dataStoredBytes: number | null;
     let indexStoredBytes: number | null;
     try {
-      const entities = getScenario("commerce").entities;
+      const entities = commerceEntities;
       for (const entity of entities) await database.exec(createTableSql(entity));
       let completedRows = 0;
       for (const entity of entities) {

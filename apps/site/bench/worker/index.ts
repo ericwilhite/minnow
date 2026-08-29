@@ -7,7 +7,7 @@
  * The Minnow-only storage and transaction checks that used to live here are library tests, not
  * an engine comparison, and now run as browser tests under packages/core.
  */
-import { failure, parseRequest, success } from "@minnowdb/core/worker-protocol";
+import { failure, parseRequest, success } from "../protocol";
 import { datasetCreate, datasetDelete, datasetList, validateCreatePayload } from "./datasets";
 import { runFeatureSuite, validateFeaturePayload } from "./feature-suite";
 import { runLiveSuite, validateLivePayload } from "./live-suite";
@@ -102,8 +102,12 @@ async function runRequest(raw: unknown): Promise<void> {
         }
         return;
       }
-      default:
-        throw new Error(`Unsupported worker operation: ${request.operation}`);
+      default: {
+        // parseRequest admits only known operations, so this arm is unreachable; the never
+        // binding makes adding an operation without a handler a compile error.
+        const operation: never = request.operation;
+        throw new Error(`Unsupported worker operation: ${String(operation)}`);
+      }
     }
   } catch (error) {
     self.postMessage(failure(requestId === "unknown" ? getRequestId(raw) : requestId, error));

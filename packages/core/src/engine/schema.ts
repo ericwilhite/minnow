@@ -143,12 +143,6 @@ type ValueOf<TType extends SchemaColumnType> = TType extends "boolean"
       : Date;
 
 /**
- * A flavored value: a column whose slot the engine can fill, so inserts may omit it. The brand
- * is an optional phantom property — plain values stay assignable in both directions.
- */
-export type HasDefault<TValue> = TValue & { readonly __minnowHasDefault?: true };
-
-/**
  * A JSON column's select value carrying a declared document shape. The value is still JSON
  * text — the brand is an optional phantom property, so plain strings stay assignable in both
  * directions — and adapters read the shape to offer typed traversal. The tuple wrapper keeps
@@ -474,31 +468,6 @@ function validateSchemaName(name: string, kind: string): void {
       `${kind} name cannot start or end with whitespace: ${JSON.stringify(name)}`,
     );
   }
-}
-
-/**
- * Rebuilds a column carrying an exact default spec — the wire layer's escape hatch, since the
- * public `.default()` accepts literals and cannot express auto-increment catalog metadata.
- */
-export function columnWithDefaultSpec(
-  base: Pick<
-    AnyColumn,
-    "type" | "isNullable" | "isUnique" | "renamedFromName" | "reference" | "enumValues"
-  > &
-    Partial<Pick<AnyColumn, "integer" | "sqlDomain">>,
-  spec: ColumnDefault,
-): AnyColumn {
-  return columnFromState({
-    type: base.type,
-    isNullable: base.isNullable,
-    isUnique: base.isUnique,
-    integer: base.integer ?? false,
-    ...(base.sqlDomain === undefined ? {} : { sqlDomain: base.sqlDomain }),
-    ...(base.renamedFromName === undefined ? {} : { renamedFromName: base.renamedFromName }),
-    ...(base.reference === undefined ? {} : { reference: base.reference }),
-    ...(base.enumValues === undefined ? {} : { enumValues: base.enumValues }),
-    defaultSpec: spec,
-  });
 }
 
 /** Rebuilds a fluent column from structured-clone-safe metadata. */

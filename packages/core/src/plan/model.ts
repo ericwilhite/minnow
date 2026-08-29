@@ -234,6 +234,39 @@ export interface JoinPlan extends TableSource {
   natural?: boolean;
 }
 
+/**
+ * A cross join rides the nested-loop inner-join path with a condition every row pair satisfies:
+ * 1 = 1 over null literal key expressions. Producers build the shape with crossJoinPlan and
+ * consumers recognize it with isCrossJoinPlan, so the encoding lives in exactly one place.
+ */
+export function crossJoinPlan(source: TableSource): JoinPlan {
+  return {
+    ...source,
+    kind: "inner",
+    left: { kind: "literal", value: null },
+    right: { kind: "literal", value: null },
+    on: {
+      kind: "condition",
+      operator: "=",
+      left: { kind: "literal", value: 1 },
+      right: { kind: "literal", value: 1 },
+    },
+  };
+}
+
+export function isCrossJoinPlan(join: JoinPlan): boolean {
+  const condition = join.on;
+  return (
+    join.kind === "inner" &&
+    condition?.kind === "condition" &&
+    condition.operator === "=" &&
+    condition.left.kind === "literal" &&
+    condition.left.value === 1 &&
+    condition.right.kind === "literal" &&
+    condition.right.value === 1
+  );
+}
+
 export type SetOperator =
   "union" | "union all" | "intersect" | "intersect all" | "except" | "except all";
 

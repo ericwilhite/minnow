@@ -1,19 +1,18 @@
 {
   "name": "@minnowdb/site",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "node scripts/build.mjs",
-    "start": "next start",
     "predev": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-playground-types.mjs && node scripts/generate-llms.mjs",
     "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-playground-types.mjs && node scripts/generate-llms.mjs",
-    "build:packages": "tsc -b ../../packages/core ../../packages/kysely ../../packages/react ../../packages/export ../../packages/devtools --force",
+    "build:packages": "tsc -b ../../packages/core ../../packages/kysely ../../packages/devtools --force",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
-    "@minnowdb/core": ">=0.6.6 <1.0.0",
+    "@minnowdb/core": ">=0.6.7 <1.0.0",
     "@minnowdb/devtools": ">=0.2.3 <1.0.0",
     "@minnowdb/kysely": ">=0.4.5 <1.0.0",
     "fumadocs-core": "^16.14.4",

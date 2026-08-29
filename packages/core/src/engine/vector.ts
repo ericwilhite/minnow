@@ -1,4 +1,5 @@
 import { dateMilliseconds } from "../date-value.js";
+import { crossJoinPlan, isCrossJoinPlan } from "../plan/model.js";
 import {
   MAX_TEMP_RUN_BATCH_BYTES,
   MAX_TEMP_RUN_PAGE_BYTES,
@@ -907,7 +908,7 @@ function orderCartesianJoins(
   if (
     plan.joins.length < 2 ||
     plan.select.some((item) => item.expression.kind === "wildcard") ||
-    plan.joins.some((join) => !isCartesianJoin(join))
+    plan.joins.some((join) => !isCrossJoinPlan(join))
   ) {
     return plan;
   }
@@ -952,23 +953,10 @@ function orderCartesianJoins(
       predicateJoinsSource(predicate, sourceIndex, available, entries, sourceTables),
     );
     const key = keyIndex < 0 ? undefined : predicates.splice(keyIndex, 1)[0];
-    joins.push(key === undefined ? cartesianJoin(source) : keyedInnerJoin(source, key));
+    joins.push(key === undefined ? crossJoinPlan(source) : keyedInnerJoin(source, key));
     available.add(sourceIndex);
   }
   return { ...plan, base: plan.base, joins, predicates };
-}
-
-function isCartesianJoin(join: JoinPlan): boolean {
-  const condition = join.on;
-  return (
-    join.kind === "inner" &&
-    condition?.kind === "condition" &&
-    condition.operator === "=" &&
-    condition.left.kind === "literal" &&
-    condition.left.value === 1 &&
-    condition.right.kind === "literal" &&
-    condition.right.value === 1
-  );
 }
 
 function tableSourceOf(join: JoinPlan): TableSource {
@@ -980,21 +968,6 @@ function tableSourceOf(join: JoinPlan): TableSource {
   void full;
   void natural;
   return source;
-}
-
-function cartesianJoin(source: TableSource): JoinPlan {
-  return {
-    ...source,
-    kind: "inner",
-    left: { kind: "literal", value: null },
-    right: { kind: "literal", value: null },
-    on: {
-      kind: "condition",
-      operator: "=",
-      left: { kind: "literal", value: 1 },
-      right: { kind: "literal", value: 1 },
-    },
-  };
 }
 
 function keyedInnerJoin(source: TableSource, predicate: Predicate): JoinPlan {

@@ -2,7 +2,7 @@
  * Dataset lifecycle: materialize the deterministic commerce dataset into each requested
  * engine sequentially, recording per-engine outcomes; list; delete.
  */
-import { getScenario, relationalTotalRows } from "../benchmark";
+import { commerceEntities, relationalTotalRows } from "../benchmark";
 import type {
   DatasetCreatePayload,
   DatasetDeletePayload,
@@ -64,7 +64,7 @@ export async function datasetCreate(
   requestId: string,
   payload: DatasetCreatePayload,
 ): Promise<DatasetRecord> {
-  const entities = getScenario("commerce").entities;
+  const entities = commerceEntities;
   const record: DatasetRecord = {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),

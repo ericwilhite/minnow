@@ -2,80 +2,12 @@ export const protocolVersion = 3 as const;
 /** Outstanding request/response pairs retained by either side of one database RPC connection. */
 export const MAX_DATABASE_RPC_IN_FLIGHT = 256;
 
-export type WorkerOperation =
-  | "benchmark"
-  | "cancelBenchmark"
-  | "datasetList"
-  | "datasetCreate"
-  | "datasetDelete"
-  | "runQuery"
-  | "suiteReference"
-  | "suiteWrite"
-  | "suiteFeatureMatrix"
-  | "suiteLive";
-
-export interface WorkerRequest<T = unknown> {
-  version: typeof protocolVersion;
-  requestId: string;
-  operation: WorkerOperation;
-  payload: T;
-}
-
-export interface SuccessResponse<T = unknown> {
-  version: typeof protocolVersion;
-  requestId: string;
-  kind: "success";
-  result: T;
-}
-
-export interface FailureResponse {
-  version: typeof protocolVersion;
-  requestId: string;
-  kind: "failure";
-  error: { name: string; message: string };
-}
-
-export interface ProgressResponse<T = unknown> {
-  version: typeof protocolVersion;
-  requestId: string;
-  kind: "progress";
-  progress: T;
-}
-
-export type WorkerResponse<T = unknown> = SuccessResponse<T> | FailureResponse | ProgressResponse;
-
-export function parseRequest(value: unknown): WorkerRequest {
-  if (typeof value !== "object" || value === null) throw new TypeError("Request must be an object");
-  const candidate = value as Partial<WorkerRequest>;
-  if (candidate.version !== protocolVersion) throw new Error("Unsupported protocol version");
-  if (typeof candidate.requestId !== "string" || candidate.requestId.length === 0) {
-    throw new TypeError("Request ID must be a non-empty string");
-  }
-  if (!isOperation(candidate.operation)) throw new Error("Unsupported worker operation");
-  return candidate as WorkerRequest;
-}
-
-export function success<T>(requestId: string, result: T): SuccessResponse<T> {
-  return { version: protocolVersion, requestId, kind: "success", result };
-}
-
-export function failure(requestId: string, error: unknown): FailureResponse {
-  const normalized = error instanceof Error ? error : new Error(String(error));
-  return {
-    version: protocolVersion,
-    requestId,
-    kind: "failure",
-    error: { name: normalized.name, message: normalized.message },
-  };
-}
-
 // --- Database RPC frames ------------------------------------------------------------------------
 //
-// A second, method-oriented message family used by the engine's worker client. Unlike
-// WorkerRequest's closed operation enum, an RPC call names a target handle and a method so the
-// channel scales with the database API instead of this package. Both families share the protocol
-// version and may coexist on one channel: parseRpcMessage returns null for anything that is not
-// an RPC frame.
+// The method-oriented message family used by the engine's worker client. An RPC call names a
+// target handle and a method so the channel scales with the database API instead of this
+// package. Other message families may share the channel: parseRpcRequest and parseRpcResponse
+// return null for anything that is not an RPC frame.
 
 export type RpcRequest =
   | {
@@ -209,19 +141,4 @@ export function parseRpcResponse(value: unknown): RpcResponse | null {
   }
   if (candidate.version !== protocolVersion) throw new Error("Unsupported protocol version");
   return candidate as RpcResponse;
-}
-
-function isOperation(value: unknown): value is WorkerOperation {
-  return [
-    "benchmark",
-    "cancelBenchmark",
-    "datasetList",
-    "datasetCreate",
-    "datasetDelete",
-    "runQuery",
-    "suiteReference",
-    "suiteWrite",
-    "suiteFeatureMatrix",
-    "suiteLive",
-  ].includes(String(value));
 }

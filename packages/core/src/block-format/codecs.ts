@@ -31,7 +31,7 @@ export interface CompressionMemoryBound {
  * pure overhead on the default compression path. The returned view may share the caller's
  * buffer at a non-zero byte offset.
  */
-export const rawCodec: CompressionCodec = {
+const rawCodec: CompressionCodec = {
   id: "raw",
   async compress(bytes, maximumOutputLength) {
     if (maximumOutputLength !== undefined) {

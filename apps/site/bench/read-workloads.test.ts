@@ -6,11 +6,11 @@
 import type { DatabaseRow } from "@minnowdb/core";
 import { compileQuery, executeQuery } from "@minnowdb/core/query";
 import { describe, expect, it } from "vitest";
-import { generateEntityBatch, getScenario } from "./benchmark";
+import { commerceEntities, generateEntityBatch } from "./benchmark";
 import { buildReferenceQueryContext, referenceQueryDefinitions } from "./worker/reference-suite";
 
 function generatedRows(table: string): DatabaseRow[] {
-  const entity = getScenario("commerce").entities.find((candidate) => candidate.name === table);
+  const entity = commerceEntities.find((candidate) => candidate.name === table);
   if (entity === undefined) throw new Error(`Missing entity: ${table}`);
   const rowCount = entity.rows(1);
   const columns = generateEntityBatch(entity, 0, rowCount, rowCount, 1);
@@ -27,14 +27,14 @@ const tuples = (values: readonly unknown[], project: (row: never) => unknown[]):
 
 describe("OLTP read queries", () => {
   it("agree across SQL, the JavaScript baseline, and the oracle", () => {
-    const orders = getScenario("commerce").entities.find((entity) => entity.name === "orders");
+    const orders = commerceEntities.find((entity) => entity.name === "orders");
     if (orders === undefined) throw new Error("Missing orders entity");
     const definitions = referenceQueryDefinitions(orders.rows(1)).filter(
       (definition) => definition.workload === "oltp",
     );
     expect(definitions.length).toBeGreaterThan(0);
     const tables = new Map<string, DatabaseRow[]>();
-    for (const entity of getScenario("commerce").entities) {
+    for (const entity of commerceEntities) {
       tables.set(entity.name, generatedRows(entity.name));
     }
     const context = buildReferenceQueryContext(tables);

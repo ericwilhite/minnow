@@ -64,7 +64,6 @@ export default tseslint.config(
     // and the docs test reads the .mdx pages off disk to run the SQL printed in them.
     files: [
       "apps/site/bench/engines/**/*.ts",
-      "apps/site/bench/worker/feature-suite.ts",
       "apps/site/lib/dataset/docs-sql.test.ts",
       // Reads the generated declaration bundle off disk and runs the compiler over it, which is
       // how the console's type checking is proved without a browser.

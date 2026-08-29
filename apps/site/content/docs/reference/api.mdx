@@ -337,7 +337,7 @@ use a new format number and retain its reader.
 ## `@minnowdb/core/worker-protocol`
 
 The versioned, structured-clone-safe RPC frames between client and worker: `protocolVersion`,
-request/response/event frame types, `parseRequest` / `parseRpcRequest` / `parseRpcResponse`,
+request/response/event frame types, `parseRpcRequest` / `parseRpcResponse`,
 `serializeError`, and the frame constructors. Method dispatch is whitelisted per handle — the
 worker never dispatches arbitrary property access. Query results and live change events travel
 inside these frames in a columnar form (one array per column, typed arrays transferred) that the

@@ -212,13 +212,6 @@
               ]
             },
             {
-              "name": "columnWithDefaultSpec",
-              "kind": "type",
-              "declarations": [
-                "export declare function columnWithDefaultSpec(base: Pick<AnyColumn, \"type\" | \"isNullable\" | \"isUnique\" | \"renamedFromName\" | \"reference\" | \"enumValues\"> & Partial<Pick<AnyColumn, \"integer\" | \"sqlDomain\">>, spec: ColumnDefault): AnyColumn;"
-              ]
-            },
-            {
               "name": "CompactionBacklogError",
               "kind": "type",
               "declarations": [
@@ -377,13 +370,6 @@
               "kind": "type",
               "declarations": [
                 "export interface GarbageCollectionResult {\n    jobId: string;\n    prunedManifestCount: number;\n    alreadyPrunedManifestCount: number;\n    retainedManifestCount: number;\n    missingManifestCount: number;\n    reclaimedSegmentCount: number;\n    retainedSegmentCount: number;\n    missingSegmentCount: number;\n    reclaimedBlockCount: number;\n    retainedBlockCount: number;\n    missingBlockCount: number;\n    reclaimedTransactionCount: number;\n    retainedTransactionCount: number;\n    missingTransactionCount: number;\n    physicallyReclaimedBytes: number;\n}"
-              ]
-            },
-            {
-              "name": "HasDefault",
-              "kind": "type",
-              "declarations": [
-                "export type HasDefault<TValue> = TValue & {\n    readonly __minnowHasDefault?: true;\n};"
               ]
             },
             {
@@ -1388,13 +1374,6 @@
               ]
             },
             {
-              "name": "rawCodec",
-              "kind": "value",
-              "declarations": [
-                "rawCodec: CompressionCodec"
-              ]
-            },
-            {
               "name": "slicePhysicalColumn",
               "kind": "value",
               "declarations": [
@@ -2104,13 +2083,6 @@
               ]
             },
             {
-              "name": "columnWithDefaultSpec",
-              "kind": "value",
-              "declarations": [
-                "export declare function columnWithDefaultSpec(base: Pick<AnyColumn, \"type\" | \"isNullable\" | \"isUnique\" | \"renamedFromName\" | \"reference\" | \"enumValues\"> & Partial<Pick<AnyColumn, \"integer\" | \"sqlDomain\">>, spec: ColumnDefault): AnyColumn;"
-              ]
-            },
-            {
               "name": "compileGeneratedColumnExpression",
               "kind": "value",
               "declarations": [
@@ -2129,13 +2101,6 @@
               "kind": "value",
               "declarations": [
                 "export declare function foreignKeyName(tableName: string, columnName: string): string;"
-              ]
-            },
-            {
-              "name": "HasDefault",
-              "kind": "type",
-              "declarations": [
-                "export type HasDefault<TValue> = TValue & {\n    readonly __minnowHasDefault?: true;\n};"
               ]
             },
             {
@@ -2744,20 +2709,6 @@
               "kind": "type",
               "declarations": [
                 "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan;"
-              ]
-            },
-            {
-              "name": "CompactionRewritePlanKind",
-              "kind": "type",
-              "declarations": [
-                "export type CompactionRewritePlanKind = (typeof compactionRewritePlanKinds)[number];"
-              ]
-            },
-            {
-              "name": "compactionRewritePlanKinds",
-              "kind": "value",
-              "declarations": [
-                "compactionRewritePlanKinds: readonly [\n    \"copy-v1\",\n    \"rechunk-v1\",\n    \"merge-v1\"\n]"
               ]
             },
             {
@@ -3895,13 +3846,6 @@
               ]
             },
             {
-              "name": "normalizeGarbageCollectionDiscovery",
-              "kind": "value",
-              "declarations": [
-                "export declare function normalizeGarbageCollectionDiscovery(discovery: GarbageCollectionDiscovery): GarbageCollectionDiscovery;"
-              ]
-            },
-            {
               "name": "normalizeGarbageCollectionJobRecord",
               "kind": "value",
               "declarations": [
@@ -4722,6 +4666,13 @@
               ]
             },
             {
+              "name": "validateFtsCandidateLimit",
+              "kind": "value",
+              "declarations": [
+                "export declare function validateFtsCandidateLimit(maxRowIds: number): void;"
+              ]
+            },
+            {
               "name": "validateFtsOrderedReadLimits",
               "kind": "value",
               "declarations": [
@@ -4733,6 +4684,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function validateFtsPostingQueries(value: unknown, label?: string): asserts value is readonly FtsPostingQuery[];"
+              ]
+            },
+            {
+              "name": "validateFtsReadVersion",
+              "kind": "value",
+              "declarations": [
+                "export declare function validateFtsReadVersion(upToVersion: number): void;"
               ]
             },
             {
@@ -5180,20 +5138,6 @@
               "kind": "type",
               "declarations": [
                 "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan;"
-              ]
-            },
-            {
-              "name": "CompactionRewritePlanKind",
-              "kind": "type",
-              "declarations": [
-                "export type CompactionRewritePlanKind = (typeof compactionRewritePlanKinds)[number];"
-              ]
-            },
-            {
-              "name": "compactionRewritePlanKinds",
-              "kind": "value",
-              "declarations": [
-                "compactionRewritePlanKinds: readonly [\n    \"copy-v1\",\n    \"rechunk-v1\",\n    \"merge-v1\"\n]"
               ]
             },
             {
@@ -6240,13 +6184,6 @@
               ]
             },
             {
-              "name": "normalizeGarbageCollectionDiscovery",
-              "kind": "value",
-              "declarations": [
-                "export declare function normalizeGarbageCollectionDiscovery(discovery: GarbageCollectionDiscovery): GarbageCollectionDiscovery;"
-              ]
-            },
-            {
               "name": "normalizeGarbageCollectionJobRecord",
               "kind": "value",
               "declarations": [
@@ -6947,6 +6884,13 @@
               ]
             },
             {
+              "name": "validateFtsCandidateLimit",
+              "kind": "value",
+              "declarations": [
+                "export declare function validateFtsCandidateLimit(maxRowIds: number): void;"
+              ]
+            },
+            {
               "name": "validateFtsOrderedReadLimits",
               "kind": "value",
               "declarations": [
@@ -6958,6 +6902,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function validateFtsPostingQueries(value: unknown, label?: string): asserts value is readonly FtsPostingQuery[];"
+              ]
+            },
+            {
+              "name": "validateFtsReadVersion",
+              "kind": "value",
+              "declarations": [
+                "export declare function validateFtsReadVersion(upToVersion: number): void;"
               ]
             },
             {
@@ -8007,31 +7958,10 @@
           "audience": "extension",
           "exports": [
             {
-              "name": "failure",
-              "kind": "value",
-              "declarations": [
-                "export declare function failure(requestId: string, error: unknown): FailureResponse;"
-              ]
-            },
-            {
-              "name": "FailureResponse",
-              "kind": "type",
-              "declarations": [
-                "export interface FailureResponse {\n    version: typeof protocolVersion;\n    requestId: string;\n    kind: \"failure\";\n    error: {\n        name: string;\n        message: string;\n    };\n}"
-              ]
-            },
-            {
               "name": "MAX_DATABASE_RPC_IN_FLIGHT",
               "kind": "value",
               "declarations": [
                 "MAX_DATABASE_RPC_IN_FLIGHT = 256"
-              ]
-            },
-            {
-              "name": "parseRequest",
-              "kind": "value",
-              "declarations": [
-                "export declare function parseRequest(value: unknown): WorkerRequest;"
               ]
             },
             {
@@ -8046,13 +7976,6 @@
               "kind": "value",
               "declarations": [
                 "export declare function parseRpcResponse(value: unknown): RpcResponse | null;"
-              ]
-            },
-            {
-              "name": "ProgressResponse",
-              "kind": "type",
-              "declarations": [
-                "export interface ProgressResponse<T = unknown> {\n    version: typeof protocolVersion;\n    requestId: string;\n    kind: \"progress\";\n    progress: T;\n}"
               ]
             },
             {
@@ -8109,41 +8032,6 @@
               "kind": "value",
               "declarations": [
                 "export declare function serializeError(error: unknown): SerializedError;"
-              ]
-            },
-            {
-              "name": "success",
-              "kind": "value",
-              "declarations": [
-                "export declare function success<T>(requestId: string, result: T): SuccessResponse<T>;"
-              ]
-            },
-            {
-              "name": "SuccessResponse",
-              "kind": "type",
-              "declarations": [
-                "export interface SuccessResponse<T = unknown> {\n    version: typeof protocolVersion;\n    requestId: string;\n    kind: \"success\";\n    result: T;\n}"
-              ]
-            },
-            {
-              "name": "WorkerOperation",
-              "kind": "type",
-              "declarations": [
-                "export type WorkerOperation = \"benchmark\" | \"cancelBenchmark\" | \"datasetList\" | \"datasetCreate\" | \"datasetDelete\" | \"runQuery\" | \"suiteReference\" | \"suiteWrite\" | \"suiteFeatureMatrix\" | \"suiteLive\";"
-              ]
-            },
-            {
-              "name": "WorkerRequest",
-              "kind": "type",
-              "declarations": [
-                "export interface WorkerRequest<T = unknown> {\n    version: typeof protocolVersion;\n    requestId: string;\n    operation: WorkerOperation;\n    payload: T;\n}"
-              ]
-            },
-            {
-              "name": "WorkerResponse",
-              "kind": "type",
-              "declarations": [
-                "export type WorkerResponse<T = unknown> = SuccessResponse<T> | FailureResponse | ProgressResponse;"
               ]
             }
           ]

@@ -5,7 +5,7 @@
  * back from any engine — the same inputs every engine received.
  */
 import type { DatabaseRow } from "@minnowdb/core";
-import { generateEntityBatch, getScenario, type EntityDefinition } from "../benchmark";
+import { commerceEntities, generateEntityBatch, type EntityDefinition } from "../benchmark";
 import { loadDriver, requireMaterialization, type EngineSession } from "../engines/session";
 import type {
   EngineId,
@@ -91,7 +91,7 @@ export async function runReferenceSuite(
   payload: ReferenceSuitePayload,
 ): Promise<ReferenceSuiteResult> {
   const record = await getDataset(payload.datasetId);
-  const entities = getScenario("commerce").entities;
+  const entities = commerceEntities;
   const entityByName = new Map(entities.map((entity) => [entity.name, entity]));
   const orderRows = entityByName.get("orders")?.rows(record.scale) ?? 0;
   const definitions = referenceQueryDefinitions(orderRows);

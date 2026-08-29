@@ -1,4 +1,5 @@
 import { dateMilliseconds } from "../date-value.js";
+import { sameLiveValue } from "./live-equal.js";
 import type { LiveQuery, LiveSnapshot } from "./typed-live.js";
 
 export type LiveResultKey = string | number | boolean | Date;
@@ -49,38 +50,6 @@ export interface KeyedLiveQueryOptions<TRow extends object, TKey extends LiveKey
   readonly key: TKey;
   /** A window refuses a result larger than this instead of retaining an accidentally unbounded query. */
   readonly maxRows?: number;
-}
-
-function sameValue(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true;
-  if (left instanceof Date || right instanceof Date) {
-    return (
-      left instanceof Date &&
-      right instanceof Date &&
-      Object.is(dateMilliseconds(left), dateMilliseconds(right))
-    );
-  }
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    for (let index = 0; index < left.length; index += 1) {
-      if (!sameValue(left[index], right[index])) return false;
-    }
-    return true;
-  }
-  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
-    return false;
-  }
-  const leftRecord = left as Record<string, unknown>;
-  const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord);
-  const rightKeys = Object.keys(rightRecord);
-  if (leftKeys.length !== rightKeys.length) return false;
-  for (let index = 0; index < leftKeys.length; index += 1) {
-    const key = leftKeys[index];
-    if (key === undefined || key !== rightKeys[index]) return false;
-    if (!sameValue(leftRecord[key], rightRecord[key])) return false;
-  }
-  return true;
 }
 
 function keyToken(value: unknown, name: PropertyKey): string {
@@ -145,7 +114,7 @@ function diffRows<TRow extends object, TKey extends keyof TRow>(
       changes.push({ type: "insert", row: next.row, index: next.index });
       continue;
     }
-    if (!sameValue(old.row, next.row)) {
+    if (!sameLiveValue(old.row, next.row)) {
       changes.push({ type: "update", row: next.row, previous: old.row, index: next.index });
     }
     if (old.index !== next.index) {

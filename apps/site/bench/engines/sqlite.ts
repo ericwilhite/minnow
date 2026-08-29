@@ -1,6 +1,6 @@
 import type { Database, SAHPoolUtil, Sqlite3Static } from "@sqlite.org/sqlite-wasm";
 import { loadSqlite } from "./vendored";
-import { generateEntityBatch, getScenario } from "../benchmark";
+import { commerceEntities, generateEntityBatch } from "../benchmark";
 import type { DatasetRecord, EngineMaterialization } from "../protocol";
 import {
   canonicalizeRow,
@@ -103,7 +103,7 @@ export const sqliteDriver: EngineDriver = {
     let dataStoredBytes: number;
     let indexStoredBytes: number;
     try {
-      const entities = getScenario("commerce").entities;
+      const entities = commerceEntities;
       for (const entity of entities) database.exec(createTableSql(entity));
       let completedRows = 0;
       for (const entity of entities) {

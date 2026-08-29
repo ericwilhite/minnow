@@ -1,4 +1,4 @@
-import { dateMilliseconds } from "../date-value.js";
+import { sameLiveValue } from "./live-equal.js";
 import type { LiveQueryInput, LiveQueryInvalidation, LiveQueryObserveOptions } from "./live.js";
 
 /** The structural live-query surface shared by MinnowDatabase and its worker client. */
@@ -42,42 +42,6 @@ export type LiveSnapshot<TRow> =
       readonly error: unknown;
       readonly version: number | null;
     };
-
-function sameLiveValue(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true;
-  if (left instanceof Date || right instanceof Date) {
-    return (
-      left instanceof Date &&
-      right instanceof Date &&
-      Object.is(dateMilliseconds(left), dateMilliseconds(right))
-    );
-  }
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    for (let index = 0; index < left.length; index += 1) {
-      if (!sameLiveValue(left[index], right[index])) return false;
-    }
-    return true;
-  }
-  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
-    return false;
-  }
-  const leftRecord = left as Record<string, unknown>;
-  const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord);
-  const rightKeys = Object.keys(rightRecord);
-  if (leftKeys.length !== rightKeys.length) return false;
-  for (let index = 0; index < leftKeys.length; index += 1) {
-    const key = leftKeys[index];
-    if (key === undefined || key !== rightKeys[index]) return false;
-    if (!sameLiveValue(leftRecord[key], rightRecord[key])) return false;
-  }
-  return true;
-}
-
-function sameRows(left: readonly unknown[], right: readonly unknown[]): boolean {
-  return sameLiveValue(left, right);
-}
 
 function immutableRows<TRow>(rows: readonly TRow[]): readonly TRow[] {
   // Adapters own their values. Copy the array so mutating the returned builder result cannot
@@ -229,11 +193,11 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
         if (
           this.#snapshot.status === "ready" &&
           this.#snapshot.version === invalidation.manifestVersion &&
-          sameRows(previous, rows)
+          sameLiveValue(previous, rows)
         ) {
           continue;
         }
-        if (sameRows(previous, rows) && this.#snapshot.status !== "loading") {
+        if (sameLiveValue(previous, rows) && this.#snapshot.status !== "loading") {
           // Advance the version without replacing the immutable row array.
           this.#snapshot = {
             status: "ready",

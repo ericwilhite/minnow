@@ -9,5 +9,6 @@ apps/site/public/docs
 apps/site/public/llms-full.txt
 apps/site/public/agent-rules.md
 apps/site/public/sql-feature-matrix.json
+apps/site/public/playground-types.json
 # Agent worktrees the Claude Code harness checks out inside the repository.
 .claude/worktrees

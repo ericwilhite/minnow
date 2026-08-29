@@ -1263,9 +1263,6 @@ export interface CompactionJobCursor {
   sourceBlockIndex: number;
 }
 
-export const compactionRewritePlanKinds = ["copy-v1", "rechunk-v1", "merge-v1"] as const;
-export type CompactionRewritePlanKind = (typeof compactionRewritePlanKinds)[number];
-
 export interface CopyCompactionRewritePlan {
   readonly kind: "copy-v1";
 }
@@ -3187,6 +3184,22 @@ export function collectFtsCandidates(
   };
 }
 
+/** Validates the snapshot bound of one full-text read; -1 selects the base view alone. */
+export function validateFtsReadVersion(upToVersion: number): void {
+  if (!Number.isSafeInteger(upToVersion) || upToVersion < -1) {
+    throw new RangeError("Full-text query version must be a safe integer at least -1");
+  }
+}
+
+/** Validates the candidate row-ID ceiling accepted by one full-text candidate read. */
+export function validateFtsCandidateLimit(maxRowIds: number): void {
+  if (!Number.isSafeInteger(maxRowIds) || maxRowIds < 1 || maxRowIds > MAX_FTS_CANDIDATE_ROW_IDS) {
+    throw new RangeError(
+      `Full-text candidate limit must be between 1 and ${String(MAX_FTS_CANDIDATE_ROW_IDS)}`,
+    );
+  }
+}
+
 /** Validates the fixed memory ceilings accepted by one ordered postings read. */
 export function validateFtsOrderedReadLimits(
   maxRowIds = MAX_FTS_CANDIDATE_ROW_IDS,
@@ -4532,7 +4545,7 @@ export function createGarbageCollectionJobRecord(
   };
 }
 
-export function normalizeGarbageCollectionDiscovery(
+function normalizeGarbageCollectionDiscovery(
   discovery: GarbageCollectionDiscovery,
 ): GarbageCollectionDiscovery {
   const runtime: unknown = discovery;

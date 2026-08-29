@@ -8,6 +8,48 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read the m
 before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.7 — August 29, 2026
+
+Published packages: `@minnowdb/core@0.6.7`.
+
+### Changed
+
+- The benchmark harness's request envelope moved out of the library. The
+  `@minnowdb/core/worker-protocol` entry point no longer exports `WorkerOperation`,
+  `WorkerRequest`, `WorkerResponse`, `SuccessResponse`, `FailureResponse`, `ProgressResponse`,
+  `parseRequest`, `success`, or `failure` — an operation vocabulary that belonged to the docs
+  site's benchmark worker, not to database RPC. The entry point keeps what the engine actually
+  speaks: `protocolVersion`, the RPC frame types and constructors, `parseRpcRequest`,
+  `parseRpcResponse`, and `serializeError`.
+- Full-text read arguments are validated identically by every block store. `readFtsPostings`
+  and `readFtsCandidates` accept `upToVersion: -1` (the base view alone) and reject anything
+  below it or non-integral with a `RangeError` on all adapters; the IndexedDB store previously
+  rejected `-1` on postings reads and skipped candidate-limit validation entirely. The shared
+  validators, `validateFtsReadVersion` and `validateFtsCandidateLimit`, are exported from the
+  storage contract for adapter authors, and the conformance kit now asserts the refusals.
+
+### Removed
+
+- Dead exports with no callers and no documented behavior: `rawCodec` from
+  `@minnowdb/core/block-format`; `normalizeGarbageCollectionDiscovery`,
+  `compactionRewritePlanKinds`, and `CompactionRewritePlanKind` from the storage contract;
+  and `columnWithDefaultSpec` and `HasDefault` from the schema DSL (both superseded —
+  `columnFromState` and the builder's `THasDefault` parameter are the living replacements).
+
+### Migration
+
+Nothing to change for correct programs. No engine, SQL, or query behavior changed. A program
+importing one of the removed symbols was exercising surface the engine itself never called;
+the benchmark envelope now lives with the benchmark worker, and the remaining removals have
+the named in-library replacements above or none needed.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+layout 5 remain readable and writable without a data migration. The IndexedDB store's schema
+is unchanged — its indexes are now created from the same declaration they are validated
+against, producing the identical schema.
+
 ## 0.6.6 — August 29, 2026
 
 Published packages: `@minnowdb/core@0.6.6`, `@minnowdb/kysely@0.4.5`, and

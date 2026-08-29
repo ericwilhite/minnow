@@ -38,6 +38,7 @@ import type {
   WindowFrameExclusion,
   WindowSpec,
 } from "../plan/model.js";
+import { crossJoinPlan } from "../plan/model.js";
 export type {
   AggregateName,
   BinaryOperator,
@@ -3096,6 +3097,9 @@ function createPreparedRowQuery(
   };
 }
 
+// protectText defaults OFF here — the row engine's own tables are already inside the SQL
+// boundary — but ON in vector.ts's columnarTableFromRows, which ingests caller-owned rows.
+// A new call site must pick deliberately, not inherit whichever default is nearest.
 function cloneRowTables(
   tables: ReadonlyMap<string, DatabaseRow[]>,
   protectText = false,
@@ -7016,19 +7020,6 @@ class Parser {
     }
     const joins: JoinPlan[] = [];
     let rightJoins = 0;
-    /** A cross join: the nested-loop path with a condition every row pair satisfies. */
-    const crossJoin = (source: TableSource): JoinPlan => ({
-      ...source,
-      kind: "inner",
-      left: { kind: "literal", value: null },
-      right: { kind: "literal", value: null },
-      on: {
-        kind: "condition",
-        operator: "=",
-        left: { kind: "literal", value: 1 },
-        right: { kind: "literal", value: 1 },
-      },
-    });
     while (
       this.#peek().text === "," ||
       this.#isKeyword("NATURAL") ||
@@ -7041,13 +7032,13 @@ class Parser {
     ) {
       if (this.#punctuation(",")) {
         // F041-07: a comma between table references is a cross join.
-        joins.push(crossJoin(this.#source()));
+        joins.push(crossJoinPlan(this.#source()));
         continue;
       }
       if (this.#isKeyword("CROSS")) {
         this.#keyword("CROSS");
         this.#keyword("JOIN");
-        joins.push(crossJoin(this.#source()));
+        joins.push(crossJoinPlan(this.#source()));
         continue;
       }
       let kind: JoinPlan["kind"] = "inner";

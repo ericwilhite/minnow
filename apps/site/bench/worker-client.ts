@@ -2,12 +2,8 @@
  * Thin request/response client for the benchmark worker. Correlates responses by
  * requestId and forwards progress messages.
  */
-import {
-  protocolVersion,
-  type WorkerOperation,
-  type WorkerResponse,
-} from "@minnowdb/core/worker-protocol";
-import type { WorkProgress } from "./protocol";
+import { protocolVersion } from "@minnowdb/core/worker-protocol";
+import type { WorkerOperation, WorkerResponse, WorkProgress } from "./protocol";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;

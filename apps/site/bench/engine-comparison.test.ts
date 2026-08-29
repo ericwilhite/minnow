@@ -1,12 +1,12 @@
 import type { DatabaseRow } from "@minnowdb/core";
 import { compileQuery, executeQuery } from "@minnowdb/core/query";
 import { describe, expect, it } from "vitest";
-import { generateEntityBatch, getScenario } from "./benchmark";
+import { commerceEntities, generateEntityBatch } from "./benchmark";
 import { comparisonQueries } from "./engines/shared";
 import { referenceQueryDefinitions } from "./worker/reference-suite";
 
 function generatedRows(table: string): DatabaseRow[] {
-  const entity = getScenario("commerce").entities.find((candidate) => candidate.name === table);
+  const entity = commerceEntities.find((candidate) => candidate.name === table);
   if (entity === undefined) throw new Error(`Missing entity: ${table}`);
   const rowCount = entity.rows(1);
   const columns = generateEntityBatch(entity, 0, rowCount, rowCount, 1);

@@ -21,6 +21,8 @@ import {
   advanceGarbageCollectionJobRecord,
   collectFtsCandidates,
   collectFtsPostingsBounded,
+  validateFtsCandidateLimit,
+  validateFtsReadVersion,
   activePostingStorageColumnIds,
   invalidateUncoveredFtsColumns,
   invalidateUncoveredSecondaryIndexes,
@@ -2295,9 +2297,7 @@ export class RecordCore {
     validateId(tableId);
     validateId(columnId);
     validateFtsPostingQueries(terms);
-    if (!Number.isSafeInteger(upToVersion) || upToVersion < -1) {
-      throw new RangeError("Full-text query version must be a safe integer at least -1");
-    }
+    validateFtsReadVersion(upToVersion);
     validateFtsCandidateLimit(maxRowIds);
     const key = `${tableId}/${columnId}`;
     const base = this.#ftsBases.get(key);
@@ -2422,9 +2422,7 @@ export class RecordCore {
   } {
     validateId(tableId);
     validateId(columnId);
-    if (!Number.isSafeInteger(upToVersion) || upToVersion < -1) {
-      throw new RangeError("Full-text query version must be a safe integer at least -1");
-    }
+    validateFtsReadVersion(upToVersion);
     const base = this.#ftsBases.get(`${tableId}/${columnId}`);
     const coversVersion = base?.coversVersion ?? -1;
     const delta = this.readFtsDeltas(tableId, columnId, coversVersion, upToVersion);
@@ -8106,14 +8104,6 @@ function sortedVersionInInterval(
   }
   const version = versions[low];
   return version !== undefined && (removedVersion === null || version < removedVersion);
-}
-
-function validateFtsCandidateLimit(value: number): void {
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_FTS_CANDIDATE_ROW_IDS) {
-    throw new RangeError(
-      `Full-text candidate limit must be between 1 and ${String(MAX_FTS_CANDIDATE_ROW_IDS)}`,
-    );
-  }
 }
 
 function varuintByteLength(value: bigint): number {

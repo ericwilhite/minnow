@@ -1,4 +1,5 @@
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import { crossJoinPlan } from "../plan/model.js";
 import {
   blockHasSubqueries,
   childExpressions,
@@ -2064,20 +2065,7 @@ function decorrelateExistsWithProbes(
     inner,
     new Map(references.map((reference, index) => [reference, probeReferences[index] ?? null])),
   );
-  inner.joins.push({
-    table: probesAlias,
-    alias: probesAlias,
-    derived: probes,
-    kind: "inner",
-    left: { kind: "literal", value: null },
-    right: { kind: "literal", value: null },
-    on: {
-      kind: "condition",
-      operator: "=",
-      left: { kind: "literal", value: 1 },
-      right: { kind: "literal", value: 1 },
-    },
-  });
+  inner.joins.push(crossJoinPlan({ table: probesAlias, alias: probesAlias, derived: probes }));
 
   const flagsAlias = nextAlias();
   const flags: CompiledQuery = {

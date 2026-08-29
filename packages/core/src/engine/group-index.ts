@@ -61,7 +61,7 @@ export class ByteGroupIndex<T> {
   }
 
   getOne(key: GroupIndexKey): T | undefined {
-    const length = encodeSingleGroupKey(key);
+    const length = encodeSingleScalarKey(key);
     const index = this.#find(length, hashScratch(length));
     return index < 0 ? undefined : this.#values[index];
   }
@@ -83,7 +83,7 @@ export class ByteGroupIndex<T> {
   }
 
   getOrInsertOne(key: GroupIndexKey, create: () => T): T {
-    const length = encodeSingleGroupKey(key);
+    const length = encodeSingleScalarKey(key);
     return this.#getOrInsertScratch(length, create);
   }
 
@@ -252,11 +252,6 @@ export function encodeSingleScalarKey(key: GroupIndexKey): number {
   return writeGroupKey(key, 0);
 }
 
-function encodeSingleGroupKey(key: GroupIndexKey): number {
-  reclaimScratch();
-  return writeGroupKey(key, 0);
-}
-
 function writeGroupKey(key: GroupIndexKey, offset: number): number {
   if (key === null) {
     ensureScratchCapacity(offset + 1);
@@ -370,14 +365,14 @@ export function copyScratchKey(length: number): Uint8Array {
   return scratch.slice(0, length);
 }
 
-function safeDouble(value: number, label: string): number {
+export function safeDouble(value: number, label: string): number {
   const doubled = value * 2;
   if (!Number.isSafeInteger(doubled))
     throw new RangeError(`${label} exceeds the safe integer range`);
   return doubled;
 }
 
-function safeProduct(left: number, right: number, label: string): number {
+export function safeProduct(left: number, right: number, label: string): number {
   const product = left * right;
   if (!Number.isSafeInteger(product))
     throw new RangeError(`${label} exceeds the safe integer range`);

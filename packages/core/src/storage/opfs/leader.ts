@@ -107,7 +107,9 @@ import {
   StorageCorruptionError,
   StorageFormatVersionError,
   validateFtsPostingQueries,
+  validateFtsCandidateLimit,
   validateFtsOrderedReadLimits,
+  validateFtsReadVersion,
   uniqueKeyBuildChunkRetainedBytes,
 } from "../types.js";
 import { dateIsoString } from "../../date-value.js";
@@ -3397,9 +3399,7 @@ export class OpfsLeader {
     validateId(tableId);
     validateId(columnId);
     validateFtsPostingQueries(terms);
-    if (!Number.isSafeInteger(upToVersion) || upToVersion < -1) {
-      throw new RangeError("Full-text query version must be a safe integer at least -1");
-    }
+    validateFtsReadVersion(upToVersion);
     validateFtsCandidateLimit(maxRowIds);
     return this.#run(async () => {
       // Unlike immutable table blocks, derived-index extents are not protected by reader leases:
@@ -3484,9 +3484,7 @@ export class OpfsLeader {
   ) {
     validateId(tableId);
     validateId(columnId);
-    if (!Number.isSafeInteger(upToVersion) || upToVersion < -1) {
-      throw new RangeError("Full-text query version must be a safe integer at least -1");
-    }
+    validateFtsReadVersion(upToVersion);
     validateFtsOrderedReadLimits(maxRowIds, maxRetainedBytes);
     return this.#run(async () => {
       const key = postingStorageKey(tableId, columnId);
@@ -5200,14 +5198,6 @@ function requireNonNegativeInteger(value: unknown, label: string): asserts value
 
 function requireCoverageVersion(value: unknown, label: string): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < -1) throw new Error(`Invalid ${label}`);
-}
-
-function validateFtsCandidateLimit(value: number): void {
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_FTS_CANDIDATE_ROW_IDS) {
-    throw new RangeError(
-      `Full-text candidate limit must be between 1 and ${String(MAX_FTS_CANDIDATE_ROW_IDS)}`,
-    );
-  }
 }
 
 function requirePositiveInteger(value: unknown, label: string): asserts value is number {

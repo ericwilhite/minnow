@@ -821,6 +821,8 @@ function sqlLiteral(value: unknown): string {
   return String(value);
 }
 
+// Deterministic copy of `positionalToNumbered` in packages/core/src/testing/oracle.ts, which the
+// built dist's exports map does not expose (it is excluded from the tarball on purpose).
 function positionalToNumbered(sql: string): string {
   let index = 0;
   return sql.replace(/\?/g, () => `$${String((index += 1))}`);

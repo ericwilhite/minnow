@@ -1438,6 +1438,45 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           ],
           "ordered postings must merge into canonical term and row-ID order",
         );
+        // The read-argument contract is uniform across adapters: -1 selects the base view
+        // alone, anything below it (or non-integral) is refused, and the candidate limit is
+        // validated on every read path.
+        const baseOnly = await store.readFtsPostings("table-t", "col-v", -1);
+        check(
+          baseOnly.hasBase && baseOnly.postings.length === 3,
+          "an upToVersion of -1 must serve the base view alone",
+        );
+        for (const version of [-2, Number.NaN, 1.5]) {
+          try {
+            await store.readFtsCandidates(
+              "table-t",
+              "col-v",
+              [{ term: "minnow", prefix: false }],
+              version,
+            );
+            throw new Error(`candidate read accepted invalid version ${String(version)}`);
+          } catch (error) {
+            check(error instanceof RangeError, "invalid candidate versions must throw RangeError");
+          }
+          try {
+            await store.readFtsPostings("table-t", "col-v", version);
+            throw new Error(`postings read accepted invalid version ${String(version)}`);
+          } catch (error) {
+            check(error instanceof RangeError, "invalid postings versions must throw RangeError");
+          }
+        }
+        try {
+          await store.readFtsCandidates(
+            "table-t",
+            "col-v",
+            [{ term: "minnow", prefix: false }],
+            10,
+            0,
+          );
+          throw new Error("candidate read accepted a zero row-ID limit");
+        } catch (error) {
+          check(error instanceof RangeError, "invalid candidate limits must throw RangeError");
+        }
         store.close();
       },
     },

@@ -3,7 +3,7 @@ import { exposeDatabase } from "@minnowdb/core/worker-host";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import type { BlockStore } from "@minnowdb/core/storage/contracts";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
-import { generateEntityBatch, getScenario } from "../benchmark";
+import { commerceEntities, generateEntityBatch } from "../benchmark";
 import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol";
 import { canonicalizeRow, createSecondaryIndexes, normalizeRows } from "./shared";
 import type {
@@ -90,7 +90,7 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
       let dataStoredBytes: number;
       let indexStoredBytes: number;
       try {
-        const entities = getScenario("commerce").entities;
+        const entities = commerceEntities;
         for (const entity of entities) {
           await database.createTable({
             name: entity.name,
