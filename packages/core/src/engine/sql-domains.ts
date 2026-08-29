@@ -540,7 +540,7 @@ export function arrayDomainValue(values: readonly unknown[]): string {
   );
 }
 
-export function enumDomainValue(
+function enumDomainValue(
   value: unknown,
   name: string,
   values: readonly string[],

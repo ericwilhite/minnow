@@ -17,9 +17,9 @@ const LEDGER_PREFIX_BYTES = 80;
 const MODE_INLINE = 0;
 const MODE_PLACEMENT = 1;
 
-export type SnapshotLedgerKind = "export" | "import" | "completed";
+type SnapshotLedgerKind = "export" | "import" | "completed";
 
-export interface SnapshotLedgerRecord {
+interface SnapshotLedgerRecord {
   readonly sequence: number;
   readonly kind: SnapshotFrameKind;
   readonly itemCount: number;

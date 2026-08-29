@@ -22,7 +22,7 @@ import { compareSqlStrings, compareSqlValues } from "./sql-semantics.js";
  * next, so what a multi-term sort pays for its later terms is proportional to how many rows tie
  * on the earlier ones.
  */
-export interface SortKeyColumn {
+interface SortKeyColumn {
   /**
    * Ascending comparison with NULL smallest. This is the column's raw comparison, not SQL's
    * default placement: the sorter applies PostgreSQL's NULLS LAST for ASC and NULLS FIRST for
@@ -51,7 +51,7 @@ export interface SortKeyTerm {
 }
 
 /** Unwraps a datetime to the number the comparisons use; every other value passes through. */
-export function comparableSortValue(value: unknown): unknown {
+function comparableSortValue(value: unknown): unknown {
   return value instanceof Date ? dateMilliseconds(value) : value;
 }
 

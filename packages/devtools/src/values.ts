@@ -2,10 +2,10 @@ import type { QueryValue } from "@minnowdb/core";
 import { dateIsoString, dateMilliseconds } from "./date-value.js";
 import type { ColumnType } from "./sql/literal.js";
 
-export type ParseResult = { ok: true; value: QueryValue } | { ok: false; message: string };
+type ParseResult = { ok: true; value: QueryValue } | { ok: false; message: string };
 
 /** The sentinel a person types to mean SQL NULL, since an empty box is ambiguous for strings. */
-export const nullInput = "NULL";
+const nullInput = "NULL";
 
 /**
  * Turns typed text into a value of the column's type, or explains why it cannot. Writes go through

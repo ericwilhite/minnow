@@ -13,8 +13,6 @@ const INITIAL_KEY_CAPACITY = 32;
 const ENTRY_FIELDS = 6;
 const UINT32_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 
-export type JoinIndexKey = boolean | number | string | Date;
-
 /** Collision-checked scalar-key hash index with typed duplicate row chains. */
 export class ByteJoinIndex {
   readonly #memory: QueryMemoryContext;

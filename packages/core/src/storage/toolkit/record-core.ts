@@ -7970,16 +7970,6 @@ function validateTempOwnerRecord(record: TempOwnerRecord): void {
   }
 }
 
-export function validateLeaseExpiration(expiresAt: string): void {
-  if (
-    typeof expiresAt !== "string" ||
-    expiresAt.length === 0 ||
-    !Number.isFinite(Date.parse(expiresAt))
-  ) {
-    throw new TypeError("Lease expiration must be valid");
-  }
-}
-
 function isCanonicalTimestamp(value: string): boolean {
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) && dateIsoString(new Date(timestamp)) === value;

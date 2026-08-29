@@ -13,16 +13,16 @@
  * Every failure is reported as a status with a reason rather than as a zero.
  */
 
-export type AgentMemoryStatus = "measured" | "unsupported" | "not-isolated" | "refused";
+type AgentMemoryStatus = "measured" | "unsupported" | "not-isolated" | "refused";
 
-export interface AgentMemorySample {
+interface AgentMemorySample {
   /** Total bytes attributed to this JavaScript agent, including WebAssembly memories. */
   bytes: number;
   /** Bytes per memory type exactly as the browser labels them; labels are not standardized. */
   byType: Record<string, number>;
 }
 
-export interface AgentMemoryResult {
+interface AgentMemoryResult {
   status: AgentMemoryStatus;
   sample: AgentMemorySample | null;
   /** Human-readable reason, shown verbatim when no sample could be taken. */
@@ -43,7 +43,7 @@ interface MemoryCapablePerformance {
  * Resolves after the browser's next garbage collection, so this can take a second or more and
  * must never sit inside a timed region.
  */
-export async function measureAgentMemory(): Promise<AgentMemoryResult> {
+async function measureAgentMemory(): Promise<AgentMemoryResult> {
   const api = performance as Performance & MemoryCapablePerformance;
   if (typeof api.measureUserAgentSpecificMemory !== "function") {
     return {
@@ -88,7 +88,7 @@ export async function measureAgentMemory(): Promise<AgentMemoryResult> {
  * JavaScript heap only. Chromium exposes it on Window; it is absent in workers, which is why
  * every sample in this app is taken on the main thread.
  */
-export function heapBytes(): number | null {
+function heapBytes(): number | null {
   const value = (performance as Performance & MemoryCapablePerformance).memory?.usedJSHeapSize;
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -121,11 +121,3 @@ export async function sampleMemory(): Promise<MemorySample> {
     heapBytes: heapBytes(),
   };
 }
-
-export const unavailableMemorySample: MemorySample = {
-  agentStatus: "unsupported",
-  agentDetail: "The page did not answer the memory checkpoint in time.",
-  agentBytes: null,
-  agentByType: null,
-  heapBytes: null,
-};

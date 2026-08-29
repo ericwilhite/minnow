@@ -100,7 +100,7 @@ export function clamp(value: number, low: number, high: number) {
 }
 
 /** Move `angle` toward `want` the short way round, by at most `step`. */
-export function turnToward(angle: number, want: number, step: number) {
+function turnToward(angle: number, want: number, step: number) {
   const delta = ((want - angle + Math.PI * 3) % TAU) - Math.PI;
   return angle + clamp(delta, -step, step);
 }

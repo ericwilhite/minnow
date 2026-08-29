@@ -233,7 +233,7 @@ export const volatileScalarFunctionNames: ReadonlySet<string> = new Set([
  * reading, so they are resolved once per execution rather than evaluated per row: every row of
  * one statement sees one instant, both executors agree, and constant folding leaves them alone.
  */
-export const statementDatetimeNames: ReadonlySet<string> = new Set([
+const statementDatetimeNames: ReadonlySet<string> = new Set([
   "CURRENT_DATE",
   "CURRENT_TIMESTAMP",
   "LOCALTIME",
@@ -739,7 +739,7 @@ function assertReplacementResultLength(source: string, search: string, replaceme
   }
 }
 
-export const dateTruncUnits: ReadonlySet<string> = new Set([
+const dateTruncUnits: ReadonlySet<string> = new Set([
   "year",
   "quarter",
   "month",
@@ -771,7 +771,7 @@ const intervalUnits = new Map<string, { months: number; milliseconds: number }>(
  * rather than converted, because a month is not a fixed number of them: adding one to January 31
  * has to land on the end of February, which only calendar arithmetic can do.
  */
-export function intervalLiteral(text: string): { months: number; milliseconds: number } {
+function intervalLiteral(text: string): { months: number; milliseconds: number } {
   let months = 0;
   let milliseconds = 0;
   let matched = 0;
@@ -796,7 +796,7 @@ export function intervalLiteral(text: string): { months: number; milliseconds: n
  * does not exist in the target month clamps to that month's last day, which is what both SQLite
  * and PostgreSQL do with 31 January plus a month.
  */
-export function dateAddValue(
+function dateAddValue(
   value: unknown,
   months: unknown,
   milliseconds: unknown,
@@ -827,7 +827,7 @@ export function dateAddValue(
     : result;
 }
 
-export function dateTruncValue(unit: unknown, value: unknown): Date | null {
+function dateTruncValue(unit: unknown, value: unknown): Date | null {
   if (typeof unit !== "string" || !dateTruncUnits.has(unit.toLowerCase())) {
     throw new TypeError(
       "DATE_TRUNC requires a unit of year, quarter, month, week, day, hour, minute, or second",
@@ -1019,7 +1019,7 @@ const statisticalAggregates = new Set([
   "STDDEV",
 ]);
 
-export interface CompileQueryOptions {
+interface CompileQueryOptions {
   /** Set false to skip deterministic plan rewrites, for example to snapshot the raw plan. */
   readonly optimize?: boolean;
 }
@@ -1109,7 +1109,7 @@ function columnDefaultFor(expression: Expression, sql: string): ColumnDefault {
  * One WHEN clause of a MERGE (F312). Branches are tried in order for each source row, and the
  * first whose match state and optional condition hold decides what happens to that row.
  */
-export type MergeBranch =
+type MergeBranch =
   | {
       when: "matched";
       condition?: Expression;
@@ -1145,7 +1145,7 @@ export interface UniqueConstraintDefinition {
 }
 
 /** An INSERT value: a constant, SQL DEFAULT, or an unbound placeholder. */
-export interface DefaultInsertValue {
+interface DefaultInsertValue {
   readonly default: true;
 }
 export type InsertValue = QueryValue | DefaultInsertValue | { parameter: number };
@@ -1402,7 +1402,7 @@ export function compileCheckExpression(sql: string, name: string): Expression {
   return expression;
 }
 
-export interface DefaultExpressionTarget {
+interface DefaultExpressionTarget {
   readonly name: string;
   readonly type: SqlColumnType;
   readonly sqlDomain?: SqlDomain;
@@ -1757,7 +1757,7 @@ export function evaluateRowExpression(
   return asQueryValue(evaluate(expression, { [alias]: row }));
 }
 
-export interface SubqueryResolutionStep {
+interface SubqueryResolutionStep {
   /** The uncorrelated block to execute; earlier steps have already substituted inside it. */
   readonly block: CompiledQuery;
   /** Replaces the subquery node with the executed result as literals. */
@@ -1974,7 +1974,7 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
 }
 
 /** True when any `?`/`$n` placeholder remains anywhere in the expression tree. */
-export function containsParameter(expression: Expression): boolean {
+function containsParameter(expression: Expression): boolean {
   if (expression.kind === "parameter") return true;
   if (expression.kind === "subquery" || expression.kind === "exists") {
     return blockHasParameters(expression.block);
@@ -1982,7 +1982,7 @@ export function containsParameter(expression: Expression): boolean {
   return childExpressions(expression).some(containsParameter);
 }
 
-export function blockHasParameters(block: CompiledQuery): boolean {
+function blockHasParameters(block: CompiledQuery): boolean {
   if (
     block.limitParameter !== undefined ||
     block.offsetParameter !== undefined ||
@@ -3471,7 +3471,7 @@ export function resolveStatementDatetimes(
 }
 
 /** One top-level full-text MATCH conjunct of a plan, with its resolved column expressions. */
-export interface FtsMatchConjunct {
+interface FtsMatchConjunct {
   columns: Expression[];
   query: string;
 }
@@ -4315,7 +4315,7 @@ function rowQueryPayloadBytes(row: QueryRow): number {
 }
 
 /** One ORDER BY resolution source: an alias and the columns a wildcard select exposes from it. */
-export interface OrderSourceShape {
+interface OrderSourceShape {
   readonly alias: string;
   readonly columns: readonly string[];
 }
@@ -4789,7 +4789,7 @@ function inListHolds(
   return operator === "NOT IN" && !hasNull;
 }
 
-export interface ListMembership {
+interface ListMembership {
   set: ReadonlySet<unknown>;
   hasNull: boolean;
 }
@@ -8796,7 +8796,7 @@ class Parser {
 // COUNT(DISTINCT) / window desugars, and the same derived-source numbering (callers thread one
 // sequence counter through every source they create, in parse order).
 
-export interface SelectBlockParts {
+interface SelectBlockParts {
   sql: string;
   base: TableSource;
   joins: JoinPlan[];
@@ -9129,7 +9129,7 @@ export function assembleSelectBlock(
  * over those same columns provides the deduplication through the grouped executor. Runs
  * exactly once per execution entry, like MATCH(*) expansion.
  */
-export function expandDistinctWildcard(
+function expandDistinctWildcard(
   plan: CompiledQuery,
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
@@ -9232,7 +9232,7 @@ export function planHasSourceColumnAliases(plan: CompiledQuery): boolean {
  * scan cannot know whether the next row ties — and the ordered result is trimmed here: rows up
  * to the limit, plus every following row equal to the last one on all ORDER BY columns.
  */
-export function withTiesPlan(plan: CompiledQuery): {
+function withTiesPlan(plan: CompiledQuery): {
   plan: CompiledQuery;
   trim: (result: QueryResult) => QueryResult;
 } {
@@ -9432,7 +9432,7 @@ export function expandSourceColumnAliases(
  * one source, and `alias.column` when it reads several, so two sources cannot collide.
  * Runs once per execution entry, like MATCH(*) and DISTINCT * expansion.
  */
-export function expandQualifiedWildcards(
+function expandQualifiedWildcards(
   plan: CompiledQuery,
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
@@ -9746,7 +9746,7 @@ function jsonTableColumnValue(
   return date;
 }
 
-export function timestampLiteral(text: string): Date {
+function timestampLiteral(text: string): Date {
   const trimmed = text.trim();
   const match =
     /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/.exec(

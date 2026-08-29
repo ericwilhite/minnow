@@ -11,7 +11,7 @@ export interface WriteColumnValues {
   readonly stringByteLengths?: readonly number[];
 }
 
-export interface WriteBlockRange {
+interface WriteBlockRange {
   readonly start: number;
   readonly end: number;
 }

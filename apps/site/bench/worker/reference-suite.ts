@@ -76,7 +76,7 @@ export function validateReferencePayload(value: unknown): ReferenceSuitePayload 
 }
 
 /** Materializes one full table as row objects from the deterministic generator. */
-export function generateTableRows(entity: EntityDefinition, scale: number): DatabaseRow[] {
+function generateTableRows(entity: EntityDefinition, scale: number): DatabaseRow[] {
   const rowCount = entity.rows(scale);
   const columns = generateEntityBatch(entity, 0, rowCount, rowCount, scale);
   return Array.from({ length: rowCount }, (_, index) =>
@@ -773,19 +773,19 @@ export function rows(tables: ReadonlyMap<string, DatabaseRow[]>, name: string): 
   return tables.get(name) ?? [];
 }
 
-export function numberField(row: DatabaseRow, name: string): number {
+function numberField(row: DatabaseRow, name: string): number {
   const value = row[name];
   if (typeof value !== "number") throw new Error(`Expected numeric field: ${name}`);
   return value;
 }
 
-export function stringField(row: DatabaseRow, name: string): string {
+function stringField(row: DatabaseRow, name: string): string {
   const value = row[name];
   if (typeof value !== "string") throw new Error(`Expected string field: ${name}`);
   return value;
 }
 
-export function dateField(row: DatabaseRow, name: string): Date {
+function dateField(row: DatabaseRow, name: string): Date {
   const value = row[name];
   if (!(value instanceof Date)) throw new Error(`Expected datetime field: ${name}`);
   return value;

@@ -156,7 +156,7 @@ export function jsonIsValid(document: unknown, kind: string): boolean {
 }
 
 /** A SQL value as its JSON counterpart: datetimes serialize as ISO text, like every cast. */
-export function jsonValueOf(value: unknown): unknown {
+function jsonValueOf(value: unknown): unknown {
   const external = externalSqlDomainValue(value);
   return external instanceof Date ? dateIsoString(external) : external;
 }

@@ -10,7 +10,7 @@
 import { dateMilliseconds } from "../date-value.js";
 import type { CompiledQuery, Expression, QueryValue } from "../plan/model.js";
 
-export type PointReadValue = boolean | number | string | Date;
+type PointReadValue = boolean | number | string | Date;
 
 export interface PointReadEquality {
   column: string;

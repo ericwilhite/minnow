@@ -11,7 +11,7 @@ import { readStored, writeStored } from "./storage.js";
 import { changesData, classifyStatement, summarize, writeBlockedMessage } from "./statements.js";
 import type { DevtoolsTarget } from "./target.js";
 
-export interface ConsoleDeps {
+interface ConsoleDeps {
   target: DevtoolsTarget;
   confirm: ConfirmLayer;
   /** Whether statements that change data are allowed to run at all. */
@@ -25,7 +25,7 @@ export interface ConsoleDeps {
   onCatalogChange(): Promise<void>;
 }
 
-export interface ConsoleView {
+interface ConsoleView {
   node: HTMLElement;
   focus(): void;
   /** Loads the real editor. Called the first time the tab is shown. */

@@ -4,7 +4,7 @@
  * because nodes are updated in place instead of replaced wholesale.
  */
 
-export interface ElementSpec {
+interface ElementSpec {
   class?: string;
   text?: string;
   title?: string;

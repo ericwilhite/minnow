@@ -39,7 +39,7 @@ function quoteString(value: string): string {
  * and compares at midnight UTC even though the SQL engine also accepts precise TIMESTAMP literals.
  * Callers must account for that day-granular explorer behavior rather than discover it.
  */
-export function toDateOnly(value: QueryValue): string {
+function toDateOnly(value: QueryValue): string {
   const date = value instanceof Date ? value : new Date(String(value));
   if (!Number.isFinite(dateMilliseconds(date))) {
     throw new TypeError(`Not a date: ${String(value)}`);

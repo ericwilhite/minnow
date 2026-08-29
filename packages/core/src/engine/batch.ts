@@ -36,7 +36,7 @@ export interface ColumnarBatch {
 /** What `insertBatch` and `upsertBatch` take: rows, or columns for a bulk load. */
 export type InsertBatchInput = readonly BatchRow[] | ColumnarBatch;
 
-export function isColumnarBatch(input: InsertBatchInput): input is ColumnarBatch {
+function isColumnarBatch(input: InsertBatchInput): input is ColumnarBatch {
   return !Array.isArray(input);
 }
 

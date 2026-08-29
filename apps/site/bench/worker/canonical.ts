@@ -50,7 +50,7 @@ export function tuplesMatch(left: readonly unknown[][], right: readonly unknown[
   });
 }
 
-export function valuesMatch(left: unknown, right: unknown): boolean {
+function valuesMatch(left: unknown, right: unknown): boolean {
   if (typeof left === "number" && typeof right === "number") {
     if (Number.isNaN(left) && Number.isNaN(right)) return true;
     return Math.abs(left - right) <= Math.max(Math.abs(left), Math.abs(right), 1) * 1e-9;

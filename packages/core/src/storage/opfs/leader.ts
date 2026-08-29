@@ -163,7 +163,7 @@ const CHECKPOINT_ENTRIES = 1024;
 export const MAX_OPFS_WAL_BYTES = 256 * 1024 * 1024;
 export const MAX_OPFS_CHECKPOINT_BYTES = 256 * 1024 * 1024;
 /** Failed physical reclamation cannot permit byte-growing work forever. */
-export const MAX_OPFS_CLEANUP_DEBT_BYTES = 64 * 1024 * 1024;
+const MAX_OPFS_CLEANUP_DEBT_BYTES = 64 * 1024 * 1024;
 /** Decoded full-text base cache: bounded primarily by modeled retained heap, count secondarily. */
 const FTS_CHUNK_CACHE_BYTES = 16 * 1024 * 1024;
 const FTS_CHUNK_CACHE_SIZE = 64;
@@ -6457,7 +6457,7 @@ function samePlacement(left: Placement | undefined, right: Placement): boolean {
 }
 
 /** Conservative retained-heap model for one decoded postings chunk and its nested arrays. */
-export function modeledFtsChunkBytes(chunk: readonly FtsPosting[]): number {
+function modeledFtsChunkBytes(chunk: readonly FtsPosting[]): number {
   let bytes = 64;
   for (const posting of chunk) {
     bytes += 64 + posting.term.length * 2 + posting.rowIds.length * 40;

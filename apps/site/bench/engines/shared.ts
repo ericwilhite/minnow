@@ -153,7 +153,7 @@ const datetimePattern = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z?$/
  * all become `YYYY-MM-DDTHH:MM:SS.mmmZ`. The generator only ever writes UTC wall-clock
  * datetimes, so this normalization is lossless for generated data.
  */
-export function canonicalizeValue(value: unknown): unknown {
+function canonicalizeValue(value: unknown): unknown {
   if (typeof value === "bigint") return Number(value);
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "string" && datetimePattern.test(value)) {

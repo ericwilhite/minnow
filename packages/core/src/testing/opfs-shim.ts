@@ -35,7 +35,7 @@ interface DirectoryNode {
 }
 
 export type WriteFault = (path: string, phase: "create" | "write" | "flush") => void;
-export type DeleteFault = (path: string) => void;
+type DeleteFault = (path: string) => void;
 export type TransferLimit = (
   path: string,
   operation: "read" | "write",

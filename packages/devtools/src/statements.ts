@@ -5,7 +5,7 @@ import { compileStatement, type CompiledStatement } from "@minnowdb/core/query";
  * compiler's own discriminant is the only way to be sure: a statement starting with the letters
  * `select` can still be something else, and one mentioning `delete` in a string literal is not.
  */
-export type StatementIntent =
+type StatementIntent =
   | { kind: "select" }
   | { kind: "insert"; table: string; columns: string[]; rowCount: number }
   | { kind: "update"; table: string; columns: string[]; filtered: boolean }
@@ -200,7 +200,7 @@ export function changesData(intent: StatementIntent): boolean {
   return intent.kind !== "select";
 }
 
-export interface StatementSummary {
+interface StatementSummary {
   /** One line naming the operation and its target, for the confirmation heading. */
   title: string;
   /** Label/value pairs spelling out what is about to happen. */

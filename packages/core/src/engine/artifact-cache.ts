@@ -1,5 +1,5 @@
 /** Snapshot of the byte-bounded artifact cache's lifetime counters. */
-export interface ArtifactCacheStats {
+interface ArtifactCacheStats {
   limitBytes: number;
   usedBytes: number;
   entries: number;

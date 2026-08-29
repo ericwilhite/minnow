@@ -17,7 +17,7 @@ import { unknownColumnDomains } from "./query.js";
  * defined — never as a prototype assignment.
  */
 
-export type WireResultColumn =
+type WireResultColumn =
   | { kind: "number"; values: Float64Array; nulls?: Uint8Array }
   | { kind: "boolean"; values: Uint8Array; nulls?: Uint8Array }
   | { kind: "datetime"; values: Float64Array; nulls?: Uint8Array }

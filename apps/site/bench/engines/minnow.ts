@@ -24,7 +24,7 @@ const BATCH_ROWS = 50_000;
  * side — so what it measures is the client layer, not the engine again. Close it and the
  * channel goes with it; the database and store are the caller's.
  */
-export function connectClient(database: MinnowDatabase): {
+function connectClient(database: MinnowDatabase): {
   client: MinnowDatabaseClient;
   close(): Promise<void>;
 } {

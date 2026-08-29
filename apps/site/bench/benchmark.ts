@@ -1,8 +1,8 @@
 import type { ColumnValues, Compression, LogicalType } from "@minnowdb/core/block-format";
 
-export const scenarioIds = ["telemetry", "commerce", "compression"] as const;
-export const benchmarkFocuses = ["roundtrip", "write", "read"] as const;
-export const durabilityModes = ["relaxed", "strict"] as const;
+const scenarioIds = ["telemetry", "commerce", "compression"] as const;
+const benchmarkFocuses = ["roundtrip", "write", "read"] as const;
+const durabilityModes = ["relaxed", "strict"] as const;
 
 export type ScenarioId = (typeof scenarioIds)[number];
 export type BenchmarkFocus = (typeof benchmarkFocuses)[number];
@@ -457,7 +457,7 @@ export const scenarios: ScenarioDefinition[] = [
   },
 ];
 
-export const relationalBaseRows = {
+const relationalBaseRows = {
   countries: 8,
   regions: 16,
   currencies: 4,

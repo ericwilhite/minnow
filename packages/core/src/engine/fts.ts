@@ -127,7 +127,7 @@ export function tokenizeQuery(query: string): FtsQueryTerm[] {
   return terms;
 }
 
-export function termMatches(token: string, term: FtsQueryTerm): boolean {
+function termMatches(token: string, term: FtsQueryTerm): boolean {
   return term.prefix ? token.startsWith(term.term) : token === term.term;
 }
 

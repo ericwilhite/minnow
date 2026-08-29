@@ -4,7 +4,7 @@
  * answered by the window, and small IndexedDB/arithmetic helpers.
  */
 import { protocolVersion, type ProgressResponse } from "@minnowdb/core/worker-protocol";
-import { unavailableMemorySample, type MemorySample } from "../memory-probe";
+import type { MemorySample } from "../memory-probe";
 import { engineIds } from "../protocol";
 import type { EngineId, WorkProgress } from "../protocol";
 
@@ -47,31 +47,9 @@ export function progress(requestId: string, value: WorkProgress): void {
 
 /**
  * Memory checkpoints answered by the window. A worker cannot read either memory API
- * itself, so it publishes a checkpoint through the progress channel and waits for the
- * reply keyed by token. Resolves to an unavailable sample rather than hanging when the
- * page cannot answer.
+ * itself, so the window replies to published checkpoints keyed by token.
  */
 const pendingMemorySamples = new Map<string, (sample: MemorySample) => void>();
-let memoryCheckpointCounter = 0;
-
-export function requestMemorySample(requestId: string, label: string): Promise<MemorySample> {
-  memoryCheckpointCounter += 1;
-  const token = `${requestId}:${String(memoryCheckpointCounter)}`;
-  const sample = new Promise<MemorySample>((resolve) => {
-    pendingMemorySamples.set(token, resolve);
-    // The measurement itself waits for a garbage collection, so allow it real time.
-    setTimeout(() => {
-      if (pendingMemorySamples.delete(token)) resolve(unavailableMemorySample);
-    }, 20_000);
-  });
-  self.postMessage({
-    version: protocolVersion,
-    requestId,
-    kind: "progress",
-    progress: { phase: "memory-checkpoint", token, label, completed: 0, total: 1, message: label },
-  } satisfies ProgressResponse);
-  return sample;
-}
 
 export function resolveMemorySample(token: string, sample: MemorySample): void {
   const resolve = pendingMemorySamples.get(token);
@@ -121,32 +99,12 @@ export function indexedDbTransactionDone(transaction: IDBTransaction): Promise<v
   });
 }
 
-export async function storageEstimate(): Promise<StorageEstimate> {
-  try {
-    return await navigator.storage.estimate();
-  } catch {
-    return {};
-  }
-}
-
 export function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
 }
 
 export function difference(after: number | null, before: number | null): number | null {
   return after === null || before === null ? null : after - before;
-}
-
-export function formatRate(rowsPerSecond: number): string {
-  return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(rowsPerSecond)} rows/s`;
-}
-
-export function describePlatform(userAgent: string): string {
-  if (userAgent.includes("Mac OS X") || userAgent.includes("Macintosh")) return "macOS";
-  if (userAgent.includes("Windows")) return "Windows";
-  if (userAgent.includes("Android")) return "Android";
-  if (userAgent.includes("Linux")) return "Linux";
-  return "Unknown";
 }
 
 export function getRequestId(value: unknown): string {
@@ -174,7 +132,7 @@ export function summarizeSamples(samples: number[]): { medianMs: number; p95Ms: 
 const TARGET_WINDOW_MS = 5;
 const MAX_BATCH = 4_096;
 
-export interface RepeatedMeasurement {
+interface RepeatedMeasurement {
   medianMs: number;
   p95Ms: number;
   /** Executions per timed window. One means the operation was slow enough to time directly. */

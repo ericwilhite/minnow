@@ -91,7 +91,7 @@ const SPILL_PAGE_MAGIC = 0x5350494c;
 const SPILL_PAGE_HEADER_BYTES = 8;
 const vectorTextEncoder = new TextEncoder();
 
-export type VectorType = "boolean" | "number" | "string" | "datetime";
+type VectorType = "boolean" | "number" | "string" | "datetime";
 
 /**
  * A resident slice of a logically longer streamed column. Window arrays index rows relative to
@@ -108,22 +108,22 @@ interface VectorBase {
   readonly window?: VectorWindow;
 }
 
-export interface BooleanVector extends VectorBase {
+interface BooleanVector extends VectorBase {
   readonly kind: "boolean";
   readonly values: Uint8Array;
 }
 
-export interface NumberVector extends VectorBase {
+interface NumberVector extends VectorBase {
   readonly kind: "number";
   readonly values: Float64Array;
 }
 
-export interface DateTimeVector extends VectorBase {
+interface DateTimeVector extends VectorBase {
   readonly kind: "datetime";
   readonly values: Float64Array;
 }
 
-export interface StringVector extends VectorBase {
+interface StringVector extends VectorBase {
   readonly kind: "string";
   readonly codes: Uint32Array;
   readonly dictionary: readonly string[];
@@ -131,7 +131,7 @@ export interface StringVector extends VectorBase {
 
 export type ColumnVector = BooleanVector | NumberVector | DateTimeVector | StringVector;
 
-export interface ColumnarColumnInput {
+interface ColumnarColumnInput {
   readonly type: VectorType;
   readonly values: readonly QueryValue[];
 }
@@ -290,7 +290,7 @@ interface InternalQueryBatchExecutionOptions extends QueryBatchExecutionOptions 
   readonly consumeFirstColumn?: (values: readonly QueryValue[]) => void | Promise<void>;
 }
 
-export interface PrepareVectorQueryOptions {
+interface PrepareVectorQueryOptions {
   readonly memoryContext?: QueryMemoryContext;
   /**
    * Exact BM25 corpus statistics served by the persisted full-text index, keyed by each

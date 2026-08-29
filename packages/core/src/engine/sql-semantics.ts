@@ -103,7 +103,7 @@ export function roundSqlNumber(value: number, precision = 0): number {
 }
 
 /** A whole-string SQL pattern matcher. Unlike RegExp, test never coerces its input. */
-export interface SqlPatternMatcher {
+interface SqlPatternMatcher {
   test(value: string): boolean;
 }
 

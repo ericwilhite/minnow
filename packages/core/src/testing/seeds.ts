@@ -60,8 +60,3 @@ export function seedsFor(suite: string, defaults: readonly number[]): number[] {
 export function seedFor(suite: string, fallback: number): number {
   return seedsFor(suite, [fallback])[0] ?? fallback;
 }
-
-/** Every regression seed on file, for the soak runner's report and for the coverage assertion. */
-export function regressionSeeds(suite: string): readonly number[] {
-  return registry.suites[suite] ?? [];
-}

@@ -29,9 +29,9 @@ import { MemoryBlockStore } from "./memory.js";
 import { mulberry32 } from "../testing/seeds.js";
 
 /** Stable clock and ID source shared by the fixture writer and its writer-shape regression. */
-export const FORMAT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
+const FORMAT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
 
-export function createFormatFixtureId(): () => string {
+function createFormatFixtureId(): () => string {
   let nextId = 0;
   return () => `fixture-${String(nextId++).padStart(6, "0")}`;
 }
