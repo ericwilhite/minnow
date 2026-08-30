@@ -457,14 +457,29 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
   numbers or strings as inputs and return lossless strings by default. JSON/JSONB also return
   strings by default; opt into native number/JSON results with `resultDecoding`. UUID, arrays,
   `DATE`, `TIME`, intervals, and enums cross this adapter as strings.
-- Kysely can generate PostgreSQL features outside Minnow's profile. The adapter's compiler
-  refuses the forms Kysely's builders can produce before execution, naming the feature and an
-  alternative: `DISTINCT ON`, `UPDATE ... FROM`, `DELETE ... USING`, `ON CONFLICT` with a
-  constraint or index-expression target (name the unique key's columns instead), row-locking
-  clauses such as `.forUpdate()`, schema-qualified names including
-  `WithSchemaPlugin`, `ALTER TABLE ... RENAME`, and an empty `IN ()` list (add Kysely's
-  `HandleEmptyInListsPlugin`). Anything else outside the profile is rejected explicitly by the
-  engine; check the executable [feature matrix](/docs/sql/feature-matrix).
+- Kysely can generate SQL outside Minnow's profile — PostgreSQL features Minnow lacks, and the
+  MySQL, SQLite, and T-SQL spellings Kysely's builders also carry. The adapter's compiler refuses
+  every such form it can see before execution, naming the feature and an alternative:
+  - Queries: `DISTINCT ON`, row-locking clauses such as `.forUpdate()`, SQL `EXPLAIN` (use the
+    Minnow database's own `explain()`), T-SQL `.top()`, `.output()`, `.crossApply()`, and
+    `.outerApply()`, and an empty `IN ()` list (add Kysely's `HandleEmptyInListsPlugin`).
+  - Mutations: `UPDATE ... FROM`, `DELETE ... USING`, MySQL `ORDER BY`/`LIMIT` on updates and
+    deletes, `replaceInto()`, `onDuplicateKeyUpdate()`, SQLite `orIgnore()`/`orAbort()` and
+    friends, `ON CONFLICT` with a constraint or index-expression target (name the unique key's
+    columns instead), `MERGE ... THEN DO NOTHING` (narrow the `WHEN` condition instead), and
+    data-modifying CTEs (run the mutation first, then query).
+  - DDL: schema-qualified names including `WithSchemaPlugin`, `CREATE`/`DROP SCHEMA`,
+    `ALTER TABLE` beyond adding and dropping columns (renames, constraint changes, column
+    alterations), serial/identity/`autoIncrement()` column DDL (declare it in Minnow's schema
+    DSL, or default to `nextval()` of a `CREATE SEQUENCE` sequence), temporary tables and views,
+    materialized views, view column lists and `CREATE VIEW IF NOT EXISTS`, non-stored generated
+    columns, `DROP`/`ALTER TYPE`, index access methods (`.using()`), partial and expression
+    indexes, and `NULLS NOT DISTINCT`.
+
+  Anything else outside the profile is rejected explicitly by the engine — for one example,
+  a correlated lateral subquery with `ORDER BY`/`LIMIT` (rank with a window function instead) —
+  with the executable [feature matrix](/docs/sql/feature-matrix) as the reference.
+
 - Rejected transaction settings are recoverable: a `startTransaction()` refused for an
   isolation level or access mode releases its connection, and rolling back a transaction whose
   engine transaction is already gone — the state a failed `COMMIT` leaves — succeeds instead of
@@ -476,7 +491,13 @@ schema declaration and `database.migrate(schema)`, which coordinates through Min
 
 ## Compatibility checks
 
-Adapter tests compile and execute DDL, inserts, queries, `RETURNING`, commits, rollbacks,
-nested savepoints, `MERGE`, connection serialization around open transactions, and
-introspection. Minnow's broader [SQL compatibility suite](/docs/conformance) compares supported
-PostgreSQL reads and writes with PGlite and checks every documented difference and exclusion.
+A full-surface conformance suite executes every supported Kysely builder form against the
+engine with asserted rows and inferred types: inner/left/right/full/cross and lateral joins,
+set operations, chained and recursive CTEs, ordering modifiers and `FETCH FIRST ... WITH TIES`,
+`CASE`, row tuples, window functions, aggregate `DISTINCT`/`FILTER`/ordered `STRING_AGG`,
+`ON CONFLICT`, `MERGE`, and DDL from composite constraints through enum types and sequences —
+plus a refusal test for every named compile-time rejection above. Adapter tests further cover
+DDL, `RETURNING`, commits, rollbacks, nested savepoints, connection serialization around open
+transactions, and introspection. Minnow's broader
+[SQL compatibility suite](/docs/conformance) compares supported PostgreSQL reads and writes with
+PGlite and checks every documented difference and exclusion.

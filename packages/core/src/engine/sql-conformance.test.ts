@@ -451,6 +451,16 @@ const templates: Template[] = [
     sql: `SELECT d.id AS id, d.region AS dr, m.rank AS r FROM data d FULL JOIN dims m ON m.region = d.region`,
     ordered: false,
   }),
+  // FULL JOIN ORDER BY once resolved qualified references against the UNION ALL desugar's
+  // compound output, where the branch table aliases no longer exist ("Unknown table alias").
+  () => ({
+    sql: `SELECT d.id AS id, m.rank AS r FROM data d FULL JOIN dims m ON m.region = d.region ORDER BY d.id NULLS LAST, m.rank NULLS LAST`,
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id, m.rank AS r FROM data d FULL JOIN dims m ON m.region = d.region ORDER BY d.id IS NULL, d.id NULLS LAST, m.rank NULLS LAST`,
+    ordered: true,
+  }),
   () => ({
     sql: `SELECT id, LAG(amount) OVER (PARTITION BY region ORDER BY id) AS prev, LEAD(amount, 2, -1.0) OVER (ORDER BY id) AS nxt FROM data`,
     ordered: false,

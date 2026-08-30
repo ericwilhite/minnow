@@ -9220,6 +9220,35 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
   if (join.on !== undefined) {
     throw new TypeError("FULL JOIN requires a single equality ON condition");
   }
+  // The UNION ALL this desugars into resolves ORDER BY against the compound's output columns,
+  // where the branches' table aliases no longer exist. Qualified references that name a select
+  // item are rewritten to its output alias, and everything else — expressions, and columns the
+  // select list does not carry — takes the shared hidden-column desugar, which re-enters this
+  // function with alias-only ordering.
+  const outputAlias = (reference: string): string | undefined => {
+    const exact = parts.select.find(
+      (item) =>
+        item.alias === reference ||
+        (item.expression.kind === "column" && item.expression.reference === reference),
+    );
+    if (exact !== undefined) return exact.alias;
+    const bare = reference.split(".").at(-1) ?? reference;
+    return parts.select.find((item) => item.alias === bare)?.alias;
+  };
+  parts = {
+    ...parts,
+    orderBy: parts.orderBy.map((order) => {
+      if (order.expression.kind !== "column" || !order.expression.reference.includes(".")) {
+        return order;
+      }
+      const alias = outputAlias(order.expression.reference);
+      if (alias === undefined) return order;
+      return { ...order, expression: { kind: "column" as const, reference: alias } };
+    }),
+  };
+  if (parts.orderBy.some((order) => orderNeedsHiddenColumn(order.expression, parts))) {
+    return assembleOrderByExpressionBlock(parts, nextSequence);
+  }
   // `on` is absent here: the guard above rejected non-equi conditions.
   const { full, kind, left, right, ...joinSource } = join;
   void full;
