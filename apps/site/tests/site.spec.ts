@@ -363,7 +363,7 @@ benchmarkTest(
 
     // The first run compares the two durable Minnow stores with SQLite, without the result-memo
     // variants or secondary indexes changing what the storage engines themselves cost.
-    await expect(page.getByRole("checkbox", { name: /^Minnow281 KB/ })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: /^Minnow\d+ KB/ })).toBeChecked();
     await expect(page.getByRole("checkbox", { name: /Minnow \(OPFS\)/ })).toBeChecked();
     await expect(page.getByRole("checkbox", { name: /SQLite/ })).toBeChecked();
     await expect(page.getByRole("checkbox", { name: /Minnow \(cached\)/ })).not.toBeChecked();
