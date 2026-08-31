@@ -4,10 +4,9 @@ description: Public APIs for building a typed layer, schema tool, or adapter on 
 ---
 
 SQL is the foundation. The engine runs statements on its own, and client adapters — including the
-official [`@minnowdb/kysely`](/docs/adapters/kysely) package — use the public APIs on this page.
-
-The Kysely adapter ships separately and uses only these APIs. That keeps this page grounded in a
-real adapter instead of a set of hooks that have never been used outside the engine.
+official [`@minnowdb/kysely`](/docs/adapters/kysely) package — use only the public APIs on this
+page. That keeps the page grounded in a real adapter instead of a set of hooks that have never
+been used outside the engine.
 
 ## The building blocks
 
@@ -129,7 +128,9 @@ const plan = planMigration(catalog, schema([table("notes", {/* ... */})]));
 
 for (const step of plan.steps) {
   step.kind; // "create-table" | "add-column" | "rename-column" | "widen-nullable" |
-  // "widen-enum" | "alter-default" | "replace-view" | "drop-view"
+  // "tighten-nullable" | "set-auto-increment" | "widen-enum" | "alter-default" |
+  // "alter-generated" | "alter-foreign-keys" | "drop-column" | "drop-table" |
+  // "replace-view" | "drop-view"
 }
 ```
 

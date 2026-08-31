@@ -7,8 +7,7 @@ Minnow is built for how browsers actually behave: tabs close without warning, st
 the same app may be open in five tabs at once. Everything below follows from that.
 
 The short version: data lives in compressed column blocks inside IndexedDB or OPFS. Each read sees
-one stable version, and queries work through the data in batches. This page explains the choices
-and why they matter.
+one stable version, and queries work through the data in batches.
 
 ## The ideas that guide it
 
@@ -53,7 +52,8 @@ scan. Similar values sit together, so they compress well, and queries fetch only
 use.
 
 `gzip` is adaptive per column and per physical output. Inputs below 4 KiB stay raw; larger probes
-stay gzip only when they save at least 20%, and an unhelpful column is re-probed every 32 blocks.
+keep gzip only when it compresses at least 1.2 to 1, and an unhelpful column is re-probed every
+32 blocks.
 The configured codec is therefore a preference: each self-describing block records the codec it
 actually used. This keeps repetitive strings compressed without making random numeric data pay a
 compression and decompression pass for single-digit percentage savings.

@@ -1,6 +1,6 @@
 ---
 title: Devtools
-description: An embeddable SQL console for your database — a floating panel in dev, an inline playground in docs.
+description: An embeddable SQL console for your database — a floating panel in dev, an inline console in docs pages.
 ---
 
 A panel you drop into any app to browse, edit, and query the database it is already using. It
@@ -266,7 +266,7 @@ of them would exhaust the storage quota on the first wide query, so recent rows 
 memory only and a recalled entry offers to run again once its rows have aged out. **Clear** forgets
 everything. History is namespaced by `storageKey`, so two panels on a page keep their own.
 
-## Embedding a playground
+## Embedding a console
 
 `mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
 panel, in flow. The [console on the home page](/#console) is exactly this, over a worker client
@@ -274,7 +274,7 @@ with its blocks in IndexedDB:
 
 ```ts
 mountMinnowDevtools(db, {
-  container: document.querySelector("#playground"),
+  container: document.querySelector("#console"),
   mode: "inline",
   initialQuery: "SELECT * FROM people",
 });
@@ -286,7 +286,7 @@ An inline panel **fills its container**. Give the container a height and the pan
 it; give it none and the panel falls back to 520px, so dropping it into a page needs no CSS at all.
 
 ```html
-<div id="playground" style="height: 70vh"></div>
+<div id="console" style="height: 70vh"></div>
 ```
 
 Pass `height` instead when the container is not yours to style. It takes a number of pixels or any
@@ -304,7 +304,7 @@ Two custom properties do the same from a stylesheet, which is what a responsive 
 they are read off the container, so a media query can change them without JavaScript:
 
 ```css
-#playground {
+#console {
   --mdt-height: 60vh;
   --mdt-min-height: 400px;
 }
@@ -324,7 +324,7 @@ Its colours are custom properties, and properties set on the container reach ins
 root, so the whole palette is yours to override:
 
 ```css
-#playground {
+#console {
   --mdt-accent: #7c3aed;
   --mdt-bg: #ffffff;
   --mdt-bg-secondary: #f7f7f5;

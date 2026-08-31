@@ -5,7 +5,7 @@ description: One major across every package, what a version change means, and ho
 
 Every Minnow package shares a major version and moves independently inside it. Each adapter names
 the oldest engine it can use and accepts later engines inside that shared major. For example, the
-current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.6.5 up to, but not including,
+current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.6.8 up to, but not including,
 1.0.0. The same rule covers the export and devtools packages; the React hook is structurally typed
 and has no engine runtime dependency.
 
@@ -18,12 +18,12 @@ APIs from working is a major change, so each package depends on its siblings by 
 the major and stops at it:
 
 ```json
-"dependencies": { "@minnowdb/core": ">=0.6.5 <1.0.0" }
+"dependencies": { "@minnowdb/core": ">=0.6.8 <1.0.0" }
 ```
 
 The ceiling is the compatibility line, and npm refuses a mixed-major install on its own. The floor
 is the sibling release this package was built against — when an adapter starts using something
-the engine added in 0.6.5, its next release says `>=0.6.5` and npm resolves an engine that has
+the engine added in 0.6.8, its next release says `>=0.6.8` and npm resolves an engine that has
 it. Below the major, a fix to the console does not drag the engine's version along with it.
 
 ## What 0.x means
@@ -55,8 +55,8 @@ contract and release-candidate checklist.
 ## Release notes
 
 The [changelog](/docs/changelog) is the release-by-release record. Each entry names the exact
-packages published together, additions and fixes, required migration steps, and stored-format
-compatibility. `npm run version:check` refuses a workspace whose current package versions are not
+packages published together and its additions and fixes; entries since 0.5.0 also record required
+migration steps and stored-format compatibility. `npm run version:check` refuses a workspace whose current package versions are not
 recorded there.
 
 ## The block format has its own version

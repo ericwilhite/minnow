@@ -17,7 +17,7 @@ npm install @minnowdb/core
 - A ready-made worker client with the same everyday database API.
 - TypeScript schema declarations and metadata-only migrations, including SQL domains,
   composite primary/foreign keys, and informational relationships.
-- Guarded columnar upserts, result-column SQL domains, typed catalog errors, and batch writes.
+- Batch and upsert write APIs, typed catalog errors, and per-column result type metadata.
 - Pull-driven query cursors, live queries, snapshots, compaction, and configurable query memory.
 
 Use [the PostgreSQL compatibility page](https://minnowdb.com/docs/sql/feature-matrix/) for the
@@ -27,7 +27,8 @@ workers, transactions, and API details.
 The optional [Kysely dialect](https://minnowdb.com/docs/adapters/kysely/) connects Kysely's
 PostgreSQL compiler to the engine and derives its `DB` types from the same schema declaration.
 
-Every `@minnowdb` package in one application must use the same major version. See
+Minnow is 0.x: breaking changes land in minor releases, so pin exact versions and upgrade
+`@minnowdb` packages together. See
 [Versioning](https://minnowdb.com/docs/reference/versioning/).
 
 ## License

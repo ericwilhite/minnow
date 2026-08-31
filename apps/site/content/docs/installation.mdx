@@ -24,14 +24,16 @@ Reactive React views and streaming files are separate, optional packages:
 npm install @minnowdb/react @minnowdb/export
 ```
 
-| Interface          | What it provides                                                          |
-| ------------------ | ------------------------------------------------------------------------- |
-| `@minnowdb/core`   | Direct SQL, pull-driven cursors, and the live-query foundation.           |
-| `@minnowdb/kysely` | Kysely dialect, inferred schema types, streaming, and typed live queries. |
-| `@minnowdb/react`  | React external-store hooks with optional Suspense and stale refreshes.    |
-| `@minnowdb/export` | Streaming CSV and NDJSON over direct or worker query cursors.             |
+| Interface            | What it provides                                                          |
+| -------------------- | ------------------------------------------------------------------------- |
+| `@minnowdb/core`     | Direct SQL, pull-driven cursors, and the live-query foundation.           |
+| `@minnowdb/kysely`   | Kysely dialect, inferred schema types, streaming, and typed live queries. |
+| `@minnowdb/react`    | React external-store hooks with optional Suspense and stale refreshes.    |
+| `@minnowdb/export`   | Streaming CSV and NDJSON over direct or worker query cursors.             |
+| `@minnowdb/devtools` | Embeddable SQL console panel — floating in dev, inline in a page.         |
 
-Keep every `@minnowdb` package in one application on the same major version. Engine-dependent
+Minnow is 0.x, so breaking changes can land in minor releases: pin exact `@minnowdb` versions
+and upgrade them together. Engine-dependent
 adapters declare the compatible core range for npm; the React hook is structurally typed and has
 no core runtime dependency. See [Versioning](/docs/reference/versioning).
 
@@ -77,7 +79,7 @@ The [worker guide](/docs/engine/workers) includes the ready-made worker entry an
 ## Browser requirements
 
 Minnow needs `CompressionStream` and `DecompressionStream` plus a storage adapter. Current Chrome,
-Firefox, Safari, and Edge support IndexedDB in a window or worker. OPFS requires a worker and is
+Firefox, Safari, and Edge support IndexedDB in a window or worker. OPFS requires a dedicated worker and is
 unavailable in Safari private browsing.
 
 Minnow targets browsers. It does not ship a Node.js engine build. Use `MemoryBlockStore` or

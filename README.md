@@ -11,8 +11,10 @@ npm install @minnowdb/core
 and benchmarks that run in your browser.
 
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
-> changes. The separately versioned block-format 2, snapshot-format 1, and native OPFS-layout 5
-> bytes are locked; an incompatible future writer must use a new format number. Pin exact package versions. See
+> changes. Stored data is stable: block format 2, snapshot format 1, IndexedDB schema 1, and OPFS
+> layout 5 are versioned separately and locked — an incompatible future writer must use a new
+> format number.
+> Pin exact package versions. See
 > [Versioning](https://minnowdb.com/docs/reference/versioning/), the
 > [v1 support policy](https://minnowdb.com/docs/reference/support/), and the
 > [Changelog](https://minnowdb.com/docs/changelog/).
@@ -26,18 +28,17 @@ and benchmarks that run in your browser.
 - **Fast analytical reads over application data.** Compressed column blocks let a query read only
   the columns it needs and skip blocks that cannot match. Secondary indexes speed up selective
   lookups and ordered reads.
-- **Durable browser storage.** IndexedDB and OPFS adapters publish writes atomically and default
-  to strict durability: IndexedDB requests the final disk flush, while OPFS performs it. Every
-  query reads one stable snapshot, even when another tab commits at the same time;
-  origin-persistence policy is explicit for applications that cannot accept automatic quota
-  eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 290 KB gzipped, with
+- **Durable browser storage.** IndexedDB (the default) and OPFS adapters publish writes
+  atomically and default to strict durability: IndexedDB requests the final disk flush, while
+  OPFS performs it. Every query reads one stable snapshot, even when another tab commits at the
+  same time, and origin-persistence policy is explicit for applications that cannot accept
+  automatic quota eviction.
+- **Plain JavaScript.** The engine with its larger durable adapter is about 294 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
-  `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so tables
-  and columns are declared once; Minnow-specific aggregate and built-in function results are
-  inferred without driver-output generics. Typed JSON projection helpers build nested objects and
-  arrays, and both paths use the same SQL engine.
+  `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so
+  tables are declared once, aggregate and built-in results are inferred without output generics,
+  and typed JSON helpers build nested projections. Both paths use the same SQL engine.
 - **Built for responsive applications.** A ready-made worker client keeps query work off the UI
   thread. Pull-driven cursors transfer one columnar page at a time; batch execution and spillable
   sorts and aggregates keep large working sets under a configurable budget.

@@ -11,7 +11,7 @@ parameters, `RETURNING`, and the PostgreSQL forms Minnow supports.
 npm install @minnowdb/core @minnowdb/kysely kysely
 ```
 
-The adapter supports Kysely 0.29.x.
+The adapter supports Kysely 0.29.5 and later 0.29 releases.
 
 ## Define once and connect
 
@@ -89,12 +89,10 @@ const db = new Kysely<DB>({
 
 Pass `schema` to the dialect when you construct Kysely yourself. It supplies the exact DB type and
 lets the compiler normalize a batch of empty value objects. Literal and SQL-expression defaults
-live only in Minnow's catalog, so Kysely, raw SQL, batches, workers, and other tabs all get the same
-behavior. There is no adapter-side generation.
-
-An empty Kysely value object compiles to PostgreSQL's normal `DEFAULT VALUES` form. A batch of
-empty objects uses `DEFAULT` value slots, so catalog defaults run once per row without
-adapter-specific SQL.
+live only in Minnow's catalog, so Kysely, raw SQL, batches, workers, and other tabs all get the
+same behavior. An empty Kysely value object compiles to PostgreSQL's normal `DEFAULT VALUES`
+form, and a batch of empty objects uses `DEFAULT` value slots, so catalog defaults run once per
+row without adapter-specific SQL.
 
 The generated SQL stays visible and ordinary. Omitted object properties compile to SQL omission
 or `DEFAULT`; explicit `null` remains a bound NULL:
@@ -161,9 +159,9 @@ const removed = await db
 // Array<{ order_id: number }>
 ```
 
-The adapter compiles these builders to ordinary PostgreSQL SQL and passes it to Minnow's shared
-planner; it does not maintain a shallower subquery implementation of its own. Kysely has no
-first-class `ALL (subquery)` builder or correlated `selectNoFrom` on an expression builder. Those
+The adapter compiles these builders to ordinary PostgreSQL SQL for Minnow's shared planner.
+Kysely has no first-class `ALL (subquery)` builder or correlated `selectNoFrom` on an
+expression builder. Those
 two SQL spellings use `sql<T>` with an explicit result type, while references interpolated from
 `eb.ref(...)` remain scope-checked.
 

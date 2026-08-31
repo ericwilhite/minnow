@@ -41,8 +41,7 @@ column's values for one row group — plus the records that say which blocks are
 Because published blocks are immutable and membership at a version is resolved from durable
 intervals, a reader can hold a version open while writers keep committing. Fixed pinned-history
 ceilings eventually backpressure new writes rather than reclaiming bytes a live reader still
-needs. That is the whole concurrency story, and it is a property of this layout rather than of any
-locking.
+needs. That is the whole concurrency story — a property of the layout, not of locks.
 
 Cold history walks are cursor-paged. Manifest membership, retired provenance, segments,
 transactions, leases, temporary owners, and maintenance jobs all expose bounded pages rather than

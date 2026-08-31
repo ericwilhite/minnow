@@ -60,10 +60,10 @@ another query-library adapter can expose the same `live(query)` shape by supplyi
 - the compiled SQL and parameters used for dependency tracking;
 - an `execute(signal)` function returning that library's inferred rows.
 
-`@minnowdb/core/live` exports `LiveQuerySource`, `LiveQueryManager`, and
-`createLiveQueryManager` for that purpose.
-The adapter continues to execute its own query, so name mapping and other result transforms are not
-bypassed. A library-specific composition helper may call the wrapper, but is not required.
+`@minnowdb/core/live` exports `LiveQuerySource`, `LiveQueryManager`, and `createLiveQueryManager`
+for that purpose. The adapter continues to execute its own query, so name mapping and other result
+transforms are not bypassed. A library-specific composition helper may call the wrapper, but is
+not required.
 
 ## Keyed changes
 

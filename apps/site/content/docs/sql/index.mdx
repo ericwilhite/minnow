@@ -30,10 +30,9 @@ const { rows, columns } = await db.query(`
 `rows` is an array of plain objects in result order. Values arrive as their JavaScript
 equivalents: numbers as `number`, `TIMESTAMP` as `Date`, `BOOLEAN` as `boolean`, and SQL `NULL`
 as `null`. Exact decimals, JSON/JSONB, UUIDs, arrays, `DATE`, `TIME`, intervals, and enums arrive
-as strings so no precision or domain value is lost. `columns` lists the result names, while the
-positionally aligned `columnDomains` identifies logical domains such as JSON, UUID, and DATE. A
-table component can render headers before it has looked at a single value, and a generic consumer
-can parse JSON without query-specific tagging.
+as strings so no precision or domain value is lost. `columns` lists the result names, and the
+positionally aligned `columnDomains` identifies logical domains such as JSON, UUID, and DATE —
+enough to render headers or parse JSON without inspecting a single value.
 
 `query` accepts only statements that produce rows. Hand it an `INSERT` and it throws rather than
 silently writing.

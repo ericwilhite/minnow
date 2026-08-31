@@ -78,8 +78,9 @@ HAVING SUM(i.line_total) > 10000
 ORDER BY revenue DESC
 ```
 
-`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `JSON_ARRAYAGG`, and per-aggregate `DISTINCT`
-are available.
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `JSON_ARRAYAGG`, the statistical spreads
+(`VARIANCE`, `STDDEV`, and their `_POP` / `_SAMP` forms), and per-aggregate `DISTINCT` are
+available.
 The numeric and counting aggregates accept `FILTER (WHERE …)` for conditional aggregation.
 `JSON_ARRAYAGG(value ORDER BY expression)` returns JSON text, keeps SQL nulls as JSON nulls by
 default, and returns SQL `NULL` for an empty input. Its `ORDER BY` list follows the same direction
@@ -144,20 +145,16 @@ WHERE rank <= 3
 
 A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXISTS` all work.
 Correlated `EXISTS` and `NOT EXISTS`, including range comparisons such as `inner.amount <
-outer.amount`, decorrelate into semi-joins and anti-joins rather than executing per row. When a
-correlated predicate is nested below `OR`, `NOT`, `CASE`, or a select expression, hidden per-probe
-state preserves true, false, and unknown without multiplying outer rows. Nested correlated
-`EXISTS`, `IN`, `NOT IN`, `ANY`, `ALL`, and supported scalar blocks use one plan-wide alias
-namespace, so sibling branches can combine them to any parser-supported depth. If an `EXISTS`
-reaches an outer column only through a nested scalar subquery or another expression, Minnow carries
-distinct outer probe tuples into the nested plan before decorrelating it.
+outer.amount`, decorrelate into semi-joins and anti-joins rather than executing per row. A
+correlated predicate nested below `OR`, `NOT`, `CASE`, or a select expression keeps its true,
+false, and unknown results without multiplying outer rows, and correlated `EXISTS`, `IN`,
+`NOT IN`, `ANY`, `ALL`, and scalar blocks can nest and sit side by side to any parser-supported
+depth.
 
 Correlated scalar subqueries support aggregate expressions—including `JSON_ARRAYAGG`—and ordinary
 single-row projections. `ORDER BY`, `LIMIT`, and `OFFSET` are applied independently for each
 distinct outer probe tuple. An ordinary scalar returns NULL for no row and raises a cardinality
-error for more than one row. Equality and range correlations both remain set-at-a-time: range
-forms join distinct outer probes to the inner rows and join the grouped result back by equality.
-The inner scalar block cannot itself use `GROUP BY` or `HAVING`.
+error for more than one row. The inner scalar block cannot itself use `GROUP BY` or `HAVING`.
 
 Correlated `IN`, `NOT IN`, `ANY`, and `ALL` preserve their empty-set and NULL behavior at top level
 and inside larger expressions. `NOT IN` carries per-probe counts rather than treating NULL as an
@@ -222,12 +219,13 @@ SELECT customer_id,
 FROM orders
 ```
 
-`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and the
-aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and explicit `ROWS` / `RANGE`
-frames. Three limits carry explicit errors: `RANGE` frames take only `UNBOUNDED` and
-`CURRENT ROW` bounds, so a numeric offset needs a `ROWS` frame; a window aggregate does not take
-`DISTINCT`; and a window function runs only in the select list — to order by one, alias it there
-and `ORDER BY` the alias.
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`,
+`NTH_VALUE`, and the aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and
+explicit `ROWS` / `RANGE` frames. Four limits carry explicit errors: `RANGE` frames take only
+`UNBOUNDED` and `CURRENT ROW` bounds, so a numeric offset needs a `ROWS` frame; a window
+aggregate does not take `DISTINCT`; `SELECT DISTINCT` does not combine with window functions; and
+a window function runs only in the select list — to order by one, alias it there and `ORDER BY`
+the alias.
 
 A window runs after `GROUP BY` and `HAVING`, matching PostgreSQL, so it ranks the groups
 rather than the rows behind them and its `OVER` clause reads the group's own aggregates — that is

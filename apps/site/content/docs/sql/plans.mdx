@@ -21,6 +21,11 @@ The plan is the optimized one — what will actually run, not the shape you wrot
 **Early filtering.** Filters move as close to their table scan as they can get, so rows are
 discarded before a join builds a hash table out of them.
 
+**Same-column OR becomes IN.** An OR of equalities on one column against literals or parameters —
+`status = 'a' OR status = 'b'` — rewrites to `status IN ('a', 'b')`, which runs as a vectorized
+membership test and can skip blocks by value range. Any other OR keeps its shape and is evaluated
+per row.
+
 **Skipping by value range.** Every block records the minimum and maximum of the column it holds. A
 comparison that cannot be true inside a block's range skips the block without decoding or
 decompressing it. This is why `WHERE placed_at >= '2025-01-01'` on a table written in date order

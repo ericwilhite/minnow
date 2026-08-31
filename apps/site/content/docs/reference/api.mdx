@@ -169,7 +169,6 @@ Notable supporting exports:
 | `MaintenanceBacklogError`                                                                     | Automatic collection repeatedly fails and storage-growth backpressure refuses another write. |
 | `DatabaseReadBacklogError`                                                                    | One database already has its bounded maximum of active reads.                                |
 | `LiveQueryLimitError`                                                                         | A live-query owner reaches its set, group, or subscription resource ceiling.                 |
-| `NoResultError`                                                                               | `executeTakeFirstOrThrow()` finds no row.                                                    |
 | `CompactionMemoryBudgetError, CompactionWriteAmplificationError, CompactionJobCancelledError` | Compaction limits or cancellation.                                                           |
 
 The worker client recreates these errors on the main thread, so `instanceof` works there too.
@@ -180,12 +179,12 @@ Manual worker-host exports live in this subpath so the main engine entry does no
 storage adapter. See [Workers & multi-tab](/docs/engine/workers). Schema serialization has its own
 `@minnowdb/core/schema-wire` entry.
 
-| Export                                      | Description                                                                                                                                                                         |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `exposeDatabase(database, scope, options?)` | Serves the full client protocol for a database you constructed. `writeHandleIdleTimeoutMs` bounds abandoned explicit writes; match it to the database's `transactionIdleTimeoutMs`. |
-| `attachDatabaseWorker(scope)`               | What the stock `@minnowdb/core/worker` entry calls: builds the database from the client's init frame.                                                                               |
-| `StoreDescriptor`                           | `{ kind: "indexeddb", name, durability?, uniqueKeyCacheBytes? } \| { kind: "opfs", name, … } \| { kind: "memory" }` — the cloneable store config.                                   |
-| `WireDatabaseOptions, DatabaseInitPayload`  | The cloneable subset of `MinnowDatabaseOptions` and the init frame shape.                                                                                                           |
+| Export                                      | Description                                                                                                                                                                                                        |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `exposeDatabase(database, scope, options?)` | Serves the full client protocol for a database you constructed. `writeHandleIdleTimeoutMs` bounds abandoned explicit writes; match it to the database's `transactionIdleTimeoutMs`.                                |
+| `attachDatabaseWorker(scope)`               | What the stock `@minnowdb/core/worker` entry calls: builds the database from the client's init frame.                                                                                                              |
+| `StoreDescriptor`                           | `{ kind: "indexeddb", name, durability?, uniqueKeyCacheBytes? } \| { kind: "opfs", name, … } \| { kind: "memory" }` — the cloneable store config. Omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`. |
+| `WireDatabaseOptions, DatabaseInitPayload`  | The cloneable subset of `MinnowDatabaseOptions` and the init frame shape.                                                                                                                                          |
 
 ## `@minnowdb/core/schema-wire`
 
@@ -247,8 +246,8 @@ The optional Kysely dialect. Installed separately with Kysely itself; see
 
 | Export                                     | Description                                                                                                         |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `useLiveQuery(store, options?)`            | Concurrent external-store read. Options add cold-start Suspense and previous-store stale-while-revalidate behavior. |
-| `useSuspenseLiveQuery(store, options?)`    | Suspense-first form whose result type excludes the cold `loading` snapshot.                                         |
+| `useLiveQuery(query, options?)`            | Concurrent external-store read. Options add cold-start Suspense and previous-store stale-while-revalidate behavior. |
+| `useSuspenseLiveQuery(query, options?)`    | Suspense-first form whose result type excludes the cold `loading` snapshot.                                         |
 | `LiveExternalStore<TSnapshot>`             | The minimal structural `getSnapshot` / `subscribe` contract.                                                        |
 | `RefreshableLiveExternalStore<TSnapshot>`  | Adds the `refresh()` promise required by Suspense.                                                                  |
 | `UseLiveQueryOptions, SettledLiveSnapshot` | React binding option and settled-result types.                                                                      |
@@ -293,8 +292,8 @@ adapter isolation explicit even to conservative bundlers.
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
 tooling but are storage internals. Their TypeScript API may still change during 0.x; the bytes
-written by the locked block-format 2, snapshot-format 1, and OPFS-layout 5 writers are separate
-format contracts and cannot be reinterpreted in place.
+written by the locked block-format 2, snapshot-format 1, IndexedDB-schema 1, and OPFS-layout 5
+writers are separate format contracts and cannot be reinterpreted in place.
 
 ## `@minnowdb/core/storage/toolkit`
 

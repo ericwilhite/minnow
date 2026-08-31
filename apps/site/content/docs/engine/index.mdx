@@ -67,13 +67,13 @@ await db.insertBatch("orders", {
 
 The full set:
 
-| Call                                    | Effect                                               |
-| --------------------------------------- | ---------------------------------------------------- |
-| `insertBatch(table, input)`             | Append rows. A duplicate key throws.                 |
-| `upsertBatch(table, input, options?)`   | Insert, replacing an allowed row with the same key.  |
-| `updateBatch(table, { keys, changes })` | Change named columns on rows addressed by key.       |
-| `deleteBatch(table, { keys })`          | Remove rows by key.                                  |
-| `insert` / `upsert` / `update`          | Single-row convenience wrappers over the same paths. |
+| Call                                      | Effect                                               |
+| ----------------------------------------- | ---------------------------------------------------- |
+| `insertBatch(table, input)`               | Append rows. A duplicate key throws.                 |
+| `upsertBatch(table, input, options?)`     | Insert, replacing an allowed row with the same key.  |
+| `updateBatch(table, { keys, changes })`   | Change named columns on rows addressed by key.       |
+| `deleteBatch(table, { keys })`            | Remove rows by key.                                  |
+| `insert` / `upsert` / `update` / `delete` | Single-row convenience wrappers over the same paths. |
 
 Each returns what it did — `rowCount`, `blockCount`, `storedBytes`, and the published `version` —
 which is enough to drive a progress bar over a large load without a second query.

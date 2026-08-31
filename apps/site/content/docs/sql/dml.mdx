@@ -52,10 +52,9 @@ DELETE FROM orders WHERE placed_at < $1
 ```
 
 Any `WHERE` clause works. Minnow finds the matching rows and records the change. `SET` expressions
-can read the row's current values, as `total - $1` does above. Subquery predicates use the same
-resolution and decorrelation pipeline as `SELECT`, including `IN (SELECT ...)`, `NOT IN (SELECT
-...)`, and correlated `EXISTS` / `NOT EXISTS`. A mutation that still contains a materialized
-subquery takes the general selection executor instead of the streamed key-only path.
+can read the row's current values, as `total - $1` does above. Subquery predicates work the same
+way they do in `SELECT`, including `IN (SELECT ...)`, `NOT IN (SELECT ...)`, and correlated
+`EXISTS` / `NOT EXISTS`.
 
 <Callout title="The table needs a unique key">
   `UPDATE` and `DELETE` are rejected on a table with no `PRIMARY KEY`:
@@ -180,13 +179,12 @@ END
 
 `DROP TRIGGER log_refunds` removes it.
 
-Trigger names are global within a database. Creation reserves the name and stores an immutable
-trigger identity in the same atomic catalog mutation, so two tabs cannot both create the same
-name and an old `DROP TRIGGER` cannot delete a later same-name replacement. Minnow resolves every
-NEW/OLD binding, body target, assignment, predicate, required target column, and default before
-admitting the trigger. Views are not writable trigger owners or targets. A later column/default
-change that would invalidate a stored body is refused; a write already staged under the old
-trigger catalog gets a schema conflict instead of publishing missing or obsolete effects.
+Trigger names are global within a database, and creation is atomic: two tabs cannot both create
+the same name, and an old `DROP TRIGGER` cannot delete a later same-name replacement. The whole
+body — every NEW/OLD binding, target column, and default — is resolved before the trigger is
+admitted, and views cannot own or be targeted by triggers. A later column or default change that
+would invalidate a stored body is refused; a write already staged under the old trigger catalog
+gets a schema conflict instead of publishing stale effects.
 
 ## Atomicity
 

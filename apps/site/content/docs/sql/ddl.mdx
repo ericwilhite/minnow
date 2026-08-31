@@ -184,7 +184,7 @@ is rejected rather than rounded.
 
 Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
 comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.
-Division picks its result scale the way PostgreSQL does — at least sixteen significant digits,
+Division picks its result scale the way PostgreSQL does — roughly sixteen significant digits,
 never fewer fractional digits than either operand, rounded half away from zero. Use an integer
 minor unit when that simpler boundary fits; use `DOUBLE PRECISION` only when approximation is
 intended.

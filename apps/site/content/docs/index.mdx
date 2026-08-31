@@ -29,17 +29,17 @@ const { rows } = await db.query(`
 ```
 
 <Callout type="warn" title="Experimental">
-  Minnow is in 0.x, so minor releases can include API and SQL breaking changes. The separately
-  versioned block-format 2, snapshot-format 1, and native OPFS-layout 5 bytes are locked; an
-  incompatible future writer must use a new format number. Pin exact package versions. The
-  [versioning guide](/docs/reference/versioning) explains the policy, and the
+  Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Stored data is
+  stable: block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5 are versioned
+  separately and locked — an incompatible future writer must use a new format number. Pin exact
+  package versions. The [versioning guide](/docs/reference/versioning) explains the policy, and the
   [changelog](/docs/changelog) lists breaking changes and migrations.
 </Callout>
 
 ## Why use Minnow
 
 - **PostgreSQL-style SQL.** Use familiar parameters, joins, CTEs, window functions, grouping sets,
-  upserts, `RETURNING`, triggers, exact decimals, JSON/JSONB, zoneless DATE, arrays, enums, sequences, and
+  upserts, `RETURNING`, triggers, stored generated columns, exact decimals, JSON/JSONB, zoneless DATE, arrays, enums, sequences, and
   savepoints. The [feature matrix](/docs/sql/feature-matrix) names the exact supported forms and
   every deliberate difference.
 - **Fast scans over local application data.** Minnow stores compressed columns, reads only the
@@ -84,7 +84,7 @@ the full PostgreSQL server, see the [comparison guide](/docs/comparison).
 - **[Schema and migrations](/docs/schema)** — define tables in TypeScript and evolve them without
   rewriting stored data.
 - **[Client adapters](/docs/adapters)** — connect Kysely to Minnow's SQL engine.
-- **[Extensions](/docs/extensions/live-queries)** — live queries, React, cursors, CSV, and NDJSON.
+- **[Extensions](/docs/extensions)** — live queries, React, cursors, CSV, and NDJSON.
 - **[Workers and engine options](/docs/engine)** — keep work off the main thread and tune memory.
 - **[Storage](/docs/storage)** — IndexedDB, OPFS, memory, snapshots, and custom adapters.
 - **[Changelog](/docs/changelog)** — release notes, migrations, and storage compatibility.

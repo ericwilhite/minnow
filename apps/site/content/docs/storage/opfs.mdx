@@ -29,7 +29,7 @@ keep working unchanged.
 
 Anything with OPFS synchronous access handles: current Chrome, Firefox, Safari 16.4+, and Edge.
 Two gaps to know about: Safari's private browsing has no OPFS at all, and the store must live in
-a worker (`{ kind: "opfs", name }` through the worker client just works; the main thread cannot
+a dedicated worker (`{ kind: "opfs", name }` through the worker client just works; the main thread cannot
 hold synchronous handles). Where OPFS is unavailable, [IndexedDB](/docs/storage/indexeddb) is the
 durable fallback:
 
@@ -49,10 +49,10 @@ becoming leader is opening the file, and failover is the next connection's open 
 The leader does every operation at held-handle speed. A commit validates in memory and appends
 one checksummed frame to the log — a synchronous write, microseconds. Reads answer from memory
 and from synchronous reads of the data files. And because the leader is provably the only
-writer, it never checks anything for freshness: the probes and version checks other designs pay
-per operation simply do not exist. This is why the store is fast: on the
-[benchmarks page](/benchmarks) the Minnow columns run the identical engine and workload, and
-the OPFS column's small operations run several times faster than IndexedDB's.
+writer, it never checks anything for freshness — the per-operation probes and version checks
+other designs pay simply do not exist. That is why the store is fast: on the
+[benchmarks page](/benchmarks) both Minnow columns run the identical engine and workload, and
+OPFS's small operations run several times faster than IndexedDB's.
 
 Other tabs are **followers**: their operations travel a `BroadcastChannel` to the leader and are
 acknowledged only after the leader's log holds them. Requests and answers are addressed — an
@@ -93,10 +93,10 @@ and index postings), `temp/` (query spill), and `snapshots-v1/` (checksummed, ap
 for active or recently completed framed-snapshot sessions). Opening fails closed when the format
 marker is missing or malformed beside storage artifacts; a torn marker is repaired only in an
 otherwise empty database directory. The locked marker is canonical: extra fields, duplicate keys,
-or alternate JSON spellings are corruption rather than extension points that an older reader might
-silently ignore. Posting row locators use a compact delta-varint encoding rather than JSON, so a
-secondary index does not spend most of its space spelling out bigint values. Deleting the directory
-deletes the database — `deleteOpfsDatabase({ name })` does exactly that.
+or alternate JSON spellings are corruption, not extension points. Posting row locators use a
+compact delta-varint encoding rather than JSON, so a secondary index does not spend most of its
+space spelling out bigint values. Deleting the directory deletes the database —
+`deleteOpfsDatabase({ name })` does exactly that.
 
 Layout 5 is the locked native OPFS contract. Its checkpoint includes the structural `schemaEpoch`
 used to reject a staged write after incompatible DDL. An unknown or pre-v1 layout marker is rejected

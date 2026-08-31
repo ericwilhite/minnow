@@ -66,7 +66,7 @@ transaction publishes the manifest pointer and deletes the live marker atomicall
 contains only per-kind counts and byte totals. Canonical metadata is carried as one semantic item
 per frame in `snapshotHeaders`; block frames carry one raw block. Metadata frames are at most
 4 MiB, one append accepts at most 64 frames and 16 MiB of metadata, and block payloads retain the
-normal block-size ceiling. No browser must clone database-sized metadata as one IndexedDB value.
+normal block-size ceiling — no browser must clone database-sized metadata as one IndexedDB value.
 While the marker exists, ordinary catalog writes through the adapter abort; final publication also
 rechecks both the marker identity and the still-empty current-manifest pointer before it publishes
 anything.
@@ -175,8 +175,8 @@ silently upgrade or rebuild the database after its caller has moved on.
 
 ## Schema compatibility and recovery
 
-IndexedDB schema 1 is Minnow's first and only initial native layout. There are no pre-contract
-schemas or compatibility branches. Future schema changes must add one
+IndexedDB schema 1 is Minnow's only native layout so far; there are no pre-contract schemas or
+compatibility branches. Future schema changes must add one
 ordered migration for every integer version between the database and the current build. All of
 those migrations run inside the browser's single `versionchange` transaction: either the complete
 chain and its data changes commit, or the old database remains byte-for-byte logical state. A

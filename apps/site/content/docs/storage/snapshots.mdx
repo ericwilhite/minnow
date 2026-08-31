@@ -21,8 +21,7 @@ await restored.importSnapshot(bytes);
 
 Both take an `onProgress` callback, and both work the same way through the
 [worker client](/docs/engine/workers). `exportSnapshot()` necessarily retains the finished file
-and is limited to 4 GiB by its `Uint8Array` result. Use the stream APIs for large databases or to
-write directly to a file or upload body:
+and is limited to 4 GiB by its `Uint8Array` result. To check a snapshot before importing it:
 
 ```ts
 import { readSnapshotSummary } from "@minnowdb/core/storage/snapshots";
@@ -34,6 +33,8 @@ const summary = await readSnapshotSummary(bytes);
 The summary helper validates the canonical header and its CRC without walking the body. It is for
 confirmation UI, not a substitute for import's complete frame, footer, reference, and block
 validation.
+
+Use the stream APIs for large databases or to write directly to a file or upload body:
 
 ```ts
 const writable = await fileHandle.createWritable();

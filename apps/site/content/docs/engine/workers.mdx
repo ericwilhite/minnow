@@ -53,12 +53,11 @@ const { rows } = await client.query("SELECT name, score FROM people ORDER BY sco
 
 ## Why you construct the Worker
 
-A worker needs a script URL at runtime. Bundlers rewrite
-`new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })` when that exact
-relative expression appears in _your_ code; a bare package name in `new URL()` is not a portable
-module resolver, and an expression buried inside a library cannot be analyzed reliably. Keeping
-the construction in your code also keeps lifecycle ownership honest (you decide when the worker
-starts and stops) and satisfies `worker-src` content-security policies from your own origin.
+Bundlers rewrite `new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })`
+only when that exact relative expression appears in _your_ code — a bare package name or an
+expression buried inside a library cannot be analyzed reliably. Keeping the construction in your
+code also makes the worker's lifecycle yours (you decide when it starts and stops) and satisfies
+`worker-src` content-security policies from your own origin.
 
 ## What changes across the boundary
 
@@ -188,8 +187,9 @@ const client = new MinnowDatabaseClient(
 ## Custom worker entries
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
-`opfs`, or `memory`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`,
-`spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, and `bufferPoolBytes`.
+`opfs`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`,
+`spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, `bufferPoolBytes`,
+`executionMemoryBudgetBytes`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
 It loads each storage adapter only when its descriptor asks for it, so a
 bundler splits the adapters into their own chunks and the worker downloads the store it opens,
 not the other two. For anything a message can't carry — a custom `BlockStore`, deterministic

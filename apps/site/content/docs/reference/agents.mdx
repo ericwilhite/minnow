@@ -59,22 +59,22 @@ machines: https://minnowdb.com/llms.txt
 - Durable adapters default to `durability: "strict"`. Use `"relaxed"` only when extra write
   throughput is worth a power-loss window. For irreplaceable browser-local data, call
   `ensureOriginPersistence("required")` from `@minnowdb/core/storage/persistence` before opening
-  the store;
-  this prevents automatic quota eviction when granted, not deliberate site-data clearing.
-- All `@minnowdb/*` packages share a major version and move independently inside it. Install them
-  on the same major. Engine-dependent adapters declare ranges that make npm reject an incompatible
+  the store; this prevents automatic quota eviction when granted, not deliberate site-data
+  clearing.
+- Minnow is 0.x: breaking changes land in minor releases, so pin exact `@minnowdb/*` versions and
+  upgrade them together. Engine-dependent adapters declare ranges that make npm reject an incompatible
   core; the structurally typed React hook has no core runtime dependency.
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns, columnDomains }`.
   `columnDomains` is positionally aligned with `columns`; use it to generically parse declared or
-  aliased JSON/JSONB text. It throws on a
-  statement that writes, rather than writing.
+  aliased JSON/JSONB text. It throws on a statement that writes, rather than writing.
 - `db.queryCursor(sql, { params, batchRows, signal })` pulls bounded result pages. Single-table,
   unordered scans stream directly; blocking sorts, groups, joins, and derived sources page the
   ordinary completed result. The worker transfers one columnar page per pull.
 - `db.execute(sql, params, options?)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
-  `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`, `create-view`, `drop-view`,
-  `create-trigger`, or `drop-trigger`) before reading `rowCount`, `version`, or `returnedRows`.
+  `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`,
+  `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading `rowCount`,
+  `version`, or `returnedRows`.
   The optional third argument takes `{ signal?, onStats?, memoize?, executionMemoryBudgetBytes? }`:
   a SELECT honors all of them; other statements check `signal` once before running.
 - Write PostgreSQL-style SQL and bind parameters with `$1`, `$2` by position. `?` in order is
@@ -169,8 +169,9 @@ machines: https://minnowdb.com/llms.txt
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
   correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, array subscripts,
   `ANY`/`ALL` over array values, `||` on array or JSONB operands, interval-valued arithmetic
-  such as interval-plus-interval, enum evolution, sequence options, `RIGHT JOIN` beside another join or `SELECT *`, `FULL JOIN` with grouping,
-  `DISTINCT`, window functions, or `SELECT *`, numeric `RANGE` frame offsets (use `ROWS`),
+  such as interval-plus-interval, enum evolution, sequence options, `RIGHT JOIN` or `FULL JOIN`
+  beside another join or combined with `SELECT *`, `FULL JOIN` without an equality `ON` or with
+  grouping, `DISTINCT`, or window functions, numeric `RANGE` frame offsets (use `ROWS`),
   `DISTINCT` window aggregates, window functions outside the select list, and
   `ON DELETE SET DEFAULT`. Check each supported entry's note before assuming every PostgreSQL
   variant.
@@ -193,8 +194,8 @@ it needs to be.
   of `INSERT` statements is the single most common performance mistake. See
   [The database API](/docs/engine).
 - **Workers.** Query execution on the main thread competes with rendering. Everyday application
-  calls are the same on either side, so there is no reason to start on the main thread and move later.
-  See [Workers & multi-tab](/docs/engine/workers).
+  calls are the same on either side, so there is no reason to start on the main thread and move
+  later. See [Workers & multi-tab](/docs/engine/workers).
 - **The SQL surface.** It is broad but not complete. The matrix lists every documented exclusion
   and the limits on narrower supported forms. Checking it first avoids generating SQL the engine
   will reject.
@@ -206,7 +207,7 @@ it needs to be.
 ## Verifying what an agent wrote
 
 The [console on the home page](/#console) runs a real database of about 590,000 rows in the
-browser, so a
-query can be pasted in and run against a schema that already exists. In an application, the
+browser, so a query can be pasted in and run against a schema that already exists. In an
+application, the
 [devtools console](/docs/devtools) does the same against your own data, and its **Plan** tab shows
 what the optimizer made of the statement.

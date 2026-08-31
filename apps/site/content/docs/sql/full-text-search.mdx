@@ -90,10 +90,11 @@ scan re-verifies, so a missing, stale, or invalidated index costs time, never co
 
 ## What it does to a term
 
-Terms are lowercased and split on non-alphanumeric boundaries. There is no stemming, no stop-word
-list, and no language configuration: `running` does not match `run`. That is a deliberate floor —
-a tokenizer that guesses a language is a tokenizer that is wrong for somebody, and the behaviour
-here is one a caller can predict and pre-process around.
+Terms are Unicode-normalized (NFKC), lowercased, and split on non-alphanumeric boundaries. CJK
+runs are indexed as character bigrams, so those languages search without a dictionary. There is no
+stemming, no stop-word list, and no language configuration: `running` does not match `run`. That
+floor is deliberate — a tokenizer that guesses a language is wrong for somebody, and this one a
+caller can predict and pre-process around.
 
 ## Tuning the threshold
 

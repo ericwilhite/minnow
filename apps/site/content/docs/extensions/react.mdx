@@ -71,7 +71,7 @@ function Page() {
 
 It calls the store's `refresh()` once per cold load and throws that shared promise until the query
 settles. Its return type excludes the `loading` snapshot. The equivalent lower-level call is
-`useLiveQuery(query, { suspense: true })`; a store used this way must implement `refresh()`.
+`useLiveQuery(query, { suspense: true })`; a query used this way must implement `refresh()`.
 
 When switching between stable query objects, keep the last settled snapshot on screen while the
 new one loads:
@@ -80,11 +80,11 @@ new one loads:
 const snapshot = useLiveQuery(query, { staleWhileRevalidate: true });
 ```
 
-The stale value is local to that hook instance and disappears as soon as the new store publishes
+The stale value is local to that hook instance and disappears as soon as the new query publishes
 `ready` or `error`. The options compose, so `{ suspense: true, staleWhileRevalidate: true }` keeps
 settled UI during a switch but still suspends on the first-ever load.
 
-`useLiveQuery` is generic over the store snapshot, so keyed changes require no second hook:
+`useLiveQuery` is generic over the query snapshot, so keyed changes require no second hook:
 
 ```tsx
 const snapshot = useLiveQuery(orderChanges);

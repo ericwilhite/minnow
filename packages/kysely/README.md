@@ -27,50 +27,28 @@ const db = createKysely({
 });
 ```
 
-`InferKyselyDatabase<typeof appSchema>` is also exported for applications that construct
-`Kysely` themselves. It preserves nullable/default insert optionality, enum literals, logical SQL
-domain boundary types, primary-key update safety, composite keys, and read-only view columns.
-Exact `NUMERIC` results are lossless strings by default, while inserts, updates, and predicates
-accept native numbers or strings. The optional `resultDecoding` shown above converts NUMERIC to
-finite JavaScript numbers and parses JSON/JSONB for buffered, streamed, and `RETURNING` rows; the
-inferred select types change with it. Zoneless `DATE` columns and casts use canonical `YYYY-MM-DD` strings;
-timestamps remain `Date`. Schema-derived databases also infer `count()` and `countAll()` results as
-Minnow's runtime `number`, infer `sum()` and `avg()` from the selected numeric domain, and infer
-the fixed return types of Minnow built-ins such as `round` and `date_trunc` without explicit
-generics. Value-returning functions such as `coalesce`, `nullif`, `greatest`, and `least` infer from
-their arguments, and `cast()` infers from its supported SQL target. Exact-numeric aggregates
-remain lossless strings by default and become numbers with native numeric decoding; ordinary
-numeric aggregates are numbers, and every aggregate except
-`count` includes `null` for an empty input. Use Kysely's inferred `coalesce()` helper when a
-fallback removes that case. Arbitrary custom functions and raw SQL still need an output type
-because TypeScript cannot derive one from a function or SQL string it does not understand.
+- **Types from your schema.** `createKysely` — and the exported `InferKyselyDatabase` for
+  applications that construct `Kysely` themselves — derives the full `DB` type from the same
+  schema declaration Minnow migrates: insert optionality, enum literals, composite keys,
+  read-only view columns, and the results of Minnow aggregates and built-ins such as `count`,
+  `sum`, `avg`, `round`, and `date_trunc`, without output generics. Raw SQL and custom functions
+  still need an explicit output type.
+- **Faithful values.** Exact `NUMERIC` results are lossless strings and JSON/JSONB is text by
+  default; `resultDecoding` converts them to numbers and parsed objects, and the inferred select
+  types follow. Zoneless `DATE` values are canonical `YYYY-MM-DD` strings; timestamps are `Date`.
+- **Catalog-owned defaults.** Literal and SQL-expression defaults and `.generatedSql()` stored
+  columns run inside Minnow, so they hold for Kysely, raw SQL, batches, workers, and other tabs.
+- **Full surface, named refusals.** Reads, writes, `RETURNING`, transactions with nested
+  savepoints, schema DDL, streaming, typed live queries, and catalog introspection are supported.
+  Forms Kysely can build that Minnow does not run — PostgreSQL features outside its profile, and
+  MySQL, SQLite, and T-SQL spellings such as `replaceInto()` or update `LIMIT` — are refused when
+  the query compiles, with the feature named and an alternative offered.
+- **Search and JSON helpers.** `search.match(eb, columns, query)` and `search.rank(...)` expose
+  Minnow's `MATCH` and BM25 SQL. `jsonBuildObject`, `jsonArrayFrom`, and `jsonObjectFrom` from
+  `@minnowdb/kysely/helpers` build fully typed nested JSON projections.
 
-Pass the schema to `createKysely` (or `MinnowDialect`) for exact types and multi-row empty-object
-INSERT normalization. Literal and SQL-expression defaults remain catalog-owned and run inside
-Minnow for Kysely, raw SQL, batches, workers, and other tabs. Compiled queries contain ordinary
-PostgreSQL SQL with visible `DEFAULT` slots and no hidden generated parameters. Stored columns
-declared with `.generatedSql()` are omitted from Kysely insert/update inputs and recomputed by
-Minnow.
-
-The dialect supports reads, inserts, updates, deletes, `RETURNING`, transactions with nested
-savepoints, schema DDL, streaming, typed live queries, and catalog introspection, including
-Minnow's exact numeric, JSON, UUID, date, time, interval, array, and enum types. Minnow is an
-embedded database, so it does not provide PostgreSQL schemas, configurable isolation levels,
-roles, or grants. Forms Kysely's builders can produce that Minnow does not run — PostgreSQL
-features outside Minnow's profile, and MySQL, SQLite, and T-SQL spellings such as
-`replaceInto()`, `orIgnore()`, `.top()`, and update/delete `LIMIT` — are refused when the query
-compiles, with the feature named and an alternative offered, instead of surfacing as engine
-parse errors. The adapter supports Kysely 0.29.x.
-
-`search.match(eb, columns, query)` and `search.rank(eb, columns, query)` expose Minnow's `MATCH`
-and BM25 SQL with checked, non-empty column lists, a bound query parameter, and an inferred numeric
-rank.
-
-`jsonBuildObject`, `jsonArrayFrom`, and `jsonObjectFrom` provide fully typed nested JSON
-projections using Minnow's native SQL. Import them from `@minnowdb/kysely/helpers` and enable
-`resultDecoding: { json: "parse" }`; row-to-object subqueries use explicit named selections.
-Nested correlated predicates and mutation subqueries compile through Kysely normally and use the
-same depth-independent planner as direct SQL.
+Minnow is an embedded database, so there are no PostgreSQL schemas, configurable isolation
+levels, roles, or grants. The adapter supports Kysely 0.29.5 and later 0.29.x releases.
 
 Full guide: [minnowdb.com/docs/adapters/kysely](https://minnowdb.com/docs/adapters/kysely/).
 
