@@ -331,6 +331,10 @@ describe("public SQL queries", () => {
       "SELECT * FROM people ORDER BY name, id LIMIT 10",
       "SELECT * FROM people ORDER BY people.name, people.id LIMIT 10",
       "SELECT * FROM people p ORDER BY p.name, p.id LIMIT 10",
+      "SELECT people.* FROM people ORDER BY people.name, people.id LIMIT 10",
+      'SELECT "people".* FROM people ORDER BY "people"."name", "people"."id" LIMIT 10',
+      "SELECT p.* FROM people p ORDER BY p.name, p.id LIMIT 10",
+      'SELECT "p".* FROM people p ORDER BY "p"."name", "p"."id" LIMIT 10',
     ]) {
       const result = await database.query(sql);
       expect(result.rows.map((row) => `${String(row.name)}/${String(row.id)}`)).toEqual(sorted);
@@ -362,6 +366,40 @@ describe("public SQL queries", () => {
       const result = await database.query(sql);
       expect(result.rows.map((row) => row["pets.pet_name"] ?? row["t.pet_name"])).toEqual(petNames);
     }
+
+    // Shape-dependent lowerings bind the wildcard before they run: an unselected joined sort
+    // key becomes hidden, DISTINCT groups exactly the chosen source, and windows receive the
+    // expanded columns rather than an unresolved `people.*` sentinel.
+    expect(
+      (
+        await database.query(
+          "SELECT people.* FROM people JOIN pets ON people.id = pets.owner " +
+            "ORDER BY pets.pet_name",
+        )
+      ).rows.map((row) => row["people.id"]),
+    ).toEqual([9, 8, 7, 6, 5]);
+    expect(
+      (
+        await database.query(
+          "SELECT DISTINCT people.* FROM people JOIN pets ON people.id = pets.owner " +
+            "ORDER BY people.id",
+        )
+      ).rows.map((row) => row["people.id"]),
+    ).toEqual([5, 6, 7, 8, 9]);
+    expect(
+      (
+        await database.query(
+          "SELECT people.*, ROW_NUMBER() OVER (ORDER BY people.id) AS position " +
+            "FROM people JOIN pets ON people.id = pets.owner ORDER BY people.id",
+        )
+      ).rows.map((row) => [row["people.id"], row.position]),
+    ).toEqual([
+      [5, 1],
+      [6, 2],
+      [7, 3],
+      [8, 4],
+      [9, 5],
+    ]);
 
     // A qualified reference that resolves to nothing is rejected, never dropped.
     await expect(database.query("SELECT * FROM people ORDER BY people.nope")).rejects.toThrow(

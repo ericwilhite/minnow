@@ -8,6 +8,48 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.6.9 — August 31, 2026
+
+Published packages: `@minnowdb/core@0.6.9`.
+
+### Fixed
+
+- Wildcard projections are now schema-bound before select-shape planning. `orders.*` and quoted
+  `"orders".*` can be ordered by qualified columns, expressions, or ordinals, and wildcard
+  projections now compose with `DISTINCT`, window columns, set operations, CTE/derived column
+  lists, and `INSERT ... SELECT`. These forms previously failed in separate late wildcard paths;
+  some `DISTINCT` and window combinations reached internal result/schema alignment errors. The
+  conformance corpus now crosses every shape-dependent lowering with wildcards and diffs the
+  results against SQLite and PGlite.
+- `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIME`, `random()`, `gen_random_uuid()`, and
+  `nextval(...)` in `INSERT ... VALUES` are now evaluated at statement execution. Cached INSERT
+  statements no longer freeze volatile values, and CURRENT values also work in mutation
+  expressions and trigger bodies.
+- SQL conformance now compares output-column names and order for empty reads and empty
+  `RETURNING` results, preserves the genuinely unoptimized wildcard plan, validates every corpus
+  ordering flag, pins every feature with no external oracle, and executes all 45 SQL fences
+  published in the guides. This audit found the runtime-value failures above and a
+  `FETCH FIRST ... WITH TIES` case whose result order had previously been discarded by the test.
+
+### Changed
+
+- `CompiledQuery` may carry `pendingSelectShape`, `pendingOutputAliases`, `pendingSetOrder`, or
+  `preserveUnoptimizedShape` on wildcard-dependent blocks. These optional fields preserve the raw
+  shape until an execution schema supplies column names; `MinnowDatabase`, `executeQuery`, and
+  `executeRowQuery` bind and optimize them automatically. Plan-inspection extensions should treat
+  such a block as unresolved rather than assuming `select.length` is its final output width.
+
+### Migration
+
+Nothing to change for correct programs. Wildcard compositions that previously threw now execute
+without a query rewrite. Cached mutation statements now evaluate statement-time and volatile
+values when they run rather than retaining a compile-time value.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5
+remain readable and writable without a data migration.
+
 ## 0.6.8 — August 30, 2026
 
 Published packages: `@minnowdb/core@0.6.8` and `@minnowdb/kysely@0.4.6`.

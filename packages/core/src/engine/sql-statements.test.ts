@@ -190,6 +190,42 @@ describe("nested correlated subqueries through the public API", () => {
 });
 
 describe("INSERT defaults", () => {
+  it("evaluates statement-time and volatile VALUES expressions at execution, not compile cache", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE SEQUENCE explicit_ids");
+    await database.execute(
+      "CREATE TABLE runtime_values (id INTEGER PRIMARY KEY, at TIMESTAMP, sample REAL, token UUID)",
+    );
+    const sql =
+      "INSERT INTO runtime_values VALUES ($1, CURRENT_TIMESTAMP, RANDOM(), GEN_RANDOM_UUID()) RETURNING *";
+    const first = await database.execute(sql, [1]);
+    const second = await database.execute(sql, [2]);
+    const firstRow = (first as { returnedRows?: Array<Record<string, unknown>> }).returnedRows?.[0];
+    const secondRow = (second as { returnedRows?: Array<Record<string, unknown>> })
+      .returnedRows?.[0];
+    expect(firstRow?.at).toBeInstanceOf(Date);
+    expect(secondRow?.at).toBeInstanceOf(Date);
+    expect(firstRow?.sample).not.toBe(secondRow?.sample);
+    expect(firstRow?.token).not.toBe(secondRow?.token);
+
+    await database.execute(
+      "INSERT INTO runtime_values (id, at) VALUES " +
+        "(NEXTVAL('explicit_ids') + 10, CURRENT_TIMESTAMP), " +
+        "(NEXTVAL('explicit_ids') + 10, CURRENT_TIMESTAMP)",
+    );
+    const rows = (
+      await database.query("SELECT id, at FROM runtime_values WHERE id >= 11 ORDER BY id")
+    ).rows as Array<{ id: number; at: Date }>;
+    expect(rows.map(({ id }) => id)).toEqual([11, 12]);
+    expect(rows[0]?.at.getTime()).toBe(rows[1]?.at.getTime());
+
+    const updated = await database.execute(
+      "UPDATE runtime_values SET at = CURRENT_TIMESTAMP WHERE id = 1 RETURNING at",
+    );
+    const updatedAt = (updated as { returnedRows?: Array<{ at?: unknown }> }).returnedRows?.[0]?.at;
+    expect(updatedAt).toBeInstanceOf(Date);
+  });
+
   it("evaluates SQL defaults per omitted row and preserves explicit NULL", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(
@@ -333,11 +369,20 @@ describe("INSERT ... SELECT", () => {
     expect(empty).toEqual({ kind: "insert", table: "people", rowCount: 0 });
   });
 
-  it("rejects wildcard and mismatched select lists", async () => {
+  it("binds wildcard select lists and rejects a mismatched width", async () => {
     const database = await seeded();
+    await database.execute("CREATE TABLE archive (name TEXT, score REAL)");
     await expect(
-      database.execute("INSERT INTO people (name, score) SELECT * FROM people"),
-    ).rejects.toThrow("explicit select list");
+      database.execute("INSERT INTO archive SELECT * FROM people"),
+    ).resolves.toMatchObject({ kind: "insert", rowCount: 2 });
+    await database.execute("CREATE TABLE qualified_archive (name TEXT, score REAL)");
+    await expect(
+      database.execute("INSERT INTO qualified_archive (name, score) SELECT people.* FROM people"),
+    ).resolves.toMatchObject({ kind: "insert", rowCount: 2 });
+    expect((await database.query("SELECT * FROM qualified_archive ORDER BY name")).rows).toEqual([
+      { name: "Ada", score: 10 },
+      { name: "Grace", score: 25 },
+    ]);
     await expect(
       database.execute("INSERT INTO people (name, score) SELECT name AS name FROM people"),
     ).rejects.toThrow("exactly the insert column count");

@@ -171,6 +171,12 @@
       "example": "SELECT * FROM rows ORDER BY amount"
     },
     {
+      "id": "order-by.qualified-wildcard-reference",
+      "status": "supported",
+      "example": "SELECT rows.* FROM rows ORDER BY rows.amount DESC",
+      "notes": "Both the wildcard and the ordering reference may use a table name or alias, quoted or unquoted. The conformance corpus crosses those spellings and compares them with SQLite and PostgreSQL."
+    },
+    {
       "id": "limit",
       "status": "supported",
       "example": "SELECT amount FROM rows ORDER BY amount LIMIT 2"
@@ -241,6 +247,15 @@
       ],
       "example": "INSERT INTO defaulted_insert DEFAULT VALUES",
       "notes": "DEFAULT VALUES inserts one row using catalog defaults. DEFAULT is also accepted in an individual VALUES slot."
+    },
+    {
+      "id": "mutation.insert-runtime-values",
+      "status": "supported",
+      "setup": [
+        "CREATE TABLE runtime_values (id INTEGER PRIMARY KEY, noted_at TIMESTAMP, sample DOUBLE PRECISION, token UUID)"
+      ],
+      "example": "INSERT INTO runtime_values VALUES (1, CURRENT_TIMESTAMP, RANDOM(), GEN_RANDOM_UUID()) RETURNING id",
+      "notes": "Statement-time, random, UUID, and sequence calls in VALUES are evaluated at execution rather than frozen in the compiled-statement cache. Every CURRENT_* call in one statement shares one clock."
     },
     {
       "id": "mutation.update-keyed",
@@ -605,7 +620,7 @@
       "id": "select.distinct-wildcard",
       "status": "supported",
       "example": "SELECT DISTINCT * FROM rows",
-      "notes": "Expands to DISTINCT over every wildcard output column once input schemas are known."
+      "notes": "Expands bare or qualified wildcards to exactly their selected source columns before DISTINCT grouping is planned."
     },
     {
       "id": "limit.offset",
@@ -806,7 +821,7 @@
       "id": "order-by.ordinal",
       "status": "supported",
       "example": "SELECT region, amount FROM rows ORDER BY 2 DESC",
-      "notes": "Ordinals resolve to the select list at compile time; out-of-range ordinals are an error."
+      "notes": "Ordinals resolve after schema-bound wildcard expansion when needed; out-of-range ordinals are an error."
     },
     {
       "id": "window.lag-lead",
@@ -818,7 +833,7 @@
       "id": "mutation.insert-select",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) SELECT name || '2' AS name, score + 1 AS score FROM keyed",
-      "notes": "The SELECT runs at one snapshot and materializes before the batch write."
+      "notes": "The SELECT runs at one snapshot and materializes before the batch write. Bare and qualified wildcard select lists are supported and their expanded width is checked against the target columns."
     },
     {
       "id": "mutation.merge",
@@ -899,7 +914,13 @@
       "id": "select.qualified-wildcard",
       "status": "supported",
       "example": "SELECT rows.* FROM rows",
-      "notes": "Output names follow the rule a bare * uses: the column's own name from one source, alias-qualified from several."
+      "notes": "Output names follow the rule a bare * uses: the column's own name from one source, alias-qualified from several. Expansion happens before shape-dependent planning, so qualified wildcards compose with DISTINCT, windows, set operations, CTE/derived column lists, ORDER BY expressions and ordinals, and INSERT SELECT."
+    },
+    {
+      "id": "select.wildcard-window-composition",
+      "status": "supported",
+      "example": "SELECT rows.*, ROW_NUMBER() OVER (ORDER BY amount) AS position FROM rows ORDER BY amount",
+      "notes": "Wildcard columns are schema-bound before window lowering. The generated conformance corpus also crosses wildcards with DISTINCT, set operations, column lists, and ORDER BY expressions and ordinals."
     },
     {
       "id": "from.column-alias-list",

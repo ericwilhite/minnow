@@ -34,6 +34,7 @@ import {
   bindPlanParameters,
   compileQuery,
   executeRowQuery,
+  transparentProjectionSource,
   type QueryResult,
   type QueryValue,
 } from "./query.js";
@@ -715,7 +716,7 @@ const templates: Template[] = [
   (rng) => ({
     // F866 over a column with ties, ordered so the tie set is unambiguous.
     sql: `SELECT region FROM data WHERE region IS NOT NULL ORDER BY region DESC FETCH FIRST ${String(1 + Math.floor(rng() * 3))} ROWS WITH TIES`,
-    ordered: false,
+    ordered: true,
     skip: ["sqlite"],
   }),
   () => ({
@@ -889,8 +890,94 @@ function cteCases(): Case[] {
   ];
 }
 
+/**
+ * Crosses both wildcard spellings with bare, qualified, and quoted ORDER BY references. These
+ * features are independently valid, but expansion used to erase the qualifier from `d.*` before
+ * ORDER BY resolution. Keeping the crossing generated prevents either feature's isolated example
+ * from claiming support while their ordinary composition is broken.
+ */
+function wildcardOrderCases(): Case[] {
+  const projections = [
+    { select: "*", from: "data", qualifiedOrder: "data.id" },
+    { select: "data.*", from: "data", qualifiedOrder: "data.id" },
+    { select: '"data".*', from: '"data"', qualifiedOrder: '"data"."id"' },
+    { select: "d.*", from: "data d", qualifiedOrder: "d.id" },
+    { select: '"d".*', from: 'data AS "d"', qualifiedOrder: '"d"."id"' },
+  ] as const;
+  return projections.flatMap(({ select, from, qualifiedOrder }) =>
+    ["id", qualifiedOrder].map((order) => ({
+      sql: `SELECT ${select} FROM ${from} ORDER BY ${order} DESC LIMIT 17`,
+      ordered: true,
+    })),
+  );
+}
+
+/**
+ * Crosses wildcard width with every lowering that consumes a concrete select shape. These were
+ * once separate late executor special cases, so each feature worked alone while ordinary
+ * compositions failed or produced an internally misaligned result.
+ */
+function wildcardShapeCases(): Case[] {
+  return [
+    {
+      sql: `SELECT * FROM data ORDER BY amount * 2 DESC, id LIMIT 19`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT data.* FROM data ORDER BY data.amount * 2 DESC, data.id LIMIT 19`,
+      ordered: true,
+    },
+    { sql: `SELECT data.* FROM data ORDER BY 3 DESC, 1 LIMIT 19`, ordered: true },
+    {
+      sql: `SELECT DISTINCT data.* FROM data ORDER BY data.id DESC LIMIT 19`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT data.*, ROW_NUMBER() OVER (ORDER BY amount, id) AS position FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT data.*, COUNT(*) OVER () AS total_rows FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.* FROM data d WHERE id <= 40 UNION SELECT e.* FROM data e WHERE id >= 120 ORDER BY 1`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.* FROM data d WHERE id <= 20 UNION ALL SELECT e.* FROM data e WHERE id >= 140 ORDER BY 1`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.* FROM data d WHERE id <= 80 INTERSECT SELECT e.* FROM data e WHERE id >= 60 ORDER BY 1`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.* FROM data d WHERE id <= 80 EXCEPT SELECT e.* FROM data e WHERE id <= 20 ORDER BY 1`,
+      ordered: true,
+    },
+    {
+      sql: `WITH copied(ident, place, total, enabled, joined_at, title) AS (SELECT * FROM data) SELECT ident, title FROM copied ORDER BY ident LIMIT 19`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT copied.ident, copied.title FROM (SELECT * FROM data) AS copied(ident, place, total, enabled, joined_at, title) ORDER BY copied.ident LIMIT 19`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+  ];
+}
+
 function combinationCases(): Case[] {
-  return [...distinctCases(), ...windowCases(), ...joinCases(), ...datetimeCases(), ...cteCases()];
+  return [
+    ...distinctCases(),
+    ...windowCases(),
+    ...joinCases(),
+    ...datetimeCases(),
+    ...cteCases(),
+    ...wildcardOrderCases(),
+    ...wildcardShapeCases(),
+  ];
 }
 
 function buildCorpus(): Case[] {
@@ -930,6 +1017,18 @@ function resultKeys(rows: ReadonlyArray<Record<string, unknown>>, ordered: boole
   return ordered ? keys : [...keys].sort();
 }
 
+/** Result ordering may live under the projection that hides an ORDER BY-only expression. */
+function hasResultOrder(plan: ReturnType<typeof compileQuery>): boolean {
+  if (plan.orderBy.length > 0) return true;
+  const wrapper = transparentProjectionSource(plan);
+  if (wrapper !== undefined) return hasResultOrder(wrapper.inner);
+  // Before FULL JOIN's internal wildcard has a schema, the ordinary transparent-wrapper helper
+  // cannot prove its pass-through aliases. The marker belongs only to that ORDER BY lowering.
+  return plan.base.alias === "(ordered)" && plan.base.derived !== undefined
+    ? hasResultOrder(plan.base.derived)
+    : false;
+}
+
 function diffSummary(label: string, left: string[], right: string[]): string {
   const firstDiff = left.findIndex((key, index) => key !== right[index]);
   const at = firstDiff === -1 ? Math.min(left.length, right.length) : firstDiff;
@@ -955,7 +1054,10 @@ function sqliteParams(params: QueryValue[] | undefined): Array<string | number |
 
 interface Oracle {
   readonly name: OracleName;
-  execute(testCase: Case): Promise<Array<Record<string, unknown>>>;
+  execute(testCase: Case): Promise<{
+    rows: Array<Record<string, unknown>>;
+    columns: string[];
+  }>;
   close(): Promise<void> | void;
 }
 
@@ -963,12 +1065,13 @@ function sqliteOracle(): Oracle {
   const database = sqliteFixture();
   return {
     name: "sqlite",
-    execute: (testCase) =>
-      Promise.resolve(
-        database.prepare(testCase.sql).all(...sqliteParams(testCase.params)) as Array<
-          Record<string, unknown>
-        >,
-      ),
+    execute: (testCase) => {
+      const statement = database.prepare(testCase.sql);
+      const rows = statement.all(...sqliteParams(testCase.params)) as Array<
+        Record<string, unknown>
+      >;
+      return Promise.resolve({ rows, columns: statement.columns().map(({ name }) => name) });
+    },
     close: () => {
       database.close();
     },
@@ -1015,7 +1118,10 @@ async function pgliteOracle(): Promise<Oracle> {
         (testCase.params ?? []) as unknown[],
         { parsers },
       );
-      return result.rows as Array<Record<string, unknown>>;
+      return {
+        rows: result.rows as Array<Record<string, unknown>>,
+        columns: result.fields.map(({ name }) => name),
+      };
     },
     close: () => database.close(),
   };
@@ -1117,12 +1223,13 @@ function matrixSqlite(): Oracle {
   for (const dim of matrixDims) insertDim.run(dim.region, dim.label, dim.amount);
   return {
     name: "sqlite",
-    execute: (testCase) =>
-      Promise.resolve(
-        database
-          .prepare(numberedToPositional(testCase.sql))
-          .all(...sqliteParams(testCase.params)) as Array<Record<string, unknown>>,
-      ),
+    execute: (testCase) => {
+      const statement = database.prepare(numberedToPositional(testCase.sql));
+      const rows = statement.all(...sqliteParams(testCase.params)) as Array<
+        Record<string, unknown>
+      >;
+      return Promise.resolve({ rows, columns: statement.columns().map(({ name }) => name) });
+    },
     close: () => {
       database.close();
     },
@@ -1172,7 +1279,10 @@ async function matrixPglite(): Promise<Oracle> {
         (testCase.params ?? []) as unknown[],
         { parsers },
       );
-      return result.rows as Array<Record<string, unknown>>;
+      return {
+        rows: result.rows as Array<Record<string, unknown>>,
+        columns: result.fields.map(({ name }) => name),
+      };
     },
     close: () => database.close(),
   };
@@ -1441,6 +1551,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
     try {
       for (const [index, testCase] of corpus.entries()) {
         const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
+        const hasTopLevelOrder = hasResultOrder(compileQuery(testCase.sql, { optimize: false }));
+        if (testCase.ordered !== hasTopLevelOrder) {
+          failures.push(
+            `${caseLabel}\n  harness ordering flag is ${String(testCase.ordered)}, compiled outer ORDER BY is ${String(hasTopLevelOrder)}`,
+          );
+          continue;
+        }
         let vectorized: QueryResult;
         let rowExecutor: QueryResult;
         try {
@@ -1461,6 +1578,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
         if (vectorKeys.join("\n") !== rowKeys.join("\n")) {
           failures.push(
             `${caseLabel}\n${diffSummary("vectorized vs row executor", vectorKeys, rowKeys)}`,
+          );
+        }
+        if (vectorized.columns.join(",") !== rowExecutor.columns.join(",")) {
+          failures.push(
+            `${caseLabel}\n  column order/names, vectorized vs row executor:\n` +
+              `    vectorized: ${vectorized.columns.join(", ")}\n` +
+              `    row: ${rowExecutor.columns.join(", ")}`,
           );
         }
         // The optimizer is otherwise inside the trusted base: both paths above compile through
@@ -1485,6 +1609,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
               `${caseLabel}\n${diffSummary("optimized vs unoptimized plan", rowKeys, unoptimizedKeys)}`,
             );
           }
+          if (rowExecutor.columns.join(",") !== unoptimized.columns.join(",")) {
+            failures.push(
+              `${caseLabel}\n  column order/names, optimized vs unoptimized plan:\n` +
+                `    optimized: ${rowExecutor.columns.join(", ")}\n` +
+                `    unoptimized: ${unoptimized.columns.join(", ")}`,
+            );
+          }
         } catch (error) {
           if (!String(error).includes(REQUIRES_LOWERING)) {
             failures.push(`${caseLabel}\n  unoptimized plan threw: ${String(error)}`);
@@ -1493,14 +1624,14 @@ describe("SQL conformance against SQLite and PGlite", () => {
         }
         for (const oracle of oracles) {
           if (testCase.skip?.includes(oracle.name)) continue;
-          let oracleRows: Array<Record<string, unknown>>;
+          let oracleResult: { rows: Array<Record<string, unknown>>; columns: string[] };
           try {
-            oracleRows = await oracle.execute(testCase);
+            oracleResult = await oracle.execute(testCase);
           } catch (error) {
             failures.push(`${caseLabel}\n  ${oracle.name} threw: ${String(error)}`);
             continue;
           }
-          const oracleKeys = resultKeys(oracleRows, testCase.ordered);
+          const oracleKeys = resultKeys(oracleResult.rows, testCase.ordered);
           if (vectorKeys.join("\n") !== oracleKeys.join("\n")) {
             failures.push(
               `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, vectorKeys, oracleKeys)}`,
@@ -1509,15 +1640,11 @@ describe("SQL conformance against SQLite and PGlite", () => {
           // Row comparison sorts keys, so it cannot see output column order. Compare the
           // projected column lists directly: a regression that reorders or renames output
           // columns would otherwise pass silently.
-          const oracleColumns = Object.keys(oracleRows[0] ?? {});
-          if (
-            oracleColumns.length > 0 &&
-            vectorized.columns.join(",") !== oracleColumns.join(",")
-          ) {
+          if (vectorized.columns.join(",") !== oracleResult.columns.join(",")) {
             failures.push(
               `${caseLabel}\n  column order/names vs ${oracle.name}:\n` +
                 `    minnow: ${vectorized.columns.join(", ")}\n` +
-                `    oracle: ${oracleColumns.join(", ")}`,
+                `    oracle: ${oracleResult.columns.join(", ")}`,
             );
           }
         }
@@ -1537,6 +1664,8 @@ describe("SQL conformance against SQLite and PGlite", () => {
     // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
     expect(corpus.length).toBeGreaterThan(1_000);
     expect(combinationCases().length).toBeGreaterThan(80);
+    expect(wildcardOrderCases()).toHaveLength(10);
+    expect(wildcardShapeCases()).toHaveLength(12);
     // The unoptimized comparison is only worth something while it actually runs. Every case that
     // got this far reached it, so pin both the total and the share that ran rather than lowered:
     // a change that routes cases into the lowering branch -- or one that makes the corpus
@@ -1557,40 +1686,50 @@ describe("SQL conformance against SQLite and PGlite", () => {
     const failures: string[] = [];
     try {
       for (const feature of covered) {
+        // The compiled outer tail distinguishes a result ORDER BY from one nested inside OVER.
+        // PostgreSQL validates final ordering; SQLite has different default NULL placement, so
+        // it remains a value-set oracle for these matrix examples.
+        const ordered = hasResultOrder(compileQuery(feature.example, { optimize: false }));
         const testCase: Case = {
           sql: feature.example,
-          ordered: false,
+          ordered,
           ...(feature.params === undefined ? {} : { params: feature.params }),
         };
-        let minnowRows: Array<Record<string, unknown>>;
+        let minnowResult: QueryResult;
         try {
-          minnowRows = (
-            await database.query(
-              testCase.sql,
-              testCase.params === undefined ? {} : { params: testCase.params },
-            )
-          ).rows;
+          minnowResult = await database.query(
+            testCase.sql,
+            testCase.params === undefined ? {} : { params: testCase.params },
+          );
         } catch (error) {
           failures.push(`${feature.id} :: ${feature.example}\n  minnow threw: ${String(error)}`);
           continue;
         }
-        const minnowKeys = resultKeys(minnowRows, false);
         const skipped = matrixSkips.get(feature.id)?.oracles ?? [];
         for (const oracle of oracles) {
           if (skipped.includes(oracle.name)) continue;
-          let oracleRows: Array<Record<string, unknown>>;
+          let oracleResult: { rows: Array<Record<string, unknown>>; columns: string[] };
           try {
-            oracleRows = await oracle.execute(testCase);
+            oracleResult = await oracle.execute(testCase);
           } catch (error) {
             failures.push(
               `${feature.id} :: ${feature.example}\n  ${oracle.name} threw: ${String(error)}`,
             );
             continue;
           }
-          const oracleKeys = resultKeys(oracleRows, false);
+          const compareOrder = ordered && oracle.name === "pglite";
+          const minnowKeys = resultKeys(minnowResult.rows, compareOrder);
+          const oracleKeys = resultKeys(oracleResult.rows, compareOrder);
           if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
             failures.push(
               `${feature.id} :: ${feature.example}\n${diffSummary(`minnow vs ${oracle.name}`, minnowKeys, oracleKeys)}`,
+            );
+          }
+          if (minnowResult.columns.join(",") !== oracleResult.columns.join(",")) {
+            failures.push(
+              `${feature.id} :: ${feature.example}\n  column order/names vs ${oracle.name}:\n` +
+                `    minnow: ${minnowResult.columns.join(", ")}\n` +
+                `    oracle: ${oracleResult.columns.join(", ")}`,
             );
           }
         }
@@ -1606,6 +1745,141 @@ describe("SQL conformance against SQLite and PGlite", () => {
       );
     }
   }, 240_000);
+
+  it("pins every read claim that neither external oracle can represent", async () => {
+    const expectedIds = [
+      "aggregate.any-value",
+      "aggregate.json",
+      "function.bm25",
+      "function.numeric-core",
+      "function.trim-multi-character",
+      "json.arrow",
+      "json.object",
+      "json.query",
+      "predicate.match",
+      "predicate.match-parameter",
+      "predicate.match-star",
+      "subquery.correlated-json-aggregate",
+      "type.array",
+      "type.date",
+      "type.exact-numeric",
+      "type.interval",
+      "type.json-jsonb",
+    ];
+    const features = matrixFeatures.filter(
+      (feature) =>
+        feature.status === "supported" &&
+        !writesData(feature.id) &&
+        matrixSkips.get(feature.id)?.oracles.length === 2,
+    );
+    expect(features.map(({ id }) => id).sort()).toEqual(expectedIds);
+    const database = await matrixMinnow();
+
+    for (const feature of features) {
+      const result = await database.query(
+        feature.example,
+        feature.params === undefined ? {} : { params: feature.params },
+      );
+      expect(result.columns, feature.id).toEqual(
+        feature.id === "function.numeric-core"
+          ? ["n", "g", "l", "f", "c", "m", "p", "s"]
+          : feature.id === "function.bm25"
+            ? ["region", "score"]
+            : feature.id === "subquery.correlated-json-aggregate"
+              ? ["region", "amounts"]
+              : [
+                  {
+                    "aggregate.any-value": "sample",
+                    "aggregate.json": "regions",
+                    "function.trim-multi-character": "trimmed",
+                    "json.arrow": "element",
+                    "json.object": "document",
+                    "json.query": "a",
+                    "predicate.match": "region",
+                    "predicate.match-parameter": "region",
+                    "predicate.match-star": "region",
+                    "type.array": "pair",
+                    "type.date": "day",
+                    "type.exact-numeric": "amount",
+                    "type.interval": "next_day",
+                    "type.json-jsonb": "document",
+                  }[feature.id] ?? "",
+                ],
+      );
+
+      if (feature.id === "function.trim-multi-character") {
+        expect(resultKeys(result.rows, false), feature.id).toEqual(
+          resultKeys([{ trimmed: "st" }, { trimmed: "st" }, { trimmed: "east" }], false),
+        );
+      } else if (feature.id === "aggregate.any-value") {
+        expect(result.rows, feature.id).toHaveLength(1);
+        expect([10, 6, 3, 8], feature.id).toContain(result.rows[0]?.sample);
+      } else if (feature.id === "aggregate.json") {
+        const regions = JSON.parse(String(result.rows[0]?.regions)) as Array<
+          Record<string, unknown>
+        >;
+        expect(resultKeys(regions, false), feature.id).toEqual(
+          resultKeys(
+            [{ region: "west" }, { region: "west" }, { region: "east" }, { region: null }],
+            false,
+          ),
+        );
+      } else if (feature.id === "subquery.correlated-json-aggregate") {
+        const normalized = result.rows.map((row) => ({
+          region: row.region,
+          amounts: row.amounts === null ? null : (JSON.parse(String(row.amounts)) as unknown),
+        }));
+        expect(normalized, feature.id).toEqual([
+          { region: "west", amounts: [{ amount: 6 }, { amount: 10 }] },
+          { region: "west", amounts: [{ amount: 6 }, { amount: 10 }] },
+          { region: "east", amounts: [{ amount: 3 }] },
+          { region: null, amounts: null },
+        ]);
+      } else if (feature.id === "json.query") {
+        expect(JSON.parse(String(result.rows[0]?.a)), feature.id).toEqual([1, 2]);
+      } else if (feature.id === "json.object") {
+        expect(JSON.parse(String(result.rows[0]?.document)), feature.id).toEqual({
+          a: 1,
+          detail: { name: "Acme" },
+        });
+      } else if (feature.id === "json.arrow") {
+        expect(JSON.parse(String(result.rows[0]?.element)), feature.id).toBe(6);
+      } else if (feature.id === "type.exact-numeric") {
+        expect(result.rows, feature.id).toEqual([{ amount: "1.25" }]);
+      } else if (feature.id === "type.json-jsonb") {
+        expect(JSON.parse(String(result.rows[0]?.document)), feature.id).toEqual({ a: 1 });
+      } else if (feature.id === "type.interval") {
+        expect(result.rows, feature.id).toEqual([
+          { next_day: new Date("2026-01-03T00:00:00.000Z") },
+          { next_day: new Date("2025-12-31T00:00:00.000Z") },
+          { next_day: new Date("2026-02-02T00:00:00.000Z") },
+          { next_day: null },
+        ]);
+      } else if (feature.id === "type.array") {
+        expect(JSON.parse(String(result.rows[0]?.pair)), feature.id).toEqual([1, 2]);
+      } else if (feature.id.startsWith("predicate.match")) {
+        expect(result.rows, feature.id).toEqual([{ region: "west" }, { region: "west" }]);
+      } else if (feature.id === "function.bm25") {
+        expect(result.rows, feature.id).toHaveLength(2);
+        for (const row of result.rows) {
+          expect(row.region, feature.id).toBe("west");
+          expect(row.score, feature.id).toEqual(expect.any(Number));
+          expect(row.score as number, feature.id).toBeGreaterThan(0);
+        }
+      } else if (feature.id === "type.date") {
+        expect(result.rows, feature.id).toEqual([{ day: "2026-08-26" }]);
+      } else if (feature.id === "function.numeric-core") {
+        expect(result.rows, feature.id).toEqual([
+          { n: 10, g: 10, l: 5, f: 10, c: 10, m: 2, p: 8, s: 4 },
+          { n: 6, g: 6, l: 5, f: 6, c: 6, m: 2, p: 8, s: 4 },
+          { n: null, g: 5, l: 3, f: 3, c: 3, m: 3, p: 8, s: 4 },
+          { n: 8, g: 8, l: 5, f: 8, c: 8, m: 0, p: 8, s: 4 },
+        ]);
+      } else {
+        expect.fail(`Missing self-check for ${feature.id}`);
+      }
+    }
+  }, 120_000);
 
   it("renders declared-scale NUMERIC results exactly as PostgreSQL", async () => {
     // The generated corpus compares NUMERIC values numerically (its oracle parses them into

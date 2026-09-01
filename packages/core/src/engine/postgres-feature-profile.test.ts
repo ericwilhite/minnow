@@ -100,6 +100,14 @@ function returnedRows(result: ExecuteResult): Array<Record<string, unknown>> {
   return [];
 }
 
+function returnedColumns(result: ExecuteResult): string[] {
+  if (result.kind === "rows") return result.result.columns;
+  if (result.kind === "insert" || result.kind === "update" || result.kind === "delete") {
+    return result.returnedColumns ?? [];
+  }
+  return [];
+}
+
 describe("PostgreSQL feature profile", () => {
   it("classifies every matrix entry and explains every divergence", () => {
     expect(profile.oracle).toMatchObject({ engine: "PGlite", version: "0.5.5" });
@@ -214,6 +222,9 @@ describe("PostgreSQL feature profile", () => {
           );
           expect(returnedRows(minnowResult), `${feature.id}: returned rows`).toEqual(
             postgresResult.rows,
+          );
+          expect(returnedColumns(minnowResult), `${feature.id}: returned columns`).toEqual(
+            postgresResult.fields.map(({ name }) => name),
           );
           expect(
             (

@@ -109,7 +109,7 @@ interface PgliteOracle {
   run(
     sql: string,
     params?: QueryValue[],
-  ): Promise<{ rows: Array<Record<string, unknown>>; count: number }>;
+  ): Promise<{ rows: Array<Record<string, unknown>>; columns: string[]; count: number }>;
   exec(sql: string): Promise<void>;
   close(): Promise<void>;
 }
@@ -137,6 +137,7 @@ async function pgliteFixture(): Promise<PgliteOracle> {
       });
       return {
         rows: result.rows as Array<Record<string, unknown>>,
+        columns: result.fields.map(({ name }) => name),
         count: result.affectedRows ?? 0,
       };
     },
@@ -338,6 +339,12 @@ const stepTemplates: StepTemplate[] = [
     sql: `UPDATE items SET amount = amount - ? WHERE id % ? = 0 AND amount > ?`,
     params: [quarter(state.rng) / 2, 3 + Math.floor(state.rng() * 5), quarter(state.rng)],
   }),
+  // An empty RETURNING result still has a schema. Row-only comparison cannot see a renamed or
+  // reordered projection here, so keep one deterministically empty case in every generated round.
+  () => ({
+    kind: "sql",
+    sql: `UPDATE items SET label = label WHERE id = -1 RETURNING label, id`,
+  }),
   // Bounded delete, RETURNING what fell.
   (state) => ({
     kind: "sql",
@@ -503,11 +510,15 @@ describe("DML conformance against SQLite and PGlite", () => {
       let minnowError: unknown;
       let minnowCount: number | undefined;
       let minnowReturned: string[] | undefined;
+      let minnowReturnedColumns: string[] | undefined;
       try {
         const result = await minnow.execute(step.sql, step.params);
         if (result.kind === "insert" || result.kind === "update" || result.kind === "delete") {
           minnowCount = result.rowCount;
-          if (returning) minnowReturned = keys(result.returnedRows ?? [], false);
+          if (returning) {
+            minnowReturned = keys(result.returnedRows ?? [], false);
+            minnowReturnedColumns = result.returnedColumns ?? [];
+          }
         }
       } catch (error) {
         minnowError = error;
@@ -515,11 +526,13 @@ describe("DML conformance against SQLite and PGlite", () => {
       let sqliteError: unknown;
       let sqliteCount: number | undefined;
       let sqliteReturned: string[] | undefined;
+      let sqliteReturnedColumns: string[] | undefined;
       try {
         const prepared = sqlite.prepare(step.sql);
         if (returning) {
           const rows = prepared.all(...sqliteParams(step.params));
           sqliteReturned = keys(rows, false);
+          sqliteReturnedColumns = prepared.columns().map(({ name }) => name);
           sqliteCount = rows.length;
         } else {
           sqliteCount = Number(prepared.run(...sqliteParams(step.params)).changes);
@@ -530,10 +543,14 @@ describe("DML conformance against SQLite and PGlite", () => {
       let pgliteError: unknown;
       let pgliteCount: number | undefined;
       let pgliteReturned: string[] | undefined;
+      let pgliteReturnedColumns: string[] | undefined;
       try {
         const result = await pglite.run(step.sql, step.params);
         pgliteCount = returning ? result.rows.length : result.count;
-        if (returning) pgliteReturned = keys(result.rows, false);
+        if (returning) {
+          pgliteReturned = keys(result.rows, false);
+          pgliteReturnedColumns = result.columns;
+        }
       } catch (error) {
         pgliteError = error;
       }
@@ -543,6 +560,7 @@ describe("DML conformance against SQLite and PGlite", () => {
         oracleError: unknown,
         oracleCount: number | undefined,
         oracleReturned: string[] | undefined,
+        oracleReturnedColumns: string[] | undefined,
       ): void => {
         if ((minnowError === undefined) !== (oracleError === undefined)) {
           failures.push(
@@ -569,9 +587,20 @@ describe("DML conformance against SQLite and PGlite", () => {
             `${label}\n${diffSummary("RETURNING rows", oracle, minnowReturned, oracleReturned)}`,
           );
         }
+        if (
+          minnowReturnedColumns !== undefined &&
+          oracleReturnedColumns !== undefined &&
+          minnowReturnedColumns.join(",") !== oracleReturnedColumns.join(",")
+        ) {
+          failures.push(
+            `${label}\n  RETURNING column order/names diverged:\n` +
+              `    minnow: ${minnowReturnedColumns.join(", ")}\n` +
+              `    ${oracle}: ${oracleReturnedColumns.join(", ")}`,
+          );
+        }
       };
-      compareOracle("sqlite", sqliteError, sqliteCount, sqliteReturned);
-      compareOracle("pglite", pgliteError, pgliteCount, pgliteReturned);
+      compareOracle("sqlite", sqliteError, sqliteCount, sqliteReturned, sqliteReturnedColumns);
+      compareOracle("pglite", pgliteError, pgliteCount, pgliteReturned, pgliteReturnedColumns);
     };
 
     const runPair = async (step: PairStep, label: string): Promise<void> => {

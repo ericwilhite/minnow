@@ -1082,7 +1082,11 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   let compiled: CompiledQuery;
   try {
     resolvePlanExactNumericConstants(plan);
-    compiled = options.optimize === false ? plan : optimizePlan(plan);
+    if (options.optimize === false && planHasPendingSelectShapes(plan)) {
+      plan.preserveUnoptimizedShape = true;
+    }
+    compiled =
+      options.optimize === false || planHasPendingSelectShapes(plan) ? plan : optimizePlan(plan);
   } catch (error) {
     // Compile-time rewrites (for example decorrelation) reject unsupported shapes; those
     // errors locate on the statement like any other compile failure.
@@ -1153,11 +1157,21 @@ export interface UniqueConstraintDefinition {
 interface DefaultInsertValue {
   readonly default: true;
 }
-export type InsertValue = QueryValue | DefaultInsertValue | { parameter: number };
+interface DeferredInsertExpression {
+  readonly expression: Expression;
+}
+export type InsertValue =
+  QueryValue | DefaultInsertValue | DeferredInsertExpression | { parameter: number };
 
 export function isDefaultInsertValue(value: InsertValue): value is DefaultInsertValue {
   return (
     typeof value === "object" && value !== null && !(value instanceof Date) && "default" in value
+  );
+}
+
+export function isDeferredInsertExpression(value: InsertValue): value is DeferredInsertExpression {
+  return (
+    typeof value === "object" && value !== null && !(value instanceof Date) && "expression" in value
   );
 }
 
@@ -2878,8 +2892,9 @@ export function createPreparedQuery(
   options: QueryExecutionOptions = {},
 ): PreparedQuery {
   assertTailParametersBound(plan);
-  validateGrouping(plan);
   plan = resolveStatementDatetimes(plan);
+  plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  validateGrouping(plan);
   // The schema-dependent rewrites run before derived sources materialize, because both can
   // turn a scanned table into one more derived block.
   plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
@@ -2940,6 +2955,13 @@ export function createPreparedColumnarQuery(
   } = {},
 ): PreparedQuery {
   plan = resolveStatementDatetimes(plan);
+  const columnarColumns = (tableName: string): readonly string[] | undefined => {
+    const table = tables.get(tableName);
+    return table === undefined
+      ? undefined
+      : [...table.columns.keys()].filter((name) => !name.startsWith("\0"));
+  };
+  plan = bindPendingSelectShapes(plan, columnarColumns);
   const ties = withTiesPlan(plan);
   if (ties.plan !== plan) {
     return trimPreparedResults(
@@ -2947,12 +2969,6 @@ export function createPreparedColumnarQuery(
       ties.trim,
     );
   }
-  const columnarColumns = (tableName: string): readonly string[] | undefined => {
-    const table = tables.get(tableName);
-    return table === undefined
-      ? undefined
-      : [...table.columns.keys()].filter((name) => !name.startsWith("\0"));
-  };
   plan = expandSourceColumnAliases(plan, columnarColumns);
   plan = expandNaturalJoins(plan, columnarColumns);
   plan = expandQualifiedWildcards(plan, columnarColumns);
@@ -4375,8 +4391,9 @@ function executeRowQueryInternal(
   memory?: QueryMemoryContext,
 ): QueryResult {
   assertTailParametersBound(plan);
-  validateGrouping(plan);
   plan = resolveStatementDatetimes(plan);
+  plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  validateGrouping(plan);
   plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
   plan = expandNaturalJoins(plan, wildcardRowColumns(tables));
   plan = expandQualifiedWildcards(plan, wildcardRowColumns(tables));
@@ -6490,11 +6507,14 @@ class Parser {
     if (this.#isKeyword("SELECT")) {
       const insertSource = this.#selectBlock("(insert select)");
       resolvePlanExactNumericConstants(insertSource);
-      const query = optimizePlan(insertSource);
-      if (query.select.some((item) => item.expression.kind === "wildcard")) {
-        throw new TypeError("INSERT ... SELECT requires an explicit select list");
-      }
-      if (columns.length > 0 && query.select.length !== columns.length) {
+      const query = planHasPendingSelectShapes(insertSource)
+        ? insertSource
+        : optimizePlan(insertSource);
+      if (
+        !planHasPendingSelectShapes(query) &&
+        columns.length > 0 &&
+        query.select.length !== columns.length
+      ) {
         throw new TypeError("INSERT ... SELECT must produce exactly the insert column count");
       }
       return {
@@ -6821,6 +6841,16 @@ class Parser {
     }
     if (hasAggregate(expression) || expressionColumns(expression).length > 0) {
       throw new TypeError(`${label} must be constant expressions`);
+    }
+    const needsExecution = (value: Expression): boolean =>
+      (value.kind === "call" &&
+        (statementDatetimeNames.has(value.name) ||
+          value.name === "NEXTVAL" ||
+          value.name === "CURRVAL" ||
+          volatileScalarFunctionNames.has(value.name))) ||
+      childExpressions(value).some(needsExecution);
+    if (needsExecution(expression)) {
+      return { expression: resolveExactNumericConstants(expression) };
     }
     return asQueryValue(evaluate(resolveExactNumericConstants(expression), {}));
   }
@@ -7375,18 +7405,7 @@ class Parser {
       if (!this.#punctuation(",")) break;
     }
     this.#expectPunctuation(")");
-    // Set-operation output takes the first member's aliases, so renaming targets it.
-    const target =
-      derived.base.union !== undefined && derived.select[0]?.expression.kind === "wildcard"
-        ? derived.base.union.blocks[0]
-        : derived;
-    if (target?.select.length !== names.length) {
-      throw new TypeError("Column alias list must match the derived table's column count");
-    }
-    names.forEach((name, index) => {
-      const item = target.select[index];
-      if (item !== undefined) item.alias = name;
-    });
+    renameBlockOutputs(derived, names, "derived table");
   }
 
   /**
@@ -9297,6 +9316,37 @@ export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
 ): CompiledQuery {
+  if (parts.select.some((item) => item.expression.kind === "wildcard")) {
+    if (parts.joins.some((join) => join.full === true)) {
+      throw new TypeError("FULL JOIN cannot be combined with SELECT *");
+    }
+    // A wildcard's width and names come from source schemas, but ordinals, hidden ORDER BY
+    // columns, DISTINCT grouping, windows, grouping sets, and FULL JOIN lowering all depend on
+    // that width. Preserve the raw block until schema binding instead of teaching each lowering
+    // a different late wildcard exception.
+    return {
+      sql: parts.sql,
+      base: parts.base,
+      joins: parts.joins,
+      select: parts.select,
+      predicates: parts.predicates,
+      groupBy: parts.groupBy,
+      having: parts.having,
+      orderBy: parts.orderBy,
+      ...(parts.limit === undefined ? {} : { limit: parts.limit }),
+      ...(parts.offset === undefined ? {} : { offset: parts.offset }),
+      ...(parts.limitParameter === undefined ? {} : { limitParameter: parts.limitParameter }),
+      ...(parts.offsetParameter === undefined ? {} : { offsetParameter: parts.offsetParameter }),
+      ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
+      pendingSelectShape: {
+        distinct: parts.distinct,
+        ...(parts.groupingSets === undefined
+          ? {}
+          : { groupingSets: structuredClone(parts.groupingSets) }),
+      },
+      ...(parts.distinct ? { distinctWildcard: true } : {}),
+    };
+  }
   parts = { ...parts, orderBy: resolveOrderByOrdinals(parts.orderBy, parts.select) };
   if (parts.joins.some((join) => join.full === true)) {
     return desugarFullJoin(parts, nextSequence);
@@ -9567,6 +9617,14 @@ function sourceWildcardColumns(
   source: TableSource,
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): readonly string[] | undefined {
+  if (
+    source.derived?.base.union !== undefined &&
+    source.derived.select[0]?.expression.kind === "wildcard"
+  ) {
+    return source.derived.base.union.blocks[0]?.select
+      .map((item) => item.alias)
+      .filter((name) => !name.startsWith("\0"));
+  }
   if (source.derived !== undefined)
     return source.derived.select.map((item) => item.alias).filter((name) => !name.startsWith("\0"));
   if (source.union !== undefined) {
@@ -9574,7 +9632,201 @@ function sourceWildcardColumns(
       .map((item) => item.alias)
       .filter((name) => !name.startsWith("\0"));
   }
+  if (source.windowed !== undefined) {
+    return [
+      ...source.windowed.block.select.map((item) => item.alias),
+      ...source.windowed.windows.map((window) => window.alias),
+    ].filter((name) => !name.startsWith("\0"));
+  }
+  if (source.recursive !== undefined) {
+    return source.recursive.base.select
+      .map((item) => item.alias)
+      .filter((name) => !name.startsWith("\0"));
+  }
   return columnsOf(source.table)?.filter((name) => !name.startsWith("\0"));
+}
+
+/** Whether any block still needs source schemas before its SELECT shape can be lowered. */
+export function planHasPendingSelectShapes(plan: CompiledQuery): boolean {
+  if (
+    plan.pendingSelectShape !== undefined ||
+    plan.pendingOutputAliases !== undefined ||
+    plan.pendingSetOrder === true
+  ) {
+    return true;
+  }
+  let pending = false;
+  forEachNestedBlock(plan, (nested) => {
+    pending ||= planHasPendingSelectShapes(nested);
+  });
+  const inspect = (expression: Expression): void => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      pending ||= planHasPendingSelectShapes(expression.block);
+      return;
+    }
+    childExpressions(expression).forEach(inspect);
+  };
+  forEachBlockExpression(plan, inspect);
+  return pending;
+}
+
+/**
+ * Expands schema-dependent SELECT wildcards, then sends the now-concrete block through the same
+ * lowering used by ordinary named select lists. This is the single boundary at which wildcard
+ * width becomes plan shape: DISTINCT, windows, ORDER BY expressions/ordinals, set operations,
+ * CTE/derived column lists, grouping sets, and FULL JOIN therefore cannot disagree about it.
+ */
+export function bindPendingSelectShapes(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (!planHasPendingSelectShapes(plan)) return plan;
+  const bound = structuredClone(plan);
+  const preserveUnoptimizedShape = bound.preserveUnoptimizedShape === true;
+  delete bound.preserveUnoptimizedShape;
+  let sequence = 0;
+  const scanSequence = (block: CompiledQuery): void => {
+    for (const source of [block.base, ...block.joins]) {
+      const match = /\((?:derived|window|union) (\d+)\)/.exec(source.table);
+      if (match?.[1] !== undefined) sequence = Math.max(sequence, Number(match[1]));
+    }
+    forEachNestedBlock(block, scanSequence);
+  };
+  scanSequence(bound);
+  const nextSequence = (): number => {
+    sequence += 1;
+    return sequence;
+  };
+
+  const bindExpressionBlocks = (expression: Expression): Expression => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      return { ...expression, block: bindBlock(expression.block) };
+    }
+    if (expression.kind === "window") {
+      return {
+        ...expression,
+        partitionBy: expression.partitionBy.map(bindExpressionBlocks),
+        orderBy: expression.orderBy.map((order) => ({
+          ...order,
+          expression: bindExpressionBlocks(order.expression),
+        })),
+        ...(expression.argument === undefined
+          ? {}
+          : { argument: bindExpressionBlocks(expression.argument) }),
+      };
+    }
+    return mapChildExpressions(expression, bindExpressionBlocks);
+  };
+
+  const bindSource = (source: TableSource): void => {
+    if (source.derived !== undefined) source.derived = bindBlock(source.derived);
+    if (source.union !== undefined) {
+      source.union.blocks = source.union.blocks.map(bindBlock);
+    }
+    if (source.windowed !== undefined) {
+      source.windowed.block = bindBlock(source.windowed.block);
+    }
+    if (source.recursive !== undefined) {
+      source.recursive.base = bindBlock(source.recursive.base);
+      source.recursive.step = bindBlock(source.recursive.step);
+    }
+  };
+
+  const expandedSelect = (block: CompiledQuery): SelectItem[] => {
+    const sources = [block.base, ...block.joins];
+    const shaped = sources.map((source) => ({
+      source,
+      columns: source.columnAliases ?? sourceWildcardColumns(source, columnsOf),
+    }));
+    const unknown = shaped.find(({ columns }) => columns === undefined);
+    if (unknown !== undefined) {
+      throw new TypeError(`SELECT * requires known columns for: ${unknown.source.table}`);
+    }
+    const multiple = shaped.filter(({ columns }) => (columns?.length ?? 0) > 0).length > 1;
+    const items = block.select.flatMap((item): SelectItem[] => {
+      if (item.expression.kind !== "wildcard") return [item];
+      const table = item.expression.table;
+      const selected =
+        table === undefined ? shaped : shaped.filter(({ source }) => source.alias === table);
+      if (table !== undefined && selected.length === 0) {
+        throw new TypeError(`Unknown table for ${table}.*: ${table}`);
+      }
+      return selected.flatMap(({ source, columns }) =>
+        (columns ?? []).map((name) => ({
+          expression: { kind: "column" as const, reference: `${source.alias}.${name}` },
+          alias: multiple ? `${source.alias}.${name}` : name,
+        })),
+      );
+    });
+    const aliases = new Set<string>();
+    for (const item of items) {
+      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
+      aliases.add(item.alias);
+    }
+    return items;
+  };
+
+  const carryPlanFlags = (from: CompiledQuery, to: CompiledQuery): void => {
+    for (const key of [
+      "parameterCount",
+      "usesStatementDatetime",
+      "usesSequenceCalls",
+      "usesVolatileFunctions",
+    ] as const) {
+      const value = from[key];
+      if (value !== undefined) Object.assign(to, { [key]: value });
+    }
+  };
+
+  function bindBlock(block: CompiledQuery): CompiledQuery {
+    for (const source of [block.base, ...block.joins]) bindSource(source);
+    mapBlockExpressions(block, bindExpressionBlocks);
+
+    let lowered = block;
+    const pending = block.pendingSelectShape;
+    if (pending !== undefined) {
+      const { pendingSelectShape, pendingOutputAliases, distinctWildcard, ...rest } = block;
+      void pendingSelectShape;
+      void pendingOutputAliases;
+      void distinctWildcard;
+      lowered = assembleSelectBlock(
+        {
+          sql: rest.sql,
+          base: rest.base,
+          joins: rest.joins,
+          select: expandedSelect(block),
+          distinct: pending.distinct,
+          predicates: rest.predicates,
+          groupBy: rest.groupBy,
+          having: rest.having,
+          orderBy: rest.orderBy,
+          ...(rest.limit === undefined ? {} : { limit: rest.limit }),
+          ...(rest.offset === undefined ? {} : { offset: rest.offset }),
+          ...(rest.limitParameter === undefined ? {} : { limitParameter: rest.limitParameter }),
+          ...(rest.offsetParameter === undefined ? {} : { offsetParameter: rest.offsetParameter }),
+          ...(rest.limitWithTies === true ? { limitWithTies: true } : {}),
+          ...(pending.groupingSets === undefined ? {} : { groupingSets: pending.groupingSets }),
+        },
+        nextSequence,
+      );
+      carryPlanFlags(block, lowered);
+    }
+
+    if (lowered.pendingSetOrder === true) {
+      const first = lowered.base.union?.blocks[0];
+      lowered.orderBy = resolveOrderByOrdinals(lowered.orderBy, first?.select ?? []);
+      delete lowered.pendingSetOrder;
+    }
+    const aliases = block.pendingOutputAliases;
+    if (aliases !== undefined) {
+      renameBlockOutputs(lowered, aliases.columns, aliases.sourceName);
+      delete lowered.pendingOutputAliases;
+    }
+    return lowered;
+  }
+
+  const lowered = bindBlock(bound);
+  return preserveUnoptimizedShape ? lowered : optimizePlan(lowered);
 }
 
 /** Whether any block of the plan still carries an unresolved NATURAL join marker. */
@@ -9741,7 +9993,13 @@ function expandQualifiedWildcards(
       }
       return columns.map((name) => {
         const output = multiple ? `${source.alias}.${name}` : name;
-        return { expression: { kind: "column" as const, reference: output }, alias: output };
+        // Keep the source-qualified input reference even though one source exposes a bare output
+        // name. ORDER BY can legally spell either form (`id` or `orders.id`), and the latter must
+        // still match this select item after the wildcard has expanded.
+        return {
+          expression: { kind: "column" as const, reference: `${source.alias}.${name}` },
+          alias: output,
+        };
       });
     });
     const aliases = new Set<string>();
@@ -9764,7 +10022,10 @@ export function compoundSelectBlock(
   nextSequence: () => number,
 ): CompiledQuery {
   // Set-operation output columns are the first member's, so ordinals resolve against them.
-  tail = { ...tail, orderBy: resolveOrderByOrdinals(tail.orderBy, blocks[0]?.select ?? []) };
+  const pendingSetOrder = blocks.some(planHasPendingSelectShapes);
+  if (!pendingSetOrder) {
+    tail = { ...tail, orderBy: resolveOrderByOrdinals(tail.orderBy, blocks[0]?.select ?? []) };
+  }
   return {
     sql,
     base: {
@@ -9778,9 +10039,12 @@ export function compoundSelectBlock(
     groupBy: [],
     having: [],
     orderBy: tail.orderBy,
+    ...(pendingSetOrder ? { pendingSetOrder: true as const } : {}),
     ...(tail.limit === undefined ? {} : { limit: tail.limit }),
     ...(tail.offset === undefined ? {} : { offset: tail.offset }),
     ...(tail.limitWithTies === true ? { limitWithTies: true } : {}),
+    ...(tail.limitParameter === undefined ? {} : { limitParameter: tail.limitParameter }),
+    ...(tail.offsetParameter === undefined ? {} : { offsetParameter: tail.offsetParameter }),
   };
 }
 
@@ -9789,9 +10053,10 @@ export function compoundSelectBlock(
  * either reuses a structurally identical select item's alias or becomes a hidden "(order N)"
  * select item, the ordering (and LIMIT/OFFSET) applies inside that block, and an outer block
  * projects only the visible aliases away from a derived source. Runs in the shared assembly,
- * so the builder and SQL front ends produce identical plans. A wildcard select has no named
- * output list to hide items behind, and DISTINCT's output would change if hidden expressions
- * joined its grouping, so both keep the named-column restriction.
+ * so the builder and SQL front ends produce identical plans. Schema-bound wildcard blocks reach
+ * this function with concrete items; only a manually constructed unresolved wildcard plan keeps
+ * the named-column restriction. DISTINCT's output would change if hidden expressions joined its
+ * grouping, so it keeps the selected-column restriction.
  */
 /**
  * Whether an ORDER BY item has to travel as a hidden select item: any expression, and also a
@@ -9855,19 +10120,46 @@ function assembleOrderByExpressionBlock(
       expression: { kind: "column", reference: alias } satisfies Expression,
     };
   });
+  // Every ordering expression matched a visible select item — no hidden columns, no wrap.
+  if (hiddenItems.length === 0) {
+    return assembleSelectBlock({ ...parts, orderBy: rewrittenOrder }, nextSequence);
+  }
+  // Once hidden columns exist, the visible projection is wrapped in a derived table. Visible
+  // output names such as `people.id` are legal result labels but are not legal internal column
+  // references there — the dot would be read as the vanished `people` source qualifier. Carry
+  // every visible value through a private dot-free name and restore its public label outside.
+  const visibleInner = parts.select.map((item, index) => ({
+    ...item,
+    alias: item.alias.includes(".") ? `(order visible ${String(index + 1)})` : item.alias,
+  }));
+  const visibleAlias = new Map(
+    parts.select.map(
+      (item, index) => [item.alias, visibleInner[index]?.alias ?? item.alias] as const,
+    ),
+  );
+  const innerOrder = rewrittenOrder.map((order) => {
+    if (order.expression.kind !== "column" || order.expression.reference.includes(".")) {
+      return order;
+    }
+    const alias = visibleAlias.get(order.expression.reference);
+    return alias === undefined
+      ? order
+      : { ...order, expression: { kind: "column" as const, reference: alias } };
+  });
   const inner = assembleSelectBlock(
-    { ...parts, select: [...parts.select, ...hiddenItems], orderBy: rewrittenOrder },
+    { ...parts, select: [...visibleInner, ...hiddenItems], orderBy: innerOrder },
     nextSequence,
   );
-  // Every ordering expression matched a visible select item — no hidden columns, no wrap.
-  if (hiddenItems.length === 0) return inner;
   const source = derivedTableSource(inner, "(ordered)", nextSequence);
   return {
     sql: parts.sql,
     base: source,
     joins: [],
-    select: parts.select.map((item) => ({
-      expression: { kind: "column", reference: item.alias } satisfies Expression,
+    select: parts.select.map((item, index) => ({
+      expression: {
+        kind: "column",
+        reference: visibleInner[index]?.alias ?? item.alias,
+      } satisfies Expression,
       alias: item.alias,
     })),
     predicates: [],
@@ -9963,10 +10255,28 @@ export function validateLimit(limit: number): number {
  * which is later than this.
  */
 function renameBlockOutputs(block: CompiledQuery, columns: readonly string[], name: string): void {
+  // Set-operation output names come from the first member. Its width may itself be pending on a
+  // wildcard, so preserve the alias list on the compound until all members have schema-bound.
+  if (block.base.union !== undefined && block.select[0]?.expression.kind === "wildcard") {
+    const first = block.base.union.blocks[0];
+    if (first === undefined || planHasPendingSelectShapes(first)) {
+      block.pendingOutputAliases = { columns: [...columns], sourceName: name };
+      return;
+    }
+    renameBlockOutputs(first, columns, name);
+    return;
+  }
+  if (block.pendingSelectShape !== undefined) {
+    block.pendingOutputAliases = { columns: [...columns], sourceName: name };
+    return;
+  }
   if (block.select.some((item) => item.expression.kind === "wildcard")) {
-    throw new TypeError(`A column list needs named columns in the CTE body: ${name}`);
+    throw new TypeError(`A column list needs named columns in the query body: ${name}`);
   }
   if (block.select.length !== columns.length) {
+    if (name === "derived table") {
+      throw new TypeError("Column alias list must match the derived table's column count");
+    }
     throw new TypeError(
       `CTE ${name} declares ${String(columns.length)} columns but selects ${String(block.select.length)}`,
     );
@@ -10079,7 +10389,14 @@ function desugarWindows(
     hasAggregate(expression) ||
     expressionColumns(expression).length === 0 ||
     groupExpressions.has(JSON.stringify(expression));
-  const innerSelect: SelectItem[] = select.filter((item) => !containsWindow(item.expression));
+  const internalAliases = select.map((item, index) =>
+    item.alias.includes(".") ? `(window visible ${String(index + 1)})` : item.alias,
+  );
+  const innerSelect: SelectItem[] = select.flatMap((item, index) =>
+    containsWindow(item.expression)
+      ? []
+      : [{ ...item, alias: internalAliases[index] ?? item.alias }],
+  );
   const windows: WindowSpec[] = [];
   let hidden = 0;
 
@@ -10150,21 +10467,55 @@ function desugarWindows(
     return mapChildExpressions(expression, split);
   };
 
-  const projections = select.map((item) => {
+  const projections = select.map((item, index) => {
+    const internalAlias = internalAliases[index] ?? item.alias;
     if (!containsWindow(item.expression)) {
-      return { expression: { kind: "column" as const, reference: item.alias }, alias: item.alias };
+      return {
+        expression: { kind: "column" as const, reference: internalAlias },
+        alias: item.alias,
+      };
     }
-    // A window that is the whole select item keeps carrying that item's own name, which is what
-    // the executor's windowed source and every existing plan already expect.
+    // A window that is the whole select item carries a private source-safe name through the
+    // windowed source, then the wrapper restores the public output alias.
     if (item.expression.kind === "window") {
-      registerWindow(item.expression, item.alias);
-      return { expression: { kind: "column" as const, reference: item.alias }, alias: item.alias };
+      registerWindow(item.expression, internalAlias);
+      return {
+        expression: { kind: "column" as const, reference: internalAlias },
+        alias: item.alias,
+      };
     }
     return { expression: split(item.expression), alias: item.alias };
   });
   if (innerSelect.length === 0) {
     innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });
   }
+  // Window evaluation replaces the FROM sources with one synthetic source. A qualified ORDER
+  // BY that names a selected column must therefore follow that value through its output alias;
+  // leaving `a.id` in the wrapper would try to resolve the vanished table alias `a`.
+  const windowTail: SelectTail = {
+    ...tail,
+    orderBy: tail.orderBy.map((order) => {
+      if (order.expression.kind !== "column") return order;
+      const reference = order.expression.reference;
+      const bare = reference.split(".").at(-1) ?? reference;
+      const selectedIndex = select.findIndex(
+        (item) =>
+          item.alias === reference ||
+          item.alias === bare ||
+          (item.expression.kind === "column" && item.expression.reference === reference),
+      );
+      const selected = selectedIndex < 0 ? undefined : select[selectedIndex];
+      const projected = selectedIndex < 0 ? undefined : projections[selectedIndex];
+      const internalReference =
+        projected?.expression.kind === "column" ? projected.expression.reference : selected?.alias;
+      return selected === undefined || internalReference === undefined
+        ? order
+        : {
+            ...order,
+            expression: { kind: "column" as const, reference: internalReference },
+          };
+    }),
+  };
   const inner: CompiledQuery = {
     sql: "(window input)",
     base,
@@ -10187,7 +10538,7 @@ function desugarWindows(
     predicates: [],
     groupBy: [],
     having: [],
-    ...tail,
+    ...windowTail,
   };
 }
 

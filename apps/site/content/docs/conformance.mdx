@@ -9,14 +9,19 @@ cannot pass in the docs while failing in the engine.
 
 ## SQL checks
 
-- Every supported example runs through both query executors.
+- Every supported read example runs through both query executors. Their rows and output-column
+  metadata are compared even when the result is empty.
 - PostgreSQL-compatible reads are compared with PGlite. SQLite provides a second comparison where
   its syntax and behavior match.
 - PostgreSQL-compatible writes replay a seeded mutation script against both SQLite and PGlite,
   comparing statement outcomes, affected-row counts, `RETURNING`, trigger effects, and the final
   table after every statement.
-- Compatible DDL must parse in PostgreSQL and create the expected Minnow catalog.
+- Compatible DDL must execute in Minnow and parse in PostgreSQL.
 - Every excluded form must fail with its documented error.
+- Forms neither external engine can represent have explicit expected-result checks instead of a
+  silent oracle exemption.
+- Every SQL fence in the SELECT, DML, DDL, full-text, transaction, and schema guides executes
+  exactly as published against its required schema.
 - SQLLogicTest adds thousands of database-neutral queries for joins, expressions, ordering, NULL
   behavior, and result checking.
 

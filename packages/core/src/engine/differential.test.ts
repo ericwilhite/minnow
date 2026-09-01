@@ -193,6 +193,7 @@ function canonicalRows(rows: readonly QueryRow[], columns: readonly string[]): s
     .map((row) =>
       JSON.stringify(
         columns.map((column) => {
+          if (!Object.hasOwn(row, column)) return "missing";
           const value = row[column] ?? null;
           if (value === null) return null;
           if (value instanceof Date) return `date:${String(value.getTime())}`;

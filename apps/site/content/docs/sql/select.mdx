@@ -31,6 +31,12 @@ them — see [Query plans](/docs/sql/plans).
 `LIMIT` and `OFFSET` both work, and a `LIMIT` without an `ORDER BY` returns rows in no promised
 order, as in any SQL engine.
 
+`*` and `alias.*` are expanded from the input schema before Minnow plans operations that depend
+on the output width. They therefore work with `DISTINCT`, window columns, set operations,
+CTE/derived column lists, `ORDER BY` expressions and ordinals, and `INSERT ... SELECT`. With one
+source, wildcard outputs use bare column names; with several sources, Minnow uses
+`alias.column` names so collisions stay visible.
+
 ## Joins
 
 ```sql

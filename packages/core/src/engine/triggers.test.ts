@@ -193,6 +193,24 @@ describe("AFTER triggers", () => {
     expect(audit.rows).toEqual([{ action: "before", amount: 10 }]);
   });
 
+  it("evaluates CURRENT_TIMESTAMP in a trigger body at firing time", async () => {
+    const database = await seeded();
+    await database.execute("CREATE TABLE timestamp_audit (account_id INTEGER, at TIMESTAMP)");
+    await database.execute(
+      "CREATE TRIGGER timestamp_accounts AFTER INSERT ON accounts BEGIN " +
+        "INSERT INTO timestamp_audit (account_id, at) VALUES (NEW.id, CURRENT_TIMESTAMP); END",
+    );
+    await database.insertBatch("accounts", {
+      columns: { id: [1, 2], balance: [10, 20], owner: ["ada", "grace"] },
+    });
+    const rows = (
+      await database.query("SELECT account_id, at FROM timestamp_audit ORDER BY account_id")
+    ).rows as Array<{ account_id: number; at: Date }>;
+    expect(rows.map(({ account_id }) => account_id)).toEqual([1, 2]);
+    expect(rows[0]?.at).toBeInstanceOf(Date);
+    expect(rows[0]?.at.getTime()).toBe(rows[1]?.at.getTime());
+  });
+
   it("runs UPDATE and DELETE trigger bodies against keyed targets", async () => {
     const database = await seeded();
     await database.createTable({

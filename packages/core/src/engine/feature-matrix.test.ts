@@ -2,7 +2,13 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
-import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import {
+  bindPlanParameters,
+  compileQuery,
+  compileStatement,
+  executeQuery,
+  executeRowQuery,
+} from "./query.js";
 
 interface MatrixFeature {
   id: string;
@@ -62,6 +68,13 @@ async function keyedDatabase(): Promise<MinnowDatabase> {
   return database;
 }
 
+function expectedResultKind(sql: string): string {
+  const kind = compileStatement(sql).kind;
+  if (kind === "create-enum") return "create-type";
+  if (kind === "create-table-as") return "create-table";
+  return kind;
+}
+
 describe("SQL feature matrix conformance", () => {
   const features = matrix.features;
 
@@ -93,7 +106,7 @@ describe("SQL feature matrix conformance", () => {
         const database = await keyedDatabase();
         for (const statement of feature.setup ?? []) await database.execute(statement);
         const result = await database.execute(feature.example, feature.params);
-        expect(result.kind).not.toBe("rows");
+        expect(result.kind).toBe(expectedResultKind(feature.example));
         // A statement that opened a transaction must not leave it open for the next example.
         if (result.kind === "transaction" && result.action === "begin") {
           await database.execute("ROLLBACK");
@@ -132,7 +145,8 @@ describe("SQL feature matrix conformance", () => {
         feature.id.startsWith("ddl.")
       ) {
         const database = await keyedDatabase();
-        await expect(database.execute(feature.example)).rejects.toThrow(error);
+        for (const statement of feature.setup ?? []) await database.execute(statement);
+        await expect(database.execute(feature.example, feature.params)).rejects.toThrow(error);
         return;
       }
       expect(() => executeRowQuery(compileQuery(feature.example), tables)).toThrow(error);

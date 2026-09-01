@@ -278,7 +278,7 @@
               "name": "CompiledQuery",
               "kind": "type",
               "declarations": [
-                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
+                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    pendingSelectShape?: {\n        distinct: boolean;\n        groupingSets?: Expression[][];\n    };\n    pendingOutputAliases?: {\n        columns: string[];\n        sourceName: string;\n    };\n    pendingSetOrder?: true;\n    preserveUnoptimizedShape?: true;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
               ]
             },
             {
@@ -418,7 +418,7 @@
               "name": "InsertValue",
               "kind": "type",
               "declarations": [
-                "export type InsertValue = QueryValue | DefaultInsertValue | {\n    parameter: number;\n};"
+                "export type InsertValue = QueryValue | DefaultInsertValue | DeferredInsertExpression | {\n    parameter: number;\n};"
               ]
             },
             {
@@ -1745,7 +1745,7 @@
               "name": "CompiledQuery",
               "kind": "type",
               "declarations": [
-                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
+                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    pendingSelectShape?: {\n        distinct: boolean;\n        groupingSets?: Expression[][];\n    };\n    pendingOutputAliases?: {\n        columns: string[];\n        sourceName: string;\n    };\n    pendingSetOrder?: true;\n    preserveUnoptimizedShape?: true;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
               ]
             },
             {
@@ -1919,7 +1919,7 @@
               "name": "CompiledQuery",
               "kind": "type",
               "declarations": [
-                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
+                "export interface CompiledQuery {\n    sql: string;\n    base: TableSource;\n    joins: JoinPlan[];\n    select: SelectItem[];\n    predicates: Predicate[];\n    groupBy: Expression[];\n    having: Predicate[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    limit?: number;\n    offset?: number;\n    pendingSelectShape?: {\n        distinct: boolean;\n        groupingSets?: Expression[][];\n    };\n    pendingOutputAliases?: {\n        columns: string[];\n        sourceName: string;\n    };\n    pendingSetOrder?: true;\n    preserveUnoptimizedShape?: true;\n    distinctWildcard?: boolean;\n    limitParameter?: number;\n    offsetParameter?: number;\n    limitValidationParameters?: number[];\n    offsetValidationParameters?: number[];\n    limitWithTies?: boolean;\n    parameterCount?: number;\n    usesStatementDatetime?: boolean;\n    usesSequenceCalls?: boolean;\n    usesVolatileFunctions?: boolean;\n}"
               ]
             },
             {
@@ -1954,7 +1954,7 @@
               "name": "InsertValue",
               "kind": "type",
               "declarations": [
-                "export type InsertValue = QueryValue | DefaultInsertValue | {\n    parameter: number;\n};"
+                "export type InsertValue = QueryValue | DefaultInsertValue | DeferredInsertExpression | {\n    parameter: number;\n};"
               ]
             },
             {

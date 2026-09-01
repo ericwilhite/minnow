@@ -317,6 +317,24 @@ export interface CompiledQuery {
   }>;
   limit?: number;
   offset?: number;
+  /**
+   * A SELECT whose output width depends on an input wildcard. The parser preserves the raw
+   * shape until source schemas are available; the schema-binding pass then expands the
+   * wildcard and runs the ordinary SELECT lowering exactly once.
+   */
+  pendingSelectShape?: {
+    distinct: boolean;
+    groupingSets?: Expression[][];
+  };
+  /** Positional output names whose count cannot be checked until a wildcard is expanded. */
+  pendingOutputAliases?: {
+    columns: string[];
+    sourceName: string;
+  };
+  /** A compound tail whose ORDER BY ordinals depend on its first member's wildcard width. */
+  pendingSetOrder?: true;
+  /** Preserve `{ optimize: false }` after a deferred wildcard shape becomes concrete. */
+  preserveUnoptimizedShape?: true;
   distinctWildcard?: boolean;
   limitParameter?: number;
   offsetParameter?: number;

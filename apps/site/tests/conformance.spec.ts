@@ -3,9 +3,12 @@ import { expect, test } from "@playwright/test";
 test("the SQL compatibility page explains its checks", async ({ page }) => {
   await page.goto("/docs/conformance/");
   await expect(page.locator("h1")).toHaveText("SQL compatibility checks");
-  await expect(
-    page.getByText("Every supported example runs through both query executors."),
-  ).toBeVisible();
+  const executorClaim = page
+    .getByRole("listitem")
+    .filter({ hasText: "Every supported read example runs through both query executors." });
+  await expect(executorClaim).toContainText(
+    "Their rows and output-column metadata are compared even when the result is empty.",
+  );
   await expect(
     page.getByText(/SQLLogicTest adds thousands of database-neutral queries/),
   ).toBeVisible();

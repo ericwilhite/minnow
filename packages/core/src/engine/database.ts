@@ -182,6 +182,7 @@ import {
 } from "../transactions/index.js";
 import {
   applyWindowFunctions,
+  bindPendingSelectShapes,
   bindPlanParameters,
   bindStatementParameters,
   DUAL_TABLE,
@@ -202,6 +203,7 @@ import {
   expressionColumnNames,
   inferBlockSchema,
   inferResultColumnDomains,
+  isDeferredInsertExpression,
   isDefaultInsertValue,
   referencedColumns,
   childExpressions,
@@ -1404,6 +1406,112 @@ function insertStatementBatch(
     ...(Object.keys(omitted).length === 0 ? {} : { omitted }),
     rowCount: statement.rows.length,
   };
+}
+
+/** Resolves CURRENT_* in every retained DML expression with one statement-start clock. */
+function resolveMutationStatementDatetimes(
+  statement: CompiledStatement,
+  now: Date,
+): CompiledStatement {
+  const plan = (block: CompiledQuery): CompiledQuery =>
+    resolveStatementDatetimes({ ...block, usesStatementDatetime: true }, now);
+  const expression = (value: Expression): Expression => {
+    const resolved = plan({
+      sql: "(statement expression)",
+      base: { table: DUAL_TABLE, alias: DUAL_TABLE },
+      joins: [],
+      select: [{ expression: value, alias: "value" }],
+      predicates: [],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    });
+    return resolved.select[0]?.expression ?? value;
+  };
+  const predicates = <T extends { left: Expression; right: Expression }>(values: T[]): T[] =>
+    values.map((predicate) => ({
+      ...predicate,
+      left: expression(predicate.left),
+      right: expression(predicate.right),
+    }));
+
+  if (statement.kind === "insert") {
+    return {
+      ...statement,
+      rows: statement.rows.map((row) =>
+        row.map((value) =>
+          isDeferredInsertExpression(value) ? { expression: expression(value.expression) } : value,
+        ),
+      ),
+      ...(statement.query === undefined ? {} : { query: plan(statement.query) }),
+      ...(statement.onConflict === undefined
+        ? {}
+        : {
+            onConflict: {
+              ...statement.onConflict,
+              ...(statement.onConflict.assignments === undefined
+                ? {}
+                : {
+                    assignments: statement.onConflict.assignments.map((assignment) => ({
+                      ...assignment,
+                      expression: expression(assignment.expression),
+                    })),
+                  }),
+              ...(statement.onConflict.where === undefined
+                ? {}
+                : { where: expression(statement.onConflict.where) }),
+            },
+          }),
+    };
+  }
+  if (statement.kind === "update") {
+    return {
+      ...statement,
+      assignments: statement.assignments.map((assignment) => ({
+        ...assignment,
+        expression: expression(assignment.expression),
+      })),
+      predicates: predicates(statement.predicates),
+    };
+  }
+  if (statement.kind === "delete") {
+    return { ...statement, predicates: predicates(statement.predicates) };
+  }
+  if (statement.kind === "merge") {
+    return {
+      ...statement,
+      on: expression(statement.on),
+      branches: statement.branches.map((branch) => {
+        const condition =
+          branch.condition === undefined ? {} : { condition: expression(branch.condition) };
+        if (branch.when === "not-matched") {
+          return {
+            ...branch,
+            ...condition,
+            action: { ...branch.action, values: branch.action.values.map(expression) },
+          };
+        }
+        return {
+          ...branch,
+          ...condition,
+          action:
+            branch.action.kind === "update"
+              ? {
+                  ...branch.action,
+                  assignments: branch.action.assignments.map((assignment) => ({
+                    ...assignment,
+                    expression: expression(assignment.expression),
+                  })),
+                }
+              : branch.action,
+        };
+      }),
+    };
+  }
+  if (statement.kind === "create-table-as") {
+    return { ...statement, query: plan(statement.query) };
+  }
+  return statement;
 }
 
 /** Quotes a catalog identifier for internally generated SQL. */
@@ -3073,6 +3181,44 @@ export class MinnowDatabase {
       return value;
     }
     throw new TypeError(`DEFAULT produced an unsupported value: ${sql}`);
+  }
+
+  /** Materializes volatile/catalog-backed INSERT values once per execution, never in the cache. */
+  async #materializeInsertExpressions(
+    statement: Extract<CompiledStatement, { kind: "insert" }>,
+    statementNow: Date,
+  ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
+    if (!statement.rows.some((row) => row.some(isDeferredInsertExpression))) return statement;
+    const rows: InsertValue[][] = [];
+    for (const row of statement.rows) {
+      const materialized: InsertValue[] = [];
+      for (const value of row) {
+        if (!isDeferredInsertExpression(value)) {
+          materialized.push(value);
+          continue;
+        }
+        let plan: CompiledQuery = {
+          sql: "(insert value)",
+          base: { table: DUAL_TABLE, alias: DUAL_TABLE },
+          joins: [],
+          select: [{ expression: value.expression, alias: "value" }],
+          predicates: [],
+          groupBy: [],
+          having: [],
+          orderBy: [],
+          usesStatementDatetime: true,
+          usesSequenceCalls: true,
+          usesVolatileFunctions: true,
+        };
+        // Every CURRENT_* occurrence in all rows sees the same statement clock. RANDOM,
+        // GEN_RANDOM_UUID, and NEXTVAL remain per expression, as SQL requires.
+        plan = resolveStatementDatetimes(plan, statementNow);
+        const result = await this.#queryCompiled(plan, { memoize: false });
+        materialized.push(result.rows[0]?.value ?? null);
+      }
+      rows.push(materialized);
+    }
+    return { ...statement, rows };
   }
 
   async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
@@ -5198,20 +5344,16 @@ export class MinnowDatabase {
     if (domains.size > 0 && planReadsTable(rewritten, (name) => domains.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains);
     }
-    const qualified = qualifyCorrelatedReferences(rewritten, catalogColumns);
-    if (qualified !== rewritten) rewritten = optimizePlan(qualified);
-    if (!aliased && !natural) return rewritten;
-    // These two need column *order*, which only the records carry; both are rare enough that
-    // reading the catalog for them is fine.
-    const columns = new Map(
-      (await this.store.listTables()).map((table) => [
-        table.name,
-        table.columns.map(({ name }) => name),
-      ]),
-    );
-    const columnsOf = (name: string): readonly string[] | undefined => columns.get(name);
+    const columnsOf = (name: string): readonly string[] | undefined => {
+      const columns = catalogColumns.get(name);
+      if (columns === undefined) throw new UnknownTableError(name);
+      return columns;
+    };
+    rewritten = bindPendingSelectShapes(rewritten, columnsOf);
     if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
-    return natural ? expandNaturalJoins(rewritten, columnsOf) : rewritten;
+    if (natural) rewritten = expandNaturalJoins(rewritten, columnsOf);
+    const qualified = qualifyCorrelatedReferences(rewritten, catalogColumns);
+    return qualified === rewritten ? rewritten : optimizePlan(qualified);
   }
 
   /** Resolves connection-local sequence calls before either synchronous executor sees the plan. */
@@ -5220,7 +5362,12 @@ export class MinnowDatabase {
       (expression.kind === "call" &&
         (expression.name === "NEXTVAL" || expression.name === "CURRVAL")) ||
       childExpressions(expression).some(usesSequence);
-    const selected = new Set(plan.select.map((item) => item.expression));
+    const selected = new Set<Expression>();
+    const markSelected = (expression: Expression): void => {
+      selected.add(expression);
+      childExpressions(expression).forEach(markSelected);
+    };
+    plan.select.forEach((item) => markSelected(item.expression));
     const sequenceExpressions: Expression[] = [];
     forEachBlockExpression(plan, (expression) => {
       if (!usesSequence(expression)) return;
@@ -6768,7 +6915,10 @@ export class MinnowDatabase {
     }
     for (const trigger of triggers) {
       for (const statement of trigger.statements) {
-        const compiled = compileStatement(statement.sql);
+        const compiled = resolveMutationStatementDatetimes(
+          compileStatement(statement.sql),
+          this.#now(),
+        );
         if (compiled.kind === "insert") {
           await this.#applyTriggerInsertBody(
             transaction,
@@ -6813,8 +6963,12 @@ export class MinnowDatabase {
     if (target.uniqueKeyColumnId !== undefined) {
       throw new TypeError(`Trigger bodies insert into keyless tables only: ${target.name}`);
     }
-    const input = insertStatementBatch({ ...compiled, rows: derivedRows });
     const statementNow = this.#now();
+    const materialized = await this.#materializeInsertExpressions(
+      { ...compiled, rows: derivedRows },
+      statementNow,
+    );
+    const input = insertStatementBatch(materialized);
     const filled = await fillColumnDefaults(
       target,
       input,
@@ -9573,25 +9727,37 @@ export class MinnowDatabase {
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     if (statement.query === undefined) return statement;
     const target = await this.#findTable(statement.table);
+    const plan = await this.#applyCatalogRewrites(statement.query);
     let result: QueryResult;
     if (writer === undefined) {
-      const prepared = await this.#prepareCompiledPlan(statement.query);
+      const prepared = await this.#prepareCompiledPlan(plan);
       try {
         result = prepared.execute();
       } finally {
         prepared.close();
       }
     } else {
-      const plan = await this.#applyCatalogRewrites(statement.query);
       result = await writer.queryPlan(plan);
+    }
+    const insertColumns =
+      statement.columns.length > 0
+        ? statement.columns
+        : visibleTableColumns(target).map(({ name }) => name);
+    if (result.columns.length !== insertColumns.length) {
+      throw new TypeError(
+        statement.columns.length > 0
+          ? "INSERT ... SELECT must produce exactly the insert column count"
+          : "INSERT ... SELECT must produce exactly the table column count",
+      );
     }
     const { query, ...rest } = statement;
     void query;
-    const targetColumns = statement.columns.map((name) =>
+    const targetColumns = insertColumns.map((name) =>
       target.columns.find((column) => column.name === name),
     );
     return {
       ...rest,
+      columns: insertColumns,
       rows: result.rows.map((row) =>
         result.columns.map((column, position) =>
           storedSqlValueFromExecution(targetColumns[position], row[column] ?? null),
@@ -9611,6 +9777,8 @@ export class MinnowDatabase {
     statement: CompiledStatement,
     options: RunStatementOptions = {},
   ): Promise<ExecuteResult> {
+    const statementNow = this.#now();
+    statement = resolveMutationStatementDatetimes(statement, statementNow);
     if (statement.kind === "select") {
       return { kind: "rows", result: await this.query(statement.sql) };
     }
@@ -9732,7 +9900,8 @@ export class MinnowDatabase {
             })),
           ]),
         );
-        const tableColumns: TableColumnRecord[] = inferBlockSchema(statement.query, schemas).map(
+        const plan = await this.#applyCatalogRewrites(statement.query, before);
+        const tableColumns: TableColumnRecord[] = inferBlockSchema(plan, schemas).map(
           ({ name, type, integer, sqlDomain }) => ({
             id: this.#createId(),
             name: validateName(name, "Column"),
@@ -9755,7 +9924,6 @@ export class MinnowDatabase {
           before.catalogEpoch,
         );
         try {
-          const plan = await this.#applyCatalogRewrites(statement.query);
           const executionMemoryBudgetBytes = Math.min(
             this.#queryExecutionMemoryBudgetBytes,
             DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
@@ -10063,6 +10231,9 @@ export class MinnowDatabase {
     if (statement.kind === "transaction") {
       return this.#runTransactionStatement(statement.action, statement.name);
     }
+    if (statement.kind === "insert") {
+      statement = await this.#materializeInsertExpressions(statement, statementNow);
+    }
     if (options.writer === undefined) {
       // Selection, assignment evaluation, constraint proofs, trigger derivation, and the write
       // itself are one statement transaction. A genuine concurrent data commit does not rebase
@@ -10095,13 +10266,12 @@ export class MinnowDatabase {
         }
       }
     }
+    if (statement.kind === "insert" && statement.query !== undefined) {
+      statement = await this.#materializeInsertSelect(statement, options.writer);
+    }
     if (statement.kind === "insert" && statement.columns.length === 0) {
       const table = await this.#findTable(statement.table);
       const columns = visibleTableColumns(table).map((column) => column.name);
-      const producedColumns = statement.query?.select.length;
-      if (producedColumns !== undefined && producedColumns !== columns.length) {
-        throw new TypeError("INSERT ... SELECT must produce exactly the table column count");
-      }
       if (statement.defaultValues === true) {
         // Keep the empty column list: omission, not NULL, is what invokes catalog defaults.
       } else if (statement.rows.some((row) => row.length !== columns.length)) {
@@ -10110,12 +10280,12 @@ export class MinnowDatabase {
         statement = { ...statement, columns };
       }
     }
+    if (statement.kind === "insert") {
+      statement = await this.#materializeInsertExpressions(statement, statementNow);
+    }
     // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
     if (statement.returning !== undefined && options.returning === undefined) {
       options = { ...options, returning: statement.returning };
-    }
-    if (statement.kind === "insert" && statement.query !== undefined) {
-      statement = await this.#materializeInsertSelect(statement, options.writer);
     }
     if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
       statement = await this.#filterConflictingInsertRows(statement, options.writer);

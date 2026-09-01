@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DatabaseRow } from "./database.js";
 import { chooseJoinOrder, optimizePlan, renderPlan } from "./optimizer.js";
-import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import { bindPendingSelectShapes, compileQuery, executeQuery, executeRowQuery } from "./query.js";
 import { columnarTableFromRows } from "./vector.js";
 
 const rows: DatabaseRow[] = [
@@ -29,6 +29,17 @@ function expectEquivalent(sql: string): void {
 }
 
 describe("deterministic plan rewrites", () => {
+  it("preserves optimize:false when wildcard lowering is deferred until schema binding", () => {
+    const sql = "SELECT * FROM rows WHERE amount > 2 + 3";
+    const columnsOf = (table: string): readonly string[] | undefined =>
+      table === "rows" ? ["region", "amount", "ratio"] : undefined;
+    const raw = bindPendingSelectShapes(compileQuery(sql, { optimize: false }), columnsOf);
+    const optimized = bindPendingSelectShapes(compileQuery(sql), columnsOf);
+
+    expect(renderPlan(raw)).toContain("where amount > (2 + 3)");
+    expect(renderPlan(optimized)).toContain("where amount > 5");
+  });
+
   it("folds constant arithmetic and ROUND while preserving non-finite runtime semantics", () => {
     const optimized = optimizePlan(
       compileQuery("SELECT amount + 1 * 2 AS bumped FROM rows WHERE amount > 2 + 3", {

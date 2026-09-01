@@ -31,6 +31,10 @@ INSERT INTO shipments VALUES ('A-1', 1, CURRENT_TIMESTAMP)
 
 The value count must then equal the table's full column count. Prefer an explicit list in
 application code so a later schema change cannot silently change the positional meaning.
+Statement-time and volatile values are evaluated when the statement runs, not when its cached
+plan is compiled: `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIME` are stable across all rows
+of one statement, while `random()`, `gen_random_uuid()`, and `nextval(...)` run for each written
+expression.
 
 Columns you leave out use their catalog default, or `NULL` when they are nullable. A `NOT NULL`
 column without a value or a default is an error. PostgreSQL's explicit forms work too:
