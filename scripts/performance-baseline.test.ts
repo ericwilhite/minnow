@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  hasPerformanceRegression,
   parsePerformanceBaseline,
+  performanceRatioRange,
   runtimePerformanceProfile,
   selectPerformanceThresholds,
   updatedPerformanceBaseline,
@@ -64,5 +66,27 @@ describe("performance baseline profiles", () => {
         thresholds: { scan: { sqlite: 0.6, pglite: 0.3 } },
       },
     });
+  });
+
+  it("requires the full current timing range to cross a threshold", () => {
+    const minnow = { median: 10, best: 8, worst: 12 };
+    const engine = { median: 20, best: 18, worst: 24 };
+
+    expect(performanceRatioRange(minnow, engine)).toEqual({
+      typical: 0.5,
+      lower: 1 / 3,
+      upper: 2 / 3,
+    });
+    // The median moved beyond 0.4, but the samples still overlap the accepted range.
+    expect(hasPerformanceRegression(minnow, engine, 0.4)).toBe(false);
+    expect(hasPerformanceRegression(minnow, engine, 0.3)).toBe(true);
+  });
+
+  it("still catches a stable ratio beyond the threshold", () => {
+    const minnow = { median: 10, best: 10, worst: 10 };
+    const engine = { median: 20, best: 20, worst: 20 };
+
+    expect(hasPerformanceRegression(minnow, engine, 0.49)).toBe(true);
+    expect(hasPerformanceRegression(minnow, engine, 0.5)).toBe(false);
   });
 });

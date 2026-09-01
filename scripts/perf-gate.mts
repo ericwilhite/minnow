@@ -4,11 +4,11 @@
  * deliberately harsh baseline: the browser competitor is its Wasm build, which runs slower
  * than what is measured here.
  *
- * Each query's minnow/engine time ratio must stay at or below the checked-in threshold in
- * packages/core/perf-baseline.json. Thresholds pin the current ratios with headroom, separately
- * for each OS/architecture/Node-major profile, so the gate catches regressions rather than host
- * differences. Run with --update to add or rewrite the current runtime's thresholds after an
- * intentional change.
+ * Each query's full sampled minnow/engine time-ratio range must move above the checked-in
+ * threshold in packages/core/perf-baseline.json before it is called a regression. Thresholds pin
+ * the current ratios with headroom, separately for each OS/architecture/Node-major profile, so
+ * the gate catches regressions rather than host differences. Run with --update to add or rewrite
+ * the current runtime's thresholds after an intentional change.
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -23,7 +23,10 @@ import { MinnowDialect } from "../packages/kysely/src/dialect.js";
 import { Kysely } from "kysely";
 import {
   PERFORMANCE_ENGINES,
+  hasPerformanceRegression,
   parsePerformanceBaseline,
+  performanceRatio,
+  performanceRatioRange,
   runtimePerformanceProfile,
   selectPerformanceThresholds,
   updatedPerformanceBaseline,
@@ -77,9 +80,6 @@ const TARGET_SAMPLE_MS = 25;
 // Memo hits can complete in a few microseconds; 10k repeats is still a short sample but lets the
 // fastest path reach TARGET_SAMPLE_MS instead of deriving a release decision from timer jitter.
 const MAX_ITERATIONS = 10_000;
-/** A tiny floor remains, against a divide-by-zero on an engine that answers instantly. */
-const ratioOf = (minnowMs: number, engineMs: number): number =>
-  Math.max(minnowMs, 0.0001) / Math.max(engineMs, 0.0001);
 
 /**
  * How many times to repeat one query per timed sample. Measured once from a single run, so the
@@ -449,7 +449,7 @@ const MARGIN_CEILING = 1.5;
 const ONCE_ONLY_MARGIN = MARGIN_CEILING;
 
 function thresholdFor(minnow: Timing, engine: Timing): number {
-  const ratio = ratioOf(minnow.median, engine.median);
+  const ratio = performanceRatio(minnow.median, engine.median);
   if (!minnow.repeated || !engine.repeated) return ratio * ONCE_ONLY_MARGIN;
   // Both sides contribute uncertainty to the ratio, so their spreads compound. The extra 5%
   // covers what nine samples in one run cannot see: the drift between one run and the next.
@@ -1086,6 +1086,7 @@ const versus = (minnowMs: number, engineMs: number): string => {
   const ratio = minnowMs / engineMs;
   return ratio <= 1 ? `${(1 / ratio).toFixed(1)}x faster` : `${ratio.toFixed(1)}x slower`;
 };
+const formatRatio = (ratio: number): string => String(Number(ratio.toPrecision(3)));
 const failures: string[] = [];
 const newThresholds: PerformanceThresholds = {};
 for (const result of results) {
@@ -1095,10 +1096,10 @@ for (const result of results) {
   newThresholds[result.name] = shapeThresholds;
   for (const engine of ENGINES) {
     const engineMs = result.engine[engine].median;
-    // The reported comparison is median against median -- the typical cost, which is what a
-    // reader wants. The recorded threshold comes from the spread instead, so a shape is judged
-    // against its own noise rather than against a number picked for the noisiest shape.
-    const ratio = ratioOf(minnowMs, engineMs);
+    // The table reports median against median -- the typical cost, which is what a reader wants.
+    // The decision uses the lower edge of the full sampled ratio range, so a median moving inside
+    // ordinary timing spread is not mislabeled as a regression.
+    const ratios = performanceRatioRange(result.minnow, result.engine[engine]);
     // Significant digits rather than fixed decimals: a memo hit against a re-executing engine
     // is a ratio of 0.00015, which two decimals would round to a threshold of zero that nothing
     // can satisfy.
@@ -1106,13 +1107,17 @@ for (const result of results) {
       thresholdFor(result.minnow, result.engine[engine]).toPrecision(3),
     );
     const threshold = update ? undefined : baseline?.[result.name]?.[engine];
-    const flag = threshold !== undefined && ratio > threshold ? "!" : " ";
+    const regression =
+      threshold !== undefined &&
+      hasPerformanceRegression(result.minnow, result.engine[engine], threshold);
+    const flag = regression ? "!" : " ";
     line.push(
       `${engineMs.toFixed(2).padStart(10)} ${versus(minnowMs, engineMs).padStart(11)}${flag}`,
     );
-    if (threshold !== undefined && ratio > threshold) {
+    if (threshold !== undefined && regression) {
       failures.push(
-        `${result.name} vs ${engine}: ratio ${ratio.toFixed(2)} exceeds threshold ${String(threshold)} ` +
+        `${result.name} vs ${engine}: ratio ${formatRatio(ratios.typical)} ` +
+          `(sampled lower bound ${formatRatio(ratios.lower)}) exceeds threshold ${String(threshold)} ` +
           `(spread-calibrated threshold from this run: ${String(newThresholds[result.name]?.[engine])})`,
       );
     }

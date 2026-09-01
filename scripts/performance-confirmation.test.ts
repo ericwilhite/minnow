@@ -9,7 +9,7 @@ describe("performance regression confirmation", () => {
     expect(
       parsePerformanceFailures(`
 2 performance regression(s):
-  bulk-ingest vs sqlite: ratio 5.36 exceeds threshold 5.21
+  bulk-ingest vs sqlite: ratio 5.36 (sampled lower bound 5.24) exceeds threshold 5.21
   distinct-aggregate vs pglite: ratio 0.20 exceeds threshold 0.181
 Error: setup failed
 `),

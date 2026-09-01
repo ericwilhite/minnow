@@ -2,9 +2,9 @@
 #
 # It compares Minnow against SQLite and PGlite as a ratio, which survives a change of machine far
 # better than a wall-clock budget would — but a shared CI runner is still noisy enough that
-# blocking a merge on it would train everyone to re-run until green. Nightly instead, and confirm
-# each flagged comparison in a fresh process: a regression shows up within a day, while one-off
-# runner or JIT noise does not become a false alarm.
+# blocking a merge on it would train everyone to re-run until green. Nightly instead, require the
+# full sampled ratio range to cross its threshold, and confirm each flag in a fresh process: a
+# regression shows up within a day, while runner or JIT noise does not become a false alarm.
 name: Performance
 
 on:

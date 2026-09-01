@@ -94,12 +94,13 @@ application it starts.
   into non-running sample code, and the harness cannot drift from the page that runs it.
 - **The performance gate** detects regressions on stable seeded query shapes, reads and writes
   alike. Read-only engines calibrate their repeat counts independently so every fast path gets a
-  measurable sample; every stateful mutation window executes the same fixed 12-operation sequence
-  on all three engines and finishes with a cross-engine state check. The suite includes
-  exact-NUMERIC arithmetic, composite-key lookup, and the Kysely compilation/driver path as well
-  as direct SQL. It is a guardrail, not a published cross-engine benchmark: the comparison engines
-  run without indexes, which is fine for noticing that Minnow got slower and useless as a fair
-  cross-engine claim.
+  measurable sample. A regression is reported only when the full ratio range observed across
+  both engines' samples crosses the checked-in threshold, then repeats in a fresh process. Every
+  stateful mutation window executes the same fixed 12-operation sequence on all three engines and
+  finishes with a cross-engine state check. The suite includes exact-NUMERIC arithmetic,
+  composite-key lookup, and the Kysely compilation/driver path as well as direct SQL. It is a
+  guardrail, not a published cross-engine benchmark: the comparison engines run without indexes,
+  which is fine for noticing that Minnow got slower and useless as a fair cross-engine claim.
 
 ## SQLLogicTest: broad, strict SQL correctness
 
