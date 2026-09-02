@@ -133,10 +133,14 @@ class MinnowKyselyConnection implements DatabaseConnection {
       // Minnow's cursor reads SELECT statements only. Kysely also streams INSERT, UPDATE, and
       // DELETE builders with RETURNING, so a mutation runs buffered and hands its returned rows
       // out in chunks, as PostgreSQL's cursor-backed dialect would.
+      // Validate before execution: a bad chunk size must never commit a mutation first and fail
+      // (or silently yield the wrong rows) afterward.
+      if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
+        throw new RangeError("Query batch rows must be a positive whole number");
+      }
       const result = await this.executeQuery<R>(compiledQuery, options);
-      const size = Math.max(1, Math.trunc(chunkSize));
-      for (let start = 0; start < result.rows.length; start += size) {
-        yield { rows: result.rows.slice(start, start + size) };
+      for (let start = 0; start < result.rows.length; start += chunkSize) {
+        yield { rows: result.rows.slice(start, start + chunkSize) };
       }
       return;
     }

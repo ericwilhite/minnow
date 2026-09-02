@@ -1423,6 +1423,20 @@ describe("MinnowDialect", () => {
       deleted.push(row.id);
     }
     expect(deleted).toEqual([4]);
+    await expect(async () => {
+      for await (const row of db
+        .updateTable("person")
+        .set({ score: 99 })
+        .where("id", "=", 1)
+        .returning("id")
+        .stream(0)) {
+        void row;
+      }
+    }).rejects.toThrow("Query batch rows must be a positive whole number");
+    // Validation happens before execution, so an invalid stream cannot commit its mutation.
+    expect(
+      await db.selectFrom("person").select("score").where("id", "=", 1).executeTakeFirst(),
+    ).toEqual({ score: 8 });
     // The stream released the connection, so the next statement runs.
     expect(await db.selectFrom("person").select("id").orderBy("id").execute()).toEqual([
       { id: 1 },

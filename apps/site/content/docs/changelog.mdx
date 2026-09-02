@@ -23,7 +23,9 @@ Stored formats are unchanged and no migration is needed.
   now bind, inside and outside a transaction.
 - `@minnowdb/kysely` streams `INSERT`, `UPDATE`, and `DELETE ... RETURNING` builders. Minnow's
   cursor reads only `SELECT`, so `.stream()` on a mutation failed with "Expected SELECT"; the
-  driver now runs the mutation buffered and yields its returned rows in chunks.
+  driver now runs the mutation buffered and yields its returned rows in chunks. It validates that
+  `chunkSize` is a positive whole number before executing, so an invalid size cannot commit the
+  mutation and then fail or yield the wrong rows.
 - `@minnowdb/kysely` introspection reports a `DATE` column's data type as `date`, not `text`.
 - `@minnowdb/kysely` keeps `resultDecoding` in a DB map that also carries hand-written tables
   (`Kysely<InferKyselyDatabase<...> & Extra>`). `cast(..., "numeric")` and the JSON functions
@@ -42,8 +44,9 @@ Stored formats are unchanged and no migration is needed.
   alternative, where the engine answered with a bare parse error: the T-SQL `identity()` column
   modifier (use `autoIncrement()`, `serial`, or `generatedAlwaysAsIdentity()`),
   `ADD COLUMN IF NOT EXISTS`, inline `addIndex()` in `createTable()`, `DROP TEMPORARY TABLE`,
-  `DROP MATERIALIZED VIEW`, `DROP VIEW` / `DROP INDEX ... CASCADE`, `dropIndex().on(table)`,
-  deferrable constraints, table-level `NULLS NOT DISTINCT` and expression unique constraints,
+  `DROP MATERIALIZED VIEW`, `DROP VIEW` / `DROP INDEX ... CASCADE`, `dropIndex().on(table)`, any
+  explicit `DEFERRABLE`/`INITIALLY` constraint modifier, table-level `NULLS NOT DISTINCT` and
+  expression unique constraints,
   `MERGE ... WHEN NOT MATCHED BY SOURCE`, and multi-table `updateTable([...])` /
   `deleteFrom([...])`.
 - `@minnowdb/kysely` refuses the JSON path operators `->$` and `->>$`. They compile to a path

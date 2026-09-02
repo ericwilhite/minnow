@@ -522,17 +522,18 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
 
   static readonly #DEFERRABLE_CONSTRAINT =
     "Minnow does not support deferrable constraints; every constraint is checked by the " +
-    "statement that writes. Remove .deferrable()/.initiallyDeferred().";
+    "statement that writes. Remove .deferrable()/.notDeferrable() and " +
+    ".initiallyDeferred()/.initiallyImmediate().";
 
   protected override visitPrimaryKeyConstraint(node: PrimaryKeyConstraintNode): void {
-    if (node.deferrable === true || node.initiallyDeferred === true) {
+    if (node.deferrable !== undefined || node.initiallyDeferred !== undefined) {
       throw new TypeError(MinnowQueryCompiler.#DEFERRABLE_CONSTRAINT);
     }
     super.visitPrimaryKeyConstraint(node);
   }
 
   protected override visitUniqueConstraint(node: UniqueConstraintNode): void {
-    if (node.deferrable === true || node.initiallyDeferred === true) {
+    if (node.deferrable !== undefined || node.initiallyDeferred !== undefined) {
       throw new TypeError(MinnowQueryCompiler.#DEFERRABLE_CONSTRAINT);
     }
     if (node.nullsNotDistinct === true) {
@@ -551,7 +552,7 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   }
 
   protected override visitForeignKeyConstraint(node: ForeignKeyConstraintNode): void {
-    if (node.deferrable === true || node.initiallyDeferred === true) {
+    if (node.deferrable !== undefined || node.initiallyDeferred !== undefined) {
       throw new TypeError(MinnowQueryCompiler.#DEFERRABLE_CONSTRAINT);
     }
     super.visitForeignKeyConstraint(node);

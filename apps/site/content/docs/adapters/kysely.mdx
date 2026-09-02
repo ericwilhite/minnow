@@ -398,6 +398,7 @@ Blocking SQL remains correct through the engine's materialized/spill path. The
 
 `.stream()` on an insert, update, or delete with `RETURNING` runs the statement buffered and hands
 its returned rows out in chunks of `chunkSize`, because Minnow's cursor reads only `SELECT`.
+`chunkSize` must be a positive whole number; an invalid size is rejected before the mutation runs.
 
 ## Cancellation
 
@@ -488,7 +489,8 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
     column lists and `CREATE VIEW IF NOT EXISTS`, non-stored generated columns,
     `DROP`/`ALTER TYPE`, `DROP VIEW` and `DROP INDEX` with `CASCADE`, `dropIndex().on(table)`,
     index access methods (`.using()`), partial and expression indexes, expression unique
-    constraints, deferrable constraints, and `NULLS NOT DISTINCT`.
+    constraints, any explicit `DEFERRABLE`/`INITIALLY` constraint modifier, and
+    `NULLS NOT DISTINCT`.
 
   Anything else outside the profile is rejected explicitly by the engine — for one example,
   a correlated lateral subquery with `ORDER BY`/`LIMIT` (rank with a window function instead) —

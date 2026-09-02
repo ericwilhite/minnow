@@ -1196,7 +1196,19 @@ describe("compile-time refusals for engine-unsupported forms", () => {
     expect(() =>
       create()
         .addColumn("a", "integer")
+        .addPrimaryKeyConstraint("pk", ["a"], (cb) => cb.notDeferrable())
+        .compile(),
+    ).toThrow("Minnow does not support deferrable constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
         .addUniqueConstraint("u", ["a"], (cb) => cb.initiallyDeferred())
+        .compile(),
+    ).toThrow("Minnow does not support deferrable constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
+        .addUniqueConstraint("u", ["a"], (cb) => cb.initiallyImmediate())
         .compile(),
     ).toThrow("Minnow does not support deferrable constraints");
     expect(() =>
@@ -1215,6 +1227,12 @@ describe("compile-time refusals for engine-unsupported forms", () => {
       create()
         .addColumn("a", "integer")
         .addForeignKeyConstraint("fk", ["a"], "users", ["userId"], (cb) => cb.deferrable())
+        .compile(),
+    ).toThrow("Minnow does not support deferrable constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
+        .addForeignKeyConstraint("fk", ["a"], "users", ["userId"], (cb) => cb.initiallyImmediate())
         .compile(),
     ).toThrow("Minnow does not support deferrable constraints");
     expect(() =>
