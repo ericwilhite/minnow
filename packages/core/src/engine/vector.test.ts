@@ -446,6 +446,33 @@ describe("vector query execution", () => {
     below.close();
   });
 
+  it("keeps top-N exact when the first key arrives sorted against the requested direction", () => {
+    // `ORDER BY id DESC LIMIT n` over a table stored in ascending key order: every row would
+    // improve on the cut line, so the bounded sink walks such batches backwards. The answer
+    // must equal the row executor's full sort for every paging shape, filtered or not.
+    const rows: DatabaseRow[] = Array.from({ length: 20_000 }, (_, index) => ({
+      id: index + 1,
+      amount: (index * 37) % 1000,
+      // Runs of equal keys and a few descents, so a batch is not always ascending.
+      wave: index % 4096 === 0 ? 0 : Math.floor(index / 3),
+    }));
+    const tables = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT id FROM rows ORDER BY id DESC LIMIT 20",
+      "SELECT id FROM rows ORDER BY id DESC LIMIT 20 OFFSET 40",
+      "SELECT id FROM rows ORDER BY id DESC LIMIT 5000 OFFSET 7",
+      "SELECT id, amount FROM rows WHERE id < 15000 ORDER BY id DESC LIMIT 20",
+      "SELECT id, amount FROM rows WHERE amount > 500 ORDER BY id DESC LIMIT 30 OFFSET 3",
+      "SELECT id, wave FROM rows ORDER BY wave DESC, id LIMIT 25",
+      "SELECT id, wave FROM rows ORDER BY wave DESC, id DESC LIMIT 25 OFFSET 2",
+      "SELECT id FROM rows ORDER BY id LIMIT 20",
+      "SELECT id FROM rows WHERE id > 100 ORDER BY id LIMIT 20 OFFSET 1",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, tables).rows, sql).toEqual(executeRowQuery(plan, tables).rows);
+    }
+  });
+
   it("applies LIMIT in place without allocating a second boxed reference slice", () => {
     const plan = compileQuery("SELECT id FROM rows LIMIT 2");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }, { id: 3 }]]]);

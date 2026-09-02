@@ -22,7 +22,8 @@ export interface PointReadShape {
   /** Conjunctive equalities, in predicate order; may repeat a column. */
   equalities: PointReadEquality[];
   /** Plain column projections, in select order. */
-  select: Array<{ column: string; alias: string }>;
+  /** Projected columns, or "*" for a bare wildcard the catalog expands at execution. */
+  select: Array<{ column: string; alias: string }> | "*";
 }
 
 /** The statement-shaped half of the analysis, computed once per cached plan. */
@@ -31,7 +32,8 @@ interface PointReadTemplate {
   equalities: Array<
     { column: string; value: PointReadValue } | { column: string; parameter: number }
   >;
-  select: Array<{ column: string; alias: string }>;
+  /** Projected columns, or "*" for a bare wildcard the catalog expands at execution. */
+  select: Array<{ column: string; alias: string }> | "*";
 }
 
 /**
@@ -118,11 +120,22 @@ function pointReadTemplate(plan: CompiledQuery): PointReadTemplate | undefined {
   ) {
     return undefined;
   }
-  const select: PointReadTemplate["select"] = [];
-  for (const item of plan.select) {
-    const column = baseColumnReference(item.expression, base.alias);
-    if (column === undefined) return undefined;
-    select.push({ column, alias: item.alias });
+  let select: PointReadTemplate["select"] = [];
+  const first = plan.select[0];
+  if (
+    plan.select.length === 1 &&
+    first?.expression.kind === "wildcard" &&
+    (first.expression.table === undefined || first.expression.table === base.alias)
+  ) {
+    // `SELECT * FROM t WHERE key = ?` is the commonest point lookup; the catalog names the
+    // columns when the read is served, in declaration order like the ordinary executor.
+    select = "*";
+  } else {
+    for (const item of plan.select) {
+      const column = baseColumnReference(item.expression, base.alias);
+      if (column === undefined) return undefined;
+      select.push({ column, alias: item.alias });
+    }
   }
   const equalities: PointReadTemplate["equalities"] = [];
   for (const predicate of plan.predicates) {

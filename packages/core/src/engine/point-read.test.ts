@@ -345,7 +345,6 @@ describe("point-read fast path", () => {
       ["SELECT payload FROM orders WHERE tenant = ? AND id = ? LIMIT 1", ["tenant-2", 3]],
       ["SELECT payload FROM orders WHERE tenant = ? AND id = ? ORDER BY id", ["tenant-2", 3]],
       ["SELECT DISTINCT payload FROM orders WHERE tenant = ? AND id = ?", ["tenant-2", 3]],
-      ["SELECT * FROM orders WHERE tenant = ? AND id = ?", ["tenant-2", 3]],
       ["SELECT UPPER(payload) AS p FROM orders WHERE tenant = ? AND id = ?", ["tenant-2", 3]],
       ["SELECT payload FROM orders WHERE tenant = ?", ["tenant-2"]],
       ["SELECT payload FROM orders WHERE id = ?", [3]],
@@ -354,6 +353,15 @@ describe("point-read fast path", () => {
       const { served } = await differential(database, sql, params);
       expect(served).toBe(false);
     }
+    // The commonest point lookup spelling: the wildcard expands from the catalog at serving
+    // time, in declaration order, with the same columns the ordinary executor projects.
+    const wildcard = await differential(
+      database,
+      "SELECT * FROM orders WHERE tenant = ? AND id = ?",
+      ["tenant-2", 3],
+    );
+    expect(wildcard.served).toBe(true);
+    expect(wildcard.rows).toHaveLength(1);
     await database.close();
   });
 

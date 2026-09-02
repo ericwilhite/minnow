@@ -5640,7 +5640,11 @@ export class MinnowDatabase {
     // paths cross the result boundary through the same externalizeQueryResult call, so
     // reporting the column's domain below makes the answers identical by construction.
     const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
-    for (const item of shape.select) {
+    const selected =
+      shape.select === "*"
+        ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
+        : shape.select;
+    for (const item of selected) {
       const column = columnByName.get(item.column);
       if (column === undefined || column.hidden === true) return undefined;
       projected.push({ column, alias: item.alias });
@@ -5794,7 +5798,7 @@ export class MinnowDatabase {
       }
     }
     return {
-      columns: shape.select.map((item) => item.alias),
+      columns: projected.map((item) => item.alias),
       columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
       rows,
     };

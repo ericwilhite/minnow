@@ -1889,6 +1889,8 @@ function createDirectLookup(
 interface ScanResultSink {
   readonly size: number;
   tryAddBatch(batch: BatchRows): boolean;
+  /** The batch loop over a filtered selection; false when the sink shape needs per-row adds. */
+  tryAddSelection(batch: BatchRows, selection: Uint32Array, survivors: number): boolean;
   add(batch: BatchRows, row: number): void;
   finish(): QueryRow[];
 }
@@ -2044,6 +2046,7 @@ async function executeBoundPlanBatches(
                 return values.length;
               },
               tryAddBatch: () => false,
+              tryAddSelection: () => false,
               add: (batch, row) => {
                 values.push(
                   asQueryValue(evaluateBatchExpression(scanPlan, firstExpression, batch, row)),
@@ -4022,6 +4025,14 @@ class ResultSink {
    * Returns false when the sink shape needs the per-row path.
    */
   tryAddBatch(batch: BatchRows): boolean {
+    return this.#tryAddRows(batch, undefined, batch.length);
+  }
+
+  tryAddSelection(batch: BatchRows, selection: Uint32Array, survivors: number): boolean {
+    return this.#tryAddRows(batch, selection, survivors);
+  }
+
+  #tryAddRows(batch: BatchRows, selection: Uint32Array | undefined, count: number): boolean {
     const fast = this.#fastFirstKey;
     if (this.#capacity === undefined || fast === undefined) return false;
     const rows = batch.rowsBySource[fast.source];
@@ -4033,7 +4044,18 @@ class ResultSink {
     const windowStart = window?.start ?? 0;
     const windowLength = window?.length ?? vector.length;
     const desc = fast.desc;
-    for (let row = 0; row < batch.length; row += 1) {
+    // A key that arrives sorted against the requested direction — `ORDER BY id DESC` over a
+    // table stored in key order, the newest-first page — would otherwise improve on the cut
+    // line on every row and rebuild the selection 200,000 times. Walking such a batch from
+    // its last row establishes the cut line within `capacity` rows and rejects the rest on the
+    // float comparison. Row order within a batch never affects the answer: ties keep the
+    // earlier `seq`, and seq numbers are assigned in scan order below either way.
+    const reversed = desc && this.#batchKeyIsAscending(rows, vector, selection, count);
+    const firstSeq = this.#seq;
+    for (let step = 0; step < count; step += 1) {
+      const position = reversed ? count - 1 - step : step;
+      const row = selection === undefined ? position : (selection[position] ?? 0);
+      if (reversed) this.#seq = firstSeq + position;
       const threshold = this.#thresholdFirst;
       if (threshold === undefined || threshold === null) {
         this.#addCandidate(batch, row);
@@ -4051,6 +4073,33 @@ class ResultSink {
         }
       }
       this.#addCandidate(batch, row);
+    }
+    if (reversed) this.#seq = firstSeq + count;
+    return true;
+  }
+
+  /**
+   * Whether the rows to add read the first order key in ascending order, checked directly on
+   * the resident values: one unboxed pass, cheaper than a single candidate insertion.
+   */
+  #batchKeyIsAscending(
+    rows: Int32Array | undefined,
+    vector: NumberVector | DateTimeVector,
+    selection: Uint32Array | undefined,
+    count: number,
+  ): boolean {
+    if (rows === undefined || count < 2) return false;
+    const windowStart = vector.window?.start ?? 0;
+    const values = vector.values;
+    const validity = vector.validity;
+    let previous = Number.NEGATIVE_INFINITY;
+    for (let position = 0; position < count; position += 1) {
+      const row = selection === undefined ? position : (selection[position] ?? 0);
+      const slot = (rows[row] ?? -1) - windowStart;
+      if (slot < 0 || slot >= values.length || !isValid(validity, slot)) return false;
+      const value = values[slot] ?? 0;
+      if (!(value >= previous)) return false;
+      previous = value;
     }
     return true;
   }
@@ -4719,6 +4768,7 @@ function consumeBatch(
       }
       return;
     }
+    if (output.tryAddSelection(batch, selection, survivors)) return;
     for (let index = 0; index < survivors; index += 1) {
       output.add(batch, selection[index] ?? 0);
       if (reachedEarlyLimit(plan, output.size)) return;
@@ -4865,13 +4915,25 @@ function updateAggregates(
     // the single surviving value.
     if (spec.rawDatetime !== undefined) {
       const sourceRow = batch.rowsBySource[spec.rawDatetime.source]?.[row] ?? -1;
-      applyAggregateValue(
-        spec,
-        state,
-        index,
-        rawFloat64Value(spec.rawDatetime.vector, sourceRow),
-        memory,
-      );
+      const value = rawFloat64Value(spec.rawDatetime.vector, sourceRow);
+      if (
+        value !== null &&
+        spec.distinct !== true &&
+        (spec.name === "MIN" || spec.name === "MAX")
+      ) {
+        // Epoch milliseconds compare as plain numbers; the generic comparator would classify
+        // both operands on every row of the scan.
+        state.counts[index] = (state.counts[index] ?? 0) + 1;
+        const current = state.values[index];
+        if (
+          typeof current !== "number" ||
+          (spec.name === "MIN" ? value < current : value > current)
+        ) {
+          replaceAggregateValue(state, index, value, `${spec.name} aggregate value`, memory);
+        }
+        continue;
+      }
+      applyAggregateValue(spec, state, index, value, memory);
       continue;
     }
     // A bare number column reads its Float64Array slot directly and accumulates SUM/AVG into
@@ -4887,15 +4949,22 @@ function updateAggregates(
         state.counts[index] = (state.counts[index] ?? 0) + 1;
         if (spec.name === "SUM" || spec.name === "AVG") {
           state.sums[index] = (state.sums[index] ?? 0) + value;
-        } else if (spec.name === "MIN") {
+        } else if (spec.name === "MIN" || spec.name === "MAX") {
+          // A raw number compares as a number. NaN keeps compareValues's place, after every
+          // finite value: it is never the minimum and always the maximum once seen.
           const current = state.values[index];
-          if (current === undefined || compareValues(value, current) < 0) {
-            replaceAggregateValue(state, index, value, "MIN aggregate value", memory);
-          }
-        } else if (spec.name === "MAX") {
-          const current = state.values[index];
-          if (current === undefined || compareValues(value, current) > 0) {
-            replaceAggregateValue(state, index, value, "MAX aggregate value", memory);
+          const better =
+            typeof current !== "number"
+              ? true
+              : Number.isNaN(value)
+                ? spec.name === "MAX" && !Number.isNaN(current)
+                : Number.isNaN(current)
+                  ? spec.name === "MIN"
+                  : spec.name === "MIN"
+                    ? value < current
+                    : value > current;
+          if (better) {
+            replaceAggregateValue(state, index, value, `${spec.name} aggregate value`, memory);
           }
         }
       }
