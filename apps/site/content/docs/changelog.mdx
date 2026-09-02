@@ -58,11 +58,12 @@ UPPER(name) AS label` — evaluated with `SELECT` semantics over the affected ro
 
 ### Changed
 
-- Wildcard outputs (`SELECT *`, `SELECT t.*`) keep their bare column names, as PostgreSQL
-  returns them. Only a name that two sources both contribute — `id` in `SELECT *` over a join on
-  `id` — is returned as `alias.column`. Previously every wildcard output over more than one
-  source was alias-qualified. Kysely's `selectAll("u")` on a join now returns the keys its types
-  declare.
+- Result rows from a wildcard select over a join (`SELECT *` or `SELECT u.*` with more than one
+  source) now use plain column names as their keys, the names PostgreSQL returns. Previously every
+  such key was `alias.column`. Only a column name that both sides of the join contribute keeps the
+  qualified form, because one row object cannot hold two properties of the same name. The SQL
+  itself is unchanged; only the property names on the returned rows differ. Kysely's
+  `selectAll("u")` on a join now returns the keys its types declare.
 - A constant on one key of an inner join or semi-join (`=`, `IN`, a range) is mirrored onto the
   other key, so the other table filters before the join, through its secondary index or unique
   key when one applies. `DATE_TRUNC('unit', col) = ts` and `EXTRACT(YEAR FROM col) = n` plan
@@ -76,9 +77,19 @@ UPPER(name) AS label` — evaluated with `SELECT` semantics over the affected ro
 
 ### Migration
 
-Programs that read `SELECT *` results over a join by `alias.column` keys must switch to the bare
-column name, except for names both sides contribute, which keep the qualified form. Everything
-else is additive; forms that previously threw now execute.
+No SQL needs to change. One result shape does: the property names on rows returned by a wildcard
+select over a join. Given
+
+```sql
+SELECT * FROM users u JOIN teams t ON t.team_id = u.team_id
+```
+
+0.6.9 returned `{ "u.user_id": 1, "u.name": "Ada", "u.team_id": 1, "t.team_id": 1, "t.team_name": "Red" }`,
+and 0.7.0 returns `{ user_id: 1, name: "Ada", "u.team_id": 1, "t.team_id": 1, team_name: "Red" }`.
+Application code that reads such a row as `row["u.name"]` should read `row.name`; `team_id`
+stays qualified on both sides because both tables have it. Queries that name their columns
+(`SELECT u.name, t.team_name …`) and single-table `SELECT *` already returned plain keys and are
+unaffected. Everything else in this release is additive; forms that previously threw now execute.
 
 ### Storage compatibility
 
