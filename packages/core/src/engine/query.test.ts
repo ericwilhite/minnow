@@ -1175,15 +1175,16 @@ describe("public SQL queries", () => {
   it("rejects unsupported DISTINCT and HAVING forms explicitly", () => {
     // DISTINCT * compiles; its wildcard expands against input schemas at execution.
     expect(compileQuery("SELECT DISTINCT * FROM rows").distinctWildcard).toBe(true);
-    expect(() => compileQuery("SELECT DISTINCT COUNT(*) AS count FROM rows")).toThrow(
-      "SELECT DISTINCT cannot be combined with aggregate functions",
-    );
-    expect(() => compileQuery("SELECT DISTINCT category FROM rows GROUP BY category")).toThrow(
-      "SELECT DISTINCT cannot be combined with GROUP BY",
-    );
-    expect(() => compileQuery("SELECT DISTINCT category FROM rows HAVING COUNT(*) > 1")).toThrow(
-      "SELECT DISTINCT cannot be combined with HAVING",
-    );
+    // DISTINCT over a grouped, aggregated, or windowed block takes the distinct rows of that
+    // block's output, as PostgreSQL does; the block runs inside a derived table.
+    for (const sql of [
+      "SELECT DISTINCT COUNT(*) AS count FROM rows",
+      "SELECT DISTINCT category FROM rows GROUP BY category",
+      "SELECT DISTINCT category FROM rows GROUP BY category HAVING COUNT(*) > 1",
+      "SELECT DISTINCT category, ROW_NUMBER() OVER (ORDER BY category) AS rn FROM rows",
+    ]) {
+      expect(compileQuery(sql).base.alias, sql).toBe("(distinct)");
+    }
     expect(() => compileQuery("SELECT value FROM rows HAVING value > 1")).toThrow(
       "HAVING requires GROUP BY or aggregate functions",
     );

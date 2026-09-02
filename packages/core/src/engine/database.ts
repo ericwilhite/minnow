@@ -10458,21 +10458,26 @@ export class MinnowDatabase {
             }));
           })();
     const referenced = new Set([keyColumn.name, ...(returningColumns ?? [])]);
-    if (statement.kind === "update") {
-      for (const assignment of updateAssignments) {
-        for (const column of expressionColumnNames(assignment.expression)) {
-          referenced.add(column.split(".").at(-1) ?? column);
-        }
-      }
-    }
+    // Each assignment rides the read as a hidden select item, so a scalar subquery in SET —
+    // correlated or not — resolves through the ordinary query pipeline (decorrelation, one
+    // snapshot for the uncorrelated) instead of a per-row evaluator that cannot run one.
+    const assignmentAlias = (column: string): string => `\u0000set:${column}`;
     const plan = optimizePlan({
       sql: `(${statement.kind})`,
-      base: { table: table.name, alias: table.name },
+      base: { table: table.name, alias: statement.alias ?? table.name },
       joins: [],
-      select: [...referenced].map((name) => ({
-        expression: { kind: "column" as const, reference: name },
-        alias: name,
-      })),
+      select: [
+        ...[...referenced].map((name) => ({
+          expression: { kind: "column" as const, reference: name },
+          alias: name,
+        })),
+        ...(statement.kind === "update"
+          ? updateAssignments.map((assignment) => ({
+              expression: assignment.expression,
+              alias: assignmentAlias(assignment.column),
+            }))
+          : []),
+      ],
       predicates: statement.predicates,
       groupBy: [],
       having: [],
@@ -10574,7 +10579,7 @@ export class MinnowDatabase {
       if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
       const executionValues = returnedChanges === undefined ? undefined : ([] as BatchValue[]);
       changes[assignment.column] = rows.map((row) => {
-        const value = evaluateRowExpression(assignment.expression, table.name, row);
+        const value = row[assignmentAlias(assignment.column)] ?? null;
         if (typeof value === "number" && !Number.isFinite(value)) {
           throw new TypeError(
             `UPDATE assignment produced a non-finite number: ${assignment.column}`,

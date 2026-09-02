@@ -990,25 +990,27 @@ describe("compile-time refusals for engine-unsupported forms", () => {
         .createTable("t")
         .addColumn("id", "serial", (col) => col.primaryKey())
         .compile(),
-    ).not.toThrow(); // "serial" is a data type; the engine names the unsupported type itself.
+    ).not.toThrow(); // SERIAL is PostgreSQL's auto-increment pseudo-type; the engine accepts it.
+    // Auto-increment, identity, and serial columns all compile: the engine reads each as its
+    // auto-increment default, so a Kysely migration can declare the key without the schema DSL.
     expect(() =>
       db.schema
         .createTable("t")
         .addColumn("id", "integer", (col) => col.autoIncrement().primaryKey())
         .compile(),
-    ).toThrow("Minnow does not support serial/identity/auto-increment DDL in SQL");
+    ).not.toThrow();
     expect(() =>
       db.schema
         .createTable("t")
-        .addColumn("id", "integer", (col) => col.generatedAlwaysAsIdentity())
+        .addColumn("id", "integer", (col) => col.generatedAlwaysAsIdentity().primaryKey())
         .compile(),
-    ).toThrow("Minnow does not support serial/identity/auto-increment DDL in SQL");
+    ).not.toThrow();
     expect(() =>
       db.schema
         .createTable("t")
-        .addColumn("id", "integer", (col) => col.identity())
+        .addColumn("id", "integer", (col) => col.identity().primaryKey())
         .compile(),
-    ).toThrow("Minnow does not support serial/identity/auto-increment DDL in SQL");
+    ).not.toThrow();
     expect(() =>
       db.schema
         .createTable("t")

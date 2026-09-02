@@ -431,17 +431,6 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   }
 
   protected override visitColumnDefinition(node: ColumnDefinitionNode): void {
-    if (
-      node.autoIncrement === true ||
-      node.identity === true ||
-      node.generated?.identity === true
-    ) {
-      throw new TypeError(
-        "Minnow does not support serial/identity/auto-increment DDL in SQL. Declare the " +
-          "column with Minnow's schema DSL (column.integer().autoIncrement()) and migrate, or " +
-          "default the column to nextval() of a CREATE SEQUENCE sequence.",
-      );
-    }
     if (node.unsigned === true) {
       throw new TypeError(
         "Minnow does not support MySQL's UNSIGNED integers. Use a plain integer column and a " +

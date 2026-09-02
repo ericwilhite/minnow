@@ -28,14 +28,16 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // NUMERIC rendering, the -> and ->> JSON operators, exact numeric constants (PostgreSQL's
 // NUMERIC typing of decimal and big-integer literals, with compile-time exact folding), and
 // PostgreSQL quotient-scale selection, schema-bound wildcard lowering, execution-time DML
-// scalar materialization, and PostgreSQL GROUP BY / set-operation tail resolution intentionally
-// expand the complete engine surface.
-// Measured: 745.4 KiB raw / 213.3 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 746 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 214 * 1024;
-// Measured with the larger durable adapter: 1078.5 KiB raw / 296.1 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1079 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 297 * 1024;
+// scalar materialization, PostgreSQL GROUP BY / set-operation tail resolution, untyped-literal
+// coercion, the table-driven PostgreSQL scalar function surface (TO_CHAR templates, regular
+// expressions, MD5, FORMAT, AGE), mutation aliases with subquery assignments, and SERIAL /
+// IDENTITY DDL intentionally expand the complete engine surface.
+// Measured: 767.6 KiB raw / 220.3 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 769 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 221 * 1024;
+// Measured with the larger durable adapter: 1100.7 KiB raw / 303.7 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1102 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 304 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

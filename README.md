@@ -33,7 +33,7 @@ and benchmarks that run in your browser.
   OPFS performs it. Every query reads one stable snapshot, even when another tab commits at the
   same time, and origin-persistence policy is explicit for applications that cannot accept
   automatic quota eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 294 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 304 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so

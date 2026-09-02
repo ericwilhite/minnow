@@ -37,6 +37,18 @@ CREATE TABLE order_items (
 Primary-key components are immutable. Composite identity uses an internal scalar locator, so it
 does not add tuple comparison work to ordinary scans.
 
+A `SERIAL`, `BIGSERIAL`, or `SMALLSERIAL` column, a column declared `GENERATED { ALWAYS | BY
+DEFAULT } AS IDENTITY`, and SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT` all read as the table's
+auto-increment key, the same thing the schema DSL's `column.integer().autoIncrement()` declares:
+omitted values count up from 1, an explicit value is accepted without advancing the counter (as
+a PostgreSQL sequence behaves), and identity sequence options in parentheses are accepted and
+ignored. The counter belongs to the
+row identity, so the column must be the primary key.
+
+```sql
+CREATE TABLE events (id SERIAL PRIMARY KEY, kind TEXT NOT NULL, at TIMESTAMP DEFAULT NOW())
+```
+
 `CREATE TABLE IF NOT EXISTS` leaves an existing table of that name alone. Concurrent callers
 converge on the one atomically admitted catalog object instead of leaking a duplicate-name race.
 `CREATE TABLE … AS SELECT` takes both its columns and its first rows from a query:
@@ -324,10 +336,18 @@ expression only when every stored value already matches it.
 ALTER TABLE orders ADD COLUMN channel TEXT
 ```
 
-Tables can gain nullable columns and widen a `NOT NULL` column to nullable. Both are catalog-only
-changes: no blocks are rewritten, so they are effectively instant however large the table is. A
-column added to a table with rows in it is always nullable — the rows already stored have no value
-for it — though a `DEFAULT` fills the rows written afterwards.
+Tables can gain columns and widen a `NOT NULL` column to nullable. Both are catalog-only changes:
+no blocks are rewritten, so they are effectively instant however large the table is. A constant
+`DEFAULT` fills the rows already stored, as PostgreSQL does, which is what lets the added column
+be `NOT NULL`:
+
+```sql
+ALTER TABLE orders ADD COLUMN channel TEXT NOT NULL DEFAULT 'web'
+```
+
+An expression default such as `NOW()` is evaluated per write, so it fills only the rows written
+afterwards; a column with one, or with no default at all, is added nullable and the rows already
+stored read `NULL`.
 
 `ALTER TABLE orders DROP COLUMN channel` performs the same guarded metadata step as an explicitly
 authorized schema migration. It refuses the unique key, the last column, and anything a check,

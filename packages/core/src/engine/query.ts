@@ -1258,6 +1258,8 @@ export type CompiledStatement =
   | {
       kind: "update";
       table: string;
+      /** `UPDATE t AS u`: the name the assignments, predicates, and RETURNING may qualify by. */
+      alias?: string;
       assignments: Array<{ column: string; expression: Expression }>;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       returning?: string[] | "*";
@@ -1266,6 +1268,7 @@ export type CompiledStatement =
   | {
       kind: "delete";
       table: string;
+      alias?: string;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       returning?: string[] | "*";
       parameterCount?: number;
@@ -6135,9 +6138,10 @@ class Parser {
         continue;
       }
       const name = this.#identifier();
-      const columnType = this.#columnType();
-      let nullable = true;
-      let defaultValue: ColumnDefault | undefined;
+      const { serial, ...columnType } = this.#columnType();
+      let nullable = serial !== true;
+      let defaultValue: ColumnDefault | undefined =
+        serial === true ? { kind: "autoincrement" } : undefined;
       let generatedValue: ColumnGenerated | undefined;
       for (;;) {
         if (this.#isKeyword("DEFAULT")) {
@@ -6147,7 +6151,27 @@ class Parser {
           continue;
         }
         if (this.#isKeyword("GENERATED")) {
+          if (this.#identityClause()) {
+            // GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY: PostgreSQL's identity column, the
+            // same auto-increment default a SERIAL column carries.
+            if (columnType.type !== "number" || columnType.integer !== true) {
+              throw new TypeError(`Identity column ${name} must be an integer type`);
+            }
+            defaultValue = { kind: "autoincrement" };
+            nullable = false;
+            continue;
+          }
           generatedValue = this.#generatedColumn();
+          continue;
+        }
+        if (this.#isKeyword("AUTOINCREMENT")) {
+          // SQLite's spelling, after PRIMARY KEY.
+          this.#keyword("AUTOINCREMENT");
+          if (columnType.type !== "number" || columnType.integer !== true) {
+            throw new TypeError(`AUTOINCREMENT column ${name} must be an integer type`);
+          }
+          defaultValue = { kind: "autoincrement" };
+          nullable = false;
           continue;
         }
         if (this.#isKeyword("CHECK")) {
@@ -6375,6 +6399,41 @@ class Parser {
   }
 
   /** GENERATED [ALWAYS] AS (expression) STORED. */
+  /**
+   * Consumes `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` and answers true; leaves the
+   * tokens alone and answers false for the stored generated-column form.
+   */
+  #identityClause(): boolean {
+    const start = this.#index;
+    this.#keyword("GENERATED");
+    if (this.#isKeyword("BY")) {
+      this.#keyword("BY");
+      this.#keyword("DEFAULT");
+    } else if (this.#isKeyword("ALWAYS")) {
+      this.#keyword("ALWAYS");
+    }
+    if (this.#isKeyword("AS")) {
+      this.#keyword("AS");
+      if (this.#isKeyword("IDENTITY")) {
+        this.#keyword("IDENTITY");
+        // Sequence options in parentheses are accepted and ignored; the counter starts at 1.
+        if (this.#punctuation("(")) {
+          let depth = 1;
+          while (depth > 0) {
+            const token = this.#peek();
+            if (token.kind === "eof") throw new TypeError("Unterminated identity options");
+            this.#index += 1;
+            if (token.kind === "punctuation" && token.text === "(") depth += 1;
+            if (token.kind === "punctuation" && token.text === ")") depth -= 1;
+          }
+        }
+        return true;
+      }
+    }
+    this.#index = start;
+    return false;
+  }
+
   #generatedColumn(): ColumnGenerated {
     this.#keyword("GENERATED");
     if (this.#isKeyword("ALWAYS")) this.#keyword("ALWAYS");
@@ -6498,6 +6557,10 @@ class Parser {
       break;
     }
     this.#take("eof");
+    // PostgreSQL fills existing rows with a constant DEFAULT when the column is added, which is
+    // also what lets the column be NOT NULL. An expression default (NOW(), nextval) is evaluated
+    // per write, so it fills only the rows written afterwards.
+    const backfill = defaultValue?.kind === "literal" ? defaultValue.value : undefined;
     return {
       kind: "add-column",
       table,
@@ -6506,7 +6569,9 @@ class Parser {
         ...columnType,
         ...(nullable ? { nullable: true } : {}),
         ...(defaultValue === undefined ? {} : { defaultValue }),
+        ...(backfill === undefined ? {} : { backfill }),
       },
+      ...(backfill === undefined ? {} : { allowNonNullableWithBackfill: true }),
     };
   }
 
@@ -6556,9 +6621,13 @@ class Parser {
     return integer ? "number-integer" : mapped;
   }
 
-  #columnType(): { type: SqlColumnType; integer?: true; sqlDomain?: SqlDomain } {
+  #columnType(): { type: SqlColumnType; integer?: true; sqlDomain?: SqlDomain; serial?: true } {
     const declared = this.#identifier();
     const word = declared.toUpperCase();
+    if (word === "SERIAL" || word === "BIGSERIAL" || word === "SMALLSERIAL") {
+      // PostgreSQL's serial pseudo-types: an integer column fed by an auto-increment default.
+      return { type: "number", integer: true, serial: true };
+    }
     if (word === "NUMERIC" || word === "DECIMAL") {
       let precision: number | undefined;
       let scale: number | undefined;
@@ -6644,14 +6713,19 @@ class Parser {
         ...this.#returningClause(table),
       };
     }
-    if (this.#isKeyword("SELECT")) {
-      const insertSource = this.#selectBlock("(insert select)");
+    if (this.#isKeyword("SELECT") || this.#isKeyword("WITH") || this.#peek().text === "(") {
+      // Any query expression feeds INSERT: a plain SELECT, a WITH, a set operation, or a
+      // parenthesized member; ON CONFLICT then applies to the produced rows as it does to VALUES.
+      const insertSource = this.#queryExpression("(insert select)");
       resolvePlanExactNumericConstants(insertSource);
       const query = planHasPendingSelectShapes(insertSource)
         ? insertSource
         : optimizePlan(insertSource);
+      // A set operation or VALUES source projects `*` over its members until execution; the
+      // materialized result is checked against the column list then, like every other source.
       if (
         !planHasPendingSelectShapes(query) &&
+        !query.select.some((item) => item.expression.kind === "wildcard") &&
         columns.length > 0 &&
         query.select.length !== columns.length
       ) {
@@ -6663,6 +6737,7 @@ class Parser {
         columns,
         rows: [],
         query,
+        ...this.#onConflictClause(table),
         ...this.#returningClause(table),
       };
     }
@@ -6770,7 +6845,7 @@ class Parser {
   }
 
   /** RETURNING *, target.*, or [target.]col, ... — execution owns the row semantics. */
-  #returningClause(table: string): { returning?: string[] | "*" } {
+  #returningClause(table: string, alias?: string): { returning?: string[] | "*" } {
     if (!this.#isKeyword("RETURNING")) return {};
     this.#keyword("RETURNING");
     if (this.#peek().text === "*") {
@@ -6781,8 +6856,8 @@ class Parser {
     for (;;) {
       const first = this.#identifier();
       if (this.#punctuation(".")) {
-        if (first !== table) {
-          throw new TypeError(`RETURNING qualifier must name the target table: ${table}`);
+        if (first !== table && first !== alias) {
+          throw new TypeError(`RETURNING qualifier must name the target table: ${alias ?? table}`);
         }
         if (this.#peek().text === "*") {
           this.#index += 1;
@@ -6926,14 +7001,18 @@ class Parser {
   #updateStatement(): CompiledStatement {
     this.#keyword("UPDATE");
     const table = this.#identifier();
+    const alias = this.#mutationAlias("SET");
     this.#keyword("SET");
     const assignments: Array<{ column: string; expression: Expression }> = [];
     for (;;) {
-      const column = this.#identifier();
+      const column = this.#mutationTargetColumn(table, alias);
       this.#operator("=");
       const expression = this.#expression();
       if (hasAggregate(expression)) {
         throw new TypeError("Aggregate functions are not allowed in UPDATE assignments");
+      }
+      if (containsWindow(expression)) {
+        throw new TypeError("Window functions are not allowed in UPDATE assignments");
       }
       assignments.push({ column, expression });
       if (!this.#punctuation(",")) break;
@@ -6942,15 +7021,54 @@ class Parser {
       throw new TypeError("UPDATE assignments must set each column once");
     }
     const predicates = this.#mutationPredicates();
-    return { kind: "update", table, assignments, predicates, ...this.#returningClause(table) };
+    return {
+      kind: "update",
+      table,
+      ...(alias === undefined ? {} : { alias }),
+      assignments,
+      predicates,
+      ...this.#returningClause(table, alias),
+    };
   }
 
   #deleteStatement(): CompiledStatement {
     this.#keyword("DELETE");
     this.#keyword("FROM");
     const table = this.#identifier();
+    const alias = this.#mutationAlias("WHERE", "RETURNING");
     const predicates = this.#mutationPredicates();
-    return { kind: "delete", table, predicates, ...this.#returningClause(table) };
+    return {
+      kind: "delete",
+      table,
+      ...(alias === undefined ? {} : { alias }),
+      predicates,
+      ...this.#returningClause(table, alias),
+    };
+  }
+
+  /**
+   * `UPDATE t AS u` / `DELETE FROM t u`: PostgreSQL's mutation alias. A bare identifier that is
+   * not one of the clause keywords that may follow the table is the alias.
+   */
+  #mutationAlias(...clauses: string[]): string | undefined {
+    if (this.#isKeyword("AS")) {
+      this.#keyword("AS");
+      return this.#identifier();
+    }
+    const token = this.#peek();
+    if (token.kind !== "identifier") return undefined;
+    if (token.quoted !== true && clauses.includes(token.text.toUpperCase())) return undefined;
+    return this.#identifier();
+  }
+
+  /** An assignment target, optionally qualified by the table or its alias (`SET u.total = …`). */
+  #mutationTargetColumn(table: string, alias: string | undefined): string {
+    const first = this.#identifier();
+    if (!this.#punctuation(".")) return first;
+    if (first !== table && first !== alias) {
+      throw new TypeError(`SET qualifier must name the target table: ${alias ?? table}`);
+    }
+    return this.#identifier();
   }
 
   #mutationPredicates(): Array<{
@@ -6990,7 +7108,10 @@ class Parser {
     if (hasAggregate(expression) || expressionColumns(expression).length > 0) {
       throw new TypeError(`${label} must be constant expressions`);
     }
+    // A scalar subquery is a value the statement reads when it runs, like the statement clock.
     const needsExecution = (value: Expression): boolean =>
+      value.kind === "subquery" ||
+      value.kind === "exists" ||
       (value.kind === "call" &&
         (statementDatetimeNames.has(value.name) ||
           value.name === "NEXTVAL" ||
@@ -7337,7 +7458,6 @@ class Parser {
     const having: Predicate[] = [];
     if (this.#isKeyword("HAVING")) {
       this.#keyword("HAVING");
-      if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
       having.push(...splitCondition(this.#expression()));
     }
     if (this.#isKeyword("WINDOW")) {
@@ -7428,14 +7548,6 @@ class Parser {
       items.push({ expression, alias });
       explicitAliases.push(explicitAlias);
       if (!this.#punctuation(",")) break;
-    }
-    if (
-      items.some(
-        (item) => item.expression.kind === "wildcard" && item.expression.table === undefined,
-      ) &&
-      items.length > 1
-    ) {
-      throw new TypeError("SELECT * cannot be mixed with other expressions");
     }
     const aliases = new Set<string>();
     for (const [index, item] of items.entries()) {
@@ -9683,13 +9795,46 @@ export function assembleSelectBlock(
   const { limitParameter, offsetParameter } = parts;
   const groupBy = [...parts.groupBy];
   let distinctWildcard = false;
+  if (
+    distinct &&
+    (groupBy.length > 0 ||
+      having.length > 0 ||
+      select.some((item) => hasAggregate(item.expression) || hasWindow(item.expression)))
+  ) {
+    // DISTINCT over a grouped, aggregated, or windowed block applies to that block's output:
+    // run the block as written inside a derived table and take the distinct rows of it,
+    // carrying the ORDER BY and paging outward, which is where they act in PostgreSQL too.
+    const inner = assembleSelectBlock({ ...parts, distinct: false, orderBy: [] }, nextSequence);
+    delete inner.limit;
+    delete inner.offset;
+    delete inner.limitParameter;
+    delete inner.offsetParameter;
+    delete inner.limitWithTies;
+    const source = derivedTableSource(inner, "(distinct)", nextSequence);
+    return assembleSelectBlock(
+      {
+        sql,
+        base: source,
+        joins: [],
+        select: inner.select.map((item) => ({
+          expression: { kind: "column", reference: item.alias },
+          alias: item.alias,
+        })),
+        distinct: true,
+        predicates: [],
+        groupBy: [],
+        having: [],
+        orderBy: parts.orderBy,
+        ...(limit === undefined ? {} : { limit }),
+        ...(offset === undefined ? {} : { offset }),
+        ...(limitParameter === undefined ? {} : { limitParameter }),
+        ...(offsetParameter === undefined ? {} : { offsetParameter }),
+        ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
+      },
+      nextSequence,
+    );
+  }
   if (distinct) {
-    if (select.some((item) => hasAggregate(item.expression)))
-      throw new TypeError("SELECT DISTINCT cannot be combined with aggregate functions");
-    if (select.some((item) => hasWindow(item.expression)))
-      throw new TypeError("SELECT DISTINCT cannot be combined with window functions");
-    if (groupBy.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with GROUP BY");
-    if (having.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
     if (select.some((item) => item.expression.kind === "wildcard")) {
       // The wildcard's columns are unknown until input schemas exist; executor entries
       // expand the flag into a concrete select list plus GROUP BY (expandDistinctWildcard).

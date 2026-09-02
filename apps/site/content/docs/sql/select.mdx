@@ -57,9 +57,10 @@ returns rows in no promised order, as in any SQL engine.
 
 `*` and `alias.*` are expanded from the input schema before Minnow plans operations that depend
 on the output width. They therefore work with `DISTINCT`, window columns, set operations,
-CTE/derived column lists, `ORDER BY` expressions and ordinals, and `INSERT ... SELECT`. With one
-source, wildcard outputs use bare column names; with several sources, Minnow uses
-`alias.column` names so collisions stay visible.
+CTE/derived column lists, `ORDER BY` expressions and ordinals, `INSERT ... SELECT`, and beside
+other select items (`SELECT *, total * 2 AS doubled FROM orders`). With one source, wildcard
+outputs use bare column names; with several sources, Minnow uses `alias.column` names so
+collisions stay visible.
 
 ## Joins
 
@@ -116,6 +117,10 @@ The numeric and counting aggregates accept `FILTER (WHERE …)` for conditional 
 default, and returns SQL `NULL` for an empty input. Its `ORDER BY` list follows the same direction
 and NULL-placement rules as query ordering. Filter its input in `WHERE`; `FILTER` is not supported
 for this aggregate. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`, and `CUBE`.
+
+`SELECT DISTINCT` over a grouped, aggregated, or windowed block takes the distinct rows of that
+block's output — `SELECT DISTINCT category, COUNT(*) … GROUP BY category, brand` — with `ORDER BY`
+and `LIMIT` applied to the distinct rows, as in PostgreSQL.
 
 `GROUP BY` items follow PostgreSQL's resolution: an integer is a select-list ordinal
 (`GROUP BY 1`), and a name that is an output alias but not a source column stands for the aliased

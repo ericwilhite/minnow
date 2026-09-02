@@ -1011,3 +1011,158 @@ describe("execute engine controls", () => {
     expect((await database.query("SELECT count(*) AS n FROM people")).rows).toEqual([{ n: 2 }]);
   });
 });
+
+describe("PostgreSQL mutation forms", () => {
+  async function fixture(): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "people",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+        { name: "team", type: "string", nullable: true },
+      ],
+    });
+    await database.createTable({
+      name: "notes",
+      columns: [
+        { name: "person", type: "string" },
+        { name: "text", type: "string" },
+      ],
+    });
+    await database.execute(
+      "INSERT INTO people (name, score, team) VALUES ('Ada', 10, 'red'), ('Grace', 25, 'red'), ('Linus', 5, NULL)",
+    );
+    await database.execute(
+      "INSERT INTO notes (person, text) VALUES ('Ada', 'a'), ('Ada', 'b'), ('Grace', 'c')",
+    );
+    return database;
+  }
+  const rows = async (database: MinnowDatabase, sql: string): Promise<unknown[]> =>
+    (await database.query(sql)).rows;
+
+  it("takes a table alias on UPDATE and DELETE, in assignments, predicates, and RETURNING", async () => {
+    const database = await fixture();
+    expect(
+      await database.execute(
+        "UPDATE people AS p SET score = p.score + 1 WHERE p.team = 'red' RETURNING p.name, p.score",
+      ),
+    ).toMatchObject({ kind: "update", rowCount: 2 });
+    expect(await rows(database, "SELECT name, score FROM people ORDER BY name")).toEqual([
+      { name: "Ada", score: 11 },
+      { name: "Grace", score: 26 },
+      { name: "Linus", score: 5 },
+    ]);
+    expect(
+      await database.execute("DELETE FROM people p WHERE p.score < 10 RETURNING p.name"),
+    ).toMatchObject({ kind: "delete", rowCount: 1, returnedRows: [{ name: "Linus" }] });
+    await expect(
+      database.execute("UPDATE people AS p SET score = 0 RETURNING q.name"),
+    ).rejects.toThrow("RETURNING qualifier must name the target table: p");
+  });
+
+  it("evaluates scalar subqueries in SET and in VALUES against the pre-statement rows", async () => {
+    const database = await fixture();
+    await database.execute(
+      "UPDATE people AS p SET score = (SELECT COUNT(*) FROM notes n WHERE n.person = p.name) * 100 + (SELECT MAX(score) FROM people)",
+    );
+    // Every assignment read the rows as they were: MAX(score) was 25 for all three.
+    expect(await rows(database, "SELECT name, score FROM people ORDER BY name")).toEqual([
+      { name: "Ada", score: 225 },
+      { name: "Grace", score: 125 },
+      { name: "Linus", score: 25 },
+    ]);
+    await database.execute(
+      "INSERT INTO people (name, score) VALUES ('Next', (SELECT MAX(score) + 1 FROM people)), ('Zero', (SELECT COUNT(*) FROM notes WHERE person = 'nobody'))",
+    );
+    expect(
+      await rows(
+        database,
+        "SELECT name, score FROM people WHERE name IN ('Next', 'Zero') ORDER BY name",
+      ),
+    ).toEqual([
+      { name: "Next", score: 226 },
+      { name: "Zero", score: 0 },
+    ]);
+    await expect(database.execute("UPDATE people SET score = MAX(score)")).rejects.toThrow(
+      "Aggregate functions are not allowed in UPDATE assignments",
+    );
+  });
+
+  it("feeds INSERT from any query expression and applies ON CONFLICT to its rows", async () => {
+    const database = await fixture();
+    expect(
+      await database.execute(
+        "INSERT INTO people (name, score) SELECT name, score + 100 FROM people WHERE score > 5 ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
+      ),
+    ).toMatchObject({ kind: "insert", rowCount: 2 });
+    expect(
+      await database.execute(
+        "INSERT INTO people (name, score) WITH top AS (SELECT name FROM people WHERE score > 100) SELECT name || '2', 1 FROM top UNION ALL SELECT 'Solo', 2 ON CONFLICT DO NOTHING",
+      ),
+    ).toMatchObject({ kind: "insert", rowCount: 3 });
+    expect(await rows(database, "SELECT name, score FROM people ORDER BY name")).toEqual([
+      { name: "Ada", score: 110 },
+      { name: "Ada2", score: 1 },
+      { name: "Grace", score: 125 },
+      { name: "Grace2", score: 1 },
+      { name: "Linus", score: 5 },
+      { name: "Solo", score: 2 },
+    ]);
+    await expect(
+      database.execute("INSERT INTO people (name, score) SELECT name FROM people"),
+    ).rejects.toThrow("column count");
+  });
+
+  it("reads SERIAL, IDENTITY, and AUTOINCREMENT as the auto-increment key and backfills added defaults", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE events (id SERIAL PRIMARY KEY, kind TEXT NOT NULL)");
+    await database.execute("INSERT INTO events (kind) VALUES ('a'), ('b')");
+    await database.execute("INSERT INTO events (id, kind) VALUES (10, 'c')");
+    await database.execute("INSERT INTO events (kind) VALUES ('d')");
+    // An explicit value does not advance the counter, exactly as a PostgreSQL sequence behaves.
+    expect(await rows(database, "SELECT id, kind FROM events ORDER BY id")).toEqual([
+      { id: 1, kind: "a" },
+      { id: 2, kind: "b" },
+      { id: 3, kind: "d" },
+      { id: 10, kind: "c" },
+    ]);
+    await database.execute(
+      "CREATE TABLE identified (id INTEGER GENERATED BY DEFAULT AS IDENTITY (START WITH 1 INCREMENT BY 1) PRIMARY KEY, label TEXT)",
+    );
+    await database.execute("INSERT INTO identified (label) VALUES ('x'), ('y')");
+    await database.execute("CREATE TABLE lite (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)");
+    await database.execute("INSERT INTO lite (label) VALUES ('z')");
+    expect(await rows(database, "SELECT id FROM identified ORDER BY id")).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    expect(await rows(database, "SELECT id FROM lite")).toEqual([{ id: 1 }]);
+    await expect(
+      database.execute("CREATE TABLE bad (code TEXT PRIMARY KEY, seq SERIAL)"),
+    ).rejects.toThrow("Auto-increment requires the unique key column");
+    await expect(
+      database.execute("CREATE TABLE bad (id TEXT GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"),
+    ).rejects.toThrow("must be an integer type");
+    // A constant DEFAULT fills the stored rows, which is what lets the column be NOT NULL.
+    await database.execute("ALTER TABLE events ADD COLUMN tier TEXT NOT NULL DEFAULT 'basic'");
+    await database.execute("ALTER TABLE events ADD COLUMN flag BOOLEAN DEFAULT FALSE");
+    await database.execute("INSERT INTO events (kind, tier) VALUES ('e', 'gold')");
+    expect(
+      await rows(database, "SELECT id, tier, flag FROM events WHERE tier = 'basic' ORDER BY id"),
+    ).toEqual([
+      { id: 1, tier: "basic", flag: false },
+      { id: 2, tier: "basic", flag: false },
+      { id: 3, tier: "basic", flag: false },
+      { id: 10, tier: "basic", flag: false },
+    ]);
+    await expect(
+      database.execute("ALTER TABLE events ADD COLUMN at TIMESTAMP NOT NULL DEFAULT NOW()"),
+    ).rejects.toThrow("existing rows have no value for it");
+    await database.execute("ALTER TABLE events ADD COLUMN at TIMESTAMP DEFAULT NOW()");
+    expect(await rows(database, "SELECT COUNT(*) AS n FROM events WHERE at IS NULL")).toEqual([
+      { n: 5 },
+    ]);
+  });
+});

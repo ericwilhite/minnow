@@ -468,8 +468,7 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
     data-modifying CTEs (run the mutation first, then query).
   - DDL: schema-qualified names including `WithSchemaPlugin`, `CREATE`/`DROP SCHEMA`,
     `ALTER TABLE` beyond adding and dropping columns (renames, constraint changes, column
-    alterations), serial/identity/`autoIncrement()` column DDL (declare it in Minnow's schema
-    DSL, or default to `nextval()` of a `CREATE SEQUENCE` sequence), temporary tables and views,
+    alterations), temporary tables and views,
     materialized views, view column lists and `CREATE VIEW IF NOT EXISTS`, non-stored generated
     columns, `DROP`/`ALTER TYPE`, index access methods (`.using()`), partial and expression
     indexes, and `NULLS NOT DISTINCT`.
