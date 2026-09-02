@@ -337,6 +337,69 @@ describe("secondary-index SQL", () => {
     await database.close();
   });
 
+  it("narrows a join side to its indexed rows when a constant reaches its key", async () => {
+    // `c.customer_id = 3` implies `o.customer = 3` across the inner-join key, and the orders
+    // side is a join source, not the base: its index must still serve the lookup, and only the
+    // selected rows are materialized. The answers are checked against plain expectations for
+    // inner and outer joins, and the postings spy proves the index was consulted.
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { autoCompact: false, rowsPerBlock: 16 });
+    await database.execute(
+      "CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    await database.execute(
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer INTEGER NOT NULL, amount INTEGER NOT NULL)",
+    );
+    await database.execute(
+      `INSERT INTO customers (customer_id, name) VALUES ${Array.from(
+        { length: 40 },
+        (_, index) => `(${String(index)}, 'name-${String(index)}')`,
+      ).join(", ")}`,
+    );
+    const orders = Array.from({ length: 400 }, (_, index) => ({
+      id: index + 1,
+      customer: (index * 7) % 40,
+      amount: (index * 13) % 100,
+    }));
+    for (let start = 0; start < orders.length; start += 100) {
+      await database.execute(
+        `INSERT INTO orders (id, customer, amount) VALUES ${orders
+          .slice(start, start + 100)
+          .map((row) => `(${String(row.id)}, ${String(row.customer)}, ${String(row.amount)})`)
+          .join(", ")}`,
+      );
+    }
+    await database.execute("CREATE INDEX orders_customer ON orders (customer)");
+    const reads = vi.spyOn(store, "readFtsCandidates");
+    const inner = await database.query(
+      "SELECT c.name, o.id, o.amount FROM customers c JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id = 3 ORDER BY o.id",
+      { memoize: false },
+    );
+    expect(inner.rows).toEqual(
+      orders
+        .filter((row) => row.customer === 3)
+        .map((row) => ({ name: "name-3", id: row.id, amount: row.amount })),
+    );
+    expect(reads).toHaveBeenCalled();
+    const outer = await database.query(
+      "SELECT c.customer_id, o.id FROM customers c LEFT JOIN orders o ON o.customer = c.customer_id WHERE o.customer IN (3, 5) ORDER BY o.id",
+      { memoize: false },
+    );
+    expect(outer.rows).toEqual(
+      orders
+        .filter((row) => row.customer === 3 || row.customer === 5)
+        .map((row) => ({ customer_id: row.customer, id: row.id })),
+    );
+    const swapped = await database.query(
+      "SELECT o.id FROM orders o JOIN customers c ON c.customer_id = o.customer WHERE c.customer_id = 7 AND o.amount > 40 ORDER BY o.id",
+      { memoize: false },
+    );
+    expect(swapped.rows).toEqual(
+      orders.filter((row) => row.customer === 7 && row.amount > 40).map((row) => ({ id: row.id })),
+    );
+    await database.close();
+  });
+
   it("skips a postings read when the table fits in one row group", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store, { rowsPerBlock: 16 });

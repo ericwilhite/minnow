@@ -26,6 +26,12 @@ discarded before a join builds a hash table out of them.
 membership test and can skip blocks by value range. Any other OR keeps its shape and is evaluated
 per row.
 
+**Constants cross join keys.** An inner equi-join makes its two key columns equal, so a constant
+on one side reaches the other: `WHERE c.customer_id = 42` with `ON o.customer = c.customer_id`
+also filters `orders` by `customer = 42` before the join, through a
+[secondary index](/docs/sql/ddl#secondary-indexes) when one exists, or through the unique key
+when the constant names it.
+
 **Skipping by value range.** Every block records the minimum and maximum of the column it holds. A
 comparison that cannot be true inside a block's range skips the block without decoding or
 decompressing it. This is why `WHERE placed_at >= '2025-01-01'` on a table written in date order
@@ -68,11 +74,22 @@ equalities covering the table's unique key — scalar or composite — names at 
 skips the batch pipeline entirely and answers from cached decoded blocks: binary search over
 ascending key components, dictionary probes for string keys. Projected columns may carry a
 logical domain — `NUMERIC`, `UUID`, `JSON`, `DATE`, enums, arrays — and render exactly as the
-ordinary executor renders them, declared-scale padding included. Anything the fast path cannot
-prove — a pending update or delete delta, a cross-type comparison, a view, a domain-typed
-column in the `WHERE` clause — falls back to the ordinary executor, which stays the authority
-on answers and errors. `EXPLAIN` reports eligibility as `key-covering equality answers as a
-point read when the visible history allows`.
+ordinary executor renders them, declared-scale padding included. Pending update and delete
+deltas do not cost a scalar key its fast path: the key's own history is replayed in visible
+order — an insert lands the row, a delete removes it, an update patches the columns it changed —
+so a row read right after it was updated still answers in microseconds. A composite key with
+pending deltas, a cross-type comparison, a view, or a domain-typed column in the `WHERE` clause
+falls back to the ordinary executor, which stays the authority on answers and errors. `EXPLAIN`
+reports eligibility as `key-covering equality answers as a point read when the visible history
+allows`.
+
+**One value at a time, not one row.** A predicate that reads exactly one string column —
+`LOWER(status) = 'paid'`, `COALESCE(region, 'none') = 'none'`, a `CASE` over one column — is
+evaluated once per distinct value of that column and applied by dictionary code. A `GROUP BY`
+over one string column or an expression of it, or over one numeric or datetime column, resolves
+its group the same way, and a `GROUP BY` over several string columns packs their codes into one
+slot. Plain number and string comparisons, number arithmetic, whole-number `ROUND`, and the
+calendar functions run as typed operations without domain checks per row.
 
 The query runner works on batches of column values rather than one row at a time, and
 scans stream block by block so a table is never required to be resident. When a hash table,

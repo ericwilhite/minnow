@@ -305,6 +305,92 @@ describe("point-read fast path", () => {
     await database.close();
   });
 
+  it("replays update and delete deltas for one scalar key", async () => {
+    // A scalar key's history is replayed per key: the answer must match the ordinary
+    // executor's through patched projections, patched filter columns, deletes, re-inserts,
+    // updates that miss, and several deltas stacked on one row, across multi-block segments.
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      autoCompact: false,
+      rowsPerBlock: 8,
+    });
+    await database.execute(
+      "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT NOT NULL, qty INTEGER NOT NULL, seen TIMESTAMP)",
+    );
+    await database.execute(
+      `INSERT INTO items (id, label, qty, seen) VALUES ${Array.from(
+        { length: 100 },
+        (_, index) =>
+          `(${String(index + 1)}, 'item-${String(index + 1)}', ${String(index % 5)}, ${
+            index % 3 === 0 ? "NULL" : "TIMESTAMP '2026-01-02 03:04:05'"
+          })`,
+      ).join(", ")}`,
+    );
+    const lookup = "SELECT id, label, qty, seen FROM items WHERE id = ?";
+    await database.execute("UPDATE items SET qty = qty + 10 WHERE id = 42");
+    let result = await differential(database, lookup, [42]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([
+      { id: 42, label: "item-42", qty: 11, seen: new Date("2026-01-02T03:04:05.000Z") },
+    ]);
+    // A filter on a patched column sees the patched value, not the stored one.
+    result = await differential(
+      database,
+      "SELECT label FROM items WHERE id = ? AND qty = ?",
+      [42, 1],
+    );
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([]);
+    result = await differential(
+      database,
+      "SELECT label FROM items WHERE id = ? AND qty = ?",
+      [42, 11],
+    );
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([{ label: "item-42" }]);
+    await database.execute("UPDATE items SET label = 'renamed', seen = NULL WHERE id = 42");
+    await database.execute("UPDATE items SET qty = 0 WHERE id = 42");
+    result = await differential(database, lookup, [42]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([{ id: 42, label: "renamed", qty: 0, seen: null }]);
+    await database.execute("DELETE FROM items WHERE id = 42");
+    result = await differential(database, lookup, [42]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([]);
+    await database.execute("UPDATE items SET qty = 99 WHERE id = 42");
+    result = await differential(database, lookup, [42]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([]);
+    await database.execute("INSERT INTO items (id, label, qty, seen) VALUES (42, 'back', 7, NULL)");
+    result = await differential(database, lookup, [42]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([{ id: 42, label: "back", qty: 7, seen: null }]);
+    await database.execute("UPDATE items SET qty = qty * 2 WHERE id IN (42, 43, 44)");
+    result = await differential(database, lookup, [42]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([{ id: 42, label: "back", qty: 14, seen: null }]);
+    result = await differential(database, lookup, [43]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([{ id: 43, label: "item-43", qty: 4, seen: null }]);
+    result = await differential(database, lookup, [7]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([{ id: 7, label: "item-7", qty: 1, seen: null }]);
+    result = await differential(database, lookup, [1000]);
+    expect(result.served).toBe(true);
+    expect(result.rows).toEqual([]);
+    await database.close();
+
+    const users = await scalarDatabase();
+    await users.execute("UPDATE users SET score = 5 WHERE email = ?", ["user-3@example.com"]);
+    await users.execute("DELETE FROM users WHERE email = ?", ["user-4@example.com"]);
+    for (const email of ["user-3@example.com", "user-4@example.com", "user-5@example.com"]) {
+      const byEmail = await differential(users, "SELECT email, score FROM users WHERE email = ?", [
+        email,
+      ]);
+      expect(byEmail.served).toBe(true);
+    }
+    await users.close();
+  });
+
   it("observes new rows immediately after an insert", async () => {
     const database = await compositeDatabase();
     await database.insert("orders", {
@@ -593,7 +679,7 @@ describe("point-read fast path", () => {
     await database.close();
   });
 
-  it("falls back for domain projections once update deltas exist, and returns after compaction", async () => {
+  it("serves domain projections through update deltas and after compaction", async () => {
     const database = await domainDatabase();
     await database.execute("UPDATE payments SET amount = 99.9 WHERE id = ?", [12]);
     const withDelta = await differential(
@@ -601,7 +687,7 @@ describe("point-read fast path", () => {
       "SELECT amount FROM payments WHERE id = ?",
       [12],
     );
-    expect(withDelta.served).toBe(false);
+    expect(withDelta.served).toBe(true);
     expect(withDelta.rows).toEqual([{ amount: "99.90" }]);
     await database.compactTable("payments");
     const compacted = await differential(

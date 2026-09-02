@@ -132,9 +132,11 @@ CREATE UNIQUE INDEX orders_customer_time ON orders (customer_id, placed_at);
 
 Composite planning follows the leftmost-prefix rule: equality or `IN` can constrain the leading
 columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. `ASC` and `DESC` are part
-of the physical tuple order. Minnow still evaluates the SQL predicate on every candidate row, so
-a stale posting or an internal locator collision can cost an extra read but cannot change an
-answer.
+of the physical tuple order. On a keyed table the postings name the matching rows exactly: an
+equality or `IN` lookup visits those rows and no others, and when the indexed table is the
+other side of a join, only those rows are read before the join. Minnow still evaluates the SQL
+predicate on every candidate row, so a stale posting or an internal locator collision can cost
+an extra read but cannot change an answer.
 
 Exact equality remains indexable for SQL-domain columns such as `NUMERIC` and enum. Their lossless
 physical strings are not bytewise SQL order, so range pruning and index-supplied `ORDER BY` fall
