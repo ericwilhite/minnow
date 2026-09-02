@@ -502,4 +502,35 @@ describe("RecordCore checkpoint recovery refusal", () => {
     ];
     expectAtomicRefusal(candidates);
   });
+
+  it("loads and removes legacy empty full-text commit deltas", () => {
+    const ftsTable = table({
+      ftsColumns: {
+        value: {
+          storage: "fts-chunks-v1",
+          tokenizerVersion: 1,
+          state: "ready",
+          buildFromVersion: 0,
+        },
+      },
+    });
+    const state: RecordCoreState = {
+      ...emptyState(),
+      currentVersion: 1,
+      catalogEpoch: 1,
+      schemaEpoch: 1,
+      manifests: [manifest(), manifest({ version: 1, previousVersion: 0 })],
+      tables: [ftsTable],
+      ftsDeltas: [["table/value", [[1, { postings: [], totalTokens: 0 }]]]],
+    };
+    const core = new RecordCore({ hasBlock: () => false, blockByteLength: () => undefined });
+
+    expect(() => core.load(state)).not.toThrow();
+    expect(core.dump().ftsDeltas).toEqual([]);
+
+    const invalid = structuredClone(state);
+    invalid.ftsDeltas = [["table/value", [[1, { postings: [], totalTokens: 1 }]]]];
+    expect(() => core.load(invalid)).toThrow("must have a zero token total");
+    expect(core.dump().ftsDeltas).toEqual([]);
+  });
 });

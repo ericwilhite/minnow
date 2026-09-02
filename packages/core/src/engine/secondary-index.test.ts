@@ -14,6 +14,7 @@ import { compileStatement } from "./query.js";
 import {
   collectFtsCandidates,
   collectFtsPostings,
+  MAX_FTS_DELTA_CHUNKS,
   secondaryUniqueKeyNamespace,
   type FtsPostingQuery,
 } from "../storage/types.js";
@@ -869,6 +870,33 @@ describe("secondary-index SQL", () => {
   });
 
   for (const implementation of implementations()) {
+    it(`${implementation.name} does not retain empty nullable-index deltas`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { autoCompact: false });
+      try {
+        await database.execute(
+          "CREATE TABLE nullable_tail (id INTEGER PRIMARY KEY, removed_at TIMESTAMP)",
+        );
+        await database.execute("CREATE INDEX nullable_tail_removed ON nullable_tail(removed_at)");
+        for (let id = 1; id <= MAX_FTS_DELTA_CHUNKS + 1; id += 1) {
+          await database.execute(
+            `INSERT INTO nullable_tail (id, removed_at) VALUES (${String(id)}, NULL)`,
+          );
+        }
+
+        const table = await store.getTableByName("nullable_tail");
+        expect(Object.values(table?.secondaryIndexes ?? {})).toMatchObject([{ state: "ready" }]);
+        expect((await database.query("SELECT COUNT(*) AS n FROM nullable_tail")).rows).toEqual([
+          { n: MAX_FTS_DELTA_CHUNKS + 1 },
+        ]);
+      } finally {
+        await database.close();
+        store.close();
+      }
+    });
+  }
+
+  for (const implementation of implementations()) {
     it(`${implementation.name} does not retain historical secondary UNIQUE keys`, async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { autoCompact: false });
@@ -1364,6 +1392,7 @@ describe("secondary-index SQL", () => {
     await database.execute("CREATE INDEX by_quantity ON inventory (quantity)");
     await database.execute("UPDATE inventory SET quantity = 9 WHERE id = 1");
     await database.close();
+    store._crashForTests();
 
     store = await OpfsBlockStore.open({ name, root: shim.root });
     database = new MinnowDatabase(store, { rowsPerBlock: 2 });
@@ -1372,6 +1401,37 @@ describe("secondary-index SQL", () => {
     ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
     expect((await database.query("SELECT id FROM inventory WHERE quantity = 2")).rows).toEqual([]);
     await database.close();
+    store.close();
+  });
+
+  it("reopens OPFS after an indexed insert batch contains only NULL values", async () => {
+    const shim = new MemoryOpfs();
+    const name = crypto.randomUUID();
+    let store = await OpfsBlockStore.open({
+      name,
+      root: shim.root,
+      checkpointEntries: 1_000,
+    });
+    let database = new MinnowDatabase(store, { autoCompact: false });
+    await database.execute(
+      "CREATE TABLE nullable_reopen (id INTEGER PRIMARY KEY, removed_at TIMESTAMP)",
+    );
+    await database.execute("CREATE INDEX nullable_reopen_removed ON nullable_reopen(removed_at)");
+    await database.execute("INSERT INTO nullable_reopen VALUES (1, NULL), (2, NULL), (3, NULL)");
+    await database.close();
+    store._crashForTests();
+
+    store = await OpfsBlockStore.open({ name, root: shim.root, checkpointEntries: 1_000 });
+    database = new MinnowDatabase(store, { autoCompact: false });
+    expect((await database.query("SELECT id FROM nullable_reopen ORDER BY id")).rows).toEqual([
+      { id: 1 },
+      { id: 2 },
+      { id: 3 },
+    ]);
+    const table = await store.getTableByName("nullable_reopen");
+    expect(Object.values(table?.secondaryIndexes ?? {})).toMatchObject([{ state: "ready" }]);
+    await database.close();
+    store.close();
   });
 
   for (const implementation of implementations()) {

@@ -30,6 +30,7 @@ import { WalWriter } from "../toolkit/wal.js";
 import { decodeSyncCheckpoint, encodeSyncCheckpoint, LOG_FORMAT_VERSION } from "../toolkit/wire.js";
 import type { SyncFileHandle } from "../toolkit/sync-file.js";
 import { OpfsTree } from "./files.js";
+import { MinnowDatabase } from "../../engine/database.js";
 import {
   assertBlockReadBatchByteLimit,
   MAX_OPFS_CHECKPOINT_BYTES,
@@ -1644,6 +1645,44 @@ describe("OPFS write-ahead log crash shapes", () => {
     reopened.close();
   });
 
+  it("rolls a lost relaxed update payload back to the last complete database commit", async () => {
+    const shim = new MemoryOpfs();
+    const name = "relaxed-update-prefix";
+    let store = await OpfsBlockStore.open({
+      name,
+      root: shim.root,
+      durability: "relaxed",
+      checkpointEntries: 1_000,
+    });
+    let database = new MinnowDatabase(store, { autoCompact: false, rowsPerBlock: 2 });
+    await database.execute("CREATE TABLE tickets (id INTEGER PRIMARY KEY, total INTEGER)");
+    await database.execute("INSERT INTO tickets VALUES (1, 100)");
+    const extentPath = `minnowdb/${name}/extents/000000`;
+    const completePrefix = shim.readFileBytes(extentPath);
+    if (completePrefix === undefined) throw new Error("Expected the committed ticket extent");
+
+    await database.execute("UPDATE tickets SET total = 200 WHERE id = 1");
+    await database.close();
+    store._crashForTests();
+    // Preserve the checksum-valid WAL but remove the physical suffix it publishes. This is the
+    // exact cross-file persistence ordering relaxed recovery must turn into an atomic rollback,
+    // never a half-visible ticket or an unreopenable database.
+    shim.writeFileBytes(extentPath, completePrefix);
+
+    store = await OpfsBlockStore.open({
+      name,
+      root: shim.root,
+      durability: "relaxed",
+      checkpointEntries: 1_000,
+    });
+    database = new MinnowDatabase(store, { autoCompact: false, rowsPerBlock: 2 });
+    expect((await database.query("SELECT id, total FROM tickets")).rows).toEqual([
+      { id: 1, total: 100 },
+    ]);
+    await database.close();
+    store.close();
+  });
+
   it("rejects placement overflow before recovery allocates or reads payload bytes", async () => {
     const shim = new MemoryOpfs();
     const empty = await OpfsBlockStore.open({ name: "placement-overflow", root: shim.root });
@@ -2217,6 +2256,45 @@ describe("OPFS write-ahead log crash shapes", () => {
     const reopened = await OpfsBlockStore.open({ name: "db", root: shim.root });
     expect(await reopened.listTables()).toHaveLength(20);
     reopened.close();
+  });
+
+  it("recovers every acknowledged strict ticket commit across checkpoints and abrupt death", async () => {
+    const shim = new MemoryOpfs();
+    const name = "strict-ticket-commits";
+    let store = await OpfsBlockStore.open({
+      name,
+      root: shim.root,
+      durability: "strict",
+      checkpointEntries: 8,
+    });
+    let database = new MinnowDatabase(store, { autoCompact: false, rowsPerBlock: 4 });
+    await database.execute(
+      "CREATE TABLE tickets (id INTEGER PRIMARY KEY, total INTEGER, sync_state VARCHAR)",
+    );
+    for (let id = 1; id <= 40; id += 1) {
+      await database.execute(
+        `INSERT INTO tickets VALUES (${String(id)}, ${String(id * 25)}, 'pending')`,
+      );
+    }
+    await database.close();
+    store._crashForTests();
+
+    store = await OpfsBlockStore.open({
+      name,
+      root: shim.root,
+      durability: "strict",
+      checkpointEntries: 8,
+    });
+    database = new MinnowDatabase(store, { autoCompact: false, rowsPerBlock: 4 });
+    expect(
+      (
+        await database.query(
+          "SELECT COUNT(*) AS count, SUM(total) AS total FROM tickets WHERE sync_state = 'pending'",
+        )
+      ).rows,
+    ).toEqual([{ count: 40, total: 20_500 }]);
+    await database.close();
+    store.close();
   });
 
   it("recovers an interrupted postings build without publishing partial chunks", async () => {

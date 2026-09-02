@@ -32,9 +32,12 @@ interface OpfsTestResult {
     compositeMatches: number;
     tailMatches: number;
     matchesAfterReopen: number;
+    nullableRowsAfterReopen: number;
+    nullableIndexedMatchesAfterReopen: number;
     uniqueRejectedAfterReopen: boolean;
     usedBeforeReopen: boolean;
     usedAfterReopen: boolean;
+    nullableIndexUsedAfterReopen: boolean;
   };
 }
 
@@ -104,6 +107,11 @@ async function runPhases(): Promise<OpfsTestResult> {
     { memoize: false },
   );
   await client.insertBatch("events", [{ id: 501, region: "special", amount: 500 }]);
+  await client.execute(
+    "CREATE TABLE nullable_events (id INTEGER PRIMARY KEY, removed_at TIMESTAMP)",
+  );
+  await client.execute("CREATE INDEX nullable_events_removed ON nullable_events(removed_at)");
+  await client.execute("INSERT INTO nullable_events VALUES (1, NULL), (2, NULL), (3, NULL)");
   const tailIndexed = await client.query(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
     { memoize: false },
@@ -120,6 +128,21 @@ async function runPhases(): Promise<OpfsTestResult> {
   const reopenedIndexPlan = await indexReopen.explain(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
   );
+  const nullableRows = await indexReopen.query("SELECT COUNT(*) AS n FROM nullable_events", {
+    memoize: false,
+  });
+  await indexReopen.execute(
+    "INSERT INTO nullable_events VALUES (4, TIMESTAMP '2026-09-02 12:00:00')",
+  );
+  const nullableIndexed = await indexReopen.query(
+    "SELECT COUNT(*) AS n FROM nullable_events " +
+      "WHERE removed_at = TIMESTAMP '2026-09-02 12:00:00'",
+    { memoize: false },
+  );
+  const nullableIndexPlan = await indexReopen.explain(
+    "SELECT COUNT(*) AS n FROM nullable_events " +
+      "WHERE removed_at = TIMESTAMP '2026-09-02 12:00:00'",
+  );
   let uniqueRejectedAfterReopen = false;
   try {
     await indexReopen.insertBatch("events", [{ id: 900, region: "west", amount: 0 }]);
@@ -131,9 +154,13 @@ async function runPhases(): Promise<OpfsTestResult> {
     compositeMatches: (compositeIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
     tailMatches: (tailIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
     matchesAfterReopen: (reopenedIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    nullableRowsAfterReopen: (nullableRows.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    nullableIndexedMatchesAfterReopen:
+      (nullableIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
     uniqueRejectedAfterReopen,
     usedBeforeReopen: indexPlan.includes("secondary index prunes"),
     usedAfterReopen: reopenedIndexPlan.includes("secondary index prunes"),
+    nullableIndexUsedAfterReopen: nullableIndexPlan.includes("secondary index prunes"),
   };
   await indexReopen.close({ terminateWorker: true });
 

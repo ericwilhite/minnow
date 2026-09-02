@@ -16,6 +16,12 @@ Stored formats are unchanged and no migration is needed.
 
 ### Fixed
 
+- Empty full-text and secondary-index commit coverage no longer becomes a persisted zero-posting
+  delta. Such coverage still protects an active index from stale writers, but does not consume
+  the bounded delta tail. OPFS recovery also accepts and removes these legal empty deltas from
+  older checkpoints and WAL replays instead of rejecting the database as corrupt. Crash tests now
+  exercise complete database commits across strict checkpoints, relaxed payload-suffix loss, and
+  a real-browser nullable-index reopen.
 - A placeholder inside a `RETURNING` expression — `RETURNING score + $2`, or Kysely's
   `returning((eb) => eb("points", "+", 3))` — failed with "Placeholder $2 is unbound" even
   though the value was passed. The statement bound its assignments and predicates but not its

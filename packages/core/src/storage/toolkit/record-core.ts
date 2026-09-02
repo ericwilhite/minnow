@@ -2360,6 +2360,11 @@ export class RecordCore {
       const currentTable: TableRecord = table;
       const active = activePostingStorageColumnIds(currentTable);
       if (!active.has(column.columnId)) continue;
+      // An empty entry is still meaningful while planning this commit: its presence proves that
+      // the writer observed the active index, so #applyFtsChanges must not invalidate it as a
+      // stale writer. Once that decision is made it contributes no postings, tokens, or readable
+      // state. Do not retain a zero-value delta or let it consume the bounded tail.
+      if (column.postings.length === 0) continue;
       const key = `${changes.tableId}/${column.columnId}`;
       const deltas =
         this.#ftsDeltas.get(key) ??
@@ -6022,7 +6027,13 @@ export class RecordCore {
     for (const [tableId, next] of cloned.nextRowIds) this.#nextRowIds.set(tableId, next);
     for (const [key, next] of cloned.nextAutoIncrement) this.#nextAutoIncrement.set(key, next);
     for (const [key, base] of cloned.ftsBases) this.#ftsBases.set(key, base);
-    for (const [key, deltas] of cloned.ftsDeltas) this.#ftsDeltas.set(key, new Map(deltas));
+    for (const [key, deltas] of cloned.ftsDeltas) {
+      // Releases that persisted legal empty commit-coverage entries must remain readable. They
+      // have no query semantics after commit, so normalize them away while loading instead of
+      // carrying non-canonical zero-value chunks into the next checkpoint.
+      const retained = deltas.filter(([, delta]) => delta.postings.length > 0);
+      if (retained.length > 0) this.#ftsDeltas.set(key, new Map(retained));
+    }
     for (const [tableId, tokens] of cloned.uniqueKeys) {
       this.#uniqueKeys.set(tableId, new OrderedStringSet(tokens));
     }
@@ -7455,7 +7466,14 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
       if (versions.has(version)) throw new TypeError(`Full-text delta ${key} repeats a version`);
       versions.add(version);
       whole(delta.totalTokens, `Full-text delta ${key} token count`);
-      if (
+      if (!Array.isArray(delta.postings)) {
+        throw new TypeError(`Full-text delta ${key} postings must be an array`);
+      }
+      if (delta.postings.length === 0) {
+        if (delta.totalTokens !== 0) {
+          throw new TypeError(`Empty full-text delta ${key} must have a zero token total`);
+        }
+      } else if (
         validateFtsPostingChunks([delta.postings], `Full-text delta ${key}`) !== delta.totalTokens
       ) {
         throw new TypeError(`Full-text delta ${key} token total does not match its postings`);

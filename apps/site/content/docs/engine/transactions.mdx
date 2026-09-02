@@ -151,11 +151,14 @@ conflicts.
 
 ## Durability
 
-Durability ends at a committed write in the durable store. Nothing depends on a page-close handler
-firing, because they do not reliably fire — a tab that vanishes loses only writes that had not
-committed.
+Under strict durability, durability begins when the committed write resolves. Nothing depends on
+a page-close handler firing, because they do not reliably fire: an abruptly terminated tab or
+worker recovers every acknowledged strict commit and discards only work that did not publish.
 
 The IndexedDB and OPFS stores default to `strict` durability: an acknowledged commit pays the
 adapter's final flush before it resolves. Open a store with `durability: "relaxed"` only when more
-write throughput is worth the possibility that a machine or device power loss drops an
-acknowledged suffix of commits. Atomicity and corruption checks remain enabled in both modes.
+write throughput is worth the possibility that storage loss drops an acknowledged suffix of
+commits. Atomicity and corruption checks remain enabled in both modes: relaxed OPFS recovery rolls
+back to the last payload-verified WAL prefix instead of opening partial state. Point-of-sale rows,
+offline sync queues, and other data that cannot be reconstructed must use `strict`, and the origin
+must request persistence separately to avoid automatic quota eviction.

@@ -85,9 +85,12 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
           compositeMatches: number;
           tailMatches: number;
           matchesAfterReopen: number;
+          nullableRowsAfterReopen: number;
+          nullableIndexedMatchesAfterReopen: number;
           uniqueRejectedAfterReopen: boolean;
           usedBeforeReopen: boolean;
           usedAfterReopen: boolean;
+          nullableIndexUsedAfterReopen: boolean;
         };
       }>;
     };
@@ -121,9 +124,12 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
   expect(result.secondaryIndex.compositeMatches).toBe(3);
   expect(result.secondaryIndex.tailMatches).toBe(1);
   expect(result.secondaryIndex.matchesAfterReopen).toBe(1);
+  expect(result.secondaryIndex.nullableRowsAfterReopen).toBe(3);
+  expect(result.secondaryIndex.nullableIndexedMatchesAfterReopen).toBe(1);
   expect(result.secondaryIndex.uniqueRejectedAfterReopen).toBe(true);
   expect(result.secondaryIndex.usedBeforeReopen).toBe(true);
   expect(result.secondaryIndex.usedAfterReopen).toBe(true);
+  expect(result.secondaryIndex.nullableIndexUsedAfterReopen).toBe(true);
 
   expect(consoleErrors).toEqual([]);
 });

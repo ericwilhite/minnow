@@ -56,8 +56,9 @@ machines: https://minnowdb.com/llms.txt
   `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
   exist in Safari private browsing, so fall back to IndexedDB when
   `navigator.storage?.getDirectory` is missing or rejects.
-- Durable adapters default to `durability: "strict"`. Use `"relaxed"` only when extra write
-  throughput is worth a power-loss window. For irreplaceable browser-local data, call
+- Durable adapters default to `durability: "strict"`. Use `"relaxed"` only for rebuildable or
+  already-replicated data; never use it for point-of-sale writes or an authoritative offline sync
+  queue. For irreplaceable browser-local data, call
   `ensureOriginPersistence("required")` from `@minnowdb/core/storage/persistence` before opening
   the store; this prevents automatic quota eviction when granted, not deliberate site-data
   clearing.

@@ -5043,7 +5043,7 @@ export class IndexedDbBlockStore implements BlockStore {
         const chunkIndex = decodeFtsDeltaIndex(rawChunkIndex);
         if (
           (rawChunkIndex !== undefined && chunkIndex === undefined) ||
-          (chunkIndex?.versions.length ?? 0) >= MAX_FTS_DELTA_CHUNKS
+          (postings.length > 0 && (chunkIndex?.versions.length ?? 0) >= MAX_FTS_DELTA_CHUNKS)
         ) {
           for (const version of chunkIndex?.versions ?? []) {
             catalog.delete(ftsChunkKey(ftsEntry.tableId, column.columnId, version));
@@ -5073,6 +5073,17 @@ export class IndexedDbBlockStore implements BlockStore {
             tableId: ftsEntry.tableId,
             columnId: column.columnId,
             count: 0,
+          });
+          continue;
+        }
+        // Empty commit coverage already protected the active index from stale-writer
+        // invalidation above. It has no durable query state and must not consume one of the
+        // bounded delta generations.
+        if (postings.length === 0) {
+          ftsDeltaCounts.push({
+            tableId: ftsEntry.tableId,
+            columnId: column.columnId,
+            count: chunkIndex?.versions.length ?? 0,
           });
           continue;
         }
