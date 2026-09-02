@@ -56,12 +56,12 @@ machines: https://minnowdb.com/llms.txt
   `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
   exist in Safari private browsing, so fall back to IndexedDB when
   `navigator.storage?.getDirectory` is missing or rejects.
-- Durable adapters default to `durability: "strict"`. Use `"relaxed"` only for rebuildable or
-  already-replicated data; never use it for point-of-sale writes or an authoritative offline sync
-  queue. For irreplaceable browser-local data, call
-  `ensureOriginPersistence("required")` from `@minnowdb/core/storage/persistence` before opening
-  the store; this prevents automatic quota eviction when granted, not deliberate site-data
-  clearing.
+- Durable adapters default to `durability: "strict"`. Use `strict` whenever losing an acknowledged
+  write is unacceptable. Use `"relaxed"` only when every acknowledged write can be reconstructed,
+  replayed, or recovered from another durable source. For browser-local data that must be preserved,
+  call `ensureOriginPersistence("required")` from `@minnowdb/core/storage/persistence` before
+  opening the store; this prevents automatic quota eviction when granted, not deliberate site-data
+  clearing or device loss, so those risks still need an independent synchronized or exported copy.
 - Minnow is 0.x: breaking changes land in minor releases, so pin exact `@minnowdb/*` versions and
   upgrade them together. Engine-dependent adapters declare ranges that make npm reject an incompatible
   core; the structurally typed React hook has no core runtime dependency.

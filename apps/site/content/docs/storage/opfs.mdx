@@ -131,16 +131,18 @@ version stops before redundant-slot fallback and before any truncation or deleti
 
 `strict`, the default, flushes each payload before flushing the WAL frame that publishes it, and
 does both before the operation resolves. A missing or corrupt durable payload is reported as
-storage corruption rather than silently rolled back. Use this mode for point-of-sale writes,
-offline sync queues, or any other locally accepted data that cannot be recreated.
+storage corruption rather than silently rolled back. Use this mode whenever losing an acknowledged
+write is unacceptable.
 
 `relaxed` completes the payload and WAL writes before acknowledging, but lets the operating
 system schedule their final flush. A tab, worker, or browser-process failure normally recovers
 the acknowledged writes already held by the operating system; a machine or device power loss can
 lose an acknowledged suffix. Recovery still accepts only a consecutive WAL prefix whose extent
 ranges and checksums verify. The extra strict-mode flushes cost write throughput, so select
-`relaxed` only for rebuildable or already-replicated data where that loss window is an accepted
-performance trade-off. It is not an appropriate setting for an authoritative offline write queue.
+`relaxed` only when every acknowledged write can be reconstructed, replayed, or recovered from
+another durable source, and that loss window is an accepted performance trade-off. A later
+checkpoint makes the writes it includes durable, but relaxed mode provides no per-write promise
+about when that checkpoint or an operating-system flush will happen.
 
 ## Quota
 
@@ -157,7 +159,8 @@ A refused write escapes as the browser's own `QuotaExceededError`, with everythi
 before it intact and the same write succeeding once space frees. Origin persistence protects
 against automatic quota eviction when the browser grants it; it cannot prevent the user from
 clearing site data. Applications whose local rows are authoritative should require both strict
-durability and origin persistence, then export or synchronize another copy when possible.
+durability and origin persistence. When acknowledged writes must survive deliberate site-data
+clearing or device loss too, export or synchronize an independent durable copy.
 `getLogicalStorageBytes()` reports the database's logical footprint, including its control log,
 newest checkpoint, and temporary spill.
 

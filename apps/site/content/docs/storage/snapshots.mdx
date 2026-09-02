@@ -202,4 +202,4 @@ every test run. A future incompatible writer uses a new format number; it does n
 these bytes. The compatibility check compares compressed blocks by their canonical uncompressed
 payload because native gzip encoders may emit different valid stored streams. A snapshot is still
 only as durable as the media and origin that holds it, so keep independent copies for
-irreplaceable data.
+data that must survive loss of that origin or device.

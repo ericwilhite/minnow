@@ -25,8 +25,10 @@ const store = await IndexedDbBlockStore.open({
 acknowledged commit is not intentionally left only in an operating-system cache.
 
 `relaxed` keeps the same atomic commit boundaries while allowing the browser to batch final disk
-flushes. It is an explicit performance choice for rebuildable or remotely synchronized data: a
-machine or storage-device power loss may lose an acknowledged suffix of commits.
+flushes. A machine or storage-device power loss may lose an acknowledged suffix of commits, so use
+it only when every acknowledged write can be reconstructed, replayed, or recovered from another
+durable source and that loss window is acceptable. Use `strict` whenever losing an acknowledged
+write is unacceptable.
 
 ## Quota
 
@@ -44,7 +46,8 @@ Persistence may be granted silently, denied, or require a user gesture depending
 `"required"` fails before the application opens its store when the browser cannot protect the
 origin from automatic quota eviction. Use `"request"` to receive a status instead, or
 `"best-effort"` to check without prompting. No browser API prevents the user from deliberately
-clearing site data, so export irreplaceable data or synchronize it elsewhere too.
+clearing site data. When acknowledged writes must survive those events too, export or synchronize
+an independent durable copy.
 
 `getLogicalStorageBytes()` reports what this database occupies, which is the number to show a user
 and the one to watch before a bulk load:

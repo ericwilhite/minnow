@@ -156,9 +156,10 @@ a page-close handler firing, because they do not reliably fire: an abruptly term
 worker recovers every acknowledged strict commit and discards only work that did not publish.
 
 The IndexedDB and OPFS stores default to `strict` durability: an acknowledged commit pays the
-adapter's final flush before it resolves. Open a store with `durability: "relaxed"` only when more
-write throughput is worth the possibility that storage loss drops an acknowledged suffix of
-commits. Atomicity and corruption checks remain enabled in both modes: relaxed OPFS recovery rolls
-back to the last payload-verified WAL prefix instead of opening partial state. Point-of-sale rows,
-offline sync queues, and other data that cannot be reconstructed must use `strict`, and the origin
-must request persistence separately to avoid automatic quota eviction.
+adapter's final flush before it resolves. Use `strict` whenever losing an acknowledged write is
+unacceptable. Open a store with `durability: "relaxed"` only when every acknowledged write can be
+reconstructed, replayed, or recovered from another durable source. Atomicity and corruption checks
+remain enabled in both modes: relaxed OPFS recovery rolls back to the last payload-verified WAL
+prefix instead of opening partial state. Browser-local data that must be preserved also needs
+required origin persistence to prevent automatic quota eviction and an independent synchronized or
+exported copy to cover deliberate site-data clearing and device loss.

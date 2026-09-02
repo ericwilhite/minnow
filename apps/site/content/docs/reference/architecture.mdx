@@ -21,7 +21,7 @@ Everything else is built around these ideas.
   atomic storage commit. Their default `strict` mode also requests or performs the final flush;
   `relaxed` keeps atomicity but explicitly accepts that power loss can remove an acknowledged
   suffix. Origin eviction and deliberate site-data clearing remain separate risks, so
-  irreplaceable data still needs an independent copy.
+  data that must survive those events still needs an independent copy.
 - **Where the engine runs is your choice.** Put it in a worker and hold an async proxy in the
   page, or construct it on the main thread. The API is async everywhere, so your code — and any
   adapter written against it — looks the same either way.
