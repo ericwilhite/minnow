@@ -200,8 +200,10 @@ depth.
 
 Correlated scalar subqueries support aggregate expressions—including `JSON_ARRAYAGG`—and ordinary
 single-row projections. `ORDER BY`, `LIMIT`, and `OFFSET` are applied independently for each
-distinct outer probe tuple. An ordinary scalar returns NULL for no row and raises a cardinality
-error for more than one row. The inner scalar block cannot itself use `GROUP BY` or `HAVING`.
+distinct outer probe tuple. The inner predicates, projection, and aggregate arguments may use any
+number of qualified outer columns; every referenced value becomes part of that probe tuple. An
+ordinary scalar returns NULL for no row and raises a cardinality error for more than one row. The
+inner scalar block cannot itself use `GROUP BY` or `HAVING`.
 
 Correlated `IN`, `NOT IN`, `ANY`, and `ALL` preserve their empty-set and NULL behavior at top level
 and inside larger expressions. `NOT IN` carries per-probe counts rather than treating NULL as an

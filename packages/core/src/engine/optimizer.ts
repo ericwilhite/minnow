@@ -2022,14 +2022,22 @@ function scalarOrderExpression(expression: Expression, rows: CompiledQuery): Exp
 }
 
 /** The value a scalar aggregate expression produces for an empty correlated input. */
-function emptyScalarExpression(expression: Expression): Expression {
+function emptyScalarExpression(
+  expression: Expression,
+  preservedColumns: ReadonlySet<string> = new Set(),
+): Expression {
   if (isAggregateCall(expression)) {
     return { kind: "literal", value: expression.name === "COUNT" ? 0 : null };
   }
-  if (expression.kind === "column" || expression.kind === "wildcard") {
+  if (expression.kind === "column") {
+    return preservedColumns.has(expression.reference)
+      ? structuredClone(expression)
+      : { kind: "literal", value: null };
+  }
+  if (expression.kind === "wildcard") {
     return { kind: "literal", value: null };
   }
-  return mapChildExpressions(expression, emptyScalarExpression);
+  return mapChildExpressions(expression, (child) => emptyScalarExpression(child, preservedColumns));
 }
 
 /**
@@ -2052,14 +2060,69 @@ function decorrelateGeneralScalar(
   if (rows.limitWithTies === true && rows.orderBy.length === 0) {
     throw new TypeError("A correlated scalar WITH TIES query requires ORDER BY");
   }
-  const keys = extractCorrelation(rows, scope, "scalar", true);
-  const outerExpressions = keys.map((key) => structuredClone(key.outer));
+  const expressionOutside: string[] = [];
+  collectExpressionOutsideReferences(
+    shape.expression,
+    new Set([rows.base.alias, ...rows.joins.map((join) => join.alias)]),
+    expressionOutside,
+  );
+  const probeLifted =
+    expressionOutside.length > 0 || !canExtractCorrelation(rows, scope, "scalar", true);
+  const references = probeLifted
+    ? probeOuterReferences(rows, expressionOutside, scope, "scalar")
+    : [];
+  const keys = probeLifted
+    ? takeCorrelationPredicates(rows, scope, true)
+    : extractCorrelation(rows, scope, "scalar", true);
+  const outerExpressions = probeLifted
+    ? references.map<Expression>((reference) => ({ kind: "column", reference }))
+    : keys.map((key) => structuredClone(key.outer));
+  const originalExpression = structuredClone(shape.expression);
   const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const probeReferences = outerExpressions.map<Expression>((_, index) => ({
     kind: "column",
     reference: `${probesAlias}.${correlationProbeAlias(index)}`,
   }));
+  if (probeLifted) {
+    const replacements = new Map(
+      references.map((reference, index) => [reference, probeReferences[index] ?? null]),
+    );
+    replacePlanReferences(rows, replacements);
+    shape.expression = replaceExpressionReferences(shape.expression, replacements);
+    const source = { table: probesAlias, alias: probesAlias, derived: probes };
+    const missingProbe: Expression = { kind: "literal", value: null };
+    const keyProbes = keys.map((key) => {
+      const reference = key.outer.kind === "column" ? key.outer.reference : "";
+      return probeReferences[references.indexOf(reference)] ?? missingProbe;
+    });
+    const keysReadBase = keys.every((key) => {
+      const parts = key.inner.kind === "column" ? key.inner.reference.split(".") : [];
+      return parts.length === 1 || parts[0] === rows.base.alias;
+    });
+    if (keys.length > 0 && keysReadBase) {
+      rows.joins.unshift(
+        generalCorrelationJoin(
+          probesAlias,
+          probes,
+          keys.map((key) => key.inner),
+          keyProbes,
+          keys.map((key) => key.operator),
+        ),
+      );
+    } else {
+      // A probe introduced before the original joins is visible to every JOIN ON expression.
+      // Keys that read one of those later joins remain WHERE predicates over the complete row.
+      rows.joins.unshift(crossJoinPlan(source));
+      rows.predicates.push(
+        ...keys.map((key, index) => ({
+          left: key.inner,
+          operator: key.operator,
+          right: keyProbes[index] ?? missingProbe,
+        })),
+      );
+    }
+  }
 
   const finalRowsAlias = nextAlias();
   const projected: Array<{ expression: Expression; alias: string }> = [];
@@ -2110,6 +2173,18 @@ function decorrelateGeneralScalar(
       return rewritten;
     }
     if (expression.kind === "column" || expression.kind === "wildcard") {
+      if (probeLifted && expression.kind === "column") {
+        const index = probeReferences.findIndex(
+          (reference) =>
+            reference.kind === "column" && reference.reference === expression.reference,
+        );
+        if (index >= 0) {
+          return {
+            kind: "column",
+            reference: `${finalRowsAlias}.${correlationKeyAlias(index)}`,
+          };
+        }
+      }
       throw new TypeError("A correlated scalar aggregate cannot select an ungrouped inner column");
     }
     if (expression.kind === "subquery" || expression.kind === "exists") {
@@ -2133,50 +2208,57 @@ function decorrelateGeneralScalar(
     base: rows.base,
     joins: rows.joins,
     select: [
-      ...keys.map((key, index) => ({
-        expression: key.inner,
-        alias: correlationKeyAlias(index),
-      })),
+      ...(probeLifted ? probeReferences : keys.map((key) => key.inner)).map(
+        (expression, index) => ({
+          expression,
+          alias: correlationKeyAlias(index),
+        }),
+      ),
       ...projected,
     ],
     // Every inner row must equal a surviving probe on the keys, so what the probe block filters
     // on its key columns filters the inner scan too: the range on the outer key becomes a
     // range on the inner key, and the scan prunes blocks by it instead of reading the table.
-    predicates: [...rows.predicates, ...mirrorPredicatesThroughKeys(probes.predicates, keys)],
+    predicates: [
+      ...rows.predicates,
+      ...(probeLifted ? [] : mirrorPredicatesThroughKeys(probes.predicates, keys)),
+    ],
     groupBy: [],
     having: [],
     orderBy: [],
   };
-  const matched: CompiledQuery = {
-    sql: "(correlated scalar matched probes)",
-    base: { table: probesAlias, alias: probesAlias, derived: probes },
-    joins: [
-      generalCorrelationJoin(
-        innerRowsAlias,
-        rawRows,
-        keys.map((_, index): Expression => ({
-          kind: "column",
-          reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
-        })),
-        probeReferences,
-        keys.map(({ operator }) => operator),
-      ),
-    ],
-    select: [
-      ...probeReferences.map((expression, index) => ({
-        expression,
-        alias: correlationKeyAlias(index),
-      })),
-      ...projected.map(({ alias }) => ({
-        expression: { kind: "column" as const, reference: `${innerRowsAlias}.${alias}` },
-        alias,
-      })),
-    ],
-    predicates: [],
-    groupBy: [],
-    having: [],
-    orderBy: [],
-  };
+  const matched: CompiledQuery = probeLifted
+    ? rawRows
+    : {
+        sql: "(correlated scalar matched probes)",
+        base: { table: probesAlias, alias: probesAlias, derived: probes },
+        joins: [
+          generalCorrelationJoin(
+            innerRowsAlias,
+            rawRows,
+            keys.map((_, index): Expression => ({
+              kind: "column",
+              reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
+            })),
+            probeReferences,
+            keys.map(({ operator }) => operator),
+          ),
+        ],
+        select: [
+          ...probeReferences.map((expression, index) => ({
+            expression,
+            alias: correlationKeyAlias(index),
+          })),
+          ...projected.map(({ alias }) => ({
+            expression: { kind: "column" as const, reference: `${innerRowsAlias}.${alias}` },
+            alias,
+          })),
+        ],
+        predicates: [],
+        groupBy: [],
+        having: [],
+        orderBy: [],
+      };
 
   let finalRows = matched;
   if (
@@ -2196,7 +2278,7 @@ function decorrelateGeneralScalar(
           {
             alias: correlationRowNumberAlias,
             name: rows.limitWithTies === true ? ("RANK" as const) : ("ROW_NUMBER" as const),
-            partitionAliases: keys.map((_, index) => correlationKeyAlias(index)),
+            partitionAliases: outerExpressions.map((_, index) => correlationKeyAlias(index)),
             orderAliases: rows.orderBy.map((order, index) => ({
               alias: correlationOrderAlias(index),
               direction: order.direction,
@@ -2241,7 +2323,7 @@ function decorrelateGeneralScalar(
       base: ranked,
       joins: [],
       select: [
-        ...keys.map((_, index) => ({
+        ...outerExpressions.map((_, index) => ({
           expression: {
             kind: "column" as const,
             reference: `${rankedAlias}.${correlationKeyAlias(index)}`,
@@ -2266,7 +2348,7 @@ function decorrelateGeneralScalar(
     };
   }
 
-  const finalProbeReferences = keys.map((_, index): Expression => ({
+  const finalProbeReferences = outerExpressions.map((_, index): Expression => ({
     kind: "column",
     reference: `${finalRowsAlias}.${correlationKeyAlias(index)}`,
   }));
@@ -2304,7 +2386,7 @@ function decorrelateGeneralScalar(
           right: { kind: "literal", value: null },
         },
         then: grouped
-          ? emptyScalarExpression(structuredClone(shape.expression))
+          ? emptyScalarExpression(originalExpression, new Set(references))
           : { kind: "literal", value: null },
       },
     ],
@@ -2528,19 +2610,7 @@ function decorrelateExistsWithProbes(
   nextAlias: NextAlias,
 ): Expression {
   const inner = exists.block;
-  const outside: string[] = [];
-  collectOutsideReferences(inner, new Set(), outside);
-  const references = [...new Set(outside)];
-  if (references.length === 0) {
-    throw new TypeError("Correlated EXISTS subquery has no usable outer reference");
-  }
-  for (const reference of references) {
-    const parts = reference.split(".");
-    const alias = parts.length === 2 ? parts[0] : undefined;
-    if (alias === undefined || !scope.has(alias)) {
-      throw new TypeError(`Correlated EXISTS references an unavailable outer source: ${reference}`);
-    }
-  }
+  const references = probeOuterReferences(inner, [], scope, "EXISTS");
 
   const outerExpressions = references.map<Expression>((reference) => ({
     kind: "column",
@@ -2613,10 +2683,10 @@ function decorrelateExistsWithProbes(
 }
 
 /** Rebinds qualified references everywhere below one plan without touching the probe definition. */
-function replacePlanReferences(
-  block: CompiledQuery,
+function replaceExpressionReferences(
+  expression: Expression,
   replacements: ReadonlyMap<string, Expression | null>,
-): void {
+): Expression {
   const rewrite = (expression: Expression): Expression => {
     if (expression.kind === "column") {
       const replacement = replacements.get(expression.reference);
@@ -2634,7 +2704,15 @@ function replacePlanReferences(
     }
     return mapChildExpressions(expression, rewrite);
   };
-  mapBlockExpressions(block, rewrite);
+  return rewrite(expression);
+}
+
+/** Rebinds qualified references everywhere below one plan without touching the probe definition. */
+function replacePlanReferences(
+  block: CompiledQuery,
+  replacements: ReadonlyMap<string, Expression | null>,
+): void {
+  mapBlockExpressions(block, (expression) => replaceExpressionReferences(expression, replacements));
   forEachNestedBlock(block, (nested) => replacePlanReferences(nested, replacements));
 }
 
@@ -2926,13 +3004,12 @@ function blockReferencesOutside(block: CompiledQuery): boolean {
   return refs.length > 0;
 }
 
-/** Collects qualified column references whose alias no enclosing scope inside `block` defines. */
-function collectOutsideReferences(
-  block: CompiledQuery,
-  outer: ReadonlySet<string>,
+/** Collects qualified references in one expression whose alias no available scope defines. */
+function collectExpressionOutsideReferences(
+  expression: Expression,
+  scope: ReadonlySet<string>,
   refs: string[],
 ): void {
-  const scope = new Set([...outer, block.base.alias, ...block.joins.map((join) => join.alias)]);
   const visit = (expression: Expression): void => {
     if (expression.kind === "column") {
       const parts = expression.reference.split(".");
@@ -2948,10 +3025,47 @@ function collectOutsideReferences(
     }
     for (const child of childExpressions(expression)) visit(child);
   };
-  forEachBlockExpression(block, visit);
+  visit(expression);
+}
+
+/** Collects qualified column references whose alias no enclosing scope inside `block` defines. */
+function collectOutsideReferences(
+  block: CompiledQuery,
+  outer: ReadonlySet<string>,
+  refs: string[],
+): void {
+  const scope = new Set([...outer, block.base.alias, ...block.joins.map((join) => join.alias)]);
+  forEachBlockExpression(block, (expression) =>
+    collectExpressionOutsideReferences(expression, scope, refs),
+  );
   forEachNestedBlock(block, (nested) => {
     collectOutsideReferences(nested, scope, refs);
   });
+}
+
+/** Returns every available qualified outer reference used by a correlated block. */
+function probeOuterReferences(
+  block: CompiledQuery,
+  additional: readonly string[],
+  scope: ReadonlySet<string>,
+  label: string,
+): string[] {
+  const outside: string[] = [];
+  collectOutsideReferences(block, new Set(), outside);
+  const references = [...new Set([...outside, ...additional])];
+  if (references.length === 0) {
+    throw new TypeError(`Correlated ${label} subquery has no usable outer reference`);
+  }
+  for (const reference of references) {
+    const parts = reference.split(".");
+    const alias = parts.length === 2 ? parts[0] : undefined;
+    if (alias === undefined || !scope.has(alias)) {
+      throw new TypeError(
+        `Correlated ${label} references an unavailable outer source: ${reference}`,
+      );
+    }
+  }
+  return references;
 }
 
 function extractCorrelation(
@@ -2960,15 +3074,7 @@ function extractCorrelation(
   label: string,
   comparisons = false,
 ): CorrelationKey[] {
-  const innerScope = new Set([inner.base.alias, ...inner.joins.map((join) => join.alias)]);
-  const keys: CorrelationKey[] = [];
-  const kept: Predicate[] = [];
-  for (const predicate of inner.predicates) {
-    const key = correlationComparison(predicate, innerScope, outerScope, comparisons);
-    if (key === undefined) kept.push(predicate);
-    else keys.push(key);
-  }
-  inner.predicates = kept;
+  const keys = takeCorrelationPredicates(inner, outerScope, comparisons);
   const leftover: string[] = [];
   collectOutsideReferences(inner, new Set(), leftover);
   if (leftover.length > 0) {
@@ -2980,6 +3086,24 @@ function extractCorrelation(
   if (keys.length === 0) {
     throw new TypeError(`Correlated ${label} subquery has no usable correlation condition`);
   }
+  return keys;
+}
+
+/** Removes the simple inner/outer comparisons that can become probe-join conditions. */
+function takeCorrelationPredicates(
+  inner: CompiledQuery,
+  outerScope: ReadonlySet<string>,
+  comparisons: boolean,
+): CorrelationKey[] {
+  const innerScope = new Set([inner.base.alias, ...inner.joins.map((join) => join.alias)]);
+  const keys: CorrelationKey[] = [];
+  const kept: Predicate[] = [];
+  for (const predicate of inner.predicates) {
+    const key = correlationComparison(predicate, innerScope, outerScope, comparisons);
+    if (key === undefined) kept.push(predicate);
+    else keys.push(key);
+  }
+  inner.predicates = kept;
   return keys;
 }
 

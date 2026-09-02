@@ -420,8 +420,8 @@
     {
       "id": "subquery.correlated-select",
       "status": "supported",
-      "example": "SELECT r.region, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r",
-      "notes": "Correlated scalar aggregates and single-row projections decorrelate in the select list. In a grouped query, their outer references must be GROUP BY columns and the scalar cannot sit inside an outer aggregate."
+      "example": "SELECT r.region, (SELECT MAX(q.amount + r.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r",
+      "notes": "Correlated scalar aggregates and single-row projections decorrelate in the select list. Every qualified outer column used by the inner predicates or projection becomes part of the distinct probe tuple. In a grouped query, outer references must be GROUP BY columns and the scalar cannot sit inside an outer aggregate."
     },
     {
       "id": "subquery.correlated-select-limit",

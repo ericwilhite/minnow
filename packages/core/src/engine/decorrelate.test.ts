@@ -98,6 +98,8 @@ const tables = new Map<string, DatabaseRow[]>([
       { petKey: 12, ownerKey: 2, petName: "Zed" },
     ],
   ],
+  ["locations", [{ locationKey: 10, regionKey: 100 }]],
+  ["yards", [{ yardKey: 1, locationKey: 10 }]],
 ]);
 
 function run(sql: string): DatabaseRow[] {
@@ -386,6 +388,114 @@ describe("correlated subquery decorrelation", () => {
     ).toEqual([
       { amount: 10, a: 8 },
       { amount: 6, a: 8 },
+    ]);
+  });
+
+  it("carries additional outer columns into a correlated scalar projection", () => {
+    expect(
+      run(
+        "SELECT l.locationKey, " +
+          "(SELECT MAX(y.yardKey + l.regionKey) FROM yards y " +
+          "WHERE y.locationKey = l.locationKey) AS v " +
+          "FROM locations l",
+      ),
+    ).toEqual([{ locationKey: 10, v: 101 }]);
+  });
+
+  it("supports outer values throughout the general correlated scalar body", () => {
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT MAX(q.amount + r.amount) FROM rows q WHERE q.region = r.region) AS v " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, v: 16 },
+      { amount: 10, v: 20 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT MAX(q.amount + r.amount + d.rank) FROM rows q " +
+          "WHERE q.region = r.region) AS v " +
+          "FROM rows r JOIN dims d ON d.region = r.region " +
+          "WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, v: 17 },
+      { amount: 10, v: 21 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT MAX(q.amount) FROM rows q " +
+          "JOIN dims d ON d.region = q.region AND d.rank < r.amount " +
+          "WHERE q.region = r.region) AS v " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, v: 10 },
+      { amount: 10, v: 10 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT MAX(q.amount + r.amount) FROM dims d " +
+          "JOIN rows q ON q.region = d.region WHERE q.region = r.region) AS v " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, v: 16 },
+      { amount: 10, v: 20 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT MAX(q.amount) + r.amount FROM rows q WHERE q.region = 'east') AS v " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, v: 9 },
+      { amount: 10, v: 13 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT COUNT(*) FROM rows q WHERE q.amount < r.amount + 1) AS c " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, c: 2 },
+      { amount: 10, c: 4 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT COALESCE(MAX(q.amount), r.amount) FROM rows q " +
+          "WHERE q.region = 'missing') AS fallback " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, fallback: 6 },
+      { amount: 10, fallback: 10 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT COALESCE(MAX(q.amount + r.amount), r.amount) FROM rows q " +
+          "WHERE q.region = r.region) AS fallback " +
+          "FROM rows r WHERE r.region IS NULL",
+      ),
+    ).toEqual([{ amount: 8, fallback: 8 }]);
+    expect(
+      run(
+        "SELECT r.amount, " +
+          "(SELECT q.amount + r.amount FROM rows q WHERE q.region = 'east') AS v " +
+          "FROM rows r WHERE r.region = 'west' ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 6, v: 9 },
+      { amount: 10, v: 13 },
     ]);
   });
 

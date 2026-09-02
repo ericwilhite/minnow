@@ -25,7 +25,8 @@ PostgreSQL grammar. These supported features have narrower limits:
 - grouped correlated scalar select items may reference grouping keys, but cannot sit inside an
   outer aggregate.
 - a correlated scalar's inner block supports aggregate expressions or an ordinary single row,
-  with per-probe ordering and limits, but not its own `GROUP BY` or `HAVING`.
+  with any number of qualified outer-column references plus per-probe ordering and limits, but
+  not its own `GROUP BY` or `HAVING`.
 - `LATERAL` supports equality and range-correlated projections and joins, without correlated grouping,
   ordering, or `LIMIT`.
 - `JSON_TABLE` supports constant documents with `$` and `$[*]` row paths.
