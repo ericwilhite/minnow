@@ -3155,23 +3155,38 @@ export function collectFtsCandidates(
   }
   const sets = terms.map(() => new Set<bigint>());
   let retainedRowIds = 0;
+  // Every chunk is strictly sorted by term (the write path refuses anything else), so each
+  // query seeks to its first possible posting by binary search and walks forward only while
+  // postings can still match: an exact term touches one posting, a prefix or range its run.
   for (const postings of chunkLists) {
-    for (const posting of postings) {
-      for (let index = 0; index < terms.length; index += 1) {
-        const term = terms[index];
-        if (term === undefined) continue;
-        const matches = ftsPostingQueryMatches(posting.term, term);
-        if (!matches) continue;
-        const set = sets[index];
-        if (set !== undefined) {
-          for (const rowId of posting.rowIds) {
-            if (set.has(rowId)) continue;
-            if (retainedRowIds === maxRowIds) {
-              return { rowIdsByTerm: terms.map(() => []), overflow: true };
-            }
-            set.add(rowId);
-            retainedRowIds += 1;
+    for (let index = 0; index < terms.length; index += 1) {
+      const term = terms[index];
+      const set = sets[index];
+      if (term === undefined || set === undefined) continue;
+      const seek = "term" in term ? term.term : term.lower;
+      let position = seek === undefined ? 0 : lowerBoundPosting(postings, seek);
+      // An exclusive lower bound starts one past its own term, which the seek lands on.
+      if (
+        !("term" in term) &&
+        term.lowerInclusive === false &&
+        postings[position]?.term === term.lower
+      ) {
+        position += 1;
+      }
+      for (; position < postings.length; position += 1) {
+        const posting = postings[position];
+        if (posting === undefined) break;
+        if (!ftsPostingQueryMatches(posting.term, term)) {
+          // Past the seek point, the first miss ends the run for every query shape.
+          break;
+        }
+        for (const rowId of posting.rowIds) {
+          if (set.has(rowId)) continue;
+          if (retainedRowIds === maxRowIds) {
+            return { rowIdsByTerm: terms.map(() => []), overflow: true };
           }
+          set.add(rowId);
+          retainedRowIds += 1;
         }
       }
     }
@@ -3182,6 +3197,18 @@ export function collectFtsCandidates(
     ),
     overflow: false,
   };
+}
+
+/** Index of the first posting whose term is not below `term` in a term-sorted chunk. */
+function lowerBoundPosting(postings: readonly FtsPosting[], term: string): number {
+  let low = 0;
+  let high = postings.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((postings[middle]?.term ?? "") < term) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 /** Validates the snapshot bound of one full-text read; -1 selects the base view alone. */

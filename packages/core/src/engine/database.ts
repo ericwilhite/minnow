@@ -327,6 +327,10 @@ const SEQUENCE_PREFIX = "\u0000minnow_sequence:";
 const MAX_POINT_READ_CANDIDATES = 1_024;
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
+/** Candidate lists wider than this scan their blocks instead of probing for exact rows. */
+const SECONDARY_INDEX_ROW_SELECTION_CAP = 4096;
+/** Candidate results at most this wide are pooled across snapshots by (column, version, terms). */
+const MAX_POOLED_FTS_CANDIDATE_ROW_IDS = 65_536;
 /** Persistent rebuild failure cannot let an accelerator append one durable delta per commit. */
 const FTS_HARD_DELTA_CHUNKS = 64;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
@@ -10895,14 +10899,18 @@ export class MinnowDatabase {
       throwIfAborted(options.signal);
       const baseSegments = indexed.segments;
       // Zone-map elimination composes after index pruning: whole row groups whose statistics
-      // reject the plan's predicates never stream at all.
-      const zonePruned = await this.#zonePrunedStreamSegments(
-        plan,
-        freshBaseTable,
-        projectedBaseColumns,
-        baseSegments,
-        snapshot,
-      );
+      // reject the plan's predicates never stream at all. An exact index row selection is
+      // numbered over the pruned blocks, so it is used as is.
+      const zonePruned =
+        indexed.rows === undefined
+          ? await this.#zonePrunedStreamSegments(
+              plan,
+              freshBaseTable,
+              projectedBaseColumns,
+              baseSegments,
+              snapshot,
+            )
+          : undefined;
       throwIfAborted(options.signal);
       const baseView = this.#streamedViewFactory(
         baseTable,
@@ -11025,6 +11033,7 @@ export class MinnowDatabase {
             try {
               const streamedResult = await prepared.executeAsync({
                 loadScanWindow: streamed.load,
+                ...(indexed.rows === undefined ? {} : { scanRows: indexed.rows }),
                 ...(options.signal === undefined ? {} : { signal: options.signal }),
               });
               options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -11038,6 +11047,7 @@ export class MinnowDatabase {
             ...(spillPageRows === undefined ? {} : { spillPageRows }),
             spillStore: this.#leasedSpillStore(),
             loadScanWindow: streamed.load,
+            ...(indexed.rows === undefined ? {} : { scanRows: indexed.rows }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -11467,6 +11477,33 @@ export class MinnowDatabase {
    * dictionary objects that stay identical across queries, which keeps per-dictionary
    * expression caches (equality codes, LIKE match sets) hot between statements.
    */
+  /**
+   * Secondary-index key locators for one block's key column, mapped to the block rows that
+   * carry them, pooled by block id. A locator is a hash, so two keys may share one; the scan's
+   * own predicate settles such collisions.
+   */
+  #blockKeyLocators(
+    blockId: string,
+    vector: ColumnVector,
+    type: SimpleDataType,
+  ): Map<bigint, number | number[]> {
+    const cached = this.#cacheGet(`dkl ${blockId}`) as Map<bigint, number | number[]> | undefined;
+    if (cached !== undefined) return cached;
+    const locators = new Map<bigint, number | number[]>();
+    for (let row = 0; row < vector.length; row += 1) {
+      const value = vectorValue(vector, row);
+      if (value === null) continue;
+      const locator = secondaryKeyLocator(type, value);
+      const existing = locators.get(locator);
+      if (existing === undefined) locators.set(locator, row);
+      else if (typeof existing === "number") locators.set(locator, [existing, row]);
+      else existing.push(row);
+    }
+    // A Map entry for a small bigint and a row number: key, value, hash slot, chain pointer.
+    this.#cachePut(`dkl ${blockId}`, locators, 64 + locators.size * 48);
+    return locators;
+  }
+
   #blockColumnVector(blockId: string, decoded: DecodedPhysicalBlock): ColumnVector {
     const cached = this.#cacheGet(`dbv ${blockId}`) as ColumnVector | undefined;
     if (cached !== undefined) return cached;
@@ -17412,16 +17449,22 @@ export class MinnowDatabase {
     }
     const cached = memo.get(key);
     if (cached !== undefined) return cached;
+    // The result is a function of the postings at one version, so it is also pooled across
+    // snapshots: a repeated point lookup then skips the chunk read and validation entirely.
+    const pooled = this.#cacheGet(`ftc\0${key}`) as FtsCandidatesResult | undefined;
+    if (pooled !== undefined) return Promise.resolve(pooled);
     // Shared leases live across queries at one version; results are version-deterministic, but
     // candidate arrays can be large, so the memo sheds wholesale rather than growing unbounded.
     if (memo.size >= 1) memo.clear();
-    const read = this.store.readFtsCandidates(
-      tableId,
-      columnId,
-      terms,
-      upToVersion,
-      MAX_FTS_CANDIDATE_ROW_IDS,
-    );
+    const read = this.store
+      .readFtsCandidates(tableId, columnId, terms, upToVersion, MAX_FTS_CANDIDATE_ROW_IDS)
+      .then((result) => {
+        const rowIds = result.rowIdsByTerm.reduce((total, ids) => total + ids.length, 0);
+        if (rowIds <= MAX_POOLED_FTS_CANDIDATE_ROW_IDS) {
+          this.#cachePut(`ftc\0${key}`, result, 128 + key.length * 2 + rowIds * 16);
+        }
+        return result;
+      });
     memo.set(key, read);
     return read;
   }
@@ -17590,7 +17633,7 @@ export class MinnowDatabase {
     segments: SegmentRecord[],
     plan: CompiledQuery,
     snapshot: LeasedSnapshot,
-  ): Promise<{ segments: SegmentRecord[]; pruned: boolean }> {
+  ): Promise<{ segments: SegmentRecord[]; pruned: boolean; rows?: number[] }> {
     const predicates = secondaryIndexPredicates(plan, table);
     if (predicates.length === 0) {
       // A killed build or a stale-writer invalidation self-heals on the next relevant query.
@@ -17672,6 +17715,18 @@ export class MinnowDatabase {
     }
     if (candidates === undefined) return { segments, pruned: false };
     const candidateSet = keyColumn === undefined ? undefined : new Set(candidates);
+    // With a key column and only appended segments, the block locator maps give the exact scan
+    // rows, in the streamed scan's numbering over the kept blocks: an equality lookup then
+    // visits a handful of rows instead of every block that holds one. Mutation segments replay
+    // keys and renumber rows, so they keep block-level pruning. A very wide candidate list is
+    // cheaper to scan than to probe.
+    const rowPositions: number[] | undefined =
+      keyColumn !== undefined &&
+      candidates.length <= SECONDARY_INDEX_ROW_SELECTION_CAP &&
+      segments.every((segment) => segment.kind === "insert" || segment.kind === "base")
+        ? []
+        : undefined;
+    let selectedRowStart = 0;
     const selected: SegmentRecord[] = [];
     for (const segment of segments) {
       const anchorColumn = keyColumn ?? table.columns[0];
@@ -17701,15 +17756,35 @@ export class MinnowDatabase {
           if (block.column.type !== keyColumn.type) {
             return { segments, pruned: false };
           }
-          const vector = this.#blockColumnVector(anchorIds[blockIndex] ?? "", block);
-          let matches = false;
-          for (let row = 0; row < vector.length && !matches; row += 1) {
-            const value = vectorValue(vector, row);
-            if (value !== null && candidateSet?.has(secondaryKeyLocator(keyColumn.type, value))) {
-              matches = true;
+          const blockId = anchorIds[blockIndex] ?? "";
+          const vector = this.#blockColumnVector(blockId, block);
+          // A block's key locators are a pure function of its immutable bytes, so they are
+          // hashed once and pooled; a lookup then probes the (few) candidates against the
+          // block's set instead of re-hashing every stored key on every query. A candidate
+          // list wider than the block walks the block's locators against the candidate set.
+          const locators = this.#blockKeyLocators(blockId, vector, keyColumn.type);
+          const positions: number[] = [];
+          const collect = (hit: number | number[] | undefined): boolean => {
+            if (hit === undefined) return false;
+            if (typeof hit === "number") positions.push(hit);
+            else positions.push(...hit);
+            return rowPositions === undefined;
+          };
+          if (candidates.length <= locators.size) {
+            for (const candidate of candidates) if (collect(locators.get(candidate))) break;
+          } else if (candidateSet !== undefined) {
+            for (const [locator, hit] of locators) {
+              if (candidateSet.has(locator) && collect(hit)) break;
             }
           }
-          if (matches) {
+          if (positions.length > 0) {
+            if (rowPositions !== undefined) {
+              positions.sort((a, b) => a - b);
+              const keptRows = rowCounts.reduce((total, count) => total + count, 0);
+              for (const position of positions) {
+                rowPositions.push(selectedRowStart + keptRows + position);
+              }
+            }
             blockIndexes.push(blockIndex);
             rowCounts.push(vector.length);
           }
@@ -17718,9 +17793,11 @@ export class MinnowDatabase {
       }
       if (rowStart !== segment.rowCount) return { segments, pruned: false };
       if (blockIndexes.length === 0) continue;
+      const keptRowCount = rowCounts.reduce((total, count) => total + count, 0);
+      selectedRowStart += keptRowCount;
       selected.push({
         ...segment,
-        rowCount: rowCounts.reduce((total, count) => total + count, 0),
+        rowCount: keptRowCount,
         columnBlockIds: Object.fromEntries(
           Object.entries(segment.columnBlockIds).map(([columnId, ids]) => [
             columnId,
@@ -17729,7 +17806,9 @@ export class MinnowDatabase {
         ),
       });
     }
-    return { segments: selected, pruned: true };
+    return rowPositions === undefined
+      ? { segments: selected, pruned: true }
+      : { segments: selected, pruned: true, rows: rowPositions };
   }
 
   #scheduleSecondaryIndexBuild(table: TableRecord, indexId: string): void {
@@ -22441,12 +22520,16 @@ function secondaryIndexPredicates(
   plan: CompiledQuery,
   table: TableRecord,
 ): SecondaryIndexPredicate[] {
-  if (plan.joins.length > 0 || plan.base.table !== table.name) return [];
+  if (plan.base.table !== table.name) return [];
+  // In a join, an unqualified reference is resolved at execution against every source, so only
+  // a reference qualified by the base alias (or table) can be claimed for the base's index.
+  const joined = plan.joins.length > 0;
   const resolveColumn = (reference: string): TableColumnRecord | undefined => {
     const parts = reference.split(".");
     if (parts.length === 2 && parts[0] !== plan.base.alias && parts[0] !== table.name) {
       return undefined;
     }
+    if (parts.length !== 2 && joined) return undefined;
     const name = parts.length === 2 ? parts[1] : parts[0];
     return table.columns.find((candidate) => candidate.name === name);
   };

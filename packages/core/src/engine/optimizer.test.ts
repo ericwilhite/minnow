@@ -180,6 +180,64 @@ describe("deterministic plan rewrites", () => {
     expectEquivalent(grouped);
   });
 
+  it("mirrors a constant on one inner-join key onto the other key", () => {
+    const plan = optimizePlan(
+      compileQuery(
+        "SELECT o.id FROM customers c JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id = 4242 AND o.amount > 5",
+      ),
+    );
+    expect(plan.predicates).toContainEqual({
+      left: { kind: "column", reference: "o.customer" },
+      operator: "=",
+      right: { kind: "literal", value: 4242 },
+    });
+    const inList = optimizePlan(
+      compileQuery(
+        "SELECT o.id FROM customers c JOIN orders o ON c.customer_id = o.customer WHERE o.customer IN (1, 2)",
+      ),
+    );
+    expect(inList.predicates).toContainEqual({
+      left: { kind: "column", reference: "c.customer_id" },
+      operator: "IN",
+      right: {
+        kind: "list",
+        items: [
+          { kind: "literal", value: 1 },
+          { kind: "literal", value: 2 },
+        ],
+      },
+    });
+    // An outer join keeps unmatched rows whose key is NULL, so nothing is implied.
+    const outer = optimizePlan(
+      compileQuery(
+        "SELECT o.id FROM customers c LEFT JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id = 4242",
+      ),
+    );
+    expect(outer.predicates).toHaveLength(1);
+    // The mirrored predicate is a filter, not a change of answer.
+    const tables = new Map<string, DatabaseRow[]>([
+      [
+        "customers",
+        [
+          { customer_id: 1, name: "a" },
+          { customer_id: 2, name: "b" },
+        ],
+      ],
+      [
+        "orders",
+        [
+          { id: 10, customer: 1, amount: 9 },
+          { id: 11, customer: 2, amount: 9 },
+          { id: 12, customer: 1, amount: 1 },
+        ],
+      ],
+    ]);
+    const sql =
+      "SELECT o.id FROM customers c JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id = 1 AND o.amount > 5 ORDER BY o.id";
+    expect(executeQuery(optimizePlan(compileQuery(sql)), tables).rows).toEqual([{ id: 10 }]);
+    expect(executeRowQuery(compileQuery(sql), tables).rows).toEqual([{ id: 10 }]);
+  });
+
   it("takes the hash key out of a conjunctive inner join and files the rest as predicates", () => {
     const sql =
       "SELECT r.region, r.amount, d.weight FROM rows r JOIN dims d ON d.region = r.region AND d.weight > 2 AND r.amount > 5 ORDER BY amount";

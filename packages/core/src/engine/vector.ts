@@ -283,6 +283,12 @@ export interface AsyncQueryExecutionOptions {
    * reference instead of stitching copies.
    */
   readonly loadScanWindow?: (start: number, length: number) => number | Promise<number>;
+  /**
+   * Ascending scan row positions an index has already narrowed the plan to. The predicates
+   * still run on every visited row, so the selection is a pure skip list: rows outside it are
+   * never loaded or evaluated. Only the streamed scan honors it.
+   */
+  readonly scanRows?: readonly number[];
 }
 
 export interface QueryBatchExecutionOptions extends AsyncQueryExecutionOptions {
@@ -2018,7 +2024,10 @@ async function executeBoundPlanAsync(
   const groups = new GroupAccumulator(plan, memory);
   const output = new ResultSink(plan, memory, options.loadScanWindow === undefined);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-  for (let start = 0; start < scanRows;) {
+  if (options.scanRows !== undefined && options.loadScanWindow !== undefined) {
+    await scanSelectedRows(plan, options.scanRows, groups, output, memory, options);
+  }
+  for (let start = 0; start < scanRows && options.scanRows === undefined;) {
     throwIfAborted(options.signal);
     let length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
     // The loader answers synchronously when the batch is already resident — the common case,
@@ -2062,6 +2071,58 @@ async function executeBoundPlanAsync(
   throwIfAborted(options.signal);
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
+}
+
+/** Selected rows closer than this run in one batch; the predicates discard the rows between. */
+const SELECTED_ROW_COALESCE_GAP = 32;
+
+/**
+ * Visits only the rows of an index-provided selection. Rows are ascending, so each streamed
+ * window is loaded once; neighbouring selected rows inside a window run as one contiguous
+ * batch, so a clustered hit costs one batch and a scattered one costs a batch per row, never
+ * a batch per unselected row in between.
+ */
+async function scanSelectedRows(
+  plan: BoundPlan,
+  selection: readonly number[],
+  groups: GroupAccumulator,
+  output: ResultSink,
+  memory: QueryMemoryContext,
+  options: AsyncQueryExecutionOptions,
+): Promise<void> {
+  const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
+  let index = 0;
+  while (index < selection.length) {
+    throwIfAborted(options.signal);
+    const first = selection[index] ?? 0;
+    if (first >= scanRows) break;
+    const loaded = options.loadScanWindow?.(first, 1);
+    const residentEnd = typeof loaded === "number" || loaded === undefined ? loaded : await loaded;
+    throwIfAborted(options.signal);
+    const windowEnd =
+      typeof residentEnd === "number" && residentEnd > first
+        ? Math.min(residentEnd, scanRows)
+        : first + 1;
+    while (index < selection.length) {
+      const begin = selection[index] ?? 0;
+      if (begin >= windowEnd) break;
+      let end = begin + 1;
+      index += 1;
+      while (index < selection.length) {
+        const next = selection[index] ?? 0;
+        if (
+          next >= windowEnd ||
+          next - end > SELECTED_ROW_COALESCE_GAP ||
+          next >= begin + DEFAULT_BATCH_ROWS
+        ) {
+          break;
+        }
+        end = next + 1;
+        index += 1;
+      }
+      if (runScanBatch(plan, begin, end - begin, groups, output, memory)) return;
+    }
+  }
 }
 
 /**

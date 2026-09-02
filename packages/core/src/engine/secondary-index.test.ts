@@ -11,7 +11,12 @@ import {
 import { MinnowDatabase } from "./database.js";
 import { UniqueConstraintError } from "./errors.js";
 import { compileStatement } from "./query.js";
-import { collectFtsPostings, secondaryUniqueKeyNamespace } from "../storage/types.js";
+import {
+  collectFtsCandidates,
+  collectFtsPostings,
+  secondaryUniqueKeyNamespace,
+  type FtsPostingQuery,
+} from "../storage/types.js";
 
 function ascendingStringTupleTerm(value: string): string {
   let term = "";
@@ -92,6 +97,49 @@ describe("secondary-index SQL", () => {
       { term: "b", rowIds: [1n, 3n], tf: [2, 4] },
       { term: "d", rowIds: [5n], tf: [1] },
     ]);
+  });
+
+  it("seeks exact, prefix, and range queries inside sorted posting chunks", () => {
+    const chunks = [
+      [
+        { term: "apple", rowIds: [1n], tf: [1] },
+        { term: "apricot", rowIds: [2n], tf: [1] },
+        { term: "banana", rowIds: [3n, 4n], tf: [1, 1] },
+        { term: "cherry", rowIds: [5n], tf: [1] },
+      ],
+      [
+        { term: "apricot", rowIds: [6n], tf: [1] },
+        { term: "blueberry", rowIds: [7n], tf: [1] },
+        { term: "date", rowIds: [8n], tf: [1] },
+      ],
+      [{ term: "zucchini", rowIds: [9n], tf: [1] }],
+    ];
+    const candidates = (query: FtsPostingQuery): bigint[] =>
+      collectFtsCandidates(chunks, [query]).rowIdsByTerm[0] ?? [];
+    expect(candidates({ term: "apricot", prefix: false })).toEqual([2n, 6n]);
+    expect(candidates({ term: "apple", prefix: false })).toEqual([1n]);
+    expect(candidates({ term: "zucchini", prefix: false })).toEqual([9n]);
+    expect(candidates({ term: "fig", prefix: false })).toEqual([]);
+    expect(candidates({ term: "aardvark", prefix: false })).toEqual([]);
+    expect(candidates({ term: "ap", prefix: true })).toEqual([1n, 2n, 6n]);
+    expect(candidates({ term: "b", prefix: true })).toEqual([3n, 4n, 7n]);
+    expect(candidates({ lower: "banana", upper: "date", upperInclusive: false })).toEqual([
+      3n,
+      4n,
+      5n,
+      7n,
+    ]);
+    expect(candidates({ lower: "banana", lowerInclusive: false, upper: "date" })).toEqual([
+      5n,
+      7n,
+      8n,
+    ]);
+    expect(candidates({ upper: "apricot" })).toEqual([1n, 2n, 6n]);
+    expect(candidates({ lower: "y" })).toEqual([9n]);
+    expect(collectFtsCandidates(chunks, [{ term: "banana", prefix: false }], 1)).toEqual({
+      rowIdsByTerm: [[]],
+      overflow: true,
+    });
   });
 
   it("parses composite directions and UNIQUE DDL", () => {
@@ -214,6 +262,80 @@ describe("secondary-index SQL", () => {
       }
     });
   }
+
+  it("serves lookups from exact index rows across blocks and falls back after mutations", async () => {
+    // Matching rows sit in every block, so block pruning alone cannot help: the locator maps
+    // must hand the scan the exact rows. Every answer is checked against the plain table, for
+    // equality, IN, ordered top-N, and a predicate the index cannot answer alone, before and
+    // after updates and deletes turn the segment history into the block-pruned fallback.
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      autoCompact: false,
+      rowsPerBlock: 16,
+    });
+    await database.execute(
+      "CREATE TABLE lookups (id INTEGER PRIMARY KEY, customer INTEGER NOT NULL, amount INTEGER NOT NULL)",
+    );
+    const rows = Array.from({ length: 400 }, (_, index) => ({
+      id: index + 1,
+      customer: (index * 7) % 40,
+      amount: (index * 13) % 100,
+    }));
+    for (let start = 0; start < rows.length; start += 100) {
+      await database.execute(
+        `INSERT INTO lookups (id, customer, amount) VALUES ${rows
+          .slice(start, start + 100)
+          .map((row) => `(${String(row.id)}, ${String(row.customer)}, ${String(row.amount)})`)
+          .join(", ")}`,
+      );
+    }
+    await database.execute("CREATE INDEX lookups_customer ON lookups (customer)");
+    const expectRows = async (
+      sql: string,
+      expected: (
+        rows: ReadonlyArray<{ id: number; customer: number; amount: number }>,
+      ) => unknown[],
+    ): Promise<void> => {
+      const result = await database.query(sql, { memoize: false });
+      expect(result.rows, sql).toEqual(expected(rows));
+    };
+    const check = async (): Promise<void> => {
+      await expectRows("SELECT id FROM lookups WHERE customer = 3 ORDER BY id", (all) =>
+        all.filter((row) => row.customer === 3).map((row) => ({ id: row.id })),
+      );
+      await expectRows("SELECT COUNT(*) AS n FROM lookups WHERE customer IN (1, 2, 39)", (all) => [
+        { n: all.filter((row) => [1, 2, 39].includes(row.customer)).length },
+      ]);
+      await expectRows(
+        "SELECT id, amount FROM lookups WHERE customer = 5 ORDER BY amount DESC, id LIMIT 3",
+        (all) =>
+          all
+            .filter((row) => row.customer === 5)
+            .sort((a, b) => b.amount - a.amount || a.id - b.id)
+            .slice(0, 3)
+            .map((row) => ({ id: row.id, amount: row.amount })),
+      );
+      await expectRows(
+        "SELECT id FROM lookups WHERE customer = 7 AND amount > 50 ORDER BY id",
+        (all) =>
+          all.filter((row) => row.customer === 7 && row.amount > 50).map((row) => ({ id: row.id })),
+      );
+      await expectRows("SELECT SUM(amount) AS total FROM lookups WHERE customer = 11", (all) => [
+        {
+          total: all.filter((row) => row.customer === 11).reduce((sum, row) => sum + row.amount, 0),
+        },
+      ]);
+      await expectRows("SELECT id FROM lookups WHERE customer = 999", () => []);
+    };
+    await check();
+    // Repeat lookups are served from pooled locators and candidates; answers must not change.
+    await check();
+    await database.execute("UPDATE lookups SET customer = 3 WHERE id IN (2, 200, 399)");
+    await database.execute("DELETE FROM lookups WHERE id IN (1, 8, 15)");
+    for (const row of rows) if ([2, 200, 399].includes(row.id)) row.customer = 3;
+    rows.splice(0, rows.length, ...rows.filter((row) => ![1, 8, 15].includes(row.id)));
+    await check();
+    await database.close();
+  });
 
   it("skips a postings read when the table fits in one row group", async () => {
     const store = new MemoryBlockStore();

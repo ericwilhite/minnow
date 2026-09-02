@@ -202,6 +202,7 @@ function optimizeBlock(block: CompiledQuery, nextCorrelationAlias: () => string)
   extractJoinKeys(block);
   normalizeBooleanPredicates(block);
   coalesceOrEqualityLists(block);
+  propagateJoinKeyConstants(block);
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
@@ -326,6 +327,58 @@ function extractJoinKeys(block: CompiledQuery): void {
     block.predicates.push(...conjuncts.filter((_, index) => index !== keyIndex));
     available.add(join.alias);
   }
+}
+
+/**
+ * An inner equi-join makes its two key columns equal on every output row, so a constant
+ * equality or IN list on one key holds for the other: `c.id = 4 AND o.customer = c.id` implies
+ * `o.customer = 4`. The implied predicate is added (never substituted), which lets the table
+ * that only carried the join key filter its own scan — through a secondary index when it has
+ * one — instead of joining first and filtering after. Only inner joins qualify: an outer join
+ * keeps rows whose key is NULL, for which the implication fails.
+ */
+function propagateJoinKeyConstants(block: CompiledQuery): void {
+  const keyPairs: Array<[string, string]> = [];
+  for (const join of block.joins) {
+    if (join.kind !== "inner" || join.on !== undefined) continue;
+    if (join.left.kind !== "column" || join.right.kind !== "column") continue;
+    keyPairs.push([join.left.reference, join.right.reference]);
+  }
+  if (keyPairs.length === 0) return;
+  const signature = (predicate: Predicate): string => JSON.stringify(predicate);
+  const present = new Set(block.predicates.map(signature));
+  const implied: Predicate[] = [];
+  for (const predicate of block.predicates) {
+    if (predicate.left.kind !== "column") continue;
+    const constant =
+      predicate.operator === "=" && predicate.right.kind === "literal"
+        ? predicate.right
+        : predicate.operator === "IN" &&
+            predicate.right.kind === "list" &&
+            predicate.right.items.every((item) => item.kind === "literal")
+          ? predicate.right
+          : undefined;
+    if (constant === undefined) continue;
+    for (const [left, right] of keyPairs) {
+      const other =
+        predicate.left.reference === left
+          ? right
+          : predicate.left.reference === right
+            ? left
+            : undefined;
+      if (other === undefined) continue;
+      const mirrored: Predicate = {
+        ...predicate,
+        left: { kind: "column", reference: other },
+        right: constant,
+      };
+      const key = signature(mirrored);
+      if (present.has(key)) continue;
+      present.add(key);
+      implied.push(mirrored);
+    }
+  }
+  block.predicates.push(...implied);
 }
 
 /**
