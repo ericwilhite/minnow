@@ -1,14 +1,13 @@
 import {
+  civilFromDays,
   copyDate,
   dateIsoString,
   dateMilliseconds,
+  daysFromCivil,
+  epochDays,
   dateUtcDate,
-  dateUtcDay,
   dateUtcFullYear,
-  dateUtcHours,
-  dateUtcMinutes,
   dateUtcMonth,
-  dateUtcSeconds,
   setDateUtcDate,
   setDateUtcMonth,
 } from "../date-value.js";
@@ -412,6 +411,106 @@ function roundHalfToEven(value: number): number {
  * SUBSTR count characters, not UTF-16 units, matching SQLite and PostgreSQL.
  */
 export function scalarFunctionValue(
+  name: Exclude<ScalarFunctionName, "COALESCE">,
+  values: readonly unknown[],
+): unknown {
+  return scalarFunctionEvaluator(name)(values);
+}
+
+export type ScalarFunctionEvaluator = (values: readonly unknown[]) => unknown;
+
+const scalarFunctionEvaluators = new Map<string, ScalarFunctionEvaluator>();
+
+/**
+ * The evaluator for one function name, resolved once. A call site that keeps the evaluator
+ * skips the name dispatch on every row; the registry functions and the hottest built-ins get
+ * a closure of their own, everything else a closure over the general dispatch.
+ */
+export function scalarFunctionEvaluator(
+  name: Exclude<ScalarFunctionName, "COALESCE">,
+): ScalarFunctionEvaluator {
+  let evaluator = scalarFunctionEvaluators.get(name);
+  if (evaluator === undefined) {
+    evaluator = buildScalarFunctionEvaluator(name);
+    scalarFunctionEvaluators.set(name, evaluator);
+  }
+  return evaluator;
+}
+
+function anyNull(values: readonly unknown[]): boolean {
+  for (const value of values) if (value === null || value === undefined) return true;
+  return false;
+}
+
+function buildScalarFunctionEvaluator(
+  name: Exclude<ScalarFunctionName, "COALESCE">,
+): ScalarFunctionEvaluator {
+  const simple = simpleScalarFunctions.get(name);
+  if (simple !== undefined) {
+    return simple.nullOnNull === false
+      ? simple.evaluate
+      : (values) => (anyNull(values) ? null : simple.evaluate(values));
+  }
+  // The specialised closures below repeat the general dispatch's rules for their name: a NULL
+  // first argument is NULL, then the case body. Names are disjoint, so the earlier name checks
+  // in scalarFunctionValueGeneric can never claim one of these.
+  switch (name) {
+    case "DATE_TRUNC":
+      return (values) => dateTruncValue(values[0], values[1]);
+    case "EXTRACT":
+      return (values) => {
+        const first = values[0];
+        if (first === null || first === undefined) return null;
+        return extractDatePart(typeof first === "string" ? first : "", values[1]);
+      };
+    case "ROUND":
+      return (values) => {
+        const first = values[0];
+        if (first === null || first === undefined) return null;
+        if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
+        const digits = values.length > 1 ? numeric(values[1]) : 0;
+        if (isExactNumeric(first) && Number.isInteger(digits) && digits >= 0) {
+          return exactNumericValue(first, undefined, digits);
+        }
+        return roundSqlNumber(numeric(first), digits);
+      };
+    case "FLOOR":
+      return (values) =>
+        values[0] === null || values[0] === undefined ? null : Math.floor(numeric(values[0]));
+    case "CEIL":
+      return (values) =>
+        values[0] === null || values[0] === undefined ? null : Math.ceil(numeric(values[0]));
+    case "ABS":
+      return (values) =>
+        values[0] === null || values[0] === undefined ? null : Math.abs(numeric(values[0]));
+    case "UPPER":
+      return (values) => {
+        const first = values[0];
+        if (first === null || first === undefined) return null;
+        const source = stringArgument("UPPER", first);
+        assertScalarInputLength(source, "UPPER input");
+        return boundedScalarResult(source.toUpperCase(), "UPPER result");
+      };
+    case "LOWER":
+      return (values) => {
+        const first = values[0];
+        if (first === null || first === undefined) return null;
+        const source = stringArgument("LOWER", first);
+        assertScalarInputLength(source, "LOWER input");
+        return boundedScalarResult(source.toLowerCase(), "LOWER result");
+      };
+    case "LENGTH":
+      return (values) => {
+        const first = values[0];
+        if (first === null || first === undefined) return null;
+        return codePointLength(stringArgument("LENGTH", first));
+      };
+    default:
+      return (values) => scalarFunctionValueGeneric(name, values);
+  }
+}
+
+function scalarFunctionValueGeneric(
   name: Exclude<ScalarFunctionName, "COALESCE">,
   values: readonly unknown[],
 ): unknown {
@@ -877,47 +976,35 @@ function dateTruncValue(unit: unknown, value: unknown): Date | null {
   }
   if (value === null || value === undefined) return null;
   const external = externalSqlDomainValue(value);
-  const input =
+  const milliseconds =
     value instanceof Date
-      ? value
+      ? dateMilliseconds(value)
       : isDateDomainValue(value) && typeof external === "string"
-        ? new Date(`${external}T00:00:00.000Z`)
+        ? Date.parse(`${external}T00:00:00.000Z`)
         : undefined;
-  if (input === undefined) throw new TypeError("DATE_TRUNC requires a date or datetime value");
+  if (milliseconds === undefined)
+    throw new TypeError("DATE_TRUNC requires a date or datetime value");
+  if (!Number.isFinite(milliseconds)) return new Date(Number.NaN);
+  // Everything is UTC arithmetic on the epoch value: no Date is built until the answer, and the
+  // calendar fields come from the civil-date conversion rather than intrinsic getters.
   const normalized = unit.toLowerCase();
-  const year = dateUtcFullYear(input);
-  const month = dateUtcMonth(input);
-  const day = dateUtcDate(input);
-  switch (normalized) {
-    case "year":
-      return new Date(Date.UTC(year, 0, 1));
-    case "quarter":
-      return new Date(Date.UTC(year, Math.floor(month / 3) * 3, 1));
-    case "month":
-      return new Date(Date.UTC(year, month, 1));
-    case "week": {
-      const start = new Date(Date.UTC(year, month, day));
-      setDateUtcDate(start, dateUtcDate(start) - ((dateUtcDay(start) + 6) % 7));
-      return start;
-    }
-    case "day":
-      return new Date(Date.UTC(year, month, day));
-    case "hour":
-      return new Date(Date.UTC(year, month, day, dateUtcHours(input)));
-    case "minute":
-      return new Date(Date.UTC(year, month, day, dateUtcHours(input), dateUtcMinutes(input)));
-    default:
-      return new Date(
-        Date.UTC(
-          year,
-          month,
-          day,
-          dateUtcHours(input),
-          dateUtcMinutes(input),
-          dateUtcSeconds(input),
-        ),
-      );
+  const day = 86_400_000;
+  if (normalized === "second") return new Date(Math.floor(milliseconds / 1000) * 1000);
+  if (normalized === "minute") return new Date(Math.floor(milliseconds / 60_000) * 60_000);
+  if (normalized === "hour") return new Date(Math.floor(milliseconds / 3_600_000) * 3_600_000);
+  const days = epochDays(milliseconds);
+  if (normalized === "day") return new Date(days * day);
+  if (normalized === "week") {
+    // 1970-01-01 was a Thursday; weeks start on Monday.
+    const weekday = (((days + 3) % 7) + 7) % 7;
+    return new Date((days - weekday) * day);
   }
+  const [year, month] = civilFromDays(days);
+  if (normalized === "month") return new Date(daysFromCivil(year, month, 1) * day);
+  if (normalized === "quarter") {
+    return new Date(daysFromCivil(year, Math.floor(month / 3) * 3, 1) * day);
+  }
+  return new Date(daysFromCivil(year, 0, 1) * day);
 }
 
 /** The output column type of one window: rankings and most aggregates count, MIN/MAX carry. */
@@ -5165,64 +5252,68 @@ function extractDatePart(field: string, value: unknown): number | null {
     throw new TypeError(`Unsupported EXTRACT field: ${field}`);
   }
   if (value === null || value === undefined) return null;
-  if (!(value instanceof Date)) {
+  let milliseconds: number;
+  if (value instanceof Date) milliseconds = dateMilliseconds(value);
+  else {
     // A DATE value is a midnight instant for every field; other text is not a datetime.
     const external = isDateDomainValue(value) ? externalSqlDomainValue(value) : undefined;
     if (typeof external !== "string") throw new TypeError("EXTRACT requires a datetime value");
-    return extractDatePart(field, new Date(`${external}T00:00:00.000Z`));
+    milliseconds = Date.parse(`${external}T00:00:00.000Z`);
   }
+  if (!Number.isFinite(milliseconds)) return Number.NaN;
+  if (normalized === "epoch") return milliseconds / 1000;
+  // Time-of-day fields are modular arithmetic on the epoch value; calendar fields come from the
+  // civil-date conversion of the day count. No Date is allocated on this path.
+  const day = 86_400_000;
+  const days = epochDays(milliseconds);
+  const timeOfDay = milliseconds - days * day;
+  switch (normalized) {
+    case "hour":
+      return Math.floor(timeOfDay / 3_600_000);
+    case "minute":
+      return Math.floor(timeOfDay / 60_000) % 60;
+    case "second":
+      return Math.floor(timeOfDay / 1000) % 60;
+    case "milliseconds":
+      return timeOfDay % 60_000;
+    case "microseconds":
+      return (timeOfDay % 60_000) * 1000;
+    case "dow":
+      return (((days + 4) % 7) + 7) % 7;
+    case "isodow": {
+      const dow = (((days + 4) % 7) + 7) % 7;
+      return dow === 0 ? 7 : dow;
+    }
+    default:
+      break;
+  }
+  const [year, month, dayOfMonth] = civilFromDays(days);
   switch (normalized) {
     case "year":
-      return dateUtcFullYear(value);
-    case "doy": {
-      const start = Date.UTC(dateUtcFullYear(value), 0, 1);
-      const day = Date.UTC(dateUtcFullYear(value), dateUtcMonth(value), dateUtcDate(value));
-      return Math.floor((day - start) / 86_400_000) + 1;
-    }
-    case "isodow":
-      return dateUtcDay(value) === 0 ? 7 : dateUtcDay(value);
-    case "isoyear": {
-      const probe = new Date(
-        Date.UTC(dateUtcFullYear(value), dateUtcMonth(value), dateUtcDate(value)),
-      );
-      setDateUtcDate(probe, dateUtcDate(probe) + 4 - (dateUtcDay(probe) || 7));
-      return dateUtcFullYear(probe);
-    }
-    case "decade":
-      return Math.floor(dateUtcFullYear(value) / 10);
-    case "century":
-      return Math.ceil(dateUtcFullYear(value) / 100);
-    case "millennium":
-      return Math.ceil(dateUtcFullYear(value) / 1000);
-    case "milliseconds":
-      return dateUtcSeconds(value) * 1000 + value.getUTCMilliseconds();
-    case "microseconds":
-      return (dateUtcSeconds(value) * 1000 + value.getUTCMilliseconds()) * 1000;
-    case "quarter":
-      return Math.floor(dateUtcMonth(value) / 3) + 1;
+      return year;
     case "month":
-      return dateUtcMonth(value) + 1;
-    case "week": {
-      const date = new Date(
-        Date.UTC(dateUtcFullYear(value), dateUtcMonth(value), dateUtcDate(value)),
-      );
-      // ISO week: shift to the Thursday of this week, then count weeks from January 1st.
-      setDateUtcDate(date, dateUtcDate(date) + 4 - (dateUtcDay(date) || 7));
-      const yearStart = Date.UTC(dateUtcFullYear(date), 0, 1);
-      return Math.ceil(((dateMilliseconds(date) - yearStart) / 86_400_000 + 1) / 7);
-    }
+      return month + 1;
     case "day":
-      return dateUtcDate(value);
-    case "hour":
-      return dateUtcHours(value);
-    case "minute":
-      return dateUtcMinutes(value);
-    case "second":
-      return dateUtcSeconds(value);
-    case "epoch":
-      return dateMilliseconds(value) / 1000;
-    default:
-      return dateUtcDay(value);
+      return dayOfMonth;
+    case "quarter":
+      return Math.floor(month / 3) + 1;
+    case "doy":
+      return days - daysFromCivil(year, 0, 1) + 1;
+    case "decade":
+      return Math.floor(year / 10);
+    case "century":
+      return Math.ceil(year / 100);
+    case "millennium":
+      return Math.ceil(year / 1000);
+    default: {
+      // ISO week and ISO year: the Thursday of this week decides both.
+      const dow = (((days + 4) % 7) + 7) % 7;
+      const thursday = days + 4 - (dow || 7);
+      const [isoYear] = civilFromDays(thursday);
+      if (normalized === "isoyear") return isoYear;
+      const yearStart = daysFromCivil(isoYear, 0, 1);
+      return Math.ceil((thursday - yearStart + 1) / 7);
+    }
   }
 }
 

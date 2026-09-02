@@ -66,6 +66,30 @@ describe("shared SQL value semantics", () => {
   it("rounds ties away from zero and bounds extreme precision", () => {
     expect(roundSqlNumber(-1.5)).toBe(-2);
     expect(roundSqlNumber(1.25, 1)).toBe(1.3);
+    // Whole-number rounding is arithmetic; it must match toFixed(0) on ties, near-ties, signed
+    // zero, and magnitudes past 2^52 where every double is already an integer.
+    for (const value of [
+      0.5,
+      1.5,
+      2.5,
+      -0.5,
+      -2.5,
+      0.49999999999999994,
+      -0.49999999999999994,
+      1e15 + 0.5,
+      4_503_599_627_370_497,
+      9_007_199_254_740_993,
+      -0,
+      123.456,
+      -123.5,
+      1e300,
+      -1e300,
+    ]) {
+      const expected = Number(value.toFixed(0));
+      expect(roundSqlNumber(value), String(value)).toBe(expected === 0 ? 0 : expected);
+    }
+    expect(Number.isNaN(roundSqlNumber(Number.NaN))).toBe(true);
+    expect(roundSqlNumber(Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
     expect(roundSqlNumber(-1.25, 1)).toBe(-1.3);
     expect(roundSqlNumber(1.23, 1_000)).toBe(1.23);
     expect(roundSqlNumber(123.45, -1)).toBe(123);

@@ -82,6 +82,21 @@ export function coerceComparisonOperands(left: unknown, right: unknown): [unknow
  * and signed zero compares equal because SQL numeric equality does not distinguish it.
  */
 export function compareSqlValues(left: unknown, right: unknown): number {
+  // Plain numbers and untagged strings are the bulk of every comparison; settle them before the
+  // domain checks. NaN falls through so its placement stays with the general ordering below, and
+  // a string starting with NUL may carry a domain tag, so only tag-free strings take the short path.
+  if (typeof left === "number" && typeof right === "number") {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    if (left === right) return 0;
+  } else if (
+    typeof left === "string" &&
+    typeof right === "string" &&
+    left.charCodeAt(0) !== 0 &&
+    right.charCodeAt(0) !== 0
+  ) {
+    return compareSqlStrings(left, right);
+  }
   const [coercedLeft, coercedRight] = coerceComparisonOperands(left, right);
   // Object.is, not !==: NaN would otherwise look changed on every pass and recurse forever.
   if (!Object.is(coercedLeft, left) || !Object.is(coercedRight, right)) {
@@ -159,6 +174,16 @@ export function encodeSqlEqualityValue(value: unknown): readonly unknown[] {
  */
 export function roundSqlNumber(value: number, precision = 0): number {
   const digits = Math.min(30, Math.max(0, Math.trunc(precision)));
+  // Whole-number rounding is arithmetic: toFixed(0) picks the integer nearest the exact binary
+  // value, ties toward larger magnitude. Below 2^52 the fractional part of a double is exact,
+  // so floor and compare reproduce it without formatting a string per row.
+  if (digits === 0 && Number.isFinite(value)) {
+    const magnitude = Math.abs(value);
+    if (magnitude >= 4_503_599_627_370_496) return value === 0 ? 0 : value;
+    const whole = Math.floor(magnitude);
+    const rounded = magnitude - whole >= 0.5 ? whole + 1 : whole;
+    return rounded === 0 ? 0 : value < 0 ? -rounded : rounded;
+  }
   // SQLite formats with the requested decimal precision and parses the result back. toFixed
   // follows the same decimal path, avoiding multiplication overflow and binary scaling drift.
   const rounded = Number(value.toFixed(digits));

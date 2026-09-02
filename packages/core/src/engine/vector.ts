@@ -32,6 +32,7 @@ import {
   orderOutputName,
   parseQuantified,
   quantifiedComparison,
+  scalarFunctionEvaluator,
   scalarFunctionValue,
   unknownColumnDomains,
 } from "./query.js";
@@ -411,6 +412,22 @@ interface BoundPredicate {
   readonly primitiveIn?: PrimitiveInList;
   /** OR of AND-groups, each group's predicates compiled like any other. */
   readonly disjunction?: BoundDisjunction;
+  /**
+   * Any predicate that reads exactly one dictionary string column: its truth is a function of
+   * the code alone, so it is evaluated once per distinct value through the generic evaluator
+   * and rows then filter by code.
+   */
+  readonly dictionaryPredicate?: DictionaryPredicate;
+}
+
+interface DictionaryPredicate {
+  readonly source: number;
+  readonly vector: StringVector;
+  /**
+   * Per dictionary code, plus one slot for NULL: 0 not yet learned, 1 true, 2 false or unknown.
+   * NULL gets its own slot because IS NULL, COALESCE, and CASE answer for it.
+   */
+  readonly cache: { dictionary: readonly string[] | undefined; truth: Uint8Array };
 }
 
 /**
@@ -551,7 +568,14 @@ interface BoundPlan {
   }>;
   readonly grouped: boolean;
   readonly sourceOrdered: boolean;
-  readonly codeGrouping?: { source: number; vector: StringVector };
+  /**
+   * Single-key GROUP BY served by dictionary codes. A bare column groups by the code itself; an
+   * expression over one string column (UPPER(status), status || region_code) is evaluated once
+   * per code and the slot then points at the state for that value.
+   */
+  readonly codeGrouping?: { source: number; vector: StringVector; expression?: BoundExpression };
+  /** Single bare number or datetime key: rows group through a Map on the raw Float64 value. */
+  readonly numberGrouping?: { source: number; vector: NumberVector | DateTimeVector };
   readonly wildcard: boolean;
   readonly limit?: number;
   readonly offset?: number;
@@ -1130,7 +1154,9 @@ function bindPlan(
     const primitive = detectPrimitiveComparison(bound);
     if (primitive !== undefined) return { ...bound, primitive };
     const primitiveIn = detectPrimitiveInList(bound);
-    return primitiveIn === undefined ? bound : { ...bound, primitiveIn };
+    if (primitiveIn !== undefined) return { ...bound, primitiveIn };
+    const dictionaryPredicate = detectDictionaryPredicate(bound);
+    return dictionaryPredicate === undefined ? bound : { ...bound, dictionaryPredicate };
   };
   const predicates = plan.predicates.map((predicate) => {
     const bound = bindPredicate(predicate);
@@ -1138,7 +1164,8 @@ function bindPlan(
     if (
       bound.dictionaryEquality !== undefined ||
       bound.dictionaryLike !== undefined ||
-      bound.dictionaryNumeric !== undefined
+      bound.dictionaryNumeric !== undefined ||
+      bound.dictionaryPredicate !== undefined
     ) {
       return bound;
     }
@@ -1220,7 +1247,11 @@ function bindPlan(
   // each swap, so windowed vectors qualify too.
   const groupColumn = groupBy.length === 1 ? groupBy[0] : undefined;
   const codeGrouping =
-    grouped && groupColumn?.kind === "column" && groupColumn.vector.kind === "string"
+    !grouped || groupColumn === undefined ? undefined : codeGroupingFor(groupColumn);
+  const numberGrouping =
+    grouped &&
+    groupColumn?.kind === "column" &&
+    (groupColumn.vector.kind === "number" || groupColumn.vector.kind === "datetime")
       ? { source: groupColumn.source, vector: groupColumn.vector }
       : undefined;
   return {
@@ -1241,10 +1272,39 @@ function bindPlan(
     grouped,
     sourceOrdered,
     ...(codeGrouping === undefined ? {} : { codeGrouping }),
+    ...(numberGrouping === undefined ? {} : { numberGrouping }),
     wildcard: plan.select[0]?.expression.kind === "wildcard",
     ...(plan.limit === undefined ? {} : { limit: plan.limit }),
     ...(plan.offset === undefined ? {} : { offset: plan.offset }),
   };
+}
+
+/**
+ * A single GROUP BY key groups by dictionary code when it is a bare string column, or any
+ * expression whose only column is one string column: the value is then a function of the code.
+ */
+function codeGroupingFor(
+  key: BoundExpression,
+): { source: number; vector: StringVector; expression?: BoundExpression } | undefined {
+  if (key.kind === "column") {
+    return key.vector.kind === "string" ? { source: key.source, vector: key.vector } : undefined;
+  }
+  const column = singleStringColumn(key);
+  return column === undefined ? undefined : { ...column, expression: key };
+}
+
+/** The one string column an expression reads, when it reads exactly one column and no FTS. */
+function singleStringColumn(
+  expression: BoundExpression,
+): { source: number; vector: StringVector } | undefined {
+  if (boundContainsFts(expression)) return undefined;
+  const columns = boundColumnNodes(expression);
+  const first = columns[0];
+  if (first?.vector.kind !== "string") return undefined;
+  if (columns.some((column) => column.source !== first.source || column.column !== first.column)) {
+    return undefined;
+  }
+  return { source: first.source, vector: first.vector };
 }
 
 function bindExpression(
@@ -3383,7 +3443,102 @@ function applyPredicateKernel(
   if (predicate.disjunction !== undefined) {
     return filterDisjunction(plan, predicate.disjunction, batch, selection, survivors);
   }
+  if (predicate.dictionaryPredicate !== undefined) {
+    return filterDictionaryPredicate(
+      plan,
+      predicate,
+      predicate.dictionaryPredicate,
+      batch,
+      selection,
+      survivors,
+    );
+  }
   return undefined;
+}
+
+/**
+ * Filters by a predicate that depends on one dictionary column only. The truth for a code is
+ * learned the first time a row carrying that code appears, by running the ordinary per-row
+ * evaluator on that row — so LOWER(status) = 'paid', a CASE over region, or STARTS_WITH on a
+ * category cost one generic evaluation per distinct value per dictionary, then one code read
+ * per row. A NULL code is never a match, exactly as the generic path treats an unknown result.
+ */
+function filterDictionaryPredicate(
+  plan: BoundPlan,
+  predicate: BoundPredicate,
+  fast: DictionaryPredicate,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number {
+  const vector = fast.vector;
+  if (fast.cache.dictionary !== vector.dictionary) {
+    fast.cache.dictionary = vector.dictionary;
+    fast.cache.truth = new Uint8Array(vector.dictionary.length + 1);
+  }
+  const truth = fast.cache.truth;
+  const nullSlot = vector.dictionary.length;
+  const rows = batch.rowsBySource[fast.source];
+  const codes = vector.codes;
+  const validity = vector.validity;
+  const windowStart = vector.window?.start ?? 0;
+  const slots = codes.length;
+  const vectorLength = vector.length;
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = selection[index] ?? 0;
+    const sourceRow = rows?.[row] ?? -1;
+    let code = nullSlot;
+    if (sourceRow >= 0 && sourceRow < vectorLength) {
+      const slot = sourceRow - windowStart;
+      if (slot < 0 || slot >= slots) {
+        throw new RangeError("Streamed vector row is outside the resident window");
+      }
+      if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) !== 0) {
+        const raw = codes[slot] ?? NULL_STRING_CODE;
+        if (raw !== NULL_STRING_CODE) code = raw;
+      }
+    }
+    let known = truth[code] ?? 0;
+    if (known === 0) {
+      known = evaluateBatchPredicate(plan, predicate, batch, row) ? 1 : 2;
+      truth[code] = known;
+    }
+    if (known !== 1) continue;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
+/** Every column node under a bound expression. */
+function boundColumnNodes(
+  expression: BoundExpression,
+  into: Array<Extract<BoundExpression, { kind: "column" }>> = [],
+): Array<Extract<BoundExpression, { kind: "column" }>> {
+  if (expression.kind === "column") into.push(expression);
+  else if (expression.kind !== "fts") {
+    for (const child of boundChildren(expression)) boundColumnNodes(child, into);
+  }
+  return into;
+}
+
+function boundContainsFts(expression: BoundExpression): boolean {
+  if (expression.kind === "fts") return true;
+  return boundChildren(expression).some(boundContainsFts);
+}
+
+function detectDictionaryPredicate(predicate: BoundPredicate): DictionaryPredicate | undefined {
+  const column = singleStringColumn({
+    kind: "logical",
+    operator: "and",
+    left: predicate.left,
+    right: predicate.right,
+    signature: "",
+  });
+  return column === undefined
+    ? undefined
+    : { ...column, cache: { dictionary: undefined, truth: new Uint8Array(0) } };
 }
 
 // Scratch for the disjunction kernel. Branch predicates are always plain conditions, so a
@@ -4347,7 +4502,13 @@ class GroupAccumulator {
   readonly #codeColumns: ReadonlyArray<{ source: number; vector: StringVector } | undefined>;
   #multiCodeColumns: ReadonlyArray<{ source: number; vector: StringVector }> | undefined;
   #multiCodeStates: Map<number, GroupState> | undefined;
+  /** The dictionaries the packed slot table was laid out for; any swap re-lays it. */
+  #multiCodeDictionaries: Array<readonly string[] | undefined> = [];
+  #multiCodeSlotsReserved = 0;
   readonly #multiCodeScratch: number[] = [];
+  /** Raw-number grouping: state per finite value, plus the NULL group. */
+  #numberStates: Map<number, GroupState> | undefined;
+  #numberNullState: GroupState | undefined;
   readonly #keyScratch: GroupIndexKey[] = [];
   // The miss factories live on the accumulator and read the pending row through these fields, so
   // the per-row lookup never allocates a capturing closure; execution is synchronous, so the
@@ -4398,43 +4559,81 @@ class GroupAccumulator {
     // are stable and value-unique within one execution, so the key encodes a fixed-width number
     // instead of re-encoding the string's UTF-8 on every row. Types are stable per position, so
     // a code can never collide with a genuine number from the same expression.
-    this.#codeColumns =
+    const codeColumns =
       plan.groupBy.length > 1
         ? plan.groupBy.map((expression) =>
-            expression.kind === "column" &&
-            expression.vector.kind === "string" &&
-            expression.vector.window === undefined
+            expression.kind === "column" && expression.vector.kind === "string"
               ? { source: expression.source, vector: expression.vector }
               : undefined,
           )
         : [];
-    // When every compound key column is dictionary-coded and the combined code space is small,
-    // group lookup packs codes into one exact integer. Small domains use a direct array; large,
-    // sparse domains use a numeric Map instead of byte-encoding and hashing each compound key.
-    // Each column contributes (dictionary size + 1) slots, the extra one for NULL.
-    if (this.#codeColumns.length > 1 && this.#codeColumns.every((column) => column !== undefined)) {
-      const columns = this.#codeColumns as ReadonlyArray<{ source: number; vector: StringVector }>;
-      let slots = 1;
-      for (const column of columns) slots *= column.vector.dictionary.length + 1;
-      if (Number.isSafeInteger(slots) && slots <= MULTI_CODE_GROUP_SLOT_CAP) {
+    // When every compound key column is dictionary-coded, group lookup packs the codes into one
+    // integer slot and byte-encodes a key only on the first row of each combination per window.
+    // The slot table is laid out lazily by #ensureMultiCodeStates, which re-lays it whenever a
+    // streamed window swaps a dictionary; the group states themselves live in the value-keyed
+    // index, so a combination seen in two windows is one group.
+    if (codeColumns.length > 1 && codeColumns.every((column) => column !== undefined)) {
+      this.#multiCodeColumns = codeColumns;
+      this.#codeColumns = [];
+      return;
+    }
+    // Otherwise the compound key substitutes the dictionary code for each bare unwindowed string
+    // column: codes are stable and value-unique within one execution, so the key encodes a
+    // fixed-width number instead of re-encoding the string's UTF-8 on every row. Types are
+    // stable per position, so a code can never collide with a genuine number from the same
+    // expression.
+    this.#codeColumns = codeColumns.map((column) =>
+      column?.vector.window === undefined ? column : undefined,
+    );
+    if (plan.numberGrouping !== undefined) this.#numberStates = new Map<number, GroupState>();
+  }
+
+  /**
+   * Lays out the packed slot table for the current window dictionaries. Small combined domains
+   * use a direct array (reserved against the budget); large ones a numeric Map. Returns false
+   * when the budget refuses the array, which sends the query to the generic per-row index.
+   */
+  #ensureMultiCodeStates(
+    columns: ReadonlyArray<{ source: number; vector: StringVector }>,
+  ): boolean {
+    let current = true;
+    for (let index = 0; index < columns.length; index += 1) {
+      if (this.#multiCodeDictionaries[index] !== columns[index]?.vector.dictionary) {
+        current = false;
+        break;
+      }
+    }
+    if (current && (this.#codeStates !== undefined || this.#multiCodeStates !== undefined)) {
+      return true;
+    }
+    let slots = 1;
+    for (const column of columns) slots *= column.vector.dictionary.length + 1;
+    if (!Number.isSafeInteger(slots)) return false;
+    if (slots <= MULTI_CODE_GROUP_SLOT_CAP) {
+      if (slots > this.#multiCodeSlotsReserved) {
         try {
-          memory.reserve(
-            safeMemoryProduct(slots, QUERY_REFERENCE_BYTES, "Group code slots"),
+          this.#memory.reserve(
+            safeMemoryProduct(
+              slots - this.#multiCodeSlotsReserved,
+              QUERY_REFERENCE_BYTES,
+              "Group code slots",
+            ),
             "Group code slots",
           );
         } catch (error) {
           if (!(error instanceof QueryMemoryBudgetError)) throw error;
-          return;
+          return false;
         }
-        this.#multiCodeColumns = columns;
-        this.#codeStates = new Array<GroupState | undefined>(slots).fill(undefined);
-        this.#ordered = [];
-      } else if (Number.isSafeInteger(slots)) {
-        this.#multiCodeColumns = columns;
-        this.#multiCodeStates = new Map<number, GroupState>();
-        this.#ordered = [];
+        this.#multiCodeSlotsReserved = slots;
       }
+      this.#codeStates = new Array<GroupState | undefined>(slots).fill(undefined);
+      this.#multiCodeStates = undefined;
+    } else {
+      this.#codeStates = undefined;
+      this.#multiCodeStates = new Map<number, GroupState>();
     }
+    this.#multiCodeDictionaries = columns.map((column) => column.vector.dictionary);
+    return true;
   }
 
   /**
@@ -4472,7 +4671,12 @@ class GroupAccumulator {
     const plan = this.#plan;
     const codeGrouping = plan.codeGrouping;
     const globalGroup = plan.groupBy.length === 0;
-    if (!globalGroup && (codeGrouping === undefined || this.#codeStates === undefined)) {
+    const numberGrouped = plan.numberGrouping !== undefined && this.#numberStates !== undefined;
+    if (
+      !globalGroup &&
+      !numberGrouped &&
+      (codeGrouping === undefined || this.#codeStates === undefined)
+    ) {
       return false;
     }
     const specs = this.#fastAggregatesCache;
@@ -4551,14 +4755,9 @@ class GroupAccumulator {
             if (rawCode !== NULL_STRING_CODE) code = rawCode;
           }
         }
-        state = states[code];
-        if (state === undefined) {
-          const value = code === nullCode ? null : (grouping.dictionary[code] ?? null);
-          state = createGroupState([value], plan, this.#memory);
-          states[code] = state;
-          this.#registerCodeState(value, state);
-          this.#ordered?.push(state);
-        }
+        state = states[code] ?? this.#createCodeState(batch, row, code, grouping.dictionary);
+      } else if (state === undefined && numberGrouped) {
+        state = this.stateFor(batch, row);
       }
       if (state === undefined) return false;
       const counts = state.counts;
@@ -4609,11 +4808,13 @@ class GroupAccumulator {
       this.#codeSlotsReserved = slots;
     }
     const next = new Array<GroupState | undefined>(slots).fill(undefined);
-    for (let code = 0; code < dictionary.length; code += 1) {
-      const state = this.#codeStateByValue.get(dictionary[code] ?? "");
-      if (state !== undefined) next[code] = state;
+    if (this.#plan.codeGrouping?.expression === undefined) {
+      for (let code = 0; code < dictionary.length; code += 1) {
+        const state = this.#codeStateByValue.get(dictionary[code] ?? "");
+        if (state !== undefined) next[code] = state;
+      }
+      next[dictionary.length] = this.#nullCodeState;
     }
-    next[dictionary.length] = this.#nullCodeState;
     this.#codeStates = next;
     this.#codeDictionary = dictionary;
   }
@@ -4622,6 +4823,37 @@ class GroupAccumulator {
   #registerCodeState(value: string | null, state: GroupState): void {
     if (value === null) this.#nullCodeState = state;
     else this.#codeStateByValue.set(value, state);
+  }
+
+  /**
+   * Fills the slot for a dictionary code seen for the first time. A bare column's slot is a new
+   * state keyed by the dictionary value; an expression key evaluates the expression on this row
+   * (the representative of its code) and shares the state of any earlier code that produced the
+   * same value, so UPPER('a') and UPPER('A') land in one group.
+   */
+  #createCodeState(
+    batch: BatchRows,
+    row: number,
+    code: number,
+    dictionary: readonly string[],
+  ): GroupState {
+    const states = required(this.#codeStates, "Group code slots are missing");
+    const expression = this.#plan.codeGrouping?.expression;
+    let state: GroupState;
+    if (expression === undefined) {
+      const value = code === dictionary.length ? null : (dictionary[code] ?? null);
+      state = createGroupState([value], this.#plan, this.#memory);
+      this.#registerCodeState(value, state);
+      this.#ordered?.push(state);
+    } else {
+      const value = asQueryValue(evaluateBatchExpression(this.#plan, expression, batch, row));
+      this.#pendingSingleValue = value;
+      const before = this.#index.size;
+      state = this.#index.getOrInsertOne(groupKey(value), this.#createPendingSingle);
+      if (this.#index.size !== before) this.#ordered?.push(state);
+    }
+    states[code] = state;
+    return state;
   }
 
   /** Resolves the group state for one row, creating it on first touch. */
@@ -4645,56 +4877,77 @@ class GroupAccumulator {
           if (rawCode !== NULL_STRING_CODE) code = rawCode;
         }
       }
-      let state = states[code];
-      if (state === undefined) {
-        const value = code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null);
-        state = createGroupState([value], plan, this.#memory);
-        states[code] = state;
-        this.#registerCodeState(value, state);
-        this.#ordered?.push(state);
-      }
-      return state;
+      return states[code] ?? this.#createCodeState(batch, row, code, vector.dictionary);
     }
     if (plan.groupBy.length === 0) {
       return required(this.#index.getEmpty(), "Grouped query state is missing");
     }
     const multiCode = this.#multiCodeColumns;
-    if (
-      multiCode !== undefined &&
-      (this.#codeStates !== undefined || this.#multiCodeStates !== undefined)
-    ) {
+    if (multiCode !== undefined) {
+      if (!this.#ensureMultiCodeStates(multiCode)) {
+        this.#multiCodeColumns = undefined;
+        this.#codeStates = undefined;
+        this.#multiCodeStates = undefined;
+        return this.stateFor(batch, row);
+      }
       let slot = 0;
       for (let index = 0; index < multiCode.length; index += 1) {
         const column = required(multiCode[index], "Group code column is missing");
         const vector = column.vector;
         const sourceRow = batch.rowsBySource[column.source]?.[row] ?? -1;
-        let code = vector.dictionary.length;
-        if (sourceRow >= 0 && sourceRow < vector.length && isValid(vector.validity, sourceRow)) {
-          const rawCode = vector.codes[sourceRow] ?? NULL_STRING_CODE;
-          if (rawCode !== NULL_STRING_CODE) code = rawCode;
-        }
+        const code = stringCodeAt(vector, sourceRow) ?? vector.dictionary.length;
         this.#multiCodeScratch[index] = code;
         slot = slot * (vector.dictionary.length + 1) + code;
       }
       let state = this.#codeStates?.[slot] ?? this.#multiCodeStates?.get(slot);
       if (state === undefined) {
-        const groupValues: QueryValue[] = [];
         for (let index = 0; index < multiCode.length; index += 1) {
           const vector = required(multiCode[index], "Group code column is missing").vector;
           const code = this.#multiCodeScratch[index] ?? vector.dictionary.length;
-          groupValues.push(
-            code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null),
-          );
+          this.#keyScratch[index] =
+            code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null);
         }
-        state = createGroupState(groupValues, plan, this.#memory);
+        this.#keyScratch.length = multiCode.length;
+        this.#pendingBatch = batch;
+        this.#pendingRow = row;
+        state = this.#index.getOrInsert(this.#keyScratch, this.#createPendingCompound);
         if (this.#codeStates !== undefined) this.#codeStates[slot] = state;
         else {
           this.#memory.tally(PACKED_GROUP_ENTRY_BYTES, "Packed group index entry");
           this.#multiCodeStates?.set(slot, state);
         }
-        this.#ordered?.push(state);
       }
       return state;
+    }
+    const numberGrouping = plan.numberGrouping;
+    const numberStates = this.#numberStates;
+    if (numberGrouping !== undefined && numberStates !== undefined) {
+      const raw = rawFloat64Value(
+        numberGrouping.vector,
+        batch.rowsBySource[numberGrouping.source]?.[row] ?? -1,
+      );
+      if (raw === null) {
+        let state = this.#numberNullState;
+        if (state === undefined) {
+          this.#pendingSingleValue = null;
+          state = this.#index.getOrInsertOne(null, this.#createPendingSingle);
+          this.#numberNullState = state;
+        }
+        return state;
+      }
+      // Non-finite values keep the generic key rules (they share the NULL key), so only finite
+      // values are cached by raw value.
+      if (Number.isFinite(raw)) {
+        let state = numberStates.get(raw);
+        if (state === undefined) {
+          const value = numberGrouping.vector.kind === "datetime" ? new Date(raw) : raw;
+          this.#pendingSingleValue = value;
+          state = this.#index.getOrInsertOne(groupKey(value), this.#createPendingSingle);
+          this.#memory.tally(PACKED_GROUP_ENTRY_BYTES, "Packed group index entry");
+          numberStates.set(raw, state);
+        }
+        return state;
+      }
     }
     if (plan.groupBy.length === 1) {
       const groupValue = asQueryValue(
@@ -6030,6 +6283,138 @@ function inListHolds(
   return operator === "NOT IN" && !hasNull;
 }
 
+type CompiledBatchExpression = (batch: BatchRows, row: number) => unknown;
+
+const compiledBatchExpressions = new WeakMap<BoundExpression, CompiledBatchExpression>();
+
+/**
+ * Compiles a bound expression to a closure once per plan, so a scan does not re-dispatch on the
+ * node kind, re-check the function name, or allocate an argument array on every row. The
+ * closures call the same value functions the interpreter does — binaryValue,
+ * scalarFunctionValue, booleanTruth — so semantics are shared, only the walk is hoisted.
+ */
+function compiledBatchExpression(
+  plan: BoundPlan,
+  expression: BoundExpression,
+): CompiledBatchExpression {
+  const cached = compiledBatchExpressions.get(expression);
+  if (cached !== undefined) return cached;
+  let compiled: CompiledBatchExpression;
+  switch (expression.kind) {
+    case "literal": {
+      const value = expression.value;
+      compiled = () => value;
+      break;
+    }
+    case "wildcard":
+      compiled = () => 1;
+      break;
+    case "column": {
+      const vector = expression.vector;
+      const source = expression.source;
+      compiled = (batch, row) => vectorValue(vector, batch.rowsBySource[source]?.[row] ?? -1);
+      break;
+    }
+    case "binary": {
+      const operator = expression.operator;
+      const left = compiledBatchExpression(plan, expression.left);
+      const right = compiledBatchExpression(plan, expression.right);
+      compiled = (batch, row) => binaryValue(operator, left(batch, row), right(batch, row));
+      break;
+    }
+    case "case": {
+      const branches = expression.branches.map((branch) => ({
+        when: compiledTruth(plan, branch.when),
+        then: compiledBatchExpression(plan, branch.then),
+      }));
+      const otherwise =
+        expression.otherwise === undefined
+          ? undefined
+          : compiledBatchExpression(plan, expression.otherwise);
+      compiled = (batch, row) => {
+        for (const branch of branches) {
+          if (branch.when(batch, row) === true) return branch.then(batch, row);
+        }
+        return otherwise === undefined ? null : otherwise(batch, row);
+      };
+      break;
+    }
+    case "condition":
+    case "logical":
+    case "not": {
+      const truth = compiledTruth(plan, expression);
+      compiled = truth;
+      break;
+    }
+    case "fts":
+      compiled = (batch, row) =>
+        expression.op === "match"
+          ? ftsBatchTruth(expression, batch, null, row)
+          : ftsBm25BatchValue(expression, batch, null, row);
+      break;
+    case "list":
+      compiled = () => {
+        throw new TypeError("Value lists are only supported with IN");
+      };
+      break;
+    default: {
+      if (expression.name === "COALESCE") {
+        const parts = expression.arguments.map((argument) =>
+          compiledBatchExpression(plan, argument),
+        );
+        compiled = (batch, row) => {
+          for (const part of parts) {
+            const candidate = part(batch, row);
+            if (candidate !== null && candidate !== undefined) return candidate;
+          }
+          return null;
+        };
+        break;
+      }
+      const name = expression.name;
+      if (!isScalarFunctionName(name)) {
+        compiled = () => {
+          throw new TypeError(`${name} requires grouped execution`);
+        };
+        break;
+      }
+      const parts = expression.arguments.map((argument) => compiledBatchExpression(plan, argument));
+      // One argument array per call site, refilled per row: a function never re-enters its own
+      // evaluation, so the slots are free again before the next row reads them.
+      const values = new Array<unknown>(parts.length);
+      const evaluate = scalarFunctionEvaluator(name);
+      compiled = (batch, row) => {
+        let index = 0;
+        for (const part of parts) {
+          values[index] = part(batch, row);
+          index += 1;
+        }
+        return evaluate(values);
+      };
+    }
+  }
+  compiledBatchExpressions.set(expression, compiled);
+  return compiled;
+}
+
+/** A boolean node compiled over its children, keeping booleanTruth's three-valued rules. */
+function compiledTruth(
+  plan: BoundPlan,
+  expression: BoundExpression,
+): (batch: BatchRows, row: number) => boolean | null {
+  // booleanTruth reads operands through a callback; binding the current row into one closure
+  // per node avoids allocating that callback per row. A node is never re-entered while its
+  // own operands evaluate, so the shared slots are safe.
+  const state = { batch: undefined as unknown as BatchRows, row: 0 };
+  const evaluateValue = (nested: BoundExpression): unknown =>
+    compiledBatchExpression(plan, nested)(state.batch, state.row);
+  return (batch, row) => {
+    state.batch = batch;
+    state.row = row;
+    return booleanTruth(expression, evaluateValue);
+  };
+}
+
 function evaluateBatchExpression(
   plan: BoundPlan,
   expression: BoundExpression,
@@ -6038,53 +6423,10 @@ function evaluateBatchExpression(
 ): unknown {
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
-  if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
-  if (
-    expression.kind === "condition" ||
-    expression.kind === "logical" ||
-    expression.kind === "not"
-  ) {
-    return booleanTruth(expression, (nested) => evaluateBatchExpression(plan, nested, batch, row));
-  }
-  if (expression.kind === "case") {
-    for (const branch of expression.branches) {
-      const matched = booleanTruth(branch.when, (nested) =>
-        evaluateBatchExpression(plan, nested, batch, row),
-      );
-      if (matched === true) return evaluateBatchExpression(plan, branch.then, batch, row);
-    }
-    return expression.otherwise === undefined
-      ? null
-      : evaluateBatchExpression(plan, expression.otherwise, batch, row);
-  }
   if (expression.kind === "column") {
     return vectorValue(expression.vector, batch.rowsBySource[expression.source]?.[row] ?? -1);
   }
-  if (expression.kind === "fts") {
-    return expression.op === "match"
-      ? ftsBatchTruth(expression, batch, null, row)
-      : ftsBm25BatchValue(expression, batch, null, row);
-  }
-  if (expression.kind === "binary") {
-    return binaryValue(
-      expression.operator,
-      evaluateBatchExpression(plan, expression.left, batch, row),
-      evaluateBatchExpression(plan, expression.right, batch, row),
-    );
-  }
-  if (expression.name === "COALESCE") {
-    for (const argument of expression.arguments) {
-      const candidate = evaluateBatchExpression(plan, argument, batch, row);
-      if (candidate !== null && candidate !== undefined) return candidate;
-    }
-    return null;
-  }
-  if (!isScalarFunctionName(expression.name))
-    throw new TypeError(`${expression.name} requires grouped execution`);
-  return scalarFunctionValue(
-    expression.name,
-    expression.arguments.map((argument) => evaluateBatchExpression(plan, argument, batch, row)),
-  );
+  return compiledBatchExpression(plan, expression)(batch, row);
 }
 
 function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Array): unknown {
@@ -6145,6 +6487,13 @@ function binaryValue(
   right: unknown,
 ): number | string | null {
   if (left === null || left === undefined || right === null || right === undefined) return null;
+  if (typeof left === "number" && typeof right === "number") {
+    if (operator === "+") return left + right;
+    if (operator === "-") return left - right;
+    if (operator === "*") return left * right;
+    if (operator === "/") return right === 0 ? null : left / right;
+    if (operator === "%") return right === 0 ? null : left % right;
+  }
   if (operator === "||") return concatenatedSqlValue(left, right);
   const exact = exactNumericBinary(operator, left, right);
   if (exact !== undefined) return exact;
@@ -6206,6 +6555,20 @@ function comparisonValue(
     rightValue === undefined
   ) {
     return false;
+  }
+  // NaN keeps the general path: SQL treats it as one value equal to itself.
+  if (
+    typeof leftValue === "number" &&
+    typeof rightValue === "number" &&
+    leftValue === leftValue &&
+    rightValue === rightValue
+  ) {
+    if (operator === "=") return leftValue === rightValue;
+    if (operator === "!=" || operator === "<>") return leftValue !== rightValue;
+    if (operator === ">") return leftValue > rightValue;
+    if (operator === ">=") return leftValue >= rightValue;
+    if (operator === "<") return leftValue < rightValue;
+    return leftValue <= rightValue;
   }
   // An untyped string beside a datetime, number, or boolean reads in that value's type, as
   // PostgreSQL types an unknown-typed literal by its context; the row executor does the same.

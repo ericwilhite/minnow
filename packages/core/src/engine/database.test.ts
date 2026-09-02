@@ -10399,3 +10399,109 @@ describe("ON CONFLICT DO NOTHING without a conflict target", () => {
     ).rejects.toThrow();
   });
 });
+
+describe("streamed window kernels", () => {
+  it("groups and filters by dictionary code across windows with different dictionaries", async () => {
+    // Every block is its own window with its own dictionary. The packed compound-key slots,
+    // the single-key code slots (bare and expression), the raw-number map, and the one-column
+    // dictionary predicate all re-lay per window; the answers must not depend on the layout.
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      autoCompact: false,
+      rowsPerBlock: 8,
+    });
+    await database.execute(
+      "CREATE TABLE windowed (id INTEGER PRIMARY KEY, region TEXT, status TEXT NOT NULL, qty INTEGER, note TEXT NOT NULL)",
+    );
+    const regionSets = [
+      ["west", "east", null],
+      ["north", "west", "south", null],
+      ["east"],
+      [null, "central", "north"],
+    ] as const;
+    const statusSets = [["new", "paid"], ["Paid", "shipped", "new"], ["PAID"]] as const;
+    const rows: Array<{
+      id: number;
+      region: string | null;
+      status: string;
+      qty: number | null;
+      note: string;
+    }> = [];
+    for (let id = 1; id <= 240; id += 1) {
+      const block = Math.floor((id - 1) / 8);
+      const regions = regionSets[block % regionSets.length] ?? [];
+      const statuses = statusSets[block % statusSets.length] ?? ["new"];
+      rows.push({
+        id,
+        region: regions[id % regions.length] ?? null,
+        status: statuses[id % statuses.length] ?? "new",
+        qty: id % 5 === 0 ? null : (id * 7) % 4,
+        note: id % 3 === 0 ? "Alpha" : id % 3 === 1 ? "alpha" : "beta",
+      });
+    }
+    for (let start = 0; start < rows.length; start += 40) {
+      await database.execute(
+        `INSERT INTO windowed (id, region, status, qty, note) VALUES ${rows
+          .slice(start, start + 40)
+          .map(
+            (row) =>
+              `(${String(row.id)}, ${row.region === null ? "NULL" : `'${row.region}'`}, '${row.status}', ${
+                row.qty === null ? "NULL" : String(row.qty)
+              }, '${row.note}')`,
+          )
+          .join(", ")}`,
+      );
+    }
+    const sorted = (result: ReadonlyArray<Record<string, unknown>>): unknown[] =>
+      [...result].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    const count = <K>(key: (row: (typeof rows)[number]) => K): Map<K, number> => {
+      const counts = new Map<K, number>();
+      for (const row of rows) counts.set(key(row), (counts.get(key(row)) ?? 0) + 1);
+      return counts;
+    };
+    const query = async (sql: string): Promise<unknown[]> =>
+      sorted((await database.query(sql, { memoize: false })).rows);
+
+    const byRegionStatus = count((row) => `${row.region ?? "\u0000"}|${row.status}`);
+    expect(
+      await query("SELECT region, status, COUNT(*) AS n FROM windowed GROUP BY region, status"),
+    ).toEqual(
+      sorted(
+        [...byRegionStatus].map(([key, n]) => {
+          const [region, status] = key.split("|") as [string, string];
+          return { region: region === "\u0000" ? null : region, status, n };
+        }),
+      ),
+    );
+    const byRegion = count((row) => row.region);
+    expect(await query("SELECT region, COUNT(*) AS n FROM windowed GROUP BY region")).toEqual(
+      sorted([...byRegion].map(([region, n]) => ({ region, n }))),
+    );
+    const byUpperStatus = count((row) => row.status.toUpperCase());
+    expect(
+      await query("SELECT UPPER(status) AS s, COUNT(*) AS n FROM windowed GROUP BY UPPER(status)"),
+    ).toEqual(sorted([...byUpperStatus].map(([s, n]) => ({ s, n }))));
+    const byQty = count((row) => row.qty);
+    expect(await query("SELECT qty, COUNT(*) AS n FROM windowed GROUP BY qty")).toEqual(
+      sorted([...byQty].map(([qty, n]) => ({ qty, n }))),
+    );
+    const scalar = async (sql: string): Promise<unknown> =>
+      (await database.query(sql, { memoize: false })).rows[0]?.n;
+    expect(await scalar("SELECT COUNT(*) AS n FROM windowed WHERE LOWER(status) = 'paid'")).toBe(
+      rows.filter((row) => row.status.toLowerCase() === "paid").length,
+    );
+    expect(
+      await scalar("SELECT COUNT(*) AS n FROM windowed WHERE COALESCE(region, 'none') = 'none'"),
+    ).toBe(rows.filter((row) => row.region === null).length);
+    expect(await scalar("SELECT COUNT(*) AS n FROM windowed WHERE region IS NULL")).toBe(
+      rows.filter((row) => row.region === null).length,
+    );
+    expect(
+      await scalar(
+        "SELECT COUNT(*) AS n FROM windowed WHERE LOWER(note) = 'alpha' AND region = 'west'",
+      ),
+    ).toBe(
+      rows.filter((row) => row.note.toLowerCase() === "alpha" && row.region === "west").length,
+    );
+    await database.close();
+  });
+});

@@ -473,6 +473,40 @@ describe("vector query execution", () => {
     }
   });
 
+  it("evaluates single-string-column predicates and group keys by dictionary code", () => {
+    // Any predicate or GROUP BY key that reads exactly one string column is answered once per
+    // distinct value and then applied by code. The answer must equal the row executor's for
+    // NULL-aware shapes (IS NULL, COALESCE, CASE), case-merging keys, and numeric keys.
+    const labels = ["alpha", "Alpha", "beta", null, "ALPHA", "gamma", "", "beta"];
+    const rows: DatabaseRow[] = Array.from({ length: 4_000 }, (_, index) => ({
+      id: index + 1,
+      label: labels[index % labels.length] ?? null,
+      amount: index % 7 === 0 ? null : (index * 13) % 100,
+      seen: new Date(Date.UTC(2024, index % 12, 1 + (index % 3))),
+    }));
+    const tables = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT COUNT(*) AS n FROM rows WHERE LOWER(label) = 'alpha'",
+      "SELECT COUNT(*) AS n FROM rows WHERE label IS NULL",
+      "SELECT COUNT(*) AS n FROM rows WHERE COALESCE(label, 'none') = 'none'",
+      "SELECT COUNT(*) AS n FROM rows WHERE CASE WHEN label IS NULL THEN 1 ELSE 0 END = 1",
+      "SELECT COUNT(*) AS n FROM rows WHERE label || label = 'betabeta'",
+      "SELECT COUNT(*) AS n FROM rows WHERE LENGTH(label) > 4 OR label = ''",
+      "SELECT COUNT(*) AS n FROM rows WHERE NOT (label = 'beta')",
+      "SELECT COUNT(*) AS n FROM rows WHERE label IS NOT DISTINCT FROM NULL",
+      "SELECT id FROM rows WHERE UPPER(label) = 'ALPHA' AND amount > 90 ORDER BY id",
+      "SELECT UPPER(label) AS key, COUNT(*) AS n, SUM(amount) AS total FROM rows GROUP BY UPPER(label) ORDER BY key",
+      "SELECT COALESCE(label, '?') AS key, COUNT(*) AS n FROM rows GROUP BY COALESCE(label, '?') ORDER BY key",
+      "SELECT LENGTH(label) AS key, COUNT(*) AS n FROM rows GROUP BY LENGTH(label) ORDER BY key",
+      "SELECT amount, COUNT(*) AS n FROM rows GROUP BY amount ORDER BY amount",
+      "SELECT seen, COUNT(*) AS n, MAX(id) AS last FROM rows GROUP BY seen ORDER BY seen",
+      "SELECT label, amount, COUNT(*) AS n FROM rows GROUP BY label, amount ORDER BY label, amount",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, tables).rows, sql).toEqual(executeRowQuery(plan, tables).rows);
+    }
+  });
+
   it("applies LIMIT in place without allocating a second boxed reference slice", () => {
     const plan = compileQuery("SELECT id FROM rows LIMIT 2");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }, { id: 3 }]]]);
