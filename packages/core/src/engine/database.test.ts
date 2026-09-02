@@ -10349,3 +10349,53 @@ describe("derived-block and pruned-projection caching", () => {
     ]);
   });
 });
+
+describe("explain over FROM-less and CTE-only statements", () => {
+  it("reports a plan instead of looking the dual row up in the catalog", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "t",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "n", type: "number" },
+      ],
+    });
+    expect(await database.explain("SELECT 1 + 1 AS two")).toContain("--");
+    expect(
+      await database.explain(
+        "WITH big AS (SELECT n FROM t WHERE n > 1) SELECT (SELECT COUNT(*) FROM big) AS c",
+      ),
+    ).toContain("--");
+    expect(await database.explain("VALUES (1), (2) ORDER BY 1 DESC")).toContain("--");
+  });
+});
+
+describe("ON CONFLICT DO NOTHING without a conflict target", () => {
+  it("skips rows that collide on the table's unique key", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "teams",
+      uniqueKey: "team_id",
+      columns: [
+        { name: "team_id", type: "number" },
+        { name: "name", type: "string" },
+      ],
+    });
+    await database.execute("INSERT INTO teams (team_id, name) VALUES (1, 'Red')");
+    const result = await database.execute(
+      "INSERT INTO teams (team_id, name) VALUES (1, 'Dup'), (2, 'Blue') ON CONFLICT DO NOTHING RETURNING team_id",
+    );
+    expect(result).toMatchObject({ kind: "insert", rowCount: 1, returnedRows: [{ team_id: 2 }] });
+    expect((await database.query("SELECT name FROM teams ORDER BY team_id")).rows).toEqual([
+      { name: "Red" },
+      { name: "Blue" },
+    ]);
+    // DO UPDATE still has to name its target, as in PostgreSQL.
+    await expect(
+      database.execute(
+        "INSERT INTO teams (team_id, name) VALUES (1, 'x') ON CONFLICT DO UPDATE SET name = 'x'",
+      ),
+    ).rejects.toThrow();
+  });
+});

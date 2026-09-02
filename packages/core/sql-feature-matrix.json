@@ -1414,6 +1414,60 @@
       "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row — insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
     },
     {
+      "id": "group-by.ordinal",
+      "status": "supported",
+      "example": "SELECT UPPER(region) AS place, COUNT(*) AS c FROM rows GROUP BY 1 ORDER BY place",
+      "notes": "An integer GROUP BY item is a select-list ordinal, resolved to that select expression before grouping, as PostgreSQL resolves it. An ordinal naming an aggregate or window column is rejected."
+    },
+    {
+      "id": "group-by.alias",
+      "status": "supported",
+      "example": "SELECT COALESCE(region, 'none') AS place, COUNT(*) AS c FROM rows GROUP BY place ORDER BY place",
+      "notes": "A bare GROUP BY name that is an output alias stands for the aliased expression. A name that is both an alias and a source column keeps its source-column meaning, which is also what PostgreSQL does."
+    },
+    {
+      "id": "group-by.expression-over-key",
+      "status": "supported",
+      "example": "SELECT FLOOR(amount / 5) * 5 AS bucket, COUNT(*) AS c FROM rows GROUP BY FLOOR(amount / 5) ORDER BY bucket",
+      "notes": "A selected expression whose column references all sit inside grouping expressions is grouped, PostgreSQL's rule. COALESCE(region, 'all') over GROUP BY ROLLUP (region) labels the total row the same way."
+    },
+    {
+      "id": "order-by.qualified-selected-column",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows AS r ORDER BY r.amount DESC",
+      "notes": "A sort key qualified by one of the block's own source aliases resolves to the same column selected unqualified. The qualifier must name a real source, and exactly one selected column must match."
+    },
+    {
+      "id": "limit.zero",
+      "status": "supported",
+      "example": "SELECT region FROM rows ORDER BY amount LIMIT 0",
+      "notes": "LIMIT 0 returns no rows and still reports the result's column shape, the way clients read a query's columns without fetching data."
+    },
+    {
+      "id": "set.trailing-order",
+      "status": "supported",
+      "example": "SELECT amount AS n FROM rows WHERE amount > 5 UNION SELECT amount FROM dims UNION ALL SELECT 100 ORDER BY n DESC LIMIT 4",
+      "notes": "A trailing ORDER BY, LIMIT, or OFFSET applies to the whole set operation and names the first member's output columns, including an alias only that member declares and columns an aggregate member does not group by."
+    },
+    {
+      "id": "select.values-ordered",
+      "status": "supported",
+      "example": "VALUES (2, 'two'), (1, 'one') ORDER BY 1 LIMIT 1",
+      "notes": "A VALUES list is a set operation of one-row selects, so it takes the same trailing ORDER BY, LIMIT, and OFFSET, with ordinals naming its column1, column2, ... outputs."
+    },
+    {
+      "id": "datetime.now",
+      "status": "supported",
+      "example": "SELECT NOW() > TIMESTAMP '2000-01-01 00:00:00' AS elapsed",
+      "notes": "PostgreSQL's now() is the statement's clock reading, the same instant CURRENT_TIMESTAMP names, resolved once per statement in every row and in mutation defaults."
+    },
+    {
+      "id": "mutation.insert-do-nothing-any-key",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('x', 9), ('z', 1) ON CONFLICT DO NOTHING",
+      "notes": "A DO NOTHING without a conflict target skips rows that collide on the table's unique key, the spelling Kysely's onConflict((oc) => oc.doNothing()) emits. DO UPDATE still names its target."
+    },
+    {
       "id": "ddl.foreign-key",
       "status": "supported",
       "setup": ["CREATE TABLE parents (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"],

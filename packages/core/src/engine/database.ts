@@ -8621,8 +8621,13 @@ export class MinnowDatabase {
     } else {
       notes.push("materializes inputs at preparation");
     }
-    const table = reported.base.derived ?? reported.base.union ?? reported.base.windowed;
-    if (table === undefined && reported.joins.length === 0) {
+    const table =
+      reported.base.derived ??
+      reported.base.union ??
+      reported.base.windowed ??
+      reported.base.recursive;
+    // A FROM-less query reads the dual row, which has no catalog record to report on.
+    if (table === undefined && reported.joins.length === 0 && reported.base.table !== DUAL_TABLE) {
       const record = await this.#findTable(reported.base.table);
       const pointTemplate = record.view === undefined ? cachedPointReadTemplate(reported) : null;
       if (pointTemplate !== null) {
@@ -9543,15 +9548,18 @@ export class MinnowDatabase {
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     const table = await this.#findTable(statement.table);
     const keyColumn = getUniqueKeyColumn(table);
-    const conflictColumns =
-      statement.onConflict?.columns ??
-      (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
     const addressColumns =
       keyColumn?.hidden === true
         ? primaryKeyColumns(table).map(({ name }) => name)
         : keyColumn === undefined
           ? []
           : [keyColumn.name];
+    // A targetless DO NOTHING means "any unique key", which for a Minnow table is its key.
+    const conflictColumns =
+      statement.onConflict?.anyTarget === true
+        ? addressColumns
+        : (statement.onConflict?.columns ??
+          (statement.onConflict === undefined ? [] : [statement.onConflict.column]));
     if (
       keyColumn === undefined ||
       conflictColumns.length !== addressColumns.length ||

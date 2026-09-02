@@ -27,9 +27,10 @@ LIMIT 50
 them — see [Query plans](/docs/sql/plans).
 
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
-`COLLATE` on string expressions.
-`LIMIT` and `OFFSET` both work, and a `LIMIT` without an `ORDER BY` returns rows in no promised
-order, as in any SQL engine.
+`COLLATE` on string expressions. A sort key may name a selected column through its source alias
+(`SELECT id FROM orders AS o ORDER BY o.id`), the way PostgreSQL resolves it.
+`LIMIT` and `OFFSET` both work, `LIMIT 0` returns no rows, and a `LIMIT` without an `ORDER BY`
+returns rows in no promised order, as in any SQL engine.
 
 `*` and `alias.*` are expanded from the input schema before Minnow plans operations that depend
 on the output width. They therefore work with `DISTINCT`, window columns, set operations,
@@ -92,6 +93,13 @@ The numeric and counting aggregates accept `FILTER (WHERE …)` for conditional 
 default, and returns SQL `NULL` for an empty input. Its `ORDER BY` list follows the same direction
 and NULL-placement rules as query ordering. Filter its input in `WHERE`; `FILTER` is not supported
 for this aggregate. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`, and `CUBE`.
+
+`GROUP BY` items follow PostgreSQL's resolution: an integer is a select-list ordinal
+(`GROUP BY 1`), and a name that is an output alias but not a source column stands for the aliased
+expression (`SELECT DATE_TRUNC('month', placed_at) AS month … GROUP BY month`). A selected
+expression built over a grouping expression is grouped, so `FLOOR(total / 50) * 50` may be
+selected beside `GROUP BY FLOOR(total / 50)`, and `COALESCE(region, 'all')` labels a `ROLLUP`
+total.
 
 JSON constructors retain JSON provenance until the result crosses the JavaScript boundary. A
 constructor used inside another constructor is embedded as a document, not quoted as text:
@@ -265,7 +273,10 @@ SELECT customer_id FROM orders WHERE placed_at >= TIMESTAMP '2025-07-01'
 ```
 
 `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT`, each requiring matching column counts and
-compatible types.
+compatible types. A trailing `ORDER BY`, `LIMIT`, or `OFFSET` applies to the whole set operation
+and names the first member's output columns, so `SELECT id AS key … UNION SELECT … ORDER BY key`
+sorts the combined rows; a member of its own needs parentheses around its `ORDER BY` or `LIMIT`.
+`VALUES` lists take the same trailing clauses.
 
 ## Consistency
 

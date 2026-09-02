@@ -868,6 +868,19 @@ function datetimeCases(): Case[] {
     sql: `SELECT TIMESTAMP '2026-01-31' + INTERVAL '1 month' AS clamped, TIMESTAMP '2024-02-29' + INTERVAL '1 year' AS leap FROM data LIMIT 1`,
     ordered: false,
   });
+  // A zoneless string cast to TIMESTAMP is UTC, like the literal; `new Date("2026-01-02 03:04:05")`
+  // would read the host's zone and answer differently on two machines.
+  cases.push({
+    sql: `SELECT CAST('2026-01-02 03:04:05' AS TIMESTAMP) AS spaced, CAST('2026-01-02' AS TIMESTAMP) AS midnight, CAST('2026-01-02T03:04:05.250Z' AS TIMESTAMP) AS iso FROM data LIMIT 1`,
+    ordered: false,
+  });
+  // CURRENT_TIMESTAMP resolves once per statement, including when the ORDER BY hides a column
+  // the select list does not carry: that desugar wraps the block, and the executor runs the
+  // inner one. Every fixture date is in the past, so the answer is the fixture ordered by id.
+  cases.push({
+    sql: `SELECT id, region FROM data WHERE joined < CURRENT_TIMESTAMP ORDER BY amount, id`,
+    ordered: true,
+  });
   // SQLite has neither the literals nor INTERVAL; PostgreSQL checks every one of these.
   return cases.map((testCase) => ({ ...testCase, skip: ["sqlite"] as const }));
 }
@@ -968,6 +981,64 @@ function wildcardShapeCases(): Case[] {
   ];
 }
 
+/**
+ * A trailing ORDER BY, LIMIT, or OFFSET belongs to the whole set operation and names the first
+ * member's output columns. The parser used to let the last member swallow the tail and resolve
+ * it against its own select list, so an alias only the first member declared, a third member,
+ * or an aggregate member all failed, and the two-member same-name case hid the whole class.
+ */
+function setOperationCases(): Case[] {
+  return [
+    { sql: `SELECT 1 AS a UNION SELECT 2 ORDER BY a DESC`, ordered: true },
+    {
+      sql: `SELECT id AS key FROM data WHERE id < 3 UNION SELECT id FROM data WHERE id < 5 ORDER BY key`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE id < 3 UNION SELECT id FROM data WHERE id < 5 UNION SELECT 9 ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE id < 3 UNION ALL SELECT id FROM data WHERE id < 5 UNION ALL SELECT 9 ORDER BY id DESC LIMIT 4`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE id < 5 INTERSECT SELECT id FROM data WHERE id > 2 UNION SELECT 100 ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE id < 5 EXCEPT SELECT id FROM data WHERE id = 2 EXCEPT SELECT 1 ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE id < 6 INTERSECT SELECT id FROM data WHERE id > 2 ORDER BY id DESC`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT COUNT(*) AS n FROM data UNION ALL SELECT COUNT(*) FROM dims ORDER BY n`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT region, COUNT(*) AS n FROM data GROUP BY region UNION ALL SELECT region, COUNT(*) FROM dims GROUP BY region ORDER BY region NULLS LAST, n`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, 'data' AS kind FROM data WHERE id < 3 UNION ALL SELECT rank, 'dim' FROM dims ORDER BY kind, id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE id < 3 UNION SELECT id FROM data WHERE id < 5 ORDER BY id LIMIT 2 OFFSET 1`,
+      ordered: true,
+    },
+    { sql: `VALUES (2), (1), (3) ORDER BY 1 DESC`, ordered: true, skip: ["sqlite"] },
+    {
+      sql: `SELECT id FROM data WHERE id < 3 UNION ALL VALUES (7), (8) ORDER BY 1 DESC`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+  ];
+}
+
 function combinationCases(): Case[] {
   return [
     ...distinctCases(),
@@ -977,6 +1048,7 @@ function combinationCases(): Case[] {
     ...cteCases(),
     ...wildcardOrderCases(),
     ...wildcardShapeCases(),
+    ...setOperationCases(),
   ];
 }
 
@@ -1524,6 +1596,11 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     { oracles: ["sqlite"], reason: "SQLite has no ALL/ANY quantifiers" },
   ],
   ["predicate.ilike", { oracles: ["sqlite"], reason: "SQLite has no ILIKE" }],
+  ["datetime.now", { oracles: ["sqlite"], reason: "SQLite has no now() function" }],
+  [
+    "select.values-ordered",
+    { oracles: ["sqlite"], reason: "SQLite's VALUES takes no trailing ORDER BY or LIMIT" },
+  ],
   ["where.between-symmetric", { oracles: ["sqlite"], reason: "SQLite has no BETWEEN SYMMETRIC" }],
   ["set.intersect-all", { oracles: ["sqlite"], reason: "SQLite has no INTERSECT ALL" }],
   ["set.except-all", { oracles: ["sqlite"], reason: "SQLite has no EXCEPT ALL" }],

@@ -114,6 +114,159 @@ describe("public SQL queries", () => {
     });
   });
 
+  it("applies a trailing ORDER BY and LIMIT to the whole set operation", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 2 });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "kind", type: "string" },
+      ],
+    });
+    await database.insertBatch("items", {
+      columns: { id: [1, 2, 3, 4], kind: ["a", "b", "a", "b"] },
+    });
+    const values = async (sql: string): Promise<unknown[]> =>
+      (await database.query(sql)).rows.map((row) => Object.values(row));
+    // The tail names the first member's output columns, including an alias only it declares.
+    expect(await values("SELECT 1 AS n UNION SELECT 2 ORDER BY n DESC")).toEqual([[2], [1]]);
+    expect(
+      await values(
+        "SELECT id AS key FROM items WHERE id < 3 UNION SELECT id FROM items WHERE id > 2 ORDER BY key DESC LIMIT 3",
+      ),
+    ).toEqual([[4], [3], [2]]);
+    // Three members, where the last one has no column named id at all.
+    expect(
+      await values(
+        "SELECT id FROM items WHERE id = 1 UNION ALL SELECT id FROM items WHERE id = 2 UNION ALL SELECT 9 ORDER BY id DESC",
+      ),
+    ).toEqual([[9], [2], [1]]);
+    // Aggregate members: the ordering column is not a group key of either member.
+    expect(
+      await values(
+        "SELECT COUNT(*) AS n FROM items UNION ALL SELECT COUNT(*) FROM items WHERE kind = 'a' ORDER BY n",
+      ),
+    ).toEqual([[2], [4]]);
+    expect(
+      await values(
+        "SELECT kind, COUNT(*) AS n FROM items GROUP BY kind UNION ALL SELECT 'all', COUNT(*) FROM items ORDER BY n DESC, kind",
+      ),
+    ).toEqual([
+      ["all", 4],
+      ["a", 2],
+      ["b", 2],
+    ]);
+    // INTERSECT binds tighter; the tail still belongs to the outermost compound.
+    expect(
+      await values(
+        "SELECT id FROM items WHERE id < 4 INTERSECT SELECT id FROM items WHERE id > 1 UNION SELECT 7 ORDER BY id DESC LIMIT 2 OFFSET 1",
+      ),
+    ).toEqual([[3], [2]]);
+    expect(await values("VALUES (2), (1), (3) ORDER BY 1 DESC LIMIT 2")).toEqual([[3], [2]]);
+    expect(
+      await values("SELECT id FROM items WHERE id = 1 UNION ALL VALUES (7), (8) ORDER BY 1 DESC"),
+    ).toEqual([[8], [7], [1]]);
+    // A member-level ORDER BY still needs parentheses, as in PostgreSQL.
+    await expect(
+      database.query("SELECT id FROM items ORDER BY id UNION SELECT id FROM items"),
+    ).rejects.toThrow("requires parentheses");
+  });
+
+  it("resolves qualified ORDER BY, GROUP BY ordinals and aliases, NOW(), and LIMIT 0", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 2 });
+    await database.createTable({
+      name: "sales",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "region", type: "string", nullable: true },
+        { name: "amount", type: "number" },
+        { name: "sold_at", type: "datetime" },
+      ],
+    });
+    await database.insertBatch("sales", {
+      columns: {
+        id: [1, 2, 3, 4],
+        region: ["west", null, "east", "west"],
+        amount: [10, 30, 60, 80],
+        sold_at: [
+          new Date("2026-01-01T00:00:00Z"),
+          new Date("2026-02-01T00:00:00Z"),
+          new Date("2026-03-01T00:00:00Z"),
+          new Date("2026-04-01T00:00:00Z"),
+        ],
+      },
+    });
+    const rows = async (sql: string): Promise<unknown[]> => (await database.query(sql)).rows;
+    // The select list carries `id` unqualified; ORDER BY names it through the source alias.
+    expect(await rows("SELECT id FROM sales AS s WHERE s.amount > 20 ORDER BY s.id DESC")).toEqual([
+      { id: 4 },
+      { id: 3 },
+      { id: 2 },
+    ]);
+    expect(await rows("SELECT id, amount FROM sales ORDER BY sales.amount DESC LIMIT 1")).toEqual([
+      { id: 4, amount: 80 },
+    ]);
+    // GROUP BY ordinals and output aliases resolve to the select expressions.
+    expect(
+      await rows(
+        "SELECT COALESCE(region, 'none') AS place, COUNT(*) AS n FROM sales GROUP BY 1 ORDER BY place",
+      ),
+    ).toEqual([
+      { place: "east", n: 1 },
+      { place: "none", n: 1 },
+      { place: "west", n: 2 },
+    ]);
+    expect(
+      await rows(
+        "SELECT COALESCE(region, 'none') AS place, COUNT(*) AS n FROM sales GROUP BY place ORDER BY place",
+      ),
+    ).toEqual([
+      { place: "east", n: 1 },
+      { place: "none", n: 1 },
+      { place: "west", n: 2 },
+    ]);
+    // A select expression over a grouping expression is grouped, as PostgreSQL rules.
+    expect(
+      await rows(
+        "SELECT FLOOR(amount / 50) * 50 AS bucket, COUNT(*) AS n FROM sales GROUP BY FLOOR(amount / 50) ORDER BY bucket",
+      ),
+    ).toEqual([
+      { bucket: 0, n: 2 },
+      { bucket: 50, n: 2 },
+    ]);
+    // A name that is both an alias and a source column keeps the column meaning.
+    expect(
+      await rows(
+        "SELECT region AS region, COUNT(*) AS n FROM sales GROUP BY region ORDER BY n DESC, region",
+      ),
+    ).toEqual([
+      { region: "west", n: 2 },
+      { region: "east", n: 1 },
+      { region: null, n: 1 },
+    ]);
+    await expect(rows("SELECT region, COUNT(*) AS n FROM sales GROUP BY 3")).rejects.toThrow(
+      "GROUP BY ordinal is out of range",
+    );
+    await expect(rows("SELECT region, COUNT(*) AS n FROM sales GROUP BY 2")).rejects.toThrow(
+      "cannot name an aggregate",
+    );
+    // now() is the statement clock, resolved once, including under a hidden ORDER BY column.
+    expect(
+      await rows(
+        "SELECT id FROM sales WHERE sold_at < NOW() AND sold_at < now() ORDER BY amount DESC",
+      ),
+    ).toEqual([{ id: 4 }, { id: 3 }, { id: 2 }, { id: 1 }]);
+    // LIMIT 0 is an empty page that still reports the column shape.
+    expect(await database.query("SELECT id, amount FROM sales ORDER BY id LIMIT 0")).toEqual({
+      columns: ["id", "amount"],
+      columnDomains: [null, null],
+      rows: [],
+    });
+    expect(await rows("SELECT id FROM sales ORDER BY id LIMIT 0 OFFSET 2")).toEqual([]);
+  });
+
   it("expands SELECT DISTINCT * across executors and joins", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 2 });
     await database.createTable({
@@ -1353,6 +1506,23 @@ describe("scalar functions", () => {
     expect(vectorized.rows, sql).toEqual(executeRowQuery(compileQuery(sql), tables).rows);
     return vectorized.rows;
   }
+
+  it("CAST to TIMESTAMP reads zoneless text as UTC, like the literal", () => {
+    // `new Date("2026-01-02 03:04:05")` reads the host's zone; a CAST that did the same would
+    // answer differently on two machines. Both executors share castValue, so one check covers them.
+    expect(
+      both(
+        "SELECT CAST('2026-01-02 03:04:05' AS TIMESTAMP) AS spaced, CAST('2026-01-02' AS TIMESTAMP) AS midnight, CAST('2026-01-02T03:04:05.250Z' AS TIMESTAMP) AS iso, CAST('2026-01-02T03:04:05+02:00' AS TIMESTAMP) AS zoned FROM rows LIMIT 1",
+      ),
+    ).toEqual([
+      {
+        spaced: new Date("2026-01-02T03:04:05.000Z"),
+        midnight: new Date("2026-01-02T00:00:00.000Z"),
+        iso: new Date("2026-01-02T03:04:05.250Z"),
+        zoned: new Date("2026-01-02T01:04:05.000Z"),
+      },
+    ]);
+  });
 
   it("COALESCE returns the first non-null argument and stays lazy over nulls", () => {
     expect(

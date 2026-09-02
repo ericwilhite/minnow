@@ -260,6 +260,8 @@ const statementDatetimeAliases: ReadonlyMap<string, string> = new Map([
   ["CURRENT_DATE", "CURRENT_DATE"],
   ["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"],
   ["LOCALTIMESTAMP", "CURRENT_TIMESTAMP"],
+  // PostgreSQL's now() is transaction_timestamp(): one reading per statement, like the rest.
+  ["NOW", "CURRENT_TIMESTAMP"],
   ["CURRENT_TIME", "LOCALTIME"],
   ["LOCALTIME", "LOCALTIME"],
 ]);
@@ -373,7 +375,7 @@ function castValue(value: unknown, target: string): unknown {
     if (value instanceof Date) return value;
     const external = externalSqlDomainValue(value);
     if (typeof external === "string" || typeof external === "number") {
-      const parsed = new Date(external);
+      const parsed = typeof external === "string" ? datetimeText(external) : new Date(external);
       if (Number.isFinite(dateMilliseconds(parsed))) return parsed;
       throw new TypeError(`Cannot cast this value to a datetime: ${String(value)}`);
     }
@@ -1093,9 +1095,17 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     throwLocated(error, offset, { start: 0, end: text.length });
   }
   if (parser.parameterCount > 0) compiled.parameterCount = parser.parameterCount;
-  if (parser.usesStatementDatetime) compiled.usesStatementDatetime = true;
-  if (parser.usesSequenceCalls) compiled.usesSequenceCalls = true;
-  if (parser.usesVolatileFunctions) compiled.usesVolatileFunctions = true;
+  // The ORDER-BY-expression desugar wraps the parsed block in a projection, and execution paths
+  // run that inner block on its own. The flags have to travel with it, or CURRENT_TIMESTAMP in a
+  // WHERE clause would reach the executor unresolved whenever the query sorts by a hidden column.
+  const flagged = [compiled, transparentProjectionSource(compiled)?.inner].filter(
+    (block): block is CompiledQuery => block !== undefined,
+  );
+  for (const block of flagged) {
+    if (parser.usesStatementDatetime) block.usesStatementDatetime = true;
+    if (parser.usesSequenceCalls) block.usesSequenceCalls = true;
+    if (parser.usesVolatileFunctions) block.usesVolatileFunctions = true;
+  }
   return compiled;
 }
 
@@ -1195,6 +1205,11 @@ export type CompiledStatement =
         column: string;
         /** The full PostgreSQL conflict target; `column` remains the scalar fast-path name. */
         columns?: string[];
+        /**
+         * `ON CONFLICT DO NOTHING` with no target: the statement names no columns, and the
+         * table's unique key is resolved at execution, where the catalog is known.
+         */
+        anyTarget?: true;
         action: "nothing" | "replace" | "update";
         /** Expressions evaluated against the stored target row and the proposed EXCLUDED row. */
         assignments?: Array<{ column: string; expression: Expression }>;
@@ -5429,6 +5444,23 @@ export function isAggregateCall(
   return expression.kind === "call" && aggregateNames.has(expression.name as AggregateName);
 }
 
+/**
+ * Whether a non-aggregate select expression is a function of the grouping expressions: it is one
+ * of them, or every column it reads sits inside a subexpression that is one of them. PostgreSQL
+ * accepts `FLOOR(amount / 25) * 25` grouped by `FLOOR(amount / 25)` on exactly this rule.
+ */
+function groupedExpression(expression: Expression, grouped: ReadonlySet<string>): boolean {
+  if (grouped.has(JSON.stringify(expression))) return true;
+  // A full-text node reads its row's searchable columns even when MATCH(*) lists none, so it
+  // is only grouped when the GROUP BY names it outright.
+  if (expression.kind === "column" || containsFtsExpression(expression)) return false;
+  const children = childExpressions(expression);
+  if (children.length === 0) return expressionColumns(expression).length === 0;
+  return children.every(
+    (child) => expressionColumns(child).length === 0 || groupedExpression(child, grouped),
+  );
+}
+
 function validateGrouping(plan: CompiledQuery): void {
   const grouped =
     plan.groupBy.length > 0 || plan.select.some((item) => hasAggregate(item.expression));
@@ -5445,7 +5477,7 @@ function validateGrouping(plan: CompiledQuery): void {
     ) {
       continue;
     }
-    if (!groupExpressions.has(JSON.stringify(item.expression))) {
+    if (!groupedExpression(item.expression, groupExpressions)) {
       throw new TypeError(`Selected column must appear in GROUP BY: ${item.alias}`);
     }
   }
@@ -5635,6 +5667,12 @@ class Parser {
   /** Placeholders seen so far: positional `?` count, and the highest `$n` number. */
   #positionalParameters = 0;
   #highestNumberedParameter = 0;
+  /**
+   * Set while a set-operation member's SELECT parses. The member leaves a trailing ORDER BY,
+   * LIMIT, OFFSET, or FETCH unparsed: PostgreSQL applies that tail to the whole compound, and a
+   * member that swallowed it would resolve the ordering against its own select list instead.
+   */
+  #compoundMember = false;
 
   /** Set when the statement names CURRENT_DATE, CURRENT_TIMESTAMP, or LOCALTIME. */
   usesStatementDatetime = false;
@@ -5755,7 +5793,7 @@ class Parser {
       }
     }
     // INTERSECT binds tighter than UNION and EXCEPT, matching PostgreSQL.
-    const firstTerm = this.#setTerm(sql);
+    const firstTerm = this.#setTerm(sql, false);
     let plan = firstTerm.block;
     if (this.#isKeyword("UNION") || this.#isKeyword("EXCEPT")) {
       const members = [firstTerm];
@@ -5774,15 +5812,42 @@ class Parser {
             ops.push("except all");
           } else ops.push("except");
         }
-        members.push(this.#setTerm("(union member)"));
+        members.push(this.#setTerm("(union member)", true));
       }
-      plan = this.#compoundBlock(sql, members, ops);
+      // PostgreSQL assigns a trailing ORDER BY or LIMIT to the whole compound, so every member
+      // after the first parsed without one and the tail is still unparsed here.
+      plan = this.#compoundBlock(sql, members, ops, this.#compoundTail());
+    } else if (firstTerm.values === true && !firstTerm.parenthesized) {
+      // A bare VALUES list desugars into a UNION ALL of one-row selects; a trailing ORDER BY
+      // or LIMIT applies to that compound, with ordinals resolving against the row shape.
+      const tail = this.#compoundTail();
+      if (tail.orderBy.length > 0 || tail.limit !== undefined || tail.offset !== undefined) {
+        const union = plan.base.union;
+        plan =
+          union === undefined
+            ? compoundSelectBlock(sql, [plan], [], tail, this.nextDerivedSequence)
+            : compoundSelectBlock(sql, union.blocks, union.ops, tail, this.nextDerivedSequence);
+      }
     }
     return plan;
   }
 
-  #setTerm(sql: string): { block: CompiledQuery; parenthesized: boolean } {
-    const first = this.#unionMember(sql);
+  /** The clauses that close a query expression: ORDER BY, then LIMIT/OFFSET or OFFSET/FETCH. */
+  #compoundTail(): SelectTail {
+    return { orderBy: this.#orderByClause(), ...this.#tailClauses() };
+  }
+
+  /**
+   * One UNION/EXCEPT term: a member, or an INTERSECT chain of members. `member` marks a term
+   * that follows a set operator, whose trailing clauses belong to the enclosing compound; the
+   * first term of a statement parses its own tail, which is where a lone INTERSECT chain's
+   * ORDER BY lands.
+   */
+  #setTerm(
+    sql: string,
+    member: boolean,
+  ): { block: CompiledQuery; parenthesized: boolean; values?: true } {
+    const first = this.#unionMember(sql, member);
     if (!this.#isKeyword("INTERSECT")) return first;
     const members = [first];
     const ops: SetOperator[] = [];
@@ -5792,51 +5857,27 @@ class Parser {
         this.#keyword("ALL");
         ops.push("intersect all");
       } else ops.push("intersect");
-      members.push(this.#unionMember("(intersect member)"));
+      members.push(this.#unionMember("(intersect member)", true));
     }
-    return { block: this.#compoundBlock(sql, members, ops), parenthesized: false };
+    const tail: SelectTail = member ? { orderBy: [] } : this.#compoundTail();
+    return { block: this.#compoundBlock(sql, members, ops, tail), parenthesized: false };
   }
 
   #compoundBlock(
     sql: string,
     members: ReadonlyArray<{ block: CompiledQuery; parenthesized: boolean }>,
     ops: SetOperator[],
+    tail: SelectTail,
   ): CompiledQuery {
-    for (const [index, member] of members.entries()) {
-      const last = index === members.length - 1;
+    // Only the first member can have parsed a tail of its own (later members skip theirs), and
+    // a member-level ORDER BY or LIMIT is legal only inside parentheses.
+    for (const member of members) {
       if (
         !member.parenthesized &&
-        !last &&
         (member.block.orderBy.length > 0 || member.block.limit !== undefined)
       ) {
         throw new TypeError("ORDER BY or LIMIT in a UNION member requires parentheses");
       }
-    }
-    // PostgreSQL assigns a trailing ORDER BY or LIMIT to the whole compound. After an
-    // unparenthesized last member the clause was greedily parsed into that member and lifts
-    // out; after a parenthesized member it is still unparsed.
-    const last = members[members.length - 1];
-    let tail: SelectTail;
-    if (last !== undefined && !last.parenthesized) {
-      tail = {
-        orderBy: last.block.orderBy,
-        ...(last.block.limit === undefined ? {} : { limit: last.block.limit }),
-        ...(last.block.offset === undefined ? {} : { offset: last.block.offset }),
-        ...(last.block.limitWithTies === true ? { limitWithTies: true } : {}),
-        ...(last.block.limitParameter === undefined
-          ? {}
-          : { limitParameter: last.block.limitParameter }),
-        ...(last.block.offsetParameter === undefined
-          ? {}
-          : { offsetParameter: last.block.offsetParameter }),
-      };
-      last.block.orderBy = [];
-      delete last.block.limit;
-      delete last.block.offset;
-      delete last.block.limitParameter;
-      delete last.block.offsetParameter;
-    } else {
-      tail = { orderBy: this.#orderByClause(), ...this.#tailClauses() };
     }
     return compoundSelectBlock(
       sql,
@@ -6556,6 +6597,7 @@ class Parser {
     onConflict?: {
       column: string;
       columns?: string[];
+      anyTarget?: true;
       action: "nothing" | "replace" | "update";
       assignments?: Array<{ column: string; expression: Expression }>;
       where?: Expression;
@@ -6564,6 +6606,13 @@ class Parser {
     if (!this.#isKeyword("ON")) return {};
     this.#keyword("ON");
     this.#keyword("CONFLICT");
+    if (this.#isKeyword("DO")) {
+      // PostgreSQL lets DO NOTHING omit the conflict target (any unique key); DO UPDATE has to
+      // name one. Kysely's `onConflict((oc) => oc.doNothing())` emits exactly this spelling.
+      this.#keyword("DO");
+      this.#keyword("NOTHING");
+      return { onConflict: { column: "", anyTarget: true, action: "nothing" } };
+    }
     this.#expectPunctuation("(");
     const columns: string[] = [];
     for (;;) {
@@ -6855,15 +6904,19 @@ class Parser {
     return asQueryValue(evaluate(resolveExactNumericConstants(expression), {}));
   }
 
-  #unionMember(sql: string): { block: CompiledQuery; parenthesized: boolean } {
+  #unionMember(
+    sql: string,
+    member: boolean,
+  ): { block: CompiledQuery; parenthesized: boolean; values?: true } {
     if (this.#punctuation("(")) {
       const block = this.#isKeyword("VALUES") ? this.#valuesBlock() : this.#queryExpression(sql);
       this.#expectPunctuation(")");
       return { block, parenthesized: true };
     }
     if (this.#isKeyword("VALUES")) {
-      return { block: this.#valuesBlock(), parenthesized: false };
+      return { block: this.#valuesBlock(), parenthesized: false, values: true };
     }
+    this.#compoundMember = member;
     return { block: this.#selectBlock(sql), parenthesized: false };
   }
 
@@ -7030,6 +7083,10 @@ class Parser {
   }
 
   #selectBlockBody(sql: string): CompiledQuery {
+    // Captured and cleared first, so a derived table or subquery inside this block parses its
+    // own tail: only the member's outermost SELECT leaves the compound's clauses alone.
+    const compoundMember = this.#compoundMember;
+    this.#compoundMember = false;
     this.#keyword("SELECT");
     let distinct = false;
     if (this.#isKeyword("DISTINCT")) {
@@ -7195,7 +7252,7 @@ class Parser {
         if (!this.#punctuation(",")) break;
       }
     }
-    const orderBy = this.#orderByClause();
+    const orderBy = compoundMember ? [] : this.#orderByClause();
     return assembleSelectBlock(
       {
         sql,
@@ -7207,7 +7264,7 @@ class Parser {
         groupBy,
         having,
         orderBy,
-        ...this.#tailClauses(),
+        ...(compoundMember ? {} : this.#tailClauses()),
         ...(groupingSets === undefined ? {} : { groupingSets }),
       },
       this.nextDerivedSequence,
@@ -9144,22 +9201,32 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
       .map((item) => {
         if (hasAggregate(item.expression)) return item;
         const signature = signatureOf(item.expression);
-        if (setSignatures.has(signature) || !universe.has(signature)) return item;
-        // MIN over an always-NULL argument: legal in a grouped select, NULL in every group, and
-        // typed like the original expression through MIN's carry and NULLIF's first argument.
+        if (setSignatures.has(signature) || expressionColumns(item.expression).length === 0) {
+          return item;
+        }
+        // A grouping expression this set aggregated away is NULL in every one of its groups.
+        // NULLIF(e, e) is that NULL typed like e, and it substitutes for the expression wherever
+        // it appears: bare (`region`) or inside a wider select expression
+        // (`COALESCE(region, 'all')`, the usual rollup label). MIN over the result keeps the
+        // member block grouped; the value is the same for every row of the group.
+        const away = { count: 0 };
+        const nullify = (expression: Expression): Expression => {
+          const inner = signatureOf(expression);
+          if (universe.has(inner) && !setSignatures.has(inner)) {
+            away.count += 1;
+            return {
+              kind: "call",
+              name: "NULLIF",
+              arguments: [structuredClone(expression), structuredClone(expression)],
+            };
+          }
+          return mapChildExpressions(expression, nullify);
+        };
+        const nullified = nullify(structuredClone(item.expression));
+        if (away.count === 0) return item;
         return {
           alias: item.alias,
-          expression: {
-            kind: "call",
-            name: "MIN",
-            arguments: [
-              {
-                kind: "call",
-                name: "NULLIF",
-                arguments: [structuredClone(item.expression), structuredClone(item.expression)],
-              },
-            ],
-          } satisfies Expression,
+          expression: { kind: "call", name: "MIN", arguments: [nullified] } satisfies Expression,
         };
       });
     return assembleSelectBlock(
@@ -9209,6 +9276,89 @@ function resolveOrderByOrdinals(
       throw new TypeError(`ORDER BY ordinal is out of range: ${String(ordinal)}`);
     }
     return { ...order, expression: { kind: "column" as const, reference: item.alias } };
+  });
+}
+
+/**
+ * `SELECT id FROM people AS p ORDER BY p.id`: a qualified sort key that names the same source
+ * column the select list carries unqualified sorts by that output. Only a qualifier that is one
+ * of the block's own sources counts, and only when exactly one selected column matches, so an
+ * ambiguous or misspelled reference still fails in resolution.
+ */
+function resolveOrderQualifiers(
+  orderBy: CompiledQuery["orderBy"],
+  select: readonly SelectItem[],
+  sourceAliases: readonly string[],
+): CompiledQuery["orderBy"] {
+  return orderBy.map((order) => {
+    const expression = order.expression;
+    if (expression.kind !== "column") return order;
+    const separator = expression.reference.indexOf(".");
+    if (separator === -1) return order;
+    if (
+      select.some(
+        (item) =>
+          item.expression.kind === "column" && item.expression.reference === expression.reference,
+      )
+    ) {
+      return order;
+    }
+    const qualifier = expression.reference.slice(0, separator);
+    const column = expression.reference.slice(separator + 1);
+    if (!sourceAliases.includes(qualifier)) return order;
+    const matches = select.filter(
+      (item) =>
+        item.expression.kind === "column" &&
+        !item.expression.reference.includes(".") &&
+        item.expression.reference === column,
+    );
+    const match = matches.length === 1 ? matches[0] : undefined;
+    if (match === undefined) return order;
+    return { ...order, expression: { kind: "column", reference: match.alias } };
+  });
+}
+
+/**
+ * Resolves GROUP BY items the way PostgreSQL does: an integer literal is a select-list ordinal,
+ * and a bare name that is an output alias — but not itself the selected column of that name —
+ * stands for the aliased expression. `GROUP BY 1` and `GROUP BY bucket` over
+ * `SELECT FLOOR(amount / 25) AS bucket` therefore group by the expression. A name that is both
+ * an alias and a source column keeps its source-column meaning, as it does in PostgreSQL.
+ */
+function resolveGroupByReferences(
+  groupBy: readonly Expression[],
+  select: readonly SelectItem[],
+): Expression[] {
+  return groupBy.map((expression) => {
+    if (expression.kind === "literal" && typeof expression.value === "number") {
+      const ordinal = expression.value;
+      const item = Number.isInteger(ordinal) ? select[ordinal - 1] : undefined;
+      if (item === undefined) {
+        throw new TypeError(`GROUP BY ordinal is out of range: ${String(ordinal)}`);
+      }
+      if (hasAggregate(item.expression) || containsWindow(item.expression)) {
+        throw new TypeError("GROUP BY ordinals cannot name an aggregate or window column");
+      }
+      return structuredClone(item.expression);
+    }
+    if (expression.kind !== "column" || expression.reference.includes(".")) return expression;
+    const aliased = select.filter((item) => item.alias === expression.reference);
+    const item = aliased.length === 1 ? aliased[0] : undefined;
+    if (
+      item === undefined ||
+      item.expression.kind === "wildcard" ||
+      hasAggregate(item.expression) ||
+      containsWindow(item.expression)
+    ) {
+      return expression;
+    }
+    // `SELECT region AS r ... GROUP BY r` groups by region. Were r also a source column,
+    // PostgreSQL would group by that column and then reject the ungrouped region, so reading
+    // the alias never changes an answer PostgreSQL gives.
+    if (item.expression.kind === "column" && item.expression.reference === expression.reference) {
+      return expression;
+    }
+    return structuredClone(item.expression);
   });
 }
 
@@ -9347,7 +9497,22 @@ export function assembleSelectBlock(
       ...(parts.distinct ? { distinctWildcard: true } : {}),
     };
   }
-  parts = { ...parts, orderBy: resolveOrderByOrdinals(parts.orderBy, parts.select) };
+  parts = {
+    ...parts,
+    orderBy: resolveOrderQualifiers(
+      resolveOrderByOrdinals(parts.orderBy, parts.select),
+      parts.select,
+      [parts.base, ...parts.joins].map((source) => source.alias),
+    ),
+    groupBy: resolveGroupByReferences(parts.groupBy, parts.select),
+    ...(parts.groupingSets === undefined
+      ? {}
+      : {
+          groupingSets: parts.groupingSets.map((set) =>
+            resolveGroupByReferences(set, parts.select),
+          ),
+        }),
+  };
   if (parts.joins.some((join) => join.full === true)) {
     return desugarFullJoin(parts, nextSequence);
   }
@@ -10244,8 +10409,10 @@ export function derivedTableSource(
 
 /** The parser's LIMIT range contract, shared with the typed builder. */
 export function validateLimit(limit: number): number {
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100_000)
-    throw new RangeError("LIMIT must be between 1 and 100,000");
+  // LIMIT 0 is a legal, empty page: PostgreSQL returns no rows, and clients use it to read a
+  // result's column shape without fetching data.
+  if (!Number.isSafeInteger(limit) || limit < 0 || limit > 100_000)
+    throw new RangeError("LIMIT must be between 0 and 100,000");
   return limit;
 }
 
@@ -10325,7 +10492,7 @@ function jsonTableColumnValue(
   }
   let date: Date;
   if (value instanceof Date) date = value;
-  else if (typeof value === "string") date = new Date(value);
+  else if (typeof value === "string") date = datetimeText(value);
   else if (typeof value === "number") date = new Date(value);
   else throw new TypeError("JSON_TABLE datetime is invalid");
   if (!Number.isFinite(dateMilliseconds(date))) {
@@ -10334,12 +10501,12 @@ function jsonTableColumnValue(
   return date;
 }
 
+const TIMESTAMP_TEXT =
+  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/;
+
 function timestampLiteral(text: string): Date {
   const trimmed = text.trim();
-  const match =
-    /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/.exec(
-      trimmed,
-    );
+  const match = TIMESTAMP_TEXT.exec(trimmed);
   if (match === null) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
   const [, day, time = "00:00:00", zone = "Z"] = match;
   const seconds = time.length === 5 ? `${time}:00` : time;
@@ -10348,6 +10515,16 @@ function timestampLiteral(text: string): Date {
     throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
   }
   return date;
+}
+
+/**
+ * Reads datetime text the way the TIMESTAMP literal does — a zoneless `2026-01-02 03:04:05` is
+ * UTC, never the host's zone — and falls back to the JavaScript parser for other spellings.
+ * `new Date("2026-01-02 03:04:05")` alone would read the same text in local time, so a CAST
+ * would answer differently on two machines.
+ */
+function datetimeText(text: string): Date {
+  return TIMESTAMP_TEXT.test(text.trim()) ? timestampLiteral(text) : new Date(text);
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
