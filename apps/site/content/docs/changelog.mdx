@@ -8,6 +8,83 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.0 — September 1, 2026
+
+Published packages: `@minnowdb/core@0.7.0`.
+
+### Added
+
+- Equality-correlated `LATERAL` queries may now group, aggregate, and take a per-row
+  `ORDER BY … LIMIT`/`OFFSET`. `GROUP BY` and `HAVING` gain the correlation key, a global
+  aggregate such as `COUNT(*)` still yields one row per outer row (0 for `COUNT`, `NULL` for the
+  rest, as PostgreSQL returns), and a `LIMIT` becomes a row number partitioned by the key.
+  `LEFT JOIN LATERAL` with an unselected `ORDER BY` term works as well.
+- `RETURNING` accepts any scalar expression — `RETURNING id, amount * 2 AS doubled,
+UPPER(name) AS label` — evaluated with `SELECT` semantics over the affected rows: the
+  post-image for `INSERT` and `UPDATE`, the removed row for `DELETE`. Aggregates are refused.
+- The PostgreSQL scalar surface: `CONCAT`, `CONCAT_WS`, `LEFT`, `RIGHT`, `REVERSE`, `REPEAT`,
+  `INITCAP`, `SPLIT_PART`, `STRPOS`, `STARTS_WITH`, `TRANSLATE`, `ASCII`, `CHR`, `BTRIM`,
+  `MD5`, `FORMAT`, `REGEXP_REPLACE`, the `~`, `~*`, `!~`, `!~*` operators, `^`, `EXP`, `LN`,
+  `LOG`, `LOG10`, `SIGN`, `TRUNC`, `PI`, `CBRT`, `DIV`, `WIDTH_BUCKET`, the trigonometric
+  functions, `TO_CHAR`, `TO_DATE`, `TO_TIMESTAMP`, `MAKE_DATE`, `MAKE_TIMESTAMP`, `AGE`,
+  `DATE_PART`, and the remaining `EXTRACT` fields; `::` casts; `GROUP BY` ordinals and output
+  aliases; `LIMIT 0`; `NOW()`; `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` and `GENERATED … AS IDENTITY`
+  columns; `ALTER TABLE … ADD COLUMN … DEFAULT` backfills; `UPDATE`/`DELETE` table aliases;
+  scalar subqueries in `SET` and `VALUES`; `INSERT … SELECT` from any query expression with
+  `ON CONFLICT`; `DISTINCT` over grouped and windowed blocks; a bare `ON CONFLICT DO NOTHING`.
+- Untyped string literals beside a number, boolean, datetime, or `DATE` column read in that
+  column's type, as PostgreSQL types an unknown-typed literal by context: `WHERE placed_at >
+'2025-01-01'` and `WHERE qty = '3'` compare as values. `||` renders numbers, booleans, and
+  datetimes beside text.
+
+### Fixed
+
+- The result memo served `SELECT NEXTVAL('seq')` from cache, returning the same value without
+  advancing the sequence. A scalar subquery, derived table, or CTE calling `RANDOM()`,
+  `GEN_RANDOM_UUID()`, or a sequence was cached under the manifest version by the derived-block
+  cache and returned the same value on every statement. `SELECT (SELECT CURRENT_TIMESTAMP)`
+  failed with an internal "must be resolved before execution" error. The statement clock is now
+  resolved once for the whole plan tree, and no cache keeps a block whose value is not a
+  function of the data.
+- `UNION … ORDER BY` applied to the last member instead of the union; `CURRENT_TIMESTAMP` in a
+  `WHERE` clause under a hidden sort reached the executor unresolved; `CAST(text AS TIMESTAMP)`
+  parsed in the local zone; `EXPLAIN` failed on a `FROM`-less `SELECT`; `ORDER BY t.col` on an
+  unqualified select was ambiguous; a duplicate key inside `BEGIN … COMMIT` was reported at
+  `COMMIT` instead of on its statement; `SELECT *` mixed with expressions was refused.
+- Secondary-index lookups read every block that held a candidate. The index now hands the scan
+  the exact rows, also through pending update and delete deltas; candidates and block locators
+  are pooled; posting chunks are searched by binary seek. An indexed equality moved from 6.3 ms
+  to 0.2 ms on a 200,000-row table; a point read after single-row updates from 5 ms to 0.1 ms.
+
+### Changed
+
+- Wildcard outputs (`SELECT *`, `SELECT t.*`) keep their bare column names, as PostgreSQL
+  returns them. Only a name that two sources both contribute — `id` in `SELECT *` over a join on
+  `id` — is returned as `alias.column`. Previously every wildcard output over more than one
+  source was alias-qualified. Kysely's `selectAll("u")` on a join now returns the keys its types
+  declare.
+- A constant on one key of an inner join or semi-join (`=`, `IN`, a range) is mirrored onto the
+  other key, so the other table filters before the join, through its secondary index or unique
+  key when one applies. `DATE_TRUNC('unit', col) = ts` and `EXTRACT(YEAR FROM col) = n` plan
+  as ranges on the column.
+- Any predicate reading one string column, `SUM`/`COUNT`/`AVG` over a `CASE` on one string
+  column, `GROUP BY` over an expression of one string column, over a number or datetime column,
+  or over several bare columns of mixed types, and comparisons and arithmetic on plain values
+  all run on typed kernels. `DATE_TRUNC` and `EXTRACT` are epoch arithmetic. Nothing changes in
+  their results; the planning page describes the shapes.
+- The engine with the OPFS adapter is 313 KB gzipped (was 304 KB).
+
+### Migration
+
+Programs that read `SELECT *` results over a join by `alias.column` keys must switch to the bare
+column name, except for names both sides contribute, which keep the qualified form. Everything
+else is additive; forms that previously threw now execute.
+
+### Storage compatibility
+
+No stored format changed. Block format 2, snapshot format 1, IndexedDB schema 1, and OPFS layout 5
+remain readable and writable without a data migration.
+
 ## 0.6.9 — August 31, 2026
 
 Published packages: `@minnowdb/core@0.6.9`.

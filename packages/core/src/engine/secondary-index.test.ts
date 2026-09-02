@@ -334,6 +334,14 @@ describe("secondary-index SQL", () => {
     for (const row of rows) if ([2, 200, 399].includes(row.id)) row.customer = 3;
     rows.splice(0, rows.length, ...rows.filter((row) => ![1, 8, 15].includes(row.id)));
     await check();
+    // Deleting every fourth remaining row shifts every later row's replayed position; the
+    // selection must follow the shift, and rows moved out of a value must stop matching.
+    const evicted = rows.filter((_, index) => index % 4 === 0).map((row) => row.id);
+    await database.execute(`DELETE FROM lookups WHERE id IN (${evicted.join(", ")})`);
+    rows.splice(0, rows.length, ...rows.filter((row) => !evicted.includes(row.id)));
+    await database.execute("UPDATE lookups SET customer = 40 WHERE customer = 5 AND id > 100");
+    for (const row of rows) if (row.customer === 5 && row.id > 100) row.customer = 40;
+    await check();
     await database.close();
   });
 

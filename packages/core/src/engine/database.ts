@@ -11349,7 +11349,9 @@ export class MinnowDatabase {
             try {
               const streamedResult = await prepared.executeAsync({
                 loadScanWindow: streamed.load,
-                ...(indexed.rows === undefined ? {} : { scanRows: indexed.rows }),
+                ...(indexed.rows === undefined
+                  ? {}
+                  : { scanRows: streamed.remapScanRows?.(indexed.rows) ?? indexed.rows }),
                 ...(options.signal === undefined ? {} : { signal: options.signal }),
               });
               options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -11363,7 +11365,9 @@ export class MinnowDatabase {
             ...(spillPageRows === undefined ? {} : { spillPageRows }),
             spillStore: this.#leasedSpillStore(),
             loadScanWindow: streamed.load,
-            ...(indexed.rows === undefined ? {} : { scanRows: indexed.rows }),
+            ...(indexed.rows === undefined
+              ? {}
+              : { scanRows: streamed.remapScanRows?.(indexed.rows) ?? indexed.rows }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -11600,6 +11604,7 @@ export class MinnowDatabase {
         create: (memory: QueryMemoryContext) => Promise<{
           table: ColumnarTable;
           load: (start: number, length: number) => number | Promise<number>;
+          remapScanRows?: (rows: readonly number[]) => number[];
         }>;
       }
     | undefined {
@@ -11673,12 +11678,14 @@ export class MinnowDatabase {
       create: (memory: QueryMemoryContext) => Promise<{
         table: ColumnarTable;
         load: (start: number, length: number) => number | Promise<number>;
+        remapScanRows?: (rows: readonly number[]) => number[];
       }>;
     },
     buildView: {
       create: (memory: QueryMemoryContext) => Promise<{
         table: ColumnarTable;
         load: (start: number, length: number) => number | Promise<number>;
+        remapScanRows?: (rows: readonly number[]) => number[];
       }>;
     },
     buildTableName: string,
@@ -12043,6 +12050,7 @@ export class MinnowDatabase {
   ): Promise<{
     table: ColumnarTable;
     load: (start: number, length: number) => number | Promise<number>;
+    remapScanRows?: (rows: readonly number[]) => number[];
   }> {
     const scanSegments = baseSegments.filter((segment) => {
       const kind = segment.kind;
@@ -12183,6 +12191,23 @@ export class MinnowDatabase {
       cursorBase = baseEnd;
       return start + liveRows;
     };
+    // Index-selected rows are numbered over the base scan; the replay removes dead rows, so a
+    // selected row's output position is its base position less the dead rows before it, and a
+    // dead selected row is not visited at all.
+    const remapScanRows = (rows: readonly number[]): number[] => {
+      const remapped: number[] = [];
+      let removedBefore = 0;
+      let scanned = 0;
+      for (const row of rows) {
+        if (row >= baseRows) break;
+        for (; scanned < row; scanned += 1) {
+          if (((dead[scanned >>> 3] ?? 0) & (1 << (scanned & 7))) !== 0) removedBefore += 1;
+        }
+        if (((dead[row >>> 3] ?? 0) & (1 << (row & 7))) !== 0) continue;
+        remapped.push(row - removedBefore);
+      }
+      return remapped;
+    };
     return {
       table: {
         name: table.name,
@@ -12190,6 +12215,7 @@ export class MinnowDatabase {
         columns: new Map(states.map((state) => [state.column.name, state.vector])),
       },
       load,
+      remapScanRows,
     };
   }
 
@@ -18046,10 +18072,19 @@ export class MinnowDatabase {
     // visits a handful of rows instead of every block that holds one. Mutation segments replay
     // keys and renumber rows, so they keep block-level pruning. A very wide candidate list is
     // cheaper to scan than to probe.
+    // Positions count the scan segments' kept rows only; update and delete deltas are replayed
+    // over that numbering by the streamed mutation table, which remaps the selection past the
+    // rows the deltas removed.
     const rowPositions: number[] | undefined =
       keyColumn !== undefined &&
       candidates.length <= SECONDARY_INDEX_ROW_SELECTION_CAP &&
-      segments.every((segment) => segment.kind === "insert" || segment.kind === "base")
+      segments.every(
+        (segment) =>
+          segment.kind === "insert" ||
+          segment.kind === "base" ||
+          segment.kind === "update" ||
+          segment.kind === "delete",
+      )
         ? []
         : undefined;
     let selectedRowStart = 0;
@@ -18104,7 +18139,10 @@ export class MinnowDatabase {
             }
           }
           if (positions.length > 0) {
-            if (rowPositions !== undefined) {
+            if (
+              rowPositions !== undefined &&
+              (segment.kind === "insert" || segment.kind === "base")
+            ) {
               positions.sort((a, b) => a - b);
               const keptRows = rowCounts.reduce((total, count) => total + count, 0);
               for (const position of positions) {
@@ -18120,7 +18158,7 @@ export class MinnowDatabase {
       if (rowStart !== segment.rowCount) return { segments, pruned: false };
       if (blockIndexes.length === 0) continue;
       const keptRowCount = rowCounts.reduce((total, count) => total + count, 0);
-      selectedRowStart += keptRowCount;
+      if (segment.kind === "insert" || segment.kind === "base") selectedRowStart += keptRowCount;
       selected.push({
         ...segment,
         rowCount: keptRowCount,
