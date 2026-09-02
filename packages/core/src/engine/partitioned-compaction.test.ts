@@ -13,7 +13,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { type CompactionJobRecord, type SegmentRecord } from "../storage/types.js";
 import { MinnowDatabase } from "./database.js";
 import { allVisibleSegments } from "./storage-test-helpers.js";
-import { mulberry32, seedFor } from "../testing/seeds.js";
+import { mulberry32, seedsFor } from "../testing/seeds.js";
 
 interface Row {
   id: number;
@@ -694,149 +694,152 @@ describe("partitioned folds under the background loop", () => {
   // runners the 36k-row workload can consume another minute while other Vitest files contend for
   // CPU, so the outer timeout leaves room for both without changing the settle deadline or any
   // correctness assertion.
-  it("keeps a large keyed table equal to a reference while auto-compaction folds it", async () => {
-    const seed = seedFor("partitioned-compaction-soak", 0x7a11);
-    const random = mulberry32(seed);
-    const store = new MemoryBlockStore();
-    // Small partitions, so a 36k-row table is eighteen of them and a fold's selectivity shows.
-    const SOAK_PARTITION_ROWS = 2_048;
-    const database = new MinnowDatabase(store, {
-      rowsPerBlock: 512,
-      compaction: { partitionRows: SOAK_PARTITION_ROWS },
-    });
-    await database.createTable({
-      name: "items",
-      uniqueKey: "id",
-      columns: [
-        { name: "id", type: "number" },
-        { name: "amount", type: "number" },
-        { name: "label", type: "string" },
-      ],
-    });
-    const KEY_SPACE = 40_000;
-    const reference = new Map<number, Row>();
-    const initial: Row[] = Array.from({ length: 36_000 }, (_, id) => ({
-      id,
-      amount: Math.floor(random() * 1000),
-      label: LABELS[id % LABELS.length] ?? "alpha",
-    }));
-    await database.insertBatch("items", initial);
-    for (const row of initial) reference.set(row.id, row);
+  it.each(seedsFor("partitioned-compaction-soak", [0x7a11]))(
+    "keeps a large keyed table equal to a reference while auto-compaction folds it (seed %s)",
+    async (seed) => {
+      const random = mulberry32(seed);
+      const store = new MemoryBlockStore();
+      // Small partitions, so a 36k-row table is eighteen of them and a fold's selectivity shows.
+      const SOAK_PARTITION_ROWS = 2_048;
+      const database = new MinnowDatabase(store, {
+        rowsPerBlock: 512,
+        compaction: { partitionRows: SOAK_PARTITION_ROWS },
+      });
+      await database.createTable({
+        name: "items",
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "amount", type: "number" },
+          { name: "label", type: "string" },
+        ],
+      });
+      const KEY_SPACE = 40_000;
+      const reference = new Map<number, Row>();
+      const initial: Row[] = Array.from({ length: 36_000 }, (_, id) => ({
+        id,
+        amount: Math.floor(random() * 1000),
+        label: LABELS[id % LABELS.length] ?? "alpha",
+      }));
+      await database.insertBatch("items", initial);
+      for (const row of initial) reference.set(row.id, row);
 
-    const check = async (context: string): Promise<void> => {
-      const expected = [...reference.values()].sort((left, right) => left.id - right.id);
-      const aggregate = (
-        await database.query("SELECT COUNT(*) AS n, SUM(amount) AS total FROM items", {
-          memoize: false,
-        })
-      ).rows[0] as { n: number; total: number | null };
-      expect(aggregate.n, `${context}: count`).toBe(expected.length);
-      expect(aggregate.total ?? 0, `${context}: sum`).toBe(
-        expected.reduce((sum, row) => sum + row.amount, 0),
-      );
-      const rows = (
-        await database.query("SELECT id, amount, label FROM items ORDER BY id", {
-          memoize: false,
-        })
-      ).rows as unknown as Row[];
-      expect(rows.length, `${context}: rows`).toBe(expected.length);
-      for (let index = 0; index < expected.length; index += 1) {
-        const want = expected[index];
-        const got = rows[index];
-        if (
-          want === undefined ||
-          got?.id !== want.id ||
-          got.amount !== want.amount ||
-          got.label !== want.label
-        ) {
-          throw new Error(
-            `seed ${String(seed)}, ${context}: row ${String(index)} diverged — wanted ` +
-              `${JSON.stringify(want)}, got ${JSON.stringify(got)}`,
-          );
+      const check = async (context: string): Promise<void> => {
+        const expected = [...reference.values()].sort((left, right) => left.id - right.id);
+        const aggregate = (
+          await database.query("SELECT COUNT(*) AS n, SUM(amount) AS total FROM items", {
+            memoize: false,
+          })
+        ).rows[0] as { n: number; total: number | null };
+        expect(aggregate.n, `${context}: count`).toBe(expected.length);
+        expect(aggregate.total ?? 0, `${context}: sum`).toBe(
+          expected.reduce((sum, row) => sum + row.amount, 0),
+        );
+        const rows = (
+          await database.query("SELECT id, amount, label FROM items ORDER BY id", {
+            memoize: false,
+          })
+        ).rows as unknown as Row[];
+        expect(rows.length, `${context}: rows`).toBe(expected.length);
+        for (let index = 0; index < expected.length; index += 1) {
+          const want = expected[index];
+          const got = rows[index];
+          if (
+            want === undefined ||
+            got?.id !== want.id ||
+            got.amount !== want.amount ||
+            got.label !== want.label
+          ) {
+            throw new Error(
+              `seed ${String(seed)}, ${context}: row ${String(index)} diverged — wanted ` +
+                `${JSON.stringify(want)}, got ${JSON.stringify(got)}`,
+            );
+          }
         }
-      }
-      const probe = expected[Math.floor(random() * expected.length)];
-      if (probe !== undefined) {
-        const found = await database.query("SELECT amount FROM items WHERE id = ?", {
-          params: [probe.id],
-          memoize: false,
-        });
-        expect(found.rows, `${context}: lookup ${String(probe.id)}`).toEqual([
-          { amount: probe.amount },
-        ]);
-      }
-    };
+        const probe = expected[Math.floor(random() * expected.length)];
+        if (probe !== undefined) {
+          const found = await database.query("SELECT amount FROM items WHERE id = ?", {
+            params: [probe.id],
+            memoize: false,
+          });
+          expect(found.rows, `${context}: lookup ${String(probe.id)}`).toEqual([
+            { amount: probe.amount },
+          ]);
+        }
+      };
 
-    // Most operations land on a hot two per cent of the key space, the rest anywhere — the
-    // shape that lets a fold leave most partitions alone. Every operation yields a macrotask,
-    // as a write from a user event would, so the background loop gets to run between them;
-    // a microtask-only loop over the memory store would starve it until the writes stop.
-    const OPERATIONS = 2_400;
-    const HOT_KEYS = Math.floor(KEY_SPACE * 0.02);
-    for (let operation = 1; operation <= OPERATIONS; operation += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      const key =
-        random() < 0.7
-          ? KEY_SPACE - 1 - Math.floor(random() * HOT_KEYS)
-          : Math.floor(random() * KEY_SPACE);
-      const roll = random();
-      const exists = reference.has(key);
-      if (!exists && roll < 0.5) {
-        const row: Row = { id: key, amount: Math.floor(random() * 1000), label: "new" };
-        await database.insertBatch("items", [row]);
-        reference.set(key, row);
-      } else if (exists && roll < 0.25) {
-        await database.deleteBatch("items", { keys: [key] });
-        reference.delete(key);
-      } else if (exists && roll < 0.8) {
-        const amount = Math.floor(random() * 1000);
-        await database.updateBatch("items", { keys: [key], changes: { amount: [amount] } });
-        reference.set(key, { ...requiredRow(reference, key), amount });
-      } else if (exists) {
-        const row: Row = { id: key, amount: Math.floor(random() * 1000), label: "up" };
-        await database.upsertBatch("items", [row]);
-        reference.set(key, row);
+      // Most operations land on a hot two per cent of the key space, the rest anywhere — the
+      // shape that lets a fold leave most partitions alone. Every operation yields a macrotask,
+      // as a write from a user event would, so the background loop gets to run between them;
+      // a microtask-only loop over the memory store would starve it until the writes stop.
+      const OPERATIONS = 2_400;
+      const HOT_KEYS = Math.floor(KEY_SPACE * 0.02);
+      for (let operation = 1; operation <= OPERATIONS; operation += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const key =
+          random() < 0.7
+            ? KEY_SPACE - 1 - Math.floor(random() * HOT_KEYS)
+            : Math.floor(random() * KEY_SPACE);
+        const roll = random();
+        const exists = reference.has(key);
+        if (!exists && roll < 0.5) {
+          const row: Row = { id: key, amount: Math.floor(random() * 1000), label: "new" };
+          await database.insertBatch("items", [row]);
+          reference.set(key, row);
+        } else if (exists && roll < 0.25) {
+          await database.deleteBatch("items", { keys: [key] });
+          reference.delete(key);
+        } else if (exists && roll < 0.8) {
+          const amount = Math.floor(random() * 1000);
+          await database.updateBatch("items", { keys: [key], changes: { amount: [amount] } });
+          reference.set(key, { ...requiredRow(reference, key), amount });
+        } else if (exists) {
+          const row: Row = { id: key, amount: Math.floor(random() * 1000), label: "up" };
+          await database.upsertBatch("items", [row]);
+          reference.set(key, row);
+        }
+        if (operation % 300 === 0) await check(`after operation ${String(operation)}`);
       }
-      if (operation % 300 === 0) await check(`after operation ${String(operation)}`);
-    }
 
-    // Let the background loop settle. Planning is not a job record yet, so an unchanged segment
-    // count alone is not a completion signal under slow coverage instrumentation: keep waiting
-    // while the actual fold condition is still due.
-    const active = async (): Promise<number> =>
-      (await database.listCompactionJobs("items")).filter(
-        (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
-      ).length;
-    let stable = 0;
-    let lastVisible = -1;
-    for (let attempt = 0; attempt < 4_000 && stable < 30; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      const currentRecords = await visibleRecords(database, store, "items");
-      const visible = currentRecords.length;
-      const deltas = currentRecords.filter((segment) => {
-        const kind = segment.kind;
-        return kind !== "insert" && kind !== "base";
-      }).length;
-      const due = visible >= 48 || deltas >= 32;
-      stable = (await active()) === 0 && !due && visible === lastVisible ? stable + 1 : 0;
-      lastVisible = visible;
-    }
-    expect(await active()).toBe(0);
-    await check("settled");
-    // Background collection prunes old fold records, so the evidence that folds happened is the
-    // shape they left: bounded partitions, and a history short of the fold threshold. How many
-    // partitions each fold touched depends on how many deltas landed while the previous one
-    // ran, which is load-dependent; the targeted suite above pins that selectivity exactly.
-    const published = (await database.listCompactionJobs("items")).filter(
-      (job) => job.state === "published",
-    );
-    expect(published.length).toBeGreaterThanOrEqual(1);
-    const records = await visibleRecords(database, store, "items");
-    const layout = assertPartitionLayout(records, SOAK_PARTITION_ROWS);
-    expect(layout.partitions.length).toBeGreaterThanOrEqual(10);
-    expect(layout.level0.length).toBeLessThan(48);
-    store.close();
-  }, 300_000);
+      // Let the background loop settle. Planning is not a job record yet, so an unchanged segment
+      // count alone is not a completion signal under slow coverage instrumentation: keep waiting
+      // while the actual fold condition is still due.
+      const active = async (): Promise<number> =>
+        (await database.listCompactionJobs("items")).filter(
+          (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
+        ).length;
+      let stable = 0;
+      let lastVisible = -1;
+      for (let attempt = 0; attempt < 4_000 && stable < 30; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const currentRecords = await visibleRecords(database, store, "items");
+        const visible = currentRecords.length;
+        const deltas = currentRecords.filter((segment) => {
+          const kind = segment.kind;
+          return kind !== "insert" && kind !== "base";
+        }).length;
+        const due = visible >= 48 || deltas >= 32;
+        stable = (await active()) === 0 && !due && visible === lastVisible ? stable + 1 : 0;
+        lastVisible = visible;
+      }
+      expect(await active()).toBe(0);
+      await check("settled");
+      // Background collection prunes old fold records, so the evidence that folds happened is the
+      // shape they left: bounded partitions, and a history short of the fold threshold. How many
+      // partitions each fold touched depends on how many deltas landed while the previous one
+      // ran, which is load-dependent; the targeted suite above pins that selectivity exactly.
+      const published = (await database.listCompactionJobs("items")).filter(
+        (job) => job.state === "published",
+      );
+      expect(published.length).toBeGreaterThanOrEqual(1);
+      const records = await visibleRecords(database, store, "items");
+      const layout = assertPartitionLayout(records, SOAK_PARTITION_ROWS);
+      expect(layout.partitions.length).toBeGreaterThanOrEqual(10);
+      expect(layout.level0.length).toBeLessThan(48);
+      store.close();
+    },
+    300_000,
+  );
 });
 
 async function storedBytes(

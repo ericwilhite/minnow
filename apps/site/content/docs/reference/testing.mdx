@@ -177,12 +177,13 @@ HTML.
 
 ## Seeds, and how a soak failure becomes a permanent test
 
-The generated suites — SQL support, write support, the deterministic simulator, and the
-columnar-versus-row comparison
-— build their corpora from a seeded generator. A committed run is deterministic: it uses the
-checked-in seeds plus every seed that has ever failed, listed in
-`packages/core/regression-seeds.json`. That makes the suite a reliable regression net, and on its
-own it would be nothing else, because the questions it asks never change.
+The generated suites — SQL support, write support, the deterministic simulator, the
+columnar-versus-row comparison, and the compaction and multi-tab soaks — build their corpora from
+a seeded generator. A committed run is deterministic: it uses the checked-in seeds plus every seed
+that has ever failed, listed in `packages/core/regression-seeds.json`. Each recorded seed runs as
+its own test case next to the suite's default, so a seed in that file is executed on every
+commit, not merely listed. That makes the suite a reliable regression net, and on its own it
+would be nothing else, because the questions it asks never change.
 
 `npm run soak` is the other half. It runs the same suites on seeds nobody has tried and stops at
 the first failure, printing the seed:

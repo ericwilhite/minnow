@@ -16,6 +16,7 @@ import {
   scalarFunctionNames,
   scalarFunctionValue,
   splitCondition,
+  statementDatetimeNames,
   volatileScalarFunctionNames,
   type BinaryOperator,
   type ComparisonOperator,
@@ -38,12 +39,47 @@ import { simpleScalarFunctions } from "./sql-functions.js";
  * The optimizer runs before subquery resolution, so subquery blocks optimize recursively and
  * predicates containing subqueries stay self-contained when they move.
  */
-export function optimizePlan(plan: CompiledQuery): CompiledQuery {
+export function optimizePlan(plan: CompiledQuery, options: OptimizeOptions = {}): CompiledQuery {
   const optimized = structuredClone(plan);
   const aliases = new Set<string>();
   collectPlanAliases(optimized, aliases);
-  optimizeBlock(optimized, correlationAliasFactory(aliases));
+  optimizeBlock(optimized, correlationAliasFactory(aliases, options.resolvedNames === true));
+  optimized.optimized = true;
   return optimized;
+}
+
+export interface OptimizeOptions {
+  /**
+   * Every unqualified column name in every subquery has been resolved against its scopes, so
+   * one that remains is local to its block. Compilation has no catalog and cannot know whether
+   * `WHERE region = home_region` inside a subquery reads the subquery's table or the enclosing
+   * query's, so it holds back the rewrites that would move such a name into a derived block —
+   * an uncorrelated `IN (SELECT …)` becoming a join, an unqualified outer predicate entering a
+   * correlation probe. The database applies them after `qualifyCorrelatedReferences`.
+   */
+  readonly resolvedNames?: boolean;
+}
+
+/** The correlation alias generator, carrying whether subquery names are resolved. */
+type NextAlias = (() => string) & { readonly resolvedNames: boolean };
+
+/**
+ * The bind-time half of the calendar rewrite. Compilation runs before parameters exist, so
+ * `DATE_TRUNC('day', col) = ?` reaches execution as a per-row call over the whole scan; once
+ * the placeholder is a Date literal the same range rewrite applies. Walks every block the
+ * optimizer would have — nested sources and subquery blocks included.
+ */
+export function rewriteBoundCalendarEqualities(plan: CompiledQuery): void {
+  rewriteCalendarEqualities(plan);
+  forEachNestedBlock(plan, rewriteBoundCalendarEqualities);
+  const visit = (expression: Expression): void => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      rewriteBoundCalendarEqualities(expression.block);
+      return;
+    }
+    for (const child of childExpressions(expression)) visit(child);
+  };
+  forEachBlockExpression(plan, visit);
 }
 
 /**
@@ -178,7 +214,7 @@ export function chooseJoinOrder(
   };
 }
 
-function optimizeBlock(block: CompiledQuery, nextCorrelationAlias: () => string): void {
+function optimizeBlock(block: CompiledQuery, nextCorrelationAlias: NextAlias): void {
   decorrelateLateralSources(block);
   decorrelateBlock(block, nextCorrelationAlias);
   for (const source of [block.base, ...block.joins]) {
@@ -686,10 +722,11 @@ function addCalendarUnit(start: Date, unit: string): Date {
 
 /**
  * An inner equi-join makes its two key columns equal on every output row, so a constant
- * equality or IN list on one key holds for the other: `c.id = 4 AND o.customer = c.id` implies
- * `o.customer = 4`. The implied predicate is added (never substituted), which lets the table
- * that only carried the join key filter its own scan — through a secondary index when it has
- * one — instead of joining first and filtering after. Only inner joins qualify: an outer join
+ * equality, range, or IN list on one key holds for the other: `c.id = 4 AND o.customer = c.id`
+ * implies `o.customer = 4`. The implied predicate is added (never substituted), which lets the
+ * table that only carried the join key filter its own scan — through a secondary index when it
+ * has one — instead of joining first and filtering after. A placeholder counts as a constant:
+ * it is one value for the whole execution once bound. Only inner joins qualify: an outer join
  * keeps rows whose key is NULL, for which the implication fails.
  */
 function propagateJoinKeyConstants(block: CompiledQuery): void {
@@ -726,13 +763,13 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
     if (predicate.operator === "IN") {
       return predicate.left.kind === "column" &&
         predicate.right.kind === "list" &&
-        predicate.right.items.every((item) => item.kind === "literal")
+        predicate.right.items.every((item) => isBoundConstant(item))
         ? "right"
         : undefined;
     }
     if (!rangeOrEqualityOperators.has(predicate.operator)) return undefined;
-    if (predicate.left.kind === "column" && predicate.right.kind === "literal") return "right";
-    if (predicate.right.kind === "column" && predicate.left.kind === "literal") return "left";
+    if (predicate.left.kind === "column" && isBoundConstant(predicate.right)) return "right";
+    if (predicate.right.kind === "column" && isBoundConstant(predicate.left)) return "left";
     return undefined;
   };
   for (const predicate of block.predicates) {
@@ -763,6 +800,11 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
 }
 
 const rangeOrEqualityOperators: ReadonlySet<string> = new Set(["=", "<", "<=", ">", ">="]);
+
+/** A literal, or a placeholder that binding turns into one before execution. */
+function isBoundConstant(expression: Expression): boolean {
+  return expression.kind === "literal" || expression.kind === "parameter";
+}
 
 /**
  * Whether an equality's two sides split cleanly along this join: one side reads only the table
@@ -1002,7 +1044,7 @@ const correlationNonNullCountAlias = "\0correlation_non_null_count";
 const correlationDecisionCountAlias = "\0correlation_decision_count";
 const correlationTruthCountAlias = "\0correlation_truth_count";
 
-function decorrelateBlock(block: CompiledQuery, nextAlias: () => string): void {
+function decorrelateBlock(block: CompiledQuery, nextAlias: NextAlias): void {
   const scope = new Set([block.base.alias, ...block.joins.map((join) => join.alias)]);
   const rewritten: Predicate[] = [];
   for (const predicate of block.predicates) {
@@ -1073,7 +1115,7 @@ function rewriteCorrelatedExpression(
   block: CompiledQuery,
   expression: Expression,
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Expression {
   if (expression.kind === "exists" && blockReferencesOutside(expression.block)) {
     return decorrelateExistsExpression(block, expression, scope, nextAlias);
@@ -1145,25 +1187,28 @@ function rewriteCorrelatedExpression(
   return expression;
 }
 
-function correlationAliasFactory(scope: Set<string>): () => string {
+function correlationAliasFactory(scope: Set<string>, resolvedNames: boolean): NextAlias {
   let sequence = 0;
-  return () => {
-    for (;;) {
-      sequence += 1;
-      const alias = `corr_${String(sequence)}`;
-      if (!scope.has(alias)) {
-        scope.add(alias);
-        return alias;
+  return Object.assign(
+    () => {
+      for (;;) {
+        sequence += 1;
+        const alias = `corr_${String(sequence)}`;
+        if (!scope.has(alias)) {
+          scope.add(alias);
+          return alias;
+        }
       }
-    }
-  };
+    },
+    { resolvedNames },
+  );
 }
 
 function decorrelatePredicate(
   block: CompiledQuery,
   predicate: Predicate,
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Predicate | "consumed" | undefined {
   // EXISTS / NOT EXISTS as a bare WHERE conjunct.
   if (predicate.operator === "IS TRUE") {
@@ -1230,7 +1275,13 @@ function decorrelatePredicate(
     predicate.right.kind === "subquery"
   ) {
     const inner = predicate.right.block;
-    if (!blockReferencesOutside(inner)) return undefined;
+    if (!blockReferencesOutside(inner)) {
+      // Only once names are resolved: an unqualified outer reference inside the subquery would
+      // otherwise be sealed into a derived block where resolution never reaches it.
+      return predicate.operator === "IN" && nextAlias.resolvedNames
+        ? rewriteUncorrelatedIn(block, predicate, inner, nextAlias)
+        : undefined;
+    }
     rejectGroupedInner(inner, "IN");
     const item = inner.select[0];
     if (inner.select.length !== 1 || item === undefined || item.expression.kind === "wildcard") {
@@ -1400,7 +1451,7 @@ function decorrelateNotIn(
   inner: CompiledQuery,
   item: Expression,
   keys: CorrelationKey[],
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Predicate {
   const valuesAlias = nextAlias();
   const values: CompiledQuery = {
@@ -1511,7 +1562,7 @@ function decorrelateRangeNotIn(
   inner: CompiledQuery,
   item: Expression,
   keys: CorrelationKey[],
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Predicate {
   const valuesAlias = nextAlias();
   const values: CompiledQuery = {
@@ -1546,7 +1597,7 @@ function decorrelateRangeNotIn(
   exactMatch.kind = "anti";
   block.joins.push(exactMatch);
 
-  const probes = outerProbeBlock(block, keys);
+  const probes = outerProbeBlock(block, keys, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const innerRowsAlias = nextAlias();
   const innerRows: CompiledQuery = {
@@ -1663,7 +1714,7 @@ function decorrelateQuantifiedExpression(
   inner: CompiledQuery,
   quantified: { comparison: ComparisonOperator; quantifier: "any" | "all" },
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
   label: "IN" | "ANY/ALL",
 ): Expression {
   rejectGroupedInner(inner, label);
@@ -1680,7 +1731,7 @@ function decorrelateQuantifiedExpression(
     ...keys.map((key) => structuredClone(key.outer)),
     structuredClone(probe),
   ];
-  const probes = outerProbeBlockForExpressions(block, outerExpressions);
+  const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const probeReferences = outerExpressions.map<Expression>((_, index) => ({
     kind: "column",
@@ -1818,7 +1869,7 @@ function decorrelateScalarSubquery(
   block: CompiledQuery,
   subquery: Extract<Expression, { kind: "subquery" }>,
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Expression {
   const inner = subquery.block;
   const passthrough = scalarPassthrough(inner);
@@ -1991,7 +2042,7 @@ function decorrelateGeneralScalar(
   block: CompiledQuery,
   inner: CompiledQuery,
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Expression {
   const shape = scalarShape(inner);
   const rows = shape.rows;
@@ -2003,7 +2054,7 @@ function decorrelateGeneralScalar(
   }
   const keys = extractCorrelation(rows, scope, "scalar", true);
   const outerExpressions = keys.map((key) => structuredClone(key.outer));
-  const probes = outerProbeBlockForExpressions(block, outerExpressions);
+  const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const probeReferences = outerExpressions.map<Expression>((_, index) => ({
     kind: "column",
@@ -2088,7 +2139,10 @@ function decorrelateGeneralScalar(
       })),
       ...projected,
     ],
-    predicates: rows.predicates,
+    // Every inner row must equal a surviving probe on the keys, so what the probe block filters
+    // on its key columns filters the inner scan too: the range on the outer key becomes a
+    // range on the inner key, and the scan prunes blocks by it instead of reading the table.
+    predicates: [...rows.predicates, ...mirrorPredicatesThroughKeys(probes.predicates, keys)],
     groupBy: [],
     having: [],
     orderBy: [],
@@ -2271,7 +2325,7 @@ function decorrelateNonEqualityScalar(
   inner: CompiledQuery,
   aggregate: Extract<Expression, { kind: "call" }>,
   keys: CorrelationKey[],
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Expression {
   if (aggregate.aggregateOrderBy !== undefined) {
     throw new TypeError("A range-correlated scalar aggregate cannot use aggregate ORDER BY");
@@ -2281,7 +2335,7 @@ function decorrelateNonEqualityScalar(
     throw new TypeError("A correlated scalar aggregate must have exactly one argument");
   }
 
-  const probes = outerProbeBlock(block, keys);
+  const probes = outerProbeBlock(block, keys, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const innerRowsAlias = nextAlias();
   const innerRows: CompiledQuery = {
@@ -2362,7 +2416,7 @@ function decorrelateExistsExpression(
   block: CompiledQuery,
   exists: Extract<Expression, { kind: "exists" }>,
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Expression {
   const inner = exists.block;
   rejectGroupedInner(inner, "EXISTS");
@@ -2398,7 +2452,7 @@ function decorrelateExistsExpression(
       right: { kind: "literal", value: null },
     };
   }
-  const probes = outerProbeBlock(block, keys);
+  const probes = outerProbeBlock(block, keys, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const innerRowsAlias = nextAlias();
   const innerRows: CompiledQuery = {
@@ -2471,7 +2525,7 @@ function decorrelateExistsWithProbes(
   block: CompiledQuery,
   exists: Extract<Expression, { kind: "exists" }>,
   scope: ReadonlySet<string>,
-  nextAlias: () => string,
+  nextAlias: NextAlias,
 ): Expression {
   const inner = exists.block;
   const outside: string[] = [];
@@ -2492,7 +2546,7 @@ function decorrelateExistsWithProbes(
     kind: "column",
     reference,
   }));
-  const probes = outerProbeBlockForExpressions(block, outerExpressions);
+  const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const probeReferences = references.map<Expression>((_, index) => ({
     kind: "column",
@@ -2585,16 +2639,22 @@ function replacePlanReferences(
 }
 
 /** Distinct outer key tuples, preserving the FROM joins needed by every referenced source. */
-function outerProbeBlock(block: CompiledQuery, keys: CorrelationKey[]): CompiledQuery {
+function outerProbeBlock(
+  block: CompiledQuery,
+  keys: CorrelationKey[],
+  resolvedNames: boolean,
+): CompiledQuery {
   return outerProbeBlockForExpressions(
     block,
     keys.map((key) => key.outer),
+    resolvedNames,
   );
 }
 
 function outerProbeBlockForExpressions(
   block: CompiledQuery,
   outerExpressions: readonly Expression[],
+  resolvedNames: boolean,
 ): CompiledQuery {
   const sources: TableSource[] = [block.base, ...block.joins];
   const sourceIndexes = outerExpressions.flatMap((expression) => {
@@ -2610,6 +2670,10 @@ function outerProbeBlockForExpressions(
   });
   const lastSource = Math.max(...sourceIndexes);
   const expressions = outerExpressions.map((expression) => structuredClone(expression));
+  const retained = new Set(sources.slice(0, lastSource + 1).map((source) => source.alias));
+  // An unqualified name resolves the same way only if the probe keeps every source — and only
+  // once names are resolved, since before that it might belong to an enclosing query.
+  const retainsAll = resolvedNames && lastSource === sources.length - 1;
   return {
     sql: "(correlation probes)",
     base: structuredClone(block.base),
@@ -2618,11 +2682,144 @@ function outerProbeBlockForExpressions(
       expression,
       alias: correlationProbeAlias(index),
     })),
-    predicates: [],
+    predicates: probePredicates(block, retained, retainsAll),
     groupBy: expressions,
     having: [],
     orderBy: [],
   };
+}
+
+/**
+ * The outer WHERE conjuncts a probe block applies to itself. The probe replicates the outer
+ * FROM prefix its keys need, so a conjunct that reads only that prefix decides the same rows
+ * there as in the outer block: a row it rejects never needs a probe (the join back is LEFT on
+ * the probe key, so a missing probe is unobservable), and without it every outer key tuple in
+ * the table would be probed — 200,000 groups and a 200,000-row join for a query that keeps 100
+ * outer rows. What must stay out: any reference beyond the prefix (unqualified names too,
+ * unless the whole FROM is retained), subqueries and EXISTS (they may be the next correlation
+ * to rewrite), aggregates and windows, full-text documents (defined against their own scan),
+ * and calls that must run once per statement rather than once more inside a derived block —
+ * volatile functions, sequence reads, and the statement clock.
+ */
+function probePredicates(
+  block: CompiledQuery,
+  retained: ReadonlySet<string>,
+  retainsAll: boolean,
+): Predicate[] {
+  return block.predicates
+    .filter(
+      (predicate) =>
+        probeSafeExpression(predicate.left, retained, retainsAll) &&
+        probeSafeExpression(predicate.right, retained, retainsAll),
+    )
+    .map((predicate) => structuredClone(predicate));
+}
+
+/**
+ * Calls that must run once per statement and never again inside a derived block. Decided per
+ * call rather than as a module-level set: this module and query.ts import each other, and
+ * query.ts's tables are not initialized yet when this module's top level runs.
+ */
+function isStatementScopedCall(name: string): boolean {
+  return (
+    volatileScalarFunctionNames.has(name) ||
+    statementDatetimeNames.has(name) ||
+    name === "NEXTVAL" ||
+    name === "CURRVAL"
+  );
+}
+
+function probeSafeExpression(
+  expression: Expression,
+  retained: ReadonlySet<string>,
+  retainsAll: boolean,
+): boolean {
+  switch (expression.kind) {
+    case "literal":
+    case "parameter":
+      return true;
+    case "column": {
+      const dot = expression.reference.indexOf(".");
+      return dot < 0 ? retainsAll : retained.has(expression.reference.slice(0, dot));
+    }
+    case "wildcard":
+    case "subquery":
+    case "exists":
+    case "window":
+    case "fts":
+      return false;
+    case "call":
+      if (!scalarFunctionNames.has(expression.name) || isStatementScopedCall(expression.name)) {
+        return false;
+      }
+      return expression.arguments.every((argument) =>
+        probeSafeExpression(argument, retained, retainsAll),
+      );
+    default:
+      return childExpressions(expression).every((child) =>
+        probeSafeExpression(child, retained, retainsAll),
+      );
+  }
+}
+
+/**
+ * Restates predicates over outer key columns in terms of the matching inner key expressions.
+ * Only equality keys whose outer side is a bare column qualify, and a predicate that reads any
+ * other column is dropped rather than half-translated. Rows the inner side loses this way are
+ * exactly the ones no surviving probe could have matched.
+ */
+function mirrorPredicatesThroughKeys(
+  predicates: readonly Predicate[],
+  keys: readonly CorrelationKey[],
+): Predicate[] {
+  const substitutions = new Map<string, Expression>();
+  for (const key of keys) {
+    if (key.operator === "=" && key.outer.kind === "column") {
+      substitutions.set(key.outer.reference, key.inner);
+    }
+  }
+  if (substitutions.size === 0) return [];
+  const mirrored: Predicate[] = [];
+  for (const predicate of predicates) {
+    const left = substituteColumns(predicate.left, substitutions);
+    if (left === undefined) continue;
+    const right = substituteColumns(predicate.right, substitutions);
+    if (right === undefined) continue;
+    mirrored.push({ ...predicate, left, right });
+  }
+  return mirrored;
+}
+
+function substituteColumns(
+  expression: Expression,
+  substitutions: ReadonlyMap<string, Expression>,
+): Expression | undefined {
+  if (expression.kind === "column") {
+    const replacement = substitutions.get(expression.reference);
+    return replacement === undefined ? undefined : structuredClone(replacement);
+  }
+  if (expression.kind === "literal" || expression.kind === "parameter") {
+    return structuredClone(expression);
+  }
+  if (
+    expression.kind === "wildcard" ||
+    expression.kind === "subquery" ||
+    expression.kind === "exists" ||
+    expression.kind === "window" ||
+    expression.kind === "fts"
+  ) {
+    return undefined;
+  }
+  const progress = { complete: true };
+  const mapped = mapChildExpressions(structuredClone(expression), (child) => {
+    const substituted = substituteColumns(child, substitutions);
+    if (substituted === undefined) {
+      progress.complete = false;
+      return child;
+    }
+    return substituted;
+  });
+  return progress.complete ? mapped : undefined;
 }
 
 /** Joins one row per outer probe tuple back with NULL-safe equality. */
@@ -2850,6 +3047,56 @@ function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
   }
 }
 
+/**
+ * `col IN (SELECT value …)` with no correlation is an inner join to the subquery's distinct
+ * values: the row survives exactly when a non-null equal value exists, which is what the
+ * membership test answers as a WHERE conjunct (a NULL probe and an empty subquery both reject
+ * the row either way). The subquery block is kept whole as a derived source — its own grouping,
+ * ordering, and limit stay in force — and only its one output is grouped for the join. A
+ * constant on the probe column then reaches the subquery's own scan through join-key mirroring
+ * and pushdown, instead of the subquery materializing every value before the first row is
+ * tested.
+ */
+function rewriteUncorrelatedIn(
+  block: CompiledQuery,
+  predicate: Predicate,
+  inner: CompiledQuery,
+  nextAlias: NextAlias,
+): "consumed" | undefined {
+  const item = inner.select[0];
+  if (
+    predicate.left.kind !== "column" ||
+    inner.select.length !== 1 ||
+    item === undefined ||
+    item.expression.kind === "wildcard" ||
+    item.alias.includes(".")
+  ) {
+    return undefined;
+  }
+  const valuesAlias = nextAlias();
+  const alias = nextAlias();
+  const value: Expression = { kind: "column", reference: `${valuesAlias}.${item.alias}` };
+  const derived: CompiledQuery = {
+    sql: "(in subquery values)",
+    base: { table: valuesAlias, alias: valuesAlias, derived: inner },
+    joins: [],
+    select: [{ expression: value, alias: correlationValueAlias }],
+    predicates: [],
+    groupBy: [structuredClone(value)],
+    having: [],
+    orderBy: [],
+  };
+  block.joins.push({
+    table: alias,
+    alias,
+    derived,
+    kind: "inner",
+    left: structuredClone(predicate.left),
+    right: { kind: "column", reference: `${alias}.${correlationValueAlias}` },
+  });
+  return "consumed";
+}
+
 function rejectGroupedInner(inner: CompiledQuery, label: string): void {
   if (inner.groupBy.length > 0 || inner.having.length > 0) {
     throw new TypeError(`Correlated ${label} subqueries cannot use GROUP BY or HAVING`);
@@ -3066,6 +3313,9 @@ function pushPredicatesIntoDerived(block: CompiledQuery): void {
       continue;
     }
     target.derived.predicates.push(target.rewritten);
+    // The derived block was optimized before this predicate arrived; let it travel on to a
+    // nested derived source when one exposes the column it names.
+    pushPredicatesIntoDerived(target.derived);
   }
   block.predicates = remaining;
 }

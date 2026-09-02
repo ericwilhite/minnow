@@ -22,6 +22,9 @@ import type * as StorageToolkit from "@minnowdb/core/storage/toolkit";
 import type * as Testing from "@minnowdb/core/testing";
 import type * as Transactions from "@minnowdb/core/transactions";
 import type * as Worker from "@minnowdb/core/worker";
+import type * as WorkerIndexedDb from "@minnowdb/core/worker/indexeddb";
+import type * as WorkerMemory from "@minnowdb/core/worker/memory";
+import type * as WorkerOpfs from "@minnowdb/core/worker/opfs";
 import type * as WorkerHost from "@minnowdb/core/worker-host";
 import type * as WorkerProtocol from "@minnowdb/core/worker-protocol";
 import type * as Devtools from "@minnowdb/devtools";
@@ -53,6 +56,9 @@ export type InstalledPublicApis = readonly [
   typeof Testing,
   typeof Transactions,
   typeof Worker,
+  typeof WorkerIndexedDb,
+  typeof WorkerMemory,
+  typeof WorkerOpfs,
   typeof WorkerHost,
   typeof WorkerProtocol,
   typeof Devtools,

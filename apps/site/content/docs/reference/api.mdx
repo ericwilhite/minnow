@@ -23,6 +23,7 @@ rules behind this table.
 | `@minnowdb/core/schema`                          | Application | Schema DSL, typed tables, and migrations without the engine     |
 | `@minnowdb/core/schema-wire`                     | Extension   | Schema serialization for workers and adapter tooling            |
 | `@minnowdb/core/worker`                          | Runtime     | Ready-made worker entry (side-effect import)                    |
+| `@minnowdb/core/worker/{indexeddb,opfs,memory}`  | Runtime     | Worker entry bundling one store only (side-effect import)       |
 | `@minnowdb/core/worker-host`                     | Extension   | Manual host for custom worker entry points                      |
 | `@minnowdb/core/plan`                            | Extension   | Low-level plan construction and optimization tools              |
 | `@minnowdb/core/storage`                         | Application | Block stores: IndexedDB, OPFS, in-memory, the storage interface |
@@ -179,12 +180,14 @@ Manual worker-host exports live in this subpath so the main engine entry does no
 storage adapter. See [Workers & multi-tab](/docs/engine/workers). Schema serialization has its own
 `@minnowdb/core/schema-wire` entry.
 
-| Export                                      | Description                                                                                                                                                                                                        |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `exposeDatabase(database, scope, options?)` | Serves the full client protocol for a database you constructed. `writeHandleIdleTimeoutMs` bounds abandoned explicit writes; match it to the database's `transactionIdleTimeoutMs`.                                |
-| `attachDatabaseWorker(scope)`               | What the stock `@minnowdb/core/worker` entry calls: builds the database from the client's init frame.                                                                                                              |
-| `StoreDescriptor`                           | `{ kind: "indexeddb", name, durability?, uniqueKeyCacheBytes? } \| { kind: "opfs", name, … } \| { kind: "memory" }` — the cloneable store config. Omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`. |
-| `WireDatabaseOptions, DatabaseInitPayload`  | The cloneable subset of `MinnowDatabaseOptions` and the init frame shape.                                                                                                                                          |
+| Export                                      | Description                                                                                                                                                                                                              |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `exposeDatabase(database, scope, options?)` | Serves the full client protocol for a database you constructed. `writeHandleIdleTimeoutMs` bounds abandoned explicit writes; match it to the database's `transactionIdleTimeoutMs`.                                      |
+| `attachDatabaseWorker(scope, options?)`     | What the stock `@minnowdb/core/worker` entry calls: builds the database from the client's init frame. `options.createStore` replaces the stock any-store factory; `options.indexedDB` injects an `IDBFactory` for tests. |
+| `singleStoreFactory(kind, open)`            | Builds a `WorkerStoreFactory` that opens one store kind through `open(descriptor, options)` and refuses every other kind, naming the per-store entry that supports it.                                                   |
+| `WorkerStoreFactory, WorkerStoreOptions`    | The store factory signature `(descriptor, options) => BlockStore \| Promise<BlockStore>` and its options (`indexedDB?`).                                                                                                 |
+| `StoreDescriptor`                           | `{ kind: "indexeddb", name, durability?, uniqueKeyCacheBytes? } \| { kind: "opfs", name, … } \| { kind: "memory" }` — the cloneable store config. Omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`.       |
+| `WireDatabaseOptions, DatabaseInitPayload`  | The cloneable subset of `MinnowDatabaseOptions` and the init frame shape.                                                                                                                                                |
 
 ## `@minnowdb/core/schema-wire`
 
@@ -207,6 +210,11 @@ format used automatically by `client.migrate()`.
 A side-effect module: importing it inside a module worker attaches the database host to
 `self`. Point a `Worker` at it and pass the store descriptor from the client — see
 [the quick start](/docs/engine/workers#quick-start).
+
+`@minnowdb/core/worker/indexeddb`, `@minnowdb/core/worker/opfs`, and `@minnowdb/core/worker/memory`
+attach the same host with one store bundled statically, for bundlers that cannot split worker
+code; each refuses an init frame for another store kind. See
+[per-store worker entries](/docs/engine/workers#per-store-worker-entries).
 
 ## `@minnowdb/core/plan`
 

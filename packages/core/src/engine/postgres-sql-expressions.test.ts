@@ -358,3 +358,81 @@ describe("LIKE ESCAPE", () => {
     );
   });
 });
+
+describe("CASE aggregates over typed dictionaries", () => {
+  it("decides NUMERIC and enum conditions through the generic evaluator", async () => {
+    // A typed dictionary (NUMERIC, enum) is never decided by string identity against the CASE
+    // literal; the domain's own equality rules answer, so 1.5 and 1.50 are one value.
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
+    await database.execute(
+      "CREATE TABLE feelings (id INTEGER PRIMARY KEY, price NUMERIC(10, 2), feeling mood)",
+    );
+    await database.execute(
+      "INSERT INTO feelings VALUES (1, 1.5, 'sad'), (2, 1.50, 'ok'), (3, 2, 'happy'), (4, NULL, NULL), (5, 1.5, 'ok')",
+    );
+    const sql =
+      "SELECT SUM(CASE WHEN price = 1.5 THEN 1 ELSE 0 END) AS n, SUM(CASE WHEN price = '1.50' THEN 1 ELSE 0 END) AS t, SUM(CASE WHEN feeling = 'ok' THEN 1 ELSE 0 END) AS ok, SUM(CASE WHEN feeling IN ('sad', 'happy') THEN 1 WHEN feeling IS NULL THEN 10 ELSE 0 END) AS extremes FROM feelings";
+    const expected = [{ n: 3, t: 3, ok: 2, extremes: 12 }];
+    expect((await database.query(sql, { memoize: false })).rows).toEqual(expected);
+    await database.close();
+  });
+});
+
+describe("subquery name resolution", () => {
+  // The rewrites that move a subquery into a derived block (an uncorrelated IN becoming a
+  // join, an outer predicate entering a correlation probe) run only after the database has
+  // resolved every unqualified name, so a subquery that reads the enclosing query's column
+  // without naming its table still correlates the way PostgreSQL resolves it.
+  async function fixture(): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, region TEXT)");
+    await database.execute(
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, home_region TEXT)",
+    );
+    await database.execute("INSERT INTO customers VALUES (1, 'west'), (2, 'east'), (3, 'west')");
+    await database.execute(
+      "INSERT INTO orders VALUES (10, 1, 'west'), (11, 2, 'west'), (12, 3, 'east'), (13, 9, 'west')",
+    );
+    return database;
+  }
+
+  it("correlates subqueries through an unqualified outer column", async () => {
+    const database = await fixture();
+    const ids = async (sql: string, params?: unknown[]): Promise<unknown[]> =>
+      (
+        await database.query(sql, {
+          memoize: false,
+          ...(params === undefined ? {} : { params: params as never }),
+        })
+      ).rows.map((row) => row.id);
+    expect(
+      await ids(
+        "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE region = home_region) ORDER BY id",
+      ),
+    ).toEqual([10]);
+    expect(
+      await ids(
+        "SELECT id FROM orders WHERE customer_id NOT IN (SELECT id FROM customers WHERE region = home_region) ORDER BY id",
+      ),
+    ).toEqual([11, 12, 13]);
+    expect(
+      await ids(
+        "SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE id = customer_id AND region = home_region) ORDER BY id",
+      ),
+    ).toEqual([10]);
+    expect(
+      await ids(
+        "SELECT id FROM orders WHERE (SELECT region FROM customers WHERE id = customer_id) = home_region ORDER BY id",
+      ),
+    ).toEqual([10]);
+    // An uncorrelated subquery becomes the join, with the outer range reaching the key.
+    expect(
+      await ids(
+        "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE region = 'west') AND id > ? ORDER BY id",
+        [10],
+      ),
+    ).toEqual([12]);
+    await database.close();
+  });
+});

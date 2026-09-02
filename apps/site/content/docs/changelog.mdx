@@ -8,6 +8,55 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.1 — September 2, 2026
+
+Published packages: `@minnowdb/core@0.7.1`.
+
+Stored formats are unchanged and no migration is needed.
+
+### Added
+
+- Per-store worker entries. `@minnowdb/core/worker/indexeddb`, `@minnowdb/core/worker/opfs`,
+  and `@minnowdb/core/worker/memory` attach the same host as `@minnowdb/core/worker` but import
+  one storage adapter statically. The generic entry loads adapters with a dynamic `import()`,
+  which only becomes a lazy chunk under a bundler that splits worker code; Vite's default `iife`
+  worker format inlines all three, so its worker carried every store (1,466 KB minified / 398 KB
+  gzip against 1,159 KB / 319 KB for the IndexedDB store alone). A per-store worker refuses an
+  init frame for any other store kind, and `client.ready()` rejects with an error naming the
+  entry that supports it. For custom entries, `attachDatabaseWorker(scope, { createStore })`
+  accepts a `WorkerStoreFactory`, and `singleStoreFactory(kind, open)` builds a one-kind factory.
+
+### Changed
+
+- Correlated subqueries no longer probe the whole outer table. The distinct-probe block a
+  correlated scalar, `EXISTS`, or `IN` subquery is rewritten into now carries the outer `WHERE`
+  conjuncts that read only its own sources, and an equality-correlated scalar mirrors those key
+  ranges onto its inner scan. A scalar subselect over 100 outer rows of a 200,000-row table went
+  from 2.1 s to 7 ms; the correlated `EXISTS` form from 129 ms to 5 ms.
+- `column IN (SELECT …)` with no correlation is planned as a join to the subquery's distinct
+  values instead of materializing every value first, and an outer constant on the column reaches
+  the subquery's own scan: 168 ms to 3.5 ms on the same table. `NOT IN` and probes that are
+  expressions rather than columns keep their previous plan.
+- A placeholder counts as a constant for join-key mirroring: `WHERE c.id >= ? AND o.customer =
+c.id` filters `orders` by the bound value, as a literal already did.
+- `DATE_TRUNC(unit, column) = ?` and `EXTRACT(YEAR FROM column) = ?` take the range rewrite when
+  the placeholder is bound, not only when the value is a literal: 39.5 ms to 2.6 ms over 200,000
+  rows.
+- `SUM`, `COUNT`, and `AVG` over a `CASE` whose conditions compare one text column with
+  literals (`=`, `<>`, `IN`, `LIKE`, `ILIKE`, `IS NULL`, and `AND`/`OR`/`NOT` over those) decide
+  the branch per dictionary entry from the dictionary strings, so a high-cardinality column costs
+  one string compare per distinct value: 22.8 ms to 3.5 ms.
+- The published package no longer carries comments in its JavaScript. The sources and the
+  declaration files keep them; the tarball shrinks from 1.0 MB to 0.8 MB packed, and no
+  application bundle changes.
+
+### Fixed
+
+- A database worker built against a different protocol version, or a failure frame without an
+  error payload, left the client's pending call hanging forever. The call now rejects with a
+  protocol error, and a frame that names no pending request fails the client the way a transport
+  error does.
+
 ## 0.7.0 — September 1, 2026
 
 Published packages: `@minnowdb/core@0.7.0`.

@@ -379,6 +379,12 @@ export interface CompiledQuery {
   pendingSetOrder?: true;
   /** Preserve `{ optimize: false }` after a deferred wildcard shape becomes concrete. */
   preserveUnoptimizedShape?: true;
+  /**
+   * Set by the optimizer on the plan it returns. Parameter binding applies the value-dependent
+   * rewrites (calendar equalities) only to optimized plans, so `{ optimize: false }` stays the
+   * untouched oracle for them.
+   */
+  optimized?: true;
   distinctWildcard?: boolean;
   limitParameter?: number;
   offsetParameter?: number;

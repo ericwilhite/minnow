@@ -96,7 +96,7 @@ import {
   jsonIsValid,
   parseJsonPath,
 } from "./sql-json.js";
-import { optimizePlan } from "./optimizer.js";
+import { optimizePlan, rewriteBoundCalendarEqualities } from "./optimizer.js";
 import {
   compareSqlValues as compareValues,
   compileLikePattern,
@@ -243,7 +243,7 @@ export const volatileScalarFunctionNames: ReadonlySet<string> = new Set([
  * reading, so they are resolved once per execution rather than evaluated per row: every row of
  * one statement sees one instant, both executors agree, and constant folding leaves them alone.
  */
-const statementDatetimeNames: ReadonlySet<string> = new Set([
+export const statementDatetimeNames: ReadonlySet<string> = new Set([
   "CURRENT_DATE",
   "CURRENT_TIMESTAMP",
   "LOCALTIME",
@@ -2359,6 +2359,9 @@ export function bindPlanParameters(
   const clone = clonePlanTree(plan);
   bindBlock(clone, params ?? []);
   delete clone.parameterCount;
+  // A placeholder that has just become a Date literal can now take the range rewrite the
+  // optimizer applies to literal calendar equalities at compile time.
+  if (clone.optimized === true) rewriteBoundCalendarEqualities(clone);
   return clone;
 }
 

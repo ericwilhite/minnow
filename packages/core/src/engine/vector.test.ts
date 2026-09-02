@@ -508,10 +508,12 @@ describe("vector query execution", () => {
   });
 
   it("decides CASE aggregates per dictionary code exactly like the row executor", () => {
-    // SUM/COUNT/AVG over a CASE whose conditions read one string column learn the branch once
-    // per distinct value. NULL codes, NULL branch values, missing ELSE, literal branches, and
-    // grouped shapes must all agree with the row executor, and shapes the kernel declines
-    // (an arithmetic THEN, a second column in a WHEN) still answer correctly.
+    // SUM/COUNT/AVG over a CASE whose conditions read one string column decide the branch once
+    // per distinct value — from the dictionary strings alone for equality, IN, LIKE, null
+    // tests, and AND/OR/NOT over those, and lazily per code for anything else. NULL codes, NULL
+    // list members, NULL branch values, missing ELSE, literal branches, WHEN precedence, and
+    // grouped shapes must all agree with the row executor, and shapes the kernel declines (an
+    // arithmetic THEN, a second column in a WHEN) still answer correctly.
     const statuses = ["paid", "new", null, "shipped", "PAID", "paid"];
     const rows: DatabaseRow[] = Array.from({ length: 3_000 }, (_, index) => ({
       id: index + 1,
@@ -530,6 +532,11 @@ describe("vector query execution", () => {
       "SELECT SUM(CASE WHEN status = 'paid' THEN amount * 2 ELSE 0 END) AS doubled FROM orders",
       "SELECT SUM(CASE WHEN status = 'paid' AND region = 'west' THEN amount ELSE 0 END) AS west FROM orders",
       "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid FROM orders WHERE amount > 50",
+      "SELECT SUM(CASE WHEN status IN ('paid', NULL) THEN 1 ELSE 0 END) AS in_null, SUM(CASE WHEN status NOT IN ('paid', 'new') THEN 1 ELSE 0 END) AS not_in, SUM(CASE WHEN status NOT IN ('paid', NULL) THEN 1 ELSE 0 END) AS not_in_null FROM orders",
+      "SELECT SUM(CASE WHEN status LIKE 'p%' THEN amount ELSE 0 END) AS p, SUM(CASE WHEN status ILIKE 'PA%' THEN 1 ELSE 0 END) AS pa, SUM(CASE WHEN status NOT LIKE '%d' THEN 1 ELSE 0 END) AS nd, SUM(CASE WHEN status LIKE 'p!_%' ESCAPE '!' THEN 1 ELSE 0 END) AS esc FROM orders",
+      "SELECT SUM(CASE WHEN status IS NOT NULL THEN 1 ELSE 0 END) AS present, SUM(CASE WHEN NOT (status = 'paid') THEN 1 ELSE 0 END) AS not_paid, SUM(CASE WHEN status = 'paid' OR status IS NULL THEN 1 ELSE 0 END) AS paid_or_null, SUM(CASE WHEN status <> 'paid' AND status != 'new' THEN 1 ELSE 0 END) AS neither FROM orders",
+      "SELECT SUM(CASE WHEN status = 'paid' THEN 1 WHEN status LIKE 'p%' THEN 10 WHEN status IS NULL THEN 100 END) AS ranked, COUNT(CASE WHEN status IS NULL THEN 1 END) AS missing FROM orders",
+      "SELECT region, SUM(CASE WHEN status NOT IN ('new') THEN amount END) AS other, SUM(CASE WHEN status ILIKE 'paid' THEN qty ELSE -1 END) AS q FROM orders GROUP BY region ORDER BY region",
     ]) {
       const plan = compileQuery(sql);
       expect(executeQuery(plan, tables).rows, sql).toEqual(executeRowQuery(plan, tables).rows);

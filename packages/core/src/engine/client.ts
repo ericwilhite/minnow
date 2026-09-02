@@ -36,6 +36,7 @@ import {
   parseRpcResponse,
   MAX_DATABASE_RPC_IN_FLIGHT,
   protocolVersion,
+  type RpcResponse,
   type SerializedError,
 } from "../worker-protocol/index.js";
 import { toColumnarBatch, type BatchRow, type InsertBatchInput } from "./batch.js";
@@ -272,6 +273,24 @@ function rehydrateError(serialized: SerializedError): Error {
   }
   if (serialized.props !== undefined) Object.assign(error, serialized.props);
   return error;
+}
+
+/**
+ * A failure frame whose payload is not a serialized error is a protocol violation, and one that
+ * must still settle the call it answers: rehydrating it blindly would throw inside the message
+ * listener and leave that call pending forever.
+ */
+function rehydrateResponseError(payload: unknown): Error {
+  const candidate = payload as Partial<SerializedError> | null;
+  if (
+    typeof candidate !== "object" ||
+    candidate === null ||
+    typeof candidate.name !== "string" ||
+    typeof candidate.message !== "string"
+  ) {
+    return new Error("The database worker reported a failure without a readable error payload");
+  }
+  return rehydrateError(candidate as SerializedError);
 }
 
 export class MinnowDatabaseClient {
@@ -981,7 +1000,13 @@ export class MinnowDatabaseClient {
   }
 
   #receive(message: unknown): void {
-    const response = parseRpcResponse(message);
+    let response: RpcResponse | null;
+    try {
+      response = parseRpcResponse(message);
+    } catch (cause) {
+      this.#rejectUnreadable(message, cause);
+      return;
+    }
     if (response === null) return;
     if (response.kind === "rpc-event") {
       const route = this.#events.get(response.handleId);
@@ -990,7 +1015,7 @@ export class MinnowDatabaseClient {
       else if (response.event === "invalidate") {
         route.onInvalidate?.(response.payload as LiveQueryInvalidation);
       } else if (response.event === "error") {
-        route.onError?.(rehydrateError(response.payload as SerializedError));
+        route.onError?.(rehydrateResponseError(response.payload));
       } else if (response.event === "progress") route.onProgress?.(response.payload);
       else if (response.event === "stats") {
         route.onStats?.(response.payload as QueryExecutionStats);
@@ -1005,7 +1030,29 @@ export class MinnowDatabaseClient {
     this.#pending.delete(response.requestId);
     pending.cleanup?.();
     if (response.kind === "rpc-result") pending.resolve(response.result);
-    else pending.reject(rehydrateError(response.error));
+    else pending.reject(rehydrateResponseError(response.error));
+  }
+
+  /**
+   * A frame the protocol module refused: an RPC response at another protocol version, from a
+   * worker built against a different release than this client. When the frame names a request
+   * still in flight, that call alone fails and the connection stays usable. Otherwise nothing
+   * this worker sends can be trusted, so every pending call fails the way a transport error does.
+   */
+  #rejectUnreadable(message: unknown, cause: unknown): void {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    const error = new Error(`The database worker sent a frame this client cannot read: ${reason}`, {
+      cause,
+    });
+    const requestId = (message as { requestId?: unknown }).requestId;
+    const pending = typeof requestId === "string" ? this.#pending.get(requestId) : undefined;
+    if (pending === undefined || typeof requestId !== "string") {
+      this.#fail(error);
+      return;
+    }
+    this.#pending.delete(requestId);
+    pending.cleanup?.();
+    pending.reject(error);
   }
 
   #fail(error: Error): void {

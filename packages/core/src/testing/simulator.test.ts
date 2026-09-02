@@ -5,7 +5,7 @@ import {
   parseSimulationPlan,
   runSimulation,
 } from "./simulator.js";
-import { seedFor } from "./seeds.js";
+import { seedsFor } from "./seeds.js";
 
 describe("deterministic simulator plans", () => {
   it("generates the same bounded plan from the same seed", () => {
@@ -64,26 +64,29 @@ describe("deterministic completion scheduling", () => {
 });
 
 describe("deterministic database simulation", () => {
-  it("replays concurrency and injected faults to the identical checked result", async () => {
-    const plan = generateSimulationPlan(seedFor("deterministic-simulator", 0x5eed), {
-      rounds: 20,
-      clients: 3,
-      keySpace: 8,
-    });
-    const first = await runSimulation(plan, { traceEvents: 64 });
-    const second = await runSimulation(parseSimulationPlan(JSON.stringify(plan)), {
-      traceEvents: 64,
-    });
+  it.each(seedsFor("deterministic-simulator", [0x5eed]))(
+    "replays concurrency and injected faults to the identical checked result (seed %s)",
+    async (seed) => {
+      const plan = generateSimulationPlan(seed, {
+        rounds: 20,
+        clients: 3,
+        keySpace: 8,
+      });
+      const first = await runSimulation(plan, { traceEvents: 64 });
+      const second = await runSimulation(parseSimulationPlan(JSON.stringify(plan)), {
+        traceEvents: 64,
+      });
 
-    expect(second).toEqual(first);
-    expect(first.injectedFaults).toBe(1);
-    expect(first.checkpoints).toBeGreaterThan(1);
-    expect(first.trace.length).toBeLessThanOrEqual(64);
-    expect(first.manifestCount).toBeLessThanOrEqual(2);
-    expect(first.blockCount).toBeLessThanOrEqual(plan.keySpace * 16 + 64);
-    expect(first.segmentCount).toBeLessThanOrEqual(plan.keySpace + 16);
-    expect(first.transactionCount).toBeLessThanOrEqual(plan.keySpace + 32);
-  });
+      expect(second).toEqual(first);
+      expect(first.injectedFaults).toBe(1);
+      expect(first.checkpoints).toBeGreaterThan(1);
+      expect(first.trace.length).toBeLessThanOrEqual(64);
+      expect(first.manifestCount).toBeLessThanOrEqual(2);
+      expect(first.blockCount).toBeLessThanOrEqual(plan.keySpace * 16 + 64);
+      expect(first.segmentCount).toBeLessThanOrEqual(plan.keySpace + 16);
+      expect(first.transactionCount).toBeLessThanOrEqual(plan.keySpace + 32);
+    },
+  );
 
   it("keeps final storage bounded by live state rather than run length", async () => {
     const plan = generateSimulationPlan(0x10_000, { rounds: 80, clients: 4, keySpace: 4 });

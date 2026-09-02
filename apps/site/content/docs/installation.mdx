@@ -88,31 +88,32 @@ defines the tested browser line, OPFS qualification, and release-candidate check
 
 ## Package entry points
 
-| Import                               | What it contains                                                                   |
-| ------------------------------------ | ---------------------------------------------------------------------------------- |
-| `@minnowdb/core`                     | `MinnowDatabase`, schema management, catalog access, errors, and engine types.     |
-| `@minnowdb/core/storage`             | IndexedDB, OPFS, and memory stores plus the shared `BlockStore` interface.         |
-| `@minnowdb/core/storage/indexeddb`   | IndexedDB adapter only; prefer this in application bundles.                        |
-| `@minnowdb/core/storage/opfs`        | OPFS adapter only; prefer this in application bundles.                             |
-| `@minnowdb/core/storage/memory`      | In-memory adapter only.                                                            |
-| `@minnowdb/core/storage/contracts`   | Storage interfaces, records, limits, and errors without an adapter.                |
-| `@minnowdb/core/storage/snapshots`   | Portable snapshot framing and streaming helpers.                                   |
-| `@minnowdb/core/storage/persistence` | Origin-persistence policy without loading a storage adapter.                       |
-| `@minnowdb/core/client`              | `MinnowDatabaseClient`, the main-thread API for a worker-hosted engine.            |
-| `@minnowdb/core/query`               | SQL compilation, standalone execution, binding, and plan inspection.               |
-| `@minnowdb/core/live`                | Typed, keyed, and low-level live-query APIs.                                       |
-| `@minnowdb/core/schema`              | Schema DSL, typed-table renderer, and migrations without the database engine.      |
-| `@minnowdb/core/schema-wire`         | Schema serialization for worker and adapter tooling.                               |
-| `@minnowdb/core/worker-host`         | Manual worker-host wiring for custom worker entry points.                          |
-| `@minnowdb/core/worker`              | The ready-made worker entry.                                                       |
-| `@minnowdb/core/plan`                | Low-level plan-building tools for custom query layers.                             |
-| `@minnowdb/core/storage/toolkit`     | Reusable parts for [custom storage adapters](/docs/storage/custom).                |
-| `@minnowdb/core/testing`             | Fault injection, deterministic simulation, SQLLogicTest, and the storage test kit. |
-| `@minnowdb/core/block-format`        | The stored block encoding for tools that inspect blocks directly.                  |
-| `@minnowdb/core/transactions`        | Low-level snapshots, transactions, and recovery tools.                             |
-| `@minnowdb/core/worker-protocol`     | Worker request, response, and event types.                                         |
-| `@minnowdb/kysely`                   | The optional Kysely dialect and schema-to-Kysely type inference.                   |
-| `@minnowdb/kysely/helpers`           | Typed nested JSON projection helpers for Minnow SQL.                               |
-| `@minnowdb/react`                    | React hook for typed live queries and keyed changes.                               |
-| `@minnowdb/export`                   | Backpressure-aware CSV and NDJSON query streams.                                   |
-| `@minnowdb/devtools`                 | The optional SQL console and data browser.                                         |
+| Import                                          | What it contains                                                                    |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `@minnowdb/core`                                | `MinnowDatabase`, schema management, catalog access, errors, and engine types.      |
+| `@minnowdb/core/storage`                        | IndexedDB, OPFS, and memory stores plus the shared `BlockStore` interface.          |
+| `@minnowdb/core/storage/indexeddb`              | IndexedDB adapter only; prefer this in application bundles.                         |
+| `@minnowdb/core/storage/opfs`                   | OPFS adapter only; prefer this in application bundles.                              |
+| `@minnowdb/core/storage/memory`                 | In-memory adapter only.                                                             |
+| `@minnowdb/core/storage/contracts`              | Storage interfaces, records, limits, and errors without an adapter.                 |
+| `@minnowdb/core/storage/snapshots`              | Portable snapshot framing and streaming helpers.                                    |
+| `@minnowdb/core/storage/persistence`            | Origin-persistence policy without loading a storage adapter.                        |
+| `@minnowdb/core/client`                         | `MinnowDatabaseClient`, the main-thread API for a worker-hosted engine.             |
+| `@minnowdb/core/query`                          | SQL compilation, standalone execution, binding, and plan inspection.                |
+| `@minnowdb/core/live`                           | Typed, keyed, and low-level live-query APIs.                                        |
+| `@minnowdb/core/schema`                         | Schema DSL, typed-table renderer, and migrations without the database engine.       |
+| `@minnowdb/core/schema-wire`                    | Schema serialization for worker and adapter tooling.                                |
+| `@minnowdb/core/worker-host`                    | Manual worker-host wiring for custom worker entry points.                           |
+| `@minnowdb/core/worker`                         | The ready-made worker entry.                                                        |
+| `@minnowdb/core/worker/{indexeddb,opfs,memory}` | A worker entry bundling one store only, for bundlers that cannot split worker code. |
+| `@minnowdb/core/plan`                           | Low-level plan-building tools for custom query layers.                              |
+| `@minnowdb/core/storage/toolkit`                | Reusable parts for [custom storage adapters](/docs/storage/custom).                 |
+| `@minnowdb/core/testing`                        | Fault injection, deterministic simulation, SQLLogicTest, and the storage test kit.  |
+| `@minnowdb/core/block-format`                   | The stored block encoding for tools that inspect blocks directly.                   |
+| `@minnowdb/core/transactions`                   | Low-level snapshots, transactions, and recovery tools.                              |
+| `@minnowdb/core/worker-protocol`                | Worker request, response, and event types.                                          |
+| `@minnowdb/kysely`                              | The optional Kysely dialect and schema-to-Kysely type inference.                    |
+| `@minnowdb/kysely/helpers`                      | Typed nested JSON projection helpers for Minnow SQL.                                |
+| `@minnowdb/react`                               | React hook for typed live queries and keyed changes.                                |
+| `@minnowdb/export`                              | Backpressure-aware CSV and NDJSON query streams.                                    |
+| `@minnowdb/devtools`                            | The optional SQL console and data browser.                                          |

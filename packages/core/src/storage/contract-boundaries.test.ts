@@ -74,17 +74,26 @@ describe("storage contract boundaries", () => {
   });
 
   it("the engine reaches storage only through its public surface", () => {
-    // The worker host is the composition root: the one module allowed to name the adapter
-    // entry modules, and only those, so its dynamic imports can code-split them.
-    const compositionRoot = join(SRC, "engine", "worker-host.ts");
-    const adapterEntries = ["storage/indexeddb.js", "storage/memory.js", "storage/opfs/index.js"];
+    // The composition roots are the only modules allowed to name the adapter entry modules: the
+    // worker host names all three so its dynamic imports can code-split them, and each per-store
+    // worker factory names exactly the one adapter its entry bundles.
+    const engine = join(SRC, "engine");
+    const compositionRoots = new Map<string, readonly string[]>([
+      [
+        join(engine, "worker-host.ts"),
+        ["storage/indexeddb.js", "storage/memory.js", "storage/opfs/index.js"],
+      ],
+      [join(engine, "worker-store-indexeddb.ts"), ["storage/indexeddb.js"]],
+      [join(engine, "worker-store-memory.ts"), ["storage/memory.js"]],
+      [join(engine, "worker-store-opfs.ts"), ["storage/opfs/index.js"]],
+    ]);
     const layers = ["engine", "plan", "transactions"].map((name) => join(SRC, name));
     for (const file of layers.flatMap(sourceFiles)) {
       for (const specifier of importsOf(file)) {
         if (!specifier.includes("/storage/")) continue;
         const surface = specifier.replace(/^(\.\.\/)+/, "");
         const allowed = ["storage/index.js", "storage/types.js", "storage/snapshot.js"];
-        if (file === compositionRoot) allowed.push(...adapterEntries);
+        allowed.push(...(compositionRoots.get(file) ?? []));
         expect(allowed, `${file} imports ${specifier}`).toContain(surface);
       }
     }

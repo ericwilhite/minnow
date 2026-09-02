@@ -6,7 +6,8 @@
     "noEmit": true,
     // Scripts import package sources directly (e.g. ../packages/core/src/storage/types.ts).
     "allowImportingTsExtensions": true,
-    // playwright.shared.mjs and clean-output.mjs are imported by files checked here.
+    // playwright.shared.mjs and clean-output.mjs are imported by files checked here; the flaky
+    // reporter is loaded by path, so it is listed below and checked through its @ts-check.
     "allowJs": true
   },
   // The root vitest/playwright configs have no project of their own, so they ride along here.
@@ -15,7 +16,9 @@
     "**/*.ts",
     "../vitest.config.ts",
     "../playwright.library.config.ts",
-    "../playwright.site.config.ts"
+    "../playwright.site.config.ts",
+    "../playwright-flaky-reporter.mjs",
+    "strip-dist-comments.mjs"
   ],
   // The consumer fixture is a standalone app the smoke test compiles with its own tsconfigs
   // against the packed tarballs; checking it here would resolve against the workspace instead.

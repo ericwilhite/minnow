@@ -7,13 +7,13 @@
   ],
   "suites": {
     "sql-conformance": [],
-    "sql-conformance-corpus": [],
     "sql-mutation-conformance": [],
     "differential": [],
     "concurrency-simulation": [],
     "deterministic-simulator": [],
     "compaction-soak": [],
     "compaction-soak-snapshots": [],
+    "partitioned-compaction-soak": [],
     "auto-compaction-soak": [26172526, 756656541, 1271068371]
   }
 }

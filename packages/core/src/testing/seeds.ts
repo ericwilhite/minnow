@@ -12,6 +12,11 @@
  * `regression-seeds.json`, where it joins the deterministic set permanently. The explored space
  * only ever grows, and it grows by exactly the amount the soak discovered.
  *
+ * Every seeded suite asks `seedsFor` for its list and runs each seed as its own test case, so
+ * a recorded seed is executed on every commit rather than merely listed. A suite that builds one
+ * corpus per run loops the same way; there is deliberately no single-seed helper, because the
+ * first element of a list that starts with the default is never the regression.
+ *
  * Set `MINNOW_SEED` to replay one specific seed:
  *
  *     MINNOW_SEED=123456 npx vitest run packages/core/src/engine/sql-conformance.test.ts
@@ -54,9 +59,4 @@ export function seedsFor(suite: string, defaults: readonly number[]): number[] {
   const override = overrideSeed();
   if (override !== undefined) return [override];
   return [...new Set([...defaults, ...(registry.suites[suite] ?? [])])];
-}
-
-/** The single seed a suite runs when it generates one corpus rather than a set of them. */
-export function seedFor(suite: string, fallback: number): number {
-  return seedsFor(suite, [fallback])[0] ?? fallback;
 }

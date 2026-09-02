@@ -39,6 +39,14 @@ const SUITES: Suite[] = [
     name: "auto-compaction-soak",
     file: "packages/core/src/engine/auto-compaction-soak.test.ts",
   },
+  {
+    name: "partitioned-compaction-soak",
+    file: "packages/core/src/engine/partitioned-compaction.test.ts",
+  },
+  {
+    name: "concurrency-simulation",
+    file: "packages/core/src/engine/concurrency-simulation.test.ts",
+  },
 ];
 
 function argument(flag: string): string | undefined {

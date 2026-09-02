@@ -153,7 +153,9 @@ adapter executes each invalidated query once.
 
 **Vite and webpack 5** understand the quick-start pattern as written: the relative URL identifies
 your one-line wrapper, and its package import resolves to Minnow's published worker entry. They
-emit it as a separate worker chunk.
+emit it as a separate worker chunk. Vite's default worker format is `iife`, which cannot split
+that chunk further, so a Vite worker built from the generic entry carries all three stores — use a
+[per-store entry](#per-store-worker-entries) or set `worker: { format: "es" }`.
 
 **esbuild** (and Parcel 2 by default) doesn't rewrite `new URL` worker expressions. Bundle the
 worker entry separately and point at the output:
@@ -184,16 +186,52 @@ const client = new MinnowDatabaseClient(
 );
 ```
 
+## Per-store worker entries
+
+The generic entry loads each storage adapter with a dynamic `import()` when the client's init
+frame asks for it. That downloads only the store the worker opens when the bundler splits worker
+code into chunks — esbuild `--splitting`, Vite with `worker: { format: "es" }`, webpack 5. A
+bundler that cannot split a worker inlines all three adapters: with Vite's default `iife` worker
+format the generic worker is about 1.5 MB minified (400 KB gzipped), against about 1.2 MB
+(320 KB) for the IndexedDB store alone.
+
+When the worker always opens the same kind of store, import the entry that bundles only that
+store:
+
+| Entry                             | Bundles         |
+| --------------------------------- | --------------- |
+| `@minnowdb/core/worker/indexeddb` | IndexedDB store |
+| `@minnowdb/core/worker/opfs`      | OPFS store      |
+| `@minnowdb/core/worker/memory`    | In-memory store |
+
+```ts
+// db-worker.ts
+import "@minnowdb/core/worker/indexeddb";
+```
+
+Nothing else changes: the client sends the same descriptor, and `{ kind: "indexeddb", name:
+"app-db" }` opens as before. A per-store worker refuses an init frame for any other kind, so
+`client.ready()` — and every call pipelined behind it — rejects with an error naming the entry
+that does support it:
+
+```text
+This worker bundles only the IndexedDB store and cannot open the OPFS store; import
+"@minnowdb/core/worker" for every adapter or "@minnowdb/core/worker/opfs" for the OPFS store.
+```
+
+An app that decides between OPFS and IndexedDB at runtime therefore keeps the generic entry, or
+ships one worker file per store and picks the file before constructing the client.
+
 ## Custom worker entries
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
 `opfs`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`,
 `spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, `bufferPoolBytes`,
 `executionMemoryBudgetBytes`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
-It loads each storage adapter only when its descriptor asks for it, so a
-bundler splits the adapters into their own chunks and the worker downloads the store it opens,
-not the other two. For anything a message can't carry — a custom `BlockStore`, deterministic
-`now`/`createId` — write your own entry:
+It loads each storage adapter only when its descriptor asks for it; whether that becomes a
+separate download depends on the bundler, as described [above](#per-store-worker-entries). For
+anything a message can't carry — a custom `BlockStore`, deterministic `now`/`createId` — write
+your own entry:
 
 ```ts
 // my-worker.ts
@@ -211,7 +249,10 @@ exposeDatabase(new MinnowDatabase(store, databaseOptions), self, {
 ```
 
 `exposeDatabase()` speaks the same protocol as the stock entry, so the main-thread code doesn't
-change. On disposal it closes the engine before calling `onDispose`, so the hook only owns the
+change. To keep the stock entry's init-frame handling but own the store's open call, pass
+`attachDatabaseWorker(self, { createStore })` a `WorkerStoreFactory` instead;
+`singleStoreFactory(kind, open)` builds one that refuses every other kind, as the per-store
+entries do. On disposal it closes the engine before calling `onDispose`, so the hook only owns the
 injected store. Its `writeHandleIdleTimeoutMs` option defaults to 30 seconds; pass the same value
 as the constructed database's `transactionIdleTimeoutMs` when you customize either deadline.
 Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe RPC where

@@ -1385,6 +1385,202 @@ function conditionalAggregate(argument: BoundExpression): ConditionalAggregate |
   };
 }
 
+/**
+ * The branch each dictionary code (plus the NULL slot) selects, decided from the dictionary
+ * strings alone when every WHEN is a comparison the dictionary can answer — equality, IN, LIKE,
+ * null tests, and AND/OR/NOT over those on the CASE's one column. A label column with tens of
+ * thousands of distinct values then costs one string compare per entry instead of one generic
+ * expression evaluation per entry per batch window. Any other WHEN leaves every slot unlearned
+ * (-2) for the per-row fallback, which learns a code when a row carrying it appears.
+ */
+function conditionalBranchTable(
+  conditional: ConditionalAggregate,
+  dictionary: readonly string[],
+): Int32Array {
+  const branch = new Int32Array(dictionary.length + 1);
+  const truths: Uint8Array[] = [];
+  for (const { when } of conditional.branches) {
+    const truth = dictionaryTruthTable(when, conditional, dictionary);
+    if (truth === undefined) return branch.fill(-2);
+    truths.push(truth);
+  }
+  for (let code = 0; code <= dictionary.length; code += 1) {
+    let chosen = -1;
+    for (let index = 0; index < truths.length; index += 1) {
+      if (truths[index]?.[code] === TRUTH_TRUE) {
+        chosen = index;
+        break;
+      }
+    }
+    branch[code] = chosen;
+  }
+  return branch;
+}
+
+const TRUTH_UNKNOWN = 0;
+const TRUTH_TRUE = 1;
+const TRUTH_FALSE = 2;
+
+/**
+ * Three-valued truth of one boolean expression per dictionary code, the NULL slot last, or
+ * undefined when the expression reads anything the dictionary alone cannot answer. Equality
+ * and IN mirror the WHERE kernel (`detectDictionaryEquality`: string identity against the
+ * dictionary entry, plain text only); LIKE shares `dictionaryLikeMatches`. A NULL column value
+ * makes every comparison unknown, exactly as the row evaluator answers.
+ */
+function dictionaryTruthTable(
+  expression: BoundExpression,
+  column: { source: number; vector: StringVector },
+  dictionary: readonly string[],
+): Uint8Array | undefined {
+  const nullSlot = dictionary.length;
+  const slots = nullSlot + 1;
+  if (expression.kind === "logical") {
+    const left = dictionaryTruthTable(expression.left, column, dictionary);
+    if (left === undefined) return undefined;
+    const right = dictionaryTruthTable(expression.right, column, dictionary);
+    if (right === undefined) return undefined;
+    const combined = new Uint8Array(slots);
+    if (expression.operator === "and") {
+      for (let slot = 0; slot < slots; slot += 1) {
+        const a = left[slot] ?? TRUTH_UNKNOWN;
+        const b = right[slot] ?? TRUTH_UNKNOWN;
+        combined[slot] =
+          a === TRUTH_FALSE || b === TRUTH_FALSE
+            ? TRUTH_FALSE
+            : a === TRUTH_TRUE && b === TRUTH_TRUE
+              ? TRUTH_TRUE
+              : TRUTH_UNKNOWN;
+      }
+    } else {
+      for (let slot = 0; slot < slots; slot += 1) {
+        const a = left[slot] ?? TRUTH_UNKNOWN;
+        const b = right[slot] ?? TRUTH_UNKNOWN;
+        combined[slot] =
+          a === TRUTH_TRUE || b === TRUTH_TRUE
+            ? TRUTH_TRUE
+            : a === TRUTH_FALSE && b === TRUTH_FALSE
+              ? TRUTH_FALSE
+              : TRUTH_UNKNOWN;
+      }
+    }
+    return combined;
+  }
+  if (expression.kind === "not") {
+    const operand = dictionaryTruthTable(expression.operand, column, dictionary);
+    if (operand === undefined) return undefined;
+    const negated = new Uint8Array(slots);
+    for (let slot = 0; slot < slots; slot += 1) {
+      const value = operand[slot] ?? TRUTH_UNKNOWN;
+      negated[slot] =
+        value === TRUTH_TRUE ? TRUTH_FALSE : value === TRUTH_FALSE ? TRUTH_TRUE : TRUTH_UNKNOWN;
+    }
+    return negated;
+  }
+  if (expression.kind !== "condition") return undefined;
+  const isColumn = (side: BoundExpression): boolean =>
+    side.kind === "column" && side.source === column.source && side.vector === column.vector;
+  // Every slot starts unknown, which is what the NULL slot keeps for every comparison.
+  const table = new Uint8Array(slots);
+  const operator = expression.operator;
+  if (operator === "IS NULL" || operator === "IS NOT NULL") {
+    if (!isColumn(expression.left)) return undefined;
+    const nullTruth = operator === "IS NULL" ? TRUTH_TRUE : TRUTH_FALSE;
+    table.fill(nullTruth === TRUTH_TRUE ? TRUTH_FALSE : TRUTH_TRUE, 0, nullSlot);
+    table[nullSlot] = nullTruth;
+    return table;
+  }
+  if (operator === "=" || operator === "!=" || operator === "<>") {
+    const literal = isColumn(expression.left)
+      ? expression.right
+      : isColumn(expression.right)
+        ? expression.left
+        : undefined;
+    if (
+      literal?.kind !== "literal" ||
+      typeof literal.value !== "string" ||
+      !isPlainTextDictionary(dictionary, literal.value)
+    ) {
+      return undefined;
+    }
+    const value = literal.value;
+    const negated = operator !== "=";
+    for (let code = 0; code < nullSlot; code += 1) {
+      table[code] = (dictionary[code] === value) !== negated ? TRUTH_TRUE : TRUTH_FALSE;
+    }
+    return table;
+  }
+  if (operator === "IN" || operator === "NOT IN") {
+    if (!isColumn(expression.left) || expression.right.kind !== "list") return undefined;
+    const members = new Set<string>();
+    let hasNull = false;
+    for (const item of expression.right.items) {
+      if (item.kind !== "literal") return undefined;
+      if (item.value === null) hasNull = true;
+      else if (typeof item.value === "string" && isPlainTextDictionary(dictionary, item.value)) {
+        members.add(item.value);
+      } else return undefined;
+    }
+    const negated = operator === "NOT IN";
+    for (let code = 0; code < nullSlot; code += 1) {
+      const member = members.has(dictionary[code] ?? "");
+      table[code] = member
+        ? negated
+          ? TRUTH_FALSE
+          : TRUTH_TRUE
+        : hasNull
+          ? TRUTH_UNKNOWN
+          : negated
+            ? TRUTH_TRUE
+            : TRUTH_FALSE;
+    }
+    return table;
+  }
+  if (
+    operator === "LIKE" ||
+    operator === "NOT LIKE" ||
+    operator === "ILIKE" ||
+    operator === "NOT ILIKE"
+  ) {
+    if (
+      !isColumn(expression.left) ||
+      expression.right.kind !== "literal" ||
+      typeof expression.right.value !== "string"
+    ) {
+      return undefined;
+    }
+    const matches = dictionaryLikeMatches(
+      dictionary,
+      expression.right.value,
+      operator === "ILIKE" || operator === "NOT ILIKE",
+      expression.escape,
+    );
+    const negated = operator === "NOT LIKE" || operator === "NOT ILIKE";
+    for (let code = 0; code < nullSlot; code += 1) {
+      table[code] = (matches[code] === 1) !== negated ? TRUTH_TRUE : TRUTH_FALSE;
+    }
+    return table;
+  }
+  return undefined;
+}
+
+const plainTextDictionaryCache = new WeakMap<readonly string[], boolean>();
+
+/**
+ * True when neither the dictionary nor the literal carries a typed SQL value (those start with
+ * NUL); identity comparison is then the whole story. A typed dictionary keeps the generic
+ * evaluator, which owns the domain's equality rules.
+ */
+function isPlainTextDictionary(dictionary: readonly string[], literal: string): boolean {
+  if (literal.charCodeAt(0) === 0) return false;
+  let plain = plainTextDictionaryCache.get(dictionary);
+  if (plain === undefined) {
+    plain = dictionary.every((value) => value.charCodeAt(0) !== 0);
+    plainTextDictionaryCache.set(dictionary, plain);
+  }
+  return plain;
+}
+
 /** The one string column an expression reads, when it reads exactly one column and no FTS. */
 function singleStringColumn(
   expression: BoundExpression,
@@ -4916,7 +5112,7 @@ class GroupAccumulator {
         const vector = conditional.vector;
         if (conditional.cache.dictionary !== vector.dictionary) {
           conditional.cache.dictionary = vector.dictionary;
-          conditional.cache.branch = new Int32Array(vector.dictionary.length + 1).fill(-2);
+          conditional.cache.branch = conditionalBranchTable(conditional, vector.dictionary);
         }
         conditionals.push({
           index,

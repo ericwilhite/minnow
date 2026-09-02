@@ -19,11 +19,26 @@ export function parsePerformanceFailures(output: string): readonly PerformanceFa
   }));
 }
 
-/** A noisy flag is actionable only when the same comparison fails in two fresh processes. */
+/**
+ * A noisy flag is actionable only when the same workload fails in two fresh processes. Which
+ * engine flags it may differ between the runs: each comparison has its own threshold, so a real
+ * slowdown can clear the SQLite line in one run and the PGlite line in the other, and demanding
+ * the identical pair would wave it through. Two runs that flag disjoint workloads are still read
+ * as one-off noisy samples. Returns every flag on a repeated workload, first run then second,
+ * so the report names both comparisons.
+ */
 export function repeatedPerformanceFailures(
   first: readonly PerformanceFailure[],
   second: readonly PerformanceFailure[],
 ): readonly PerformanceFailure[] {
-  const secondKeys = new Set(second.map(performanceFailureKey));
-  return first.filter((failure) => secondKeys.has(performanceFailureKey(failure)));
+  const firstWorkloads = new Set(first.map((failure) => failure.workload));
+  const repeatedWorkloads = new Set(
+    second.map((failure) => failure.workload).filter((workload) => firstWorkloads.has(workload)),
+  );
+  const repeated = new Map<string, PerformanceFailure>();
+  for (const failure of [...first, ...second]) {
+    if (!repeatedWorkloads.has(failure.workload)) continue;
+    repeated.set(performanceFailureKey(failure), failure);
+  }
+  return [...repeated.values()];
 }

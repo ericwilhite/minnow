@@ -5452,8 +5452,13 @@ export class MinnowDatabase {
     rewritten = bindPendingSelectShapes(rewritten, columnsOf);
     if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
     if (natural) rewritten = expandNaturalJoins(rewritten, columnsOf);
-    const qualified = qualifyCorrelatedReferences(rewritten, catalogColumns);
-    return qualified === rewritten ? rewritten : optimizePlan(qualified);
+    // With every subquery name resolved, the rewrites compilation had to hold back can run:
+    // a name still unqualified is local to its block, so an uncorrelated IN subquery may become
+    // a join and an outer predicate may enter a correlation probe.
+    if (!blockHasSubqueries(rewritten)) return rewritten;
+    return optimizePlan(qualifyCorrelatedReferences(rewritten, catalogColumns), {
+      resolvedNames: true,
+    });
   }
 
   /** Replaces a statement's whole-row RETURNING payload with its expression items. */

@@ -27,7 +27,7 @@ import { describe, expect, it } from "vitest";
 import rawPostgresProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
-import { mulberry32, seedFor } from "../testing/seeds.js";
+import { mulberry32, seedsFor } from "../testing/seeds.js";
 import { positionalToNumbered } from "../testing/oracle.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import {
@@ -61,8 +61,8 @@ interface FixtureRow {
   label: string;
 }
 
-function buildFixture(): FixtureRow[] {
-  const rng = mulberry32(seedFor("sql-conformance", 0x5eed));
+function buildFixture(seed: number): FixtureRow[] {
+  const rng = mulberry32(seed);
   const rows: FixtureRow[] = [];
   for (let id = 1; id <= 150; id += 1) {
     const region = REGIONS[Math.floor(rng() * REGIONS.length)] ?? null;
@@ -81,7 +81,6 @@ function buildFixture(): FixtureRow[] {
   return rows;
 }
 
-const fixture = buildFixture();
 const dims = [
   { region: "west", label: "West Coast", rank: 1 },
   { region: "east", label: "East Coast", rank: 2 },
@@ -89,7 +88,7 @@ const dims = [
   { region: "central", label: "Central", rank: 4 },
 ];
 
-async function minnowFixture(): Promise<MinnowDatabase> {
+async function minnowFixture(fixture: readonly FixtureRow[]): Promise<MinnowDatabase> {
   const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 32 });
   await database.createTable({
     name: "data",
@@ -116,12 +115,14 @@ async function minnowFixture(): Promise<MinnowDatabase> {
   return database;
 }
 
-const rowTables = new Map<string, DatabaseRow[]>([
-  ["data", fixture as unknown as DatabaseRow[]],
-  ["dims", dims],
-]);
+function rowTablesFor(fixture: readonly FixtureRow[]): Map<string, DatabaseRow[]> {
+  return new Map<string, DatabaseRow[]>([
+    ["data", fixture as unknown as DatabaseRow[]],
+    ["dims", dims],
+  ]);
+}
 
-function sqliteFixture(): DatabaseSync {
+function sqliteFixture(fixture: readonly FixtureRow[]): DatabaseSync {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA case_sensitive_like = ON");
   database.exec(
@@ -1156,14 +1157,38 @@ function combinationCases(): Case[] {
   ];
 }
 
-function buildCorpus(): Case[] {
-  const rng = mulberry32(seedFor("sql-conformance-corpus", 0xc0ffee));
+function buildCorpus(seed: number): Case[] {
+  const rng = mulberry32(seed);
   const corpus: Case[] = [];
   for (let round = 0; round < 12; round += 1) {
     for (const template of templates) corpus.push(template(rng));
   }
   corpus.push(...combinationCases());
   return corpus;
+}
+
+// --- Seeds --------------------------------------------------------------------------------------
+
+interface ConformanceRun {
+  readonly fixtureSeed: number;
+  readonly corpusSeed: number;
+}
+
+const DEFAULT_FIXTURE_SEED = 0x5eed;
+const DEFAULT_CORPUS_SEED = 0xc0ffee;
+
+/**
+ * The runs this suite makes. The checked-in run has always drawn its fixture and its corpus from
+ * two different seeds, and keeps both so the questions it asks do not change. Every other seed —
+ * a `MINNOW_SEED` override or a regression recorded from a soak — drives the fixture and the
+ * corpus together, because that is what the soak run that found it did: a replay that varied
+ * only the corpus could miss a failure that needed the data too.
+ */
+function conformanceRuns(): ConformanceRun[] {
+  return seedsFor("sql-conformance", [DEFAULT_CORPUS_SEED]).map((seed) => ({
+    fixtureSeed: seed === DEFAULT_CORPUS_SEED ? DEFAULT_FIXTURE_SEED : seed,
+    corpusSeed: seed,
+  }));
 }
 
 // --- Comparison ---------------------------------------------------------------------------------
@@ -1237,8 +1262,8 @@ interface Oracle {
   close(): Promise<void> | void;
 }
 
-function sqliteOracle(): Oracle {
-  const database = sqliteFixture();
+function sqliteOracle(fixture: readonly FixtureRow[]): Oracle {
+  const database = sqliteFixture(fixture);
   return {
     name: "sqlite",
     execute: (testCase) => {
@@ -1254,7 +1279,7 @@ function sqliteOracle(): Oracle {
   };
 }
 
-async function pgliteOracle(): Promise<Oracle> {
+async function pgliteOracle(fixture: readonly FixtureRow[]): Promise<Oracle> {
   const { PGlite } = await import("@electric-sql/pglite");
   const database = await PGlite.create();
   // Minnow reads every datetime as an instant in UTC, including a TIMESTAMP literal written
@@ -1776,138 +1801,144 @@ const REQUIRES_LOWERING = "Unknown table alias";
 // --- The harness --------------------------------------------------------------------------------
 
 describe("SQL conformance against SQLite and PGlite", () => {
-  it("agrees on the generated corpus across all execution paths and oracles", async () => {
-    const corpus = buildCorpus();
-    const database = await minnowFixture();
-    const oracles: Oracle[] = [sqliteOracle(), await pgliteOracle()];
-    const failures: string[] = [];
-    let unoptimizedCompared = 0;
-    let unoptimizedLowered = 0;
-    try {
-      for (const [index, testCase] of corpus.entries()) {
-        const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
-        const hasTopLevelOrder = hasResultOrder(compileQuery(testCase.sql, { optimize: false }));
-        if (testCase.ordered !== hasTopLevelOrder) {
-          failures.push(
-            `${caseLabel}\n  harness ordering flag is ${String(testCase.ordered)}, compiled outer ORDER BY is ${String(hasTopLevelOrder)}`,
-          );
-          continue;
-        }
-        let vectorized: QueryResult;
-        let rowExecutor: QueryResult;
-        try {
-          vectorized = await database.query(
-            testCase.sql,
-            testCase.params === undefined ? {} : { params: testCase.params },
-          );
-          rowExecutor = executeRowQuery(
-            bindPlanParameters(compileQuery(testCase.sql), testCase.params),
-            rowTables,
-          );
-        } catch (error) {
-          failures.push(`${caseLabel}\n  minnow threw: ${String(error)}`);
-          continue;
-        }
-        const vectorKeys = resultKeys(vectorized.rows, testCase.ordered);
-        const rowKeys = resultKeys(rowExecutor.rows, testCase.ordered);
-        if (vectorKeys.join("\n") !== rowKeys.join("\n")) {
-          failures.push(
-            `${caseLabel}\n${diffSummary("vectorized vs row executor", vectorKeys, rowKeys)}`,
-          );
-        }
-        if (vectorized.columns.join(",") !== rowExecutor.columns.join(",")) {
-          failures.push(
-            `${caseLabel}\n  column order/names, vectorized vs row executor:\n` +
-              `    vectorized: ${vectorized.columns.join(", ")}\n` +
-              `    row: ${rowExecutor.columns.join(", ")}`,
-          );
-        }
-        // The optimizer is otherwise inside the trusted base: both paths above compile through
-        // it, so a rewrite that changes an answer consistently is invisible to their diff and
-        // visible only to an oracle. Features no oracle can judge -- MATCH, BM25, and the rest of
-        // matrixSkips -- would have nothing left to contradict them. Comparing against the
-        // unoptimized plan is SQLite's disabled-optimization run: same question, no rewrites.
-        //
-        // Decorrelation is the exception, because it is lowering rather than optimization: a
-        // correlated subquery has no executable form until it runs, so those plans legitimately
-        // fail to execute unoptimized. That is allowed and counted, and any *other* failure is a
-        // real one -- see the assertions below, which pin both the count and the reason.
-        try {
-          const unoptimized = executeRowQuery(
-            bindPlanParameters(compileQuery(testCase.sql, { optimize: false }), testCase.params),
-            rowTables,
-          );
-          unoptimizedCompared += 1;
-          const unoptimizedKeys = resultKeys(unoptimized.rows, testCase.ordered);
-          if (rowKeys.join("\n") !== unoptimizedKeys.join("\n")) {
+  it.each(conformanceRuns())(
+    "agrees on the generated corpus across all execution paths and oracles (fixture seed $fixtureSeed, corpus seed $corpusSeed)",
+    async ({ fixtureSeed, corpusSeed }) => {
+      const fixture = buildFixture(fixtureSeed);
+      const corpus = buildCorpus(corpusSeed);
+      const rowTables = rowTablesFor(fixture);
+      const database = await minnowFixture(fixture);
+      const oracles: Oracle[] = [sqliteOracle(fixture), await pgliteOracle(fixture)];
+      const failures: string[] = [];
+      let unoptimizedCompared = 0;
+      let unoptimizedLowered = 0;
+      try {
+        for (const [index, testCase] of corpus.entries()) {
+          const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
+          const hasTopLevelOrder = hasResultOrder(compileQuery(testCase.sql, { optimize: false }));
+          if (testCase.ordered !== hasTopLevelOrder) {
             failures.push(
-              `${caseLabel}\n${diffSummary("optimized vs unoptimized plan", rowKeys, unoptimizedKeys)}`,
+              `${caseLabel}\n  harness ordering flag is ${String(testCase.ordered)}, compiled outer ORDER BY is ${String(hasTopLevelOrder)}`,
             );
-          }
-          if (rowExecutor.columns.join(",") !== unoptimized.columns.join(",")) {
-            failures.push(
-              `${caseLabel}\n  column order/names, optimized vs unoptimized plan:\n` +
-                `    optimized: ${rowExecutor.columns.join(", ")}\n` +
-                `    unoptimized: ${unoptimized.columns.join(", ")}`,
-            );
-          }
-        } catch (error) {
-          if (!String(error).includes(REQUIRES_LOWERING)) {
-            failures.push(`${caseLabel}\n  unoptimized plan threw: ${String(error)}`);
-          }
-          unoptimizedLowered += 1;
-        }
-        for (const oracle of oracles) {
-          if (testCase.skip?.includes(oracle.name)) continue;
-          let oracleResult: { rows: Array<Record<string, unknown>>; columns: string[] };
-          try {
-            oracleResult = await oracle.execute(testCase);
-          } catch (error) {
-            failures.push(`${caseLabel}\n  ${oracle.name} threw: ${String(error)}`);
             continue;
           }
-          const oracleKeys = resultKeys(oracleResult.rows, testCase.ordered);
-          if (vectorKeys.join("\n") !== oracleKeys.join("\n")) {
+          let vectorized: QueryResult;
+          let rowExecutor: QueryResult;
+          try {
+            vectorized = await database.query(
+              testCase.sql,
+              testCase.params === undefined ? {} : { params: testCase.params },
+            );
+            rowExecutor = executeRowQuery(
+              bindPlanParameters(compileQuery(testCase.sql), testCase.params),
+              rowTables,
+            );
+          } catch (error) {
+            failures.push(`${caseLabel}\n  minnow threw: ${String(error)}`);
+            continue;
+          }
+          const vectorKeys = resultKeys(vectorized.rows, testCase.ordered);
+          const rowKeys = resultKeys(rowExecutor.rows, testCase.ordered);
+          if (vectorKeys.join("\n") !== rowKeys.join("\n")) {
             failures.push(
-              `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, vectorKeys, oracleKeys)}`,
+              `${caseLabel}\n${diffSummary("vectorized vs row executor", vectorKeys, rowKeys)}`,
             );
           }
-          // Row comparison sorts keys, so it cannot see output column order. Compare the
-          // projected column lists directly: a regression that reorders or renames output
-          // columns would otherwise pass silently.
-          if (vectorized.columns.join(",") !== oracleResult.columns.join(",")) {
+          if (vectorized.columns.join(",") !== rowExecutor.columns.join(",")) {
             failures.push(
-              `${caseLabel}\n  column order/names vs ${oracle.name}:\n` +
-                `    minnow: ${vectorized.columns.join(", ")}\n` +
-                `    oracle: ${oracleResult.columns.join(", ")}`,
+              `${caseLabel}\n  column order/names, vectorized vs row executor:\n` +
+                `    vectorized: ${vectorized.columns.join(", ")}\n` +
+                `    row: ${rowExecutor.columns.join(", ")}`,
             );
+          }
+          // The optimizer is otherwise inside the trusted base: both paths above compile through
+          // it, so a rewrite that changes an answer consistently is invisible to their diff and
+          // visible only to an oracle. Features no oracle can judge -- MATCH, BM25, and the rest of
+          // matrixSkips -- would have nothing left to contradict them. Comparing against the
+          // unoptimized plan is SQLite's disabled-optimization run: same question, no rewrites.
+          //
+          // Decorrelation is the exception, because it is lowering rather than optimization: a
+          // correlated subquery has no executable form until it runs, so those plans legitimately
+          // fail to execute unoptimized. That is allowed and counted, and any *other* failure is a
+          // real one -- see the assertions below, which pin both the count and the reason.
+          try {
+            const unoptimized = executeRowQuery(
+              bindPlanParameters(compileQuery(testCase.sql, { optimize: false }), testCase.params),
+              rowTables,
+            );
+            unoptimizedCompared += 1;
+            const unoptimizedKeys = resultKeys(unoptimized.rows, testCase.ordered);
+            if (rowKeys.join("\n") !== unoptimizedKeys.join("\n")) {
+              failures.push(
+                `${caseLabel}\n${diffSummary("optimized vs unoptimized plan", rowKeys, unoptimizedKeys)}`,
+              );
+            }
+            if (rowExecutor.columns.join(",") !== unoptimized.columns.join(",")) {
+              failures.push(
+                `${caseLabel}\n  column order/names, optimized vs unoptimized plan:\n` +
+                  `    optimized: ${rowExecutor.columns.join(", ")}\n` +
+                  `    unoptimized: ${unoptimized.columns.join(", ")}`,
+              );
+            }
+          } catch (error) {
+            if (!String(error).includes(REQUIRES_LOWERING)) {
+              failures.push(`${caseLabel}\n  unoptimized plan threw: ${String(error)}`);
+            }
+            unoptimizedLowered += 1;
+          }
+          for (const oracle of oracles) {
+            if (testCase.skip?.includes(oracle.name)) continue;
+            let oracleResult: { rows: Array<Record<string, unknown>>; columns: string[] };
+            try {
+              oracleResult = await oracle.execute(testCase);
+            } catch (error) {
+              failures.push(`${caseLabel}\n  ${oracle.name} threw: ${String(error)}`);
+              continue;
+            }
+            const oracleKeys = resultKeys(oracleResult.rows, testCase.ordered);
+            if (vectorKeys.join("\n") !== oracleKeys.join("\n")) {
+              failures.push(
+                `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, vectorKeys, oracleKeys)}`,
+              );
+            }
+            // Row comparison sorts keys, so it cannot see output column order. Compare the
+            // projected column lists directly: a regression that reorders or renames output
+            // columns would otherwise pass silently.
+            if (vectorized.columns.join(",") !== oracleResult.columns.join(",")) {
+              failures.push(
+                `${caseLabel}\n  column order/names vs ${oracle.name}:\n` +
+                  `    minnow: ${vectorized.columns.join(", ")}\n` +
+                  `    oracle: ${oracleResult.columns.join(", ")}`,
+              );
+            }
           }
         }
+      } finally {
+        for (const oracle of oracles) await oracle.close();
       }
-    } finally {
-      for (const oracle of oracles) await oracle.close();
-    }
-    // Divergences are reported before the structural floors below, because a real disagreement
-    // is the thing worth reading: a failing case also skips the rest of its own checks, which
-    // would otherwise trip a floor and bury the diff that explains it.
-    if (failures.length > 0) {
-      expect.fail(
-        `${String(failures.length)} of ${String(corpus.length)} conformance cases diverged:\n\n` +
-          failures.slice(0, 10).join("\n\n"),
-      );
-    }
-    // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
-    expect(corpus.length).toBeGreaterThan(1_000);
-    expect(combinationCases().length).toBeGreaterThan(80);
-    expect(wildcardOrderCases()).toHaveLength(10);
-    expect(wildcardShapeCases()).toHaveLength(12);
-    // The unoptimized comparison is only worth something while it actually runs. Every case that
-    // got this far reached it, so pin both the total and the share that ran rather than lowered:
-    // a change that routes cases into the lowering branch -- or one that makes the corpus
-    // unrunnable without the optimizer -- fails here instead of quietly becoming a no-op.
-    expect(unoptimizedCompared + unoptimizedLowered).toBe(corpus.length);
-    expect(unoptimizedCompared / corpus.length).toBeGreaterThan(0.9);
-  }, 240_000);
+      // Divergences are reported before the structural floors below, because a real disagreement
+      // is the thing worth reading: a failing case also skips the rest of its own checks, which
+      // would otherwise trip a floor and bury the diff that explains it.
+      if (failures.length > 0) {
+        expect.fail(
+          `${String(failures.length)} of ${String(corpus.length)} conformance cases diverged:\n\n` +
+            failures.slice(0, 10).join("\n\n"),
+        );
+      }
+      // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
+      expect(corpus.length).toBeGreaterThan(1_000);
+      expect(combinationCases().length).toBeGreaterThan(80);
+      expect(wildcardOrderCases()).toHaveLength(10);
+      expect(wildcardShapeCases()).toHaveLength(12);
+      // The unoptimized comparison is only worth something while it actually runs. Every case that
+      // got this far reached it, so pin both the total and the share that ran rather than lowered:
+      // a change that routes cases into the lowering branch -- or one that makes the corpus
+      // unrunnable without the optimizer -- fails here instead of quietly becoming a no-op.
+      expect(unoptimizedCompared + unoptimizedLowered).toBe(corpus.length);
+      expect(unoptimizedCompared / corpus.length).toBeGreaterThan(0.9);
+    },
+    240_000,
+  );
 
   it("agrees with the oracles on every read-only feature the matrix claims", async () => {
     const covered = matrixFeatures.filter(

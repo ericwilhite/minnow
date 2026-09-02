@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -110,4 +111,41 @@ describe("published package shape", () => {
     expect(consoleSource).toContain('new URL("./minnow-worker.ts", import.meta.url)');
     expect(consoleSource).not.toContain('new URL("@minnowdb/core/worker"');
   });
+});
+
+describe("published core tarball", () => {
+  it("ships its JavaScript without comments and stays under the packed-size budget", async () => {
+    // The prepack hook strips comments from dist/**.js (never from the declarations), which is
+    // a fifth of the tarball. A dry-run pack runs the hook the way a publish does, so this
+    // proves the wiring rather than the script alone.
+    const { stripComments } = (await import("./strip-dist-comments.mjs")) as {
+      stripComments: (source: string) => string;
+    };
+    const stripped = stripComments(
+      "/** doc */\nexport function f(a) {\n  // note\n  return a + 1; /* trailing */\n}\n",
+    );
+    expect(stripped).not.toMatch(/\/\*|\/\//u);
+    expect(stripped).toMatch(/export/u);
+    expect(stripped).toContain("return a + 1;");
+    const coreRoot = join(repoRoot, "packages", "core");
+    const manifest = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    expect(manifest.scripts?.prepack).toBe("node ../../scripts/strip-dist-comments.mjs dist");
+    const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
+      cwd: coreRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const [report] = JSON.parse(output.slice(output.indexOf("["))) as Array<{
+      size: number;
+      unpackedSize: number;
+    }>;
+    // Measured after stripping: 799 KB packed / 3.98 MB unpacked (1,003 KB / 4.89 MB before).
+    expect(report?.size, "packed bytes").toBeLessThanOrEqual(850_000);
+    expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_200_000);
+    const emitted = await readFile(join(coreRoot, "dist", "engine", "optimizer.js"), "utf8");
+    expect(emitted).not.toContain("/**");
+    expect(emitted).not.toMatch(/^\s*\/\//mu);
+  }, 60_000);
 });

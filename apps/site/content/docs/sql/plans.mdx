@@ -30,14 +30,17 @@ per row.
 makes its two key columns equal, so an equality, `IN` list, or range on one side reaches the
 other: `WHERE c.customer_id = 42` with `ON o.customer = c.customer_id` also filters `orders` by
 `customer = 42` before the join, through a [secondary index](/docs/sql/ddl#secondary-indexes)
-when one exists, or through the unique key when the constant names it. A `LEFT` join keeps its
-null-extended rows, which a mirrored predicate would fail, so it gets none.
+when one exists, or through the unique key when the constant names it. A placeholder is a
+constant here too: `WHERE c.customer_id >= ?` mirrors the bound value the same way. A `LEFT`
+join keeps its null-extended rows, which a mirrored predicate would fail, so it gets none.
 
 **Calendar equalities become ranges.** `DATE_TRUNC('month', placed_at) = TIMESTAMP '2025-06-01
 00:00:00'` and `EXTRACT(YEAR FROM placed_at) = 2025` are planned as `placed_at >= start AND
 placed_at < start + 1 unit`, which skips blocks by value range and runs on the raw datetime
 kernel instead of computing a calendar value per row. A timestamp not aligned to its unit can
-never equal a truncation, so that predicate is a constant false.
+never equal a truncation, so that predicate is a constant false. With a placeholder
+(`DATE_TRUNC('day', placed_at) = ?`) the same rewrite runs when the value is bound, so a
+parameterized query reads the same blocks as its literal form.
 
 **Skipping by value range.** Every block records the minimum and maximum of the column it holds. A
 comparison that cannot be true inside a block's range skips the block without decoding or
@@ -57,8 +60,14 @@ comma/CROSS-join groups keep the streamed base fixed, then choose connected sour
 anti-join rather than executed once per outer row; both equality and range comparisons take this
 path. Correlated scalar aggregate expressions and ordinary single-row projections join distinct
 outer probe values to the inner rows; per-probe window ranks implement their ordering, limits,
-and offsets before the grouped value joins back. Correlated `IN` uses equality-key joins directly
-or distinct probes for a range comparison. Correlated `NOT IN` carries explicit empty-set and NULL
+and offsets before the grouped value joins back. The probe block carries the outer `WHERE`
+conjuncts that read only its own sources, so `WHERE o.id BETWEEN ? AND ?` probes a hundred
+keys rather than every key in the table, and an equality-correlated scalar mirrors those key
+ranges onto its inner scan as well. Correlated `IN` uses equality-key joins directly or
+distinct probes for a range comparison. An uncorrelated `column IN (SELECT …)` is a join to
+the subquery's distinct values, so a constant on the column reaches the subquery's own scan
+through the join key instead of the subquery materializing every value first; `NOT IN` and a
+probe that is an expression rather than a column keep the membership test. Correlated `NOT IN` carries explicit empty-set and NULL
 flags alongside its anti-join, including for range comparisons. Below `OR`, `NOT`,
 `CASE`, or a select expression, `IN`, `NOT IN`, `ANY`, and `ALL` group true, false, unknown, and
 empty-set state per distinct outer probe tuple. Generated aliases are unique across the complete

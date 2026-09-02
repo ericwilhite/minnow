@@ -20,7 +20,7 @@ Error: setup failed
     expect(parsePerformanceFailures("Error: setup failed")).toEqual([]);
   });
 
-  it("requires the same workload and comparison engine to fail twice", () => {
+  it("confirms a workload that fails twice even when a different engine flags it", () => {
     const first = [
       { workload: "bulk-ingest", engine: "sqlite" as const },
       { workload: "scan", engine: "pglite" as const },
@@ -30,7 +30,18 @@ Error: setup failed
       { workload: "scan", engine: "pglite" as const },
     ];
     expect(repeatedPerformanceFailures(first, second)).toEqual([
+      { workload: "bulk-ingest", engine: "sqlite" },
       { workload: "scan", engine: "pglite" },
+      { workload: "bulk-ingest", engine: "pglite" },
     ]);
+  });
+
+  it("reads two runs that flag different workloads as one-off noise", () => {
+    expect(
+      repeatedPerformanceFailures(
+        [{ workload: "point-lookup", engine: "sqlite" }],
+        [{ workload: "bulk-ingest", engine: "sqlite" }],
+      ),
+    ).toEqual([]);
   });
 });

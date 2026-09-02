@@ -116,6 +116,21 @@
           "description": "Side-effect-only ready-made dedicated-worker entry."
         },
         {
+          "subpath": "./worker/indexeddb",
+          "audience": "runtime",
+          "description": "Side-effect-only dedicated-worker entry bundling the IndexedDB store alone."
+        },
+        {
+          "subpath": "./worker/memory",
+          "audience": "runtime",
+          "description": "Side-effect-only dedicated-worker entry bundling the in-memory store alone."
+        },
+        {
+          "subpath": "./worker/opfs",
+          "audience": "runtime",
+          "description": "Side-effect-only dedicated-worker entry bundling the OPFS store alone."
+        },
+        {
           "subpath": "./worker-host",
           "audience": "extension",
           "description": "Manual worker exposure and stock database-worker attachment."

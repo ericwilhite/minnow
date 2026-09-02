@@ -31,13 +31,20 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // scalar materialization, PostgreSQL GROUP BY / set-operation tail resolution, untyped-literal
 // coercion, the table-driven PostgreSQL scalar function surface (TO_CHAR templates, regular
 // expressions, MD5, FORMAT, AGE), mutation aliases with subquery assignments, and SERIAL /
-// IDENTITY DDL intentionally expand the complete engine surface.
-// Measured: 767.6 KiB raw / 220.3 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 796 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 230 * 1024;
-// Measured with the larger durable adapter: 1100.7 KiB raw / 303.7 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1130 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 313 * 1024;
+// IDENTITY DDL, correlation probes that carry the outer predicates and mirror key ranges,
+// uncorrelated IN subqueries planned as joins, and dictionary-decided CASE aggregate branches
+// intentionally expand the complete engine surface.
+// Measured: 799.0 KiB raw / 229.9 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 801 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 231 * 1024;
+// Measured with the larger durable adapter: 1132.4 KiB raw / 313.2 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1134 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 315 * 1024;
+// The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
+// code splitting the way Vite's default iife worker format does. The generic entry inlined the
+// same way measured 1465.6 KiB raw / 397.8 KiB gzip. Measured: 1158.8 KiB raw / 319.0 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1170 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 322 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
@@ -56,27 +63,37 @@ async function bundle(contents: string): Promise<string> {
   return output.text;
 }
 
+/** A production build the way an application ships it: minified, without code splitting. */
+async function measure(
+  label: string,
+  source: { entryPoint: string } | { contents: string },
+): Promise<{ rawBytes: number; gzipBytes: number }> {
+  const result = await build({
+    ...("entryPoint" in source
+      ? { entryPoints: [source.entryPoint], absWorkingDir: repoRoot }
+      : { stdin: { contents: source.contents, resolveDir: repoRoot } }),
+    bundle: true,
+    write: false,
+    minify: true,
+    format: "esm",
+    platform: "browser",
+    target: "es2022",
+    define: { "process.env.NODE_ENV": '"production"' },
+    logLevel: "silent",
+  });
+  const output = result.outputFiles[0];
+  if (output === undefined) throw new Error(`esbuild produced no ${label} output`);
+  return {
+    rawBytes: output.contents.byteLength,
+    gzipBytes: gzipSync(output.contents, { level: constants.Z_BEST_COMPRESSION }).byteLength,
+  };
+}
+
 describe("core packaging", () => {
   it("keeps the complete main entry below its download budget", async () => {
-    const result = await build({
-      entryPoints: ["@minnowdb/core"],
-      absWorkingDir: repoRoot,
-      bundle: true,
-      write: false,
-      minify: true,
-      format: "esm",
-      platform: "browser",
-      target: "es2022",
-      define: { "process.env.NODE_ENV": '"production"' },
-      logLevel: "silent",
-    });
-    const output = result.outputFiles[0];
-    if (output === undefined) throw new Error("esbuild produced no main-entry output");
-    const gzipBytes = gzipSync(output.contents, {
-      level: constants.Z_BEST_COMPRESSION,
-    }).byteLength;
+    const { rawBytes, gzipBytes } = await measure("main-entry", { entryPoint: "@minnowdb/core" });
 
-    expect(output.contents.byteLength, "complete main entry raw bytes").toBeLessThanOrEqual(
+    expect(rawBytes, "complete main entry raw bytes").toBeLessThanOrEqual(
       COMPLETE_ENTRY_RAW_BUDGET,
     );
     expect(gzipBytes, "complete main entry gzip bytes").toBeLessThanOrEqual(
@@ -85,33 +102,28 @@ describe("core packaging", () => {
   });
 
   it("keeps a usable engine with the larger durable adapter below its download budget", async () => {
-    const result = await build({
-      stdin: {
-        contents:
-          'export { MinnowDatabase } from "@minnowdb/core"; ' +
-          'export { OpfsBlockStore } from "@minnowdb/core/storage/opfs";',
-        resolveDir: repoRoot,
-      },
-      bundle: true,
-      write: false,
-      minify: true,
-      format: "esm",
-      platform: "browser",
-      target: "es2022",
-      define: { "process.env.NODE_ENV": '"production"' },
-      logLevel: "silent",
+    const { rawBytes, gzipBytes } = await measure("durable-engine", {
+      contents:
+        'export { MinnowDatabase } from "@minnowdb/core"; ' +
+        'export { OpfsBlockStore } from "@minnowdb/core/storage/opfs";',
     });
-    const output = result.outputFiles[0];
-    if (output === undefined) throw new Error("esbuild produced no durable-engine output");
-    const gzipBytes = gzipSync(output.contents, {
-      level: constants.Z_BEST_COMPRESSION,
-    }).byteLength;
 
-    expect(output.contents.byteLength, "engine plus OPFS raw bytes").toBeLessThanOrEqual(
-      ENGINE_WITH_OPFS_RAW_BUDGET,
-    );
+    expect(rawBytes, "engine plus OPFS raw bytes").toBeLessThanOrEqual(ENGINE_WITH_OPFS_RAW_BUDGET);
     expect(gzipBytes, "engine plus OPFS gzip bytes").toBeLessThanOrEqual(
       ENGINE_WITH_OPFS_GZIP_BUDGET,
+    );
+  });
+
+  it("keeps the IndexedDB-only worker entry below its download budget", async () => {
+    const { rawBytes, gzipBytes } = await measure("IndexedDB worker", {
+      entryPoint: "@minnowdb/core/worker/indexeddb",
+    });
+
+    expect(rawBytes, "IndexedDB-only worker raw bytes").toBeLessThanOrEqual(
+      INDEXEDDB_WORKER_RAW_BUDGET,
+    );
+    expect(gzipBytes, "IndexedDB-only worker gzip bytes").toBeLessThanOrEqual(
+      INDEXEDDB_WORKER_GZIP_BUDGET,
     );
   });
 
@@ -170,6 +182,36 @@ describe("core packaging", () => {
     // build would survive even if package.json accidentally stopped marking worker.js as a side
     // effect; a consumer's bare import would not.
     expect(output).toContain("Database is not initialized: send init first");
+  });
+
+  it("retains each per-store worker's side-effect attachment through a bare import", async () => {
+    for (const kind of ["indexeddb", "opfs", "memory"]) {
+      const output = await bundle(`import "@minnowdb/core/worker/${kind}";`);
+      expect(output, `@minnowdb/core/worker/${kind}`).toContain(
+        "Database is not initialized: send init first",
+      );
+    }
+  });
+
+  it("each per-store worker entry bundles exactly its own adapter", async () => {
+    // Bundled without splitting, as Vite's default iife worker format does: the dynamic imports
+    // in the generic entry's store factory are inlined, so it carries every adapter …
+    const generic = await bundle('import "@minnowdb/core/worker";');
+    expect(generic).toContain(IDB_MARKER);
+    expect(generic).toContain(OPFS_MARKER);
+
+    // … and the per-store entries are the way to carry one.
+    const indexedDb = await bundle('import "@minnowdb/core/worker/indexeddb";');
+    expect(indexedDb).toContain(IDB_MARKER);
+    expect(indexedDb).not.toContain(OPFS_MARKER);
+
+    const opfs = await bundle('import "@minnowdb/core/worker/opfs";');
+    expect(opfs).toContain(OPFS_MARKER);
+    expect(opfs).not.toContain(IDB_MARKER);
+
+    const memory = await bundle('import "@minnowdb/core/worker/memory";');
+    expect(memory).not.toContain(IDB_MARKER);
+    expect(memory).not.toContain(OPFS_MARKER);
   });
 
   it("an IndexedDB-only subpath does not pull the OPFS store", async () => {

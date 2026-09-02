@@ -52,7 +52,7 @@ function main(): number {
   const repeated = repeatedPerformanceFailures(firstFailures, secondFailures);
   if (repeated.length === 0) {
     console.log(
-      "\nThe two runs flagged different comparisons; no repeatable performance regression was found.",
+      "\nThe two runs flagged different workloads; no repeatable performance regression was found.",
     );
     return 0;
   }

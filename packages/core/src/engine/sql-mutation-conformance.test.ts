@@ -20,7 +20,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
-import { mulberry32, seedFor } from "../testing/seeds.js";
+import { mulberry32, seedsFor } from "../testing/seeds.js";
 import { positionalToNumbered } from "../testing/oracle.js";
 import { MinnowDatabase } from "./database.js";
 import { type QueryValue } from "./query.js";
@@ -394,11 +394,8 @@ const stepTemplates: StepTemplate[] = [
   }),
 ];
 
-function buildScript(): Step[] {
-  const state: ScriptState = {
-    nextId: 1,
-    rng: mulberry32(seedFor("sql-mutation-conformance", 0xd1ffe4)),
-  };
+function buildScript(seed: number): Step[] {
+  const state: ScriptState = { nextId: 1, rng: mulberry32(seed) };
   const script: Step[] = [];
   // Seed rows so the first predicates have something to chew on.
   for (let index = 0; index < 8; index += 1) {
@@ -466,306 +463,321 @@ function sqliteParams(params: QueryValue[] | undefined): Array<string | number |
 // --- The harness --------------------------------------------------------------------------------
 
 describe("DML conformance against SQLite and PGlite", () => {
-  it("agrees on state, triggers, outcomes, and row counts across a seeded mutation script", async () => {
-    const script = buildScript();
-    const minnow = await minnowFixture();
-    const sqlite = sqliteFixture();
-    const pglite = await pgliteFixture();
-    const failures: string[] = [];
-    let pgliteCompared = 0;
+  it.each(seedsFor("sql-mutation-conformance", [0xd1ffe4]))(
+    "agrees on state, triggers, outcomes, and row counts across a seeded mutation script (seed %s)",
+    async (seed) => {
+      const script = buildScript(seed);
+      const minnow = await minnowFixture();
+      const sqlite = sqliteFixture();
+      const pglite = await pgliteFixture();
+      const failures: string[] = [];
+      let pgliteCompared = 0;
 
-    const compareState = async (label: string): Promise<void> => {
-      const stateSql = `SELECT id, region, amount, active, label FROM items ORDER BY id`;
-      const minnowState = keys((await minnow.query(stateSql)).rows, true);
-      const sqliteState = keys(sqlite.prepare(stateSql).all(), true);
-      if (minnowState.join("\n") !== sqliteState.join("\n")) {
-        failures.push(
-          `${label}\n${diffSummary("table state", "sqlite", minnowState, sqliteState)}`,
-        );
-      }
-      const pgliteState = keys((await pglite.run(stateSql)).rows, true);
-      if (minnowState.join("\n") !== pgliteState.join("\n")) {
-        failures.push(
-          `${label}\n${diffSummary("table state", "pglite", minnowState, pgliteState)}`,
-        );
-      }
-      const auditSql = `SELECT action, item_id, amount FROM audit`;
-      const minnowAudit = keys((await minnow.query(auditSql)).rows, false);
-      const sqliteAudit = keys(sqlite.prepare(auditSql).all(), false);
-      if (minnowAudit.join("\n") !== sqliteAudit.join("\n")) {
-        failures.push(
-          `${label}\n${diffSummary("audit trail", "sqlite", minnowAudit, sqliteAudit)}`,
-        );
-      }
-      const pgliteAudit = keys((await pglite.run(auditSql)).rows, false);
-      if (minnowAudit.join("\n") !== pgliteAudit.join("\n")) {
-        failures.push(
-          `${label}\n${diffSummary("audit trail", "pglite", minnowAudit, pgliteAudit)}`,
-        );
-      }
-    };
-
-    const runSql = async (step: SqlStep, label: string): Promise<void> => {
-      const returning = step.sql.includes("RETURNING");
-      let minnowError: unknown;
-      let minnowCount: number | undefined;
-      let minnowReturned: string[] | undefined;
-      let minnowReturnedColumns: string[] | undefined;
-      try {
-        const result = await minnow.execute(step.sql, step.params);
-        if (result.kind === "insert" || result.kind === "update" || result.kind === "delete") {
-          minnowCount = result.rowCount;
-          if (returning) {
-            minnowReturned = keys(result.returnedRows ?? [], false);
-            minnowReturnedColumns = result.returnedColumns ?? [];
-          }
-        }
-      } catch (error) {
-        minnowError = error;
-      }
-      let sqliteError: unknown;
-      let sqliteCount: number | undefined;
-      let sqliteReturned: string[] | undefined;
-      let sqliteReturnedColumns: string[] | undefined;
-      try {
-        const prepared = sqlite.prepare(step.sql);
-        if (returning) {
-          const rows = prepared.all(...sqliteParams(step.params));
-          sqliteReturned = keys(rows, false);
-          sqliteReturnedColumns = prepared.columns().map(({ name }) => name);
-          sqliteCount = rows.length;
-        } else {
-          sqliteCount = Number(prepared.run(...sqliteParams(step.params)).changes);
-        }
-      } catch (error) {
-        sqliteError = error;
-      }
-      let pgliteError: unknown;
-      let pgliteCount: number | undefined;
-      let pgliteReturned: string[] | undefined;
-      let pgliteReturnedColumns: string[] | undefined;
-      try {
-        const result = await pglite.run(step.sql, step.params);
-        pgliteCount = returning ? result.rows.length : result.count;
-        if (returning) {
-          pgliteReturned = keys(result.rows, false);
-          pgliteReturnedColumns = result.columns;
-        }
-      } catch (error) {
-        pgliteError = error;
-      }
-      pgliteCompared += 1;
-      const compareOracle = (
-        oracle: string,
-        oracleError: unknown,
-        oracleCount: number | undefined,
-        oracleReturned: string[] | undefined,
-        oracleReturnedColumns: string[] | undefined,
-      ): void => {
-        if ((minnowError === undefined) !== (oracleError === undefined)) {
+      const compareState = async (label: string): Promise<void> => {
+        const stateSql = `SELECT id, region, amount, active, label FROM items ORDER BY id`;
+        const minnowState = keys((await minnow.query(stateSql)).rows, true);
+        const sqliteState = keys(sqlite.prepare(stateSql).all(), true);
+        if (minnowState.join("\n") !== sqliteState.join("\n")) {
           failures.push(
-            `${label}\n  outcome diverged: minnow ${
-              minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
-            }; ${oracle} ${
-              oracleError === undefined ? "succeeded" : `threw: ${describeError(oracleError)}`
-            }`,
-          );
-          return;
-        }
-        if (minnowError !== undefined) return; // Both rejected; compareState confirms no damage.
-        if (minnowCount !== undefined && oracleCount !== undefined && minnowCount !== oracleCount) {
-          failures.push(
-            `${label}\n  affected rows diverged: minnow ${String(minnowCount)}, ${oracle} ${String(oracleCount)}`,
+            `${label}\n${diffSummary("table state", "sqlite", minnowState, sqliteState)}`,
           );
         }
-        if (
-          minnowReturned !== undefined &&
-          oracleReturned !== undefined &&
-          minnowReturned.join("\n") !== oracleReturned.join("\n")
-        ) {
+        const pgliteState = keys((await pglite.run(stateSql)).rows, true);
+        if (minnowState.join("\n") !== pgliteState.join("\n")) {
           failures.push(
-            `${label}\n${diffSummary("RETURNING rows", oracle, minnowReturned, oracleReturned)}`,
+            `${label}\n${diffSummary("table state", "pglite", minnowState, pgliteState)}`,
           );
         }
-        if (
-          minnowReturnedColumns !== undefined &&
-          oracleReturnedColumns !== undefined &&
-          minnowReturnedColumns.join(",") !== oracleReturnedColumns.join(",")
-        ) {
+        const auditSql = `SELECT action, item_id, amount FROM audit`;
+        const minnowAudit = keys((await minnow.query(auditSql)).rows, false);
+        const sqliteAudit = keys(sqlite.prepare(auditSql).all(), false);
+        if (minnowAudit.join("\n") !== sqliteAudit.join("\n")) {
           failures.push(
-            `${label}\n  RETURNING column order/names diverged:\n` +
-              `    minnow: ${minnowReturnedColumns.join(", ")}\n` +
-              `    ${oracle}: ${oracleReturnedColumns.join(", ")}`,
+            `${label}\n${diffSummary("audit trail", "sqlite", minnowAudit, sqliteAudit)}`,
+          );
+        }
+        const pgliteAudit = keys((await pglite.run(auditSql)).rows, false);
+        if (minnowAudit.join("\n") !== pgliteAudit.join("\n")) {
+          failures.push(
+            `${label}\n${diffSummary("audit trail", "pglite", minnowAudit, pgliteAudit)}`,
           );
         }
       };
-      compareOracle("sqlite", sqliteError, sqliteCount, sqliteReturned, sqliteReturnedColumns);
-      compareOracle("pglite", pgliteError, pgliteCount, pgliteReturned, pgliteReturnedColumns);
-    };
 
-    const runPair = async (step: PairStep, label: string): Promise<void> => {
-      let minnowError: unknown;
-      try {
-        await minnow.execute(step.minnow.sql, step.minnow.params);
-      } catch (error) {
-        minnowError = error;
-      }
-      let sqliteError: unknown;
-      try {
+      const runSql = async (step: SqlStep, label: string): Promise<void> => {
+        const returning = step.sql.includes("RETURNING");
+        let minnowError: unknown;
+        let minnowCount: number | undefined;
+        let minnowReturned: string[] | undefined;
+        let minnowReturnedColumns: string[] | undefined;
+        try {
+          const result = await minnow.execute(step.sql, step.params);
+          if (result.kind === "insert" || result.kind === "update" || result.kind === "delete") {
+            minnowCount = result.rowCount;
+            if (returning) {
+              minnowReturned = keys(result.returnedRows ?? [], false);
+              minnowReturnedColumns = result.returnedColumns ?? [];
+            }
+          }
+        } catch (error) {
+          minnowError = error;
+        }
+        let sqliteError: unknown;
+        let sqliteCount: number | undefined;
+        let sqliteReturned: string[] | undefined;
+        let sqliteReturnedColumns: string[] | undefined;
+        try {
+          const prepared = sqlite.prepare(step.sql);
+          if (returning) {
+            const rows = prepared.all(...sqliteParams(step.params));
+            sqliteReturned = keys(rows, false);
+            sqliteReturnedColumns = prepared.columns().map(({ name }) => name);
+            sqliteCount = rows.length;
+          } else {
+            sqliteCount = Number(prepared.run(...sqliteParams(step.params)).changes);
+          }
+        } catch (error) {
+          sqliteError = error;
+        }
+        let pgliteError: unknown;
+        let pgliteCount: number | undefined;
+        let pgliteReturned: string[] | undefined;
+        let pgliteReturnedColumns: string[] | undefined;
+        try {
+          const result = await pglite.run(step.sql, step.params);
+          pgliteCount = returning ? result.rows.length : result.count;
+          if (returning) {
+            pgliteReturned = keys(result.rows, false);
+            pgliteReturnedColumns = result.columns;
+          }
+        } catch (error) {
+          pgliteError = error;
+        }
+        pgliteCompared += 1;
+        const compareOracle = (
+          oracle: string,
+          oracleError: unknown,
+          oracleCount: number | undefined,
+          oracleReturned: string[] | undefined,
+          oracleReturnedColumns: string[] | undefined,
+        ): void => {
+          if ((minnowError === undefined) !== (oracleError === undefined)) {
+            failures.push(
+              `${label}\n  outcome diverged: minnow ${
+                minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
+              }; ${oracle} ${
+                oracleError === undefined ? "succeeded" : `threw: ${describeError(oracleError)}`
+              }`,
+            );
+            return;
+          }
+          if (minnowError !== undefined) return; // Both rejected; compareState confirms no damage.
+          if (
+            minnowCount !== undefined &&
+            oracleCount !== undefined &&
+            minnowCount !== oracleCount
+          ) {
+            failures.push(
+              `${label}\n  affected rows diverged: minnow ${String(minnowCount)}, ${oracle} ${String(oracleCount)}`,
+            );
+          }
+          if (
+            minnowReturned !== undefined &&
+            oracleReturned !== undefined &&
+            minnowReturned.join("\n") !== oracleReturned.join("\n")
+          ) {
+            failures.push(
+              `${label}\n${diffSummary("RETURNING rows", oracle, minnowReturned, oracleReturned)}`,
+            );
+          }
+          if (
+            minnowReturnedColumns !== undefined &&
+            oracleReturnedColumns !== undefined &&
+            minnowReturnedColumns.join(",") !== oracleReturnedColumns.join(",")
+          ) {
+            failures.push(
+              `${label}\n  RETURNING column order/names diverged:\n` +
+                `    minnow: ${minnowReturnedColumns.join(", ")}\n` +
+                `    ${oracle}: ${oracleReturnedColumns.join(", ")}`,
+            );
+          }
+        };
+        compareOracle("sqlite", sqliteError, sqliteCount, sqliteReturned, sqliteReturnedColumns);
+        compareOracle("pglite", pgliteError, pgliteCount, pgliteReturned, pgliteReturnedColumns);
+      };
+
+      const runPair = async (step: PairStep, label: string): Promise<void> => {
+        let minnowError: unknown;
+        try {
+          await minnow.execute(step.minnow.sql, step.minnow.params);
+        } catch (error) {
+          minnowError = error;
+        }
+        let sqliteError: unknown;
+        try {
+          sqlite.exec("BEGIN");
+          for (const statement of step.sqlite) {
+            sqlite.prepare(statement.sql).run(...sqliteParams(statement.params));
+          }
+          sqlite.exec("COMMIT");
+        } catch (error) {
+          sqlite.exec("ROLLBACK");
+          sqliteError = error;
+        }
+        // PGlite speaks the Minnow spelling (MERGE) directly, so it runs verbatim. Affected-row
+        // reporting still differs between MERGE and its UPDATE + INSERT expansion, so a PairStep
+        // compares outcomes here and leaves the row-level evidence to compareState.
+        let pgliteError: unknown;
+        try {
+          await pglite.run(step.minnow.sql, step.minnow.params);
+        } catch (error) {
+          pgliteError = error;
+        }
+        pgliteCompared += 1;
+        for (const [oracle, oracleError] of [
+          ["sqlite", sqliteError],
+          ["pglite", pgliteError],
+        ] as const) {
+          if ((minnowError === undefined) !== (oracleError === undefined)) {
+            failures.push(
+              `${label}\n  outcome diverged: minnow ${
+                minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
+              }; ${oracle} ${
+                oracleError === undefined ? "succeeded" : `threw: ${describeError(oracleError)}`
+              }`,
+            );
+          }
+        }
+      };
+
+      const runScope = async (step: ScopeStep, label: string): Promise<void> => {
+        // Resolve staged updates/deletes against current state so both engines see identical ops:
+        // Minnow's updateBatch requires existing keys, so filter to rows that exist right now.
+        const present = new Set(
+          ((await minnow.query(`SELECT id FROM items`)).rows as Array<{ id: number }>).map(
+            (row) => row.id,
+          ),
+        );
+        const updates = step.updates.filter((update) => present.has(update.id));
+        const deletes = step.deletes.filter(
+          (id) => present.has(id) && !updates.some((update) => update.id === id),
+        );
+        let minnowError: unknown;
+        try {
+          await minnow.write(async (tx) => {
+            for (const update of updates) {
+              await tx.updateBatch("items", {
+                keys: [update.id],
+                changes: { amount: [update.amount] },
+              });
+            }
+            if (step.inserts.length > 0) {
+              await tx.insertBatch("items", {
+                columns: {
+                  id: step.inserts.map((row) => row.id),
+                  region: step.inserts.map((row) => row.region),
+                  amount: step.inserts.map((row) => row.amount),
+                  active: step.inserts.map(() => true),
+                  label: step.inserts.map((row) => row.label),
+                },
+              });
+            }
+            const deleteKeys = [...deletes, ...(step.absentDeletes ?? [])];
+            if (deleteKeys.length > 0) await tx.deleteBatch("items", { keys: deleteKeys });
+            if (step.poisonKey !== undefined) {
+              await tx.updateBatch("items", { keys: [step.poisonKey], changes: { amount: [0] } });
+            }
+          });
+        } catch (error) {
+          minnowError = error;
+        }
+        if (step.poisonKey !== undefined && minnowError === undefined) {
+          failures.push(`${label}\n  poisoned scope was expected to abort but committed`);
+          return;
+        }
+        if (step.poisonKey === undefined && minnowError !== undefined) {
+          failures.push(`${label}\n  scope unexpectedly aborted: ${describeError(minnowError)}`);
+          return;
+        }
+        if (minnowError !== undefined) return; // Aborted scope: the oracles apply nothing either.
         sqlite.exec("BEGIN");
-        for (const statement of step.sqlite) {
-          sqlite.prepare(statement.sql).run(...sqliteParams(statement.params));
-        }
-        sqlite.exec("COMMIT");
-      } catch (error) {
-        sqlite.exec("ROLLBACK");
-        sqliteError = error;
-      }
-      // PGlite speaks the Minnow spelling (MERGE) directly, so it runs verbatim. Affected-row
-      // reporting still differs between MERGE and its UPDATE + INSERT expansion, so a PairStep
-      // compares outcomes here and leaves the row-level evidence to compareState.
-      let pgliteError: unknown;
-      try {
-        await pglite.run(step.minnow.sql, step.minnow.params);
-      } catch (error) {
-        pgliteError = error;
-      }
-      pgliteCompared += 1;
-      for (const [oracle, oracleError] of [
-        ["sqlite", sqliteError],
-        ["pglite", pgliteError],
-      ] as const) {
-        if ((minnowError === undefined) !== (oracleError === undefined)) {
-          failures.push(
-            `${label}\n  outcome diverged: minnow ${
-              minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
-            }; ${oracle} ${
-              oracleError === undefined ? "succeeded" : `threw: ${describeError(oracleError)}`
-            }`,
-          );
-        }
-      }
-    };
-
-    const runScope = async (step: ScopeStep, label: string): Promise<void> => {
-      // Resolve staged updates/deletes against current state so both engines see identical ops:
-      // Minnow's updateBatch requires existing keys, so filter to rows that exist right now.
-      const present = new Set(
-        ((await minnow.query(`SELECT id FROM items`)).rows as Array<{ id: number }>).map(
-          (row) => row.id,
-        ),
-      );
-      const updates = step.updates.filter((update) => present.has(update.id));
-      const deletes = step.deletes.filter(
-        (id) => present.has(id) && !updates.some((update) => update.id === id),
-      );
-      let minnowError: unknown;
-      try {
-        await minnow.write(async (tx) => {
+        try {
           for (const update of updates) {
-            await tx.updateBatch("items", {
-              keys: [update.id],
-              changes: { amount: [update.amount] },
-            });
+            sqlite
+              .prepare(`UPDATE items SET amount = ? WHERE id = ?`)
+              .run(update.amount, update.id);
           }
-          if (step.inserts.length > 0) {
-            await tx.insertBatch("items", {
-              columns: {
-                id: step.inserts.map((row) => row.id),
-                region: step.inserts.map((row) => row.region),
-                amount: step.inserts.map((row) => row.amount),
-                active: step.inserts.map(() => true),
-                label: step.inserts.map((row) => row.label),
-              },
-            });
+          for (const row of step.inserts) {
+            sqlite
+              .prepare(
+                `INSERT INTO items (id, region, amount, active, label) VALUES (?, ?, ?, 1, ?)`,
+              )
+              .run(row.id, row.region, row.amount, row.label);
           }
-          const deleteKeys = [...deletes, ...(step.absentDeletes ?? [])];
-          if (deleteKeys.length > 0) await tx.deleteBatch("items", { keys: deleteKeys });
-          if (step.poisonKey !== undefined) {
-            await tx.updateBatch("items", { keys: [step.poisonKey], changes: { amount: [0] } });
+          for (const id of deletes) sqlite.prepare(`DELETE FROM items WHERE id = ?`).run(id);
+          sqlite.exec("COMMIT");
+        } catch (error) {
+          sqlite.exec("ROLLBACK");
+          failures.push(`${label}\n  sqlite mirror transaction failed: ${describeError(error)}`);
+        }
+        try {
+          await pglite.exec("BEGIN");
+          for (const update of updates) {
+            await pglite.run(`UPDATE items SET amount = ? WHERE id = ?`, [
+              update.amount,
+              update.id,
+            ]);
           }
-        });
-      } catch (error) {
-        minnowError = error;
-      }
-      if (step.poisonKey !== undefined && minnowError === undefined) {
-        failures.push(`${label}\n  poisoned scope was expected to abort but committed`);
-        return;
-      }
-      if (step.poisonKey === undefined && minnowError !== undefined) {
-        failures.push(`${label}\n  scope unexpectedly aborted: ${describeError(minnowError)}`);
-        return;
-      }
-      if (minnowError !== undefined) return; // Aborted scope: the oracles apply nothing either.
-      sqlite.exec("BEGIN");
-      try {
-        for (const update of updates) {
-          sqlite.prepare(`UPDATE items SET amount = ? WHERE id = ?`).run(update.amount, update.id);
+          for (const row of step.inserts) {
+            await pglite.run(
+              `INSERT INTO items (id, region, amount, active, label) VALUES (?, ?, ?, TRUE, ?)`,
+              [row.id, row.region, row.amount, row.label],
+            );
+          }
+          for (const id of deletes) await pglite.run(`DELETE FROM items WHERE id = ?`, [id]);
+          await pglite.exec("COMMIT");
+        } catch (error) {
+          await pglite.exec("ROLLBACK");
+          failures.push(`${label}\n  pglite mirror transaction failed: ${describeError(error)}`);
         }
-        for (const row of step.inserts) {
-          sqlite
-            .prepare(`INSERT INTO items (id, region, amount, active, label) VALUES (?, ?, ?, 1, ?)`)
-            .run(row.id, row.region, row.amount, row.label);
-        }
-        for (const id of deletes) sqlite.prepare(`DELETE FROM items WHERE id = ?`).run(id);
-        sqlite.exec("COMMIT");
-      } catch (error) {
-        sqlite.exec("ROLLBACK");
-        failures.push(`${label}\n  sqlite mirror transaction failed: ${describeError(error)}`);
-      }
-      try {
-        await pglite.exec("BEGIN");
-        for (const update of updates) {
-          await pglite.run(`UPDATE items SET amount = ? WHERE id = ?`, [update.amount, update.id]);
-        }
-        for (const row of step.inserts) {
-          await pglite.run(
-            `INSERT INTO items (id, region, amount, active, label) VALUES (?, ?, ?, TRUE, ?)`,
-            [row.id, row.region, row.amount, row.label],
-          );
-        }
-        for (const id of deletes) await pglite.run(`DELETE FROM items WHERE id = ?`, [id]);
-        await pglite.exec("COMMIT");
-      } catch (error) {
-        await pglite.exec("ROLLBACK");
-        failures.push(`${label}\n  pglite mirror transaction failed: ${describeError(error)}`);
-      }
-      pgliteCompared += 1;
-    };
+        pgliteCompared += 1;
+      };
 
-    try {
-      for (const [index, step] of script.entries()) {
-        const label =
-          step.kind === "sql"
-            ? `#${String(index)} ${step.sql} :: ${JSON.stringify(step.params ?? [])}`
-            : step.kind === "pair"
-              ? `#${String(index)} ${step.minnow.sql}`
-              : `#${String(index)} write-scope ${JSON.stringify({
-                  updates: step.updates,
-                  inserts: step.inserts.map((row) => row.id),
-                  deletes: step.deletes,
-                  poisonKey: step.poisonKey,
-                })}`;
-        if (step.kind === "sql") await runSql(step, label);
-        else if (step.kind === "pair") await runPair(step, label);
-        else await runScope(step, label);
-        await compareState(label);
-        if (failures.length >= 10) break; // Divergence cascades; stop at a useful sample.
+      try {
+        for (const [index, step] of script.entries()) {
+          const label =
+            step.kind === "sql"
+              ? `#${String(index)} ${step.sql} :: ${JSON.stringify(step.params ?? [])}`
+              : step.kind === "pair"
+                ? `#${String(index)} ${step.minnow.sql}`
+                : `#${String(index)} write-scope ${JSON.stringify({
+                    updates: step.updates,
+                    inserts: step.inserts.map((row) => row.id),
+                    deletes: step.deletes,
+                    poisonKey: step.poisonKey,
+                  })}`;
+          if (step.kind === "sql") await runSql(step, label);
+          else if (step.kind === "pair") await runPair(step, label);
+          else await runScope(step, label);
+          await compareState(label);
+          if (failures.length >= 10) break; // Divergence cascades; stop at a useful sample.
+        }
+      } finally {
+        sqlite.close();
+        await pglite.close();
       }
-    } finally {
-      sqlite.close();
-      await pglite.close();
-    }
-    expect(script.length).toBeGreaterThan(60);
-    if (failures.length > 0) {
-      expect.fail(
-        `${String(failures.length)} DML conformance divergences:\n\n` +
-          failures.slice(0, 10).join("\n\n"),
-      );
-    }
-    // The PGlite leg is only worth something while it actually runs: every SQL statement, MERGE
-    // pair, and committed write scope must have been diffed against PostgreSQL as well. The floor
-    // sits after the failure report so a real divergence is read before a coverage shortfall.
-    expect(pgliteCompared).toBeGreaterThan(60);
-  }, 180_000);
+      expect(script.length).toBeGreaterThan(60);
+      if (failures.length > 0) {
+        expect.fail(
+          `${String(failures.length)} DML conformance divergences:\n\n` +
+            failures.slice(0, 10).join("\n\n"),
+        );
+      }
+      // The PGlite leg is only worth something while it actually runs: every SQL statement, MERGE
+      // pair, and committed write scope must have been diffed against PostgreSQL as well. The floor
+      // sits after the failure report so a real divergence is read before a coverage shortfall.
+      expect(pgliteCompared).toBeGreaterThan(60);
+    },
+    180_000,
+  );
 });

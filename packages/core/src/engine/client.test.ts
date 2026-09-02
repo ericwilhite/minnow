@@ -16,6 +16,7 @@ import {
   rpcFailure,
   type RpcResponse,
 } from "../worker-protocol/index.js";
+import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { MinnowDatabaseClient, type ClientTransport } from "./client.js";
 import { MinnowDatabase } from "./database.js";
@@ -37,6 +38,9 @@ import {
   type ExposeDatabaseOptions,
   type RpcScope,
 } from "./worker-host.js";
+import { attachWorkerHost } from "./worker-server.js";
+import { indexedDbWorkerStore } from "./worker-store-indexeddb.js";
+import { memoryWorkerStore } from "./worker-store-memory.js";
 
 /**
  * An in-process stand-in for the worker boundary: two endpoints whose messages are
@@ -505,6 +509,46 @@ async function expectNoActiveWorkerOwners(store: MemoryBlockStore): Promise<void
   const transactions = await store.listTransactionPage(null, 256);
   expect(transactions.records.filter((record) => record.status === "active")).toEqual([]);
   expect(await store.listLeases()).toEqual([]);
+}
+
+/**
+ * A client over a transport that answers only the init handshake, so a test can hand the client
+ * exactly the response frames it wants to see and inspect the request it is answering.
+ */
+function fakeWorkerClient(): {
+  client: MinnowDatabaseClient;
+  deliver: (data: unknown) => void;
+  lastRequestId: () => string;
+} {
+  let messageListener: ((event: MessageEvent<unknown>) => void) | undefined;
+  const requests: Array<{ kind: string; requestId: string }> = [];
+  const deliver = (data: unknown): void => {
+    messageListener?.({ data } as MessageEvent<unknown>);
+  };
+  const transport: ClientTransport = {
+    postMessage: (message) => {
+      const request = message as { kind: string; requestId: string };
+      requests.push(request);
+      if (request.kind === "rpc-init") {
+        queueMicrotask(() => {
+          deliver({
+            version: protocolVersion,
+            requestId: request.requestId,
+            kind: "rpc-result",
+            result: {},
+          });
+        });
+      }
+    },
+    addEventListener: (type, listener) => {
+      if (type === "message") messageListener = listener;
+    },
+  };
+  return {
+    client: new MinnowDatabaseClient(transport, { store: { kind: "memory" } }),
+    deliver,
+    lastRequestId: () => requests.at(-1)?.requestId ?? "",
+  };
 }
 
 describe("MinnowDatabaseClient", () => {
@@ -1311,6 +1355,52 @@ describe("MinnowDatabaseClient", () => {
     await expect(broken.ready()).rejects.toThrow("could not be deserialized");
   });
 
+  it("rejects a pending call on a frame it cannot read and stays usable afterwards", async () => {
+    const { client, deliver, lastRequestId } = fakeWorkerClient();
+    await client.ready();
+
+    // A newer worker answering an older client: the version check throws inside the listener.
+    const newer = client.listTables();
+    deliver({
+      version: protocolVersion + 1,
+      requestId: lastRequestId(),
+      kind: "rpc-result",
+      result: [],
+    });
+    await expect(newer).rejects.toThrow("cannot read: Unsupported protocol version");
+
+    // A failure frame without an error payload used to throw while rehydrating it.
+    const malformed = client.listTables();
+    deliver({ version: protocolVersion, requestId: lastRequestId(), kind: "rpc-failure" });
+    await expect(malformed).rejects.toThrow("without a readable error payload");
+
+    // Neither frame poisoned the connection: a well-formed answer still settles its call.
+    const healthy = client.listTables();
+    deliver({
+      version: protocolVersion,
+      requestId: lastRequestId(),
+      kind: "rpc-result",
+      result: [{ name: "ok" }],
+    });
+    await expect(healthy).resolves.toEqual([{ name: "ok" }]);
+  });
+
+  it("fails every pending call when an unreadable frame names no request in flight", async () => {
+    const { client, deliver } = fakeWorkerClient();
+    await client.ready();
+    const pending = client.listTables();
+    deliver({
+      version: protocolVersion + 1,
+      requestId: null,
+      kind: "rpc-event",
+      handleId: "unknown",
+      event: "change",
+      payload: {},
+    });
+    await expect(pending).rejects.toThrow("cannot read");
+    await expect(client.listTables()).rejects.toThrow("cannot read");
+  });
+
   it("installs and removes the browser visibility reporter", async () => {
     const documentListeners = new Map<string, () => void>();
     const removed: string[] = [];
@@ -1554,6 +1644,39 @@ describe("MinnowDatabaseClient", () => {
     await expect(client.listTables()).rejects.toThrow(
       /Database initialization failed: .*IndexedDB is unavailable/,
     );
+  });
+
+  it("a per-store worker refuses an init frame for another store kind", async () => {
+    const { clientSide, workerSide } = createBoundary();
+    attachWorkerHost(workerSide, indexedDbWorkerStore);
+    const client = new MinnowDatabaseClient(clientSide, { store: { kind: "memory" } });
+    const refusal =
+      "This worker bundles only the IndexedDB store and cannot open the memory store; " +
+      'import "@minnowdb/core/worker" for every adapter or "@minnowdb/core/worker/memory" for ' +
+      "the memory store.";
+    // The refusal is an ordinary init failure: it fails the init call itself …
+    await expect(client.ready()).rejects.toThrow(refusal);
+    // … and the calls pipelined behind it carry the same reason.
+    await expect(client.listTables()).rejects.toThrow(refusal);
+  });
+
+  it("a per-store worker opens the store kind it bundles", async () => {
+    const indexedDb = createBoundary();
+    attachWorkerHost(indexedDb.workerSide, indexedDbWorkerStore, { indexedDB: new IDBFactory() });
+    const indexedDbClient = new MinnowDatabaseClient(indexedDb.clientSide, {
+      store: { kind: "indexeddb", name: "bundled-store" },
+    });
+    await indexedDbClient.ready();
+    await createPeopleTable(indexedDbClient);
+    expect((await indexedDbClient.listTables()).map((table) => table.name)).toEqual(["people"]);
+    await indexedDbClient.close();
+
+    const memory = createBoundary();
+    attachWorkerHost(memory.workerSide, memoryWorkerStore);
+    const memoryClient = new MinnowDatabaseClient(memory.clientSide, { store: { kind: "memory" } });
+    await memoryClient.ready();
+    expect(await memoryClient.listTables()).toEqual([]);
+    await memoryClient.close();
   });
 
   it("initializes, writes, and queries through the boundary", async () => {

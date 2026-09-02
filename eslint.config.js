@@ -75,6 +75,11 @@ export default tseslint.config(
       "packages/core/src/engine/sql-mutation-conformance.test.ts",
       "packages/core/src/engine/delta-scan.test.ts",
       "packages/core/src/engine/scan-kernels.test.ts",
+      // Reads the test sources and the soak runner off disk to prove every recorded regression
+      // seed is iterated by exactly one suite the soak explores.
+      "packages/core/src/testing/seeds.test.ts",
+      // The Playwright runner's shared config and its flaky-test reporter are Node processes.
+      "playwright*.mjs",
       // Reads the checked-in format fixtures off disk; they are the databases earlier builds
       // wrote, and there is nowhere else to keep them.
       "packages/core/src/storage/format-compatibility.test.ts",
