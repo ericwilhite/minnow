@@ -26,6 +26,8 @@ import {
   type PredicateOperator,
   type QueryValue,
   type TableSource,
+  transparentProjectionSource,
+  dateTruncValue,
 } from "./query.js";
 import { concatenatedSqlValue, isSqlDomainValue } from "./sql-domains.js";
 import { simpleScalarFunctions } from "./sql-functions.js";
@@ -202,58 +204,146 @@ function optimizeBlock(block: CompiledQuery, nextCorrelationAlias: () => string)
   extractJoinKeys(block);
   normalizeBooleanPredicates(block);
   coalesceOrEqualityLists(block);
+  rewriteCalendarEqualities(block);
   propagateJoinKeyConstants(block);
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
 }
 
-/** Converts correlated LATERAL derived tables into ordinary set-at-a-time joins. */
+/**
+ * Converts correlated LATERAL derived tables into ordinary set-at-a-time joins. The inner
+ * block's correlation predicates become join keys; its grouping, per-row ordering, and LIMIT
+ * are kept by grouping on the keys and ranking within them, the same way a correlated scalar
+ * subquery is rewritten:
+ *
+ * - `GROUP BY` gains the equality keys, so each outer row still sees only its own group.
+ * - A global aggregate (`SELECT COUNT(*) …` with no GROUP BY) always yields one row per outer
+ *   row, so the join becomes a left join and the outer block reads each aggregate through
+ *   `CASE WHEN <key> IS NULL THEN <empty value> ELSE <column> END`: COUNT reads 0, others NULL.
+ * - `ORDER BY … LIMIT` becomes a row number partitioned by the keys, filtered to the window.
+ *
+ * Range correlations (`o.amount > c.threshold`) cannot be grouped or partitioned on, so those
+ * shapes keep the plain set-at-a-time join and are refused with grouping or LIMIT.
+ */
 function decorrelateLateralSources(block: CompiledQuery): void {
   if (block.base.lateral === true) {
     throw new TypeError("LATERAL needs a source to its left");
   }
   const available = new Set([block.base.alias]);
+  let lateralSequence = 0;
   for (const join of block.joins) {
     if (join.lateral !== true) {
       available.add(join.alias);
       continue;
     }
     delete join.lateral;
-    const inner = join.derived;
-    if (inner === undefined) throw new TypeError("LATERAL requires a derived query");
-    if (!blockReferencesOutside(inner)) {
+    const derived = join.derived;
+    if (derived === undefined) throw new TypeError("LATERAL requires a derived query");
+    if (!blockReferencesOutside(derived)) {
       available.add(join.alias);
       continue;
     }
-    if (
-      inner.groupBy.length > 0 ||
-      inner.having.length > 0 ||
-      inner.orderBy.length > 0 ||
-      inner.limit !== undefined
-    ) {
-      throw new TypeError(
-        "Correlated LATERAL queries cannot use grouping, HAVING, ORDER BY, or LIMIT",
-      );
-    }
+    // An ORDER BY over an unselected expression parses as a projection over the ordered block;
+    // the correlation, grouping, and ranking live in that inner block, and the projection is
+    // widened afterwards so the join can reach the key columns it adds.
+    const wrapper = transparentProjectionSource(derived);
+    const inner = wrapper?.inner ?? derived;
     const keys = extractCorrelation(inner, available, "LATERAL", true);
     const keyAliases = keys.map((_, index) => `\u0000lateral_key_${String(index + 1)}`);
+    const grouped = inner.groupBy.length > 0;
+    const globalAggregate =
+      !grouped &&
+      inner.select.some((item) => containsAggregateCall(item.expression)) &&
+      inner.having.length === 0;
+    const ranked =
+      inner.limit !== undefined ||
+      inner.limitParameter !== undefined ||
+      inner.offset !== undefined ||
+      inner.offsetParameter !== undefined;
+    const cross =
+      (join.on?.kind === "condition" &&
+        join.on.operator === "=" &&
+        join.on.left.kind === "literal" &&
+        join.on.left.value === 1 &&
+        join.on.right.kind === "literal" &&
+        join.on.right.value === 1) ||
+      (join.on?.kind === "literal" && join.on.value === true);
+    if (grouped || globalAggregate || ranked || inner.having.length > 0) {
+      if (!keys.every((key) => key.operator === "=")) {
+        throw new TypeError(
+          "Correlated LATERAL queries with grouping, HAVING, ORDER BY, or LIMIT need equality correlations",
+        );
+      }
+      if (inner.having.length > 0 && !grouped) {
+        throw new TypeError("HAVING in a correlated LATERAL query needs GROUP BY");
+      }
+    }
+    if (grouped || globalAggregate) {
+      for (const key of keys) inner.groupBy.push(structuredClone(key.inner));
+    }
     keys.forEach((key, index) => {
       inner.select.push({ expression: key.inner, alias: keyAliases[index] ?? "" });
     });
+    if (ranked) {
+      lateralSequence += 1;
+      const rankedRows = rankLateralRows(inner, keyAliases, lateralSequence);
+      if (wrapper === undefined) join.derived = rankedRows;
+      else derived.base.derived = rankedRows;
+    } else {
+      inner.orderBy = [];
+    }
+    if (wrapper !== undefined) {
+      for (const keyAlias of keyAliases) {
+        derived.select.push({
+          expression: { kind: "column", reference: `${derived.base.alias}.${keyAlias}` },
+          alias: keyAlias,
+        });
+      }
+    }
+    if (globalAggregate) {
+      if (!cross) {
+        throw new TypeError(
+          "A correlated LATERAL aggregate without GROUP BY needs ON TRUE or a comma join",
+        );
+      }
+      join.kind = "left";
+      const keyReference: Expression = {
+        kind: "column",
+        reference: `${join.alias}.${keyAliases[0] ?? ""}`,
+      };
+      const replacements = new Map<string, Expression>();
+      const visible = new Set(derived.select.map((item) => item.alias));
+      for (const item of inner.select) {
+        if (item.alias.startsWith("\u0000") || !visible.has(item.alias)) continue;
+        const empty = emptyScalarExpression(structuredClone(item.expression));
+        if (empty.kind === "literal" && empty.value === null) continue;
+        replacements.set(`${join.alias}.${item.alias}`, {
+          kind: "case",
+          branches: [
+            {
+              when: {
+                kind: "condition",
+                operator: "IS NULL",
+                left: structuredClone(keyReference),
+                right: { kind: "literal", value: null },
+              },
+              then: empty,
+            },
+          ],
+          otherwise: { kind: "column", reference: `${join.alias}.${item.alias}` },
+        });
+      }
+      if (replacements.size > 0) {
+        replaceOuterReferences(block, join.alias, replacements);
+      }
+    }
     const correlations = keys.map<Expression>((key, index) => ({
       kind: "condition",
       operator: reverseComparison(key.operator),
       left: key.outer,
       right: { kind: "column", reference: `${join.alias}.${keyAliases[index] ?? ""}` },
     }));
-    const cross =
-      join.on?.kind === "condition" &&
-      join.on.operator === "=" &&
-      join.on.left.kind === "literal" &&
-      join.on.left.value === 1 &&
-      join.on.right.kind === "literal" &&
-      join.on.right.value === 1;
     const original = cross
       ? undefined
       : (join.on ?? {
@@ -284,6 +374,136 @@ function decorrelateLateralSources(block: CompiledQuery): void {
       );
     }
     available.add(join.alias);
+  }
+}
+
+/**
+ * Wraps a LATERAL inner block whose ORDER BY/LIMIT apply per outer row: the block's order
+ * expressions project as hidden columns, a row number (RANK for WITH TIES) partitioned by the
+ * correlation keys ranks them, and a filtering block keeps the requested window. The result
+ * exposes the inner block's own aliases, so the outer query's references still resolve.
+ */
+function rankLateralRows(
+  inner: CompiledQuery,
+  keyAliases: readonly string[],
+  sequence: number,
+): CompiledQuery {
+  // An order term that names one of the block's own output aliases (the parser's hidden
+  // "(order n)" projections included) ranks on that column; any other term projects as a
+  // hidden column of its own.
+  const selectAliases = new Set(inner.select.map((item) => item.alias));
+  const orderAliases = inner.orderBy.map((order, index) => {
+    if (
+      order.expression.kind === "column" &&
+      !order.expression.reference.includes(".") &&
+      selectAliases.has(order.expression.reference)
+    ) {
+      return order.expression.reference;
+    }
+    const alias = `\u0000lateral_order_${String(sequence)}_${String(index + 1)}`;
+    inner.select.push({ expression: structuredClone(order.expression), alias });
+    return alias;
+  });
+  const windows = [
+    {
+      alias: `\u0000lateral_row_${String(sequence)}`,
+      name: inner.limitWithTies === true ? ("RANK" as const) : ("ROW_NUMBER" as const),
+      partitionAliases: [...keyAliases],
+      orderAliases: inner.orderBy.map((order, index) => ({
+        alias: orderAliases[index] ?? "",
+        direction: order.direction,
+        ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
+      })),
+    },
+  ];
+  const { limit, limitParameter, offset, offsetParameter, limitWithTies, ...rows } = inner;
+  void limitWithTies;
+  rows.orderBy = [];
+  const rankedAlias = `\u0000lateral_ranked_${String(sequence)}`;
+  const rowNumber: Expression = {
+    kind: "column",
+    reference: `${rankedAlias}.${windows[0]?.alias ?? ""}`,
+  };
+  const offsetExpression: Expression =
+    offsetParameter === undefined
+      ? { kind: "literal", value: offset ?? 0 }
+      : { kind: "parameter", index: offsetParameter };
+  const predicates: Predicate[] = [];
+  if ((offset ?? 0) > 0 || offsetParameter !== undefined) {
+    predicates.push({ left: rowNumber, operator: ">", right: offsetExpression });
+  }
+  if (limit !== undefined || limitParameter !== undefined) {
+    const limitExpression: Expression =
+      limitParameter === undefined
+        ? { kind: "literal", value: limit ?? 0 }
+        : { kind: "parameter", index: limitParameter };
+    predicates.push({
+      left: structuredClone(rowNumber),
+      operator: "<=",
+      right:
+        offset === undefined && offsetParameter === undefined
+          ? limitExpression
+          : {
+              kind: "binary",
+              operator: "+",
+              left: structuredClone(offsetExpression),
+              right: limitExpression,
+            },
+    });
+  }
+  return {
+    sql: "(lateral ranked rows)",
+    base: { table: rankedAlias, alias: rankedAlias, windowed: { block: rows, windows } },
+    joins: [],
+    select: rows.select.map((item) => ({
+      expression: { kind: "column" as const, reference: `${rankedAlias}.${item.alias}` },
+      alias: item.alias,
+    })),
+    predicates,
+    groupBy: [],
+    having: [],
+    orderBy: [],
+    ...(limitParameter === undefined ? {} : { limitValidationParameters: [limitParameter] }),
+    ...(offsetParameter === undefined ? {} : { offsetValidationParameters: [offsetParameter] }),
+  };
+}
+
+/**
+ * Replaces the outer block's references to one join alias's columns — everywhere except the
+ * join's own key expressions, which must keep addressing the raw column.
+ */
+function replaceOuterReferences(
+  block: CompiledQuery,
+  alias: string,
+  replacements: ReadonlyMap<string, Expression>,
+): void {
+  const rewrite = (expression: Expression): Expression => {
+    if (expression.kind === "column") {
+      const replacement = replacements.get(expression.reference);
+      return replacement === undefined ? expression : structuredClone(replacement);
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      replaceOuterReferences(expression.block, alias, replacements);
+      return expression;
+    }
+    if (expression.kind === "window") {
+      expression.partitionBy = expression.partitionBy.map(rewrite);
+      for (const order of expression.orderBy) order.expression = rewrite(order.expression);
+      if (expression.argument !== undefined) expression.argument = rewrite(expression.argument);
+      return expression;
+    }
+    return mapChildExpressions(expression, rewrite);
+  };
+  for (const item of block.select) item.expression = rewrite(item.expression);
+  for (const predicate of [...block.predicates, ...block.having]) {
+    predicate.left = rewrite(predicate.left);
+    predicate.right = rewrite(predicate.right);
+  }
+  block.groupBy = block.groupBy.map(rewrite);
+  for (const order of block.orderBy) order.expression = rewrite(order.expression);
+  for (const join of block.joins) {
+    if (join.alias === alias) continue;
+    if (join.on !== undefined) join.on = rewrite(join.on);
   }
 }
 
@@ -330,6 +550,141 @@ function extractJoinKeys(block: CompiledQuery): void {
 }
 
 /**
+ * `DATE_TRUNC('unit', col) = ts` and `EXTRACT(YEAR FROM col) = n` are equalities on a derived
+ * value that the scan cannot use; the same truth as a range on the column itself — `col >=
+ * start AND col < start + 1 unit` — reads by value range, prunes blocks by their statistics,
+ * and runs on the raw datetime kernel. A timestamp that is not aligned to its unit can never
+ * equal a truncation, so that predicate becomes a constant false.
+ */
+function rewriteCalendarEqualities(block: CompiledQuery): void {
+  const rewritten: Predicate[] = [];
+  for (const predicate of block.predicates) {
+    if (predicate.operator !== "=") {
+      rewritten.push(predicate);
+      continue;
+    }
+    let call: Extract<Expression, { kind: "call" }> | undefined;
+    let literal: Extract<Expression, { kind: "literal" }> | undefined;
+    if (predicate.left.kind === "call" && predicate.right.kind === "literal") {
+      call = predicate.left;
+      literal = predicate.right;
+    } else if (predicate.left.kind === "literal" && predicate.right.kind === "call") {
+      call = predicate.right;
+      literal = predicate.left;
+    }
+    if (call === undefined || literal === undefined) {
+      rewritten.push(predicate);
+      continue;
+    }
+    const range = calendarRange(call, literal);
+    if (range === undefined) {
+      rewritten.push(predicate);
+      continue;
+    }
+    if (range === "never") {
+      rewritten.push({
+        left: { kind: "literal", value: 1 },
+        operator: "=",
+        right: { kind: "literal", value: 0 },
+      });
+      continue;
+    }
+    rewritten.push(
+      {
+        left: structuredClone(range.column),
+        operator: ">=",
+        right: { kind: "literal", value: range.start },
+      },
+      {
+        left: structuredClone(range.column),
+        operator: "<",
+        right: { kind: "literal", value: range.end },
+      },
+    );
+  }
+  block.predicates = rewritten;
+}
+
+function calendarRange(
+  call: Extract<Expression, { kind: "call" }>,
+  literal: Extract<Expression, { kind: "literal" }>,
+): { column: Expression; start: Date; end: Date } | "never" | undefined {
+  if (call.name === "DATE_TRUNC") {
+    const [unit, column] = call.arguments;
+    if (
+      unit?.kind !== "literal" ||
+      typeof unit.value !== "string" ||
+      column?.kind !== "column" ||
+      !(literal.value instanceof Date)
+    ) {
+      return undefined;
+    }
+    const normalized = unit.value.toLowerCase();
+    if (!calendarUnitSteps.has(normalized)) return undefined;
+    const start = dateTruncValue(normalized, literal.value);
+    if (start === null || Number.isNaN(start.getTime())) return undefined;
+    if (start.getTime() !== literal.value.getTime()) return "never";
+    return { column, start, end: addCalendarUnit(start, normalized) };
+  }
+  if (call.name === "EXTRACT") {
+    const [field, column] = call.arguments;
+    if (
+      field?.kind !== "literal" ||
+      typeof field.value !== "string" ||
+      field.value.toLowerCase() !== "year" ||
+      column?.kind !== "column" ||
+      typeof literal.value !== "number"
+    ) {
+      return undefined;
+    }
+    const year = literal.value;
+    if (!Number.isInteger(year) || year < 1 || year > 9999) return "never";
+    return {
+      column,
+      start: new Date(Date.UTC(year, 0, 1)),
+      end: new Date(Date.UTC(year + 1, 0, 1)),
+    };
+  }
+  return undefined;
+}
+
+const calendarUnitSteps: ReadonlySet<string> = new Set([
+  "year",
+  "quarter",
+  "month",
+  "week",
+  "day",
+  "hour",
+  "minute",
+  "second",
+]);
+
+/** The instant one calendar unit after an aligned UTC instant. */
+function addCalendarUnit(start: Date, unit: string): Date {
+  const year = start.getUTCFullYear();
+  const month = start.getUTCMonth();
+  const day = start.getUTCDate();
+  switch (unit) {
+    case "year":
+      return new Date(Date.UTC(year + 1, 0, 1));
+    case "quarter":
+      return new Date(Date.UTC(year, month + 3, 1));
+    case "month":
+      return new Date(Date.UTC(year, month + 1, 1));
+    case "week":
+      return new Date(start.getTime() + 7 * 86_400_000);
+    case "day":
+      return new Date(Date.UTC(year, month, day + 1));
+    case "hour":
+      return new Date(start.getTime() + 3_600_000);
+    case "minute":
+      return new Date(start.getTime() + 60_000);
+    default:
+      return new Date(start.getTime() + 1000);
+  }
+}
+
+/**
  * An inner equi-join makes its two key columns equal on every output row, so a constant
  * equality or IN list on one key holds for the other: `c.id = 4 AND o.customer = c.id` implies
  * `o.customer = 4`. The implied predicate is added (never substituted), which lets the table
@@ -338,40 +693,66 @@ function extractJoinKeys(block: CompiledQuery): void {
  * keeps rows whose key is NULL, for which the implication fails.
  */
 function propagateJoinKeyConstants(block: CompiledQuery): void {
-  const keyPairs: Array<[string, string]> = [];
+  const earlier = new Set([block.base.alias]);
+  const pairs: Array<{ inner: string; outer: string; toInner: boolean; toOuter: boolean }> = [];
   for (const join of block.joins) {
-    if (join.kind !== "inner" || join.on !== undefined) continue;
-    if (join.left.kind !== "column" || join.right.kind !== "column") continue;
-    keyPairs.push([join.left.reference, join.right.reference]);
+    const ownAlias = join.alias;
+    // Only joins that drop an unmatched outer row qualify: a mirrored predicate is applied to
+    // the join's output, where a LEFT or anti join's null-extended row would fail it.
+    if (
+      join.on === undefined &&
+      join.left.kind === "column" &&
+      join.right.kind === "column" &&
+      (join.kind === "inner" || join.kind === "semi")
+    ) {
+      const leftOwn = join.left.reference.startsWith(`${ownAlias}.`);
+      const rightOwn = join.right.reference.startsWith(`${ownAlias}.`);
+      if (leftOwn !== rightOwn) {
+        const inner = leftOwn ? join.left.reference : join.right.reference;
+        const outer = leftOwn ? join.right.reference : join.left.reference;
+        const outerAlias = outer.slice(0, outer.indexOf("."));
+        // Both directions hold: the key values are equal on every surviving row, and a row
+        // without a match on either side is dropped anyway.
+        if (earlier.has(outerAlias)) pairs.push({ inner, outer, toInner: true, toOuter: true });
+      }
+    }
+    earlier.add(ownAlias);
   }
-  if (keyPairs.length === 0) return;
+  if (pairs.length === 0) return;
   const signature = (predicate: Predicate): string => JSON.stringify(predicate);
   const present = new Set(block.predicates.map(signature));
   const implied: Predicate[] = [];
+  const constantSide = (predicate: Predicate): "left" | "right" | undefined => {
+    if (predicate.operator === "IN") {
+      return predicate.left.kind === "column" &&
+        predicate.right.kind === "list" &&
+        predicate.right.items.every((item) => item.kind === "literal")
+        ? "right"
+        : undefined;
+    }
+    if (!rangeOrEqualityOperators.has(predicate.operator)) return undefined;
+    if (predicate.left.kind === "column" && predicate.right.kind === "literal") return "right";
+    if (predicate.right.kind === "column" && predicate.left.kind === "literal") return "left";
+    return undefined;
+  };
   for (const predicate of block.predicates) {
-    if (predicate.left.kind !== "column") continue;
-    const constant =
-      predicate.operator === "=" && predicate.right.kind === "literal"
-        ? predicate.right
-        : predicate.operator === "IN" &&
-            predicate.right.kind === "list" &&
-            predicate.right.items.every((item) => item.kind === "literal")
-          ? predicate.right
-          : undefined;
-    if (constant === undefined) continue;
-    for (const [left, right] of keyPairs) {
-      const other =
-        predicate.left.reference === left
-          ? right
-          : predicate.left.reference === right
-            ? left
+    const side = constantSide(predicate);
+    if (side === undefined) continue;
+    const column = side === "right" ? predicate.left : predicate.right;
+    if (column.kind !== "column") continue;
+    for (const pair of pairs) {
+      const target =
+        column.reference === pair.outer && pair.toInner
+          ? pair.inner
+          : column.reference === pair.inner && pair.toOuter
+            ? pair.outer
             : undefined;
-      if (other === undefined) continue;
-      const mirrored: Predicate = {
-        ...predicate,
-        left: { kind: "column", reference: other },
-        right: constant,
-      };
+      if (target === undefined) continue;
+      const replacement: Expression = { kind: "column", reference: target };
+      const mirrored: Predicate =
+        side === "right"
+          ? { ...predicate, left: replacement, right: structuredClone(predicate.right) }
+          : { ...predicate, left: structuredClone(predicate.left), right: replacement };
       const key = signature(mirrored);
       if (present.has(key)) continue;
       present.add(key);
@@ -380,6 +761,8 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
   }
   block.predicates.push(...implied);
 }
+
+const rangeOrEqualityOperators: ReadonlySet<string> = new Set(["=", "<", "<=", ">", ">="]);
 
 /**
  * Whether an equality's two sides split cleanly along this join: one side reads only the table

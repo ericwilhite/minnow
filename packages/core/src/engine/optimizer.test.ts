@@ -180,6 +180,187 @@ describe("deterministic plan rewrites", () => {
     expectEquivalent(grouped);
   });
 
+  it("rewrites calendar equalities into ranges the scan can use", () => {
+    const rows: DatabaseRow[] = [
+      { id: 1, at: new Date("2025-05-31T23:59:59.999Z") },
+      { id: 2, at: new Date("2025-06-01T00:00:00.000Z") },
+      { id: 3, at: new Date("2025-06-15T12:00:00.000Z") },
+      { id: 4, at: new Date("2025-06-30T23:59:59.999Z") },
+      { id: 5, at: new Date("2025-07-01T00:00:00.000Z") },
+      { id: 6, at: null },
+      { id: 7, at: new Date("2024-12-31T23:59:59.000Z") },
+      { id: 8, at: new Date("2025-01-01T00:00:00.000Z") },
+    ];
+    const tables = new Map<string, DatabaseRow[]>([["events", rows]]);
+    const ids = (sql: string): unknown[] => {
+      const optimized = optimizePlan(compileQuery(sql));
+      const raw = compileQuery(sql, { optimize: false });
+      const fromOptimized = executeQuery(optimized, tables).rows;
+      expect(fromOptimized, sql).toEqual(executeRowQuery(optimized, tables).rows);
+      expect(fromOptimized, sql).toEqual(executeRowQuery(raw, tables).rows);
+      return fromOptimized.map((row) => row.id);
+    };
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('month', at) = TIMESTAMP '2025-06-01 00:00:00' ORDER BY id",
+      ),
+    ).toEqual([2, 3, 4]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE TIMESTAMP '2025-06-01 00:00:00' = DATE_TRUNC('month', at) ORDER BY id",
+      ),
+    ).toEqual([2, 3, 4]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('month', at) = TIMESTAMP '2025-06-01 00:00:01' ORDER BY id",
+      ),
+    ).toEqual([]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('year', at) = TIMESTAMP '2025-01-01 00:00:00' ORDER BY id",
+      ),
+    ).toEqual([1, 2, 3, 4, 5, 8]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('quarter', at) = TIMESTAMP '2025-04-01 00:00:00' ORDER BY id",
+      ),
+    ).toEqual([1, 2, 3, 4]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('day', at) = TIMESTAMP '2025-06-30 00:00:00' ORDER BY id",
+      ),
+    ).toEqual([4]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('week', at) = TIMESTAMP '2025-06-09 00:00:00' ORDER BY id",
+      ),
+    ).toEqual([3]);
+    expect(
+      ids(
+        "SELECT id FROM events WHERE DATE_TRUNC('hour', at) = TIMESTAMP '2025-06-15 12:00:00' ORDER BY id",
+      ),
+    ).toEqual([3]);
+    expect(ids("SELECT id FROM events WHERE EXTRACT(YEAR FROM at) = 2025 ORDER BY id")).toEqual([
+      1, 2, 3, 4, 5, 8,
+    ]);
+    expect(ids("SELECT id FROM events WHERE EXTRACT(YEAR FROM at) = 2024 ORDER BY id")).toEqual([
+      7,
+    ]);
+    expect(ids("SELECT id FROM events WHERE EXTRACT(YEAR FROM at) = 2025.5 ORDER BY id")).toEqual(
+      [],
+    );
+    // The rewritten shape is a pair of ranges on the column itself.
+    const plan = optimizePlan(
+      compileQuery(
+        "SELECT id FROM events WHERE DATE_TRUNC('month', at) = TIMESTAMP '2025-06-01 00:00:00'",
+      ),
+    );
+    expect(plan.predicates).toEqual([
+      {
+        left: { kind: "column", reference: "at" },
+        operator: ">=",
+        right: { kind: "literal", value: new Date("2025-06-01T00:00:00.000Z") },
+      },
+      {
+        left: { kind: "column", reference: "at" },
+        operator: "<",
+        right: { kind: "literal", value: new Date("2025-07-01T00:00:00.000Z") },
+      },
+    ]);
+  });
+
+  it("mirrors key constants across joins in the directions each join kind allows", () => {
+    const tables = new Map<string, DatabaseRow[]>([
+      [
+        "customers",
+        [
+          { customer_id: 1, name: "a" },
+          { customer_id: 2, name: "b" },
+          { customer_id: 3, name: "c" },
+        ],
+      ],
+      [
+        "orders",
+        [
+          { id: 10, customer: 1, amount: 9 },
+          { id: 11, customer: 2, amount: 9 },
+          { id: 12, customer: 1, amount: 1 },
+          { id: 13, customer: 9, amount: 5 },
+        ],
+      ],
+    ]);
+    // Correlated subqueries have no runnable unoptimized form (decorrelation is lowering), so
+    // those shapes compare the two executors only.
+    const check = (sql: string, expected: unknown[], raw = true): void => {
+      const optimized = optimizePlan(compileQuery(sql));
+      expect(executeQuery(optimized, tables).rows, sql).toEqual(expected);
+      expect(executeRowQuery(optimized, tables).rows, sql).toEqual(expected);
+      if (raw) {
+        expect(executeRowQuery(compileQuery(sql, { optimize: false }), tables).rows, sql).toEqual(
+          expected,
+        );
+      }
+    };
+    // A range on the outer key reaches the inner side of an inner join and a semi-join. A LEFT
+    // join keeps its null-extended rows, which a mirrored predicate would fail, so it gets none.
+    check(
+      "SELECT o.id FROM customers c JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id <= 1 ORDER BY o.id",
+      [{ id: 10 }, { id: 12 }],
+    );
+    const leftPlan = optimizePlan(
+      compileQuery(
+        "SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id >= 2 ORDER BY c.name, o.id",
+      ),
+    );
+    expect(leftPlan.predicates).toHaveLength(1);
+    check(
+      "SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer = c.customer_id WHERE c.customer_id >= 2 ORDER BY c.name, o.id",
+      [
+        { name: "b", id: 11 },
+        { name: "c", id: null },
+      ],
+    );
+    check(
+      "SELECT c.name FROM customers c WHERE c.customer_id < 3 AND EXISTS (SELECT 1 FROM orders o WHERE o.customer = c.customer_id AND o.amount > 5) ORDER BY c.name",
+      [{ name: "a" }, { name: "b" }],
+      false,
+    );
+    check(
+      "SELECT c.name FROM customers c WHERE c.customer_id >= 2 AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer = c.customer_id) ORDER BY c.name",
+      [{ name: "c" }],
+      false,
+    );
+    // An inner-side constant only travels outward where unmatched outer rows are dropped anyway.
+    const leftInner = optimizePlan(
+      compileQuery(
+        "SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer = c.customer_id WHERE o.customer IN (1, 9) ORDER BY c.name",
+      ),
+    );
+    expect(
+      leftInner.predicates.some(
+        (predicate) =>
+          predicate.left.kind === "column" && predicate.left.reference === "c.customer_id",
+      ),
+    ).toBe(false);
+    check(
+      "SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer = c.customer_id WHERE o.customer IN (1, 9) ORDER BY c.name, o.id",
+      [
+        { name: "a", id: 10 },
+        { name: "a", id: 12 },
+      ],
+    );
+    const inner = optimizePlan(
+      compileQuery(
+        "SELECT c.name, o.id FROM customers c JOIN orders o ON o.customer = c.customer_id WHERE o.customer > 1 ORDER BY c.name",
+      ),
+    );
+    expect(inner.predicates).toContainEqual({
+      left: { kind: "column", reference: "c.customer_id" },
+      operator: ">",
+      right: { kind: "literal", value: 1 },
+    });
+  });
+
   it("mirrors a constant on one inner-join key onto the other key", () => {
     const plan = optimizePlan(
       compileQuery(

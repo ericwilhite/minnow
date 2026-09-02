@@ -126,10 +126,11 @@ describe("basic query specification", () => {
     expect(run("SELECT r.* FROM rows r WHERE id = 3")).toEqual([
       { id: 3, region: "east", amount: 3, label: "charlie" },
     ]);
-    // With several sources the outputs are alias-qualified, the same naming a bare * uses.
+    // With several sources the outputs keep their bare names unless two sources contribute the
+    // same one, the same naming a bare * uses.
     expect(
       run("SELECT d.*, r.id FROM rows r JOIN dims d ON d.region = r.region WHERE r.id = 1"),
-    ).toEqual([{ "d.region": "west", "d.tag": "W", id: 1 }]);
+    ).toEqual([{ region: "west", tag: "W", id: 1 }]);
     expect(run("SELECT s.* FROM (SELECT id, amount FROM rows WHERE id = 1) s")).toEqual([
       { id: 1, amount: 10 },
     ]);

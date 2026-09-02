@@ -26,11 +26,18 @@ discarded before a join builds a hash table out of them.
 membership test and can skip blocks by value range. Any other OR keeps its shape and is evaluated
 per row.
 
-**Constants cross join keys.** An inner equi-join makes its two key columns equal, so a constant
-on one side reaches the other: `WHERE c.customer_id = 42` with `ON o.customer = c.customer_id`
-also filters `orders` by `customer = 42` before the join, through a
-[secondary index](/docs/sql/ddl#secondary-indexes) when one exists, or through the unique key
-when the constant names it.
+**Constants cross join keys.** An inner equi-join or a semi-join (a decorrelated `EXISTS`)
+makes its two key columns equal, so an equality, `IN` list, or range on one side reaches the
+other: `WHERE c.customer_id = 42` with `ON o.customer = c.customer_id` also filters `orders` by
+`customer = 42` before the join, through a [secondary index](/docs/sql/ddl#secondary-indexes)
+when one exists, or through the unique key when the constant names it. A `LEFT` join keeps its
+null-extended rows, which a mirrored predicate would fail, so it gets none.
+
+**Calendar equalities become ranges.** `DATE_TRUNC('month', placed_at) = TIMESTAMP '2025-06-01
+00:00:00'` and `EXTRACT(YEAR FROM placed_at) = 2025` are planned as `placed_at >= start AND
+placed_at < start + 1 unit`, which skips blocks by value range and runs on the raw datetime
+kernel instead of computing a calendar value per row. A timestamp not aligned to its unit can
+never equal a truncation, so that predicate is a constant false.
 
 **Skipping by value range.** Every block records the minimum and maximum of the column it holds. A
 comparison that cannot be true inside a block's range skips the block without decoding or
@@ -85,11 +92,14 @@ allows`.
 
 **One value at a time, not one row.** A predicate that reads exactly one string column —
 `LOWER(status) = 'paid'`, `COALESCE(region, 'none') = 'none'`, a `CASE` over one column — is
-evaluated once per distinct value of that column and applied by dictionary code. A `GROUP BY`
-over one string column or an expression of it, or over one numeric or datetime column, resolves
-its group the same way, and a `GROUP BY` over several string columns packs their codes into one
-slot. Plain number and string comparisons, number arithmetic, whole-number `ROUND`, and the
-calendar functions run as typed operations without domain checks per row.
+evaluated once per distinct value of that column and applied by dictionary code. So is a
+conditional aggregate: `SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END)` decides the
+branch once per distinct status and then reads the number column directly. A `GROUP BY` over one
+string column or an expression of it, or over one numeric or datetime column, resolves its group
+the same way, and a `GROUP BY` over several bare columns — string, number, or datetime — packs
+one code per column into a single slot. Plain number and string comparisons, number arithmetic,
+whole-number `ROUND`, and the calendar functions run as typed operations without domain checks
+per row.
 
 The query runner works on batches of column values rather than one row at a time, and
 scans stream block by block so a table is never required to be resident. When a hash table,

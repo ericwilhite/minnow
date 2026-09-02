@@ -968,7 +968,7 @@ function dateAddValue(
     : result;
 }
 
-function dateTruncValue(unit: unknown, value: unknown): Date | null {
+export function dateTruncValue(unit: unknown, value: unknown): Date | null {
   if (typeof unit !== "string" || !dateTruncUnits.has(unit.toLowerCase())) {
     throw new TypeError(
       "DATE_TRUNC requires a unit of year, quarter, month, week, day, hour, minute, or second",
@@ -1190,6 +1190,15 @@ function throwLocated(error: unknown, offset: number, span: { start: number; end
   throw error;
 }
 
+/** One RETURNING item beyond a plain column: its statement text, output name, and the column it names when it is one. */
+export interface ReturningItem {
+  sql: string;
+  alias: string;
+  expression: Expression;
+  /** The target column the item names, when it is a bare column reference. */
+  column?: string;
+}
+
 export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
   validateSqlSource(sql);
   const { text, offset } = normalizeSql(sql);
@@ -1340,6 +1349,8 @@ export type CompiledStatement =
         where?: Expression;
       };
       returning?: string[] | "*";
+      /** RETURNING items that are not plain columns, evaluated over the affected rows. */
+      returningItems?: ReturningItem[];
       parameterCount?: number;
     }
   | {
@@ -1350,6 +1361,8 @@ export type CompiledStatement =
       assignments: Array<{ column: string; expression: Expression }>;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       returning?: string[] | "*";
+      /** RETURNING items that are not plain columns, evaluated over the affected rows. */
+      returningItems?: ReturningItem[];
       parameterCount?: number;
     }
   | {
@@ -1358,6 +1371,8 @@ export type CompiledStatement =
       alias?: string;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       returning?: string[] | "*";
+      /** RETURNING items that are not plain columns, evaluated over the affected rows. */
+      returningItems?: ReturningItem[];
       parameterCount?: number;
     }
   | {
@@ -6936,34 +6951,80 @@ class Parser {
   }
 
   /** RETURNING *, target.*, or [target.]col, ... — execution owns the row semantics. */
-  #returningClause(table: string, alias?: string): { returning?: string[] | "*" } {
+  /**
+   * RETURNING: `*`, `target.*`, or a list of items. A list of plain (optionally target-qualified)
+   * columns keeps the column form; any other item — an expression, a function call, an
+   * aliased column — is carried as an expression list that the executor evaluates over the
+   * affected rows through an ordinary SELECT, with the statement text of each item.
+   */
+  #returningClause(
+    table: string,
+    alias?: string,
+  ): { returning?: string[] | "*"; returningItems?: ReturningItem[] } {
     if (!this.#isKeyword("RETURNING")) return {};
     this.#keyword("RETURNING");
     if (this.#peek().text === "*") {
       this.#index += 1;
       return { returning: "*" };
     }
-    const columns: string[] = [];
+    const items: ReturningItem[] = [];
+    let plain = true;
     for (;;) {
-      const first = this.#identifier();
-      if (this.#punctuation(".")) {
-        if (first !== table && first !== alias) {
+      const start = this.#peek();
+      if (
+        start.kind === "identifier" &&
+        this.tokens[this.#index + 1]?.text === "." &&
+        this.tokens[this.#index + 2]?.text === "*"
+      ) {
+        this.#index += 3;
+        if (start.text !== table && start.text !== alias) {
           throw new TypeError(`RETURNING qualifier must name the target table: ${alias ?? table}`);
         }
-        if (this.#peek().text === "*") {
-          this.#index += 1;
-          if (columns.length > 0 || this.#peek().text === ",") {
-            throw new TypeError("RETURNING target.* must be the only returned item");
-          }
-          return { returning: "*" };
+        if (items.length > 0 || this.#peek().text === ",") {
+          throw new TypeError("RETURNING target.* must be the only returned item");
         }
-        columns.push(this.#identifier());
-      } else {
-        columns.push(first);
+        return { returning: "*" };
       }
+      const expression = this.#expression();
+      const end = this.tokens[this.#index - 1] ?? start;
+      let outputAlias = defaultAlias(expression);
+      let explicit = false;
+      if (this.#isKeyword("AS")) {
+        this.#keyword("AS");
+        outputAlias = this.#identifier();
+        explicit = true;
+      }
+      let column: string | undefined;
+      if (expression.kind === "column") {
+        const parts = expression.reference.split(".");
+        if (parts.length === 1) column = parts[0];
+        else if (parts.length === 2 && (parts[0] === table || parts[0] === alias))
+          column = parts[1];
+        else {
+          throw new TypeError(`RETURNING qualifier must name the target table: ${alias ?? table}`);
+        }
+      }
+      if (column === undefined || explicit) plain = false;
+      items.push({
+        sql: this.text.slice(start.start, end.end),
+        alias: outputAlias,
+        expression,
+        ...(column === undefined ? {} : { column }),
+      });
       if (!this.#punctuation(",")) break;
     }
-    return { returning: columns };
+    if (plain) return { returning: items.map((item) => item.column ?? item.alias) };
+    for (const item of items) {
+      if (hasAggregate(item.expression)) {
+        throw new TypeError("RETURNING cannot use aggregate functions");
+      }
+    }
+    const aliases = new Set<string>();
+    for (const item of items) {
+      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
+      aliases.add(item.alias);
+    }
+    return { returningItems: items };
   }
 
   /**
@@ -9651,13 +9712,16 @@ function resolveOrderQualifiers(
     if (expression.kind !== "column") return order;
     const separator = expression.reference.indexOf(".");
     if (separator === -1) return order;
-    if (
-      select.some(
-        (item) =>
-          item.expression.kind === "column" && item.expression.reference === expression.reference,
-      )
-    ) {
-      return order;
+    // A selected column referenced exactly as written orders by that output column: a wildcard
+    // expansion reads `p.name` but names the output `name`.
+    const exact = select.find(
+      (item) =>
+        item.expression.kind === "column" && item.expression.reference === expression.reference,
+    );
+    if (exact !== undefined) {
+      return exact.alias === expression.reference
+        ? order
+        : { ...order, expression: { kind: "column", reference: exact.alias } };
     }
     const qualifier = expression.reference.slice(0, separator);
     const column = expression.reference.slice(separator + 1);
@@ -10021,15 +10085,18 @@ function expandDistinctWildcard(
     columns: sourceWildcardColumns(source, columnsOf),
   }));
   const visible = shaped.filter(({ columns }) => (columns?.length ?? 0) > 0);
-  const multiple = visible.length > 1;
+  const contributed = new Map<string, number>();
+  for (const { columns } of visible) {
+    for (const name of columns ?? []) contributed.set(name, (contributed.get(name) ?? 0) + 1);
+  }
   const select: SelectItem[] = visible.flatMap(({ source, columns }) => {
     if (columns === undefined) {
       throw new TypeError(`SELECT DISTINCT * requires known columns for: ${source.table}`);
     }
-    return columns.map((name) => {
-      const output = multiple ? `${source.alias}.${name}` : name;
-      return { expression: { kind: "column" as const, reference: output }, alias: output };
-    });
+    return columns.map((name) => ({
+      expression: { kind: "column" as const, reference: `${source.alias}.${name}` },
+      alias: (contributed.get(name) ?? 0) > 1 ? `${source.alias}.${name}` : name,
+    }));
   });
   const { distinctWildcard, ...rest } = plan;
   void distinctWildcard;
@@ -10296,7 +10363,18 @@ export function bindPendingSelectShapes(
     if (unknown !== undefined) {
       throw new TypeError(`SELECT * requires known columns for: ${unknown.source.table}`);
     }
-    const multiple = shaped.filter(({ columns }) => (columns?.length ?? 0) > 0).length > 1;
+    // Wildcard outputs keep their bare column names, as PostgreSQL returns them; only a name
+    // that two sources both contribute (`SELECT *` over a join on `id`) is alias-qualified, since
+    // a result row cannot carry two columns named `id`.
+    const contributed = new Map<string, number>();
+    for (const item of block.select) {
+      if (item.expression.kind !== "wildcard") continue;
+      const table = item.expression.table;
+      for (const { source, columns } of shaped) {
+        if (table !== undefined && source.alias !== table) continue;
+        for (const name of columns ?? []) contributed.set(name, (contributed.get(name) ?? 0) + 1);
+      }
+    }
     const items = block.select.flatMap((item): SelectItem[] => {
       if (item.expression.kind !== "wildcard") return [item];
       const table = item.expression.table;
@@ -10308,7 +10386,7 @@ export function bindPendingSelectShapes(
       return selected.flatMap(({ source, columns }) =>
         (columns ?? []).map((name) => ({
           expression: { kind: "column" as const, reference: `${source.alias}.${name}` },
-          alias: multiple ? `${source.alias}.${name}` : name,
+          alias: (contributed.get(name) ?? 0) > 1 ? `${source.alias}.${name}` : name,
         })),
       );
     });

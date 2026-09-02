@@ -393,7 +393,8 @@ describe("public SQL queries", () => {
     );
     expect(reference.rows).toEqual([{ a: 3, b: null }]);
 
-    // Joined wildcard outputs stay alias-qualified, exactly like plain SELECT *.
+    // Joined wildcard outputs keep bare names except where two sources contribute the same
+    // name, exactly like plain SELECT *: `a` comes from both sides, `b` and `tag` do not.
     await database.createTable({
       name: "tags",
       columns: [
@@ -406,9 +407,9 @@ describe("public SQL queries", () => {
       "SELECT DISTINCT * FROM pairs p JOIN tags t ON t.a = p.a WHERE p.b = 'x'",
     );
     expect(joined).toEqual({
-      columns: ["p.a", "p.b", "t.a", "t.tag"],
+      columns: ["p.a", "b", "t.a", "tag"],
       columnDomains: [null, null, null, null],
-      rows: [{ "p.a": 1, "p.b": "x", "t.a": 1, "t.tag": "t" }],
+      rows: [{ "p.a": 1, b: "x", "t.a": 1, tag: "t" }],
     });
   });
 
@@ -579,7 +580,8 @@ describe("public SQL queries", () => {
       expect(result.rows.map((row) => `${String(row.name)}/${String(row.id)}`)).toEqual(sorted);
     }
 
-    // Several sources prefix the outputs instead, so a bare reference resolves the other way.
+    // Several sources keep bare output names unless they collide (none do here), and a
+    // qualified reference resolves to the output that the wildcard expansion produced.
     await database.createTable({
       name: "pets",
       uniqueKey: "pet_id",
@@ -603,7 +605,7 @@ describe("public SQL queries", () => {
       "SELECT * FROM people o JOIN pets t ON o.id = t.owner ORDER BY t.pet_name",
     ]) {
       const result = await database.query(sql);
-      expect(result.rows.map((row) => row["pets.pet_name"] ?? row["t.pet_name"])).toEqual(petNames);
+      expect(result.rows.map((row) => row.pet_name)).toEqual(petNames);
     }
 
     // Shape-dependent lowerings bind the wildcard before they run: an unselected joined sort
@@ -615,7 +617,7 @@ describe("public SQL queries", () => {
           "SELECT people.* FROM people JOIN pets ON people.id = pets.owner " +
             "ORDER BY pets.pet_name",
         )
-      ).rows.map((row) => row["people.id"]),
+      ).rows.map((row) => row.id),
     ).toEqual([9, 8, 7, 6, 5]);
     expect(
       (
@@ -623,7 +625,7 @@ describe("public SQL queries", () => {
           "SELECT DISTINCT people.* FROM people JOIN pets ON people.id = pets.owner " +
             "ORDER BY people.id",
         )
-      ).rows.map((row) => row["people.id"]),
+      ).rows.map((row) => row.id),
     ).toEqual([5, 6, 7, 8, 9]);
     expect(
       (
@@ -631,7 +633,7 @@ describe("public SQL queries", () => {
           "SELECT people.*, ROW_NUMBER() OVER (ORDER BY people.id) AS position " +
             "FROM people JOIN pets ON people.id = pets.owner ORDER BY people.id",
         )
-      ).rows.map((row) => [row["people.id"], row.position]),
+      ).rows.map((row) => [row.id, row.position]),
     ).toEqual([
       [5, 1],
       [6, 2],

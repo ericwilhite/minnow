@@ -217,11 +217,88 @@ describe("correlated subquery decorrelation", () => {
           "(SELECT d.label FROM dims d WHERE d.region = r.region) x ON TRUE ORDER BY r.amount",
       ),
     ).toEqual([
-      { amount: 3, "x.label": null },
-      { amount: 6, "x.label": "West Coast" },
-      { amount: 8, "x.label": null },
-      { amount: 10, "x.label": "West Coast" },
+      { amount: 3, label: null },
+      { amount: 6, label: "West Coast" },
+      { amount: 8, label: null },
+      { amount: 10, label: "West Coast" },
     ]);
+  });
+
+  it("groups, aggregates, and limits inside an equality-correlated LATERAL query", () => {
+    // Global aggregates answer once per outer row, including the rows with no match: COUNT is
+    // 0 and the rest NULL, for inner and left joins alike, exactly as PostgreSQL returns.
+    for (const sql of [
+      "SELECT r.amount, x.n, x.best FROM rows r JOIN LATERAL (SELECT COUNT(*) AS n, MAX(d.rank) AS best FROM dims d WHERE d.region = r.region) x ON TRUE ORDER BY r.amount",
+      "SELECT r.amount, x.n, x.best FROM rows r, LATERAL (SELECT COUNT(*) AS n, MAX(d.rank) AS best FROM dims d WHERE d.region = r.region) x ORDER BY r.amount",
+      "SELECT r.amount, x.n, x.best FROM rows r LEFT JOIN LATERAL (SELECT COUNT(*) AS n, MAX(d.rank) AS best FROM dims d WHERE d.region = r.region) x ON TRUE ORDER BY r.amount",
+    ]) {
+      expect(run(sql), sql).toEqual([
+        { amount: 3, n: 0, best: null },
+        { amount: 6, n: 1, best: 1 },
+        { amount: 8, n: 0, best: null },
+        { amount: 10, n: 1, best: 1 },
+      ]);
+    }
+    // The aggregate column may sit inside an outer expression and a WHERE clause.
+    expect(
+      run(
+        "SELECT r.amount, x.n + 100 AS shifted FROM rows r JOIN LATERAL (SELECT COUNT(*) AS n FROM dims d WHERE d.region = r.region) x ON TRUE WHERE x.n = 0 ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, shifted: 100 },
+      { amount: 8, shifted: 100 },
+    ]);
+    // GROUP BY and HAVING inside the lateral query group per outer row.
+    expect(
+      run(
+        "SELECT r.region, x.label, x.n FROM rows r JOIN LATERAL (SELECT d.label, COUNT(*) AS n FROM dims d WHERE d.region = r.region GROUP BY d.label HAVING COUNT(*) >= 1) x ON TRUE ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { region: "west", label: "West Coast", n: 1 },
+      { region: "west", label: "West Coast", n: 1 },
+    ]);
+    // ORDER BY ... LIMIT ranks within each outer row; a left join keeps rows with no match,
+    // OFFSET skips the first ranked row, and an unselected order term is still honored.
+    expect(
+      run(
+        "SELECT r.amount, x.v FROM rows r JOIN LATERAL (SELECT q.amount AS v FROM rows q WHERE q.region = r.region ORDER BY q.amount DESC LIMIT 1) x ON TRUE ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, v: 3 },
+      { amount: 6, v: 10 },
+      { amount: 10, v: 10 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, x.v FROM rows r LEFT JOIN LATERAL (SELECT q.amount AS v FROM rows q WHERE q.region = r.region ORDER BY q.amount LIMIT 1 OFFSET 1) x ON TRUE ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, v: null },
+      { amount: 6, v: 10 },
+      { amount: 8, v: null },
+      { amount: 10, v: 10 },
+    ]);
+    expect(
+      run(
+        "SELECT r.amount, x.label FROM rows r LEFT JOIN LATERAL (SELECT d.label FROM dims d WHERE d.region = r.region ORDER BY d.rank DESC LIMIT 1) x ON TRUE ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, label: null },
+      { amount: 6, label: "West Coast" },
+      { amount: 8, label: null },
+      { amount: 10, label: "West Coast" },
+    ]);
+    // A range correlation cannot be grouped or partitioned on.
+    expect(() =>
+      compileQuery(
+        "SELECT r.amount, x.n FROM rows r JOIN LATERAL (SELECT COUNT(*) AS n FROM rows q WHERE q.amount < r.amount) x ON TRUE",
+      ),
+    ).toThrow("need equality correlations");
+    expect(() =>
+      compileQuery(
+        "SELECT r.amount, x.v FROM rows r JOIN LATERAL (SELECT q.amount AS v FROM rows q WHERE q.amount < r.amount ORDER BY q.amount LIMIT 1) x ON TRUE",
+      ),
+    ).toThrow("need equality correlations");
   });
 
   it("supports multi-key correlation", () => {

@@ -1618,6 +1618,12 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ],
   ["from.lateral", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
   ["from.lateral-non-equi", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
+  ["from.lateral-aggregate", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
+  ["from.lateral-limit", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
+  [
+    "where.calendar-equality",
+    { oracles: ["sqlite"], reason: "SQLite has no DATE_TRUNC or EXTRACT" },
+  ],
   ["aggregate.string-agg", { oracles: ["sqlite"], reason: "SQLite spells it GROUP_CONCAT" }],
   ["json.table", { oracles: ["sqlite"], reason: "SQLite has no SQL/JSON JSON_TABLE syntax" }],
   ["predicate.similar-to", { oracles: ["sqlite"], reason: "SQLite has no SIMILAR TO" }],

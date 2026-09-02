@@ -276,6 +276,12 @@
       "notes": "RETURNING works on INSERT, UPDATE, and DELETE; inserts echo written values, updates return post-update values, and deletes return the rows as read. Columns and target.* may be target-qualified."
     },
     {
+      "id": "mutation.returning-expression",
+      "status": "supported",
+      "example": "UPDATE keyed SET score = score + 1 WHERE name = 'x' RETURNING name, score * 2 AS doubled, UPPER(name) AS label",
+      "notes": "Any scalar expression may appear in RETURNING, with SELECT semantics over the affected row: the post-image for INSERT and UPDATE, the removed row for DELETE. Aggregates are refused."
+    },
+    {
       "id": "mutation.upsert",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
@@ -1291,7 +1297,19 @@
       "id": "from.lateral",
       "status": "supported",
       "example": "SELECT x.amount FROM rows r, LATERAL (SELECT amount FROM dims WHERE dims.region = r.region) x",
-      "notes": "Equality and range-correlated derived sources become set-at-a-time joins. Correlated grouping, ordering, and LIMIT remain unsupported."
+      "notes": "Equality and range-correlated derived sources become set-at-a-time joins. Grouping, aggregates, and per-row ORDER BY ... LIMIT are supported for equality correlations; a range correlation keeps the plain join."
+    },
+    {
+      "id": "from.lateral-aggregate",
+      "status": "supported",
+      "example": "SELECT r.amount, x.n, x.best FROM rows r JOIN LATERAL (SELECT COUNT(*) AS n, MAX(d.label) AS best FROM dims d WHERE d.region = r.region) x ON TRUE ORDER BY r.amount",
+      "notes": "A global aggregate yields one row per outer row even with no matching inner rows: COUNT reads 0, other aggregates NULL, as PostgreSQL returns. GROUP BY and HAVING inside the lateral query gain the correlation key."
+    },
+    {
+      "id": "from.lateral-limit",
+      "status": "supported",
+      "example": "SELECT r.amount, x.label FROM rows r LEFT JOIN LATERAL (SELECT d.label FROM dims d WHERE d.region = r.region ORDER BY d.label DESC LIMIT 1) x ON TRUE ORDER BY r.amount",
+      "notes": "ORDER BY ... LIMIT/OFFSET inside an equality-correlated lateral query ranks rows per outer row (ROW_NUMBER partitioned by the key, RANK for WITH TIES) instead of running the query once per row."
     },
     {
       "id": "from.lateral-non-equi",
@@ -1508,6 +1526,12 @@
       "status": "supported",
       "example": "SELECT AGE(TIMESTAMP '2026-03-15 12:00:00', joined) AS since, AGE(joined) AS so_far FROM rows WHERE joined IS NOT NULL",
       "notes": "The calendar difference PostgreSQL's AGE reports (years and months, then days borrowed from the earlier date's month, then time); AGE(x) measures from the statement's CURRENT_DATE. The result is Minnow's canonical interval text."
+    },
+    {
+      "id": "where.calendar-equality",
+      "status": "supported",
+      "example": "SELECT amount FROM rows WHERE DATE_TRUNC('month', joined) = TIMESTAMP '2026-01-01 00:00:00' OR EXTRACT(YEAR FROM joined) = 2026 ORDER BY amount",
+      "notes": "DATE_TRUNC('unit', col) = ts and EXTRACT(YEAR FROM col) = n are planned as ranges on the column (col >= start AND col < start + 1 unit), so they skip blocks by value range and run on the raw datetime kernel; an unaligned timestamp is a constant false."
     },
     {
       "id": "function.date-part",

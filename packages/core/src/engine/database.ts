@@ -233,6 +233,7 @@ import {
   type PredicateOperator,
   type CompiledQuery,
   type CompiledStatement,
+  type ReturningItem,
   type ForeignKeyDefinition,
   type Expression,
   type InsertValue,
@@ -302,6 +303,7 @@ import {
   type ColumnVector,
   type QuerySpillStore,
   type VectorWindow,
+  type ColumnarColumnInput,
 } from "./vector.js";
 import {
   cachedPointReadTemplate,
@@ -1346,6 +1348,78 @@ interface ReturningExecuteFields {
   returnedColumns?: string[];
   /** Logical domains aligned with returnedColumns. */
   returnedColumnDomains?: Array<SqlDomain | null>;
+}
+
+/**
+ * Evaluates RETURNING expression items over the affected rows (every visible column of the
+ * post-image for INSERT and UPDATE, the pre-image for DELETE) through the row executor, so a
+ * function, arithmetic, or CASE in RETURNING has exactly the semantics it has in a SELECT.
+ */
+function projectReturningItems(
+  table: TableRecord,
+  alias: string,
+  items: readonly ReturningItem[],
+  rows: readonly QueryRow[],
+  facts: Pick<CatalogFacts, "domains" | "types">,
+): Required<ReturningExecuteFields> {
+  // The same catalog normalization a SELECT receives, and the same columnar executor: the
+  // affected rows become a one-table input whose values carry the execution form a stored row
+  // reads with, so `amount * 2` over a NUMERIC column is exact arithmetic here as well.
+  const plan = normalizePlanDomainLiterals(
+    {
+      sql: "(returning)",
+      base: { table: table.name, alias },
+      joins: [],
+      select: items.map((item) => ({
+        expression: structuredClone(item.expression),
+        alias: item.alias,
+      })),
+      predicates: [],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    },
+    facts.domains,
+    facts.types,
+  );
+  const visible = visibleTableColumns(table);
+  const columns = new Map<string, ColumnarColumnInput>(
+    visible.map((column) => [
+      column.name,
+      {
+        type: column.type,
+        values: rows.map((row) => {
+          const value = row[column.name] ?? null;
+          return typeof value === "string" && value.charCodeAt(0) !== 0
+            ? executionSqlValueFromInput(column, value)
+            : value;
+        }),
+      },
+    ]),
+  );
+  const input = createColumnarTable(table.name, columns);
+  const typedSchemas = new Map<string, SqlColumnSchema[]>([
+    [
+      table.name,
+      visible.map(({ name, type, integer, sqlDomain }) => ({
+        name,
+        type,
+        ...(integer === true ? { integer: true as const } : {}),
+        ...(sqlDomain === undefined ? {} : { sqlDomain }),
+      })),
+    ],
+  ]);
+  const memory = new QueryMemoryContext(undefined);
+  const prepared = createPreparedColumnarQuery(plan, new Map([[table.name, input]]), memory);
+  try {
+    return {
+      returnedRows: prepared.execute().rows,
+      returnedColumns: items.map((item) => item.alias),
+      returnedColumnDomains: inferResultColumnDomains(plan, typedSchemas),
+    };
+  } finally {
+    prepared.close();
+  }
 }
 
 function returningExecuteFields(
@@ -5382,6 +5456,29 @@ export class MinnowDatabase {
     return qualified === rewritten ? rewritten : optimizePlan(qualified);
   }
 
+  /** Replaces a statement's whole-row RETURNING payload with its expression items. */
+  async #projectReturningItems(
+    statement: CompiledStatement,
+    result: ExecuteResult,
+  ): Promise<ExecuteResult> {
+    if (
+      (statement.kind !== "insert" && statement.kind !== "update" && statement.kind !== "delete") ||
+      statement.returningItems === undefined ||
+      (result.kind !== "insert" && result.kind !== "update" && result.kind !== "delete") ||
+      result.returnedRows === undefined
+    ) {
+      return result;
+    }
+    const table = await this.#findTable(statement.table);
+    const alias =
+      statement.kind !== "insert" && statement.alias !== undefined ? statement.alias : table.name;
+    const facts = await this.#catalogFacts();
+    return {
+      ...result,
+      ...projectReturningItems(table, alias, statement.returningItems, result.returnedRows, facts),
+    };
+  }
+
   /** Resolves connection-local sequence calls before either synchronous executor sees the plan. */
   async #resolveSequenceCalls(plan: CompiledQuery): Promise<CompiledQuery> {
     const usesSequence = (expression: Expression): boolean =>
@@ -8989,11 +9086,17 @@ export class MinnowDatabase {
         );
       }
       return externalizeExecuteResult(
-        await this.#duringTransaction(open, () => open.session.executeStatement(boundStatement)),
+        await this.#projectReturningItems(
+          boundStatement,
+          await this.#duringTransaction(open, () => open.session.executeStatement(boundStatement)),
+        ),
       );
     }
     return externalizeExecuteResult(
-      await this.runStatement(bindStatementParameters(statement, params)),
+      await this.#projectReturningItems(
+        statement,
+        await this.runStatement(bindStatementParameters(statement, params)),
+      ),
     );
   }
 
@@ -10559,9 +10662,12 @@ export class MinnowDatabase {
     if (statement.kind === "insert") {
       statement = await this.#materializeInsertExpressions(statement, statementNow);
     }
-    // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
+    // A RETURNING clause parsed from SQL text applies unless the caller overrides it. Expression
+    // items read every column of the affected rows here; execute() projects them afterwards.
     if (statement.returning !== undefined && options.returning === undefined) {
       options = { ...options, returning: statement.returning };
+    } else if (statement.returningItems !== undefined && options.returning === undefined) {
+      options = { ...options, returning: "*" };
     }
     if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
       statement = await this.#filterConflictingInsertRows(statement, options.writer);

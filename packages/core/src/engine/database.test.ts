@@ -10484,6 +10484,17 @@ describe("streamed window kernels", () => {
     expect(await query("SELECT qty, COUNT(*) AS n FROM windowed GROUP BY qty")).toEqual(
       sorted([...byQty].map(([qty, n]) => ({ qty, n }))),
     );
+    const byQtyStatus = count((row) => `${String(row.qty)}|${row.status}`);
+    expect(
+      await query("SELECT qty, status, COUNT(*) AS n FROM windowed GROUP BY qty, status"),
+    ).toEqual(
+      sorted(
+        [...byQtyStatus].map(([key, n]) => {
+          const [qty, status] = key.split("|") as [string, string];
+          return { qty: qty === "null" ? null : Number(qty), status, n };
+        }),
+      ),
+    );
     const scalar = async (sql: string): Promise<unknown> =>
       (await database.query(sql, { memoize: false })).rows[0]?.n;
     expect(await scalar("SELECT COUNT(*) AS n FROM windowed WHERE LOWER(status) = 'paid'")).toBe(

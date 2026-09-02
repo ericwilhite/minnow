@@ -135,7 +135,7 @@ interface StringVector extends VectorBase {
 
 export type ColumnVector = BooleanVector | NumberVector | DateTimeVector | StringVector;
 
-interface ColumnarColumnInput {
+export interface ColumnarColumnInput {
   readonly type: VectorType;
   readonly values: readonly QueryValue[];
 }
@@ -535,6 +535,44 @@ interface AggregateSpec {
   readonly rawNumber?: { source: number; vector: NumberVector };
   /** AVG over a declared-scale NUMERIC column: the internal division's minimum result scale. */
   readonly avgScale?: number;
+  /**
+   * COUNT/SUM/AVG over a CASE whose conditions read one string column and whose branches are a
+   * bare number column or a numeric literal: the branch is decided once per dictionary code.
+   */
+  readonly conditional?: ConditionalAggregate;
+}
+
+type ConditionalBranchValue =
+  | { kind: "column"; source: number; vector: NumberVector }
+  | { kind: "literal"; value: number | null };
+
+interface ConditionalAggregate {
+  readonly source: number;
+  readonly vector: StringVector;
+  readonly branches: ReadonlyArray<{ when: BoundExpression; value: ConditionalBranchValue }>;
+  readonly otherwise: ConditionalBranchValue;
+  /** Per dictionary code plus NULL: -2 not yet learned, -1 the ELSE branch, else a branch index. */
+  readonly cache: { dictionary: readonly string[] | undefined; branch: Int32Array };
+}
+
+/**
+ * One column of a packed compound group key: a string column contributes its dictionary code,
+ * a number or datetime column a dense code assigned to each distinct raw value on first sight.
+ */
+type MultiCodeColumn =
+  | { readonly source: number; readonly vector: StringVector; readonly codes?: undefined }
+  | {
+      readonly source: number;
+      readonly vector: NumberVector | DateTimeVector;
+      readonly codes: Map<number, number>;
+    };
+
+/** Distinct raw values a packed number key column may carry before the generic index takes over. */
+const NUMBER_KEY_CODE_CAP = 1 << 20;
+
+interface FastAggregateSpec {
+  readonly kind: "star" | "column" | "conditional";
+  readonly sums: boolean;
 }
 
 interface GroupState {
@@ -1299,6 +1337,54 @@ function codeGroupingFor(
   return column === undefined ? undefined : { ...column, expression: key };
 }
 
+/**
+ * A CASE the batch aggregate kernel can decide per dictionary code: every WHEN reads exactly one
+ * string column (the same one), and every THEN/ELSE is a bare number column or a numeric literal.
+ */
+function conditionalAggregate(argument: BoundExpression): ConditionalAggregate | undefined {
+  if (argument.kind !== "case" || argument.branches.length === 0) return undefined;
+  const whens = argument.branches.map((branch) => branch.when);
+  const first = whens[0];
+  if (first === undefined) return undefined;
+  const conjunction = whens
+    .slice(1)
+    .reduce<BoundExpression>(
+      (left, right) => ({ kind: "logical", operator: "and", left, right, signature: "" }),
+      first,
+    );
+  const column = singleStringColumn(conjunction);
+  if (column === undefined) return undefined;
+  const branchValue = (
+    expression: BoundExpression | undefined,
+  ): ConditionalBranchValue | undefined => {
+    if (expression === undefined) return { kind: "literal", value: null };
+    if (expression.kind === "column" && expression.vector.kind === "number") {
+      return { kind: "column", source: expression.source, vector: expression.vector };
+    }
+    if (
+      expression.kind === "literal" &&
+      (expression.value === null || typeof expression.value === "number")
+    ) {
+      return { kind: "literal", value: expression.value };
+    }
+    return undefined;
+  };
+  const branches: Array<{ when: BoundExpression; value: ConditionalBranchValue }> = [];
+  for (const branch of argument.branches) {
+    const value = branchValue(branch.then);
+    if (value === undefined) return undefined;
+    branches.push({ when: branch.when, value });
+  }
+  const otherwise = branchValue(argument.otherwise);
+  if (otherwise === undefined) return undefined;
+  return {
+    ...column,
+    branches,
+    otherwise,
+    cache: { dictionary: undefined, branch: new Int32Array(0) },
+  };
+}
+
 /** The one string column an expression reads, when it reads exactly one column and no FTS. */
 function singleStringColumn(
   expression: BoundExpression,
@@ -1587,9 +1673,15 @@ function bindExpression(
       argument.vector.kind === "number"
         ? { source: argument.source, vector: argument.vector }
         : undefined;
+    const conditional =
+      (expression.name === "COUNT" || expression.name === "SUM" || expression.name === "AVG") &&
+      expression.distinct !== true
+        ? conditionalAggregate(argument)
+        : undefined;
     aggregateSpecs.push({
       name: expression.name,
       argument,
+      ...(conditional === undefined ? {} : { conditional }),
       ...(expression.name === "STRING_AGG"
         ? { delimiter: required(arguments_[1], "STRING_AGG delimiter is missing") }
         : {}),
@@ -3572,6 +3664,11 @@ function filterDictionaryPredicate(
   return kept;
 }
 
+/** Slots one packed key column occupies: dictionary size plus NULL, or the number-code cap. */
+function multiCodeSpan(column: MultiCodeColumn): number {
+  return column.codes === undefined ? column.vector.dictionary.length + 1 : NUMBER_KEY_CODE_CAP;
+}
+
 /** Every column node under a bound expression. */
 function boundColumnNodes(
   expression: BoundExpression,
@@ -4561,7 +4658,7 @@ class GroupAccumulator {
   #codeSlotsReserved = 0;
   #ordered: GroupState[] | undefined;
   readonly #codeColumns: ReadonlyArray<{ source: number; vector: StringVector } | undefined>;
-  #multiCodeColumns: ReadonlyArray<{ source: number; vector: StringVector }> | undefined;
+  #multiCodeColumns: readonly MultiCodeColumn[] | undefined;
   #multiCodeStates: Map<number, GroupState> | undefined;
   /** The dictionaries the packed slot table was laid out for; any swap re-lays it. */
   #multiCodeDictionaries: Array<readonly string[] | undefined> = [];
@@ -4595,7 +4692,7 @@ class GroupAccumulator {
       this.#memory,
     );
 
-  readonly #fastAggregatesCache: Array<{ kind: "star" | "column"; sums: boolean }> | undefined;
+  readonly #fastAggregatesCache: FastAggregateSpec[] | undefined;
 
   constructor(plan: BoundPlan, memory: QueryMemoryContext) {
     this.#plan = plan;
@@ -4628,13 +4725,31 @@ class GroupAccumulator {
               : undefined,
           )
         : [];
-    // When every compound key column is dictionary-coded, group lookup packs the codes into one
-    // integer slot and byte-encodes a key only on the first row of each combination per window.
-    // The slot table is laid out lazily by #ensureMultiCodeStates, which re-lays it whenever a
-    // streamed window swaps a dictionary; the group states themselves live in the value-keyed
-    // index, so a combination seen in two windows is one group.
-    if (codeColumns.length > 1 && codeColumns.every((column) => column !== undefined)) {
-      this.#multiCodeColumns = codeColumns;
+    // When every compound key column is a bare string, number, or datetime column, group lookup
+    // packs one code per column into one integer slot and byte-encodes a key only on the first
+    // row of each combination per window. The slot table is laid out lazily by
+    // #ensureMultiCodeStates, which re-lays it whenever a streamed window swaps a dictionary;
+    // the group states themselves live in the value-keyed index, so a combination seen in two
+    // windows is one group.
+    const packed: Array<MultiCodeColumn | undefined> =
+      plan.groupBy.length > 1
+        ? plan.groupBy.map((expression): MultiCodeColumn | undefined => {
+            if (expression.kind !== "column") return undefined;
+            if (expression.vector.kind === "string") {
+              return { source: expression.source, vector: expression.vector };
+            }
+            if (expression.vector.kind === "number" || expression.vector.kind === "datetime") {
+              return {
+                source: expression.source,
+                vector: expression.vector,
+                codes: new Map<number, number>(),
+              };
+            }
+            return undefined;
+          })
+        : [];
+    if (packed.length > 1 && packed.every((column) => column !== undefined)) {
+      this.#multiCodeColumns = packed;
       this.#codeColumns = [];
       return;
     }
@@ -4654,12 +4769,12 @@ class GroupAccumulator {
    * use a direct array (reserved against the budget); large ones a numeric Map. Returns false
    * when the budget refuses the array, which sends the query to the generic per-row index.
    */
-  #ensureMultiCodeStates(
-    columns: ReadonlyArray<{ source: number; vector: StringVector }>,
-  ): boolean {
+  #ensureMultiCodeStates(columns: readonly MultiCodeColumn[]): boolean {
     let current = true;
     for (let index = 0; index < columns.length; index += 1) {
-      if (this.#multiCodeDictionaries[index] !== columns[index]?.vector.dictionary) {
+      const column = columns[index];
+      if (column?.codes !== undefined) continue;
+      if (this.#multiCodeDictionaries[index] !== column?.vector.dictionary) {
         current = false;
         break;
       }
@@ -4668,7 +4783,7 @@ class GroupAccumulator {
       return true;
     }
     let slots = 1;
-    for (const column of columns) slots *= column.vector.dictionary.length + 1;
+    for (const column of columns) slots *= multiCodeSpan(column);
     if (!Number.isSafeInteger(slots)) return false;
     if (slots <= MULTI_CODE_GROUP_SLOT_CAP) {
       if (slots > this.#multiCodeSlotsReserved) {
@@ -4693,7 +4808,9 @@ class GroupAccumulator {
       this.#codeStates = undefined;
       this.#multiCodeStates = new Map<number, GroupState>();
     }
-    this.#multiCodeDictionaries = columns.map((column) => column.vector.dictionary);
+    this.#multiCodeDictionaries = columns.map((column) =>
+      column.codes === undefined ? column.vector.dictionary : undefined,
+    );
     return true;
   }
 
@@ -4702,8 +4819,8 @@ class GroupAccumulator {
    * column under COUNT/SUM/AVG. MIN/MAX keep the generic path for its comparison and memory
    * accounting semantics. Undefined when any aggregate needs the generic path.
    */
-  #fastAggregates(): Array<{ kind: "star" | "column"; sums: boolean }> | undefined {
-    const specs: Array<{ kind: "star" | "column"; sums: boolean }> = [];
+  #fastAggregates(): FastAggregateSpec[] | undefined {
+    const specs: FastAggregateSpec[] = [];
     for (const spec of this.#plan.aggregates) {
       // The kernel counts every row it is given; deduplication needs the per-row path.
       if (spec.distinct === true) return undefined;
@@ -4716,6 +4833,10 @@ class GroupAccumulator {
         (spec.name === "COUNT" || spec.name === "SUM" || spec.name === "AVG")
       ) {
         specs.push({ kind: "column", sums: spec.name !== "COUNT" });
+        continue;
+      }
+      if (spec.conditional !== undefined) {
+        specs.push({ kind: "conditional", sums: spec.name !== "COUNT" });
         continue;
       }
       return undefined;
@@ -4770,11 +4891,42 @@ class GroupAccumulator {
       readonly length: number;
       readonly slots: number;
     }> = [];
+    // Conditional aggregates: the branch for a dictionary code is learned from the first row
+    // carrying it (the generic truth evaluator on that row), then every later row with the code
+    // reads its branch's number column or literal directly.
+    const conditionals: Array<{
+      readonly index: number;
+      readonly sums: boolean;
+      readonly spec: ConditionalAggregate;
+      readonly rows: Int32Array | undefined;
+      readonly branch: Int32Array;
+      readonly nullSlot: number;
+      readonly truths: Array<(batch: BatchRows, row: number) => boolean | null>;
+    }> = [];
     let stars = 0;
     for (let index = 0; index < specs.length; index += 1) {
       const spec = specs[index];
       if (spec === undefined || spec.kind === "star") {
         stars += 1;
+        continue;
+      }
+      if (spec.kind === "conditional") {
+        const conditional = plan.aggregates[index]?.conditional;
+        if (conditional === undefined) return false;
+        const vector = conditional.vector;
+        if (conditional.cache.dictionary !== vector.dictionary) {
+          conditional.cache.dictionary = vector.dictionary;
+          conditional.cache.branch = new Int32Array(vector.dictionary.length + 1).fill(-2);
+        }
+        conditionals.push({
+          index,
+          sums: spec.sums,
+          spec: conditional,
+          rows: batch.rowsBySource[conditional.source],
+          branch: conditional.cache.branch,
+          nullSlot: vector.dictionary.length,
+          truths: conditional.branches.map((branch) => compiledTruth(plan, branch.when)),
+        });
         continue;
       }
       const raw = plan.aggregates[index]?.rawNumber;
@@ -4840,11 +4992,43 @@ class GroupAccumulator {
           state.sums[column.index] = (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
         }
       }
+      for (const conditional of conditionals) {
+        const code =
+          stringCodeAt(conditional.spec.vector, conditional.rows?.[row] ?? -1) ??
+          conditional.nullSlot;
+        let chosen = conditional.branch[code] ?? -2;
+        if (chosen === -2) {
+          chosen = -1;
+          for (let index = 0; index < conditional.truths.length; index += 1) {
+            if (conditional.truths[index]?.(batch, row) === true) {
+              chosen = index;
+              break;
+            }
+          }
+          conditional.branch[code] = chosen;
+        }
+        const branchValue =
+          chosen < 0 ? conditional.spec.otherwise : conditional.spec.branches[chosen]?.value;
+        if (branchValue === undefined) return false;
+        let value: number | null;
+        if (branchValue.kind === "literal") value = branchValue.value;
+        else {
+          value = rawFloat64Value(
+            branchValue.vector,
+            batch.rowsBySource[branchValue.source]?.[row] ?? -1,
+          );
+        }
+        if (value === null) continue;
+        counts[conditional.index] = (counts[conditional.index] ?? 0) + 1;
+        if (conditional.sums) {
+          state.sums[conditional.index] = (state.sums[conditional.index] ?? 0) + value;
+        }
+      }
     }
     return true;
   }
 
-  get fastAggregatesCache(): Array<{ kind: "star" | "column"; sums: boolean }> | undefined {
+  get fastAggregatesCache(): FastAggregateSpec[] | undefined {
     return this.#fastAggregatesCache;
   }
 
@@ -4954,19 +5138,55 @@ class GroupAccumulator {
       let slot = 0;
       for (let index = 0; index < multiCode.length; index += 1) {
         const column = required(multiCode[index], "Group code column is missing");
-        const vector = column.vector;
         const sourceRow = batch.rowsBySource[column.source]?.[row] ?? -1;
-        const code = stringCodeAt(vector, sourceRow) ?? vector.dictionary.length;
+        let code: number;
+        if (column.codes === undefined) {
+          code = stringCodeAt(column.vector, sourceRow) ?? column.vector.dictionary.length;
+        } else {
+          // Code 0 is NULL and every other finite value gets the next dense code; a key column
+          // with too many distinct values, or a non-finite one, hands the query to the index.
+          const raw = rawFloat64Value(column.vector, sourceRow);
+          if (raw === null) code = 0;
+          else if (!Number.isFinite(raw)) code = -1;
+          else {
+            const known = column.codes.get(raw);
+            if (known !== undefined) code = known;
+            else if (column.codes.size + 1 >= NUMBER_KEY_CODE_CAP) code = -1;
+            else {
+              code = column.codes.size + 1;
+              this.#memory.tally(PACKED_GROUP_ENTRY_BYTES, "Packed group key code");
+              column.codes.set(raw, code);
+            }
+          }
+          if (code < 0) {
+            this.#multiCodeColumns = undefined;
+            this.#codeStates = undefined;
+            this.#multiCodeStates = undefined;
+            return this.stateFor(batch, row);
+          }
+        }
         this.#multiCodeScratch[index] = code;
-        slot = slot * (vector.dictionary.length + 1) + code;
+        slot = slot * multiCodeSpan(column) + code;
       }
       let state = this.#codeStates?.[slot] ?? this.#multiCodeStates?.get(slot);
       if (state === undefined) {
         for (let index = 0; index < multiCode.length; index += 1) {
-          const vector = required(multiCode[index], "Group code column is missing").vector;
-          const code = this.#multiCodeScratch[index] ?? vector.dictionary.length;
-          this.#keyScratch[index] =
-            code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null);
+          const column = required(multiCode[index], "Group code column is missing");
+          const code = this.#multiCodeScratch[index] ?? 0;
+          if (column.codes === undefined) {
+            const vector = column.vector;
+            this.#keyScratch[index] =
+              code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null);
+          } else {
+            const raw = rawFloat64Value(
+              column.vector,
+              batch.rowsBySource[column.source]?.[row] ?? -1,
+            );
+            this.#keyScratch[index] =
+              raw === null
+                ? null
+                : groupKey(column.vector.kind === "datetime" ? new Date(raw) : raw);
+          }
         }
         this.#keyScratch.length = multiCode.length;
         this.#pendingBatch = batch;

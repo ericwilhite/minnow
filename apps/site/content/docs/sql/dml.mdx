@@ -159,7 +159,10 @@ RETURNING product_id, name, list_price
 ```
 
 The target qualifier is optional for columns and `*`, so PostgreSQL-builder output such as
-`RETURNING products.product_id` and `RETURNING products.*` is equivalent.
+`RETURNING products.product_id` and `RETURNING products.*` is equivalent. Any scalar expression
+works too, with the semantics it has in a `SELECT`: `RETURNING product_id, list_price * 1.05 AS
+next_price, UPPER(name) AS label` reads the post-update row for `UPDATE`, the written row for
+`INSERT`, and the removed row for `DELETE`. Aggregates are not allowed in `RETURNING`.
 
 ```ts
 const result = await db.execute(sql, [productId]);

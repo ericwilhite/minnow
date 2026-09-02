@@ -507,6 +507,62 @@ describe("vector query execution", () => {
     }
   });
 
+  it("decides CASE aggregates per dictionary code exactly like the row executor", () => {
+    // SUM/COUNT/AVG over a CASE whose conditions read one string column learn the branch once
+    // per distinct value. NULL codes, NULL branch values, missing ELSE, literal branches, and
+    // grouped shapes must all agree with the row executor, and shapes the kernel declines
+    // (an arithmetic THEN, a second column in a WHEN) still answer correctly.
+    const statuses = ["paid", "new", null, "shipped", "PAID", "paid"];
+    const rows: DatabaseRow[] = Array.from({ length: 3_000 }, (_, index) => ({
+      id: index + 1,
+      status: statuses[index % statuses.length] ?? null,
+      region: index % 3 === 0 ? "west" : "east",
+      amount: index % 11 === 0 ? null : (index * 7) % 100,
+      qty: index % 5,
+    }));
+    const tables = new Map([["orders", rows]]);
+    for (const sql of [
+      "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid, SUM(CASE WHEN status = 'new' THEN amount ELSE 0 END) AS fresh FROM orders",
+      "SELECT COUNT(CASE WHEN status = 'paid' THEN 1 END) AS n, AVG(CASE WHEN LOWER(status) = 'paid' THEN amount END) AS a FROM orders",
+      "SELECT SUM(CASE WHEN status IS NULL THEN 1 ELSE 0 END) AS missing, SUM(CASE WHEN status IN ('paid', 'PAID') THEN qty WHEN status = 'new' THEN 100 ELSE NULL END) AS mixed FROM orders",
+      "SELECT region, SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid, COUNT(*) AS n FROM orders GROUP BY region ORDER BY region",
+      "SELECT qty, SUM(CASE WHEN status <> 'new' THEN amount ELSE 0 END) AS other FROM orders GROUP BY qty ORDER BY qty",
+      "SELECT SUM(CASE WHEN status = 'paid' THEN amount * 2 ELSE 0 END) AS doubled FROM orders",
+      "SELECT SUM(CASE WHEN status = 'paid' AND region = 'west' THEN amount ELSE 0 END) AS west FROM orders",
+      "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid FROM orders WHERE amount > 50",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, tables).rows, sql).toEqual(executeRowQuery(plan, tables).rows);
+    }
+  });
+
+  it("packs number and datetime key columns into compound group slots exactly", () => {
+    // A compound GROUP BY over string, number, and datetime columns packs one code per column;
+    // NULL keys, repeated values, and a high-cardinality number column (which spills the packed
+    // path back to the generic index) must all agree with the row executor.
+    const rows: DatabaseRow[] = Array.from({ length: 6_000 }, (_, index) => ({
+      id: index + 1,
+      status: ["new", "paid", null, "shipped"][index % 4] ?? null,
+      region: index % 3 === 0 ? "west" : "east",
+      qty: index % 7 === 0 ? null : index % 5,
+      seen: index % 9 === 0 ? null : new Date(Date.UTC(2026, index % 4, 1)),
+      amount: (index * 13) % 100,
+      wide: index % 1_500,
+    }));
+    const tables = new Map([["orders", rows]]);
+    for (const sql of [
+      "SELECT qty, status, COUNT(*) AS n, SUM(amount) AS total FROM orders GROUP BY qty, status ORDER BY qty, status",
+      "SELECT status, qty, region, COUNT(*) AS n FROM orders GROUP BY status, qty, region ORDER BY status, qty, region",
+      "SELECT seen, region, MAX(amount) AS peak FROM orders GROUP BY seen, region ORDER BY seen, region",
+      "SELECT qty, seen, COUNT(*) AS n FROM orders GROUP BY qty, seen ORDER BY qty, seen",
+      "SELECT wide, status, COUNT(*) AS n FROM orders GROUP BY wide, status ORDER BY wide, status",
+      "SELECT qty, status, COUNT(*) AS n FROM orders WHERE amount > 40 GROUP BY qty, status HAVING COUNT(*) > 100 ORDER BY qty, status",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, tables).rows, sql).toEqual(executeRowQuery(plan, tables).rows);
+    }
+  });
+
   it("applies LIMIT in place without allocating a second boxed reference slice", () => {
     const plan = compileQuery("SELECT id FROM rows LIMIT 2");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }, { id: 3 }]]]);
@@ -875,9 +931,9 @@ describe("vector query execution", () => {
       ]),
     );
     expect(prepared.execute()).toEqual({
-      columns: ["l.id", "l.label", "r.id", "r.value"],
+      columns: ["l.id", "label", "r.id", "value"],
       columnDomains: [null, null, null, null],
-      rows: [{ "l.id": 1, "l.label": "left", "r.id": null, "r.value": null }],
+      rows: [{ "l.id": 1, label: "left", "r.id": null, value: null }],
     });
   });
 
@@ -914,9 +970,9 @@ describe("vector query execution", () => {
         ]),
       ),
     ).toEqual({
-      columns: ["l.id", "l.label", "r.id", "r.value"],
+      columns: ["l.id", "label", "r.id", "value"],
       columnDomains: [null, null, null, null],
-      rows: [{ "l.id": 1, "l.label": "left", "r.id": null, "r.value": null }],
+      rows: [{ "l.id": 1, label: "left", "r.id": null, value: null }],
     });
   });
 

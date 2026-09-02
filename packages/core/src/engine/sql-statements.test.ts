@@ -40,6 +40,71 @@ describe("RETURNING in SQL statements", () => {
   });
 });
 
+describe("RETURNING expressions", () => {
+  it("evaluates expressions over the written, post-update, and removed rows", async () => {
+    const database = await seeded();
+    const inserted = await database.execute(
+      "INSERT INTO people (name, score) VALUES (?, ?) RETURNING UPPER(name) AS label, score * 2 AS doubled, people.score",
+      ["Linus", 5],
+    );
+    expect(inserted).toMatchObject({
+      kind: "insert",
+      returnedColumns: ["label", "doubled", "score"],
+      returnedRows: [{ label: "LINUS", doubled: 10, score: 5 }],
+    });
+    const updated = await database.execute(
+      "UPDATE people AS p SET score = score + 1 WHERE name = 'Ada' RETURNING p.name, p.score - 1 AS previous, CASE WHEN p.score > 10 THEN 'high' ELSE 'low' END AS band",
+    );
+    expect(updated).toMatchObject({
+      kind: "update",
+      returnedRows: [{ name: "Ada", previous: 10, band: "high" }],
+    });
+    const deleted = await database.execute(
+      "DELETE FROM people WHERE score > 20 RETURNING name || '!' AS shout, score + 0.5 AS half",
+    );
+    expect(deleted).toMatchObject({
+      kind: "delete",
+      returnedRows: [{ shout: "Grace!", half: 25.5 }],
+    });
+    // Inside a statement transaction the same projection applies.
+    await database.execute("BEGIN");
+    const staged = await database.execute(
+      "UPDATE people SET score = 0 WHERE name = 'Linus' RETURNING name, score AS zero",
+    );
+    expect(staged).toMatchObject({ returnedRows: [{ name: "Linus", zero: 0 }] });
+    await database.execute("COMMIT");
+    expect((await database.query("SELECT score FROM people WHERE name = 'Linus'")).rows).toEqual([
+      { score: 0 },
+    ]);
+    await expect(
+      database.execute("UPDATE people SET score = 1 RETURNING COUNT(*) AS n"),
+    ).rejects.toThrow("RETURNING cannot use aggregate functions");
+    await expect(
+      database.execute("UPDATE people SET score = 1 RETURNING other.name"),
+    ).rejects.toThrow("RETURNING qualifier must name the target table");
+    await database.close();
+  });
+
+  it("keeps a domain column's rendering through an expression item", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE prices (sku TEXT PRIMARY KEY, amount NUMERIC(10, 2) NOT NULL)",
+    );
+    const inserted = await database.execute(
+      "INSERT INTO prices (sku, amount) VALUES ('a', 12.5) RETURNING sku, amount, amount * 2 AS doubled",
+    );
+    expect(inserted).toMatchObject({
+      returnedRows: [{ sku: "a", amount: "12.50", doubled: "25" }],
+      returnedColumnDomains: [
+        null,
+        { kind: "numeric", precision: 10, scale: 2 },
+        { kind: "numeric" },
+      ],
+    });
+    await database.close();
+  });
+});
+
 describe("DELETE selection", () => {
   it("streams unique keys through mutation history and falls back for staged overlays", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore(), {

@@ -58,9 +58,10 @@ returns rows in no promised order, as in any SQL engine.
 `*` and `alias.*` are expanded from the input schema before Minnow plans operations that depend
 on the output width. They therefore work with `DISTINCT`, window columns, set operations,
 CTE/derived column lists, `ORDER BY` expressions and ordinals, `INSERT ... SELECT`, and beside
-other select items (`SELECT *, total * 2 AS doubled FROM orders`). With one source, wildcard
-outputs use bare column names; with several sources, Minnow uses `alias.column` names so
-collisions stay visible.
+other select items (`SELECT *, total * 2 AS doubled FROM orders`). Wildcard outputs use bare
+column names, as PostgreSQL returns them; only a name that two sources both contribute — `id` in
+`SELECT *` over a join on `id` — is returned as `alias.column`, since one result row cannot
+carry two columns of the same name.
 
 ## Joins
 
@@ -90,7 +91,11 @@ An `ON` clause that carries more than its equality still hashes on that equality
 pairs it finds, rather than comparing every row with every row.
 
 Equality and range-correlated `LATERAL` derived sources are decorrelated into the same set-at-a-time
-join path. Correlated lateral queries do not support grouping, `HAVING`, ordering, or `LIMIT`.
+join path. An equality-correlated lateral query may also group, aggregate, and take a per-row
+`ORDER BY … LIMIT`: `GROUP BY` gains the correlation key, a global aggregate such as `COUNT(*)`
+still yields one row per outer row (0 for `COUNT`, `NULL` for the rest, exactly as PostgreSQL
+returns), and a `LIMIT` becomes a row number partitioned by the key. A range-correlated lateral
+query (`o.amount > c.threshold`) keeps the plain join and cannot group or limit.
 
 ## Aggregation
 

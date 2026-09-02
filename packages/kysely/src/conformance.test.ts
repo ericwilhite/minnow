@@ -79,6 +79,37 @@ afterEach(async () => {
 });
 
 describe("joins", () => {
+  it("names selectAll() outputs by their bare column names on joins", async () => {
+    const aliased = db
+      .selectFrom("users as u")
+      .innerJoin("teams as t", "t.teamId", "u.teamId")
+      .selectAll("u")
+      .orderBy("u.userId");
+    expectTypeOf<Awaited<ReturnType<typeof aliased.execute>>>().toEqualTypeOf<
+      Array<{ userId: number; name: string; age: number | null; teamId: number | null }>
+    >();
+    expect(await aliased.execute()).toEqual([
+      { userId: 1, name: "Ada", age: 36, teamId: 1 },
+      { userId: 2, name: "Grace", age: null, teamId: 1 },
+      { userId: 3, name: "Katherine", age: 55, teamId: 2 },
+    ]);
+    // A bare select * over the join keeps every name bare except the one both sides carry.
+    const rows = await db
+      .selectFrom("users")
+      .innerJoin("teams", "teams.teamId", "users.teamId")
+      .selectAll()
+      .orderBy("users.userId")
+      .execute();
+    expect(rows[0]).toEqual({
+      userId: 1,
+      name: "Ada",
+      age: 36,
+      "users.teamId": 1,
+      "teams.teamId": 1,
+      teamName: "Red",
+    });
+  });
+
   it("executes inner, left, right, full, and cross joins with exact nullability", async () => {
     const inner = db
       .selectFrom("users")
@@ -235,27 +266,30 @@ describe("joins", () => {
     ).toEqual([{ teamName: "Red", members: 4 }]);
   });
 
-  it("names the engine limit on correlated lateral ORDER BY/LIMIT subqueries", async () => {
-    // Top-N-per-group via LATERAL ... ORDER BY ... LIMIT is not supported by the engine; the
-    // refusal is a clear named error rather than a parse failure. Rank with a window function
-    // and filter instead.
-    await expect(
-      db
-        .selectFrom("users")
-        .innerJoinLateral(
-          (eb) =>
-            eb
-              .selectFrom("scores")
-              .select("scores.points")
-              .whereRef("scores.userId", "=", "users.userId")
-              .orderBy("scores.points", "desc")
-              .limit(1)
-              .as("best"),
-          (join) => join.onTrue(),
-        )
-        .select(["users.name", "best.points"])
-        .execute(),
-    ).rejects.toThrow("Correlated LATERAL queries cannot use grouping, HAVING, ORDER BY, or LIMIT");
+  it("answers top-N-per-group through a correlated lateral ORDER BY/LIMIT subquery", async () => {
+    // The engine ranks the lateral rows per outer row; users without scores drop out of the
+    // inner join, and the best score per user comes back.
+    const best = await db
+      .selectFrom("users")
+      .innerJoinLateral(
+        (eb) =>
+          eb
+            .selectFrom("scores")
+            .select("scores.points")
+            .whereRef("scores.userId", "=", "users.userId")
+            .orderBy("scores.points", "desc")
+            .limit(1)
+            .as("best"),
+        (join) => join.onTrue(),
+      )
+      .select(["users.name", "best.points"])
+      .orderBy("users.userId")
+      .execute();
+    expect(best).toEqual([
+      { name: "Ada", points: 20 },
+      { name: "Grace", points: 30 },
+      { name: "Katherine", points: 5 },
+    ]);
   });
 });
 
@@ -741,6 +775,22 @@ describe("mutations", () => {
     expect(await db.selectFrom("users").select("name").where("userId", "=", 4).execute()).toEqual([
       { name: "Solo" },
     ]);
+  });
+
+  it("returns expressions from RETURNING with SELECT semantics", async () => {
+    const updated = await db
+      .updateTable("users")
+      .set({ age: 40 })
+      .where("userId", "=", 1)
+      .returning((eb) => ["name", eb.lit(1).as("one"), sql<number>`"age" * 2`.as("doubleAge")])
+      .executeTakeFirstOrThrow();
+    expect(updated).toEqual({ name: "Ada", one: 1, doubleAge: 80 });
+    const deleted = await db
+      .deleteFrom("scores")
+      .where("scoreId", "=", 2)
+      .returning(sql<string>`'score-' || "points"`.as("label"))
+      .executeTakeFirstOrThrow();
+    expect(deleted).toEqual({ label: "score-20" });
   });
 
   it("updates through expressions and subquery predicates", async () => {
