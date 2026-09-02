@@ -838,7 +838,14 @@ function concatenationDomainKind(value: string): string | undefined {
  * those shapes keeps `||` from inventing a text concatenation PostgreSQL does not have —
  * and from ever concatenating internal domain encodings.
  */
-export function concatenatedSqlValue(left: string, right: string): string {
+export function concatenatedSqlValue(leftValue: unknown, rightValue: unknown): string {
+  // PostgreSQL has text || anynonarray and anynonarray || text: one side is text and the other
+  // renders as text. Two non-text operands (1 || 2, TRUE || FALSE) have no || operator.
+  const leftText = typeof leftValue === "string";
+  const rightText = typeof rightValue === "string";
+  if (!leftText && !rightText) throw new TypeError("|| requires a string operand");
+  const left = leftText ? leftValue : concatenationOperandText(leftValue);
+  const right = rightText ? rightValue : concatenationOperandText(rightValue);
   const leftKind = concatenationDomainKind(left);
   const rightKind = concatenationDomainKind(right);
   for (const kind of [leftKind, rightKind]) {
@@ -855,6 +862,14 @@ export function concatenatedSqlValue(left: string, right: string): string {
   return protectedSqlTextValue(
     String(externalSqlDomainValue(left)) + String(externalSqlDomainValue(right)),
   );
+}
+
+/** The text a non-string || operand contributes: PostgreSQL's output rendering of the value. */
+function concatenationOperandText(value: unknown): string {
+  if (typeof value === "number") return String(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value instanceof Date) return dateIsoString(value);
+  throw new TypeError("|| requires a string operand");
 }
 
 export function isSqlDomainValue(value: unknown): value is string {

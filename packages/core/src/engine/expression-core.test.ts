@@ -41,7 +41,7 @@ describe("CAST", () => {
     expect(run("SELECT CAST(NULL AS INTEGER) AS n FROM rows WHERE id = 1")).toEqual([{ n: null }]);
     expect(run("SELECT CAST(amount AS JSONB) AS x FROM rows WHERE id = 1")).toEqual([{ x: "10" }]);
     // Integer targets truncate toward zero, including negatives.
-    expect(run("SELECT CAST(0 - 2.7 AS INTEGER) AS i FROM rows WHERE id = 1")).toEqual([{ i: -2 }]);
+    expect(run("SELECT CAST(0 - 2.7 AS INTEGER) AS i FROM rows WHERE id = 1")).toEqual([{ i: -3 }]);
   });
 
   it("rejects lossy or meaningless casts instead of guessing", () => {

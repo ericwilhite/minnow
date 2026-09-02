@@ -12,6 +12,7 @@ import {
   externalSqlDomainValue,
   externalSqlTextValue,
   isDateDomainValue,
+  isSqlDomainValue,
 } from "./sql-domains.js";
 
 /**
@@ -21,11 +22,70 @@ import {
  * optimization cannot silently change query results.
  */
 
+const SQL_TIMESTAMP_TEXT =
+  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/;
+
+/**
+ * The standard's datetime text — `2026-01-02`, `2026-01-02 03:04:05`, `2026-01-02T03:04:05.250Z`,
+ * an optional zone offset — read as an instant. A zoneless spelling is UTC, the reading every
+ * datetime in a Minnow database has; `undefined` for text in any other shape.
+ */
+export function parseSqlTimestampText(text: string): Date | undefined {
+  const match = SQL_TIMESTAMP_TEXT.exec(text.trim());
+  if (match === null) return undefined;
+  const [, day, time = "00:00:00", zone = "Z"] = match;
+  const seconds = time.length === 5 ? `${time}:00` : time;
+  const date = new Date(`${String(day)}T${seconds}${zone === "Z" ? "Z" : zone}`);
+  return Number.isFinite(dateMilliseconds(date)) ? date : undefined;
+}
+
+/**
+ * PostgreSQL reads an untyped string constant beside a typed value in that value's type:
+ * `joined >= '2026-01-01'`, `id = '5'`, `active = 't'`. Catalog-backed plans coerce such literals
+ * before execution; this runtime reading covers the schema-less row executor and anything the
+ * plan rewrite could not see. Text that does not parse in the other side's type keeps the
+ * comparable-types error below, so a genuine mismatch still fails.
+ */
+export function coercedComparable(text: string, other: unknown): unknown {
+  if (other instanceof Date || isDateDomainValue(other)) return parseSqlTimestampText(text) ?? text;
+  if (typeof other === "number") {
+    const trimmed = text.trim();
+    if (trimmed === "") return text;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : text;
+  }
+  if (typeof other === "boolean") {
+    const lowered = text.trim().toLowerCase();
+    if (lowered === "t" || lowered === "true" || lowered === "1") return true;
+    if (lowered === "f" || lowered === "false" || lowered === "0") return false;
+  }
+  return text;
+}
+
+/**
+ * Applies the untyped-literal reading to a comparison's two operands: a plain string beside a
+ * typed value (datetime, DATE, number, boolean) is read in that value's type when it parses.
+ * Both executors call this before their own comparisons, so the reading is one decision.
+ */
+export function coerceComparisonOperands(left: unknown, right: unknown): [unknown, unknown] {
+  const plainText = (value: unknown): value is string =>
+    typeof value === "string" && !isSqlDomainValue(value);
+  const typed = (value: unknown): boolean => typeof value !== "string" || isDateDomainValue(value);
+  if (plainText(left) && typed(right)) return [coercedComparable(left, right), right];
+  if (plainText(right) && typed(left)) return [left, coercedComparable(right, left)];
+  return [left, right];
+}
+
 /**
  * Deterministic SQL ordering. Strings use Unicode codepoint order rather than host locale data,
  * and signed zero compares equal because SQL numeric equality does not distinguish it.
  */
 export function compareSqlValues(left: unknown, right: unknown): number {
+  const [coercedLeft, coercedRight] = coerceComparisonOperands(left, right);
+  // Object.is, not !==: NaN would otherwise look changed on every pass and recurse forever.
+  if (!Object.is(coercedLeft, left) || !Object.is(coercedRight, right)) {
+    return compareSqlValues(coercedLeft, coercedRight);
+  }
   const plainLeft = externalSqlTextValue(left);
   const plainRight = externalSqlTextValue(right);
   if (

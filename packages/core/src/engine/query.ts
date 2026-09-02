@@ -83,7 +83,12 @@ import {
 } from "./fts.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
-import { stringArgument } from "./sql-semantics.js";
+import {
+  coerceComparisonOperands,
+  coercedComparable,
+  parseSqlTimestampText,
+  stringArgument,
+} from "./sql-semantics.js";
 import {
   jsonArrowStep,
   jsonAtPath,
@@ -347,7 +352,10 @@ function castValue(value: unknown, target: string): unknown {
     }
     if (parsed !== undefined) {
       if (target !== "number-integer") return parsed;
-      const integer = Math.trunc(parsed);
+      // PostgreSQL rounds a double precision value cast to an integer type to the nearest
+      // integer, ties to even (2.5 -> 2, 3.5 -> 4, -2.5 -> -2); SQLite truncates. A stored
+      // number is double precision, so the engine follows PostgreSQL's float8 cast.
+      const integer = roundHalfToEven(parsed);
       if (!Number.isSafeInteger(integer)) {
         throw new RangeError(`Integer cast is outside the exact safe range: ${String(value)}`);
       }
@@ -381,6 +389,15 @@ function castValue(value: unknown, target: string): unknown {
     }
   }
   throw new TypeError(`Unsupported CAST: ${typeof value} to ${target}`);
+}
+
+/** Nearest integer with ties to even, the rounding PostgreSQL applies to float8 -> integer. */
+function roundHalfToEven(value: number): number {
+  const floor = Math.floor(value);
+  const fraction = value - floor;
+  if (fraction < 0.5) return floor;
+  if (fraction > 0.5) return floor + 1;
+  return floor % 2 === 0 ? floor : floor + 1;
 }
 
 /**
@@ -2533,11 +2550,10 @@ export function inferBlockSchema(
     }
     if (expression.kind === "binary") {
       if (expression.operator === "||") {
-        for (const side of [expression.left, expression.right]) {
-          const type = infer(side);
-          if (type !== "string" && type !== "null") {
-            throw new TypeError("|| requires string operands");
-          }
+        // PostgreSQL's text || anynonarray: one side must be text, the other renders as text.
+        const types = [expression.left, expression.right].map(infer);
+        if (!types.some((type) => type === "string" || type === "null")) {
+          throw new TypeError("|| requires a string operand");
         }
         return "string";
       }
@@ -4772,12 +4788,7 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       const left = evaluate(expression.left, context, group);
       const right = evaluate(expression.right, context, group);
       if (left === null || left === undefined || right === null || right === undefined) return null;
-      if (expression.operator === "||") {
-        if (typeof left !== "string" || typeof right !== "string") {
-          throw new TypeError("|| requires string operands");
-        }
-        return concatenatedSqlValue(left, right);
-      }
+      if (expression.operator === "||") return concatenatedSqlValue(left, right);
       const exact = exactNumericBinary(expression.operator, left, right);
       if (exact !== undefined) return exact;
       const a = numeric(left);
@@ -4984,6 +4995,15 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
       const value = evaluate(predicate.left, context);
       if (value === null || value === undefined) return false;
       if (membership.set.has(comparable(value))) return predicate.operator === "IN";
+      // A typed value beside text members reads them in its own type (`id IN ('1', '2')`),
+      // which the hashed set cannot see; the per-item path coerces as comparisons do.
+      if (typeof value !== "string" && membership.hasText) {
+        return inListHolds(
+          predicate.operator,
+          value,
+          predicate.right.items.map((item) => evaluate(item, context)),
+        );
+      }
       return predicate.operator === "NOT IN" && !membership.hasNull;
     }
     return inListHolds(
@@ -5031,7 +5051,9 @@ function inListHolds(
       hasNull = true;
       continue;
     }
-    if (comparable(value) === comparable(item)) return operator === "IN";
+    const member =
+      typeof item === "string" && typeof value !== "string" ? coercedComparable(item, value) : item;
+    if (comparable(value) === comparable(member)) return operator === "IN";
   }
   return operator === "NOT IN" && !hasNull;
 }
@@ -5039,6 +5061,8 @@ function inListHolds(
 interface ListMembership {
   set: ReadonlySet<unknown>;
   hasNull: boolean;
+  /** Whether any member is text, which a typed left value may read in its own type. */
+  hasText: boolean;
 }
 
 const listMembershipCache = new WeakMap<object, ListMembership | null>();
@@ -5059,11 +5083,15 @@ export function cachedListMembership(
     if (items.every((item) => item.kind === "literal")) {
       const set = new Set<unknown>();
       let hasNull = false;
+      let hasText = false;
       for (const item of items as ReadonlyArray<{ kind: "literal"; value: unknown }>) {
         if (item.value === null || item.value === undefined) hasNull = true;
-        else set.add(comparable(item.value));
+        else {
+          if (typeof item.value === "string") hasText = true;
+          set.add(comparable(item.value));
+        }
       }
-      cached = { set, hasNull };
+      cached = { set, hasNull, hasText };
     } else {
       cached = null;
     }
@@ -5358,6 +5386,9 @@ export function comparisonHolds(
     rightValue === undefined
   )
     return false;
+  // An untyped string beside a datetime, number, or boolean reads in that value's type, as
+  // PostgreSQL types an unknown-typed literal by its context (`joined >= '2026-01-01'`).
+  [leftValue, rightValue] = coerceComparisonOperands(leftValue, rightValue);
   const left = comparable(leftValue);
   const right = comparable(rightValue);
   if (operator === "=") return compareValues(left, right) === 0;
@@ -8085,15 +8116,27 @@ class Parser {
       // || and the JSON arrows share PostgreSQL's loosest "any other operator" level, applying
       // left-to-right to whole arithmetic terms: `'a' || d ->> 'k'` is `('a' || d) ->> 'k'`.
       const precedence =
-        operator === "*" || operator === "/" || operator === "%"
-          ? 20
-          : operator === "+" || operator === "-"
-            ? 10
-            : operator === "||" || operator === "->" || operator === "->>"
-              ? 5
-              : -1;
+        operator === "::"
+          ? 30
+          : operator === "*" || operator === "/" || operator === "%"
+            ? 20
+            : operator === "+" || operator === "-"
+              ? 10
+              : operator === "||" || operator === "->" || operator === "->>"
+                ? 5
+                : -1;
       if (precedence < minimumPrecedence) break;
       this.#index += 1;
+      if (operator === "::") {
+        // PostgreSQL's postfix cast binds tighter than every binary operator, so it applies to
+        // the term just parsed and rides the same CAST call as the standard spelling.
+        left = {
+          kind: "call",
+          name: "CAST",
+          arguments: [left, { kind: "literal", value: this.#castTarget() }],
+        };
+        continue;
+      }
       if (operator === "->" || operator === "->>") {
         const key = this.#additive(precedence + 1);
         // A key fixed at compile time fails here rather than per row, like SQL/JSON paths.
@@ -10501,19 +10544,9 @@ function jsonTableColumnValue(
   return date;
 }
 
-const TIMESTAMP_TEXT =
-  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/;
-
 function timestampLiteral(text: string): Date {
-  const trimmed = text.trim();
-  const match = TIMESTAMP_TEXT.exec(trimmed);
-  if (match === null) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
-  const [, day, time = "00:00:00", zone = "Z"] = match;
-  const seconds = time.length === 5 ? `${time}:00` : time;
-  const date = new Date(`${String(day)}T${seconds}${zone === "Z" ? "Z" : zone}`);
-  if (!Number.isFinite(dateMilliseconds(date))) {
-    throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
-  }
+  const date = parseSqlTimestampText(text);
+  if (date === undefined) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
   return date;
 }
 
@@ -10523,8 +10556,8 @@ function timestampLiteral(text: string): Date {
  * `new Date("2026-01-02 03:04:05")` alone would read the same text in local time, so a CAST
  * would answer differently on two machines.
  */
-function datetimeText(text: string): Date {
-  return TIMESTAMP_TEXT.test(text.trim()) ? timestampLiteral(text) : new Date(text);
+export function datetimeText(text: string): Date {
+  return parseSqlTimestampText(text) ?? new Date(text);
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
@@ -10928,6 +10961,12 @@ function tokenize(sql: string): Token[] {
     }
     if ([">=", "<=", "!=", "<>", "||", "->"].includes(pair)) {
       push({ kind: "operator", text: pair, start: index, end: index + 2 });
+      index += 2;
+      continue;
+    }
+    if (pair === "::") {
+      // PostgreSQL's postfix cast, `expression::type`.
+      push({ kind: "operator", text: "::", start: index, end: index + 2 });
       index += 2;
       continue;
     }

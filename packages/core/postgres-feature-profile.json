@@ -94,11 +94,6 @@
       "reason": "Minnow permits % on its number type; PostgreSQL has no % operator for double precision."
     },
     {
-      "id": "expression.cast",
-      "classification": "different",
-      "reason": "Casting an approximate number to INTEGER truncates in Minnow; PostgreSQL rounds."
-    },
-    {
       "id": "expression.date-trunc",
       "classification": "compatible",
       "reason": "DATE_TRUNC follows PostgreSQL syntax; Minnow evaluates datetimes in UTC because it has no session time zone."

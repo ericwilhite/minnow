@@ -58,6 +58,7 @@ import {
   type QueryMemoryUsage,
 } from "./memory.js";
 import {
+  coerceComparisonOperands,
   compareSqlValues,
   compileSimilarPattern,
   defineSqlResultProperty,
@@ -6075,12 +6076,7 @@ function binaryValue(
   right: unknown,
 ): number | string | null {
   if (left === null || left === undefined || right === null || right === undefined) return null;
-  if (operator === "||") {
-    if (typeof left !== "string" || typeof right !== "string") {
-      throw new TypeError("|| requires string operands");
-    }
-    return concatenatedSqlValue(left, right);
-  }
+  if (operator === "||") return concatenatedSqlValue(left, right);
   const exact = exactNumericBinary(operator, left, right);
   if (exact !== undefined) return exact;
   const a = numeric(left);
@@ -6142,6 +6138,9 @@ function comparisonValue(
   ) {
     return false;
   }
+  // An untyped string beside a datetime, number, or boolean reads in that value's type, as
+  // PostgreSQL types an unknown-typed literal by its context; the row executor does the same.
+  [leftValue, rightValue] = coerceComparisonOperands(leftValue, rightValue);
   const left = comparable(leftValue);
   const right = comparable(rightValue);
   if (operator === "=") return compareValues(left, right) === 0;

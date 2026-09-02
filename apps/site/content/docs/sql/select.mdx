@@ -26,6 +26,18 @@ LIMIT 50
 `AND` / `OR` / `NOT`, and `CASE`. Filters on columns with recorded value ranges can skip whole groups of rows without decoding
 them — see [Query plans](/docs/sql/plans).
 
+A string constant beside a typed value reads in that value's type, the way PostgreSQL types an
+untyped literal by its context: `placed_at >= '2025-01-01'` compares as a timestamp (a zoneless
+string is UTC), `customer_id = '42'` as a number, and `refunded = 't'` as a boolean. A bound
+parameter gets the same reading. Text that does not parse in that type is still a type error, so
+`placed_at >= 'yesterday'` fails rather than matching nothing.
+
+Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
+tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double
+precision value cast to an integer type rounds to the nearest integer with ties to even, as
+PostgreSQL's cast does. `||` concatenates text, and a number, boolean, or timestamp on the other
+side renders as text: `'order-' || order_id`.
+
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
 `COLLATE` on string expressions. A sort key may name a selected column through its source alias
 (`SELECT id FROM orders AS o ORDER BY o.id`), the way PostgreSQL resolves it.

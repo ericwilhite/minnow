@@ -268,7 +268,7 @@ import {
   qualifyCorrelatedReferences,
   renderPlan,
 } from "./optimizer.js";
-import { encodeSqlEqualityValue } from "./sql-semantics.js";
+import { encodeSqlEqualityValue, parseSqlTimestampText } from "./sql-semantics.js";
 import {
   exactNumericAsNumber,
   externalSqlDomainValue,
@@ -1255,6 +1255,8 @@ interface CatalogFacts {
   domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>;
   /** Physical table names to their visible columns, used for nested SQL name resolution. */
   columns: ReadonlyMap<string, readonly string[]>;
+  /** Physical table and column names to the stored value type, for untyped-literal coercion. */
+  types: ReadonlyMap<string, ReadonlyMap<string, SimpleDataType>>;
 }
 
 /** Thrown into a held write scope to make it abort; never surfaces to a caller. */
@@ -5327,7 +5329,7 @@ export class MinnowDatabase {
     // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
     // result memoization — and only re-reads the view set when the catalog has actually moved.
     // A database with no views therefore pays one probe, not a catalog scan per query.
-    const { views, domains, columns: catalogColumns } = await this.#catalogFacts(probe);
+    const { views, domains, types, columns: catalogColumns } = await this.#catalogFacts(probe);
     let rewritten = plan.usesSequenceCalls === true ? await this.#resolveSequenceCalls(plan) : plan;
     if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
@@ -5341,8 +5343,8 @@ export class MinnowDatabase {
         return compiled;
       });
     }
-    if (domains.size > 0 && planReadsTable(rewritten, (name) => domains.has(name))) {
-      rewritten = normalizePlanDomainLiterals(rewritten, domains);
+    if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
+      rewritten = normalizePlanDomainLiterals(rewritten, domains, types);
     }
     const columnsOf = (name: string): readonly string[] | undefined => {
       const columns = catalogColumns.get(name);
@@ -5462,11 +5464,14 @@ export class MinnowDatabase {
     const childKeys = new Map<string, ChildForeignKey[]>();
     const domains = new Map<string, ReadonlyMap<string, SqlDomain>>();
     const columns = new Map<string, readonly string[]>();
+    const types = new Map<string, ReadonlyMap<string, SimpleDataType>>();
     for (const table of await this.store.listTables()) {
+      const visible = table.columns.filter(({ hidden }) => hidden !== true);
       columns.set(
         table.name,
-        table.columns.filter(({ hidden }) => hidden !== true).map(({ name }) => name),
+        visible.map(({ name }) => name),
       );
+      types.set(table.name, new Map(visible.map((column) => [column.name, column.type])));
       const tableDomains = new Map(
         table.columns.flatMap((column) =>
           column.sqlDomain === undefined ? [] : [[column.name, column.sqlDomain] as const],
@@ -5480,7 +5485,7 @@ export class MinnowDatabase {
         else existing.push({ table, key });
       }
     }
-    const facts: CatalogFacts = { views, childKeys, domains, columns };
+    const facts: CatalogFacts = { views, childKeys, domains, columns, types };
     this.#catalogCache = { epoch, facts };
     return facts;
   }
@@ -20843,12 +20848,35 @@ function normalizeDomainUpdate(table: TableRecord, input: UpdateBatchInput): Upd
   return changed || keys !== input.keys ? { keys, changes } : input;
 }
 
-/** Coerces literals and bound parameters opposite a domain column before planning/index probes. */
+/**
+ * Coerces literals and bound parameters opposite a domain column before planning/index probes,
+ * and reads an untyped string constant beside a datetime, number, or boolean column in that
+ * column's type — `joined >= '2026-01-01'`, `id = '5'`, `active = 't'` — the way PostgreSQL
+ * types an unknown-typed literal by its context. Text that does not parse is left alone and
+ * fails at comparison time as a type mismatch. Coercing here, rather than only at comparison,
+ * keeps the typed kernels, zone-map pruning, and the keyed point read on the fast paths.
+ */
 function normalizePlanDomainLiterals(
   input: CompiledQuery,
   domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>,
+  types: ReadonlyMap<string, ReadonlyMap<string, SimpleDataType>> = new Map(),
 ): CompiledQuery {
   const plan = structuredClone(input);
+  const coerceText = (type: SimpleDataType, text: string): QueryValue | undefined => {
+    if (type === "datetime") return parseSqlTimestampText(text);
+    if (type === "number") {
+      const trimmed = text.trim();
+      if (trimmed === "") return undefined;
+      const parsed = Number(trimmed);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    if (type === "boolean") {
+      const lowered = text.trim().toLowerCase();
+      if (lowered === "t" || lowered === "true" || lowered === "1") return true;
+      if (lowered === "f" || lowered === "false" || lowered === "0") return false;
+    }
+    return undefined;
+  };
   const rewriteBlock = (block: CompiledQuery): void => {
     for (const source of [block.base, ...block.joins]) {
       if (source.derived !== undefined) rewriteBlock(source.derived);
@@ -20860,24 +20888,44 @@ function normalizePlanDomainLiterals(
       }
     }
     const sources = [block.base, ...block.joins];
-    const domainFor = (reference: string): SqlDomain | undefined => {
+    const lookup = <T>(
+      reference: string,
+      catalog: ReadonlyMap<string, ReadonlyMap<string, T>>,
+    ): T | undefined => {
       const separator = reference.indexOf(".");
       if (separator !== -1) {
         const alias = reference.slice(0, separator);
         const name = reference.slice(separator + 1);
         const source = sources.find((candidate) => candidate.alias === alias);
-        return source === undefined ? undefined : domains.get(source.table)?.get(name);
+        return source === undefined ? undefined : catalog.get(source.table)?.get(name);
       }
       const matches = sources.flatMap((source) => {
-        const domain = domains.get(source.table)?.get(reference);
-        return domain === undefined ? [] : [domain];
+        const found = catalog.get(source.table)?.get(reference);
+        return found === undefined ? [] : [found];
       });
       return matches.length === 1 ? matches[0] : undefined;
+    };
+    const domainFor = (reference: string): SqlDomain | undefined => lookup(reference, domains);
+    const coerceTyped = (column: Expression, value: Expression): void => {
+      if (column.kind !== "column") return;
+      const type = lookup(column.reference, types);
+      if (type === undefined || type === "string") return;
+      const literals =
+        value.kind === "literal" ? [value] : value.kind === "list" ? value.items : [];
+      for (const literal of literals) {
+        if (literal.kind !== "literal" || typeof literal.value !== "string") continue;
+        if (literal.internalSqlValue === true) continue;
+        const coerced = coerceText(type, literal.value);
+        if (coerced !== undefined) literal.value = coerced;
+      }
     };
     const coercePair = (column: Expression, value: Expression): void => {
       if (column.kind !== "column") return;
       const domain = domainFor(column.reference);
-      if (domain === undefined) return;
+      if (domain === undefined) {
+        coerceTyped(column, value);
+        return;
+      }
       if (value.kind === "literal") {
         value.value = normalizeSqlDomainValue(domain, value.value);
         value.internalSqlValue = true;

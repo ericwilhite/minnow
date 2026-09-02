@@ -14,6 +14,7 @@ import {
   clonePlanTree,
   applyWindowFunctions,
   bindPlanParameters,
+  type QueryValue,
 } from "./query.js";
 
 interface QueryStoreHarness {
@@ -171,6 +172,91 @@ describe("public SQL queries", () => {
     await expect(
       database.query("SELECT id FROM items ORDER BY id UNION SELECT id FROM items"),
     ).rejects.toThrow("requires parentheses");
+  });
+
+  it("reads untyped strings in the typed side's type, casts with ::, and concatenates typed values", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 2 });
+    await database.createTable({
+      name: "events",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "at", type: "datetime" },
+        { name: "flag", type: "boolean" },
+        { name: "amount", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    await database.insertBatch("events", {
+      columns: {
+        id: [1, 2, 3],
+        at: [
+          new Date("2026-01-02T03:04:05Z"),
+          new Date("2026-02-01T00:00:00Z"),
+          new Date("2026-03-15T12:00:00Z"),
+        ],
+        flag: [true, false, true],
+        amount: [10.5, 20.5, 30],
+        label: ["a", "b", "c"],
+      },
+    });
+    const ids = async (sql: string, params?: QueryValue[]): Promise<unknown[]> =>
+      (await database.query(sql, params === undefined ? {} : { params })).rows.map((row) => row.id);
+    expect(await ids("SELECT id FROM events WHERE at >= '2026-02-01' ORDER BY id")).toEqual([2, 3]);
+    expect(await ids("SELECT id FROM events WHERE at = '2026-01-02 03:04:05' ORDER BY id")).toEqual(
+      [1],
+    );
+    expect(
+      await ids("SELECT id FROM events WHERE at BETWEEN '2026-01-01' AND '2026-02-01' ORDER BY id"),
+    ).toEqual([1, 2]);
+    expect(await ids("SELECT id FROM events WHERE at > ? ORDER BY id", ["2026-02-01"])).toEqual([
+      3,
+    ]);
+    expect(await ids("SELECT id FROM events WHERE amount = '20.5'")).toEqual([2]);
+    expect(await ids("SELECT id FROM events WHERE id IN ('1', '3') ORDER BY id")).toEqual([1, 3]);
+    expect(await ids("SELECT id FROM events WHERE id = ?", ["3"])).toEqual([3]);
+    expect(await ids("SELECT id FROM events WHERE flag = 't' ORDER BY id")).toEqual([1, 3]);
+    expect(await ids("SELECT id FROM events WHERE flag <> 'true' ORDER BY id")).toEqual([2]);
+    expect(
+      await ids("SELECT id FROM events WHERE CAST(at AS DATE) >= '2026-02-01' ORDER BY id"),
+    ).toEqual([2, 3]);
+    // Text that does not parse in the typed side's type is still a type error, and a text
+    // column beside a number literal has no operator, as in PostgreSQL.
+    await expect(database.query("SELECT id FROM events WHERE at >= 'yesterday'")).rejects.toThrow(
+      "comparable SQL types",
+    );
+    await expect(database.query("SELECT id FROM events WHERE label = 5")).rejects.toThrow(
+      "comparable SQL types",
+    );
+    // :: is CAST and binds tighter than every operator; float8 -> integer rounds ties to even.
+    expect(
+      (
+        await database.query(
+          "SELECT amount::INTEGER AS whole, -amount::INTEGER * 2 AS scaled, (amount * 2)::INTEGER AS doubled FROM events ORDER BY id",
+        )
+      ).rows,
+    ).toEqual([
+      { whole: 10, scaled: -20, doubled: 21 },
+      { whole: 20, scaled: -40, doubled: 41 },
+      { whole: 30, scaled: -60, doubled: 60 },
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT CAST(2.5 AS INTEGER) AS a, CAST(3.5 AS INTEGER) AS b, CAST(-2.5 AS INTEGER) AS c, CAST(2.7 AS INTEGER) AS d",
+        )
+      ).rows,
+    ).toEqual([{ a: 2, b: 4, c: -2, d: 3 }]);
+    expect(
+      (
+        await database.query(
+          "SELECT 'e-' || id || '/' || amount || '/' || flag AS tag FROM events ORDER BY id LIMIT 1",
+        )
+      ).rows,
+    ).toEqual([{ tag: "e-1/10.5/true" }]);
+    await expect(database.query("SELECT 1 || 2 AS n")).rejects.toThrow(
+      "|| requires a string operand",
+    );
   });
 
   it("resolves qualified ORDER BY, GROUP BY ordinals and aliases, NOW(), and LIMIT 0", async () => {

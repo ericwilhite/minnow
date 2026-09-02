@@ -427,8 +427,8 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT id, CAST(amount AS INTEGER) AS whole, CAST(id AS TEXT) AS label, CAST('42.5' AS REAL) AS parsed FROM data ORDER BY id`,
     ordered: true,
-    // PostgreSQL rounds float-to-integer casts; Minnow truncates, matching SQLite.
-    skip: ["pglite"],
+    // PostgreSQL rounds float-to-integer casts, and so does Minnow; SQLite truncates.
+    skip: ["sqlite"],
   }),
   (rng) => ({
     sql: `SELECT "id", "data"."amount" AS "amt" FROM "data" WHERE "amount" >= ? ORDER BY "id"`,
@@ -1039,8 +1039,54 @@ function setOperationCases(): Case[] {
   ];
 }
 
+/**
+ * Untyped string constants beside typed columns read in the column's type, as PostgreSQL types
+ * an unknown-typed literal by its context. SQLite compares text against REAL and ISO text
+ * lexically instead, so only the forms it happens to agree on include it.
+ */
+function coercionCases(): Case[] {
+  return [
+    { sql: `SELECT id FROM data WHERE joined >= '2026-01-01' ORDER BY id`, ordered: true },
+    {
+      sql: `SELECT id FROM data WHERE joined = '2026-01-02T03:04:05.000Z' ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE joined BETWEEN '2025-12-01' AND '2026-02-01 12:00:00' ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    {
+      sql: `SELECT id FROM data WHERE joined IN ('2026-01-02T03:04:05.000Z', '2025-12-30T00:00:00.000Z') ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE joined > ? ORDER BY id`,
+      params: ["2026-02-01"],
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    { sql: `SELECT id FROM data WHERE amount = '10' ORDER BY id`, ordered: true },
+    { sql: `SELECT id FROM data WHERE amount > '90.5' ORDER BY id`, ordered: true },
+    { sql: `SELECT id FROM data WHERE id IN ('1', '2', '3') ORDER BY id`, ordered: true },
+    { sql: `SELECT id FROM data WHERE amount >= ? ORDER BY id`, params: ["95"], ordered: true },
+    { sql: `SELECT id FROM data WHERE active = 't' ORDER BY id`, ordered: true, skip: ["sqlite"] },
+    {
+      sql: `SELECT id FROM data WHERE CAST(joined AS DATE) >= '2026-01-02' ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    {
+      sql: `SELECT id, amount::INTEGER AS whole, -amount::INTEGER * 2 AS scaled, 'r-' || id || '/' || amount AS tag FROM data ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+  ];
+}
+
 function combinationCases(): Case[] {
   return [
+    ...coercionCases(),
     ...distinctCases(),
     ...windowCases(),
     ...joinCases(),
@@ -1597,6 +1643,15 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ],
   ["predicate.ilike", { oracles: ["sqlite"], reason: "SQLite has no ILIKE" }],
   ["datetime.now", { oracles: ["sqlite"], reason: "SQLite has no now() function" }],
+  ["expression.cast-postfix", { oracles: ["sqlite"], reason: "SQLite has no :: cast syntax" }],
+  [
+    "expression.concat-typed",
+    { oracles: ["sqlite"], reason: "SQLite renders a REAL as 10.0 and a boolean as 1 in ||" },
+  ],
+  [
+    "where.boolean-text",
+    { oracles: ["sqlite"], reason: "SQLite stores booleans as integers, which 't' never equals" },
+  ],
   [
     "select.values-ordered",
     { oracles: ["sqlite"], reason: "SQLite's VALUES takes no trailing ORDER BY or LIMIT" },

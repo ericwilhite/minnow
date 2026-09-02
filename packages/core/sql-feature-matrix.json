@@ -727,7 +727,7 @@
       "id": "expression.cast",
       "status": "supported",
       "example": "SELECT CAST(amount AS INTEGER) AS whole, CAST(amount AS TEXT) AS label FROM rows",
-      "notes": "Common PostgreSQL type names map to the four stored value kinds; integer targets truncate toward zero, unlike PostgreSQL's rounding, and non-numeric strings fail rather than becoming 0."
+      "notes": "Common PostgreSQL type names map to the four stored value kinds; integer targets round to the nearest integer with ties to even, PostgreSQL's float8 cast (SQLite truncates), and non-numeric strings fail rather than becoming 0. The postfix spelling amount::INTEGER is the same cast."
     },
     {
       "id": "identifier.quoted",
@@ -1412,6 +1412,36 @@
       "status": "supported",
       "example": "CREATE TABLE checked (a INTEGER NOT NULL CHECK (a > 0), CONSTRAINT small CHECK (a < 100))",
       "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row — insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
+    },
+    {
+      "id": "expression.cast-postfix",
+      "status": "supported",
+      "example": "SELECT amount::INTEGER AS whole, -amount::INTEGER * 2 AS scaled FROM rows",
+      "notes": "PostgreSQL's postfix cast spelling, the same conversion as CAST(x AS type). It binds tighter than every binary and unary operator, so -amount::INTEGER negates the cast value."
+    },
+    {
+      "id": "expression.concat-typed",
+      "status": "supported",
+      "example": "SELECT 'order-' || amount || '/' || active AS tag FROM rows",
+      "notes": "PostgreSQL's text || anynonarray: one operand is text and a number, boolean, or timestamp on the other side renders as text. Two non-text operands (1 || 2) have no || operator, in PostgreSQL or here."
+    },
+    {
+      "id": "where.datetime-text",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE joined >= '2026-01-01' AND joined < '2026-02-01 00:00:00'",
+      "notes": "A string constant beside a datetime column reads as a timestamp, a zoneless spelling in UTC, as PostgreSQL types an untyped literal by its context. Catalog-backed plans coerce before execution so zone-map pruning and the keyed point read still apply; both executors read the same way at comparison time. Text that is not a timestamp stays a type error."
+    },
+    {
+      "id": "where.number-text",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount = '10' OR amount IN ('3', '6')",
+      "notes": "A numeric string beside a number column reads as a number, including in IN lists and bound parameters. A text column compared with a number literal is still rejected, as it is in PostgreSQL."
+    },
+    {
+      "id": "where.boolean-text",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE active = 't' AND active <> 'false'",
+      "notes": "PostgreSQL's boolean input spellings t, true, 1, f, false, and 0 read as booleans beside a boolean column."
     },
     {
       "id": "group-by.ordinal",

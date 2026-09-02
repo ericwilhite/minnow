@@ -257,10 +257,14 @@ describe("point-read fast path", () => {
       "SELECT payload FROM orders WHERE tenant = ? AND id = ?",
       [3, 3],
     );
-    await differentialError(database, "SELECT payload FROM orders WHERE tenant = ? AND id = ?", [
-      "tenant-2",
-      "3",
-    ]);
+    // A string beside the numeric key reads as a number, as PostgreSQL types an untyped
+    // literal by its context; fast path and ordinary executor must answer the same row.
+    const coerced = await differential(
+      database,
+      "SELECT payload FROM orders WHERE tenant = ? AND id = ?",
+      ["tenant-2", "3"],
+    );
+    expect(coerced.rows).toHaveLength(1);
     await differentialError(
       database,
       "SELECT payload FROM orders WHERE tenant = ? AND id = ? AND active = ?",
