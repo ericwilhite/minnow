@@ -1384,6 +1384,15 @@ function boundInsertValue(value: InsertValue): QueryValue {
 }
 
 /** Keeps SQL DEFAULT distinct from explicit NULL while pivoting INSERT rows. */
+/** The non-null unique-key values an insert batch proposes, in row order. */
+function insertBatchKeyValues(input: InsertBatchInput, keyColumn: string): QueryValue[] {
+  const values: readonly BatchValue[] =
+    "columns" in input
+      ? (input.columns[keyColumn] ?? [])
+      : input.map((row) => row[keyColumn] ?? null);
+  return values.filter((value): value is Exclude<BatchValue, null> => value !== null);
+}
+
 function insertStatementBatch(
   statement: Extract<CompiledStatement, { kind: "insert" }>,
 ): ColumnarBatch {
@@ -9643,6 +9652,43 @@ export class MinnowDatabase {
     };
   }
 
+  /** Rejects an INSERT staged into a scope whose keys already exist there or in committed rows. */
+  async #assertStagedInsertKeysFree(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    input: InsertBatchInput,
+    writer: StatementWriter,
+  ): Promise<void> {
+    if (keyColumn.hidden === true) return;
+    const keys = insertBatchKeyValues(input, keyColumn.name);
+    if (keys.length === 0) return;
+    const plan: CompiledQuery = {
+      sql: "(staged insert keys)",
+      base: { table: table.name, alias: table.name },
+      joins: [],
+      select: [{ expression: { kind: "column", reference: keyColumn.name }, alias: "key" }],
+      predicates: [
+        {
+          left: { kind: "column", reference: keyColumn.name },
+          operator: "IN",
+          right: { kind: "list", items: keys.map((value) => ({ kind: "literal", value })) },
+        },
+      ],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    };
+    const existing = (await writer.queryPlan(plan)).rows[0]?.key;
+    if (
+      typeof existing === "string" ||
+      typeof existing === "number" ||
+      typeof existing === "boolean" ||
+      existing instanceof Date
+    ) {
+      throw new UniqueConstraintError(table.name, keyColumn.name, existing);
+    }
+  }
+
   /**
    * MERGE (F312). One pass over the source, joined to the target on the match condition, decides
    * each row's branch; the branches then apply as ordinary batched writes inside a single write
@@ -10371,6 +10417,23 @@ export class MinnowDatabase {
         }
       }
       const writer = options.writer;
+      const stagedKeyColumn = writer === undefined ? undefined : getUniqueKeyColumn(table);
+      if (writer !== undefined && !viaUpsert && stagedKeyColumn !== undefined) {
+        // Statement validity first, so an invalid projection reports as itself, not as a
+        // duplicate the invalid statement would also have hit.
+        const assignedGenerated = table.columns.find(
+          (column) =>
+            column.generatedValue !== undefined && statement.columns.includes(column.name),
+        );
+        if (assignedGenerated !== undefined) {
+          throw new TypeError(`Generated column cannot be assigned: ${assignedGenerated.name}`);
+        }
+        // Inside BEGIN ... COMMIT a duplicate key must fail the INSERT itself, as it does in
+        // PostgreSQL, not surface at COMMIT after the application has moved on. The scope's
+        // read sees committed rows plus everything it staged, so one keyed lookup settles it;
+        // commit still re-validates as the last word.
+        await this.#assertStagedInsertKeysFree(table, stagedKeyColumn, input, writer);
+      }
       // A scope stages and reports rows; a standalone write also publishes a version and any
       // values the engine generated. Both shapes answer here, and the narrow one has less to
       // report rather than something different.

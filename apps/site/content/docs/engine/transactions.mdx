@@ -56,8 +56,10 @@ try {
 }
 ```
 
-Reads inside the transaction see its earlier writes. Schema changes are refused because they are
-saved outside the transaction. Savepoints checkpoint staged blocks, mutation deltas, unique-index
+Reads inside the transaction see its earlier writes. A statement that violates a unique key fails
+on that statement, as it does in PostgreSQL, whether the conflicting row was committed before the
+transaction or staged earlier in it; the transaction stays open, so the caller decides whether to
+roll back or continue. Schema changes are refused because they are saved outside the transaction. Savepoints checkpoint staged blocks, mutation deltas, unique-index
 membership, and trigger effects:
 
 ```sql

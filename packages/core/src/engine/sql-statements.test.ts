@@ -1166,3 +1166,36 @@ describe("PostgreSQL mutation forms", () => {
     ]);
   });
 });
+
+describe("statement errors inside BEGIN ... COMMIT", () => {
+  it("fails a duplicate-key INSERT on the statement itself, and keeps the scope usable", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "people",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    await database.execute("INSERT INTO people (name, score) VALUES ('Ada', 10)");
+    await database.execute("BEGIN");
+    await database.execute("UPDATE people SET score = 0 WHERE name = 'Ada'");
+    // Against a committed row, and against a row this scope staged: both fail here, not at COMMIT.
+    await expect(
+      database.execute("INSERT INTO people (name, score) VALUES ('Ada', 1)"),
+    ).rejects.toThrow("Duplicate value for people.name: Ada");
+    await database.execute("INSERT INTO people (name, score) VALUES ('Grace', 2)");
+    await expect(
+      database.execute("INSERT INTO people (name, score) VALUES ('Grace', 3)"),
+    ).rejects.toThrow("Duplicate value for people.name: Grace");
+    // A row deleted earlier in the scope is free again.
+    await database.execute("DELETE FROM people WHERE name = 'Ada'");
+    await database.execute("INSERT INTO people (name, score) VALUES ('Ada', 7)");
+    await database.execute("COMMIT");
+    expect((await database.query("SELECT name, score FROM people ORDER BY name")).rows).toEqual([
+      { name: "Ada", score: 7 },
+      { name: "Grace", score: 2 },
+    ]);
+  });
+});
