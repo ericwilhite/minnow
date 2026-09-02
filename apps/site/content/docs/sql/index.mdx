@@ -141,7 +141,10 @@ directly and never touches the parser.
 
 A statement re-run over data that has not changed is answered from a memo rather than executed
 again. The memo is validated against the catalog before it is served, so it can never return a
-stale answer — a commit anywhere in the tables the statement reads invalidates it.
+stale answer — a commit anywhere in the tables the statement reads invalidates it. Statements
+that are not a function of the data are never memoized: those reading the clock
+(`CURRENT_TIMESTAMP`, `NOW()`), `RANDOM()` or `GEN_RANDOM_UUID()`, or a sequence (`NEXTVAL`,
+`CURRVAL`), and any query run with an explicit `version`, memory budget, or spill option.
 
 That is what you want in an application and exactly what you do not want in a benchmark:
 

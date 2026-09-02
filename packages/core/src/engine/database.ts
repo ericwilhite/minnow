@@ -212,6 +212,7 @@ import {
   expandSourceColumnAliases,
   expandViewSources,
   forEachBlockExpression,
+  forEachNestedBlock,
   planContainsFts,
   planHasNaturalJoins,
   planHasSourceColumnAliases,
@@ -241,6 +242,7 @@ import {
   type QueryValue,
   type SqlColumnSchema,
   type UniqueConstraintDefinition,
+  volatileScalarFunctionNames,
 } from "./query.js";
 import {
   copyQueryResult,
@@ -4399,6 +4401,10 @@ export class MinnowDatabase {
   ): Promise<PreparedQuery> {
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
+    // One statement clock for the whole plan tree, fixed before any nested block executes on
+    // its own: a scalar subquery reading CURRENT_TIMESTAMP is resolved here, not left for the
+    // executor that only ever sees the block it runs.
+    if (plan.usesStatementDatetime === true) plan = resolveStatementDatetimes(plan, this.#now());
     // The ORDER-BY-expression desugar's wrapper is projection-only: prepare the inner block
     // directly (no derived materialization) and project each result to the visible aliases,
     // so `.search()` costs the same whether or not the caller also selects the score.
@@ -5160,6 +5166,9 @@ export class MinnowDatabase {
       // cannot tell a fresh answer from a stale one.
       plan.usesStatementDatetime !== true &&
       plan.usesVolatileFunctions !== true &&
+      // A sequence call advances connection state on every execution; a memo hit would both
+      // repeat the old value and skip the advance.
+      plan.usesSequenceCalls !== true &&
       options.version === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
       options.spillToStorage === undefined &&
@@ -5393,7 +5402,14 @@ export class MinnowDatabase {
         throw new TypeError("NEXTVAL and CURRVAL are supported in the SELECT list");
       }
     });
-    if (sequenceExpressions.length === 0) return plan;
+    if (sequenceExpressions.length === 0) {
+      if (blockCallsFunctions(plan, sequenceFunctionNames)) {
+        throw new TypeError(
+          "NEXTVAL and CURRVAL are supported in the SELECT list of a SELECT without FROM",
+        );
+      }
+      return plan;
+    }
     if (plan.base.table !== DUAL_TABLE || plan.joins.length > 0) {
       throw new TypeError("NEXTVAL and CURRVAL currently require a SELECT without FROM");
     }
@@ -12538,6 +12554,9 @@ export class MinnowDatabase {
     // the single switch that makes a statement compute its results instead of reusing them.
     if (!cacheResults) return undefined;
     if (!this.#artifactCache.enabled) return undefined;
+    // A block whose value is not a function of the data — RANDOM(), a sequence call, an
+    // unresolved clock — must run every time; the version key cannot tell its answers apart.
+    if (blockCallsFunctions(block, nonDeterministicFunctionNames)) return undefined;
     // Staged writes can change repeatedly without changing either the pinned manifest version or
     // their transaction id. Do not cache them under an identity that could become stale.
     if (visibility.overlayTransactionId !== undefined) return undefined;
@@ -17654,7 +17673,14 @@ export class MinnowDatabase {
       .readFtsCandidates(tableId, columnId, terms, upToVersion, MAX_FTS_CANDIDATE_ROW_IDS)
       .then((result) => {
         const rowIds = result.rowIdsByTerm.reduce((total, ids) => total + ids.length, 0);
-        if (rowIds <= MAX_POOLED_FTS_CANDIDATE_ROW_IDS) {
+        // Only a complete answer is pooled: a missing base or a build past the asked version
+        // is transient state the next read must observe again, not a fact about the version.
+        if (
+          result.hasBase &&
+          !result.overflow &&
+          result.coversVersion <= upToVersion &&
+          rowIds <= MAX_POOLED_FTS_CANDIDATE_ROW_IDS
+        ) {
           this.#cachePut(`ftc\0${key}`, result, 128 + key.length * 2 + rowIds * 16);
         }
         return result;
@@ -21416,7 +21442,11 @@ function normalizePlanDomainLiterals(
   domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>,
   types: ReadonlyMap<string, ReadonlyMap<string, SimpleDataType>> = new Map(),
 ): CompiledQuery {
-  const plan = structuredClone(input);
+  // Most plans have nothing to coerce. A probing pass over the shared (cached) plan finds out
+  // without touching it; only a plan that needs a rewrite is cloned and rewritten, so the
+  // per-query cost of a plan that compares typed columns to typed literals is one walk, not a
+  // structured clone.
+  const pass = { probing: true, needed: false };
   const coerceText = (type: SimpleDataType, text: string): QueryValue | undefined => {
     if (type === "datetime") return parseSqlTimestampText(text);
     if (type === "number") {
@@ -21433,6 +21463,7 @@ function normalizePlanDomainLiterals(
     return undefined;
   };
   const rewriteBlock = (block: CompiledQuery): void => {
+    if (pass.probing && pass.needed) return;
     for (const source of [block.base, ...block.joins]) {
       if (source.derived !== undefined) rewriteBlock(source.derived);
       source.union?.blocks.forEach(rewriteBlock);
@@ -21471,7 +21502,9 @@ function normalizePlanDomainLiterals(
         if (literal.kind !== "literal" || typeof literal.value !== "string") continue;
         if (literal.internalSqlValue === true) continue;
         const coerced = coerceText(type, literal.value);
-        if (coerced !== undefined) literal.value = coerced;
+        if (coerced === undefined) continue;
+        if (pass.probing) pass.needed = true;
+        else literal.value = coerced;
       }
     };
     const coercePair = (column: Expression, value: Expression): void => {
@@ -21482,12 +21515,20 @@ function normalizePlanDomainLiterals(
         return;
       }
       if (value.kind === "literal") {
+        if (pass.probing) {
+          pass.needed = true;
+          return;
+        }
         value.value = normalizeSqlDomainValue(domain, value.value);
         value.internalSqlValue = true;
         value.sqlDomain = domain;
       } else if (value.kind === "list") {
         for (const item of value.items) {
           if (item.kind === "literal") {
+            if (pass.probing) {
+              pass.needed = true;
+              return;
+            }
             item.value = normalizeSqlDomainValue(domain, item.value);
             item.internalSqlValue = true;
             item.sqlDomain = domain;
@@ -21548,6 +21589,10 @@ function normalizePlanDomainLiterals(
     block.groupBy = block.groupBy.map(rewrite);
     for (const order of block.orderBy) order.expression = rewrite(order.expression);
   };
+  rewriteBlock(input);
+  if (!pass.needed) return input;
+  pass.probing = false;
+  const plan = structuredClone(input);
   rewriteBlock(plan);
   return plan;
 }
@@ -23224,6 +23269,40 @@ function firstMemberAtLeast(members: Float64Array, value: number): number {
     else high = middle;
   }
   return low;
+}
+
+const sequenceFunctionNames: ReadonlySet<string> = new Set(["NEXTVAL", "CURRVAL"]);
+const nonDeterministicFunctionNames: ReadonlySet<string> = new Set([
+  ...volatileScalarFunctionNames,
+  ...sequenceFunctionNames,
+  "CURRENT_DATE",
+  "CURRENT_TIMESTAMP",
+  "CURRENT_TIME",
+  "LOCALTIME",
+  "LOCALTIMESTAMP",
+  "NOW",
+]);
+
+/** Whether any expression of a block, or of a block nested anywhere under it, calls a name. */
+function blockCallsFunctions(block: CompiledQuery, names: ReadonlySet<string>): boolean {
+  const state = { found: false };
+  const visit = (expression: Expression): void => {
+    if (state.found) return;
+    if (expression.kind === "call" && names.has(expression.name)) {
+      state.found = true;
+      return;
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      if (blockCallsFunctions(expression.block, names)) state.found = true;
+      return;
+    }
+    childExpressions(expression).forEach(visit);
+  };
+  forEachBlockExpression(block, visit);
+  forEachNestedBlock(block, (nested) => {
+    if (!state.found && blockCallsFunctions(nested, names)) state.found = true;
+  });
+  return state.found;
 }
 
 /**

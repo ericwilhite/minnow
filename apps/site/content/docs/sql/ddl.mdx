@@ -251,7 +251,9 @@ SELECT CURRVAL('order_ids') AS current_order_id;
 ```
 
 `CURRVAL` is local to the database session and fails before its first `NEXTVAL`. Minnow does not
-support sequence options, `ALTER SEQUENCE`, or sequence calls inside table-reading queries.
+support sequence options, `ALTER SEQUENCE`, or sequence calls anywhere but the select list of a
+`SELECT` without `FROM` — not in a table-reading query, a subquery, or a derived table. A
+statement that calls a sequence is never answered from the result memo.
 `nextval('name')` is valid in a column default. Use the key column's `autoincrement` default for
 ordinary table IDs.
 
