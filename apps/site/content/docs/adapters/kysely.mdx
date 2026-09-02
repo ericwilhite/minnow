@@ -71,7 +71,10 @@ The inferred Kysely columns retain Minnow's separate select, insert, and update 
 - stored generated columns are omitted from insert and update inputs;
 - enum values remain literal unions;
 - exact `NUMERIC` selects as a lossless `string`, while writes and predicates naturally accept
-  `string | number`;
+  `string | number` — in `where`, `having`, join `on`, `ON CONFLICT ... WHERE`, `between`,
+  `case().when`, `MERGE` conditions, and aggregate `filterWhere`. A column read through a derived
+  table (`selectFrom(subquery.as("sub"))`) and an aggregate compared in `having` carry only the
+  select type, so compare those with a string such as `"25"`;
 - scalar and composite primary-key columns cannot be updated;
 - declared views select normally and accept no column values on insert or update.
 
@@ -393,6 +396,9 @@ Directly streamable scans honor backpressure through the vector executor and wor
 Blocking SQL remains correct through the engine's materialized/spill path. The
 [cursor and export guide](/docs/extensions/exports) explains the boundary.
 
+`.stream()` on an insert, update, or delete with `RETURNING` runs the statement buffered and hands
+its returned rows out in chunks of `chunkSize`, because Minnow's cursor reads only `SELECT`.
+
 ## Cancellation
 
 Kysely's abortable execution options forward to the engine, for buffered queries as well as
@@ -417,14 +423,18 @@ applied.
 - Reads, inserts, updates, deletes, and their `$n` parameters.
 - Type-safe `MATCH` predicates and `BM25` ranking expressions.
 - Typed live queries, keyed changes, and ordered bounded windows.
-- `.stream(chunkSize)` over direct and worker-backed query cursors.
+- `.stream(chunkSize)` over direct and worker-backed query cursors, and over the buffered
+  `RETURNING` rows of a mutation.
 - `AbortSignal` cancellation for buffered `.execute({ signal })` and for `.stream()`.
 - `RETURNING` rows and Kysely's affected-row counts.
 - `db.transaction().execute(...)` through Minnow's `BEGIN`, `COMMIT`, and `ROLLBACK`.
 - Controlled transactions: `db.startTransaction()` with `savepoint(name)`,
   `rollbackToSavepoint(name)`, and `releaseSavepoint(name)` mapped onto Minnow's `SAVEPOINT`,
   `ROLLBACK TO`, and `RELEASE`. Raw SQL savepoints inside a transaction work too.
-- Kysely schema statements that stay inside Minnow's supported DDL profile.
+- Kysely schema statements that stay inside Minnow's supported DDL profile. A column's
+  `.autoIncrement()` compiles to the `autoincrement` spelling the engine reads as its
+  auto-increment key, as Kysely's SQLite dialect emits it; `serial` and
+  `generatedAlwaysAsIdentity()` declare the same key.
 - `db.introspection`: tables, views, columns, nullability, defaults, auto-increment, and logical
   types. Exact `NUMERIC(p, s)`, JSON/JSONB, UUID, DATE, TIME, INTERVAL, arrays, and enum names are
   reported instead of being flattened to `text`.
@@ -460,18 +470,25 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
   every such form it can see before execution, naming the feature and an alternative:
   - Queries: `DISTINCT ON`, row-locking clauses such as `.forUpdate()`, SQL `EXPLAIN` (use the
     Minnow database's own `explain()`), T-SQL `.top()`, `.output()`, `.crossApply()`, and
-    `.outerApply()`, and an empty `IN ()` list (add Kysely's `HandleEmptyInListsPlugin`).
-  - Mutations: `UPDATE ... FROM`, `DELETE ... USING`, MySQL `ORDER BY`/`LIMIT` on updates and
-    deletes, `replaceInto()`, `onDuplicateKeyUpdate()`, SQLite `orIgnore()`/`orAbort()` and
-    friends, `ON CONFLICT` with a constraint or index-expression target (name the unique key's
-    columns instead), `MERGE ... THEN DO NOTHING` (narrow the `WHEN` condition instead), and
-    data-modifying CTEs (run the mutation first, then query).
+    `.outerApply()`, an empty `IN ()` list (add Kysely's `HandleEmptyInListsPlugin`), and the
+    JSON path operators `->$` and `->>$`, which compile to a path string that Minnow's `->` would
+    read as one member name (use `->` / `->>` with `.key()` and `.at()`).
+  - Mutations: `UPDATE ... FROM`, `DELETE ... USING`, multi-table `updateTable([...])` and
+    `deleteFrom([...])`, MySQL `ORDER BY`/`LIMIT` on updates and deletes, `replaceInto()`,
+    `onDuplicateKeyUpdate()`, SQLite `orIgnore()`/`orAbort()` and friends, `ON CONFLICT` with a
+    constraint or index-expression target (name the unique key's columns instead),
+    `MERGE ... THEN DO NOTHING` (narrow the `WHEN` condition instead),
+    `MERGE ... WHEN NOT MATCHED BY SOURCE`, and data-modifying CTEs (run the mutation first, then
+    query).
   - DDL: schema-qualified names including `WithSchemaPlugin`, `CREATE`/`DROP SCHEMA`,
     `ALTER TABLE` beyond adding and dropping columns (renames, constraint changes, column
-    alterations), temporary tables and views,
-    materialized views, view column lists and `CREATE VIEW IF NOT EXISTS`, non-stored generated
-    columns, `DROP`/`ALTER TYPE`, index access methods (`.using()`), partial and expression
-    indexes, and `NULLS NOT DISTINCT`.
+    alterations, `ADD COLUMN IF NOT EXISTS`), the T-SQL `identity()` column modifier (use
+    `autoIncrement()`, the `serial` type, or `generatedAlwaysAsIdentity()`), inline
+    `addIndex()` in `createTable()`, temporary tables and views, materialized views, view
+    column lists and `CREATE VIEW IF NOT EXISTS`, non-stored generated columns,
+    `DROP`/`ALTER TYPE`, `DROP VIEW` and `DROP INDEX` with `CASCADE`, `dropIndex().on(table)`,
+    index access methods (`.using()`), partial and expression indexes, expression unique
+    constraints, deferrable constraints, and `NULLS NOT DISTINCT`.
 
   Anything else outside the profile is rejected explicitly by the engine — for one example,
   a correlated lateral subquery with `ORDER BY`/`LIMIT` (rank with a window function instead) —

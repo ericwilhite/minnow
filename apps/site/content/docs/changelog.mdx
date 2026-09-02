@@ -8,6 +8,48 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.2 — September 2, 2026
+
+Published packages: `@minnowdb/core@0.7.2` and `@minnowdb/kysely@0.4.7`.
+
+Stored formats are unchanged and no migration is needed.
+
+### Fixed
+
+- A placeholder inside a `RETURNING` expression — `RETURNING score + $2`, or Kysely's
+  `returning((eb) => eb("points", "+", 3))` — failed with "Placeholder $2 is unbound" even
+  though the value was passed. The statement bound its assignments and predicates but not its
+  `RETURNING` items, and the buffered path then projected them from the unbound statement. Both
+  now bind, inside and outside a transaction.
+- `@minnowdb/kysely` streams `INSERT`, `UPDATE`, and `DELETE ... RETURNING` builders. Minnow's
+  cursor reads only `SELECT`, so `.stream()` on a mutation failed with "Expected SELECT"; the
+  driver now runs the mutation buffered and yields its returned rows in chunks.
+- `@minnowdb/kysely` introspection reports a `DATE` column's data type as `date`, not `text`.
+- `@minnowdb/kysely` keeps `resultDecoding` in a DB map that also carries hand-written tables
+  (`Kysely<InferKyselyDatabase<...> & Extra>`). `cast(..., "numeric")` and the JSON functions
+  inferred the undecoded string there.
+
+### Changed
+
+- `@minnowdb/kysely` accepts the same string-or-number operand for exact `NUMERIC` columns in
+  `eb.between()`, `eb.betweenSymmetric()`, `case().when()`, `whenMatchedAnd()` /
+  `whenNotMatchedAnd()`, and aggregate `filterWhere()` that `where()`, `on()`, and `having()`
+  already took.
+- `@minnowdb/kysely` compiles a column's `.autoIncrement()` to `autoincrement`, the SQLite
+  spelling Minnow reads as its auto-increment key, as Kysely's SQLite dialect does. The
+  PostgreSQL compiler's `auto_increment` failed at the engine with "Expected )".
+- `@minnowdb/kysely` refuses more builder forms at compile time, naming the feature and an
+  alternative, where the engine answered with a bare parse error: the T-SQL `identity()` column
+  modifier (use `autoIncrement()`, `serial`, or `generatedAlwaysAsIdentity()`),
+  `ADD COLUMN IF NOT EXISTS`, inline `addIndex()` in `createTable()`, `DROP TEMPORARY TABLE`,
+  `DROP MATERIALIZED VIEW`, `DROP VIEW` / `DROP INDEX ... CASCADE`, `dropIndex().on(table)`,
+  deferrable constraints, table-level `NULLS NOT DISTINCT` and expression unique constraints,
+  `MERGE ... WHEN NOT MATCHED BY SOURCE`, and multi-table `updateTable([...])` /
+  `deleteFrom([...])`.
+- `@minnowdb/kysely` refuses the JSON path operators `->$` and `->>$`. They compile to a path
+  string such as `'$."name"'`, which Minnow's `->` reads as one member name, so the query
+  returned `NULL` with no error. Use `->` / `->>` with `.key()` and `.at()`.
+
 ## 0.7.1 — September 2, 2026
 
 Published packages: `@minnowdb/core@0.7.1`.

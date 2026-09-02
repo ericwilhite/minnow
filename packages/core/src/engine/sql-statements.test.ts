@@ -85,6 +85,41 @@ describe("RETURNING expressions", () => {
     await database.close();
   });
 
+  it("binds placeholders inside RETURNING items alongside the statement's own", async () => {
+    const database = await seeded();
+    const inserted = await database.execute(
+      "INSERT INTO people (name, score) VALUES ($1, $2) RETURNING score + $3 AS bumped",
+      ["Linus", 5, 1],
+    );
+    expect(inserted).toMatchObject({ kind: "insert", returnedRows: [{ bumped: 6 }] });
+    const updated = await database.execute(
+      "UPDATE people SET score = $1 WHERE name = $2 " +
+        "RETURNING score - $3 AS previous, CASE WHEN name = $4 THEN 'me' ELSE 'other' END AS who",
+      [12, "Ada", 2, "Ada"],
+    );
+    expect(updated).toMatchObject({ kind: "update", returnedRows: [{ previous: 10, who: "me" }] });
+    const deleted = await database.execute(
+      "DELETE FROM people WHERE score > $1 RETURNING name || $2 AS shout",
+      [20, "!"],
+    );
+    expect(deleted).toMatchObject({ kind: "delete", returnedRows: [{ shout: "Grace!" }] });
+    // A placeholder that appears only in RETURNING still counts and binds.
+    const only = await database.execute(
+      "DELETE FROM people WHERE name = 'Linus' RETURNING score + $1 AS next",
+      [1],
+    );
+    expect(only).toMatchObject({ kind: "delete", returnedRows: [{ next: 6 }] });
+    // The statement-transaction path binds through the same code.
+    await database.execute("BEGIN");
+    const staged = await database.execute(
+      "UPDATE people SET score = score + $1 WHERE name = $2 RETURNING score * $3 AS scaled",
+      [1, "Ada", 2],
+    );
+    expect(staged).toMatchObject({ returnedRows: [{ scaled: 26 }] });
+    await database.execute("ROLLBACK");
+    await database.close();
+  });
+
   it("keeps a domain column's rendering through an expression item", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(

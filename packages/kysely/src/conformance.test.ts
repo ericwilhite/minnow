@@ -1,9 +1,9 @@
-import { MinnowDatabase, column, schema, table } from "@minnowdb/core";
+import { MinnowDatabase, column, schema, table, type MinnowSqlDriver } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { Kysely, sql, type ColumnType, type Generated } from "kysely";
 import { beforeEach, afterEach, describe, expect, expectTypeOf, it } from "vitest";
 import { createKysely } from "./create-kysely.js";
-import type { InferKyselyDatabase } from "./schema.js";
+import type { InferKyselyDatabase, MinnowJsonValue } from "./schema.js";
 
 /**
  * Full-surface conformance: every Kysely builder form the engine supports executes here with
@@ -791,6 +791,20 @@ describe("mutations", () => {
       .returning(sql<string>`'score-' || "points"`.as("label"))
       .executeTakeFirstOrThrow();
     expect(deleted).toEqual({ label: "score-20" });
+    // Bound values inside RETURNING share the statement's placeholder numbering.
+    const bumped = await db
+      .updateTable("scores")
+      .set({ points: 7 })
+      .where("scoreId", "=", 1)
+      .returning((eb) => [eb("points", "+", 3).as("bumped"), eb.val("tag").as("tag")])
+      .executeTakeFirstOrThrow();
+    expect(bumped).toEqual({ bumped: 10, tag: "tag" });
+    const inserted = await db
+      .insertInto("scores")
+      .values({ scoreId: 9, userId: 4, points: 1 })
+      .returning((eb) => eb("points", "*", 5).as("scaled"))
+      .executeTakeFirstOrThrow();
+    expect(inserted).toEqual({ scaled: 5 });
   });
 
   it("updates through expressions and subquery predicates", async () => {
@@ -1041,26 +1055,28 @@ describe("compile-time refusals for engine-unsupported forms", () => {
         .addColumn("id", "serial", (col) => col.primaryKey())
         .compile(),
     ).not.toThrow(); // SERIAL is PostgreSQL's auto-increment pseudo-type; the engine accepts it.
-    // Auto-increment, identity, and serial columns all compile: the engine reads each as its
+    // Auto-increment, identity, and serial columns compile to spellings the engine reads as its
     // auto-increment default, so a Kysely migration can declare the key without the schema DSL.
-    expect(() =>
+    // `.autoIncrement()` takes SQLite's `autoincrement`, as Kysely's own SQLite dialect emits.
+    expect(
       db.schema
         .createTable("t")
         .addColumn("id", "integer", (col) => col.autoIncrement().primaryKey())
-        .compile(),
-    ).not.toThrow();
+        .compile().sql,
+    ).toBe('create table "t" ("id" integer primary key autoincrement)');
     expect(() =>
       db.schema
         .createTable("t")
         .addColumn("id", "integer", (col) => col.generatedAlwaysAsIdentity().primaryKey())
         .compile(),
     ).not.toThrow();
+    // T-SQL's bare IDENTITY modifier has no PostgreSQL reading.
     expect(() =>
       db.schema
         .createTable("t")
         .addColumn("id", "integer", (col) => col.identity().primaryKey())
         .compile(),
-    ).not.toThrow();
+    ).toThrow("Minnow does not support the T-SQL IDENTITY column modifier");
     expect(() =>
       db.schema
         .createTable("t")
@@ -1138,6 +1154,101 @@ describe("compile-time refusals for engine-unsupported forms", () => {
     expect(() => alter.addIndex("i").columns(["name"]).compile()).toThrow(
       "Minnow does not support MySQL's ALTER TABLE ... ADD/DROP INDEX",
     );
+  });
+
+  it("refuses column modifiers, drop options, constraints, and multi-table forms from other dialects", () => {
+    const create = () => db.schema.createTable("t");
+    expect(() =>
+      create()
+        .addColumn("id", "integer", (col) => col.primaryKey().identity())
+        .compile(),
+    ).toThrow("Minnow does not support the T-SQL IDENTITY column modifier");
+    expect(() =>
+      db.schema
+        .alterTable("users")
+        .addColumn("extra", "text", (col) => col.ifNotExists())
+        .compile(),
+    ).toThrow("Minnow does not support ADD COLUMN IF NOT EXISTS");
+    expect(() => create().addColumn("id", "integer").addIndex("t_id", ["id"]).compile()).toThrow(
+      "Minnow does not support MySQL's inline INDEX in CREATE TABLE",
+    );
+    expect(() => db.schema.dropTable("users").temporary().compile()).toThrow(
+      "DROP TEMPORARY TABLE has nothing to drop",
+    );
+    expect(() => db.schema.dropView("v").materialized().compile()).toThrow(
+      "DROP MATERIALIZED VIEW has nothing to drop",
+    );
+    expect(() => db.schema.dropView("v").cascade().compile()).toThrow(
+      "Minnow does not support DROP VIEW ... CASCADE",
+    );
+    expect(() => db.schema.dropIndex("i").cascade().compile()).toThrow(
+      "Minnow does not support DROP INDEX ... CASCADE",
+    );
+    expect(() => db.schema.dropIndex("i").on("users").compile()).toThrow(
+      "Minnow does not support MySQL's DROP INDEX ... ON table",
+    );
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
+        .addPrimaryKeyConstraint("pk", ["a"], (cb) => cb.deferrable())
+        .compile(),
+    ).toThrow("Minnow does not support deferrable constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
+        .addUniqueConstraint("u", ["a"], (cb) => cb.initiallyDeferred())
+        .compile(),
+    ).toThrow("Minnow does not support deferrable constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
+        .addUniqueConstraint("u", ["a"], (cb) => cb.nullsNotDistinct())
+        .compile(),
+    ).toThrow("Minnow does not support NULLS NOT DISTINCT on unique constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "text")
+        .addUniqueConstraint("u", [sql`lower(a)`])
+        .compile(),
+    ).toThrow("Minnow does not support expression unique constraints");
+    expect(() =>
+      create()
+        .addColumn("a", "integer")
+        .addForeignKeyConstraint("fk", ["a"], "users", ["userId"], (cb) => cb.deferrable())
+        .compile(),
+    ).toThrow("Minnow does not support deferrable constraints");
+    expect(() =>
+      db
+        .mergeInto("users")
+        .using("user_changes", "user_changes.userId", "users.userId")
+        .whenNotMatchedBySource()
+        .thenDelete()
+        .compile(),
+    ).toThrow("Minnow does not support MERGE ... WHEN NOT MATCHED BY SOURCE");
+    expect(() => db.updateTable(["users", "teams"]).set({ name: "x" }).compile()).toThrow(
+      "Minnow does not support MySQL's multi-table UPDATE",
+    );
+    expect(() => db.deleteFrom(["users", "teams"]).compile()).toThrow(
+      "Minnow does not support MySQL's multi-table DELETE",
+    );
+    // The supported spellings of the same intentions still compile.
+    expect(() =>
+      create()
+        .addColumn("id", "integer", (col) => col.primaryKey().autoIncrement())
+        .compile(),
+    ).not.toThrow();
+    expect(() =>
+      create()
+        .addColumn("id", "integer", (col) => col.primaryKey().generatedAlwaysAsIdentity())
+        .compile(),
+    ).not.toThrow();
+    expect(() =>
+      create()
+        .addColumn("id", "serial", (col) => col.primaryKey())
+        .compile(),
+    ).not.toThrow();
+    expect(() => db.schema.dropView("v").ifExists().compile()).not.toThrow();
+    expect(() => db.schema.dropIndex("i").ifExists().compile()).not.toThrow();
   });
 });
 
@@ -1263,6 +1374,24 @@ describe("supported DDL executes end to end", () => {
       (await copied.selectFrom("user_names").selectAll().orderBy("userId").execute()).length,
     ).toBe(4);
 
+    // `.autoIncrement()` executes as the engine's auto-increment key.
+    await db.schema
+      .createTable("counters")
+      .addColumn("id", "integer", (col) => col.primaryKey().autoIncrement())
+      .addColumn("label", "text", (col) => col.notNull())
+      .execute();
+    const counters = db as unknown as Kysely<
+      ConformanceDatabase & { counters: { id: Generated<number>; label: string } }
+    >;
+    await counters
+      .insertInto("counters")
+      .values([{ label: "a" }, { label: "b" }])
+      .execute();
+    expect(await counters.selectFrom("counters").selectAll().orderBy("id").execute()).toEqual([
+      { id: 1, label: "a" },
+      { id: 2, label: "b" },
+    ]);
+
     await sql`CREATE SEQUENCE ticket_ids`.execute(db);
     await db.schema
       .createTable("tickets")
@@ -1324,6 +1453,80 @@ function numericOperandsSpanJoins(boundaryDb: Kysely<BoundaryDatabase>): void {
     .selectAll();
 }
 
+function numericOperandsReachEveryComparisonEntryPoint(boundaryDb: Kysely<BoundaryDatabase>): void {
+  // BETWEEN, CASE ... WHEN, MERGE conditions, and aggregate FILTER take the same string-or-number
+  // operand WHERE does.
+  void boundaryDb
+    .selectFrom("orders")
+    .select("id")
+    .where((eb) => eb.between("total", 1, "5"));
+  void boundaryDb
+    .selectFrom("orders")
+    .select("id")
+    .where((eb) => eb.betweenSymmetric("total", 5, 1));
+  void boundaryDb
+    .selectFrom("orders")
+    .select((eb) =>
+      eb
+        .case()
+        .when("total", ">", 25)
+        .then("big")
+        .when("total", ">", 5)
+        .then("mid")
+        .else("small")
+        .end()
+        .as("size"),
+    );
+  void boundaryDb
+    .mergeInto("orders")
+    .using("payments", "payments.orderId", "orders.id")
+    .whenMatchedAnd("payments.amount", ">", 25)
+    .thenDelete()
+    .whenNotMatchedAnd("payments.amount", ">", "25")
+    .thenDoNothing();
+  void boundaryDb
+    .selectFrom("orders")
+    .select((eb) => eb.fn.count("id").filterWhere("total", ">", 1).as("c"));
+  void boundaryDb
+    .selectFrom("orders")
+    .select("id")
+    // @ts-expect-error BETWEEN bounds follow the operand type
+    .where((eb) => eb.between("total", true, false));
+  void boundaryDb.selectFrom("orders").select((eb) =>
+    // @ts-expect-error CASE conditions follow the operand type
+    eb.case().when("total", ">", true).then(1).end().as("x"),
+  );
+  // `case(value)` keeps Kysely's own overloads.
+  void boundaryDb
+    .selectFrom("orders")
+    .select((eb) => eb.case("open").when(true).then(1).else(0).end().as("flag"));
+}
+
+function mixedDatabaseMapsKeepResultDecoding(driver: MinnowSqlDriver): void {
+  interface Extra {
+    extra: { id: number; note: ColumnType<string, string, string> };
+  }
+  const decoded = createKysely({
+    driver,
+    schema: boundarySchema,
+    resultDecoding: { numeric: "number", json: "parse" },
+  });
+  const mixed = decoded as unknown as Kysely<
+    InferKyselyDatabase<typeof boundarySchema, { numeric: "number"; json: "parse" }> & Extra
+  >;
+  const query = mixed
+    .selectFrom("orders")
+    .select((eb) => [
+      eb.cast("id", "numeric").as("exact"),
+      eb.cast("id", "json").as("document"),
+      eb.fn.sum("total").as("revenue"),
+    ]);
+  expectTypeOf<Awaited<ReturnType<typeof query.execute>>>().toEqualTypeOf<
+    Array<{ exact: number; document: MinnowJsonValue; revenue: number | null }>
+  >();
+  void query;
+}
+
 function kyselyTypeUtilitiesSurviveBranding(dbRef: Kysely<ConformanceDatabase>): void {
   const narrowed = dbRef
     .selectFrom("users")
@@ -1353,6 +1556,8 @@ function kyselyTypeUtilitiesSurviveBranding(dbRef: Kysely<ConformanceDatabase>):
 describe("type-level DX", () => {
   it("keeps operand boundaries and Kysely's type utilities intact", () => {
     expect(numericOperandsSpanJoins).toBeTypeOf("function");
+    expect(numericOperandsReachEveryComparisonEntryPoint).toBeTypeOf("function");
+    expect(mixedDatabaseMapsKeepResultDecoding).toBeTypeOf("function");
     expect(kyselyTypeUtilitiesSurviveBranding).toBeTypeOf("function");
     expect(boundarySchema.tables.length).toBe(2);
   });

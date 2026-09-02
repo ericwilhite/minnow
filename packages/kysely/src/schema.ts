@@ -1,7 +1,7 @@
 import type { AnyTable, AnyView, PrimaryKeyKeys, SchemaDefinition } from "@minnowdb/core";
 import type {
-  AggregateFunctionBuilder,
   BinaryOperator,
+  CaseThenBuilder,
   ColumnDataType,
   ColumnType,
   ComparisonOperator,
@@ -11,10 +11,13 @@ import type {
   JSONOperatorWith$,
   JSONPathBuilder,
   KyselyTypeError,
+  MatchedThenableMergeQueryBuilder,
+  NotMatchedThenableMergeQueryBuilder,
   ReferenceExpression,
   SelectType,
   SqlBool,
   StringReference,
+  ValueExpression,
   ValueExpressionOrList,
 } from "kysely";
 import type { MinnowResultDecoding } from "./driver.js";
@@ -124,6 +127,13 @@ type MinnowOperandExpression<
   RE extends StringReference<DB, TB>,
 > = ValueExpressionOrList<DB, TB, MinnowOperandType<DB, TB, RE> | null>;
 
+/** One operand where a list is not accepted: BETWEEN bounds. */
+type MinnowOperandValue<
+  DB,
+  TB extends keyof DB,
+  RE extends StringReference<DB, TB>,
+> = ValueExpression<DB, TB, MinnowOperandType<DB, TB, RE>>;
+
 type MinnowFilterObject<DB, TB extends keyof DB> = {
   [RE in StringReference<DB, TB>]?: MinnowOperandExpression<DB, TB, RE>;
 };
@@ -138,10 +148,18 @@ type HasMinnowColumns<DB> = [
   ? false
   : true;
 
-type DatabaseResultDecoding<DB> =
-  DatabaseColumnType<DB> extends {
-    readonly __minnow_result_decoding__?: infer TDecoding;
-  }
+/**
+ * The decoding every schema-derived column carries. Read from the Minnow columns alone, so a DB
+ * map that also holds hand-written tables (`Kysely<InferKyselyDatabase<...> & Extra>`) keeps
+ * the decoding its schema-derived half was created with.
+ */
+type DatabaseResultDecoding<DB> = [
+  Extract<DatabaseColumnType<DB>, { readonly __minnow_result_decoding__?: unknown }>,
+] extends [never]
+  ? undefined
+  : Extract<DatabaseColumnType<DB>, { readonly __minnow_result_decoding__?: unknown }> extends {
+        readonly __minnow_result_decoding__?: infer TDecoding;
+      }
     ? TDecoding
     : undefined;
 
@@ -597,6 +615,57 @@ declare module "kysely" {
       expr: RE,
       dataType: TDataType & ColumnDataType,
     ): ExpressionWrapper<DB, TB, MinnowCastOutput<DB, TB, RE, TDataType>>;
+    between<RE extends StringReference<DB, TB>>(
+      expr: RE,
+      start: MinnowOperandValue<DB, TB, RE>,
+      end: MinnowOperandValue<DB, TB, RE>,
+    ): ExpressionWrapper<DB, TB, SqlBool>;
+    betweenSymmetric<RE extends StringReference<DB, TB>>(
+      expr: RE,
+      start: MinnowOperandValue<DB, TB, RE>,
+      end: MinnowOperandValue<DB, TB, RE>,
+    ): ExpressionWrapper<DB, TB, SqlBool>;
+  }
+
+  interface AggregateFunctionBuilder<DB, TB extends keyof DB, O> {
+    filterWhere<RE extends StringReference<DB, TB>>(
+      lhs: RE,
+      op: ComparisonOperatorExpression,
+      rhs: MinnowOperandExpression<DB, TB, RE>,
+    ): AggregateFunctionBuilder<DB, TB, O>;
+  }
+
+  interface CaseBuilder<DB, TB extends keyof DB, W, O> {
+    when<RE extends StringReference<DB, TB>>(
+      lhs: unknown extends W
+        ? RE
+        : KyselyTypeError<"when(lhs, op, rhs) is not supported when using case(value)">,
+      op: ComparisonOperatorExpression,
+      rhs: MinnowOperandExpression<DB, TB, RE>,
+    ): CaseThenBuilder<DB, TB, W, O>;
+  }
+
+  interface CaseWhenBuilder<DB, TB extends keyof DB, W, O> {
+    when<RE extends StringReference<DB, TB>>(
+      lhs: unknown extends W
+        ? RE
+        : KyselyTypeError<"when(lhs, op, rhs) is not supported when using case(value)">,
+      op: ComparisonOperatorExpression,
+      rhs: MinnowOperandExpression<DB, TB, RE>,
+    ): CaseThenBuilder<DB, TB, W, O>;
+  }
+
+  interface WheneableMergeQueryBuilder<DB, TT extends keyof DB, ST extends keyof DB, O> {
+    whenMatchedAnd<RE extends StringReference<DB, TT | ST>>(
+      lhs: RE,
+      op: ComparisonOperatorExpression,
+      rhs: MinnowOperandExpression<DB, TT | ST, RE>,
+    ): MatchedThenableMergeQueryBuilder<DB, TT, ST, TT | ST, O>;
+    whenNotMatchedAnd<RE extends StringReference<DB, ST>>(
+      lhs: RE,
+      op: ComparisonOperatorExpression,
+      rhs: MinnowOperandExpression<DB, ST, RE>,
+    ): NotMatchedThenableMergeQueryBuilder<DB, TT, ST, O>;
   }
 
   interface ExpressionWrapper<DB, TB extends keyof DB, T> {

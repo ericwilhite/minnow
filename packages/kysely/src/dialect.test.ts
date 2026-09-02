@@ -1159,8 +1159,8 @@ describe("MinnowDialect", () => {
     await database.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')");
     await database.execute(
       "CREATE TABLE domain_metadata (" +
-        "amount NUMERIC(12, 2), document JSONB, reference UUID, at TIME, span INTERVAL, " +
-        "tags TEXT[], feeling mood)",
+        "amount NUMERIC(12, 2), document JSONB, reference UUID, born DATE, at TIME, " +
+        "span INTERVAL, tags TEXT[], feeling mood)",
     );
 
     const table = (await db.introspection.getTables()).find(
@@ -1170,6 +1170,7 @@ describe("MinnowDialect", () => {
       { name: "amount", dataType: "numeric(12,2)" },
       { name: "document", dataType: "jsonb" },
       { name: "reference", dataType: "uuid" },
+      { name: "born", dataType: "date" },
       { name: "at", dataType: "time" },
       { name: "span", dataType: "interval" },
       { name: "tags", dataType: "text[]" },
@@ -1384,6 +1385,52 @@ describe("MinnowDialect", () => {
     ]);
   });
 
+  it("streams RETURNING rows from mutations through a buffered fallback", async () => {
+    // Minnow's cursor reads only SELECT statements, while Kysely streams mutation builders too.
+    await db
+      .insertInto("person")
+      .values([
+        { id: 1, name: "Ada", score: 8 },
+        { id: 2, name: "Grace", score: 9 },
+        { id: 3, name: "Katherine", score: 10 },
+      ])
+      .execute();
+    const updated: Array<{ id: number }> = [];
+    for await (const row of db
+      .updateTable("person")
+      .set({ score: 0 })
+      .where("id", ">", 1)
+      .returning("id")
+      .stream(1)) {
+      updated.push(row);
+    }
+    expect(updated).toEqual([{ id: 2 }, { id: 3 }]);
+    const inserted: Array<{ id: number; name: string }> = [];
+    for await (const row of db
+      .insertInto("person")
+      .values({ id: 4, name: "Linus", score: null })
+      .returning(["id", "name"])
+      .stream()) {
+      inserted.push(row);
+    }
+    expect(inserted).toEqual([{ id: 4, name: "Linus" }]);
+    const deleted: number[] = [];
+    for await (const row of db
+      .deleteFrom("person")
+      .where("score", "is", null)
+      .returning("id")
+      .stream(10)) {
+      deleted.push(row.id);
+    }
+    expect(deleted).toEqual([4]);
+    // The stream released the connection, so the next statement runs.
+    expect(await db.selectFrom("person").select("id").orderBy("id").execute()).toEqual([
+      { id: 1 },
+      { id: 2 },
+      { id: 3 },
+    ]);
+  });
+
   it("does not take ownership of the underlying database", async () => {
     await db.destroy();
     expect((await database.query("SELECT COUNT(*) AS count FROM person")).rows).toEqual([
@@ -1433,6 +1480,29 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
     expect(() => db.schema.alterTable("person").renameColumn("name", "title").compile()).toThrow(
       "RENAME COLUMN",
     );
+  });
+
+  it("refuses JSON path operators that Minnow's -> and ->> would read as one key", () => {
+    // `->$` compiles to `"doc"->'$."a"'`. The engine would look for a member literally named
+    // `$."a"` and return NULL without an error; one key or index per step is the supported form.
+    expect(() =>
+      db
+        .selectFrom("person")
+        .select((eb) => eb.ref("doc", "->$").key("a").as("a"))
+        .compile(),
+    ).toThrow("not a JSON path");
+    expect(() =>
+      db
+        .selectFrom("person")
+        .select((eb) => eb.ref("doc", "->>$").key("a").as("a"))
+        .compile(),
+    ).toThrow("not a JSON path");
+    expect(() =>
+      db
+        .selectFrom("person")
+        .select((eb) => eb.ref("doc", "->>").key("a").as("a"))
+        .compile(),
+    ).not.toThrow();
   });
 
   it("keeps the supported neighbors compiling", () => {

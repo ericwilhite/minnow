@@ -2407,6 +2407,7 @@ export function bindStatementParameters(
     if (clone.onConflict?.where !== undefined) {
       clone.onConflict.where = bindExpression(clone.onConflict.where, values);
     }
+    bindReturningItems(clone.returningItems, values);
     return clone;
   }
   if (
@@ -2446,7 +2447,17 @@ export function bindStatementParameters(
     predicate.left = bindExpression(predicate.left, values);
     predicate.right = bindExpression(predicate.right, values);
   }
+  bindReturningItems(clone.returningItems, values);
   return clone;
+}
+
+/** RETURNING expression items share the statement's placeholder numbering with its predicates. */
+function bindReturningItems(
+  items: ReturningItem[] | undefined,
+  values: readonly QueryValue[],
+): void {
+  if (items === undefined) return;
+  for (const item of items) item.expression = bindExpression(item.expression, values);
 }
 
 export type SqlColumnType = "boolean" | "number" | "string" | "datetime";

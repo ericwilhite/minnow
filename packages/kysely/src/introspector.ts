@@ -18,6 +18,7 @@ function dataType(column: CatalogColumn): string {
     domain?.kind === "json" ||
     domain?.kind === "jsonb" ||
     domain?.kind === "uuid" ||
+    domain?.kind === "date" ||
     domain?.kind === "time" ||
     domain?.kind === "interval"
   ) {

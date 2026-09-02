@@ -2,6 +2,7 @@ import type { ExecuteResult, MinnowSqlDriver, QueryValue } from "@minnowdb/core"
 import {
   IdentifierNode,
   RawNode,
+  SelectQueryNode,
   createQueryId,
   type CompiledQuery,
   type DatabaseConnection,
@@ -128,6 +129,17 @@ class MinnowKyselyConnection implements DatabaseConnection {
     chunkSize: number,
     options?: AbortableOperationOptions,
   ): AsyncIterableIterator<QueryResult<R>> {
+    if (!SelectQueryNode.is(compiledQuery.query)) {
+      // Minnow's cursor reads SELECT statements only. Kysely also streams INSERT, UPDATE, and
+      // DELETE builders with RETURNING, so a mutation runs buffered and hands its returned rows
+      // out in chunks, as PostgreSQL's cursor-backed dialect would.
+      const result = await this.executeQuery<R>(compiledQuery, options);
+      const size = Math.max(1, Math.trunc(chunkSize));
+      for (let start = 0; start < result.rows.length; start += size) {
+        yield { rows: result.rows.slice(start, start + size) };
+      }
+      return;
+    }
     for await (const batch of this.#driver.queryCursor(compiledQuery.sql, {
       params: kyselyQueryValues(compiledQuery.parameters),
       batchRows: chunkSize,

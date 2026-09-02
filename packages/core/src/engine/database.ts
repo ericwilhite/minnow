@@ -9097,11 +9097,9 @@ export class MinnowDatabase {
         ),
       );
     }
+    const boundStatement = bindStatementParameters(statement, params);
     return externalizeExecuteResult(
-      await this.#projectReturningItems(
-        statement,
-        await this.runStatement(bindStatementParameters(statement, params)),
-      ),
+      await this.#projectReturningItems(boundStatement, await this.runStatement(boundStatement)),
     );
   }
 

@@ -136,10 +136,10 @@ machines: https://minnowdb.com/llms.txt
   parsed JSON results are preferred to core's lossless strings. The option covers buffered,
   streamed, and `RETURNING` rows; omit numeric decoding when decimal precision must remain exact.
 - Kysely builder forms outside Minnow's profile — MySQL/SQLite/T-SQL spellings such as
-  `replaceInto()`, `orIgnore()`, `.top()`, and update/delete `LIMIT`, plus SQL `EXPLAIN`,
-  data-modifying CTEs, and `ALTER TABLE` beyond add/drop column — are refused when the query
-  compiles, with the alternative named in the error. Follow that alternative instead of retrying
-  the same form.
+  `replaceInto()`, `orIgnore()`, `.top()`, `identity()`, and update/delete `LIMIT`, plus SQL
+  `EXPLAIN`, data-modifying CTEs, the JSON path operators `->$`/`->>$`, and `ALTER TABLE` beyond
+  add/drop column — are refused when the query compiles, with the alternative named in the
+  error. Follow that alternative instead of retrying the same form.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
   With Kysely, use `search.match(eb, columns, query)` and `search.rank(eb, columns, query)` so the

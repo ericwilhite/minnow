@@ -3,6 +3,7 @@ import {
   ColumnNode,
   DefaultInsertValueNode,
   InsertQueryNode,
+  ListNode,
   MergeQueryNode,
   PostgresQueryCompiler,
   PrimitiveValueListNode,
@@ -17,9 +18,16 @@ import {
   type CreateTableNode,
   type CreateViewNode,
   type DeleteQueryNode,
+  type DropIndexNode,
+  type DropTableNode,
+  type DropViewNode,
+  type ForeignKeyConstraintNode,
   type FunctionNode,
   type JoinNode,
+  type JSONPathNode,
+  type MatchedNode,
   type OperationNode,
+  type PrimaryKeyConstraintNode,
   type QueryId,
   type OnConflictNode,
   type RootOperationNode,
@@ -27,6 +35,7 @@ import {
   type SelectModifier,
   type SelectModifierNode,
   type SelectQueryNode,
+  type UniqueConstraintNode,
   type UpdateQueryNode,
   type ValuesItemNode,
 } from "kysely";
@@ -326,6 +335,27 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
     super.visitJoin(node);
   }
 
+  protected override visitJSONPath(node: JSONPathNode): void {
+    // `->$` and `->>$` compile to a JSON path string such as '$."name"'. Minnow's -> and ->>
+    // read that string as one member name, so the traversal quietly yields NULL.
+    void node;
+    throw new TypeError(
+      "Minnow's -> and ->> operators take one key or array index per step, not a JSON path. " +
+        "Use eb.ref(column, '->') or eb.ref(column, '->>') with .key() and .at(), or " +
+        "JSON_VALUE through sql for a path.",
+    );
+  }
+
+  protected override visitMatched(node: MatchedNode): void {
+    if (node.bySource) {
+      throw new TypeError(
+        "Minnow does not support MERGE ... WHEN NOT MATCHED BY SOURCE. Update or delete the " +
+          "unmatched target rows with a separate statement whose WHERE excludes the source keys.",
+      );
+    }
+    super.visitMatched(node);
+  }
+
   protected override visitInsertQuery(node: InsertQueryNode): void {
     if (node.replace === true) {
       throw new TypeError(
@@ -349,6 +379,12 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   }
 
   protected override visitUpdateQuery(node: UpdateQueryNode): void {
+    if (node.table !== undefined && ListNode.is(node.table)) {
+      throw new TypeError(
+        "Minnow does not support MySQL's multi-table UPDATE. Update one table per statement, " +
+          "with WHERE ... IN (SELECT ...) for values that come from another table.",
+      );
+    }
     if (node.from !== undefined) {
       throw new TypeError(
         "Minnow does not support UPDATE ... FROM. Rewrite the update with a correlated " +
@@ -365,6 +401,12 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   }
 
   protected override visitDeleteQuery(node: DeleteQueryNode): void {
+    if (node.from.froms.length > 1) {
+      throw new TypeError(
+        "Minnow does not support MySQL's multi-table DELETE. Delete from one table per " +
+          "statement, with WHERE ... IN (SELECT ...) for keys that come from another table.",
+      );
+    }
     if (node.using !== undefined) {
       throw new TypeError(
         "Minnow does not support DELETE ... USING. Rewrite the delete with a correlated " +
@@ -427,10 +469,118 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
           "done, or query over VALUES/a CTE for transient rows.",
       );
     }
+    if ((node.indexes?.length ?? 0) > 0) {
+      throw new TypeError(
+        "Minnow does not support MySQL's inline INDEX in CREATE TABLE. Create the table, then " +
+          "add the index with createIndex().",
+      );
+    }
     super.visitCreateTable(node);
   }
 
+  protected override visitDropTable(node: DropTableNode): void {
+    if (node.temporary === true) {
+      throw new TypeError(
+        "Minnow does not support temporary tables, so DROP TEMPORARY TABLE has nothing to " +
+          "drop. Remove .temporary().",
+      );
+    }
+    super.visitDropTable(node);
+  }
+
+  protected override visitDropView(node: DropViewNode): void {
+    if (node.materialized === true) {
+      throw new TypeError(
+        "Minnow does not support materialized views, so DROP MATERIALIZED VIEW has nothing to " +
+          "drop. Remove .materialized().",
+      );
+    }
+    if (node.cascade === true) {
+      throw new TypeError(
+        "Minnow does not support DROP VIEW ... CASCADE. Drop the views that depend on this one " +
+          "first, then remove .cascade().",
+      );
+    }
+    super.visitDropView(node);
+  }
+
+  protected override visitDropIndex(node: DropIndexNode): void {
+    if (node.table !== undefined) {
+      throw new TypeError(
+        "Minnow does not support MySQL's DROP INDEX ... ON table. Remove .on(); index names " +
+          "are unique across the database.",
+      );
+    }
+    if (node.cascade === true) {
+      throw new TypeError(
+        "Minnow does not support DROP INDEX ... CASCADE; nothing depends on an index. Remove " +
+          ".cascade().",
+      );
+    }
+    super.visitDropIndex(node);
+  }
+
+  static readonly #DEFERRABLE_CONSTRAINT =
+    "Minnow does not support deferrable constraints; every constraint is checked by the " +
+    "statement that writes. Remove .deferrable()/.initiallyDeferred().";
+
+  protected override visitPrimaryKeyConstraint(node: PrimaryKeyConstraintNode): void {
+    if (node.deferrable === true || node.initiallyDeferred === true) {
+      throw new TypeError(MinnowQueryCompiler.#DEFERRABLE_CONSTRAINT);
+    }
+    super.visitPrimaryKeyConstraint(node);
+  }
+
+  protected override visitUniqueConstraint(node: UniqueConstraintNode): void {
+    if (node.deferrable === true || node.initiallyDeferred === true) {
+      throw new TypeError(MinnowQueryCompiler.#DEFERRABLE_CONSTRAINT);
+    }
+    if (node.nullsNotDistinct === true) {
+      throw new TypeError(
+        "Minnow does not support NULLS NOT DISTINCT on unique constraints; unique keys treat " +
+          "NULLs as distinct.",
+      );
+    }
+    if (node.columns.some((column) => !ColumnNode.is(column))) {
+      throw new TypeError(
+        "Minnow does not support expression unique constraints. Store the expression in a " +
+          "generated column (generatedAlwaysAs(...).stored()) and make that column unique.",
+      );
+    }
+    super.visitUniqueConstraint(node);
+  }
+
+  protected override visitForeignKeyConstraint(node: ForeignKeyConstraintNode): void {
+    if (node.deferrable === true || node.initiallyDeferred === true) {
+      throw new TypeError(MinnowQueryCompiler.#DEFERRABLE_CONSTRAINT);
+    }
+    super.visitForeignKeyConstraint(node);
+  }
+
+  /**
+   * `.autoIncrement()` spells MySQL's `auto_increment` in Kysely's PostgreSQL compiler, which
+   * no PostgreSQL-style parser reads. Minnow accepts SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`
+   * as its auto-increment key, so the modifier compiles the way Kysely's own SQLite dialect
+   * compiles it and the builder's portable spelling keeps working.
+   */
+  protected override getAutoIncrement(): string {
+    return "autoincrement";
+  }
+
   protected override visitColumnDefinition(node: ColumnDefinitionNode): void {
+    if (node.identity === true) {
+      throw new TypeError(
+        "Minnow does not support the T-SQL IDENTITY column modifier. Give the column the " +
+          "'serial' data type, or call generatedAlwaysAsIdentity()/" +
+          "generatedByDefaultAsIdentity().",
+      );
+    }
+    if (node.ifNotExists === true) {
+      throw new TypeError(
+        "Minnow does not support ADD COLUMN IF NOT EXISTS. Check db.introspection.getTables() " +
+          "for the column first, or declare the schema and let database.migrate() add it.",
+      );
+    }
     if (node.unsigned === true) {
       throw new TypeError(
         "Minnow does not support MySQL's UNSIGNED integers. Use a plain integer column and a " +
