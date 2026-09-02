@@ -28,6 +28,7 @@ import {
   type TableSource,
 } from "./query.js";
 import { concatenatedSqlValue, isSqlDomainValue } from "./sql-domains.js";
+import { simpleScalarFunctions } from "./sql-functions.js";
 
 /**
  * Deterministic plan-to-plan rewrites over the shared compiled representation. Every rule
@@ -2518,7 +2519,11 @@ function foldExpression(expression: Expression): Expression {
                     expression.name === "JSON_ARRAY" ||
                     expression.name === "MINNOW_JSON_GET"
                   ? ({ kind: "json" } as const)
-                  : undefined;
+                  : simpleScalarFunctions.get(expression.name)?.returns === "date"
+                    ? ({ kind: "date" } as const)
+                    : simpleScalarFunctions.get(expression.name)?.returns === "interval"
+                      ? ({ kind: "interval" } as const)
+                      : undefined;
           return {
             kind: "literal",
             value: folded,

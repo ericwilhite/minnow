@@ -1444,6 +1444,78 @@
       "notes": "PostgreSQL's boolean input spellings t, true, 1, f, false, and 0 read as booleans beside a boolean column."
     },
     {
+      "id": "function.string-postgres",
+      "status": "supported",
+      "example": "SELECT CONCAT(region, '-', amount) AS tag, CONCAT_WS('/', region, NULL, 'x') AS joined, LEFT(region, 2) AS l, RIGHT(region, 2) AS r, REVERSE(region) AS rev, REPEAT('ab', 2) AS rep, INITCAP('hello world') AS cap, SPLIT_PART('a-b-c', '-', 2) AS part, STRPOS(region, 'st') AS at, STARTS_WITH(region, 'we') AS starts, TRANSLATE(region, 'we', 'WE') AS tr, ASCII(region) AS code, CHR(65) AS letter, BTRIM('xxhixx', 'x') AS trimmed FROM rows WHERE region IS NOT NULL",
+      "notes": "PostgreSQL's everyday string functions. CONCAT and CONCAT_WS skip NULL arguments and render numbers, booleans, and timestamps as text; LEFT and RIGHT take negative counts; SPLIT_PART counts from the end for a negative field; BTRIM removes any character of its set, as PostgreSQL does."
+    },
+    {
+      "id": "function.md5-format",
+      "status": "supported",
+      "example": "SELECT MD5(region) AS digest, FORMAT('%s has %s items (%I, %L)', region, amount, 'a b', 'it''s') AS message FROM rows WHERE region IS NOT NULL",
+      "notes": "MD5 hashes the UTF-8 bytes to 32 lowercase hex digits. FORMAT supports %s, %I (quoted identifier), %L (quoted literal), %% and positional %n$s; other conversion letters are rejected."
+    },
+    {
+      "id": "predicate.regex",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region ~ '^w' AND region !~* 'EAST$' AND region ~* 'W.ST'",
+      "notes": "PostgreSQL's ~, ~*, !~, and !~* run as JavaScript regular expressions, which agree with advanced regular expressions on everyday syntax. They sit at PostgreSQL's operator level, so `label ~ 'a' || 'b'` matches against the concatenation."
+    },
+    {
+      "id": "function.regexp-replace",
+      "status": "supported",
+      "example": "SELECT REGEXP_REPLACE(region, 'e+', 'E') AS first, REGEXP_REPLACE(region, '[aeiou]', '_', 'g') AS all_vowels, REGEXP_REPLACE('abc', '(a)(b)', '\\2\\1') AS swapped FROM rows WHERE region IS NOT NULL",
+      "notes": "Flags g (every match), i (case-insensitive), and n (newline-sensitive); \\1 back-references and \\& in the replacement follow PostgreSQL."
+    },
+    {
+      "id": "expression.power-operator",
+      "status": "supported",
+      "example": "SELECT 2 ^ 10 AS kib, 2 ^ 3 ^ 2 AS left_assoc, -2 ^ 2 AS negated, 2 * 3 ^ 2 AS mixed",
+      "notes": "PostgreSQL's ^ is exponentiation, binding above * and / and associating to the left: 2 ^ 3 ^ 2 is 64."
+    },
+    {
+      "id": "function.math-extended",
+      "status": "supported",
+      "example": "SELECT EXP(1) AS e, LN(amount) AS ln, LOG(amount) AS log10, LOG(2, 8) AS log2, LOG10(1000) AS thousand, SIGN(amount - 5) AS sign, TRUNC(CAST(amount AS NUMERIC) / 3, 2) AS trunc, PI() AS pi, CBRT(27) AS cbrt, DIV(CAST(amount AS NUMERIC), 3) AS quotient, WIDTH_BUCKET(amount, 0, 10, 5) AS bucket, DEGREES(PI()) AS half_turn, ROUND(SIN(RADIANS(90))) AS sine FROM rows",
+      "notes": "LOG(x) is base 10 and LOG(b, x) an explicit base, as in PostgreSQL. LN, LOG, and LOG10 reject non-positive input; DIV truncates toward zero; the trigonometric family (SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, DEGREES, RADIANS) is included."
+    },
+    {
+      "id": "function.to-char-datetime",
+      "status": "supported",
+      "example": "SELECT TO_CHAR(joined, 'YYYY-MM-DD HH24:MI:SS') AS iso, TO_CHAR(joined, 'FMDay, DD FMMonth YYYY') AS spoken, TO_CHAR(joined, 'HH12:MI AM') AS clock, TO_CHAR(joined, 'IW DDD Q') AS calendar FROM rows WHERE joined IS NOT NULL",
+      "notes": "The datetime template fields YYYY, YY, MM, DD, DDD, D, Q, IW, J, HH24, HH12, HH, MI, SS, MS, US, AM/PM, Month/Mon/Day/Dy in every case, TZ (always UTC), FM to drop padding, and double-quoted literal text. Every datetime is an instant in UTC."
+    },
+    {
+      "id": "function.to-char-numeric",
+      "status": "supported",
+      "example": "SELECT TO_CHAR(amount, '999.99') AS padded, TO_CHAR(amount, 'FM999.00') AS trimmed, TO_CHAR(-amount, '9999.9') AS negative, TO_CHAR(amount, '00009') AS zeros, TO_CHAR(amount * 1000, '9,999,999.99') AS grouped, TO_CHAR(amount, 'S999.99') AS signed FROM rows",
+      "notes": "The numeric template elements 9, 0, the decimal point, group separators, FM, S, and MI, with PostgreSQL's padding and sign placement. Other elements (EEEE, RN, V, PL, L, TH) are rejected rather than rendered wrongly."
+    },
+    {
+      "id": "function.to-date-timestamp",
+      "status": "supported",
+      "example": "SELECT TO_DATE('02/01/2026', 'DD/MM/YYYY') AS day, TO_TIMESTAMP('2026-01-02 03:04 PM', 'YYYY-MM-DD HH12:MI AM') AS at, TO_TIMESTAMP(1767322800) AS epoch",
+      "notes": "Reads text against the same template fields TO_CHAR writes; a one-argument TO_TIMESTAMP converts seconds since the epoch. TO_DATE returns a DATE value, rendered as YYYY-MM-DD at the JavaScript boundary."
+    },
+    {
+      "id": "function.make-date",
+      "status": "supported",
+      "example": "SELECT MAKE_DATE(2026, 1, 2) AS day, MAKE_TIMESTAMP(2026, 1, 2, 3, 4, 5.5) AS at",
+      "notes": "Fields that do not form a real date or timestamp are an error."
+    },
+    {
+      "id": "function.age",
+      "status": "supported",
+      "example": "SELECT AGE(TIMESTAMP '2026-03-15 12:00:00', joined) AS since, AGE(joined) AS so_far FROM rows WHERE joined IS NOT NULL",
+      "notes": "The calendar difference PostgreSQL's AGE reports (years and months, then days borrowed from the earlier date's month, then time); AGE(x) measures from the statement's CURRENT_DATE. The result is Minnow's canonical interval text."
+    },
+    {
+      "id": "function.date-part",
+      "status": "supported",
+      "example": "SELECT DATE_PART('year', joined) AS y, EXTRACT(DOY FROM joined) AS doy, EXTRACT(ISODOW FROM joined) AS isodow, EXTRACT(ISOYEAR FROM joined) AS isoyear, EXTRACT(DECADE FROM joined) AS decade, EXTRACT(MILLISECONDS FROM joined) AS ms, EXTRACT(YEAR FROM DATE '2026-03-04') AS from_date FROM rows WHERE joined IS NOT NULL",
+      "notes": "DATE_PART('field', value) is EXTRACT(field FROM value). The fields year, quarter, month, week, day, hour, minute, second, epoch, dow, doy, isodow, isoyear, decade, century, millennium, milliseconds, and microseconds, over timestamps and DATE values, in UTC."
+    },
+    {
       "id": "group-by.ordinal",
       "status": "supported",
       "example": "SELECT UPPER(region) AS place, COUNT(*) AS c FROM rows GROUP BY 1 ORDER BY place",

@@ -186,7 +186,7 @@ describe("features SQLite cannot arbitrate", () => {
         "SELECT EXTRACT(quarter FROM joined) AS q, EXTRACT(week FROM joined) AS w, EXTRACT(hour FROM joined) AS h FROM rows WHERE id = 1",
       ),
     ).toEqual([{ q: 1, w: 1, h: 3 }]);
-    expect(() => run("SELECT EXTRACT(century FROM joined) AS c FROM rows")).toThrow(
+    expect(() => run("SELECT EXTRACT(timezone_hour FROM joined) AS c FROM rows")).toThrow(
       "Unsupported EXTRACT field",
     );
   });

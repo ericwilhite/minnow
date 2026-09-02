@@ -155,6 +155,21 @@
       "reason": "Minnow returns arrays as canonical JSON text at the JavaScript boundary while PostgreSQL clients commonly return native arrays."
     },
     {
+      "id": "function.to-date-timestamp",
+      "classification": "different",
+      "reason": "TO_DATE returns a zoneless DATE rendered as YYYY-MM-DD text at the JavaScript boundary, where PostgreSQL clients commonly materialize a midnight Date; TO_TIMESTAMP values agree."
+    },
+    {
+      "id": "function.make-date",
+      "classification": "different",
+      "reason": "MAKE_DATE returns a zoneless DATE rendered as YYYY-MM-DD text at the JavaScript boundary, where PostgreSQL clients commonly materialize a midnight Date; MAKE_TIMESTAMP values agree."
+    },
+    {
+      "id": "function.age",
+      "classification": "different",
+      "reason": "AGE computes PostgreSQL's calendar difference but returns Minnow's canonical months/days/usecs interval text rather than PostgreSQL's '1 mon 14 days 12:00:00' rendering."
+    },
+    {
       "id": "type.date",
       "classification": "different",
       "reason": "Minnow returns zoneless DATE values as canonical YYYY-MM-DD text while PostgreSQL clients commonly materialize them as midnight Date objects."

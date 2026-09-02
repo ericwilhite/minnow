@@ -89,6 +89,7 @@ import {
   parseSqlTimestampText,
   stringArgument,
 } from "./sql-semantics.js";
+import { simpleScalarFunctions } from "./sql-functions.js";
 import {
   jsonArrowStep,
   jsonAtPath,
@@ -229,6 +230,7 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "CURRVAL",
   "RANDOM",
   "GEN_RANDOM_UUID",
+  ...(Array.from(simpleScalarFunctions.keys()) as ScalarFunctionName[]),
 ] satisfies ScalarFunctionName[]);
 
 /** Functions whose answer can change without any catalog or input-row change. */
@@ -256,6 +258,8 @@ const statementDatetimeNames: ReadonlySet<string> = new Set([
 /** Standard function spellings that share one canonical plan name. */
 const functionSpellings: ReadonlyMap<string, string> = new Map([
   ["SUBSTRING", "SUBSTR"],
+  // DATE_PART('field', value) is EXTRACT(field FROM value) with the field as a string.
+  ["DATE_PART", "EXTRACT"],
   ["CEILING", "CEIL"],
   ["CHAR_LENGTH", "LENGTH"],
   ["CHARACTER_LENGTH", "LENGTH"],
@@ -449,6 +453,16 @@ export function scalarFunctionValue(
   if (name === "NEXTVAL" || name === "CURRVAL") {
     throw new TypeError(`${name} must be resolved by the database catalog`);
   }
+  const simple = simpleScalarFunctions.get(name);
+  if (simple !== undefined) {
+    if (
+      simple.nullOnNull !== false &&
+      values.some((value) => value === null || value === undefined)
+    ) {
+      return null;
+    }
+    return simple.evaluate(values);
+  }
   if (name === "MINNOW_TUPLE_KEY") {
     // SQL equality cannot match a tuple containing NULL. JSON stringification of the tagged
     // scalar equality encodings is prefix-free and keeps strings, numbers, booleans, and
@@ -514,6 +528,11 @@ export function scalarFunctionValue(
     case "ROUND": {
       if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
       const digits = values.length > 1 ? numeric(values[1]) : 0;
+      // An exact NUMERIC rounds exactly, to the requested scale, half away from zero as
+      // PostgreSQL's numeric ROUND does; a double takes the float path.
+      if (isExactNumeric(first) && Number.isInteger(digits) && digits >= 0) {
+        return exactNumericValue(first, undefined, digits);
+      }
       return roundSqlNumber(numeric(first), digits);
     }
     case "ABS":
@@ -2448,6 +2467,9 @@ export function inferBlockSchema(
     }
     if (expression.kind !== "call") return undefined;
     if (expression.name === "CURRENT_DATE") return { kind: "date" };
+    const simple = simpleScalarFunctions.get(expression.name);
+    if (simple?.returns === "date") return { kind: "date" };
+    if (simple?.returns === "interval") return { kind: "interval" };
     if (expression.name === "CAST") {
       const target = expression.arguments[1];
       return target?.kind === "literal" && typeof target.value === "string"
@@ -2608,6 +2630,15 @@ export function inferBlockSchema(
       return "string";
     }
     if (expression.name === "JSON_EXISTS" || expression.name === "IS_JSON") return "boolean";
+    const simple = simpleScalarFunctions.get(expression.name);
+    if (simple !== undefined) {
+      if (simple.returns === "argument") {
+        const argument = expression.arguments[0];
+        return argument === undefined ? "null" : infer(argument);
+      }
+      // DATE and INTERVAL results are logical domains carried as strings.
+      return simple.returns === "date" || simple.returns === "interval" ? "string" : simple.returns;
+    }
     if (expression.name === "DATE_TRUNC") return "datetime";
     if (expression.name === "DATE_ADD") {
       return inferDomain(expression)?.kind === "date" ? "string" : "datetime";
@@ -5111,6 +5142,14 @@ const extractFields: ReadonlySet<string> = new Set([
   "second",
   "epoch",
   "dow",
+  "doy",
+  "isodow",
+  "isoyear",
+  "decade",
+  "century",
+  "millennium",
+  "milliseconds",
+  "microseconds",
 ]);
 
 /**
@@ -5123,10 +5162,39 @@ function extractDatePart(field: string, value: unknown): number | null {
     throw new TypeError(`Unsupported EXTRACT field: ${field}`);
   }
   if (value === null || value === undefined) return null;
-  if (!(value instanceof Date)) throw new TypeError("EXTRACT requires a datetime value");
+  if (!(value instanceof Date)) {
+    // A DATE value is a midnight instant for every field; other text is not a datetime.
+    const external = isDateDomainValue(value) ? externalSqlDomainValue(value) : undefined;
+    if (typeof external !== "string") throw new TypeError("EXTRACT requires a datetime value");
+    return extractDatePart(field, new Date(`${external}T00:00:00.000Z`));
+  }
   switch (normalized) {
     case "year":
       return dateUtcFullYear(value);
+    case "doy": {
+      const start = Date.UTC(dateUtcFullYear(value), 0, 1);
+      const day = Date.UTC(dateUtcFullYear(value), dateUtcMonth(value), dateUtcDate(value));
+      return Math.floor((day - start) / 86_400_000) + 1;
+    }
+    case "isodow":
+      return dateUtcDay(value) === 0 ? 7 : dateUtcDay(value);
+    case "isoyear": {
+      const probe = new Date(
+        Date.UTC(dateUtcFullYear(value), dateUtcMonth(value), dateUtcDate(value)),
+      );
+      setDateUtcDate(probe, dateUtcDate(probe) + 4 - (dateUtcDay(probe) || 7));
+      return dateUtcFullYear(probe);
+    }
+    case "decade":
+      return Math.floor(dateUtcFullYear(value) / 10);
+    case "century":
+      return Math.ceil(dateUtcFullYear(value) / 100);
+    case "millennium":
+      return Math.ceil(dateUtcFullYear(value) / 1000);
+    case "milliseconds":
+      return dateUtcSeconds(value) * 1000 + value.getUTCMilliseconds();
+    case "microseconds":
+      return (dateUtcSeconds(value) * 1000 + value.getUTCMilliseconds()) * 1000;
     case "quarter":
       return Math.floor(dateUtcMonth(value) / 3) + 1;
     case "month":
@@ -8115,18 +8183,39 @@ class Parser {
       }
       // || and the JSON arrows share PostgreSQL's loosest "any other operator" level, applying
       // left-to-right to whole arithmetic terms: `'a' || d ->> 'k'` is `('a' || d) ->> 'k'`.
+      const regexOperator =
+        operator === "~" || operator === "~*" || operator === "!~" || operator === "!~*";
       const precedence =
         operator === "::"
           ? 30
-          : operator === "*" || operator === "/" || operator === "%"
-            ? 20
-            : operator === "+" || operator === "-"
-              ? 10
-              : operator === "||" || operator === "->" || operator === "->>"
-                ? 5
-                : -1;
+          : operator === "^"
+            ? 25
+            : operator === "*" || operator === "/" || operator === "%"
+              ? 20
+              : operator === "+" || operator === "-"
+                ? 10
+                : operator === "||" || operator === "->" || operator === "->>" || regexOperator
+                  ? 5
+                  : -1;
       if (precedence < minimumPrecedence) break;
       this.#index += 1;
+      if (operator === "^") {
+        // Exponentiation binds above * and / and, as in PostgreSQL, associates to the left:
+        // 2 ^ 3 ^ 2 is (2 ^ 3) ^ 2.
+        const exponent = this.#additive(precedence + 1);
+        left = { kind: "call", name: "POWER", arguments: [left, exponent] };
+        continue;
+      }
+      if (regexOperator) {
+        const pattern = this.#additive(precedence + 1);
+        const match: Expression = {
+          kind: "call",
+          name: "MINNOW_REGEX_MATCH",
+          arguments: [left, pattern, { kind: "literal", value: operator.endsWith("*") ? "i" : "" }],
+        };
+        left = operator.startsWith("!") ? { kind: "not", operand: match } : match;
+        continue;
+      }
       if (operator === "::") {
         // PostgreSQL's postfix cast binds tighter than every binary operator, so it applies to
         // the term just parsed and rides the same CAST call as the standard spelling.
@@ -8658,7 +8747,8 @@ class Parser {
         name === "MINNOW_COLLATE" ||
         name === "MINNOW_SINGLE_VALUE" ||
         name === "MINNOW_JSON_GET" ||
-        name === "MINNOW_JSON_GET_TEXT"
+        name === "MINNOW_JSON_GET_TEXT" ||
+        name === "MINNOW_REGEX_MATCH"
       ) {
         throw new TypeError(`Unsupported function: ${identifier}`);
       }
@@ -8704,6 +8794,26 @@ class Parser {
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "JSON_ARRAYAGG" && args[0]?.kind === "wildcard") {
         throw new TypeError("JSON_ARRAYAGG requires a scalar value expression");
+      }
+      const simple = simpleScalarFunctions.get(name);
+      if (simple !== undefined) {
+        if (name === "AGE" && args.length === 1) {
+          // AGE(x) is AGE(CURRENT_DATE, x): the statement clock, resolved once per statement.
+          this.usesStatementDatetime = true;
+          args.unshift({ kind: "call", name: "CURRENT_DATE", arguments: [] });
+        }
+        if (args.length < simple.minArgs || args.length > simple.maxArgs) {
+          const range =
+            simple.minArgs === simple.maxArgs
+              ? `exactly ${String(simple.minArgs)}`
+              : simple.maxArgs === Number.POSITIVE_INFINITY
+                ? `at least ${String(simple.minArgs)}`
+                : `${String(simple.minArgs)} to ${String(simple.maxArgs)}`;
+          throw new TypeError(`${name} takes ${range} argument${simple.maxArgs === 1 ? "" : "s"}`);
+        }
+        if (args.some((argument) => argument.kind === "wildcard")) {
+          throw new TypeError(`${name} takes scalar arguments`);
+        }
       }
       if (name === "ROUND" && (args.length < 1 || args.length > 2))
         throw new TypeError("ROUND requires one or two arguments");
@@ -10968,6 +11078,23 @@ function tokenize(sql: string): Token[] {
       // PostgreSQL's postfix cast, `expression::type`.
       push({ kind: "operator", text: "::", start: index, end: index + 2 });
       index += 2;
+      continue;
+    }
+    if (pair === "!~") {
+      const text = sql[index + 2] === "*" ? "!~*" : "!~";
+      push({ kind: "operator", text, start: index, end: index + text.length });
+      index += text.length;
+      continue;
+    }
+    if (character === "~") {
+      const text = sql[index + 1] === "*" ? "~*" : "~";
+      push({ kind: "operator", text, start: index, end: index + text.length });
+      index += text.length;
+      continue;
+    }
+    if (character === "^") {
+      push({ kind: "operator", text: "^", start: index, end: index + 1 });
+      index += 1;
       continue;
     }
     if (["+", "-", "*", "/", "%", "=", ">", "<"].includes(character))

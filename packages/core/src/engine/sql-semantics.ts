@@ -11,6 +11,7 @@ import {
   exactNumericCompare,
   externalSqlDomainValue,
   externalSqlTextValue,
+  intervalDomainCompare,
   isDateDomainValue,
   isSqlDomainValue,
 } from "./sql-domains.js";
@@ -99,6 +100,8 @@ export function compareSqlValues(left: unknown, right: unknown): number {
   }
   const collated = collatedDomainCompare(left, right);
   if (collated !== undefined) return collated;
+  const interval = intervalDomainCompare(left, right);
+  if (interval !== undefined) return interval;
   const enumOrder = enumDomainCompare(left, right);
   if (enumOrder !== undefined) return enumOrder;
   const exact = exactNumericCompare(left, right);
@@ -607,6 +610,46 @@ function nfaMatcher(pattern: string, escape: string): WeightedPatternMatcher {
   // more than their integer payload. A conservative model keeps large compiled patterns out of
   // the cache instead of pretending their Uint32-sized indexes are the whole retained graph.
   return { test, retainedSize: states.length * 32 };
+}
+
+const regexCache = new Map<string, RegExp>();
+
+/**
+ * PostgreSQL's ~ / ~* / !~ / !~* operators and REGEXP_REPLACE, compiled as JavaScript regular
+ * expressions. Advanced regular expressions and JavaScript agree on the everyday syntax; the
+ * `n` flag makes `.` and anchors newline-sensitive, `i` is case-insensitive, and `g` replaces
+ * every match. Patterns are bounded like every other SQL pattern.
+ */
+export function compileRegexPattern(pattern: string, flags = ""): RegExp {
+  assertBoundedPattern(pattern, "regular expression");
+  const normalized = [...new Set(flags)].sort().join("");
+  const key = `${normalized}\u0000${pattern}`;
+  const cached = regexCache.get(key);
+  if (cached !== undefined) {
+    cached.lastIndex = 0;
+    return cached;
+  }
+  let jsFlags = "u";
+  if (normalized.includes("i")) jsFlags += "i";
+  if (normalized.includes("g")) jsFlags += "g";
+  if (normalized.includes("n")) jsFlags += "m";
+  else jsFlags += "s";
+  let expression: RegExp;
+  try {
+    expression = new RegExp(pattern, jsFlags);
+  } catch {
+    try {
+      expression = new RegExp(pattern, jsFlags.replace("u", ""));
+    } catch (error) {
+      throw new TypeError(
+        `Invalid regular expression: ${error instanceof Error ? error.message : pattern}`,
+        { cause: error },
+      );
+    }
+  }
+  if (regexCache.size >= 256) regexCache.clear();
+  regexCache.set(key, expression);
+  return expression;
 }
 
 /** PostgreSQL SIMILAR TO compiled to a Thompson NFA with bounded deterministic work. */

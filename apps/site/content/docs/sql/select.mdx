@@ -38,6 +38,17 @@ precision value cast to an integer type rounds to the nearest integer with ties 
 PostgreSQL's cast does. `||` concatenates text, and a number, boolean, or timestamp on the other
 side renders as text: `'order-' || order_id`.
 
+The scalar function surface follows PostgreSQL: `CONCAT`, `CONCAT_WS`, `LEFT`, `RIGHT`,
+`REVERSE`, `REPEAT`, `INITCAP`, `SPLIT_PART`, `STRPOS`, `STARTS_WITH`, `TRANSLATE`, `ASCII`,
+`CHR`, `BTRIM`, `MD5`, `FORMAT`, and `REGEXP_REPLACE` beside the standard `UPPER`, `LOWER`,
+`TRIM`, `SUBSTRING`, `POSITION`, `OVERLAY`, and padding functions; the regex operators `~`,
+`~*`, `!~`, and `!~*`; `^` for exponentiation with `EXP`, `LN`, `LOG`, `LOG10`, `SIGN`, `TRUNC`,
+`PI`, `CBRT`, `DIV`, `WIDTH_BUCKET`, and the trigonometric family beside `ROUND`, `ABS`, `MOD`,
+`POWER`, and `SQRT`; and `TO_CHAR`, `TO_DATE`, `TO_TIMESTAMP`, `DATE_PART`, `EXTRACT`,
+`DATE_TRUNC`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`, `NOW()`, and the `CURRENT_*` clock beside
+interval arithmetic. The [compatibility page](/docs/sql/feature-matrix) lists each with its
+example and any difference from PostgreSQL.
+
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
 `COLLATE` on string expressions. A sort key may name a selected column through its source alias
 (`SELECT id FROM orders AS o ORDER BY o.id`), the way PostgreSQL resolves it.

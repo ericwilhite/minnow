@@ -1084,9 +1084,67 @@ function coercionCases(): Case[] {
   ];
 }
 
+/** The table-driven PostgreSQL functions and operators, diffed against PGlite (SQLite lacks them). */
+function functionCases(): Case[] {
+  const cases: Case[] = [
+    {
+      sql: `SELECT id, CONCAT(region, '-', label, '-', amount) AS tag, CONCAT_WS('/', region, label) AS joined, LEFT(label, 2) AS l2, RIGHT(label, -2) AS rn2, REVERSE(label) AS rev, INITCAP(label || ' ' || label) AS cap, SPLIT_PART(label, 'l', 1) AS part, STRPOS(label, 'l') AS at, STARTS_WITH(label, 'a') AS starts, TRANSLATE(label, 'ao', 'AO') AS tr, ASCII(label) AS code, BTRIM(label, 'a') AS trimmed FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, MD5(label) AS digest, FORMAT('%s:%s', label, amount) AS formatted, REGEXP_REPLACE(label, '[aeiou]', '_', 'g') AS vowels, REGEXP_REPLACE(label, 'l+', 'L') AS first FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE label ~ '^[a-c]' AND label !~* 'O$' ORDER BY id`,
+      ordered: true,
+    },
+    { sql: `SELECT id, (label ~ 'a') || '!' AS tagged FROM data ORDER BY id`, ordered: true },
+    {
+      sql: `SELECT id FROM data WHERE region ~* '^W' OR label ~ ('l' || 'ta') ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, amount ^ 2 AS squared, 2 ^ 3 ^ 2 AS left_assoc, -2 ^ 2 AS negated, CAST(ROUND(CAST(EXP(1) AS NUMERIC), 6) AS DOUBLE PRECISION) AS e, CAST(ROUND(CAST(LN(amount + 1) AS NUMERIC), 6) AS DOUBLE PRECISION) AS ln, CAST(ROUND(CAST(LOG(amount + 1) AS NUMERIC), 6) AS DOUBLE PRECISION) AS lg, CAST(ROUND(LOG(2, CAST(amount + 1 AS NUMERIC)), 6) AS DOUBLE PRECISION) AS lg2, SIGN(amount - 50) AS sign, TRUNC(CAST(amount AS NUMERIC) / 7, 2) AS trunc, CBRT(27) AS cbrt, DIV(CAST(amount AS NUMERIC), 7) AS quotient, WIDTH_BUCKET(amount, 0, 100, 4) AS bucket FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, TO_CHAR(joined, 'YYYY-MM-DD HH24:MI:SS.MS') AS iso, TO_CHAR(joined, 'FMDay, DD FMMonth YYYY') AS spoken, TO_CHAR(joined, 'Dy Mon DD HH12:MI AM') AS clock, TO_CHAR(joined, 'IW DDD Q D J') AS calendar, TO_CHAR(joined, 'YY "week" IW') AS quoted FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, TO_CHAR(amount, '999.99') AS padded, TO_CHAR(amount, 'FM999.00') AS trimmed, TO_CHAR(-amount, '9999.9') AS negative, TO_CHAR(amount, '00009') AS zeros, TO_CHAR(amount * 1000, '9,999,999.99') AS grouped, TO_CHAR(amount, 'S999.99') AS signed, TO_CHAR(amount, '999.99MI') AS trailing, TO_CHAR(amount / 400, '9.99') AS fraction FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT TO_TIMESTAMP('2026-01-02 03:04:05', 'YYYY-MM-DD HH24:MI:SS') AS at, TO_TIMESTAMP('02/01/2026 03:04 PM', 'DD/MM/YYYY HH12:MI AM') AS pm, TO_TIMESTAMP(1767322800) AS epoch, MAKE_TIMESTAMP(2026, 1, 2, 3, 4, 5.5) AS made FROM data LIMIT 1`,
+      ordered: false,
+    },
+    {
+      sql: `SELECT id, DATE_PART('year', joined) AS y, DATE_PART('month', joined) AS m, EXTRACT(DOY FROM joined) AS doy, EXTRACT(ISODOW FROM joined) AS isodow, EXTRACT(ISOYEAR FROM joined) AS isoyear, EXTRACT(DECADE FROM joined) AS decade, EXTRACT(CENTURY FROM joined) AS century, EXTRACT(MILLISECONDS FROM joined) AS ms, EXTRACT(MICROSECONDS FROM joined) AS us, EXTRACT(YEAR FROM DATE '2026-03-04') AS from_date FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE TO_CHAR(joined, 'YYYY-MM') = '2026-01' ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT TO_CHAR(joined, 'YYYY-MM') AS month, COUNT(*) AS n FROM data WHERE joined IS NOT NULL GROUP BY 1 ORDER BY 1`,
+      ordered: true,
+    },
+    // AGE and TO_DATE agree on the value; PostgreSQL renders intervals and dates differently.
+    {
+      sql: `SELECT id, AGE(TIMESTAMP '2026-06-15 12:00:00', joined) > INTERVAL '3 months' AS quarter_old, TO_DATE('02/01/2026', 'DD/MM/YYYY') < joined AS after FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ordered: true,
+    },
+  ];
+  return cases.map((testCase) => ({ ...testCase, skip: ["sqlite"] as const }));
+}
+
 function combinationCases(): Case[] {
   return [
     ...coercionCases(),
+    ...functionCases(),
     ...distinctCases(),
     ...windowCases(),
     ...joinCases(),
@@ -1643,6 +1701,45 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ],
   ["predicate.ilike", { oracles: ["sqlite"], reason: "SQLite has no ILIKE" }],
   ["datetime.now", { oracles: ["sqlite"], reason: "SQLite has no now() function" }],
+  [
+    "function.string-postgres",
+    { oracles: ["sqlite"], reason: "SQLite lacks LEFT, RIGHT, REVERSE, INITCAP, and the rest" },
+  ],
+  ["function.md5-format", { oracles: ["sqlite"], reason: "SQLite has no MD5 or FORMAT %I/%L" }],
+  ["predicate.regex", { oracles: ["sqlite"], reason: "SQLite has no ~ operators" }],
+  ["function.regexp-replace", { oracles: ["sqlite"], reason: "SQLite has no REGEXP_REPLACE" }],
+  ["expression.power-operator", { oracles: ["sqlite"], reason: "SQLite has no ^ operator" }],
+  [
+    "function.math-extended",
+    { oracles: ["sqlite"], reason: "SQLite lacks two-argument LOG, DIV, and WIDTH_BUCKET" },
+  ],
+  ["function.to-char-datetime", { oracles: ["sqlite"], reason: "SQLite has no TO_CHAR" }],
+  ["function.to-char-numeric", { oracles: ["sqlite"], reason: "SQLite has no TO_CHAR" }],
+  [
+    "function.to-date-timestamp",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite has no TO_DATE; PostgreSQL clients materialize DATE as a midnight Date while Minnow preserves zoneless YYYY-MM-DD text (the corpus diffs TO_TIMESTAMP directly and TO_DATE through comparisons)",
+    },
+  ],
+  [
+    "function.make-date",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite has no MAKE_DATE; PostgreSQL clients materialize DATE as a midnight Date while Minnow preserves zoneless YYYY-MM-DD text (the corpus diffs the value through comparisons)",
+    },
+  ],
+  [
+    "function.age",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite has no AGE; PostgreSQL renders intervals as '1 mon 14 days 12:00:00' while Minnow returns its canonical months/days/usecs text (the unit tests pin the calendar arithmetic against PostgreSQL's answers)",
+    },
+  ],
+  ["function.date-part", { oracles: ["sqlite"], reason: "SQLite has no DATE_PART or EXTRACT" }],
   ["expression.cast-postfix", { oracles: ["sqlite"], reason: "SQLite has no :: cast syntax" }],
   [
     "expression.concat-typed",
@@ -1882,8 +1979,11 @@ describe("SQL conformance against SQLite and PGlite", () => {
     const expectedIds = [
       "aggregate.any-value",
       "aggregate.json",
+      "function.age",
       "function.bm25",
+      "function.make-date",
       "function.numeric-core",
+      "function.to-date-timestamp",
       "function.trim-multi-character",
       "json.arrow",
       "json.object",
@@ -1919,24 +2019,30 @@ describe("SQL conformance against SQLite and PGlite", () => {
             ? ["region", "score"]
             : feature.id === "subquery.correlated-json-aggregate"
               ? ["region", "amounts"]
-              : [
-                  {
-                    "aggregate.any-value": "sample",
-                    "aggregate.json": "regions",
-                    "function.trim-multi-character": "trimmed",
-                    "json.arrow": "element",
-                    "json.object": "document",
-                    "json.query": "a",
-                    "predicate.match": "region",
-                    "predicate.match-parameter": "region",
-                    "predicate.match-star": "region",
-                    "type.array": "pair",
-                    "type.date": "day",
-                    "type.exact-numeric": "amount",
-                    "type.interval": "next_day",
-                    "type.json-jsonb": "document",
-                  }[feature.id] ?? "",
-                ],
+              : feature.id === "function.age"
+                ? ["since", "so_far"]
+                : feature.id === "function.make-date"
+                  ? ["day", "at"]
+                  : feature.id === "function.to-date-timestamp"
+                    ? ["day", "at", "epoch"]
+                    : [
+                        {
+                          "aggregate.any-value": "sample",
+                          "aggregate.json": "regions",
+                          "function.trim-multi-character": "trimmed",
+                          "json.arrow": "element",
+                          "json.object": "document",
+                          "json.query": "a",
+                          "predicate.match": "region",
+                          "predicate.match-parameter": "region",
+                          "predicate.match-star": "region",
+                          "type.array": "pair",
+                          "type.date": "day",
+                          "type.exact-numeric": "amount",
+                          "type.interval": "next_day",
+                          "type.json-jsonb": "document",
+                        }[feature.id] ?? "",
+                      ],
       );
 
       if (feature.id === "function.trim-multi-character") {
@@ -2000,6 +2106,40 @@ describe("SQL conformance against SQLite and PGlite", () => {
         }
       } else if (feature.id === "type.date") {
         expect(result.rows, feature.id).toEqual([{ day: "2026-08-26" }]);
+      } else if (feature.id === "function.make-date") {
+        expect(result.rows, feature.id).toEqual([
+          { day: "2026-01-02", at: new Date("2026-01-02T03:04:05.500Z") },
+        ]);
+      } else if (feature.id === "function.to-date-timestamp") {
+        expect(result.rows, feature.id).toEqual([
+          {
+            day: "2026-01-02",
+            at: new Date("2026-01-02T15:04:00.000Z"),
+            epoch: new Date("2026-01-02T03:00:00.000Z"),
+          },
+        ]);
+      } else if (feature.id === "function.age") {
+        // PostgreSQL's answers for these three fixture dates, rendered as Minnow's interval text:
+        // years and months first, days borrowed from the earlier date's month, then the time.
+        expect(
+          resultKeys(
+            result.rows.map(({ since }) => ({ since })),
+            false,
+          ),
+          feature.id,
+        ).toEqual(
+          resultKeys(
+            [
+              { since: "2 mons 13 days 43200000000 usecs" },
+              { since: "2 mons 16 days 43200000000 usecs" },
+              { since: "1 mons 14 days 43200000000 usecs" },
+            ],
+            false,
+          ),
+        );
+        for (const row of result.rows) {
+          expect(String(row.so_far), feature.id).toMatch(/^\d+ mons \d+ days \d+ usecs$/);
+        }
       } else if (feature.id === "function.numeric-core") {
         expect(result.rows, feature.id).toEqual([
           { n: 10, g: 10, l: 5, f: 10, c: 10, m: 2, p: 8, s: 4 },

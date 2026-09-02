@@ -872,6 +872,32 @@ function concatenationOperandText(value: unknown): string {
   throw new TypeError("|| requires a string operand");
 }
 
+/**
+ * Orders two INTERVAL values the way PostgreSQL's interval comparison does: a month counts as
+ * 30 days and a day as 24 hours, so INTERVAL '3 months' equals INTERVAL '90 days' and
+ * INTERVAL '2 days' sorts below INTERVAL '10 days'. Undefined unless both are intervals.
+ */
+export function intervalDomainCompare(left: unknown, right: unknown): number | undefined {
+  if (
+    typeof left !== "string" ||
+    typeof right !== "string" ||
+    !left.startsWith(INTERVAL_VALUE) ||
+    !right.startsWith(INTERVAL_VALUE)
+  ) {
+    return undefined;
+  }
+  const total = (value: string): number => {
+    const [months, days, microseconds] = JSON.parse(value.slice(INTERVAL_VALUE.length)) as [
+      number,
+      number,
+      number,
+    ];
+    return (months * 30 + days) * 86_400_000_000 + microseconds;
+  };
+  const difference = total(left) - total(right);
+  return difference === 0 ? 0 : difference < 0 ? -1 : 1;
+}
+
 export function isSqlDomainValue(value: unknown): value is string {
   return typeof value === "string" && value.startsWith(PREFIX);
 }

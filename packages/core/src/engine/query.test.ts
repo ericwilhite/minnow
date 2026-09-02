@@ -1610,6 +1610,124 @@ describe("scalar functions", () => {
     ]);
   });
 
+  it("formats, hashes, splits, and matches the way PostgreSQL does", () => {
+    const one = (sql: string): Record<string, unknown> =>
+      both(`${sql} FROM rows WHERE amount = 10`)[0] as Record<string, unknown>;
+    expect(
+      one(
+        "SELECT TO_CHAR(95, '999.99') AS a, TO_CHAR(95, 'FM999.00') AS b, TO_CHAR(-95, '9999.9') AS c, TO_CHAR(95, '00009') AS d, TO_CHAR(1234567.891, '9,999,999.99') AS e, TO_CHAR(0.5, '9.9') AS f, TO_CHAR(95, 'S999.99') AS g, TO_CHAR(-95, '999MI') AS h, TO_CHAR(12345, '999') AS i",
+      ),
+    ).toEqual({
+      a: "  95.00",
+      b: "95.00",
+      c: "  -95.0",
+      d: " 00095",
+      e: " 1,234,567.89",
+      f: "  .5",
+      g: " +95.00",
+      h: " 95-",
+      i: "####",
+    });
+    expect(() => both("SELECT TO_CHAR(1, '9RN') AS r FROM rows")).toThrow(
+      "numeric template element",
+    );
+    expect(
+      one(
+        "SELECT TO_CHAR(joined, 'YYYY-MM-DD HH24:MI:SS.MS') AS a, TO_CHAR(joined, 'Day') AS b, TO_CHAR(joined, 'FMDay, FMMonth FMDD') AS c, TO_CHAR(joined, 'HH12:MI PM') AS d, TO_CHAR(joined, 'YYYY\"Q\"Q') AS e",
+      ),
+    ).toEqual({
+      a: "2026-02-14 13:45:30.500",
+      b: "Saturday ",
+      c: "Saturday, February 14",
+      d: "01:45 PM",
+      e: "2026Q1",
+    });
+    expect(
+      one(
+        "SELECT TO_DATE('March 5, 2026', 'Month DD, YYYY') AS a, TO_TIMESTAMP('2026-01-02 03:04 PM', 'YYYY-MM-DD HH12:MI AM') AS b, TO_TIMESTAMP(0) AS c",
+      ),
+    ).toEqual({
+      a: "2026-03-05",
+      b: new Date("2026-01-02T15:04:00.000Z"),
+      c: new Date("1970-01-01T00:00:00.000Z"),
+    });
+    expect(() => both("SELECT TO_DATE('2026-02-30', 'YYYY-MM-DD') AS d FROM rows")).toThrow(
+      "invalid date",
+    );
+    expect(one("SELECT MD5('') AS a, MD5('abc') AS b, MD5('héllo') AS c")).toEqual({
+      a: "d41d8cd98f00b204e9800998ecf8427e",
+      b: "900150983cd24fb0d6963f7d28e17f72",
+      c: "be50e8478cf24ff3595bc7307fb91b50",
+    });
+    expect(
+      one(
+        "SELECT FORMAT('%s-%s', 'a', 1) AS a, FORMAT('%2$s %1$s', 'x', 'y') AS b, FORMAT('%I.%L', 'a b', 'it''s') AS c, FORMAT('100%%') AS d, FORMAT('%s', NULL) AS e",
+      ),
+    ).toEqual({
+      a: "a-1",
+      b: "y x",
+      c: `"a b".'it''s'`,
+      d: "100%",
+      e: "",
+    });
+    expect(
+      one(
+        "SELECT SPLIT_PART('a-b-c', '-', 2) AS a, SPLIT_PART('a-b-c', '-', 5) AS b, SPLIT_PART('a-b-c', '-', -1) AS c, LEFT('hello', -1) AS d, RIGHT('hello', -1) AS e, CONCAT_WS('-', NULL, 'x', NULL, 'y') AS f, CONCAT(NULL, NULL) AS g, INITCAP('hello wORLD-foo') AS h, BTRIM('xyhixy', 'xy') AS i, TRANSLATE('abcabc', 'ab', 'x') AS j",
+      ),
+    ).toEqual({
+      a: "b",
+      b: "",
+      c: "c",
+      d: "hell",
+      e: "ello",
+      f: "x-y",
+      g: "",
+      h: "Hello World-Foo",
+      i: "hi",
+      j: "xcxc",
+    });
+    expect(
+      one(
+        "SELECT 'hello' ~ 'l+' AS a, 'hello' !~ 'z' AS b, 'HELLO' ~* 'hel' AS c, 'HELLO' !~* 'hel' AS d, ('ab' ~ 'a') || 'b' AS e, REGEXP_REPLACE('abc', '(a)(b)', '\\2\\1') AS f, REGEXP_REPLACE('a1b2', '\\d', '#', 'g') AS g",
+      ),
+    ).toEqual({
+      a: true,
+      b: true,
+      c: true,
+      d: false,
+      e: "trueb",
+      f: "bac",
+      g: "a#b#",
+    });
+    expect(() => both("SELECT 'x' ~ '(' AS bad FROM rows")).toThrow("Invalid regular expression");
+    expect(
+      one(
+        "SELECT 2 ^ 3 ^ 2 AS a, -2 ^ 2 AS b, 2 * 3 ^ 2 AS c, DIV(-7, 2) AS d, WIDTH_BUCKET(10, 0, 10, 5) AS e, TRUNC(-3.14159, 2) AS f, LOG(2, 8) AS g",
+      ),
+    ).toEqual({
+      a: 64,
+      b: 4,
+      c: 18,
+      d: -3,
+      e: 6,
+      f: -3.14,
+      g: 3,
+    });
+    expect(() => both("SELECT LN(0) AS x FROM rows")).toThrow("positive");
+    expect(
+      one(
+        "SELECT AGE(TIMESTAMP '2026-03-15 12:00:00', TIMESTAMP '2025-01-31 08:30:00') AS a, AGE(DATE '2026-03-01', DATE '2026-01-31') AS b, AGE(TIMESTAMP '2025-01-01', TIMESTAMP '2026-03-15') AS c, EXTRACT(DOY FROM DATE '2026-03-04') AS d, EXTRACT(ISODOW FROM DATE '2026-03-08') AS e, DATE_PART('isoyear', DATE '2027-01-01') AS f",
+      ),
+    ).toEqual({
+      a: "13 mons 15 days 12600000000 usecs",
+      b: "1 mons 1 days 0 usecs",
+      c: "-14 mons -14 days 0 usecs",
+      d: 63,
+      e: 7,
+      f: 2026,
+    });
+  });
+
   it("COALESCE returns the first non-null argument and stays lazy over nulls", () => {
     expect(
       both("SELECT COALESCE(region, 'unknown') AS label, amount FROM rows ORDER BY amount"),
