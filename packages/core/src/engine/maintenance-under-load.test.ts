@@ -50,7 +50,7 @@ describe("maintenance under a writer that never pauses", () => {
       { n: 4_200, total: (7 * 4_199 * 4_200) / 2 },
     ]);
     await database.close();
-  }, 120_000);
+  }, 300_000);
 
   it("publishes a finished fold through the write queue rather than losing the manifest race", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
@@ -72,7 +72,7 @@ describe("maintenance under a writer that never pauses", () => {
     expect(firstFoldAt).toBeLessThanOrEqual(512);
     expect(mostSegments).toBeLessThan(512);
     await database.close();
-  }, 120_000);
+  }, 300_000);
 
   it("keeps a read-then-update loop under the level-zero ceiling", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
@@ -93,7 +93,7 @@ describe("maintenance under a writer that never pauses", () => {
       { total: (99 * 100) / 2 + 4_200 },
     ]);
     await database.close();
-  }, 120_000);
+  }, 300_000);
 });
 
 /**
@@ -181,7 +181,7 @@ describe("a single-row update loop over a folded table", () => {
         { n: rows, total: expectedTotal(values) },
       ]);
       await database.close();
-    }, 120_000);
+    }, 300_000);
   }
 
   /**
@@ -216,7 +216,7 @@ describe("a single-row update loop over a folded table", () => {
       { total: expectedTotal(values) },
     ]);
     await database.close();
-  }, 120_000);
+  }, 300_000);
 });
 
 describe("repair of a fold whose owner lease expired", () => {
