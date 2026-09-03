@@ -39,7 +39,12 @@ import {
   type RpcResponse,
   type SerializedError,
 } from "../worker-protocol/index.js";
-import { toColumnarBatch, type BatchRow, type InsertBatchInput } from "./batch.js";
+import {
+  definedVectors,
+  toColumnarBatch,
+  type BatchRow,
+  type InsertBatchInputLike,
+} from "./batch.js";
 import type { Catalog } from "./catalog.js";
 import type {
   BatchValue,
@@ -106,7 +111,23 @@ import type {
 import { QueryMemoryBudgetError } from "./memory.js";
 import type { CompiledQuery, CompiledStatement, QueryResult, QueryValue } from "./query.js";
 import { decodeQueryResult } from "./result-wire.js";
-import type { AnyTable, SchemaDefinition } from "./schema.js";
+import type {
+  AnySchema,
+  UntypedSchema,
+  AnyTable,
+  BatchColumnName,
+  BatchDeleteInput,
+  BatchInsertInput,
+  BatchInsertRow,
+  BatchKeyValue,
+  BatchReadOptions,
+  BatchReadRow,
+  BatchUpdateChanges,
+  BatchUpdateInput,
+  BatchUpsertOptions,
+  SchemaDefinition,
+  TableName,
+} from "./schema.js";
 import { serializeSchema, type WireMigrationStep } from "./schema-wire.js";
 import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "./worker-host.js";
 
@@ -134,7 +155,13 @@ export interface ClientTransport {
   terminate?(): void;
 }
 
-export interface MinnowDatabaseClientOptions {
+export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {
+  /**
+   * The schema this database is declared against. It types every batch method by table name and
+   * is what a bare `migrate()` applies. It stays on the main thread: the worker learns the
+   * schema from `migrate()`, not from construction.
+   */
+  schema?: TSchema;
   /**
    * Defaults to `{ kind: "indexeddb", name: "minnow" }`. The `opfs` kind selects
    * `OpfsBlockStore`, which needs the worker to be a dedicated worker (it always is with
@@ -294,7 +321,13 @@ function rehydrateResponseError(payload: unknown): Error {
   return rehydrateError(candidate as SerializedError);
 }
 
-export class MinnowDatabaseClient {
+export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
+  readonly #schema: TSchema | undefined;
+  /** This client with the batch API erased to plain strings, for the handles it hands itself to. */
+  // eslint-disable-next-line @typescript-eslint/prefer-return-this-type -- the erasure is the point
+  get #erased(): MinnowDatabaseClient {
+    return this;
+  }
   readonly #transport: ClientTransport;
   readonly #pending = new Map<string, PendingCall>();
   readonly #events = new Map<string, EventRoute>();
@@ -312,7 +345,8 @@ export class MinnowDatabaseClient {
     this.#fail(new Error("A database worker message could not be deserialized"));
   };
 
-  constructor(transport: ClientTransport, options: MinnowDatabaseClientOptions = {}) {
+  constructor(transport: ClientTransport, options: MinnowDatabaseClientOptions<TSchema> = {}) {
+    this.#schema = options.schema;
     this.#transport = transport;
     transport.addEventListener("message", this.#onMessage);
     transport.addEventListener("error", this.#onError);
@@ -402,36 +436,63 @@ export class MinnowDatabaseClient {
     return (await this.#call("listTables", [])) as TableDefinition[];
   }
 
+  /**
+   * Brings storage in line with a schema declaration. With no argument it applies the schema the
+   * client was constructed with.
+   */
   async migrate(
-    definition: SchemaDefinition<readonly AnyTable[]>,
+    definition: SchemaDefinition<readonly AnyTable[]> | undefined = this.#schema,
     options: MigrateOptions = {},
   ): Promise<ClientMigrationResult> {
+    if (definition === undefined) {
+      throw new TypeError(
+        "migrate() needs a schema: pass a definition, or construct the client with { schema }",
+      );
+    }
     return (await this.#call("migrate", [
       serializeSchema(definition),
       options,
     ])) as ClientMigrationResult;
   }
 
-  async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
+  insertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+  ): Promise<InsertBatchResult>;
+  async insertBatch(tableName: string, input: InsertBatchInputLike): Promise<InsertBatchResult> {
     // Pivoted here rather than in the worker: the columnar form is the cheaper structured clone,
     // and it keeps the worker protocol's payload shape the same whichever form the caller used.
     const batch = toColumnarBatch(input);
     return (await this.#call("insertBatch", [tableName, batch])) as InsertBatchResult;
   }
 
+  insert<TName extends TableName<TSchema>>(
+    tableName: TName,
+    row: BatchInsertRow<TSchema, TName>,
+  ): Promise<InsertBatchResult>;
   async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
     return (await this.#call("insert", [tableName, row])) as InsertBatchResult;
   }
 
+  upsertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+    options?: BatchUpsertOptions<TSchema, TName>,
+  ): Promise<UpsertBatchResult>;
   async upsertBatch(
     tableName: string,
-    input: InsertBatchInput,
+    input: InsertBatchInputLike,
     options: UpsertOptions = {},
   ): Promise<UpsertBatchResult> {
     const batch = toColumnarBatch(input);
     return (await this.#call("upsertBatch", [tableName, batch, options])) as UpsertBatchResult;
   }
 
+  upsert<TName extends TableName<TSchema>>(
+    tableName: TName,
+    row: BatchInsertRow<TSchema, TName>,
+    options?: BatchUpsertOptions<TSchema, TName>,
+  ): Promise<UpsertBatchResult>;
   async upsert(
     tableName: string,
     row: BatchRow,
@@ -440,38 +501,89 @@ export class MinnowDatabaseClient {
     return (await this.#call("upsert", [tableName, row, options])) as UpsertBatchResult;
   }
 
-  async updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
-    return (await this.#call("updateBatch", [tableName, input])) as UpdateBatchResult;
+  updateBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchUpdateInput<TSchema, TName>,
+  ): Promise<UpdateBatchResult>;
+  async updateBatch(
+    tableName: string,
+    input: {
+      readonly keys: readonly BatchValue[];
+      readonly changes: Readonly<Record<string, readonly BatchValue[] | undefined>>;
+    },
+  ): Promise<UpdateBatchResult> {
+    const wire: UpdateBatchInput = { keys: input.keys, changes: definedVectors(input.changes) };
+    return (await this.#call("updateBatch", [tableName, wire])) as UpdateBatchResult;
   }
 
+  /**
+   * Changes one row by the table's unique key. An explicitly `undefined` change leaves that
+   * column untouched, so a patch spread from optional fields needs no filtering first.
+   */
+  update<TName extends TableName<TSchema>>(
+    tableName: TName,
+    key: BatchKeyValue<TSchema, TName>,
+    changes: BatchUpdateChanges<TSchema, TName>,
+  ): Promise<UpdateBatchResult>;
   async update(
     tableName: string,
     key: Exclude<BatchValue, null>,
-    changes: Readonly<Record<string, BatchValue>>,
+    changes: Readonly<Record<string, BatchValue | undefined>>,
   ): Promise<UpdateBatchResult> {
-    return (await this.#call("update", [tableName, key, changes])) as UpdateBatchResult;
+    // Structured clone keeps an `undefined` property; strip it here so the wire carries only
+    // real changes and the worker's own filtering never sees a shape the direct engine would not.
+    const present = Object.fromEntries(
+      Object.entries(changes).filter(([, value]) => value !== undefined),
+    );
+    return (await this.#call("update", [tableName, key, present])) as UpdateBatchResult;
   }
 
+  deleteBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchDeleteInput<TSchema, TName>,
+  ): Promise<DeleteBatchResult>;
   async deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
     return (await this.#call("deleteBatch", [tableName, input])) as DeleteBatchResult;
   }
 
+  delete<TName extends TableName<TSchema>>(
+    tableName: TName,
+    key: BatchKeyValue<TSchema, TName>,
+  ): Promise<DeleteBatchResult>;
   async delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult> {
     return (await this.#call("delete", [tableName, key])) as DeleteBatchResult;
   }
 
-  bufferedWriter(tableName: string, options: BufferedWriterOptions = {}): ClientBufferedWriter {
+  bufferedWriter<TName extends TableName<TSchema>>(
+    tableName: TName,
+    options: BufferedWriterOptions = {},
+  ): ClientBufferedWriter<BatchInsertRow<TSchema, TName>> {
     const handleId = crypto.randomUUID();
     const { onError, ...wireOptions } = options;
     this.#events.set(handleId, {
       ...(onError === undefined ? {} : { onError }),
     });
     const created = this.#call("bufferedWriter", [handleId, tableName, wireOptions]);
-    return new ClientBufferedWriter(this, handleId, created);
+    return new ClientBufferedWriter<BatchInsertRow<TSchema, TName>>(
+      this.#erased,
+      handleId,
+      created,
+    );
   }
 
   // --- Reads ------------------------------------------------------------------------------------
 
+  readTable<
+    TName extends TableName<TSchema>,
+    const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>,
+  >(
+    tableName: TName,
+    options: BatchReadOptions<TSchema, TName, TColumns> & { readonly columns: TColumns },
+  ): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;
+  readTable<TName extends TableName<TSchema>>(
+    tableName: TName,
+    versionOrOptions?: number | BatchReadOptions<TSchema, TName>,
+  ): Promise<Array<BatchReadRow<TSchema, TName>>>;
   async readTable(
     tableName: string,
     versionOrOptions?: number | ReadTableOptions,
@@ -609,7 +721,7 @@ export class MinnowDatabaseClient {
    * aborts the scope with nothing published.
    */
   async write<T>(
-    action: (session: ClientWriteSession) => Promise<T>,
+    action: (session: ClientWriteSession<TSchema>) => Promise<T>,
   ): Promise<{ result: T; version: number | null }> {
     const opened = (await this.#call("writeOpen", [])) as { handleId: string };
     const stage = (
@@ -649,7 +761,8 @@ export class MinnowDatabaseClient {
       deleteBatch: (tableName, input) => stage("deleteBatch", tableName, input),
     };
     try {
-      const result = await action(session);
+      // The scope stages by runtime table name; the declaration only types the caller's view.
+      const result = await action(session as ClientWriteSession<TSchema>);
       const committed = (await this._invoke(opened.handleId, "commit", [])) as {
         version: number | null;
       };
@@ -808,7 +921,7 @@ export class MinnowDatabaseClient {
   liveQueries(options: ClientLiveQueryOptions = {}): ClientLiveQuerySet {
     const handleId = crypto.randomUUID();
     const created = this.#call("liveQueries", [handleId, options]);
-    return new ClientLiveQuerySet(this, handleId, created);
+    return new ClientLiveQuerySet(this.#erased, handleId, created);
   }
 
   // --- Maintenance ------------------------------------------------------------------------------
@@ -1080,18 +1193,27 @@ export class MinnowDatabaseClient {
  * consistent with each other for the lifetime of the callback.
  */
 /** The scope handed to the client `write()`; mirrors the in-worker WriteSession. */
-export interface ClientWriteSession {
+export interface ClientWriteSession<TSchema extends AnySchema = UntypedSchema> {
   /** Read-your-writes: observes the pre-scope snapshot plus everything staged so far. */
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
-  insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
-  upsertBatch(
-    tableName: string,
-    input: InsertBatchInput,
-    options?: UpsertOptions,
+  insertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+  ): Promise<StagedWriteResult>;
+  upsertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+    options?: BatchUpsertOptions<TSchema, TName>,
   ): Promise<StagedUpsertResult>;
-  updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
-  deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
+  updateBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchUpdateInput<TSchema, TName>,
+  ): Promise<StagedWriteResult>;
+  deleteBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchDeleteInput<TSchema, TName>,
+  ): Promise<StagedWriteResult>;
 }
 
 export interface ClientSnapshotSession {
@@ -1104,7 +1226,7 @@ export interface ClientSnapshotSession {
  * Proxy of a worker-side BufferedTableWriter. The age timer runs on the worker's clock, and
  * onError fires for background flush failures exactly as in-worker — delivered as an event.
  */
-export class ClientBufferedWriter {
+export class ClientBufferedWriter<TRow extends BatchRow = BatchRow> {
   constructor(
     private readonly client: MinnowDatabaseClient,
     private readonly handleId: string,
@@ -1117,7 +1239,7 @@ export class ClientBufferedWriter {
 
   readonly #created: Promise<unknown>;
 
-  async add(row: Readonly<Record<string, BatchValue>>): Promise<BufferedFlushResult | undefined> {
+  async add(row: TRow): Promise<BufferedFlushResult | undefined> {
     await this.#created;
     return (await this.client._invoke(this.handleId, "add", [row])) as
       BufferedFlushResult | undefined;

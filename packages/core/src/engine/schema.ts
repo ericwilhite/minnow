@@ -8,7 +8,10 @@ import {
   type TableColumnRecord,
   type TableRecord,
 } from "../storage/types.js";
+import type { ComparisonOperator } from "../plan/model.js";
+import type { BatchRow, BatchValue, InsertBatchInput } from "./batch.js";
 import { type Catalog, type CatalogColumn, type CatalogTable } from "./catalog.js";
+import type { DatabaseRow, DeleteBatchInput, UpdateBatchInput, UpsertOptions } from "./database.js";
 import {
   childExpressions,
   compileCheckExpression,
@@ -1104,8 +1107,14 @@ export function schema<TTables extends readonly AnyTable[], TViews extends reado
 
 // --- Compile-time row types ---------------------------------------------------------------------
 
+// The `SchemaValue` bounds matter beyond documentation: they are what lets a row type over a
+// still-generic table (inside `MinnowDatabase<TSchema>`) relate to the erased `BatchRow`, so
+// a typed database is assignable wherever an untyped one is expected.
 type ColumnTypeMetadata<TColumn> = TColumn extends {
-  readonly "~types"?: infer TMetadata extends { readonly select: unknown; readonly input: unknown };
+  readonly "~types"?: infer TMetadata extends {
+    readonly select: SchemaValue;
+    readonly input: SchemaValue;
+  };
 }
   ? NonNullable<TMetadata>
   : never;
@@ -1178,6 +1187,152 @@ export type InferUpdateChanges<TTable extends AnyTable> = {
       : K
   ]?: ColumnInputValue<TTable["columns"][K]> | undefined;
 };
+
+// --- Schema-inferred batch API types ------------------------------------------------------------
+//
+// `MinnowDatabase`, `MinnowDatabaseClient`, their write scopes and buffered writers take the
+// declared schema as a type parameter. Every batch method is then keyed by table name: rows,
+// keys, update changes, `conflictWhere`, and `readTable` results follow the declaration. Without
+// a schema (the default) each type below resolves to the erased shape the method always had, so
+// an untyped database, and code such as devtools that addresses tables by runtime string, is
+// unchanged.
+
+/** The bound every schema type parameter carries. */
+export type AnySchema = SchemaDefinition<readonly AnyTable[]>;
+
+/**
+ * The schema type parameter's default: no declaration, so the batch API addresses tables by
+ * plain string. It is `any` rather than `AnySchema` so that a database declared against a schema
+ * remains assignable to the undeclared class — `MinnowDatabase<typeof mine>` is a
+ * `MinnowDatabase` — which no ordinary type argument can express once table names are checked.
+ * Every type below resolves to its erased branch for it, so nothing else about it is `any`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type UntypedSchema = any;
+
+type SchemaTable<TSchema extends AnySchema> = TSchema["tables"][number];
+
+/** True when the schema carries no literal table names — the untyped default. */
+type ErasedSchema<TSchema extends AnySchema> = string extends SchemaTable<TSchema>["name"]
+  ? true
+  : false;
+
+/** The declared table names; `string` for an untyped database. */
+export type TableName<TSchema extends AnySchema> = SchemaTable<TSchema>["name"];
+
+/** The declaration behind one table name. */
+export type TableOf<TSchema extends AnySchema, TName extends TableName<TSchema>> = Extract<
+  SchemaTable<TSchema>,
+  { readonly name: TName }
+>;
+
+/** A declared table's column names; `string` for an untyped database. */
+export type BatchColumnName<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true ? string : keyof TableOf<TSchema, TName>["columns"] & string;
+
+/** The columnar form of `InferInsertRow`: one vector per column, optional where the row is. */
+export interface ColumnarInsertBatch<TTable extends AnyTable> {
+  readonly columns: {
+    readonly [K in RequiredInsertKeys<TTable>]: ReadonlyArray<
+      ColumnInputValue<TTable["columns"][K]>
+    >;
+  } & {
+    readonly [K in OptionalInsertKeys<TTable>]?: ReadonlyArray<
+      ColumnInputValue<TTable["columns"][K]>
+    >;
+  };
+  /** Per row, whether the column was omitted (takes its default) rather than set to NULL. */
+  readonly omitted?: Partial<Readonly<Record<OptionalInsertKeys<TTable>, readonly boolean[]>>>;
+  readonly rowCount?: number;
+}
+
+/** What `insertBatch` and `upsertBatch` accept for one table: typed rows, or a typed columnar batch. */
+export type BatchInsertInput<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true
+    ? InsertBatchInput
+    : | ReadonlyArray<InferInsertRow<TableOf<TSchema, TName>>>
+      | ColumnarInsertBatch<TableOf<TSchema, TName>>;
+
+/** One row for `insert`, `upsert`, or a buffered writer's `add`. */
+export type BatchInsertRow<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true ? BatchRow : InferInsertRow<TableOf<TSchema, TName>>;
+
+/** What `readTable` returns per row. */
+export type BatchReadRow<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true ? DatabaseRow : InferRow<TableOf<TSchema, TName>>;
+
+/**
+ * The key a batch write addresses a row by: the `.unique()` column or a one-column table-level
+ * primary key. A composite primary key is addressed through its hidden locator, which the batch
+ * API does not expose, so those tables get `never` here and are written through SQL instead.
+ */
+type BatchKey<TTable extends AnyTable> = TTable["primaryKey"] extends readonly [
+  unknown,
+  unknown,
+  ...unknown[],
+]
+  ? never
+  : TTable["primaryKey"] extends readonly [infer TOnly extends keyof TTable["columns"]]
+    ? NonNullable<ColumnValue<TTable["columns"][TOnly]>>
+    : NonNullable<ScalarUniqueKeyValue<TTable>>;
+
+/** One key value for `update` and `delete`. */
+export type BatchKeyValue<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true
+    ? Exclude<BatchValue, null>
+    : BatchKey<TableOf<TSchema, TName>>;
+
+/** The changes object `update` takes: every non-key, non-generated column, each optional. */
+export type BatchUpdateChanges<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true
+    ? Readonly<Record<string, BatchValue>>
+    : InferUpdateChanges<TableOf<TSchema, TName>>;
+
+/** What `updateBatch` takes: typed keys and one vector per changed column. */
+export type BatchUpdateInput<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true
+    ? UpdateBatchInput
+    : {
+        readonly keys: ReadonlyArray<BatchKey<TableOf<TSchema, TName>>>;
+        readonly changes: {
+          readonly [K in keyof InferUpdateChanges<TableOf<TSchema, TName>>]?: ReadonlyArray<
+            Exclude<InferUpdateChanges<TableOf<TSchema, TName>>[K], undefined>
+          >;
+        };
+      };
+
+/** What `deleteBatch` takes. */
+export type BatchDeleteInput<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true
+    ? DeleteBatchInput
+    : { readonly keys: ReadonlyArray<BatchKey<TableOf<TSchema, TName>>> };
+
+/** A `conflictWhere` guard whose `value` follows the column it names. */
+export type BatchConflictWhere<TTable extends AnyTable> = {
+  [K in keyof TTable["columns"] & string]: {
+    readonly column: K;
+    readonly operator: ComparisonOperator;
+    readonly value: ColumnInputValue<TTable["columns"][K]>;
+  };
+}[keyof TTable["columns"] & string];
+
+/** `upsertBatch`/`upsert` options, with the guard typed against the table. */
+export type BatchUpsertOptions<TSchema extends AnySchema, TName extends TableName<TSchema>> =
+  ErasedSchema<TSchema> extends true
+    ? UpsertOptions
+    : { readonly conflictWhere?: BatchConflictWhere<TableOf<TSchema, TName>> };
+
+/** `readTable` options; naming `columns` narrows the returned rows to those columns. */
+export interface BatchReadOptions<
+  TSchema extends AnySchema,
+  TName extends TableName<TSchema>,
+  TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>> = ReadonlyArray<
+    BatchColumnName<TSchema, TName>
+  >,
+> {
+  readonly version?: number;
+  readonly columns?: TColumns;
+}
 
 // --- Migration planning -------------------------------------------------------------------------
 

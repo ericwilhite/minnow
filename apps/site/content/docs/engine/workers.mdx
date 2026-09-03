@@ -27,9 +27,11 @@ const appSchema = schema([people]);
 
 const client = new MinnowDatabaseClient(
   new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" }),
-  { store: { kind: "indexeddb", name: "app-db" } },
+  { store: { kind: "indexeddb", name: "app-db" }, schema: appSchema },
 );
-await client.migrate(appSchema);
+// Applies `appSchema`; it also types every batch method by table name, exactly as it does on
+// `MinnowDatabase`. The declaration stays on the main thread: only `migrate()` crosses the wire.
+await client.migrate();
 
 await client.execute("INSERT INTO people (name, score) VALUES ($1, $2), ($3, $4)", [
   "Ada",
@@ -86,8 +88,10 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
   structured-cloned, so the client removes them from the options frame. Abort becomes a small
   cancellation frame; stats return as an ordered event before the result. Ordinary queries,
   cursor queries, buffered `execute()` statements, and reads inside `client.write()` support the
-  same controls as the direct engine. Cancellation requires protocol version 3; deploy the client
-  and worker from the same package build so a cached older worker cannot outlive its client.
+  same controls as the direct engine. The client and worker must speak the same protocol version
+  (4 since core 0.7.8); a mismatch fails every call loudly with "Unsupported protocol version"
+  rather than silently dropping a newer argument, so deploy the client and worker from the same
+  package build and make sure a cached older worker cannot outlive its client.
 - **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and
   256 stateful handle lifecycles, including handles still opening or durably settling. Await
   requests and close cursors, snapshots, buffered writers, and live-query handles when they are

@@ -1,7 +1,7 @@
 /* eslint-disable no-restricted-imports -- Node-only test reads fixture provenance; this file is not shipped. */
 import { readFileSync } from "node:fs";
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CompactionJobConflictError,
   GarbageCollectionJobConflictError,
@@ -35,6 +35,9 @@ import {
 } from "./index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { crc32, encodeBlock, MAX_BLOCK_ROW_COUNT } from "../block-format/index.js";
+import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
 const POSTING_BUILD_CREATED_AT = "2026-01-01T00:00:00.000Z";
 const POSTING_BUILD_EXPIRES_AT = "2026-01-01T00:30:00.000Z";
@@ -240,7 +243,7 @@ it("OPFS repacks mixed live/dead extents when collection completes", async () =>
   expect(await reopened.getBlock("extent-block-3")).toEqual(blocks[3]?.bytes);
   expect(await reopened.getBlock("extent-block-4")).toEqual(blocks[4]?.bytes);
   reopened.close();
-}, 60_000);
+});
 
 it("OPFS relocates a staged postings build instead of letting it block extent compaction", async () => {
   const shim = new MemoryOpfs();

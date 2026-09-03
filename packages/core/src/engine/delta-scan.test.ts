@@ -11,11 +11,14 @@
  * once without, so a divergence cannot hide in whichever path this table size happens to pick.
  */
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { type QueryValue } from "./query.js";
 import { mulberry32 } from "../testing/seeds.js";
+import { heavyTestTimeout } from "./storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
 const REGIONS = ["west", "east", "north", null] as const;
 const LABELS = ["alpha", "bravo", "charlie", "delta"] as const;
@@ -166,8 +169,7 @@ describe("scans over mutation histories", () => {
       await compare(`step ${String(step)}`);
     }
     sqlite.close();
-  }, 120_000);
-
+  });
   it("keeps a deleted row out of a range its zone map still covers", async () => {
     // The deleted row sits inside the queried key range, so elimination keeps its row group and
     // the mask has to remove exactly one row from it — the case a pruned scan could double-count.

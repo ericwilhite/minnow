@@ -108,8 +108,9 @@ From `@minnowdb/core`. See [Writes & transactions](/docs/sql/dml).
 new MinnowDatabase(store: BlockStore, options?: MinnowDatabaseOptions)
 ```
 
-`MinnowDatabaseOptions` covers compression, block size, write retries, query spilling, idle SQL
-transactions, caching, automatic full-text indexing, and background maintenance. The full option
+`MinnowDatabaseOptions` covers the schema the database is typed against, compression, block size,
+write retries, query spilling, idle SQL transactions, caching, automatic full-text indexing, and
+background maintenance. The full option
 table is on [The database API](/docs/engine#options). `bufferPoolBytes` defaults to 64 MiB and
 limits one shared cache of decoded blocks and reusable query work; `0` disables it. Compiled SQL
 plans are cached separately by statement text.

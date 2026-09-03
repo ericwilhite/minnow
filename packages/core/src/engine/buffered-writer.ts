@@ -1,5 +1,5 @@
 import { copyDate } from "../date-value.js";
-import type { BatchValue } from "./batch.js";
+import type { BatchRow, BatchValue } from "./batch.js";
 import { estimateRowBytes } from "./byte-estimates.js";
 import type { InsertBatchResult, MinnowDatabase, UpsertBatchResult } from "./database.js";
 
@@ -36,8 +36,11 @@ export interface LifecycleFlushOptions {
 /** Maximum accepted `add()` calls that have not completed. Callers must await for backpressure. */
 export const MAX_BUFFERED_WRITER_PENDING_ADDS = 64;
 
-/** Batches row-oriented writes by row count, estimated bytes, or age. */
-export class BufferedTableWriter {
+/**
+ * Batches row-oriented writes by row count, estimated bytes, or age. `TRow` is the declared
+ * table's insert row when the database that opened the writer carries a schema.
+ */
+export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
   readonly #mode: "insert" | "upsert";
   readonly #maxRows: number;
   readonly #maxBytes: number;
@@ -72,7 +75,7 @@ export class BufferedTableWriter {
     return this.#estimatedBytes;
   }
 
-  async add(row: Readonly<Record<string, BatchValue>>): Promise<BufferedFlushResult | undefined> {
+  async add(row: TRow): Promise<BufferedFlushResult | undefined> {
     this.#assertOpen();
     if (!this.#acceptingAdds) return Promise.reject(new Error("Buffered writer is closing"));
     if (this.#pendingAddCount >= MAX_BUFFERED_WRITER_PENDING_ADDS) {

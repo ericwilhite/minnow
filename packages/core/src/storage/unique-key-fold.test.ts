@@ -7,10 +7,13 @@
  * base written before the token count was recorded.
  */
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MinnowDatabase, UniqueConstraintError } from "../engine/database.js";
 import { secondaryUniqueKeyNamespace, type TableRecord } from "./types.js";
+import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
 /**
  * The tail holds 16 chunks, so a fold lands on every 17th commit. Two folds are the minimum
@@ -319,8 +322,7 @@ describe("unique-key base fold", () => {
     for (let batch = 0; batch < FOLD_BATCHES; batch += 1) await insert(database, [200 + batch]);
     expect(await present(store, database, [500])).toEqual(new Set());
     store.close();
-  }, 60_000);
-
+  });
   it("still rejects a duplicate key after folding", async () => {
     const { store, database } = await open();
     for (let batch = 0; batch < FOLD_BATCHES; batch += 1) {

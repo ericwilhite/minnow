@@ -109,6 +109,11 @@ machines: https://minnowdb.com/llms.txt
   Adding a new generated column to an existing table is refused, while adopting generation on an
   existing column scans and verifies its values.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
+- Construct the engine or client with the declaration — `new MinnowDatabase(store, { schema })`,
+  `new MinnowDatabaseClient(worker, { store, schema })` — then call `migrate()` with no
+  argument. Every batch method is then typed by table name: rows, keys, update changes,
+  `conflictWhere`, `readTable` results and `write()` scopes all follow the declared columns, and
+  a misspelled table or column fails to compile. Without `schema` those methods take plain strings.
 - Use `db.upsertBatch(table, rows, { conflictWhere: { column, operator, value } })` when an
   existing target row must satisfy a guard before replacement. Inserts still land; inspect
   `skippedRowCount` for rejected conflicts. The same `conflictWhere` option works on

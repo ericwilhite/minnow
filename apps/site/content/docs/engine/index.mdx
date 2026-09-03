@@ -52,6 +52,10 @@ await db.insertBatch("orders", [
 ]);
 ```
 
+Construct the database with `{ schema }` and these calls are typed by the declaration: the
+rows above must carry `orders`' required columns, and a misspelled table or column will not
+compile. See [typed batch writes](/docs/schema#typed-batch-writes).
+
 Or columns, when you already hold them that way — which skips the pivot the engine would
 otherwise do:
 
@@ -130,6 +134,7 @@ follow the tab into the grave.
 
 | Option                        | Default  | What it does                                                                                                                                                                                                      |
 | ----------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema`                      | none     | The `schema([...])` declaration this database is typed against. Every batch method is then keyed by table name (see [typed batch writes](/docs/schema#typed-batch-writes)), and a bare `migrate()` applies it.    |
 | `compression`                 | `"gzip"` | Block encoding. `"raw"` writes faster; `gzip` usually uses about half the storage and can make a cold read faster because the browser fetches fewer bytes.                                                        |
 | `rowsPerBlock`                | `65536`  | Maximum rows in an ordinary write block, up to the format ceiling of 1,048,576. Smaller blocks can help narrow reads but add more work to broad scans.                                                            |
 | `targetBlockBytes`            | 2 MiB    | Target uncompressed bytes in each ordinary write block. Every column uses the same row boundaries. One value may exceed the target, up to the format's 64 MiB hard limit.                                         |

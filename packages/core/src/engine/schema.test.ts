@@ -8,7 +8,7 @@ import {
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { toCatalog, type Catalog } from "./catalog.js";
 import { MinnowDatabase } from "./database.js";
-import { allVisibleSegments } from "./storage-test-helpers.js";
+import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
 import {
   column,
   declaredForeignKeys,
@@ -23,6 +23,8 @@ import {
   type InferUpdateChanges,
 } from "./schema.js";
 import { deserializeSchema, serializeMigrationSteps, serializeSchema } from "./schema-wire.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(30_000) });
 
 const people = table("people", {
   name: column.string().unique(),
@@ -1167,7 +1169,7 @@ for (const implementation of implementations()) {
     // too, and did nothing but fail on a loaded machine: quadratic planning shows up as extra
     // catalog reads, which the counters catch exactly. Timings belong in the performance gate.
     store.close();
-  }, 30_000);
+  });
 }
 
 describe("migration planning rejections", () => {

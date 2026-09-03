@@ -1,10 +1,12 @@
 import { crossJoinPlan } from "../plan/model.js";
 import {
+  definedVectors,
   toColumnarBatch,
   type BatchRow,
   type BatchValue,
   type ColumnarBatch,
   type InsertBatchInput,
+  type InsertBatchInputLike,
 } from "./batch.js";
 import { ArtifactCache } from "./artifact-cache.js";
 import { estimateBatchBytes, estimateRowBytes, estimateValuesBytes } from "./byte-estimates.js";
@@ -300,10 +302,23 @@ import {
   declaredForeignKeys,
   isDestructiveStep,
   planMigration,
+  type AnySchema,
+  type UntypedSchema,
   type AnyTable,
   type AnyView,
+  type BatchColumnName,
+  type BatchDeleteInput,
+  type BatchInsertInput,
+  type BatchInsertRow,
+  type BatchKeyValue,
+  type BatchReadOptions,
+  type BatchReadRow,
+  type BatchUpdateChanges,
+  type BatchUpdateInput,
+  type BatchUpsertOptions,
   type MigrationStep,
   type SchemaDefinition,
+  type TableName,
 } from "./schema.js";
 import {
   columnarTableFromRows,
@@ -791,6 +806,7 @@ export interface UpsertBatchResult extends Omit<InsertBatchResult, "segmentId"> 
   requestedRowCount: number;
   insertedRowCount: number;
   updatedRowCount: number;
+  /** Input rows rejected by `conflictWhere`; always 0 without it. */
   skippedRowCount: number;
 }
 
@@ -811,6 +827,18 @@ export interface UpdateBatchInput {
   keys: readonly BatchValue[];
   /** Stable ordinary arrays; do not mutate or expose changing accessors until the write settles. */
   changes: Readonly<Record<string, readonly BatchValue[]>>;
+}
+
+/** `UpdateBatchInput` as the typed overload hands it on; see `ColumnarBatchLike`. */
+interface UpdateBatchInputLike {
+  readonly keys: readonly BatchValue[];
+  readonly changes: Readonly<Record<string, readonly BatchValue[] | undefined>>;
+}
+
+function compactUpdateBatchInput(input: UpdateBatchInputLike): UpdateBatchInput {
+  return Object.values(input.changes).includes(undefined)
+    ? { keys: input.keys, changes: definedVectors(input.changes) }
+    : (input as UpdateBatchInput);
 }
 
 export interface UpdateBatchResult {
@@ -896,7 +924,7 @@ export interface StagedUpsertResult extends StagedWriteResult {
  * caught the original error. A mutation that fails validation before registering anything
  * leaves the scope usable.
  */
-export interface WriteSession {
+export interface WriteSession<TSchema extends AnySchema = UntypedSchema> {
   /**
    * Read-your-writes: the query observes the pre-scope snapshot PLUS everything this scope
    * has staged so far, ordered after all committed data — without publishing anything.
@@ -904,14 +932,23 @@ export interface WriteSession {
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   /** Runs a SELECT, INSERT, UPDATE, or DELETE inside this write scope. */
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
-  insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
-  upsertBatch(
-    tableName: string,
-    input: InsertBatchInput,
-    options?: UpsertOptions,
+  insertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+  ): Promise<StagedWriteResult>;
+  upsertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+    options?: BatchUpsertOptions<TSchema, TName>,
   ): Promise<StagedUpsertResult>;
-  updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
-  deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
+  updateBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchUpdateInput<TSchema, TName>,
+  ): Promise<StagedWriteResult>;
+  deleteBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchDeleteInput<TSchema, TName>,
+  ): Promise<StagedWriteResult>;
 }
 
 /** What one statement's execution cost, reported by the engine that ran it. */
@@ -1194,7 +1231,13 @@ export {
   VisibleSegmentCursorStaleError,
 };
 
-export interface MinnowDatabaseOptions {
+export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {
+  /**
+   * The schema this database is declared against. It types every batch method by table name —
+   * rows, keys, update changes, `conflictWhere`, `readTable` results — and is what a bare
+   * `migrate()` applies. Without it the batch API addresses tables by plain string, as SQL does.
+   */
+  schema?: TSchema;
   /**
    * Block codec for newly written blocks; defaults to "gzip", which is also what compaction
    * rewrites to, so a table's blocks are encoded the same way however they got there.
@@ -1994,7 +2037,17 @@ async function* singleSnapshotChunk(bytes: Uint8Array): AsyncGenerator<Uint8Arra
   }
 }
 
-export class MinnowDatabase {
+export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
+  readonly #schema: TSchema | undefined;
+  /**
+   * This database with the batch API erased to plain strings. The engine addresses tables by
+   * runtime name — a statement's target, a foreign key's child — and only the public surface is
+   * typed by the declaration, so internal calls go through here.
+   */
+  // eslint-disable-next-line @typescript-eslint/prefer-return-this-type -- the erasure is the point
+  get #erased(): MinnowDatabase {
+    return this;
+  }
   #closed = false;
   #closePromise: Promise<void> | undefined;
   readonly #transactions: TransactionManager;
@@ -2140,8 +2193,9 @@ export class MinnowDatabase {
 
   constructor(
     private readonly store: BlockStore,
-    options: MinnowDatabaseOptions = {},
+    options: MinnowDatabaseOptions<TSchema> = {},
   ) {
+    this.#schema = options.schema;
     this.#compression = options.compression ?? "gzip";
     // The block is the streamed scan's row group and the buffer pool's residency unit.
     // Measured curve (400k rows, streamed filter/group/like/top-n, 2026-08): throughput is
@@ -3363,13 +3417,17 @@ export class MinnowDatabase {
     }
   }
 
-  insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
+  insertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+  ): Promise<InsertBatchResult>;
+  insertBatch(tableName: string, input: InsertBatchInputLike): Promise<InsertBatchResult> {
     return this.#withWriteReservation(() => this.#insertBatchReserved(tableName, input));
   }
 
   async #insertBatchReserved(
     tableName: string,
-    input: InsertBatchInput,
+    input: InsertBatchInputLike,
   ): Promise<InsertBatchResult> {
     const completed = await this.#runWrite(async () => {
       const table = await this.#findTable(tableName);
@@ -3401,7 +3459,7 @@ export class MinnowDatabase {
   /** Pivots, evaluates SQL defaults, and validates — shared by insert and upsert. */
   async #fillDefaults(
     table: TableRecord,
-    input: InsertBatchInput,
+    input: InsertBatchInputLike,
   ): Promise<FilledBatch & { rowCount: number }> {
     const pivoted = toColumnarBatch(input);
     // The pivot stamps rowCount, so an all-default batch keeps its row count even after the
@@ -3491,13 +3549,22 @@ export class MinnowDatabase {
     return { ...statement, rows };
   }
 
+  insert<TName extends TableName<TSchema>>(
+    tableName: TName,
+    row: BatchInsertRow<TSchema, TName>,
+  ): Promise<InsertBatchResult>;
   async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
-    return this.insertBatch(tableName, [row]);
+    return this.#erased.insertBatch(tableName, [row]);
   }
 
+  upsertBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchInsertInput<TSchema, TName>,
+    options?: BatchUpsertOptions<TSchema, TName>,
+  ): Promise<UpsertBatchResult>;
   upsertBatch(
     tableName: string,
-    input: InsertBatchInput,
+    input: InsertBatchInputLike,
     options: UpsertOptions = {},
   ): Promise<UpsertBatchResult> {
     return this.#withWriteReservation(() => this.#upsertBatchReserved(tableName, input, options));
@@ -3505,7 +3572,7 @@ export class MinnowDatabase {
 
   async #upsertBatchReserved(
     tableName: string,
-    input: InsertBatchInput,
+    input: InsertBatchInputLike,
     options: UpsertOptions,
   ): Promise<UpsertBatchResult> {
     const completed = await this.#runWrite(async () => {
@@ -3550,16 +3617,27 @@ export class MinnowDatabase {
     };
   }
 
+  upsert<TName extends TableName<TSchema>>(
+    tableName: TName,
+    row: BatchInsertRow<TSchema, TName>,
+    options?: BatchUpsertOptions<TSchema, TName>,
+  ): Promise<UpsertBatchResult>;
   async upsert(
     tableName: string,
     row: BatchRow,
     options: UpsertOptions = {},
   ): Promise<UpsertBatchResult> {
-    return this.upsertBatch(tableName, [row], options);
+    return this.#erased.upsertBatch(tableName, [row], options);
   }
 
-  updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
-    return this.#withWriteReservation(() => this.#updateBatchReserved(tableName, input));
+  updateBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchUpdateInput<TSchema, TName>,
+  ): Promise<UpdateBatchResult>;
+  updateBatch(tableName: string, input: UpdateBatchInputLike): Promise<UpdateBatchResult> {
+    return this.#withWriteReservation(() =>
+      this.#updateBatchReserved(tableName, compactUpdateBatchInput(input)),
+    );
   }
 
   async #updateBatchReserved(
@@ -3585,22 +3663,43 @@ export class MinnowDatabase {
     });
   }
 
+  /**
+   * Changes one row by the table's unique key. An explicitly `undefined` change leaves that
+   * column untouched, so a patch spread from optional fields needs no filtering first.
+   */
+  update<TName extends TableName<TSchema>>(
+    tableName: TName,
+    key: BatchKeyValue<TSchema, TName>,
+    changes: BatchUpdateChanges<TSchema, TName>,
+  ): Promise<UpdateBatchResult>;
   async update(
     tableName: string,
     key: Exclude<BatchValue, null>,
-    changes: Readonly<Record<string, BatchValue>>,
+    changes: Readonly<Record<string, BatchValue | undefined>>,
   ): Promise<UpdateBatchResult> {
-    return this.updateBatch(tableName, {
+    return this.#erased.updateBatch(tableName, {
       keys: [key],
-      changes: Object.fromEntries(Object.entries(changes).map(([name, value]) => [name, [value]])),
+      changes: Object.fromEntries(
+        Object.entries(changes).flatMap(([name, value]) =>
+          value === undefined ? [] : [[name, [value]]],
+        ),
+      ),
     });
   }
 
   /** Deletes one row by the table's unique key. */
+  delete<TName extends TableName<TSchema>>(
+    tableName: TName,
+    key: BatchKeyValue<TSchema, TName>,
+  ): Promise<DeleteBatchResult>;
   async delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult> {
-    return this.deleteBatch(tableName, { keys: [key] });
+    return this.#erased.deleteBatch(tableName, { keys: [key] });
   }
 
+  deleteBatch<TName extends TableName<TSchema>>(
+    tableName: TName,
+    input: BatchDeleteInput<TSchema, TName>,
+  ): Promise<DeleteBatchResult>;
   deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
     return this.#withWriteReservation(() => this.#deleteBatchReserved(tableName, input));
   }
@@ -3621,7 +3720,7 @@ export class MinnowDatabase {
       if (dependents.length === 0) return this.#deleteBatchOnce(tableName, normalizedInput);
       // E141-04: the referential actions and the delete itself publish as one commit.
       const started = performance.now();
-      const { result, version } = await this.write(async (session) => {
+      const { result, version } = await this.#erased.write(async (session) => {
         await this.#applyReferentialActions(
           table,
           [...normalizedInput.keys],
@@ -3879,8 +3978,15 @@ export class MinnowDatabase {
     }
   }
 
-  bufferedWriter(tableName: string, options: BufferedWriterOptions = {}): BufferedTableWriter {
-    return new BufferedTableWriter(this, tableName, options);
+  bufferedWriter<TName extends TableName<TSchema>>(
+    tableName: TName,
+    options: BufferedWriterOptions = {},
+  ): BufferedTableWriter<BatchInsertRow<TSchema, TName>> {
+    return new BufferedTableWriter<BatchInsertRow<TSchema, TName>>(
+      this.#erased,
+      tableName,
+      options,
+    );
   }
 
   async #writeUpdateBatch(
@@ -4174,14 +4280,7 @@ export class MinnowDatabase {
     let counts: { inserted: number; updated: number } | undefined;
     let skippedRowCount = 0;
     let acceptedRowIndexes = Array.from({ length: requestedRowCount }, (_, index) => index);
-    let upsertFirings:
-      | {
-          inserts: number[];
-          updates: number[];
-          skipped: number[];
-          oldImages: Array<Record<string, BatchValue> | undefined>;
-        }
-      | undefined;
+    let upsertFirings: UpsertFirings | undefined;
     let encodeMs = 0;
     let stageMs = 0;
     let commitMs = 0;
@@ -4520,6 +4619,17 @@ export class MinnowDatabase {
     }
   }
 
+  readTable<
+    TName extends TableName<TSchema>,
+    const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>,
+  >(
+    tableName: TName,
+    options: BatchReadOptions<TSchema, TName, TColumns> & { readonly columns: TColumns },
+  ): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;
+  readTable<TName extends TableName<TSchema>>(
+    tableName: TName,
+    versionOrOptions?: number | BatchReadOptions<TSchema, TName>,
+  ): Promise<Array<BatchReadRow<TSchema, TName>>>;
   async readTable(
     tableName: string,
     versionOrOptions?: number | ReadTableOptions,
@@ -7356,15 +7466,7 @@ export class MinnowDatabase {
       operator: ComparisonOperator;
       value: BatchValue;
     },
-  ): Promise<
-    | {
-        inserts: number[];
-        updates: number[];
-        skipped: number[];
-        oldImages: Array<Record<string, BatchValue> | undefined>;
-      }
-    | undefined
-  > {
+  ): Promise<UpsertFirings | undefined> {
     const fires = (table.triggers ?? []).some(
       (trigger) => trigger.event === "insert" || trigger.event === "update",
     );
@@ -7446,12 +7548,7 @@ export class MinnowDatabase {
     transaction: DatabaseTransaction,
     table: TableRecord,
     batch: ColumnarBatch,
-    firings: {
-      inserts: number[];
-      updates: number[];
-      skipped: number[];
-      oldImages: Array<Record<string, BatchValue> | undefined>;
-    },
+    firings: UpsertFirings,
     timing: "before" | "after",
     cascadeBudget = 1,
   ): Promise<void> {
@@ -7853,9 +7950,10 @@ export class MinnowDatabase {
    * scope with nothing published. A scope that stages nothing publishes nothing.
    */
   async write<T>(
-    action: (session: WriteSession) => Promise<T>,
+    action: (session: WriteSession<TSchema>) => Promise<T>,
   ): Promise<{ result: T; version: number | null }> {
-    return this.#openWriteScope((session) => action(session));
+    // The scope stages by runtime table name; the declaration only types the caller's view.
+    return this.#openWriteScope((session) => action(session as WriteSession<TSchema>));
   }
 
   /**
@@ -8320,6 +8418,16 @@ export class MinnowDatabase {
     cascadeBudget = 1,
   ): Promise<StagedUpsertResult> {
     const table = await this.#findTable(tableName);
+    // Session upserts classify against the scope's own staged state, so a row inserted
+    // earlier in the scope makes a later upsert of its key fire as an UPDATE.
+    const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
+    const normalizedConflictWhere =
+      kind === "upsert" && options?.conflictWhere !== undefined
+        ? normalizeUpsertConflictWhere(table, options.conflictWhere)
+        : undefined;
+    if (normalizedConflictWhere !== undefined && sessionUpsertKeyColumn === undefined) {
+      throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
+    }
     const filled = await this.#fillDefaults(table, input);
     const { generated, autoIncrement } = filled;
     let batch = filled.batch;
@@ -8336,16 +8444,6 @@ export class MinnowDatabase {
       for (const rowIndex of autoIncrement.missingIndexes) {
         validateValue(autoIncrement.column, patched[rowIndex] ?? null, rowIndex);
       }
-    }
-    // Session upserts classify against the scope's own staged state, so a row inserted
-    // earlier in the scope makes a later upsert of its key fire as an UPDATE.
-    const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
-    const normalizedConflictWhere =
-      kind === "upsert" && options?.conflictWhere !== undefined
-        ? normalizeUpsertConflictWhere(table, options.conflictWhere)
-        : undefined;
-    if (normalizedConflictWhere !== undefined && sessionUpsertKeyColumn === undefined) {
-      throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
     }
     let sessionUpsertFirings =
       sessionUpsertKeyColumn === undefined
@@ -8374,7 +8472,9 @@ export class MinnowDatabase {
       if (rowCount === 0) {
         // Nothing will be staged for this table, so registering a level-zero segment limit
         // here (via #assertCompactionCapacity below) would leave the transaction with a limit
-        // that no pending segment covers — an invariant #planCommit enforces at commit time.
+        // that no pending segment covers — the store's commit planning (RecordCore#planCommit
+        // and its IndexedDB equivalent) rejects that at commit time.
+        collectAutoIncrementGenerated(batch, generated, autoIncrement);
         return {
           tableName: table.name,
           segmentId: null,
@@ -8832,10 +8932,19 @@ export class MinnowDatabase {
    * steps — and every catalog alteration is one atomic compare-and-swap, so a concurrent
    * migrator fails explicitly with a conflict instead of interleaving.
    */
+  /**
+   * Brings storage in line with a schema declaration. With no argument it applies the schema the
+   * database was constructed with.
+   */
   async migrate(
-    definition: SchemaDefinition<readonly AnyTable[]>,
+    definition: SchemaDefinition<readonly AnyTable[]> | undefined = this.#schema,
     options: MigrateOptions = {},
   ): Promise<MigrateResult> {
+    if (definition === undefined) {
+      throw new TypeError(
+        "migrate() needs a schema: pass a definition, or construct the database with { schema }",
+      );
+    }
     // Table revisions also move under background full-text index activity (build stamps,
     // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
     // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
@@ -10225,7 +10334,7 @@ export class MinnowDatabase {
     let outcome: { affectedRows: number[]; returnedRows?: QueryRow[] };
     let version: number | null | undefined;
     if (options.writer === undefined) {
-      const completed = await this.write(apply);
+      const completed = await this.#erased.write(apply);
       outcome = completed.result;
       version = completed.version;
     } else {
@@ -10398,7 +10507,7 @@ export class MinnowDatabase {
     const sourceKey = mergeSourceKeyExpression(statement, keyColumn.name);
     // The source's key value per row, and the target row it matches (or none).
     const sourceSql = mergeSourceSql(statement);
-    const { result: applied, version } = await this.write(async (session) => {
+    const { result: applied, version } = await this.#erased.write(async (session) => {
       const sourceRows = (await session.query(sourceSql)).rows;
       const keys = sourceRows.map((row) =>
         storedSqlValueFromExecution(
@@ -11168,9 +11277,10 @@ export class MinnowDatabase {
         version?: number;
         generatedColumns?: Record<string, BatchValue[]>;
       } = await (viaUpsert
-        ? (writer?.upsertBatch(statement.table, input) ?? this.upsertBatch(statement.table, input))
+        ? (writer?.upsertBatch(statement.table, input) ??
+          this.#erased.upsertBatch(statement.table, input))
         : (writer?.insertBatch(statement.table, input) ??
-          this.insertBatch(statement.table, input)));
+          this.#erased.insertBatch(statement.table, input)));
       const generated = "generatedColumns" in result ? (result.generatedColumns ?? {}) : {};
       return {
         kind: "insert",
@@ -11358,7 +11468,7 @@ export class MinnowDatabase {
       }
       const deleted: { deletedRowCount?: number; rowCount?: number; version?: number | null } =
         options.writer === undefined
-          ? await this.deleteBatch(table.name, { keys })
+          ? await this.#erased.deleteBatch(table.name, { keys })
           : await options.writer.deleteBatch(table.name, { keys });
       return {
         kind: "delete",
@@ -11415,7 +11525,7 @@ export class MinnowDatabase {
       generatedColumns?: Record<string, BatchValue[]>;
     } =
       options.writer === undefined
-        ? await this.updateBatch(table.name, { keys, changes })
+        ? await this.#erased.updateBatch(table.name, { keys, changes })
         : await options.writer.updateBatch(table.name, { keys, changes });
     const returnedRows =
       returningColumns === undefined
@@ -22307,7 +22417,7 @@ function applyUpsertConflictFilter(
   };
 }
 
-/** Reindexes generated-column values onto an accepted row subset; a no-op when nothing changed. */
+/** Reindexes generated-column values onto an accepted row subset; callers skip it when every row was accepted. */
 function remapGeneratedColumns(
   generated: Map<string, BatchValue[]>,
   acceptedRowIndexes: readonly number[],

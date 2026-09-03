@@ -1,6 +1,19 @@
 import type { BlockStore, SegmentRecord, TransactionRecord } from "../storage/index.js";
 import type { MinnowDatabase, VisibleSegment, VisibleSegmentPageCursor } from "./database.js";
 
+/**
+ * The test timeout for a file too heavy for vitest.config.ts's 20-second local default, applied
+ * with `vi.setConfig({ testTimeout })` rather than as a third `it()` argument — prettier keeps
+ * a test call's layout only when that argument is a numeric literal. Locally it is exactly the
+ * number given, so a hang still fails fast; on CI it is never below the 300 seconds the config
+ * grants every other test there, because a hosted runner's two shared cores plus coverage
+ * instrumentation run this suite five to ten times slower — a literal tuned on a developer
+ * machine is a flake generator on CI.
+ */
+export function heavyTestTimeout(localMs: number): number {
+  return process.env.CI === undefined ? localMs : Math.max(localMs, 300_000);
+}
+
 /** Exhausts the bounded public segment cursor for finite test fixtures. */
 export async function allVisibleSegments(
   database: MinnowDatabase,

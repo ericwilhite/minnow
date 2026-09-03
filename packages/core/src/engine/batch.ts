@@ -36,13 +36,50 @@ export interface ColumnarBatch {
 /** What `insertBatch` and `upsertBatch` take: rows, or columns for a bulk load. */
 export type InsertBatchInput = readonly BatchRow[] | ColumnarBatch;
 
-function isColumnarBatch(input: InsertBatchInput): input is ColumnarBatch {
+/**
+ * `ColumnarBatch` as the schema-typed overloads hand it to the erased implementation: a column
+ * vector or omission mask may be `undefined`, meaning that column is not in the batch. Only the
+ * type is looser — `toColumnarBatch` drops such entries, so nothing downstream sees them.
+ */
+export interface ColumnarBatchLike {
+  readonly columns: Readonly<Record<string, readonly BatchValue[] | undefined>>;
+  readonly omitted?: Readonly<Record<string, readonly boolean[] | undefined>>;
+  readonly rowCount?: number;
+}
+
+export type InsertBatchInputLike = readonly BatchRow[] | ColumnarBatchLike;
+
+/** The entries of a per-column record whose vector is present. */
+export function definedVectors<T>(
+  vectors: Readonly<Record<string, T | undefined>>,
+): Record<string, T> {
+  const defined: Record<string, T> = {};
+  for (const [name, vector] of Object.entries(vectors)) {
+    if (vector !== undefined) defined[name] = vector;
+  }
+  return defined;
+}
+
+function hasUndefinedVector(vectors: Readonly<Record<string, unknown>>): boolean {
+  return Object.values(vectors).includes(undefined);
+}
+
+function isColumnarBatch(input: InsertBatchInputLike): input is ColumnarBatchLike {
   return !Array.isArray(input);
 }
 
 /** Pivots rows into the engine's columnar form; a columnar batch passes straight through. */
-export function toColumnarBatch(input: InsertBatchInput): ColumnarBatch {
-  if (isColumnarBatch(input)) return input;
+export function toColumnarBatch(input: InsertBatchInputLike): ColumnarBatch {
+  if (isColumnarBatch(input)) {
+    const columnsComplete = !hasUndefinedVector(input.columns);
+    const omittedComplete = input.omitted === undefined || !hasUndefinedVector(input.omitted);
+    if (columnsComplete && omittedComplete) return input as ColumnarBatch;
+    return {
+      columns: definedVectors(input.columns),
+      ...(input.omitted === undefined ? {} : { omitted: definedVectors(input.omitted) }),
+      ...(input.rowCount === undefined ? {} : { rowCount: input.rowCount }),
+    };
+  }
   if (input.length === 0) throw new TypeError("A batch needs at least one row");
   // One pass over the rows, discovering columns in first-seen order. Values and omission are
   // separate so an explicit NULL can never accidentally invoke a default.

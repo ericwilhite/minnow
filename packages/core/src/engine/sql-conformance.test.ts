@@ -23,7 +23,7 @@
  * instant in UTC and a zone difference would be a difference in the question.
  */
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import rawPostgresProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
@@ -41,6 +41,9 @@ import {
   type QueryResult,
   type QueryValue,
 } from "./query.js";
+import { heavyTestTimeout } from "./storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(240_000) });
 
 // --- Deterministic fixture ----------------------------------------------------------------------
 
@@ -2509,8 +2512,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
           failures.slice(0, 10).join("\n\n"),
       );
     }
-  }, 240_000);
-
+  });
   it("pins every read claim that neither external oracle can represent", async () => {
     const expectedIds = [
       "aggregate.any-value",
@@ -2687,8 +2689,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
         expect.fail(`Missing self-check for ${feature.id}`);
       }
     }
-  }, 120_000);
-
+  });
   it("renders declared-scale NUMERIC results exactly as PostgreSQL", async () => {
     // The generated corpus compares NUMERIC values numerically (its oracle parses them into
     // numbers), so it cannot see the rendered text. This case diffs the strings themselves:
@@ -2778,8 +2779,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
       await postgres.close();
     }
     expect(failures).toEqual([]);
-  }, 120_000);
-
+  });
   it("keeps ROUND and its numeric siblings exact over NUMERIC, rendered as PostgreSQL does", async () => {
     // ROUND over an exact NUMERIC once returned the engine's internal tag ("\u0000minnow-domain:
     // numeric:75.91") because the result column carried no NUMERIC domain, and a derived table
@@ -2862,8 +2862,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
       await postgres.close();
     }
     expect(failures).toEqual([]);
-  }, 120_000);
-
+  });
   it("leaves no supported feature unaccounted for", () => {
     const unclassified = matrixFeatures
       .filter((feature) => feature.status === "supported")

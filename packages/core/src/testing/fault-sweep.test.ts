@@ -15,7 +15,7 @@
  * "the surviving state is one of the states a caller could have observed", never "the write
  * landed".
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import {
   IndexedDbBlockStore,
@@ -26,6 +26,9 @@ import {
 import { MemoryOpfs } from "./opfs-shim.js";
 import { MinnowDatabase } from "../engine/database.js";
 import { FaultInjectingBlockStore, faultPoints, type FaultPoint } from "./index.js";
+import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
 /** Every row the workload could possibly have written, keyed by id. */
 const REGIONS = ["west", "east", "north", "south"] as const;
@@ -232,6 +235,6 @@ describe("fault sweep", () => {
         observed.size,
         `every injection left the same ${String([...observed])} rows -- faults are not landing on writes`,
       ).toBeGreaterThan(1);
-    }, 120_000);
+    });
   }
 });

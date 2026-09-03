@@ -9,6 +9,13 @@
           "audience": "application",
           "exports": [
             {
+              "name": "AnySchema",
+              "kind": "type",
+              "declarations": [
+                "export type AnySchema = SchemaDefinition<readonly AnyTable[]>;"
+              ]
+            },
+            {
               "name": "AnyTable",
               "kind": "type",
               "declarations": [
@@ -51,10 +58,87 @@
               ]
             },
             {
+              "name": "BatchColumnName",
+              "kind": "type",
+              "declarations": [
+                "export type BatchColumnName<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? string : keyof TableOf<TSchema, TName>[\"columns\"] & string;"
+              ]
+            },
+            {
+              "name": "BatchConflictWhere",
+              "kind": "type",
+              "declarations": [
+                "export type BatchConflictWhere<TTable extends AnyTable> = {\n    [K in keyof TTable[\"columns\"] & string]: {\n        readonly column: K;\n        readonly operator: ComparisonOperator;\n        readonly value: ColumnInputValue<TTable[\"columns\"][K]>;\n    };\n}[keyof TTable[\"columns\"] & string];"
+              ]
+            },
+            {
+              "name": "BatchDeleteInput",
+              "kind": "type",
+              "declarations": [
+                "export type BatchDeleteInput<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? DeleteBatchInput : {\n    readonly keys: ReadonlyArray<BatchKey<TableOf<TSchema, TName>>>;\n};"
+              ]
+            },
+            {
+              "name": "BatchInsertInput",
+              "kind": "type",
+              "declarations": [
+                "export type BatchInsertInput<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? InsertBatchInput : ReadonlyArray<InferInsertRow<TableOf<TSchema, TName>>> | ColumnarInsertBatch<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchInsertRow",
+              "kind": "type",
+              "declarations": [
+                "export type BatchInsertRow<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? BatchRow : InferInsertRow<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchKeyValue",
+              "kind": "type",
+              "declarations": [
+                "export type BatchKeyValue<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? Exclude<BatchValue, null> : BatchKey<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchReadOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface BatchReadOptions<TSchema extends AnySchema, TName extends TableName<TSchema>, TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>> = ReadonlyArray<BatchColumnName<TSchema, TName>>> {\n    readonly version?: number;\n    readonly columns?: TColumns;\n}"
+              ]
+            },
+            {
+              "name": "BatchReadRow",
+              "kind": "type",
+              "declarations": [
+                "export type BatchReadRow<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? DatabaseRow : InferRow<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
               "name": "BatchRow",
               "kind": "type",
               "declarations": [
                 "export type BatchRow = Readonly<Record<string, BatchValue>>;"
+              ]
+            },
+            {
+              "name": "BatchUpdateChanges",
+              "kind": "type",
+              "declarations": [
+                "export type BatchUpdateChanges<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? Readonly<Record<string, BatchValue>> : InferUpdateChanges<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchUpdateInput",
+              "kind": "type",
+              "declarations": [
+                "export type BatchUpdateInput<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? UpdateBatchInput : {\n    readonly keys: ReadonlyArray<BatchKey<TableOf<TSchema, TName>>>;\n    readonly changes: {\n        readonly [K in keyof InferUpdateChanges<TableOf<TSchema, TName>>]?: ReadonlyArray<Exclude<InferUpdateChanges<TableOf<TSchema, TName>>[K], undefined>>;\n    };\n};"
+              ]
+            },
+            {
+              "name": "BatchUpsertOptions",
+              "kind": "type",
+              "declarations": [
+                "export type BatchUpsertOptions<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? UpsertOptions : {\n    readonly conflictWhere?: BatchConflictWhere<TableOf<TSchema, TName>>;\n};"
               ]
             },
             {
@@ -75,7 +159,7 @@
               "name": "BufferedTableWriter",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class BufferedTableWriter {\n    #private;\n    private readonly database;\n    private readonly tableName;\n    constructor(database: MinnowDatabase, tableName: string, options?: BufferedWriterOptions);\n    get pendingRowCount(): number;\n    get estimatedBytes(): number;\n    add(row: Readonly<Record<string, BatchValue>>): Promise<BufferedFlushResult | undefined>;\n    flush(): Promise<BufferedFlushResult | undefined>;\n    requestFlush(): void;\n    close(): Promise<BufferedFlushResult | undefined>;\n    discard(): number;\n}"
+                "export declare class BufferedTableWriter<TRow extends BatchRow = BatchRow> {\n    #private;\n    private readonly database;\n    private readonly tableName;\n    constructor(database: MinnowDatabase, tableName: string, options?: BufferedWriterOptions);\n    get pendingRowCount(): number;\n    get estimatedBytes(): number;\n    add(row: TRow): Promise<BufferedFlushResult | undefined>;\n    flush(): Promise<BufferedFlushResult | undefined>;\n    requestFlush(): void;\n    close(): Promise<BufferedFlushResult | undefined>;\n    discard(): number;\n}"
               ]
             },
             {
@@ -181,6 +265,13 @@
               "kind": "type",
               "declarations": [
                 "export interface ColumnarBatch {\n    columns: Readonly<Record<string, readonly BatchValue[]>>;\n    omitted?: Readonly<Record<string, readonly boolean[]>>;\n    rowCount?: number;\n}"
+              ]
+            },
+            {
+              "name": "ColumnarInsertBatch",
+              "kind": "type",
+              "declarations": [
+                "export interface ColumnarInsertBatch<TTable extends AnyTable> {\n    readonly columns: {\n        readonly [K in RequiredInsertKeys<TTable>]: ReadonlyArray<ColumnInputValue<TTable[\"columns\"][K]>>;\n    } & {\n        readonly [K in OptionalInsertKeys<TTable>]?: ReadonlyArray<ColumnInputValue<TTable[\"columns\"][K]>>;\n    };\n    readonly omitted?: Partial<Readonly<Record<OptionalInsertKeys<TTable>, readonly boolean[]>>>;\n    readonly rowCount?: number;\n}"
               ]
             },
             {
@@ -635,14 +726,14 @@
               "name": "MinnowDatabase",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class MinnowDatabase {\n    #private;\n    private readonly store;\n    constructor(store: BlockStore, options?: MinnowDatabaseOptions);\n    close(): Promise<void>;\n    maintenanceStatus(): MaintenanceStatus;\n    createTable(input: CreateTableInput): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult>;\n    insert(tableName: string, row: BatchRow): Promise<InsertBatchResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput, options?: UpsertOptions): Promise<UpsertBatchResult>;\n    upsert(tableName: string, row: BatchRow, options?: UpsertOptions): Promise<UpsertBatchResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult>;\n    update(tableName: string, key: Exclude<BatchValue, null>, changes: Readonly<Record<string, BatchValue>>): Promise<UpdateBatchResult>;\n    delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult>;\n    bufferedWriter(tableName: string, options?: BufferedWriterOptions): BufferedTableWriter;\n    readTable(tableName: string, versionOrOptions?: number | ReadTableOptions): Promise<DatabaseRow[]>;\n    snapshot<T>(action: (session: SnapshotSession) => Promise<T>): Promise<T>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    liveQueries(options?: LiveQuerySetOptions): LiveQuerySet;\n    write<T>(action: (session: WriteSession) => Promise<T>): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    migrate(definition: SchemaDefinition<readonly AnyTable[]>, options?: MigrateOptions): Promise<MigrateResult>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryValue[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    bufferPoolStats(): BufferPoolStats;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n}"
+                "export declare class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {\n    #private;\n    private readonly store;\n    constructor(store: BlockStore, options?: MinnowDatabaseOptions<TSchema>);\n    close(): Promise<void>;\n    maintenanceStatus(): MaintenanceStatus;\n    createTable(input: CreateTableInput): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<InsertBatchResult>;\n    insert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>): Promise<InsertBatchResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    upsert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<UpdateBatchResult>;\n    update<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>, changes: BatchUpdateChanges<TSchema, TName>): Promise<UpdateBatchResult>;\n    delete<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>): Promise<DeleteBatchResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<DeleteBatchResult>;\n    bufferedWriter<TName extends TableName<TSchema>>(tableName: TName, options?: BufferedWriterOptions): BufferedTableWriter<BatchInsertRow<TSchema, TName>>;\n    readTable<TName extends TableName<TSchema>, const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>>(tableName: TName, options: BatchReadOptions<TSchema, TName, TColumns> & {\n        readonly columns: TColumns;\n    }): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;\n    readTable<TName extends TableName<TSchema>>(tableName: TName, versionOrOptions?: number | BatchReadOptions<TSchema, TName>): Promise<Array<BatchReadRow<TSchema, TName>>>;\n    snapshot<T>(action: (session: SnapshotSession) => Promise<T>): Promise<T>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    liveQueries(options?: LiveQuerySetOptions): LiveQuerySet;\n    write<T>(action: (session: WriteSession<TSchema>) => Promise<T>): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    migrate(definition?: SchemaDefinition<readonly AnyTable[]> | undefined, options?: MigrateOptions): Promise<MigrateResult>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryValue[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    bufferPoolStats(): BufferPoolStats;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n}"
               ]
             },
             {
               "name": "MinnowDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseOptions {\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    now?: () => Date;\n    createId?: () => string;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
+                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    now?: () => Date;\n    createId?: () => string;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
               ]
             },
             {
@@ -927,6 +1018,20 @@
               ]
             },
             {
+              "name": "TableName",
+              "kind": "type",
+              "declarations": [
+                "export type TableName<TSchema extends AnySchema> = SchemaTable<TSchema>[\"name\"];"
+              ]
+            },
+            {
+              "name": "TableOf",
+              "kind": "type",
+              "declarations": [
+                "export type TableOf<TSchema extends AnySchema, TName extends TableName<TSchema>> = Extract<SchemaTable<TSchema>, {\n    readonly name: TName;\n}>;"
+              ]
+            },
+            {
               "name": "TableOptions",
               "kind": "type",
               "declarations": [
@@ -966,6 +1071,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare class UnknownTableError extends TypeError {\n    readonly tableName: string;\n    readonly name = \"UnknownTableError\";\n    constructor(tableName: string);\n}"
+              ]
+            },
+            {
+              "name": "UntypedSchema",
+              "kind": "type",
+              "declarations": [
+                "export type UntypedSchema = any;"
               ]
             },
             {
@@ -1070,7 +1182,7 @@
               "name": "WriteSession",
               "kind": "type",
               "declarations": [
-                "export interface WriteSession {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput, options?: UpsertOptions): Promise<StagedUpsertResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;\n}"
+                "export interface WriteSession<TSchema extends AnySchema = UntypedSchema> {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<StagedWriteResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<StagedUpsertResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<StagedWriteResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<StagedWriteResult>;\n}"
               ]
             }
           ]
@@ -1439,7 +1551,7 @@
               "name": "ClientBufferedWriter",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class ClientBufferedWriter {\n    #private;\n    private readonly client;\n    private readonly handleId;\n    constructor(client: MinnowDatabaseClient, handleId: string, created: Promise<unknown>);\n    add(row: Readonly<Record<string, BatchValue>>): Promise<BufferedFlushResult | undefined>;\n    flush(): Promise<BufferedFlushResult | undefined>;\n    requestFlush(): void;\n    stats(): Promise<{\n        pendingRowCount: number;\n        estimatedBytes: number;\n    }>;\n    discard(): Promise<number>;\n    close(): Promise<BufferedFlushResult | undefined>;\n}"
+                "export declare class ClientBufferedWriter<TRow extends BatchRow = BatchRow> {\n    #private;\n    private readonly client;\n    private readonly handleId;\n    constructor(client: MinnowDatabaseClient, handleId: string, created: Promise<unknown>);\n    add(row: TRow): Promise<BufferedFlushResult | undefined>;\n    flush(): Promise<BufferedFlushResult | undefined>;\n    requestFlush(): void;\n    stats(): Promise<{\n        pendingRowCount: number;\n        estimatedBytes: number;\n    }>;\n    discard(): Promise<number>;\n    close(): Promise<BufferedFlushResult | undefined>;\n}"
               ]
             },
             {
@@ -1488,7 +1600,7 @@
               "name": "ClientWriteSession",
               "kind": "type",
               "declarations": [
-                "export interface ClientWriteSession {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput, options?: UpsertOptions): Promise<StagedUpsertResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;\n}"
+                "export interface ClientWriteSession<TSchema extends AnySchema = UntypedSchema> {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<StagedWriteResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<StagedUpsertResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<StagedWriteResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<StagedWriteResult>;\n}"
               ]
             },
             {
@@ -1502,14 +1614,14 @@
               "name": "MinnowDatabaseClient",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class MinnowDatabaseClient {\n    #private;\n    constructor(transport: ClientTransport, options?: MinnowDatabaseClientOptions);\n    ready(): Promise<void>;\n    createTable(input: CreateTableInput): Promise<void>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    migrate(definition: SchemaDefinition<readonly AnyTable[]>, options?: MigrateOptions): Promise<ClientMigrationResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult>;\n    insert(tableName: string, row: BatchRow): Promise<InsertBatchResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput, options?: UpsertOptions): Promise<UpsertBatchResult>;\n    upsert(tableName: string, row: BatchRow, options?: UpsertOptions): Promise<UpsertBatchResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult>;\n    update(tableName: string, key: Exclude<BatchValue, null>, changes: Readonly<Record<string, BatchValue>>): Promise<UpdateBatchResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult>;\n    delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult>;\n    bufferedWriter(tableName: string, options?: BufferedWriterOptions): ClientBufferedWriter;\n    readTable(tableName: string, versionOrOptions?: number | ReadTableOptions): Promise<DatabaseRow[]>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryValue[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T>;\n    write<T>(action: (session: ClientWriteSession) => Promise<T>): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    bufferPoolStats(): Promise<BufferPoolStats>;\n    maintenanceStatus(): Promise<MaintenanceStatus>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    liveQueries(options?: ClientLiveQueryOptions): ClientLiveQuerySet;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: {\n        maxItems?: number;\n    }): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    close(options?: CloseClientOptions): Promise<void>;\n    _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;\n    _invokeControlled(handleId: string, method: string, args: unknown[], controls: RpcCallControls): Promise<unknown>;\n    _routeEvents(handleId: string, route: EventRoute): void;\n    _unrouteEvents(handleId: string): void;\n}"
+                "export declare class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {\n    #private;\n    constructor(transport: ClientTransport, options?: MinnowDatabaseClientOptions<TSchema>);\n    ready(): Promise<void>;\n    createTable(input: CreateTableInput): Promise<void>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    migrate(definition?: SchemaDefinition<readonly AnyTable[]> | undefined, options?: MigrateOptions): Promise<ClientMigrationResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<InsertBatchResult>;\n    insert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>): Promise<InsertBatchResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    upsert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<UpdateBatchResult>;\n    update<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>, changes: BatchUpdateChanges<TSchema, TName>): Promise<UpdateBatchResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<DeleteBatchResult>;\n    delete<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>): Promise<DeleteBatchResult>;\n    bufferedWriter<TName extends TableName<TSchema>>(tableName: TName, options?: BufferedWriterOptions): ClientBufferedWriter<BatchInsertRow<TSchema, TName>>;\n    readTable<TName extends TableName<TSchema>, const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>>(tableName: TName, options: BatchReadOptions<TSchema, TName, TColumns> & {\n        readonly columns: TColumns;\n    }): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;\n    readTable<TName extends TableName<TSchema>>(tableName: TName, versionOrOptions?: number | BatchReadOptions<TSchema, TName>): Promise<Array<BatchReadRow<TSchema, TName>>>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryValue[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T>;\n    write<T>(action: (session: ClientWriteSession<TSchema>) => Promise<T>): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    bufferPoolStats(): Promise<BufferPoolStats>;\n    maintenanceStatus(): Promise<MaintenanceStatus>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    liveQueries(options?: ClientLiveQueryOptions): ClientLiveQuerySet;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: {\n        maxItems?: number;\n    }): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    close(options?: CloseClientOptions): Promise<void>;\n    _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;\n    _invokeControlled(handleId: string, method: string, args: unknown[], controls: RpcCallControls): Promise<unknown>;\n    _routeEvents(handleId: string, route: EventRoute): void;\n    _unrouteEvents(handleId: string): void;\n}"
               ]
             },
             {
               "name": "MinnowDatabaseClientOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseClientOptions {\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n}"
+                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n}"
               ]
             }
           ]
@@ -2034,6 +2146,13 @@
           "audience": "application",
           "exports": [
             {
+              "name": "AnySchema",
+              "kind": "type",
+              "declarations": [
+                "export type AnySchema = SchemaDefinition<readonly AnyTable[]>;"
+              ]
+            },
+            {
               "name": "AnyTable",
               "kind": "type",
               "declarations": [
@@ -2062,10 +2181,94 @@
               ]
             },
             {
+              "name": "BatchColumnName",
+              "kind": "type",
+              "declarations": [
+                "export type BatchColumnName<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? string : keyof TableOf<TSchema, TName>[\"columns\"] & string;"
+              ]
+            },
+            {
+              "name": "BatchConflictWhere",
+              "kind": "type",
+              "declarations": [
+                "export type BatchConflictWhere<TTable extends AnyTable> = {\n    [K in keyof TTable[\"columns\"] & string]: {\n        readonly column: K;\n        readonly operator: ComparisonOperator;\n        readonly value: ColumnInputValue<TTable[\"columns\"][K]>;\n    };\n}[keyof TTable[\"columns\"] & string];"
+              ]
+            },
+            {
+              "name": "BatchDeleteInput",
+              "kind": "type",
+              "declarations": [
+                "export type BatchDeleteInput<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? DeleteBatchInput : {\n    readonly keys: ReadonlyArray<BatchKey<TableOf<TSchema, TName>>>;\n};"
+              ]
+            },
+            {
+              "name": "BatchInsertInput",
+              "kind": "type",
+              "declarations": [
+                "export type BatchInsertInput<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? InsertBatchInput : ReadonlyArray<InferInsertRow<TableOf<TSchema, TName>>> | ColumnarInsertBatch<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchInsertRow",
+              "kind": "type",
+              "declarations": [
+                "export type BatchInsertRow<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? BatchRow : InferInsertRow<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchKeyValue",
+              "kind": "type",
+              "declarations": [
+                "export type BatchKeyValue<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? Exclude<BatchValue, null> : BatchKey<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchReadOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface BatchReadOptions<TSchema extends AnySchema, TName extends TableName<TSchema>, TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>> = ReadonlyArray<BatchColumnName<TSchema, TName>>> {\n    readonly version?: number;\n    readonly columns?: TColumns;\n}"
+              ]
+            },
+            {
+              "name": "BatchReadRow",
+              "kind": "type",
+              "declarations": [
+                "export type BatchReadRow<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? DatabaseRow : InferRow<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchUpdateChanges",
+              "kind": "type",
+              "declarations": [
+                "export type BatchUpdateChanges<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? Readonly<Record<string, BatchValue>> : InferUpdateChanges<TableOf<TSchema, TName>>;"
+              ]
+            },
+            {
+              "name": "BatchUpdateInput",
+              "kind": "type",
+              "declarations": [
+                "export type BatchUpdateInput<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? UpdateBatchInput : {\n    readonly keys: ReadonlyArray<BatchKey<TableOf<TSchema, TName>>>;\n    readonly changes: {\n        readonly [K in keyof InferUpdateChanges<TableOf<TSchema, TName>>]?: ReadonlyArray<Exclude<InferUpdateChanges<TableOf<TSchema, TName>>[K], undefined>>;\n    };\n};"
+              ]
+            },
+            {
+              "name": "BatchUpsertOptions",
+              "kind": "type",
+              "declarations": [
+                "export type BatchUpsertOptions<TSchema extends AnySchema, TName extends TableName<TSchema>> = ErasedSchema<TSchema> extends true ? UpsertOptions : {\n    readonly conflictWhere?: BatchConflictWhere<TableOf<TSchema, TName>>;\n};"
+              ]
+            },
+            {
               "name": "column",
               "kind": "value",
               "declarations": [
                 "column: {\n    boolean: () => ColumnBuilder<boolean, false, false, false, boolean, undefined, false>;\n    number: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    integer: () => ColumnBuilder<number, false, false, false, number, undefined, false>;\n    string: () => ColumnBuilder<string, false, false, false, string, undefined, false>;\n    datetime: () => ColumnBuilder<Date, false, false, false, Date, undefined, false>;\n    numeric: (options?: {\n        precision?: number;\n        scale?: number;\n    }) => ColumnBuilder<string, false, false, false, string | number, \"numeric\", false>;\n    json: <TShape = never>() => ColumnBuilder<JsonColumnValue<TShape>, false, false, false, string, \"json\", false>;\n    jsonb: <TShape = never>() => ColumnBuilder<JsonColumnValue<TShape>, false, false, false, string, \"jsonb\", false>;\n    uuid: () => ColumnBuilder<string, false, false, false, string, \"uuid\", false>;\n    date: () => ColumnBuilder<string, false, false, false, string, \"date\", false>;\n    time: () => ColumnBuilder<string, false, false, false, string, \"time\", false>;\n    interval: () => ColumnBuilder<string, false, false, false, string, \"interval\", false>;\n    array: (element: string) => ColumnBuilder<string, false, false, false, string, \"array\", false>;\n    sqlEnum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(name: string, values: TValues) => ColumnBuilder<TValues[number], false, false, false, TValues[number], \"enum\">;\n    enum: <const TValues extends readonly [\n        string,\n        ...string[]\n    ]>(values: TValues) => ColumnBuilder<TValues[number], false>;\n}"
+              ]
+            },
+            {
+              "name": "ColumnarInsertBatch",
+              "kind": "type",
+              "declarations": [
+                "export interface ColumnarInsertBatch<TTable extends AnyTable> {\n    readonly columns: {\n        readonly [K in RequiredInsertKeys<TTable>]: ReadonlyArray<ColumnInputValue<TTable[\"columns\"][K]>>;\n    } & {\n        readonly [K in OptionalInsertKeys<TTable>]?: ReadonlyArray<ColumnInputValue<TTable[\"columns\"][K]>>;\n    };\n    readonly omitted?: Partial<Readonly<Record<OptionalInsertKeys<TTable>, readonly boolean[]>>>;\n    readonly rowCount?: number;\n}"
               ]
             },
             {
@@ -2245,6 +2448,20 @@
               ]
             },
             {
+              "name": "TableName",
+              "kind": "type",
+              "declarations": [
+                "export type TableName<TSchema extends AnySchema> = SchemaTable<TSchema>[\"name\"];"
+              ]
+            },
+            {
+              "name": "TableOf",
+              "kind": "type",
+              "declarations": [
+                "export type TableOf<TSchema extends AnySchema, TName extends TableName<TSchema>> = Extract<SchemaTable<TSchema>, {\n    readonly name: TName;\n}>;"
+              ]
+            },
+            {
               "name": "TableOptions",
               "kind": "type",
               "declarations": [
@@ -2263,6 +2480,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function typedTable<TTable extends AnyTable>(database: TypedTableDatabase, definition: TTable): {\n    definition: TTable;\n    insert(rows: ReadonlyArray<InferInsertRow<TTable>>): Promise<unknown>;\n    upsert(rows: ReadonlyArray<InferInsertRow<TTable>>): Promise<unknown>;\n    update(input: {\n        keys: ReadonlyArray<PrimaryKeyValue<TTable>>;\n        changes: Partial<ColumnArrays<InferUpdateChanges<TTable>>>;\n    }): Promise<unknown>;\n    delete(input: {\n        keys: ReadonlyArray<PrimaryKeyValue<TTable>>;\n    }): Promise<unknown>;\n    rows(): Promise<Array<InferRow<TTable>>>;\n};"
+              ]
+            },
+            {
+              "name": "UntypedSchema",
+              "kind": "type",
+              "declarations": [
+                "export type UntypedSchema = any;"
               ]
             },
             {
@@ -8024,7 +8248,7 @@
               "name": "protocolVersion",
               "kind": "value",
               "declarations": [
-                "protocolVersion: 3"
+                "protocolVersion: 4"
               ]
             },
             {

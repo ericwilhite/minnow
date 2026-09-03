@@ -13,11 +13,13 @@
  * The reference is a plain Map maintained alongside; after every checkpoint, the database's
  * contents must equal it. A divergence reports the seed and the operation index.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
-import { allVisibleSegments } from "./storage-test-helpers.js";
+import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
 import { mulberry32, seedsFor } from "../testing/seeds.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(180_000) });
 
 /** Keys are drawn from a small space so inserts, updates and deletes collide constantly. */
 const KEY_SPACE = 400;
@@ -252,6 +254,6 @@ describe.each(seedsFor("auto-compaction-soak", [0x7a5c]))(
       expect(storageStats.obsoleteBlockCount, `seed ${String(seed)}: obsolete payloads`).toBe(0);
       expect((await database.listCompactionJobs()).length).toBeGreaterThan(0);
       expect((await database.listGarbageCollectionJobs()).length).toBeGreaterThan(0);
-    }, 180_000);
+    });
   },
 );

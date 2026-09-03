@@ -451,6 +451,35 @@ type PersonChanges = InferUpdateChanges<typeof people>;
 | `InferInsertRow`     | The insert shape; nullable columns may be omitted.  |
 | `InferUpdateChanges` | The partial-update shape accepted by keyed updates. |
 
+## Typed batch writes
+
+Hand the same declaration to the engine — or to `MinnowDatabaseClient` — and its batch API is
+typed by it. Every method is keyed by table name, and `migrate()` needs no argument:
+
+```ts
+const database = new MinnowDatabase(store, { schema: appSchema });
+await database.migrate();
+
+// `joined` and `birthday` are nullable, so they may be omitted; `name` and `score` may not.
+await database.insertBatch("people", [{ name: "Ada", score: 10 }]);
+// The key has the `.unique()` column's type; an `undefined` change leaves that column alone.
+await database.update("people", "Ada", { score: 11, birthday: undefined });
+// Array<{ name: string; score: number }>
+const scores = await database.readTable("people", { columns: ["name", "score"] });
+// The guard's `value` follows the column it names.
+await database.upsert(
+  "people",
+  { name: "Ada", score: 12 },
+  { conflictWhere: { column: "score", operator: "<", value: 12 } },
+);
+```
+
+A misspelled table or column, a missing required column, a key of the wrong type, or a guard
+whose value does not match its column is a compile error — inside `write()` scopes and on a
+buffered writer's `add` as well. Without `schema` the batch methods take plain strings, as they
+always have, and a declared database is still assignable wherever an undeclared `MinnowDatabase`
+or `MinnowDatabaseClient` is expected.
+
 Each table definition also carries a Standard Schema-compatible `~standard` validator, so any
 library that speaks that interface can validate rows at runtime with your definitions.
 

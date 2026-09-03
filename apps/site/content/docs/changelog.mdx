@@ -8,6 +8,50 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.8 — September 3, 2026
+
+Published packages: `@minnowdb/core@0.7.8`.
+
+Stored formats are unchanged and no migration is needed. The client/worker wire protocol moved
+from version 3 to 4: a main-thread client and a database worker from different builds now refuse
+each other with "Unsupported protocol version" instead of one silently ignoring an argument the
+other does not know. Deploy the two from the same package build, as the
+[workers guide](/docs/engine/workers) already asks.
+
+### Added
+
+- The batch API is typed by the schema declaration. `new MinnowDatabase(store, { schema })` and
+  `new MinnowDatabaseClient(worker, { store, schema })` take the `schema([...])` value the
+  application already declares, and from then on `insertBatch`, `insert`, `upsertBatch`, `upsert`,
+  `updateBatch`, `update`, `deleteBatch`, `delete`, `bufferedWriter(...).add`, `readTable`, and
+  every method of a `write()` scope are keyed by table name: a row must carry the declared
+  required columns and may omit nullable or defaulted ones, a key has the unique column's type,
+  an update cannot name the key or a generated column, a `conflictWhere` guard's `value` follows
+  the column it names, and `readTable` returns the declared row shape — or exactly the columns
+  it was asked for. A misspelled table or column is a compile error; a columnar batch is checked
+  column by column. `migrate()` with no argument applies the declared schema. Nothing changes for
+  a database constructed without `schema`: every method keeps the plain-string signature it had,
+  and a declared database is still assignable wherever an undeclared `MinnowDatabase` or
+  `MinnowDatabaseClient` is expected, so existing helpers keep compiling. The new types are
+  exported from `@minnowdb/core` and `@minnowdb/core/schema` (`AnySchema`, `TableName`,
+  `TableOf`, `BatchInsertInput`, `BatchInsertRow`, `BatchReadRow`, `BatchKeyValue`,
+  `BatchUpdateChanges`, `BatchUpdateInput`, `BatchDeleteInput`, `BatchConflictWhere`,
+  `BatchUpsertOptions`, `BatchReadOptions`, `ColumnarInsertBatch`). `update` on both the engine
+  and the client now also accepts an explicitly `undefined` change and leaves that column
+  untouched, matching `InferUpdateChanges`, so a patch spread from optional fields needs no
+  filtering first.
+
+### Fixed
+
+- A `write()` scope whose guarded `upsertBatch` rejected every row committed cleanly in 0.7.7 by
+  accident of ordering rather than by construction: nothing pinned it. The scope now registers
+  its level-zero segment limit only once a segment will actually be staged, and a test covers the
+  all-rows-skipped scope alone, beside another table's delete, and followed by an insert to the
+  same table.
+- The five heaviest maintenance tests, and every other test that hard-coded a per-test timeout,
+  now take a CI-aware ceiling instead of a number tuned on a developer machine; three of them
+  timed out at 120 s under coverage on a hosted runner and blocked the 0.7.7 release until rerun.
+
 ## 0.7.7 — September 3, 2026
 
 Published packages: `@minnowdb/core@0.7.7`.
@@ -38,9 +82,9 @@ Stored formats are unchanged and no migration is needed.
   scope, so composing it atomically with another staged mutation — replacing an offline-created
   row with its server-confirmed twin only when nothing has since edited it locally, in the same
   commit as the delete that removes the local placeholder — required falling back to raw SQL
-  inside the scope. The classification and row-filtering logic is now shared with the autocommit
-  path (`applyUpsertConflictFilter`), which also fixed the autocommit path doing a full batch copy
-  and an O(n log n) sort on every guarded upsert even when nothing was actually skipped.
+  inside the scope. The classification and row-filtering logic is now shared internally with the
+  autocommit path, which also fixed the autocommit path doing a full batch copy and an O(n log n)
+  sort on every guarded upsert even when nothing was actually skipped.
 
 ## 0.7.6 — September 3, 2026
 

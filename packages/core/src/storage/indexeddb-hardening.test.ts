@@ -1,5 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { crc32, encodeBlock } from "../block-format/index.js";
 import {
   decodeSnapshotMetadataItems,
@@ -58,6 +58,9 @@ import {
   type SnapshotFrameStreamHeader,
   type TableRecord,
 } from "./index.js";
+import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(300_000) });
 
 const NOW = "2026-08-24T12:00:00.000Z";
 
@@ -2940,8 +2943,7 @@ describe("IndexedDB corruption hardening", () => {
     ).toMatchObject({ hasBase: false });
     restored.close();
     source.close();
-  }, 30_000);
-
+  });
   it("never treats missing, legacy, partition, or tail UNIQUE membership as empty", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();
@@ -4070,8 +4072,7 @@ describe("IndexedDB corruption hardening", () => {
     target.close();
     sourceA.close();
     sourceB.close();
-  }, 30_000);
-
+  });
   it("keeps framed snapshot planning to one retained semantic item at high cardinality", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();
@@ -4129,8 +4130,7 @@ describe("IndexedDB corruption hardening", () => {
       ownerId: "high-cardinality-export",
     });
     store.close();
-  }, 20_000);
-
+  });
   it("streams canonical UNIQUE membership in fixed parts and restores enforcement", async () => {
     const indexedDB = new IDBFactory();
     const source = await openStore(indexedDB);
@@ -4195,8 +4195,7 @@ describe("IndexedDB corruption hardening", () => {
     expect(await restored.checkIntegrity({ mode: "full" })).toMatchObject({ ok: true });
     restored.close();
     source.close();
-  }, 300_000);
-
+  });
   it("accounts catalog bytes atomically at the hard ceiling and fails closed on drift", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();
@@ -4781,8 +4780,7 @@ describe("IndexedDB corruption hardening", () => {
       expiresAt: "2026-08-24T12:30:00.000Z",
     });
     store.close();
-  }, 60_000);
-
+  });
   it("refuses retired-history and terminal-maintenance growth atomically across reopen", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();

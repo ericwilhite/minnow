@@ -161,6 +161,58 @@ describe("early-adopter engine contracts", () => {
     await database.close();
   });
 
+  it("commits a write() scope whose guarded upsertBatch skipped every row", async () => {
+    // A staged upsert that ends up writing nothing must not leave the scope's transaction with a
+    // level-zero segment limit registered for a table that has no pending segment: the store
+    // refuses that commit ("Level-zero segment limits must exactly cover pending level-zero
+    // tables"), which would fail the whole scope, other tables' work included.
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    for (const name of ["synced", "other"]) {
+      await database.createTable({
+        name,
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "_synced", type: "boolean" },
+        ],
+      });
+    }
+    await database.insertBatch("synced", [{ id: 1, _synced: false }]);
+    await database.insertBatch("other", [{ id: 7, _synced: true }]);
+    const guard = { conflictWhere: { column: "_synced", operator: "=", value: true } } as const;
+
+    const withOtherTable = await database.write(async (session) => {
+      await session.deleteBatch("other", { keys: [7] });
+      return session.upsertBatch("synced", [{ id: 1, _synced: true }], guard);
+    });
+    expect(withOtherTable.result).toEqual({
+      tableName: "synced",
+      segmentId: null,
+      rowCount: 0,
+      skippedRowCount: 1,
+    });
+    expect(withOtherTable.version).not.toBeNull();
+    expect(await database.readTable("other")).toEqual([]);
+
+    const alone = await database.write((session) =>
+      session.upsertBatch("synced", [{ id: 1, _synced: true }], guard),
+    );
+    expect(alone.result.rowCount).toBe(0);
+    expect(alone.version).not.toBeNull();
+
+    // A later stage on the same table registers the limit it needs itself.
+    const thenInsert = await database.write(async (session) => {
+      await session.upsertBatch("synced", [{ id: 1, _synced: true }], guard);
+      return session.insertBatch("synced", [{ id: 2, _synced: true }]);
+    });
+    expect(thenInsert.result.rowCount).toBe(1);
+    expect(await database.readTable("synced")).toEqual([
+      { id: 1, _synced: false },
+      { id: 2, _synced: true },
+    ]);
+    await database.close();
+  });
+
   it("windows guarded upsert classification beyond the SQL parameter limit", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore(), {
       compression: "raw",
@@ -191,7 +243,7 @@ describe("early-adopter engine contracts", () => {
       segmentId: null,
     });
     await database.close();
-  }, 20_000);
+  });
 
   it("preserves guarded-upsert semantics across concurrent commits", async () => {
     const factory = new IDBFactory();

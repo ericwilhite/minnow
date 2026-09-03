@@ -1,10 +1,13 @@
 import { PGlite } from "@electric-sql/pglite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import rawProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase, type ExecuteResult } from "./database.js";
 import { positionalToNumbered } from "../testing/oracle.js";
+import { heavyTestTimeout } from "./storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
 type Classification = "compatible" | "different" | "extension" | "unsupported" | "inapplicable";
 
@@ -190,8 +193,7 @@ describe("PostgreSQL feature profile", () => {
     }
     expect(compatibleWrites.length).toBeGreaterThan(20);
     expect(failures).toEqual([]);
-  }, 120_000);
-
+  });
   it("matches PostgreSQL mutation counts, returned rows, and resulting table state", async () => {
     const compatibleMutations = features.filter(
       (feature) =>
@@ -249,8 +251,7 @@ describe("PostgreSQL feature profile", () => {
     }
     expect(compatibleMutations.length).toBeGreaterThan(10);
     expect(failures).toEqual([]);
-  }, 120_000);
-
+  });
   it("accepts the one nondeterministic compatible read in both engines", async () => {
     const feature = features.find(({ id }) => id === "aggregate.any-value");
     expect(feature).toBeDefined();

@@ -8,10 +8,12 @@
  * were refused — and stayed refused after `collectGarbage()`, because every write at the
  * level-zero ceiling resumed the dead owner. These pin the properties that close that loop.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
-import { allVisibleSegments } from "./storage-test-helpers.js";
+import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
 /** A clock the test moves, for the durable owner lease a compaction transaction carries. */
 function testClock(): { now: () => Date; advance: (ms: number) => void } {
@@ -50,8 +52,7 @@ describe("maintenance under a writer that never pauses", () => {
       { n: 4_200, total: (7 * 4_199 * 4_200) / 2 },
     ]);
     await database.close();
-  }, 300_000);
-
+  });
   it("publishes a finished fold through the write queue rather than losing the manifest race", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, a INTEGER)");
@@ -72,8 +73,7 @@ describe("maintenance under a writer that never pauses", () => {
     expect(firstFoldAt).toBeLessThanOrEqual(512);
     expect(mostSegments).toBeLessThan(512);
     await database.close();
-  }, 300_000);
-
+  });
   it("keeps a read-then-update loop under the level-zero ceiling", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, a INTEGER)");
@@ -93,7 +93,7 @@ describe("maintenance under a writer that never pauses", () => {
       { total: (99 * 100) / 2 + 4_200 },
     ]);
     await database.close();
-  }, 300_000);
+  });
 });
 
 /**
@@ -181,7 +181,7 @@ describe("a single-row update loop over a folded table", () => {
         { n: rows, total: expectedTotal(values) },
       ]);
       await database.close();
-    }, 300_000);
+    });
   }
 
   /**
@@ -216,7 +216,7 @@ describe("a single-row update loop over a folded table", () => {
       { total: expectedTotal(values) },
     ]);
     await database.close();
-  }, 300_000);
+  });
 });
 
 describe("repair of a fold whose owner lease expired", () => {
@@ -318,5 +318,5 @@ describe("backing off a failing fold", () => {
     expect(await publishedFolds(database, "t")).toBeGreaterThan(0);
     expect(store.planAttempts).toBeGreaterThan(duringBurst);
     await database.close();
-  }, 60_000);
+  });
 });

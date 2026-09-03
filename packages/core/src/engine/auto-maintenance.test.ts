@@ -13,7 +13,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore, type Manifest, type TransactionRecord } from "../storage/index.js";
 import { SnapshotManifestMissingError } from "../storage/types.js";
 import { MaintenanceBacklogError, MinnowDatabase } from "./database.js";
-import { allVisibleSegments } from "./storage-test-helpers.js";
+import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
+
+vi.setConfig({ testTimeout: heavyTestTimeout(180_000) });
 
 async function manifestRecords(store: MemoryBlockStore) {
   const records: Manifest[] = [];
@@ -401,8 +403,7 @@ describe("background maintenance", () => {
       { n: 3 },
     ]);
     await database.close();
-  }, 120_000);
-
+  });
   it("keeps tombstone provenance across bounded jobs and reopen", async () => {
     class CandidateReadCountingStore extends MemoryBlockStore {
       candidateReadCalls = 0;
@@ -489,8 +490,7 @@ describe("background maintenance", () => {
     expect(
       (await database.listGarbageCollectionJobs()).some((job) => job.state === "completed"),
     ).toBe(true);
-  }, 120_000);
-
+  });
   it("keeps the footprint bounded across repeated bursts", async () => {
     // The property that matters for a tab open all day: a second and third burst settle back
     // to the same place the first did, rather than each leaving a residue the next builds on.
@@ -520,8 +520,7 @@ describe("background maintenance", () => {
     expect(third.visibleSegments).toBeLessThanOrEqual(33);
     expect(third.transactions).toBeLessThanOrEqual(third.visibleSegments + 8);
     await expectContents(database, reference);
-  }, 180_000);
-
+  });
   it("keeps recent versions readable and prunes old ones", async () => {
     const { store, database, reference, clock } = await seeded();
     const early = await store.getCurrentManifestVersion();
@@ -541,8 +540,7 @@ describe("background maintenance", () => {
     await expect(database.readTable("items", current - 10)).rejects.toBeInstanceOf(
       SnapshotManifestMissingError,
     );
-  }, 120_000);
-
+  });
   it("still collects when only compaction is disabled", async () => {
     const { store, database, reference, clock } = await seeded({ autoCompact: false });
     await burst(database, reference, 120, 0);
@@ -575,8 +573,7 @@ describe("background maintenance", () => {
     expect((await database.listGarbageCollectionJobs()).length).toBeGreaterThan(0);
     expect(idle.unprunedManifests).toBeLessThanOrEqual(64 + 2);
     await expectContents(database, reference);
-  }, 60_000);
-
+  });
   it("does nothing when compaction and collection are both disabled", async () => {
     const { store, database, reference } = await seeded({
       autoCompact: false,
@@ -590,8 +587,7 @@ describe("background maintenance", () => {
     expect(await database.listGarbageCollectionJobs()).toEqual([]);
     expect(idle.unprunedManifests).toBe(idle.manifests);
     await expectContents(database, reference);
-  }, 60_000);
-
+  });
   it("reclaims a reopened backlog of crashed active writers without another write", async () => {
     vi.useFakeTimers();
     const reopenedAt = new Date("2026-01-01T01:00:00.000Z");
@@ -674,8 +670,7 @@ describe("background maintenance", () => {
     expect(await database.listGarbageCollectionJobs()).toEqual([]);
     expect(idle.unprunedManifests).toBe(idle.manifests);
     await expectContents(database, reference);
-  }, 60_000);
-
+  });
   it("keeps the buffer pool inside its budget under many distinct queries", async () => {
     const { database, reference } = await seeded({ bufferPoolBytes: 256 * 1024 });
     await burst(database, reference, 40, 0);
@@ -690,5 +685,5 @@ describe("background maintenance", () => {
     expect(stats.usedBytes).toBeLessThanOrEqual(stats.limitBytes);
     expect(stats.evictions).toBeGreaterThan(0);
     await expectContents(database, reference);
-  }, 60_000);
+  });
 });
