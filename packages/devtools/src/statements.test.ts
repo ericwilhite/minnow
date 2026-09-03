@@ -1,6 +1,6 @@
 import { SqlCompileError } from "@minnowdb/core";
 import { describe, expect, it } from "vitest";
-import { changesData, classifyStatement, summarize } from "./statements.js";
+import { changesData, classifyStatement, needsConfirmation, summarize } from "./statements.js";
 
 describe("classifyStatement", () => {
   it("reads the operation off the compiled plan", () => {
@@ -63,6 +63,13 @@ describe("classifyStatement", () => {
       kind: "execute",
       operation: "transaction",
       summary: { confirmLabel: "Begin" },
+      confirm: false,
+    });
+    expect(classifyStatement("ROLLBACK")).toMatchObject({
+      kind: "execute",
+      operation: "transaction",
+      summary: { confirmLabel: "Rollback", destructive: true },
+      confirm: true,
     });
     expect(classifyStatement("ALTER TABLE people ADD COLUMN note VARCHAR")).toMatchObject({
       kind: "execute",
@@ -91,6 +98,15 @@ describe("classifyStatement", () => {
     });
   });
 
+  it("treats session settings as neither a query nor a write", () => {
+    expect(classifyStatement("SET search_path = public")).toEqual({
+      kind: "session",
+      operation: "set",
+    });
+    expect(classifyStatement("RESET search_path")).toEqual({ kind: "session", operation: "set" });
+    expect(classifyStatement("SHOW search_path")).toEqual({ kind: "session", operation: "show" });
+  });
+
   it("passes the located compile error through", () => {
     const sql = "SELECT * FROM people WHERE name = 'oops";
     expect(() => classifyStatement(sql)).toThrow(SqlCompileError);
@@ -110,7 +126,41 @@ describe("changesData", () => {
     expect(changesData(classifyStatement("UPDATE people SET score = 0"))).toBe(true);
     expect(changesData(classifyStatement("INSERT INTO people (name) VALUES ('a')"))).toBe(true);
     expect(changesData(classifyStatement("CREATE INDEX by_name ON people(name)"))).toBe(true);
+    expect(changesData(classifyStatement("BEGIN"))).toBe(true);
     expect(changesData(classifyStatement("COMMIT"))).toBe(true);
+    expect(changesData(classifyStatement("ROLLBACK"))).toBe(true);
+  });
+
+  it("lets session settings through even when writes are off", () => {
+    expect(changesData(classifyStatement("SET search_path = public"))).toBe(false);
+    expect(changesData(classifyStatement("RESET search_path"))).toBe(false);
+    expect(changesData(classifyStatement("SHOW search_path"))).toBe(false);
+  });
+});
+
+describe("needsConfirmation", () => {
+  it("asks before every data and schema change", () => {
+    expect(needsConfirmation(classifyStatement("DELETE FROM people"))).toBe(true);
+    expect(needsConfirmation(classifyStatement("INSERT INTO people (name) VALUES ('a')"))).toBe(
+      true,
+    );
+    expect(needsConfirmation(classifyStatement("CREATE INDEX by_name ON people(name)"))).toBe(true);
+    expect(needsConfirmation(classifyStatement("DROP TABLE people"))).toBe(true);
+  });
+
+  it("asks before a rollback but not before begin or commit", () => {
+    // Each statement inside the transaction is confirmed on its own; COMMIT only keeps what was
+    // already approved, while ROLLBACK throws it away.
+    expect(needsConfirmation(classifyStatement("ROLLBACK"))).toBe(true);
+    expect(needsConfirmation(classifyStatement("BEGIN"))).toBe(false);
+    expect(needsConfirmation(classifyStatement("COMMIT"))).toBe(false);
+  });
+
+  it("never asks for queries or session settings", () => {
+    expect(needsConfirmation({ kind: "select" })).toBe(false);
+    expect(needsConfirmation(classifyStatement("SET search_path = public"))).toBe(false);
+    expect(needsConfirmation(classifyStatement("RESET search_path"))).toBe(false);
+    expect(needsConfirmation(classifyStatement("SHOW search_path"))).toBe(false);
   });
 });
 

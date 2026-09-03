@@ -8,7 +8,13 @@ import { draggable } from "./panel/drag.js";
 import { resizeSplit } from "./panel/window.js";
 import { createGrid } from "./results/grid.js";
 import { readStored, writeStored } from "./storage.js";
-import { changesData, classifyStatement, summarize, writeBlockedMessage } from "./statements.js";
+import {
+  changesData,
+  classifyStatement,
+  needsConfirmation,
+  summarize,
+  writeBlockedMessage,
+} from "./statements.js";
 import type { DevtoolsTarget } from "./target.js";
 
 interface ConsoleDeps {
@@ -373,11 +379,11 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
       return;
     }
 
-    if (changesData(intent)) {
-      if (!deps.write) {
-        setNotice("blocked", writeBlockedMessage(intent));
-        return;
-      }
+    if (changesData(intent) && !deps.write) {
+      setNotice("blocked", writeBlockedMessage(intent));
+      return;
+    }
+    if (needsConfirmation(intent)) {
       const summary = summarize(intent);
       const confirmed = await deps.confirm.ask({
         title: summary.title,

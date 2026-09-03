@@ -7,13 +7,24 @@ import { compileStatement, type CompiledStatement } from "@minnowdb/core/query";
  */
 type StatementIntent =
   | { kind: "select" }
+  /** `SET`, `RESET`, and `SHOW`: session settings, never data. Runs without review or the write gate. */
+  | { kind: "session"; operation: "set" | "show" }
   | { kind: "insert"; table: string; columns: string[]; rowCount: number }
   | { kind: "update"; table: string; columns: string[]; filtered: boolean }
   | { kind: "delete"; table: string; filtered: boolean }
   | {
       kind: "execute";
-      operation: Exclude<CompiledStatement["kind"], "select" | "insert" | "update" | "delete">;
+      operation: Exclude<
+        CompiledStatement["kind"],
+        "select" | "insert" | "update" | "delete" | "set" | "show"
+      >;
       summary: StatementSummary;
+      /**
+       * Whether the statement is described and confirmed before it runs. Off only for `BEGIN` and
+       * `COMMIT`: neither changes anything by itself, and every write inside the transaction was
+       * already confirmed one statement at a time. `ROLLBACK` discards those, so it stays on.
+       */
+      confirm: boolean;
     };
 
 /** Throws the compiler's own `SqlCompileError` — position included — when the SQL is bad. */
@@ -66,17 +77,8 @@ export function classifyStatement(sql: string): StatementIntent {
         confirmLabel: "Create type",
       });
     case "set":
-      return executeIntent(statement.kind, {
-        title: `${statement.action === "set" ? "Set" : "Reset"} ${statement.name}`,
-        facts: [["setting", statement.name]],
-        confirmLabel: statement.action === "set" ? "Set" : "Reset",
-      });
     case "show":
-      return executeIntent(statement.kind, {
-        title: `Show ${statement.name}`,
-        facts: [["setting", statement.name]],
-        confirmLabel: "Show",
-      });
+      return { kind: "session", operation: statement.kind };
     case "create-sequence":
       return executeIntent(statement.kind, {
         title: `Create sequence ${statement.name}`,
@@ -154,15 +156,20 @@ export function classifyStatement(sql: string): StatementIntent {
       });
     case "transaction": {
       const label = `${statement.action[0]?.toUpperCase() ?? ""}${statement.action.slice(1)}`;
-      return executeIntent(statement.kind, {
-        title: `${label} transaction`,
-        facts: [["action", statement.action.toUpperCase()]],
-        ...(statement.action === "rollback"
-          ? { warning: "Every uncommitted change in the transaction will be discarded." }
-          : {}),
-        confirmLabel: label,
-        destructive: statement.action === "rollback",
-      });
+      const rollback = statement.action === "rollback";
+      return executeIntent(
+        statement.kind,
+        {
+          title: `${label} transaction`,
+          facts: [["action", statement.action.toUpperCase()]],
+          ...(rollback
+            ? { warning: "Every uncommitted change in the transaction will be discarded." }
+            : {}),
+          confirmLabel: label,
+          destructive: rollback,
+        },
+        rollback,
+      );
     }
     case "merge":
       return executeIntent(statement.kind, {
@@ -204,12 +211,22 @@ export function classifyStatement(sql: string): StatementIntent {
 function executeIntent(
   operation: Extract<StatementIntent, { kind: "execute" }>["operation"],
   summary: StatementSummary,
+  confirm = true,
 ): StatementIntent {
-  return { kind: "execute", operation, summary };
+  return { kind: "execute", operation, summary, confirm };
 }
 
+/**
+ * Whether the statement can change the database, and so is refused when `permissions.write` is
+ * off. Queries and session settings (`SET`, `RESET`, `SHOW`) never can.
+ */
 export function changesData(intent: StatementIntent): boolean {
-  return intent.kind !== "select";
+  return intent.kind !== "select" && intent.kind !== "session";
+}
+
+/** Whether the statement is described and confirmed before it runs. A subset of {@link changesData}. */
+export function needsConfirmation(intent: StatementIntent): boolean {
+  return changesData(intent) && (intent.kind !== "execute" || intent.confirm);
 }
 
 interface StatementSummary {
@@ -266,6 +283,12 @@ export function summarize(intent: StatementIntent): StatementSummary {
       return intent.summary;
     case "select":
       return { title: "Run query", facts: [], confirmLabel: "Run query" };
+    case "session":
+      return {
+        title: intent.operation === "show" ? "Show setting" : "Change setting",
+        facts: [],
+        confirmLabel: intent.operation === "show" ? "Show" : "Set",
+      };
   }
 }
 

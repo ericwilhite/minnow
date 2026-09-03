@@ -218,10 +218,14 @@ Queries return rows; anything that changes data is described and confirmed first
 - An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
 - With `permissions.write: false`, the statement is refused outright and never reaches the database.
 
-That confirmation step covers every statement that can change the database: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, schema
-DDL, index and trigger DDL, and transaction control. Destructive schema operations say what will
-be removed. Successful DDL refreshes the rail and completion automatically, so a new table,
-column, or index is available without pressing reload.
+That confirmation step covers every statement that changes the database: `INSERT`, `UPDATE`,
+`DELETE`, `MERGE`, schema DDL, index and trigger DDL, and `ROLLBACK`, which discards uncommitted
+work. `BEGIN` and `COMMIT` are not confirmed: each statement inside the transaction is confirmed on
+its own, and `COMMIT` only keeps what was already approved. Session settings — `SET`, `RESET`, and
+`SHOW` — change no data, so they run without confirmation and are allowed even with
+`permissions.write: false`. Destructive schema operations say what will be removed. Successful DDL
+refreshes the rail and completion automatically, so a new table, column, or index is available
+without pressing reload.
 
 `RETURNING` rows from an insert, update, or delete appear in the Rows tab and are cached with that
 history entry just like a SELECT result.
