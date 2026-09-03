@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { type DatabaseRow } from "./database.js";
-import { compileQuery, executeQuery, executeRowQuery, type QueryRow } from "./query.js";
+import {
+  bindPlanParameters,
+  compileQuery,
+  executeQuery,
+  executeRowQuery,
+  type QueryRow,
+} from "./query.js";
 import { mulberry32, seedsFor } from "../testing/seeds.js";
 
 /**
@@ -241,4 +247,92 @@ describe("differential executor fuzzing", () => {
       }
     });
   }
+});
+
+// --- Derived-table row windows ------------------------------------------------------------------
+//
+// A filter above a derived table or CTE is pushed inside it when the inner block is a plain
+// projection. That is wrong below a LIMIT or OFFSET — literal, `ROWS`-suffixed, or a placeholder —
+// because filtering before the window changes which rows it keeps. Only the literal LIMIT was
+// guarded, so this crosses every spelling of the window with every outer shape that reads the
+// block, binding the placeholders the way the database does before either executor runs.
+
+const WINDOWS: ReadonlyArray<{ sql: string; params: number[] }> = [
+  { sql: "LIMIT 6", params: [] },
+  { sql: "OFFSET 4", params: [] },
+  { sql: "OFFSET 4 ROWS", params: [] },
+  { sql: "OFFSET ?", params: [4] },
+  { sql: "LIMIT ?", params: [6] },
+  { sql: "LIMIT ? OFFSET ?", params: [6, 3] },
+  { sql: "FETCH FIRST ? ROWS ONLY", params: [5] },
+];
+
+const OUTER_SHAPES: ReadonlyArray<{ sql: (source: string) => string; params: number[] }> = [
+  { sql: (source) => `SELECT d.id FROM ${source} WHERE d.region = 'west'`, params: [] },
+  {
+    sql: (source) =>
+      `SELECT d.id, p.label FROM ${source} JOIN paged p ON p.id = d.id WHERE d.region = 'west'`,
+    params: [],
+  },
+  {
+    sql: (source) =>
+      `SELECT d.id FROM ${source} WHERE d.region = 'west' ORDER BY d.id DESC LIMIT 2`,
+    params: [],
+  },
+  // The outer window itself: a literal LIMIT over a placeholder OFFSET must not merge inward.
+  { sql: (source) => `SELECT d.id FROM ${source} ORDER BY d.id LIMIT 2 OFFSET ?`, params: [1] },
+];
+
+/** The same paged block as a derived table and as a CTE, both read under the alias `d`. */
+function pagedSources(window: string): ReadonlyArray<{ prefix: string; source: string }> {
+  const block = `SELECT id, region, label FROM paged ORDER BY id ${window}`;
+  return [
+    { prefix: "", source: `(${block}) d` },
+    { prefix: `WITH d AS (${block}) `, source: "d" },
+  ];
+}
+
+describe("derived-table row windows", () => {
+  const fuzzer = createFuzzer(7);
+  const paged: DatabaseRow[] = Array.from({ length: 40 }, (_, index) => ({
+    id: index + 1,
+    region: fuzzer.pick(REGIONS),
+    label: fuzzer.pick(LABELS),
+  }));
+  const tables = new Map([["paged", paged]]);
+  const agree = (sql: string, params: number[]): void => {
+    const columnar = executeQuery(bindPlanParameters(compileQuery(sql), params), tables);
+    const reference = executeRowQuery(
+      bindPlanParameters(compileQuery(sql, { optimize: false }), params),
+      tables,
+    );
+    const label = `${sql} :: ${JSON.stringify(params)}`;
+    expect(columnar.columns, label).toEqual(reference.columns);
+    expect(canonicalRows(columnar.rows, columnar.columns), label).toEqual(
+      canonicalRows(reference.rows, reference.columns),
+    );
+  };
+
+  it.each(WINDOWS)("agrees under every outer shape over a block paged with $sql", (window) => {
+    for (const { prefix, source } of pagedSources(window.sql)) {
+      for (const outer of OUTER_SHAPES) {
+        agree(`${prefix}${outer.sql(source)}`, [...window.params, ...outer.params]);
+      }
+    }
+  });
+
+  it("binds numbered placeholders in a derived window the same way", () => {
+    agree(
+      "SELECT d.id FROM (SELECT id, region FROM paged ORDER BY id LIMIT $1) d WHERE d.region = 'west'",
+      [6],
+    );
+    agree(
+      "SELECT d.id FROM (SELECT id, region FROM paged ORDER BY id LIMIT $1 OFFSET $2) d WHERE d.region = 'west'",
+      [6, 3],
+    );
+    agree(
+      "WITH d AS (SELECT id, region FROM paged ORDER BY id OFFSET $1) SELECT d.id FROM d WHERE d.region = 'west' ORDER BY d.id DESC LIMIT $2",
+      [4, 2],
+    );
+  });
 });

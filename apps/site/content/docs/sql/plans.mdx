@@ -19,7 +19,9 @@ The plan is the optimized one — what will actually run, not the shape you wrot
 ## What the optimizer does
 
 **Early filtering.** Filters move as close to their table scan as they can get, so rows are
-discarded before a join builds a hash table out of them.
+discarded before a join builds a hash table out of them. A filter on a derived table or CTE moves
+inside the block when it names a plain projected column, but never past a `LIMIT` or `OFFSET`,
+literal or placeholder: filtering before the window would change which rows the window keeps.
 
 **Same-column OR becomes IN.** An OR of equalities on one column against literals or parameters —
 `status = 'a' OR status = 'b'` — rewrites to `status IN ('a', 'b')`, which runs as a vectorized
@@ -62,8 +64,10 @@ path. Correlated scalar aggregate expressions and ordinary single-row projection
 outer probe values to the inner rows; per-probe window ranks implement their ordering, limits,
 and offsets before the grouped value joins back. The probe block carries the outer `WHERE`
 conjuncts that read only its own sources, so `WHERE o.id BETWEEN ? AND ?` probes a hundred
-keys rather than every key in the table, and an equality-correlated scalar mirrors those key
-ranges onto its inner scan as well. Correlated `IN` uses equality-key joins directly or
+keys rather than every key in the table, and every equality-correlated scalar — the plain
+grouped aggregate included — mirrors those key conjuncts onto its inner scan as well, so a
+`WHERE c.id = ?` outside becomes `o.customer_id = ?` inside and the inner scan takes that
+column's index. Correlated `IN` uses equality-key joins directly or
 distinct probes for a range comparison. An uncorrelated `column IN (SELECT …)` is a join to
 the subquery's distinct values, so a constant on the column reaches the subquery's own scan
 through the join key instead of the subquery materializing every value first; `NOT IN` and a

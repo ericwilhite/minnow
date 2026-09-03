@@ -1,6 +1,7 @@
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { crossJoinPlan } from "../plan/model.js";
 import {
+  blockHasRowWindow,
   blockHasSubqueries,
   childExpressions,
   DUAL_TABLE,
@@ -292,11 +293,7 @@ function decorrelateLateralSources(block: CompiledQuery): void {
       !grouped &&
       inner.select.some((item) => containsAggregateCall(item.expression)) &&
       inner.having.length === 0;
-    const ranked =
-      inner.limit !== undefined ||
-      inner.limitParameter !== undefined ||
-      inner.offset !== undefined ||
-      inner.offsetParameter !== undefined;
+    const ranked = blockHasRowWindow(inner);
     const cross =
       (join.on?.kind === "condition" &&
         join.on.operator === "=" &&
@@ -1882,8 +1879,7 @@ function decorrelateScalarSubquery(
     inner.groupBy.length > 0 ||
     inner.having.length > 0 ||
     inner.orderBy.length > 0 ||
-    inner.limit !== undefined ||
-    inner.offset !== undefined ||
+    blockHasRowWindow(inner) ||
     !canExtractCorrelation(inner, scope, "scalar", true)
   ) {
     return decorrelateGeneralScalar(block, inner, scope, nextAlias);
@@ -1942,6 +1938,8 @@ function scalarPassthrough(inner: CompiledQuery): Expression | undefined {
     inner.having.length > 0 ||
     inner.orderBy.length > 0 ||
     inner.offset !== undefined ||
+    inner.offsetParameter !== undefined ||
+    inner.limitParameter !== undefined ||
     (inner.limit !== undefined && inner.limit < 1)
   ) {
     return undefined;
@@ -1976,10 +1974,7 @@ function scalarShape(inner: CompiledQuery): ScalarShape {
       rows.groupBy.length > 0 ||
       rows.having.length > 0 ||
       rows.orderBy.length > 0 ||
-      rows.limit !== undefined ||
-      rows.limitParameter !== undefined ||
-      rows.offset !== undefined ||
-      rows.offsetParameter !== undefined ||
+      blockHasRowWindow(rows) ||
       rows.distinctWildcard === true
     ) {
       break;
@@ -2261,12 +2256,7 @@ function decorrelateGeneralScalar(
       };
 
   let finalRows = matched;
-  if (
-    rows.limit !== undefined ||
-    rows.limitParameter !== undefined ||
-    rows.offset !== undefined ||
-    rows.offsetParameter !== undefined
-  ) {
+  if (blockHasRowWindow(rows)) {
     const rankedAlias = nextAlias();
     const rankedTable = nextAlias();
     const ranked = {
@@ -3451,7 +3441,9 @@ function pushdownTarget(
 ): { derived: CompiledQuery; rewritten: Predicate } | undefined {
   for (const source of sources) {
     const derived = source.derived;
-    if (derived === undefined || derived.limit !== undefined) continue;
+    // A filter pushed below LIMIT or OFFSET — literal or placeholder — would change which rows
+    // the window keeps, so a paged block only ever receives the predicate above it.
+    if (derived === undefined || blockHasRowWindow(derived)) continue;
     const left = rewriteForInner(predicate.left, source, derived, singleSource);
     if (left === undefined) continue;
     const right = rewriteForInner(predicate.right, source, derived, singleSource);
@@ -3700,9 +3692,13 @@ function combineDerivedLimit(block: CompiledQuery): void {
     block.having.length > 0 ||
     block.orderBy.length > 0 ||
     block.limit === undefined ||
-    // An OFFSET at either level changes which rows survive, so the limits cannot merge.
+    // An OFFSET at either level changes which rows survive, so the limits cannot merge; a
+    // placeholder limit or offset is unknown until binding, so those blocks keep their own.
     block.offset !== undefined ||
-    derived.offset !== undefined
+    block.offsetParameter !== undefined ||
+    derived.offset !== undefined ||
+    derived.offsetParameter !== undefined ||
+    derived.limitParameter !== undefined
   ) {
     return;
   }

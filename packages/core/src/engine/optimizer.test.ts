@@ -509,6 +509,47 @@ describe("deterministic plan rewrites", () => {
     expectEquivalent(sql);
   });
 
+  it("keeps predicates above a derived block that pages its rows, in every spelling", () => {
+    // Only the literal LIMIT used to stop the push; OFFSET, `ROWS`, and every placeholder form
+    // let the filter run before the window. The plan keeps the predicate on the outer block, and
+    // the bound plans agree with the unoptimized one under each spelling.
+    const windows: ReadonlyArray<{ window: string; params: number[] }> = [
+      { window: "LIMIT 2", params: [] },
+      { window: "OFFSET 1", params: [] },
+      { window: "OFFSET 1 ROWS", params: [] },
+      { window: "OFFSET ?", params: [1] },
+      { window: "LIMIT ?", params: [2] },
+      { window: "LIMIT ? OFFSET ?", params: [2, 1] },
+      { window: "FETCH FIRST ? ROWS ONLY", params: [2] },
+    ];
+    for (const { window, params } of windows) {
+      const sql = `SELECT d.amount FROM (SELECT region, amount FROM rows ORDER BY amount ${window}) d WHERE d.region = 'west'`;
+      const raw = compileQuery(sql, { optimize: false });
+      const optimized = optimizePlan(raw);
+      const rendered = renderPlan(optimized);
+      expect(rendered, sql).toContain("where d.region = 'west'");
+      expect(rendered, sql).not.toContain("where region = 'west'");
+      const reference = executeRowQuery(bindPlanParameters(raw, params), tables);
+      expect(executeRowQuery(bindPlanParameters(optimized, params), tables), sql).toEqual(
+        reference,
+      );
+      expect(executeQuery(bindPlanParameters(optimized, params), tables), sql).toEqual(reference);
+    }
+  });
+
+  it("leaves a derived limit alone under an outer placeholder offset", () => {
+    // Merging the outer LIMIT into the derived block would leave the outer OFFSET nothing to
+    // skip past: `LIMIT 2 OFFSET ?` over a merged two-row block returned no rows at all.
+    const sql = "SELECT d.amount FROM (SELECT amount FROM rows ORDER BY amount) d LIMIT 2 OFFSET ?";
+    const raw = compileQuery(sql, { optimize: false });
+    const optimized = optimizePlan(raw);
+    expect(renderPlan(optimized).match(/limit 2/g)).toHaveLength(1);
+    const reference = executeRowQuery(bindPlanParameters(raw, [1]), tables);
+    expect(reference.rows).toEqual([{ amount: 8 }, { amount: 10 }]);
+    expect(executeRowQuery(bindPlanParameters(optimized, [1]), tables)).toEqual(reference);
+    expect(executeQuery(bindPlanParameters(optimized, [1]), tables)).toEqual(reference);
+  });
+
   it("chooses the smaller inner-join input as the build side from exact row counts", () => {
     const big = Array.from({ length: 100 }, (_, index) => ({
       region: index % 2 === 0 ? "west" : "east",

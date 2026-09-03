@@ -8,6 +8,26 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.3 — September 2, 2026
+
+Published packages: `@minnowdb/core@0.7.3`.
+
+Stored formats are unchanged and no migration is needed.
+
+### Fixed
+
+- A `WHERE` on a derived table or CTE that paged its rows with `OFFSET n`, `OFFSET n ROWS`,
+  `LIMIT ?`, `LIMIT ? OFFSET ?`, or `FETCH FIRST ? ROWS ONLY` was pushed inside the block and ran
+  before the window, so
+  `SELECT d.id FROM (SELECT id, k FROM t ORDER BY id OFFSET 4) d WHERE d.k = 'even'` returned
+  `[10]` instead of `[6, 8, 10]`. The same block as a CTE, under a join, or under an outer
+  `ORDER BY … LIMIT` was wrong the same way; only a literal `LIMIT n` stopped the rewrite. Every
+  optimizer guard that asks whether a block pages its rows now shares one check that also sees
+  offsets and placeholders, so the filter stays above such blocks.
+- An outer `LIMIT n OFFSET ?` over a derived table merged its limit into the derived block,
+  leaving the offset nothing to skip past, so the statement returned no rows. The two limits now
+  merge only when both windows are literal and neither has an offset.
+
 ## 0.7.2 — September 2, 2026
 
 Published packages: `@minnowdb/core@0.7.2` and `@minnowdb/kysely@0.4.7`.

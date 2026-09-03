@@ -905,6 +905,74 @@ function cteCases(): Case[] {
 }
 
 /**
+ * Crosses every spelling of a derived block's row window with every outer shape that reads the
+ * block. An outer filter is pushed inside a plain derived table or CTE, which is wrong below a
+ * window: only the literal LIMIT form was guarded, so under OFFSET, `ROWS`, and every placeholder
+ * form the filter ran before the window. SQLite has no FETCH FIRST and requires LIMIT before
+ * OFFSET, so those windows compare against PostgreSQL alone.
+ */
+function derivedWindowCases(): Case[] {
+  const windows: ReadonlyArray<{ sql: string; params: QueryValue[]; skip?: OracleName[] }> = [
+    { sql: "LIMIT 6", params: [] },
+    { sql: "LIMIT ?", params: [6] },
+    { sql: "LIMIT ? OFFSET ?", params: [6, 3] },
+    { sql: "OFFSET 4", params: [], skip: ["sqlite"] },
+    { sql: "OFFSET 4 ROWS", params: [], skip: ["sqlite"] },
+    { sql: "OFFSET ?", params: [4], skip: ["sqlite"] },
+    { sql: "FETCH FIRST ? ROWS ONLY", params: [5], skip: ["sqlite"] },
+  ];
+  const outers: ReadonlyArray<{
+    sql: (source: string) => string;
+    params: QueryValue[];
+    ordered: boolean;
+  }> = [
+    {
+      sql: (source) => `SELECT d.id FROM ${source} WHERE d.region = 'west'`,
+      params: [],
+      ordered: false,
+    },
+    {
+      sql: (source) =>
+        `SELECT d.id, o.label FROM ${source} JOIN data o ON o.id = d.id WHERE d.region = 'west'`,
+      params: [],
+      ordered: false,
+    },
+    {
+      sql: (source) =>
+        `SELECT d.id FROM ${source} WHERE d.region = 'west' ORDER BY d.id DESC LIMIT 2`,
+      params: [],
+      ordered: true,
+    },
+    // The outer window itself: a literal LIMIT over a placeholder OFFSET must not merge inward.
+    {
+      sql: (source) => `SELECT d.id FROM ${source} ORDER BY d.id LIMIT 2 OFFSET ?`,
+      params: [1],
+      ordered: true,
+    },
+  ];
+  const cases: Case[] = [];
+  for (const window of windows) {
+    const block = `SELECT id, region FROM data ORDER BY id ${window.sql}`;
+    const sources = [
+      { prefix: "", source: `(${block}) d` },
+      { prefix: `WITH d AS (${block}) `, source: "d" },
+    ];
+    for (const { prefix, source } of sources) {
+      for (const outer of outers) {
+        const params = [...window.params, ...outer.params];
+        cases.push({
+          sql: `${prefix}${outer.sql(source)}`,
+          ordered: outer.ordered,
+          ...(params.length === 0 ? {} : { params }),
+          ...(window.skip === undefined ? {} : { skip: window.skip }),
+        });
+      }
+    }
+  }
+  return cases;
+}
+
+/**
  * Crosses both wildcard spellings with bare, qualified, and quoted ORDER BY references. These
  * features are independently valid, but expansion used to erase the qualifier from `d.*` before
  * ORDER BY resolution. Keeping the crossing generated prevents either feature's isolated example
@@ -1151,6 +1219,7 @@ function combinationCases(): Case[] {
     ...joinCases(),
     ...datetimeCases(),
     ...cteCases(),
+    ...derivedWindowCases(),
     ...wildcardOrderCases(),
     ...wildcardShapeCases(),
     ...setOperationCases(),

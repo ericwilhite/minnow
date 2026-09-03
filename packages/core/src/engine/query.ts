@@ -10816,6 +10816,21 @@ function assembleOrderByExpressionBlock(
 }
 
 /**
+ * True when a block trims its rows with LIMIT, OFFSET, or a placeholder for either. A rewrite
+ * that moves a filter or a limit across such a block changes which rows the window sees, so every
+ * "does this block page its rows" guard goes through here: reading only the literal fields lets
+ * `LIMIT ?`, `OFFSET ?`, and a bare `OFFSET n` slip past and the predicate run before the window.
+ */
+export function blockHasRowWindow(block: CompiledQuery): boolean {
+  return (
+    block.limit !== undefined ||
+    block.offset !== undefined ||
+    block.limitParameter !== undefined ||
+    block.offsetParameter !== undefined
+  );
+}
+
+/**
  * Detects a pure projection wrapper over one derived block — the shape the ORDER-BY-expression
  * desugar emits: no joins, filters, grouping, ordering, or paging of its own, and every select
  * item passing an inner output alias through under the same name. Whole-plan strategies (the
@@ -10832,8 +10847,7 @@ export function transparentProjectionSource(
     plan.groupBy.length > 0 ||
     plan.having.length > 0 ||
     plan.orderBy.length > 0 ||
-    plan.limit !== undefined ||
-    plan.offset !== undefined
+    blockHasRowWindow(plan)
   ) {
     return undefined;
   }
