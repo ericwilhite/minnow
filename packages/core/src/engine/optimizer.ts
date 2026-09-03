@@ -1907,7 +1907,20 @@ function decorrelateScalarSubquery(
       })),
       { expression: item.expression, alias: correlationValueAlias },
     ],
-    predicates: inner.predicates,
+    // The join back is on the keys, so an outer conjunct that decides a key value decides the
+    // same rows here: `c.id = ?` outside becomes `o.customer_id = ?` inside, and the inner scan
+    // takes the secondary index instead of grouping the whole table by the key.
+    predicates: [
+      ...inner.predicates,
+      ...mirrorPredicatesThroughKeys(
+        outerProbePredicates(
+          block,
+          keys.map((key) => key.outer),
+          nextAlias.resolvedNames,
+        ),
+        keys,
+      ),
+    ],
     groupBy: keys.map((key) => key.inner),
     having: [],
     orderBy: [],
@@ -2724,6 +2737,50 @@ function outerProbeBlockForExpressions(
   outerExpressions: readonly Expression[],
   resolvedNames: boolean,
 ): CompiledQuery {
+  const prefix = outerProbePrefix(block, outerExpressions, resolvedNames);
+  const expressions = outerExpressions.map((expression) => structuredClone(expression));
+  return {
+    sql: "(correlation probes)",
+    base: structuredClone(block.base),
+    joins: structuredClone(block.joins.slice(0, prefix.lastSource)),
+    select: expressions.map((expression, index) => ({
+      expression,
+      alias: correlationProbeAlias(index),
+    })),
+    predicates: probePredicates(block, prefix.retained, prefix.retainsAll),
+    groupBy: expressions,
+    having: [],
+    orderBy: [],
+  };
+}
+
+/**
+ * The outer WHERE conjuncts a probe block over these expressions would keep, for a rewrite that
+ * needs only those conjuncts and not the probe itself. Returns nothing when an expression reads
+ * a source this block does not define — an enclosing query's, for a nested correlation — since
+ * the prefix that decides those conjuncts is not this block's to replicate.
+ */
+function outerProbePredicates(
+  block: CompiledQuery,
+  outerExpressions: readonly Expression[],
+  resolvedNames: boolean,
+): Predicate[] {
+  const sources = new Set([block.base.alias, ...block.joins.map((join) => join.alias)]);
+  for (const expression of outerExpressions) {
+    for (const alias of expressionAliases(expression)) {
+      if (!sources.has(alias)) return [];
+    }
+  }
+  const prefix = outerProbePrefix(block, outerExpressions, resolvedNames);
+  return probePredicates(block, prefix.retained, prefix.retainsAll);
+}
+
+/** The shortest outer FROM prefix that defines every source these expressions read. */
+function outerProbePrefix(
+  block: CompiledQuery,
+  outerExpressions: readonly Expression[],
+  resolvedNames: boolean,
+): { lastSource: number; retained: ReadonlySet<string>; retainsAll: boolean } {
   const sources: TableSource[] = [block.base, ...block.joins];
   const sourceIndexes = outerExpressions.flatMap((expression) => {
     const aliases = [...expressionAliases(expression)];
@@ -2737,24 +2794,11 @@ function outerProbeBlockForExpressions(
     });
   });
   const lastSource = Math.max(...sourceIndexes);
-  const expressions = outerExpressions.map((expression) => structuredClone(expression));
   const retained = new Set(sources.slice(0, lastSource + 1).map((source) => source.alias));
   // An unqualified name resolves the same way only if the probe keeps every source — and only
   // once names are resolved, since before that it might belong to an enclosing query.
   const retainsAll = resolvedNames && lastSource === sources.length - 1;
-  return {
-    sql: "(correlation probes)",
-    base: structuredClone(block.base),
-    joins: structuredClone(block.joins.slice(0, lastSource)),
-    select: expressions.map((expression, index) => ({
-      expression,
-      alias: correlationProbeAlias(index),
-    })),
-    predicates: probePredicates(block, retained, retainsAll),
-    groupBy: expressions,
-    having: [],
-    orderBy: [],
-  };
+  return { lastSource, retained, retainsAll };
 }
 
 /**

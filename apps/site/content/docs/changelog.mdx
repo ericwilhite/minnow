@@ -27,6 +27,14 @@ Stored formats are unchanged and no migration is needed.
 - An outer `LIMIT n OFFSET ?` over a derived table merged its limit into the derived block,
   leaving the offset nothing to skip past, so the statement returned no rows. The two limits now
   merge only when both windows are literal and neither has an offset.
+- A correlated scalar aggregate under an outer key filter now reaches the inner table's
+  secondary index. `SELECT c.id, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) FROM
+customers c WHERE c.id = ?` grouped every order by customer on each call, about 50x the cost of
+  the equivalent `EXISTS`; the outer `c.id = ?` (and any other outer conjunct that reads only the
+  key columns) is now restated over the inner key, so the scan takes the index. Conjuncts that
+  read other columns, later joins, subqueries, windows, aggregates, or statement-scoped calls stay
+  outside, as they do for the general correlated-scalar rewrite. The performance gate gains a
+  `correlated-count-lookup` workload over an indexed child table.
 
 ## 0.7.2 — September 2, 2026
 

@@ -44,6 +44,10 @@
           "sqlite": 0.00447,
           "pglite": 0.00172
         },
+        "correlated-count-lookup": {
+          "sqlite": 0.0905,
+          "pglite": 0.0371
+        },
         "kysely-point-lookup": {
           "sqlite": 0.00649,
           "pglite": 0.00257
@@ -167,6 +171,10 @@
         "point-lookup": {
           "sqlite": 0.0322,
           "pglite": 0.0144
+        },
+        "correlated-count-lookup": {
+          "sqlite": 0.905,
+          "pglite": 0.315
         },
         "kysely-point-lookup": {
           "sqlite": 0.0361,

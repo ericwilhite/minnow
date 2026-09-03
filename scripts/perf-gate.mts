@@ -205,6 +205,17 @@ const QUERIES: readonly PerfQuery[] = [
     params: [123_456],
   },
   {
+    /**
+     * A correlated scalar aggregate under a keyed outer lookup. The outer `d.id = ?` must reach
+     * the inner scan as `o.customer_id = ?` and take the secondary index; when the rewrite
+     * dropped it, the inner block grouped all 200k orders by key on every call, about 50x the
+     * cost of the equivalent EXISTS.
+     */
+    name: "correlated-count-lookup",
+    sql: "SELECT d.id, d.label, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = d.id) AS n FROM data d WHERE d.id = ?",
+    params: [4242],
+  },
+  {
     // The adapter is a shipped execution path, not just a type layer. This measures Kysely's
     // builder/compiler and Minnow driver bridge together against the equivalent direct SQL.
     name: "kysely-point-lookup",
@@ -605,6 +616,25 @@ await minnow.createTable({
   ],
 });
 await minnow.insertBatch("dims", DIMS);
+/**
+ * A child table with a secondary index on its foreign key, so a correlated scalar over it has an
+ * index to reach. Each of the first ORDERS_PARENTS `data` rows has about twenty orders, and a
+ * few orders belong to no row at all, so the correlated shape is answered from a small keyed
+ * slice of the table rather than a group of the whole table by key.
+ */
+const ORDERS_PARENTS = 10_000;
+const orderRows = Array.from({ length: ROWS }, (_, index) => ({
+  id: index + 1,
+  customer_id: index % 97 === 0 ? null : ((index * 7919) % ORDERS_PARENTS) + 1,
+  amount: (index % 1000) / 4,
+}));
+await minnow.execute(
+  "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL NOT NULL)",
+);
+await minnow.execute("CREATE INDEX orders_customer_id ON orders (customer_id)");
+for (let start = 0; start < orderRows.length; start += 50_000) {
+  await minnow.insertBatch("orders", orderRows.slice(start, start + 50_000));
+}
 const kysely = new Kysely<BenchmarkDatabase>({ dialect: new MinnowDialect({ driver: minnow }) });
 
 const DOMAIN_ROWS = 20_000;
@@ -800,6 +830,14 @@ sqlite.exec(
   sqlite.exec("COMMIT");
   sqlite.exec("DELETE FROM data_mut WHERE id = 7");
   sqlite.exec(
+    `CREATE TABLE orders ("id" INTEGER PRIMARY KEY, "customer_id" INTEGER, "amount" REAL NOT NULL)`,
+  );
+  const order = sqlite.prepare("INSERT INTO orders VALUES (?, ?, ?)");
+  sqlite.exec("BEGIN");
+  for (const row of orderRows) order.run(row.id, row.customer_id, row.amount);
+  sqlite.exec("COMMIT");
+  sqlite.exec(`CREATE INDEX orders_customer_id ON orders ("customer_id")`);
+  sqlite.exec(
     `CREATE TABLE data_settled ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
   );
   const settledInsert = sqlite.prepare("INSERT INTO data_settled VALUES (?, ?, ?, ?, ?, ?)");
@@ -892,6 +930,17 @@ for (let start = 0; start < rows.length; start += 2000) {
   await pglite.exec(`INSERT INTO data_mut VALUES ${batch}`);
 }
 await pglite.exec("DELETE FROM data_mut WHERE id = 7");
+await pglite.exec(
+  `CREATE TABLE orders ("id" INTEGER PRIMARY KEY, "customer_id" INTEGER, "amount" DOUBLE PRECISION NOT NULL)`,
+);
+for (let start = 0; start < orderRows.length; start += 2000) {
+  const batch = orderRows
+    .slice(start, start + 2000)
+    .map((row) => `(${[row.id, row.customer_id, row.amount].map(sqlLiteral).join(", ")})`)
+    .join(", ");
+  await pglite.exec(`INSERT INTO orders VALUES ${batch}`);
+}
+await pglite.exec(`CREATE INDEX orders_customer_id ON orders ("customer_id")`);
 await pglite.exec(
   `CREATE TABLE data_settled ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );

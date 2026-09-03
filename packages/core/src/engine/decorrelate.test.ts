@@ -1,6 +1,13 @@
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import type { DatabaseRow } from "./database.js";
-import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import {
+  bindPlanParameters,
+  compileQuery,
+  executeQuery,
+  executeRowQuery,
+  type Predicate,
+} from "./query.js";
 
 const tables = new Map<string, DatabaseRow[]>([
   [
@@ -875,5 +882,222 @@ describe("correlated subquery decorrelation", () => {
     expect(
       run("SELECT r.amount FROM rows r WHERE r.amount > (SELECT AVG(q.amount) FROM rows q)"),
     ).toEqual([{ amount: 10 }, { amount: 8 }]);
+  });
+});
+
+/**
+ * The simple correlated-scalar path mirrors the outer conjuncts on its key columns into the
+ * inner scan, the way the general path does, so `c.id = ?` outside reaches the secondary index
+ * inside instead of grouping the whole inner table. Every shape below is answered three ways:
+ * the columnar executor and the row executor over the rewritten plan, and SQLite over the
+ * original statement. Neither executor evaluates a correlated subquery without the rewrite, so
+ * SQLite is the oracle for what the unrewritten statement means.
+ */
+describe("outer key conjuncts mirrored into simple correlated scalars", () => {
+  interface Customer {
+    id: number | null;
+    tier: string;
+    region: string | null;
+  }
+  interface Order {
+    customer_id: number | null;
+    region: string | null;
+    amount: number | null;
+  }
+  interface Tier {
+    name: string;
+    rank: number;
+  }
+  // `satisfies` keeps the literal object types, which the row map accepts where an interface
+  // array would not, while still checking every row and typing the SQLite inserts.
+  const customerRows = [
+    { id: 1, tier: "gold", region: "west" },
+    { id: 2, tier: "silver", region: "west" },
+    { id: 3, tier: "gold", region: "east" },
+    { id: 4, tier: "silver", region: "east" },
+    { id: 5, tier: "gold", region: null },
+    { id: null, tier: "gold", region: "west" },
+    { id: null, tier: "silver", region: "east" },
+  ] satisfies Customer[];
+  const orderRows = [
+    { customer_id: 1, region: "west", amount: 10 },
+    { customer_id: 1, region: "west", amount: 10 },
+    { customer_id: 1, region: "east", amount: null },
+    { customer_id: 2, region: "west", amount: 5 },
+    { customer_id: 2, region: "west", amount: 5 },
+    { customer_id: 3, region: "east", amount: 7 },
+    { customer_id: 3, region: "west", amount: 1 },
+    { customer_id: null, region: "west", amount: 100 },
+    { customer_id: null, region: null, amount: null },
+    { customer_id: 9, region: "west", amount: 3 },
+  ] satisfies Order[];
+  const tierRows = [
+    { name: "gold", rank: 1 },
+    { name: "silver", rank: 2 },
+  ] satisfies Tier[];
+  const fixture = new Map<string, DatabaseRow[]>([
+    ["customers", customerRows],
+    ["orders", orderRows],
+    ["tiers", tierRows],
+  ]);
+
+  function sqliteFixture(): DatabaseSync {
+    const database = new DatabaseSync(":memory:");
+    database.exec(`CREATE TABLE customers ("id" INTEGER, "tier" TEXT, "region" TEXT)`);
+    database.exec(`CREATE TABLE orders ("customer_id" INTEGER, "region" TEXT, "amount" REAL)`);
+    database.exec(`CREATE TABLE tiers ("name" TEXT, "rank" INTEGER)`);
+    const customer = database.prepare("INSERT INTO customers VALUES (?, ?, ?)");
+    for (const row of customerRows) customer.run(row.id, row.tier, row.region);
+    const order = database.prepare("INSERT INTO orders VALUES (?, ?, ?)");
+    for (const row of orderRows) order.run(row.customer_id, row.region, row.amount);
+    const tier = database.prepare("INSERT INTO tiers VALUES (?, ?)");
+    for (const row of tierRows) tier.run(row.name, row.rank);
+    return database;
+  }
+  const sqlite = sqliteFixture();
+
+  /** Column-equal multisets: the shapes have no unique ORDER BY, and SQLite sorts NULL ids first. */
+  function canonical(rows: readonly DatabaseRow[]): string[] {
+    return rows
+      .map((row) =>
+        JSON.stringify(
+          Object.keys(row)
+            .sort()
+            .map((column) => {
+              const value = row[column];
+              return [column, value === null || value === undefined ? null : Number(value)];
+            }),
+        ),
+      )
+      .sort();
+  }
+
+  function agree(sql: string, params: ReadonlyArray<number | string | null> = []): DatabaseRow[] {
+    const plan = bindPlanParameters(compileQuery(sql), params);
+    const columnar = executeQuery(plan, fixture);
+    const byRow = executeRowQuery(plan, fixture);
+    const oracle = sqlite.prepare(sql).all(...params) as DatabaseRow[];
+    expect(canonical(columnar.rows), sql).toEqual(canonical(byRow.rows));
+    expect(canonical(columnar.rows), sql).toEqual(canonical(oracle));
+    return columnar.rows;
+  }
+
+  /** The predicates the rewrite gave the inner block, beyond the correlation itself. */
+  function innerPredicates(sql: string): Predicate[] {
+    const plan = compileQuery(sql);
+    const join = plan.joins.find((candidate) => candidate.derived?.sql === "(correlated scalar)");
+    if (join?.derived === undefined) throw new Error(`No simple correlated scalar in: ${sql}`);
+    return join.derived.predicates;
+  }
+
+  const count =
+    "SELECT c.id, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS n FROM customers c";
+  const sum =
+    "SELECT c.id, (SELECT SUM(o.amount) FROM orders o WHERE o.customer_id = c.id) AS s FROM customers c";
+
+  it("mirrors an outer equality on the key into the inner scan", () => {
+    expect(innerPredicates(`${count} WHERE c.id = ?`)).toEqual([
+      {
+        left: { kind: "column", reference: "o.customer_id" },
+        operator: "=",
+        right: { kind: "parameter", index: 0 },
+      },
+    ]);
+    expect(agree(`${count} WHERE c.id = ?`, [1])).toEqual([{ id: 1, n: 3 }]);
+    expect(agree(`${count} WHERE c.id = ?`, [2])).toEqual([{ id: 2, n: 2 }]);
+    expect(agree(`${count} WHERE c.id = ?`, [4])).toEqual([{ id: 4, n: 0 }]);
+    expect(agree(`${count} WHERE c.id = ?`, [9])).toEqual([]);
+    expect(agree(`${count} WHERE c.id = ?`, [null])).toEqual([]);
+    expect(agree(`${sum} WHERE c.id = ?`, [1])).toEqual([{ id: 1, s: 20 }]);
+    expect(agree(`${sum} WHERE c.id = ?`, [4])).toEqual([{ id: 4, s: null }]);
+  });
+
+  it("mirrors ranges and lists on the key and keeps NULL keys matching nothing", () => {
+    // BETWEEN is two conjuncts by the time the rewrite runs, and both mirror.
+    expect(innerPredicates(`${count} WHERE c.id BETWEEN ? AND ?`)).toEqual([
+      {
+        left: { kind: "column", reference: "o.customer_id" },
+        operator: ">=",
+        right: { kind: "parameter", index: 0 },
+      },
+      {
+        left: { kind: "column", reference: "o.customer_id" },
+        operator: "<=",
+        right: { kind: "parameter", index: 1 },
+      },
+    ]);
+    expect(agree(`${count} WHERE c.id BETWEEN ? AND ?`, [2, 4])).toEqual([
+      { id: 2, n: 2 },
+      { id: 3, n: 2 },
+      { id: 4, n: 0 },
+    ]);
+    expect(agree(`${count} WHERE c.id IN (?, ?)`, [1, 3])).toEqual([
+      { id: 1, n: 3 },
+      { id: 3, n: 2 },
+    ]);
+    expect(agree(`${count} WHERE c.id IS NULL`)).toEqual([
+      { id: null, n: 0 },
+      { id: null, n: 0 },
+    ]);
+    expect(agree(`${count} WHERE c.id = ? OR c.id IS NULL`, [3])).toEqual([
+      { id: 3, n: 2 },
+      { id: null, n: 0 },
+      { id: null, n: 0 },
+    ]);
+    expect(agree(`${sum} WHERE c.id + 1 = ?`, [3])).toEqual([{ id: 2, s: 10 }]);
+  });
+
+  it("does not mirror a conjunct that reads beyond the key", () => {
+    const orSql = `${count} WHERE c.id = ? OR c.tier = ?`;
+    expect(innerPredicates(orSql)).toEqual([]);
+    expect(agree(orSql, [2, "gold"])).toEqual([
+      { id: 1, n: 3 },
+      { id: 2, n: 2 },
+      { id: 3, n: 2 },
+      { id: 5, n: 0 },
+      { id: null, n: 0 },
+    ]);
+    const tierSql = `${count} WHERE c.tier = ?`;
+    expect(innerPredicates(tierSql)).toEqual([]);
+    expect(agree(tierSql, ["silver"])).toEqual([
+      { id: 2, n: 2 },
+      { id: 4, n: 0 },
+      { id: null, n: 0 },
+    ]);
+    // Only the outer prefix the key needs is retained: a conjunct on a later join stays outside.
+    const joinedSql =
+      "SELECT c.id, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS n " +
+      "FROM customers c JOIN tiers t ON t.name = c.tier WHERE t.rank = ? AND c.id > ?";
+    expect(innerPredicates(joinedSql)).toEqual([
+      {
+        left: { kind: "column", reference: "o.customer_id" },
+        operator: ">",
+        right: { kind: "parameter", index: 1 },
+      },
+    ]);
+    expect(agree(joinedSql, [1, 1])).toEqual([
+      { id: 3, n: 2 },
+      { id: 5, n: 0 },
+    ]);
+  });
+
+  it("mirrors each key of a multi-key correlation independently", () => {
+    const sql =
+      "SELECT c.id, c.region, (SELECT COUNT(*) FROM orders o " +
+      "WHERE o.customer_id = c.id AND o.region = c.region) AS n FROM customers c WHERE c.id = ?";
+    expect(innerPredicates(sql)).toEqual([
+      {
+        left: { kind: "column", reference: "o.customer_id" },
+        operator: "=",
+        right: { kind: "parameter", index: 0 },
+      },
+    ]);
+    expect(agree(sql, [1])).toEqual([{ id: 1, region: "west", n: 2 }]);
+    expect(agree(sql, [3])).toEqual([{ id: 3, region: "east", n: 1 }]);
+    expect(agree(sql, [5])).toEqual([{ id: 5, region: null, n: 0 }]);
+    const both = `${sql} AND c.region = ?`;
+    expect(innerPredicates(both)).toHaveLength(2);
+    expect(agree(both, [1, "west"])).toEqual([{ id: 1, region: "west", n: 2 }]);
+    expect(agree(both, [1, "east"])).toEqual([]);
   });
 });

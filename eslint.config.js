@@ -73,6 +73,9 @@ export default tseslint.config(
       "apps/site/scripts/*.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
       "packages/core/src/engine/sql-mutation-conformance.test.ts",
+      // Neither executor runs a correlated subquery without the rewrite, so the rewrite's
+      // differential tests need node:sqlite as the oracle for the original statement.
+      "packages/core/src/engine/decorrelate.test.ts",
       "packages/core/src/engine/delta-scan.test.ts",
       "packages/core/src/engine/scan-kernels.test.ts",
       // Reads the test sources and the soak runner off disk to prove every recorded regression
