@@ -125,6 +125,7 @@ import {
   MAX_MANIFEST_BLOCK_PRESENCE_IDS,
   MAX_MAINTENANCE_BATCH_ITEMS,
   MAX_STORAGE_BULK_READ_ITEMS,
+  MAX_BLOCK_READ_BATCH_BYTES,
   MAX_TRANSACTION_STAGE_BLOCKS,
   MAX_TRANSACTION_STAGE_BYTES,
   MAX_SNAPSHOT_SESSION_TTL_MS,
@@ -430,6 +431,14 @@ const AUTO_COMPACT_STEP_BLOCKS = 4;
  * cost several; the stored-bytes ceiling still bounds the pass.
  */
 const AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS = 256;
+/**
+ * Level-zero segments past which a write drives one fold step before its own commit. The
+ * background fold takes one bounded step per commit under a writer that never pauses, so a
+ * writer whose every statement adds a segment outruns any fold that costs more steps than the
+ * segments it retires. Past two folds' worth of backlog the writer lends the fold its own turn:
+ * a statement is delayed by one step, where the absolute ceiling would refuse it.
+ */
+const AUTO_COMPACT_BACKPRESSURE_LEVEL_ZERO_SEGMENTS = 2 * AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS;
 /** A failed background fold waits this long before the next attempt, doubling per failure. */
 const AUTO_COMPACT_RETRY_MIN_MS = 250;
 const AUTO_COMPACT_RETRY_MAX_MS = 60_000;
@@ -569,6 +578,13 @@ interface PhysicalCompactionSourceColumn {
   readonly columnId: string;
   readonly type: SimpleDataType;
   readonly sourceRanges: readonly PhysicalCompactionSourceRange[];
+}
+
+/** What a grouped compaction read needs of a source block: its ID and the plan's two sizes. */
+interface CompactionSourceBlockRef {
+  readonly blockId: string;
+  readonly storedBytes: number;
+  readonly encodedBytes: number;
 }
 
 interface PhysicalCompactionLayout {
@@ -6856,6 +6872,23 @@ export class MinnowDatabase {
     });
   }
 
+  /**
+   * The write-path guard on level-zero growth, in two tiers. Past the backpressure threshold
+   * the write drives one bounded fold step before its own work — the step the background fold
+   * would take next, on the writer's turn instead of the fold's — and then proceeds whatever
+   * the step did. At the absolute ceiling it takes that step and refuses if the table is still
+   * at the ceiling afterwards.
+   *
+   * The background fold yields once per commit, so under a writer that never pauses it gets one
+   * bounded step per statement while every statement adds a segment. A fold that costs more
+   * steps than the segments it retires — single-row updates spread over a table whose every
+   * partition they touch — then falls behind without bound, and reached the ceiling still in
+   * flight, where the one step taken there could only plan. Lending it the writer's turn past
+   * two folds' worth of backlog bounds the backlog at that plus one fold's steps: the loop pays
+   * a step per statement until the fold publishes, then runs free again. A step that fails or
+   * cannot help backs the table off exactly as the background fold does, so a table that
+   * cannot be folded costs one attempt per backoff period, not one per write.
+   */
   async #assertCompactionCapacity(
     table: TableRecord,
     transaction?: DatabaseTransaction,
@@ -6868,22 +6901,36 @@ export class MinnowDatabase {
     const hintVersion =
       transaction?.snapshotVersion ?? (await this.store.getCurrentManifestVersion());
     const hint = this.#autoCompactionHints.get(table.id);
-    if (hint?.version === hintVersion && hint.levelZero < MAX_LEVEL_ZERO_SEGMENTS) return;
-    let segments = await this.#currentVisibleSegments(table);
-    let levelZero = 0;
-    for (const segment of segments) {
-      if (segment.level === 0) levelZero += 1;
+    let visible: number;
+    let levelZero: number;
+    if (hint?.version === hintVersion) {
+      ({ visible, levelZero } = hint);
+    } else {
+      const segments = await this.#currentVisibleSegments(table);
+      visible = segments.length;
+      levelZero = countLevelZeroSegments(segments);
     }
-    if (levelZero < MAX_LEVEL_ZERO_SEGMENTS) return;
+    if (levelZero < AUTO_COMPACT_BACKPRESSURE_LEVEL_ZERO_SEGMENTS) return;
+    const atCeiling = levelZero >= MAX_LEVEL_ZERO_SEGMENTS;
+    if (!atCeiling && this.#autoCompactionBackoff.get(table.id)?.retryTimer !== undefined) return;
     // A fold waiting to publish is the step that helps most, and stepping the table would wait
     // behind it while it waits for this write: run it here rather than deadlock on it.
     await this.#publishPendingCompactions();
-    await this.compactTableStep(table.name, {
-      maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
-      maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
-    });
-    segments = await this.#currentVisibleSegments(table);
-    levelZero = segments.reduce((count, segment) => count + (segment.level === 0 ? 1 : 0), 0);
+    try {
+      const progress = await this.compactTableStep(table.name, {
+        maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
+        maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+      });
+      if (!atCeiling && progress.result !== null && !progress.result.compacted) {
+        this.#backOffAutoCompaction(table.id, visible);
+      }
+    } catch (error) {
+      if (atCeiling) throw error;
+      this.#backOffAutoCompaction(table.id, visible);
+      return;
+    }
+    if (!atCeiling) return;
+    levelZero = countLevelZeroSegments(await this.#currentVisibleSegments(table));
     if (levelZero >= MAX_LEVEL_ZERO_SEGMENTS) {
       throw new CompactionBacklogError(table.name, levelZero, MAX_LEVEL_ZERO_SEGMENTS);
     }
@@ -7553,9 +7600,21 @@ export class MinnowDatabase {
     if (target.uniqueKeyColumnId !== undefined) {
       throw new TypeError(`Trigger bodies insert into keyless tables only: ${target.name}`);
     }
+    // A body INSERT without a column list binds positionally to the visible columns, as the
+    // top-level path does; an empty list on a batch means "every column omitted", which would
+    // write NULL for each literal. DEFAULT VALUES keeps the empty list so defaults apply.
+    let columns = compiled.columns;
+    if (columns.length === 0 && compiled.defaultValues !== true) {
+      columns = visibleTableColumns(target).map((column) => column.name);
+      if (derivedRows.some((row) => row.length !== columns.length)) {
+        throw new TypeError(
+          `Trigger body INSERT must match the ${String(columns.length)} visible columns of ${target.name}`,
+        );
+      }
+    }
     const statementNow = this.#now();
     const materialized = await this.#materializeInsertExpressions(
-      { ...compiled, rows: derivedRows },
+      { ...compiled, columns, rows: derivedRows },
       statementNow,
     );
     const input = insertStatementBatch(materialized);
@@ -15009,7 +15068,11 @@ export class MinnowDatabase {
         ) - priorAttemptOutputStoredBytes,
       );
       const plannedOutputStoredBytesUpperBound =
-        await this.#plannedPhysicalOutputStoredBytesUpperBound(rewritePlan, snapshot);
+        await this.#plannedPhysicalOutputStoredBytesUpperBound(
+          rewritePlan,
+          memoryBudgetBytes,
+          snapshot,
+        );
       levelTwoBudget = {
         outputPartitionOrdinal,
         maxWriteAmplification,
@@ -15672,19 +15735,25 @@ export class MinnowDatabase {
     }
     const columnIndexById = new Map(table.columns.map((column, index) => [column.id, index]));
 
-    // Pass 1: the keys any delta references, and each delta's keys in row order.
+    // Pass 1: the keys any delta references, and each delta's keys in row order. The deltas'
+    // key blocks are decoded together: the bound above reserved decode scratch for them, and
+    // whatever of the budget it left unused is theirs as well.
     const touched = new Set<OverlayKey>();
     const deltaKeys = new Map<string, OverlayKey[]>();
-    for (const segment of segments) {
-      if (!mergeSourceReferencesKeys(segment.kind)) continue;
-      const keys: OverlayKey[] = [];
-      await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value) => {
+    const deltas = segments.filter((segment) => mergeSourceReferencesKeys(segment.kind));
+    for (const segment of deltas) deltaKeys.set(segment.segmentId, []);
+    const unusedBudgetBytes = memoryBudgetBytes - plannerMemoryBytes;
+    await this.#forEachMergeSourceKey(
+      deltas,
+      keyColumn,
+      unusedBudgetBytes,
+      snapshot,
+      (segment, value) => {
         const key = overlayKeyOf(keyColumn.type, value);
-        keys.push(key);
+        deltaKeys.get(segment.segmentId)?.push(key);
         touched.add(key);
-      });
-      deltaKeys.set(segment.segmentId, keys);
-    }
+      },
+    );
 
     // Pass 2: replay into slot state.
     let slotCount = 0;
@@ -15765,9 +15834,15 @@ export class MinnowDatabase {
         keys.forEach(visit);
       } else if (touched.size > 0) {
         // With nothing referencing keys there is nothing to track: every row passes through.
-        await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value, rowIndex) => {
-          visit(overlayKeyOf(keyColumn.type, value), rowIndex);
-        });
+        await this.#forEachMergeSourceKey(
+          [segment],
+          keyColumn,
+          unusedBudgetBytes,
+          snapshot,
+          (_, value, rowIndex) => {
+            visit(overlayKeyOf(keyColumn.type, value), rowIndex);
+          },
+        );
       }
       slotBase += segment.rowCount;
     }
@@ -15801,39 +15876,85 @@ export class MinnowDatabase {
     return { ...output.finish(), sourceOutputRowStarts };
   }
 
+  /**
+   * Streams the key column of each segment to `action`, in segment order and row order. The
+   * key blocks are read and decoded in groups (#decodeCompactionBlocks) within the decode
+   * scratch the merge planner's bound reserved — a multiple of the largest key block — plus
+   * whatever of the fold's memory budget that bound left unused; a decoded block is dropped
+   * once its keys are handed over, so nothing accumulates across groups.
+   */
   async #forEachMergeSourceKey(
-    segment: MergeCompactionSourceSegment,
+    segments: readonly MergeCompactionSourceSegment[],
     column: TableColumnRecord,
+    unusedBudgetBytes: number,
     snapshot: LeasedSnapshot,
-    action: (value: BatchValue, rowIndex: number) => void,
+    action: (segment: MergeCompactionSourceSegment, value: BatchValue, rowIndex: number) => void,
   ): Promise<void> {
-    const planned = segment.columns.find((candidate) => candidate.columnId === column.id);
-    if (planned === undefined) {
-      throw new Error(`Mutation segment has no key column: ${segment.segmentId}`);
-    }
-    let rowIndex = 0;
-    for (const source of planned.sourceBlocks) {
-      await this.#renewInternalLeaseIfNeeded(snapshot);
-      const bytes = await this.store.getBlock(source.blockId);
-      if (bytes === undefined)
-        throw new Error(`Compaction source block is missing: ${source.blockId}`);
-      const description = inspectBlock(bytes);
-      if (
-        bytes.byteLength !== source.storedBytes ||
-        description.encodedLength !== source.encodedBytes ||
-        description.checksum !== source.checksum ||
-        description.rowCount !== source.rowCount ||
-        description.type !== column.type
-      ) {
-        throw new Error(`Compaction source block differs from its plan: ${source.blockId}`);
+    const blocks: Array<
+      CompactionSourceBlockRef & {
+        readonly segment: MergeCompactionSourceSegment;
+        readonly source: MergeCompactionSourceBlock;
       }
-      for (const value of (await decodeBlock(bytes)).column.values) {
-        action(value, rowIndex);
-        rowIndex += 1;
+    > = [];
+    let largestEncodedBytes = 0;
+    for (const segment of segments) {
+      const planned = segment.columns.find((candidate) => candidate.columnId === column.id);
+      if (planned === undefined) {
+        throw new Error(`Mutation segment has no key column: ${segment.segmentId}`);
+      }
+      for (const source of planned.sourceBlocks) {
+        blocks.push({
+          blockId: source.blockId,
+          storedBytes: source.storedBytes,
+          encodedBytes: source.encodedBytes,
+          segment,
+          source,
+        });
+        largestEncodedBytes = Math.max(largestEncodedBytes, source.encodedBytes);
       }
     }
-    if (rowIndex !== segment.rowCount) {
-      throw new Error(`Mutation segment key rows differ: ${segment.segmentId}`);
+    const limitBytes = safeWholeNumberSum(
+      [
+        Math.max(0, unusedBudgetBytes),
+        safeWholeNumberProduct(
+          largestEncodedBytes,
+          MERGE_PLANNER_DECODED_KEY_BLOCK_FACTOR,
+          "Mutation compaction key decode memory",
+        ),
+      ],
+      "Mutation compaction key decode memory",
+    );
+    const rowIndexes = new Map<string, number>();
+    await this.#decodeCompactionBlocks(
+      blocks,
+      { limitBytes, retainsDecoded: false },
+      snapshot,
+      async (bytes, { source }) => {
+        const description = inspectBlock(bytes);
+        if (
+          bytes.byteLength !== source.storedBytes ||
+          description.encodedLength !== source.encodedBytes ||
+          description.checksum !== source.checksum ||
+          description.rowCount !== source.rowCount ||
+          description.type !== column.type
+        ) {
+          throw new Error(`Compaction source block differs from its plan: ${source.blockId}`);
+        }
+        return (await decodeBlock(bytes)).column.values;
+      },
+      (values, { segment }) => {
+        let rowIndex = rowIndexes.get(segment.segmentId) ?? 0;
+        for (const value of values) {
+          action(segment, value, rowIndex);
+          rowIndex += 1;
+        }
+        rowIndexes.set(segment.segmentId, rowIndex);
+      },
+    );
+    for (const segment of segments) {
+      if ((rowIndexes.get(segment.segmentId) ?? 0) !== segment.rowCount) {
+        throw new Error(`Mutation segment key rows differ: ${segment.segmentId}`);
+      }
     }
   }
 
@@ -15965,6 +16086,7 @@ export class MinnowDatabase {
 
   async #plannedPhysicalOutputStoredBytesUpperBound(
     plan: PhysicalCompactionRewritePlan,
+    memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
   ): Promise<number> {
     const layout = physicalRewriteLayout(plan);
@@ -15975,7 +16097,7 @@ export class MinnowDatabase {
           column,
           output,
           plan.outputCompression,
-          Number.MAX_SAFE_INTEGER,
+          memoryBudgetBytes,
           snapshot,
         );
         total = safeWholeNumberSum(
@@ -16469,6 +16591,13 @@ export class MinnowDatabase {
     return { physical, peakWorkingBytes: loaded.peakWorkingBytes };
   }
 
+  /**
+   * The decoded source slices one output block of one column is built from. Every distinct
+   * source block is read and decoded once, however many runs of the output it feeds — a
+   * partition's block feeds one run per patched row between its rows — and the distinct blocks
+   * are decoded in groups (#decodeCompactionBlocks) within the fold's memory budget, of which
+   * the plan reserved `physicalOutputMemoryBound` for this output.
+   */
   async #loadPhysicalCompactionRanges(
     column: PhysicalCompactionSourceColumn,
     output: RechunkCompactionOutputWindow,
@@ -16484,24 +16613,44 @@ export class MinnowDatabase {
       [output.rowStart, output.rowCount],
       "Compaction output row range",
     );
+    const sourceBlocks = overlappingPhysicalSourceRanges(column, output);
+    const distinct: PhysicalCompactionSourceRange[] = [];
+    const seen = new Set<string>();
+    for (const sourceBlock of sourceBlocks) {
+      if (seen.has(sourceBlock.blockId)) continue;
+      seen.add(sourceBlock.blockId);
+      distinct.push(sourceBlock);
+    }
+    const decoded = new Map<string, DecodedPhysicalBlock>();
+    const peakWorkingBytes = await this.#decodeCompactionBlocks(
+      distinct,
+      { limitBytes: memoryBudgetBytes, retainsDecoded: true },
+      snapshot,
+      async (bytes, sourceBlock) => {
+        const description = inspectBlock(bytes);
+        if (
+          bytes.byteLength !== sourceBlock.storedBytes ||
+          description.encodedLength !== sourceBlock.encodedBytes ||
+          description.checksum !== sourceBlock.checksum ||
+          description.rowCount !== sourceBlock.sourceBlockRowCount ||
+          description.type !== column.type
+        ) {
+          throw new Error(
+            `A compaction source block differs from its plan: ${sourceBlock.blockId}`,
+          );
+        }
+        return decodePhysicalBlock(bytes);
+      },
+      (block, sourceBlock) => {
+        decoded.set(sourceBlock.blockId, block);
+      },
+    );
     const ranges: PhysicalColumnRange[] = [];
-    for (const sourceBlock of overlappingPhysicalSourceRanges(column, output)) {
-      if (snapshot !== undefined) await this.#renewInternalLeaseIfNeeded(snapshot);
-      const bytes = await this.store.getBlock(sourceBlock.blockId);
-      if (bytes === undefined) {
+    for (const sourceBlock of sourceBlocks) {
+      const block = decoded.get(sourceBlock.blockId);
+      if (block === undefined) {
         throw new Error(`A compaction source block is missing: ${sourceBlock.blockId}`);
       }
-      const description = inspectBlock(bytes);
-      if (
-        bytes.byteLength !== sourceBlock.storedBytes ||
-        description.encodedLength !== sourceBlock.encodedBytes ||
-        description.checksum !== sourceBlock.checksum ||
-        description.rowCount !== sourceBlock.sourceBlockRowCount ||
-        description.type !== column.type
-      ) {
-        throw new Error(`A compaction source block differs from its plan: ${sourceBlock.blockId}`);
-      }
-      const decoded = await decodePhysicalBlock(bytes);
       const sourceEnd = safeWholeNumberSum(
         [sourceBlock.outputRowStart, sourceBlock.rowCount],
         "Compaction source row range",
@@ -16512,10 +16661,82 @@ export class MinnowDatabase {
         sourceBlock.outputRowStart;
       const end =
         sourceBlock.sourceRowStart + Math.min(outputEnd, sourceEnd) - sourceBlock.outputRowStart;
-      const slice = slicePhysicalColumn(decoded.column, start, end);
+      const slice = slicePhysicalColumn(block.column, start, end);
       ranges.push({ column: slice, start: 0, end: slice.rowCount });
     }
-    return { ranges, peakWorkingBytes: memoryBound };
+    return { ranges, peakWorkingBytes: Math.max(memoryBound, peakWorkingBytes) };
+  }
+
+  /**
+   * Reads and decodes compaction source blocks in groups: one bulk read and one concurrent
+   * decode per group, sized so that the group's modeled decode memory — twice the stored and
+   * twice the encoded bytes of each block, as `physicalOutputMemoryBound` models a decode —
+   * plus what earlier groups retained stays within `limitBytes`. `consume` sees every block in
+   * the order given, whatever order the decodes complete in. Returns the modeled peak.
+   *
+   * A block decoded on its own costs one event-loop turn: decompression completes as a task,
+   * not a microtask. Under a writer that never pauses, background maintenance gets one turn per
+   * commit, so a fold that decoded its sources one after another advanced by one block per
+   * statement while every statement added a level-zero segment, and a fold of a few thousand
+   * reads fell further behind a loop of a few thousand statements until the ceiling refused
+   * them. A group costs one turn however many blocks it holds.
+   */
+  async #decodeCompactionBlocks<B extends CompactionSourceBlockRef, T>(
+    blocks: readonly B[],
+    budget: { limitBytes: number; retainsDecoded: boolean },
+    snapshot: LeasedSnapshot | undefined,
+    decode: (bytes: Uint8Array, block: B) => Promise<T>,
+    consume: (decoded: T, block: B) => void,
+  ): Promise<number> {
+    let retainedBytes = 0;
+    let peakBytes = 0;
+    let start = 0;
+    while (start < blocks.length) {
+      let end = start;
+      let transientBytes = 0;
+      let storedBytes = 0;
+      for (; end < blocks.length && end - start < MAX_STORAGE_BULK_READ_ITEMS; end += 1) {
+        const block = blocks[end];
+        if (block === undefined) break;
+        const blockTransientBytes = safeWholeNumberSum(
+          [
+            safeWholeNumberProduct(block.storedBytes, 2, "Compaction decode memory"),
+            safeWholeNumberProduct(block.encodedBytes, 2, "Compaction decode memory"),
+          ],
+          "Compaction decode memory",
+        );
+        if (
+          end > start &&
+          (transientBytes + blockTransientBytes > budget.limitBytes - retainedBytes ||
+            storedBytes + block.storedBytes > MAX_BLOCK_READ_BATCH_BYTES)
+        ) {
+          break;
+        }
+        transientBytes += blockTransientBytes;
+        storedBytes += block.storedBytes;
+      }
+      const group = blocks.slice(start, end);
+      if (snapshot !== undefined) await this.#renewInternalLeaseIfNeeded(snapshot);
+      const bytes = await this.#readBlockWindow(group.map((block) => block.blockId));
+      const decoded = await Promise.all(
+        group.map((block, index) => {
+          const stored = bytes[index];
+          if (stored === undefined) {
+            throw new Error(`A compaction source block is missing: ${block.blockId}`);
+          }
+          return decode(stored, block);
+        }),
+      );
+      peakBytes = Math.max(peakBytes, retainedBytes + transientBytes);
+      for (const [index, block] of group.entries()) {
+        const value = decoded[index];
+        if (value === undefined) throw new Error("Compaction decode lost a block");
+        consume(value, block);
+        if (budget.retainsDecoded) retainedBytes += block.encodedBytes;
+      }
+      start = end;
+    }
+    return peakBytes;
   }
 
   async #loadCompactionSources(job: CompactionJobRecord): Promise<SegmentRecord[]> {
@@ -22320,6 +22541,14 @@ function autoCompactionHint(
   };
 }
 
+function countLevelZeroSegments(segments: readonly SegmentRecord[]): number {
+  let levelZero = 0;
+  for (const segment of segments) {
+    if (segment.level === 0) levelZero += 1;
+  }
+  return levelZero;
+}
+
 function autoCompactionDueHint(hint: AutoCompactionHint): boolean {
   return hint.levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || hint.deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
 }
@@ -24256,6 +24485,8 @@ function sourceOrderTuple(
 
 /** Modeled bytes per referenced key the merge planner and the partition probe hold resident. */
 const MERGE_PLANNER_KEY_BYTES = 96;
+/** Decode scratch the merge planner reserves, as a multiple of its largest key block. */
+const MERGE_PLANNER_DECODED_KEY_BLOCK_FACTOR = 4;
 
 /** How a keyed level-one fold cuts its output into partitions. */
 interface KeyedPartitioning {
@@ -24466,7 +24697,6 @@ function mergePlannerMemoryBound(
   const PATCH_ROW_BYTES = 64;
   const PATCH_CELL_BYTES = 48;
   const RANGE_BYTES = 80;
-  const DECODED_KEY_BLOCK_FACTOR = 4;
   let slotRows = 0;
   let deltaKeys = 0;
   let patchRows = 0;
@@ -24510,7 +24740,7 @@ function mergePlannerMemoryBound(
       ),
       safeWholeNumberProduct(
         largestKeyBlockBytes,
-        DECODED_KEY_BLOCK_FACTOR,
+        MERGE_PLANNER_DECODED_KEY_BLOCK_FACTOR,
         "Mutation compaction decoded key block",
       ),
     ],

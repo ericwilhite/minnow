@@ -2492,6 +2492,24 @@ for (const implementation of implementations()) {
       expect(await database.dropTable("audit")).toBe(true);
     });
 
+    it("binds a trigger body INSERT without a column list to the visible columns in order", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, s TEXT)");
+      await database.execute("INSERT INTO t VALUES (1, 10, 'x')");
+      await database.execute(
+        "CREATE TABLE audit (kind TEXT, tid INTEGER, old_a INTEGER, new_a INTEGER)",
+      );
+      await database.execute(
+        "CREATE TRIGGER audit_t AFTER UPDATE ON t BEGIN " +
+          "INSERT INTO audit VALUES ('u', NEW.id, OLD.a, NEW.a); END",
+      );
+      await database.execute("UPDATE t SET a = a + 1 WHERE id = 1");
+      expect((await database.query("SELECT * FROM audit")).rows).toEqual([
+        { kind: "u", tid: 1, old_a: 10, new_a: 11 },
+      ]);
+    });
+
     it("creates tables with only simple data types and inserts a column batch", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { rowsPerBlock: 2 });
@@ -5557,7 +5575,11 @@ it("restages checkpointed outputs with bounded reads after stale-transaction rec
     outputBlockCount: 4,
     result: { compacted: true, rowCount: 4 },
   });
-  expect(store.blockReadCalls).toBe(0);
+  // The checkpointed outputs are restaged one at a time, never as one bulk read; the sources
+  // of the remaining output are read as a bounded group.
+  expect(
+    store.blockIdsRead.flat().filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
+  ).toEqual([]);
   expect(
     store.singleBlockIdsRead.filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
   ).toEqual(interrupted.outputBlockIds);
@@ -5636,7 +5658,11 @@ it("reconciles outputs when a crash follows replacement-transaction linkage", as
     outputBlockCount: 4,
     result: { compacted: true, rowCount: 4 },
   });
-  expect(store.blockReadCalls).toBe(0);
+  // The checkpointed outputs are restaged one at a time, never as one bulk read; the sources
+  // of the remaining output are read as a bounded group.
+  expect(
+    store.blockIdsRead.flat().filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
+  ).toEqual([]);
   expect(
     store.singleBlockIdsRead.filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
   ).toEqual(interrupted.outputBlockIds);

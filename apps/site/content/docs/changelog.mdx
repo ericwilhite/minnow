@@ -8,6 +8,33 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.6 — September 3, 2026
+
+Published packages: `@minnowdb/core@0.7.6`.
+
+Stored formats are unchanged and no migration is needed.
+
+### Fixed
+
+- A loop of single-row `UPDATE`s on a folded table of tens of thousands of rows, awaited one
+  after another with nothing in between, no longer outruns automatic compaction. Each fold of
+  such a table rewrites every partition the updates touch, and it read and decoded its source
+  blocks one at a time — each decode completing as a task the loop let run once per statement —
+  while every statement added a level-zero segment, so the fold fell further behind with every
+  statement: on a 20,000-row table latency climbed from 1.1 ms to 18 ms and the 4,100th-odd
+  statement was refused with `CompactionBacklogError`; a 2,000-row table reached 4,000 segments
+  and 60 ms per statement. Two changes close it. A fold now reads and decodes its source blocks
+  in groups within its memory budget, each distinct block once per output block rather than
+  once per run it feeds, so a fold of that table is 1,300 block reads instead of 2,800 and costs
+  the loop a turn per group instead of a turn per block. And past 512 level-zero segments —
+  twice the prefix one background fold absorbs — a write drives one fold step before its own
+  commit rather than waiting for the 4,096-segment ceiling to refuse it, so a fold the loop has
+  outrun stays within one fold's steps of that threshold; a step that fails or cannot help backs
+  the table off as a background fold does. The same 6,000-statement loop now holds between
+  about 1.4 and 3.6 ms per statement on the 20,000-row table with at most 479 level-zero
+  segments, and 1.4 ms flat on the 2,000-row table with at most 94; `maintenance-under-load`
+  pins both, and a store whose compaction checkpoints are slow pins the write-path step.
+
 ## 0.7.5 — September 3, 2026
 
 Published packages: `@minnowdb/core@0.7.5`, `@minnowdb/kysely@0.4.9`, and

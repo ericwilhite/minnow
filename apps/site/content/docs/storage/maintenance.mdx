@@ -21,8 +21,10 @@ It runs automatically by default: a scan or a run of commits that finds a table 
 threshold plans a fold and drives it to publication in small steps, yielding between them, and
 keeps going while the table is still due. A step yields to the event loop or to this database's
 next commit, whichever comes first, so a loop that awaits one statement after another without
-pausing still lets the fold advance. A finished fold publishes on the write path: the next
-statement lands it before its own work, rather than the fold racing every write for the manifest.
+pausing still lets the fold advance. A fold reads and decodes its source blocks in groups sized
+by its memory budget, so a step costs the loop a turn per group rather than a turn per block. A
+finished fold publishes on the write path: the next statement lands it before its own work,
+rather than the fold racing every write for the manifest.
 
 Setting `autoCompact: false` transfers that responsibility to the caller. Small-write segments
 then accumulate, so scans become progressively slower and writes eventually meet the fixed
@@ -97,9 +99,17 @@ closed mid-fold — is taken over by whoever resumes it, background maintenance 
 owner is aborted and the job continues under a fresh one. `cancelCompactionJob(jobId)` stops one cleanly —
 compaction is visible-data-neutral by construction, so cancelling it can never lose data.
 The store atomically admits only one non-terminal compaction for a table, so two tabs racing the
-plan step converge on the same durable job instead of creating parallel roots. A table may retain
-at most 4,096 level-zero segments; a write at the ceiling first assists compaction and then applies
-backpressure rather than letting every later query grow linearly forever.
+plan step converge on the same durable job instead of creating parallel roots.
+
+Level-zero growth is guarded on the write path in two tiers. Past 512 level-zero segments — twice
+the prefix one background fold absorbs — a write drives one fold step before its own commit and
+then proceeds, so a loop that adds a segment per statement faster than the fold retires them
+lends the fold its own turn: each statement is delayed by one step until the fold publishes, and
+the backlog stays within one fold's steps of that threshold. A table may retain at most 4,096
+level-zero segments; a write at that ceiling takes the same step and is refused with
+`CompactionBacklogError` only if the table is still at the ceiling afterwards. A step that fails
+or cannot help backs the table off as a background fold would, so a table that cannot be folded
+costs one attempt per backoff period, not one per write.
 
 ## Garbage collection
 
@@ -192,10 +202,10 @@ not compacted or collected still reads correctly over more blocks and bytes — 
 eventually refused at the fixed segment, history, or maintenance-debt safety ceiling. Run or
 restore maintenance rather than treating those fuses as an operating target.
 
-One shape can still outrun automatic folds: a loop of single-row `UPDATE`s on a table of tens of
-thousands of rows that never awaits anything else between statements. Each fold of such a table
-reads every block it merges, and each read waits on decompression, so the loop can add a
-level-zero segment per statement faster than the fold retires them and be refused at the
-4,096-segment ceiling after a few thousand statements. Inserts and small tables stay flat, as
-does the same loop with any other await between statements; a bulk update through
-`updateBatch()` or `UPDATE … FROM` a VALUES source lands as one segment.
+A loop of single-row `UPDATE`s that never awaits anything else between statements is the
+hardest shape for background folds, because each statement adds a level-zero segment and gives
+maintenance one turn. Grouped block reads and the write-path step above keep it bounded: on a
+folded 20,000-row table, 6,000 such statements hold between about 1.4 and 3.6 ms each with the
+level-zero count never past 512, where before 0.7.6 latency climbed to 18 ms and the loop was
+refused at the ceiling by its 4,200th statement. A bulk update through `updateBatch()` or
+`UPDATE … FROM` a VALUES source is still cheaper: it lands as one segment.

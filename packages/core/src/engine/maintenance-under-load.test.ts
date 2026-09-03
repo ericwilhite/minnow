@@ -96,6 +96,129 @@ describe("maintenance under a writer that never pauses", () => {
   }, 120_000);
 });
 
+/**
+ * A folded table of `rows` rows and six columns, as an import followed by `compactTable` leaves
+ * it, so the loop below starts from partitions rather than from the import's own segments.
+ */
+async function foldedTable(database: MinnowDatabase, rows: number): Promise<Map<number, number>> {
+  await database.execute(
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, d TEXT, e DOUBLE PRECISION)",
+  );
+  const values = new Map<number, number>();
+  for (let start = 0; start < rows; start += 1_000) {
+    const tuples: string[] = [];
+    for (let id = start; id < Math.min(rows, start + 1_000); id += 1) {
+      values.set(id, id * 3);
+      tuples.push(
+        `(${String(id)}, ${String(id * 3)}, ${String(id % 97)}, 'name-${String(id)}', 'city-${String(id % 50)}', ${String(id / 7)})`,
+      );
+    }
+    await database.execute(`INSERT INTO t VALUES ${tuples.join(",")}`);
+  }
+  expect((await database.compactTable("t")).compacted).toBe(true);
+  await database.collectGarbage();
+  return values;
+}
+
+/** The table's visible level-zero segments: everything a fold has not yet absorbed. */
+async function levelZeroSegments(
+  database: MinnowDatabase,
+  store: MemoryBlockStore,
+): Promise<number> {
+  const records = await Promise.all(
+    (await allVisibleSegments(database, "t")).map((segment) => store.getSegment(segment.id)),
+  );
+  return records.filter((record) => record?.level === 0).length;
+}
+
+/**
+ * `count` single-row updates, each to a different row spread over the whole table, awaited one
+ * after another with nothing else in between; returns the most level-zero segments seen at any
+ * sample, and updates `values` to what every row should hold afterwards.
+ */
+async function updateLoop(
+  database: MinnowDatabase,
+  store: MemoryBlockStore,
+  values: Map<number, number>,
+  count: number,
+  sampleEvery: number,
+): Promise<number> {
+  let mostLevelZero = 0;
+  for (let index = 0; index < count; index += 1) {
+    const id = (index * 7_919) % values.size;
+    await database.execute("UPDATE t SET a = ? WHERE id = ?", [index, id]);
+    values.set(id, index);
+    if (index % sampleEvery !== sampleEvery - 1) continue;
+    mostLevelZero = Math.max(mostLevelZero, await levelZeroSegments(database, store));
+  }
+  return mostLevelZero;
+}
+
+function expectedTotal(values: Map<number, number>): number {
+  let total = 0;
+  for (const value of values.values()) total += value;
+  return total;
+}
+
+describe("a single-row update loop over a folded table", () => {
+  // Every fold of the 20,000-row table rewrites both of its partitions: the updates land in
+  // both, so the fold reads every block of the table and costs a few thousand block reads,
+  // where the 2,000-row table's fold is cheap. Before 0.7.6 the large table was refused at the
+  // 4,096-segment ceiling by the 4,200th statement, with the third fold still planning: each
+  // decode waited a turn the loop gave once per statement, and each statement added a segment.
+  for (const rows of [20_000, 2_000]) {
+    it(`keeps ${String(rows)} rows bounded through 6,000 back-to-back updates`, async () => {
+      const store = new MemoryBlockStore();
+      const database = new MinnowDatabase(store);
+      const values = await foldedTable(database, rows);
+      const mostLevelZero = await updateLoop(database, store, values, 6_000, 100);
+      // Never within a factor of four of the ceiling: the background fold keeps up, and past
+      // twice one fold's prefix the writer drives it.
+      expect(mostLevelZero).toBeLessThan(1_024);
+      expect(await publishedFolds(database, "t")).toBeGreaterThan(0);
+      expect(database.maintenanceStatus()).toMatchObject({ lastError: null });
+      expect((await database.query("SELECT COUNT(*) AS n, SUM(a) AS total FROM t")).rows).toEqual([
+        { n: rows, total: expectedTotal(values) },
+      ]);
+      await database.close();
+    }, 120_000);
+  }
+
+  /**
+   * A store whose compaction checkpoints each take many event-loop turns, as a durable store's
+   * record writes do. A fold then needs far more turns than the segments it retires, and a loop
+   * that gives it one turn per statement outruns it however cheap its reads are.
+   */
+  class SlowCheckpointStore extends MemoryBlockStore {
+    override async updateCompactionJob(
+      ...args: Parameters<MemoryBlockStore["updateCompactionJob"]>
+    ): ReturnType<MemoryBlockStore["updateCompactionJob"]> {
+      for (let turn = 0; turn < 40; turn += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return super.updateCompactionJob(...args);
+    }
+  }
+
+  it("lends the writer's turn to a fold the loop has outrun, past twice one fold's prefix", async () => {
+    const store = new SlowCheckpointStore();
+    const database = new MinnowDatabase(store);
+    const values = await foldedTable(database, 2_000);
+    const mostLevelZero = await updateLoop(database, store, values, 1_500, 25);
+    // The background fold alone could not hold the table under twice the 256-segment prefix
+    // one fold absorbs; from there each statement drove a fold step before its own commit, so
+    // the backlog stayed within one fold's steps of the threshold instead of climbing to the
+    // ceiling one segment per statement.
+    expect(mostLevelZero).toBeGreaterThanOrEqual(512);
+    expect(mostLevelZero).toBeLessThan(512 + 64);
+    expect(database.maintenanceStatus()).toMatchObject({ lastError: null });
+    expect((await database.query("SELECT SUM(a) AS total FROM t")).rows).toEqual([
+      { total: expectedTotal(values) },
+    ]);
+    await database.close();
+  }, 120_000);
+});
+
 describe("repair of a fold whose owner lease expired", () => {
   async function stalledFold(clock: ReturnType<typeof testClock>) {
     const store = new MemoryBlockStore();
