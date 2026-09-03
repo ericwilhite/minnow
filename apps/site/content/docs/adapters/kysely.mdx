@@ -295,10 +295,11 @@ their aggregates infer `number` instead. Use `eb.fn.coalesce(aggregate, eb.val(f
 wants a non-null fallback—the result narrows without a generic. The generic `fn` and `fn.agg`
 entry points also know Minnow's supported fixed-return functions and aggregates, so calls such as
 `eb.fn("round", ...)`, `eb.fn("date_trunc", ...)`, and `eb.fn.agg("count", ...)` infer their
-results. An arithmetic scalar function — `round`, `abs`, `floor`, `ceil`, `mod`, `power`,
-`sqrt` — over an exact `NUMERIC` column is a type error rather than a `number`, because the
-engine refuses string-boundary arguments there; `CAST` the column to `double precision` first,
-or aggregate it with `fn.sum`/`fn.avg`, which keep the lossless string boundary. `coalesce`,
+results. `round`, `abs`, `floor`, `ceil`, and `mod` over an exact `NUMERIC` column stay exact
+in the engine, so they infer the column's boundary: `string`, or `number` with native numeric
+result decoding. `power` and `sqrt` run in Float64, so over an exact `NUMERIC` column they are a
+type error rather than a `number`; `CAST` the column to `double precision` first, or aggregate
+it with `fn.sum`/`fn.avg`, which keep the lossless string boundary. `coalesce`,
 `nullif`, `greatest`, and `least` infer from their arguments. Nullable scalar
 inputs are carried into the result where the SQL function propagates NULL. `eb.cast(value, target)`
 also needs no output generic for Minnow's supported targets: integer and floating targets infer

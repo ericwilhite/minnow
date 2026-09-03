@@ -129,11 +129,11 @@ describe("RETURNING expressions", () => {
       "INSERT INTO prices (sku, amount) VALUES ('a', 12.5) RETURNING sku, amount, amount * 2 AS doubled",
     );
     expect(inserted).toMatchObject({
-      returnedRows: [{ sku: "a", amount: "12.50", doubled: "25" }],
+      returnedRows: [{ sku: "a", amount: "12.50", doubled: "25.00" }],
       returnedColumnDomains: [
         null,
         { kind: "numeric", precision: 10, scale: 2 },
-        { kind: "numeric" },
+        { kind: "numeric", scale: 2 },
       ],
     });
     await database.close();

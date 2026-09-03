@@ -1545,28 +1545,31 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
 });
 
 describe("arithmetic scalar functions over exact NUMERIC columns", () => {
-  it("rejects them at the type level instead of promising a number the engine refuses", () => {
+  it("types the exact family at the NUMERIC boundary and still refuses POWER and SQRT", () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     const db = createKysely({ driver: database, schema: functionSchema });
     const query = db.selectFrom("events").select((eb) => [
       // A Float64 column stays a number.
       eb.fn("round", ["amount"]).as("rounded"),
-      // An exact NUMERIC crosses the SQL boundary as a string; the engine refuses ROUND on it,
-      // so the inferred result is the refusal, not an unreachable number.
-      eb.fn("round", ["exact_amount"]).as("rejected"),
-      eb.fn("abs", ["exact_amount"]).as("rejected_abs"),
-      // A CAST to a float target is the documented path back to arithmetic.
+      // ROUND, ABS, FLOOR, CEIL, and MOD are numeric-in, numeric-out in PostgreSQL, and the
+      // engine keeps them exact, so the result is the column's lossless string boundary.
+      eb.fn("round", ["exact_amount"]).as("exact"),
+      eb.fn("abs", ["exact_amount"]).as("exact_abs"),
+      // POWER and SQRT run in Float64, so a string-boundary argument is still refused.
+      eb.fn("sqrt", ["exact_amount"]).as("rejected"),
+      // A CAST to a float target is the documented path back to Float64 arithmetic.
       eb.fn("round", [eb.cast<number>("exact_amount", "double precision")]).as("cast_first"),
     ]);
     type Row = Awaited<ReturnType<typeof query.execute>>[number];
     expectTypeOf<Row["rounded"]>().toEqualTypeOf<number>();
     expectTypeOf<Row["cast_first"]>().toEqualTypeOf<number>();
+    expectTypeOf<Row["exact"]>().toEqualTypeOf<string>();
+    expectTypeOf<Row["exact_abs"]>().toEqualTypeOf<string>();
     expectTypeOf<Row["rejected"]>().not.toExtend<number>();
-    expectTypeOf<Row["rejected_abs"]>().not.toExtend<number>();
+    expectTypeOf<Row["rejected"]>().not.toExtend<string>();
 
-    // The refusal keys off the operand boundary, so numeric result decoding — which turns the
-    // select type into number while the engine still sees the string boundary — cannot
-    // reintroduce the unsound number.
+    // Numeric result decoding moves the exact family's result to number along with the column,
+    // while POWER and SQRT stay refused: the engine still sees the string boundary there.
     const decoded = createKysely({
       driver: database,
       schema: functionSchema,
@@ -1574,8 +1577,12 @@ describe("arithmetic scalar functions over exact NUMERIC columns", () => {
     });
     const decodedQuery = decoded
       .selectFrom("events")
-      .select((eb) => [eb.fn("round", ["exact_amount"]).as("rejected")]);
+      .select((eb) => [
+        eb.fn("round", ["exact_amount"]).as("exact"),
+        eb.fn("sqrt", ["exact_amount"]).as("rejected"),
+      ]);
     type DecodedRow = Awaited<ReturnType<typeof decodedQuery.execute>>[number];
+    expectTypeOf<DecodedRow["exact"]>().toEqualTypeOf<number>();
     expectTypeOf<DecodedRow["rejected"]>().not.toExtend<number>();
     void query;
     void decodedQuery;

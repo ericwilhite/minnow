@@ -92,9 +92,10 @@ machines: https://minnowdb.com/llms.txt
   cannot be updated.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers. `NUMERIC` and
   `DECIMAL` are exact and return decimal strings, rendered at the column's declared scale like
-  PostgreSQL (`'1.50'` from `NUMERIC(10, 2)`); a bare `NUMERIC` and derived arithmetic render
-  canonically, without trailing fractional zeros. Use `DOUBLE PRECISION` only when approximation
-  is intended. Numeric constants in SQL are exact, as in PostgreSQL: `0.1 + 0.2` is `0.3`, and a
+  PostgreSQL (`'1.50'` from `NUMERIC(10, 2)`). Exact `+`, `-`, `*`, `%`, `ROUND`, and `TRUNC`
+  carry PostgreSQL's display scale (`'8.00'` from `NUMERIC(10, 2) + 1`); a bare `NUMERIC` and a
+  division result render canonically, without trailing fractional zeros. Use `DOUBLE PRECISION`
+  only when approximation is intended. Numeric constants in SQL are exact, as in PostgreSQL: `0.1 + 0.2` is `0.3`, and a
   constant or constant-arithmetic result that would not read back identically from a JavaScript
   number (24-digit decimals, integers beyond 2^53) comes back as a decimal string rather than a
   rounded number or an error.

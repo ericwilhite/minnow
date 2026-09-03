@@ -1396,6 +1396,27 @@ function rowKey(row: Record<string, unknown>): string {
   );
 }
 
+/**
+ * Minnow returns exact NUMERIC as lossless text, while the PGlite oracle's `numeric` parser (OID
+ * 1700, below) reads it as a number and SQLite has no decimal type at all. Columns the result
+ * declares NUMERIC decode the same way before an oracle comparison, so numeric-typed math such
+ * as TRUNC(CAST(amount AS NUMERIC) / 7, 2) compares by value; text columns stay text.
+ */
+function numericDecodedRows(result: QueryResult): Array<Record<string, unknown>> {
+  const numericColumns = result.columns.filter(
+    (_, index) => result.columnDomains[index]?.kind === "numeric",
+  );
+  if (numericColumns.length === 0) return result.rows;
+  return result.rows.map((row) => {
+    const decoded: Record<string, unknown> = { ...row };
+    for (const name of numericColumns) {
+      const value = decoded[name];
+      if (typeof value === "string") decoded[name] = Number(value);
+    }
+    return decoded;
+  });
+}
+
 function resultKeys(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): string[] {
   const keys = rows.map(rowKey);
   return ordered ? keys : [...keys].sort();
@@ -2080,9 +2101,10 @@ describe("SQL conformance against SQLite and PGlite", () => {
               continue;
             }
             const oracleKeys = resultKeys(oracleResult.rows, testCase.ordered);
-            if (vectorKeys.join("\n") !== oracleKeys.join("\n")) {
+            const minnowKeys = resultKeys(numericDecodedRows(vectorized), testCase.ordered);
+            if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
               failures.push(
-                `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, vectorKeys, oracleKeys)}`,
+                `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, minnowKeys, oracleKeys)}`,
               );
             }
             // Row comparison sorts keys, so it cannot see output column order. Compare the
@@ -2168,7 +2190,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
             continue;
           }
           const compareOrder = ordered && oracle.name === "pglite";
-          const minnowKeys = resultKeys(minnowResult.rows, compareOrder);
+          const minnowKeys = resultKeys(numericDecodedRows(minnowResult), compareOrder);
           const oracleKeys = resultKeys(oracleResult.rows, compareOrder);
           if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
             failures.push(
@@ -2458,6 +2480,90 @@ describe("SQL conformance against SQLite and PGlite", () => {
           `${returning}\n  minnow:   ${JSON.stringify(minnowReturned.returnedRows)}\n` +
             `  postgres: ${JSON.stringify(postgresReturned.rows)}`,
         );
+      }
+    } finally {
+      await postgres.close();
+    }
+    expect(failures).toEqual([]);
+  }, 120_000);
+
+  it("keeps ROUND and its numeric siblings exact over NUMERIC, rendered as PostgreSQL does", async () => {
+    // ROUND over an exact NUMERIC once returned the engine's internal tag ("\u0000minnow-domain:
+    // numeric:75.91") because the result column carried no NUMERIC domain, and a derived table
+    // over it failed to build a number vector. This diffs the rendered text against PGlite for
+    // every scalar that PostgreSQL types numeric-in, numeric-out — ROUND, TRUNC, ABS, FLOOR,
+    // CEIL, MOD, SIGN, negation — across projection, aggregates, COALESCE, GROUP BY keys,
+    // derived tables, UNION members, predicates, and window ordering.
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const { PGlite } = await import("@electric-sql/pglite");
+    const postgres = await PGlite.create();
+    const failures: string[] = [];
+    try {
+      const statements = [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, total DOUBLE PRECISION)",
+        "INSERT INTO o VALUES (1, 101.314), (2, 50.5)",
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, m NUMERIC(10, 2), g INTEGER)",
+        "INSERT INTO n VALUES (1, '1.25', 1), (2, '2.35', 1), (3, '-3.45', 2), (4, NULL, 2), " +
+          "(5, '12345.67', 3), (6, '7', 3)",
+      ];
+      for (const sql of statements) {
+        await database.execute(sql);
+        await postgres.exec(sql);
+      }
+      const queries = [
+        // Doubles cast to NUMERIC, then rounded: the shape that first leaked the tag.
+        "SELECT round(avg(total)::numeric, 2) AS a FROM o",
+        "SELECT round(sum(total)::numeric, 2) AS a FROM o",
+        "SELECT id, round(total::numeric, 1) AS a FROM o ORDER BY id",
+        // A declared-scale column through every ROUND shape.
+        "SELECT id, ROUND(m, 1) AS r FROM n ORDER BY id",
+        "SELECT id, ROUND(m) AS r FROM n ORDER BY id",
+        "SELECT id, ROUND(m, 3) AS r FROM n ORDER BY id",
+        "SELECT id, ROUND(m, -1) AS r FROM n ORDER BY id",
+        "SELECT ROUND(SUM(m), 1) AS r FROM n",
+        "SELECT SUM(ROUND(m, 1)) AS r FROM n",
+        "SELECT SUM(ROUND(m, 3)) AS r FROM n",
+        "SELECT id, COALESCE(ROUND(m, 1), 0) AS r FROM n ORDER BY id",
+        "SELECT ROUND(m, 1) AS k, COUNT(*) AS c FROM n GROUP BY ROUND(m, 1) ORDER BY k",
+        "SELECT ROUND(m, 1) AS k FROM n GROUP BY ROUND(m, 1) HAVING ROUND(m, 1) > 2 ORDER BY k",
+        "SELECT t.r FROM (SELECT ROUND(m, 1) AS r FROM n) t ORDER BY t.r",
+        "SELECT t.r, COUNT(*) AS c FROM (SELECT ROUND(m, 1) AS r FROM n) t GROUP BY t.r ORDER BY t.r",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY ROUND(m, 1)) AS rn FROM n ORDER BY id",
+        "SELECT id, ROUND(m, 1) AS r FROM n ORDER BY ROUND(m, 1) DESC NULLS LAST",
+        "SELECT id FROM n WHERE ROUND(m, 1) > 2 ORDER BY id",
+        "SELECT id, ROUND(m, 1) + 1 AS r FROM n ORDER BY id",
+        "SELECT id, ROUND(CAST(m AS NUMERIC(10, 3)), 2) AS r FROM n ORDER BY id",
+        "SELECT ROUND(CAST(2.5 AS NUMERIC)) AS up, ROUND(CAST(-2.5 AS NUMERIC)) AS down",
+        // Members of differing scale union as unconstrained NUMERIC; the combined column renders
+        // canonically, so the row whose PostgreSQL text would keep a trailing zero stays out.
+        "SELECT ROUND(m, 1) AS r FROM n WHERE id <> 6 UNION ALL SELECT ROUND(m, 2) FROM n WHERE id <> 6 ORDER BY r",
+        // The rest of PostgreSQL's numeric-in, numeric-out scalar family.
+        "SELECT id, TRUNC(m, 1) AS t, TRUNC(m) AS t0, TRUNC(m, 3) AS t3, TRUNC(m, -1) AS tn FROM n ORDER BY id",
+        "SELECT id, ABS(m) AS a, FLOOR(m) AS f, CEIL(m) AS c, CEILING(m) AS c2 FROM n ORDER BY id",
+        "SELECT id, MOD(m, 2) AS md, SIGN(m) AS s, -m AS neg FROM n ORDER BY id",
+        "SELECT SUM(ABS(m)) AS a, MIN(FLOOR(m)) AS f, MAX(CEIL(m)) AS c FROM n",
+        // A plain-number fallback beside NUMERIC values renders at its own scale.
+        "SELECT id, COALESCE(m, 0) AS r FROM n ORDER BY id",
+        "SELECT id, CASE WHEN m IS NULL THEN 0 ELSE m END AS r FROM n ORDER BY id",
+        "SELECT id, GREATEST(m, 2) AS g, LEAST(m, 2) AS l FROM n ORDER BY id",
+        "SELECT COALESCE(SUM(m), 0) AS s FROM n WHERE id > 100",
+      ];
+      for (const sql of queries) {
+        let minnow: string;
+        let expected: string;
+        try {
+          minnow = JSON.stringify((await database.query(sql)).rows);
+        } catch (error) {
+          minnow = `threw ${error instanceof Error ? error.message : String(error)}`;
+        }
+        try {
+          expected = JSON.stringify((await postgres.query(sql)).rows);
+        } catch (error) {
+          expected = `threw ${error instanceof Error ? error.message : String(error)}`;
+        }
+        if (minnow !== expected) {
+          failures.push(`${sql}\n  minnow:   ${minnow}\n  postgres: ${expected}`);
+        }
       }
     } finally {
       await postgres.close();

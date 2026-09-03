@@ -117,8 +117,76 @@ function taggedDecimalParts(value: unknown): DecimalParts | undefined {
   return decimalParts(value.slice(NUMERIC.length));
 }
 
+/** The fractional digits a finite number shows when written as a decimal: 1.25 has 2, 8 has 0. */
+export function decimalScaleOfNumber(value: number): number {
+  return normalizeDecimal(decimalParts(value)).scale;
+}
+
 export function isExactNumeric(value: unknown): value is string {
   return taggedDecimalParts(value) !== undefined;
+}
+
+/**
+ * PostgreSQL's numeric ROUND and TRUNC at `digits` fractional places, which may be negative to
+ * work left of the decimal point (`ROUND(12345.67, -1)` is 12350). ROUND is half away from
+ * zero, TRUNC toward zero. The result is canonical; a caller wanting display scale reads it
+ * from the inferred column domain.
+ */
+export function exactNumericRounded(
+  value: string,
+  digits: number,
+  mode: "round" | "trunc",
+): string {
+  const parts = taggedDecimalParts(value);
+  if (parts === undefined) throw new TypeError("ROUND and TRUNC take an exact NUMERIC value");
+  if (!Number.isSafeInteger(digits) || digits > 100_000 || digits < -100_000) {
+    throw new RangeError(`NUMERIC scale is outside the supported range: ${String(digits)}`);
+  }
+  let result = parts;
+  if (parts.scale > digits) {
+    const divisor = pow10(parts.scale - digits);
+    let quotient = parts.coefficient / divisor;
+    if (mode === "round") {
+      const remainder = parts.coefficient % divisor;
+      if ((remainder < 0n ? -remainder : remainder) * 2n >= divisor) {
+        quotient += parts.coefficient < 0n ? -1n : 1n;
+      }
+    }
+    result =
+      digits >= 0
+        ? { coefficient: quotient, scale: digits }
+        : { coefficient: quotient * pow10(-digits), scale: 0 };
+  }
+  return boundedTaggedDomainValue(
+    NUMERIC,
+    formatDecimal(normalizeDecimal(result)),
+    "NUMERIC result",
+  );
+}
+
+/** ABS, FLOOR, CEIL, and SIGN over an exact NUMERIC value, as PostgreSQL's numeric variants. */
+export function exactNumericUnary(name: "ABS" | "FLOOR" | "CEIL" | "SIGN", value: string): string {
+  const parts = taggedDecimalParts(value);
+  if (parts === undefined) throw new TypeError(`${name} takes an exact NUMERIC value`);
+  const { coefficient, scale } = parts;
+  let result: DecimalParts;
+  if (name === "ABS") {
+    result = { coefficient: coefficient < 0n ? -coefficient : coefficient, scale };
+  } else if (name === "SIGN") {
+    result = { coefficient: coefficient === 0n ? 0n : coefficient < 0n ? -1n : 1n, scale: 0 };
+  } else {
+    const divisor = pow10(scale);
+    let quotient = coefficient / divisor;
+    const remainder = coefficient % divisor;
+    if (name === "FLOOR" && remainder < 0n) quotient -= 1n;
+    if (name === "CEIL" && remainder > 0n) quotient += 1n;
+    result = { coefficient: quotient, scale: 0 };
+  }
+  return boundedTaggedDomainValue(
+    NUMERIC,
+    formatDecimal(normalizeDecimal(result)),
+    "NUMERIC result",
+  );
 }
 
 export function exactNumericValue(
@@ -781,6 +849,16 @@ export function externalSqlDomainColumnValue(
   value: unknown,
   domain: SqlDomain | null | undefined,
 ): unknown {
+  if (domain?.kind === "numeric" && typeof value === "number" && Number.isFinite(value)) {
+    // A plain number reaching a NUMERIC column — `COALESCE(amount, 0)`, a CASE branch — is
+    // PostgreSQL's implicit cast of that constant to NUMERIC: it renders as decimal text at its
+    // own scale, not padded to the column's, exactly as PostgreSQL shows `0` beside `7.00`.
+    try {
+      return externalSqlDomainValue(exactNumericValue(value));
+    } catch {
+      return value;
+    }
+  }
   if (
     domain?.kind === "numeric" &&
     domain.scale !== undefined &&

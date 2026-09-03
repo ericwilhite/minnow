@@ -19,9 +19,12 @@ import {
 import { MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
 import {
   dateDomainValue,
+  exactNumericRounded,
+  exactNumericUnary,
   externalSqlDomainValue,
   intervalDomainValue,
   isDateDomainValue,
+  isExactNumeric,
   protectedSqlTextValue,
 } from "./sql-domains.js";
 import { compileRegexPattern, parseSqlTimestampText, stringArgument } from "./sql-semantics.js";
@@ -1036,7 +1039,10 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
       minArgs: 1,
       maxArgs: 1,
       returns: "number",
-      evaluate: (values) => Math.sign(number("SIGN", values[0])),
+      evaluate: (values) =>
+        isExactNumeric(values[0])
+          ? exactNumericUnary("SIGN", values[0])
+          : Math.sign(number("SIGN", values[0])),
     },
   ],
   [
@@ -1046,8 +1052,11 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
       maxArgs: 2,
       returns: "number",
       evaluate: (values) => {
-        const operand = number("TRUNC", values[0]);
         const digits = values.length > 1 ? integer("TRUNC", values[1]) : 0;
+        // An exact NUMERIC truncates exactly, to the requested scale, as PostgreSQL's numeric
+        // TRUNC does; a double takes the float path.
+        if (isExactNumeric(values[0])) return exactNumericRounded(values[0], digits, "trunc");
+        const operand = number("TRUNC", values[0]);
         const scale = 10 ** digits;
         return Math.trunc(operand * scale) / scale;
       },

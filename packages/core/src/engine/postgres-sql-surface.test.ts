@@ -1477,10 +1477,11 @@ describe("schema statements", () => {
       { loose: "1.5" },
       { loose: "7" },
     ]);
-    // Derived arithmetic types as bare NUMERIC, so its results render canonically too.
+    // Derived arithmetic carries PostgreSQL's display scale: a product sums the operand scales
+    // (the integer constant contributes none), so the doubled price still shows two places.
     expect(
       (await database.query("SELECT price * 2 AS doubled FROM scaled WHERE id = 1")).rows,
-    ).toEqual([{ doubled: "3" }]);
+    ).toEqual([{ doubled: "3.00" }]);
   });
 
   it("keeps ordinary TEXT distinct from internal SQL-domain encodings", async () => {

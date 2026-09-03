@@ -113,6 +113,9 @@ import {
   exactNumericAsNumber,
   exactNumericBinary,
   exactNumericLiteral,
+  decimalScaleOfNumber,
+  exactNumericRounded,
+  exactNumericUnary,
   exactNumericValue,
   externalSqlDomainColumnValue,
   externalSqlDomainValue,
@@ -469,20 +472,25 @@ function buildScalarFunctionEvaluator(
         if (first === null || first === undefined) return null;
         if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
         const digits = values.length > 1 ? numeric(values[1]) : 0;
-        if (isExactNumeric(first) && Number.isInteger(digits) && digits >= 0) {
-          return exactNumericValue(first, undefined, digits);
+        if (isExactNumeric(first) && Number.isInteger(digits)) {
+          return exactNumericRounded(first, digits, "round");
         }
         return roundSqlNumber(numeric(first), digits);
       };
     case "FLOOR":
-      return (values) =>
-        values[0] === null || values[0] === undefined ? null : Math.floor(numeric(values[0]));
     case "CEIL":
-      return (values) =>
-        values[0] === null || values[0] === undefined ? null : Math.ceil(numeric(values[0]));
     case "ABS":
-      return (values) =>
-        values[0] === null || values[0] === undefined ? null : Math.abs(numeric(values[0]));
+      return (values) => {
+        const first = values[0];
+        if (first === null || first === undefined) return null;
+        if (isExactNumeric(first)) return exactNumericUnary(name, first);
+        const operand = numeric(first);
+        return name === "FLOOR"
+          ? Math.floor(operand)
+          : name === "CEIL"
+            ? Math.ceil(operand)
+            : Math.abs(operand);
+      };
     case "UPPER":
       return (values) => {
         const first = values[0];
@@ -578,11 +586,15 @@ function scalarFunctionValueGeneric(
       return comparable(first) === comparable(other) ? null : first;
     }
     case "FLOOR":
-      return Math.floor(numeric(first));
+      return isExactNumeric(first) ? exactNumericUnary("FLOOR", first) : Math.floor(numeric(first));
     case "CEIL":
-      return Math.ceil(numeric(first));
+      return isExactNumeric(first) ? exactNumericUnary("CEIL", first) : Math.ceil(numeric(first));
     case "MOD": {
       if (values[1] === null || values[1] === undefined) return null;
+      // An exact NUMERIC operand keeps the remainder exact, with the dividend's sign as in
+      // PostgreSQL; a zero divisor is NULL on both paths.
+      const exact = exactNumericBinary("%", first, values[1]);
+      if (exact !== undefined) return exact;
       const divisor = numeric(values[1]);
       return divisor === 0 ? null : numeric(first) % divisor;
     }
@@ -627,15 +639,16 @@ function scalarFunctionValueGeneric(
     case "ROUND": {
       if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
       const digits = values.length > 1 ? numeric(values[1]) : 0;
-      // An exact NUMERIC rounds exactly, to the requested scale, half away from zero as
-      // PostgreSQL's numeric ROUND does; a double takes the float path.
-      if (isExactNumeric(first) && Number.isInteger(digits) && digits >= 0) {
-        return exactNumericValue(first, undefined, digits);
+      // An exact NUMERIC rounds exactly, to the requested scale (negative digits round left of
+      // the point), half away from zero as PostgreSQL's numeric ROUND does; a double takes the
+      // float path.
+      if (isExactNumeric(first) && Number.isInteger(digits)) {
+        return exactNumericRounded(first, digits, "round");
       }
       return roundSqlNumber(numeric(first), digits);
     }
     case "ABS":
-      return Math.abs(numeric(first));
+      return isExactNumeric(first) ? exactNumericUnary("ABS", first) : Math.abs(numeric(first));
     case "UPPER": {
       const source = stringArgument("UPPER", first);
       assertScalarInputLength(source, "UPPER input");
@@ -2638,15 +2651,52 @@ export function inferBlockSchema(
     if (target === "interval") return { kind: "interval" };
     return undefined;
   };
+  /**
+   * The display scale one operand contributes to exact arithmetic, as PostgreSQL derives it: a
+   * NUMERIC's declared or inferred scale, a plain constant's written fraction, an integer or
+   * float column's zero. Undefined when the operand's scale is only known at run time.
+   */
+  const operandScale = (
+    expression: Expression,
+    domain: SqlDomain | undefined,
+  ): number | undefined => {
+    if (domain !== undefined) return domain.kind === "numeric" ? domain.scale : undefined;
+    if (expression.kind === "literal") {
+      return typeof expression.value === "number" && Number.isFinite(expression.value)
+        ? decimalScaleOfNumber(expression.value)
+        : undefined;
+    }
+    return expression.kind === "column" ? 0 : undefined;
+  };
+  /**
+   * PostgreSQL's result scale for exact `+`, `-`, `%` (the larger operand scale) and `*` (their
+   * sum); division selects its own scale from the values, so it carries none here.
+   */
+  const numericResultDomain = (
+    operator: string,
+    sides: ReadonlyArray<readonly [Expression, SqlDomain | undefined]>,
+  ): SqlDomain => {
+    const scales = sides.map(([expression, domain]) => operandScale(expression, domain));
+    if (scales.some((scale) => scale === undefined)) return { kind: "numeric" };
+    const known = scales as number[];
+    return {
+      kind: "numeric",
+      scale: operator === "*" ? known.reduce((sum, scale) => sum + scale, 0) : Math.max(...known),
+    };
+  };
   const inferDomain = (expression: Expression): SqlDomain | undefined => {
     if (expression.kind === "literal") return expression.sqlDomain;
     if (expression.kind === "column") return resolveColumnDomain(expression.reference);
     if (expression.kind === "binary") {
+      if (expression.operator === "||") return undefined;
       const left = inferDomain(expression.left);
       const right = inferDomain(expression.right);
-      return left?.kind === "numeric" || right?.kind === "numeric"
-        ? { kind: "numeric" }
-        : undefined;
+      if (left?.kind !== "numeric" && right?.kind !== "numeric") return undefined;
+      if (expression.operator === "/") return { kind: "numeric" };
+      return numericResultDomain(expression.operator, [
+        [expression.left, left],
+        [expression.right, right],
+      ]);
     }
     if (expression.kind === "case") {
       const outcomes = [
@@ -2676,6 +2726,35 @@ export function inferBlockSchema(
       return { kind: "json" };
     }
     if (expression.name === "GEN_RANDOM_UUID") return { kind: "uuid" };
+    if (expression.name === "ROUND" || expression.name === "TRUNC") {
+      // PostgreSQL's numeric ROUND/TRUNC return NUMERIC at the requested scale; a literal digit
+      // count becomes the result's display scale, a computed one leaves the value canonical.
+      const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
+      if (input?.kind !== "numeric") return undefined;
+      const digits = expression.arguments[1];
+      return digits?.kind === "literal" &&
+        typeof digits.value === "number" &&
+        Number.isInteger(digits.value) &&
+        digits.value > 0
+        ? { kind: "numeric", scale: digits.value }
+        : { kind: "numeric" };
+    }
+    if (expression.name === "ABS") {
+      const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
+      return input?.kind === "numeric" ? input : undefined;
+    }
+    if (expression.name === "FLOOR" || expression.name === "CEIL" || expression.name === "SIGN") {
+      const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
+      return input?.kind === "numeric" ? { kind: "numeric" } : undefined;
+    }
+    if (expression.name === "MOD") {
+      const sides = expression.arguments.map(
+        (argument) => [argument, inferDomain(argument)] as const,
+      );
+      return sides.some(([, domain]) => domain?.kind === "numeric")
+        ? numericResultDomain("%", sides)
+        : undefined;
+    }
     if (expression.name === "DATE_ADD") {
       const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
       const milliseconds = expression.arguments[2];
@@ -2701,6 +2780,18 @@ export function inferBlockSchema(
     }
     return undefined;
   };
+  /**
+   * Whether a value-choosing expression (CASE, COALESCE, NULLIF, GREATEST, LEAST) mixes an
+   * exact NUMERIC branch with a plain number one. PostgreSQL resolves that mix to NUMERIC, so
+   * the output keeps the tagged string representation rather than failing as a type clash.
+   */
+  const exactNumericMix = (
+    expression: Expression,
+    left: SqlColumnType,
+    right: SqlColumnType,
+  ): boolean =>
+    ((left === "string" && right === "number") || (left === "number" && right === "string")) &&
+    inferDomain(expression)?.kind === "numeric";
   const infer = (expression: Expression): SqlColumnType | "null" => {
     if (expression.kind === "subquery" || expression.kind === "list") {
       throw new TypeError("Subqueries must be resolved before schema inference");
@@ -2729,6 +2820,10 @@ export function inferBlockSchema(
         const type = infer(outcome);
         if (type === "null") continue;
         if (resolved !== "null" && resolved !== type) {
+          if (exactNumericMix(expression, resolved, type)) {
+            resolved = "string";
+            continue;
+          }
           throw new TypeError("CASE branches must produce one value type");
         }
         resolved = type;
@@ -2786,11 +2881,16 @@ export function inferBlockSchema(
     }
     if (
       expression.name === "ROUND" ||
-      expression.name === "LENGTH" ||
       expression.name === "ABS" ||
       expression.name === "FLOOR" ||
       expression.name === "CEIL" ||
-      expression.name === "MOD" ||
+      expression.name === "MOD"
+    ) {
+      // Exact NUMERIC in, exact NUMERIC out: the value stays a tagged string.
+      return inferDomain(expression)?.kind === "numeric" ? "string" : "number";
+    }
+    if (
+      expression.name === "LENGTH" ||
       expression.name === "POWER" ||
       expression.name === "SQRT" ||
       expression.name === "INSTR" ||
@@ -2826,6 +2926,9 @@ export function inferBlockSchema(
         const argument = expression.arguments[0];
         return argument === undefined ? "null" : infer(argument);
       }
+      if (simple.returns === "number" && inferDomain(expression)?.kind === "numeric") {
+        return "string";
+      }
       // DATE and INTERVAL results are logical domains carried as strings.
       return simple.returns === "date" || simple.returns === "interval" ? "string" : simple.returns;
     }
@@ -2849,6 +2952,10 @@ export function inferBlockSchema(
         const type = infer(argument);
         if (type === "null") continue;
         if (resolved !== "null" && resolved !== type) {
+          if (exactNumericMix(expression, resolved, type)) {
+            resolved = "string";
+            continue;
+          }
           throw new TypeError(`${expression.name} arguments must produce one value type`);
         }
         resolved = type;
@@ -2893,6 +3000,10 @@ export function inferBlockSchema(
         const type = infer(argument);
         if (type === "null") continue;
         if (resolved !== "null" && resolved !== type) {
+          if (exactNumericMix(expression, resolved, type)) {
+            resolved = "string";
+            continue;
+          }
           throw new TypeError("COALESCE arguments must produce one value type");
         }
         resolved = type;
@@ -5902,7 +6013,15 @@ export function externalizeQueryResult(result: QueryResult): QueryResult {
     for (let position = 0; position < result.columns.length; position += 1) {
       const name = result.columns[position] ?? "";
       const value = row[name];
-      if (value !== undefined && !isSqlDomainValue(value)) continue;
+      if (
+        value !== undefined &&
+        !isSqlDomainValue(value) &&
+        // A plain number in an exact NUMERIC column is a fallback such as COALESCE(amount, 0);
+        // it renders as NUMERIC text so the column's boundary stays one representation.
+        !(typeof value === "number" && result.columnDomains[position]?.kind === "numeric")
+      ) {
+        continue;
+      }
       const external = asQueryValue(
         externalSqlDomainColumnValue(value, result.columnDomains[position]),
       );

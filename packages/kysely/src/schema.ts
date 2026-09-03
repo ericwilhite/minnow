@@ -229,13 +229,15 @@ type MinnowFixedScalarFunctionSpelling =
 
 type MinnowArithmeticScalarFunction = "ROUND" | "ABS" | "FLOOR" | "CEIL" | "MOD" | "POWER" | "SQRT";
 
+/** The arithmetic functions PostgreSQL also defines numeric-in, numeric-out; the engine keeps them exact. */
+type MinnowExactNumericScalarFunction = "ROUND" | "ABS" | "FLOOR" | "CEIL" | "MOD";
+
 /**
  * Whether one argument reference carries a Float64 or integer value. Exact NUMERIC columns cross
- * the SQL boundary as lossless strings and the engine refuses them in arithmetic scalar
- * functions, so typing that call `number` would promise a result the engine never produces. The
- * operand brand decides for schema-derived columns — the select type turns `number` under
- * result decoding, but the engine still sees the string boundary — and the extracted value type
- * decides for plain columns and expression arguments.
+ * the SQL boundary as lossless strings, so typing a call over one `number` would promise a
+ * result the engine never produces. The operand brand decides for schema-derived columns — the
+ * select type turns `number` under result decoding, but the engine still sees the string
+ * boundary — and the extracted value type decides for plain columns and expression arguments.
  */
 type MinnowArithmeticReady<DB, TB extends keyof DB, RE> =
   RE extends StringReference<DB, TB>
@@ -250,6 +252,29 @@ type MinnowArithmeticReady<DB, TB extends keyof DB, RE> =
       ? true
       : false;
 
+/**
+ * Whether one argument reference is a schema-derived exact NUMERIC column: its operand brand is
+ * the only one that accepts both the lossless string and a number.
+ */
+type MinnowExactNumericReference<DB, TB extends keyof DB, RE> =
+  RE extends StringReference<DB, TB>
+    ? [MinnowOperandType<DB, TB, RE>] extends [never]
+      ? false
+      : string extends Exclude<MinnowOperandType<DB, TB, RE>, null>
+        ? number extends Exclude<MinnowOperandType<DB, TB, RE>, null>
+          ? true
+          : false
+        : false
+    : false;
+
+/** An exact NUMERIC result at the configured boundary: lossless string, or number under decoding. */
+type MinnowExactNumericOutput<DB> =
+  DatabaseResultDecoding<DB> extends {
+    readonly numeric: "number";
+  }
+    ? number
+    : string;
+
 type MinnowFixedScalarBaseOutput<
   DB,
   TB extends keyof DB,
@@ -258,7 +283,11 @@ type MinnowFixedScalarBaseOutput<
 > =
   Uppercase<TName> extends MinnowArithmeticScalarFunction
     ? false extends MinnowArithmeticReady<DB, TB, RE>
-      ? KyselyTypeError<"This arithmetic function needs float or integer arguments; an exact NUMERIC column crosses the SQL boundary as a string. CAST the column to double precision first, or aggregate it with fn.sum/fn.avg.">
+      ? Uppercase<TName> extends MinnowExactNumericScalarFunction
+        ? true extends MinnowExactNumericReference<DB, TB, RE>
+          ? MinnowExactNumericOutput<DB>
+          : KyselyTypeError<"This arithmetic function needs a float, integer, or exact NUMERIC column argument.">
+        : KyselyTypeError<"POWER and SQRT need float or integer arguments; the engine computes them in Float64, so an exact NUMERIC column crossing the SQL boundary as a string is refused. CAST the column to double precision first, or aggregate it with fn.sum/fn.avg.">
       : number
     : Uppercase<TName> extends
           | "LENGTH"

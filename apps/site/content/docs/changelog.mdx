@@ -10,7 +10,7 @@ compatibility policy and release process.
 
 ## 0.7.3 — September 2, 2026
 
-Published packages: `@minnowdb/core@0.7.3`.
+Published packages: `@minnowdb/core@0.7.3` and `@minnowdb/kysely@0.4.8`.
 
 Stored formats are unchanged and no migration is needed.
 
@@ -51,6 +51,32 @@ customers c WHERE c.id = ?` grouped every order by customer on each call, about 
   read other columns, later joins, subqueries, windows, aggregates, or statement-scoped calls stay
   outside, as they do for the general correlated-scalar rewrite. The performance gate gains a
   `correlated-count-lookup` workload over an indexed child table.
+- `ROUND` over an exact `NUMERIC` value returned the engine's internal tag as the row value:
+  `SELECT round(avg(total)::numeric, 2)` gave `" minnow-domain:numeric:75.91"` where PostgreSQL
+  gives `75.91`, for a rounded column, `SUM`, `AVG`, `COALESCE`, and `GROUP BY` key alike, and a
+  derived table or window ordering over the same expression failed with "Invalid number vector
+  value". The rounded result carried no `NUMERIC` domain, so the boundary never stripped the
+  tag. `ROUND` and `TRUNC` now infer a `NUMERIC` result over a `NUMERIC` argument, a literal
+  digit count is that result's display scale (`ROUND(m, 3)` over a `NUMERIC(10, 2)` renders
+  `1.250`, as PostgreSQL does), and a negative digit count rounds left of the decimal point.
+- `ABS`, `FLOOR`, `CEIL`, `MOD`, and `SIGN` over an exact `NUMERIC` value threw "Arithmetic and
+  numeric aggregates require numbers", and `TRUNC` silently returned a rounded double. All are
+  now exact, numeric-in, numeric-out, as in PostgreSQL.
+- Exact `+`, `-`, `*`, `%`, and negation carry PostgreSQL's display scale: `m + 1` over a
+  `NUMERIC(10, 2)` renders `8.00`, not `8`, and `-m` renders `-7.00`. Division still selects its
+  own scale from the values.
+- A plain-number fallback beside `NUMERIC` values — `COALESCE(m, 0)`, a `CASE` branch,
+  `GREATEST(m, 2)` — was a type clash inside a derived table and a bare `0` at the top level. It
+  now renders as PostgreSQL's implicit cast, `0` beside `7.00`, and builds the derived table.
+- `UNION` members of exact `NUMERIC` type with different precision or scale no longer fail with
+  "UNION member column types must match"; the combined column is unconstrained `NUMERIC`.
+
+### Changed
+
+- `@minnowdb/kysely` types `fn("round" | "abs" | "floor" | "ceil" | "mod", [numericColumn])`
+  at the column's boundary — `string`, or `number` under `resultDecoding: { numeric: "number" }`
+  — instead of refusing it, because the engine now keeps those functions exact. `power` and
+  `sqrt` over an exact `NUMERIC` column remain a type error.
 
 ## 0.7.2 — September 2, 2026
 

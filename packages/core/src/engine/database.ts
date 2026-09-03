@@ -274,6 +274,7 @@ import {
 import { encodeSqlEqualityValue, parseSqlTimestampText } from "./sql-semantics.js";
 import {
   exactNumericAsNumber,
+  exactNumericValue,
   externalSqlDomainValue,
   externalSqlTextValue,
   isDateDomainValue,
@@ -5025,11 +5026,25 @@ export class MinnowDatabase {
             }
             memberSchema.forEach((column, index) => {
               const expected = schema?.[index];
+              if (expected === undefined) return;
               if (
-                expected !== undefined &&
-                (column.type !== expected.type ||
-                  JSON.stringify(column.sqlDomain ?? null) !==
-                    JSON.stringify(expected.sqlDomain ?? null))
+                column.type === expected.type &&
+                column.sqlDomain?.kind === "numeric" &&
+                expected.sqlDomain?.kind === "numeric"
+              ) {
+                // Two exact NUMERIC members union regardless of declared precision or scale,
+                // as in PostgreSQL; a mismatch leaves the combined column unconstrained.
+                if (JSON.stringify(column.sqlDomain) !== JSON.stringify(expected.sqlDomain)) {
+                  schema = schema?.map((entry, position) =>
+                    position === index ? { ...entry, sqlDomain: { kind: "numeric" } } : entry,
+                  );
+                }
+                return;
+              }
+              if (
+                column.type !== expected.type ||
+                JSON.stringify(column.sqlDomain ?? null) !==
+                  JSON.stringify(expected.sqlDomain ?? null)
               ) {
                 throw new TypeError(`UNION member column types must match: ${expected.name}`);
               }
@@ -22335,9 +22350,21 @@ function derivedColumnarTable(
   schema: readonly SqlColumnSchema[],
 ): ColumnarTable {
   const columns = new Map(
-    schema.map(({ name: columnName, type }) => [
+    schema.map(({ name: columnName, type, sqlDomain }) => [
       columnName,
-      { type, values: result.rows.map((row) => row[columnName] ?? null) },
+      {
+        type,
+        values:
+          sqlDomain?.kind === "numeric"
+            ? // COALESCE(amount, 0) or a CASE branch can hand an exact NUMERIC column a plain
+              // number; PostgreSQL casts it to the column's type, and the string vector
+              // needs the tagged form.
+              result.rows.map((row) => {
+                const value = row[columnName] ?? null;
+                return typeof value === "number" ? exactNumericValue(value) : value;
+              })
+            : result.rows.map((row) => row[columnName] ?? null),
+      },
     ]),
   );
   return createColumnarTable(name, columns);
