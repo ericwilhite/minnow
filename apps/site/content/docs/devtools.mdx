@@ -239,8 +239,8 @@ line. This costs nothing per keystroke: `compileStatement` is part of the librar
 page, so nothing is sent to the worker and no query is executed to find out that the SQL is wrong.
 
 Where the engine recognizes an unsupported SQL feature, the message names it and what stands in
-for it. For example, `SET TRANSACTION ISOLATION LEVEL` explains that Minnow has one fixed isolation
-level. That comes from the shipped
+for it. For example, `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` explains that the engine has
+one isolation level. That comes from the shipped
 [feature matrix](/docs/sql/feature-matrix), so it stays true as the engine changes. A message that several
 features share explains nothing rather than guessing between them.
 

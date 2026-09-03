@@ -1333,6 +1333,14 @@ function distinctOnCases(): Case[] {
       `SELECT DISTINCT ON (region) region, COUNT(*) AS n FROM data GROUP BY region, active ORDER BY region NULLS LAST, n DESC, active`,
     ),
     pg(`SELECT DISTINCT ON (region) region FROM data ORDER BY region NULLS LAST`),
+    // An output alias that is also a column name (`amount AS label` beside data.label) orders
+    // the window by the labelled expression, as ORDER BY reads it, not by the column.
+    pg(
+      `SELECT DISTINCT ON (region) region, amount AS label, id FROM data ORDER BY region NULLS LAST, label DESC, id`,
+    ),
+    pg(
+      `SELECT DISTINCT ON (region) region, amount AS label FROM data ORDER BY region NULLS LAST, label, id`,
+    ),
   ];
 }
 
@@ -1528,6 +1536,19 @@ function divisionCases(): Case[] {
     },
     ordered(`SELECT id FROM data WHERE id / 2 = 1 ORDER BY id`),
     ordered(`SELECT id FROM data WHERE id / 3 > 1 AND id / 2 * 2 = id ORDER BY id`),
+    // An untyped string constant beside an integer is an integer: `'7' / 2` is 3 on every
+    // engine, and so is `id / '2'`; beside a decimal constant it stays exact division.
+    ordered(
+      `SELECT id, '7' / 2 AS q, 2 / '7' AS inverse, id / '2' AS half, (id + 1) / '2' AS shifted, '7' / 2.0 AS exact FROM data ORDER BY id`,
+    ),
+    ordered(`SELECT id FROM data WHERE id / '2' = 1 AND '7' / 2 = 3 ORDER BY id`),
+    // ROUND with a negative count rounds left of the point on a plain number as on a NUMERIC
+    // (PostgreSQL types these constants NUMERIC; SQLite reads a negative count as zero).
+    {
+      sql: `SELECT id, ROUND(id * 1234.5, -2) AS hundreds, ROUND(12345.678, -2) AS fixed, ROUND(1250, -2) AS up, ROUND(-1250, -2) AS down, ROUND(id * 1234.5, -1) AS tens FROM data ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
     ordered(`SELECT id, id / 2 AS bucket FROM data ORDER BY id / 2 DESC, id`),
     ordered(
       `SELECT id / 2 AS bucket, COUNT(*) AS n, SUM(id) / COUNT(*) AS mean, SUM(id) / 2 AS half, MIN(id) / 2 AS low, MAX(id) / 2 AS high FROM data GROUP BY id / 2 ORDER BY bucket`,

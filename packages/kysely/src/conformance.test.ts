@@ -1046,9 +1046,14 @@ describe("compile-time refusals for engine-unsupported forms", () => {
   });
 
   it("refuses unsupported table and column DDL with the working alternative", () => {
+    // CREATE TEMPORARY TABLE compiles: the engine reads it as an ordinary table. ON COMMIT
+    // would need the table to drop itself, which nothing here does.
     expect(() =>
       db.schema.createTable("t").temporary().addColumn("id", "integer").compile(),
-    ).toThrow("Minnow does not support temporary tables");
+    ).not.toThrow();
+    expect(() =>
+      db.schema.createTable("t").temporary().onCommit("drop").addColumn("id", "integer").compile(),
+    ).toThrow("Minnow does not support ON COMMIT on temporary tables");
     expect(() =>
       db.schema
         .createTable("t")
@@ -1173,7 +1178,7 @@ describe("compile-time refusals for engine-unsupported forms", () => {
       "Minnow does not support MySQL's inline INDEX in CREATE TABLE",
     );
     expect(() => db.schema.dropTable("users").temporary().compile()).toThrow(
-      "DROP TEMPORARY TABLE has nothing to drop",
+      "Minnow does not support MySQL's DROP TEMPORARY TABLE",
     );
     expect(() => db.schema.dropView("v").materialized().compile()).toThrow(
       "DROP MATERIALIZED VIEW has nothing to drop",

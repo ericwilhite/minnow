@@ -27,8 +27,9 @@ PostgreSQL grammar. These supported features have narrower limits:
 - a correlated scalar's inner block supports aggregate expressions or an ordinary single row,
   with any number of qualified outer-column references plus per-probe ordering and limits, but
   not its own `GROUP BY` or `HAVING`.
-- `LATERAL` supports equality and range-correlated projections and joins, without correlated grouping,
-  ordering, or `LIMIT`.
+- `LATERAL` supports equality and range-correlated projections and joins. An equality-correlated
+  lateral query may also group, aggregate, and take a per-row `ORDER BY … LIMIT`; a
+  range-correlated one cannot group or limit.
 - `JSON_TABLE` supports constant documents with `$` and `$[*]` row paths.
 - `CREATE SEQUENCE` supports `NEXTVAL` and session-local `CURRVAL`, without sequence options.
 - enums support declaration, validation, and declaration-order comparison, without `ALTER TYPE`.
@@ -38,7 +39,8 @@ PostgreSQL grammar. These supported features have narrower limits:
 Minnow deliberately excludes three PostgreSQL server or storage-model features:
 
 - `UPDATE` and `DELETE` on tables without row identity;
-- configurable transaction isolation levels;
+- the `SERIALIZABLE` isolation level — every transaction reads one snapshot, which satisfies the
+  weaker levels, so `READ COMMITTED` and `REPEATABLE READ` are accepted and ignored;
 - roles and `GRANT` privileges.
 
 The excluded-forms list below also records the narrower forms the engine rejects — `RIGHT JOIN`

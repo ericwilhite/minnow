@@ -41,7 +41,8 @@ INSERT INTO shipments VALUES ('A-1', 1, CURRENT_TIMESTAMP)
 The value count must then equal the table's full column count. Prefer an explicit list in
 application code so a later schema change cannot silently change the positional meaning.
 Statement-time and volatile values are evaluated when the statement runs, not when its cached
-plan is compiled: `CURRENT_DATE`, `CURRENT_TIMESTAMP` (also spelled `NOW()`), and `LOCALTIME` are
+plan is compiled: `CURRENT_DATE`, `CURRENT_TIMESTAMP` (also spelled `NOW()`,
+`transaction_timestamp()`, `statement_timestamp()`, or `clock_timestamp()`), and `LOCALTIME` are
 stable across all rows of one statement, while `random()`, `gen_random_uuid()`, and
 `nextval(...)` run for each written expression.
 

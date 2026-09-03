@@ -1455,7 +1455,7 @@ describe("MinnowDialect", () => {
 
 describe("compile-time refusals for unsupported PostgreSQL forms", () => {
   // Kysely can build forms Minnow's engine refuses with a bare parse error ("Expected eof,
-  // found from"). The compiler knows which builder produced each node, so it refuses these
+  // found on"). The compiler knows which builder produced each node, so it refuses these
   // before execution with the feature named and an alternative offered.
   interface ProbeDatabase {
     person: { id: number; name: string; doc: { a: number } | null };
@@ -1465,17 +1465,16 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
   });
 
   it("names each unsupported query form instead of the engine's parse error", () => {
-    expect(() => db.selectFrom("person").distinctOn("name").selectAll().compile()).toThrow(
-      "Minnow does not support DISTINCT ON",
-    );
-    expect(() => db.selectFrom("person").selectAll().forUpdate().compile()).toThrow(
-      "row-locking clauses",
-    );
     expect(() =>
-      db.updateTable("person").from("person as source").set({ name: "renamed" }).compile(),
-    ).toThrow("Minnow does not support UPDATE ... FROM");
-    expect(() => db.deleteFrom("person").using("person as source").compile()).toThrow(
-      "Minnow does not support DELETE ... USING",
+      db.schema
+        .createTable("scratch")
+        .temporary()
+        .onCommit("drop")
+        .addColumn("id", "integer")
+        .compile(),
+    ).toThrow("Minnow does not support ON COMMIT on temporary tables");
+    expect(() => db.schema.dropTable("scratch").temporary().compile()).toThrow(
+      "Minnow does not support MySQL's DROP TEMPORARY TABLE",
     );
     expect(() =>
       db
@@ -1541,6 +1540,157 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
         .where("id", "in", [])
         .compile(),
     ).not.toThrow();
+  });
+});
+
+describe("PostgreSQL forms the engine runs pass through the compiler", () => {
+  // Earlier adapter releases refused these at compile time because the engine's parser did not
+  // read them. The engine now lowers DISTINCT ON to a ROW_NUMBER window, joins UPDATE ... FROM
+  // and DELETE ... USING sources to the target, ignores row-locking clauses, and reads
+  // CREATE TEMPORARY TABLE as an ordinary table, so the adapter emits them unchanged. Each
+  // result is checked against the same SQL run on the engine directly.
+  interface PassThroughDatabase {
+    person: { id: number; name: string; score: number; team: string };
+    bonus: { person_id: number; amount: number };
+    scratch: { id: number; label: string | null };
+  }
+  let database: MinnowDatabase;
+  let db: Kysely<PassThroughDatabase>;
+
+  beforeEach(async () => {
+    database = new MinnowDatabase(new MemoryBlockStore());
+    db = new Kysely<PassThroughDatabase>({ dialect: new MinnowDialect({ driver: database }) });
+    await database.execute(
+      "CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
+        "score DOUBLE PRECISION NOT NULL, team TEXT NOT NULL)",
+    );
+    await database.execute(
+      "CREATE TABLE bonus (person_id INTEGER PRIMARY KEY, amount DOUBLE PRECISION NOT NULL)",
+    );
+    await database.execute(
+      "INSERT INTO person VALUES (1, 'Ada', 8, 'a'), (2, 'Grace', 9, 'a'), " +
+        "(3, 'Katherine', 10, 'b'), (4, 'Linus', 7, 'b')",
+    );
+    await database.execute("INSERT INTO bonus VALUES (2, 5), (3, 7)");
+  });
+
+  it("keeps the first row per DISTINCT ON group in ORDER BY order", async () => {
+    const query = db
+      .selectFrom("person")
+      .distinctOn("team")
+      .select(["team", "name"])
+      .orderBy("team")
+      .orderBy("score", "desc");
+    const compiled = query.compile();
+    expect(compiled.sql).toBe(
+      'select distinct on ("team") "team", "name" from "person" order by "team", "score" desc',
+    );
+    const rows = await query.execute();
+    expect(rows).toEqual([
+      { team: "a", name: "Grace" },
+      { team: "b", name: "Katherine" },
+    ]);
+    expect((await database.query(compiled.sql)).rows).toEqual(rows);
+    // LIMIT applies to the kept rows, not the rows the window ranked.
+    expect(await query.limit(1).execute()).toEqual([{ team: "a", name: "Grace" }]);
+  });
+
+  it("joins UPDATE ... FROM and DELETE ... USING sources to the target table", async () => {
+    const update = db
+      .updateTable("person")
+      .from("bonus")
+      .set((eb) => ({ score: eb("person.score", "+", eb.ref("bonus.amount")) }))
+      .whereRef("bonus.person_id", "=", "person.id")
+      .returning(["id", "score"]);
+    expect(update.compile().sql).toBe(
+      'update "person" set "score" = "person"."score" + "bonus"."amount" from "bonus" ' +
+        'where "bonus"."person_id" = "person"."id" returning "id", "score"',
+    );
+    expect(await update.execute()).toEqual([
+      { id: 2, score: 14 },
+      { id: 3, score: 17 },
+    ]);
+    const counted = await db
+      .updateTable("person")
+      .from("bonus")
+      .set({ team: "bonus" })
+      .whereRef("bonus.person_id", "=", "person.id")
+      .executeTakeFirst();
+    expect(counted.numUpdatedRows).toBe(2n);
+
+    const remove = db
+      .deleteFrom("person")
+      .using("bonus")
+      .whereRef("bonus.person_id", "=", "person.id")
+      .where("bonus.amount", ">", 6)
+      .returning("id");
+    expect(remove.compile().sql).toBe(
+      'delete from "person" using "bonus" where "bonus"."person_id" = "person"."id" ' +
+        'and "bonus"."amount" > $1 returning "id"',
+    );
+    expect(await remove.execute()).toEqual([{ id: 3 }]);
+    const deleted = await db
+      .deleteFrom("person")
+      .using("bonus")
+      .whereRef("bonus.person_id", "=", "person.id")
+      .executeTakeFirst();
+    expect(deleted.numDeletedRows).toBe(1n);
+    expect((await database.query("SELECT id, score, team FROM person ORDER BY id")).rows).toEqual([
+      { id: 1, score: 8, team: "a" },
+      { id: 4, score: 7, team: "b" },
+    ]);
+  });
+
+  it("accepts and ignores row-locking clauses", async () => {
+    const expected = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+    const locked = [
+      db.selectFrom("person").select("id").orderBy("id").forUpdate(),
+      db.selectFrom("person").select("id").orderBy("id").forUpdate("person").noWait(),
+      db.selectFrom("person").select("id").orderBy("id").forNoKeyUpdate(),
+      db.selectFrom("person").select("id").orderBy("id").forShare().skipLocked(),
+      db.selectFrom("person").select("id").orderBy("id").forKeyShare(),
+    ];
+    for (const query of locked) {
+      expect(await query.execute()).toEqual(expected);
+    }
+    expect(locked[1]?.compile().sql).toBe(
+      'select "id" from "person" order by "id" for update of "person" nowait',
+    );
+    expect(locked[3]?.compile().sql).toBe(
+      'select "id" from "person" order by "id" for share skip locked',
+    );
+    // A read inside a transaction takes the same snapshot, lock clause or not.
+    await db.transaction().execute(async (trx) => {
+      expect(
+        await trx.selectFrom("person").select("id").orderBy("id").forUpdate().execute(),
+      ).toEqual(expected);
+      await trx.updateTable("person").set({ score: 0 }).where("id", "=", 1).execute();
+    });
+    expect(
+      await db.selectFrom("person").select("score").where("id", "=", 1).executeTakeFirst(),
+    ).toEqual({ score: 0 });
+  });
+
+  it("creates a temporary table as an ordinary table", async () => {
+    const create = db.schema
+      .createTable("scratch")
+      .temporary()
+      .addColumn("id", "integer", (column) => column.primaryKey())
+      .addColumn("label", "text");
+    expect(create.compile().sql).toBe(
+      'create temporary table "scratch" ("id" integer primary key, "label" text)',
+    );
+    await create.execute();
+    await db.insertInto("scratch").values({ id: 1, label: "draft" }).execute();
+    expect(await db.selectFrom("scratch").selectAll().execute()).toEqual([
+      { id: 1, label: "draft" },
+    ]);
+    expect((await database.query("SELECT id, label FROM scratch")).rows).toEqual([
+      { id: 1, label: "draft" },
+    ]);
+    // It is dropped like any other table.
+    await db.schema.dropTable("scratch").execute();
+    await expect(db.selectFrom("scratch").selectAll().execute()).rejects.toThrow();
   });
 });
 

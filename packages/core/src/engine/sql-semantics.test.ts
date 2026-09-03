@@ -92,7 +92,13 @@ describe("shared SQL value semantics", () => {
     expect(roundSqlNumber(Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
     expect(roundSqlNumber(-1.25, 1)).toBe(-1.3);
     expect(roundSqlNumber(1.23, 1_000)).toBe(1.23);
-    expect(roundSqlNumber(123.45, -1)).toBe(123);
+    // A negative count rounds left of the point, as PostgreSQL's ROUND(numeric, int) does.
+    expect(roundSqlNumber(123.45, -1)).toBe(120);
+    expect(roundSqlNumber(125, -1)).toBe(130);
+    expect(roundSqlNumber(-1250, -2)).toBe(-1300);
+    expect(roundSqlNumber(12345.678, -2)).toBe(12300);
+    expect(roundSqlNumber(4, -1)).toBe(0);
+    expect(roundSqlNumber(1e300, -400)).toBe(1e300);
     expect(roundSqlNumber(1.005, 2)).toBe(1);
     expect(roundSqlNumber(2.675, 2)).toBe(2.67);
   });

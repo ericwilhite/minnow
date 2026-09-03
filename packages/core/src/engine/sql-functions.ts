@@ -1060,8 +1060,13 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
         if (typeof value !== "number" || !Number.isSafeInteger(value)) {
           throw new TypeError("TO_HEX requires an integer");
         }
-        // PostgreSQL renders a negative integer as its two's-complement bigint hex.
-        return (value < 0 ? BigInt.asUintN(64, BigInt(value)) : BigInt(value)).toString(16);
+        // PostgreSQL renders a negative integer as its two's-complement hex at the integer's
+        // width: an int4 value (`to_hex(-1)` is ffffffff) or a bigint beyond int4.
+        if (value < 0) {
+          const width = value >= -2_147_483_648 ? 32 : 64;
+          return BigInt.asUintN(width, BigInt(value)).toString(16);
+        }
+        return BigInt(value).toString(16);
       },
     },
   ],

@@ -59,12 +59,16 @@ side renders as text: `'order-' || order_id`.
 The scalar function surface follows PostgreSQL: `CONCAT`, `CONCAT_WS`, `LEFT`, `RIGHT`,
 `REVERSE`, `REPEAT`, `INITCAP`, `SPLIT_PART`, `STRPOS`, `STARTS_WITH`, `TRANSLATE`, `ASCII`,
 `CHR`, `BTRIM`, `MD5`, `FORMAT`, and `REGEXP_REPLACE` beside the standard `UPPER`, `LOWER`,
-`TRIM`, `SUBSTRING`, `POSITION`, `OVERLAY`, and padding functions; the regex operators `~`,
-`~*`, `!~`, and `!~*`; `^` for exponentiation with `EXP`, `LN`, `LOG`, `LOG10`, `SIGN`, `TRUNC`,
-`PI`, `CBRT`, `DIV`, `WIDTH_BUCKET`, and the trigonometric family beside `ROUND`, `ABS`, `MOD`,
-`POWER`, and `SQRT` (with `/` dividing two integers as integers, truncating toward zero as
-PostgreSQL does); and `TO_CHAR`, `TO_DATE`, `TO_TIMESTAMP`, `DATE_PART`, `EXTRACT`,
-`DATE_TRUNC`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`, `NOW()`, and the `CURRENT_*` clock beside
+`TRIM`, `SUBSTRING` (including the POSIX-regex `SUBSTRING(text FROM 'pattern')` (or `SUBSTRING(text, 'pattern')`)), `POSITION`,
+`OVERLAY`, and padding functions, plus `TO_HEX`, `QUOTE_LITERAL`, and `QUOTE_IDENT`; the regex
+operators `~`, `~*`, `!~`, and `!~*`; `^` for exponentiation with `EXP`, `LN`, `LOG`, `LOG10`,
+`SIGN`, `TRUNC`, `PI`, `CBRT`, `DIV`, `GCD`, `LCM`, `WIDTH_BUCKET`, and the trigonometric family
+beside `ROUND`, `ABS`, `MOD`, `POWER` (also spelled `POW`), and `SQRT` (with `/` dividing two
+integers as integers, truncating toward zero as PostgreSQL does — see
+[integer division](/docs/sql/ddl#column-types)); `NUM_NULLS` and `NUM_NONNULLS`; and `TO_CHAR`,
+`TO_DATE`, `TO_TIMESTAMP`, `DATE()` (the `DATE` cast as a function), `DATE_PART`, `EXTRACT`,
+`DATE_TRUNC`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`, `NOW()` with its `transaction_timestamp()`,
+`statement_timestamp()`, and `clock_timestamp()` aliases, and the `CURRENT_*` clock beside
 interval arithmetic. The [compatibility page](/docs/sql/feature-matrix) lists each with its
 example and any difference from PostgreSQL.
 

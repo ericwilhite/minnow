@@ -96,7 +96,7 @@
     {
       "id": "expression.modulo",
       "classification": "different",
-      "reason": "Minnow permits % on its number type; PostgreSQL has no % operator for double precision."
+      "reason": "Minnow permits % on double precision values; PostgreSQL has no % operator for double precision."
     },
     {
       "id": "expression.date-trunc",
@@ -106,7 +106,7 @@
     {
       "id": "function.numeric-core",
       "classification": "different",
-      "reason": "Minnow's one number type accepts combinations that PostgreSQL's distinct integer, numeric, and double-precision overloads do not."
+      "reason": "Minnow's numeric functions accept integer, exact, and double-precision arguments interchangeably, where PostgreSQL's distinct integer, numeric, and double-precision overloads do not."
     },
     {
       "id": "function.string-extended",
@@ -252,7 +252,7 @@
     {
       "id": "transaction.isolation-level",
       "classification": "inapplicable",
-      "reason": "Minnow exposes one snapshot transaction model, so there is no session isolation level to configure."
+      "reason": "Every transaction reads one snapshot and commits atomically, which satisfies READ UNCOMMITTED, READ COMMITTED, and REPEATABLE READ, so those levels are accepted and ignored. SERIALIZABLE promises more than one snapshot can, and is refused rather than silently downgraded."
     },
     {
       "id": "privileges.grant",

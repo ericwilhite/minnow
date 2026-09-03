@@ -72,7 +72,7 @@ machines: https://minnowdb.com/llms.txt
   unordered scans stream directly; blocking sorts, groups, joins, and derived sources page the
   ordinary completed result. The worker transfers one columnar page per pull.
 - `db.execute(sql, params, options?)` runs any statement. Check `result.kind` to see what happened
-  (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
+  (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `set`, `create-table`, `add-column`,
   `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`,
   `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading `rowCount`,
   `version`, or `returnedRows`.
@@ -144,13 +144,17 @@ machines: https://minnowdb.com/llms.txt
   `replaceInto()`, `orIgnore()`, `.top()`, `identity()`, and update/delete `LIMIT`, plus SQL
   `EXPLAIN`, data-modifying CTEs, the JSON path operators `->$`/`->>$`, and `ALTER TABLE` beyond
   add/drop column — are refused when the query compiles, with the alternative named in the
-  error. Follow that alternative instead of retrying the same form.
+  error. Follow that alternative instead of retrying the same form. `distinctOn()`,
+  `updateTable().from()`, `deleteFrom().using()`, the row-locking modifiers (`forUpdate()`,
+  `forShare()`, `skipLocked()`; accepted and ignored), and `createTable().temporary()` pass
+  through to the engine; `onCommit()` and `dropTable().temporary()` are refused.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
   With Kysely, use `search.match(eb, columns, query)` and `search.rank(eb, columns, query)` so the
   non-empty column list is checked against the query's visible tables and aliases.
 - With Kysely, import `jsonBuildObject`, `jsonArrayFrom`, and `jsonObjectFrom` from
-  `@minnowdb/kysely/helpers` instead of `kysely/helpers/postgres`. Enable
+  `@minnowdb/kysely/helpers`; the `kysely/helpers/postgres` versions also run, but Minnow's are
+  the typed default. Enable
   `resultDecoding: { json: "parse" }` and use explicit named selections in row-to-object
   subqueries.
 - Declare a JSON column's document shape in the schema — `column.jsonb<Shape>()` — so the derived
@@ -182,18 +186,24 @@ machines: https://minnowdb.com/llms.txt
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
   unquoted identifiers, `SET`/`RESET`/`SHOW` session settings (accepted and ignored, except a
   non-UTC time zone), `FOR UPDATE` (ignored), and `E'…'`/`$$…$$` strings.
-- Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, DDL inside
-  `BEGIN … COMMIT`, correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents,
-  arrays beyond a JSON-text literal (no subscripts, `ANY`/`ALL` over array values, `unnest`,
-  `array_agg`, `generate_series`), `||` on array or JSONB operands and the `#>`/`@>`/`?`
-  operators, `jsonb_set`/`jsonb_typeof`/`json_object_agg`, interval-valued arithmetic such as
-  interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `ALTER TABLE` beyond
-  ADD/DROP COLUMN, partial and expression indexes, `ON CONFLICT` on a non-key UNIQUE column,
-  schemas and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set aggregates,
-  bitwise operators, `bytea`, enum evolution, sequence options, `RIGHT JOIN` or `FULL JOIN`
-  beside another join or combined with `SELECT *`, `FULL JOIN` without a single equality `ON` or
-  with grouping, `DISTINCT`, or window functions, numeric `RANGE` frame offsets (use `ROWS`),
-  `DISTINCT` window aggregates, window functions outside the select list, and
+- Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
+  inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
+  grouping/order/limit, correlated JSON_TABLE documents, arrays beyond a JSON-text literal (no
+  subscripts, `ANY`/`ALL` over array values, `ARRAY(SELECT …)`, `unnest`, `array_agg`,
+  `generate_series`), `||` on array or JSONB operands and the `#>`/`@>`/`?` operators,
+  `jsonb_set`/`jsonb_typeof`/`json_object_agg`, `regexp_match` and the other array-returning
+  regex functions, `ROW(…)` as a value, bit-string literals, interval-valued arithmetic such as
+  interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `version()` and other
+  server introspection, `TABLESAMPLE`, `SET column = DEFAULT` and `SET (a, b) = (…)` in
+  `UPDATE`, data-modifying CTEs, `ALTER TABLE` beyond ADD/DROP COLUMN, `CREATE TABLE … (LIKE …)`,
+  `SERIAL` on a non-key column, `ON UPDATE` and `DEFERRABLE` foreign-key options, partial and
+  expression indexes, `ON CONFLICT` on a non-key UNIQUE column, `DROP TABLE a, b`, view column
+  lists and materialized views, `setval`, domains, functions, `EXCLUDE` constraints, schemas,
+  schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set
+  aggregates, bitwise operators, `bytea`, enum evolution, sequence options, `RIGHT JOIN` or
+  `FULL JOIN` beside another join or combined with `SELECT *`, `FULL JOIN` without a single
+  equality `ON` or with grouping, `DISTINCT`, or window functions, numeric `RANGE` frame offsets
+  (use `ROWS`), `DISTINCT` window aggregates, window functions outside the select list, and
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.

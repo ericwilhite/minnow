@@ -186,10 +186,16 @@ export function encodeSqlEqualityValue(value: unknown): readonly unknown[] {
 
 /**
  * SQLite-compatible ROUND behavior for Minnow's finite number type: precision truncates to an
- * integer and clamps to 0..30, with ties rounded away from zero.
+ * integer and clamps to -30..30, with ties rounded away from zero. A negative precision rounds
+ * left of the decimal point as PostgreSQL does: ROUND(1250, -2) is 1300.
  */
 export function roundSqlNumber(value: number, precision = 0): number {
-  const digits = Math.min(30, Math.max(0, Math.trunc(precision)));
+  const digits = Math.min(30, Math.max(-30, Math.trunc(precision)));
+  if (digits < 0) {
+    if (!Number.isFinite(value)) return value;
+    const scale = 10 ** -digits;
+    return roundSqlNumber(value / scale) * scale;
+  }
   // Whole-number rounding is arithmetic: toFixed(0) picks the integer nearest the exact binary
   // value, ties toward larger magnitude. Below 2^52 the fractional part of a double is exact,
   // so floor and compare reproduce it without formatting a string per row.

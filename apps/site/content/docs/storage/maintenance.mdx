@@ -191,3 +191,11 @@ Leaving them undone costs storage and scan speed. It never changes an answer —
 not compacted or collected still reads correctly over more blocks and bytes — but new growth is
 eventually refused at the fixed segment, history, or maintenance-debt safety ceiling. Run or
 restore maintenance rather than treating those fuses as an operating target.
+
+One shape can still outrun automatic folds: a loop of single-row `UPDATE`s on a table of tens of
+thousands of rows that never awaits anything else between statements. Each fold of such a table
+reads every block it merges, and each read waits on decompression, so the loop can add a
+level-zero segment per statement faster than the fold retires them and be refused at the
+4,096-segment ceiling after a few thousand statements. Inserts and small tables stay flat, as
+does the same loop with any other await between statements; a bulk update through
+`updateBatch()` or `UPDATE … FROM` a VALUES source lands as one segment.

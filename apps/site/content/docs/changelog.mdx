@@ -10,7 +10,8 @@ compatibility policy and release process.
 
 ## 0.7.5 — September 3, 2026
 
-Published packages: `@minnowdb/core@0.7.5`.
+Published packages: `@minnowdb/core@0.7.5`, `@minnowdb/kysely@0.4.9`, and
+`@minnowdb/devtools@0.2.4`.
 
 Stored formats are unchanged and no migration is needed, but a query that divides two integers
 now returns a different value; see the migration note below.
@@ -59,11 +60,11 @@ zone`, `time with time zone`) are accepted in `CREATE TABLE` and `CAST`, as pg_d
   statement clock like `NOW()`, and `NUM_NONNULLS`, `NUM_NULLS`, `GCD`, and `LCM` are new.
 - `UPDATE … SET … FROM sources WHERE …` and `DELETE FROM … USING sources WHERE …` join extra
   tables, views, or derived tables to the target, as PostgreSQL does (Kysely's
-  `updateTable().from()`, Drizzle's `update().from()`). Assignments and predicates may read the
-  sources, `RETURNING` works, and a target row matched by several source rows is updated or
-  deleted once.
+  `updateTable().from()` and `deleteFrom().using()`, Drizzle's `update().from()`). Assignments
+  and predicates may read the sources, `RETURNING` works, and a target row matched by several
+  source rows is updated or deleted once.
 - `SELECT DISTINCT ON (expressions) … ORDER BY …` keeps the first row of each group in ORDER BY
-  order, as PostgreSQL does (Kysely's `distinctOn`, Prisma's `distinct`). It lowers to a
+  order, as PostgreSQL does (Kysely's `distinctOn()`, Prisma's `distinct`). It lowers to a
   `ROW_NUMBER()` window over the block, so the `ORDER BY` may name output aliases and columns the
   select list omits, and `LIMIT`/`OFFSET` apply to the kept rows.
 - PostgreSQL's JSON spellings: `json_agg` and `jsonb_agg` (JSON_ARRAYAGG), `json_build_object`,
@@ -81,6 +82,10 @@ SET Name = …`, `INSERT INTO Users (ID, Name) …`. Exact names are never folde
   `ORDER BY` — `SELECT u.id, u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON … GROUP BY
 u.id`. The "HAVING conditions must use aggregates, literals, or GROUP BY expressions" check now
   runs at execution, where the catalog is known, instead of at compile time.
+- `ROUND(x, -n)` on a plain number rounds left of the decimal point as PostgreSQL does
+  (`ROUND(1250, -2)` is 1300); previously the negative count was ignored. A string constant
+  beside an integer divides as an integer (`'7' / 2` is 3), and text that is not a number in
+  arithmetic raises the type error instead of recursing.
 - A datetime that is not a column compared against a string constant no longer fails with
   "Values must have comparable SQL types": `NOW() > '2020-01-01'`, `CURRENT_DATE >= '…'`,
   `HAVING MAX(joined) > '2026-03-01'`, `(SELECT MAX(joined) FROM t) > '…'`, and
@@ -89,6 +94,14 @@ u.id`. The "HAVING conditions must use aggregates, literals, or GROUP BY express
 
 ### Added
 
+- `@minnowdb/kysely@0.4.9` passes `distinctOn()`, `updateTable().from()`, `deleteFrom().using()`,
+  the row-locking modifiers (`forUpdate()`, `forNoKeyUpdate()`, `forShare()`, `forKeyShare()`,
+  `noWait()`, `skipLocked()`; the engine accepts and ignores them), and
+  `createTable().temporary()` through to the engine instead of refusing them when the query
+  compiles. `onCommit()` on a temporary table, `dropTable().temporary()`, and temporary views are
+  still refused, with the alternative named.
+- `@minnowdb/devtools@0.2.4` summarizes the new `SET`, `RESET`, and `SHOW` statements in its console
+  and statement classifier; it has no other change.
 - `ExecuteResult` gains `{ kind: "set", action: "set" | "reset", name }` for `SET` and `RESET`
   statements; `SHOW` returns a `rows` result. `CompiledStatement` gains the `set` and `show`
   kinds and, on `update` and `delete`, an optional `from` (`MutationSources`). Plan expression
@@ -120,7 +133,7 @@ Stored formats are unchanged and no migration is needed.
   collector queued behind it, and at 4,096 commits writes failed with `MaintenanceBacklogError`.
   `collectGarbage()` did not help: every write at the level-zero ceiling resumed the dead owner
   and failed with "Transaction is no longer active". A read-then-update loop hit the same wall
-  as `CompactionBacklogError`. Now:
+  as `CompactionBacklogError`. Now (with one remaining limit, below):
   - A finished fold publishes on the write path. The next statement — a plain write or a SQL
     statement's scope — lands the fold's rebase and commit before its own work, and an idle
     database lands it on the next event-loop turn; inside that turn the fold retries against
@@ -143,6 +156,13 @@ Stored formats are unchanged and no migration is needed.
   - Collection debt resets after any pass that reclaims something. A write at the debt ceiling
     still assists with one bounded pass, but is refused only when that pass reclaims nothing,
     not merely because a large backlog needs another.
+  - Remaining limit: a fold of a large table reads every block it merges, and each block read
+    waits on decompression, so a loop of single-row `UPDATE`s on a table of tens of thousands of
+    rows that never yields between statements can still add level-zero segments faster than the
+    fold retires them. Measured: 20,000 rows, one update per statement, refused at about the
+    4,250th statement with `CompactionBacklogError`. Inserts, small tables, and any loop that
+    awaits something else between statements stay flat. A follow-up will fold level-zero
+    segments among themselves before rewriting the base.
 
 ### Changed
 

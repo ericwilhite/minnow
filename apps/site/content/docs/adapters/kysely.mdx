@@ -170,9 +170,11 @@ two SQL spellings use `sql<T>` with an explicit result type, while references in
 
 ## Nested JSON projections
 
-Import Minnow's JSON helpers instead of the PostgreSQL-specific helpers. They keep Kysely's exact
-object, nullable-object, and object-array inference while emitting Minnow's SQL-standard
-`JSON_OBJECT` and `JSON_ARRAYAGG` forms:
+Import Minnow's JSON helpers. They keep Kysely's exact object, nullable-object, and object-array
+inference while emitting Minnow's SQL-standard `JSON_OBJECT` and `JSON_ARRAYAGG` forms. The
+engine also runs the SQL `kysely/helpers/postgres` emits — `json_agg`, `json_build_object`, and
+`to_json` over a derived-table alias — so those helpers work too, but Minnow's are the typed
+default:
 
 ```ts
 import { jsonArrayFrom, jsonBuildObject, jsonObjectFrom } from "@minnowdb/kysely/helpers";
@@ -422,7 +424,9 @@ applied.
 
 ## Supported Kysely operations
 
-- Reads, inserts, updates, deletes, and their `$n` parameters.
+- Reads, inserts, updates, deletes, and their `$n` parameters, including `distinctOn()`,
+  `updateTable().from()`, `deleteFrom().using()`, and the row-locking modifiers (`forUpdate()`,
+  `forShare()`, `noWait()`, `skipLocked()`, and friends), which the engine accepts and ignores.
 - Type-safe `MATCH` predicates and `BM25` ranking expressions.
 - Typed live queries, keyed changes, and ordered bounded windows.
 - `.stream(chunkSize)` over direct and worker-backed query cursors, and over the buffered
@@ -433,7 +437,8 @@ applied.
 - Controlled transactions: `db.startTransaction()` with `savepoint(name)`,
   `rollbackToSavepoint(name)`, and `releaseSavepoint(name)` mapped onto Minnow's `SAVEPOINT`,
   `ROLLBACK TO`, and `RELEASE`. Raw SQL savepoints inside a transaction work too.
-- Kysely schema statements that stay inside Minnow's supported DDL profile. A column's
+- Kysely schema statements that stay inside Minnow's supported DDL profile.
+  `createTable().temporary()` creates an ordinary table, as the engine reads it. A column's
   `.autoIncrement()` compiles to the `autoincrement` spelling the engine reads as its
   auto-increment key, as Kysely's SQLite dialect emits it; `serial` and
   `generatedAlwaysAsIdentity()` declare the same key.
@@ -470,15 +475,15 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
 - Kysely can generate SQL outside Minnow's profile — PostgreSQL features Minnow lacks, and the
   MySQL, SQLite, and T-SQL spellings Kysely's builders also carry. The adapter's compiler refuses
   every such form it can see before execution, naming the feature and an alternative:
-  - Queries: `DISTINCT ON`, row-locking clauses such as `.forUpdate()`, SQL `EXPLAIN` (use the
-    Minnow database's own `explain()`), T-SQL `.top()`, `.output()`, `.crossApply()`, and
-    `.outerApply()`, an empty `IN ()` list (add Kysely's `HandleEmptyInListsPlugin`), and the
-    JSON path operators `->$` and `->>$`, which compile to a path string that Minnow's `->` would
-    read as one member name (use `->` / `->>` with `.key()` and `.at()`).
-  - Mutations: `UPDATE ... FROM`, `DELETE ... USING`, multi-table `updateTable([...])` and
-    `deleteFrom([...])`, MySQL `ORDER BY`/`LIMIT` on updates and deletes, `replaceInto()`,
-    `onDuplicateKeyUpdate()`, SQLite `orIgnore()`/`orAbort()` and friends, `ON CONFLICT` with a
-    constraint or index-expression target (name the unique key's columns instead),
+  - Queries: SQL `EXPLAIN` (use the Minnow database's own `explain()`), T-SQL `.top()`,
+    `.output()`, `.crossApply()`, and `.outerApply()`, an empty `IN ()` list (add Kysely's
+    `HandleEmptyInListsPlugin`), and the JSON path operators `->$` and `->>$`, which compile to a
+    path string that Minnow's `->` would read as one member name (use `->` / `->>` with `.key()`
+    and `.at()`).
+  - Mutations: multi-table `updateTable([...])` and `deleteFrom([...])`, MySQL
+    `ORDER BY`/`LIMIT` on updates and deletes, `replaceInto()`, `onDuplicateKeyUpdate()`, SQLite
+    `orIgnore()`/`orAbort()` and friends, `ON CONFLICT` with a constraint or index-expression
+    target (name the unique key's columns instead),
     `MERGE ... THEN DO NOTHING` (narrow the `WHEN` condition instead),
     `MERGE ... WHEN NOT MATCHED BY SOURCE`, and data-modifying CTEs (run the mutation first, then
     query).
@@ -486,7 +491,9 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
     `ALTER TABLE` beyond adding and dropping columns (renames, constraint changes, column
     alterations, `ADD COLUMN IF NOT EXISTS`), the T-SQL `identity()` column modifier (use
     `autoIncrement()`, the `serial` type, or `generatedAlwaysAsIdentity()`), inline
-    `addIndex()` in `createTable()`, temporary tables and views, materialized views, view
+    `addIndex()` in `createTable()`, `onCommit()` on a temporary table and MySQL's
+    `dropTable().temporary()` (a temporary table is an ordinary table here; drop it with
+    `dropTable()`), temporary views, materialized views, view
     column lists and `CREATE VIEW IF NOT EXISTS`, non-stored generated columns,
     `DROP`/`ALTER TYPE`, `DROP VIEW` and `DROP INDEX` with `CASCADE`, `dropIndex().on(table)`,
     index access methods (`.using()`), partial and expression indexes, expression unique
@@ -494,7 +501,8 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
     `NULLS NOT DISTINCT`.
 
   Anything else outside the profile is rejected explicitly by the engine — for one example,
-  a correlated lateral subquery with `ORDER BY`/`LIMIT` (rank with a window function instead) —
+  a range-correlated lateral subquery with `ORDER BY`/`LIMIT` (rank with a window function
+  instead) —
   with the executable [feature matrix](/docs/sql/feature-matrix) as the reference.
 
 - Rejected transaction settings are recoverable: a `startTransaction()` refused for an

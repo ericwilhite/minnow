@@ -512,6 +512,19 @@ describe("CREATE TABLE", () => {
     ]);
   });
 
+  it("reads PostgreSQL's multi-word type names, TIME WITH TIME ZONE included", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE spelled (id CHARACTER VARYING(10) PRIMARY KEY, at TIMESTAMP WITH TIME ZONE, plain TIMESTAMP WITHOUT TIME ZONE, clock TIME WITH TIME ZONE)",
+    );
+    await database.execute(
+      "INSERT INTO spelled VALUES ('a', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', '10:00:00')",
+    );
+    expect((await database.query("SELECT id, at, clock FROM spelled")).rows).toEqual([
+      { id: "a", at: new Date("2020-01-01T00:00:00.000Z"), clock: "10:00:00" },
+    ]);
+  });
+
   it("stores generated columns, recomputes them on every write, and indexes their values", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(
@@ -1141,6 +1154,35 @@ describe("PostgreSQL mutation forms", () => {
   }
   const rows = async (database: MinnowDatabase, sql: string): Promise<unknown[]> =>
     (await database.query(sql)).rows;
+
+  it("truncates integer division in statement constants before they fold", async () => {
+    // `7 / 2` once folded to 3.5 ahead of the integer-division mark, so an INTEGER column
+    // refused the value PostgreSQL stores (3).
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE counts (id INTEGER PRIMARY KEY, n INTEGER)");
+    expect(
+      await database.execute("INSERT INTO counts VALUES (1, 7 / 2), (2, -7 / 2) RETURNING n"),
+    ).toMatchObject({ returnedRows: [{ n: 3 }, { n: -3 }] });
+    expect(
+      await database.execute("UPDATE counts SET n = 9 / 2 WHERE id = 1 RETURNING n"),
+    ).toMatchObject({ returnedRows: [{ n: 4 }] });
+    expect(
+      await database.execute("UPDATE counts SET n = n / 2 WHERE n / 2 = 2 RETURNING n"),
+    ).toMatchObject({ returnedRows: [{ n: 2 }] });
+    expect(
+      await database.execute(
+        "MERGE INTO counts USING (SELECT 2 AS id) s ON counts.id = s.id WHEN MATCHED THEN UPDATE SET n = 9 / 2",
+      ),
+    ).toMatchObject({ rowCount: 1 });
+    expect(await rows(database, "SELECT id, n FROM counts ORDER BY id")).toEqual([
+      { id: 1, n: 2 },
+      { id: 2, n: 4 },
+    ]);
+    // A decimal constant keeps exact division: 7 / 2.0 is 3.5, which an INTEGER column refuses.
+    await expect(database.execute("UPDATE counts SET n = 7 / 2.0 WHERE id = 1")).rejects.toThrow(
+      /safe integer/,
+    );
+  });
 
   it("takes a table alias on UPDATE and DELETE, in assignments, predicates, and RETURNING", async () => {
     const database = await fixture();

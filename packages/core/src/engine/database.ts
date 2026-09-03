@@ -7881,6 +7881,10 @@ export class MinnowDatabase {
           }));
         }
         const statement = bindStatementParameters(compiled, params);
+        // Session settings touch no data and no catalog, so they run inside a scope as well.
+        if (statement.kind === "set" || statement.kind === "show") {
+          return externalizeExecuteResult(await this.runStatement(statement));
+        }
         if (!isTransactionalStatement(statement)) {
           throw new TypeError(
             `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a write scope`,

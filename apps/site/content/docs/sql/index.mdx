@@ -110,11 +110,12 @@ if (result.kind === "update") {
 }
 ```
 
-The kinds are `rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`,
+The kinds are `rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `set`, `create-table`,
 `create-type`, `create-sequence`, `add-column`, `drop-column`, `drop-table`, `create-index`, `drop-index`,
 `create-view`, `drop-view`, `create-trigger`, and `drop-trigger`.
 Row-writing kinds carry `rowCount` and the published `version`; `returnedRows` appears only when
-the statement had a `RETURNING` clause.
+the statement had a `RETURNING` clause. `TRUNCATE` reports as a `delete`; `SET` and `RESET`
+return `{ kind: "set", action, name }`, and `SHOW` returns `rows`.
 
 `execute` also takes the engine controls a `query` does, as a third optional argument:
 `execute(sql, params?, { signal?, onStats?, memoize?, executionMemoryBudgetBytes? })`. A SELECT

@@ -334,7 +334,7 @@
       "status": "supported",
       "setup": ["INSERT INTO keyed (name, score) VALUES ('z', 3)"],
       "example": "TRUNCATE TABLE keyed",
-      "notes": "TRUNCATE [TABLE] [ONLY] name [RESTART IDENTITY | CONTINUE IDENTITY] [RESTRICT] removes every row of one table, the same as an unfiltered DELETE. Several tables in one statement and CASCADE are refused; truncate each table separately."
+      "notes": "TRUNCATE [TABLE] [ONLY] name [RESTART IDENTITY | CONTINUE IDENTITY] [RESTRICT] removes every row of one table, the same as an unfiltered DELETE, so like DELETE it needs a table with a unique key. Several tables in one statement and CASCADE are refused; truncate each table separately."
     },
     {
       "id": "mutation.returning",

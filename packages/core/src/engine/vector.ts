@@ -7004,12 +7004,16 @@ function binaryValue(
     if (operator === "%") return right === 0 ? null : left % right;
   }
   if (operator === "||") return concatenatedSqlValue(left, right);
-  // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`.
+  // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`. Text
+  // that does not read as a number is left for `numeric` to refuse below: recursing on it
+  // would never terminate.
   if (typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)) {
-    return binaryValue(operator, readUntypedText("number", left), right, integer);
+    const read = readUntypedText("number", left);
+    if (typeof read === "number") return binaryValue(operator, read, right, integer);
   }
   if (typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)) {
-    return binaryValue(operator, left, readUntypedText("number", right), integer);
+    const read = readUntypedText("number", right);
+    if (typeof read === "number") return binaryValue(operator, left, read, integer);
   }
   const exact = exactNumericBinary(operator, left, right);
   if (exact !== undefined) return exact;

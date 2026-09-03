@@ -14,6 +14,8 @@ import {
   clonePlanTree,
   applyWindowFunctions,
   bindPlanParameters,
+  foldIdentifierCase,
+  expandRowReferences,
   type QueryValue,
 } from "./query.js";
 
@@ -1618,6 +1620,44 @@ describe("scalar functions", () => {
     ]);
   });
 
+  it("refuses text that does not read as a number beside a number, on both executors", () => {
+    // The vectorized path once re-read the same unreadable text forever (a stack overflow);
+    // both executors now raise the arithmetic type error PostgreSQL's input error stands for.
+    for (const sql of [
+      "SELECT 'abc' + 1 AS x FROM rows",
+      "SELECT 1 + '' AS x FROM rows",
+      "SELECT region + 1 AS x FROM rows",
+    ]) {
+      expect(() => executeQuery(compileQuery(sql), tables)).toThrow(TypeError);
+      expect(() => executeQuery(compileQuery(sql), tables)).not.toThrow(RangeError);
+      expect(() => executeRowQuery(compileQuery(sql), tables)).toThrow(TypeError);
+    }
+    expect(
+      both("SELECT '5' + 1 AS x, '7' / 2 AS q, amount / '4' AS h FROM rows WHERE amount = 10"),
+    ).toEqual([{ x: 6, q: 3, h: 2.5 }]);
+  });
+
+  it("renders TO_HEX at the integer's width and reads substring(text, 'pattern') as a regex", () => {
+    expect(
+      both(
+        "SELECT TO_HEX(-1) AS a, TO_HEX(255) AS b, TO_HEX(-2147483649) AS c, SUBSTRING('foobar', 'o+') AS d, SUBSTRING('foobar', 'f(o+)') AS e, SUBSTRING('foobar', '2') AS f, SUBSTRING('foobar', 2) AS g, ROUND(1250, -2) AS h, ROUND(-1250, -2) AS i, ROUND(12345.678, -2) AS j FROM rows WHERE amount = 10",
+      ),
+    ).toEqual([
+      {
+        a: "ffffffff",
+        b: "ff",
+        c: "ffffffff7fffffff",
+        d: "oo",
+        e: "oo",
+        f: null,
+        g: "oobar",
+        h: 1300,
+        i: -1300,
+        j: 12300,
+      },
+    ]);
+  });
+
   it("formats, hashes, splits, and matches the way PostgreSQL does", () => {
     const one = (sql: string): Record<string, unknown> =>
       both(`${sql} FROM rows WHERE amount = 10`)[0] as Record<string, unknown>;
@@ -1863,6 +1903,19 @@ describe("compile error positions", () => {
     expect(queryFailure("\t\t SELECT # FROM events").at).toBe("#");
   });
 
+  it("maps positions through the TABLE name rewrite back onto the written text", () => {
+    // `TABLE events` is read as `SELECT * FROM events`, which is longer than what was typed;
+    // an error after the table name must still point into the caller's statement.
+    expect(queryFailure("TABLE events LIMIT x")).toEqual({
+      at: "x",
+      message: "Expected number, found x",
+    });
+    expect(queryFailure("  table events WHERE 1 +").at).toBe("");
+    expect(queryFailure("TABLE events WHERE #").at).toBe("#");
+    const statement = "TABLE events LIMIT x";
+    expect(failurePoint(() => compileStatement(statement), statement).at).toBe("x");
+  });
+
   it("locates statement failures too", () => {
     // INSERT ... SELECT is a statement now, so the failing keyword is a misspelled one.
     const sql = "  INSERT INTO t (a) SELEC a FROM t";
@@ -1883,6 +1936,82 @@ describe("compile error positions", () => {
     })();
     expect(error).toBeInstanceOf(TypeError);
     expect(error).toBeInstanceOf(SqlCompileError);
+  });
+});
+
+describe("identifier case folding", () => {
+  const tables = new Map<string, readonly string[]>([
+    ["users", ["id", "name", "Name"]],
+    ["Orders", ["id", "total"]],
+  ]);
+
+  it("keeps an ORDER BY name that is an output alias, and a written alias's spelling", () => {
+    // PostgreSQL reads `ORDER BY NAME` as the output column NAME labels, not the folded
+    // table column; a fold that rewrote it lost the alias and refused the query.
+    const plan = foldIdentifierCase(
+      compileQuery('SELECT LOWER(name) AS NAME, id AS "Id", ID FROM USERS ORDER BY NAME'),
+      tables,
+    );
+    expect(plan.base.table).toBe("users");
+    expect(plan.orderBy.map((order) => order.expression)).toEqual([
+      { kind: "column", reference: "NAME" },
+    ]);
+    // A written alias (`AS "Id"`) is the user's spelling; only an implicit one follows the fold.
+    expect(plan.select.map((item) => item.alias)).toEqual(["NAME", "Id", "id"]);
+    expect(plan.select[2]?.expression).toEqual({ kind: "column", reference: "id" });
+    const implicit = foldIdentifierCase(compileQuery("SELECT ID FROM users"), tables);
+    expect(implicit.select.map((item) => item.alias)).toEqual(["id"]);
+  });
+
+  it("prefers the lower-cased name when the table has several case-insensitive matches", () => {
+    // `users` has both `name` and `Name`: PostgreSQL's own reading of NAME is `name`.
+    const plan = foldIdentifierCase(compileQuery("SELECT NAME FROM users"), tables);
+    expect(plan.select[0]?.expression).toEqual({ kind: "column", reference: "name" });
+    const orders = foldIdentifierCase(compileQuery("SELECT total FROM ORDERS"), tables);
+    expect(orders.base.table).toBe("Orders");
+  });
+});
+
+describe("row reference expansion", () => {
+  const tables = new Map<string, readonly string[]>([["users", ["id", "name", "age"]]]);
+
+  it("leaves a cached plan's expression objects untouched when nothing expands", () => {
+    // The probe runs on the shared compiled plan for every query. A probe that wrote back
+    // copies of the nodes it visited kept the plan's content but replaced its objects, so
+    // caches keyed on node identity (IN-list membership sets) missed on every execution.
+    const plan = compileQuery(
+      "SELECT age + 1 AS n, COUNT(*) AS c FROM users u WHERE age IN (1, 2, 3) " +
+        "GROUP BY age + 1 HAVING COUNT(*) > 1 ORDER BY age + 1",
+    );
+    const before = {
+      select: plan.select.map((item) => item.expression),
+      predicates: plan.predicates.map((predicate) => predicate.right),
+      groupBy: [...plan.groupBy],
+      having: plan.having.map((predicate) => predicate.left),
+      orderBy: plan.orderBy.map((order) => order.expression),
+    };
+    expect(expandRowReferences(plan, (table) => tables.get(table))).toBe(plan);
+    expect(plan.select.map((item) => item.expression)).toEqual(before.select);
+    plan.select.forEach((item, index) => expect(item.expression).toBe(before.select[index]));
+    plan.predicates.forEach((predicate, index) =>
+      expect(predicate.right).toBe(before.predicates[index]),
+    );
+    plan.groupBy.forEach((expression, index) => expect(expression).toBe(before.groupBy[index]));
+    plan.having.forEach((predicate, index) => expect(predicate.left).toBe(before.having[index]));
+    plan.orderBy.forEach((order, index) => expect(order.expression).toBe(before.orderBy[index]));
+  });
+
+  it("expands a row reference on a clone and leaves the original plan alone", () => {
+    const plan = compileQuery("SELECT to_json(u) AS j FROM users u");
+    const snapshot = JSON.stringify(plan);
+    const expanded = expandRowReferences(plan, (table) => tables.get(table));
+    expect(expanded).not.toBe(plan);
+    expect(JSON.stringify(plan)).toBe(snapshot);
+    expect(expanded.select[0]?.expression).toMatchObject({
+      kind: "call",
+      name: "TO_JSON",
+      arguments: [{ kind: "call", name: "JSON_OBJECT" }],
+    });
   });
 });
 

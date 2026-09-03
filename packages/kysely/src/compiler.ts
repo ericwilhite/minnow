@@ -32,8 +32,6 @@ import {
   type OnConflictNode,
   type RootOperationNode,
   type SchemableIdentifierNode,
-  type SelectModifier,
-  type SelectModifierNode,
   type SelectQueryNode,
   type UniqueConstraintNode,
   type UpdateQueryNode,
@@ -115,15 +113,6 @@ function normalizeInsert(
   return normalizeEmptyValues(node, tableName, tables.get(tableName));
 }
 
-const LOCKING_MODIFIERS: ReadonlySet<SelectModifier> = new Set([
-  "ForUpdate",
-  "ForNoKeyUpdate",
-  "ForShare",
-  "ForKeyShare",
-  "NoWait",
-  "SkipLocked",
-]);
-
 /** Whole statement kinds Minnow's engine has no counterpart for. */
 const REFUSED_STATEMENTS: ReadonlyMap<string, string> = new Map([
   [
@@ -173,10 +162,11 @@ function isDoNothingResult(result: OperationNode | undefined): boolean {
  * PostgreSQL SQL compilation with Kysely's empty-object inserts normalized to valid SQL.
  *
  * Kysely can build PostgreSQL forms Minnow's engine refuses, and the engine's refusal is a bare
- * parse error ("Expected eof, found from") with no hint at the unsupported feature. This
+ * parse error ("Expected eof, found on") with no hint at the unsupported feature. This
  * compiler knows which builder produced the node, so it refuses those forms before execution
  * with the feature named and an alternative offered — the same treatment MERGE ... RETURNING
- * already gets.
+ * already gets. Forms the engine reads — DISTINCT ON, UPDATE ... FROM, DELETE ... USING, the
+ * row-locking clauses it ignores, CREATE TEMPORARY TABLE — pass through unchanged.
  */
 export class MinnowQueryCompiler extends PostgresQueryCompiler {
   readonly #tables: ReadonlyMap<string, TableMetadata>;
@@ -254,23 +244,7 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
           "subquery for mutations.",
       );
     }
-    if (node.distinctOn !== undefined) {
-      throw new TypeError(
-        "Minnow does not support DISTINCT ON. Group by the key, or rank rows with a window " +
-          "function and keep the first per key.",
-      );
-    }
     super.visitSelectQuery(node);
-  }
-
-  protected override visitSelectModifier(node: SelectModifierNode): void {
-    if (node.modifier !== undefined && LOCKING_MODIFIERS.has(node.modifier)) {
-      throw new TypeError(
-        "Minnow does not support row-locking clauses such as FOR UPDATE: the engine has a " +
-          "single writer and snapshot reads, so remove the locking modifier.",
-      );
-    }
-    super.visitSelectModifier(node);
   }
 
   // Kysely's PostgreSQL-flavored JSON functions are the most common porting trap: the engine
@@ -385,12 +359,6 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
           "with WHERE ... IN (SELECT ...) for values that come from another table.",
       );
     }
-    if (node.from !== undefined) {
-      throw new TypeError(
-        "Minnow does not support UPDATE ... FROM. Rewrite the update with a correlated " +
-          "subquery or WHERE ... IN (SELECT ...).",
-      );
-    }
     if (node.orderBy !== undefined || node.limit !== undefined) {
       throw new TypeError(
         "Minnow does not support MySQL's ORDER BY/LIMIT on UPDATE. Select the target keys " +
@@ -405,12 +373,6 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
       throw new TypeError(
         "Minnow does not support MySQL's multi-table DELETE. Delete from one table per " +
           "statement, with WHERE ... IN (SELECT ...) for keys that come from another table.",
-      );
-    }
-    if (node.using !== undefined) {
-      throw new TypeError(
-        "Minnow does not support DELETE ... USING. Rewrite the delete with a correlated " +
-          "subquery or WHERE ... IN (SELECT ...).",
       );
     }
     if (node.orderBy !== undefined || node.limit !== undefined) {
@@ -463,10 +425,12 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   }
 
   protected override visitCreateTable(node: CreateTableNode): void {
-    if (node.temporary === true || node.onCommit !== undefined) {
+    // The engine reads CREATE TEMPORARY TABLE as an ordinary table: every table lives in one
+    // database with one durability. ON COMMIT would need the table to go away by itself.
+    if (node.onCommit !== undefined) {
       throw new TypeError(
-        "Minnow does not support temporary tables. Create an ordinary table and drop it when " +
-          "done, or query over VALUES/a CTE for transient rows.",
+        "Minnow does not support ON COMMIT on temporary tables: a temporary table is an " +
+          "ordinary table here. Remove .onCommit() and drop the table when done.",
       );
     }
     if ((node.indexes?.length ?? 0) > 0) {
@@ -481,8 +445,8 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   protected override visitDropTable(node: DropTableNode): void {
     if (node.temporary === true) {
       throw new TypeError(
-        "Minnow does not support temporary tables, so DROP TEMPORARY TABLE has nothing to " +
-          "drop. Remove .temporary().",
+        "Minnow does not support MySQL's DROP TEMPORARY TABLE: a temporary table is an " +
+          "ordinary table here, so drop it with dropTable() and remove .temporary().",
       );
     }
     super.visitDropTable(node);

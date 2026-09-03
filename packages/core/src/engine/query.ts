@@ -1292,19 +1292,33 @@ function normalizeSql(sql: string): { text: string; offset: number } {
 }
 
 /**
+ * `TABLE name` is the standard's spelling of `SELECT * FROM name`. The rewritten text is
+ * longer than what was written, so `offset` carries the difference and an error located in the
+ * rewritten text lands on the written statement.
+ */
+function normalizeQuerySql(sql: string): { text: string; offset: number } {
+  const spelling = "SELECT * FROM ";
+  const table = /^\s*TABLE\s+(?=[A-Za-z_"])/i.exec(sql);
+  if (table === null) return normalizeSql(sql);
+  const { text } = normalizeSql(spelling + sql.slice(table[0].length));
+  return { text, offset: table[0].length - spelling.length };
+}
+
+/**
  * Rethrows a compilation failure with a position. Errors that already carry one only shift into
  * the caller's coordinates; anything else takes the parser's current token as its anchor. Non-type
  * errors pass through untouched — they come from execution, not from reading the text.
  */
 function throwLocated(error: unknown, offset: number, span: { start: number; end: number }): never {
+  // A negative offset (the `TABLE name` rewrite lengthens the text) never lands before the start.
   if (error instanceof SqlCompileError) {
     if (offset === 0) throw error;
-    throw new SqlCompileError(error.message, error.offset + offset, error.length);
+    throw new SqlCompileError(error.message, Math.max(error.offset + offset, 0), error.length);
   }
   if (error instanceof TypeError) {
     throw new SqlCompileError(
       error.message,
-      offset + span.start,
+      Math.max(offset + span.start, 0),
       Math.max(span.end - span.start, 0),
     );
   }
@@ -1322,10 +1336,7 @@ export interface ReturningItem {
 
 export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
   validateSqlSource(sql);
-  // `TABLE name` is the standard's spelling of `SELECT * FROM name`.
-  const { text, offset } = normalizeSql(
-    sql.replace(/^\s*TABLE\s+(?=[A-Za-z_"])/i, "SELECT * FROM "),
-  );
+  const { text, offset } = normalizeQuerySql(sql);
   if (text.length === 0) throw new SqlCompileError("Enter a SELECT query", offset, 0);
   let parser: Parser | undefined;
   let plan: CompiledQuery;
@@ -2081,10 +2092,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
  */
 export function compileStatement(sql: string): CompiledStatement {
   validateSqlSource(sql);
-  // `TABLE name` is the standard's spelling of `SELECT * FROM name`.
-  const { text, offset } = normalizeSql(
-    sql.replace(/^\s*TABLE\s+(?=[A-Za-z_"])/i, "SELECT * FROM "),
-  );
+  const { text, offset } = normalizeQuerySql(sql);
   if (text.length === 0) throw new SqlCompileError("Enter a SQL statement", offset, 0);
   let parser: Parser | undefined;
   try {
@@ -4064,10 +4072,14 @@ export function integerTypedExpression(
       const left = typed(expression.left);
       const right = typed(expression.right);
       if (left && right) return true;
-      return (
-        (left && expression.right.kind === "parameter") ||
-        (right && expression.left.kind === "parameter")
-      );
+      // A placeholder or an untyped string constant takes its integer partner's type, as
+      // PostgreSQL infers `qty / $1` and `'7' / 2`.
+      const untyped = (candidate: Expression): boolean =>
+        candidate.kind === "parameter" ||
+        (candidate.kind === "literal" &&
+          typeof candidate.value === "string" &&
+          candidate.internalSqlValue !== true);
+      return (left && untyped(expression.right)) || (right && untyped(expression.left));
     }
     case "call": {
       const { name, arguments: args } = expression;
@@ -4290,14 +4302,19 @@ export function foldIdentifierCase(
     if (bucket === undefined) lowerTables.set(lowered, [name]);
     else bucket.push(name);
   }
+  // PostgreSQL's own reading — the lower-cased name — wins when it exists (`NAME` over a table
+  // with both `Name` and `name` is `name`); otherwise a unique case-insensitive match.
   const foldTable = (name: string): string | undefined => {
     if (tables.has(name)) return undefined;
-    const candidates = lowerTables.get(name.toLowerCase());
+    const lowered = name.toLowerCase();
+    if (tables.has(lowered)) return lowered;
+    const candidates = lowerTables.get(lowered);
     return candidates?.length === 1 ? candidates[0] : undefined;
   };
   const foldColumn = (columns: readonly string[], name: string): string | undefined => {
     if (columns.includes(name)) return undefined;
     const lowered = name.toLowerCase();
+    if (columns.includes(lowered)) return lowered;
     const matches = columns.filter((column) => column.toLowerCase() === lowered);
     return matches.length === 1 ? matches[0] : undefined;
   };
@@ -4362,8 +4379,21 @@ export function foldIdentifierCase(
         .filter((name): name is string => name !== undefined);
       return folded.length === 1 ? folded[0] : undefined;
     };
+    // An ORDER BY name that is an output alias keeps that meaning, as it does in PostgreSQL:
+    // `LOWER(name) AS NAME … ORDER BY NAME` orders by the alias, not the folded column.
+    const aliases = new Set(block.select.map((item) => item.alias));
+    const orderByAliases = new Set(
+      block.orderBy
+        .map((order) => order.expression)
+        .filter((expression) => expression.kind === "column" && aliases.has(expression.reference)),
+    );
+    // A bare column's written spelling, so an implicit output name can follow the fold.
+    const writtenNames = block.select.map((item) =>
+      item.expression.kind === "column" ? bareColumnName(item.expression.reference) : undefined,
+    );
     const rewrite = (expression: Expression): void => {
       if (expression.kind === "column") {
+        if (orderByAliases.has(expression)) return;
         const folded = foldReference(expression.reference);
         if (folded === undefined) return;
         if (pass.probing) pass.needed = true;
@@ -4388,17 +4418,15 @@ export function foldIdentifierCase(
       childExpressions(expression).forEach(rewrite);
     };
     forEachBlockExpression(block, rewrite);
-    // A bare column's output name is the folded name, as PostgreSQL's would be: `SELECT ID`
-    // over `users` returns a column called `id`.
+    // A bare column's implicit output name is the folded name, as PostgreSQL's would be:
+    // `SELECT ID` over `users` returns a column called `id`. A written alias (`a AS "A"`) is
+    // the user's spelling and stays.
     if (!pass.probing) {
-      for (const item of block.select) {
-        if (item.expression.kind !== "column") continue;
-        const separator = item.expression.reference.indexOf(".");
-        const name = item.expression.reference.slice(separator + 1);
-        if (item.alias !== name && item.alias.toLowerCase() === name.toLowerCase()) {
-          item.alias = name;
-        }
-      }
+      block.select.forEach((item, index) => {
+        if (item.expression.kind !== "column") return;
+        const name = bareColumnName(item.expression.reference);
+        if (item.alias !== name && item.alias === writtenNames[index]) item.alias = name;
+      });
     }
   };
   rewriteBlock(plan);
@@ -4454,15 +4482,28 @@ export function expandRowReferences(
         ]),
       };
     };
+    if (pass.probing) {
+      // The probe only reads: `mapChildExpressions` copies every node it maps, and writing
+      // those copies back would replace the cached plan's expression objects on every query,
+      // defeating the caches keyed on their identity (`cachedListMembership`).
+      const probe = (expression: Expression): void => {
+        if (pass.needed) return;
+        if (expression.kind === "column") {
+          if (rowObject(expression.reference) !== undefined) pass.needed = true;
+          return;
+        }
+        if (expression.kind === "subquery" || expression.kind === "exists") {
+          rewriteBlock(expression.block);
+          return;
+        }
+        childExpressions(expression).forEach(probe);
+      };
+      forEachBlockExpression(block, probe);
+      return;
+    }
     const rewrite = (expression: Expression): Expression => {
       if (expression.kind === "column") {
-        const expanded = rowObject(expression.reference);
-        if (expanded === undefined) return expression;
-        if (pass.probing) {
-          pass.needed = true;
-          return expression;
-        }
-        return expanded;
+        return rowObject(expression.reference) ?? expression;
       }
       if (expression.kind === "subquery" || expression.kind === "exists") {
         rewriteBlock(expression.block);
@@ -4926,8 +4967,17 @@ function resolvePlanExactNumericConstants(plan: CompiledQuery): void {
  * mutation evaluates later. INSERT VALUES cells are absent because the parser evaluates them
  * to values on the spot, resolving each expression first.
  */
+/**
+ * A statement expression is typed before its constants fold: `SET a = 7 / 2` is integer
+ * division, so the fold must see the mark, or it would store 3.5 where PostgreSQL stores 3.
+ */
+function resolveStatementExpression(expression: Expression): Expression {
+  annotateIntegerDivision(expression);
+  return resolveExactNumericConstants(expression);
+}
+
 function resolveStatementExactNumericConstants(statement: CompiledStatement): void {
-  const resolve = resolveExactNumericConstants;
+  const resolve = resolveStatementExpression;
   if (statement.kind === "insert") {
     const conflict = statement.onConflict;
     if (conflict?.assignments !== undefined) {
@@ -5944,27 +5994,28 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       const right = evaluate(expression.right, context, group);
       if (left === null || left === undefined || right === null || right === undefined) return null;
       if (expression.operator === "||") return concatenatedSqlValue(left, right);
+      // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`;
+      // read before the integer check, so `'7' / 2` truncates as its typing says.
+      const leftValue =
+        typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)
+          ? readUntypedText("number", left)
+          : left;
+      const rightValue =
+        typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)
+          ? readUntypedText("number", right)
+          : right;
       if (
         expression.integer === true &&
         expression.operator === "/" &&
-        typeof left === "number" &&
-        typeof right === "number"
+        typeof leftValue === "number" &&
+        typeof rightValue === "number"
       ) {
-        return integerQuotient(left, right);
+        return integerQuotient(leftValue, rightValue);
       }
-      const exact = exactNumericBinary(expression.operator, left, right);
+      const exact = exactNumericBinary(expression.operator, leftValue, rightValue);
       if (exact !== undefined) return exact;
-      // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`.
-      const a = numeric(
-        typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)
-          ? readUntypedText("number", left)
-          : left,
-      );
-      const b = numeric(
-        typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)
-          ? readUntypedText("number", right)
-          : right,
-      );
+      const a = numeric(leftValue);
+      const b = numeric(rightValue);
       if (expression.operator === "+") return a + b;
       if (expression.operator === "-") return a - b;
       if (expression.operator === "*") return a * b;
@@ -7805,6 +7856,8 @@ class Parser {
       return `numeric:${precision === undefined ? "" : String(precision)}:${scale === undefined ? "" : String(scale)}`;
     }
     if (["JSON", "JSONB", "UUID", "DATE", "TIME", "INTERVAL"].includes(word)) {
+      // `TIME WITH TIME ZONE` is the TIME domain: the zone tail is read with the type name.
+      this.#multiWordTypeTail(word);
       return word.toLowerCase();
     }
     if (word === "DOUBLE") {
@@ -7870,6 +7923,8 @@ class Parser {
       };
     }
     if (["JSON", "JSONB", "UUID", "DATE", "TIME", "INTERVAL"].includes(word)) {
+      // `TIME WITH TIME ZONE` stays the TIME domain: the zone tail is read with the type name.
+      this.#multiWordTypeTail(word);
       return { type: "string", sqlDomain: { kind: word.toLowerCase() as "json" } };
     }
     if (word === "DOUBLE") {
@@ -8403,9 +8458,9 @@ class Parser {
           volatileScalarFunctionNames.has(value.name))) ||
       childExpressions(value).some(needsExecution);
     if (needsExecution(expression)) {
-      return { expression: resolveExactNumericConstants(expression) };
+      return { expression: resolveStatementExpression(expression) };
     }
-    return asQueryValue(evaluate(resolveExactNumericConstants(expression), {}));
+    return asQueryValue(evaluate(resolveStatementExpression(expression), {}));
   }
 
   #unionMember(
@@ -8755,11 +8810,13 @@ class Parser {
         .filter((item) => item.expression.kind !== "wildcard")
         .map((item) => [item.alias, item.expression] as const),
     );
-    // The window sees the block's own columns and expressions, not the output aliases.
+    // The window sees the block's own columns and expressions, not the output aliases. An alias
+    // that labels a column is replaced too: `a AS b … ORDER BY b` orders by `a`, even when the
+    // block has a column called `b`.
     const windowExpression = (expression: Expression): Expression => {
       if (expression.kind === "column" && !expression.reference.includes(".")) {
         const labelled = aliased.get(expression.reference);
-        if (labelled !== undefined && labelled.kind !== "column") return labelled;
+        if (labelled !== undefined) return labelled;
       }
       return expression;
     };
@@ -10603,6 +10660,17 @@ class Parser {
       }
       if (name === "SUBSTR" && (args.length < 2 || args.length > 3))
         throw new TypeError("SUBSTR requires a string, a start, and an optional length");
+      // substring(text, 'pattern') is PostgreSQL's regular-expression form, like its FROM
+      // spelling above; substr(text, 'pattern') is a start position that fails to read.
+      const substringPattern = args[1];
+      if (
+        upper === "SUBSTRING" &&
+        args.length === 2 &&
+        substringPattern?.kind === "literal" &&
+        typeof substringPattern.value === "string"
+      ) {
+        return { kind: "call", name: "REGEXP_SUBSTR", arguments: args };
+      }
       if (name === "DATE_TRUNC") {
         if (args.length !== 2)
           throw new TypeError("DATE_TRUNC requires a unit and a datetime argument");
