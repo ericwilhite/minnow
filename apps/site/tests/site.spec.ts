@@ -200,7 +200,8 @@ test("the TypeScript tab checks a snippet against the schema and runs it", async
   // And the chip that shows it off typechecks and runs: its guarded upsert is skipped, not written.
   await console_.getByRole("button", { name: "The engine, typed too" }).click();
   await console_.getByRole("button", { name: "Run", exact: true }).click();
-  await expect(console_.getByText(/skipped/)).toBeVisible({ timeout: 60_000 });
+  // The logged object is drawn more than once (as a table and as text), so any match will do.
+  await expect(console_.getByText(/skipped/).first()).toBeVisible({ timeout: 60_000 });
   await expect(console_.getByText("the compiler refused it")).toHaveCount(0);
 });
 
