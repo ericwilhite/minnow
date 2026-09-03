@@ -9,6 +9,12 @@ export interface ConfirmRequest {
   warning?: string;
   confirmLabel: string;
   destructive?: boolean;
+  /**
+   * Counts what the statement will touch, shown as a fact line while the prompt is open — "12
+   * rows" beside an UPDATE, so nobody confirms a WHERE clause that matches the whole table by
+   * accident. It runs after the prompt appears and never delays it; a failure shows as such.
+   */
+  preview?: () => Promise<string>;
 }
 
 export interface ConfirmLayer {
@@ -92,15 +98,34 @@ export function createConfirmLayer(): ConfirmLayer {
             : undefined;
         heading.textContent = request.title;
 
-        facts.replaceChildren(
-          ...request.facts.map(([key, value]) =>
-            el("div", { class: "plate-row" }, [
-              el("span", { class: "plate-key", text: key }),
-              el("span", { class: "plate-value", text: value }),
-            ]),
-          ),
+        const rows = request.facts.map(([key, value]) =>
+          el("div", { class: "plate-row" }, [
+            el("span", { class: "plate-key", text: key }),
+            el("span", { class: "plate-value", text: value }),
+          ]),
         );
-        facts.hidden = request.facts.length === 0;
+        const previewValue = el("span", { class: "plate-value", text: "counting…" });
+        if (request.preview !== undefined) {
+          rows.push(
+            el("div", { class: "plate-row" }, [
+              el("span", { class: "plate-key", text: "affects" }),
+              previewValue,
+            ]),
+          );
+          const mine = settle;
+          request.preview().then(
+            (text) => {
+              if (settle === mine) previewValue.textContent = text;
+            },
+            (error: unknown) => {
+              if (settle === mine) {
+                previewValue.textContent = `could not count: ${error instanceof Error ? error.message : String(error)}`;
+              }
+            },
+          );
+        }
+        facts.replaceChildren(...rows);
+        facts.hidden = rows.length === 0;
 
         statement.replaceChildren(el("pre", { text: request.sql ?? "" }));
         statement.hidden = request.sql === undefined;

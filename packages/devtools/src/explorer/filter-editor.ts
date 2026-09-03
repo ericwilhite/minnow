@@ -1,8 +1,7 @@
 import type { QueryValue } from "@minnowdb/core";
 import { button, el } from "../dom.js";
-import type { ColumnType } from "../sql/literal.js";
 import { parseInput } from "../values.js";
-import type { TableInfo } from "./catalog.js";
+import type { ColumnInfo, TableInfo } from "./catalog.js";
 import {
   describeFilter,
   isComplete,
@@ -18,17 +17,41 @@ export interface FilterBar {
   node: HTMLElement;
   setTable(table: TableInfo | undefined): void;
   filters(): Filter[];
-  clear(): void;
+  /** Adds a filter from outside — a cell's "filter to this value" — and reports the change. */
+  add(filter: Filter): void;
+  /** Replaces the filters without reporting a change, for a table opened already filtered. */
+  setFilters(filters: readonly Filter[]): void;
 }
 
+type Parsed = { ok: true; values: QueryValue[] } | { ok: false; message: string };
+
 /**
- * A filter value is always optional — a blank box means "no filter yet", not "match NULL", which
- * is what the `is null` operator is for. So parsing treats every column as nullable and the
- * incomplete filter is simply dropped.
+ * The typed values for one filter, or the first reason one of them cannot be read. A value is
+ * parsed as the column is typed — `abc` in a number column is refused here, in the editor, rather
+ * than compiled into `amount = NULL` and matching nothing without a word. Blank means "no value
+ * yet", never NULL: the `is null` operator is how NULL is asked for.
  */
-function parseValue(text: string, type: ColumnType): QueryValue {
-  const parsed = parseInput(text, type, true);
-  return parsed.ok ? parsed.value : null;
+export function parseFilterValues(
+  column: ColumnInfo,
+  operator: FilterOperator,
+  first: string,
+  second: string,
+): Parsed {
+  const arity = operatorArity(operator);
+  if (arity === 0) return { ok: true, values: [] };
+  const parts = arity === "many" ? first.split(",") : arity === 2 ? [first, second] : [first];
+  const values: QueryValue[] = [];
+  for (const part of parts) {
+    if (part.trim().length === 0) {
+      if (arity === "many") continue;
+      return { ok: false, message: arity === 2 ? "Both values are needed." : "Enter a value." };
+    }
+    const parsed = parseInput(part, column.type, false, column.enumValues);
+    if (!parsed.ok) return { ok: false, message: parsed.message };
+    values.push(parsed.value);
+  }
+  if (values.length === 0) return { ok: false, message: "Enter at least one value." };
+  return { ok: true, values };
 }
 
 /**
@@ -50,12 +73,15 @@ export function createFilterBar(onChange: () => void): FilterBar {
     attrs: { placeholder: "and", "aria-label": "Second value" },
   });
   const add = button("btn mini", "Add");
+  const error = el("span", { class: "filter-error", attrs: { role: "alert" } });
+  error.hidden = true;
   const editor = el("div", { class: "filter-editor" }, [
     columnSelect,
     operatorSelect,
     valueInput,
     secondInput,
     add,
+    error,
   ]);
   editor.hidden = true;
 
@@ -65,12 +91,17 @@ export function createFilterBar(onChange: () => void): FilterBar {
   let table: TableInfo | undefined;
   let active: Filter[] = [];
 
-  function currentType(): ColumnType {
-    return table?.columns.find(({ name }) => name === columnSelect.value)?.type ?? "string";
+  function currentColumn(): ColumnInfo | undefined {
+    return table?.columns.find(({ name }) => name === columnSelect.value);
+  }
+
+  function showError(message: string | undefined): void {
+    error.textContent = message ?? "";
+    error.hidden = message === undefined;
   }
 
   function renderOperators(): void {
-    const type = currentType();
+    const type = currentColumn()?.type ?? "string";
     const available = operatorsFor(type);
     operatorSelect.replaceChildren(
       ...available.map((operator) => {
@@ -90,6 +121,7 @@ export function createFilterBar(onChange: () => void): FilterBar {
     // The hint carries the shape — `%crea%` for a raw pattern, a bare word for `contains` — so the
     // difference between the two is visible before anything is typed.
     valueInput.placeholder = operatorHint(operator) ?? (arity === "many" ? "a, b, c" : "value");
+    showError(undefined);
   }
 
   function renderChips(): void {
@@ -110,32 +142,27 @@ export function createFilterBar(onChange: () => void): FilterBar {
   }
 
   function submit(): void {
-    if (table === undefined) return;
-    const column = table.columns.find(({ name }) => name === columnSelect.value);
-    if (column === undefined) return;
+    const column = currentColumn();
+    if (table === undefined || column === undefined) return;
     const operator = operatorSelect.value as FilterOperator;
-    const arity = operatorArity(operator);
-    const values =
-      arity === 0
-        ? []
-        : arity === "many"
-          ? valueInput.value
-              .split(",")
-              .map((part) => parseValue(part, column.type))
-              .filter((value) => value !== null)
-          : arity === 2
-            ? [
-                parseValue(valueInput.value, column.type),
-                parseValue(secondInput.value, column.type),
-              ]
-            : [parseValue(valueInput.value, column.type)];
-
-    const filter: Filter = { column: column.name, type: column.type, operator, values };
+    const parsed = parseFilterValues(column, operator, valueInput.value, secondInput.value);
+    if (!parsed.ok) {
+      showError(parsed.message);
+      valueInput.focus();
+      return;
+    }
+    const filter: Filter = {
+      column: column.name,
+      type: column.type,
+      operator,
+      values: parsed.values,
+    };
     if (!isComplete(filter)) return;
     active.push(filter);
     valueInput.value = "";
     secondInput.value = "";
     editor.hidden = true;
+    showError(undefined);
     renderChips();
     onChange();
   }
@@ -151,20 +178,28 @@ export function createFilterBar(onChange: () => void): FilterBar {
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") submit();
     });
+    input.addEventListener("input", () => {
+      showError(undefined);
+    });
   }
 
   return {
     node,
     filters: () => active.filter(isComplete),
-    clear: () => {
-      active = [];
-      editor.hidden = true;
+    add: (filter) => {
+      active.push(filter);
+      renderChips();
+      onChange();
+    },
+    setFilters: (filters) => {
+      active = [...filters];
       renderChips();
     },
     setTable: (next) => {
       table = next;
       active = [];
       renderChips();
+      showError(undefined);
       columnSelect.replaceChildren(
         ...(next?.columns ?? []).map((column) => {
           const option = el("option", { text: column.name });

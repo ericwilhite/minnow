@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@minnowdb/core": ">=0.7.9 <1.0.0",
-    "@minnowdb/devtools": ">=0.2.4 <1.0.0",
+    "@minnowdb/devtools": ">=0.3.0 <1.0.0",
     "@minnowdb/kysely": ">=0.4.9 <1.0.0",
     "fumadocs-core": "^16.14.4",
     "fumadocs-mdx": "^15.2.3",

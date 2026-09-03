@@ -25,7 +25,7 @@ export function sqlLiteral(value: QueryValue, type: ColumnType): string {
     case "boolean":
       return value === true || value === "true" || value === 1 ? "TRUE" : "FALSE";
     case "datetime":
-      return `DATE ${quoteString(toDateOnly(value))}`;
+      return `TIMESTAMP ${quoteString(toTimestampText(value))}`;
   }
 }
 
@@ -35,46 +35,38 @@ function quoteString(value: string): string {
 }
 
 /**
- * The explorer deliberately renders datetime filters as `DATE '2026-08-12'`, so it drops the time
- * and compares at midnight UTC even though the SQL engine also accepts precise TIMESTAMP literals.
- * Callers must account for that day-granular explorer behavior rather than discover it.
+ * A datetime is written to the millisecond, as an ISO instant in UTC — the engine's `TIMESTAMP`
+ * literal reads exactly that text, and every datetime in a Minnow database is UTC already. Full
+ * precision is what lets a keyset cursor address a datetime row exactly, and what makes a filter
+ * on `10:30` mean half past ten rather than midnight.
  */
-function toDateOnly(value: QueryValue): string {
+function toTimestampText(value: QueryValue): string {
   const date = value instanceof Date ? value : new Date(String(value));
   if (!Number.isFinite(dateMilliseconds(date))) {
     throw new TypeError(`Not a date: ${String(value)}`);
   }
-  return dateIsoString(date).slice(0, 10);
+  return dateIsoString(date);
 }
 
-/** Whether a cursor can address this type exactly. Day-granular datetimes cannot. */
-export function isExactlyComparable(type: ColumnType): boolean {
-  return type !== "datetime";
-}
+const bareIdentifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-const identifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-function checkName(kind: string, name: string): string {
-  if (!identifier.test(name)) throw new TypeError(`Unsupported ${kind} name: ${name}`);
-  return name;
+/**
+ * A name as the engine will read it back. A bare identifier goes through as-is; anything else —
+ * a space, a hyphen, a quote — is written as a quoted identifier, which the engine reads as a plain
+ * reference whatever it contains. The table's own name goes through here too, since the catalog
+ * accepts any non-empty name for either.
+ */
+export function sqlIdentifier(name: string): string {
+  if (name.length === 0) throw new TypeError("Empty identifier");
+  return bareIdentifier.test(name) ? name : `"${name.replaceAll('"', '""')}"`;
 }
 
 /**
- * A column reference, always qualified — in WHERE and in ORDER BY alike. The engine has no quoted
- * identifiers, so a column named after a keyword — `case`, `null` — only parses with its table in
- * front of it; qualifying every column means the explorer never has to know which names are
- * special. ORDER BY resolves a qualified reference against the source table of `SELECT *`, so the
- * same form serves both clauses.
+ * A column reference, always qualified — in WHERE and in ORDER BY alike. A column named after a
+ * keyword — `case`, `null` — only parses with its table in front of it; qualifying every column
+ * means the explorer never has to know which names are special. ORDER BY resolves a qualified
+ * reference against the source table of `SELECT *`, so the same form serves both clauses.
  */
 export function sqlColumn(table: string, column: string): string {
-  return `${checkName("table", table)}.${checkName("column", column)}`;
-}
-
-/**
- * Whether a column can be sorted on at all. Qualifying covers every keyword name, so only a name
- * this module cannot render — one that is not a bare identifier — is refused. Sorting is dropped
- * rather than attempted for those, because rows in an order nobody asked for are worse than none.
- */
-export function isSortable(column: string): boolean {
-  return identifier.test(column);
+  return `${sqlIdentifier(table)}.${sqlIdentifier(column)}`;
 }

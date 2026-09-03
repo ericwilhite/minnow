@@ -8,6 +8,76 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Devtools 0.3.0 — September 3, 2026
+
+Published packages: `@minnowdb/devtools@0.3.0`.
+
+A devtools-only release: `@minnowdb/core` stays at 0.7.9, stored formats are unchanged, and no
+migration is needed. The panel keeps its API — `mountMinnowDevtools`, the custom element, and the
+handle are as they were — and grows from a table browser into a database explorer.
+
+### Added
+
+- **Relationships.** The rail lists each table's foreign keys, checks, and triggers under its
+  columns; a foreign key clicked on the Query tab inserts the `JOIN … ON` it describes, and on the
+  Data tab opens the parent table. A right-click on a cell offers the parent row a foreign key
+  points at and the related rows in each child table, and the new **Details** sidebar reads the
+  selected row in full with the same links.
+- **Views.** Views are listed in their own group with the query they stand for, open read-only in
+  the grid, and no longer appear as keyless tables with an Add row button they could not honour.
+- **Declared types.** Columns show their SQL type — `INTEGER`, `NUMERIC(10,2)`, `JSONB`, an enum
+  type's name — in the rail, the grid header, and the forms, and are badged when enum, generated,
+  or engine-filled. Enum and boolean columns are edited through a menu; generated columns are shown
+  with their expression and never asked for.
+- **Scripts and selection.** Several statements separated by semicolons run in order behind one
+  confirmation, with each outcome listed; a selection in the editor runs alone. Strings, quoted
+  names, comments, and trigger bodies are read correctly when splitting.
+- **Row cap, cancel, and statistics.** An unbounded `SELECT` shows its first 1,000 rows and offers
+  the rest; **Cancel** stops a running query; the status bar reports the engine's peak memory.
+- **Live mode** on both tabs, over the engine's live queries: the grid re-renders whenever the
+  database commits something the rows can see.
+- **Copy and export.** Copy results as CSV or JSON, download every row of a query as CSV (read
+  through the target's cursor when the grid holds only the capped part), copy a cell or the
+  selected rows with `Cmd/Ctrl + C`, and copy a row as JSON or as an `INSERT` statement.
+- **Affected-row counts.** The confirmation for an `UPDATE` or `DELETE` with a `WHERE` clause counts
+  the rows it matches and shows the number.
+- **Multi-row selection** with `Shift` and `Cmd/Ctrl`, deleting several rows in one confirmation;
+  **Duplicate row** and **Filter to this value** on the cell menu; column resizing by dragging a
+  header's edge.
+- **Saved queries.** The star beside a history entry keeps it at the top, past the 50-run limit and
+  past Clear.
+- **Storage tab** with the database's storage statistics and maintenance status, read on demand.
+- `Escape` closes the floating panel; `Cmd/Ctrl + K` jumps to the table filter. The custom
+  element observes its attributes, so a changed `theme` repaints and any other change remounts.
+
+### Fixed
+
+- The data grid repaints when its viewport grows or its tab is shown; it used to leave blank
+  space below the first rows until scrolled.
+- The rail highlights the table being browsed.
+- `SET`, `RESET`, `SHOW`, `BEGIN`, and `COMMIT` no longer open the write confirmation.
+- Datetime filters and cursors carry the full instant — `TIMESTAMP '…T10:30:00.250Z'` — instead of
+  the day alone, so a filter on a time of day means what it says and a sort on a datetime column
+  pages by cursor.
+- A value a column cannot take — `abc` in a number filter — is refused in the filter editor
+  instead of becoming `= NULL` and matching nothing silently.
+- Table and column names that are not bare identifiers are quoted, so a column called
+  `order date` can be sorted and filtered.
+- The count query runs when the table or filters change, not on every sort.
+- The editor follows a `setTheme` call and an OS theme change; its base theme used to be chosen
+  once at load.
+
+### Changed
+
+- The SQL compiler and the snapshot codec load on first use rather than at mount. An application
+  that talks to the engine through the worker client now keeps them off its main thread until a
+  statement is run or a snapshot moves — about 73 KB gzipped less at mount.
+- The unsupported-feature explanations come from a generated slice of the feature matrix, four
+  kilobytes gzipped where the whole matrix was 29. `npm run devtools:matrix` regenerates it and a
+  test fails when it is stale.
+- The devtools' DOM modules are unit-tested under happy-dom: the console, grid, explorer forms,
+  rail, history, and custom element.
+
 ## 0.7.9 — September 3, 2026
 
 Published packages: `@minnowdb/core@0.7.9` and `@minnowdb/react@0.2.1`.

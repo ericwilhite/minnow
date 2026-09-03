@@ -77,6 +77,12 @@ export const icons = {
   upload: "M12 15V5M8 9l4-4 4 4M5 19h14",
   fish: "M17 12l4-3v6l-4-3M3 12c0-2.8 3.1-5 7-5s7 2.2 7 5-3.1 5-7 5-7-2.2-7-5z",
   warning: "M12 3l9 17H3l9-17zM12 10v4M12 17.2v.1",
+  view: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12zM12 9a3 3 0 100 6 3 3 0 000-6z",
+  link: "M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1",
+  copy: "M9 9h10v10H9zM5 15V5h10",
+  detail: "M4 6h16M4 12h10M4 18h6",
+  storage: "M4 6a8 3 0 0016 0 8 3 0 00-16 0zM4 6v12a8 3 0 0016 0V6M4 12a8 3 0 0016 0",
+  x: "M6 6l12 12M18 6L6 18",
 } as const;
 
 export function clear(node: Element): void {

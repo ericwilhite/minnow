@@ -35,6 +35,31 @@ await database.insertBatch("orders", [
 ]);
 await database.execute("CREATE UNIQUE INDEX people_by_city_score ON people(city ASC, score DESC)");
 
+// Everything the rail and the editors know how to show beyond columns: a view, an enum column, a
+// generated column, a NUMERIC domain, a CHECK, and a trigger. The FK from orders to people is
+// declared above; this table adds one to orders, so a row can be followed two hops.
+await database.execute(
+  "CREATE VIEW big_orders AS SELECT order_id, person, total FROM orders WHERE total > 10",
+);
+await database.execute("CREATE TYPE shipment_state AS ENUM ('packed', 'shipped', 'delivered')");
+await database.execute(
+  "CREATE TABLE shipments (" +
+    "shipment_id INTEGER PRIMARY KEY, " +
+    "order_id DOUBLE PRECISION NOT NULL REFERENCES orders(order_id), " +
+    "state shipment_state NOT NULL DEFAULT 'packed', " +
+    "weight_kg NUMERIC(6,2) NOT NULL CHECK (weight_kg > 0), " +
+    "weight_g NUMERIC GENERATED ALWAYS AS (weight_kg * 1000) STORED, " +
+    "packed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+);
+await database.execute(
+  "CREATE TRIGGER shipments_audit AFTER INSERT ON shipments FOR EACH ROW BEGIN " +
+    "UPDATE orders SET total = total WHERE order_id = NEW.order_id; END",
+);
+await database.execute(
+  "INSERT INTO shipments (shipment_id, order_id, state, weight_kg) VALUES " +
+    "(1, 1, 'shipped', 1.25), (2, 3, 'packed', 12.5)",
+);
+
 /**
  * A wide, keyless table and a big keyed one, so the explorer's two hard cases — no cursor to page
  * with, and far more rows than fit in the DOM — are both reachable from the demo.

@@ -16,6 +16,10 @@ const keyed: TableInfo = {
   ],
 };
 
+/** A datetime's instant; `String(date)` drops the milliseconds, which is what these tests check. */
+const instant = (value: QueryRow[string] | undefined): number =>
+  value instanceof Date ? value.getTime() : new Date(String(value)).getTime();
+
 const keyless: TableInfo = {
   name: "events",
   columns: [{ name: "kind", type: "string", nullable: false, isUniqueKey: false }],
@@ -36,8 +40,8 @@ describe("pagingMode", () => {
     expect(pagingMode(keyed, { column: "city", direction: "asc" })).toBe("offset");
   });
 
-  it("falls back on a datetime, which the engine can only compare by day", () => {
-    expect(pagingMode(keyed, { column: "joined", direction: "asc" })).toBe("offset");
+  it("cursors a datetime, whose literal carries the full instant", () => {
+    expect(pagingMode(keyed, { column: "joined", direction: "asc" })).toBe("keyset");
   });
 });
 
@@ -122,6 +126,31 @@ describe("buildPageQuery", () => {
       "SELECT * FROM people WHERE (people.city = 'London') AND (people.name LIKE 'A%')" +
         " AND people.id > 4 ORDER BY people.id LIMIT 20",
     );
+  });
+
+  it("quotes a name that is not a bare identifier, on the table and the column alike", () => {
+    const odd: TableInfo = {
+      name: "odd names",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number", nullable: false, isUniqueKey: true },
+        { name: "order date", type: "datetime", nullable: false, isUniqueKey: false },
+      ],
+    };
+    expect(
+      buildPageQuery({
+        table: odd,
+        filters: [],
+        sort: { column: "order date", direction: "desc" },
+        cursor: [new Date("2026-01-05T10:30:00.250Z"), 3],
+        limit: 5,
+      }),
+    ).toBe(
+      'SELECT * FROM "odd names" WHERE ("odd names"."order date" < TIMESTAMP \'2026-01-05T10:30:00.250Z\'' +
+        ' OR ("odd names"."order date" = TIMESTAMP \'2026-01-05T10:30:00.250Z\' AND "odd names".id < 3))' +
+        ' ORDER BY "odd names"."order date" DESC, "odd names".id DESC LIMIT 5',
+    );
+    expect(buildCountQuery(odd, [])).toBe('SELECT COUNT(*) AS row_count FROM "odd names"');
   });
 
   it("escapes a quote in a filter value rather than breaking the statement", () => {
@@ -269,20 +298,67 @@ describe("against the engine", () => {
     expect(cases).toEqual([...cases].sort());
   });
 
-  it("filters a datetime by day, the only granularity the engine parses", async () => {
+  it("filters a datetime to the millisecond", async () => {
     const { database, table } = await seeded();
-    const filters: Filter[] = [
-      {
-        column: "joined",
-        type: "datetime",
-        operator: ">=",
-        values: [new Date(Date.UTC(2026, 0, 20))],
-      },
+    const at = Date.UTC(2026, 0, 20, 10, 30, 0, 250);
+    await database.insert("people", {
+      id: rowCount,
+      name: "late",
+      city: null,
+      joined: new Date(at),
+    });
+    const after: Filter[] = [
+      { column: "joined", type: "datetime", operator: ">", values: [new Date(at - 1)] },
     ];
-    const rows = await readAll(database, table, undefined, filters);
-    expect(rows.length).toBeGreaterThan(0);
+    const rows = await readAll(database, table, undefined, after);
     for (const row of rows) {
-      expect(new Date(String(row.joined)).getTime()).toBeGreaterThanOrEqual(Date.UTC(2026, 0, 20));
+      expect(instant(row.joined)).toBeGreaterThan(at - 1);
     }
+    expect(rows.map((row) => row.id)).toContain(rowCount);
+    const exact: Filter[] = [
+      { column: "joined", type: "datetime", operator: "=", values: [new Date(at)] },
+    ];
+    expect((await readAll(database, table, undefined, exact)).map((row) => row.id)).toEqual([
+      rowCount,
+    ]);
+  });
+
+  it("cursors through a datetime sort, visiting every row exactly once", async () => {
+    const { database, table } = await seeded();
+    const sort: Sort = { column: "joined", direction: "desc" };
+    expect(pagingMode(table, sort)).toBe("keyset");
+    const rows = await readAll(database, table, sort);
+    expect(new Set(rows.map((row) => row.id)).size).toBe(rowCount);
+    const times = rows.map((row) => instant(row.joined));
+    expect(times).toEqual([...times].sort((a, b) => b - a));
+  });
+
+  it("pages a table whose names need quoting", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 16 });
+    await database.createTable({
+      name: "odd names",
+      uniqueKey: "row id",
+      columns: [
+        { name: "row id", type: "number" },
+        { name: "order date", type: "datetime" },
+        { name: 'quo"te', type: "string", nullable: true },
+      ],
+    });
+    for (let index = 0; index < 50; index += 1) {
+      await database.insert("odd names", {
+        "row id": index,
+        "order date": new Date(Date.UTC(2026, 0, 1, index % 5)),
+        'quo"te': index % 3 === 0 ? null : `v${String(index)}`,
+      });
+    }
+    const [table] = toCatalog(await database.listTables());
+    if (table === undefined) throw new Error("missing table");
+    const sort: Sort = { column: "order date", direction: "asc" };
+    expect(pagingMode(table, sort)).toBe("keyset");
+    const rows = await readAll(database, table, sort, [
+      { column: 'quo"te', type: "string", operator: "is not null", values: [] },
+    ]);
+    expect(rows.map((row) => row["row id"])).toHaveLength(33);
+    expect(new Set(rows.map((row) => row["row id"])).size).toBe(33);
   });
 });

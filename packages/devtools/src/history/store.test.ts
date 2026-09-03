@@ -147,3 +147,31 @@ describe("describeOutcome", () => {
     ).toBe("created index by_name on people(name) · 12ms");
   });
 });
+
+describe("saved queries", () => {
+  it("keeps a saved entry past the limit and past Clear", () => {
+    const store = createHistoryStore(memoryStorage(), "panel");
+    store.add({ sql: "SELECT 'keep'", ms: 1 }, "keep", 0);
+    store.toggleSaved("keep");
+    for (let index = 0; index < historyLimit + 5; index += 1) {
+      store.add({ sql: `SELECT ${String(index)}`, ms: 1 }, `id-${String(index)}`, index + 1);
+    }
+    expect(store.entries()).toHaveLength(historyLimit + 1);
+    expect(store.entries().at(-1)?.sql).toBe("SELECT 'keep'");
+    store.clear();
+    expect(store.entries().map((entry) => entry.sql)).toEqual(["SELECT 'keep'"]);
+  });
+
+  it("toggles back to forgotten, after which the entry ages out like any other", () => {
+    const storage = memoryStorage();
+    const store = createHistoryStore(storage, "panel");
+    store.add({ sql: "SELECT 1", ms: 1 }, "a", 0);
+    store.toggleSaved("a");
+    expect(store.entries()[0]?.saved).toBe(true);
+    expect(storage.written()).toContain('"saved":true');
+    store.toggleSaved("a");
+    expect(store.entries()[0]?.saved).toBe(false);
+    store.clear();
+    expect(store.entries()).toEqual([]);
+  });
+});

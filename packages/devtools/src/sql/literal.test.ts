@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isExactlyComparable, isSortable, sqlColumn, sqlLiteral } from "./literal.js";
+import { sqlColumn, sqlIdentifier, sqlLiteral } from "./literal.js";
 
 describe("sqlLiteral", () => {
   it("doubles a quote instead of ending the string early", () => {
@@ -25,8 +25,11 @@ describe("sqlLiteral", () => {
     expect(sqlLiteral(false, "boolean")).toBe("FALSE");
   });
 
-  it("writes a datetime as the explorer's day-granular date literal", () => {
-    expect(sqlLiteral(new Date("2026-08-12T18:40:00Z"), "datetime")).toBe("DATE '2026-08-12'");
+  it("writes a datetime to the millisecond, in UTC", () => {
+    expect(sqlLiteral(new Date("2026-08-12T18:40:00.250Z"), "datetime")).toBe(
+      "TIMESTAMP '2026-08-12T18:40:00.250Z'",
+    );
+    expect(sqlLiteral("2026-08-12", "datetime")).toBe("TIMESTAMP '2026-08-12T00:00:00.000Z'");
     expect(() => sqlLiteral("not a date", "datetime")).toThrow(TypeError);
   });
 
@@ -37,36 +40,34 @@ describe("sqlLiteral", () => {
   });
 });
 
+describe("sqlIdentifier", () => {
+  it("leaves a bare identifier alone, keywords included", () => {
+    for (const name of ["people", "case", "NOT", "null", "_x1", "order"]) {
+      expect(sqlIdentifier(name)).toBe(name);
+    }
+  });
+
+  it("quotes anything else, doubling quotes inside", () => {
+    expect(sqlIdentifier("order date")).toBe('"order date"');
+    expect(sqlIdentifier("a-b")).toBe('"a-b"');
+    expect(sqlIdentifier('quo"te')).toBe('"quo""te"');
+    expect(sqlIdentifier("x; DROP TABLE y")).toBe('"x; DROP TABLE y"');
+    expect(sqlIdentifier("1st")).toBe('"1st"');
+  });
+
+  it("refuses an empty name, which no quoting can express", () => {
+    expect(() => sqlIdentifier("")).toThrow(TypeError);
+  });
+});
+
 describe("sqlColumn", () => {
   it("qualifies, so a keyword-named column still parses in WHERE", () => {
     expect(sqlColumn("people", "when")).toBe("people.when");
   });
 
-  it("refuses a name that is not a bare identifier", () => {
-    expect(() => sqlColumn("people", "a b")).toThrow(TypeError);
-    expect(() => sqlColumn("people", "x; DROP TABLE y")).toThrow(TypeError);
-    expect(() => sqlColumn("people p", "x")).toThrow(TypeError);
+  it("quotes either side when it has to", () => {
+    expect(sqlColumn("people", "a b")).toBe('people."a b"');
+    expect(sqlColumn("people p", "x")).toBe('"people p".x');
     expect(() => sqlColumn("people", "")).toThrow(TypeError);
-  });
-});
-
-describe("isSortable", () => {
-  it("allows keyword names, which qualifying in ORDER BY makes sortable", () => {
-    for (const column of ["case", "NOT", "null", "exists", "count", "date", "when", "order"]) {
-      expect(isSortable(column)).toBe(true);
-    }
-  });
-
-  it("refuses a name this package cannot render as SQL", () => {
-    expect(isSortable("name DESC, id")).toBe(false);
-    expect(isSortable("")).toBe(false);
-  });
-});
-
-describe("isExactlyComparable", () => {
-  it("excludes datetimes, whose literals carry no time of day", () => {
-    expect(isExactlyComparable("datetime")).toBe(false);
-    expect(isExactlyComparable("number")).toBe(true);
-    expect(isExactlyComparable("string")).toBe(true);
   });
 });

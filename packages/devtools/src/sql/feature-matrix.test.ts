@@ -4,23 +4,18 @@ import {
   buildFailureIndex,
   describeUnsupported,
   lookupFailure,
-  type MatrixFeature,
+  type UnsupportedFeatureRecord,
 } from "./feature-matrix.js";
+import { unsupportedFeatures } from "./unsupported-features.js";
 
-const features: MatrixFeature[] = [
-  { id: "a.one", status: "unsupported", error: "Only mine", notes: "Use the other thing." },
-  { id: "a.two", status: "unsupported", error: "No note here" },
-  { id: "b.one", status: "unsupported", error: "Shared" },
-  { id: "b.two", status: "unsupported", error: "Shared", notes: "Never seen." },
-  { id: "c.one", status: "supported", error: "Supported things are skipped" },
+const features: UnsupportedFeatureRecord[] = [
+  { id: "a.one", error: "Only mine", notes: "Use the other thing." },
+  { id: "a.two", error: "No note here" },
+  { id: "b.one", error: "Shared" },
+  { id: "b.two", error: "Shared", notes: "Never seen." },
 ];
 
 describe("buildFailureIndex", () => {
-  it("indexes only unsupported features", () => {
-    const index = buildFailureIndex(features);
-    expect(index.has("Supported things are skipped")).toBe(false);
-  });
-
   it("drops a fragment two features share, rather than guessing between them", () => {
     // `Expected SELECT` is the real case: DDL and transactions both report it, and so does a
     // perfectly supported DELETE sent through the read-only path.
@@ -56,10 +51,26 @@ describe("describeUnsupported", () => {
   });
 });
 
-/** The shipped matrix is the source of truth, so the shape this relies on is worth asserting. */
-describe("the shipped matrix", () => {
+/**
+ * The shipped module is a generated slice of core's matrix — the unsupported features that carry
+ * an error fragment — so it has to say exactly what the matrix says. This is the check that keeps
+ * it current: when the matrix changes, `npm run devtools:matrix` rewrites the module.
+ */
+describe("the generated unsupported-features module", () => {
+  it("matches the shipped matrix", () => {
+    const expected = matrix.features
+      .filter((feature) => feature.status === "unsupported" && feature.error !== undefined)
+      .map((feature) => ({
+        id: feature.id,
+        error: feature.error ?? "",
+        ...(feature.notes === undefined ? {} : { notes: feature.notes }),
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id));
+    expect(unsupportedFeatures).toEqual(expected);
+  });
+
   it("explains the failures that a devtools user is most likely to hit", () => {
-    const index = buildFailureIndex(matrix.features);
+    const index = buildFailureIndex(unsupportedFeatures);
     for (const message of [
       "UPDATE requires a table with a unique key",
       // SET is a statement now; SERIALIZABLE is what a user still cannot ask for.
@@ -72,6 +83,8 @@ describe("the shipped matrix", () => {
 
   it("refuses to explain Expected SELECT, which several features share", () => {
     // A supported DELETE run through query() reports this; attaching a DDL note would mislead.
-    expect(lookupFailure(buildFailureIndex(matrix.features), "Expected SELECT")).toBeUndefined();
+    expect(
+      lookupFailure(buildFailureIndex(unsupportedFeatures), "Expected SELECT"),
+    ).toBeUndefined();
   });
 });

@@ -96,6 +96,11 @@ export function resolveOptions(options: DevtoolsOptions = {}): ResolvedDevtoolsO
   };
 }
 
+/** The palette an attribute value names; an absent or unknown value follows the system. */
+export function themeFromAttribute(value: string | null): DevtoolsTheme {
+  return oneOf(themes, value ?? undefined, "system");
+}
+
 /** Reads the same options off element attributes, so the custom element configures declaratively. */
 export function optionsFromAttributes(element: {
   getAttribute(name: string): string | null;

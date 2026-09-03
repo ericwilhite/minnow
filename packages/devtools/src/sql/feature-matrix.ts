@@ -1,8 +1,8 @@
-/** What the shipped matrix records about one SQL feature. */
-export interface MatrixFeature {
+/** One unsupported feature, as the generated `unsupported-features.ts` records it. */
+export interface UnsupportedFeatureRecord {
   id: string;
-  status: string;
-  error?: string;
+  /** The fragment of the engine's error message that names this feature. */
+  error: string;
   notes?: string;
 }
 
@@ -20,11 +20,10 @@ export interface UnsupportedFeature {
  * read-only path — so an ambiguous fragment explains nothing rather than guessing wrong.
  */
 export function buildFailureIndex(
-  features: readonly MatrixFeature[],
+  features: readonly UnsupportedFeatureRecord[],
 ): Map<string, UnsupportedFeature> {
-  const byFragment = new Map<string, MatrixFeature[]>();
+  const byFragment = new Map<string, UnsupportedFeatureRecord[]>();
   for (const feature of features) {
-    if (feature.status !== "unsupported" || feature.error === undefined) continue;
     byFragment.set(feature.error, [...(byFragment.get(feature.error) ?? []), feature]);
   }
   const index = new Map<string, UnsupportedFeature>();

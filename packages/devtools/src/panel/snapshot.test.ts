@@ -1,12 +1,7 @@
 import type { SnapshotSummary } from "@minnowdb/core/storage/snapshots";
 import { describe, expect, it } from "vitest";
-import {
-  confirmRestore,
-  describeExport,
-  describeLoad,
-  formatBytes,
-  snapshotFileName,
-} from "./snapshot.js";
+import { confirmRestore, describeExport, describeLoad, snapshotFileName } from "./snapshot.js";
+import { formatBytes } from "../format.js";
 
 const summary: SnapshotSummary = {
   formatVersion: 1,

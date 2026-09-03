@@ -134,6 +134,11 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
   // The schema lives in a compartment so the catalog can be swapped in without rebuilding the
   // editor — the document, history, and caret all survive a reconfigure.
   const schemaCompartment = new Compartment();
+  // The theme lives in one too: `setTheme` on the panel flips the palette without rebuilding the
+  // editor, and CodeMirror's base theme has to be told which half to apply along with it.
+  const themeCompartment = new Compartment();
+  const theme = (dark: boolean): ReturnType<typeof EditorView.theme> =>
+    EditorView.theme(themeSpec, { dark });
   const sqlExtension = (schema: EditorSchema): ReturnType<typeof langSql.sql> =>
     langSql.sql({ schema, upperCaseKeywords: true });
 
@@ -176,7 +181,7 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
         // Tells CodeMirror which half of its base theme to apply. Every colour that matters is
         // overridden above, but the base theme still decides things like the tooltip's own
         // borders, and it defaults to light.
-        EditorView.theme(themeSpec, { dark: prefersDark(deps.root) }),
+        themeCompartment.of(theme(prefersDark(deps.root))),
       ],
     }),
   });
@@ -210,8 +215,16 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
         scrollIntoView: true,
       });
     },
+    selectedText: () => {
+      const { from, to } = editorView.state.selection.main;
+      return editorView.state.doc.sliceString(from, to);
+    },
+    selectionStart: () => editorView.state.selection.main.from,
     setSchema: (schema) => {
       editorView.dispatch({ effects: schemaCompartment.reconfigure(sqlExtension(schema)) });
+    },
+    setDark: (dark) => {
+      editorView.dispatch({ effects: themeCompartment.reconfigure(theme(dark)) });
     },
     destroy: () => {
       editorView.destroy();

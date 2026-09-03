@@ -1,12 +1,14 @@
-import { compileStatement, type CompiledStatement } from "@minnowdb/core/query";
+import { compileQuery, compileStatement, type CompiledStatement } from "@minnowdb/core/query";
+import { sqlIdentifier } from "./sql/literal.js";
 
 /**
  * What a statement will do, read off the compiled plan rather than the text. Matching on the
  * compiler's own discriminant is the only way to be sure: a statement starting with the letters
  * `select` can still be something else, and one mentioning `delete` in a string literal is not.
  */
-type StatementIntent =
-  | { kind: "select" }
+export type StatementIntent =
+  /** `limited` says whether the query bounds itself; the console caps one that does not. */
+  | { kind: "select"; limited: boolean }
   /** `SET`, `RESET`, and `SHOW`: session settings, never data. Runs without review or the write gate. */
   | { kind: "session"; operation: "set" | "show" }
   | { kind: "insert"; table: string; columns: string[]; rowCount: number }
@@ -48,7 +50,7 @@ export function classifyStatement(sql: string): StatementIntent {
     case "delete":
       return { kind: "delete", table: statement.table, filtered: statement.predicates.length > 0 };
     case "select":
-      return { kind: "select" };
+      return { kind: "select", limited: compileQuery(sql).limit !== undefined };
     case "create-table":
       return executeIntent(statement.kind, {
         title: `Create table ${statement.table}`,
@@ -227,6 +229,96 @@ export function changesData(intent: StatementIntent): boolean {
 /** Whether the statement is described and confirmed before it runs. A subset of {@link changesData}. */
 export function needsConfirmation(intent: StatementIntent): boolean {
   return changesData(intent) && (intent.kind !== "execute" || intent.confirm);
+}
+
+const catalogOperations: ReadonlySet<string> = new Set([
+  "create-table",
+  "create-table-as",
+  "create-enum",
+  "create-sequence",
+  "create-index",
+  "drop-index",
+  "add-column",
+  "drop-column",
+  "drop-table",
+  "create-view",
+  "drop-view",
+  "create-trigger",
+  "drop-trigger",
+]);
+
+/** Whether a successful run changes what the catalog says, so the rail and completion reread it. */
+export function changesCatalog(intent: StatementIntent): boolean {
+  return intent.kind === "execute" && catalogOperations.has(intent.operation);
+}
+
+/**
+ * The query that counts the rows an UPDATE or DELETE will touch, so the confirmation can say
+ * "12 rows" rather than "matching rows". The WHERE clause is lifted from the statement's own
+ * text — the compiled predicates have no SQL form — by finding the top-level `WHERE` outside
+ * strings, comments, and parentheses, and stopping at a top-level `RETURNING`. Undefined for
+ * every other statement, and for a text this cannot read with confidence.
+ */
+export function previewQuery(sql: string, intent: StatementIntent): string | undefined {
+  if (intent.kind !== "update" && intent.kind !== "delete") return undefined;
+  const table = sqlIdentifier(intent.table);
+  if (!intent.filtered) return `SELECT COUNT(*) AS row_count FROM ${table}`;
+  const where = whereClauseOf(sql);
+  return where === undefined
+    ? undefined
+    : `SELECT COUNT(*) AS row_count FROM ${table} WHERE ${where}`;
+}
+
+/** The text between a top-level WHERE and the end of the statement or its RETURNING clause. */
+function whereClauseOf(sql: string): string | undefined {
+  let depth = 0;
+  let start: number | undefined;
+  let index = 0;
+  while (index < sql.length) {
+    const char = sql[index] ?? "";
+    const next = sql[index + 1] ?? "";
+    if (char === "-" && next === "-") {
+      const eol = sql.indexOf("\n", index);
+      index = eol < 0 ? sql.length : eol + 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      const close = sql.indexOf("*/", index + 2);
+      index = close < 0 ? sql.length : close + 2;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      index += 1;
+      while (index < sql.length) {
+        if (sql[index] === char) {
+          if (sql[index + 1] === char) index += 2;
+          else break;
+        } else index += 1;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === "(") depth += 1;
+    else if (char === ")") depth -= 1;
+    else if (/[A-Za-z_]/.test(char)) {
+      let end = index + 1;
+      while (end < sql.length && /[A-Za-z0-9_$]/.test(sql[end] ?? "")) end += 1;
+      const word = sql.slice(index, end).toUpperCase();
+      if (depth === 0 && start === undefined && word === "WHERE") start = end;
+      else if (depth === 0 && start !== undefined && word === "RETURNING") {
+        return clause(sql.slice(start, index));
+      }
+      index = end;
+      continue;
+    }
+    index += 1;
+  }
+  return start === undefined ? undefined : clause(sql.slice(start));
+}
+
+function clause(text: string): string | undefined {
+  const trimmed = text.replace(/[\s;]+$/u, "").trim();
+  return trimmed.length === 0 ? undefined : trimmed;
 }
 
 interface StatementSummary {

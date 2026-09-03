@@ -33,8 +33,14 @@ export interface SqlEditor {
   selectRange(from: number, to: number): void;
   /** Inserts at the caret, replacing any selection, and leaves the caret after it. */
   insert(text: string): void;
+  /** The selected text, empty when nothing is selected — what "run the selection" runs. */
+  selectedText(): string;
+  /** Where the selection starts, so an error inside a run selection can be pointed at. */
+  selectionStart(): number;
   /** Feeds the catalog to completion; the textarea ignores it. */
   setSchema(schema: EditorSchema): void;
+  /** Repaints for a palette switch; the textarea is styled by tokens and ignores it. */
+  setDark(dark: boolean): void;
   destroy(): void;
 }
 
@@ -77,7 +83,10 @@ export function createTextareaEditor(deps: SqlEditorDeps): SqlEditor {
       node.focus();
       node.setSelectionRange(start + insert.length, start + insert.length);
     },
+    selectedText: () => node.value.slice(node.selectionStart, node.selectionEnd),
+    selectionStart: () => node.selectionStart,
     setSchema: () => undefined,
+    setDark: () => undefined,
     destroy: () => undefined,
   };
 }

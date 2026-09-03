@@ -60,6 +60,18 @@ export interface SnapshotTarget extends DevtoolsTarget {
   ): Promise<void>;
 }
 
+/**
+ * The batched read the whole-result download uses. Both `MinnowDatabase` and the worker client
+ * offer it; a target without it downloads what the grid holds.
+ */
+export interface CursorTarget extends DevtoolsTarget {
+  queryCursor(sql: string): AsyncIterable<QueryResult>;
+}
+
+export function isCursorTarget(target: DevtoolsTarget): target is CursorTarget {
+  return typeof (target as { queryCursor?: unknown }).queryCursor === "function";
+}
+
 const snapshotMethods = ["exportSnapshot", "importSnapshot"] as const;
 
 /** Whether this target can copy a database out and load one back. */

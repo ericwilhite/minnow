@@ -1,14 +1,14 @@
-import matrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
 import { SqlCompileError } from "@minnowdb/core";
 import { compileStatement } from "@minnowdb/core/query";
 import { buildFailureIndex, describeUnsupported, lookupFailure } from "../sql/feature-matrix.js";
+import { unsupportedFeatures } from "../sql/unsupported-features.js";
 
 /**
- * The matrix is 14 KB of JSON, and it rides in the editor chunk rather than the panel's — the
- * same chunk as CodeMirror, which is already two orders of magnitude larger, so it costs nothing
- * anyone notices and the panel that never opens the console never fetches it.
+ * The unsupported slice of core's feature matrix — a generated module a few kilobytes long, rather
+ * than the hundred-kilobyte matrix itself. It rides in the editor chunk with CodeMirror, so the
+ * panel that never opens the console never fetches it.
  */
-const index = buildFailureIndex(matrix.features);
+const index = buildFailureIndex(unsupportedFeatures);
 
 /**
  * What the engine records about a failure, beyond the message: which capability it ran into, and

@@ -1,7 +1,7 @@
 import type { QueryRow, QueryValue } from "@minnowdb/core";
 import { findColumn, type TableInfo } from "../explorer/catalog.js";
 import { renderFilters, type Filter } from "../explorer/filters.js";
-import { isExactlyComparable, isSortable, sqlColumn, sqlLiteral } from "./literal.js";
+import { sqlColumn, sqlIdentifier, sqlLiteral } from "./literal.js";
 
 export interface Sort {
   column: string;
@@ -32,34 +32,28 @@ export interface PageRequest {
 export type PagingMode = "keyset" | "offset";
 
 /**
- * A cursor can only address a row exactly when three things hold: the table has a unique key to
- * break ties, the sort column compares exactly (datetimes do not because the explorer's literal
- * encoder is intentionally day-granular), and the sort column has no NULLs, since every comparison
- * against NULL is unknown and would silently drop those rows from every page after the first.
+ * A cursor can only address a row exactly when two things hold: the table has a unique key to
+ * break ties, and the sort column has no NULLs, since every comparison against NULL is unknown and
+ * would silently drop those rows from every page after the first. Every column type compares
+ * exactly — a datetime literal carries its milliseconds — so the type never decides.
  */
 export function pagingMode(table: TableInfo, sort?: Sort): PagingMode {
   const key = table.uniqueKey;
-  if (key === undefined || !isSortable(key)) return "offset";
-  if (sort === undefined) return "keyset";
+  if (key === undefined) return "offset";
+  if (sort === undefined || sort.column === key) return "keyset";
   const column = findColumn(table, sort.column);
   if (column === undefined) return "offset";
-  if (column.name === key) return "keyset";
-  return column.nullable || !isExactlyComparable(column.type) ? "offset" : "keyset";
+  return column.nullable ? "offset" : "keyset";
 }
 
-/**
- * The ordering actually sent: the chosen column, then the key so the order is total. A name this
- * package cannot render as SQL is dropped rather than sent — see `isSortable`.
- */
+/** The ordering actually sent: the chosen column, then the key so the order is total. */
 function orderColumns(table: TableInfo, sort?: Sort): Sort[] {
-  const key =
-    table.uniqueKey !== undefined && isSortable(table.uniqueKey) ? table.uniqueKey : undefined;
-  const chosen = sort !== undefined && isSortable(sort.column) ? sort : undefined;
-  if (chosen === undefined) {
+  const key = table.uniqueKey;
+  if (sort === undefined) {
     return key === undefined ? [] : [{ column: key, direction: "asc" }];
   }
-  if (key === undefined || chosen.column === key) return [chosen];
-  return [chosen, { column: key, direction: chosen.direction }];
+  if (key === undefined || sort.column === key) return [sort];
+  return [sort, { column: key, direction: sort.direction }];
 }
 
 /**
@@ -120,12 +114,22 @@ export function buildPageQuery(request: PageRequest): string {
   const offset = mode === "offset" ? (request.offset ?? 0) : 0;
   const tail =
     offset > 0 ? ` LIMIT ${String(limit)} OFFSET ${String(offset)}` : ` LIMIT ${String(limit)}`;
-  return `SELECT * FROM ${table.name}${whereClause([filterSql, cursorSql])}${orderClause(table.name, order)}${tail}`;
+  return `SELECT * FROM ${sqlIdentifier(table.name)}${whereClause([filterSql, cursorSql])}${orderClause(table.name, order)}${tail}`;
+}
+
+/** The rows being browsed as a plain statement, for the console to start from. Unbounded on purpose: the console caps it. */
+export function buildBrowseQuery(
+  table: TableInfo,
+  filters: readonly Filter[],
+  sort?: Sort,
+): string {
+  const filterSql = renderFilters(table.name, filters);
+  return `SELECT * FROM ${sqlIdentifier(table.name)}${whereClause([filterSql])}${orderClause(table.name, orderColumns(table, sort))}`;
 }
 
 /** Counting scans the whole table, so callers ask for it separately and never wait on it. */
 export function buildCountQuery(table: TableInfo, filters: readonly Filter[]): string {
-  return `SELECT COUNT(*) AS row_count FROM ${table.name}${whereClause([renderFilters(table.name, filters)])}`;
+  return `SELECT COUNT(*) AS row_count FROM ${sqlIdentifier(table.name)}${whereClause([renderFilters(table.name, filters)])}`;
 }
 
 /** The cursor for the page after this row, or undefined when the table cannot be cursored. */

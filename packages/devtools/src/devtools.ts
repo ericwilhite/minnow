@@ -6,8 +6,10 @@ import { createSchemaRail } from "./explorer/tree.js";
 import { matchesHotkey } from "./hotkey.js";
 import { resolveOptions, type DevtoolsOptions, type DevtoolsTheme } from "./options.js";
 import { createLauncher } from "./panel/launcher.js";
-import { createPanel } from "./panel/panel.js";
+import { createPanel, type PanelView } from "./panel/panel.js";
 import { createSnapshotActions } from "./panel/snapshot.js";
+import { createStorageView, isStorageTarget } from "./panel/storage-view.js";
+import { sqlColumn, sqlIdentifier } from "./sql/literal.js";
 import { styles } from "./styles.js";
 import {
   isSnapshotTarget,
@@ -73,14 +75,50 @@ export function createDevtools(
   const host = root.host;
   host.setAttribute("data-minnow-devtools", resolved.mode);
 
-  function applyTheme(theme: DevtoolsTheme): void {
-    if (theme === "system") host.removeAttribute("theme");
-    else host.setAttribute("theme", theme);
+  /**
+   * The palette follows the OS unless the page pins it. The stylesheet reads the attribute; the
+   * editor is told directly, since CodeMirror's base theme has a light and a dark half of its own.
+   */
+  const systemDark =
+    typeof globalThis.matchMedia === "function"
+      ? globalThis.matchMedia("(prefers-color-scheme: dark)")
+      : undefined;
+  let theme: DevtoolsTheme = resolved.theme;
+
+  function isDark(): boolean {
+    if (theme === "dark") return true;
+    if (theme === "light") return false;
+    return systemDark?.matches ?? false;
   }
-  applyTheme(resolved.theme);
+
+  function applyTheme(next: DevtoolsTheme): void {
+    theme = next;
+    if (next === "system") host.removeAttribute("theme");
+    else host.setAttribute("theme", next);
+    view.setDark(isDark());
+  }
+
+  const onSystemTheme = (): void => {
+    if (theme === "system") view.setDark(isDark());
+  };
+  systemDark?.addEventListener("change", onSystemTheme);
 
   const confirm = createConfirmLayer();
-  const explorer = createExplorer({ target, confirm, write: resolved.write });
+  const explorer = createExplorer({
+    target,
+    confirm,
+    write: resolved.write,
+    storageKey: resolved.storageKey,
+    // The explorer is the one place that knows which table is showing, whichever route opened
+    // it, so the rail's highlight follows it rather than the click that may have caused it.
+    onOpen: (table) => {
+      rail.setSelected(table);
+    },
+    onRunQuery: (sql) => {
+      panel.show("query");
+      void view.runQuery(sql);
+    },
+  });
   const view = createConsole({
     target,
     confirm,
@@ -101,16 +139,34 @@ export function createDevtools(
       void loadCatalog();
     },
     onPickTable: (table) => {
-      if (panel.activeView() === "query") view.insert(table.name);
+      if (panel.activeView() === "query") view.insert(sqlIdentifier(table.name));
       else void explorer.open(table.name);
     },
     onPickColumn: (table, column) => {
-      if (panel.activeView() === "query") view.insert(`${table.name}.${column.name}`);
+      if (panel.activeView() === "query") view.insert(sqlColumn(table.name, column.name));
       else void explorer.open(table.name);
     },
     onPickIndex: (table, index) => {
-      if (panel.activeView() === "query") view.insert(index.name);
+      if (panel.activeView() === "query") view.insert(sqlIdentifier(index.name));
       else void explorer.open(table.name);
+    },
+    // A foreign key is a join waiting to be written, or the parent table waiting to be opened.
+    onPickForeignKey: (table, key) => {
+      if (panel.activeView() === "query") {
+        const on = key.columns
+          .map(
+            (column, index) =>
+              `${sqlColumn(table.name, column)} = ${sqlColumn(key.parentTable, key.parentColumns[index] ?? column)}`,
+          )
+          .join(" AND ");
+        view.insert(`JOIN ${sqlIdentifier(key.parentTable)} ON ${on}`);
+      } else void explorer.open(key.parentTable);
+    },
+    onPickViewSql: (table) => {
+      if (panel.activeView() === "query") {
+        setOpen(true);
+        view.setQuery(table.view?.sql ?? "");
+      } else void explorer.open(table.name);
     },
   });
 
@@ -131,33 +187,51 @@ export function createDevtools(
       })
     : undefined;
 
+  /** Bytes and blocks and the collector's state, for a target that reports them. */
+  const storage = isStorageTarget(target) ? createStorageView(target) : undefined;
+
+  const views: PanelView[] = [
+    // The console leads: writing a query is what the panel is opened for most often.
+    {
+      id: "query",
+      label: "Query",
+      node: view.node,
+      // CodeMirror is fetched here, so the panel opens without it.
+      onFirstShow: () => {
+        void view.upgrade();
+      },
+    },
+    {
+      id: "data",
+      label: "Data",
+      node: explorer.node,
+      // The first page usually arrives while this tab is hidden, and a hidden grid measures
+      // 0px tall: it pools only its overscan rows until told the real height is available.
+      onShow: () => {
+        explorer.layout();
+      },
+    },
+    ...(storage === undefined
+      ? []
+      : [
+          {
+            id: "storage",
+            label: "Storage",
+            node: storage.node,
+            // Each report walks the store, so it is read when looked at, never in the background.
+            onShow: () => {
+              void storage.refresh();
+            },
+          },
+        ]),
+  ];
+
   const panel = createPanel({
     options: resolved,
     offMainThread: runsOffMainThread(target),
     rail: rail.node,
     ...(snapshots === undefined ? {} : { actions: snapshots.nodes }),
-    // The console leads: writing a query is what the panel is opened for most often.
-    views: [
-      {
-        id: "query",
-        label: "Query",
-        node: view.node,
-        // CodeMirror is fetched here, so the panel opens without it.
-        onFirstShow: () => {
-          void view.upgrade();
-        },
-      },
-      {
-        id: "data",
-        label: "Data",
-        node: explorer.node,
-        // The first page usually arrives while this tab is hidden, and a hidden grid measures
-        // 0px tall: it pools only its overscan rows until told the real height is available.
-        onShow: () => {
-          explorer.layout();
-        },
-      },
-    ],
+    views,
     overlay: confirm.node,
     onClose: () => {
       close();
@@ -193,6 +267,7 @@ export function createDevtools(
 
   if (launcher !== undefined) root.append(launcher.node);
   root.append(panel.node);
+  applyTheme(resolved.theme);
 
   let open = false;
   let destroyed = false;
@@ -240,6 +315,23 @@ export function createDevtools(
     window.addEventListener("keydown", onKeyDown);
   }
 
+  /**
+   * Keys that act on the panel from anywhere inside it. Escape closes a floating panel, once
+   * nothing inside it wanted the key — the confirmation, a cell editor, the insert form, and a
+   * completion list all take it first. Mod+K jumps to the table filter.
+   */
+  panel.node.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented) return;
+    if (event.key === "Escape" && resolved.mode === "launcher") {
+      event.preventDefault();
+      close();
+      launcher?.node.focus();
+    } else if (matchesHotkey("mod+k", event)) {
+      event.preventDefault();
+      rail.focusSearch();
+    }
+  });
+
   panel.node.hidden = true;
   launcher?.setOpen(false);
   if (resolved.defaultOpen) setOpen(true, false);
@@ -256,9 +348,9 @@ export function createDevtools(
       panel.show("query");
       view.setQuery(sql);
     },
-    setTheme: (theme: DevtoolsTheme) => {
+    setTheme: (next: DevtoolsTheme) => {
       if (destroyed) return;
-      applyTheme(theme);
+      applyTheme(next);
     },
     get isOpen() {
       return open;
@@ -267,8 +359,10 @@ export function createDevtools(
       if (destroyed) return;
       destroyed = true;
       window.removeEventListener("keydown", onKeyDown);
+      systemDark?.removeEventListener("change", onSystemTheme);
       confirm.dismiss();
       view.destroy();
+      explorer.destroy();
       panel.destroy();
       // The theme attribute stays: on the custom element it is the caller's own markup, and a
       // remount reads its options back off the element.

@@ -8421,7 +8421,7 @@
               "name": "MinnowDevtoolsElement",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class MinnowDevtoolsElement extends HTMLElement {\n    #private;\n    constructor();\n    get target(): DevtoolsAttachable | undefined;\n    set target(value: DevtoolsAttachable | undefined);\n    get options(): DevtoolsOptions;\n    set options(value: DevtoolsOptions);\n    open(): void;\n    close(): void;\n    toggle(): void;\n    setTheme(theme: DevtoolsTheme): void;\n    connectedCallback(): void;\n    disconnectedCallback(): void;\n}"
+                "export declare class MinnowDevtoolsElement extends HTMLElement {\n    #private;\n    static get observedAttributes(): readonly string[];\n    constructor();\n    get target(): DevtoolsAttachable | undefined;\n    set target(value: DevtoolsAttachable | undefined);\n    get options(): DevtoolsOptions;\n    set options(value: DevtoolsOptions);\n    open(): void;\n    close(): void;\n    toggle(): void;\n    setTheme(theme: DevtoolsTheme): void;\n    connectedCallback(): void;\n    disconnectedCallback(): void;\n    attributeChangedCallback(name: string, previous: string | null, next: string | null): void;\n}"
               ]
             },
             {

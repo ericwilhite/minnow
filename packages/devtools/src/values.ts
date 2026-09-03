@@ -9,10 +9,16 @@ const nullInput = "NULL";
 
 /**
  * Turns typed text into a value of the column's type, or explains why it cannot. Writes go through
- * the batch API rather than SQL text, so the value here is the value stored — a datetime keeps its
- * full precision, unlike the day-granular literals a filter has to compile to.
+ * the batch API rather than SQL text, so the value here is the value stored. An enum column takes
+ * only its declared values; the check is here so the form refuses `pending` before the engine
+ * does, with the accepted values in the message.
  */
-export function parseInput(text: string, type: ColumnType, nullable: boolean): ParseResult {
+export function parseInput(
+  text: string,
+  type: ColumnType,
+  nullable: boolean,
+  enumValues?: readonly string[],
+): ParseResult {
   const trimmed = text.trim();
   if (trimmed.length === 0 || trimmed.toUpperCase() === nullInput) {
     return nullable
@@ -39,6 +45,9 @@ export function parseInput(text: string, type: ColumnType, nullable: boolean): P
         : { ok: false, message: `Not a date: ${trimmed}` };
     }
     case "string":
+      if (enumValues !== undefined && !enumValues.includes(trimmed)) {
+        return { ok: false, message: `Not one of ${enumValues.join(", ")}: ${trimmed}` };
+      }
       return { ok: true, value: trimmed };
   }
 }

@@ -1,6 +1,6 @@
 ---
 title: Devtools
-description: An embeddable SQL console for your database — a floating panel in dev, an inline console in docs pages.
+description: An embeddable SQL console and database explorer — a floating panel in dev, an inline console in docs pages.
 ---
 
 A panel you drop into any app to browse, edit, and query the database it is already using. It
@@ -38,7 +38,8 @@ if (import.meta.env.DEV) {
 }
 ```
 
-That adds a launcher button in the corner. Click it, or press `Cmd/Ctrl + Shift + D`.
+That adds a launcher button in the corner. Click it, or press `Cmd/Ctrl + Shift + D`. `Escape`
+closes the panel again from anywhere inside it, once nothing inside it wants the key.
 
 Keep the mount behind a development check. The devtools are a separate package precisely so they
 can be left out of a production bundle.
@@ -59,7 +60,9 @@ document.querySelector("minnow-devtools").target = db;
 <minnow-devtools corner="bottom-left" hotkey="mod+k"></minnow-devtools>
 ```
 
-The database is a property rather than an attribute, because it is an object.
+The database is a property rather than an attribute, because it is an object. Attributes are live:
+change `theme` and the panel repaints in place, change any other and it remounts with the new
+value, so a framework that re-renders them works without a remount of its own.
 
 ## Options
 
@@ -72,39 +75,47 @@ The database is a property rather than an attribute, because it is an object.
 | `zIndex`       | `z-index`       | `2147483000`, `0` inline | Stacking against your own overlays. A floating panel clears the page; an inline one stays in its flow, under a sticky header. |
 | `permissions`  | `write`         | `{ write: true }`        | `write: false` refuses every statement that changes data.                                                                     |
 | `initialQuery` | `initial-query` | `""`                     | SQL the console starts with.                                                                                                  |
-| `storageKey`   | `storage-key`   | `"minnow-devtools"`      | Namespace for the remembered panel geometry.                                                                                  |
+| `storageKey`   | `storage-key`   | `"minnow-devtools"`      | Namespace for the remembered panel geometry, history, and saved queries.                                                      |
 | `theme`        | `theme`         | `"system"`               | `"light"` or `"dark"` pins the palette; `"system"` follows the OS.                                                            |
 | `height`       | `height`        | container                | Height of an inline panel. A number is pixels; a string is any CSS length.                                                    |
 
 ## The schema rail
 
-Your tables sit down the left of both tabs, each expanding to its columns with their types,
-nullability, and which one is the unique key. SQL-declared indexes follow the columns with their
-ordered keys, descending directions, uniqueness, and build health. Knowing what a column or index
-is called is as useful for writing a statement as it is for browsing a table, so the rail never
-goes away.
+Your tables sit down the left of every tab, views in their own group below them. Each expands to
+its columns with their declared SQL types — `INTEGER`, `NUMERIC(10,2)`, `JSONB`, an enum type's
+name — nullability, and which one is the unique key. Columns are badged when they are enum values,
+generated from an expression, or filled by the engine when omitted. Below the columns come the
+indexes with their ordered keys and build health, the foreign keys with what they point at and how
+they delete, the check constraints, and the triggers. A view shows the query it stands for.
+
+Knowing what a column or index is called is as useful for writing a statement as it is for
+browsing a table, so the rail never goes away. `Cmd/Ctrl + K` jumps to its filter box.
 
 What clicking does follows the tab you are on:
 
 - On **Query**, a table, column, or index name is inserted at the caret — `orders`,
-  `orders.total`, or `orders_by_total` — spaced from whatever precedes it.
-- On **Data**, a table opens in the grid.
+  `orders.total`, or `orders_by_total` — spaced from whatever precedes it. A foreign key inserts
+  the `JOIN … ON` it describes, and a view's SQL replaces the statement with the view's query.
+- On **Data**, a table or view opens in the grid; a foreign key opens the table it points at.
 
 The chevron expands a table either way, so you can read its columns without loading it.
 
 ## Browsing data
 
-The **Data** tab browses one table at a time. Pick it from the rail, or from the picker in the
-toolbar.
+The **Data** tab browses one table or view at a time. Pick it from the rail, or from the picker in
+the toolbar.
 
 **Sorting.** Click a column header to sort ascending, again for descending, again to return to the
 table's own order. The unique key is appended to every sort, so rows with equal values keep a
-stable order instead of shuffling between pages.
+stable order instead of shuffling between pages. Drag a header's trailing edge to resize the
+column.
 
 **Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `contains`, `starts with`, `<`, `≤`,
 `>`, `≥`, `like`, `in`, `between`, `is null`, and `is not null`, offered per column type. Values are
-converted to the column's type before they reach SQL, so `score > 10` compares numbers. Filters
-combine with AND.
+converted to the column's type before they reach SQL, so `score > 10` compares numbers, and a value
+the column cannot take — `abc` in a number column, a name outside an enum's values — is refused in
+the editor rather than compiled into a filter that silently matches nothing. Datetimes compare to
+the millisecond. Filters combine with AND.
 
 For text, **`contains` is the one you usually want** — it adds the wildcards, so `crea` finds
 `created`. `like` takes a pattern exactly as written, following PostgreSQL: `like crea` matches
@@ -121,31 +132,55 @@ one I saw" rather than "skip the first N", so reading deep into a table costs th
 the start of it. The status bar always says which it is using.
 
 A cursor needs a total order it can address exactly, so the explorer counts from the start instead
-when the table has no unique key, when the sort column is nullable (no comparison matches NULL), or
-when it is a datetime (the explorer deliberately renders its filter and cursor values at day
-precision). Both give the same rows; one just gets slower the further in you go.
+when the table has no unique key, or when the sort column is nullable (no comparison matches NULL).
+Both give the same rows; one just gets slower the further in you go.
 
 **Counting.** `COUNT(*)` scans the whole table, so it runs alongside the first page rather than
-delaying it. While it runs, the status bar says how many rows are loaded.
+delaying it, and only when the answer can have changed — a new table or a new filter, never a sort.
+While it runs, the status bar says how many rows are loaded.
+
+**Live.** The **Live** toggle in the toolbar reloads the first page whenever the database commits
+something the table can see — a row the app just wrote shows up without a click. It uses the same
+[live queries](/docs/extensions/live-queries) an application subscribes with, so the engine decides
+which commits matter and skips the ones that cannot change the rows.
+
+### Rows and relationships
+
+Click a row to select it. `Shift`-click selects the run from the last selected row; `Cmd/Ctrl`-click
+adds and removes single rows. `Cmd/Ctrl + C` on a focused cell copies its value, or, with rows
+selected, copies them as tab-separated text ready for a spreadsheet.
+
+**Details** in the toolbar opens a sidebar that reads the selected row top to bottom, every value in
+full and JSON re-indented. Where the catalog knows a foreign key, the value carries a button to the
+parent row; below the values, **Related rows** lists the tables whose foreign keys point at this
+row, each a click away. Following either opens the other table filtered to exactly those rows.
+
+**Right-click a cell** for the same things without the sidebar:
+
+- Copy the value, or the whole row as JSON or as an `INSERT` statement.
+- Filter the table to this column's value.
+- Open the parent row a foreign key points at, or the related rows in a child table.
+- Query these rows in the console — the current table, filters, and sort as a `SELECT` to build on.
+- Edit the value, duplicate the row into a new-row form, or delete the selected rows.
 
 ## Editing rows
 
 Double-click a cell to edit it, then save with the check beside the input or with `Enter`; the ×
 or `Escape` discards it. Clicking elsewhere leaves the editor open rather than throwing the edit
-away. Click a row to select it, then **Delete row**. **Add row** opens a form with one input per
-column. Every one of them describes what it is about to do and waits for you to agree — the
-confirmation names the table, the key, and the before and after values.
+away. An enum column offers its values as a menu, and so does a boolean. Click a row to select it,
+then **Delete row** — or select several and delete them together. **Add row** opens a form with one
+input per column; a generated column is shown with its expression and never asked for, since the
+engine computes it. Every one of them describes what it is about to do and waits for you to agree
+— the confirmation names the table, the key, and the before and after values.
 
 Values are typed as the column is typed, and checked in the editor rather than after you confirm:
 `twelve` in a number column is refused on the spot. A blank input means NULL where the column
 allows it, and `NULL` typed into a text column means the same thing (a literal `'NULL'` string
 needs the quotes).
 
-Writes go through the keyed batch API rather than generated SQL, so a datetime is written to the
-millisecond — the day-granular limit applies only to filters, which have to compile to SQL.
-
-After a write the row is read again rather than patched in place, so the grid shows the committed
-value.
+Writes go through the keyed batch API rather than generated SQL, and every value — a datetime
+included — is written exactly as typed. After a write the row is read again rather than patched in
+place, so the grid shows the committed value.
 
 **When editing is unavailable**, the panel says so in a banner instead of leaving a dead button:
 
@@ -154,6 +189,7 @@ value.
 | `permissions.write: false`  | Browse only.                                                                                            |
 | The target has no write API | Browse only.                                                                                            |
 | The table has no unique key | Browse and insert — the engine keys updates and deletes by the unique key and refuses them without one. |
+| It is a view                | Browse only. Its rows come from a query; the rail shows which one.                                      |
 
 ## The window
 
@@ -202,19 +238,52 @@ page keeps painting while a large one is copied.
 Restoring is a write, so the button is absent with `permissions.write: false`. Both buttons are
 absent when the target cannot do snapshots at all.
 
+## Storage
+
+The **Storage** tab reads the database's own report of itself: the storage backend, bytes live and
+obsolete, block and segment counts, write-ahead log and checkpoint sizes where the store has them,
+and what the collector is doing — whether it is running, how many commits are waiting on it, and
+whether it has been failing. Each read walks the store, so the report is taken when the tab is
+shown and on **Refresh**, never in the background. The tab is absent for a target that reports
+nothing.
+
 ## Running statements
 
 The **Query** tab is a SQL console over the same database, with syntax highlighting and completion
 drawn from your own catalog: type a table name and its columns are offered, `events.` narrows to
-that table's columns. `Cmd/Ctrl + Enter` runs.
+that table's columns. `Cmd/Ctrl + Enter` runs. When part of the editor is selected, only the
+selection runs.
 
-The editor loads the first time you open the tab, not when the panel mounts — the launcher and the
-data explorer never pay for it. Until it arrives (and if it fails to arrive at all) the console is a
-plain text box that runs queries exactly the same way.
+The editor and the compiler load the first time you open the tab and run something, not when the
+panel mounts — the launcher and the data explorer never pay for them. Until the editor arrives (and
+if it fails to arrive at all) the console is a plain text box that runs queries exactly the same
+way.
+
+**Scripts.** Several statements separated by semicolons run in order, each on its own, and the
+notice lists what each one did. Strings, quoted names, comments, and trigger bodies are read
+correctly, so a semicolon inside any of them is not a boundary. A script that changes data asks
+once, listing every change it contains; the first failure stops it and is pointed at in the editor.
+
+**Rows.** An unbounded `SELECT` shows its first 1,000 rows and says so — the rows travel in one
+message and are held in memory with the history, so a `SELECT *` over a million rows is capped
+here rather than freezing the page. **Load all rows** in the status bar runs it again without the
+cap. A `SELECT` with its own `LIMIT` is left alone. **Cancel** replaces **Run** while a query is
+running and stops it between batches, where the target can be interrupted.
+
+The status bar shows the timing and, where the engine reports it, the peak memory the statement
+used. **Copy CSV** and **Copy JSON** above the rows copy what is shown; **Download CSV** saves every
+row of the last query as a file, reading it again through the target's cursor when the grid holds
+only the capped part.
+
+**Live.** The **Live** toggle follows the last `SELECT` the way the data tab follows a table: the
+rows re-render whenever the database commits something they can see. A statement that changes data
+stops the following until the next `SELECT`.
 
 Queries return rows; anything that changes data is described and confirmed first:
 
-- The prompt names the table, the operation, and the statement itself before it runs.
+- The prompt names the table, the operation, and the statement itself before it runs. An `UPDATE`
+  or `DELETE` counts the rows its `WHERE` clause matches and shows the number beside the
+  statement, so a clause that matches the whole table is caught before it runs.
 - An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
 - With `permissions.write: false`, the statement is refused outright and never reaches the database.
 
@@ -252,12 +321,13 @@ features share explains nothing rather than guessing between them.
 
 The **Plan** tab beside the results shows what the optimizer made of the statement — the join
 order, where filters run, and whether the scan can stream. It is asked for only
-when you look at it, and running a query returns you to the rows. Non-query statements say that a
-SELECT is required instead of passing DDL to the query planner.
+when you look at it, and running a query returns you to the rows. It explains one statement at a
+time: select the one you mean inside a script. Non-query statements say that a SELECT is required
+instead of passing DDL to the query planner.
 
-The Query/Data and Rows/Plan tab bars use the standard arrow, Home, and End keys. The editor
-divider is keyboard-resizable with Up and Down. In the data grid, arrow keys move between visible
-cells, Space selects a row, and Enter starts editing a cell when editing is available.
+The Query/Data/Storage and Rows/Plan tab bars use the standard arrow, Home, and End keys. The
+editor divider is keyboard-resizable with Up and Down. In the data grid, arrow keys move between
+visible cells, Space selects a row, and Enter starts editing a cell when editing is available.
 
 ## History
 
@@ -265,10 +335,13 @@ The last 50 runs are kept beside the console, newest first. Queries show their r
 statements show their operation-specific result. Every entry carries its timing and age — or its
 error message, in red, if it failed. Click one to put it back in the editor.
 
+The star beside an entry **saves** it: a saved query sits in its own group at the top, never ages
+out, and survives **Clear**, which forgets every run that is not saved.
+
 The query text and those timings persist, so history survives a reload. Result sets do not: fifty
 of them would exhaust the storage quota on the first wide query, so recent rows are cached in
-memory only and a recalled entry offers to run again once its rows have aged out. **Clear** forgets
-everything. History is namespaced by `storageKey`, so two panels on a page keep their own.
+memory only and a recalled entry offers to run again once its rows have aged out. History is
+namespaced by `storageKey`, so two panels on a page keep their own.
 
 ## Embedding a console
 
@@ -323,6 +396,9 @@ page's. A page with its own light/dark switch tells the panel which way it went:
 const devtools = mountMinnowDevtools(db, { container, mode: "inline", theme: "dark" });
 devtools.setTheme("light"); // when your switch is flipped — no remount, the query survives
 ```
+
+The editor turns with the panel, and a panel on `"system"` follows the OS when it changes while
+the page is open.
 
 Its colours are custom properties, and properties set on the container reach inside the shadow
 root, so the whole palette is yours to override:

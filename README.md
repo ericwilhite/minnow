@@ -53,13 +53,13 @@ queries. It does not provide a server, replication, or multi-device sync.
 
 ## Packages
 
-| Package              | Purpose                                                                   |
-| -------------------- | ------------------------------------------------------------------------- |
-| `@minnowdb/core`     | SQL engine, schema management, workers, storage adapters, and snapshots.  |
-| `@minnowdb/kysely`   | Kysely dialect with typed JSON, search, streaming, and live-query tools.  |
-| `@minnowdb/react`    | React external-store hook for live queries.                               |
-| `@minnowdb/export`   | Streaming CSV and NDJSON over direct or worker cursors.                   |
-| `@minnowdb/devtools` | Optional SQL console and data browser for development and embedded demos. |
+| Package              | Purpose                                                                        |
+| -------------------- | ------------------------------------------------------------------------------ |
+| `@minnowdb/core`     | SQL engine, schema management, workers, storage adapters, and snapshots.       |
+| `@minnowdb/kysely`   | Kysely dialect with typed JSON, search, streaming, and live-query tools.       |
+| `@minnowdb/react`    | React external-store hook for live queries.                                    |
+| `@minnowdb/export`   | Streaming CSV and NDJSON over direct or worker cursors.                        |
+| `@minnowdb/devtools` | Optional SQL console and database explorer for development and embedded demos. |
 
 Start with [Installation](https://minnowdb.com/docs/installation/) and
 [Your first query](https://minnowdb.com/docs/first-query/). The

@@ -1,11 +1,15 @@
 import type { QueryRow, QueryValue } from "@minnowdb/core";
 import { dateIsoString } from "../date-value.js";
 import { el, iconButton, icons } from "../dom.js";
+import { draggable } from "../panel/drag.js";
+import { toCsv } from "./serialize.js";
 
 export interface GridColumn {
   name: string;
-  /** Right-aligns numbers and drives the sort affordance; absent for a bare query result. */
+  /** Right-aligns numbers and sizes the column; inferred from the values for a bare query result. */
   type?: string;
+  /** What the header shows beside the name — the declared SQL type — when it is more than `type`. */
+  label?: string;
   sortable?: boolean;
   sorted?: "asc" | "desc";
   /** Marks the unique key, which is what row actions are keyed by. */
@@ -17,16 +21,28 @@ export interface GridDeps {
   onSort?(column: string): void;
   /** Fired when the viewport nears the end of the loaded rows. */
   onNearEnd?(): void;
-  /** Fired when a row is clicked, with undefined when the selection is cleared. */
+  /** Fired when the selection changes, with the anchor row, or undefined when it was cleared. */
   onSelect?(row: QueryRow | undefined, index: number | undefined): void;
   /** Fired on a double-click in a cell, which is the request to edit it. */
   onEditCell?(row: QueryRow, column: string, index: number): void;
+  /** Fired after Ctrl/Cmd+C put something on the clipboard, with what it was. */
+  onCopied?(what: string): void;
+  /** Fired on a right-click in a cell, with where the menu should open. */
+  onContextMenu?(hit: CellHit, at: { x: number; y: number }): void;
+}
+
+export interface CellHit {
+  row: QueryRow;
+  column: string;
+  index: number;
 }
 
 export interface CellEditor {
   /** Text the editor opens with. */
   initial: string;
   placeholder?: string;
+  /** A closed set of values — an enum column — offered as a menu instead of a box. */
+  choices?: readonly string[];
   onCommit(text: string): void;
   onCancel(): void;
 }
@@ -42,8 +58,12 @@ export interface Grid {
   setMessage(message: string): void;
   rowCount(): number;
   rowAt(index: number): QueryRow | undefined;
+  columnNames(): string[];
   setSelected(index: number | undefined): void;
+  /** The anchor of the selection: the row clicked last. */
   selectedIndex(): number | undefined;
+  /** Every selected row, ascending. Shift-click extends the selection; Ctrl/Cmd-click toggles. */
+  selectedIndexes(): number[];
   /** Replaces one row's values in place, after a write changed it. */
   replaceRow(index: number, row: QueryRow): void;
   /** Drops one row, after it was deleted. */
@@ -102,11 +122,18 @@ export function createGrid(deps: GridDeps = {}): Grid {
   let frame = 0;
   let template = "";
   let notifiedForCount = -1;
+  /** The row clicked last, which is what row actions act on and where a shift-click extends from. */
   let selected: number | undefined;
+  const selection = new Set<number>();
+  /** Widths dragged on a header, by column name, so a reload of the same table keeps them. */
+  const widths = new Map<string, number>();
   /** The open cell editor, positioned like a row so the grid template aligns it for free. */
-  let editing: { index: number; node: HTMLElement; input: HTMLInputElement } | undefined;
+  let editing:
+    { index: number; node: HTMLElement; input: HTMLInputElement | HTMLSelectElement } | undefined;
 
   function columnWidth(column: GridColumn): string {
+    const dragged = widths.get(column.name);
+    if (dragged !== undefined) return `${String(dragged)}px`;
     // Numbers and keys are narrow and predictable; text gets the room, bounded so one long value
     // cannot push every other column off screen.
     if (column.type === "number" || column.isKey === true) return "minmax(90px, 140px)";
@@ -115,17 +142,53 @@ export function createGrid(deps: GridDeps = {}): Grid {
     return "minmax(120px, 260px)";
   }
 
-  function renderHead(): void {
+  function applyTemplate(): void {
     template = columns.map(columnWidth).join(" ");
     head.style.gridTemplateColumns = template;
     sizer.style.gridTemplateColumns = template;
+    for (const row of pool) row.style.gridTemplateColumns = template;
+    if (editing !== undefined) editing.node.style.gridTemplateColumns = template;
+  }
+
+  /**
+   * A drag handle on the header's trailing edge. The width is written into the grid template,
+   * which every row shares, so one drag resizes the column for every row at once and no row is
+   * laid out on its own.
+   */
+  function resizeHandle(column: GridColumn, cell: HTMLElement): HTMLElement {
+    const handle = el("span", { class: "grid-resize", attrs: { "aria-hidden": "true" } });
+    let startWidth = 0;
+    draggable(handle, {
+      onStart: () => {
+        startWidth = cell.getBoundingClientRect().width;
+        handle.classList.add("dragging");
+        return true;
+      },
+      onMove: (dx) => {
+        widths.set(column.name, Math.max(48, Math.round(startWidth + dx)));
+        applyTemplate();
+      },
+      onEnd: () => {
+        handle.classList.remove("dragging");
+      },
+    });
+    // The handle sits inside a button on a sortable column; a press on it must not sort.
+    handle.addEventListener("click", (event) => {
+      event.stopPropagation();
+    });
+    return handle;
+  }
+
+  function renderHead(): void {
+    applyTemplate();
     node.setAttribute("aria-colcount", String(columns.length));
     head.replaceChildren(
       ...columns.map((column) => {
         const label = el("span", { class: "grid-name", text: column.name });
         const children: Array<Node | string> = [label];
-        if (column.type !== undefined) {
-          children.push(el("span", { class: "grid-type", text: column.type }));
+        const typeText = column.label ?? column.type;
+        if (typeText !== undefined) {
+          children.push(el("span", { class: "grid-type", text: typeText }));
         }
         if (column.sorted !== undefined) {
           children.push(
@@ -155,6 +218,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
             deps.onSort?.(column.name);
           });
         }
+        cell.append(resizeHandle(column, cell));
         return cell;
       }),
     );
@@ -191,9 +255,9 @@ export function createGrid(deps: GridDeps = {}): Grid {
     if (row === undefined) return;
     node.style.transform = `translateY(${String(index * rowHeight)}px)`;
     node.dataset.index = String(index);
-    node.classList.toggle("sel", index === selected);
+    node.classList.toggle("sel", selection.has(index));
     node.setAttribute("aria-rowindex", String(index + 2));
-    node.setAttribute("aria-selected", String(index === selected));
+    node.setAttribute("aria-selected", String(selection.has(index)));
     const cells = node.children;
     for (let column = 0; column < columns.length; column += 1) {
       const cell = cells[column];
@@ -289,14 +353,58 @@ export function createGrid(deps: GridDeps = {}): Grid {
     return column === undefined ? { index, row } : { index, row, column };
   }
 
+  /**
+   * Selection follows the file-manager conventions: a click selects one row (or clears it when
+   * it was the one selected, so there is always a way back to nothing), Ctrl/Cmd toggles a row
+   * in and out, Shift selects the run from the anchor to the row.
+   */
+  function select(index: number, modifiers: { toggle: boolean; extend: boolean }): void {
+    const previous = [...selection];
+    if (modifiers.extend && selected !== undefined) {
+      const [low, high] = [Math.min(selected, index), Math.max(selected, index)];
+      for (let at = low; at <= high; at += 1) selection.add(at);
+    } else if (modifiers.toggle) {
+      if (selection.has(index)) selection.delete(index);
+      else selection.add(index);
+      selected = selection.has(index) ? index : [...selection].at(-1);
+    } else if (selection.size === 1 && selection.has(index)) {
+      selection.clear();
+      selected = undefined;
+    } else {
+      selection.clear();
+      selection.add(index);
+      selected = index;
+    }
+    if (modifiers.extend && selected === undefined) selected = index;
+    invalidate(...previous, ...selection);
+    deps.onSelect?.(selected === undefined ? undefined : rows[selected], selected);
+  }
+
   sizer.addEventListener("click", (event) => {
     const hit = locate(event);
     if (hit === undefined) return;
-    // Clicking the selected row again clears it, so there is always a way back to no selection.
-    const next = selected === hit.index ? undefined : hit.index;
-    setSelected(next);
-    deps.onSelect?.(next === undefined ? undefined : hit.row, next);
+    select(hit.index, { toggle: event.metaKey || event.ctrlKey, extend: event.shiftKey });
   });
+
+  /** Ctrl/Cmd+C on a focused cell copies it; with rows selected, copies them as tab-separated text. */
+  async function copyFocused(cell: HTMLElement): Promise<void> {
+    const names = columns.map((column) => column.name);
+    const picked = [...selection].sort((a, b) => a - b).map((index) => rows[index]);
+    const text =
+      picked.length > 0
+        ? toCsv(
+            names,
+            picked.filter((row): row is QueryRow => row !== undefined),
+            "\t",
+          )
+        : cell.textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+      deps.onCopied?.(picked.length > 0 ? `${String(picked.length)} rows` : "cell");
+    } catch {
+      // Clipboard access can be refused; there is nothing to show for it in the grid itself.
+    }
+  }
 
   sizer.addEventListener("keydown", (event) => {
     const cell = (event.target as Element | null)?.closest<HTMLElement>(".cell");
@@ -305,11 +413,14 @@ export function createGrid(deps: GridDeps = {}): Grid {
     const rowNode = cell.closest<HTMLElement>(".grid-row");
     if (rowNode === null) return;
     const column = Array.prototype.indexOf.call(rowNode.children, cell);
+    if ((event.key === "c" || event.key === "C") && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      void copyFocused(cell);
+      return;
+    }
     if (event.key === " " || event.key === "Spacebar") {
       event.preventDefault();
-      const next = selected === hit.index ? undefined : hit.index;
-      setSelected(next);
-      deps.onSelect?.(next === undefined ? undefined : hit.row, next);
+      select(hit.index, { toggle: event.metaKey || event.ctrlKey, extend: event.shiftKey });
       return;
     }
     if (event.key === "Enter" && hit.column !== undefined && deps.onEditCell !== undefined) {
@@ -336,6 +447,19 @@ export function createGrid(deps: GridDeps = {}): Grid {
     deps.onEditCell?.(hit.row, hit.column, hit.index);
   });
 
+  sizer.addEventListener("contextmenu", (event) => {
+    const hit = locate(event);
+    if (hit?.column === undefined || deps.onContextMenu === undefined) return;
+    event.preventDefault();
+    // A right-click on an unselected row selects it first, the way a file manager does, so the
+    // menu's row actions act on the row under the pointer.
+    if (!selection.has(hit.index)) select(hit.index, { toggle: false, extend: false });
+    deps.onContextMenu(
+      { row: hit.row, column: hit.column, index: hit.index },
+      { x: event.clientX, y: event.clientY },
+    );
+  });
+
   /** Repaints just the slots holding these rows, rather than the whole window. */
   function invalidate(...indexes: Array<number | undefined>): void {
     for (const index of indexes) {
@@ -347,9 +471,11 @@ export function createGrid(deps: GridDeps = {}): Grid {
   }
 
   function setSelected(index: number | undefined): void {
-    const previous = selected;
+    const previous = [...selection];
+    selection.clear();
+    if (index !== undefined) selection.add(index);
     selected = index;
-    invalidate(previous, index);
+    invalidate(...previous, index);
   }
 
   function closeEdit(): void {
@@ -372,7 +498,9 @@ export function createGrid(deps: GridDeps = {}): Grid {
     node,
     rowCount: () => rows.length,
     rowAt: (index) => rows[index],
+    columnNames: () => columns.map((column) => column.name),
     selectedIndex: () => selected,
+    selectedIndexes: () => [...selection].sort((a, b) => a - b),
     setSelected,
     closeEdit,
     layout: schedule,
@@ -388,6 +516,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
       node.setAttribute("aria-rowcount", String(rows.length + 1));
       notifiedForCount = -1;
       selected = undefined;
+      selection.clear();
       closeEdit();
       reset();
       setHeight();
@@ -410,7 +539,14 @@ export function createGrid(deps: GridDeps = {}): Grid {
       if (rows[index] === undefined) return;
       rows.splice(index, 1);
       node.setAttribute("aria-rowcount", String(rows.length + 1));
+      // Every selected row past the removed one moved up by one.
+      const shifted = [...selection]
+        .filter((at) => at !== index)
+        .map((at) => (at > index ? at - 1 : at));
+      selection.clear();
+      for (const at of shifted) selection.add(at);
       if (selected === index) selected = undefined;
+      else if (selected !== undefined && selected > index) selected -= 1;
       closeEdit();
       setHeight();
       // Every row after the removed one shifted up, so the whole ring is stale.
@@ -421,6 +557,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
       rows = [];
       node.setAttribute("aria-rowcount", columns.length === 0 ? "0" : "1");
       selected = undefined;
+      selection.clear();
       closeEdit();
       reset();
       sizer.style.height = "auto";
@@ -431,13 +568,21 @@ export function createGrid(deps: GridDeps = {}): Grid {
       const position = columns.findIndex(({ name }) => name === column);
       if (position < 0 || rows[index] === undefined) return;
 
-      const input = el("input", {
-        class: "cell-input",
-        type: "text",
-        attrs: { "aria-label": `${column} value`, spellcheck: "false" },
-      });
+      const input =
+        editor.choices === undefined
+          ? el("input", {
+              class: "cell-input",
+              type: "text",
+              attrs: { "aria-label": `${column} value`, spellcheck: "false" },
+            })
+          : el("select", { class: "cell-input", attrs: { "aria-label": `${column} value` } }, [
+              el("option", { text: editor.placeholder ?? "", attrs: { value: "" } }),
+              ...editor.choices.map((choice) => el("option", { text: choice })),
+            ]);
       input.value = editor.initial;
-      if (editor.placeholder !== undefined) input.placeholder = editor.placeholder;
+      if (input instanceof HTMLInputElement && editor.placeholder !== undefined) {
+        input.placeholder = editor.placeholder;
+      }
 
       const holder = el("div", { class: "cell-edit" }, [input]);
       holder.style.gridColumn = String(position + 1);
@@ -468,7 +613,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
       node.style.gridTemplateColumns = template;
       node.style.transform = `translateY(${String(index * rowHeight)}px)`;
 
-      input.addEventListener("keydown", (event) => {
+      (input as HTMLElement).addEventListener("keydown", (event) => {
         if (event.key === "Enter") {
           event.preventDefault();
           commit();
@@ -481,7 +626,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
       sizer.append(node);
       editing = { index, node, input };
       input.focus();
-      input.select();
+      if (input instanceof HTMLInputElement) input.select();
     },
   };
 }

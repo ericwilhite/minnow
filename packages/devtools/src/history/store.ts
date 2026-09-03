@@ -11,9 +11,11 @@ export interface HistoryEntry {
   /** Operation-specific result for a non-query statement. */
   outcome?: string;
   error?: string;
+  /** Kept past the limit and past Clear: a query worth finding again next week. */
+  saved?: boolean;
 }
 
-/** How many runs are remembered. Past this the oldest falls off the end. */
+/** How many unsaved runs are remembered. Past this the oldest falls off the end. */
 export const historyLimit = 50;
 
 /**
@@ -36,7 +38,20 @@ export interface HistoryStore {
   /** The result of a past run, when it is still cached. */
   resultFor(id: string): QueryResult | undefined;
   rememberResult(id: string, result: QueryResult): void;
+  /** Saves an entry, or forgets that it was saved. */
+  toggleSaved(id: string): void;
+  /** Forgets every unsaved run. Saved ones stay. */
   clear(): void;
+}
+
+/** Newest first, with saved entries kept whatever their age. */
+function trim(entries: readonly HistoryEntry[]): HistoryEntry[] {
+  let unsaved = 0;
+  return entries.filter((entry) => {
+    if (entry.saved === true) return true;
+    unsaved += 1;
+    return unsaved <= historyLimit;
+  });
 }
 
 function parseEntries(raw: string | null): HistoryEntry[] {
@@ -85,7 +100,7 @@ export function createHistoryStore(storage: HistoryStorage, storageKey: string):
     add: (entry, id, at) => {
       const recorded: HistoryEntry = { ...entry, id, at };
       // Newest first, so the list reads top-down without reversing on every render.
-      entries = [recorded, ...entries].slice(0, historyLimit);
+      entries = trim([recorded, ...entries]);
       const live = new Set(entries.map((item) => item.id));
       for (const cached of [...results.keys()]) {
         if (!live.has(cached)) results.delete(cached);
@@ -102,9 +117,19 @@ export function createHistoryStore(storage: HistoryStorage, storageKey: string):
         results.delete(oldest.value);
       }
     },
+    toggleSaved: (id) => {
+      entries = trim(
+        entries.map((entry) =>
+          entry.id === id ? { ...entry, saved: entry.saved !== true } : entry,
+        ),
+      );
+      persist();
+    },
     clear: () => {
-      entries = [];
-      results.clear();
+      entries = entries.filter((entry) => entry.saved === true);
+      for (const cached of [...results.keys()]) {
+        if (!entries.some((entry) => entry.id === cached)) results.delete(cached);
+      }
       persist();
     },
   };

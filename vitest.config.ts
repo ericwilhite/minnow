@@ -42,9 +42,10 @@ export default defineConfig({
        * Raise a floor after a run comes in comfortably above it; never lower one to make a red
        * gate green -- that is the failure the floor exists to report.
        *
-       * The per-package floors matter more than the global one: devtools is a DOM layer proved
-       * by the site browser runner rather than by Vitest, and averaging it in would let the
-       * engine's coverage fall a long way while the total still looked healthy.
+       * The per-package floors matter more than the global one: averaging a thinner package in
+       * would let the engine's coverage fall a long way while the total still looked healthy.
+       * The devtools' DOM modules run under happy-dom (each test file opts in with a
+       * `@vitest-environment` comment); the site browser runner covers what a real browser adds.
        */
       thresholds: {
         statements: 82,
@@ -52,7 +53,7 @@ export default defineConfig({
         functions: 84,
         lines: 84,
         "packages/core/src/**": { statements: 87, branches: 78, functions: 91, lines: 89 },
-        "packages/devtools/src/**": { statements: 22, branches: 30, functions: 21, lines: 21 },
+        "packages/devtools/src/**": { statements: 50, branches: 48, functions: 47, lines: 51 },
         "packages/export/src/**": { statements: 91, branches: 81, functions: 99, lines: 97 },
         "packages/kysely/src/**": { statements: 93, branches: 84, functions: 99, lines: 95 },
         "packages/react/src/**": { statements: 70, branches: 49, functions: 59, lines: 79 },

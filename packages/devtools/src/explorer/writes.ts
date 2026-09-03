@@ -7,7 +7,8 @@ import type { ColumnInfo, TableInfo } from "./catalog.js";
 /**
  * Why a table cannot be edited, or undefined when it can. The engine keys updates and deletes by
  * the unique key and refuses them outright without one, so a keyless table is browsable only —
- * which the panel says up front rather than discovering at save time.
+ * which the panel says up front rather than discovering at save time. A view is browsable only
+ * for a different reason: it has no rows of its own.
  */
 export function editingBlockedReason(
   table: TableInfo,
@@ -16,6 +17,9 @@ export function editingBlockedReason(
 ): string | undefined {
   if (!canWrite) return "Writes are turned off in these devtools.";
   if (!targetSupportsWrites) return "This target has no write API.";
+  if (table.view !== undefined) {
+    return `${table.name} is a view. Its rows come from a query, so there is nothing here to edit.`;
+  }
   if (table.uniqueKey === undefined) {
     return `${table.name} has no unique key, so rows cannot be updated or deleted. Inserts still work.`;
   }
@@ -55,6 +59,15 @@ export async function applyDelete(
   key: QueryValue,
 ): Promise<number> {
   const result = await target.deleteBatch(table.name, { keys: [key] });
+  return result.deletedRowCount;
+}
+
+export async function applyDeleteMany(
+  target: EditableTarget,
+  table: TableInfo,
+  keys: readonly QueryValue[],
+): Promise<number> {
+  const result = await target.deleteBatch(table.name, { keys: [...keys] });
   return result.deletedRowCount;
 }
 
@@ -99,6 +112,22 @@ export function confirmDelete(table: TableInfo, key: QueryValue, row: QueryRow):
     confirmLabel: "Delete row",
     destructive: true,
     warning: "Rows in other tables that reference this one are not touched.",
+  };
+}
+
+export function confirmDeleteMany(table: TableInfo, keys: readonly QueryValue[]): ConfirmRequest {
+  const shown = keys.slice(0, 5).map(describeValue).join(", ");
+  return {
+    title: `Delete ${String(keys.length)} rows from ${table.name}`,
+    facts: [
+      ["table", table.name],
+      ["rows", String(keys.length)],
+      ["keys", keys.length > 5 ? `${shown}, …` : shown],
+      ["call", `deleteBatch('${table.name}', { keys })`],
+    ],
+    confirmLabel: `Delete ${String(keys.length)} rows`,
+    destructive: true,
+    warning: "Rows in other tables that reference these are not touched.",
   };
 }
 

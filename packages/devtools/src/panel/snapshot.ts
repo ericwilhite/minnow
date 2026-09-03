@@ -1,12 +1,14 @@
-import {
-  readSnapshotSummary,
-  type SnapshotExportProgress,
-  type SnapshotLoadProgress,
-  type SnapshotSummary,
+import type {
+  SnapshotExportProgress,
+  SnapshotLoadProgress,
+  SnapshotSummary,
 } from "@minnowdb/core/storage/snapshots";
 import type { ConfirmLayer, ConfirmRequest } from "../confirm.js";
+import { messageOf } from "../errors.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { el, iconButton, icons } from "../dom.js";
+import { downloadBlob } from "../download.js";
+import { formatBytes } from "../format.js";
 import type { SnapshotTarget } from "../target.js";
 
 /**
@@ -21,19 +23,6 @@ import type { SnapshotTarget } from "../target.js";
 
 /** Snapshot files carry their own magic number; the extension is only for the file picker. */
 const SNAPSHOT_EXTENSION = ".minnow";
-
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${String(bytes)} B`;
-  const units = ["KB", "MB", "GB"] as const;
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  const rounded = value < 10 ? value.toFixed(1) : String(Math.round(value));
-  return `${rounded} ${units[unit] ?? "GB"}`;
-}
 
 function percent(done: number, total: number): string {
   if (total <= 0) return "0%";
@@ -91,28 +80,13 @@ export function confirmRestore(fileName: string, summary: SnapshotSummary): Conf
   };
 }
 
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /**
- * Hands the bytes to the browser's own download. The anchor goes in the host document rather than
- * the panel's shadow root, which is where a download has to be started from, and the object URL is
- * released on a later task — revoking it in the same turn as the click cancels the download.
+ * The header reader rides in with the snapshot stream codec, which nothing else in the panel
+ * needs; it is fetched the first time a snapshot moves rather than at mount.
  */
-function save(bytes: Uint8Array, fileName: string): void {
-  // TypeScript allows for a Uint8Array over shared memory, which Blob will not take; a snapshot
-  // the engine encoded never is, so the cast narrows rather than lies.
-  const part = bytes as Uint8Array<ArrayBuffer>;
-  const url = URL.createObjectURL(new Blob([part], { type: "application/octet-stream" }));
-  const link = el("a", { attrs: { href: url, download: fileName } });
-  link.hidden = true;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  setTimeout(() => {
-    URL.revokeObjectURL(url);
-  }, 0);
+async function summaryOf(bytes: Uint8Array): Promise<SnapshotSummary> {
+  const { readSnapshotSummary } = await import("@minnowdb/core/storage/snapshots");
+  return readSnapshotSummary(bytes);
 }
 
 export interface SnapshotActionsDeps {
@@ -168,8 +142,14 @@ export function createSnapshotActions(deps: SnapshotActionsDeps): SnapshotAction
         },
       });
       // Header only, and it is already in memory: the file names itself after the version it holds.
-      const summary = await readSnapshotSummary(bytes);
-      save(bytes, snapshotFileName(summary, new Date()));
+      const summary = await summaryOf(bytes);
+      // TypeScript allows for a Uint8Array over shared memory, which Blob will not take; a
+      // snapshot the engine encoded never is, so the cast narrows rather than lies.
+      const part = bytes as Uint8Array<ArrayBuffer>;
+      downloadBlob(
+        new Blob([part], { type: "application/octet-stream" }),
+        snapshotFileName(summary, new Date()),
+      );
       setStatus(`saved ${formatBytes(bytes.byteLength)}`, " ok");
     } catch (error) {
       setStatus(messageOf(error), " warn");
@@ -184,7 +164,7 @@ export function createSnapshotActions(deps: SnapshotActionsDeps): SnapshotAction
     try {
       setStatus(`reading ${chosen.name}`);
       const bytes = new Uint8Array(await chosen.arrayBuffer());
-      const summary = await readSnapshotSummary(bytes);
+      const summary = await summaryOf(bytes);
       setStatus("waiting for confirmation");
       if (!(await deps.confirm.ask(confirmRestore(chosen.name, summary)))) {
         setStatus("cancelled");
