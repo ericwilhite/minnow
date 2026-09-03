@@ -144,9 +144,38 @@ describe("the console's declarations", () => {
     expect(diagnose(probe)).toEqual([]);
   });
 
+  it("type the engine by the same declaration: rows, keys, guards and reads by table name", () => {
+    const probe = [
+      'const stores = await database.readTable("stores", { columns: ["store_id", "city"] });',
+      "const city: string = stores[0]!.city;",
+      'const orders = await database.readTable("orders");',
+      "const total: number = orders[0]!.total;",
+      'const [store] = await database.readTable("stores");',
+      'await database.upsert("stores", { ...store!, code: "X" }, {',
+      '  conflictWhere: { column: "city", operator: "=", value: city },',
+      "});",
+      'await database.update("orders", orders[0]!.order_id, { status: "completed" });',
+      "void total;",
+      // The declaration itself is importable, as the setup snippet says.
+      'import { retailDefinition } from "./schema";',
+      "void retailDefinition.tables.length;",
+    ].join("\n");
+    expect(diagnose(probe)).toEqual([]);
+  });
+
   it("reject a column the playground's schema does not have", () => {
     expect(diagnose('db.selectFrom("orders").select(["nmae"]);').join(" ")).toMatch(/nmae/);
     expect(diagnose('db.selectFrom("ordrs").selectAll();').join(" ")).toMatch(/ordrs/);
+    expect(diagnose('await database.insertBatch("stroes", []);').join(" ")).toMatch(/"stores"/);
+    expect(diagnose('await database.insertBatch("stores", [{ store_id: 1 }]);').join(" ")).toMatch(
+      /code/,
+    );
+    expect(
+      diagnose('await database.update("orders", "1", { status: "completed" });').join(" "),
+    ).toMatch(/number/);
+    expect(
+      diagnose('await database.readTable("orders", { columns: ["nmae"] });').join(" "),
+    ).toMatch(/nmae/);
   });
 
   it("infers the complete aggregate sample without output generics", () => {

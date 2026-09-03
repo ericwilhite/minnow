@@ -19,7 +19,7 @@
  * - Names, cities, and product names come from combinatorial pools (see `./pools.ts`), so
  *   GROUP BY over any of them produces thousands of buckets rather than a dozen.
  */
-import { column, schema, table, type AnyTable, type SchemaColumnType } from "@minnowdb/core";
+import type { AnyTable, SchemaColumnType } from "@minnowdb/core";
 import {
   BRANDS,
   CATEGORIES,
@@ -33,6 +33,9 @@ import {
   STORE_FORMATS,
   type City,
 } from "./pools";
+import { retailTables } from "./schema";
+
+export { retailDefinition, retailTables } from "./schema";
 
 export type ColumnType = SchemaColumnType;
 
@@ -54,98 +57,9 @@ export type Value = boolean | number | string | Date | null;
 export type Row = Record<string, Value>;
 
 /**
- * The schema, in dependency order — every table's foreign keys point at a table already created.
- *
- * This is the single declaration. `migrate()` creates the tables from it, the Kysely adapter turns
- * it into the row types the typed console hands to the visitor, and `retailSchema` below reduces
- * it back to the plain shape the loader and the tests read. Nothing here is written twice, so a
- * column added to a table cannot be missing from the types that describe it.
+ * The schema itself lives in `./schema`, re-exported above; `retailSchema` below reduces it to
+ * the plain shape the loader and the dataset tests read.
  */
-export const retailTables = [
-  table("stores", {
-    store_id: column.number().unique(),
-    code: column.string(),
-    name: column.string(),
-    city: column.string(),
-    region: column.string(),
-    country: column.string(),
-    format: column.string(),
-    floor_sqm: column.number(),
-    opened_on: column.datetime(),
-  }),
-  table("employees", {
-    employee_id: column.number().unique(),
-    store_id: column.number(),
-    name: column.string(),
-    role: column.string(),
-    hourly_rate: column.number(),
-    hired_on: column.datetime(),
-    active: column.boolean(),
-  }),
-  table("products", {
-    product_id: column.number().unique(),
-    sku: column.string(),
-    name: column.string(),
-    category: column.string(),
-    subcategory: column.string(),
-    brand: column.string(),
-    unit_cost: column.number(),
-    list_price: column.number(),
-    launched_on: column.datetime(),
-    discontinued: column.boolean(),
-  }),
-  table("customers", {
-    customer_id: column.number().unique(),
-    name: column.string(),
-    email: column.string(),
-    city: column.string(),
-    region: column.string(),
-    country: column.string(),
-    postal_code: column.string(),
-    loyalty_tier: column.string(),
-    birth_year: column.number(),
-    marketing_opt_in: column.boolean(),
-    signed_up_on: column.datetime(),
-  }),
-  table("orders", {
-    order_id: column.number().unique(),
-    customer_id: column.number(),
-    store_id: column.number(),
-    employee_id: column.number().nullable(),
-    channel: column.string(),
-    status: column.string(),
-    payment_method: column.string(),
-    item_count: column.number(),
-    subtotal: column.number(),
-    discount: column.number(),
-    tax: column.number(),
-    shipping: column.number(),
-    total: column.number(),
-    placed_at: column.datetime(),
-  }),
-  table("order_items", {
-    order_item_id: column.number().unique(),
-    order_id: column.number(),
-    product_id: column.number(),
-    quantity: column.number(),
-    unit_price: column.number(),
-    discount: column.number(),
-    line_total: column.number(),
-  }),
-  table("returns", {
-    return_id: column.number().unique(),
-    order_item_id: column.number(),
-    order_id: column.number(),
-    product_id: column.number(),
-    quantity: column.number(),
-    reason: column.string(),
-    refund_amount: column.number(),
-    returned_at: column.datetime(),
-  }),
-] as const;
-
-/** The schema `migrate()` takes, and the value Kysely infers its DB map from. */
-export const retailDefinition = schema(retailTables);
 
 /**
  * What each table holds, in one line. Read by the Kysely console, which prints them as doc

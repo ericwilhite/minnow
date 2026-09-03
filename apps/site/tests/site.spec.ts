@@ -187,6 +187,21 @@ test("the TypeScript tab checks a snippet against the schema and runs it", async
   await console_.getByRole("button", { name: "Run", exact: true }).click();
   await expect(console_.getByText("the compiler refused it")).toBeVisible({ timeout: 60_000 });
   await expect(console_.getByText(/nmae/)).toBeVisible();
+
+  // The engine under the builder is declared against the same schema, so a table it does not
+  // have is refused by name — and the message lists the ones it does.
+  await console_.locator(".monaco-editor .view-lines").first().click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText('await database.insertBatch("stroes", []);');
+  await console_.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(console_.getByText(/"stroes"/)).toBeVisible({ timeout: 60_000 });
+  await expect(console_.getByText(/"stores" \| "employees"/)).toBeVisible();
+
+  // And the chip that shows it off typechecks and runs: its guarded upsert is skipped, not written.
+  await console_.getByRole("button", { name: "The engine, typed too" }).click();
+  await console_.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(console_.getByText(/skipped/)).toBeVisible({ timeout: 60_000 });
+  await expect(console_.getByText("the compiler refused it")).toHaveCount(0);
 });
 
 /**

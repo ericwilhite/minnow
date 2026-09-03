@@ -163,6 +163,25 @@ const result = await sql<{ status: string; orders: number; revenue: number }>\`
 console.log(result.rows);`,
   },
   {
+    id: "typed-engine",
+    label: "The engine, typed too",
+    note: "The batch API under the builder is typed by the same declaration: tables, rows, keys, and guards.",
+    code: `// \`database\` is the engine underneath \`db\`, declared against the same schema, so
+// table names, row shapes, keys, and guards are all checked. Misspell "stores" to see.
+const stores = await database.readTable("stores", { columns: ["store_id", "name", "city"] });
+console.log(stores.length, stores[0]);
+
+// A guarded upsert replaces the row only while the existing one satisfies the guard.
+// No store is in Atlantis, so this one is skipped rather than written — safe to run twice.
+const [store] = await database.readTable("stores");
+const result = await database.upsert(
+  "stores",
+  { ...store!, name: "Minnow Roastery" },
+  { conflictWhere: { column: "city", operator: "=", value: "Atlantis" } },
+);
+console.log({ updated: result.updatedRowCount, skipped: result.skippedRowCount });`,
+  },
+  {
     id: "write",
     label: "Writing, and reading it back",
     note: "A parameterized Kysely upsert, then the row the engine wrote.",

@@ -7,8 +7,17 @@
  * database is being built underneath it. That is also exactly how an application would do this,
  * which is the point of doing it this way rather than the convenient way.
  */
-import { column, schema, table } from "@minnowdb/core";
-import type { MinnowDatabaseClient } from "@minnowdb/core/client";
+import {
+  column,
+  schema,
+  table,
+  type AnySchema,
+  type BatchRow,
+  type InsertBatchInput,
+  type MigrateOptions,
+  type QueryOptions,
+  type QueryResult,
+} from "@minnowdb/core";
 import { retailBatches, retailEstimatedRows, retailSchema, retailTables } from "./retail";
 
 export interface LoadProgress {
@@ -33,15 +42,18 @@ const playgroundDefinition = schema([...retailTables, receiptTable]);
 const emptyDefinition = schema([]);
 const playgroundTables = [...retailSchema.map(({ name }) => name), RECEIPT_TABLE] as const;
 
-/** The small shared surface used by both the worker client and in-memory lifecycle tests. */
+/**
+ * The small shared surface used by both the worker client and in-memory lifecycle tests. Method
+ * signatures on purpose: the loader addresses tables by runtime name, including its private load
+ * receipt, and a client declared against the retail schema must still satisfy this — which its
+ * generic, table-name-typed methods do only under method bivariance.
+ */
 interface DatasetClient {
-  listTables: () => Promise<Array<{ name: string }>>;
-  migrate: (...args: Parameters<MinnowDatabaseClient["migrate"]>) => Promise<unknown>;
-  insertBatch: (...args: Parameters<MinnowDatabaseClient["insertBatch"]>) => Promise<unknown>;
-  insert: (...args: Parameters<MinnowDatabaseClient["insert"]>) => Promise<unknown>;
-  query: (
-    ...args: Parameters<MinnowDatabaseClient["query"]>
-  ) => ReturnType<MinnowDatabaseClient["query"]>;
+  listTables(): Promise<Array<{ name: string }>>;
+  migrate(definition: AnySchema, options?: MigrateOptions): Promise<unknown>;
+  insertBatch(tableName: string, input: InsertBatchInput): Promise<unknown>;
+  insert(tableName: string, row: BatchRow): Promise<unknown>;
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
 }
 
 export interface LoadedDataset {

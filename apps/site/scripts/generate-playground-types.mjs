@@ -15,6 +15,10 @@
  * - Source-map comments are dropped. Nothing serves the `.d.ts.map` files, so every one of them
  *   would be a 404 on load.
  *
+ * One file that is not a package declaration rides along: `lib/dataset/schema.ts`, the
+ * playground's own schema, shipped as the editor's `./schema` module so the ambient `db` and
+ * `database` can be typed by `typeof retailDefinition` — the value `migrate()` actually runs.
+ *
  * Runs from `prebuild` and `predev`, after the packages are built, so the file is always in step
  * with `dist`.
  */
@@ -93,6 +97,12 @@ for (const name of PACKAGES) {
     paths[specifier] = [`node_modules/${name}/${types.replace(/^\.\//, "")}`];
   }
 }
+
+// The schema module resolves relative to the ambient `file:///playground.d.ts`, so it sits at the
+// root; its only import is `@minnowdb/core`, which the paths above already cover.
+files["file:///schema.ts"] = rewrite(
+  await readFile(path.join(here, "../lib/dataset/schema.ts"), "utf8"),
+);
 
 const missing = Object.entries(paths).filter(([, [target]]) => !(`file:///${target}` in files));
 if (missing.length > 0) {

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { PLAYGROUND_DATABASE, isLoaded, loadRetailDataset } from "@/lib/dataset/load";
 import { retailSizes } from "@/lib/dataset/retail";
+import { retailDefinition } from "@/lib/dataset/schema";
 import { SqlConsole } from "./sql-console";
 import { TypeScriptConsole } from "./typescript-console";
 import { useSiteTheme } from "./use-site-theme";
@@ -101,6 +102,9 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
       worker.current = spawned;
       const connection = new Client(spawned, {
         store: { kind: "indexeddb", name: PLAYGROUND_DATABASE },
+        // The declaration types the client's batch API; the same object is what the TypeScript
+        // console hands its snippets as `database`, so the editor and the runtime agree.
+        schema: retailDefinition,
       });
       attemptClient = connection;
       client.current = connection;
