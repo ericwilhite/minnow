@@ -19,6 +19,36 @@
       "notes": "SELECT ALL names the default: every row, duplicates kept. ALL is also accepted inside an aggregate, as in COUNT(ALL amount)."
     },
     {
+      "id": "select.distinct-on",
+      "status": "supported",
+      "example": "SELECT DISTINCT ON (region) region, amount FROM rows ORDER BY region, amount DESC",
+      "notes": "PostgreSQL's DISTINCT ON (expressions) keeps the first row of each group in ORDER BY order. It lowers to ROW_NUMBER() OVER (PARTITION BY expressions ORDER BY …) = 1 over the block, so ORDER BY may name output aliases and columns the select list omits, and LIMIT and OFFSET apply to the kept rows."
+    },
+    {
+      "id": "select.locking-clause",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows FOR UPDATE",
+      "notes": "FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, and FOR KEY SHARE, with OF, NOWAIT, or SKIP LOCKED, are accepted and ignored: row locks coordinate concurrent sessions, and a single-session engine has none to coordinate."
+    },
+    {
+      "id": "select.table-command",
+      "status": "supported",
+      "example": "TABLE rows",
+      "notes": "TABLE name is the standard's spelling of SELECT * FROM name."
+    },
+    {
+      "id": "literal.string-spellings",
+      "status": "supported",
+      "example": "SELECT E'tab\\\\there' AS escaped, $$dollar 'quoted'$$ AS plain, 5. AS five, .5 AS half FROM rows",
+      "notes": "E'…' strings take C-style backslash escapes (\\\\n, \\\\t, \\\\xHH, \\\\uHHHH, octal), $tag$…$tag$ strings are taken verbatim, and 5. and .5 spell 5.0 and 0.5, as in PostgreSQL."
+    },
+    {
+      "id": "predicate.like-operators",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region ~~ 'w%' OR region !~~* 'E%'",
+      "notes": "~~, !~~, ~~*, and !~~* are PostgreSQL's operator spellings of LIKE, NOT LIKE, ILIKE, and NOT ILIKE."
+    },
+    {
       "id": "select.label-without-as",
       "status": "supported",
       "example": "SELECT amount total, region \"area\" FROM rows",
@@ -199,6 +229,12 @@
       "example": "WITH west AS (SELECT amount FROM rows WHERE region = 'west') SELECT COUNT(*) AS count FROM west"
     },
     {
+      "id": "cte.materialized",
+      "status": "supported",
+      "example": "WITH w AS MATERIALIZED (SELECT region, amount FROM rows) SELECT region FROM w",
+      "notes": "[NOT] MATERIALIZED is PostgreSQL's planner hint on a CTE; the block is planned the same way either way."
+    },
+    {
       "id": "cte.chained",
       "status": "supported",
       "example": "WITH a AS (SELECT amount FROM rows), b AS (SELECT amount FROM a WHERE amount > 5) SELECT COUNT(*) AS count FROM b"
@@ -280,6 +316,25 @@
       "status": "supported",
       "example": "DELETE FROM keyed WHERE score < 0",
       "notes": "Requires a unique-key table."
+    },
+    {
+      "id": "mutation.update-from",
+      "status": "supported",
+      "example": "UPDATE keyed SET score = r.amount FROM (SELECT 'x' AS name, 5 AS amount) r WHERE r.name = keyed.name",
+      "notes": "UPDATE … FROM joins extra sources — tables, views, or derived tables — to the target as PostgreSQL does; the assignments and predicates may read them. A target row matched by several source rows is updated once, from its first match."
+    },
+    {
+      "id": "mutation.delete-using",
+      "status": "supported",
+      "example": "DELETE FROM keyed USING (SELECT 'y' AS name) gone WHERE gone.name = keyed.name",
+      "notes": "DELETE … USING joins extra sources to the target as PostgreSQL does; a target row matched by several source rows is deleted once."
+    },
+    {
+      "id": "mutation.truncate",
+      "status": "supported",
+      "setup": ["INSERT INTO keyed (name, score) VALUES ('z', 3)"],
+      "example": "TRUNCATE TABLE keyed",
+      "notes": "TRUNCATE [TABLE] [ONLY] name [RESTART IDENTITY | CONTINUE IDENTITY] [RESTRICT] removes every row of one table, the same as an unfiltered DELETE. Several tables in one statement and CASCADE are refused; truncate each table separately."
     },
     {
       "id": "mutation.returning",
@@ -379,6 +434,12 @@
       "id": "function.bm25",
       "status": "supported",
       "example": "SELECT region, BM25(region) AGAINST 'west' AS score FROM rows WHERE MATCH(region) AGAINST 'west' ORDER BY score DESC"
+    },
+    {
+      "id": "function.regexp-substring",
+      "status": "supported",
+      "example": "SELECT SUBSTRING(region FROM '(e.)') AS part, SUBSTRING(region FROM 2 FOR 2) AS middle, TO_HEX(255) AS hex, QUOTE_LITERAL(region) AS quoted, QUOTE_IDENT('Mixed Name') AS ident FROM rows",
+      "notes": "SUBSTRING(text FROM 'pattern') is PostgreSQL's POSIX-regex form: the first match, or its first parenthesized group; a number after FROM is the ordinary start position. TO_HEX renders an integer in hexadecimal; QUOTE_LITERAL and QUOTE_IDENT quote a value or a name for use in SQL text."
     },
     {
       "id": "order-by.expression",
@@ -500,6 +561,13 @@
       "status": "supported",
       "example": "SELECT r.amount FROM rows r WHERE r.amount = 3 OR r.amount > ALL (SELECT q.amount FROM rows q WHERE q.region = r.region)",
       "notes": "Top-level WHERE uses semi/anti joins. Nested expressions group true, false, unknown, and empty-set counts per distinct outer probe tuple."
+    },
+    {
+      "id": "subquery.array-constructor",
+      "status": "unsupported",
+      "example": "SELECT ARRAY(SELECT amount FROM rows) AS amounts FROM rows",
+      "error": "Expected )",
+      "notes": "ARRAY(subquery) is not supported; a scalar subquery with json_agg builds the same list as a JSON document."
     },
     {
       "id": "cte.recursive",
@@ -683,6 +751,24 @@
       "notes": "Common PostgreSQL type names map onto Minnow's four stored value kinds (widths parse and are ignored); one PRIMARY KEY or UNIQUE column becomes the row-addressing key. ALTER TABLE ADD/DROP COLUMN and DROP TABLE are tracked separately."
     },
     {
+      "id": "ddl.type-spellings",
+      "status": "supported",
+      "example": "CREATE TABLE spelled (id int4 PRIMARY KEY, name character varying(10), note character varying, at timestamp with time zone, seen timestamp without time zone, big int8, small int2, f float8, r float4, flag bool)",
+      "notes": "PostgreSQL's internal type names (int2, int4, int8, float4, float8, bool) and its multi-word spellings (character varying, timestamp with time zone, timestamp without time zone, time with time zone) map onto the same storage as INTEGER, BIGINT, DOUBLE PRECISION, BOOLEAN, VARCHAR, and TIMESTAMPTZ. pg_dump and migration tools emit these spellings."
+    },
+    {
+      "id": "ddl.temporary-table",
+      "status": "supported",
+      "example": "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, note TEXT)",
+      "notes": "TEMP, TEMPORARY, UNLOGGED, GLOBAL, and LOCAL are accepted and ignored: every table lives in the one database with one durability, so the modifiers document intent and change nothing."
+    },
+    {
+      "id": "ddl.named-column-constraint",
+      "status": "supported",
+      "example": "CREATE TABLE guarded (id INTEGER PRIMARY KEY, n INTEGER CONSTRAINT guarded_n_positive CHECK (n > 0))",
+      "notes": "CONSTRAINT name before a column's CHECK or REFERENCES names that constraint, as it does at table level; the name of a column's PRIMARY KEY, UNIQUE, or NOT NULL is informational."
+    },
+    {
       "id": "mutation.update-keyless",
       "status": "unsupported",
       "example": "UPDATE rows SET amount = 1",
@@ -734,6 +820,18 @@
       "status": "supported",
       "example": "SELECT region || '-' || label AS tag FROM dims",
       "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error. One operand must be ordinary text, matching PostgreSQL's operator resolution: array and JSONB || are structural concatenation (see array.concat and json.concat), and two non-text domain operands have no || operator. A domain value concatenated with text renders in its Minnow text form."
+    },
+    {
+      "id": "expression.integer-division",
+      "status": "supported",
+      "example": "SELECT 7 / 2 AS quotient, -7 / 2 AS negative, 7.0 / 2 AS exact, CAST(amount AS INTEGER) / 2 AS half FROM rows",
+      "notes": "Division follows PostgreSQL's typing. Two integer operands — INTEGER, BIGINT, or SMALLINT columns, integer constants, COUNT, integer CASTs, and integer arithmetic or aggregates over them — divide as integers, truncating toward zero: 7 / 2 is 3 and -7 / 2 is -3. A double, NUMERIC, or decimal constant operand makes the quotient fractional: 7.0 / 2 is 3.5. A bound parameter takes the type of its integer partner, so id / $1 truncates when $1 is bound to an integer."
+    },
+    {
+      "id": "expression.untyped-arithmetic",
+      "status": "supported",
+      "example": "SELECT '5' + 1 AS six, 2 * '3' AS six_again FROM rows",
+      "notes": "An untyped string constant beside a number in + - * / % is read as a number, as PostgreSQL types the unknown literal by its partner. Text that is not a number is still an error."
     },
     {
       "id": "expression.modulo",
@@ -867,6 +965,32 @@
       "notes": "Holds the same scope `write()` opens between statements instead of around a callback: writes stage into it, reads see what it staged, and COMMIT publishes them together. Schema changes are refused inside one, because the catalog commits outside the scope and a rollback could not take them back. A transaction left untouched past the idle bound rolls itself back, so an abandoned BEGIN cannot hold storage forever."
     },
     {
+      "id": "transaction.end",
+      "status": "supported",
+      "setup": ["BEGIN"],
+      "example": "END",
+      "notes": "END and END TRANSACTION commit, as COMMIT does."
+    },
+    {
+      "id": "transaction.abort",
+      "status": "supported",
+      "setup": ["BEGIN"],
+      "example": "ABORT",
+      "notes": "ABORT rolls back, as ROLLBACK does."
+    },
+    {
+      "id": "transaction.session-settings",
+      "status": "supported",
+      "example": "SET search_path TO public",
+      "notes": "SET [SESSION | LOCAL] name TO value, SET TRANSACTION …, and RESET name are accepted and ignored: an embedded single-session engine has no search path, timeouts, encodings, or isolation levels to configure, and drivers and migration tools issue these on every connection. SET TIME ZONE accepts only UTC, because every datetime is an instant in UTC; another zone is refused rather than silently ignored."
+    },
+    {
+      "id": "transaction.show-setting",
+      "status": "supported",
+      "example": "SHOW server_version",
+      "notes": "SHOW returns the engine's fixed answer for the settings drivers and tools read on connection — search_path, server_version, timezone, transaction_isolation, client_encoding, and the like — as one row. An unknown setting is an error, as in PostgreSQL."
+    },
+    {
       "id": "transaction.commit",
       "status": "supported",
       "setup": ["BEGIN"],
@@ -882,8 +1006,8 @@
       "id": "transaction.isolation-level",
       "status": "unsupported",
       "example": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-      "error": "Expected SELECT, found SET",
-      "notes": "The engine has one isolation level. Every read runs against a single version and every write scope commits atomically, so there is no weaker mode to relax into and no stronger one to ask for."
+      "error": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
+      "notes": "Every transaction reads one snapshot and commits atomically, which satisfies READ UNCOMMITTED, READ COMMITTED, and REPEATABLE READ, so those levels are accepted in SET TRANSACTION and BEGIN. SERIALIZABLE promises more than that and is refused rather than silently downgraded."
     },
     {
       "id": "function.char-length",
@@ -989,6 +1113,13 @@
       "notes": "The shared columns are compared but not merged, so an unqualified reference to one is ambiguous — qualify it. NATURAL RIGHT JOIN is rejected, because the right-join mirror rewrites the sources the shared-column search reads."
     },
     {
+      "id": "join.full-compound-on",
+      "status": "unsupported",
+      "example": "SELECT r.region FROM rows r FULL JOIN keyed k ON k.name = r.region AND k.score > 0",
+      "error": "FULL JOIN requires a single equality ON condition",
+      "notes": "FULL JOIN takes a single equality ON condition; move the extra condition into a derived source."
+    },
+    {
       "id": "datetime.current-date",
       "status": "supported",
       "example": "SELECT CURRENT_DATE > DATE '2000-01-01' AS elapsed",
@@ -1049,6 +1180,13 @@
       "notes": "Scientific notation is a numeric constant, as in PostgreSQL. PostgreSQL renders every such constant as NUMERIC text; Minnow returns a number when the value reads back identically from one, and renders a constant that stays exact fully expanded, as PostgreSQL renders it."
     },
     {
+      "id": "literal.bit-string",
+      "status": "unsupported",
+      "example": "SELECT B'101' AS bits FROM rows",
+      "error": "Expected eof, found 101",
+      "notes": "Bit-string literals and the BIT types are not supported."
+    },
+    {
       "id": "limit.with-ties",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IS NOT NULL ORDER BY region DESC FETCH FIRST 1 ROWS WITH TIES",
@@ -1106,6 +1244,30 @@
       "id": "aggregate.boolean",
       "status": "supported",
       "example": "SELECT EVERY(amount > 1) AS all_positive FROM rows"
+    },
+    {
+      "id": "json.agg-spellings",
+      "status": "supported",
+      "example": "SELECT region, JSON_AGG(amount ORDER BY amount) AS amounts, JSONB_AGG(amount ORDER BY amount DESC) AS amounts_desc FROM rows GROUP BY region",
+      "notes": "json_agg and jsonb_agg are PostgreSQL's spellings of JSON_ARRAYAGG, with the same ORDER BY inside the call. jsonb and json produce the same document text."
+    },
+    {
+      "id": "json.build-object",
+      "status": "supported",
+      "example": "SELECT JSON_BUILD_OBJECT('region', region, 'amount', amount) AS doc, JSONB_BUILD_ARRAY(amount, region) AS list FROM rows",
+      "notes": "json_build_object, jsonb_build_object, json_build_array, and jsonb_build_array are PostgreSQL's spellings of JSON_OBJECT and JSON_ARRAY."
+    },
+    {
+      "id": "json.to-json",
+      "status": "supported",
+      "example": "SELECT TO_JSON(amount) AS amount_doc, TO_JSONB(region) AS region_doc FROM rows",
+      "notes": "to_json and to_jsonb render one SQL value as a JSON document: a number as itself, text as a JSON string, a boolean as true or false, NULL as the document null, and a JSON value as itself."
+    },
+    {
+      "id": "json.row-reference",
+      "status": "supported",
+      "example": "SELECT r.region, JSON_AGG(r ORDER BY r.amount) AS rows_doc, JSON_AGG(ROW_TO_JSON(r) ORDER BY r.amount) AS row_docs FROM (SELECT region, amount FROM rows) r GROUP BY r.region",
+      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it — the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as ISO 8601 with a Z suffix."
     },
     {
       "id": "json.value",
@@ -1305,6 +1467,22 @@
       "notes": "SAVEPOINT, ROLLBACK TO, and RELEASE operate on staged transaction state."
     },
     {
+      "id": "transaction.ddl-inside",
+      "status": "unsupported",
+      "setup": ["BEGIN"],
+      "example": "CREATE TABLE inside (id INTEGER PRIMARY KEY)",
+      "error": "CREATE TABLE is not allowed inside a transaction",
+      "notes": "Schema statements are refused inside BEGIN … COMMIT: the catalog commits outside the scope, so a rollback could not take them back. Run DDL outside a transaction; migration tools that wrap migrations in one need that step split out."
+    },
+    {
+      "id": "transaction.lock-table",
+      "status": "unsupported",
+      "setup": ["BEGIN"],
+      "example": "LOCK TABLE keyed IN SHARE MODE",
+      "error": "Expected SELECT, found LOCK",
+      "notes": "LOCK TABLE is not supported; a single-session engine has no other session to lock against."
+    },
+    {
       "id": "privileges.grant",
       "status": "unsupported",
       "example": "GRANT SELECT ON rows TO reader",
@@ -1373,6 +1551,20 @@
       "notes": "Supports DISTINCT and aggregate-local ORDER BY, embeds JSON-producing inputs as documents, includes SQL NULL as JSON null, and returns NULL for empty input. FILTER, window use, and explicit NULL/ABSENT clauses are not supported; input order is unspecified without ORDER BY."
     },
     {
+      "id": "aggregate.array-agg",
+      "status": "unsupported",
+      "example": "SELECT region, array_agg(amount) AS amounts FROM rows GROUP BY region",
+      "error": "Unsupported function: array_agg",
+      "notes": "array_agg is not supported because arrays are not; json_agg (JSON_ARRAYAGG) collects a group into a JSON array instead."
+    },
+    {
+      "id": "aggregate.ordered-set",
+      "status": "unsupported",
+      "example": "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median FROM rows",
+      "error": "Unsupported function: percentile_cont",
+      "notes": "Ordered-set aggregates (percentile_cont, percentile_disc, mode) and corr are not supported; a window over ROW_NUMBER() and COUNT() OVER () computes a median."
+    },
+    {
       "id": "type.array",
       "status": "supported",
       "example": "SELECT ARRAY[1, 2] AS pair",
@@ -1407,6 +1599,41 @@
       "notes": "PostgreSQL's jsonb || jsonb merges documents structurally. Minnow refuses || whenever either operand is JSONB rather than inventing a text concatenation PostgreSQL does not have."
     },
     {
+      "id": "json.object-agg",
+      "status": "unsupported",
+      "example": "SELECT json_object_agg(region, amount) AS doc FROM rows",
+      "error": "Unsupported function: json_object_agg",
+      "notes": "json_object_agg / jsonb_object_agg are not supported; json_agg of json_build_object pairs is the usual substitute."
+    },
+    {
+      "id": "json.mutation-functions",
+      "status": "unsupported",
+      "example": "SELECT jsonb_set('{\"a\":1}'::jsonb, '{a}', '2') AS doc FROM rows",
+      "error": "Unsupported function: jsonb_set",
+      "notes": "jsonb_set, jsonb_insert, jsonb_strip_nulls, and json_extract_path_text are not supported; rebuild the document with JSON_OBJECT / json_build_object and read members with -> and ->>."
+    },
+    {
+      "id": "json.inspection-functions",
+      "status": "unsupported",
+      "example": "SELECT jsonb_typeof('{\"a\":1}'::jsonb) AS kind FROM rows",
+      "error": "Unsupported function: jsonb_typeof",
+      "notes": "jsonb_typeof and jsonb_array_length are not supported; JSON_EXISTS, JSON_VALUE, and JSON_QUERY answer most of the same questions."
+    },
+    {
+      "id": "json.path-operators",
+      "status": "unsupported",
+      "example": "SELECT ('{\"a\":{\"b\":[1,2]}}'::jsonb) #>> '{a,b,0}' AS leaf FROM rows",
+      "error": "Unsupported SQL character: #",
+      "notes": "The #> and #>> path operators are not supported; chain -> and ->> or use JSON_VALUE with a path."
+    },
+    {
+      "id": "json.containment-operators",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE ('{\"theme\":\"dark\"}'::jsonb) @> '{\"theme\":\"dark\"}'",
+      "error": "Unsupported SQL character: @",
+      "notes": "The @>, <@, ?, ?|, and ?& operators are not supported; compare members with ->> or test presence with JSON_EXISTS."
+    },
+    {
       "id": "type.time",
       "status": "supported",
       "example": "SELECT TIME '12:00:00' AS at",
@@ -1417,6 +1644,13 @@
       "status": "supported",
       "example": "SELECT CAST('2026-08-26' AS DATE) AS day",
       "notes": "A calendar date without a time zone, returned as canonical YYYY-MM-DD text."
+    },
+    {
+      "id": "type.array-any-parameter",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE amount = ANY(ARRAY[1, 2])",
+      "error": "ANY/ALL take a subquery",
+      "notes": "= ANY(array) is not supported; use IN (…) with a list or a subquery."
     },
     {
       "id": "ddl.sequence",
@@ -1510,6 +1744,41 @@
       "notes": "PostgreSQL's ^ is exponentiation, binding above * and / and associating to the left: 2 ^ 3 ^ 2 is 64."
     },
     {
+      "id": "expression.interval-values",
+      "status": "unsupported",
+      "example": "SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total FROM rows",
+      "error": "Date arithmetic requires a date or datetime value",
+      "notes": "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, EXTRACT(EPOCH FROM interval), justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds."
+    },
+    {
+      "id": "expression.date-minus-date",
+      "status": "unsupported",
+      "example": "SELECT DATE '2026-01-10' - DATE '2026-01-05' AS days FROM rows",
+      "error": "Arithmetic and numeric aggregates require numbers",
+      "notes": "date - date and timestamp - timestamp are not supported; see expression.interval-values."
+    },
+    {
+      "id": "expression.at-time-zone",
+      "status": "unsupported",
+      "example": "SELECT CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS local FROM rows",
+      "error": "Expected eof, found AT",
+      "notes": "AT TIME ZONE and timezone() are not supported: every datetime is an instant in UTC, and rendering in another zone belongs to the application."
+    },
+    {
+      "id": "expression.bitwise-operators",
+      "status": "unsupported",
+      "example": "SELECT 1 & 3 AS both, 1 | 2 AS either, 1 # 3 AS differ, 1 << 2 AS shifted FROM rows",
+      "error": "Unsupported SQL character: &",
+      "notes": "The bitwise operators &, |, #, ~, <<, and >> and the prefix operators |/ and @ are not supported."
+    },
+    {
+      "id": "expression.row-constructor-value",
+      "status": "unsupported",
+      "example": "SELECT ROW(1, 2) AS pair FROM rows",
+      "error": "Unsupported function: ROW",
+      "notes": "A row constructor as a value is not supported; row comparisons ((a, b) = (1, 2), (a, b) IN (…)) are."
+    },
+    {
       "id": "function.math-extended",
       "status": "supported",
       "example": "SELECT EXP(1) AS e, LN(amount) AS ln, LOG(amount) AS log10, LOG(2, 8) AS log2, LOG10(1000) AS thousand, SIGN(amount - 5) AS sign, TRUNC(CAST(amount AS NUMERIC) / 3, 2) AS trunc, PI() AS pi, CBRT(27) AS cbrt, DIV(CAST(amount AS NUMERIC), 3) AS quotient, WIDTH_BUCKET(amount, 0, 10, 5) AS bucket, DEGREES(PI()) AS half_turn, ROUND(SIN(RADIANS(90))) AS sine FROM rows",
@@ -1556,6 +1825,34 @@
       "status": "supported",
       "example": "SELECT DATE_PART('year', joined) AS y, EXTRACT(DOY FROM joined) AS doy, EXTRACT(ISODOW FROM joined) AS isodow, EXTRACT(ISOYEAR FROM joined) AS isoyear, EXTRACT(DECADE FROM joined) AS decade, EXTRACT(MILLISECONDS FROM joined) AS ms, EXTRACT(YEAR FROM DATE '2026-03-04') AS from_date FROM rows WHERE joined IS NOT NULL",
       "notes": "DATE_PART('field', value) is EXTRACT(field FROM value). The fields year, quarter, month, week, day, hour, minute, second, epoch, dow, doy, isodow, isoyear, decade, century, millennium, milliseconds, and microseconds, over timestamps and DATE values, in UTC."
+    },
+    {
+      "id": "function.unnest",
+      "status": "unsupported",
+      "example": "SELECT x FROM unnest(ARRAY[3, 1, 2]) AS x",
+      "error": "Expected )",
+      "notes": "Set-returning functions (unnest, generate_series, regexp_split_to_table, jsonb_array_elements) are not supported as FROM sources; use a VALUES source, a recursive CTE for a series, or JSON_TABLE for a JSON array."
+    },
+    {
+      "id": "function.generate-series",
+      "status": "unsupported",
+      "example": "SELECT n FROM generate_series(1, 3) AS n",
+      "error": "Expected identifier, found 1",
+      "notes": "generate_series is not supported; a recursive CTE produces a series."
+    },
+    {
+      "id": "function.regexp-arrays",
+      "status": "unsupported",
+      "example": "SELECT regexp_match(region, '(e.)') AS groups FROM rows",
+      "error": "Unsupported function: regexp_match",
+      "notes": "regexp_match, regexp_matches, regexp_split_to_array, and regexp_split_to_table return arrays or sets, which are not supported; SUBSTRING(text FROM 'pattern'), REGEXP_REPLACE, and the ~ operators cover single matches."
+    },
+    {
+      "id": "function.server-introspection",
+      "status": "unsupported",
+      "example": "SELECT version() AS server FROM rows",
+      "error": "Unsupported function: version",
+      "notes": "version(), current_user, session_user, current_schema, pg_typeof, and setseed describe a server this engine is not; SHOW server_version answers the version question."
     },
     {
       "id": "group-by.ordinal",
@@ -1636,6 +1933,13 @@
       "notes": "DISTINCT over a grouped, aggregated, HAVING-filtered, or windowed block takes the distinct rows of that block's output, which runs inside a derived table; ORDER BY and LIMIT apply to the distinct rows."
     },
     {
+      "id": "select.tablesample",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows TABLESAMPLE SYSTEM (50)",
+      "error": "Expected eof, found SYSTEM",
+      "notes": "TABLESAMPLE is not supported; ORDER BY RANDOM() LIMIT n samples rows."
+    },
+    {
       "id": "mutation.update-alias",
       "status": "supported",
       "example": "UPDATE keyed AS k SET score = k.score + 1 WHERE k.name = 'x' RETURNING k.name, k.score",
@@ -1670,6 +1974,34 @@
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) WITH top AS (SELECT name FROM keyed WHERE score > 0) SELECT name || '2', 2 FROM top UNION ALL SELECT 'u', 3",
       "notes": "Any query expression feeds INSERT: a WITH, a set operation, or a parenthesized member; the produced column count is checked against the column list when the rows materialize."
+    },
+    {
+      "id": "mutation.upsert-non-key-unique",
+      "status": "unsupported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('z', 3) ON CONFLICT (score) DO NOTHING",
+      "error": "ON CONFLICT targets the table's primary or unique key columns: name",
+      "notes": "ON CONFLICT targets the table's primary or row-addressing unique key; a secondary UNIQUE column, a constraint name (ON CONSTRAINT), or a partial-index predicate cannot be the target."
+    },
+    {
+      "id": "mutation.update-set-default",
+      "status": "unsupported",
+      "example": "UPDATE keyed SET bonus = DEFAULT WHERE name = 'x'",
+      "error": "Ambiguous or missing column: DEFAULT",
+      "notes": "SET column = DEFAULT and the row-value form SET (a, b) = (…) are not supported; assign the value explicitly."
+    },
+    {
+      "id": "mutation.update-row-value",
+      "status": "unsupported",
+      "example": "UPDATE keyed SET (score, bonus) = (1, 2) WHERE name = 'x'",
+      "error": "Expected identifier, found (",
+      "notes": "The row-value assignment SET (a, b) = (…) is not supported; assign each column."
+    },
+    {
+      "id": "mutation.data-modifying-cte",
+      "status": "unsupported",
+      "example": "WITH w AS (INSERT INTO keyed (name, score) VALUES ('w', 0) RETURNING name) SELECT name FROM w",
+      "error": "Expected SELECT, found INSERT",
+      "notes": "A data-modifying statement inside WITH is not supported; run the write, then the read."
     },
     {
       "id": "ddl.serial",
@@ -1707,6 +2039,181 @@
       "example": "CREATE TABLE default_children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES default_parents(id) ON DELETE SET DEFAULT)",
       "error": "SET DEFAULT is not supported; use SET NULL or CASCADE",
       "notes": "SET DEFAULT would rewrite orphaned references to the column's default value at delete time; Minnow implements RESTRICT, CASCADE, and SET NULL. The statement is rejected at parse, before touching the catalog."
+    },
+    {
+      "id": "ddl.alter-table-rename",
+      "status": "unsupported",
+      "example": "ALTER TABLE keyed RENAME COLUMN score TO points",
+      "error": "Expected ADD, found RENAME",
+      "notes": "ALTER TABLE RENAME COLUMN, RENAME TO, ALTER COLUMN TYPE / SET DEFAULT / SET NOT NULL / DROP NOT NULL, ADD CONSTRAINT, and DROP CONSTRAINT are not supported as SQL. ALTER TABLE ADD COLUMN and DROP COLUMN are. The schema DSL's migrate() renames columns and widens nullability through the catalog."
+    },
+    {
+      "id": "ddl.alter-column",
+      "status": "unsupported",
+      "example": "ALTER TABLE keyed ALTER COLUMN score SET DEFAULT 7",
+      "error": "Expected ADD, found ALTER",
+      "notes": "ALTER COLUMN forms are not supported; see ddl.alter-table-rename."
+    },
+    {
+      "id": "ddl.add-constraint",
+      "status": "unsupported",
+      "example": "ALTER TABLE keyed ADD CONSTRAINT keyed_score_positive CHECK (score > -10)",
+      "error": "Expected eof, found CHECK",
+      "notes": "ADD CONSTRAINT and DROP CONSTRAINT are not supported; constraints are declared in CREATE TABLE."
+    },
+    {
+      "id": "ddl.add-column-if-not-exists",
+      "status": "unsupported",
+      "example": "ALTER TABLE keyed ADD COLUMN IF NOT EXISTS note TEXT",
+      "error": "Expected eof, found EXISTS",
+      "notes": "ADD COLUMN IF NOT EXISTS is not supported; check the catalog first or let the duplicate-column error stand."
+    },
+    {
+      "id": "ddl.create-table-like",
+      "status": "unsupported",
+      "example": "CREATE TABLE copied (LIKE keyed)",
+      "error": "Unsupported column type: keyed",
+      "notes": "CREATE TABLE … (LIKE other) is not supported; spell the columns out, or CREATE TABLE AS SELECT for a data copy."
+    },
+    {
+      "id": "ddl.serial-non-key",
+      "status": "unsupported",
+      "example": "CREATE TABLE ticketed (id INTEGER PRIMARY KEY, seq SERIAL)",
+      "error": "Auto-increment requires the unique key column: seq",
+      "notes": "SERIAL and GENERATED … AS IDENTITY are supported on the primary key only; a sequence-fed non-key column is refused."
+    },
+    {
+      "id": "ddl.bytea",
+      "status": "unsupported",
+      "example": "CREATE TABLE blobs (id INTEGER PRIMARY KEY, body BYTEA)",
+      "error": "Unsupported column type: BYTEA",
+      "notes": "BYTEA columns and bytea literals, casts, and functions (encode, decode, sha256) are not supported; store binary data as base64 or hex TEXT."
+    },
+    {
+      "id": "ddl.foreign-key-on-update",
+      "status": "unsupported",
+      "example": "CREATE TABLE child (id INTEGER PRIMARY KEY, parent TEXT REFERENCES keyed (name) ON UPDATE CASCADE)",
+      "error": "ON UPDATE CASCADE has nothing to act on: a unique key cannot change",
+      "notes": "ON UPDATE actions are not supported because primary-key values cannot be updated; ON DELETE CASCADE, SET NULL, RESTRICT, and NO ACTION are."
+    },
+    {
+      "id": "ddl.deferrable-constraints",
+      "status": "unsupported",
+      "example": "CREATE TABLE deferred (id INTEGER PRIMARY KEY, parent TEXT REFERENCES keyed (name) DEFERRABLE INITIALLY DEFERRED)",
+      "error": "Expected )",
+      "notes": "DEFERRABLE constraints are not supported; every constraint is checked at the statement."
+    },
+    {
+      "id": "ddl.partial-index",
+      "status": "unsupported",
+      "example": "CREATE INDEX keyed_positive ON keyed (score) WHERE score > 0",
+      "error": "Expected eof, found WHERE",
+      "notes": "Partial indexes (WHERE), expression indexes, INCLUDE columns, USING method, and CONCURRENTLY are not supported; an index is over one or more plain columns."
+    },
+    {
+      "id": "ddl.expression-index",
+      "status": "unsupported",
+      "example": "CREATE INDEX keyed_lower ON keyed (LOWER(name))",
+      "error": "Expected )",
+      "notes": "Expression indexes are not supported; index a stored generated column instead."
+    },
+    {
+      "id": "ddl.drop-table-multiple",
+      "status": "unsupported",
+      "example": "DROP TABLE IF EXISTS keyed, rows",
+      "error": "Expected eof, found ,",
+      "notes": "DROP TABLE takes one table per statement."
+    },
+    {
+      "id": "ddl.view-column-list",
+      "status": "unsupported",
+      "example": "CREATE VIEW scored (person, points) AS SELECT name, score FROM keyed",
+      "error": "CREATE VIEW takes a name and AS <query>; column lists are not supported",
+      "notes": "A column list on CREATE VIEW and WITH CHECK OPTION are not supported; alias the columns in the view's SELECT."
+    },
+    {
+      "id": "ddl.materialized-view",
+      "status": "unsupported",
+      "example": "CREATE MATERIALIZED VIEW scores AS SELECT name, score FROM keyed",
+      "error": "Expected TABLE, found MATERIALIZED",
+      "notes": "Materialized views are not supported; CREATE TABLE AS SELECT stores a snapshot."
+    },
+    {
+      "id": "ddl.sequence-functions",
+      "status": "unsupported",
+      "example": "SELECT setval('numbering', 10) FROM rows",
+      "error": "Unsupported function: setval",
+      "notes": "setval, currval, and ALTER SEQUENCE are not supported; nextval and CREATE SEQUENCE are."
+    },
+    {
+      "id": "ddl.alter-type",
+      "status": "unsupported",
+      "example": "ALTER TYPE mood ADD VALUE 'meh'",
+      "error": "Expected TABLE, found TYPE",
+      "notes": "ALTER TYPE and DROP TYPE are not supported; CREATE TYPE … AS ENUM is, and the schema DSL widens enum values through migrate()."
+    },
+    {
+      "id": "ddl.domain",
+      "status": "unsupported",
+      "example": "CREATE DOMAIN positive_int AS INTEGER CHECK (VALUE > 0)",
+      "error": "Expected TABLE, found DOMAIN",
+      "notes": "CREATE DOMAIN is not supported; put the CHECK on the column."
+    },
+    {
+      "id": "ddl.schema",
+      "status": "unsupported",
+      "example": "CREATE SCHEMA app",
+      "error": "Expected TABLE, found SCHEMA",
+      "notes": "Schemas are not supported: there is one namespace, and a schema-qualified name (public.users) is refused."
+    },
+    {
+      "id": "ddl.schema-qualified-name",
+      "status": "unsupported",
+      "example": "SELECT region FROM public.rows",
+      "error": "Expected eof, found .",
+      "notes": "Schema-qualified names are not supported; there is one namespace."
+    },
+    {
+      "id": "ddl.function",
+      "status": "unsupported",
+      "example": "CREATE FUNCTION one() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+      "error": "Expected TABLE, found FUNCTION",
+      "notes": "CREATE FUNCTION and CREATE TRIGGER … EXECUTE FUNCTION are not supported; triggers take an inline BEGIN … END body of INSERT, UPDATE, and DELETE statements."
+    },
+    {
+      "id": "ddl.exclude-constraint",
+      "status": "unsupported",
+      "example": "CREATE TABLE slots (id INTEGER PRIMARY KEY, n INTEGER, EXCLUDE USING gist (n WITH =))",
+      "error": "Expected )",
+      "notes": "EXCLUDE constraints are not supported."
+    },
+    {
+      "id": "statement.server-commands",
+      "status": "unsupported",
+      "example": "VACUUM",
+      "error": "Expected SELECT, found VACUUM",
+      "notes": "VACUUM, ANALYZE, COMMENT ON, LISTEN, NOTIFY, and DISCARD are server commands with no meaning here; maintenance runs automatically and is driven from the API."
+    },
+    {
+      "id": "statement.multiple",
+      "status": "unsupported",
+      "example": "SELECT 1 AS a; SELECT 2 AS b",
+      "error": "Run one SELECT statement at a time",
+      "notes": "One statement per execute() call; a script is split at its semicolons by the caller."
+    },
+    {
+      "id": "statement.explain",
+      "status": "unsupported",
+      "example": "EXPLAIN SELECT region FROM rows",
+      "error": "Expected SELECT, found EXPLAIN",
+      "notes": "EXPLAIN is not supported as SQL; the explain() API renders the plan for a query."
+    },
+    {
+      "id": "catalog.information-schema",
+      "status": "unsupported",
+      "example": "SELECT column_name FROM information_schema.columns WHERE table_name = 'rows'",
+      "error": "Expected eof, found .",
+      "notes": "information_schema, pg_catalog, and sqlite_master are not supported; the catalog is read through the API (listTables, describe)."
     }
   ]
 }

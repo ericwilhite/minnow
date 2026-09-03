@@ -90,7 +90,10 @@ machines: https://minnowdb.com/llms.txt
 - `UPDATE` and `DELETE` require scalar or composite row identity: a `PRIMARY KEY`, or the
   single inline `UNIQUE` form. A table without one can only be appended to. Primary-key components
   cannot be updated.
-- `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers. `NUMERIC` and
+- `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers, and `/` between two
+  integers (columns, constants, `COUNT`, integer aggregates) truncates toward zero as in
+  PostgreSQL: `7 / 2` is `3`. Divide by `2.0` or a `DOUBLE PRECISION`/`NUMERIC` operand for a
+  fractional quotient. `NUMERIC` and
   `DECIMAL` are exact and return decimal strings, rendered at the column's declared scale like
   PostgreSQL (`'1.50'` from `NUMERIC(10, 2)`). Exact `+`, `-`, `*`, `%`, `ROUND`, and `TRUNC`
   carry PostgreSQL's display scale (`'8.00'` from `NUMERIC(10, 2) + 1`); a bare `NUMERIC` and a
@@ -172,16 +175,27 @@ machines: https://minnowdb.com/llms.txt
   projections with multiple qualified outer-column references and per-probe ordering/limits,
   subquery predicates in UPDATE/DELETE,
   range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, constant
-  JSON_TABLE, and the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
-  a non-JSON document).
-- Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
-  correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents, array subscripts,
-  `ANY`/`ALL` over array values, `||` on array or JSONB operands, interval-valued arithmetic
-  such as interval-plus-interval, enum evolution, sequence options, `RIGHT JOIN` or `FULL JOIN`
-  beside another join or combined with `SELECT *`, `FULL JOIN` without an equality `ON` or with
-  grouping, `DISTINCT`, or window functions, numeric `RANGE` frame offsets (use `ROWS`),
+  JSON_TABLE, the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
+  a non-JSON document), `DISTINCT ON`, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
+  PostgreSQL's `json_agg`/`json_build_object`/`to_json`/`row_to_json` spellings with a table
+  alias as a row value (Kysely's `jsonArrayFrom`/`jsonObjectFrom`), integer division that
+  truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
+  unquoted identifiers, `SET`/`RESET`/`SHOW` session settings (accepted and ignored, except a
+  non-UTC time zone), `FOR UPDATE` (ignored), and `E'…'`/`$$…$$` strings.
+- Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, DDL inside
+  `BEGIN … COMMIT`, correlated LATERAL grouping/order/limit, correlated JSON_TABLE documents,
+  arrays beyond a JSON-text literal (no subscripts, `ANY`/`ALL` over array values, `unnest`,
+  `array_agg`, `generate_series`), `||` on array or JSONB operands and the `#>`/`@>`/`?`
+  operators, `jsonb_set`/`jsonb_typeof`/`json_object_agg`, interval-valued arithmetic such as
+  interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `ALTER TABLE` beyond
+  ADD/DROP COLUMN, partial and expression indexes, `ON CONFLICT` on a non-key UNIQUE column,
+  schemas and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set aggregates,
+  bitwise operators, `bytea`, enum evolution, sequence options, `RIGHT JOIN` or `FULL JOIN`
+  beside another join or combined with `SELECT *`, `FULL JOIN` without a single equality `ON` or
+  with grouping, `DISTINCT`, or window functions, numeric `RANGE` frame offsets (use `ROWS`),
   `DISTINCT` window aggregates, window functions outside the select list, and
-  `ON DELETE SET DEFAULT`. Check each supported entry's note before assuming every PostgreSQL
+  `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
+  with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
 ```
 

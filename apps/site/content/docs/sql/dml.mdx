@@ -77,7 +77,20 @@ WHERE c.signed_up_on < $1
 Both statements take PostgreSQL's table alias (`UPDATE customers AS c`, `DELETE FROM orders o`),
 which the assignments, predicates, and `RETURNING` may qualify by. Subquery predicates work the
 same way they do in `SELECT`, including `IN (SELECT ...)`, `NOT IN (SELECT ...)`, and correlated
-`EXISTS` / `NOT EXISTS`.
+`EXISTS` / `NOT EXISTS`. `UPDATE … FROM` and `DELETE … USING` join extra sources — tables,
+views, or derived tables — to the target, as PostgreSQL does; the assignments and predicates may
+read them, and a target row matched by several source rows is touched once:
+
+```sql
+UPDATE customers c
+SET last_order_at = o.placed_at
+FROM (SELECT customer_id, MAX(placed_at) AS placed_at FROM orders GROUP BY customer_id) o
+WHERE o.customer_id = c.customer_id
+```
+
+`TRUNCATE [TABLE] name` removes every row of one table, the same as an
+unfiltered `DELETE`; it reports the rows removed, takes one table at a time, and refuses
+`CASCADE`.
 
 <Callout title="The table needs a unique key">
   `UPDATE` and `DELETE` are rejected on a table with no `PRIMARY KEY`:
@@ -106,6 +119,13 @@ INSERT INTO customers (customer_id, name, city, signed_up_on)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (customer_id) DO UPDATE SET name = EXCLUDED.name, city = EXCLUDED.city
 ```
+
+A string constant or bound parameter written into a datetime, number, or boolean column is read
+in the column's type, the way PostgreSQL types an unknown literal by its target:
+`INSERT INTO orders (placed_at) VALUES ('2026-04-01T00:00:00Z')`, `SET quantity = '7'`, and a
+string bound to `$1` all store the typed value, and `RETURNING` echoes it. Text that does not
+parse in that type is refused with the column's type error. This is a property of SQL statements;
+the typed programmatic API still takes values of the column's JavaScript type.
 
 `DO NOTHING` is also available, with or without a conflict target — a bare `ON CONFLICT DO
 NOTHING` skips rows that collide on the table's unique key — and a later duplicate key in the same
@@ -238,7 +258,14 @@ COMMIT;
 ```
 
 Statements inside see each other — a `SELECT` after the `UPDATE` reads the new value — and
-`ROLLBACK` discards the lot. Two rules keep an open transaction from becoming a leak: schema
+`ROLLBACK` (or `ABORT`) discards the lot (`END` commits, as `COMMIT` does). `BEGIN` and
+`SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, and `ISOLATION LEVEL` below `SERIALIZABLE`:
+every transaction reads one snapshot and commits atomically, which satisfies those levels, while
+`SERIALIZABLE` is refused rather than silently downgraded. Session settings — `SET name TO
+value`, `SET LOCAL …`, `SET TRANSACTION …`, `RESET name` — are accepted and ignored, since an
+embedded single-session engine has nothing to configure by them; `SET TIME ZONE` accepts only UTC.
+`SHOW setting` answers the questions drivers ask on connection (`server_version`, `search_path`,
+`timezone`, `transaction_isolation`, …) with the engine's fixed values. Two rules keep an open transaction from becoming a leak: schema
 changes are refused inside one, because the catalog commits outside the scope and a rollback could
 not take them back, and a transaction left untouched for 30 seconds rolls itself back. A callback
 scope has no such bound, which is why it stays the better form when you have one.

@@ -29,8 +29,26 @@ them — see [Query plans](/docs/sql/plans).
 A string constant beside a typed value reads in that value's type, the way PostgreSQL types an
 untyped literal by its context: `placed_at >= '2025-01-01'` compares as a timestamp (a zoneless
 string is UTC), `customer_id = '42'` as a number, and `refunded = 't'` as a boolean. A bound
-parameter gets the same reading. Text that does not parse in that type is still a type error, so
-`placed_at >= 'yesterday'` fails rather than matching nothing.
+parameter gets the same reading, and so does a constant beside a datetime that is not a column:
+`NOW() > '2020-01-01'`, `HAVING MAX(placed_at) > '2026-03-01'`, or a scalar subquery. Text that
+does not parse in that type is still a type error, so `placed_at >= 'yesterday'` fails rather
+than matching nothing. The same reading applies when a SQL statement writes a string constant or
+parameter into a typed column — see [DML](/docs/sql/dml).
+
+Unquoted identifiers resolve the way PostgreSQL folds them when no exact name exists:
+`SELECT ID, Region FROM ORDERS` reads the table `orders` and its columns `id` and `region`,
+and the output columns take the catalog's spelling. A name that matches exactly is never
+folded, so a table created as `Orders` through the typed API is still addressed as `Orders`;
+a name that matches several catalog names case-insensitively is an error. `GROUP BY` follows
+PostgreSQL's functional dependency: once a table's whole primary key is grouped, any other
+column of that table may appear in the select list, `HAVING`, or `ORDER BY` ungrouped
+(`SELECT c.id, c.name, COUNT(o.id) FROM customers c LEFT JOIN orders o ON … GROUP BY c.id`).
+
+String constants take PostgreSQL's spellings too: `'it''s'`, `E'tab\there'` with C-style
+escapes, and `$tag$…$tag$` dollar quotes; `5.` and `.5` are numbers; `~~`, `!~~`, `~~*`, and
+`!~~*` spell `LIKE`, `NOT LIKE`, `ILIKE`, and `NOT ILIKE`; `TABLE name` is `SELECT * FROM name`;
+and a trailing `FOR UPDATE` or `FOR SHARE` is accepted and ignored, since a single-session engine
+has no other session to lock rows against.
 
 Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
 tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double
@@ -44,7 +62,8 @@ The scalar function surface follows PostgreSQL: `CONCAT`, `CONCAT_WS`, `LEFT`, `
 `TRIM`, `SUBSTRING`, `POSITION`, `OVERLAY`, and padding functions; the regex operators `~`,
 `~*`, `!~`, and `!~*`; `^` for exponentiation with `EXP`, `LN`, `LOG`, `LOG10`, `SIGN`, `TRUNC`,
 `PI`, `CBRT`, `DIV`, `WIDTH_BUCKET`, and the trigonometric family beside `ROUND`, `ABS`, `MOD`,
-`POWER`, and `SQRT`; and `TO_CHAR`, `TO_DATE`, `TO_TIMESTAMP`, `DATE_PART`, `EXTRACT`,
+`POWER`, and `SQRT` (with `/` dividing two integers as integers, truncating toward zero as
+PostgreSQL does); and `TO_CHAR`, `TO_DATE`, `TO_TIMESTAMP`, `DATE_PART`, `EXTRACT`,
 `DATE_TRUNC`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`, `NOW()`, and the `CURRENT_*` clock beside
 interval arithmetic. The [compatibility page](/docs/sql/feature-matrix) lists each with its
 example and any difference from PostgreSQL.
@@ -135,6 +154,15 @@ default, and returns SQL `NULL` for an empty input. Its `ORDER BY` list follows 
 and NULL-placement rules as query ordering. Filter its input in `WHERE`; `FILTER` is not supported
 for this aggregate. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`, and `CUBE`.
 
+`SELECT DISTINCT ON (expressions)` keeps the first row of each group in `ORDER BY` order — the
+PostgreSQL idiom for "the latest order per customer":
+
+```sql
+SELECT DISTINCT ON (customer_id) customer_id, order_id, placed_at
+FROM orders
+ORDER BY customer_id, placed_at DESC
+```
+
 `SELECT DISTINCT` over a grouped, aggregated, or windowed block takes the distinct rows of that
 block's output — `SELECT DISTINCT category, COUNT(*) … GROUP BY category, brand` — with `ORDER BY`
 and `LIMIT` applied to the distinct rows, as in PostgreSQL.
@@ -162,6 +190,21 @@ FROM orders o
 JOIN order_items i ON i.order_id = o.order_id
 JOIN products p ON p.product_id = i.product_id
 GROUP BY o.order_id, o.status
+```
+
+PostgreSQL's spellings are accepted too: `json_agg` and `jsonb_agg` for `JSON_ARRAYAGG`,
+`json_build_object` and `json_build_array` (and their `jsonb_` twins) for `JSON_OBJECT` and
+`JSON_ARRAY`, and `to_json`, `to_jsonb`, and `row_to_json` to render one value as a document. A
+table alias used as a value is the row as a JSON object with the source's columns in order, so
+the shapes Kysely's `jsonArrayFrom` and `jsonObjectFrom` and Drizzle's relational queries emit
+run unchanged:
+
+```sql
+SELECT c.customer_id,
+  (SELECT COALESCE(json_agg(agg), '[]')
+   FROM (SELECT o.order_id, o.total FROM orders o WHERE o.customer_id = c.customer_id) agg
+  ) AS orders
+FROM customers c
 ```
 
 The same rule applies through `JSON_QUERY`. Ordinary text that happens to contain JSON remains a

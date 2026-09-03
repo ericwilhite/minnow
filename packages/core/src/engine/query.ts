@@ -87,6 +87,7 @@ import {
   coercedComparable,
   parseSqlTimestampText,
   stringArgument,
+  readUntypedText,
 } from "./sql-semantics.js";
 import { simpleScalarFunctions } from "./sql-functions.js";
 import {
@@ -95,6 +96,7 @@ import {
   jsonConstructor,
   jsonIsValid,
   parseJsonPath,
+  jsonDocumentOf,
 } from "./sql-json.js";
 import { optimizePlan, rewriteBoundCalendarEqualities } from "./optimizer.js";
 import {
@@ -222,6 +224,7 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "JSON_EXISTS",
   "JSON_OBJECT",
   "JSON_ARRAY",
+  "TO_JSON",
   "IS_JSON",
   "ARRAY",
   "MINNOW_JSON_GET",
@@ -265,6 +268,15 @@ const functionSpellings: ReadonlyMap<string, string> = new Map([
   ["CEILING", "CEIL"],
   ["CHAR_LENGTH", "LENGTH"],
   ["CHARACTER_LENGTH", "LENGTH"],
+  ["POW", "POWER"],
+  // PostgreSQL's JSON spellings of the standard constructors and aggregate. jsonb and json
+  // produce the same document text here, so both prefixes name one function.
+  ["JSON_AGG", "JSON_ARRAYAGG"],
+  ["JSONB_AGG", "JSON_ARRAYAGG"],
+  ["JSON_BUILD_ARRAY", "JSON_ARRAY"],
+  ["JSONB_BUILD_ARRAY", "JSON_ARRAY"],
+  ["TO_JSONB", "TO_JSON"],
+  ["ROW_TO_JSON", "TO_JSON"],
 ]);
 
 const statementDatetimeAliases: ReadonlyMap<string, string> = new Map([
@@ -273,6 +285,10 @@ const statementDatetimeAliases: ReadonlyMap<string, string> = new Map([
   ["LOCALTIMESTAMP", "CURRENT_TIMESTAMP"],
   // PostgreSQL's now() is transaction_timestamp(): one reading per statement, like the rest.
   ["NOW", "CURRENT_TIMESTAMP"],
+  ["TRANSACTION_TIMESTAMP", "CURRENT_TIMESTAMP"],
+  ["STATEMENT_TIMESTAMP", "CURRENT_TIMESTAMP"],
+  // clock_timestamp() advances within a statement in PostgreSQL; here a statement is one instant.
+  ["CLOCK_TIMESTAMP", "CURRENT_TIMESTAMP"],
   ["CURRENT_TIME", "LOCALTIME"],
   ["LOCALTIME", "LOCALTIME"],
 ]);
@@ -687,6 +703,9 @@ function scalarFunctionValueGeneric(
       // JSON_QUERY returns JSON text, so a selected string keeps its quotes.
       return preservedJsonDomainValue(JSON.stringify(found.value));
     }
+    case "TO_JSON":
+      // A SQL NULL is a JSON null document, as PostgreSQL's to_json(NULL) is.
+      return preservedJsonDomainValue(jsonDocumentOf(first));
     case "MINNOW_JSON_GET": {
       if (values[1] === null || values[1] === undefined) return null;
       const found = jsonArrowStep(first, values[1], "->");
@@ -1105,21 +1124,39 @@ const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
   ["BOOL", "boolean"],
   ["INTEGER", "number"],
   ["INT", "number"],
+  ["INT4", "number"],
   ["BIGINT", "number"],
+  ["INT8", "number"],
   ["SMALLINT", "number"],
+  ["INT2", "number"],
   ["REAL", "number"],
+  ["FLOAT4", "number"],
   ["FLOAT", "number"],
+  ["FLOAT8", "number"],
   ["TEXT", "string"],
   ["VARCHAR", "string"],
   ["CHAR", "string"],
+  ["CHARACTER", "string"],
   ["STRING", "string"],
   ["TIMESTAMP", "datetime"],
   ["TIMESTAMPTZ", "datetime"],
   ["DATETIME", "datetime"],
 ]);
 
+/** PostgreSQL's integer type names, including the internal spellings pg_dump emits. */
+const integerTypeNames: ReadonlySet<string> = new Set([
+  "INTEGER",
+  "INT",
+  "INT4",
+  "BIGINT",
+  "INT8",
+  "SMALLINT",
+  "INT2",
+]);
+
 const clauseKeywords = new Set([
   "WHERE",
+  "FOR",
   "NATURAL",
   "USING",
   "OUTER",
@@ -1285,7 +1322,10 @@ export interface ReturningItem {
 
 export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
   validateSqlSource(sql);
-  const { text, offset } = normalizeSql(sql);
+  // `TABLE name` is the standard's spelling of `SELECT * FROM name`.
+  const { text, offset } = normalizeSql(
+    sql.replace(/^\s*TABLE\s+(?=[A-Za-z_"])/i, "SELECT * FROM "),
+  );
   if (text.length === 0) throw new SqlCompileError("Enter a SELECT query", offset, 0);
   let parser: Parser | undefined;
   let plan: CompiledQuery;
@@ -1299,6 +1339,10 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   }
   let compiled: CompiledQuery;
   try {
+    // A derived source's alias used as a value (`json_agg(agg)`) expands here, where its
+    // columns are already known; a plain table's alias waits for the catalog.
+    plan = expandRowReferences(plan, () => undefined);
+    annotatePlanIntegerDivision(plan);
     resolvePlanExactNumericConstants(plan);
     if (options.optimize === false && planHasPendingSelectShapes(plan)) {
       plan.preserveUnoptimizedShape = true;
@@ -1401,6 +1445,14 @@ export function isDeferredInsertExpression(value: InsertValue): value is Deferre
   );
 }
 
+/** The FROM / USING sources of an UPDATE or DELETE, joined to the target as a cross product. */
+export interface MutationSources {
+  base: TableSource;
+  joins: JoinPlan[];
+  /** ON conditions of parenthesized join groups, which filter the product like WHERE. */
+  predicates: Predicate[];
+}
+
 export type CompiledStatement =
   | { kind: "select"; sql: string; parameterCount?: number }
   | {
@@ -1444,6 +1496,12 @@ export type CompiledStatement =
       alias?: string;
       assignments: Array<{ column: string; expression: Expression }>;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+      /**
+       * `UPDATE t SET … FROM sources WHERE …`: the extra sources the assignments and predicates
+       * may read, joined to the target as PostgreSQL joins them. A target row matched by several
+       * source rows is updated once, from the first match.
+       */
+      from?: MutationSources;
       returning?: string[] | "*";
       /** RETURNING items that are not plain columns, evaluated over the affected rows. */
       returningItems?: ReturningItem[];
@@ -1454,6 +1512,8 @@ export type CompiledStatement =
       table: string;
       alias?: string;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+      /** `DELETE FROM t USING sources WHERE …`: the extra sources the predicates may read. */
+      from?: MutationSources;
       returning?: string[] | "*";
       /** RETURNING items that are not plain columns, evaluated over the affected rows. */
       returningItems?: ReturningItem[];
@@ -1530,6 +1590,10 @@ export type CompiledStatement =
       parameterCount?: number;
     }
   | { kind: "drop-view"; view: string; ifExists?: boolean; parameterCount?: number }
+  /** A session setting, accepted and ignored: `SET name TO value`, `RESET name`. */
+  | { kind: "set"; action: "set" | "reset"; name: string; parameterCount?: number }
+  /** `SHOW name`: the engine's value for a PostgreSQL setting, as one row. */
+  | { kind: "show"; name: string; parameterCount?: number }
   | {
       kind: "transaction";
       action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release";
@@ -1596,6 +1660,125 @@ export type CompiledStatement =
  * and carries no meaning here: this engine has one isolation level, snapshot, and no read-only
  * mode a transaction could relax into.
  */
+/**
+ * `SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE zone`, `SET TRANSACTION …`, and
+ * `RESET name | ALL`: PostgreSQL's session settings. An embedded single-session engine has no
+ * search path, timeouts, encodings, or isolation levels to configure, so these are accepted and
+ * ignored — migration tools and drivers issue them on every connection. The one setting with a
+ * meaning here is the time zone: every datetime is an instant in UTC, so only UTC (or the
+ * default) is accepted, and another zone is refused rather than silently ignored.
+ */
+function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatement {
+  const words = tokens.filter((token) => token.kind !== "eof");
+  const upperAt = (at: number): string | undefined => {
+    const word = words[at];
+    return word?.kind === "identifier" && word.quoted !== true
+      ? word.text.toUpperCase()
+      : undefined;
+  };
+  if (keyword === "RESET") {
+    const name = words[1];
+    if (name === undefined || (name.kind !== "identifier" && name.kind !== "string")) {
+      throw new TypeError("RESET takes a setting name or ALL");
+    }
+    return { kind: "set", action: "reset", name: name.text };
+  }
+  let index = 1;
+  if (upperAt(index) === "SESSION" || upperAt(index) === "LOCAL") index += 1;
+  if (upperAt(index) === "TIME" && upperAt(index + 1) === "ZONE") {
+    const zone = words[index + 2];
+    const spelled = zone?.kind === "string" ? zone.text : zone?.text.toUpperCase();
+    const utc =
+      spelled === undefined ||
+      spelled.toUpperCase() === "UTC" ||
+      spelled.toUpperCase() === "DEFAULT" ||
+      spelled.toUpperCase() === "LOCAL" ||
+      spelled === "Etc/UTC" ||
+      spelled === "GMT";
+    if (!utc) {
+      throw new TypeError(
+        `SET TIME ZONE ${zone?.text ?? ""} is not supported: every datetime is an instant in UTC`,
+      );
+    }
+    return { kind: "set", action: "set", name: "timezone" };
+  }
+  if (upperAt(index) === "TRANSACTION" || upperAt(index) === "CONSTRAINTS") {
+    // Every transaction reads one snapshot and commits atomically, which satisfies READ
+    // UNCOMMITTED, READ COMMITTED, and REPEATABLE READ; SERIALIZABLE promises more than that.
+    if (words.some((word) => word.text.toUpperCase() === "SERIALIZABLE")) {
+      throw new TypeError(
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
+      );
+    }
+    return { kind: "set", action: "set", name: (upperAt(index) ?? "").toLowerCase() };
+  }
+  const name = words[index];
+  if (name?.kind !== "identifier") {
+    throw new TypeError(`Expected a setting name, found ${name?.text ?? "end of input"}`);
+  }
+  let cursor = index + 1;
+  while (words[cursor]?.text === ".") cursor += 2;
+  const settingName = words
+    .slice(index, cursor)
+    .map((token) => token.text)
+    .join("");
+  const separator = words[cursor];
+  if (
+    separator === undefined ||
+    (separator.text.toUpperCase() !== "TO" && separator.text !== "=")
+  ) {
+    throw new TypeError(`SET ${settingName} takes TO or = and a value`);
+  }
+  if (words[cursor + 1] === undefined) throw new TypeError(`SET ${settingName} needs a value`);
+  if (settingName.toLowerCase() === "timezone" || settingName.toLowerCase() === "time_zone") {
+    const zone = words[cursor + 1];
+    const spelled = zone?.kind === "string" ? zone.text : (zone?.text ?? "");
+    if (!["utc", "default", "local", "etc/utc", "gmt"].includes(spelled.toLowerCase())) {
+      throw new TypeError(
+        `SET ${settingName} = ${zone?.text ?? ""} is not supported: every datetime is an instant in UTC`,
+      );
+    }
+  }
+  return { kind: "set", action: "set", name: settingName };
+}
+
+/**
+ * `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]` removes
+ * every row of one table, which is exactly an unfiltered DELETE here: there is no per-row
+ * cost to skip and no sequence state to reset differently. Several tables in one statement and
+ * CASCADE onto dependents are not supported; issue one TRUNCATE per table.
+ */
+function parseTruncateStatement(tokens: Token[]): CompiledStatement {
+  const words = tokens.filter((token) => token.kind !== "eof");
+  let index = 1;
+  const upperAt = (at: number): string | undefined => {
+    const word = words[at];
+    return word?.kind === "identifier" ? word.text.toUpperCase() : undefined;
+  };
+  if (upperAt(index) === "TABLE") index += 1;
+  if (upperAt(index) === "ONLY") index += 1;
+  const table = words[index];
+  if (table?.kind !== "identifier") {
+    throw new TypeError(`Expected table name, found ${table?.text ?? "end of input"}`);
+  }
+  index += 1;
+  if (words[index]?.text === ",") throw new TypeError("TRUNCATE takes one table at a time");
+  if (upperAt(index) === "RESTART" || upperAt(index) === "CONTINUE") {
+    if (upperAt(index + 1) !== "IDENTITY") {
+      throw new TypeError(`Expected IDENTITY, found ${words[index + 1]?.text ?? "end of input"}`);
+    }
+    index += 2;
+  }
+  if (upperAt(index) === "CASCADE") {
+    throw new TypeError("TRUNCATE CASCADE is not supported; truncate dependents explicitly");
+  }
+  if (upperAt(index) === "RESTRICT") index += 1;
+  if (index !== words.length) {
+    throw new TypeError(`Unexpected input after TRUNCATE: ${words[index]?.text ?? ""}`);
+  }
+  return { kind: "delete", table: table.text, predicates: [] };
+}
+
 function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledStatement {
   const identifierAt = (index: number): string => {
     const token = tokens[index];
@@ -1634,8 +1817,40 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
   const words = tokens
     .filter((token) => token.kind === "identifier")
     .map((token) => token.text.toUpperCase());
-  const action = keyword === "START" || keyword === "BEGIN" ? "begin" : keyword.toLowerCase();
-  const allowed = new Set(["BEGIN", "START", "COMMIT", "ROLLBACK", "WORK", "TRANSACTION"]);
+  const action =
+    keyword === "START" || keyword === "BEGIN"
+      ? "begin"
+      : keyword === "END"
+        ? "commit"
+        : keyword === "ABORT"
+          ? "rollback"
+          : keyword.toLowerCase();
+  if (words.includes("SERIALIZABLE")) {
+    throw new TypeError(
+      "BEGIN ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
+    );
+  }
+  // READ ONLY / READ WRITE / [NOT] DEFERRABLE name transaction modes the engine already has.
+  const allowed = new Set([
+    "BEGIN",
+    "START",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "ABORT",
+    "WORK",
+    "TRANSACTION",
+    "READ",
+    "ONLY",
+    "WRITE",
+    "NOT",
+    "DEFERRABLE",
+    "ISOLATION",
+    "LEVEL",
+    "COMMITTED",
+    "UNCOMMITTED",
+    "REPEATABLE",
+  ]);
   for (const word of words) {
     if (!allowed.has(word)) {
       throw new TypeError(`${keyword} takes no ${word}: this engine has one isolation level`);
@@ -1866,14 +2081,17 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
  */
 export function compileStatement(sql: string): CompiledStatement {
   validateSqlSource(sql);
-  const { text, offset } = normalizeSql(sql);
+  // `TABLE name` is the standard's spelling of `SELECT * FROM name`.
+  const { text, offset } = normalizeSql(
+    sql.replace(/^\s*TABLE\s+(?=[A-Za-z_"])/i, "SELECT * FROM "),
+  );
   if (text.length === 0) throw new SqlCompileError("Enter a SQL statement", offset, 0);
   let parser: Parser | undefined;
   try {
     const tokens = tokenize(text);
     const first = tokens[0];
     const keyword = first?.kind === "identifier" ? first.text.toUpperCase() : "";
-    const second = tokens[1];
+    let second = tokens[1];
     const isTriggerDdl =
       (keyword === "CREATE" || keyword === "DROP") &&
       second?.kind === "identifier" &&
@@ -1883,11 +2101,27 @@ export function compileStatement(sql: string): CompiledStatement {
       keyword === "BEGIN" ||
       keyword === "START" ||
       keyword === "COMMIT" ||
+      keyword === "END" ||
       keyword === "ROLLBACK" ||
+      keyword === "ABORT" ||
       keyword === "SAVEPOINT" ||
       keyword === "RELEASE"
     ) {
       return parseTransactionStatement(keyword, tokens);
+    }
+    if (keyword === "TRUNCATE") return parseTruncateStatement(tokens);
+    if (keyword === "SET" || keyword === "RESET") return parseSettingStatement(keyword, tokens);
+    if (keyword === "SHOW") {
+      const name = tokens[1];
+      if (name?.kind !== "identifier" || (tokens[2]?.kind !== "eof" && tokens[2]?.text !== ".")) {
+        throw new TypeError("SHOW takes one setting name");
+      }
+      const setting = tokens
+        .slice(1)
+        .filter((token) => token.kind !== "eof")
+        .map((token) => token.text)
+        .join("");
+      return { kind: "show", name: setting };
     }
     if (keyword === "MERGE") {
       parser = new Parser(tokens, text);
@@ -1903,6 +2137,15 @@ export function compileStatement(sql: string): CompiledStatement {
     }
     if (keyword === "CREATE") {
       if (isTriggerDdl) return parseCreateTrigger(text, tokens);
+      // TEMP, TEMPORARY, UNLOGGED, GLOBAL, LOCAL: every table here lives in one database with
+      // one durability, so the persistence modifiers document intent and change nothing.
+      while (
+        tokens[1]?.kind === "identifier" &&
+        ["TEMP", "TEMPORARY", "UNLOGGED", "GLOBAL", "LOCAL"].includes(tokens[1].text.toUpperCase())
+      ) {
+        tokens.splice(1, 1);
+      }
+      second = tokens[1];
       if (second?.kind === "identifier" && second.text.toUpperCase() === "TYPE") {
         const name = tokens[2];
         if (name?.kind !== "identifier") throw new TypeError("CREATE TYPE needs a name");
@@ -2721,6 +2964,7 @@ export function inferBlockSchema(
       expression.name === "JSON_QUERY" ||
       expression.name === "JSON_OBJECT" ||
       expression.name === "JSON_ARRAY" ||
+      expression.name === "TO_JSON" ||
       expression.name === "MINNOW_JSON_GET"
     ) {
       return { kind: "json" };
@@ -2910,6 +3154,7 @@ export function inferBlockSchema(
       expression.name === "JSON_QUERY" ||
       expression.name === "JSON_OBJECT" ||
       expression.name === "JSON_ARRAY" ||
+      expression.name === "TO_JSON" ||
       expression.name === "ARRAY" ||
       expression.name === "MINNOW_JSON_GET" ||
       expression.name === "MINNOW_JSON_GET_TEXT" ||
@@ -3024,13 +3269,7 @@ export function inferBlockSchema(
     if (type === "null") {
       throw new TypeError(`Cannot infer a column type for output ${item.alias}`);
     }
-    const integer =
-      (item.expression.kind === "column" && resolveColumnInteger(item.expression.reference)) ||
-      (item.expression.kind === "call" &&
-        item.expression.name === "CAST" &&
-        item.expression.arguments[1]?.kind === "literal" &&
-        item.expression.arguments[1].value === "number-integer") ||
-      (item.expression.kind === "call" && item.expression.name === "COUNT");
+    const integer = integerTypedExpression(item.expression, resolveColumnInteger);
     const sqlDomain = inferDomain(item.expression);
     return [
       {
@@ -3781,6 +4020,564 @@ export function forEachNestedBlock(
 }
 
 /**
+ * Whether an expression is integer-typed the way PostgreSQL types it: an INTEGER, BIGINT, or
+ * SMALLINT column, an integer constant, COUNT, an integer CAST, SUM/MIN/MAX/ABS over an
+ * integer, MOD over integers, a CASE/COALESCE/NULLIF/GREATEST/LEAST whose every branch is an
+ * integer, or `+ - * / %` over two integers. A bound parameter takes the type of its integer
+ * partner, as PostgreSQL infers `qty / $1`. A column the caller cannot type is not an integer,
+ * so the compiler's static answer only ever widens once the catalog is known.
+ */
+export function integerTypedExpression(
+  expression: Expression,
+  columnInteger: (reference: string) => boolean = () => false,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+): boolean {
+  const typed = (candidate: Expression): boolean =>
+    integerTypedExpression(candidate, columnInteger, tableIntegerColumns);
+  switch (expression.kind) {
+    case "subquery": {
+      // A scalar subquery has the type of its one output, read in the inner block's scope. An
+      // outer (correlated) column is opaque there and reads as not-an-integer.
+      const item = expression.block.select[0];
+      return (
+        expression.block.select.length === 1 &&
+        item !== undefined &&
+        integerTypedExpression(
+          item.expression,
+          blockColumnIntegerResolver(expression.block, tableIntegerColumns),
+          tableIntegerColumns,
+        )
+      );
+    }
+    case "literal":
+      return (
+        typeof expression.value === "number" &&
+        expression.exactText === undefined &&
+        expression.decimal !== true &&
+        expression.internalSqlValue !== true &&
+        Number.isSafeInteger(expression.value)
+      );
+    case "column":
+      return columnInteger(expression.reference);
+    case "binary": {
+      if (expression.operator === "||") return false;
+      const left = typed(expression.left);
+      const right = typed(expression.right);
+      if (left && right) return true;
+      return (
+        (left && expression.right.kind === "parameter") ||
+        (right && expression.left.kind === "parameter")
+      );
+    }
+    case "call": {
+      const { name, arguments: args } = expression;
+      if (name === "COUNT") return true;
+      if (name === "CAST") {
+        return args[1]?.kind === "literal" && args[1].value === "number-integer";
+      }
+      if (name === "SUM" || name === "MIN" || name === "MAX" || name === "ABS") {
+        return args.length === 1 && args[0] !== undefined && typed(args[0]);
+      }
+      if (name === "MOD") return args.length === 2 && args.every(typed);
+      if (name === "COALESCE" || name === "NULLIF" || name === "GREATEST" || name === "LEAST") {
+        return args.length > 0 && args.every(typed);
+      }
+      return false;
+    }
+    case "case":
+      return (
+        expression.branches.every((branch) => typed(branch.then)) &&
+        (expression.otherwise === undefined || typed(expression.otherwise))
+      );
+    default:
+      return false;
+  }
+}
+
+/** A table's integer columns, or `true` when every column may be one (the bind-time probe). */
+export type IntegerColumns = ReadonlySet<string> | true;
+
+/** PostgreSQL's integer `/`: truncation toward zero, NULL for a zero divisor. */
+export function integerQuotient(left: number, right: number): number | null {
+  if (right === 0) return null;
+  if (!Number.isInteger(left) || !Number.isInteger(right)) return left / right;
+  const quotient = Math.trunc(left / right);
+  return quotient === 0 ? 0 : quotient;
+}
+
+/**
+ * Marks every `/` in one expression whose operands are integers, subquery blocks included, so
+ * that every evaluator truncates it the way PostgreSQL does. Children are marked first: the
+ * parent's typing reads the children, and `(a / b) / c` is integer only once `a / b` is.
+ */
+export function annotateIntegerDivision(
+  expression: Expression,
+  columnInteger: (reference: string) => boolean = () => false,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+): void {
+  if (expression.kind === "subquery" || expression.kind === "exists") {
+    annotatePlanIntegerDivision(expression.block, tableIntegerColumns);
+    return;
+  }
+  for (const child of childExpressions(expression)) {
+    annotateIntegerDivision(child, columnInteger, tableIntegerColumns);
+  }
+  if (
+    expression.kind === "binary" &&
+    expression.operator === "/" &&
+    expression.integer !== true &&
+    integerTypedExpression(expression, columnInteger, tableIntegerColumns)
+  ) {
+    expression.integer = true;
+  }
+}
+
+/**
+ * The integer-typed output names of a block, for a derived source that reads it. Wildcards
+ * expand to the integer columns of the sources they cover; a positional column-alias list
+ * renames outputs in order.
+ */
+function blockIntegerOutputs(
+  block: CompiledQuery,
+  tableIntegerColumns: ((table: string) => IntegerColumns | undefined) | undefined,
+  columnAliases?: readonly string[],
+): IntegerColumns {
+  const resolver = blockColumnIntegerResolver(block, tableIntegerColumns);
+  const names: string[] = [];
+  for (const item of block.select) {
+    if (item.expression.kind === "wildcard") {
+      const table = item.expression.table;
+      for (const source of [block.base, ...block.joins]) {
+        if (table !== undefined && source.alias !== table) continue;
+        const columns = sourceIntegerColumns(source, tableIntegerColumns);
+        if (columns === true) return true;
+        for (const name of columns) if (resolver(name)) names.push(name);
+      }
+      continue;
+    }
+    if (integerTypedExpression(item.expression, resolver, tableIntegerColumns)) {
+      names.push(item.alias);
+    }
+  }
+  if (columnAliases === undefined) return new Set(names);
+  const aliased = new Set<string>();
+  block.select.forEach((item, index) => {
+    const alias = columnAliases[index];
+    if (alias !== undefined && item.expression.kind !== "wildcard" && names.includes(item.alias)) {
+      aliased.add(alias);
+    }
+  });
+  return aliased;
+}
+
+function sourceIntegerColumns(
+  source: TableSource,
+  tableIntegerColumns: ((table: string) => IntegerColumns | undefined) | undefined,
+): IntegerColumns {
+  if (source.derived !== undefined) {
+    return blockIntegerOutputs(source.derived, tableIntegerColumns, source.columnAliases);
+  }
+  if (source.union !== undefined) {
+    const first = source.union.blocks[0];
+    return first === undefined
+      ? new Set()
+      : blockIntegerOutputs(first, tableIntegerColumns, source.columnAliases);
+  }
+  if (source.windowed !== undefined) {
+    return blockIntegerOutputs(source.windowed.block, tableIntegerColumns, source.columnAliases);
+  }
+  if (source.recursive !== undefined) return new Set();
+  return tableIntegerColumns?.(source.table) ?? new Set();
+}
+
+/** Resolves a column reference of one block to whether it names an integer column. */
+function blockColumnIntegerResolver(
+  block: CompiledQuery,
+  tableIntegerColumns: ((table: string) => IntegerColumns | undefined) | undefined,
+): (reference: string) => boolean {
+  const sources = [block.base, ...block.joins];
+  const cache = new Map<TableSource, IntegerColumns>();
+  const has = (columns: IntegerColumns, name: string): boolean =>
+    columns === true || columns.has(name);
+  const columnsOf = (source: TableSource): IntegerColumns => {
+    let columns = cache.get(source);
+    if (columns === undefined) {
+      columns = sourceIntegerColumns(source, tableIntegerColumns);
+      cache.set(source, columns);
+    }
+    return columns;
+  };
+  return (reference) => {
+    const separator = reference.indexOf(".");
+    if (separator !== -1) {
+      const alias = reference.slice(0, separator);
+      const name = reference.slice(separator + 1);
+      const source = sources.find((candidate) => candidate.alias === alias);
+      return source !== undefined && has(columnsOf(source), name);
+    }
+    let found = 0;
+    for (const source of sources) if (has(columnsOf(source), reference)) found += 1;
+    return found === 1;
+  };
+}
+
+/**
+ * Marks integer division throughout a plan, nested blocks first. Without a catalog only
+ * constants, COUNT, and integer CASTs type as integers; with one, INTEGER columns do too, and
+ * a derived source's outputs follow from its own select list.
+ */
+export function annotatePlanIntegerDivision(
+  plan: CompiledQuery,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+): void {
+  forEachNestedBlock(plan, (nested) => annotatePlanIntegerDivision(nested, tableIntegerColumns));
+  const resolver = blockColumnIntegerResolver(plan, tableIntegerColumns);
+  forEachBlockExpression(plan, (expression) =>
+    annotateIntegerDivision(expression, resolver, tableIntegerColumns),
+  );
+}
+
+/**
+ * Whether catalog binding could still mark a division in this plan: a `/` not yet marked whose
+ * operands would be integers if every column were one. Plans without such a node — the common
+ * case — need no clone at bind time.
+ */
+export function planMayHaveIntegerDivision(plan: CompiledQuery): boolean {
+  const state = { found: false };
+  const optimistic = (): boolean => true;
+  const everyColumn = (): IntegerColumns => true;
+  const probe = (expression: Expression): void => {
+    if (state.found) return;
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      if (planMayHaveIntegerDivision(expression.block)) state.found = true;
+      return;
+    }
+    if (
+      expression.kind === "binary" &&
+      expression.operator === "/" &&
+      expression.integer !== true &&
+      integerTypedExpression(expression, optimistic, everyColumn)
+    ) {
+      state.found = true;
+      return;
+    }
+    childExpressions(expression).forEach(probe);
+  };
+  forEachNestedBlock(plan, (nested) => {
+    if (!state.found && planMayHaveIntegerDivision(nested)) state.found = true;
+  });
+  if (!state.found) forEachBlockExpression(plan, probe);
+  return state.found;
+}
+
+/**
+ * PostgreSQL folds an unquoted identifier to lower case, so `SELECT ID FROM USERS` reads the
+ * table `users` and its column `id`. Minnow keeps the written spelling and resolves it exactly,
+ * which is what a catalog created through the typed API (where `Orders` is a legal name)
+ * relies on. This pass gives both: a table or column name that resolves exactly is left alone,
+ * and one that does not is read as the unique catalog name that matches it case-insensitively.
+ * Only plain tables and their columns are folded; derived sources expose their aliases as
+ * written. Returns the same plan when nothing needed folding, so cached plans stay untouched.
+ */
+export function foldIdentifierCase(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, readonly string[]>,
+): CompiledQuery {
+  const lowerTables = new Map<string, string[]>();
+  for (const name of tables.keys()) {
+    const lowered = name.toLowerCase();
+    const bucket = lowerTables.get(lowered);
+    if (bucket === undefined) lowerTables.set(lowered, [name]);
+    else bucket.push(name);
+  }
+  const foldTable = (name: string): string | undefined => {
+    if (tables.has(name)) return undefined;
+    const candidates = lowerTables.get(name.toLowerCase());
+    return candidates?.length === 1 ? candidates[0] : undefined;
+  };
+  const foldColumn = (columns: readonly string[], name: string): string | undefined => {
+    if (columns.includes(name)) return undefined;
+    const lowered = name.toLowerCase();
+    const matches = columns.filter((column) => column.toLowerCase() === lowered);
+    return matches.length === 1 ? matches[0] : undefined;
+  };
+  const pass = { probing: true, needed: false };
+  const sourceColumns = (source: TableSource): readonly string[] => {
+    if (source.derived !== undefined) {
+      return source.columnAliases ?? source.derived.select.map((item) => item.alias);
+    }
+    if (source.union !== undefined) {
+      return source.columnAliases ?? source.union.blocks[0]?.select.map((item) => item.alias) ?? [];
+    }
+    if (source.windowed !== undefined) {
+      return source.columnAliases ?? source.windowed.block.select.map((item) => item.alias);
+    }
+    if (source.recursive !== undefined) return source.columnAliases ?? [];
+    return source.columnAliases ?? tables.get(source.table) ?? [];
+  };
+  const rewriteBlock = (block: CompiledQuery): void => {
+    if (pass.probing && pass.needed) return;
+    forEachNestedBlock(block, rewriteBlock);
+    const sources = [block.base, ...block.joins];
+    for (const source of sources) {
+      const plain =
+        source.derived === undefined &&
+        source.union === undefined &&
+        source.windowed === undefined &&
+        source.recursive === undefined;
+      if (!plain) continue;
+      const folded = foldTable(source.table);
+      if (folded === undefined) continue;
+      if (pass.probing) {
+        pass.needed = true;
+        return;
+      }
+      const aliasWasTable = source.alias === source.table;
+      source.table = folded;
+      if (aliasWasTable) source.alias = folded;
+    }
+    const foldReference = (reference: string): string | undefined => {
+      const separator = reference.indexOf(".");
+      if (separator !== -1) {
+        const qualifier = reference.slice(0, separator);
+        const name = reference.slice(separator + 1);
+        let source = sources.find((candidate) => candidate.alias === qualifier);
+        let foldedQualifier: string | undefined;
+        if (source === undefined) {
+          const lowered = qualifier.toLowerCase();
+          const matches = sources.filter((candidate) => candidate.alias.toLowerCase() === lowered);
+          if (matches.length !== 1) return undefined;
+          source = matches[0];
+          foldedQualifier = source?.alias;
+        }
+        if (source === undefined) return undefined;
+        const columns = sourceColumns(source);
+        const foldedName = columns.includes(name) ? undefined : foldColumn(columns, name);
+        if (foldedQualifier === undefined && foldedName === undefined) return undefined;
+        return `${foldedQualifier ?? qualifier}.${foldedName ?? name}`;
+      }
+      if (sources.some((source) => sourceColumns(source).includes(reference))) return undefined;
+      const folded = sources
+        .map((source) => foldColumn(sourceColumns(source), reference))
+        .filter((name): name is string => name !== undefined);
+      return folded.length === 1 ? folded[0] : undefined;
+    };
+    const rewrite = (expression: Expression): void => {
+      if (expression.kind === "column") {
+        const folded = foldReference(expression.reference);
+        if (folded === undefined) return;
+        if (pass.probing) pass.needed = true;
+        else expression.reference = folded;
+        return;
+      }
+      if (expression.kind === "wildcard") {
+        if (expression.table === undefined) return;
+        const exact = sources.some((source) => source.alias === expression.table);
+        if (exact) return;
+        const lowered = expression.table.toLowerCase();
+        const matches = sources.filter((source) => source.alias.toLowerCase() === lowered);
+        if (matches.length !== 1) return;
+        if (pass.probing) pass.needed = true;
+        else expression.table = matches[0]?.alias ?? expression.table;
+        return;
+      }
+      if (expression.kind === "subquery" || expression.kind === "exists") {
+        rewriteBlock(expression.block);
+        return;
+      }
+      childExpressions(expression).forEach(rewrite);
+    };
+    forEachBlockExpression(block, rewrite);
+    // A bare column's output name is the folded name, as PostgreSQL's would be: `SELECT ID`
+    // over `users` returns a column called `id`.
+    if (!pass.probing) {
+      for (const item of block.select) {
+        if (item.expression.kind !== "column") continue;
+        const separator = item.expression.reference.indexOf(".");
+        const name = item.expression.reference.slice(separator + 1);
+        if (item.alias !== name && item.alias.toLowerCase() === name.toLowerCase()) {
+          item.alias = name;
+        }
+      }
+    }
+  };
+  rewriteBlock(plan);
+  if (!pass.needed) return plan;
+  const cloned = clonePlanTree(plan);
+  pass.probing = false;
+  rewriteBlock(cloned);
+  return cloned;
+}
+
+/**
+ * A table alias used as a value — `json_agg(agg)`, `to_json(obj)`, `row_to_json(u)` — is the
+ * row as a JSON object in PostgreSQL. The reference is expanded here, once the catalog is
+ * known, into JSON_OBJECT over the source's columns in declaration order, so the aggregate and
+ * constructor paths see a scalar document. Only an alias of the same block that names no column
+ * expands; a bare name that is also a column stays that column.
+ */
+export function expandRowReferences(
+  plan: CompiledQuery,
+  tableColumns: (table: string) => readonly string[] | undefined,
+): CompiledQuery {
+  const pass = { probing: true, needed: false };
+  const sourceColumns = (source: TableSource): readonly string[] => {
+    if (source.columnAliases !== undefined) return source.columnAliases;
+    if (source.derived !== undefined) return source.derived.select.map((item) => item.alias);
+    if (source.union !== undefined) {
+      return source.union.blocks[0]?.select.map((item) => item.alias) ?? [];
+    }
+    if (source.windowed !== undefined)
+      return source.windowed.block.select.map((item) => item.alias);
+    if (source.recursive !== undefined) return [];
+    return tableColumns(source.table) ?? [];
+  };
+  const rewriteBlock = (block: CompiledQuery): void => {
+    if (pass.probing && pass.needed) return;
+    forEachNestedBlock(block, rewriteBlock);
+    const sources = [block.base, ...block.joins];
+    const rowObject = (reference: string): Expression | undefined => {
+      if (reference.includes(".")) return undefined;
+      const source = sources.find((candidate) => candidate.alias === reference);
+      if (source === undefined) return undefined;
+      if (sources.some((candidate) => sourceColumns(candidate).includes(reference))) {
+        return undefined;
+      }
+      const columns = sourceColumns(source);
+      if (columns.length === 0 || columns.some((name) => name.startsWith("\0"))) return undefined;
+      return {
+        kind: "call",
+        name: "JSON_OBJECT",
+        arguments: columns.flatMap((name) => [
+          { kind: "literal", value: name },
+          { kind: "column", reference: `${source.alias}.${name}` },
+        ]),
+      };
+    };
+    const rewrite = (expression: Expression): Expression => {
+      if (expression.kind === "column") {
+        const expanded = rowObject(expression.reference);
+        if (expanded === undefined) return expression;
+        if (pass.probing) {
+          pass.needed = true;
+          return expression;
+        }
+        return expanded;
+      }
+      if (expression.kind === "subquery" || expression.kind === "exists") {
+        rewriteBlock(expression.block);
+        return expression;
+      }
+      return mapChildExpressions(expression, rewrite);
+    };
+    mapBlockExpressions(block, rewrite);
+  };
+  rewriteBlock(plan);
+  if (!pass.needed) return plan;
+  const cloned = clonePlanTree(plan);
+  pass.probing = false;
+  rewriteBlock(cloned);
+  return cloned;
+}
+
+/**
+ * PostgreSQL's functional-dependency rule (SQL:2003 T301): once a table's whole primary key is
+ * in GROUP BY, any other column of that table may appear ungrouped, because the key determines
+ * the row. Minnow's executors group by the listed expressions only, so such a column is added
+ * to GROUP BY here — the groups are unchanged, since the key already separates every row — and
+ * the containment check then accepts it. Only plain table sources with a declared key
+ * qualify; a derived table exposes no key. Returns the same plan when nothing needed adding.
+ */
+export function extendGroupByWithKeyDependents(
+  plan: CompiledQuery,
+  keyColumns: (table: string) => readonly string[] | undefined,
+  tableColumns: (table: string) => readonly string[] | undefined = keyColumns,
+): CompiledQuery {
+  const pass = { probing: true, needed: false };
+  const rewriteBlock = (block: CompiledQuery): void => {
+    if (pass.probing && pass.needed) return;
+    forEachNestedBlock(block, rewriteBlock);
+    const visitSubqueries = (expression: Expression): void => {
+      if (expression.kind === "subquery" || expression.kind === "exists") {
+        rewriteBlock(expression.block);
+        return;
+      }
+      childExpressions(expression).forEach(visitSubqueries);
+    };
+    forEachBlockExpression(block, visitSubqueries);
+    if (block.groupBy.length === 0) return;
+    const sources = [block.base, ...block.joins];
+    const multipleSources = sources.length > 1;
+    const groupedColumns = new Set(
+      block.groupBy.flatMap((expression) =>
+        expression.kind === "column" ? [expression.reference] : [],
+      ),
+    );
+    const additions: Expression[] = [];
+    for (const source of sources) {
+      const plain =
+        source.derived === undefined &&
+        source.union === undefined &&
+        source.windowed === undefined &&
+        source.recursive === undefined &&
+        source.columnAliases === undefined;
+      if (!plain) continue;
+      const key = keyColumns(source.table);
+      if (key === undefined || key.length === 0) continue;
+      const columns = tableColumns(source.table) ?? key;
+      const namesFor = (column: string): string[] =>
+        multipleSources ? [`${source.alias}.${column}`] : [column, `${source.alias}.${column}`];
+      const keyGrouped = key.every((column) =>
+        namesFor(column).some((name) => groupedColumns.has(name)),
+      );
+      if (!keyGrouped) continue;
+      // Every ungrouped plain column reference to this source, outside aggregates, is dependent.
+      const referenced = new Set<string>();
+      const collect = (expression: Expression, insideAggregate: boolean): void => {
+        if (expression.kind === "column") {
+          if (insideAggregate || groupedColumns.has(expression.reference)) return;
+          const separator = expression.reference.indexOf(".");
+          const qualifier = separator === -1 ? undefined : expression.reference.slice(0, separator);
+          if (qualifier === undefined ? multipleSources : qualifier !== source.alias) return;
+          // Only a column of this table is dependent; an output alias (`ORDER BY n`) is not.
+          const name =
+            separator === -1 ? expression.reference : expression.reference.slice(separator + 1);
+          if (!columns.includes(name)) return;
+          referenced.add(expression.reference);
+          return;
+        }
+        if (expression.kind === "subquery" || expression.kind === "exists") return;
+        const aggregate =
+          insideAggregate ||
+          (expression.kind === "call" && aggregateNames.has(expression.name as AggregateName));
+        childExpressions(expression).forEach((child) => collect(child, aggregate));
+      };
+      for (const item of block.select) collect(item.expression, false);
+      for (const predicate of block.having) {
+        collect(predicate.left, false);
+        collect(predicate.right, false);
+      }
+      for (const order of block.orderBy) collect(order.expression, false);
+      for (const reference of referenced) {
+        if (pass.probing) {
+          pass.needed = true;
+          return;
+        }
+        groupedColumns.add(reference);
+        additions.push({ kind: "column", reference });
+      }
+    }
+    if (additions.length > 0) block.groupBy = [...block.groupBy, ...additions];
+  };
+  rewriteBlock(plan);
+  if (!pass.needed) return plan;
+  const cloned = clonePlanTree(plan);
+  pass.probing = false;
+  rewriteBlock(cloned);
+  return cloned;
+}
+
+/**
  * Rewrites every expression slot of one block in place, the writing counterpart to
  * `forEachBlockExpression`. The mapper receives each root expression and returns its
  * replacement; returning the same object leaves the slot untouched.
@@ -4061,6 +4858,14 @@ function exactConstantFold(
   if (right === undefined) return undefined;
   const seeded = left.seeded || right.seeded;
   if (left.value === null || right.value === null) return { value: null, seeded };
+  if (
+    expression.integer === true &&
+    expression.operator === "/" &&
+    typeof left.value === "number" &&
+    typeof right.value === "number"
+  ) {
+    return { value: integerQuotient(left.value, right.value), seeded };
+  }
   const folded = exactNumericBinary(expression.operator, left.value, right.value, 0, false);
   return folded === undefined ? undefined : { value: folded, seeded };
 }
@@ -4081,10 +4886,13 @@ function resolveExactNumericConstants(expression: Expression): Expression {
     folded = undefined;
   }
   if (folded?.seeded === true) {
+    // A seeded fold was typed NUMERIC by PostgreSQL's rules; the demoted number keeps that
+    // typing so a later integer-division check never mistakes `2.0 * 3` for an integer.
     const value = folded.value;
-    if (value === null || typeof value === "number") return { kind: "literal", value };
+    if (value === null) return { kind: "literal", value };
+    if (typeof value === "number") return { kind: "literal", value, decimal: true };
     const fits = exactNumericAsNumber(value);
-    if (fits !== undefined) return { kind: "literal", value: fits };
+    if (fits !== undefined) return { kind: "literal", value: fits, decimal: true };
     return { kind: "literal", value, internalSqlValue: true, sqlDomain: { kind: "numeric" } };
   }
   if (expression.kind === "subquery" || expression.kind === "exists") {
@@ -4139,6 +4947,17 @@ function resolveStatementExactNumericConstants(statement: CompiledStatement): vo
     for (const predicate of statement.predicates) {
       predicate.left = resolve(predicate.left);
       predicate.right = resolve(predicate.right);
+    }
+    if (statement.from !== undefined) {
+      for (const predicate of statement.from.predicates) {
+        predicate.left = resolve(predicate.left);
+        predicate.right = resolve(predicate.right);
+      }
+      for (const join of statement.from.joins) {
+        join.left = resolve(join.left);
+        join.right = resolve(join.right);
+        if (join.on !== undefined) join.on = resolve(join.on);
+      }
     }
     return;
   }
@@ -5125,10 +5944,27 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       const right = evaluate(expression.right, context, group);
       if (left === null || left === undefined || right === null || right === undefined) return null;
       if (expression.operator === "||") return concatenatedSqlValue(left, right);
+      if (
+        expression.integer === true &&
+        expression.operator === "/" &&
+        typeof left === "number" &&
+        typeof right === "number"
+      ) {
+        return integerQuotient(left, right);
+      }
       const exact = exactNumericBinary(expression.operator, left, right);
       if (exact !== undefined) return exact;
-      const a = numeric(left);
-      const b = numeric(right);
+      // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`.
+      const a = numeric(
+        typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)
+          ? readUntypedText("number", left)
+          : left,
+      );
+      const b = numeric(
+        typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)
+          ? readUntypedText("number", right)
+          : right,
+      );
       if (expression.operator === "+") return a + b;
       if (expression.operator === "-") return a - b;
       if (expression.operator === "*") return a * b;
@@ -5696,9 +6532,19 @@ export function evaluateBooleanExpression(
       );
       return operator === "IS DISTINCT FROM" ? distinct : !distinct;
     }
-    const left = evaluateValue(expression.left);
-    const right = evaluateValue(expression.right);
-    if (left === null || left === undefined || right === null || right === undefined) return null;
+    const evaluatedLeft = evaluateValue(expression.left);
+    const evaluatedRight = evaluateValue(expression.right);
+    if (
+      evaluatedLeft === null ||
+      evaluatedLeft === undefined ||
+      evaluatedRight === null ||
+      evaluatedRight === undefined
+    ) {
+      return null;
+    }
+    // Read an untyped string constant in the other side's type before `comparable` turns a
+    // datetime into milliseconds, the same decision the vectorized executor makes.
+    const [left, right] = coerceComparisonOperands(evaluatedLeft, evaluatedRight);
     const a = comparable(left);
     const b = comparable(right);
     if (operator === "=") return compareValues(a, b) === 0;
@@ -5887,6 +6733,16 @@ function validateGrouping(plan: CompiledQuery): void {
     }
     if (!groupedExpression(item.expression, groupExpressions)) {
       throw new TypeError(`Selected column must appear in GROUP BY: ${item.alias}`);
+    }
+  }
+  for (const predicate of plan.having) {
+    for (const side of [predicate.left, predicate.right]) {
+      if (hasAggregate(side) || expressionColumns(side).length === 0) continue;
+      if (!groupedExpression(side, groupExpressions)) {
+        throw new TypeError(
+          "HAVING conditions must use aggregates, literals, or GROUP BY expressions",
+        );
+      }
     }
   }
   const forbiddenAggregates = [
@@ -6139,6 +6995,13 @@ class Parser {
       // because the step refers to the working set by these names and not by the base's.
       const columns = this.#cteColumnList();
       this.#keyword("AS");
+      // [NOT] MATERIALIZED is PostgreSQL's planner hint; the block is planned the same way.
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        this.#keyword("MATERIALIZED");
+      } else if (this.#isKeyword("MATERIALIZED")) {
+        this.#keyword("MATERIALIZED");
+      }
       this.#expectPunctuation("(");
       if (recursive) {
         this.#recursiveCte(name, columns);
@@ -6250,7 +7113,9 @@ class Parser {
 
   /** The clauses that close a query expression: ORDER BY, then LIMIT/OFFSET or OFFSET/FETCH. */
   #compoundTail(): SelectTail {
-    return { orderBy: this.#orderByClause(), ...this.#tailClauses() };
+    const tail = { orderBy: this.#orderByClause(), ...this.#tailClauses() };
+    this.#lockingClause();
+    return tail;
   }
 
   /**
@@ -6487,6 +7352,29 @@ class Parser {
           defaultValue = { kind: "autoincrement" };
           nullable = false;
           continue;
+        }
+        if (this.#isKeyword("CONSTRAINT")) {
+          // `CONSTRAINT name` before a column constraint names a CHECK or FOREIGN KEY; the
+          // name of a PRIMARY KEY, UNIQUE, or NOT NULL constraint is informational here.
+          this.#keyword("CONSTRAINT");
+          const constraintName = this.#identifier();
+          if (this.#isKeyword("CHECK")) {
+            checks.push(this.#checkConstraint(constraintName));
+            continue;
+          }
+          if (this.#isKeyword("REFERENCES")) {
+            foreignKeys.push(this.#references(constraintName, [name]));
+            continue;
+          }
+          if (
+            this.#isKeyword("PRIMARY") ||
+            this.#isKeyword("UNIQUE") ||
+            this.#isKeyword("NOT") ||
+            this.#isKeyword("NULL")
+          ) {
+            continue;
+          }
+          throw new TypeError(`Expected a constraint after CONSTRAINT ${constraintName}`);
         }
         if (this.#isKeyword("CHECK")) {
           checks.push(this.#checkConstraint(`${table}_${name}_check`));
@@ -6925,14 +7813,36 @@ class Parser {
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
+    this.#multiWordTypeTail(word);
     if (this.#punctuation("(")) {
       this.#typeWidth();
       if (this.#punctuation(",")) this.#typeWidth();
       this.#expectPunctuation(")");
     }
-    const integer =
-      word === "INTEGER" || word === "INT" || word === "BIGINT" || word === "SMALLINT";
-    return integer ? "number-integer" : mapped;
+    return integerTypeNames.has(word) ? "number-integer" : mapped;
+  }
+
+  /**
+   * The words PostgreSQL's multi-word type names carry after their first word: `CHARACTER
+   * VARYING`, `TIMESTAMP WITH TIME ZONE`, `TIMESTAMP WITHOUT TIME ZONE`, `TIME WITH TIME ZONE`.
+   * Each maps onto the same storage as its one-word spelling, so the tail is consumed and
+   * nothing else changes. Returns whether a tail was present.
+   */
+  #multiWordTypeTail(word: string): boolean {
+    if (word === "CHARACTER" && this.#isKeyword("VARYING")) {
+      this.#keyword("VARYING");
+      return true;
+    }
+    if (
+      (word === "TIMESTAMP" || word === "TIME") &&
+      (this.#isKeyword("WITH") || this.#isKeyword("WITHOUT"))
+    ) {
+      this.#keyword(this.#isKeyword("WITH") ? "WITH" : "WITHOUT");
+      this.#keyword("TIME");
+      this.#keyword("ZONE");
+      return true;
+    }
+    return false;
   }
 
   #columnType(): { type: SqlColumnType; integer?: true; sqlDomain?: SqlDomain; serial?: true } {
@@ -6970,6 +7880,8 @@ class Parser {
     if (mapped === undefined) {
       return { type: "string", sqlDomain: { kind: "enum", name: declared, values: [] } };
     }
+    // `TIME WITH TIME ZONE` stays the TIME domain: the zone tail is parsed with the type name.
+    const multiWord = this.#multiWordTypeTail(word);
     // Character widths document intent and do not truncate values.
     if (this.#punctuation("(")) {
       this.#typeWidth();
@@ -6978,13 +7890,11 @@ class Parser {
       }
       this.#expectPunctuation(")");
     }
-    if (this.#punctuation("[")) {
+    if (!multiWord && this.#punctuation("[")) {
       this.#expectPunctuation("]");
       return { type: "string", sqlDomain: { kind: "array", element: word } };
     }
-    const integer =
-      word === "INTEGER" || word === "INT" || word === "BIGINT" || word === "SMALLINT";
-    return { type: mapped, ...(integer ? { integer: true } : {}) };
+    return { type: mapped, ...(integerTypeNames.has(word) ? { integer: true } : {}) };
   }
 
   parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {
@@ -7031,6 +7941,7 @@ class Parser {
       // Any query expression feeds INSERT: a plain SELECT, a WITH, a set operation, or a
       // parenthesized member; ON CONFLICT then applies to the produced rows as it does to VALUES.
       const insertSource = this.#queryExpression("(insert select)");
+      annotatePlanIntegerDivision(insertSource);
       resolvePlanExactNumericConstants(insertSource);
       const query = planHasPendingSelectShapes(insertSource)
         ? insertSource
@@ -7380,6 +8291,7 @@ class Parser {
     if (new Set(assignments.map(({ column }) => column)).size !== assignments.length) {
       throw new TypeError("UPDATE assignments must set each column once");
     }
+    const from = this.#mutationSources("FROM");
     const predicates = this.#mutationPredicates();
     return {
       kind: "update",
@@ -7387,21 +8299,33 @@ class Parser {
       ...(alias === undefined ? {} : { alias }),
       assignments,
       predicates,
+      ...(from === undefined ? {} : { from }),
       ...this.#returningClause(table, alias),
     };
+  }
+
+  /** `FROM sources` after UPDATE's SET list, or `USING sources` after DELETE's target. */
+  #mutationSources(keyword: "FROM" | "USING"): MutationSources | undefined {
+    if (!this.#isKeyword(keyword)) return undefined;
+    this.#keyword(keyword);
+    const groupConditions: Expression[] = [];
+    const { base, joins } = this.#joinedSources([], groupConditions);
+    return { base, joins, predicates: groupConditions.flatMap(splitCondition) };
   }
 
   #deleteStatement(): CompiledStatement {
     this.#keyword("DELETE");
     this.#keyword("FROM");
     const table = this.#identifier();
-    const alias = this.#mutationAlias("WHERE", "RETURNING");
+    const alias = this.#mutationAlias("WHERE", "USING", "RETURNING");
+    const from = this.#mutationSources("USING");
     const predicates = this.#mutationPredicates();
     return {
       kind: "delete",
       table,
       ...(alias === undefined ? {} : { alias }),
       predicates,
+      ...(from === undefined ? {} : { from }),
       ...this.#returningClause(table, alias),
     };
   }
@@ -7589,6 +8513,39 @@ class Parser {
   }
 
   /** LIMIT/OFFSET in either dialect order: LIMIT n [OFFSET m], or OFFSET m [FETCH FIRST ...]. */
+  /**
+   * `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE [OF table, …] [NOWAIT | SKIP LOCKED]`: row
+   * locks for concurrent sessions, which a single-session engine has no need of. Accepted and
+   * ignored so a query written for PostgreSQL runs unchanged.
+   */
+  #lockingClause(): void {
+    while (this.#isKeyword("FOR")) {
+      this.#keyword("FOR");
+      if (this.#isKeyword("UPDATE")) this.#keyword("UPDATE");
+      else if (this.#isKeyword("SHARE")) this.#keyword("SHARE");
+      else if (this.#isKeyword("NO")) {
+        this.#keyword("NO");
+        this.#keyword("KEY");
+        this.#keyword("UPDATE");
+      } else if (this.#isKeyword("KEY")) {
+        this.#keyword("KEY");
+        this.#keyword("SHARE");
+      } else {
+        throw new TypeError(`Expected UPDATE or SHARE after FOR, found ${this.#peek().text}`);
+      }
+      if (this.#isKeyword("OF")) {
+        this.#keyword("OF");
+        this.#identifier();
+        while (this.#punctuation(",")) this.#identifier();
+      }
+      if (this.#isKeyword("NOWAIT")) this.#keyword("NOWAIT");
+      else if (this.#isKeyword("SKIP")) {
+        this.#keyword("SKIP");
+        this.#keyword("LOCKED");
+      }
+    }
+  }
+
   #tailClauses(): {
     limit?: number;
     limitParameter?: number;
@@ -7674,9 +8631,18 @@ class Parser {
     this.#compoundMember = false;
     this.#keyword("SELECT");
     let distinct = false;
+    let distinctOn: Expression[] | undefined;
     if (this.#isKeyword("DISTINCT")) {
       this.#keyword("DISTINCT");
-      distinct = true;
+      if (this.#isKeyword("ON")) {
+        // PostgreSQL's DISTINCT ON (exprs): the first row of each group in ORDER BY order.
+        this.#keyword("ON");
+        this.#expectPunctuation("(");
+        distinctOn = this.#expressionList();
+        this.#expectPunctuation(")");
+      } else {
+        distinct = true;
+      }
     } else if (this.#isKeyword("ALL")) {
       // SELECT ALL names the default: every row, duplicates kept.
       this.#keyword("ALL");
@@ -7731,6 +8697,16 @@ class Parser {
       }
     }
     const orderBy = compoundMember ? [] : this.#orderByClause();
+    const tail = compoundMember ? {} : this.#tailClauses();
+    if (!compoundMember) this.#lockingClause();
+    if (distinctOn !== undefined) {
+      return this.#distinctOnBlock(
+        sql,
+        distinctOn,
+        { base, joins, select, predicates, groupBy, having, orderBy, groupingSets },
+        tail,
+      );
+    }
     return assembleSelectBlock(
       {
         sql,
@@ -7742,8 +8718,120 @@ class Parser {
         groupBy,
         having,
         orderBy,
-        ...(compoundMember ? {} : this.#tailClauses()),
+        ...tail,
         ...(groupingSets === undefined ? {} : { groupingSets }),
+      },
+      this.nextDerivedSequence,
+    );
+  }
+
+  /**
+   * `SELECT DISTINCT ON (k) … ORDER BY k, rest` keeps the first row of each `k` group in that
+   * order — PostgreSQL's spelling of "one row per key". It lowers to the standard form: the
+   * block computes ROW_NUMBER() OVER (PARTITION BY k ORDER BY rest) beside its outputs, and an
+   * outer block keeps the rows numbered 1 and applies the ORDER BY, LIMIT, and OFFSET. Ordering
+   * expressions that are not outputs ride along as hidden columns, and an output alias named in
+   * ORDER BY orders the window by the expression it labels, since a window cannot see aliases.
+   */
+  #distinctOnBlock(
+    sql: string,
+    distinctOn: Expression[],
+    parts: {
+      base: TableSource;
+      joins: JoinPlan[];
+      select: SelectItem[];
+      predicates: Predicate[];
+      groupBy: Expression[];
+      having: Predicate[];
+      orderBy: CompiledQuery["orderBy"];
+      groupingSets: Expression[][] | undefined;
+    },
+    tail: Omit<SelectTail, "orderBy">,
+  ): CompiledQuery {
+    const rowNumberAlias = "\0distinct_on";
+    const innerSelect: SelectItem[] = [...parts.select];
+    const aliased = new Map(
+      parts.select
+        .filter((item) => item.expression.kind !== "wildcard")
+        .map((item) => [item.alias, item.expression] as const),
+    );
+    // The window sees the block's own columns and expressions, not the output aliases.
+    const windowExpression = (expression: Expression): Expression => {
+      if (expression.kind === "column" && !expression.reference.includes(".")) {
+        const labelled = aliased.get(expression.reference);
+        if (labelled !== undefined && labelled.kind !== "column") return labelled;
+      }
+      return expression;
+    };
+    const outerOrderBy: CompiledQuery["orderBy"] = [];
+    parts.orderBy.forEach((order, index) => {
+      const expression = order.expression;
+      const output =
+        expression.kind === "column" && !expression.reference.includes(".")
+          ? parts.select.find((item) => item.alias === expression.reference)
+          : parts.select.find(
+              (item) =>
+                item.expression.kind !== "wildcard" &&
+                JSON.stringify(item.expression) === JSON.stringify(expression),
+            );
+      let alias = output?.alias;
+      if (alias === undefined) {
+        alias = `\0distinct_on_order_${String(index)}`;
+        innerSelect.push({ expression, alias });
+      }
+      outerOrderBy.push({ ...order, expression: { kind: "column", reference: alias } });
+    });
+    innerSelect.push({
+      expression: {
+        kind: "window",
+        name: "ROW_NUMBER",
+        partitionBy: distinctOn.map(windowExpression),
+        orderBy: parts.orderBy.map((order) => ({
+          ...order,
+          expression: windowExpression(order.expression),
+        })),
+      },
+      alias: rowNumberAlias,
+    });
+    const inner = assembleSelectBlock(
+      {
+        sql: "(distinct on)",
+        base: parts.base,
+        joins: parts.joins,
+        select: innerSelect,
+        distinct: false,
+        predicates: parts.predicates,
+        groupBy: parts.groupBy,
+        having: parts.having,
+        orderBy: [],
+        ...(parts.groupingSets === undefined ? {} : { groupingSets: parts.groupingSets }),
+      },
+      this.nextDerivedSequence,
+    );
+    const outerAlias = "(distinct on)";
+    const outerSelect: SelectItem[] = parts.select.map((item) =>
+      item.expression.kind === "wildcard"
+        ? item
+        : { expression: { kind: "column", reference: item.alias }, alias: item.alias },
+    );
+    return assembleSelectBlock(
+      {
+        sql,
+        base: this.#derivedSource(inner, outerAlias),
+        joins: [],
+        select: outerSelect,
+        distinct: false,
+        predicates: [
+          {
+            left: { kind: "column", reference: rowNumberAlias },
+            operator: "=",
+            right: { kind: "literal", value: 1 },
+          },
+        ],
+        groupBy: [],
+        having: [],
+        orderBy: outerOrderBy,
+        ...tail,
       },
       this.nextDerivedSequence,
     );
@@ -8678,6 +9766,21 @@ class Parser {
       }
       return { kind: "condition", operator, left, right: { kind: "list", items } };
     }
+    // ~~, !~~, ~~*, !~~*: PostgreSQL's operator spellings of LIKE, NOT LIKE, ILIKE, NOT ILIKE.
+    const likeSpelling = this.#peek();
+    if (likeSpelling.kind === "operator" && /^!?~~\*?$/.test(likeSpelling.text)) {
+      this.#index += 1;
+      const negatedSpelling = likeSpelling.text.startsWith("!") !== negated;
+      const insensitiveSpelling = likeSpelling.text.endsWith("*");
+      const operator: PredicateOperator = insensitiveSpelling
+        ? negatedSpelling
+          ? "NOT ILIKE"
+          : "ILIKE"
+        : negatedSpelling
+          ? "NOT LIKE"
+          : "LIKE";
+      return { kind: "condition", operator, left, right: this.#additive() };
+    }
     if (this.#isKeyword("LIKE") || this.#isKeyword("ILIKE")) {
       const insensitive = this.#isKeyword("ILIKE");
       this.#keyword(insensitive ? "ILIKE" : "LIKE");
@@ -8919,7 +10022,9 @@ class Parser {
         );
       }
       const fits = exactNumericAsNumber(tagged);
-      if (fits !== undefined) return { kind: "literal", value: fits, exactText: token.text };
+      if (fits !== undefined) {
+        return { kind: "literal", value: fits, exactText: token.text, decimal: true };
+      }
       return {
         kind: "literal",
         value: tagged,
@@ -9096,6 +10201,11 @@ class Parser {
           args.push(this.#expression());
         }
         this.#expectPunctuation(")");
+        // PostgreSQL reads a string constant after FROM as a POSIX pattern: the first match.
+        const pattern = args[1];
+        if (args.length === 2 && pattern?.kind === "literal" && typeof pattern.value === "string") {
+          return { kind: "call", name: "REGEXP_SUBSTR", arguments: args };
+        }
         return { kind: "call", name: "SUBSTR", arguments: args };
       }
       this.#index = restore;
@@ -9326,7 +10436,23 @@ class Parser {
           ...(fallback === null ? {} : { fallback }),
         };
       }
-      if (upper === "JSON_OBJECT") return this.#jsonObject();
+      if (
+        upper === "JSON_OBJECT" ||
+        upper === "JSON_BUILD_OBJECT" ||
+        upper === "JSONB_BUILD_OBJECT"
+      ) {
+        return this.#jsonObject();
+      }
+      if (upper === "DATE") {
+        // PostgreSQL's date(x) is the DATE cast spelled as a function.
+        const operand = this.#expression();
+        this.#expectPunctuation(")");
+        return {
+          kind: "call",
+          name: "CAST",
+          arguments: [operand, { kind: "literal", value: "date" }],
+        };
+      }
       if (statisticalAggregates.has(upper)) return this.#statisticalAggregate(upper);
       if (upper === "EVERY" || upper === "BOOL_AND" || upper === "BOOL_OR") {
         return this.#booleanAggregate(upper);
@@ -10478,17 +11604,9 @@ export function assembleSelectBlock(
     const grouped =
       parts.groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
     if (!grouped) throw new TypeError("HAVING requires GROUP BY or aggregate functions");
-    const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
-    for (const predicate of having) {
-      for (const side of [predicate.left, predicate.right]) {
-        if (hasAggregate(side)) continue;
-        if (expressionColumns(side).length === 0) continue;
-        if (groupExpressions.has(JSON.stringify(side))) continue;
-        throw new TypeError(
-          "HAVING conditions must use aggregates, literals, or GROUP BY expressions",
-        );
-      }
-    }
+    // Whether each HAVING side is grouped is checked with the select list once the catalog
+    // is known (validateGrouping): a primary key in GROUP BY makes its row's other columns
+    // legal there, which the statement alone cannot tell.
   }
   const clauseExpressions = [
     ...predicates.flatMap((predicate) => [predicate.left, predicate.right]),
@@ -11742,13 +12860,67 @@ function tokenize(sql: string): Token[] {
       index += 1;
       continue;
     }
+    if ((character === "E" || character === "e") && sql[index + 1] === "'") {
+      // E'…': a string with C-style backslash escapes.
+      const start = index;
+      index += 2;
+      let value = "";
+      let closed = false;
+      while (index < sql.length) {
+        const current = sql[index] ?? "";
+        if (current === "'" && sql[index + 1] === "'") {
+          value += "'";
+          index += 2;
+        } else if (current === "'") {
+          index += 1;
+          closed = true;
+          break;
+        } else if (current === "\\") {
+          const next = sql[index + 1] ?? "";
+          const simple = new Map([
+            ["n", "\n"],
+            ["t", "\t"],
+            ["r", "\r"],
+            ["b", "\b"],
+            ["f", "\f"],
+          ]);
+          const escaped = simple.get(next);
+          if (escaped !== undefined) {
+            value += escaped;
+            index += 2;
+          } else if (next === "x" && /[0-9A-Fa-f]/.test(sql[index + 2] ?? "")) {
+            const hex = /^[0-9A-Fa-f]{1,2}/.exec(sql.slice(index + 2, index + 4))?.[0] ?? "";
+            value += String.fromCharCode(Number.parseInt(hex, 16));
+            index += 2 + hex.length;
+          } else if (next === "u" && /^[0-9A-Fa-f]{4}/.test(sql.slice(index + 2, index + 6))) {
+            value += String.fromCharCode(Number.parseInt(sql.slice(index + 2, index + 6), 16));
+            index += 6;
+          } else if (/[0-7]/.test(next)) {
+            const octal = /^[0-7]{1,3}/.exec(sql.slice(index + 1, index + 4))?.[0] ?? "";
+            value += String.fromCharCode(Number.parseInt(octal, 8));
+            index += 1 + octal.length;
+          } else {
+            value += next;
+            index += 2;
+          }
+        } else {
+          value += current;
+          index += 1;
+        }
+      }
+      if (!closed) {
+        throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
+      }
+      push({ kind: "string", text: value, start, end: index });
+      continue;
+    }
     if (/[A-Za-z_]/.test(character)) {
       const start = index++;
       while (index < sql.length && /[A-Za-z0-9_]/.test(sql[index] ?? "")) index += 1;
       push({ kind: "identifier", text: sql.slice(start, index), start, end: index });
       continue;
     }
-    if (/\d/.test(character)) {
+    if (/\d/.test(character) || (character === "." && /\d/.test(sql[index + 1] ?? ""))) {
       const start = index;
       // T661: 0x/0o/0b integers. The radix prefix is checked before the decimal scan, which
       // would otherwise stop at the letter and leave `x1F` looking like an identifier.
@@ -11780,9 +12952,15 @@ function tokenize(sql: string): Token[] {
           while (index < sql.length && /\d/.test(sql[index] ?? "")) index += 1;
         }
       }
-      const text = sql.slice(start, index);
+      // `5.` and `.5` are PostgreSQL's spellings of 5.0 and 0.5.
+      const spelled = sql.slice(start, index);
+      const text = spelled.startsWith(".")
+        ? `0${spelled}`
+        : /^\d+\.(?:[eE][+-]?\d+)?$/.test(spelled)
+          ? spelled.replace(".", ".0")
+          : spelled;
       if (!validNumericLiteral(text, 10))
-        throw new SqlCompileError(`Invalid number: ${text}`, start, index - start);
+        throw new SqlCompileError(`Invalid number: ${spelled}`, start, index - start);
       push({ kind: "number", text: text.replaceAll("_", ""), start, end: index });
       continue;
     }
@@ -11835,6 +13013,19 @@ function tokenize(sql: string): Token[] {
     }
     if (character === "$") {
       const start = index++;
+      // $tag$ … $tag$: a dollar-quoted string, whose body is taken verbatim.
+      const tagMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(start));
+      if (tagMatch !== null) {
+        const tag = tagMatch[0];
+        const bodyStart = start + tag.length;
+        const close = sql.indexOf(tag, bodyStart);
+        if (close === -1) {
+          throw new SqlCompileError("Unterminated dollar-quoted string", start, sql.length - start);
+        }
+        push({ kind: "string", text: sql.slice(bodyStart, close), start, end: close + tag.length });
+        index = close + tag.length;
+        continue;
+      }
       while (index < sql.length && /\d/.test(sql[index] ?? "")) index += 1;
       const digits = sql.slice(start + 1, index);
       if (digits.length === 0) {
@@ -11869,6 +13060,18 @@ function tokenize(sql: string): Token[] {
     if (pair === "->" && sql[index + 2] === ">") {
       push({ kind: "operator", text: "->>", start: index, end: index + 3 });
       index += 3;
+      continue;
+    }
+    // PostgreSQL's operator spellings of LIKE: ~~, !~~, ~~*, !~~*.
+    const likeOperator = /^!?~~\*?/.exec(sql.slice(index, index + 4))?.[0];
+    if (likeOperator !== undefined) {
+      push({
+        kind: "operator",
+        text: likeOperator,
+        start: index,
+        end: index + likeOperator.length,
+      });
+      index += likeOperator.length;
       continue;
     }
     if ([">=", "<=", "!=", "<>", "||", "->"].includes(pair)) {

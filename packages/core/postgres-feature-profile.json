@@ -31,7 +31,7 @@
     {
       "id": "expression.arithmetic",
       "classification": "different",
-      "reason": "Minnow has one JavaScript number type: integer-looking division stays fractional, and division by zero returns NULL instead of raising PostgreSQL's error."
+      "reason": "Division by zero returns NULL instead of raising PostgreSQL's error. Integer division itself follows PostgreSQL: two integer operands truncate toward zero."
     },
     {
       "id": "expression.round",
@@ -42,6 +42,11 @@
       "id": "parameter.positional",
       "classification": "extension",
       "reason": "PostgreSQL uses $n parameters. Minnow also accepts ? as adapter-friendly shorthand."
+    },
+    {
+      "id": "mutation.truncate",
+      "classification": "different",
+      "reason": "TRUNCATE reports the number of rows it removed, where PostgreSQL's command tag carries no count. The resulting table state is identical."
     },
     {
       "id": "mutation.upsert-replace",

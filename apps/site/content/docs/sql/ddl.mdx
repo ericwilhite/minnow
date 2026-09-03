@@ -171,23 +171,26 @@ Those restrictions affect speed only, never the accepted SQL or its result.
 Blocks retain four compact physical kinds—number, string, boolean, and datetime—but SQL domains
 add validation and semantics without widening hot scan vectors:
 
-| SQL domain         | Spellings                                    | JavaScript result                 |
-| ------------------ | -------------------------------------------- | --------------------------------- |
-| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`              | `number`                          |
-| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT`          | `number`                          |
-| exact decimal      | `NUMERIC(p, s)`, `DECIMAL(p, s)`             | decimal `string`                  |
-| string             | `VARCHAR(n)`, `TEXT`, `CHAR(n)`              | `string`                          |
-| boolean            | `BOOLEAN`                                    | `boolean`                         |
-| calendar date      | `DATE`                                       | canonical `YYYY-MM-DD` `string`   |
-| datetime           | `TIMESTAMP`                                  | `Date`                            |
-| time of day        | `TIME`                                       | canonical `string`                |
-| JSON               | `JSON`, `JSONB`                              | JSON `string`                     |
-| UUID               | `UUID`                                       | lowercase `string`                |
-| interval           | `INTERVAL`                                   | months/days/microseconds `string` |
-| array              | `INTEGER[]`, `TEXT[]`, and other core arrays | JSON `string`                     |
-| enum               | a name declared by `CREATE TYPE … AS ENUM`   | member `string`                   |
+| SQL domain         | Spellings                                               | JavaScript result                 |
+| ------------------ | ------------------------------------------------------- | --------------------------------- |
+| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`, `INT4`, `INT8`, `INT2` | `number`                          |
+| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT`, `FLOAT8`, `FLOAT4` | `number`                          |
+| exact decimal      | `NUMERIC(p, s)`, `DECIMAL(p, s)`                        | decimal `string`                  |
+| string             | `VARCHAR(n)`, `CHARACTER VARYING(n)`, `TEXT`, `CHAR(n)` | `string`                          |
+| boolean            | `BOOLEAN`, `BOOL`                                       | `boolean`                         |
+| calendar date      | `DATE`                                                  | canonical `YYYY-MM-DD` `string`   |
+| datetime           | `TIMESTAMP`, `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`  | `Date`                            |
+| time of day        | `TIME`                                                  | canonical `string`                |
+| JSON               | `JSON`, `JSONB`                                         | JSON `string`                     |
+| UUID               | `UUID`                                                  | lowercase `string`                |
+| interval           | `INTERVAL`                                              | months/days/microseconds `string` |
+| array              | `INTEGER[]`, `TEXT[]`, and other core arrays            | JSON `string`                     |
+| enum               | a name declared by `CREATE TYPE … AS ENUM`              | member `string`                   |
 
 Widths in `VARCHAR(80)` are accepted and ignored — they document intent, and nothing truncates.
+So are `CREATE TEMP`, `TEMPORARY`, and `UNLOGGED TABLE`: every table lives in the one database
+with one durability. A column constraint may be named (`n INTEGER CONSTRAINT n_positive CHECK
+(n > 0)`), as a table constraint may.
 An integer write or cast must be inside JavaScript's exact safe-integer range,
 −9,007,199,254,740,991 through 9,007,199,254,740,991. Minnow rejects a value outside that range
 instead of rounding an ID or quantity before it reaches disk. SQL declarations set this guard
@@ -195,6 +198,13 @@ automatically; the low-level `createTable` API can request the same domain with 
 a number column. An integer _constant_ beyond that range is not an error: it stays exact, like
 PostgreSQL's `int8` and `NUMERIC` typing of large constants, and writing one to an integer column
 is rejected rather than rounded.
+
+Integer division is PostgreSQL's. When both operands of `/` are integers — integer columns,
+integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them —
+the quotient truncates toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, and `SUM(qty) / COUNT(*)`
+is a whole number. Write `7 / 2.0`, divide by a `DOUBLE PRECISION` or `NUMERIC` column, or cast
+an operand when a fractional quotient is wanted. A bound parameter takes the type of its integer
+partner, so `qty / $1` truncates when `$1` is bound to an integer.
 
 Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
 comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.

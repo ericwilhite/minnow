@@ -1,3 +1,4 @@
+import { crossJoinPlan } from "../plan/model.js";
 import {
   toColumnarBatch,
   type BatchRow,
@@ -244,6 +245,13 @@ import {
   type SqlColumnSchema,
   type UniqueConstraintDefinition,
   volatileScalarFunctionNames,
+  annotatePlanIntegerDivision,
+  clonePlanTree,
+  planMayHaveIntegerDivision,
+  foldIdentifierCase,
+  extendGroupByWithKeyDependents,
+  expandRowReferences,
+  type MutationSources,
 } from "./query.js";
 import {
   copyQueryResult,
@@ -271,7 +279,7 @@ import {
   qualifyCorrelatedReferences,
   renderPlan,
 } from "./optimizer.js";
-import { encodeSqlEqualityValue, parseSqlTimestampText } from "./sql-semantics.js";
+import { encodeSqlEqualityValue, readUntypedText } from "./sql-semantics.js";
 import {
   exactNumericAsNumber,
   exactNumericValue,
@@ -1281,6 +1289,10 @@ interface CatalogFacts {
   columns: ReadonlyMap<string, readonly string[]>;
   /** Physical table and column names to the stored value type, for untyped-literal coercion. */
   types: ReadonlyMap<string, ReadonlyMap<string, SimpleDataType>>;
+  /** Physical table names to their SQL integer columns, for PostgreSQL integer division. */
+  integers: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Physical table names to their primary-key columns, for GROUP BY functional dependency. */
+  keys: ReadonlyMap<string, readonly string[]>;
 }
 
 /** Thrown into a held write scope to make it abort; never surfaces to a caller. */
@@ -1339,6 +1351,8 @@ export type ExecuteResult =
     }
   | { kind: "create-view"; view: string }
   | { kind: "drop-view"; view: string; dropped: boolean }
+  /** A session setting statement (`SET`, `RESET`), accepted and ignored. */
+  | { kind: "set"; action: "set" | "reset"; name: string }
   | { kind: "create-trigger"; table: string; name: string }
   | { kind: "drop-trigger"; name: string }
   | ({
@@ -1374,7 +1388,7 @@ function projectReturningItems(
   alias: string,
   items: readonly ReturningItem[],
   rows: readonly QueryRow[],
-  facts: Pick<CatalogFacts, "domains" | "types">,
+  facts: Pick<CatalogFacts, "domains" | "types" | "integers">,
 ): Required<ReturningExecuteFields> {
   // The same catalog normalization a SELECT receives, and the same columnar executor: the
   // affected rows become a one-table input whose values carry the execution form a stored row
@@ -1396,6 +1410,7 @@ function projectReturningItems(
     facts.domains,
     facts.types,
   );
+  annotatePlanIntegerDivision(plan, (name) => facts.integers.get(name));
   const visible = visibleTableColumns(table);
   const columns = new Map<string, ColumnarColumnInput>(
     visible.map((column) => [
@@ -1571,6 +1586,21 @@ function resolveMutationStatementDatetimes(
           }),
     };
   }
+  const sources = (from: MutationSources | undefined): { from?: MutationSources } =>
+    from === undefined
+      ? {}
+      : {
+          from: {
+            ...from,
+            predicates: predicates(from.predicates),
+            joins: from.joins.map((join) => ({
+              ...join,
+              left: expression(join.left),
+              right: expression(join.right),
+              ...(join.on === undefined ? {} : { on: expression(join.on) }),
+            })),
+          },
+        };
   if (statement.kind === "update") {
     return {
       ...statement,
@@ -1579,10 +1609,15 @@ function resolveMutationStatementDatetimes(
         expression: expression(assignment.expression),
       })),
       predicates: predicates(statement.predicates),
+      ...sources(statement.from),
     };
   }
   if (statement.kind === "delete") {
-    return { ...statement, predicates: predicates(statement.predicates) };
+    return {
+      ...statement,
+      predicates: predicates(statement.predicates),
+      ...sources(statement.from),
+    };
   }
   if (statement.kind === "merge") {
     return {
@@ -5352,7 +5387,14 @@ export class MinnowDatabase {
       if (template !== null) {
         const shape = resolvePointReadShape(template, options.params ?? []);
         if (shape !== undefined) {
-          const point = await this.#pointReadResult(shape, options);
+          let point: QueryResult | undefined;
+          try {
+            point = await this.#pointReadResult(shape, options);
+          } catch (error) {
+            // A table name that only folds case-insensitively is unknown to the fast path;
+            // the general path below resolves it, so this is a miss, not a failure.
+            if (!(error instanceof UnknownTableError)) throw error;
+          }
           throwIfAborted(options.signal);
           if (point !== undefined) return externalizeQueryResult(point);
         }
@@ -5558,9 +5600,20 @@ export class MinnowDatabase {
     // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
     // result memoization — and only re-reads the view set when the catalog has actually moved.
     // A database with no views therefore pays one probe, not a catalog scan per query.
-    const { views, domains, types, columns: catalogColumns } = await this.#catalogFacts(probe);
+    const {
+      views,
+      domains,
+      types,
+      integers,
+      keys,
+      columns: catalogColumns,
+    } = await this.#catalogFacts(probe);
     let rewritten = plan.usesSequenceCalls === true ? await this.#resolveSequenceCalls(plan) : plan;
-    if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
+    // Unquoted identifiers that resolve only case-insensitively are read as PostgreSQL folds
+    // them; a name that resolves exactly is never touched, so this is one probing walk.
+    rewritten = foldIdentifierCase(rewritten, catalogColumns);
+    rewritten = expandRowReferences(rewritten, (name) => catalogColumns.get(name));
+    if (views.size > 0 && planReadsViews(rewritten, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
       rewritten = expandViewSources(rewritten, (name) => {
         const sql = views.get(name);
@@ -5574,6 +5627,20 @@ export class MinnowDatabase {
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains, types);
+    }
+    // Integer division needs the catalog: `qty / 2` truncates only once `qty` is known to be
+    // an INTEGER column. The probe is one walk; a plan with a candidate is cloned so the shared
+    // compiled plan stays catalog-free.
+    if (integers.size > 0 && planMayHaveIntegerDivision(rewritten)) {
+      rewritten = clonePlanTree(rewritten);
+      annotatePlanIntegerDivision(rewritten, (name) => integers.get(name));
+    }
+    if (keys.size > 0) {
+      rewritten = extendGroupByWithKeyDependents(
+        rewritten,
+        (name) => keys.get(name),
+        (name) => catalogColumns.get(name),
+      );
     }
     const columnsOf = (name: string): readonly string[] | undefined => {
       const columns = catalogColumns.get(name);
@@ -5714,6 +5781,19 @@ export class MinnowDatabase {
   }
 
   /**
+   * The catalog name an unquoted identifier folds to when no table has the written spelling: the
+   * unique case-insensitive match, as PostgreSQL reads `USERS` as `users`. A name that matches
+   * nothing, or several tables, is returned unchanged for the caller's own error.
+   */
+  async #foldTableName(name: string): Promise<string> {
+    const { columns } = await this.#catalogFacts();
+    if (columns.has(name)) return name;
+    const lowered = name.toLowerCase();
+    const matches = [...columns.keys()].filter((candidate) => candidate.toLowerCase() === lowered);
+    return matches.length === 1 ? (matches[0] ?? name) : name;
+  }
+
+  /**
    * The two things the catalog knows that statements cannot: which names are views, and which
    * tables reference which. Both are consulted by every read or write of the relevant kind, so
    * the steady state has to be one epoch probe and no allocation; the facts are rebuilt only
@@ -5729,13 +5809,28 @@ export class MinnowDatabase {
     const domains = new Map<string, ReadonlyMap<string, SqlDomain>>();
     const columns = new Map<string, readonly string[]>();
     const types = new Map<string, ReadonlyMap<string, SimpleDataType>>();
+    const integers = new Map<string, ReadonlySet<string>>();
+    const keys = new Map<string, readonly string[]>();
     for (const table of await this.store.listTables()) {
       const visible = table.columns.filter(({ hidden }) => hidden !== true);
+      const keyColumn = getUniqueKeyColumn(table);
+      const keyNames =
+        keyColumn !== undefined && !keyColumn.hidden
+          ? [keyColumn.name]
+          : (table.primaryKeyColumnIds ?? []).flatMap((columnId) => {
+              const column = table.columns.find((candidate) => candidate.id === columnId);
+              return column === undefined ? [] : [column.name];
+            });
+      if (keyNames.length > 0) keys.set(table.name, keyNames);
       columns.set(
         table.name,
         visible.map(({ name }) => name),
       );
       types.set(table.name, new Map(visible.map((column) => [column.name, column.type])));
+      const integerColumns = visible.filter((column) => column.integer === true);
+      if (integerColumns.length > 0) {
+        integers.set(table.name, new Set(integerColumns.map(({ name }) => name)));
+      }
       const tableDomains = new Map(
         table.columns.flatMap((column) =>
           column.sqlDomain === undefined ? [] : [[column.name, column.sqlDomain] as const],
@@ -5749,7 +5844,7 @@ export class MinnowDatabase {
         else existing.push({ table, key });
       }
     }
-    const facts: CatalogFacts = { views, childKeys, domains, columns, types };
+    const facts: CatalogFacts = { views, childKeys, domains, columns, types, integers, keys };
     this.#catalogCache = { epoch, facts };
     return facts;
   }
@@ -7464,6 +7559,7 @@ export class MinnowDatabase {
       statementNow,
     );
     const input = insertStatementBatch(materialized);
+    coerceSqlWriteBatch(target, input);
     const filled = await fillColumnDefaults(
       target,
       input,
@@ -7538,6 +7634,9 @@ export class MinnowDatabase {
       const params = bindings.map((binding) => valueAt(binding.source, binding.column, rowIndex));
       const bound = bindStatementParameters(compiled, params);
       if (bound.kind !== "update" && bound.kind !== "delete") continue;
+      if (bound.from !== undefined) {
+        throw new TypeError(`Trigger body ${bound.kind.toUpperCase()}s cannot join other sources`);
+      }
       const referenced = new Set<string>([keyColumn.name]);
       if (bound.kind === "update") {
         for (const assignment of bound.assignments) {
@@ -9245,6 +9344,11 @@ export class MinnowDatabase {
         }),
       };
     }
+    // Session settings touch no data and no catalog, so they run the same inside a transaction
+    // (where SET LOCAL belongs) as outside one.
+    if (statement.kind === "set" || statement.kind === "show") {
+      return externalizeExecuteResult(await this.runStatement(statement));
+    }
     const open = this.#openTransaction;
     if (open !== undefined) {
       // Inside BEGIN … COMMIT every write stages into that one scope, so the statements publish
@@ -9753,12 +9857,14 @@ export class MinnowDatabase {
         `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
       );
     }
+    statement = foldInsertColumns(table, statement);
     for (const name of statement.columns) {
       if (!table.columns.some((column) => column.name === name)) {
         throw new TypeError(`INSERT column does not exist: ${name}`);
       }
     }
     const proposedBatch = insertStatementBatch(statement);
+    coerceSqlWriteBatch(table, proposedBatch);
     const statementNow = this.#now();
     const filledProposed = await fillColumnDefaults(
       table,
@@ -10074,6 +10180,7 @@ export class MinnowDatabase {
       );
     }
     const proposed = insertStatementBatch(statement);
+    coerceSqlWriteBatch(table, proposed);
     const statementNow = this.#now();
     const filled = await fillColumnDefaults(
       table,
@@ -10330,6 +10437,39 @@ export class MinnowDatabase {
     statement = resolveMutationStatementDatetimes(statement, statementNow);
     if (statement.kind === "select") {
       return { kind: "rows", result: await this.query(statement.sql) };
+    }
+    if (statement.kind === "set") {
+      return { kind: "set", action: statement.action, name: statement.name };
+    }
+    if (statement.kind === "show") {
+      // The settings a driver or tool reads on connection, with the engine's fixed answers.
+      const settings: Record<string, string> = {
+        search_path: "public",
+        server_version: "16.0",
+        server_version_num: "160000",
+        timezone: "UTC",
+        time_zone: "UTC",
+        transaction_isolation: "repeatable read",
+        default_transaction_isolation: "repeatable read",
+        client_encoding: "UTF8",
+        server_encoding: "UTF8",
+        standard_conforming_strings: "on",
+        integer_datetimes: "on",
+        datestyle: "ISO, MDY",
+        intervalstyle: "postgres",
+        application_name: "",
+        is_superuser: "on",
+        max_identifier_length: "63",
+      };
+      const name = statement.name.toLowerCase();
+      const value = settings[name];
+      if (value === undefined) {
+        throw new TypeError(`unrecognized configuration parameter "${statement.name}"`);
+      }
+      return {
+        kind: "rows",
+        result: await this.query(`SELECT $1 AS ${quoteIdentifier(name)}`, { params: [value] }),
+      };
     }
     if (statement.kind === "create-enum") {
       const values = validateEnumValues(statement.values, statement.name);
@@ -10886,14 +11026,18 @@ export class MinnowDatabase {
           );
         }
       }
-      for (const name of statement.columns) {
+      // Narrowing does not survive a reassignment inside the closures below, so the folded
+      // spelling lives beside the statement rather than replacing it.
+      const spelledColumns = foldInsertColumns(table, statement).columns;
+      for (const name of spelledColumns) {
         if (!table.columns.some((column) => column.name === name)) {
           throw new TypeError(`INSERT column does not exist: ${name}`);
         }
       }
-      const input = insertStatementBatch(statement);
+      const input = insertStatementBatch({ ...statement, columns: spelledColumns });
       // Normalize before dispatch as well as inside the write path so RETURNING echoes the exact
       // stored/public domain value rather than the caller's unnormalized spelling.
+      coerceSqlWriteBatch(table, input);
       normalizeDomainBatch(table, input);
       let returningColumns: readonly string[] | undefined;
       if (options.returning !== undefined) {
@@ -10915,8 +11059,7 @@ export class MinnowDatabase {
         // Statement validity first, so an invalid projection reports as itself, not as a
         // duplicate the invalid statement would also have hit.
         const assignedGenerated = table.columns.find(
-          (column) =>
-            column.generatedValue !== undefined && statement.columns.includes(column.name),
+          (column) => column.generatedValue !== undefined && spelledColumns.includes(column.name),
         );
         if (assignedGenerated !== undefined) {
           throw new TypeError(`Generated column cannot be assigned: ${assignedGenerated.name}`);
@@ -10954,7 +11097,7 @@ export class MinnowDatabase {
                   Object.fromEntries(
                     returningColumns.map((name) => {
                       const column = table.columns.find((candidate) => candidate.name === name);
-                      const position = statement.columns.indexOf(name);
+                      const position = spelledColumns.indexOf(name);
                       const inserted = position < 0 ? undefined : row[position];
                       const value =
                         generated[name]?.[rowIndex] ??
@@ -10987,8 +11130,9 @@ export class MinnowDatabase {
       statement.kind !== "update"
         ? []
         : await (async () => {
+            const spelled = foldAssignmentColumns(table, statement.assignments);
             if (!table.columns.some((column) => column.sqlDomain !== undefined)) {
-              return statement.assignments;
+              return spelled;
             }
             const { domains } = await this.#catalogFacts();
             if (!domains.has(table.name)) return statement.assignments;
@@ -10997,7 +11141,7 @@ export class MinnowDatabase {
                 sql: `UPDATE ${table.name}`,
                 base: { table: table.name, alias: table.name },
                 joins: [],
-                select: statement.assignments.map((assignment) => ({
+                select: spelled.map((assignment) => ({
                   expression: assignment.expression,
                   alias: assignment.column,
                 })),
@@ -11008,7 +11152,7 @@ export class MinnowDatabase {
               },
               domains,
             );
-            return statement.assignments.map((assignment, index) => ({
+            return spelled.map((assignment, index) => ({
               ...assignment,
               expression: normalized.select[index]?.expression ?? assignment.expression,
             }));
@@ -11018,13 +11162,21 @@ export class MinnowDatabase {
     // correlated or not — resolves through the ordinary query pipeline (decorrelation, one
     // snapshot for the uncorrelated) instead of a per-row evaluator that cannot run one.
     const assignmentAlias = (column: string): string => `\u0000set:${column}`;
+    // UPDATE … FROM / DELETE … USING: the extra sources join the target as a cross product that
+    // the WHERE filters, as PostgreSQL plans them; the target's own columns are then read
+    // qualified, since a source may share a column name.
+    const targetAlias = statement.alias ?? table.name;
+    const from = statement.from;
     const plan = optimizePlan({
       sql: `(${statement.kind})`,
-      base: { table: table.name, alias: statement.alias ?? table.name },
-      joins: [],
+      base: { table: table.name, alias: targetAlias },
+      joins: from === undefined ? [] : [crossJoinPlan(from.base), ...from.joins],
       select: [
         ...[...referenced].map((name) => ({
-          expression: { kind: "column" as const, reference: name },
+          expression: {
+            kind: "column" as const,
+            reference: from === undefined ? name : `${targetAlias}.${name}`,
+          },
           alias: name,
         })),
         ...(statement.kind === "update"
@@ -11034,12 +11186,13 @@ export class MinnowDatabase {
             }))
           : []),
       ],
-      predicates: statement.predicates,
+      predicates:
+        from === undefined ? statement.predicates : [...statement.predicates, ...from.predicates],
       groupBy: [],
       having: [],
       orderBy: [],
     });
-    if (statement.kind === "delete" && returningColumns === undefined) {
+    if (statement.kind === "delete" && returningColumns === undefined && from === undefined) {
       const internalWriter = options.writer as StatementWriter &
         Partial<Pick<TransactionStatementWriter, "queryFirstColumn">>;
       if (internalWriter.queryFirstColumn !== undefined) {
@@ -11076,6 +11229,17 @@ export class MinnowDatabase {
       // narrowing find the rows to touch, where the prepared path materialized the table's
       // columns first — most of a bulk delete's cost, at 200k rows.
       rows = (await this.#queryCompiled(plan)).rows;
+    }
+    if (from !== undefined) {
+      // A target row matched by several source rows is touched once, from its first match —
+      // PostgreSQL's rule for UPDATE … FROM, where the join may fan out.
+      const seen = new Set<string>();
+      rows = rows.filter((row) => {
+        const key = JSON.stringify(row[keyColumn.name] ?? null);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
     }
     const keys =
       keyColumn.type === "string" && keyColumn.sqlDomain === undefined
@@ -11141,10 +11305,13 @@ export class MinnowDatabase {
             `UPDATE assignment produced a non-finite number: ${assignment.column}`,
           );
         }
-        executionValues?.push(value);
-        return column.type === "string" && column.sqlDomain === undefined
-          ? storedSqlValueFromExecution(column, value)
-          : value;
+        // The stored form: a plain-TEXT value unprotected, an untyped string constant read in
+        // the column's type. RETURNING echoes the same form, as PostgreSQL returns the typed value.
+        const stored = storedSqlValueFromExecution(column, value);
+        executionValues?.push(
+          column.type === "string" && column.sqlDomain === undefined ? value : stored,
+        );
+        return stored;
       });
       if (executionValues !== undefined && returnedChanges !== undefined) {
         returnedChanges[assignment.column] = executionValues;
@@ -20074,7 +20241,9 @@ export class MinnowDatabase {
 
   async #findTable(name: string): Promise<TableRecord> {
     validateName(name, "Table");
-    const table = await this.store.getTableByName(name);
+    const table =
+      (await this.store.getTableByName(name)) ??
+      (await this.store.getTableByName(await this.#foldTableName(name)));
     if (table === undefined) throw new UnknownTableError(name);
     // Reads resolve a view into its query before reaching here, so a view arriving at this
     // point is a write, a DDL statement, or a path that forgot to rewrite: all of them errors.
@@ -21055,9 +21224,45 @@ function storedSqlValueFromExecution(
   column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
   value: BatchValue,
 ): BatchValue {
-  return column?.type === "string" && column.sqlDomain === undefined && typeof value === "string"
-    ? (externalSqlTextValue(value) as BatchValue)
-    : value;
+  if (column?.type === "string" && column.sqlDomain === undefined && typeof value === "string") {
+    return externalSqlTextValue(value) as BatchValue;
+  }
+  return coerceSqlWriteValue(column, value);
+}
+
+/**
+ * A SQL statement's untyped string constant or parameter reaching a datetime, number, or
+ * boolean column is read in the column's type — `SET at = '2026-04-01'`, `VALUES (1, '7')`,
+ * a string bound to `$1` — as PostgreSQL types an unknown-typed literal by its target. Text that
+ * does not parse is left for validation to refuse. Domain columns (DATE, NUMERIC, …) already
+ * normalize their text through the domain, and the typed programmatic API never passes here.
+ */
+function coerceSqlWriteValue(
+  column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
+  value: BatchValue,
+): BatchValue {
+  if (
+    column === undefined ||
+    column.sqlDomain !== undefined ||
+    column.type === "string" ||
+    typeof value !== "string" ||
+    isSqlDomainValue(value)
+  ) {
+    return value;
+  }
+  return readUntypedText(column.type, value) as BatchValue;
+}
+
+/** Applies `coerceSqlWriteValue` to every typed column of a SQL INSERT batch, in place. */
+function coerceSqlWriteBatch(table: TableRecord, input: ColumnarBatch): void {
+  for (const column of table.columns) {
+    if (column.type === "string" || column.sqlDomain !== undefined) continue;
+    const values = input.columns[column.name];
+    if (!values?.some((value) => typeof value === "string")) continue;
+    (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
+      coerceSqlWriteValue(column, value),
+    );
+  }
 }
 
 /** Protects a physical plain-TEXT value before a schema-less result externalizer sees it. */
@@ -21703,6 +21908,46 @@ function compositeKeyValue(
     .join("");
 }
 
+/**
+ * Folds a statement's column names the way PostgreSQL folds unquoted identifiers: a name with
+ * no exact column keeps the unique case-insensitive match. Names with an exact column, and
+ * names with no match at all, are returned as written for the caller's own error.
+ */
+function foldColumnName(table: TableRecord, name: string): string {
+  const columns = visibleTableColumns(table);
+  if (columns.some((column) => column.name === name)) return name;
+  const lowered = name.toLowerCase();
+  const matches = columns.filter((column) => column.name.toLowerCase() === lowered);
+  return matches.length === 1 ? (matches[0]?.name ?? name) : name;
+}
+
+function foldInsertColumns<T extends { columns: readonly string[] }>(
+  table: TableRecord,
+  statement: T,
+): T {
+  const columns = statement.columns.map((name) => foldColumnName(table, name));
+  return columns.some((name, index) => name !== statement.columns[index])
+    ? { ...statement, columns }
+    : statement;
+}
+
+function foldAssignmentColumns<T extends { column: string }>(
+  table: TableRecord,
+  assignments: readonly T[],
+): readonly T[] {
+  const folded = assignments.map((assignment) => {
+    const column = foldColumnName(table, assignment.column);
+    return column === assignment.column ? assignment : { ...assignment, column };
+  });
+  return folded.some((assignment, index) => assignment !== assignments[index])
+    ? folded
+    : assignments;
+}
+
+function quoteIdentifier(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
 /** Canonicalizes logical PostgreSQL domains before validation and primitive block encoding. */
 function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
@@ -21838,19 +22083,8 @@ function normalizePlanDomainLiterals(
   // structured clone.
   const pass = { probing: true, needed: false };
   const coerceText = (type: SimpleDataType, text: string): QueryValue | undefined => {
-    if (type === "datetime") return parseSqlTimestampText(text);
-    if (type === "number") {
-      const trimmed = text.trim();
-      if (trimmed === "") return undefined;
-      const parsed = Number(trimmed);
-      return Number.isFinite(parsed) ? parsed : undefined;
-    }
-    if (type === "boolean") {
-      const lowered = text.trim().toLowerCase();
-      if (lowered === "t" || lowered === "true" || lowered === "1") return true;
-      if (lowered === "f" || lowered === "false" || lowered === "0") return false;
-    }
-    return undefined;
+    const read = readUntypedText(type, text);
+    return read === text ? undefined : (read as QueryValue);
   };
   const rewriteBlock = (block: CompiledQuery): void => {
     if (pass.probing && pass.needed) return;

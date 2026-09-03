@@ -62,8 +62,8 @@ describe("the shipped matrix", () => {
     const index = buildFailureIndex(matrix.features);
     for (const message of [
       "UPDATE requires a table with a unique key",
-      // BEGIN is a statement now; the isolation level is what a user still cannot ask for.
-      "Expected SELECT, found SET",
+      // SET is a statement now; SERIALIZABLE is what a user still cannot ask for.
+      "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
       "Expected SELECT, found GRANT",
     ]) {
       expect(lookupFailure(index, message)?.notes).toBeDefined();

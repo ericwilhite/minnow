@@ -217,6 +217,69 @@ function rowValues(row: ReturnType<typeof freshRow>, rng: () => number): string 
 }
 
 const stepTemplates: StepTemplate[] = [
+  // UPDATE … FROM reads a derived source (SQLite 3.33+ has the same form); DELETE … USING is
+  // PostgreSQL-only, so SQLite runs the equivalent IN (subquery) delete.
+  (state) => {
+    const existing = 1 + Math.floor(state.rng() * Math.max(1, state.nextId - 1));
+    const bump = Math.floor(state.rng() * 40) / 4;
+    return {
+      kind: "sql",
+      sql:
+        `UPDATE items SET amount = s.amount + ${String(bump)}, label = s.label || '!' ` +
+        `FROM (SELECT id, amount, label FROM items WHERE id <= ${String(existing)}) s WHERE s.id = items.id`,
+    };
+  },
+  (state) => {
+    const existing = 1 + Math.floor(state.rng() * Math.max(1, state.nextId - 1));
+    return {
+      kind: "pair",
+      minnow: {
+        sql: `DELETE FROM items USING (SELECT id FROM items WHERE id = ${String(existing)}) gone WHERE gone.id = items.id`,
+      },
+      sqlite: [
+        {
+          sql: `DELETE FROM items WHERE id IN (SELECT id FROM items WHERE id = ${String(existing)})`,
+        },
+      ],
+    };
+  },
+  // Untyped string constants and parameters land in typed columns in the column's type, as
+  // PostgreSQL reads an unknown-typed literal by its target: a numeric spelling for a number
+  // column, and a string bound to a placeholder the same way.
+  (state) => {
+    const row = freshRow(state);
+    const region = row.region === null ? "NULL" : `'${row.region}'`;
+    return {
+      kind: "sql",
+      sql: `INSERT INTO items (id, region, amount, active, label) VALUES ('${String(row.id)}', ${region}, '${String(row.amount)}', TRUE, '${row.label}')`,
+    };
+  },
+  (state) => {
+    const row = freshRow(state);
+    return {
+      kind: "sql",
+      sql: `INSERT INTO items (id, region, amount, active, label) VALUES (?, ?, ?, FALSE, ?)`,
+      params: [row.id, row.region, String(row.amount), row.label],
+    };
+  },
+  (state) => {
+    const existing = 1 + Math.floor(state.rng() * Math.max(1, state.nextId - 1));
+    const amount = Math.floor(state.rng() * 400) / 4;
+    return {
+      kind: "sql",
+      sql: `UPDATE items SET amount = '${String(amount)}' WHERE id = ${String(existing)}`,
+    };
+  },
+  (state) => {
+    const existing = 1 + Math.floor(state.rng() * Math.max(1, state.nextId - 1));
+    const collide = { ...freshRow(state), id: existing };
+    return {
+      kind: "sql",
+      sql:
+        `INSERT INTO items (id, region, amount, active, label) VALUES ${rowValues(collide, state.rng)} ` +
+        `ON CONFLICT (id) DO UPDATE SET amount = '${String(collide.amount)}', label = EXCLUDED.label`,
+    };
+  },
   // Plain multi-row insert with fresh keys.
   (state) => {
     const count = 1 + Math.floor(state.rng() * 3);

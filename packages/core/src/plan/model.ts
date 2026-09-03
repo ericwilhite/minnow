@@ -65,6 +65,7 @@ export type ScalarFunctionName =
   | "JSON_EXISTS"
   | "JSON_OBJECT"
   | "JSON_ARRAY"
+  | "TO_JSON"
   | "IS_JSON"
   | "ARRAY"
   /** Parser-produced `->` JSON member/element access returning a JSON value. */
@@ -95,6 +96,14 @@ export type ScalarFunctionName =
   | "CHR"
   | "BTRIM"
   | "MD5"
+  | "REGEXP_SUBSTR"
+  | "NUM_NONNULLS"
+  | "NUM_NULLS"
+  | "GCD"
+  | "LCM"
+  | "TO_HEX"
+  | "QUOTE_LITERAL"
+  | "QUOTE_IDENT"
   | "FORMAT"
   | "REGEXP_REPLACE"
   | "MINNOW_REGEX_MATCH"
@@ -148,13 +157,30 @@ export type Expression =
        * PostgreSQL types every decimal constant NUMERIC before evaluating it.
        */
       exactText?: string;
+      /**
+       * Written with a decimal point or exponent, or folded from such a constant: PostgreSQL
+       * types it NUMERIC, so it is never an integer operand even when its value is whole
+       * (`7 / 2.0` is 3.5 where `7 / 2` is 3).
+       */
+      decimal?: true;
     }
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }
   | { kind: "column"; reference: string }
   /** `*`, or `alias.*` when `table` is set. */
   | { kind: "wildcard"; table?: string }
-  | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
+  | {
+      kind: "binary";
+      operator: BinaryOperator;
+      left: Expression;
+      right: Expression;
+      /**
+       * Integer division: both operands are integer-typed, so `/` truncates toward zero as
+       * PostgreSQL's integer `/` does. Set by the compiler for constants and by catalog
+       * binding for columns; absent, `/` is ordinary Float64 or exact-NUMERIC division.
+       */
+      integer?: true;
+    }
   | {
       kind: "call";
       name: AggregateName | ScalarFunctionName;

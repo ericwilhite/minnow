@@ -65,6 +65,18 @@ export function classifyStatement(sql: string): StatementIntent {
         ],
         confirmLabel: "Create type",
       });
+    case "set":
+      return executeIntent(statement.kind, {
+        title: `${statement.action === "set" ? "Set" : "Reset"} ${statement.name}`,
+        facts: [["setting", statement.name]],
+        confirmLabel: statement.action === "set" ? "Set" : "Reset",
+      });
+    case "show":
+      return executeIntent(statement.kind, {
+        title: `Show ${statement.name}`,
+        facts: [["setting", statement.name]],
+        confirmLabel: "Show",
+      });
     case "create-sequence":
       return executeIntent(statement.kind, {
         title: `Create sequence ${statement.name}`,

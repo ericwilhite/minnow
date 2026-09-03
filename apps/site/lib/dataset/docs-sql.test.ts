@@ -173,12 +173,22 @@ const documentedSqlCases: DocumentedSqlCase[] = [
     file: "sql/dml.mdx",
     block: 8,
     setup: [
+      "CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, last_order_at TIMESTAMP)",
+      "CREATE TABLE orders (order_id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, placed_at TIMESTAMP NOT NULL)",
+      "INSERT INTO customers VALUES (1, NULL), (2, NULL)",
+      "INSERT INTO orders VALUES (10, 1, CAST('2026-01-06T00:00:00Z' AS TIMESTAMP)), (11, 1, CAST('2026-02-06T00:00:00Z' AS TIMESTAMP))",
+    ],
+  },
+  {
+    file: "sql/dml.mdx",
+    block: 9,
+    setup: [
       "CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT, city TEXT, signed_up_on DATE)",
       "INSERT INTO customers VALUES (1, 'Old', 'Dallas', DATE '2025-01-01')",
     ],
     params: [[1, "Ada", "Austin", "2026-01-01"]],
   },
-  ...[9, 11].map<DocumentedSqlCase>((block) => ({
+  ...[10, 12].map<DocumentedSqlCase>((block) => ({
     file: "sql/dml.mdx",
     block,
     setup: [
@@ -189,7 +199,7 @@ const documentedSqlCases: DocumentedSqlCase[] = [
   })),
   {
     file: "sql/dml.mdx",
-    block: 10,
+    block: 11,
     setup: [
       "CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT, city TEXT, signed_up_on DATE)",
       "INSERT INTO customers VALUES (1, 'Old', 'Dallas', DATE '2025-01-01')",
@@ -198,7 +208,7 @@ const documentedSqlCases: DocumentedSqlCase[] = [
   },
   {
     file: "sql/dml.mdx",
-    block: 12,
+    block: 13,
     setup: [
       "CREATE TABLE products (product_id INTEGER PRIMARY KEY, name TEXT, list_price DOUBLE PRECISION)",
       "INSERT INTO products VALUES (1, 'Kettle', 20)",
@@ -207,7 +217,7 @@ const documentedSqlCases: DocumentedSqlCase[] = [
   },
   {
     file: "sql/dml.mdx",
-    block: 13,
+    block: 14,
     setup: [
       "CREATE TABLE orders (order_id INTEGER PRIMARY KEY, status TEXT)",
       "CREATE TABLE audit (order_id INTEGER, old_status TEXT, new_status TEXT, at TIMESTAMP)",
@@ -215,7 +225,7 @@ const documentedSqlCases: DocumentedSqlCase[] = [
   },
   {
     file: "sql/dml.mdx",
-    block: 14,
+    block: 15,
     setup: [
       "CREATE TABLE stock (sku TEXT PRIMARY KEY, on_hand INTEGER)",
       "CREATE TABLE shipments (sku TEXT, qty INTEGER, at TIMESTAMP)",
@@ -225,7 +235,7 @@ const documentedSqlCases: DocumentedSqlCase[] = [
   },
   {
     file: "sql/dml.mdx",
-    block: 15,
+    block: 16,
     setup: [
       "CREATE TABLE stock (sku TEXT PRIMARY KEY, on_hand INTEGER)",
       "CREATE TABLE delivery (sku TEXT, qty INTEGER)",
@@ -296,10 +306,10 @@ describe("the other SQL guides' examples", () => {
     const blocksByFile = new Map(
       files.map((file) => [file, sqlBlocks(`${docsRoot}/${file}`)] as const),
     );
-    expect([...blocksByFile.values()].reduce((count, blocks) => count + blocks.length, 0)).toBe(37);
+    expect([...blocksByFile.values()].reduce((count, blocks) => count + blocks.length, 0)).toBe(38);
     expect(
       new Set(documentedSqlCases.map(({ file, block }) => `${file}#${String(block)}`)).size,
-    ).toBe(37);
+    ).toBe(38);
 
     const failures: string[] = [];
     for (const testCase of documentedSqlCases) {

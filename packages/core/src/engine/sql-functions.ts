@@ -700,6 +700,13 @@ function ageInterval(later: Date, earlier: Date): string | null {
 
 // --- The registry --------------------------------------------------------------------------
 
+function integerArgument(name: string, value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new TypeError(`${name} requires integers`);
+  }
+  return value;
+}
+
 function nullish(value: unknown): value is null | undefined {
   return value === null || value === undefined;
 }
@@ -966,6 +973,131 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
           text("REGEXP_REPLACE", values[0]).replace(expression, replacement),
           "REGEXP_REPLACE",
         );
+      },
+    },
+  ],
+  [
+    // substring(text FROM 'pattern') and substring(text, 'pattern'): the first match of a POSIX
+    // regular expression, or its first parenthesized group when the pattern has one.
+    "REGEXP_SUBSTR",
+    {
+      minArgs: 2,
+      maxArgs: 3,
+      returns: "string",
+      evaluate: (values) => {
+        const expression = compileRegexPattern(
+          text("SUBSTRING", values[1]),
+          regexFlags("SUBSTRING", values[2]),
+        );
+        const match = expression.exec(text("SUBSTRING", values[0]));
+        if (match === null) return null;
+        const group = match.length > 1 ? match[1] : match[0];
+        return group === undefined ? null : bounded(group, "SUBSTRING");
+      },
+    },
+  ],
+  [
+    "NUM_NONNULLS",
+    {
+      minArgs: 1,
+      maxArgs: Number.POSITIVE_INFINITY,
+      returns: "number",
+      nullOnNull: false,
+      evaluate: (values) => values.filter((value) => !nullish(value)).length,
+    },
+  ],
+  [
+    "NUM_NULLS",
+    {
+      minArgs: 1,
+      maxArgs: Number.POSITIVE_INFINITY,
+      returns: "number",
+      nullOnNull: false,
+      evaluate: (values) => values.filter((value) => nullish(value)).length,
+    },
+  ],
+  [
+    "GCD",
+    {
+      minArgs: 2,
+      maxArgs: 2,
+      returns: "number",
+      evaluate: (values) => {
+        let a = Math.abs(integerArgument("GCD", values[0]));
+        let b = Math.abs(integerArgument("GCD", values[1]));
+        while (b !== 0) [a, b] = [b, a % b];
+        return a;
+      },
+    },
+  ],
+  [
+    "LCM",
+    {
+      minArgs: 2,
+      maxArgs: 2,
+      returns: "number",
+      evaluate: (values) => {
+        const a = Math.abs(integerArgument("LCM", values[0]));
+        const b = Math.abs(integerArgument("LCM", values[1]));
+        if (a === 0 || b === 0) return 0;
+        let x = a;
+        let y = b;
+        while (y !== 0) [x, y] = [y, x % y];
+        const result = (a / x) * b;
+        if (!Number.isSafeInteger(result)) throw new RangeError("LCM result is out of range");
+        return result;
+      },
+    },
+  ],
+  [
+    "TO_HEX",
+    {
+      minArgs: 1,
+      maxArgs: 1,
+      returns: "string",
+      evaluate: (values) => {
+        const value = values[0];
+        if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+          throw new TypeError("TO_HEX requires an integer");
+        }
+        // PostgreSQL renders a negative integer as its two's-complement bigint hex.
+        return (value < 0 ? BigInt.asUintN(64, BigInt(value)) : BigInt(value)).toString(16);
+      },
+    },
+  ],
+  [
+    "QUOTE_LITERAL",
+    {
+      minArgs: 1,
+      maxArgs: 1,
+      returns: "string",
+      evaluate: (values) => {
+        const value = values[0];
+        const rendered =
+          typeof value === "string"
+            ? value
+            : typeof value === "number"
+              ? String(value)
+              : String(value);
+        const escaped = rendered.replace(/'/g, "''");
+        return bounded(
+          escaped.includes("\\") ? `E'${escaped.replace(/\\/g, "\\\\")}'` : `'${escaped}'`,
+          "QUOTE_LITERAL",
+        );
+      },
+    },
+  ],
+  [
+    "QUOTE_IDENT",
+    {
+      minArgs: 1,
+      maxArgs: 1,
+      returns: "string",
+      evaluate: (values) => {
+        const name = text("QUOTE_IDENT", values[0]);
+        return /^[a-z_][a-z0-9_]*$/.test(name)
+          ? name
+          : bounded(`"${name.replace(/"/g, '""')}"`, "QUOTE_IDENT");
       },
     },
   ],

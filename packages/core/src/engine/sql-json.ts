@@ -219,6 +219,11 @@ function boundedJsonDocument(value: unknown, caller: string): string {
   return document;
 }
 
+/** to_json(x) / to_jsonb(x): one SQL value as a JSON document (a JSON-domain value as itself). */
+export function jsonDocumentOf(value: unknown): string {
+  return boundedJsonValue(value ?? null, "TO_JSON value");
+}
+
 function boundedJsonValue(value: unknown, label: string): string {
   const domainDocument = jsonDomainDocument(value);
   if (domainDocument !== undefined) {

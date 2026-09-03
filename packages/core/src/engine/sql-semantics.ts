@@ -48,14 +48,30 @@ export function parseSqlTimestampText(text: string): Date | undefined {
  * comparable-types error below, so a genuine mismatch still fails.
  */
 export function coercedComparable(text: string, other: unknown): unknown {
-  if (other instanceof Date || isDateDomainValue(other)) return parseSqlTimestampText(text) ?? text;
-  if (typeof other === "number") {
+  if (other instanceof Date || isDateDomainValue(other)) return readUntypedText("datetime", text);
+  if (typeof other === "number") return readUntypedText("number", text);
+  if (typeof other === "boolean") return readUntypedText("boolean", text);
+  return text;
+}
+
+/**
+ * Reads an untyped string constant in a primitive column type, the way PostgreSQL types an
+ * unknown-typed literal by its context: a timestamp spelling for datetime, a finite number for
+ * number, `t`/`true`/`1` and `f`/`false`/`0` for boolean. Text that does not parse is returned
+ * unchanged, so the caller's own type check still reports the mismatch.
+ */
+export function readUntypedText(
+  type: "datetime" | "number" | "boolean" | "string",
+  text: string,
+): unknown {
+  if (type === "datetime") return parseSqlTimestampText(text) ?? text;
+  if (type === "number") {
     const trimmed = text.trim();
     if (trimmed === "") return text;
     const parsed = Number(trimmed);
     return Number.isFinite(parsed) ? parsed : text;
   }
-  if (typeof other === "boolean") {
+  if (type === "boolean") {
     const lowered = text.trim().toLowerCase();
     if (lowered === "t" || lowered === "true" || lowered === "1") return true;
     if (lowered === "f" || lowered === "false" || lowered === "0") return false;

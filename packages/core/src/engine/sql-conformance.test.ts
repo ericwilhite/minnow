@@ -17,7 +17,7 @@
  *    the mutation harness, or named in `matrixSkips` with the reason an oracle cannot judge it.
  *
  * Forms where the engines' documented semantics differ are skipped per oracle rather than
- * dropped: `/` (SQLite divides integers as integers), ROUND (half-away-from-zero vs half-even),
+ * dropped: ROUND (half-away-from-zero vs half-even),
  * LIKE case-insensitivity (disabled via PRAGMA case_sensitive_like), and Minnow extensions
  * (MATCH/BM25). Both PostgreSQL sessions run in UTC, since Minnow reads every datetime as an
  * instant in UTC and a zone difference would be a difference in the question.
@@ -31,8 +31,11 @@ import { mulberry32, seedsFor } from "../testing/seeds.js";
 import { positionalToNumbered } from "../testing/oracle.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import {
+  annotatePlanIntegerDivision,
   bindPlanParameters,
   compileQuery,
+  extendGroupByWithKeyDependents,
+  foldIdentifierCase,
   executeRowQuery,
   transparentProjectionSource,
   type QueryResult,
@@ -94,7 +97,8 @@ async function minnowFixture(fixture: readonly FixtureRow[]): Promise<MinnowData
     name: "data",
     uniqueKey: "id",
     columns: [
-      { name: "id", type: "number" },
+      // INTEGER, as both oracles declare it: `id / 2` is integer division on all three.
+      { name: "id", type: "number", integer: true },
       { name: "region", type: "string", nullable: true },
       { name: "amount", type: "number" },
       { name: "active", type: "boolean" },
@@ -115,6 +119,27 @@ async function minnowFixture(fixture: readonly FixtureRow[]): Promise<MinnowData
   return database;
 }
 
+/**
+ * The row executor has no catalog, so it receives what catalog binding would have added: the
+ * integer-division marks that `data.id` (an INTEGER on every engine) implies.
+ */
+function catalogBoundPlan(sql: string, params: QueryValue[] | undefined, optimize = true) {
+  let plan = compileQuery(sql, optimize ? {} : { optimize: false });
+  plan = foldIdentifierCase(plan, catalogColumnNames);
+  annotatePlanIntegerDivision(plan, (table) => (table === "data" ? new Set(["id"]) : undefined));
+  plan = extendGroupByWithKeyDependents(
+    plan,
+    (table) => (table === "data" ? ["id"] : undefined),
+    (table) => catalogColumnNames.get(table),
+  );
+  return bindPlanParameters(plan, params);
+}
+
+const catalogColumnNames = new Map<string, readonly string[]>([
+  ["data", ["id", "region", "amount", "active", "joined", "label"]],
+  ["dims", ["region", "label", "rank"]],
+]);
+
 function rowTablesFor(fixture: readonly FixtureRow[]): Map<string, DatabaseRow[]> {
   return new Map<string, DatabaseRow[]>([
     ["data", fixture as unknown as DatabaseRow[]],
@@ -126,7 +151,7 @@ function sqliteFixture(fixture: readonly FixtureRow[]): DatabaseSync {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA case_sensitive_like = ON");
   database.exec(
-    `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+    `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
   );
   database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
   const insert = database.prepare(`INSERT INTO data VALUES (?, ?, ?, ?, ?, ?)`);
@@ -1135,6 +1160,30 @@ function coercionCases(): Case[] {
       ordered: true,
       skip: ["sqlite"],
     },
+    // The untyped-constant reading also applies beside a datetime that is not a column: an
+    // aggregate, a scalar subquery, the statement clock, or a COALESCE fallback.
+    {
+      sql: `SELECT region, COUNT(*) AS n FROM data GROUP BY region HAVING MAX(joined) > '2026-01-01' ORDER BY region NULLS LAST`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE joined IS NOT NULL AND (SELECT MAX(joined) FROM data) > '2026-01-01' ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, MAX(joined) > '2026-01-01' AS recent FROM data GROUP BY id ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    {
+      sql: `SELECT id, CURRENT_DATE >= '2020-01-01' AS later FROM data ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE COALESCE(joined, '2000-01-01') < '2026-01-01' ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
     { sql: `SELECT id FROM data WHERE amount = '10' ORDER BY id`, ordered: true },
     { sql: `SELECT id FROM data WHERE amount > '90.5' ORDER BY id`, ordered: true },
     { sql: `SELECT id FROM data WHERE id IN ('1', '2', '3') ORDER BY id`, ordered: true },
@@ -1156,6 +1205,11 @@ function coercionCases(): Case[] {
 /** The table-driven PostgreSQL functions and operators, diffed against PGlite (SQLite lacks them). */
 function functionCases(): Case[] {
   const cases: Case[] = [
+    {
+      // date(x) is the DATE cast spelled as a function; POW is POWER's other spelling.
+      sql: `SELECT id, CAST(DATE(joined) AS TEXT) AS day, POW(2, id) AS doubled, POWER(id, 2) AS squared FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ordered: true,
+    },
     {
       sql: `SELECT id, CONCAT(region, '-', label, '-', amount) AS tag, CONCAT_WS('/', region, label) AS joined, LEFT(label, 2) AS l2, RIGHT(label, -2) AS rn2, REVERSE(label) AS rev, INITCAP(label || ' ' || label) AS cap, SPLIT_PART(label, 'l', 1) AS part, STRPOS(label, 'l') AS at, STARTS_WITH(label, 'a') AS starts, TRANSLATE(label, 'ao', 'AO') AS tr, ASCII(label) AS code, BTRIM(label, 'a') AS trimmed FROM data ORDER BY id`,
       ordered: true,
@@ -1217,6 +1271,94 @@ function functionCases(): Case[] {
  * can have. Every one was a rejection the upstream SQLLogicTest random corpus found, so the
  * crossings keep the fix from being narrower than the corpus.
  */
+/**
+ * Name resolution PostgreSQL performs from the catalog: unquoted identifiers fold to the unique
+ * case-insensitive match when no exact name exists (output names keep the catalog spelling),
+ * and a primary key in GROUP BY lets the row's other columns appear ungrouped.
+ */
+/**
+ * PostgreSQL's JSON spellings — json_agg, json_build_object, to_json, row_to_json — and a table
+ * alias used as a value, which is the row as a JSON object. These are the shapes Kysely's
+ * jsonArrayFrom/jsonObjectFrom and Drizzle's relational queries emit. SQLite has none of them.
+ */
+function jsonSpellingCases(): Case[] {
+  const pg = (sql: string): Case => ({ sql, ordered: true, skip: ["sqlite"] });
+  return [
+    pg(
+      `SELECT region, JSON_AGG(amount ORDER BY amount) AS amounts, JSONB_AGG(label ORDER BY id) AS labels FROM data GROUP BY region ORDER BY region NULLS LAST`,
+    ),
+    pg(
+      `SELECT id, JSON_BUILD_OBJECT('id', id, 'region', region, 'active', active) AS doc, JSONB_BUILD_OBJECT('amount', amount) AS amount_doc FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, TO_JSON(amount) AS amount_doc, TO_JSONB(region) AS region_doc, TO_JSON(active) AS active_doc FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT r.id, ROW_TO_JSON(r) AS row_doc FROM (SELECT id, region, amount FROM data) r ORDER BY r.id`,
+    ),
+    {
+      sql: `SELECT JSON_AGG(r ORDER BY r.id) AS rows_doc FROM (SELECT id, amount FROM data WHERE id <= 3) r`,
+      ordered: false,
+      skip: ["sqlite"],
+    },
+    pg(
+      `SELECT d.region, (SELECT COALESCE(JSON_AGG(agg), '[]') FROM (SELECT m.label, m.rank FROM dims m WHERE m.region = d.region ORDER BY m.rank) agg) AS dims FROM data d WHERE d.id <= 5 ORDER BY d.id`,
+    ),
+    pg(
+      `SELECT d.id, (SELECT TO_JSON(obj) FROM (SELECT m.label, m.rank FROM dims m WHERE m.region = d.region ORDER BY m.rank LIMIT 1) obj) AS dim FROM data d WHERE d.id <= 5 ORDER BY d.id`,
+    ),
+    pg(
+      `SELECT region, JSON_AGG(JSON_BUILD_OBJECT('id', id, 'amount', amount) ORDER BY id) AS items FROM data WHERE id <= 6 GROUP BY region ORDER BY region NULLS LAST`,
+    ),
+  ];
+}
+
+/** DISTINCT ON: the first row per key in ORDER BY order. SQLite has no such form. */
+function distinctOnCases(): Case[] {
+  const pg = (sql: string, ordered = true): Case => ({ sql, ordered, skip: ["sqlite"] });
+  return [
+    pg(
+      `SELECT DISTINCT ON (region) region, id, amount FROM data ORDER BY region NULLS LAST, amount DESC, id`,
+    ),
+    pg(
+      `SELECT DISTINCT ON (region, active) region, active, id FROM data ORDER BY region NULLS LAST, active, id`,
+    ),
+    pg(
+      `SELECT DISTINCT ON (region) id, amount * 2 AS doubled FROM data ORDER BY region NULLS LAST, doubled DESC, id`,
+    ),
+    pg(
+      `SELECT DISTINCT ON (d.region) d.region, d.id FROM data d WHERE d.amount > 20 ORDER BY d.region NULLS LAST, d.joined DESC NULLS LAST, d.id LIMIT 3`,
+    ),
+    pg(
+      `SELECT DISTINCT ON (region) region, COUNT(*) AS n FROM data GROUP BY region, active ORDER BY region NULLS LAST, n DESC, active`,
+    ),
+    pg(`SELECT DISTINCT ON (region) region FROM data ORDER BY region NULLS LAST`),
+  ];
+}
+
+function resolutionCases(): Case[] {
+  return [
+    { sql: `SELECT ID, Region, AMOUNT FROM DATA WHERE Id < 4 ORDER BY id`, ordered: true },
+    { sql: `SELECT D.id, d.LABEL FROM Data AS D ORDER BY D.ID`, ordered: true },
+    {
+      sql: `SELECT d.Region, COUNT(*) AS n FROM DATA d GROUP BY D.region ORDER BY d.REGION NULLS LAST`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id, region, label, COUNT(*) AS n FROM data GROUP BY id ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.id, d.region, dm.label AS dim, SUM(d.amount) AS total FROM data d LEFT JOIN dims dm ON dm.region = d.region GROUP BY d.id, dm.label ORDER BY d.id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.id, d.amount FROM data d GROUP BY d.id HAVING d.amount > 50 ORDER BY d.amount DESC, d.id`,
+      ordered: true,
+    },
+  ];
+}
+
 function spellingCases(): Case[] {
   const cases: Case[] = [];
   // SELECT [ALL | DISTINCT] × a label with AS, without AS, quoted either way, and a label after
@@ -1347,7 +1489,83 @@ function buildCorpus(seed: number): Case[] {
     for (const template of templates) corpus.push(template(rng));
   }
   corpus.push(...combinationCases());
+  corpus.push(...divisionCases());
+  corpus.push(...resolutionCases());
+  corpus.push(...jsonSpellingCases());
+  corpus.push(...distinctOnCases());
   return corpus;
+}
+
+/**
+ * Division follows PostgreSQL's typing: `/` over two integers truncates toward zero, and a
+ * float or NUMERIC operand makes it fractional. `id` is INTEGER on every engine, `amount` is a
+ * double, and constants type by their spelling, so every operand pairing is diffed here: column
+ * and constant, integer aggregate and count, CAST, CASE and COALESCE, a scalar subquery, a
+ * derived table and CTE output, a bound parameter, and the WHERE and ORDER BY positions where
+ * a truncated quotient selects different rows.
+ */
+function divisionCases(): Case[] {
+  const ordered = (sql: string, params?: QueryValue[]): Case => ({
+    sql,
+    ordered: true,
+    ...(params === undefined ? {} : { params }),
+  });
+  return [
+    ordered(
+      `SELECT 7 / 2 AS q, -7 / 2 AS nq, 7 / -2 AS qn, 1 / 3 AS third, 10 / 4 * 4 AS back, 7 / 2 * 1.5 AS mixed FROM data WHERE id = 1 ORDER BY id`,
+    ),
+    ordered(
+      `SELECT id, id / 2 AS half, id / 3 AS third, -id / 2 AS neg, id / 2.0 AS exact, id / 4 * 4 AS floored FROM data ORDER BY id`,
+    ),
+    ordered(
+      `SELECT id, amount / 2 AS half, amount / id AS ratio, id / amount AS inverse FROM data WHERE amount <> 0 ORDER BY id`,
+    ),
+    {
+      // PostgreSQL rounds a float-to-integer cast and so does Minnow; SQLite truncates.
+      sql: `SELECT id, CAST(amount AS INTEGER) / 2 AS half, CAST(id AS DOUBLE PRECISION) / 2 AS exact FROM data ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    ordered(`SELECT id FROM data WHERE id / 2 = 1 ORDER BY id`),
+    ordered(`SELECT id FROM data WHERE id / 3 > 1 AND id / 2 * 2 = id ORDER BY id`),
+    ordered(`SELECT id, id / 2 AS bucket FROM data ORDER BY id / 2 DESC, id`),
+    ordered(
+      `SELECT id / 2 AS bucket, COUNT(*) AS n, SUM(id) / COUNT(*) AS mean, SUM(id) / 2 AS half, MIN(id) / 2 AS low, MAX(id) / 2 AS high FROM data GROUP BY id / 2 ORDER BY bucket`,
+    ),
+    ordered(
+      `SELECT COUNT(*) / 2 AS half_count, SUM(amount) / COUNT(*) AS mean_amount, AVG(id) / 2 AS half_mean FROM data ORDER BY 1`,
+    ),
+    ordered(
+      `SELECT id, CASE WHEN active THEN id ELSE 0 END / 2 AS half, COALESCE(NULLIF(id, 3), 0) / 2 AS coalesced, ABS(-id) / 2 AS absolute FROM data ORDER BY id`,
+    ),
+    ordered(
+      `SELECT id, (SELECT COUNT(*) FROM data) / 2 AS half_count, (SELECT SUM(id) FROM data) / 2 AS half_sum FROM data ORDER BY id`,
+    ),
+    ordered(`SELECT d.half FROM (SELECT id, id / 2 AS half FROM data) d ORDER BY d.half, d.id`),
+    ordered(`SELECT d.total / 2 AS half FROM (SELECT SUM(id) AS total FROM data) d ORDER BY 1`),
+    ordered(`SELECT d.id FROM (SELECT id, amount FROM data) d WHERE d.id / 2 = 2 ORDER BY d.id`),
+    ordered(
+      `WITH halves AS (SELECT id, id / 2 AS half FROM data) SELECT id, half FROM halves WHERE half > 1 ORDER BY id`,
+    ),
+    // PostgreSQL types a parameter beside an integer as an integer; node:sqlite binds every
+    // JavaScript number as REAL, so its `/` is fractional and only PGlite judges these two.
+    {
+      sql: `SELECT id / ? AS q FROM data ORDER BY id`,
+      params: [2],
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    {
+      sql: `SELECT id FROM data WHERE id / ? = ? ORDER BY id`,
+      params: [3, 1],
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    ordered(`SELECT id, id / 2 AS half FROM data UNION ALL SELECT 9, 9 / 2 ORDER BY id, half`),
+    ordered(
+      `SELECT id, id % 3 AS remainder, -id % 3 AS neg_remainder, id / 3 * 3 + id % 3 AS rebuilt FROM data ORDER BY id`,
+    ),
+  ];
 }
 
 // --- Seeds --------------------------------------------------------------------------------------
@@ -1385,7 +1603,33 @@ function normalize(value: unknown): unknown {
     if (Object.is(value, -0)) return 0;
     return Number(value.toFixed(9));
   }
+  // JSON documents: Minnow returns text, PGlite parses json/jsonb into values, jsonb reorders
+  // object keys (shorter first), and json keeps the producer's whitespace. All of those are one
+  // document, so an object, an array, or text that parses as one compares in canonical form.
+  if (typeof value === "object" && value !== null) return canonicalJson(value);
+  if (typeof value === "string" && (value.startsWith("{") || value.startsWith("["))) {
+    try {
+      return canonicalJson(JSON.parse(value) as unknown);
+    } catch {
+      return value;
+    }
+  }
   return value;
+}
+
+function canonicalJson(value: unknown): string {
+  const sorted = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(sorted);
+    if (node !== null && typeof node === "object") {
+      return Object.fromEntries(
+        Object.keys(node)
+          .sort()
+          .map((key) => [key, sorted((node as Record<string, unknown>)[key])]),
+      );
+    }
+    return typeof node === "number" ? Number(node.toFixed(9)) : node;
+  };
+  return `json:${JSON.stringify(sorted(value))}`;
 }
 
 function rowKey(row: Record<string, unknown>): string {
@@ -1406,12 +1650,21 @@ function numericDecodedRows(result: QueryResult): Array<Record<string, unknown>>
   const numericColumns = result.columns.filter(
     (_, index) => result.columnDomains[index]?.kind === "numeric",
   );
-  if (numericColumns.length === 0) return result.rows;
+  // JSON columns decode the same way: Minnow returns the document text, PGlite parses json and
+  // jsonb into values, so a scalar document (`TO_JSON(amount)` is `95`) compares by value.
+  const jsonColumns = result.columns.filter(
+    (_, index) => result.columnDomains[index]?.kind === "json",
+  );
+  if (numericColumns.length === 0 && jsonColumns.length === 0) return result.rows;
   return result.rows.map((row) => {
     const decoded: Record<string, unknown> = { ...row };
     for (const name of numericColumns) {
       const value = decoded[name];
       if (typeof value === "string") decoded[name] = Number(value);
+    }
+    for (const name of jsonColumns) {
+      const value = decoded[name];
+      if (typeof value === "string") decoded[name] = JSON.parse(value) as unknown;
     }
     return decoded;
   });
@@ -1491,7 +1744,7 @@ async function pgliteOracle(fixture: readonly FixtureRow[]): Promise<Oracle> {
   // two disagree by the offset — a difference in the question, not in the answer.
   await database.exec(`SET TIME ZONE 'UTC'`);
   await database.exec(
-    `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+    `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
   );
   await database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
   for (const row of fixture) {
@@ -1781,6 +2034,25 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ],
   // --- SQL/JSON --------------------------------------------------------------------------
   ["json.value", { oracles: ["sqlite"], reason: "SQLite spells it json_extract" }],
+  ["select.distinct-on", { oracles: ["sqlite"], reason: "SQLite has no DISTINCT ON" }],
+  ["select.locking-clause", { oracles: ["sqlite"], reason: "SQLite has no FOR UPDATE" }],
+  ["select.table-command", { oracles: ["sqlite"], reason: "SQLite has no TABLE command" }],
+  [
+    "literal.string-spellings",
+    { oracles: ["sqlite"], reason: "SQLite has no E'…' or dollar-quoted strings" },
+  ],
+  ["predicate.like-operators", { oracles: ["sqlite"], reason: "SQLite has no ~~ operators" }],
+  [
+    "function.regexp-substring",
+    { oracles: ["sqlite"], reason: "SQLite has no regex SUBSTRING, TO_HEX, or QUOTE_ functions" },
+  ],
+  ["json.agg-spellings", { oracles: ["sqlite"], reason: "SQLite spells it json_group_array" }],
+  ["json.build-object", { oracles: ["sqlite"], reason: "SQLite spells it json_object" }],
+  ["json.to-json", { oracles: ["sqlite"], reason: "SQLite spells it json_quote" }],
+  [
+    "json.row-reference",
+    { oracles: ["sqlite"], reason: "SQLite has no row-valued alias or json_agg" },
+  ],
   [
     "json.query",
     {
@@ -2035,7 +2307,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
               testCase.params === undefined ? {} : { params: testCase.params },
             );
             rowExecutor = executeRowQuery(
-              bindPlanParameters(compileQuery(testCase.sql), testCase.params),
+              catalogBoundPlan(testCase.sql, testCase.params),
               rowTables,
             );
           } catch (error) {
@@ -2068,7 +2340,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
           // real one -- see the assertions below, which pin both the count and the reason.
           try {
             const unoptimized = executeRowQuery(
-              bindPlanParameters(compileQuery(testCase.sql, { optimize: false }), testCase.params),
+              catalogBoundPlan(testCase.sql, testCase.params, false),
               rowTables,
             );
             unoptimizedCompared += 1;

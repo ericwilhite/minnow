@@ -1190,9 +1190,14 @@ describe("public SQL queries", () => {
     expect(() => compileQuery("SELECT value FROM rows HAVING value > 1")).toThrow(
       "HAVING requires GROUP BY or aggregate functions",
     );
+    // Whether a HAVING side is grouped is judged at execution, once a primary key in GROUP BY
+    // can make its row's other columns legal; the statement alone cannot tell.
     expect(() =>
-      compileQuery(
-        "SELECT category, COUNT(*) AS count FROM rows GROUP BY category HAVING value > 1",
+      executeRowQuery(
+        compileQuery(
+          "SELECT category, COUNT(*) AS count FROM rows GROUP BY category HAVING value > 1",
+        ),
+        new Map([["rows", []]]),
       ),
     ).toThrow("HAVING conditions must use aggregates, literals, or GROUP BY expressions");
   });

@@ -30,6 +30,7 @@ import {
   type TableSource,
   transparentProjectionSource,
   dateTruncValue,
+  integerQuotient,
 } from "./query.js";
 import { concatenatedSqlValue, isSqlDomainValue } from "./sql-domains.js";
 import { simpleScalarFunctions } from "./sql-functions.js";
@@ -3295,7 +3296,12 @@ function foldExpression(expression: Expression): Expression {
     const left = foldExpression(expression.left);
     const right = foldExpression(expression.right);
     if (left.kind === "literal" && right.kind === "literal") {
-      const folded = foldBinary(expression.operator, left.value, right.value);
+      const folded = foldBinary(
+        expression.operator,
+        left.value,
+        right.value,
+        expression.integer === true,
+      );
       if (folded !== undefined) {
         const domain =
           left.sqlDomain?.kind === "numeric" || right.sqlDomain?.kind === "numeric"
@@ -3306,6 +3312,7 @@ function foldExpression(expression: Expression): Expression {
           value: folded,
           ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
           ...(domain === undefined ? {} : { sqlDomain: domain }),
+          ...(left.decimal === true || right.decimal === true ? { decimal: true as const } : {}),
         };
       }
     }
@@ -3424,6 +3431,7 @@ function foldBinary(
   operator: BinaryOperator,
   leftValue: QueryValue,
   rightValue: QueryValue,
+  integer = false,
 ): QueryValue | undefined {
   if (leftValue === null || rightValue === null) return null;
   if (operator === "||") {
@@ -3443,6 +3451,9 @@ function foldBinary(
   const left = leftValue instanceof Date ? dateMilliseconds(leftValue) : leftValue;
   const right = rightValue instanceof Date ? dateMilliseconds(rightValue) : rightValue;
   if ((operator === "/" || operator === "%") && right === 0) return null;
+  if (operator === "/" && integer && typeof left === "number" && typeof right === "number") {
+    return integerQuotient(left, right);
+  }
   const result =
     operator === "+"
       ? left + right

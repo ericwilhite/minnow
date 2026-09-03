@@ -67,6 +67,7 @@ function describeExecuteResult(result: ExecuteResult): string {
       : `no column ${result.table}.${result.column}`;
   }
   if (result.kind === "transaction") return `${result.action} transaction`;
+  if (result.kind === "set") return `${result.action} ${result.name}`;
   const rows = result.rowCount === 1 ? "1 row" : `${String(result.rowCount)} rows`;
   return `${result.kind}: ${rows} in ${result.table}`;
 }

@@ -72,6 +72,7 @@ function expectedResultKind(sql: string): string {
   const kind = compileStatement(sql).kind;
   if (kind === "create-enum") return "create-type";
   if (kind === "create-table-as") return "create-table";
+  if (kind === "show") return "rows";
   return kind;
 }
 

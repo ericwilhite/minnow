@@ -35,6 +35,7 @@ import {
   scalarFunctionEvaluator,
   scalarFunctionValue,
   unknownColumnDomains,
+  integerQuotient,
 } from "./query.js";
 import { jsonConstructor } from "./sql-json.js";
 import {
@@ -63,6 +64,7 @@ import {
   compareSqlValues,
   compileSimilarPattern,
   defineSqlResultProperty,
+  readUntypedText,
 } from "./sql-semantics.js";
 import {
   concatenatedSqlValue,
@@ -72,6 +74,7 @@ import {
   isExactNumeric,
   preservedJsonDomainValue,
   protectedSqlTextValue,
+  isSqlDomainValue,
 } from "./sql-domains.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 
@@ -326,6 +329,8 @@ type BoundExpression =
       operator: "+" | "-" | "*" | "/";
       left: BoundExpression;
       right: BoundExpression;
+      /** PostgreSQL integer division: truncate toward zero. */
+      integer?: true;
       signature: string;
     }
   | {
@@ -1752,6 +1757,7 @@ function bindExpression(
       ...(expression.kind === "condition" && expression.escape !== undefined
         ? { escape: expression.escape }
         : {}),
+      ...(expression.kind === "binary" && expression.integer === true ? { integer: true } : {}),
       signature,
     } as BoundExpression;
   }
@@ -5968,6 +5974,7 @@ function evaluateFinalExpression(
       expression.operator,
       evaluateFinalExpression(plan, expression.left, group),
       evaluateFinalExpression(plan, expression.right, group),
+      expression.integer === true,
     );
   }
   if (expression.name === "COALESCE") {
@@ -6391,7 +6398,14 @@ function constantBoundExpressionValue(
     const right = constantBoundExpressionValue(expression.right);
     if (left === undefined || right === undefined) return undefined;
     try {
-      return { value: binaryValue(expression.operator, left.value, right.value) };
+      return {
+        value: binaryValue(
+          expression.operator,
+          left.value,
+          right.value,
+          expression.integer === true,
+        ),
+      };
     } catch {
       return undefined;
     }
@@ -6443,8 +6457,10 @@ function dictionaryNumericExpression(
       vector: column.vector,
       signature: expression.signature,
       evaluate: columnFirst
-        ? (dictionaryValue) => binaryValue(expression.operator, dictionaryValue, value)
-        : (dictionaryValue) => binaryValue(expression.operator, value, dictionaryValue),
+        ? (dictionaryValue) =>
+            binaryValue(expression.operator, dictionaryValue, value, expression.integer === true)
+        : (dictionaryValue) =>
+            binaryValue(expression.operator, value, dictionaryValue, expression.integer === true),
     };
   }
   return undefined;
@@ -6602,9 +6618,20 @@ function booleanTruth(
       );
       return operator === "IS DISTINCT FROM" ? distinct : !distinct;
     }
-    const left = evaluateValue(expression.left);
-    const right = evaluateValue(expression.right);
-    if (left === null || left === undefined || right === null || right === undefined) return null;
+    const evaluatedLeft = evaluateValue(expression.left);
+    const evaluatedRight = evaluateValue(expression.right);
+    if (
+      evaluatedLeft === null ||
+      evaluatedLeft === undefined ||
+      evaluatedRight === null ||
+      evaluatedRight === undefined
+    ) {
+      return null;
+    }
+    // An untyped string constant beside a datetime, number, or boolean value reads in that
+    // value's type — `now() > '2020-01-01'`, `MAX(joined) > '2026-03-01'` — before `comparable`
+    // turns a Date into milliseconds, which would leave the text with nothing to be read as.
+    const [left, right] = coerceComparisonOperands(evaluatedLeft, evaluatedRight);
     const a = comparable(left);
     const b = comparable(right);
     if (operator === "=") return compareValues(a, b) === 0;
@@ -6794,9 +6821,11 @@ function compiledBatchExpression(
     }
     case "binary": {
       const operator = expression.operator;
+      const integer = expression.integer === true;
       const left = compiledBatchExpression(plan, expression.left);
       const right = compiledBatchExpression(plan, expression.right);
-      compiled = (batch, row) => binaryValue(operator, left(batch, row), right(batch, row));
+      compiled = (batch, row) =>
+        binaryValue(operator, left(batch, row), right(batch, row), integer);
       break;
     }
     case "case": {
@@ -6941,6 +6970,7 @@ function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Arra
       expression.operator,
       evaluateExpression(expression.left, rowsBySource),
       evaluateExpression(expression.right, rowsBySource),
+      expression.integer === true,
     );
   }
   if (expression.name === "COALESCE") {
@@ -6962,16 +6992,25 @@ function binaryValue(
   operator: BinaryOperator,
   left: unknown,
   right: unknown,
+  integer = false,
 ): number | string | null {
   if (left === null || left === undefined || right === null || right === undefined) return null;
   if (typeof left === "number" && typeof right === "number") {
     if (operator === "+") return left + right;
     if (operator === "-") return left - right;
     if (operator === "*") return left * right;
-    if (operator === "/") return right === 0 ? null : left / right;
+    if (operator === "/")
+      return integer ? integerQuotient(left, right) : right === 0 ? null : left / right;
     if (operator === "%") return right === 0 ? null : left % right;
   }
   if (operator === "||") return concatenatedSqlValue(left, right);
+  // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`.
+  if (typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)) {
+    return binaryValue(operator, readUntypedText("number", left), right, integer);
+  }
+  if (typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)) {
+    return binaryValue(operator, left, readUntypedText("number", right), integer);
+  }
   const exact = exactNumericBinary(operator, left, right);
   if (exact !== undefined) return exact;
   const a = numeric(left);

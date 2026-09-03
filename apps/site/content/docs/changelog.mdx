@@ -8,6 +8,102 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.5 — September 3, 2026
+
+Published packages: `@minnowdb/core@0.7.5`.
+
+Stored formats are unchanged and no migration is needed, but a query that divides two integers
+now returns a different value; see the migration note below.
+
+### Changed
+
+- Integer division follows PostgreSQL. `/` over two integer operands — `INTEGER`, `BIGINT`, or
+  `SMALLINT` columns, integer constants, `COUNT`, an integer `CAST`, and integer arithmetic or
+  aggregates (`SUM`, `MIN`, `MAX`, `ABS`, `MOD`, `CASE`, `COALESCE`) over them — truncates toward
+  zero: `7 / 2` is `3`, `-7 / 2` is `-3`, `id / 2 = 1` selects ids 2 and 3, and
+  `SUM(qty) / COUNT(*)` is a whole number. A `DOUBLE PRECISION` or `NUMERIC` operand or a decimal
+  constant (`7 / 2.0`) keeps the fractional quotient, and a bound parameter takes the type of
+  its integer partner, as PostgreSQL infers it. The typing is carried through derived tables,
+  CTEs, scalar subqueries, `UPDATE … SET`, `RETURNING`, `INSERT … SELECT`, and
+  `CREATE TABLE AS`, and an integer quotient is itself an integer column when it lands in a
+  new table. Division by zero is still `NULL`. Previously every `/` divided as Float64, so
+  `7 / 2` was `3.5` — a result neither PostgreSQL nor SQLite gives — and the conformance harness
+  had skipped the operator; it now diffs nineteen division shapes against both oracles.
+
+### Fixed
+
+- An untyped string constant or bound parameter written into a datetime, number, or boolean
+  column by a SQL statement is now read in the column's type, as PostgreSQL types an unknown
+  literal by its target: `INSERT INTO t (at) VALUES ('2026-04-01T00:00:00Z')`,
+  `VALUES (1, '7')` into an `INTEGER`, `SET active = 'true'`, `ON CONFLICT DO UPDATE SET amount =
+'3.5'`, `INSERT … SELECT` with a literal, and a string bound to `$1`. Text that does not parse
+  is still refused with the column's type error. The typed programmatic API is unchanged.
+- PostgreSQL's internal type names (`int2`, `int4`, `int8`, `float4`, `float8`, `bool`) and
+  multi-word spellings (`character varying`, `timestamp with time zone`, `timestamp without time
+zone`, `time with time zone`) are accepted in `CREATE TABLE` and `CAST`, as pg_dump and
+  migration tools emit them. `TRUNCATE [TABLE] name` removes every row, `END` commits like
+  `COMMIT`, `DATE(x)` is the `DATE` cast spelled as a function, and `POW` is `POWER`.
+- More PostgreSQL spellings parse: `TABLE name`, `FOR UPDATE` / `FOR SHARE` (with `OF`,
+  `NOWAIT`, `SKIP LOCKED`; accepted and ignored), `WITH w AS [NOT] MATERIALIZED (…)`,
+  `CREATE TEMP | TEMPORARY | UNLOGGED TABLE`, `CONSTRAINT name` before a column's `CHECK` or
+  `REFERENCES`, `E'…'` escape strings, `$tag$…$tag$` dollar-quoted strings, `5.` and `.5`
+  numerics, the `~~` / `!~~` / `~~*` / `!~~*` operators, `ABORT`, `SHOW setting`, and
+  `BEGIN` / `SET TRANSACTION` with `ISOLATION LEVEL` other than `SERIALIZABLE` (every
+  transaction reads one snapshot, which satisfies the weaker levels).
+- `SET [SESSION | LOCAL] name TO value`, `SET TRANSACTION …`, and `RESET name` are accepted and
+  ignored, as drivers and migration tools issue them on every connection; `SET TIME ZONE` accepts
+  only UTC and refuses another zone rather than silently ignoring it. `SUBSTRING(text FROM
+'pattern')` is the POSIX-regex form, and `TO_HEX`, `QUOTE_LITERAL`, and `QUOTE_IDENT` are new.
+  An untyped string constant beside a number in arithmetic is read as a number (`'5' + 1` is 6).
+  `transaction_timestamp()`, `statement_timestamp()`, and `clock_timestamp()` read the
+  statement clock like `NOW()`, and `NUM_NONNULLS`, `NUM_NULLS`, `GCD`, and `LCM` are new.
+- `UPDATE … SET … FROM sources WHERE …` and `DELETE FROM … USING sources WHERE …` join extra
+  tables, views, or derived tables to the target, as PostgreSQL does (Kysely's
+  `updateTable().from()`, Drizzle's `update().from()`). Assignments and predicates may read the
+  sources, `RETURNING` works, and a target row matched by several source rows is updated or
+  deleted once.
+- `SELECT DISTINCT ON (expressions) … ORDER BY …` keeps the first row of each group in ORDER BY
+  order, as PostgreSQL does (Kysely's `distinctOn`, Prisma's `distinct`). It lowers to a
+  `ROW_NUMBER()` window over the block, so the `ORDER BY` may name output aliases and columns the
+  select list omits, and `LIMIT`/`OFFSET` apply to the kept rows.
+- PostgreSQL's JSON spellings: `json_agg` and `jsonb_agg` (JSON_ARRAYAGG), `json_build_object`,
+  `jsonb_build_object`, `json_build_array`, and `jsonb_build_array` (JSON_OBJECT and JSON_ARRAY),
+  and `to_json`, `to_jsonb`, and `row_to_json`. A table alias used as a value — `json_agg(agg)`,
+  `to_json(obj)`, `row_to_json(u)` — is the row as a JSON object, so Kysely's `jsonArrayFrom` and
+  `jsonObjectFrom` and Drizzle's relational queries run unchanged.
+- Unquoted identifiers that match no exact name resolve to the unique case-insensitive catalog
+  name, as PostgreSQL folds them: `SELECT ID, NAME FROM USERS WHERE ID = 1`, `UPDATE Users
+SET Name = …`, `INSERT INTO Users (ID, Name) …`. Exact names are never folded, so mixed-case
+  tables created through the typed API keep working, and the output column of a folded bare
+  column is the catalog spelling (`id`, not `ID`).
+- `GROUP BY` accepts PostgreSQL's functional dependency: with a table's whole primary key
+  grouped, that table's other columns may appear ungrouped in the select list, `HAVING`, and
+  `ORDER BY` — `SELECT u.id, u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON … GROUP BY
+u.id`. The "HAVING conditions must use aggregates, literals, or GROUP BY expressions" check now
+  runs at execution, where the catalog is known, instead of at compile time.
+- A datetime that is not a column compared against a string constant no longer fails with
+  "Values must have comparable SQL types": `NOW() > '2020-01-01'`, `CURRENT_DATE >= '…'`,
+  `HAVING MAX(joined) > '2026-03-01'`, `(SELECT MAX(joined) FROM t) > '…'`, and
+  `COALESCE(joined, '2000-01-01') < '…'` read the constant as a timestamp, as a column
+  comparison already did.
+
+### Added
+
+- `ExecuteResult` gains `{ kind: "set", action: "set" | "reset", name }` for `SET` and `RESET`
+  statements; `SHOW` returns a `rows` result. `CompiledStatement` gains the `set` and `show`
+  kinds and, on `update` and `delete`, an optional `from` (`MutationSources`). Plan expression
+  nodes gain optional `integer` (on `/`) and `decimal` (on constants) markers.
+- The feature matrix now lists every known unsupported PostgreSQL form as an executable
+  `unsupported` row with its exact error, so the compatibility page and `/agent-rules.md`
+  enumerate the gaps rather than implying them.
+
+### Migration
+
+- A query that relied on `/` returning a fraction for two integer operands must make one operand
+  non-integer: `qty / 2.0`, `CAST(qty AS DOUBLE PRECISION) / 2`, or a `NUMERIC` column. Tables
+  created through the low-level `createTable` API with plain `number` columns are unaffected;
+  only columns declared `INTEGER`, `BIGINT`, `SMALLINT`, or `integer: true` divide as integers.
+
 ## 0.7.4 — September 2, 2026
 
 Published packages: `@minnowdb/core@0.7.4`.
