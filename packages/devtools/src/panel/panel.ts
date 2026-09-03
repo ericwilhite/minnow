@@ -23,6 +23,8 @@ export interface PanelView {
   node: HTMLElement;
   /** Called the first time the view is shown, for work worth deferring until then. */
   onFirstShow?(): void;
+  /** Called every time the view is shown, after `onFirstShow` on the first. */
+  onShow?(): void;
 }
 
 export interface PanelDeps {
@@ -130,10 +132,12 @@ export function createPanel(deps: PanelDeps): Panel {
       buttons[index]?.classList.toggle("on", selected);
       buttons[index]?.setAttribute("aria-selected", String(selected));
       if (buttons[index] !== undefined) buttons[index].tabIndex = selected ? 0 : -1;
-      if (selected && !shown.has(view.id)) {
+      if (!selected) return;
+      if (!shown.has(view.id)) {
         shown.add(view.id);
         view.onFirstShow?.();
       }
+      view.onShow?.();
     });
   }
 

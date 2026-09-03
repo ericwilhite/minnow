@@ -147,7 +147,16 @@ export function createDevtools(
           void view.upgrade();
         },
       },
-      { id: "data", label: "Data", node: explorer.node },
+      {
+        id: "data",
+        label: "Data",
+        node: explorer.node,
+        // The first page usually arrives while this tab is hidden, and a hidden grid measures
+        // 0px tall: it pools only its overscan rows until told the real height is available.
+        onShow: () => {
+          explorer.layout();
+        },
+      },
     ],
     overlay: confirm.node,
     onClose: () => {

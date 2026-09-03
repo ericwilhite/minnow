@@ -33,6 +33,8 @@ export interface ExplorerView {
   setCatalog(catalog: readonly TableInfo[]): Promise<void>;
   /** Opens a table by name, for the rail. */
   open(table: string): Promise<void>;
+  /** The view was just shown; the grid lays out for the size it now has. */
+  layout(): void;
 }
 
 export interface ExplorerDeps {
@@ -421,5 +423,12 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   addRow.hidden = true;
   deleteRow.hidden = true;
 
-  return { node, setCatalog, open };
+  return {
+    node,
+    setCatalog,
+    open,
+    layout: () => {
+      grid.layout();
+    },
+  };
 }

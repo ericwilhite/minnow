@@ -51,6 +51,12 @@ export interface Grid {
   /** Opens an input over a cell, aligned to the column by the grid template itself. */
   editCell(index: number, column: string, editor: CellEditor): void;
   closeEdit(): void;
+  /**
+   * Re-derives the window from the viewport's current size. The grid watches its own viewport
+   * where the browser can report a resize; this is for a host that showed a hidden grid and
+   * wants the rows there before the next frame reports it.
+   */
+  layout(): void;
 }
 
 /** Row height is fixed so the scroll position maps to an index by division, not measurement. */
@@ -256,6 +262,16 @@ export function createGrid(deps: GridDeps = {}): Grid {
   }
 
   viewport.addEventListener("scroll", schedule, { passive: true });
+  // The window is sized from the viewport, so a viewport that grew — the panel maximized or
+  // dragged taller, or the grid's tab shown after its first page arrived while it was hidden
+  // and measured 0px — needs more rows pooled than the last render laid down. Without this the
+  // space below the old window stays blank until a scroll happens to ask for a render. Where
+  // there is no ResizeObserver the scroll path still completes the window, just late.
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => {
+      schedule();
+    }).observe(viewport);
+  }
 
   /** Reads the row and column a pointer event landed on, using the pooled node's own bookkeeping. */
   function locate(event: Event): { index: number; row: QueryRow; column?: string } | undefined {
@@ -359,6 +375,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     selectedIndex: () => selected,
     setSelected,
     closeEdit,
+    layout: schedule,
     setColumns: (next) => {
       columns = [...next];
       closeEdit();
