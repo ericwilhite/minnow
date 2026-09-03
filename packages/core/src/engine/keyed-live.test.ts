@@ -182,6 +182,67 @@ describe("keyed live queries", () => {
     keyed.close();
   });
 
+  it("keeps unchanged rows by identity across reorders and version bumps", async () => {
+    const backend = new KeyedBackend();
+    let rows: Row[] = [
+      { id: 1, label: "a", nested: { active: true } },
+      { id: 2, label: "b", nested: { active: true } },
+      { id: 3, label: "c", nested: { active: true } },
+    ];
+    const source = new LiveQuery<Row>(backend, {
+      query: "SELECT * FROM rows",
+      execute: async () => rows.map((row) => ({ ...row, nested: { ...row.nested } })),
+    });
+    const keyed = new KeyedLiveQuery(source, { key: "id" });
+    let emits = 0;
+    const unsubscribe = keyed.subscribe(() => {
+      emits += 1;
+    });
+    await until(() => expect(keyed.getSnapshot().status).toBe("ready"));
+    const first = keyed.getSnapshot();
+    if (first.status !== "ready") throw new Error("expected ready");
+    const emitsAfterInitial = emits;
+
+    // Reordered and one row updated: the two untouched rows keep their objects, the moved
+    // row's change record carries the retained object, and the update carries the new one.
+    rows = [
+      { id: 3, label: "c", nested: { active: true } },
+      { id: 1, label: "a", nested: { active: true } },
+      { id: 2, label: "B", nested: { active: true } },
+    ];
+    backend.invalidate();
+    await until(() => expect(keyed.getSnapshot()).toMatchObject({ version: 2 }));
+    const second = keyed.getSnapshot();
+    if (second.status !== "ready") throw new Error("expected ready");
+    expect(second.rows[0]).toBe(first.rows[2]);
+    expect(second.rows[1]).toBe(first.rows[0]);
+    expect(second.rows[2]).not.toBe(first.rows[1]);
+    expect(second.rows[2]?.label).toBe("B");
+    expect(second.changes.map((change) => change.type).sort()).toEqual([
+      "move",
+      "move",
+      "move",
+      "update",
+    ]);
+    const moved = second.changes.find((change) => change.type === "move" && change.key === 3);
+    expect(moved).toMatchObject({ from: 2, to: 0 });
+    expect(moved?.type === "move" ? moved.row : undefined).toBe(first.rows[2]);
+
+    // The source keeps its array when a version moves without a change; the view publishes
+    // the version with no changes and the same rows array, indexing nothing again.
+    const emitsBefore = emits;
+    backend.invalidate();
+    await until(() => expect(keyed.getSnapshot()).toMatchObject({ version: 3 }));
+    const third = keyed.getSnapshot();
+    if (third.status !== "ready") throw new Error("expected ready");
+    expect(third.rows).toBe(second.rows);
+    expect(third.changes).toEqual([]);
+    expect(emits).toBe(emitsBefore + 1);
+    expect(emitsAfterInitial).toBeGreaterThan(0);
+    unsubscribe();
+    keyed.close();
+  });
+
   it("returns one update for one changed row in a large keyed result", async () => {
     const backend = new KeyedBackend();
     let rows = Array.from({ length: 20_000 }, (_, id) => ({ id, value: id }));

@@ -87,15 +87,16 @@ From `@minnowdb/core`. See [Extending Minnow](/docs/reference/extending).
 
 From `@minnowdb/core/live`.
 
-| Export                                                              | Description                                                                                                                |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `class LiveQuery<TRow>`                                             | Typed external store and async iterable with `loading` / `ready` / `error` snapshots, stable identity, and `refresh()`.    |
-| `class KeyedLiveQuery<TRow, TKey>`                                  | Exact keyed `insert` / `update` / `delete` / `move` changes, with optional row-bound enforcement.                          |
-| `class LiveQueryManager` / `createLiveQueryManager`                 | Owns one shared observer backend and creates typed queries from adapter-provided `LiveQuerySource` values.                 |
-| `class LiveQuerySet`                                                | Low-level SQL/plan set from `database.liveQueries()`: `subscribe`, observer-only `observe`, `refresh`, stats, and `close`. |
-| `LiveSnapshot / LiveChangesSnapshot / LiveResultChange / LiveKeyOf` | Typed snapshot, patch, and key-selection types.                                                                            |
-| `LiveQuerySource / LiveQueryBackend / LiveQueryDriver`              | Structural contracts for query-library adapters.                                                                           |
-| `LiveQuerySetOptions / LiveQueryStats / LiveQueryInput`             | Hint/poll configuration, execution counters, and low-level query inputs.                                                   |
+| Export                                                              | Description                                                                                                                                                 |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class LiveQuery<TRow>`                                             | Typed external store and async iterable with `loading` / `ready` / `error` snapshots, stable identity, and `refresh()`.                                     |
+| `class KeyedLiveQuery<TRow, TKey>`                                  | Exact keyed `insert` / `update` / `delete` / `move` changes, with optional row-bound enforcement.                                                           |
+| `class LiveQueryManager` / `createLiveQueryManager`                 | Owns one shared observer backend and creates typed queries from adapter-provided `LiveQuerySource` values.                                                  |
+| `class LiveQuerySet`                                                | Low-level SQL/plan set from `database.liveQueries()`: `subscribe`, observer-only `observe` (optionally `suppressUnchanged`), `refresh`, stats, and `close`. |
+| `LiveSnapshot / LiveChangesSnapshot / LiveResultChange / LiveKeyOf` | Typed snapshot, patch, and key-selection types.                                                                                                             |
+| `LiveQuerySource / LiveQueryBackend / LiveQueryDriver`              | Structural contracts for query-library adapters.                                                                                                            |
+| `LiveQuerySetOptions / LiveQueryStats / LiveQueryInput`             | Hint/poll/`sharedResults` configuration, execution counters, and low-level query inputs.                                                                    |
+| `LiveQueryHost / LiveQueryExecuteContext`                           | The probe, manifest, dependency, and execution contract a `LiveQuerySet` runs over.                                                                         |
 
 See [Live queries](/docs/extensions/live-queries) for Kysely composition, keyed changes, windows,
 cross-tab invalidation, and teardown.
@@ -253,13 +254,14 @@ The optional Kysely dialect. Installed separately with Kysely itself; see
 
 ## `@minnowdb/react`
 
-| Export                                     | Description                                                                                                         |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `useLiveQuery(query, options?)`            | Concurrent external-store read. Options add cold-start Suspense and previous-store stale-while-revalidate behavior. |
-| `useSuspenseLiveQuery(query, options?)`    | Suspense-first form whose result type excludes the cold `loading` snapshot.                                         |
-| `LiveExternalStore<TSnapshot>`             | The minimal structural `getSnapshot` / `subscribe` contract.                                                        |
-| `RefreshableLiveExternalStore<TSnapshot>`  | Adds the `refresh()` promise required by Suspense.                                                                  |
-| `UseLiveQueryOptions, SettledLiveSnapshot` | React binding option and settled-result types.                                                                      |
+| Export                                                             | Description                                                                                                         |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `useLiveQuery(query, options?)`                                    | Concurrent external-store read. Options add cold-start Suspense and previous-store stale-while-revalidate behavior. |
+| `useSuspenseLiveQuery(query, options?)`                            | Suspense-first form whose result type excludes the cold `loading` snapshot.                                         |
+| `useLiveSelector(query, { select, isEqual? })`                     | Reads one derived value and re-renders only when it changes; `isEqual` defaults to `Object.is`.                     |
+| `LiveExternalStore<TSnapshot>`                                     | The minimal structural `getSnapshot` / `subscribe` contract.                                                        |
+| `RefreshableLiveExternalStore<TSnapshot>`                          | Adds the `refresh()` promise required by Suspense.                                                                  |
+| `UseLiveQueryOptions, UseLiveSelectorOptions, SettledLiveSnapshot` | React binding option and settled-result types.                                                                      |
 
 ## `@minnowdb/export`
 

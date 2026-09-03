@@ -273,6 +273,7 @@ import {
   LiveQueryLimitError,
   LiveQuerySet,
   MAX_LIVE_QUERY_SETS_PER_DATABASE,
+  type LiveQueryExecuteContext,
   type LiveQueryInput,
   type LiveQuerySetOptions,
 } from "./live.js";
@@ -2909,15 +2910,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
-  async #queryWithReadReservation(sql: string, options: QueryOptions): Promise<QueryResult> {
+  async #queryWithReadReservation(
+    sql: string,
+    options: QueryOptions,
+    probe?: CatalogProbe,
+    storeMemo = true,
+  ): Promise<QueryResult> {
     throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
     throwIfAborted(options.signal);
     // An open statement transaction routes through its session, which owns the reservation for
     // the actual execution. Avoid charging the same query twice at this public boundary.
     return this.#openTransaction === undefined
-      ? this.#withReadReservation(() => this.#queryUnreserved(sql, options))
-      : this.#queryUnreserved(sql, options);
+      ? this.#withReadReservation(() => this.#queryUnreserved(sql, options, probe, storeMemo))
+      : this.#queryUnreserved(sql, options, probe, storeMemo);
   }
 
   /**
@@ -5475,7 +5481,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return this.#queryWithReadReservation(sql, options);
   }
 
-  async #queryUnreserved(sql: string, options: QueryOptions): Promise<QueryResult> {
+  /**
+   * `probe` is a freshness read the caller made moments ago; execution may start from it.
+   * `storeMemo` false still answers from the result memo but does not add to it: a live set
+   * retains its own result, and would otherwise turn every re-run into a cache entry.
+   */
+  async #queryUnreserved(
+    sql: string,
+    options: QueryOptions,
+    probe?: CatalogProbe,
+    storeMemo = true,
+  ): Promise<QueryResult> {
     throwIfAborted(options.signal);
     const open = this.#openTransaction;
     if (open !== undefined) {
@@ -5521,7 +5537,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // of the key, so any commit or DDL changes the key and a hit can never be stale. Only
     // plain current-version queries memoize — explicit versions, budgets, and spill options
     // carry semantics of their own.
-    const probe = this.store.getCatalogProbe.bind(this.store);
+    const readProbe = this.store.getCatalogProbe.bind(this.store);
     const memoizable =
       options.memoize !== false &&
       cacheableQueryInput(sql, options.params ?? []) &&
@@ -5537,12 +5553,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       options.spillToStorage === undefined &&
       options.spillPageRows === undefined;
     const result = !memoizable
-      ? await this.#queryCompiled(plan, options)
+      ? await this.#queryCompiled(plan, options, probe)
       : await this.#memoizedQuery(
           plan,
           `res ${queryResultMemoKey(sql, options.params ?? [])}`,
           options,
+          readProbe,
           probe,
+          storeMemo,
         );
     throwIfAborted(options.signal);
     return externalizeQueryResult(result);
@@ -5674,9 +5692,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     key: string,
     options: QueryOptions,
     probe: () => Promise<CatalogProbe>,
+    before?: CatalogProbe,
+    store = true,
   ): Promise<QueryResult> {
     throwIfAborted(options.signal);
-    const before = await probe();
+    // A probe the caller read moments ago serves as `before`: a hit under its epoch is exactly
+    // that epoch's answer, and a miss executes from it, at least as fresh. The `after` read
+    // below still guards the cache, since a commit may have landed since either read.
+    before ??= await probe();
     throwIfAborted(options.signal);
     const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
       QueryResult | undefined;
@@ -5686,6 +5709,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const result = await this.#queryCompiled(plan, options, before);
     throwIfAborted(options.signal);
+    if (!store) return result;
     const bytes = queryResultRetainedBytes(result);
     if (bytes <= RESULT_MEMO_MAX_BYTES) {
       // Cache only when the epoch did not move during execution: the result is then exactly
@@ -6658,18 +6682,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           return this.store.getCatalogProbe();
         },
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
-        dependencyTableIds: async (query) => {
+        dependencyTableIds: async (query, probe) => {
           const compiled = compileLiveQuery(query);
           // A live query over a view depends on the tables behind it, not on the view's name.
-          const plan = await this.#applyCatalogRewrites(compiled);
+          const plan = await this.#applyCatalogRewrites(compiled, probe);
           const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
-        execute: async (query) => {
-          if (typeof query === "string") return this.query(query);
-          if (query.kind === "typed-query") return this.#queryCompiled(query.plan);
-          return this.query(query.sql, { params: query.params });
-        },
+        execute: (query, context) => this.#liveExecute(query, context),
         changeCanAffect: (query, tableIds, after, until) =>
           this.#liveChangeCanAffect(query, tableIds, after, until),
       },
@@ -6684,6 +6704,45 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     this.#liveSets.add(set);
     return set;
+  }
+
+  /**
+   * One live re-run. The set already read a freshness probe for the sweep, so execution starts
+   * from it instead of probing again — on IndexedDB that is one read transaction per affected
+   * subscription per commit. The set retains the result itself, so the engine memoizes it only
+   * when an adapter is about to ask for the same statement at the same version.
+   */
+  async #liveExecute(
+    query: LiveQueryInput,
+    context: LiveQueryExecuteContext | undefined,
+  ): Promise<QueryResult> {
+    if (context === undefined) {
+      if (typeof query === "string") return this.query(query);
+      if (query.kind === "typed-query") return this.#queryCompiled(query.plan);
+      return this.query(query.sql, { params: query.params });
+    }
+    const { probe, memoize } = context;
+    if (typeof query !== "string" && query.kind === "typed-query") {
+      const plan = query.plan;
+      const memoizable =
+        plan.usesStatementDatetime !== true &&
+        plan.usesVolatileFunctions !== true &&
+        plan.usesSequenceCalls !== true;
+      return this.#withReadReservation(() =>
+        memoizable
+          ? this.#memoizedQuery(
+              plan,
+              `typed ${planMemoKey(plan)}`,
+              {},
+              this.store.getCatalogProbe.bind(this.store),
+              probe,
+              memoize,
+            )
+          : this.#queryCompiled(plan, {}, probe),
+      );
+    }
+    if (typeof query === "string") return this.#queryWithReadReservation(query, {}, probe, memoize);
+    return this.#queryWithReadReservation(query.sql, { params: query.params }, probe, memoize);
   }
 
   /**

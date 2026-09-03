@@ -1995,11 +1995,25 @@ describe("MinnowDatabaseClient", () => {
         completed += 1;
       },
     });
+    // The comparing form crosses the boundary too: the worker executes and stays quiet for a
+    // commit that leaves these rows alone, and speaks up for one that changes them.
+    const quiet: Array<{ initial: boolean }> = [];
+    const quietObserver = await observerSet.observe(
+      "SELECT COUNT(*) AS n FROM rpc_surface WHERE id > 100",
+      { suppressUnchanged: true, onInvalidate: (invalidation) => quiet.push(invalidation) },
+    );
     expect(invalidations).toEqual([expect.objectContaining({ initial: true })]);
+    expect(quiet).toEqual([expect.objectContaining({ initial: true })]);
     observerSet.notifyLocalCommit();
     await client.insert("rpc_surface", { id: 7, value: "seven" });
     await observerSet.refresh();
     expect(invalidations.at(-1)).toMatchObject({ initial: false });
+    expect(quiet).toHaveLength(1);
+    await client.insert("rpc_surface", { id: 700, value: "seven hundred" });
+    await observerSet.refresh();
+    expect(quiet).toHaveLength(2);
+    expect(quiet.at(-1)).toMatchObject({ initial: false });
+    await quietObserver.close();
     await observer.close();
     expect(completed).toBe(1);
     await observerSet.close();

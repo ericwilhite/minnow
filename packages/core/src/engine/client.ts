@@ -1356,6 +1356,7 @@ export class ClientLiveQuerySet {
       const created = (await this.client._invoke(this.handleId, "observe", [
         subscriptionId,
         query,
+        { suppressUnchanged: options.suppressUnchanged === true },
       ])) as { dependencyTableIds: string[] };
       this.#subscriptionIds.add(subscriptionId);
       return new ClientLiveSubscription(

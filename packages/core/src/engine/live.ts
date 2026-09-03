@@ -8,8 +8,11 @@ import { type CompiledQuery, type QueryResult, type QueryRow, type QueryValue } 
  * table sets then decide which prepared queries may be stale. Hints may be lost, duplicated, or
  * reordered without changing correctness.
  *
- * Equal statements share one dependency record and one execution per sweep. Results retain an
- * exact private snapshot: a 32-bit digest is only a fast inequality check, never proof of equality.
+ * A sweep costs what changed, not what is subscribed: the commit window's table set selects the
+ * groups to visit through a per-table index, and a group nobody visits keeps its result on the
+ * strength of the invariant that every window touching one of its tables would have visited it.
+ * Equal statements share one dependency record and one execution per sweep. Results are compared
+ * exactly, row by row, so an unchanged result never reaches a subscriber.
  */
 
 export interface LiveQueryHintChannel {
@@ -28,6 +31,14 @@ export interface LiveQuerySetOptions {
   readonly maxGroups?: number;
   /** Maximum result/observer subscriptions retained by this set. Defaults to 1,024. */
   readonly maxSubscriptions?: number;
+  /**
+   * Hand `onChange` the set's retained result instead of a private copy. The result is shared
+   * with every equal subscription and with the next change comparison, so a subscriber must
+   * treat it as read-only. A consumer that only reads it synchronously — the worker host that
+   * encodes it for the channel, a renderer that copies what it displays — saves one full copy
+   * per subscriber per change.
+   */
+  readonly sharedResults?: boolean;
   /** Called once when the set closes; the owner uses this to drop its reference. */
   readonly onClosed?: () => void;
 }
@@ -37,6 +48,12 @@ export const DEFAULT_LIVE_QUERY_MAX_SUBSCRIPTIONS = 1_024;
 export const MAX_LIVE_QUERY_GROUPS = 4_096;
 export const MAX_LIVE_QUERY_SUBSCRIPTIONS = 16_384;
 export const MAX_LIVE_QUERY_SETS_PER_DATABASE = 256;
+/**
+ * Executions one set runs at once. A page mounting hundreds of subscriptions in one turn used
+ * to queue them behind one sweep chain; without that, they would race straight into the
+ * engine's active-read ceiling. This keeps the engine busy without exhausting it.
+ */
+const LIVE_QUERY_EXECUTION_CONCURRENCY = 8;
 
 export { LiveQueryLimitError } from "./errors.js";
 
@@ -57,6 +74,14 @@ export interface LiveQueryObserveOptions {
   onInvalidate(invalidation: LiveQueryInvalidation): void;
   onError?(error: unknown): void;
   onComplete?(): void;
+  /**
+   * Execute the statement inside the set on every relevant commit and invalidate only when the
+   * rows changed. The engine keeps that execution in its result memo, so an adapter that then
+   * re-executes the same statement at the same version is served from cache rather than from a
+   * second scan. A commit that leaves the rows as they were costs one execution and reaches no
+   * observer at all — nothing crosses a worker channel and nothing re-renders.
+   */
+  readonly suppressUnchanged?: boolean;
 }
 
 export interface LiveQuerySubscription {
@@ -69,12 +94,16 @@ export interface LiveQueryStats {
   versionChecks: number;
   sweeps: number;
   reruns: number;
+  /** Subscribed groups a sweep did not re-run: nothing they read changed, or a proof said so. */
   rerunsAvoided: number;
   /** Re-runs skipped because the data layer proved the commits could not change the result. */
   zoneSkips: number;
+  /** Deliveries withheld because an execution produced exactly the rows already delivered. */
   notificationsSuppressed: number;
-  /** Observer-only invalidations delivered without executing the statement inside the set. */
+  /** Observer invalidations delivered. */
   invalidations: number;
+  /** Groups a sweep looked at: those whose tables the commits changed, plus any left lagging. */
+  groupsVisited: number;
   /** Work avoided because equal statements shared one query group or in-flight execution. */
   sharedExecutions: number;
   lastSweepMs: number;
@@ -86,11 +115,29 @@ export type LiveQueryInput =
   | { kind: "sql-query"; sql: string; params: readonly QueryValue[] }
   | { kind: "typed-query"; plan: CompiledQuery };
 
-interface LiveQueryHost {
+/** What the set already knows when it asks the host to execute a statement. */
+export interface LiveQueryExecuteContext {
+  /**
+   * A freshness probe the set read moments ago. The host may start execution from it instead of
+   * reading its own; a result may still observe a newer commit, and the set treats the probe as
+   * a lower bound on what the result reflects.
+   */
+  readonly probe: CatalogProbe;
+  /**
+   * Whether the host should keep the result in its memo. The set retains its own copy, so a
+   * memo entry only pays off when another caller — an adapter re-executing after an
+   * invalidation — will ask for the same statement at the same version.
+   */
+  readonly memoize: boolean;
+}
+
+export interface LiveQueryHost {
   currentProbe(): Promise<CatalogProbe>;
   manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;
-  dependencyTableIds(query: LiveQueryInput): Promise<Set<string>>;
-  execute(query: LiveQueryInput): Promise<QueryResult>;
+  /** The base tables the statement reads, resolved through views; `probe` is a recent read. */
+  dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;
+  /** Executes the statement; the returned result belongs to the set and is never shared. */
+  execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;
   /** Returns false only on proof that the commit window cannot affect the statement. */
   changeCanAffect?(
     query: LiveQueryInput,
@@ -116,58 +163,20 @@ interface ObserverSubscriber {
 
 type Subscriber = ResultSubscriber | ObserverSubscriber;
 
+interface Execution {
+  readonly result: QueryResult;
+  readonly changed: boolean;
+}
+
 interface QueryGroup {
   readonly key: string;
   readonly query: LiveQueryInput;
   dependencies: ReadonlySet<string>;
   readonly subscribers: Set<Subscriber>;
+  /** The newest probe the retained result is known to reflect. */
   seenProbe: CatalogProbe;
   result: QueryResult | undefined;
-  digest: number | undefined;
-  execution: Promise<{ result: QueryResult; changed: boolean }> | undefined;
-}
-
-const digestScratch = new DataView(new ArrayBuffer(8));
-
-/** Fast inequality filter. Equal digests are always followed by exact comparison. */
-function digestResult(result: QueryResult): number {
-  let hash = 0x811c9dc5;
-  const mixByte = (byte: number): void => {
-    hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
-  };
-  const mixNumber = (value: number): void => {
-    digestScratch.setFloat64(0, value);
-    for (let index = 0; index < 8; index += 1) mixByte(digestScratch.getUint8(index));
-  };
-  const mixString = (value: string): void => {
-    for (let index = 0; index < value.length; index += 1) {
-      const code = value.charCodeAt(index);
-      mixByte(code & 0xff);
-      mixByte(code >>> 8);
-    }
-    mixByte(0xff);
-  };
-  for (const column of result.columns) mixString(column);
-  for (const domain of result.columnDomains) mixString(JSON.stringify(domain));
-  for (const row of result.rows) {
-    for (const column of result.columns) {
-      const value = row[column] ?? null;
-      if (value === null) mixByte(1);
-      else if (typeof value === "number") {
-        mixByte(2);
-        mixNumber(value);
-      } else if (typeof value === "string") {
-        mixByte(3);
-        mixString(value);
-      } else if (typeof value === "boolean") mixByte(value ? 4 : 5);
-      else {
-        mixByte(6);
-        mixNumber(dateMilliseconds(value));
-      }
-    }
-    mixByte(0xfe);
-  }
-  return hash;
+  execution: Promise<Execution> | undefined;
 }
 
 function sameQueryValue(left: QueryValue, right: QueryValue): boolean {
@@ -181,6 +190,7 @@ function sameQueryValue(left: QueryValue, right: QueryValue): boolean {
   return Object.is(left, right);
 }
 
+/** Exact structural equality; stops at the first difference. */
 function sameResult(left: QueryResult, right: QueryResult): boolean {
   if (left.columns.length !== right.columns.length || left.rows.length !== right.rows.length) {
     return false;
@@ -191,11 +201,13 @@ function sameResult(left: QueryResult, right: QueryResult): boolean {
       return false;
     }
   }
+  const columns = left.columns;
   for (let rowIndex = 0; rowIndex < left.rows.length; rowIndex += 1) {
     const leftRow = left.rows[rowIndex];
     const rightRow = right.rows[rowIndex];
     if (leftRow === undefined || rightRow === undefined) return false;
-    for (const column of left.columns) {
+    if (leftRow === rightRow) continue;
+    for (const column of columns) {
       if (!sameQueryValue(leftRow[column] ?? null, rightRow[column] ?? null)) return false;
     }
   }
@@ -283,6 +295,12 @@ function versionOrdinal(version: number | null): number {
   return version ?? -1;
 }
 
+function newerProbe(left: CatalogProbe, right: CatalogProbe): CatalogProbe {
+  return versionOrdinal(right.manifestVersion) > versionOrdinal(left.manifestVersion)
+    ? right
+    : left;
+}
+
 function boundedLiveLimit(value: number, maximum: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new RangeError(`Live query ${label} limit must be between 1 and ${String(maximum)}`);
@@ -300,6 +318,31 @@ function catalogChangedBetween(previous: CatalogProbe, current: CatalogProbe): b
   );
 }
 
+function isResultSubscriber(subscriber: Subscriber): subscriber is ResultSubscriber {
+  return subscriber.kind === "result" && !subscriber.closed;
+}
+
+function isObserver(subscriber: Subscriber): subscriber is ObserverSubscriber {
+  return subscriber.kind === "observer" && !subscriber.closed;
+}
+
+/** Whether a sweep must execute this group: someone wants rows, or wants silence unless rows changed. */
+function groupExecutes(group: QueryGroup): boolean {
+  for (const subscriber of group.subscribers) {
+    if (subscriber.closed) continue;
+    if (subscriber.kind === "result" || subscriber.options.suppressUnchanged === true) return true;
+  }
+  return false;
+}
+
+/** Whether an adapter will re-execute this statement after an invalidation and expect a memo hit. */
+function groupMemoizes(group: QueryGroup): boolean {
+  for (const subscriber of group.subscribers) {
+    if (!subscriber.closed && subscriber.kind === "observer") return true;
+  }
+  return false;
+}
+
 export class LiveQuerySet {
   readonly #host: LiveQueryHost;
   readonly #channel: LiveQueryHintChannel | undefined;
@@ -309,8 +352,15 @@ export class LiveQuerySet {
   readonly #groups = new Map<string, QueryGroup>();
   readonly #opening = new Map<string, Promise<QueryGroup>>();
   readonly #groupsByTable = new Map<string, Set<QueryGroup>>();
+  /**
+   * Groups whose result is not known to reflect `#lastProbe`: opened against an older probe,
+   * failed a re-run, or skipped while their initial execution was in flight. Every other group
+   * is current as of the last sweep, because a sweep visits every group whose tables changed.
+   */
+  readonly #lagging = new Set<QueryGroup>();
   readonly #maxGroups: number;
   readonly #maxSubscriptions: number;
+  readonly #sharedResults: boolean;
   readonly #stats: LiveQueryStats = {
     hints: 0,
     versionChecks: 0,
@@ -320,10 +370,16 @@ export class LiveQuerySet {
     zoneSkips: 0,
     notificationsSuppressed: 0,
     invalidations: 0,
+    groupsVisited: 0,
     sharedExecutions: 0,
     lastSweepMs: 0,
   };
+  /** The probe the last completed sweep brought every non-lagging group up to. */
   #lastProbe: CatalogProbe | undefined;
+  /** A probe read that has been requested but not yet started; see `#freshProbe`. */
+  #pendingProbe: Promise<CatalogProbe> | undefined;
+  #executing = 0;
+  readonly #executionWaiters: Array<() => void> = [];
   #sweepChain = Promise.resolve();
   #sweepQueued = false;
   #pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -349,6 +405,7 @@ export class LiveQuerySet {
       MAX_LIVE_QUERY_SUBSCRIPTIONS,
       "subscription",
     );
+    this.#sharedResults = options.sharedResults === true;
     this.#host = host;
     if (options.channel !== undefined) {
       this.#channel = options.channel;
@@ -373,6 +430,25 @@ export class LiveQuerySet {
     return { ...this.#stats };
   }
 
+  /**
+   * One durable probe shared by every caller that asks for it in the same turn. The read
+   * starts a microtask later, so it is at least as fresh as each caller needs: a commit any of
+   * them awaited has landed before the read begins. A hundred subscriptions opening together
+   * then pay two store reads between them instead of two each — on IndexedDB, two transactions
+   * instead of two hundred. Sequential callers share nothing and lose nothing.
+   */
+  #freshProbe(): Promise<CatalogProbe> {
+    let pending = this.#pendingProbe;
+    if (pending === undefined) {
+      pending = Promise.resolve().then(() => {
+        if (this.#pendingProbe === pending) this.#pendingProbe = undefined;
+        return this.#host.currentProbe();
+      });
+      this.#pendingProbe = pending;
+    }
+    return pending;
+  }
+
   #throwIfClosed(): void {
     if (this.#closed) throw new Error("Live query set is closed");
   }
@@ -394,7 +470,8 @@ export class LiveQuerySet {
     let group: QueryGroup | undefined;
     let subscriber: ResultSubscriber | undefined;
     try {
-      group = await this.#getOrOpenGroup(query);
+      const opened = await this.#getOrOpenGroup(query);
+      group = opened.group;
       this.#throwIfClosed();
       subscriber = {
         kind: "result",
@@ -403,8 +480,7 @@ export class LiveQuerySet {
         closed: false,
       };
       group.subscribers.add(subscriber);
-      // Reconcile before exposing a shared cached result to a late subscriber.
-      await this.refresh();
+      await this.#settleGroup(group, opened.fresh, true);
       this.#throwIfClosed();
       if (!subscriber.delivered) {
         const result = group.result ?? (await this.#executeGroup(group)).result;
@@ -423,7 +499,7 @@ export class LiveQuerySet {
     return this.#subscriptionHandle(group, subscriber);
   }
 
-  /** Observes invalidation without executing the statement inside the set. */
+  /** Observes invalidation; the statement executes inside the set only when asked to compare. */
   async observe(
     query: LiveQueryInput,
     options: LiveQueryObserveOptions,
@@ -433,7 +509,8 @@ export class LiveQuerySet {
     let group: QueryGroup | undefined;
     let subscriber: ObserverSubscriber | undefined;
     try {
-      group = await this.#getOrOpenGroup(query);
+      const opened = await this.#getOrOpenGroup(query);
+      group = opened.group;
       this.#throwIfClosed();
       subscriber = {
         kind: "observer",
@@ -442,7 +519,7 @@ export class LiveQuerySet {
         closed: false,
       };
       group.subscribers.add(subscriber);
-      await this.refresh();
+      await this.#settleGroup(group, opened.fresh, options.suppressUnchanged === true);
       this.#throwIfClosed();
       if (!subscriber.delivered) {
         this.#deliverInvalidation(subscriber, { ...group.seenProbe, initial: true });
@@ -457,6 +534,29 @@ export class LiveQuerySet {
       throw error;
     }
     return this.#subscriptionHandle(group, subscriber);
+  }
+
+  /**
+   * Brings a group to a state a new subscriber may read from. A group opened by this call is
+   * current as of the probe its dependencies were resolved under, so it needs no sweep — only
+   * its first execution, primed from that probe. A group that already existed, or one a
+   * concurrent sweep left lagging, reconciles through one authoritative sweep first, which
+   * also delivers to the new subscriber when the group changed.
+   */
+  async #settleGroup(group: QueryGroup, fresh: boolean, execute: boolean): Promise<void> {
+    if (execute && group.result === undefined) {
+      if (group.execution !== undefined) {
+        this.#stats.sharedExecutions += 1;
+        await group.execution;
+      } else {
+        await this.#executeGroup(group, {
+          probe: group.seenProbe,
+          memoize: groupMemoizes(group),
+        });
+      }
+      this.#throwIfClosed();
+    }
+    if (!fresh || this.#lagging.has(group)) await this.refresh();
   }
 
   #subscriptionHandle(group: QueryGroup, subscriber: Subscriber): LiveQuerySubscription {
@@ -481,20 +581,21 @@ export class LiveQuerySet {
     if (group.subscribers.size !== 0) return;
     if (this.#groups.get(group.key) !== group) return;
     this.#groups.delete(group.key);
+    this.#lagging.delete(group);
     this.#unindexGroup(group, group.dependencies);
   }
 
-  async #getOrOpenGroup(query: LiveQueryInput): Promise<QueryGroup> {
+  async #getOrOpenGroup(query: LiveQueryInput): Promise<{ group: QueryGroup; fresh: boolean }> {
     const key = queryKey(query);
     const existing = this.#groups.get(key);
     if (existing !== undefined) {
       this.#stats.sharedExecutions += 1;
-      return existing;
+      return { group: existing, fresh: false };
     }
     const opening = this.#opening.get(key);
     if (opening !== undefined) {
       this.#stats.sharedExecutions += 1;
-      return opening;
+      return { group: await opening, fresh: false };
     }
     if (this.#groups.size + this.#opening.size >= this.#maxGroups) {
       throw new LiveQueryLimitError("group", this.#maxGroups);
@@ -502,7 +603,7 @@ export class LiveQuerySet {
     const created = this.#openGroup(key, query);
     this.#opening.set(key, created);
     try {
-      return await created;
+      return { group: await created, fresh: true };
     } finally {
       this.#opening.delete(key);
     }
@@ -517,16 +618,18 @@ export class LiveQuerySet {
       subscribers: new Set(),
       seenProbe: after,
       result: undefined,
-      digest: undefined,
       execution: undefined,
     };
     this.#groups.set(key, group);
     this.#indexGroup(group, dependencies);
-    if (
-      this.#lastProbe === undefined ||
-      versionOrdinal(after.manifestVersion) < versionOrdinal(this.#lastProbe.manifestVersion)
+    if (this.#lastProbe === undefined) this.#lastProbe = after;
+    else if (
+      versionOrdinal(after.manifestVersion) < versionOrdinal(this.#lastProbe.manifestVersion) ||
+      after.schemaEpoch !== this.#lastProbe.schemaEpoch
     ) {
-      this.#lastProbe = after;
+      // Opened against a probe older than the last sweep: only a sweep can say whether the
+      // commits in between touched its tables.
+      this.#lagging.add(group);
     }
     return group;
   }
@@ -562,12 +665,12 @@ export class LiveQuerySet {
   async #stableDependencies(
     query: LiveQueryInput,
   ): Promise<{ dependencies: Set<string>; probe: CatalogProbe }> {
-    let before = await this.#host.currentProbe();
+    let before = await this.#freshProbe();
     this.#throwIfClosed();
     for (let attempt = 0; attempt < 8; attempt += 1) {
-      const dependencies = await this.#host.dependencyTableIds(query);
+      const dependencies = await this.#host.dependencyTableIds(query, before);
       this.#throwIfClosed();
-      const after = await this.#host.currentProbe();
+      const after = await this.#freshProbe();
       this.#throwIfClosed();
       if (!catalogChangedBetween(before, after)) return { dependencies, probe: after };
       before = after;
@@ -575,21 +678,24 @@ export class LiveQuerySet {
     throw new Error("Catalog kept changing while live-query dependencies were resolved");
   }
 
-  async #executeGroup(group: QueryGroup): Promise<{ result: QueryResult; changed: boolean }> {
+  async #executeGroup(group: QueryGroup, context?: LiveQueryExecuteContext): Promise<Execution> {
     if (group.execution !== undefined) {
       this.#stats.sharedExecutions += 1;
       return group.execution;
     }
-    const execution = (async () => {
-      const executed = await this.#host.execute(group.query);
-      const digest = digestResult(executed);
+    const execution = (async (): Promise<Execution> => {
+      await this.#acquireExecutionSlot();
+      let executed: QueryResult;
+      try {
+        executed = await this.#host.execute(group.query, context);
+      } finally {
+        this.#releaseExecutionSlot();
+      }
       const previous = group.result;
-      const changed =
-        previous === undefined || group.digest !== digest || !sameResult(previous, executed);
-      const retained = cloneResult(executed);
-      group.result = retained;
-      group.digest = digest;
-      return { result: retained, changed };
+      const changed = previous === undefined || !sameResult(previous, executed);
+      // The host hands over a result nobody else holds, so the set retains it as it is.
+      group.result = executed;
+      return { result: executed, changed };
     })();
     group.execution = execution;
     try {
@@ -599,10 +705,26 @@ export class LiveQuerySet {
     }
   }
 
+  async #acquireExecutionSlot(): Promise<void> {
+    if (this.#executing < LIVE_QUERY_EXECUTION_CONCURRENCY) {
+      this.#executing += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.#executionWaiters.push(resolve);
+    });
+    this.#executing += 1;
+  }
+
+  #releaseExecutionSlot(): void {
+    this.#executing -= 1;
+    this.#executionWaiters.shift()?.();
+  }
+
   #deliverResult(subscriber: ResultSubscriber, result: QueryResult): void {
     if (subscriber.closed) return;
     subscriber.delivered = true;
-    subscriber.options.onChange(cloneResult(result));
+    subscriber.options.onChange(this.#sharedResults ? result : cloneResult(result));
   }
 
   #deliverInvalidation(subscriber: ObserverSubscriber, invalidation: LiveQueryInvalidation): void {
@@ -632,6 +754,7 @@ export class LiveQuerySet {
     const groups = [...this.#groups.values()];
     this.#groups.clear();
     this.#groupsByTable.clear();
+    this.#lagging.clear();
     for (const group of groups) {
       const subscribers = [...group.subscribers];
       group.subscribers.clear();
@@ -664,19 +787,41 @@ export class LiveQuerySet {
     return !this.#closed;
   }
 
+  /**
+   * The groups one sweep must look at. A moved schema epoch or a manifest reset re-resolves
+   * every dependency; a missing stretch of history re-runs everything; otherwise the tables
+   * the window changed pick their groups from the index, plus whatever was already lagging.
+   */
+  async #sweepCandidates(
+    last: CatalogProbe,
+    current: CatalogProbe,
+    changedSince: (after: number | null) => Promise<Set<string> | "all">,
+  ): Promise<QueryGroup[] | undefined> {
+    if (catalogChangedBetween(last, current)) return [...this.#groups.values()];
+    if (sameProbe(last, current)) return [...this.#lagging];
+    const changed = await changedSince(last.manifestVersion);
+    if (!this.#stillOpen()) return undefined;
+    if (changed === "all") return [...this.#groups.values()];
+    const candidates = new Set(this.#lagging);
+    for (const tableId of changed) {
+      const groups = this.#groupsByTable.get(tableId);
+      if (groups === undefined) continue;
+      for (const group of groups) candidates.add(group);
+    }
+    return [...candidates];
+  }
+
   async #sweep(): Promise<void> {
     if (this.#closed || this.#groups.size === 0) return;
     this.#stats.versionChecks += 1;
-    const current = await this.#host.currentProbe();
+    const current = await this.#freshProbe();
     if (!this.#stillOpen()) return;
     const last = this.#lastProbe ?? current;
-    const anyLagging = [...this.#groups.values()].some(
-      (group) => !sameProbe(group.seenProbe, current),
-    );
-    if (sameProbe(last, current) && !anyLagging) return;
+    if (sameProbe(last, current) && this.#lagging.size === 0) return;
 
     const started = performance.now();
     this.#stats.sweeps += 1;
+    const rerunsBefore = this.#stats.reruns;
     const windowCache = new Map<number, Promise<Set<string> | "all">>();
     const changedSince = (after: number | null): Promise<Set<string> | "all"> => {
       const key = versionOrdinal(after);
@@ -688,15 +833,25 @@ export class LiveQuerySet {
       return pending;
     };
 
-    for (const group of [...this.#groups.values()]) {
+    const candidates = await this.#sweepCandidates(last, current, changedSince);
+    if (candidates === undefined) return;
+    for (const group of candidates) {
       if (!this.#stillOpen()) return;
-      if (group.subscribers.size === 0 || sameProbe(group.seenProbe, current)) continue;
-      const prior = group.seenProbe;
+      if (group.subscribers.size === 0 || this.#groups.get(group.key) !== group) continue;
+      this.#stats.groupsVisited += 1;
+      if (sameProbe(group.seenProbe, current)) {
+        this.#lagging.delete(group);
+        continue;
+      }
+      // A group nobody had to visit since its last sweep is current as of that sweep's probe:
+      // its window starts there, not at the older probe it last executed under.
+      const prior = this.#lagging.has(group) ? group.seenProbe : newerProbe(group.seenProbe, last);
       const catalogChanged = catalogChangedBetween(prior, current);
       if (catalogChanged) {
         try {
           await this.#refreshDependencies(group);
         } catch (error) {
+          this.#lagging.add(group);
           this.#notifyGroupError(group, error);
           continue;
         }
@@ -714,8 +869,7 @@ export class LiveQuerySet {
         }
       }
       if (!affected) {
-        this.#stats.rerunsAvoided += 1;
-        group.seenProbe = current;
+        this.#settleProbe(group, current);
         continue;
       }
 
@@ -738,62 +892,74 @@ export class LiveQuerySet {
         }
         if (!this.#stillOpen()) return;
         if (!canAffect) {
-          this.#stats.rerunsAvoided += 1;
           this.#stats.zoneSkips += 1;
-          group.seenProbe = current;
+          this.#settleProbe(group, current);
           continue;
         }
       }
 
-      const resultSubscribers = [...group.subscribers].filter(
-        (subscriber): subscriber is ResultSubscriber =>
-          subscriber.kind === "result" && !subscriber.closed,
-      );
-      const observers = [...group.subscribers].filter(
-        (subscriber): subscriber is ObserverSubscriber =>
-          subscriber.kind === "observer" && !subscriber.closed,
-      );
       try {
-        let execution: { result: QueryResult; changed: boolean } | undefined;
-        if (resultSubscribers.length > 0) {
+        let execution: Execution | undefined;
+        if (groupExecutes(group)) {
           // An initial delivery may be executing against the pre-sweep snapshot. Waiting for it
           // here can deadlock callers that intentionally hold that execute while awaiting this
-          // refresh. Leave the group dirty; once the initial delivery lands, the next refresh
+          // refresh. Leave the group lagging; once the initial delivery lands, the next refresh
           // re-runs it against `current`.
-          if (group.result === undefined && group.execution !== undefined) continue;
+          if (group.result === undefined && group.execution !== undefined) {
+            this.#lagging.add(group);
+            continue;
+          }
           this.#stats.reruns += 1;
-          execution = await this.#executeGroup(group);
-          if (!this.#stillOpen() || !this.#groups.has(group.key)) continue;
+          execution = await this.#executeGroup(group, {
+            probe: current,
+            memoize: groupMemoizes(group),
+          });
+          if (!this.#stillOpen() || this.#groups.get(group.key) !== group) continue;
         }
-        for (const observer of observers) {
-          try {
-            this.#deliverInvalidation(observer, { ...current, initial: false });
-            this.#stats.invalidations += 1;
-          } catch (error) {
-            observer.options.onError?.(error);
-          }
-        }
-        if (execution !== undefined) {
-          if (execution.changed) {
-            for (const subscriber of resultSubscribers) {
-              try {
-                this.#deliverResult(subscriber, execution.result);
-              } catch (error) {
-                subscriber.options.onError?.(error);
-              }
+        const invalidation: LiveQueryInvalidation = { ...current, initial: false };
+        for (const subscriber of [...group.subscribers]) {
+          if (isObserver(subscriber)) {
+            if (
+              execution !== undefined &&
+              !execution.changed &&
+              subscriber.options.suppressUnchanged === true
+            ) {
+              this.#stats.notificationsSuppressed += 1;
+              continue;
             }
-          } else {
-            this.#stats.notificationsSuppressed += resultSubscribers.length;
+            try {
+              this.#deliverInvalidation(subscriber, invalidation);
+              this.#stats.invalidations += 1;
+            } catch (error) {
+              subscriber.options.onError?.(error);
+            }
+          } else if (isResultSubscriber(subscriber) && execution !== undefined) {
+            if (!execution.changed) {
+              this.#stats.notificationsSuppressed += 1;
+              continue;
+            }
+            try {
+              this.#deliverResult(subscriber, execution.result);
+            } catch (error) {
+              subscriber.options.onError?.(error);
+            }
           }
         }
-        group.seenProbe = current;
+        this.#settleProbe(group, current);
       } catch (error) {
-        // Do not advance seenProbe. A refresh with no newer commit retries the dirty group.
+        // The group stays lagging. A refresh with no newer commit retries it.
+        this.#lagging.add(group);
         this.#notifyGroupError(group, error);
       }
     }
     this.#lastProbe = current;
+    this.#stats.rerunsAvoided += this.#groups.size - (this.#stats.reruns - rerunsBefore);
     this.#stats.lastSweepMs = performance.now() - started;
+  }
+
+  #settleProbe(group: QueryGroup, probe: CatalogProbe): void {
+    group.seenProbe = probe;
+    this.#lagging.delete(group);
   }
 
   #notifyGroupError(group: QueryGroup, error: unknown): void {

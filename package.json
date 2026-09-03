@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -52,6 +52,7 @@
     "soak:memory": "NODE_OPTIONS=--expose-gc vite-node scripts/memory-soak.mts",
     "fixture:format": "vite-node scripts/write-format-fixture.mts",
     "fixture:opfs-format": "vite-node scripts/write-opfs-format-fixture.mts",
+    "devtools:matrix": "vite-node scripts/devtools-unsupported-features.mts",
     "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts"
   },
   "devDependencies": {
@@ -65,6 +66,7 @@
     "fake-indexeddb": "^6.2.5",
     "fast-check": "^4.9.0",
     "globals": "^17.11.0",
+    "happy-dom": "^20.14.0",
     "monaco-editor": "^0.56.0",
     "prettier": "^3.9.6",
     "typescript": "^5.9.3",

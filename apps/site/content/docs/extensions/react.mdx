@@ -91,5 +91,51 @@ const snapshot = useLiveQuery(orderChanges);
 if (snapshot.status === "ready") applyChanges(snapshot.changes);
 ```
 
+## Rendering only what changed
+
+A live query keeps the object of every row that did not change between snapshots, and keeps the
+`rows` array itself when nothing changed. A list whose items are memoized on the row object
+re-renders only the rows that differ:
+
+```tsx
+const OrderRow = memo(function OrderRow({ row }: { row: typeof query.$inferRow }) {
+  return <li>{row.customer_id}</li>;
+});
+
+function OpenOrders() {
+  const snapshot = useLiveQuery(query);
+  if (snapshot.status !== "ready") return null;
+  return (
+    <ul>
+      {snapshot.rows.map((row) => (
+        <OrderRow key={row.order_id} row={row} />
+      ))}
+    </ul>
+  );
+}
+```
+
+For a component that needs one thing from a snapshot — a count, one row by key, the ids of a
+list — `useLiveSelector` re-renders only when that thing changes:
+
+```tsx
+import { useLiveSelector } from "@minnowdb/react";
+
+function OpenOrderCount() {
+  const count = useLiveSelector(query, {
+    select: (snapshot) => (snapshot.status === "ready" ? snapshot.rows.length : null),
+  });
+  return <span>{count ?? "…"}</span>;
+}
+```
+
+The selection is compared with `Object.is` by default. Pass `isEqual` when `select` builds a new
+value each time, such as an array of ids, so an equal selection keeps the previous value and the
+component stays put. The selector runs synchronously against the snapshot and may be an inline
+function; a new function re-selects, and `isEqual` decides whether the result counts as a change.
+
+Commits that change a table without changing a query's rows never reach the component at all: the
+engine compares before it invalidates, so neither hook sees a new snapshot.
+
 See [Live queries](/docs/extensions/live-queries) for query construction, errors, keyed changes,
 windows, and teardown.

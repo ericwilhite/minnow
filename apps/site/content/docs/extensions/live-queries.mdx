@@ -34,8 +34,10 @@ const unsubscribe = openOrders.subscribe(() => {
 - `error`, with the error and the last good rows retained.
 
 `getSnapshot()` keeps the same object identity until state changes, and `subscribe()` returns a
-synchronous cleanup function. The same object therefore works with framework external-store APIs
-and as an async iterable:
+synchronous cleanup function. Within a snapshot, a row that did not change keeps the object it had
+in the previous snapshot, and when no row changed the `rows` array itself is kept. A renderer that
+compares by identity — a memoized list item, a selector — therefore re-renders only what moved.
+The same object works with framework external-store APIs and as an async iterable:
 
 ```ts
 for await (const snapshot of openOrders) {
@@ -86,7 +88,9 @@ orderChanges.subscribe(() => {
 
 Key types are restricted at compile time to non-null string, number, boolean, or `Date` columns.
 Duplicate or null keys fail at runtime instead of producing an ambiguous diff. Diffing is exact and
-linear in the previous plus current row counts.
+linear in the current row count: the previous snapshot's key index is retained, so each snapshot
+is indexed once. A row whose values did not change keeps its previous object in `rows`, and the
+`update` record for a changed row carries both objects.
 
 ## Ordered, bounded windows
 
@@ -111,21 +115,39 @@ as the final ordering term so window membership and `move` patches are determini
 ## How invalidation works
 
 Broadcast messages are only latency hints. Every sweep reads the store's durable manifest and
-catalog probe, unions the tables changed by missed commits, and re-runs only intersecting queries.
-The engine can also use block statistics to prove that some same-table inserts cannot affect a
-predicate. Equal low-level SQL subscriptions share execution and dependency work. Typed adapters
-share dependency/invalidation work; each typed store still executes through its own adapter so
-different result-plugin stacks cannot be merged incorrectly.
+catalog probe, unions the tables changed by missed commits, and looks only at the subscriptions
+that read one of those tables: a commit to one table costs the subscriptions on that table, not a
+pass over every subscription in the set. The engine can also use block statistics to prove that
+some same-table inserts cannot affect a predicate. Equal low-level SQL subscriptions share
+execution and dependency work. Typed adapters share dependency/invalidation work; each typed store
+still executes through its own adapter so different result-plugin stacks cannot be merged
+incorrectly.
+
+A typed query asks the engine to compare before it invalidates. On a relevant commit the engine
+re-runs the statement where the data is, compares the rows with the ones it delivered last, and
+invalidates the adapter only when they differ; the re-run stays in the engine's result memo, so the
+adapter's own execution that follows is a cache hit at the same version. A commit that changes a
+table without changing the query's rows therefore costs one execution inside the engine and
+nothing else: nothing crosses a worker channel, no rows are rebuilt on the main thread, and no
+component re-renders.
+
+Subscribing is cheap enough to do per component. A new statement resolves its dependencies and
+runs once; it needs no sweep, because the probe its dependencies were resolved under is what a
+sweep would read. Subscriptions opened in the same turn — a page mounting many components — share
+the two probe reads between them, and a set runs at most eight statements at once so a burst of
+subscriptions never exhausts the engine's read admission.
 
 Catalog-only changes, including replacing a view, refresh dependencies before execution. A failed
-query remains dirty so `refresh()` retries without requiring another commit. Exact row comparison
-suppresses an unchanged notification; its digest is only a fast inequality check, never the proof
-of equality.
+query remains dirty so `refresh()` retries without requiring another commit. Results are compared
+exactly, row by row, and an unchanged result is never delivered.
 
 Built-in IndexedDB and OPFS stores derive a cross-tab channel name from the database name. Set
 `channelName` explicitly only to coordinate a custom store or naming scheme, and use
 `pollIntervalMs` when an environment needs a bounded fallback without BroadcastChannel hints.
 
 The low-level `database.liveQueries()` / `client.liveQueries()` API remains available for raw SQL
-callbacks. Its `observe()` form reports invalidations without also executing the statement, which
-is what typed adapters use to avoid duplicate SQL work.
+callbacks. Each `onChange` receives a private copy of the result; a set created with
+`sharedResults: true` hands every subscriber the set's retained result instead, which the worker
+host uses because it encodes the result for the channel synchronously. Its `observe()` form
+reports invalidations without delivering rows; with `suppressUnchanged: true` the set executes the
+statement itself and invalidates only when the rows changed, which is what typed adapters use.

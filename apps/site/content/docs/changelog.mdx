@@ -8,6 +8,56 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.9 — September 3, 2026
+
+Published packages: `@minnowdb/core@0.7.9` and `@minnowdb/react@0.2.1`.
+
+Stored formats are unchanged and no migration is needed. The client/worker wire protocol moved
+from version 4 to 5: an observer subscription now carries its options across the channel. Deploy
+the client and worker from the same package build.
+
+### Changed
+
+- Live queries cost what changed, not what is subscribed. A sweep looks only at the subscriptions
+  that read a table the commits changed, found through a per-table index, instead of walking every
+  subscription; a commit to a table nobody watches is a probe and a manifest read. Re-runs start
+  from the probe the sweep already holds instead of reading another, and their results are
+  compared exactly, row by row, so the digest pass every execution used to make is gone. A set
+  runs at most eight statements at once. On IndexedDB, subscribing 500 statements takes 41% of the
+  time it did and a commit affecting 63 of them notifies in about 60% of the time, measured in Node
+  against `fake-indexeddb`.
+- Subscribing is cheap enough to do per component. A new statement no longer runs a full sweep
+  before its first delivery; it executes once from the probe its dependencies were resolved under,
+  reading the engine's result memo when the same statement was just run. Subscriptions opened in
+  the same turn share their two probe reads. A subscription whose first execution raced a sweep
+  now reconciles before delivering, so it never hands its subscriber rows the sweep already knew
+  were stale.
+- Typed live queries ask the engine to compare before invalidating. On a relevant commit the engine
+  re-runs the statement, compares against the rows it delivered last, and invalidates only when
+  they differ; the re-run stays in the result memo so the adapter's execution that follows is a
+  cache hit. A commit that leaves a query's rows as they were now costs one execution inside the
+  worker and nothing on the main thread — previously every affected typed query re-executed over
+  the channel, rebuilt its rows, and published a new snapshot for the version alone. The low-level
+  form is `observe(query, { suppressUnchanged: true, … })`.
+- Snapshots preserve row identity. A row that did not change keeps the object it had in the
+  previous snapshot, and `rows` itself is kept when nothing changed, in both `LiveQuery` and
+  `KeyedLiveQuery`; a `move` record carries the retained object. Keyed diffing retains the previous
+  key index and keys its map by the primitive value, so one snapshot indexes once: diffing a
+  100,000-row result with one changed row takes about a quarter of the time it did.
+- `LiveQueryStats` gains `groupsVisited`. `rerunsAvoided` now counts every subscribed statement a
+  sweep did not re-run, whether or not the sweep looked at it.
+- `database.liveQueries({ sharedResults: true })` hands `onChange` the set's retained result
+  instead of a private copy; the worker host uses it, since it encodes the result for the channel
+  synchronously. The default is unchanged. `LiveQueryHost` and `LiveQueryExecuteContext` are
+  exported: a host's `execute` may receive the sweep's probe and whether to memoize, and its
+  `dependencyTableIds` the probe the set just read.
+
+### Added
+
+- `@minnowdb/react` exports `useLiveSelector(query, { select, isEqual? })`, which reads one derived
+  value from a snapshot and re-renders only when that value changes; `isEqual` defaults to
+  `Object.is`. `UseLiveSelectorOptions` types it.
+
 ## 0.7.8 — September 3, 2026
 
 Published packages: `@minnowdb/core@0.7.8`.

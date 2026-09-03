@@ -43,10 +43,29 @@ export type LiveSnapshot<TRow> =
       readonly version: number | null;
     };
 
-function immutableRows<TRow>(rows: readonly TRow[]): readonly TRow[] {
-  // Adapters own their values. Copy the array so mutating the returned builder result cannot
-  // change the snapshot identity retained for exact suppression.
-  return Object.freeze([...rows]);
+/**
+ * The next snapshot's rows, or `undefined` when nothing changed. A row that is structurally
+ * equal to the row at the same position keeps the previous object, so a renderer that keys on
+ * row identity — `React.memo` over a list item, a memoized selector — re-renders only the rows
+ * that actually differ. Adapters own their values, so the array is a fresh frozen copy either
+ * way: mutating the builder's result cannot change the snapshot retained for exact suppression.
+ */
+function reconcileRows<TRow>(
+  previous: readonly TRow[],
+  next: readonly TRow[],
+): readonly TRow[] | undefined {
+  const rows = new Array<TRow>(next.length);
+  let changed = previous.length !== next.length;
+  for (let index = 0; index < next.length; index += 1) {
+    const row = next[index] as TRow;
+    const before = previous[index];
+    if (index < previous.length && sameLiveValue(before, row)) rows[index] = before as TRow;
+    else {
+      rows[index] = row;
+      changed = true;
+    }
+  }
+  return changed ? Object.freeze(rows) : undefined;
 }
 
 /**
@@ -134,6 +153,10 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     if (this.#subscription !== undefined || this.#closed) return;
     const generation = (this.#observationGeneration += 1);
     const subscription = this.#backend.observe(this.#source.query, {
+      // The engine executes and compares before invalidating: a commit that leaves these rows
+      // as they were never reaches this thread, and one that changes them is served from the
+      // engine's memo when the adapter re-executes below.
+      suppressUnchanged: true,
       onInvalidate: (invalidation) => {
         if (generation !== this.#observationGeneration || this.#closed) return;
         this.#schedule(invalidation);
@@ -184,24 +207,25 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
       const abort = new AbortController();
       this.#executionAbort = abort;
       try {
-        const rows = immutableRows(await this.#source.execute(abort.signal));
+        const executed = await this.#source.execute(abort.signal);
         if (this.#executionWasCancelled(abort)) continue;
         // A newer invalidation arrived while this ran. Skip the intermediate snapshot and let
         // the loop execute once more against the newest durable state.
         if (this.#hasQueuedInvalidation()) continue;
         const previous = this.#snapshot.rows;
-        if (
-          this.#snapshot.status === "ready" &&
-          this.#snapshot.version === invalidation.manifestVersion &&
-          sameLiveValue(previous, rows)
-        ) {
-          continue;
-        }
-        if (sameLiveValue(previous, rows) && this.#snapshot.status !== "loading") {
-          // Advance the version without replacing the immutable row array.
+        const rows = reconcileRows(previous, executed);
+        if (rows === undefined) {
+          if (
+            this.#snapshot.status === "ready" &&
+            this.#snapshot.version === invalidation.manifestVersion
+          ) {
+            continue;
+          }
+          // Advance the version (or settle a cold/error snapshot) without replacing the
+          // immutable row array, so consumers comparing by identity see no change in rows.
           this.#snapshot = {
             status: "ready",
-            rows: previous,
+            rows: this.#snapshot.status === "loading" ? Object.freeze([...previous]) : previous,
             version: invalidation.manifestVersion,
           };
         } else {

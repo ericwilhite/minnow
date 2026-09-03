@@ -120,6 +120,64 @@ describe("typed live query", () => {
     await until(() => expect(backend.closes).toBe(1));
   });
 
+  it("asks the backend to compare before invalidating", async () => {
+    const backend = new TestBackend();
+    const query = new LiveQuery(backend, { query: "SELECT 1", execute: async () => [1] });
+    const unsubscribe = query.subscribe(() => undefined);
+    await until(() => expect(backend.options?.suppressUnchanged).toBe(true));
+    unsubscribe();
+    query.close();
+  });
+
+  it("keeps the object of every row that did not change", async () => {
+    const backend = new TestBackend();
+    let rows = [
+      { id: 1, label: "a" },
+      { id: 2, label: "b" },
+      { id: 3, label: "c" },
+    ];
+    const query = new LiveQuery(backend, {
+      query: "SELECT id, label FROM t",
+      // A fresh object per row per execution, as any adapter produces.
+      execute: async () => rows.map((row) => ({ ...row })),
+    });
+    const emits: Array<ReadonlyArray<{ id: number; label: string }>> = [];
+    const unsubscribe = query.subscribe(() => emits.push(query.getSnapshot().rows));
+    await until(() => expect(query.getSnapshot().status).toBe("ready"));
+    const first = query.getSnapshot().rows;
+
+    // One row changes: the other two keep their identity, the array is new.
+    rows = [
+      { id: 1, label: "a" },
+      { id: 2, label: "B" },
+      { id: 3, label: "c" },
+    ];
+    backend.invalidate(2);
+    await until(() => expect(query.getSnapshot().rows[1]?.label).toBe("B"));
+    const second = query.getSnapshot().rows;
+    expect(second).not.toBe(first);
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).not.toBe(first[1]);
+    expect(second[2]).toBe(first[2]);
+    expect(Object.isFrozen(second)).toBe(true);
+
+    // Nothing changes: the array itself survives, and only the version moves.
+    backend.invalidate(3);
+    await until(() => expect(query.getSnapshot()).toMatchObject({ version: 3 }));
+    expect(query.getSnapshot().rows).toBe(second);
+
+    // A shorter result is a change even when every surviving row is the same.
+    rows = rows.slice(0, 2);
+    backend.invalidate(4);
+    await until(() => expect(query.getSnapshot().rows).toHaveLength(2));
+    const third = query.getSnapshot().rows;
+    expect(third[0]).toBe(first[0]);
+    expect(third[1]).toBe(second[1]);
+    expect(emits.length).toBeGreaterThanOrEqual(3);
+    unsubscribe();
+    query.close();
+  });
+
   it("coalesces invalidations that arrive during a slow execution", async () => {
     const backend = new TestBackend();
     let release!: () => void;

@@ -633,9 +633,12 @@ class DatabaseRpcServer {
         // The database owns channelName resolution (and closes the channel with the set).
         let set: LiveQuerySet | undefined;
         try {
+          // Results are encoded for the channel synchronously inside onChange, so the set's
+          // retained result serves as it is and no per-subscriber copy is made.
           set = this.database.liveQueries({
             ...(channelName === undefined ? {} : { channelName }),
             ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
+            sharedResults: true,
           });
           this.#publishHandle(handleId, { type: "live-set", set, subscriptionIds: new Set() });
         } catch (error) {
@@ -1022,9 +1025,11 @@ class DatabaseRpcServer {
       case "observe": {
         const subscriptionId = this.#claimHandleId(args[0]);
         const query = args[1] as LiveQueryInput;
+        const { suppressUnchanged } = (args[2] ?? {}) as { suppressUnchanged?: boolean };
         let subscription: LiveQuerySubscription | undefined;
         try {
           subscription = await handle.set.observe(query, {
+            ...(suppressUnchanged === true ? { suppressUnchanged: true } : {}),
             onInvalidate: (invalidation) => {
               this.scope.postMessage(rpcEvent(subscriptionId, "invalidate", invalidation));
             },

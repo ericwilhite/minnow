@@ -1701,10 +1701,24 @@
               ]
             },
             {
+              "name": "LiveQueryExecuteContext",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveQueryExecuteContext {\n    readonly probe: CatalogProbe;\n    readonly memoize: boolean;\n}"
+              ]
+            },
+            {
               "name": "LiveQueryHintChannel",
               "kind": "type",
               "declarations": [
                 "export interface LiveQueryHintChannel {\n    postMessage(message: unknown): void;\n    addEventListener(type: \"message\", listener: () => void): void;\n    removeEventListener(type: \"message\", listener: () => void): void;\n    close?(): void;\n}"
+              ]
+            },
+            {
+              "name": "LiveQueryHost",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
               ]
             },
             {
@@ -1746,7 +1760,7 @@
               "name": "LiveQueryObserveOptions",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryObserveOptions {\n    onInvalidate(invalidation: LiveQueryInvalidation): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n}"
+                "export interface LiveQueryObserveOptions {\n    onInvalidate(invalidation: LiveQueryInvalidation): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n    readonly suppressUnchanged?: boolean;\n}"
               ]
             },
             {
@@ -1760,7 +1774,7 @@
               "name": "LiveQuerySetOptions",
               "kind": "type",
               "declarations": [
-                "export interface LiveQuerySetOptions {\n    readonly channel?: LiveQueryHintChannel;\n    readonly channelName?: string;\n    readonly pollIntervalMs?: number;\n    readonly maxGroups?: number;\n    readonly maxSubscriptions?: number;\n    readonly onClosed?: () => void;\n}"
+                "export interface LiveQuerySetOptions {\n    readonly channel?: LiveQueryHintChannel;\n    readonly channelName?: string;\n    readonly pollIntervalMs?: number;\n    readonly maxGroups?: number;\n    readonly maxSubscriptions?: number;\n    readonly sharedResults?: boolean;\n    readonly onClosed?: () => void;\n}"
               ]
             },
             {
@@ -1774,7 +1788,7 @@
               "name": "LiveQueryStats",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
+                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    groupsVisited: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
               ]
             },
             {
@@ -8248,7 +8262,7 @@
               "name": "protocolVersion",
               "kind": "value",
               "declarations": [
-                "protocolVersion: 4"
+                "protocolVersion: 5"
               ]
             },
             {
@@ -8741,6 +8755,20 @@
               "kind": "type",
               "declarations": [
                 "export interface UseLiveQueryOptions {\n    readonly suspense?: boolean;\n    readonly staleWhileRevalidate?: boolean;\n}"
+              ]
+            },
+            {
+              "name": "useLiveSelector",
+              "kind": "value",
+              "declarations": [
+                "export declare function useLiveSelector<TSnapshot, TSelected>(query: LiveExternalStore<TSnapshot>, options: UseLiveSelectorOptions<TSnapshot, TSelected>): TSelected;"
+              ]
+            },
+            {
+              "name": "UseLiveSelectorOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface UseLiveSelectorOptions<TSnapshot, TSelected> {\n    readonly select: (snapshot: TSnapshot) => TSelected;\n    readonly isEqual?: (previous: TSelected, next: TSelected) => boolean;\n}"
               ]
             },
             {

@@ -515,15 +515,19 @@ describe("live queries", () => {
     await live.refresh();
     expect(aChanges.at(-1)?.rows).toEqual([{ v: 2 }]);
 
-    // B finishes subscribing with the stale snapshot it observed.
+    // B's stale initial execute lands. The sweep left B lagging, so subscribe reconciles it
+    // before delivering: the subscriber sees the current rows once, never the stale ones.
     bBlock.release();
     const bSubscription = await bPromise;
     expect(bChanges).toHaveLength(1);
-    expect(bChanges[0]?.rows).toEqual([{ v: 1 }]);
+    expect(bChanges[0]?.rows).toEqual([{ v: 2 }]);
+    expect(race.executions("B")).toBe(2);
 
-    // A refresh with no new commit must still bring the lagging subscription up to date.
+    // Nothing is left lagging: a refresh with no new commit is a probe and no sweep.
+    const sweeps = live.stats.sweeps;
     await live.refresh();
-    expect(bChanges.at(-1)?.rows).toEqual([{ v: 2 }]);
+    expect(live.stats.sweeps).toBe(sweeps);
+    expect(bChanges).toHaveLength(1);
     bSubscription.close();
     live.close();
   });
@@ -617,10 +621,7 @@ describe("live queries", () => {
     live.close();
   });
 
-  it("uses exact equality after a 32-bit digest collision", async () => {
-    // These two values collide under this module's complete FNV digest (column and row markers
-    // included). The digest may reject inequality quickly, but can never prove equality.
-    const values = ["srborjp0s6132n", "i7khstlux91r3m"];
+  it("compares results exactly and delivers a change confined to the last row", async () => {
     let version = 1;
     const manifests: Manifest[] = [
       {
@@ -632,6 +633,7 @@ describe("live queries", () => {
         changedTableIds: ["table"],
       },
     ];
+    const rows = Array.from({ length: 64 }, (_, index) => ({ id: index, v: "same" }));
     const live = new LiveQuerySet({
       currentProbe: () =>
         Promise.resolve({ manifestVersion: version, catalogEpoch: version, schemaEpoch: 0 }),
@@ -643,24 +645,269 @@ describe("live queries", () => {
       dependencyTableIds: () => Promise.resolve(new Set(["table"])),
       execute: () =>
         Promise.resolve({
-          columns: ["v"],
-          columnDomains: [null],
-          rows: [{ v: values[version - 1] ?? null }],
+          columns: ["id", "v"],
+          columnDomains: [null, null],
+          rows: rows.map((row, index) =>
+            index === rows.length - 1 && version >= 3 ? { ...row, v: "last" } : { ...row },
+          ),
         }),
     });
     const changes: QueryResult[] = [];
-    await live.subscribe("collision", { onChange: (result) => changes.push(result) });
-    version = 2;
-    manifests.push({
-      version,
-      previousVersion: 1,
-      createdAt: "",
-      liveBlockCount: 0,
-      liveBlockBytes: 0,
-      changedTableIds: ["table"],
-    });
+    await live.subscribe("exact", { onChange: (result) => changes.push(result) });
+    const commit = (): void => {
+      version += 1;
+      manifests.push({
+        version,
+        previousVersion: version - 1,
+        createdAt: "",
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: ["table"],
+      });
+    };
+    // Same rows, new version: the re-run finds nothing different and stays silent.
+    commit();
     await live.refresh();
-    expect(changes.map((result) => result.rows[0]?.v)).toEqual(values);
+    expect(changes).toHaveLength(1);
+    expect(live.stats.notificationsSuppressed).toBe(1);
+    // A difference in the final row of the final column is still a difference.
+    commit();
+    await live.refresh();
+    expect(changes).toHaveLength(2);
+    expect(changes[1]?.rows.at(-1)).toEqual({ id: 63, v: "last" });
+    live.close();
+  });
+
+  it("shares the retained result with subscribers that opt out of private copies", async () => {
+    const race = createRaceHost();
+    const shared = new LiveQuerySet(race.host, { sharedResults: true });
+    const left: QueryResult[] = [];
+    const right: QueryResult[] = [];
+    await shared.subscribe("A", { onChange: (result) => left.push(result) });
+    await shared.subscribe("A", { onChange: (result) => right.push(result) });
+    expect(left[0]).toBe(right[0]);
+    race.commit();
+    await shared.refresh();
+    expect(left[1]).toBe(right[1]);
+    expect(left[1]).not.toBe(left[0]);
+    shared.close();
+
+    // The default hands every subscriber its own copy.
+    const copying = new LiveQuerySet(race.host);
+    const first: QueryResult[] = [];
+    const second: QueryResult[] = [];
+    await copying.subscribe("A", { onChange: (result) => first.push(result) });
+    await copying.subscribe("A", { onChange: (result) => second.push(result) });
+    expect(first[0]).toEqual(second[0]);
+    expect(first[0]).not.toBe(second[0]);
+    copying.close();
+  });
+
+  it("executes for an observer that asked to be told only when the rows changed", async () => {
+    let version = 1;
+    let value = 1;
+    const manifests: Manifest[] = [
+      {
+        version,
+        previousVersion: null,
+        createdAt: "",
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: ["table"],
+      },
+    ];
+    let executions = 0;
+    const live = new LiveQuerySet({
+      currentProbe: () =>
+        Promise.resolve({ manifestVersion: version, catalogEpoch: version, schemaEpoch: 0 }),
+      manifestPage: (after, limit) =>
+        Promise.resolve({
+          records: manifests.filter((manifest) => manifest.version > (after ?? -1)).slice(0, limit),
+          nextCursor: null,
+        }),
+      dependencyTableIds: () => Promise.resolve(new Set(["table"])),
+      execute: (_query, context) => {
+        executions += 1;
+        // The set primes and re-runs from the probe it already holds, asking for a memo entry
+        // so the observer's own execution afterwards is a cache hit.
+        expect(context).toMatchObject({ memoize: true });
+        return Promise.resolve({ columns: ["v"], columnDomains: [null], rows: [{ v: value }] });
+      },
+    });
+    const plain: number[] = [];
+    const quiet: number[] = [];
+    await live.observe("Q", {
+      onInvalidate: ({ manifestVersion }) => plain.push(manifestVersion ?? -1),
+    });
+    await live.observe("Q", {
+      suppressUnchanged: true,
+      onInvalidate: ({ manifestVersion }) => quiet.push(manifestVersion ?? -1),
+    });
+    // Opening the suppressing observer primed the group once; the plain one never executed.
+    expect(executions).toBe(1);
+    expect(plain).toEqual([1]);
+    expect(quiet).toEqual([1]);
+
+    const commit = (): void => {
+      version += 1;
+      manifests.push({
+        version,
+        previousVersion: version - 1,
+        createdAt: "",
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: ["table"],
+      });
+    };
+    // Same rows: the plain observer hears about the commit, the suppressing one does not.
+    commit();
+    await live.refresh();
+    expect(executions).toBe(2);
+    expect(plain).toEqual([1, 2]);
+    expect(quiet).toEqual([1]);
+    expect(live.stats.notificationsSuppressed).toBe(1);
+    // Changed rows reach both.
+    value = 2;
+    commit();
+    await live.refresh();
+    expect(plain).toEqual([1, 2, 3]);
+    expect(quiet).toEqual([1, 3]);
+    live.close();
+  });
+
+  it("visits only the groups whose tables the commits changed", async () => {
+    let version = 1;
+    const manifests: Manifest[] = [
+      {
+        version,
+        previousVersion: null,
+        createdAt: "",
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: ["a", "b"],
+      },
+    ];
+    const executions = new Map<string, number>();
+    const live = new LiveQuerySet({
+      currentProbe: () =>
+        Promise.resolve({ manifestVersion: version, catalogEpoch: version, schemaEpoch: 0 }),
+      manifestPage: (after, limit) =>
+        Promise.resolve({
+          records: manifests.filter((manifest) => manifest.version > (after ?? -1)).slice(0, limit),
+          nextCursor: null,
+        }),
+      dependencyTableIds: (query) =>
+        Promise.resolve(new Set([typeof query === "string" ? query.slice(0, 1) : ""])),
+      execute: (query) => {
+        const name = typeof query === "string" ? query : "";
+        executions.set(name, (executions.get(name) ?? 0) + 1);
+        return Promise.resolve({
+          columns: ["v"],
+          columnDomains: [null],
+          rows: [{ v: version }],
+        });
+      },
+    });
+    const commit = (tables: string[]): void => {
+      version += 1;
+      manifests.push({
+        version,
+        previousVersion: version - 1,
+        createdAt: "",
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: tables,
+      });
+    };
+    // Sixteen groups on table a, one on table b.
+    for (let index = 0; index < 16; index += 1) {
+      await live.subscribe(`a-${String(index)}`, { onChange: () => undefined });
+    }
+    await live.subscribe("b-0", { onChange: () => undefined });
+    expect(live.stats.groupsVisited).toBe(0);
+
+    // A commit to b alone looks at b's one group; a's sixteen are never touched.
+    commit(["b"]);
+    await live.refresh();
+    expect(live.stats.groupsVisited).toBe(1);
+    expect(live.stats.reruns).toBe(1);
+    expect(live.stats.rerunsAvoided).toBe(16);
+    expect(executions.get("a-0")).toBe(1);
+
+    // Two commits later, a group on a re-runs against a window that starts at the last sweep,
+    // not at the probe it last executed under: it is current as of every sweep it skipped.
+    commit(["b"]);
+    await live.refresh();
+    commit(["a"]);
+    await live.refresh();
+    expect(live.stats.groupsVisited).toBe(1 + 1 + 16);
+    expect(executions.get("a-0")).toBe(2);
+    expect(executions.get("b-0")).toBe(3);
+
+    // A commit that changed nothing anyone subscribed to is a probe and a manifest read.
+    commit(["c"]);
+    const sweeps = live.stats.sweeps;
+    await live.refresh();
+    expect(live.stats.sweeps).toBe(sweeps + 1);
+    expect(live.stats.groupsVisited).toBe(18);
+    live.close();
+  });
+
+  it("shares one probe among subscriptions opening in the same turn", async () => {
+    const race = createRaceHost();
+    let probes = 0;
+    const host = {
+      ...race.host,
+      currentProbe: () => {
+        probes += 1;
+        return race.host.currentProbe();
+      },
+    };
+    const live = new LiveQuerySet(host, { maxGroups: 1_024 });
+    await Promise.all(
+      Array.from({ length: 64 }, (_, index) =>
+        live.subscribe(`q-${String(index)}`, { onChange: () => undefined }),
+      ),
+    );
+    // One read before dependency resolution and one after, for all sixty-four together.
+    expect(probes).toBe(2);
+    for (let index = 0; index < 64; index += 1)
+      expect(race.executions(`q-${String(index)}`)).toBe(1);
+
+    // A hint after a commit still reads: the coalesced probe starts after the commit landed.
+    race.commit();
+    probes = 0;
+    await live.refresh();
+    expect(probes).toBe(1);
+    expect(race.executions("q-0")).toBe(2);
+    live.close();
+  });
+
+  it("bounds how many statements execute at once", async () => {
+    const race = createRaceHost();
+    let inFlight = 0;
+    let peak = 0;
+    const host = {
+      ...race.host,
+      execute: async (query: LiveQueryInput): Promise<QueryResult> => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 1);
+        });
+        inFlight -= 1;
+        return race.host.execute(query);
+      },
+    };
+    const live = new LiveQuerySet(host, { maxGroups: 1_024 });
+    const handles = await Promise.all(
+      Array.from({ length: 40 }, (_, index) =>
+        live.subscribe(`q-${String(index)}`, { onChange: () => undefined }),
+      ),
+    );
+    expect(handles).toHaveLength(40);
+    expect(peak).toBeLessThanOrEqual(8);
+    expect(peak).toBeGreaterThan(1);
     live.close();
   });
 
