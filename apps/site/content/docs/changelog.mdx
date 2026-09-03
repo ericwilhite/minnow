@@ -14,8 +14,24 @@ Published packages: `@minnowdb/core@0.7.3`.
 
 Stored formats are unchanged and no migration is needed.
 
+### Added
+
+- Five SELECT spellings PostgreSQL and SQLite accept, which together caused 27-43% of the
+  failures in every sampled `random/*` file of the upstream SQLLogicTest corpus: `SELECT ALL`;
+  a column label without `AS` (`SELECT amount total`, `SELECT + 81 col2`, `SELECT (a) b`); a
+  grouped column spelled bare on one side and qualified on the other
+  (`SELECT col0 FROM t GROUP BY t.col0`, `SELECT c.col0 + 36 FROM t AS c GROUP BY col0`), with
+  several sources resolving a bare name through the schemas at execution; a parenthesized join
+  group (`FROM ( t AS a CROSS JOIN t b )`) as the first source or as a comma, `CROSS JOIN`, or
+  `INNER JOIN` operand; and `LIMIT ALL`. The conformance corpus crosses each with its
+  neighbours against SQLite and PGlite, and the feature matrix lists them.
+
 ### Fixed
 
+- The SQLLogicTest runner rejected `onlyif mysql # comment` and `skipif mssql # comment` with
+  "conditional must name exactly one engine", which stopped `npm run test:sql:upstream` on the
+  first `random/*` or `index/*` file. Directive lines now drop a trailing `# comment`, and
+  `--keep-going` prints the engine error under each failed record.
 - A `WHERE` on a derived table or CTE that paged its rows with `OFFSET n`, `OFFSET n ROWS`,
   `LIMIT ?`, `LIMIT ? OFFSET ?`, or `FETCH FIRST ? ROWS ONLY` was pushed inside the block and ran
   before the window, so

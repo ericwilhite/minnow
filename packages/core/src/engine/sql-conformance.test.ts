@@ -1210,8 +1210,122 @@ function functionCases(): Case[] {
   return cases.map((testCase) => ({ ...testCase, skip: ["sqlite"] as const }));
 }
 
+/**
+ * Spellings PostgreSQL and SQLite both accept for one meaning — SELECT ALL, a column label
+ * without AS, a GROUP BY that qualifies what the select list leaves bare (or the reverse), a
+ * parenthesized join group, and LIMIT ALL — each crossed with the positions and neighbours it
+ * can have. Every one was a rejection the upstream SQLLogicTest random corpus found, so the
+ * crossings keep the fix from being narrower than the corpus.
+ */
+function spellingCases(): Case[] {
+  const cases: Case[] = [];
+  // SELECT [ALL | DISTINCT] × a label with AS, without AS, quoted either way, and a label after
+  // a parenthesized or signed expression.
+  for (const prefix of ["", "ALL ", "DISTINCT "]) {
+    for (const label of ["AS total", "total", '"total"', 'AS "total"']) {
+      cases.push({
+        sql: `SELECT ${prefix}label, amount * 2 ${label} FROM data WHERE amount > 80 ORDER BY 1, 2`,
+        ordered: true,
+      });
+    }
+    cases.push({
+      sql: `SELECT ${prefix}(amount) a, + amount b, - amount c, id n FROM data WHERE id <= 20 ORDER BY n`,
+      ordered: true,
+    });
+    cases.push({
+      sql: `SELECT ${prefix}COUNT(ALL amount) n, MIN(ALL label) first_label, MAX(region) last_region FROM data`,
+      ordered: false,
+    });
+  }
+  // A grouped column spelled bare on one side and qualified on the other, over a table named
+  // by itself, with AS, and with a bare alias; alone, inside arithmetic, both spellings in one
+  // expression, under HAVING and DISTINCT, and ordered by the other spelling. NULL regions stay
+  // out of the sort keys, since the oracles place them differently.
+  for (const { from, q } of [
+    { from: "data", q: "data" },
+    { from: "data AS d", q: "d" },
+    { from: "data d", q: "d" },
+  ]) {
+    const shapes = [
+      { select: "region", by: `${q}.region` },
+      { select: `${q}.region`, by: "region" },
+      { select: `${q}.region || '-' || region AS pair`, by: "region" },
+      { select: `region || '-' || ${q}.region AS pair`, by: `${q}.region` },
+      { select: `${q}.amount * 2 + amount AS triple`, by: "amount" },
+      { select: `amount * 2 + ${q}.amount AS triple`, by: `${q}.amount` },
+    ];
+    for (const { select, by } of shapes) {
+      cases.push({
+        sql: `SELECT ${select}, COUNT(*) AS n, SUM(${q}.amount) AS total FROM ${from} WHERE region IS NOT NULL GROUP BY ${by} ORDER BY 1`,
+        ordered: true,
+      });
+      cases.push({
+        sql: `SELECT ${select} FROM ${from} GROUP BY ${by} HAVING COUNT(*) > 1`,
+        ordered: false,
+      });
+    }
+    cases.push({
+      sql: `SELECT region, ${q}.label, COUNT(*) AS n FROM ${from} WHERE region IS NOT NULL GROUP BY ${q}.region, label ORDER BY region, ${q}.label`,
+      ordered: true,
+    });
+    cases.push({
+      sql: `SELECT DISTINCT ${q}.region FROM ${from} GROUP BY region, label`,
+      ordered: false,
+    });
+    cases.push({
+      sql: `SELECT region, MAX(amount) AS peak FROM ${from} WHERE region IS NOT NULL GROUP BY ${q}.region ORDER BY ${q}.region`,
+      ordered: true,
+    });
+  }
+  // Several sources: a bare name belongs to the one source that has it.
+  cases.push({
+    sql: "SELECT rank, d.active, COUNT(*) AS n FROM data d JOIN dims m ON m.region = d.region GROUP BY m.rank, active ORDER BY rank, d.active",
+    ordered: true,
+  });
+  cases.push({
+    sql: "SELECT m.rank + 1 AS next_rank, active FROM data d JOIN dims m ON m.region = d.region GROUP BY rank, d.active ORDER BY next_rank, active",
+    ordered: true,
+  });
+  // A parenthesized join group as the whole FROM, nested, beside a comma, and as the operand
+  // of CROSS JOIN and INNER JOIN.
+  for (const from of [
+    "( data d CROSS JOIN dims m )",
+    "( data AS d CROSS JOIN dims AS m )",
+    "( data d JOIN dims m ON m.region = d.region )",
+    "( ( data d CROSS JOIN dims m ) )",
+    "( data d CROSS JOIN dims m ) CROSS JOIN dims x",
+    "dims x CROSS JOIN ( data d CROSS JOIN dims m )",
+    "dims x, ( data d JOIN dims m ON m.region = d.region )",
+    "dims x JOIN ( data d JOIN dims m ON m.region = d.region ) ON x.rank = m.rank",
+  ]) {
+    cases.push({
+      sql: `SELECT COUNT(*) AS n, SUM(d.amount) AS total FROM ${from}`,
+      ordered: false,
+    });
+    cases.push({
+      sql: `SELECT d.id, m.label AS place FROM ${from} WHERE d.id <= 10 ORDER BY d.id, place`,
+      ordered: true,
+    });
+  }
+  // LIMIT ALL is PostgreSQL's spelling of no limit, alone, before OFFSET, and on a compound.
+  for (const tail of ["LIMIT ALL", "LIMIT ALL OFFSET 3"]) {
+    cases.push({
+      sql: `SELECT id, amount FROM data WHERE amount > 60 ORDER BY id ${tail}`,
+      ordered: true,
+      skip: ["sqlite"],
+    });
+    cases.push({
+      sql: `SELECT label FROM data WHERE amount > 90 UNION SELECT label FROM dims ORDER BY 1 ${tail}`,
+      ordered: true,
+      skip: ["sqlite"],
+    });
+  }
+  return cases;
+}
+
 function combinationCases(): Case[] {
   return [
+    ...spellingCases(),
     ...coercionCases(),
     ...functionCases(),
     ...distinctCases(),
@@ -1578,6 +1692,7 @@ function writesData(id: string): boolean {
 const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: string }>([
   // --- PostgreSQL forms SQLite does not spell -----------------------------------------------
   ["function.char-length", { oracles: ["sqlite"], reason: "SQLite spells it LENGTH" }],
+  ["limit.all", { oracles: ["sqlite"], reason: "SQLite has no LIMIT ALL" }],
   [
     "function.substring-from-for",
     { oracles: ["sqlite"], reason: "SQLite has no SUBSTRING(x FROM a FOR b) syntax" },

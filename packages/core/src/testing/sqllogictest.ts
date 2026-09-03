@@ -274,8 +274,11 @@ function parseExpected(
   return { kind: "hash", valueCount, hash: (match[2] ?? "").toLowerCase() };
 }
 
+/** Splits a directive line into words, dropping a trailing `# comment` the upstream corpus uses. */
 function tokenizeDirective(line: string): string[] {
-  return line.trim().split(/\s+/u);
+  const hash = line.indexOf("#");
+  const directive = hash === -1 ? line : line.slice(0, hash);
+  return directive.trim().split(/\s+/u);
 }
 
 function sqlLines(lines: readonly SourceLine[]): string {

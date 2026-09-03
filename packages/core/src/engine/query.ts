@@ -1128,6 +1128,77 @@ const clauseKeywords = new Set([
   "UNION",
   "RETURNING",
 ]);
+/**
+ * Words that cannot be a column label written without AS (`SELECT amount total`): the clause
+ * keywords above, PostgreSQL's reserved words, and the operator words the expression grammar
+ * reads after an operand. A quoted identifier is never one of them.
+ */
+const bareLabelStopWords = new Set([
+  ...clauseKeywords,
+  "ALL",
+  "AND",
+  "ANY",
+  "ARRAY",
+  "AS",
+  "ASC",
+  "AT",
+  "BETWEEN",
+  "BOTH",
+  "CASE",
+  "CAST",
+  "CHECK",
+  "COLLATE",
+  "COLUMN",
+  "CONSTRAINT",
+  "CREATE",
+  "DEFAULT",
+  "DESC",
+  "DISTINCT",
+  "DO",
+  "ELSE",
+  "END",
+  "ESCAPE",
+  "FALSE",
+  "FILTER",
+  "FOR",
+  "FOREIGN",
+  "FROM",
+  "GRANT",
+  "ILIKE",
+  "IN",
+  "INTO",
+  "IS",
+  "ISNULL",
+  "LATERAL",
+  "LEADING",
+  "LIKE",
+  "NOT",
+  "NOTNULL",
+  "NULL",
+  "ON",
+  "ONLY",
+  "OR",
+  "OVER",
+  "OVERLAPS",
+  "PLACING",
+  "PRIMARY",
+  "REFERENCES",
+  "SELECT",
+  "SIMILAR",
+  "SOME",
+  "TABLE",
+  "THEN",
+  "TO",
+  "TRAILING",
+  "TRUE",
+  "UNIQUE",
+  "USER",
+  "VALUES",
+  "WHEN",
+  "WITH",
+  "WITHIN",
+  "WITHOUT",
+]);
 const aggregateNames = new Set<AggregateName>([
   "COUNT",
   "SUM",
@@ -2935,6 +3006,7 @@ export function referencedColumns(
   const sourceAliases = sources.map((source) => source.alias);
   if (new Set(sourceAliases).size !== sourceAliases.length)
     throw new TypeError("Table aliases must be unique");
+  plan = unifyPlanGroupedReferences(plan, (tableName) => schemas.get(tableName));
   validateGrouping(plan);
   const aliases = new Map(sources.map((source) => [source.alias, source.table]));
   const requested = new Map<string, Set<string>>(
@@ -3075,6 +3147,7 @@ export function createPreparedQuery(
   assertTailParametersBound(plan);
   plan = resolveStatementDatetimes(plan);
   plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  plan = unifyPlanGroupedReferences(plan, wildcardRowColumns(tables));
   validateGrouping(plan);
   // The schema-dependent rewrites run before derived sources materialize, because both can
   // turn a scanned table into one more derived block.
@@ -3154,6 +3227,7 @@ export function createPreparedColumnarQuery(
   plan = expandNaturalJoins(plan, columnarColumns);
   plan = expandQualifiedWildcards(plan, columnarColumns);
   plan = expandDistinctWildcard(plan, columnarColumns);
+  plan = unifyPlanGroupedReferences(plan, columnarColumns);
   validateGrouping(plan);
   let closed = false;
   let prepared: PreparedVectorQuery | undefined;
@@ -4574,6 +4648,7 @@ function executeRowQueryInternal(
   assertTailParametersBound(plan);
   plan = resolveStatementDatetimes(plan);
   plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  plan = unifyPlanGroupedReferences(plan, wildcardRowColumns(tables));
   validateGrouping(plan);
   plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
   plan = expandNaturalJoins(plan, wildcardRowColumns(tables));
@@ -7339,6 +7414,11 @@ class Parser {
   #limitClause(): { limit?: number; limitParameter?: number } {
     if (this.#isKeyword("LIMIT")) {
       this.#keyword("LIMIT");
+      // LIMIT ALL is PostgreSQL's spelling of no limit.
+      if (this.#isKeyword("ALL")) {
+        this.#keyword("ALL");
+        return {};
+      }
       if (this.#peek().kind === "parameter") {
         const parameter = this.#parameterExpression();
         return { limitParameter: parameter.index };
@@ -7478,12 +7558,19 @@ class Parser {
     if (this.#isKeyword("DISTINCT")) {
       this.#keyword("DISTINCT");
       distinct = true;
+    } else if (this.#isKeyword("ALL")) {
+      // SELECT ALL names the default: every row, duplicates kept.
+      this.#keyword("ALL");
     }
     const select = this.#selectList();
     let base: TableSource;
+    let joins: JoinPlan[] = [];
+    // ON conditions that join a parenthesized join group to the sources before it. An inner
+    // join's condition filters the product, so they become WHERE predicates.
+    const groupConditions: Expression[] = [];
     if (this.#isKeyword("FROM")) {
       this.#keyword("FROM");
-      base = this.#source();
+      ({ base, joins } = this.#joinedSources(select, groupConditions));
     } else {
       // A FROM-less SELECT evaluates its expressions over the one-row dual source.
       if (select.some((item) => item.expression.kind === "wildcard")) {
@@ -7491,126 +7578,13 @@ class Parser {
       }
       base = { table: DUAL_TABLE, alias: DUAL_TABLE };
     }
-    const joins: JoinPlan[] = [];
-    let rightJoins = 0;
-    while (
-      this.#peek().text === "," ||
-      this.#isKeyword("NATURAL") ||
-      this.#isKeyword("JOIN") ||
-      this.#isKeyword("INNER") ||
-      this.#isKeyword("LEFT") ||
-      this.#isKeyword("RIGHT") ||
-      this.#isKeyword("FULL") ||
-      this.#isKeyword("CROSS")
-    ) {
-      if (this.#punctuation(",")) {
-        // F041-07: a comma between table references is a cross join.
-        joins.push(crossJoinPlan(this.#source()));
-        continue;
-      }
-      if (this.#isKeyword("CROSS")) {
-        this.#keyword("CROSS");
-        this.#keyword("JOIN");
-        joins.push(crossJoinPlan(this.#source()));
-        continue;
-      }
-      let kind: JoinPlan["kind"] = "inner";
-      let right = false;
-      let full = false;
-      let natural = false;
-      if (this.#isKeyword("NATURAL")) {
-        // F401-01: the join columns are the names both sides share, which only the catalog
-        // knows; the join carries the marker until an execution entry resolves it.
-        this.#keyword("NATURAL");
-        natural = true;
-      }
-      if (this.#isKeyword("INNER")) this.#keyword("INNER");
-      else if (this.#isKeyword("LEFT")) {
-        this.#keyword("LEFT");
-        kind = "left";
-      } else if (this.#isKeyword("RIGHT")) {
-        this.#keyword("RIGHT");
-        right = true;
-        rightJoins += 1;
-      } else if (this.#isKeyword("FULL")) {
-        this.#keyword("FULL");
-        kind = "left";
-        full = true;
-      }
-      if (this.#isKeyword("OUTER")) this.#keyword("OUTER");
-      this.#keyword("JOIN");
-      const source = this.#source();
-      if (natural) {
-        if (this.#isKeyword("ON") || this.#isKeyword("USING")) {
-          throw new TypeError("A NATURAL join takes no ON or USING clause");
-        }
-        if (right) {
-          // The RIGHT mirror below rewrites the join's sources, which the shared-column search
-          // has to see; a natural right join would resolve against the wrong side.
-          throw new TypeError("NATURAL RIGHT JOIN is not supported; write it as a LEFT join");
-        }
-        joins.push({
-          ...source,
-          kind,
-          left: { kind: "literal", value: null },
-          right: { kind: "literal", value: null },
-          natural: true,
-          ...(full ? { full } : {}),
-        });
-        continue;
-      }
-      const condition = this.#isKeyword("USING")
-        ? this.#usingCondition(base.alias, source.alias)
-        : (this.#keyword("ON"), this.#expression());
-      if (condition.kind === "condition" && condition.operator === "=") {
-        joins.push({
-          ...source,
-          kind,
-          left: condition.left,
-          right: condition.right,
-          ...(full ? { full } : {}),
-        });
-      } else {
-        // Any other boolean condition becomes a nested-loop join.
-        joins.push({
-          ...source,
-          kind,
-          left: { kind: "literal", value: null },
-          right: { kind: "literal", value: null },
-          on: condition,
-          ...(full ? { full } : {}),
-        });
-      }
-      if (right) {
-        // A RIGHT JOIN is the mirrored LEFT JOIN; with a single join the sources just swap.
-        if (joins.length !== 1 || rightJoins !== 1) {
-          throw new TypeError("RIGHT JOIN is only supported as the sole join");
-        }
-        if (select.some((item) => item.expression.kind === "wildcard")) {
-          throw new TypeError("RIGHT JOIN cannot be combined with SELECT *");
-        }
-        const [only] = joins;
-        if (only !== undefined) {
-          const { kind: joinKind, left, right: rightSide, ...joinSource } = only;
-          void joinKind;
-          const previousBase = base;
-          base = joinSource;
-          joins[0] = {
-            ...previousBase,
-            kind: "left",
-            left,
-            right: rightSide,
-            ...(only.on === undefined ? {} : { on: only.on }),
-          };
-        }
-      }
-    }
-    const predicates: Predicate[] = [];
+    const predicates: Predicate[] = groupConditions.flatMap(splitCondition);
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
       predicates.push(...splitCondition(this.#expression()));
     }
     const groupBy: Expression[] = [];
+
     let groupingSets: Expression[][] | undefined;
     if (this.#isKeyword("GROUP")) {
       this.#keyword("GROUP");
@@ -7699,6 +7673,218 @@ class Parser {
     return sets;
   }
 
+  /**
+   * A FROM list: the first source and its join chain, flattened into the base and the joins
+   * the executors take in order. A parenthesized join group — `( t AS a CROSS JOIN t AS b )` —
+   * is the same chain inside parentheses, so it splices in flat: as the first source, or as
+   * the operand of a comma, CROSS JOIN, or INNER JOIN, whose ON condition then filters the
+   * product through `groupConditions`.
+   */
+  #joinedSources(
+    select: readonly SelectItem[],
+    groupConditions: Expression[],
+  ): { base: TableSource; joins: JoinPlan[]; rightJoins: number } {
+    const first = this.#joinOperand(select, groupConditions);
+    let base = first.base;
+    const joins: JoinPlan[] = [...first.joins];
+    let rightJoins = first.rightJoins;
+    while (
+      this.#peek().text === "," ||
+      this.#isKeyword("NATURAL") ||
+      this.#isKeyword("JOIN") ||
+      this.#isKeyword("INNER") ||
+      this.#isKeyword("LEFT") ||
+      this.#isKeyword("RIGHT") ||
+      this.#isKeyword("FULL") ||
+      this.#isKeyword("CROSS")
+    ) {
+      if (this.#punctuation(",")) {
+        // F041-07: a comma between table references is a cross join.
+        const operand = this.#joinOperand(select, groupConditions);
+        joins.push(crossJoinPlan(operand.base), ...operand.joins);
+        rightJoins += operand.rightJoins;
+        continue;
+      }
+      if (this.#isKeyword("CROSS")) {
+        this.#keyword("CROSS");
+        this.#keyword("JOIN");
+        const operand = this.#joinOperand(select, groupConditions);
+        joins.push(crossJoinPlan(operand.base), ...operand.joins);
+        rightJoins += operand.rightJoins;
+        continue;
+      }
+      let kind: JoinPlan["kind"] = "inner";
+      let right = false;
+      let full = false;
+      let natural = false;
+      if (this.#isKeyword("NATURAL")) {
+        // F401-01: the join columns are the names both sides share, which only the catalog
+        // knows; the join carries the marker until an execution entry resolves it.
+        this.#keyword("NATURAL");
+        natural = true;
+      }
+      if (this.#isKeyword("INNER")) this.#keyword("INNER");
+      else if (this.#isKeyword("LEFT")) {
+        this.#keyword("LEFT");
+        kind = "left";
+      } else if (this.#isKeyword("RIGHT")) {
+        this.#keyword("RIGHT");
+        right = true;
+        rightJoins += 1;
+      } else if (this.#isKeyword("FULL")) {
+        this.#keyword("FULL");
+        kind = "left";
+        full = true;
+      }
+      if (this.#isKeyword("OUTER")) this.#keyword("OUTER");
+      this.#keyword("JOIN");
+      const operand = this.#joinOperand(select, groupConditions);
+      if (operand.group) {
+        // Flattening keeps an inner join's answer: its ON filters the product. An outer,
+        // NATURAL, or USING join reads the group as one side, which a flat chain cannot say.
+        if (natural || right || full || kind === "left") {
+          throw new TypeError(
+            "A parenthesized join can only follow a comma, CROSS JOIN, or INNER JOIN",
+          );
+        }
+        if (this.#isKeyword("USING")) {
+          throw new TypeError("A parenthesized join takes an ON condition, not USING");
+        }
+        this.#keyword("ON");
+        groupConditions.push(this.#expression());
+        joins.push(crossJoinPlan(operand.base), ...operand.joins);
+        rightJoins += operand.rightJoins;
+        continue;
+      }
+      const source = operand.base;
+      if (natural) {
+        if (this.#isKeyword("ON") || this.#isKeyword("USING")) {
+          throw new TypeError("A NATURAL join takes no ON or USING clause");
+        }
+        if (right) {
+          // The RIGHT mirror below rewrites the join's sources, which the shared-column search
+          // has to see; a natural right join would resolve against the wrong side.
+          throw new TypeError("NATURAL RIGHT JOIN is not supported; write it as a LEFT join");
+        }
+        joins.push({
+          ...source,
+          kind,
+          left: { kind: "literal", value: null },
+          right: { kind: "literal", value: null },
+          natural: true,
+          ...(full ? { full } : {}),
+        });
+        continue;
+      }
+      const condition = this.#isKeyword("USING")
+        ? this.#usingCondition(base.alias, source.alias)
+        : (this.#keyword("ON"), this.#expression());
+      if (condition.kind === "condition" && condition.operator === "=") {
+        joins.push({
+          ...source,
+          kind,
+          left: condition.left,
+          right: condition.right,
+          ...(full ? { full } : {}),
+        });
+      } else {
+        // Any other boolean condition becomes a nested-loop join.
+        joins.push({
+          ...source,
+          kind,
+          left: { kind: "literal", value: null },
+          right: { kind: "literal", value: null },
+          on: condition,
+          ...(full ? { full } : {}),
+        });
+      }
+      if (right) {
+        // A RIGHT JOIN is the mirrored LEFT JOIN; with a single join the sources just swap.
+        if (joins.length !== 1 || rightJoins !== 1) {
+          throw new TypeError("RIGHT JOIN is only supported as the sole join");
+        }
+        if (select.some((item) => item.expression.kind === "wildcard")) {
+          throw new TypeError("RIGHT JOIN cannot be combined with SELECT *");
+        }
+        const [only] = joins;
+        if (only !== undefined) {
+          const { kind: joinKind, left, right: rightSide, ...joinSource } = only;
+          void joinKind;
+          const previousBase = base;
+          base = joinSource;
+          joins[0] = {
+            ...previousBase,
+            kind: "left",
+            left,
+            right: rightSide,
+            ...(only.on === undefined ? {} : { on: only.on }),
+          };
+        }
+      }
+    }
+    // A group's RIGHT JOIN mirrored inside its own chain still has to be the block's only join.
+    if (rightJoins > 0 && joins.length !== 1) {
+      throw new TypeError("RIGHT JOIN is only supported as the sole join");
+    }
+    return { base, joins, rightJoins };
+  }
+
+  /** One operand of a join chain: a source, or a parenthesized join group spliced in flat. */
+  #joinOperand(
+    select: readonly SelectItem[],
+    groupConditions: Expression[],
+  ): { base: TableSource; joins: JoinPlan[]; rightJoins: number; group: boolean } {
+    const next = this.#peek();
+    if (next.kind === "punctuation" && next.text === "(" && this.#parenthesizedJoinAhead()) {
+      this.#expectPunctuation("(");
+      const inner = this.#joinedSources(select, groupConditions);
+      this.#expectPunctuation(")");
+      // PostgreSQL lets an alias rename a whole group; the flat chain has no name for one.
+      if (this.#sourceAlias() !== undefined) {
+        throw new TypeError("A parenthesized join cannot take an alias");
+      }
+      return { ...inner, group: true };
+    }
+    return { base: this.#source(), joins: [], rightJoins: 0, group: false };
+  }
+
+  /**
+   * Whether the `(` ahead opens a join group rather than a derived table. A table name inside
+   * says group. A query inside — SELECT, VALUES, or WITH past any run of parentheses — is a
+   * derived table when an alias follows the matching `)`, which a derived table must take and
+   * a group never can; `((SELECT …) d CROSS JOIN t)` therefore reads as a group and
+   * `((SELECT …) UNION (SELECT …)) d` as a derived table.
+   */
+  #parenthesizedJoinAhead(): boolean {
+    let cursor = this.#index;
+    let first = this.tokens[cursor];
+    while (first?.kind === "punctuation" && first.text === "(") {
+      cursor += 1;
+      first = this.tokens[cursor];
+    }
+    if (first?.kind !== "identifier") return false;
+    const keyword = first.quoted === true ? "" : first.text.toUpperCase();
+    if (keyword !== "SELECT" && keyword !== "VALUES" && keyword !== "WITH") return true;
+    // A query right inside the parenthesis is a derived table, with or without its alias; only
+    // a query one level deeper can be a group's first source.
+    if (cursor === this.#index + 1) return false;
+    let depth = 0;
+    for (let index = this.#index; index < this.tokens.length; index += 1) {
+      const token = this.tokens[index];
+      if (token?.kind !== "punctuation") continue;
+      if (token.text === "(") depth += 1;
+      else if (token.text === ")") {
+        depth -= 1;
+        if (depth > 0) continue;
+        const next = this.tokens[index + 1];
+        if (next?.kind !== "identifier") return true;
+        if (next.quoted === true || next.text.toUpperCase() === "AS") return false;
+        return clauseKeywords.has(next.text.toUpperCase()) || next.text.toUpperCase() === "ON";
+      }
+    }
+    return false;
+  }
+
   #selectList(): SelectItem[] {
     const items: SelectItem[] = [];
     const explicitAliases: boolean[] = [];
@@ -7708,6 +7894,10 @@ class Parser {
       let explicitAlias = false;
       if (this.#isKeyword("AS")) {
         this.#keyword("AS");
+        alias = this.#identifier();
+        explicitAlias = true;
+      } else if (this.#bareLabelAhead()) {
+        // `SELECT amount total`: a label needs no AS, as in PostgreSQL and SQLite.
         alias = this.#identifier();
         explicitAlias = true;
       }
@@ -8048,6 +8238,13 @@ class Parser {
       return { table, alias, columnAliases };
     }
     return { table, alias };
+  }
+
+  /** A column label written without AS: an identifier that no clause or operator can claim. */
+  #bareLabelAhead(): boolean {
+    const token = this.#peek();
+    if (token.kind !== "identifier") return false;
+    return token.quoted === true || !bareLabelStopWords.has(token.text.toUpperCase());
   }
 
   #sourceAlias(): string | undefined {
@@ -9797,6 +9994,149 @@ function resolveGroupByReferences(
 }
 
 /**
+ * One spelling per grouped column. PostgreSQL resolves `SELECT col0 … GROUP BY t.col0` and
+ * `SELECT t.col0 + 1 … GROUP BY col0` to the same column before it checks that every selected
+ * column is grouped. Both executors match a select expression to its grouping key by the
+ * expression's exact spelling, so the GROUP BY's spelling wins: a reference in the select list,
+ * HAVING, ORDER BY, or another grouping set that `resolve` maps to the same column is respelled
+ * to it. An ORDER BY name that is an output alias keeps that meaning, and a nested block resolves
+ * its own names. `resolve` names the column a reference denotes (`alias.column`), or undefined
+ * when the block cannot tell: an outer reference, or an unqualified name across several sources
+ * before the schemas are known. Returns the same object when nothing needed respelling.
+ */
+function unifyGroupedReferences<
+  T extends Pick<CompiledQuery, "select" | "groupBy" | "having" | "orderBy"> & {
+    groupingSets?: Expression[][];
+  },
+>(block: T, resolve: (reference: string) => string | undefined): T {
+  const groupingReferences = [...block.groupBy, ...(block.groupingSets ?? []).flat()].flatMap(
+    (expression) => (expression.kind === "column" ? [expression.reference] : []),
+  );
+  if (groupingReferences.length === 0) return block;
+  // Syntax alone says whether any reference could be another spelling of a grouped column:
+  // one outside the GROUP BY spellings whose bare name a grouping reference shares. Nothing to
+  // do is the common case, and it must not cost a schema lookup or a rebuilt tree.
+  const spelled = new Set(groupingReferences);
+  const bareNames = new Set(groupingReferences.map(bareColumnName));
+  const candidate = (expression: Expression): boolean =>
+    expressionColumns(expression).some(
+      (reference) => !spelled.has(reference) && bareNames.has(bareColumnName(reference)),
+    );
+  const aliases = new Set(block.select.map((item) => item.alias));
+  const orderCandidates = block.orderBy.filter(
+    (order) => !(order.expression.kind === "column" && aliases.has(order.expression.reference)),
+  );
+  if (
+    !block.select.some((item) => candidate(item.expression)) &&
+    !block.having.some((predicate) => candidate(predicate.left) || candidate(predicate.right)) &&
+    !orderCandidates.some((order) => candidate(order.expression)) &&
+    !groupingReferences.some((reference) => !spelled.has(reference))
+  ) {
+    return block;
+  }
+  const spellings = new Map<string, string>();
+  for (const reference of groupingReferences) {
+    const column = resolve(reference);
+    if (column !== undefined && !spellings.has(column)) spellings.set(column, reference);
+  }
+  if (spellings.size === 0) return block;
+  let respelled = 0;
+  const respell = (expression: Expression): Expression => {
+    if (expression.kind === "column") {
+      const column = resolve(expression.reference);
+      const spelling = column === undefined ? undefined : spellings.get(column);
+      if (spelling === undefined || spelling === expression.reference) return expression;
+      respelled += 1;
+      return { ...expression, reference: spelling };
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") return expression;
+    if (expression.kind === "window") {
+      return {
+        ...expression,
+        partitionBy: expression.partitionBy.map(respell),
+        orderBy: expression.orderBy.map((order) => ({
+          ...order,
+          expression: respell(order.expression),
+        })),
+        ...(expression.argument === undefined ? {} : { argument: respell(expression.argument) }),
+      };
+    }
+    return mapChildExpressions(expression, respell);
+  };
+  const unified: T = {
+    ...block,
+    select: block.select.map((item) => ({ ...item, expression: respell(item.expression) })),
+    groupBy: block.groupBy.map(respell),
+    having: block.having.map((predicate) => ({
+      ...predicate,
+      left: respell(predicate.left),
+      right: respell(predicate.right),
+    })),
+    orderBy: block.orderBy.map((order) =>
+      order.expression.kind === "column" && aliases.has(order.expression.reference)
+        ? order
+        : { ...order, expression: respell(order.expression) },
+    ),
+    ...(block.groupingSets === undefined
+      ? {}
+      : { groupingSets: block.groupingSets.map((set) => set.map(respell)) }),
+  };
+  return respelled > 0 ? unified : block;
+}
+
+function bareColumnName(reference: string): string {
+  const separator = reference.indexOf(".");
+  return separator === -1 ? reference : reference.slice(separator + 1);
+}
+
+/**
+ * The parse-time half of unifyGroupedReferences: with one source every name is that source's,
+ * so `alias.column` and `column` unify without a schema. A block over several sources waits
+ * for unifyPlanGroupedReferences at an execution entry, where the schemas say which source an
+ * unqualified name belongs to.
+ */
+function unifyBlockGroupedReferences(parts: SelectBlockParts): SelectBlockParts {
+  if (parts.joins.length > 0 || parts.base.table === DUAL_TABLE) return parts;
+  const alias = parts.base.alias;
+  return unifyGroupedReferences(parts, (reference) => {
+    const separator = reference.indexOf(".");
+    if (separator === -1) return `${alias}.${reference}`;
+    return reference.slice(0, separator) === alias ? reference : undefined;
+  });
+}
+
+/**
+ * The execution-time half of unifyGroupedReferences for a block over several sources: an
+ * unqualified name is the column of the one source that has it, which only the schemas know.
+ */
+export function unifyPlanGroupedReferences(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (plan.joins.length === 0 || plan.groupBy.length === 0) return plan;
+  const sources = [plan.base, ...plan.joins];
+  const aliases = new Set(sources.map((source) => source.alias));
+  let columnsBySource: Map<string, ReadonlySet<string>> | undefined;
+  return unifyGroupedReferences(plan, (reference) => {
+    const separator = reference.indexOf(".");
+    if (separator !== -1) return aliases.has(reference.slice(0, separator)) ? reference : undefined;
+    columnsBySource ??= new Map(
+      sources.map((source) => [
+        source.alias,
+        new Set(sourceWildcardColumns(source, columnsOf) ?? []),
+      ]),
+    );
+    let owner: string | undefined;
+    for (const [alias, columns] of columnsBySource) {
+      if (!columns.has(reference)) continue;
+      if (owner !== undefined) return undefined;
+      owner = alias;
+    }
+    return owner === undefined ? undefined : `${owner}.${reference}`;
+  });
+}
+
+/**
  * FULL OUTER JOIN desugars into UNION ALL of two left joins: the plain left join carries every
  * base row (matched or not), and the swapped left join filtered to a NULL-extended base side
  * carries the joined source's unmatched rows. Sound because an equality join key never matches
@@ -9947,6 +10287,7 @@ export function assembleSelectBlock(
           ),
         }),
   };
+  parts = unifyBlockGroupedReferences(parts);
   if (parts.joins.some((join) => join.full === true)) {
     return desugarFullJoin(parts, nextSequence);
   }

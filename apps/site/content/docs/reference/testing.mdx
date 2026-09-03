@@ -111,8 +111,9 @@ time and creates one empty database per file. A large corpus therefore does not 
 large in-memory syntax tree.
 
 The runner implements the original format's `statement ok/error`, typed `query`, `nosort`,
-`rowsort`, `valuesort`, result labels, MD5 result hashes, `hash-threshold`, `skipif`, `onlyif`, and
-`halt` directives. Malformed records, wrong value counts, wrong types, duplicate labels with
+`rowsort`, `valuesort`, result labels, MD5 result hashes, `hash-threshold`, `skipif`, `onlyif`
+(with the trailing `# comment` the upstream corpus writes after an engine name), and `halt`
+directives. Malformed records, wrong value counts, wrong types, duplicate labels with
 different answers, and unknown directives are failures with exact source lines. Conditions are
 reported as skips; they are never silently discarded.
 

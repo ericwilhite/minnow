@@ -13,6 +13,18 @@
       "example": "SELECT amount AS total FROM rows"
     },
     {
+      "id": "select.all",
+      "status": "supported",
+      "example": "SELECT ALL region, amount FROM rows",
+      "notes": "SELECT ALL names the default: every row, duplicates kept. ALL is also accepted inside an aggregate, as in COUNT(ALL amount)."
+    },
+    {
+      "id": "select.label-without-as",
+      "status": "supported",
+      "example": "SELECT amount total, region \"area\" FROM rows",
+      "notes": "A column label needs no AS, as in PostgreSQL and SQLite. The label is any identifier that no clause or operator keyword can claim; a quoted identifier is always a label."
+    },
+    {
       "id": "select.wildcard",
       "status": "supported",
       "example": "SELECT * FROM rows"
@@ -37,7 +49,7 @@
       "id": "expression.round",
       "status": "supported",
       "example": "SELECT ROUND(amount / 3, 2) AS thirds FROM rows",
-      "notes": "Precision truncates to an integer and clamps to 0..30; halfway values round away from zero, matching SQLite."
+      "notes": "Over a double, precision truncates to an integer and clamps to 0..30, and halfway values round away from zero, matching SQLite. Over an exact NUMERIC the result is PostgreSQL's numeric ROUND: exact, half away from zero, a negative digit count rounds left of the decimal point, and a literal digit count is the result's display scale."
     },
     {
       "id": "literal.string",
@@ -934,6 +946,12 @@
       "example": "SELECT y.a AS a FROM rows AS y(a, b, c, d)"
     },
     {
+      "id": "from.parenthesized-join",
+      "status": "supported",
+      "example": "SELECT COUNT(*) AS pairs FROM (rows r CROSS JOIN dims d)",
+      "notes": "A parenthesized join group is accepted as the first source or as the operand of a comma, CROSS JOIN, or INNER JOIN, whose ON condition then filters the product. A group cannot take an alias, and LEFT, RIGHT, FULL, NATURAL, or USING joins onto a group are rejected: the flat join chain cannot treat the group as one side."
+    },
+    {
       "id": "aggregate.all-quantifier",
       "status": "supported",
       "example": "SELECT SUM(ALL amount) AS total FROM rows"
@@ -1183,7 +1201,7 @@
       "id": "type.exact-numeric",
       "status": "supported",
       "example": "SELECT CAST(1.25 AS DECIMAL(12, 2)) AS amount",
-      "notes": "Exact through storage, arithmetic, comparison, aggregates, and windows. Division selects its result scale the way PostgreSQL does: at least sixteen significant digits, never fewer fractional digits than either operand, rounded half away from zero."
+      "notes": "Exact through storage, arithmetic, comparison, aggregates, windows, and ROUND, TRUNC, ABS, FLOOR, CEIL, MOD, and SIGN. Addition, subtraction, remainder, and multiplication carry PostgreSQL's display scale (the larger operand scale, or their sum for a product); division selects its result scale the way PostgreSQL does: at least sixteen significant digits, never fewer fractional digits than either operand, rounded half away from zero. A plain-number fallback beside NUMERIC values, as in COALESCE(amount, 0), renders at its own scale."
     },
     {
       "id": "type.json-jsonb",
@@ -1552,6 +1570,12 @@
       "notes": "A bare GROUP BY name that is an output alias stands for the aliased expression. A name that is both an alias and a source column keeps its source-column meaning, which is also what PostgreSQL does."
     },
     {
+      "id": "group-by.qualified-spelling",
+      "status": "supported",
+      "example": "SELECT region, SUM(r.amount) AS total FROM rows r GROUP BY r.region ORDER BY region",
+      "notes": "A grouped column may be spelled bare in the select list and qualified in GROUP BY, or the reverse, and both spellings may appear in one expression. With several sources a bare name is the column of the one source that has it, resolved from the schemas at execution."
+    },
+    {
       "id": "group-by.expression-over-key",
       "status": "supported",
       "example": "SELECT FLOOR(amount / 5) * 5 AS bucket, COUNT(*) AS c FROM rows GROUP BY FLOOR(amount / 5) ORDER BY bucket",
@@ -1568,6 +1592,12 @@
       "status": "supported",
       "example": "SELECT region FROM rows ORDER BY amount LIMIT 0",
       "notes": "LIMIT 0 returns no rows and still reports the result's column shape, the way clients read a query's columns without fetching data."
+    },
+    {
+      "id": "limit.all",
+      "status": "supported",
+      "example": "SELECT amount FROM rows ORDER BY amount LIMIT ALL OFFSET 1",
+      "notes": "LIMIT ALL is PostgreSQL's spelling of no limit, alone or before OFFSET, on a block or a set operation. SQLite has no LIMIT ALL."
     },
     {
       "id": "set.trailing-order",

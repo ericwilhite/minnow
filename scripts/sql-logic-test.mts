@@ -88,7 +88,8 @@ try {
         ? {
             onFailure: (failure) => {
               failures.push(failure);
-              console.error(`FAIL ${failure.message}\n`);
+              const cause = failure.cause instanceof Error ? `\n${failure.cause.message}` : "";
+              console.error(`FAIL ${failure.message}${cause}\n`);
               if (failures.length >= maxFailures) throw failure;
               return "continue";
             },

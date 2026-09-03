@@ -109,6 +109,21 @@ describe("SQLLogicTest parser", () => {
     );
   });
 
+  it("drops a trailing comment from a conditional, as the upstream corpus writes them", () => {
+    const records = parseSqlLogicTest(
+      "onlyif mysql # not compatible\nskipif mssql # not compatible\nquery I\nSELECT 1\n----\n1",
+      "upstream.test",
+    );
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      kind: "query",
+      conditions: [
+        { kind: "onlyif", engine: "mysql", location: { file: "upstream.test", line: 1 } },
+        { kind: "skipif", engine: "mssql", location: { file: "upstream.test", line: 2 } },
+      ],
+    });
+  });
+
   it.each([
     ["statement maybe\nSELECT 1", "statement must be"],
     ["query IX\nSELECT 1\n----\n1", "type string"],

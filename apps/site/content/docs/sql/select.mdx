@@ -52,8 +52,14 @@ example and any difference from PostgreSQL.
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
 `COLLATE` on string expressions. A sort key may name a selected column through its source alias
 (`SELECT id FROM orders AS o ORDER BY o.id`), the way PostgreSQL resolves it.
-`LIMIT` and `OFFSET` both work, `LIMIT 0` returns no rows, and a `LIMIT` without an `ORDER BY`
-returns rows in no promised order, as in any SQL engine.
+`LIMIT` and `OFFSET` both work, `LIMIT 0` returns no rows, `LIMIT ALL` is PostgreSQL's spelling
+of no limit, and a `LIMIT` without an `ORDER BY` returns rows in no promised order, as in any SQL
+engine.
+
+`SELECT ALL` names the default (every row, duplicates kept), and a column label needs no `AS`:
+`SELECT total * 2 doubled FROM orders` is `SELECT total * 2 AS doubled FROM orders`. A label is
+any identifier that no clause or operator keyword can claim; a quoted identifier is always a
+label.
 
 `*` and `alias.*` are expanded from the input schema before Minnow plans operations that depend
 on the output width. They therefore work with `DISTINCT`, window columns, set operations,
@@ -79,6 +85,12 @@ ORDER BY revenue DESC
 `ON`. Minnow estimates how many rows each side will produce, then orders the joins and builds its
 lookup table from the smaller side. Equality joins can use the unique-key lookup when one side has
 one.
+
+A parenthesized join group — `FROM (orders o CROSS JOIN stores s)` — is accepted as the first
+source or as the operand of a comma, `CROSS JOIN`, or `INNER JOIN`, whose `ON` condition then
+filters the product. A group cannot take an alias, and a `LEFT`, `RIGHT`, `FULL`, `NATURAL`, or
+`USING` join onto a group is rejected with an explicit error, since the flat join chain cannot
+treat the group as one side.
 
 `RIGHT JOIN` must be the only join in its block and cannot be combined with `SELECT *` — both
 rejections come with explicit errors, and the mirrored `LEFT JOIN` is always available. `FULL
@@ -132,7 +144,10 @@ and `LIMIT` applied to the distinct rows, as in PostgreSQL.
 expression (`SELECT DATE_TRUNC('month', placed_at) AS month … GROUP BY month`). A selected
 expression built over a grouping expression is grouped, so `FLOOR(total / 50) * 50` may be
 selected beside `GROUP BY FLOOR(total / 50)`, and `COALESCE(region, 'all')` labels a `ROLLUP`
-total.
+total. A grouped column may be spelled bare on one side and qualified on the other
+(`SELECT status … FROM orders o GROUP BY o.status`, or `SELECT o.status … GROUP BY status`),
+and both spellings may appear in one expression; with several sources a bare name is the column
+of the one source that has it.
 
 JSON constructors retain JSON provenance until the result crosses the JavaScript boundary. A
 constructor used inside another constructor is embedded as a document, not quoted as text:
