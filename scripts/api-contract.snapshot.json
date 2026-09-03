@@ -870,6 +870,13 @@
               ]
             },
             {
+              "name": "StagedUpsertResult",
+              "kind": "type",
+              "declarations": [
+                "export interface StagedUpsertResult extends StagedWriteResult {\n    skippedRowCount: number;\n}"
+              ]
+            },
+            {
               "name": "StagedWriteResult",
               "kind": "type",
               "declarations": [
@@ -1063,7 +1070,7 @@
               "name": "WriteSession",
               "kind": "type",
               "declarations": [
-                "export interface WriteSession {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;\n}"
+                "export interface WriteSession {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput, options?: UpsertOptions): Promise<StagedUpsertResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;\n}"
               ]
             }
           ]
@@ -1481,7 +1488,7 @@
               "name": "ClientWriteSession",
               "kind": "type",
               "declarations": [
-                "export interface ClientWriteSession {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;\n}"
+                "export interface ClientWriteSession {\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;\n    insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;\n    upsertBatch(tableName: string, input: InsertBatchInput, options?: UpsertOptions): Promise<StagedUpsertResult>;\n    updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;\n    deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;\n}"
               ]
             },
             {
@@ -2926,6 +2933,13 @@
               "kind": "type",
               "declarations": [
                 "export interface GarbageCollectionArtifactCursor {\n    family: \"manifest\" | \"transaction\" | \"compaction\";\n    recordId: string;\n    blockId: string | null;\n    blockIndex: number;\n    segmentIndex: number;\n}"
+              ]
+            },
+            {
+              "name": "GarbageCollectionCandidateSet",
+              "kind": "type",
+              "declarations": [
+                "export interface GarbageCollectionCandidateSet {\n    readonly candidateManifestVersions: readonly number[];\n    readonly candidateSegmentIds: readonly string[];\n    readonly candidateBlockIds: readonly string[];\n    readonly candidateTransactionIds: readonly string[];\n}"
               ]
             },
             {
@@ -5292,6 +5306,13 @@
               "kind": "type",
               "declarations": [
                 "export interface GarbageCollectionArtifactCursor {\n    family: \"manifest\" | \"transaction\" | \"compaction\";\n    recordId: string;\n    blockId: string | null;\n    blockIndex: number;\n    segmentIndex: number;\n}"
+              ]
+            },
+            {
+              "name": "GarbageCollectionCandidateSet",
+              "kind": "type",
+              "declarations": [
+                "export interface GarbageCollectionCandidateSet {\n    readonly candidateManifestVersions: readonly number[];\n    readonly candidateSegmentIds: readonly string[];\n    readonly candidateBlockIds: readonly string[];\n    readonly candidateTransactionIds: readonly string[];\n}"
               ]
             },
             {

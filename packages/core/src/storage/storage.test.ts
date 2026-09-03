@@ -4757,6 +4757,99 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("does not re-reject an earlier page's candidate reclaimed by concurrent maintenance", async () => {
+      const store = await implementation.create();
+      await store.addTable({
+        managed: false,
+        id: "mid-plan-table",
+        name: "mid_plan_table",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const staged = await stageTestArtifacts(store, {
+        transactionId: "mid-plan-writer",
+        blocks: [{ id: "mid-plan-block", bytes: Uint8Array.of(1) }],
+        segments: [
+          {
+            id: "mid-plan-segment",
+            tableId: "mid-plan-table",
+            transactionId: "mid-plan-writer",
+            rowCount: 1,
+            rowIdStart: 1n,
+            rowIdEndExclusive: 2n,
+            columnBlockIds: { value: ["mid-plan-block"] },
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+      await store.commitTransaction({
+        transactionId: staged.id,
+        expectedTransactionRevision: staged.revision,
+        expectedManifestVersion: null,
+        removedBlockIds: [],
+        levelZeroSegmentLimits: [{ tableId: "mid-plan-table", limit: 1 }],
+        committedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      const discovery = {
+        phase: "segments" as const,
+        currentManifestVersion: (await store.getCurrentManifest())?.version ?? null,
+        retainAboveVersion: 0,
+        retainAfter: 0,
+        maxPlanningItems: 8,
+        manifestCursor: null,
+        segmentCursor: null,
+        transactionCursor: null,
+        compactionCursor: null,
+        visitedRecords: 0,
+      };
+
+      // Page 1: nominate a segment that currently exists. This is the normal, valid case.
+      const job = await store.createGarbageCollectionJob({
+        id: "mid-plan-gc",
+        candidateManifestVersions: [],
+        candidateSegmentIds: ["mid-plan-segment"],
+        candidateBlockIds: [],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:01:00.000Z",
+        discovery,
+      });
+      expect(job.candidateSegmentIds).toEqual(["mid-plan-segment"]);
+
+      // Concurrent maintenance (here, dropping the owning table) reclaims that same segment
+      // before planning has finished paging through the rest of the store.
+      await store.dropTable({
+        tableId: "mid-plan-table",
+        expectedTableRevision: 0,
+        expectedManifestVersion: 0,
+        expectedCatalogEpoch: (await store.getCatalogProbe()).catalogEpoch,
+        committedAt: "2026-01-01T00:02:00.000Z",
+      });
+      expect(await store.getSegment("mid-plan-segment")).toBeUndefined();
+
+      // Page 2 only appends new, still-valid candidates. It must not be wedged by the earlier
+      // page's candidate having since lost its provenance through legitimate reclamation.
+      const advanced = await store.updateGarbageCollectionPlanning({
+        jobId: job.id,
+        expectedRevision: job.revision,
+        candidateManifestVersions: [],
+        discovery: { ...discovery, phase: "complete", visitedRecords: 1 },
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      });
+      expect(advanced.candidateSegmentIds).toEqual(["mid-plan-segment"]);
+
+      const step = await store.runGarbageCollectionStep({
+        jobId: advanced.id,
+        expectedRevision: advanced.revision,
+        maxItems: 10,
+        updatedAt: "2026-01-01T00:04:00.000Z",
+      });
+      expect(step.missingSegmentIds).toEqual(["mid-plan-segment"]);
+      expect(step.job.state).toBe("completed");
+      store.close();
+    });
+
     it("allows only one garbage collection step for a job revision", async () => {
       const store = await implementation.create();
       const prefix = "contended-gc";

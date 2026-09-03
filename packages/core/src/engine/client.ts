@@ -45,6 +45,7 @@ import type {
   BatchValue,
   BufferPoolStats,
   StagedWriteResult,
+  StagedUpsertResult,
   BufferedFlushResult,
   BufferedWriterOptions,
   CancelCompactionJobResult,
@@ -615,8 +616,14 @@ export class MinnowDatabaseClient {
       op: "insertBatch" | "upsertBatch" | "updateBatch" | "deleteBatch",
       tableName: string,
       input: unknown,
+      options?: UpsertOptions,
     ): Promise<StagedWriteResult> =>
-      this._invoke(opened.handleId, "stage", [op, tableName, input]) as Promise<StagedWriteResult>;
+      this._invoke(opened.handleId, "stage", [
+        op,
+        tableName,
+        input,
+        options,
+      ]) as Promise<StagedWriteResult>;
     const session: ClientWriteSession = {
       query: async (sql, options = {}) => {
         const { signal, onStats, ...wireOptions } = options;
@@ -636,7 +643,8 @@ export class MinnowDatabaseClient {
           params === undefined ? [sql] : [sql, params],
         ) as Promise<ExecuteResult>,
       insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
-      upsertBatch: (tableName, input) => stage("upsertBatch", tableName, input),
+      upsertBatch: (tableName, input, options) =>
+        stage("upsertBatch", tableName, input, options) as Promise<StagedUpsertResult>,
       updateBatch: (tableName, input) => stage("updateBatch", tableName, input),
       deleteBatch: (tableName, input) => stage("deleteBatch", tableName, input),
     };
@@ -1077,7 +1085,11 @@ export interface ClientWriteSession {
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
-  upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
+  upsertBatch(
+    tableName: string,
+    input: InsertBatchInput,
+    options?: UpsertOptions,
+  ): Promise<StagedUpsertResult>;
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
   deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
 }

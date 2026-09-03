@@ -21,6 +21,7 @@ import {
   type QueryExecutionStats,
   type QueryOptions,
   type ReadTableOptions,
+  type UpsertOptions,
 } from "./database.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
 import type { CompiledQuery, QueryRow, QueryValue } from "./query.js";
@@ -842,9 +843,17 @@ class DatabaseRpcServer {
       return handle.session.execute(sql, params);
     }
     if (method === "stage") {
-      const [op, tableName, input] = args as [unknown, string, never];
+      const [op, tableName, input, options] = args as [
+        unknown,
+        string,
+        never,
+        UpsertOptions | undefined,
+      ];
       if (!isStageOp(op)) {
         throw new Error(`Unsupported write stage operation: ${String(op)}`);
+      }
+      if (op === "upsertBatch") {
+        return handle.session.upsertBatch(tableName, input, options);
       }
       return handle.session[op](tableName, input);
     }

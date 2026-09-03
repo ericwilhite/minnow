@@ -24,6 +24,21 @@ The callback can mix batch calls with parameterized SQL through `tx.execute(...)
 transaction callback to Minnow's SQL transaction statements; see the
 [Kysely adapter](/docs/adapters/kysely).
 
+`tx.upsertBatch` accepts the same `conflictWhere` guard as the autocommit form (see
+[Bulk writes](/docs/engine#bulk-writes)), so a guarded upsert composes atomically with the rest of
+the scope — for example, replacing an offline-created row with its server-confirmed twin only when
+nothing has since edited it locally, in the same commit as the delete that removes the local
+placeholder:
+
+```ts
+await db.write(async (tx) => {
+  await tx.deleteBatch("orders", { keys: [offlineId] });
+  return tx.upsertBatch("orders", [serverRow], {
+    conflictWhere: { column: "_synced", operator: "=", value: true },
+  });
+});
+```
+
 Everything inside becomes visible at once, including to other tabs: nobody observes the stock
 decremented without the shipment. If the callback throws, nothing is published.
 

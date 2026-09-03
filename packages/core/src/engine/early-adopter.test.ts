@@ -124,6 +124,43 @@ describe("early-adopter engine contracts", () => {
     await database.close();
   });
 
+  it("threads conflictWhere through a write() scope's upsertBatch, atomic with a delete", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    await database.createTable({
+      name: "sync_rows",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "value", type: "string" },
+        { name: "_synced", type: "boolean" },
+      ],
+    });
+    await database.insertBatch("sync_rows", [
+      { id: -1, value: "offline-draft", _synced: false },
+      { id: 2, value: "pending-local-edit", _synced: false },
+    ]);
+
+    const { result, version } = await database.write(async (session) => {
+      await session.deleteBatch("sync_rows", { keys: [-1] });
+      return session.upsertBatch(
+        "sync_rows",
+        [
+          { id: 1, value: "server-row", _synced: true },
+          { id: 2, value: "must-not-win", _synced: true },
+        ],
+        { conflictWhere: { column: "_synced", operator: "=", value: true } },
+      );
+    });
+
+    expect(result).toMatchObject({ rowCount: 1, skippedRowCount: 1 });
+    expect(version).not.toBeNull();
+    expect(await database.readTable("sync_rows")).toEqual([
+      { id: 2, value: "pending-local-edit", _synced: false },
+      { id: 1, value: "server-row", _synced: true },
+    ]);
+    await database.close();
+  });
+
   it("windows guarded upsert classification beyond the SQL parameter limit", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore(), {
       compression: "raw",

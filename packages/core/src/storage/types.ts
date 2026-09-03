@@ -1921,6 +1921,18 @@ export interface UpdateGarbageCollectionPlanningInput {
   updatedAt: string;
 }
 
+/**
+ * One page's (or one job's full) proposed garbage-collection candidates, checked for persisted
+ * provenance before being accepted. Shared by every adapter's provenance assertion so a candidate
+ * kind added to one cannot be forgotten in another.
+ */
+export interface GarbageCollectionCandidateSet {
+  readonly candidateManifestVersions: readonly number[];
+  readonly candidateSegmentIds: readonly string[];
+  readonly candidateBlockIds: readonly string[];
+  readonly candidateTransactionIds: readonly string[];
+}
+
 export interface GarbageCollectionJobRecord {
   id: string;
   candidateManifestVersions: number[];

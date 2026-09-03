@@ -880,6 +880,11 @@ export interface StagedWriteResult {
   generatedColumns?: Record<string, QueryValue[]>;
 }
 
+export interface StagedUpsertResult extends StagedWriteResult {
+  /** Input rows rejected by `conflictWhere`; always 0 without it. */
+  skippedRowCount: number;
+}
+
 /**
  * The scope handed to `write()`: every mutation stages into one transaction and publishes
  * as one commit — all of it or none of it, in every tab. Reads observe the pre-scope snapshot
@@ -900,7 +905,11 @@ export interface WriteSession {
   /** Runs a SELECT, INSERT, UPDATE, or DELETE inside this write scope. */
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
-  upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
+  upsertBatch(
+    tableName: string,
+    input: InsertBatchInput,
+    options?: UpsertOptions,
+  ): Promise<StagedUpsertResult>;
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
   deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
 }
@@ -3523,12 +3532,7 @@ export class MinnowDatabase {
     const { result, batch, generated, autoIncrement } = completed;
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     if (result.acceptedRowIndexes.length !== result.requestedRowCount) {
-      for (const [name, values] of generated) {
-        generated.set(
-          name,
-          result.acceptedRowIndexes.map((index) => values[index] ?? null),
-        );
-      }
+      remapGeneratedColumns(generated, result.acceptedRowIndexes);
     }
     return {
       tableName: result.tableName,
@@ -4217,35 +4221,21 @@ export class MinnowDatabase {
           rowCount,
           (sql, params) => this.#sessionQuery(transaction, sql, { params }),
           normalizedConflictWhere,
-          normalizedConflictWhere !== undefined,
         );
       }
       if (normalizedConflictWhere !== undefined) {
         if (upsertFirings === undefined) {
           throw new Error("Upsert conflict classification is missing");
         }
-        const classifiedFirings = upsertFirings;
-        acceptedRowIndexes = [...classifiedFirings.inserts, ...classifiedFirings.updates].sort(
-          (left, right) => left - right,
-        );
-        skippedRowCount = classifiedFirings.skipped.length;
-        input = selectBatchRows(input, acceptedRowIndexes);
-        rowCount = acceptedRowIndexes.length;
+        counts = { inserted: upsertFirings.inserts.length, updated: upsertFirings.updates.length };
+        const filtered = applyUpsertConflictFilter(input, rowCount, upsertFirings);
+        acceptedRowIndexes = filtered.acceptedRowIndexes;
+        skippedRowCount = filtered.skippedRowCount;
+        input = filtered.batch;
+        rowCount = filtered.rowCount;
+        upsertFirings = filtered.firings;
         logicalBytes = estimateBatchBytes(input);
         resolvedKeys = batchKeys(table, input);
-        counts = {
-          inserted: classifiedFirings.inserts.length,
-          updated: classifiedFirings.updates.length,
-        };
-        const acceptedPosition = new Map(
-          acceptedRowIndexes.map((original, position) => [original, position] as const),
-        );
-        upsertFirings = {
-          inserts: classifiedFirings.inserts.map((index) => acceptedPosition.get(index) ?? -1),
-          updates: classifiedFirings.updates.map((index) => acceptedPosition.get(index) ?? -1),
-          skipped: [],
-          oldImages: acceptedRowIndexes.map((index) => classifiedFirings.oldImages[index]),
-        };
         if (rowCount === 0) {
           await transaction.abort();
           const version = transaction.snapshotVersion;
@@ -7366,7 +7356,6 @@ export class MinnowDatabase {
       operator: ComparisonOperator;
       value: BatchValue;
     },
-    force = false,
   ): Promise<
     | {
         inserts: number[];
@@ -7379,7 +7368,7 @@ export class MinnowDatabase {
     const fires = (table.triggers ?? []).some(
       (trigger) => trigger.event === "insert" || trigger.event === "update",
     );
-    if ((!fires && !force) || rowCount === 0) return undefined;
+    if ((!fires && conflictWhere === undefined) || rowCount === 0) return undefined;
     const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
     const keyValues = batch.columns[keyColumn.name] ?? [];
     const distinct = new Map<string, Exclude<BatchValue, null>>();
@@ -7959,10 +7948,10 @@ export class MinnowDatabase {
         staged += 1;
         return guarded(() => this.#sessionInsert(transaction, tableName, input, "insert"));
       },
-      upsertBatch: async (tableName, input) => {
+      upsertBatch: async (tableName, input, options) => {
         open();
         staged += 1;
-        return guarded(() => this.#sessionInsert(transaction, tableName, input, "upsert"));
+        return guarded(() => this.#sessionInsert(transaction, tableName, input, "upsert", options));
       },
       updateBatch: async (tableName, input) => {
         open();
@@ -8327,11 +8316,14 @@ export class MinnowDatabase {
     tableName: string,
     input: InsertBatchInput,
     kind: "insert" | "upsert",
+    options?: UpsertOptions,
     cascadeBudget = 1,
-  ): Promise<StagedWriteResult> {
+  ): Promise<StagedUpsertResult> {
     const table = await this.#findTable(tableName);
-    await this.#assertCompactionCapacity(table, transaction);
-    const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
+    const filled = await this.#fillDefaults(table, input);
+    const { generated, autoIncrement } = filled;
+    let batch = filled.batch;
+    let rowCount = filled.rowCount;
     if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
         table.id,
@@ -8345,6 +8337,54 @@ export class MinnowDatabase {
         validateValue(autoIncrement.column, patched[rowIndex] ?? null, rowIndex);
       }
     }
+    // Session upserts classify against the scope's own staged state, so a row inserted
+    // earlier in the scope makes a later upsert of its key fire as an UPDATE.
+    const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
+    const normalizedConflictWhere =
+      kind === "upsert" && options?.conflictWhere !== undefined
+        ? normalizeUpsertConflictWhere(table, options.conflictWhere)
+        : undefined;
+    if (normalizedConflictWhere !== undefined && sessionUpsertKeyColumn === undefined) {
+      throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
+    }
+    let sessionUpsertFirings =
+      sessionUpsertKeyColumn === undefined
+        ? undefined
+        : await this.#upsertTriggerFirings(
+            table,
+            sessionUpsertKeyColumn,
+            batch,
+            rowCount,
+            (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+            normalizedConflictWhere,
+          );
+    let skippedRowCount = 0;
+    if (normalizedConflictWhere !== undefined) {
+      if (sessionUpsertFirings === undefined) {
+        throw new Error("Upsert conflict classification is missing");
+      }
+      const filtered = applyUpsertConflictFilter(batch, rowCount, sessionUpsertFirings);
+      skippedRowCount = filtered.skippedRowCount;
+      if (filtered.rowCount !== rowCount) {
+        remapGeneratedColumns(generated, filtered.acceptedRowIndexes);
+      }
+      batch = filtered.batch;
+      rowCount = filtered.rowCount;
+      sessionUpsertFirings = filtered.firings;
+      if (rowCount === 0) {
+        // Nothing will be staged for this table, so registering a level-zero segment limit
+        // here (via #assertCompactionCapacity below) would leave the transaction with a limit
+        // that no pending segment covers — an invariant #planCommit enforces at commit time.
+        return {
+          tableName: table.name,
+          segmentId: null,
+          rowCount: 0,
+          skippedRowCount,
+          ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
+        };
+      }
+    }
+    await this.#assertCompactionCapacity(table, transaction);
     const keys = batchKeys(table, batch);
     if (keys !== undefined) {
       transaction.setUniqueKeyChanges({
@@ -8362,19 +8402,6 @@ export class MinnowDatabase {
     const rowIds = await this.store.reserveRowIds(table.id, rowCount);
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
-    // Session upserts classify against the scope's own staged state, so a row inserted
-    // earlier in the scope makes a later upsert of its key fire as an UPDATE.
-    const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
-    const sessionUpsertFirings =
-      sessionUpsertKeyColumn === undefined
-        ? undefined
-        : await this.#upsertTriggerFirings(
-            table,
-            sessionUpsertKeyColumn,
-            batch,
-            rowCount,
-            (sql, params) => this.#sessionQuery(transaction, sql, { params }),
-          );
     stageSecondaryUniqueInsertChanges(
       transaction,
       table,
@@ -8434,6 +8461,7 @@ export class MinnowDatabase {
       tableName: table.name,
       segmentId,
       rowCount,
+      skippedRowCount,
       ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
     };
   }
@@ -22212,6 +22240,84 @@ function normalizeColumnLogicalValue(column: TableColumnRecord, value: BatchValu
     return Number(externalSqlDomainValue(value));
   }
   return value;
+}
+
+/** Merges two ascending, disjoint row-index arrays into one ascending array, without a sort. */
+function mergeAscendingIndexes(left: readonly number[], right: readonly number[]): number[] {
+  const merged: number[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length || rightIndex < right.length) {
+    const a = left[leftIndex];
+    const b = right[rightIndex];
+    if (b === undefined || (a !== undefined && a <= b)) {
+      if (a !== undefined) merged.push(a);
+      leftIndex += 1;
+    } else {
+      merged.push(b);
+      rightIndex += 1;
+    }
+  }
+  return merged;
+}
+
+interface UpsertFirings {
+  inserts: number[];
+  updates: number[];
+  skipped: number[];
+  oldImages: Array<Record<string, BatchValue> | undefined>;
+}
+
+/**
+ * Filters a `conflictWhere`-classified upsert batch down to its accepted rows (inserts + updates,
+ * dropping skips) and remaps the firing indexes to match — shared by the autocommit and
+ * write-scope upsert paths so a fix to this logic cannot silently miss one of them. Returns the
+ * input batch and firings unchanged (no copy) when nothing was skipped.
+ */
+function applyUpsertConflictFilter(
+  batch: ColumnarBatch,
+  rowCount: number,
+  classified: UpsertFirings,
+): {
+  batch: ColumnarBatch;
+  rowCount: number;
+  skippedRowCount: number;
+  acceptedRowIndexes: number[];
+  firings: UpsertFirings;
+} {
+  const acceptedRowIndexes = mergeAscendingIndexes(classified.inserts, classified.updates);
+  const skippedRowCount = classified.skipped.length;
+  if (acceptedRowIndexes.length === rowCount) {
+    return { batch, rowCount, skippedRowCount, acceptedRowIndexes, firings: classified };
+  }
+  const acceptedPosition = new Map(
+    acceptedRowIndexes.map((original, position) => [original, position] as const),
+  );
+  return {
+    batch: selectBatchRows(batch, acceptedRowIndexes),
+    rowCount: acceptedRowIndexes.length,
+    skippedRowCount,
+    acceptedRowIndexes,
+    firings: {
+      inserts: classified.inserts.map((index) => acceptedPosition.get(index) ?? -1),
+      updates: classified.updates.map((index) => acceptedPosition.get(index) ?? -1),
+      skipped: [],
+      oldImages: acceptedRowIndexes.map((index) => classified.oldImages[index]),
+    },
+  };
+}
+
+/** Reindexes generated-column values onto an accepted row subset; a no-op when nothing changed. */
+function remapGeneratedColumns(
+  generated: Map<string, BatchValue[]>,
+  acceptedRowIndexes: readonly number[],
+): void {
+  for (const [name, values] of generated) {
+    generated.set(
+      name,
+      acceptedRowIndexes.map((index) => values[index] ?? null),
+    );
+  }
 }
 
 function selectBatchRows(input: ColumnarBatch, indexes: readonly number[]): ColumnarBatch {

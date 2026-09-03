@@ -30,6 +30,7 @@ import {
   type FtsChanges,
   type FtsPostingQuery,
   type FtsPosting,
+  type GarbageCollectionCandidateSet,
   type GarbageCollectionJobRecord,
   GarbageCollectionJobConflictError,
   type GarbageCollectionStepResult,
@@ -4996,7 +4997,12 @@ export class RecordCore {
     }
     const updated = updateGarbageCollectionPlanningRecord(current, input);
     assertGarbageCollectionCandidateProvenance(
-      updated,
+      {
+        candidateManifestVersions: input.candidateManifestVersions ?? [],
+        candidateSegmentIds: input.candidateSegmentIds ?? [],
+        candidateBlockIds: input.candidateBlockIds ?? [],
+        candidateTransactionIds: input.candidateTransactionIds ?? [],
+      },
       this.#manifests,
       this.#manifestBlocks,
       this.#segments,
@@ -7778,20 +7784,28 @@ function assertPendingArtifactsAvailable(
   }
 }
 
+/**
+ * Validates only the given candidate set, not a job's full accumulated history. A resumed,
+ * multi-page planning job re-adds nothing for candidates already appended on earlier pages, so
+ * callers must pass just the newly-appended candidates on each page — a candidate proven once at
+ * nomination stays proven, even if concurrent maintenance later reclaims it. Re-validating the
+ * whole accumulated list on every page would treat that legitimate reclaim as corruption and
+ * wedge the job on the same stale id forever.
+ */
 function assertGarbageCollectionCandidateProvenance(
-  job: GarbageCollectionJobRecord,
+  candidates: GarbageCollectionCandidateSet,
   manifests: ReadonlyMap<number, Manifest>,
   manifestBlocks: ReadonlyMap<string, ManifestBlockRecord>,
   segments: ReadonlyMap<string, SegmentRecord>,
   transactions: ReadonlyMap<string, TransactionRecord>,
   roots: RecordRootIndex,
 ): void {
-  for (const version of job.candidateManifestVersions) {
+  for (const version of candidates.candidateManifestVersions) {
     if (!manifests.has(version)) {
       throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
     }
   }
-  for (const id of job.candidateTransactionIds) {
+  for (const id of candidates.candidateTransactionIds) {
     const transaction = transactions.get(id);
     if (
       transaction === undefined ||
@@ -7801,7 +7815,7 @@ function assertGarbageCollectionCandidateProvenance(
       throw new Error(`Garbage collection transaction candidate is not terminal: ${id}`);
     }
   }
-  const unprovenBlockId = job.candidateBlockIds.find(
+  const unprovenBlockId = candidates.candidateBlockIds.find(
     (id) =>
       !manifestBlocks.has(id) &&
       roots.abortedTransactionBlockCount(id) === 0 &&
@@ -7812,7 +7826,7 @@ function assertGarbageCollectionCandidateProvenance(
       `Garbage collection block candidate has no persisted provenance: ${unprovenBlockId}`,
     );
   }
-  const unprovenSegmentId = job.candidateSegmentIds.find((id) => {
+  const unprovenSegmentId = candidates.candidateSegmentIds.find((id) => {
     // The persisted segment record is sufficient provenance for nominating that exact id.
     // Its blocks may already have been reclaimed by an earlier bounded pass, and terminal
     // compaction records are intentionally aged out, so neither is a durable discovery source.

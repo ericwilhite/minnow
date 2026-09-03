@@ -69,6 +69,7 @@ import {
   type FtsCandidates,
   type FtsPostingQuery,
   type FtsPosting,
+  type GarbageCollectionCandidateSet,
   type GarbageCollectionJobRecord,
   GarbageCollectionJobConflictError,
   type GarbageCollectionStepResult,
@@ -5843,7 +5844,12 @@ export class IndexedDbBlockStore implements BlockStore {
         await assertActiveGarbageCollectionMarker(gcStore, current);
       }
       const updated = updateGarbageCollectionPlanningRecord(current, input);
-      await assertGarbageCollectionCandidateProvenanceInTransaction(transaction, updated);
+      await assertGarbageCollectionCandidateProvenanceInTransaction(transaction, {
+        candidateManifestVersions: input.candidateManifestVersions ?? [],
+        candidateSegmentIds: input.candidateSegmentIds ?? [],
+        candidateBlockIds: input.candidateBlockIds ?? [],
+        candidateTransactionIds: input.candidateTransactionIds ?? [],
+      });
       gcStore.put(garbageCollectionJobEnvelope(updated), key);
       await transactionDone(transaction);
       return structuredClone(updated);
@@ -14060,18 +14066,26 @@ function assertGenericTransactionUpdateAllowed(
   }
 }
 
+/**
+ * Validates only the given candidate set, not a job's full accumulated history. A resumed,
+ * multi-page planning job re-adds nothing for candidates already appended on earlier pages, so
+ * callers must pass just the newly-appended candidates on each page — a candidate proven once at
+ * nomination stays proven, even if concurrent maintenance later reclaims it. Re-validating the
+ * whole accumulated list on every page would treat that legitimate reclaim as corruption and
+ * wedge the job on the same stale id forever.
+ */
 async function assertGarbageCollectionCandidateProvenanceInTransaction(
   transaction: IDBTransaction,
-  job: GarbageCollectionJobRecord,
+  candidates: GarbageCollectionCandidateSet,
 ): Promise<void> {
   const manifestStore = transaction.objectStore("manifests");
-  for (const version of job.candidateManifestVersions) {
+  for (const version of candidates.candidateManifestVersions) {
     const value: unknown = await requestResult(manifestStore.get(version));
     if (value === undefined) {
       throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
     }
   }
-  for (const id of job.candidateTransactionIds) {
+  for (const id of candidates.candidateTransactionIds) {
     const value: unknown = await requestResult(transaction.objectStore("transactions").get(id));
     const record = value === undefined ? undefined : asTransactionRecord(value);
     if (
@@ -14084,13 +14098,13 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   }
   const manifestProvenBlockIds = new Set<string>();
   const manifestValues = await Promise.all(
-    job.candidateBlockIds.map((id) =>
+    candidates.candidateBlockIds.map((id) =>
       requestResult<unknown>(transaction.objectStore("catalog").get(manifestBlockKey(id))),
     ),
   );
   for (const [index, value] of manifestValues.entries()) {
     if (value !== undefined) {
-      const id = job.candidateBlockIds[index] ?? "";
+      const id = candidates.candidateBlockIds[index] ?? "";
       asManifestBlockRecord(value, id);
       manifestProvenBlockIds.add(id);
     }
@@ -14114,11 +14128,11 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
       );
     });
   };
-  for (const id of job.candidateBlockIds) {
+  for (const id of candidates.candidateBlockIds) {
     if (await blockHasProvenance(id)) continue;
     throw new Error(`Garbage collection block candidate has no persisted provenance: ${id}`);
   }
-  for (const id of job.candidateSegmentIds) {
+  for (const id of candidates.candidateSegmentIds) {
     const segmentValue: unknown = await requestResult(transaction.objectStore("segments").get(id));
     if (segmentValue !== undefined) continue;
     throw new Error(`Garbage collection segment candidate has no persisted provenance: ${id}`);

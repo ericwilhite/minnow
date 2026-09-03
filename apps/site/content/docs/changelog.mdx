@@ -8,6 +8,40 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.7 — September 3, 2026
+
+Published packages: `@minnowdb/core@0.7.7`.
+
+Stored formats are unchanged and no migration is needed.
+
+### Fixed
+
+- A garbage-collection job that spans multiple planning pages could wedge permanently with
+  `Garbage collection segment candidate has no persisted provenance: <id>` repeating forever,
+  `maintenanceStatus().consecutiveFailures` climbing without bound and `pendingCommitDebt` never
+  draining. Each planning page re-validated the job's entire accumulated candidate list against
+  live storage state, not just the candidates that page added; a candidate accepted on an earlier
+  page but legitimately reclaimed by concurrent maintenance before a later page committed (a
+  dropped table, an aborted transaction's rebase, a rollback) failed that revalidation
+  unconditionally, and because `collectGarbageStep` always resumes the same persisted job, every
+  future tick re-threw the identical error on the same stale id. Planning now validates only the
+  newly-submitted candidates on each page — a candidate proven once at nomination stays proven,
+  and a candidate gone by the time collection actually runs is already handled there as a tolerated
+  `missing*` outcome, not an error. A new conformance test reproduces the exact race (nominate,
+  concurrently reclaim, submit the next page) against all three storage backends.
+
+### Added
+
+- `WriteSession.upsertBatch` (the `tx.upsertBatch` inside a `db.write()` scope) now accepts the
+  same `{ conflictWhere }` guard as the top-level autocommit `upsertBatch`/`upsert`, returning a
+  `StagedUpsertResult` with `skippedRowCount`. Previously the guard existed only outside a write
+  scope, so composing it atomically with another staged mutation — replacing an offline-created
+  row with its server-confirmed twin only when nothing has since edited it locally, in the same
+  commit as the delete that removes the local placeholder — required falling back to raw SQL
+  inside the scope. The classification and row-filtering logic is now shared with the autocommit
+  path (`applyUpsertConflictFilter`), which also fixed the autocommit path doing a full batch copy
+  and an O(n log n) sort on every guarded upsert even when nothing was actually skipped.
+
 ## 0.7.6 — September 3, 2026
 
 Published packages: `@minnowdb/core@0.7.6`.
