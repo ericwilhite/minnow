@@ -8,6 +8,53 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.4 — September 2, 2026
+
+Published packages: `@minnowdb/core@0.7.4`.
+
+Stored formats are unchanged and no migration is needed.
+
+### Fixed
+
+- A loop that awaited one statement after another stopped background maintenance and was
+  eventually refused. A finished fold lost the manifest race to the next write on every retry,
+  or, on `MemoryBlockStore`, sat parked on an event-loop yield the loop never gave it, so no
+  fold published, the table grew by one level-zero segment per commit, every write scanned all
+  of them (1 ms rising to 18 ms per insert), the fold's owner lease expired unrenewed, the
+  collector queued behind it, and at 4,096 commits writes failed with `MaintenanceBacklogError`.
+  `collectGarbage()` did not help: every write at the level-zero ceiling resumed the dead owner
+  and failed with "Transaction is no longer active". A read-then-update loop hit the same wall
+  as `CompactionBacklogError`. Now:
+  - A finished fold publishes on the write path. The next statement — a plain write or a SQL
+    statement's scope — lands the fold's rebase and commit before its own work, and an idle
+    database lands it on the next event-loop turn; inside that turn the fold retries against
+    the writers already in flight without yielding, and abandons the job after 64 lost races so
+    the next check plans a fresh one.
+  - Background maintenance steps yield to the event loop or to this database's next commit,
+    whichever comes first, so a caller that never pauses still lets folds and collection passes
+    advance one bounded step per commit.
+  - `MemoryBlockStore` acknowledges every commit on the next event-loop turn, as a store backed
+    by real I/O does, so timers, the transaction heartbeat, and block compression keep running
+    under a tight write loop.
+  - A compaction job whose owner lease has expired is taken over on resume, by background
+    maintenance and by `resumeCompactionJob`/`compactTableStep` alike: the dead owner is aborted
+    and the job continues under a fresh transaction instead of failing every step.
+  - `collectGarbage()` reconciles compaction jobs before it reclaims, as a background pass does,
+    so an explicit call repairs a stalled fold rather than only collecting around it.
+  - A compaction step that fails inside a background collection pass is recorded on the job and
+    re-planned; it no longer counts as a collection failure that puts the collector on its retry
+    timer.
+  - Collection debt resets after any pass that reclaims something. A write at the debt ceiling
+    still assists with one bounded pass, but is refused only when that pass reclaims nothing,
+    not merely because a large backlog needs another.
+
+### Changed
+
+- Automatic compaction backs off a failing table in time as well as in segments: the wait
+  doubles from a quarter of a second per consecutive failure up to a minute, and the table is
+  re-checked when it ends without waiting for another write. Before, a table at the largest
+  level-zero prefix was re-planned on every eighth commit while the failure persisted.
+
 ## 0.7.3 — September 2, 2026
 
 Published packages: `@minnowdb/core@0.7.3` and `@minnowdb/kysely@0.4.8`.

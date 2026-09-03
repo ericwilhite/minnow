@@ -19,7 +19,10 @@ await db.compactTable("orders");
 
 It runs automatically by default: a scan or a run of commits that finds a table past the
 threshold plans a fold and drives it to publication in small steps, yielding between them, and
-keeps going while the table is still due.
+keeps going while the table is still due. A step yields to the event loop or to this database's
+next commit, whichever comes first, so a loop that awaits one statement after another without
+pausing still lets the fold advance. A finished fold publishes on the write path: the next
+statement lands it before its own work, rather than the fold racing every write for the manifest.
 
 Setting `autoCompact: false` transfers that responsibility to the caller. Small-write segments
 then accumulate, so scans become progressively slower and writes eventually meet the fixed
@@ -81,13 +84,17 @@ await db.compactTable("orders", { memoryBudgetBytes: 256 * 1024 * 1024 });
 ```
 
 Automatic compaction backs off a table whose attempt fails, rather than retrying it on every
-query. The backoff is capped at the largest level-zero prefix one fold consumes, and a threshold
-crossed while another fold is running is queued. Writes are sampled during a burst and its final
-tail is checked after a short quiet period, so the last writes cannot leave a table permanently
-above the fold threshold.
+query. The backoff is in segments and in time: the count the table must reach again is capped at
+the largest level-zero prefix one fold consumes, and the wait doubles from a quarter of a second
+per consecutive failure up to a minute, after which the table is re-checked without waiting for
+another write. A threshold crossed while another fold is running is queued. Writes are sampled
+during a burst and its final tail is checked after a short quiet period, so the last writes cannot
+leave a table permanently above the fold threshold.
 
 Jobs are records in the store, so `listCompactionJobs()` finds one a previous session left behind
-and `resumeCompactionJob(jobId)` picks it up. `cancelCompactionJob(jobId)` stops one cleanly —
+and `resumeCompactionJob(jobId)` picks it up. A job whose owner lease has expired — a tab that
+closed mid-fold — is taken over by whoever resumes it, background maintenance included: the dead
+owner is aborted and the job continues under a fresh one. `cancelCompactionJob(jobId)` stops one cleanly —
 compaction is visible-data-neutral by construction, so cancelling it can never lose data.
 The store atomically admits only one non-terminal compaction for a table, so two tabs racing the
 plan step converge on the same durable job instead of creating parallel roots. A table may retain
@@ -129,13 +136,16 @@ after open or the last commit so a reopened, read-only tab still shrinks. A larg
 bounded pass until it settles instead of stopping at one internal batch. Background passes keep
 the 64 most recent versions readable for up to a minute, so `query({ version })` on a version you
 were just handed still finds it. An explicit `collectGarbage()` reclaims everything no lease or
-job pins; pass `retainRecentVersions` to keep a window.
+job pins; pass `retainRecentVersions` to keep a window. It first reconciles compaction jobs the
+way a background pass does — an owner past its lease is aborted and its job resumed or cancelled —
+so an explicit call also repairs a fold a dead owner left behind.
 
 Collection failures are visible and bounded. `db.maintenanceStatus()` reports pending commit
 debt, whether a pass is running or queued, retry time, consecutive failures, and the last error.
-Failures retry on a capped timer even when no more writes arrive. If repeated failures let debt
-reach the safety ceiling, the next write first assists collection and throws
-`MaintenanceBacklogError` if growth still cannot be bounded; already committed data is unchanged.
+Failures retry on a capped timer even when no more writes arrive. Debt resets after any pass
+that reclaims something. If repeated failures let it reach the safety ceiling, the next write
+first assists collection and, if that pass still reclaims nothing, throws
+`MaintenanceBacklogError`; already committed data is unchanged.
 
 Active writers are durable but not immortal. A one-stage explicit scope starts with a renewable
 reader lease on its pre-scope manifest, so compaction and collection cannot reclaim that snapshot

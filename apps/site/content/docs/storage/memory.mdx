@@ -13,7 +13,8 @@ const db = new MinnowDatabase(new MemoryBlockStore());
 No options, nothing to open, nothing to clean up. It uses the same `BlockStore` interface as
 the IndexedDB adapter, including atomic commits, snapshot reads, leases, and conflict detection —
 so a test against it exercises the same engine paths an application uses, not a simplified
-stand-in.
+stand-in. Every commit acknowledges on the next event-loop turn, as a commit to disk does, so a
+loop that awaits one statement after another still lets timers and background maintenance run.
 
 ## What it is for
 

@@ -139,10 +139,51 @@ interface MemorySnapshotFrameImportState {
 }
 
 /**
+ * One event-loop turn after a commit, as a store backed by real I/O gives every commit for
+ * free. Nothing here touches I/O, so a caller awaiting one statement after another would never
+ * leave the microtask queue: timers (the transaction heartbeat), MessageChannel yields (every
+ * background maintenance step), and the thread-pool completions behind block compression would
+ * all starve until the caller paused, and a fold that needed any of them parked for as long as
+ * the writes kept coming — while every write scanned one more level-zero segment.
+ *
+ * `setImmediate` where the runtime has it: its check phase runs once per loop iteration, after
+ * timers and I/O have had theirs. A MessageChannel is not enough there — Node drains a port's
+ * queue in place, so a caller that re-posts from a microtask never lets the iteration end and
+ * starves timers exactly as before. Browsers have no `setImmediate`, and schedule message tasks
+ * fairly, so the channel serves them. The real function is captured at load so fake-timer
+ * tests, which write through this store, are not stalled by it; a timer is the last resort.
+ */
+const commitTurn: () => Promise<void> = (() => {
+  const immediate = (globalThis as { setImmediate?: (callback: () => void) => unknown })
+    .setImmediate;
+  if (immediate !== undefined && !Reflect.has(immediate, "clock")) {
+    return () =>
+      new Promise((resolve) => {
+        immediate(resolve);
+      });
+  }
+  if (typeof MessageChannel === "undefined") {
+    return () => new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  let channel: MessageChannel | undefined;
+  const waiting: Array<() => void> = [];
+  return () =>
+    new Promise((resolve) => {
+      if (channel === undefined) {
+        channel = new MessageChannel();
+        channel.port1.onmessage = () => waiting.shift()?.();
+      }
+      waiting.push(resolve);
+      channel.port2.postMessage(undefined);
+    });
+})();
+
+/**
  * The in-process store: record semantics live in `RecordCore` (shared with the OPFS store),
  * block and temp-page bytes live in Maps here, and atomicity comes from running every mutating
  * record operation on a promise-chain queue — each queued body is synchronous, so no operation
- * ever observes another mid-mutation.
+ * ever observes another mid-mutation. Every commit acknowledges on the next event-loop turn
+ * (`commitTurn`), so a write loop yields to background work as it would on disk.
  */
 export class MemoryBlockStore implements BlockStore {
   readonly #blocks = new Map<string, Uint8Array>();
@@ -866,16 +907,20 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
-    return this.#runAtomic(() => this.#core.commitTransaction(input));
+    const summary = await this.#runAtomic(() => this.#core.commitTransaction(input));
+    await commitTurn();
+    return summary;
   }
 
   async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
-    return this.#runAtomic(() => {
+    const summary = await this.#runAtomic(() => {
       const summary = this.#core.writeTransaction(input);
       // The record half validated everything; the bytes land in this same atomic step.
       for (const block of input.blocks) this.#putBlock(block.id, block.bytes);
       return summary;
     });
+    await commitTurn();
+    return summary;
   }
 
   async createLease(record: LeaseRecord): Promise<void> {

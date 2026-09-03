@@ -367,14 +367,14 @@ describe("background maintenance", () => {
       columns: [{ name: "id", type: "number" }],
     });
     await database.insert("backlog_items", { id: 1 });
-    // Foreground assistance is one bounded run: this old history needs a follow-up, so the
-    // attempted write is refused before staging instead of blocking in proportion to the whole
-    // backlog. The collector requeues itself and settles the remainder without another write.
-    await expect(database.insert("backlog_items", { id: 2 })).rejects.toBeInstanceOf(
-      MaintenanceBacklogError,
-    );
+    // Foreground assistance is one bounded run, so a write never blocks in proportion to the
+    // whole backlog. That run reclaims history, which is the collector keeping up: the write
+    // proceeds, and the collector requeues itself to settle the remainder without another one.
+    // Only a run that reclaims nothing leaves the debt standing and the write refused.
+    await database.insert("backlog_items", { id: 2 });
+    expect(database.maintenanceStatus().pendingCommitDebt).toBeLessThanOrEqual(1);
     expect((await database.query("SELECT COUNT(*) AS n FROM backlog_items")).rows).toEqual([
-      { n: 1 },
+      { n: 2 },
     ]);
     for (let attempt = 0; attempt < 2_000; attempt += 1) {
       const status = database.maintenanceStatus();
@@ -395,10 +395,10 @@ describe("background maintenance", () => {
       consecutiveFailures: 0,
       lastError: null,
     });
-    await database.insert("backlog_items", { id: 2 });
+    await database.insert("backlog_items", { id: 3 });
     expect((await store.listGarbageCollectionJobs()).length).toBeLessThanOrEqual(8);
     expect((await database.query("SELECT COUNT(*) AS n FROM backlog_items")).rows).toEqual([
-      { n: 2 },
+      { n: 3 },
     ]);
     await database.close();
   }, 120_000);
@@ -506,9 +506,16 @@ describe("background maintenance", () => {
     const [first, , third] = after;
     if (first === undefined || third === undefined) throw new Error("Expected three rounds");
     // Each round settles to the same place, within the last fold's leftovers; without
-    // collection each round would add its whole burst to the previous one.
+    // collection each round would add its whole burst to the previous one. Blocks are compared
+    // as obsolete residue and live growth rather than as a ratio: the folded table's own block
+    // count depends on which sources its last fold merged, and how many sub-threshold deltas a
+    // burst leaves unfolded depends on when its last fold ran, so a first round that happened
+    // to end small would fail a later, equally clean one.
     expect(third.storedBytes).toBeLessThanOrEqual(first.storedBytes * 1.5);
-    expect(third.storedBlocks).toBeLessThanOrEqual(first.storedBlocks * 1.5);
+    expect(third.storedBlocks - third.liveBlocks).toBeLessThanOrEqual(
+      first.storedBlocks - first.liveBlocks + 8,
+    );
+    expect(third.liveBlocks).toBeLessThanOrEqual(first.liveBlocks + 2 * 32 + 8);
     expect(third.unprunedManifests).toBeLessThanOrEqual(64 + 2);
     expect(third.visibleSegments).toBeLessThanOrEqual(33);
     expect(third.transactions).toBeLessThanOrEqual(third.visibleSegments + 8);

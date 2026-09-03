@@ -422,6 +422,19 @@ const AUTO_COMPACT_STEP_BLOCKS = 4;
  * cost several; the stored-bytes ceiling still bounds the pass.
  */
 const AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS = 256;
+/** A failed background fold waits this long before the next attempt, doubling per failure. */
+const AUTO_COMPACT_RETRY_MIN_MS = 250;
+const AUTO_COMPACT_RETRY_MAX_MS = 60_000;
+/** Manifest races a complete fold may lose to writers already in flight before it is abandoned. */
+const MAX_COMPACTION_PUBLICATION_CONFLICTS = 64;
+
+/** Why a table's next background fold waits: a segment count it must reach, and a timer. */
+interface AutoCompactionBackoff {
+  readonly minimumSegments: number;
+  readonly failures: number;
+  /** Set while the time part of the backoff is still running; its firing re-checks the table. */
+  readonly retryTimer: ReturnType<typeof setTimeout> | undefined;
+}
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
 const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 
@@ -1998,7 +2011,7 @@ export class MinnowDatabase {
   /** Tables whose drop is retiring data; prevents a new background fold from starting. */
   readonly #droppingTables = new Set<string>();
   /** Per table: the visible segment count a failed auto-compaction must see before retrying. */
-  readonly #autoCompactionBackoff = new Map<string, number>();
+  readonly #autoCompactionBackoff = new Map<string, AutoCompactionBackoff>();
   /** Exact current-layout counters; local commits advance them without rescanning history. */
   readonly #autoCompactionHints = new Map<string, AutoCompactionHint>();
   /** Data commits per table since its last write-path auto-compaction check. */
@@ -2007,6 +2020,12 @@ export class MinnowDatabase {
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
   /** The simple writes in flight, chained so they commit one after another: see #runWrite. */
   #writeChain: Promise<unknown> = Promise.resolve();
+  /** Fold publications waiting for a turn on the write chain: see #withCompactionPublicationSlot. */
+  readonly #pendingCompactionPublications = new Set<() => Promise<void>>();
+  /** Settled by the next local commit; maintenance parked on a yield wakes on it. */
+  #commitSignal: { promise: Promise<void>; resolve: () => void } | undefined;
+  /** One shared pending event-loop turn, so parked maintenance holds one channel, not one each. */
+  #pendingEventLoopTurn: Promise<void> | undefined;
   #pendingWriteReservations = 0;
   #activeReadReservations = 0;
   /** The complete automatic collection loop, retained so close() can join it before the store. */
@@ -2222,6 +2241,9 @@ export class MinnowDatabase {
     this.#gzipVerdicts.clear();
     this.#autoCompactionsRequested.clear();
     this.#idleCompactionTableIds.clear();
+    for (const backoff of this.#autoCompactionBackoff.values()) {
+      if (backoff.retryTimer !== undefined) clearTimeout(backoff.retryTimer);
+    }
     this.#autoCompactionBackoff.clear();
     this.#autoCompactionHints.clear();
     this.#commitsSinceCompactionCheck.clear();
@@ -2622,9 +2644,15 @@ export class MinnowDatabase {
    * other instances and other tabs still contend, and the retry loop is still what resolves
    * them. Write scopes are not queued: a scope's callback may issue a plain write of its own,
    * which must not wait on the scope that contains it.
+   *
+   * A complete background fold whose publication lost the manifest race takes its turn here
+   * first, before the write's own statement, so the queue itself is what lands it (see
+   * #withCompactionPublicationSlot). That runs before collection assistance: assistance can
+   * wait on the collector, and the collector on that fold.
    */
   async #runWrite<T>(run: () => Promise<T>): Promise<T> {
     const restarting = async (): Promise<T> => {
+      await this.#publishPendingCompactions();
       await this.#assistAutomaticCollection();
       for (let attempt = 0; ; attempt += 1) {
         try {
@@ -2651,6 +2679,94 @@ export class MinnowDatabase {
     } finally {
       if (this.#writeChain === current) this.#writeChain = Promise.resolve();
     }
+  }
+
+  /**
+   * Runs one publication attempt for a compaction as a writer of this database: the next
+   * write — a queued simple write or a SQL statement's scope — runs it before its own work, and
+   * an idle database runs it on the next event-loop turn, whichever comes first. Writers that
+   * arrive while it runs wait for it, so only writers already in flight can commit between its
+   * rebase and its commit, and the attempt retries against those without yielding.
+   *
+   * A retry on the fold's own event-loop turn is not enough. A caller that awaits one statement
+   * after another keeps this database's write queue moving, so a rebase followed by a yield lost
+   * the manifest race to the next write every time; on an in-memory store such a caller never
+   * even reaches the macrotask queue, and the fold sat parked on its yield — its lease expiring
+   * unrenewed — while every write scanned one more level-zero segment.
+   */
+  async #withCompactionPublicationSlot<T>(attempt: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      // The claim stays pending until the attempt has finished, not until it has started: a
+      // writer that arrives while it is in flight waits for it. Otherwise, on a store where a
+      // write is in flight for several event-loop turns, the turn claims the slot mid-write,
+      // that write lands between the fold's rebase and its commit, the next write starts
+      // unhindered, and the fold loses every retry to a writer it can never get ahead of.
+      let settled: Promise<void> | undefined;
+      const claim = (): Promise<void> => {
+        settled ??= (async () => {
+          try {
+            resolve(await attempt());
+          } catch (error) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+          } finally {
+            this.#pendingCompactionPublications.delete(claim);
+          }
+        })();
+        return settled;
+      };
+      this.#pendingCompactionPublications.add(claim);
+      void this.#eventLoopTurn().then(claim);
+    });
+  }
+
+  /**
+   * Runs, or waits for, every fold publication pending a turn; a claim never throws to its
+   * runner. A writer calls this before it starts, so at most the writers already in flight
+   * can commit under a publication attempt.
+   */
+  async #publishPendingCompactions(): Promise<void> {
+    while (this.#pendingCompactionPublications.size > 0) {
+      const [claim] = this.#pendingCompactionPublications;
+      if (claim === undefined) return;
+      await claim();
+    }
+  }
+
+  /** The next event-loop turn, shared by everything waiting on it at once. */
+  #eventLoopTurn(): Promise<void> {
+    const pending = this.#pendingEventLoopTurn;
+    if (pending !== undefined) return pending;
+    const turn = yieldToEventLoop().then(() => {
+      if (this.#pendingEventLoopTurn === turn) this.#pendingEventLoopTurn = undefined;
+    });
+    this.#pendingEventLoopTurn = turn;
+    return turn;
+  }
+
+  /** Settles when this database next publishes a commit. */
+  #nextLocalCommit(): Promise<void> {
+    if (this.#commitSignal === undefined) {
+      let resolve = (): void => undefined;
+      const promise = new Promise<void>((settle) => {
+        resolve = settle;
+      });
+      this.#commitSignal = { promise, resolve };
+    }
+    return this.#commitSignal.promise;
+  }
+
+  /**
+   * The cooperative yield of background maintenance: the next event-loop turn, or the next
+   * commit this database publishes, whichever comes first. The turn is what lets rendering,
+   * timers, and other clients run between bounded steps. The commit is what keeps maintenance
+   * moving under a caller that never yields — a loop awaiting one statement after another on an
+   * in-memory store drains only microtasks, so a fold or a collection pass parked on a timer
+   * or a MessageChannel alone made no progress at all, and the table grew by one segment per
+   * commit until the write ceiling. Waking on the commit gives every such step one turn per
+   * commit instead; a step is bounded, so a write still pays for at most one.
+   */
+  async #yieldMaintenance(): Promise<void> {
+    await Promise.race([this.#eventLoopTurn(), this.#nextLocalCommit()]);
   }
 
   async #withWriteReservation<T>(run: () => Promise<T>): Promise<T> {
@@ -4741,7 +4857,7 @@ export class MinnowDatabase {
           catalogEpoch: after.catalogEpoch,
         };
       }
-      await yieldToEventLoop();
+      await this.#yieldMaintenance();
     }
   }
 
@@ -6269,7 +6385,7 @@ export class MinnowDatabase {
       }
       if (page.nextCursor === null) break;
       cursor = page.nextCursor;
-      await yieldToEventLoop();
+      await this.#yieldMaintenance();
     }
     return result;
   }
@@ -6299,7 +6415,7 @@ export class MinnowDatabase {
       }
       if (page.nextCursor === null) break;
       cursor = page.nextCursor;
-      await yieldToEventLoop();
+      await this.#yieldMaintenance();
     }
     return result;
   }
@@ -6581,7 +6697,10 @@ export class MinnowDatabase {
     if (!this.#autoCompact) return;
     if (this.#droppingTables.has(table.id)) return;
     if (!autoCompactionDueHint(hint)) return;
-    if (hint.visible < (this.#autoCompactionBackoff.get(table.id) ?? 0)) return;
+    const backoff = this.#autoCompactionBackoff.get(table.id);
+    if (backoff !== undefined) {
+      if (backoff.retryTimer !== undefined || hint.visible < backoff.minimumSegments) return;
+    }
     if (this.#autoCompactionsInFlight.has(table.id)) {
       // A final burst can cross the threshold while the prior fold is still planning or
       // running. Remember it: otherwise no later commit or scan may arrive to trigger the fold
@@ -6592,32 +6711,54 @@ export class MinnowDatabase {
     const run = this.#runAutoCompaction(table)
       .then((folded) => {
         if (folded) this.#autoCompactionBackoff.delete(table.id);
-        else {
-          this.#autoCompactionBackoff.set(
-            table.id,
-            Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, hint.visible * 2)),
-          );
-        }
+        else this.#backOffAutoCompaction(table.id, hint.visible);
       })
       .catch(() => {
-        // Back off deterministic failures, but never beyond the maximum L0 prefix a fold can
-        // consume. A transient conflict near the end of a burst must not strand hundreds of
-        // segments waiting for a segment count the idle database can never reach.
-        this.#autoCompactionBackoff.set(
-          table.id,
-          Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, hint.visible * 2)),
-        );
+        this.#backOffAutoCompaction(table.id, hint.visible);
       })
       .finally(() => {
         if (this.#autoCompactionsInFlight.get(table.id) === run) {
           this.#autoCompactionsInFlight.delete(table.id);
         }
         if (this.#autoCompactionsRequested.delete(table.id)) {
-          void yieldToEventLoop().then(() => this.#checkAutoCompaction(table.id));
+          void this.#yieldMaintenance().then(() => this.#checkAutoCompaction(table.id));
         }
       });
     this.#autoCompactionsInFlight.set(table.id, run);
     void run;
+  }
+
+  /**
+   * Backs off a table whose fold failed or could not help: in segments, never beyond the
+   * largest level-zero prefix one fold consumes, so a transient conflict near the end of a
+   * burst cannot strand hundreds of segments behind a count the idle database never reaches;
+   * and in time, doubling per consecutive failure, so a table at that prefix is not re-planned
+   * on every eighth commit while the failure persists. The timer, like the collector's retry
+   * timer, is the clock for the time part — it re-checks the table itself when it fires, in
+   * case no later commit or scan arrives — and is unreferenced, so it never keeps a process up.
+   */
+  #backOffAutoCompaction(tableId: string, visible: number): void {
+    if (this.#closed) return;
+    const previous = this.#autoCompactionBackoff.get(tableId);
+    if (previous?.retryTimer !== undefined) clearTimeout(previous.retryTimer);
+    const failures = (previous?.failures ?? 0) + 1;
+    const delay = Math.min(
+      AUTO_COMPACT_RETRY_MAX_MS,
+      AUTO_COMPACT_RETRY_MIN_MS * 2 ** Math.min(16, failures - 1),
+    );
+    const timer = setTimeout(() => {
+      const current = this.#autoCompactionBackoff.get(tableId);
+      if (current?.retryTimer === timer) {
+        this.#autoCompactionBackoff.set(tableId, { ...current, retryTimer: undefined });
+      }
+      void this.#checkAutoCompaction(tableId);
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.#autoCompactionBackoff.set(tableId, {
+      minimumSegments: Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, visible * 2)),
+      failures,
+      retryTimer: timer,
+    });
   }
 
   async #assertCompactionCapacity(
@@ -6639,6 +6780,9 @@ export class MinnowDatabase {
       if (segment.level === 0) levelZero += 1;
     }
     if (levelZero < MAX_LEVEL_ZERO_SEGMENTS) return;
+    // A fold waiting to publish is the step that helps most, and stepping the table would wait
+    // behind it while it waits for this write: run it here rather than deadlock on it.
+    await this.#publishPendingCompactions();
     await this.compactTableStep(table.name, {
       maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
       maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
@@ -6672,14 +6816,14 @@ export class MinnowDatabase {
       let progress = await this.compactTableStep(table.name, options);
       while (progress.result === null) {
         if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
-        await yieldToEventLoop();
+        await this.#yieldMaintenance();
         progress = await this.resumeCompactionJob(progress.jobId, options);
       }
       if (!progress.result.compacted) return folded;
       folded = true;
       // The fold's sources are garbage now; collect before planning the next fold.
       this.#maybeScheduleAutoCollection();
-      await yieldToEventLoop();
+      await this.#yieldMaintenance();
       const current = await this.store.getTable(table.id);
       if (
         current === undefined ||
@@ -6717,6 +6861,9 @@ export class MinnowDatabase {
    * toward their next write-path auto-compaction check.
    */
   #afterCommit(manifest: ManifestSummary, transaction?: DatabaseTransaction): void {
+    const signal = this.#commitSignal;
+    this.#commitSignal = undefined;
+    signal?.resolve();
     if (this.#closed) return;
     const contribution = transaction?.committedCatalogContribution;
     this.#advanceAutoCompactionHints(manifest, contribution?.segments);
@@ -7577,6 +7724,11 @@ export class MinnowDatabase {
     ) => Promise<T>,
     options: { durableSnapshot?: boolean } = {},
   ): Promise<{ result: T; version: number | null }> {
+    // A scope is not queued behind other writes, but it is a writer all the same, and SQL
+    // statements are scopes: a fold waiting to publish takes its turn before the scope opens
+    // its transaction (see #withCompactionPublicationSlot), where nothing of this scope's can
+    // yet conflict with it. A scope inside a scope simply rebases over the neutral manifest.
+    await this.#publishPendingCompactions();
     await this.#assistAutomaticCollection();
     // Keep one storage-sized statement batch process-local. The common single-statement write
     // then publishes through writeTransaction atomically; a second stage spills the first batch
@@ -13212,7 +13364,7 @@ export class MinnowDatabase {
       );
       if (active !== undefined) return active;
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     return undefined;
   }
@@ -13255,7 +13407,7 @@ export class MinnowDatabase {
         }
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
   }
 
@@ -13265,6 +13417,15 @@ export class MinnowDatabase {
       options.maxItemsPerStep ?? 64,
       "Garbage collection items per step",
     );
+    // Crash-left and abandoned compaction work first, over every job record, as a background
+    // pass does over a page: an owner past its lease is aborted and its job resumed or
+    // cancelled. An explicit call is how a caller repairs a store, and repair that only the
+    // background retry timer performed left a write at the level-zero ceiling failing on a
+    // dead owner after this call had returned.
+    let reconciliationCursor: string | null = null;
+    do {
+      reconciliationCursor = (await this.#reconcileCompactionPage(reconciliationCursor)).nextCursor;
+    } while (reconciliationCursor !== null);
     let progress = await this.collectGarbageStep({
       maxItems,
       ...(options.maxPlanningItems === undefined
@@ -13328,7 +13489,7 @@ export class MinnowDatabase {
       const active = page.records.find((job) => job.state === "planned" || job.state === "running");
       if (active !== undefined) return active;
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     return undefined;
   }
@@ -13393,13 +13554,16 @@ export class MinnowDatabase {
     this.#commitsSinceCollection = 0;
     this.#lastCollectionAt = dateMilliseconds(this.#now());
     const run = this.#runAutoCollection()
-      .then((moreWork) => {
+      .then(({ moreWork, reclaimed }) => {
         this.#autoCollectionConsecutiveFailures = 0;
         this.#autoCollectionLastError = undefined;
         this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
         this.#autoCollectionRetryAt = undefined;
         if (moreWork) this.#autoCollectionRequested = true;
-        else this.#autoCollectionDebtCommits = 0;
+        // Debt counts commits the collector has not kept up with. A pass that reclaimed
+        // something kept up; only a run that found nothing to reclaim while compaction work
+        // is still outstanding leaves the count for the next one to settle.
+        if (reclaimed || !moreWork) this.#autoCollectionDebtCommits = 0;
       })
       .catch((error: unknown) => {
         this.#autoCollectionConsecutiveFailures += 1;
@@ -13415,7 +13579,7 @@ export class MinnowDatabase {
         if (this.#autoCollectionTask === run) this.#autoCollectionTask = undefined;
         this.#autoCollectionInFlight = false;
         if (this.#autoCollectionRequested) {
-          void yieldToEventLoop().then(() => {
+          void this.#yieldMaintenance().then(() => {
             // Keep `collectionRequested` true until the continuation takes ownership. Otherwise
             // maintenanceStatus briefly reports a false idle state between bounded runs, and a
             // caller waiting for quiescence can leave a real backlog behind.
@@ -13467,12 +13631,13 @@ export class MinnowDatabase {
     this.#idleCollectionTimer = timer;
   }
 
-  async #runAutoCollection(): Promise<boolean> {
+  async #runAutoCollection(): Promise<{ moreWork: boolean; reclaimed: boolean }> {
     const reconciliationMoreWork = await this.#reconcileCompactionMaintenance();
     // One pass plans a bounded number of candidates, so a backlog — a burst of commits that
     // outran the passes between them — takes several. Keep passing while a pass still finds
     // something, up to a ceiling that keeps a pathological store from pinning the loop.
     let moreWork = false;
+    let reclaimed = false;
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
       if (this.#closed) break;
       this.#releaseIdleSharedLease();
@@ -13485,7 +13650,7 @@ export class MinnowDatabase {
         AUTO_COLLECT_RETAINED_VERSION_MS,
       );
       while (progress.result === null) {
-        await yieldToEventLoop();
+        await this.#yieldMaintenance();
         progress = await this.resumeGarbageCollectionJob(progress.jobId, {
           maxItems: AUTO_COLLECT_STEP_ITEMS,
         });
@@ -13500,10 +13665,11 @@ export class MinnowDatabase {
       if (!moreWork) {
         break;
       }
-      await yieldToEventLoop();
+      reclaimed = true;
+      await this.#yieldMaintenance();
     }
     await this.#pruneFinishedJobRecords();
-    return moreWork || reconciliationMoreWork;
+    return { moreWork: moreWork || reconciliationMoreWork, reclaimed };
   }
 
   /**
@@ -13512,11 +13678,18 @@ export class MinnowDatabase {
    * one output block per job keeps a quiet pass out of the foreground latency budget.
    */
   async #reconcileCompactionMaintenance(): Promise<boolean> {
-    const page = await this.store.listCompactionJobPage(
+    const { nextCursor, moreWork } = await this.#reconcileCompactionPage(
       this.#compactionReconciliationCursor,
-      AUTO_COMPACTION_RECONCILE_RECORDS,
     );
-    this.#compactionReconciliationCursor = page.nextCursor;
+    this.#compactionReconciliationCursor = nextCursor;
+    return moreWork;
+  }
+
+  /** One page of #reconcileCompactionMaintenance, from a caller-chosen cursor. */
+  async #reconcileCompactionPage(
+    cursor: string | null,
+  ): Promise<{ nextCursor: string | null; moreWork: boolean }> {
+    const page = await this.store.listCompactionJobPage(cursor, AUTO_COMPACTION_RECONCILE_RECORDS);
     let moreWork = page.nextCursor !== null;
     const cutoff = dateIsoString(this.#now());
     for (const listed of page.records) {
@@ -13567,13 +13740,23 @@ export class MinnowDatabase {
         continue;
       }
 
-      const progress = await this.resumeCompactionJob(job.id, { maxBlocks: 1 });
-      if (progress.result !== null) {
-        job = (await this.store.getCompactionJob(job.id)) ?? job;
-        if (!isActiveCompactionState(job.state)) continue;
+      // One step of the job, as this database's own fold would take it. A step that fails —
+      // publication abandoned, a source gone, a budget exceeded — is recorded on the job, and
+      // the next check re-plans the table; it is not a collection failure, and must not put
+      // the collector on its retry timer for it.
+      try {
+        const progress = await this.resumeCompactionJob(job.id, { maxBlocks: 1 });
+        if (progress.result !== null) {
+          job = (await this.store.getCompactionJob(job.id)) ?? job;
+          if (!isActiveCompactionState(job.state)) continue;
+        }
+      } catch (error) {
+        if (error instanceof CompactionJobCancelledError) continue;
+        if (this.#closed) throw error;
+        this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
       }
     }
-    return moreWork;
+    return { nextCursor: page.nextCursor, moreWork };
   }
 
   /** Drops finished maintenance records while preserving the state needed for safe L2 retries. */
@@ -13602,7 +13785,7 @@ export class MinnowDatabase {
         }
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     const retainedCompactionIds = new Set(newestCompactions.map((job) => job.id));
 
@@ -13656,7 +13839,7 @@ export class MinnowDatabase {
         }
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
 
     const newestCollections: GarbageCollectionJobRecord[] = [];
@@ -13667,7 +13850,7 @@ export class MinnowDatabase {
         if (job.state === "completed") retainNewest(newestCollections, job);
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     const retainedCollectionIds = new Set(newestCollections.map((job) => job.id));
     cursor = null;
@@ -13679,7 +13862,7 @@ export class MinnowDatabase {
         }
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
   }
 
@@ -13779,7 +13962,7 @@ export class MinnowDatabase {
         }
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     return newest?.discovery === undefined
       ? undefined
@@ -14768,7 +14951,7 @@ export class MinnowDatabase {
         );
       }
       cursor = page.nextCursor;
-      if (cursor !== null) await yieldToEventLoop();
+      if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     return largest;
   }
@@ -15651,8 +15834,26 @@ export class MinnowDatabase {
     if (job.state === "published") {
       return this.#publishedCompactionProgress(table, job);
     }
-    const linkedTransaction =
+    let linkedTransaction =
       job.transactionId === null ? undefined : await this.store.getTransaction(job.transactionId);
+    if (
+      job.transactionId !== null &&
+      linkedTransaction?.status === "active" &&
+      Date.parse(linkedTransaction.expiresAt) <= dateMilliseconds(this.#now())
+    ) {
+      // An owner past its lease is dead whoever held it — a closed tab, or this database's own
+      // fold parked on a starved event loop. The store will not renew it, so resuming it fails
+      // every step; and at the level-zero ceiling every write takes a step. Abort it here and
+      // begin again below rather than wait for the background reconciler's retry timer.
+      const cutoff = dateIsoString(this.#now());
+      await this.store.abortTransactionIfExpired({
+        transactionId: linkedTransaction.id,
+        expectedOwnerId: linkedTransaction.ownerId,
+        expiresAtCutoff: cutoff,
+        updatedAt: cutoff,
+      });
+      linkedTransaction = await this.store.getTransaction(job.transactionId);
+    }
     if (linkedTransaction?.status === "committed" && linkedTransaction.committedVersion !== null) {
       job = await this.#markCompactionPublished(job, linkedTransaction.committedVersion);
       const recoveredManifest = await this.store.getManifest(linkedTransaction.committedVersion);
@@ -15855,24 +16056,21 @@ export class MinnowDatabase {
 
       transaction.setCompactionIntent(job.id, job.sourceBlockIds);
       transaction.markLogicallyUnchanged();
-      let manifest: ManifestSummary;
-      for (;;) {
-        let publicationConflict: WriteConflictError | undefined;
+      let publicationConflict: WriteConflictError | undefined;
+      const publish = async (): Promise<ManifestSummary | undefined> => {
         try {
-          manifest = await transaction.commit();
+          const manifest = await transaction.commit();
           this.#afterCompactionCommit(manifest, table.id);
-          break;
+          return manifest;
         } catch (error) {
           if (!(error instanceof WriteConflictError)) throw error;
           publicationConflict = error;
+          return undefined;
         }
-
-        // Publication is logically neutral, so it may follow any number of concurrent data
-        // commits while every source remains visible and in the same logical position. A single
-        // retry is not sufficient: another tab (or this database's write queue) can win the
-        // manifest CAS again between rebase and commit, leaving an otherwise complete job stuck
-        // in `ready` after the last write. Keep rebasing until publication wins or a source
-        // genuinely changes.
+      };
+      // Publication is logically neutral, so it may follow any number of concurrent data
+      // commits while every source remains visible and in the same logical position.
+      const rebaseOverConcurrentCommits = async (): Promise<void> => {
         const currentVersion = await this.store.getCurrentManifestVersion();
         const sourcePresence = await this.#manifestBlockPresence(
           currentVersion,
@@ -15905,7 +16103,37 @@ export class MinnowDatabase {
         }
         transaction.setCompactionIntent(job.id, job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
-        await yieldToEventLoop();
+      };
+      let manifest = await publish();
+      if (manifest === undefined) {
+        // A retry on this fold's own turn is not sufficient: this database's writers win the
+        // manifest CAS again between rebase and commit, every time, leaving a complete job in
+        // `ready` while the table grows. So the rebase and the commit take a turn as a writer
+        // (#withCompactionPublicationSlot), and inside that turn they retry without yielding:
+        // what can still commit in between is a writer already in flight — a pipelined scope,
+        // another tab — and those are finite, where a fold that yielded between attempts met
+        // a fresh one each time. Past the limit the job is abandoned and the next check plans
+        // a fresh one.
+        manifest = await this.#withCompactionPublicationSlot(async () => {
+          for (
+            let conflicts = 1;
+            conflicts <= MAX_COMPACTION_PUBLICATION_CONFLICTS;
+            conflicts += 1
+          ) {
+            await rebaseOverConcurrentCommits();
+            const published = await publish();
+            if (published !== undefined) return published;
+          }
+          return undefined;
+        });
+        if (manifest === undefined) {
+          if (transaction.status === "active") await transaction.abort();
+          job = await this.#abortCompactionJob(
+            job,
+            `Compaction publication lost ${String(MAX_COMPACTION_PUBLICATION_CONFLICTS + 1)} manifest races`,
+          );
+          throw new Error(job.error, { cause: publicationConflict });
+        }
       }
       job = await this.#markCompactionPublished(job, manifest.version);
       return compactionProgress(
@@ -16161,7 +16389,7 @@ export class MinnowDatabase {
         }
       }
       segmentCursor = page.nextCursor;
-      if (segmentCursor !== null) await yieldToEventLoop();
+      if (segmentCursor !== null) await this.#yieldMaintenance();
     } while (segmentCursor !== null);
     if (
       job.outputPartitionOrdinal === undefined &&
