@@ -1,4 +1,4 @@
-export const protocolVersion = 5 as const;
+export const protocolVersion = 6 as const;
 /** Outstanding request/response pairs retained by either side of one database RPC connection. */
 export const MAX_DATABASE_RPC_IN_FLIGHT = 256;
 

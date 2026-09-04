@@ -35,17 +35,17 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // uncorrelated IN subqueries planned as joins, dictionary-decided CASE aggregate branches, and
 // exact NUMERIC ROUND/TRUNC/ABS/FLOOR/CEIL/MOD/SIGN with PostgreSQL display-scale inference
 // intentionally expand the complete engine surface.
-// Measured: 836.3 KiB raw / 241.2 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 840 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 243 * 1024;
-// Measured with the larger durable adapter: 1170.1 KiB raw / 324.8 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1174 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 328 * 1024;
+// Measured: 844.8 KiB raw / 244.1 KiB gzip. Pin both with less than 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 847 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 247 * 1024;
+// Measured with the larger durable adapter: 1178.7 KiB raw / 327.7 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1181 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 330 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
-// same way measured 1465.6 KiB raw / 397.8 KiB gzip. Measured: 1196.5 KiB raw / 330.5 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1200 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 333 * 1024;
+// same way measured 1465.6 KiB raw / 397.8 KiB gzip. Measured: 1205.2 KiB raw / 333.4 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1208 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 336 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

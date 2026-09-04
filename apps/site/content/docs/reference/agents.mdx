@@ -135,11 +135,13 @@ machines: https://minnowdb.com/llms.txt
   `@minnowdb/core/worker`: it bundles that store alone, which matters under Vite's default
   `iife` worker format, where the generic entry carries all three. It refuses any other store
   kind in the client's options.
-- For typed Kysely live queries, create one `createKyselyLiveQueries({ driver })` manager and wrap
-  a selectable query with `query.$call(live)` or `live(query)`. Prefer `live.window()` with a
-  unique result key, `ORDER BY`, and a limit for UI lists. Close queries and then the manager.
-  One subscription per component is fine: unchanged rows keep their object identity across
-  snapshots, so memoize list items on the row and use `useLiveSelector` for a derived value.
+- For typed Kysely live queries, create one `createKyselyLiveQueries({ driver, db })` manager
+  and wrap a selectable query with `query.$call(live)` or `live(query)`. Prefer `live.window()`
+  with a unique result key, `ORDER BY`, and a limit for UI lists: single-table statements with a
+  unique key are maintained incrementally from each commit's rows rather than re-executed. Close
+  queries and then the manager. One subscription per component is fine: unchanged rows keep
+  their object identity across snapshots, so memoize list items on the row and use
+  `useLiveSelector` for a derived value.
 - A Kysely DB derived from the Minnow schema infers `count()` / `countAll()` as `number`, numeric
   `sum()` / `avg()` from the column domain, and fixed-return Minnow functions through `fn` /
   `fn.agg`; supported `cast()` targets are inferred too. Do not add redundant output generics.

@@ -266,6 +266,69 @@ describe("Kysely live queries", () => {
     store.close();
   });
 
+  it("decodes engine-delivered results through the dialect and plugins when given the db", async () => {
+    const { clientSide, workerSide } = createBoundary();
+    attachDatabaseWorker(workerSide);
+    const client = new MinnowDatabaseClient(clientSide, { store: { kind: "memory" } });
+    await client.migrate(shopSchema);
+    // A snake_case table under CamelCasePlugin: a delivered row must come out camelCased too.
+    await client.createTable({
+      name: "people",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "first_name", type: "string" },
+      ],
+    });
+    const db = createKysely({
+      driver: client,
+      schema: shopSchema,
+      resultDecoding: { numeric: "number" },
+    }).withPlugin(new CamelCasePlugin());
+    const live = createKyselyLiveQueries({ driver: client, db });
+    // Count SELECTs reaching the driver: the dialect executes through this client object.
+    let selects = 0;
+    const execute = client.execute.bind(client);
+    client.execute = ((sql: string, ...rest: unknown[]) => {
+      if (/^\s*select/i.test(sql)) selects += 1;
+      return (execute as (...args: unknown[]) => unknown)(sql, ...rest);
+    }) as typeof client.execute;
+    const orders = live(db.selectFrom("orders").select(["id", "status", "total"]));
+    const people = live(
+      (db as unknown as Kysely<{ people: { id: number; firstName: string } }>)
+        .selectFrom("people")
+        .selectAll(),
+    );
+    const unsubscribe = orders.subscribe(() => undefined);
+    const unsubscribePeople = people.subscribe(() => undefined);
+    await until(() => expect(orders.getSnapshot().status).toBe("ready"));
+    await until(() => expect(people.getSnapshot().status).toBe("ready"));
+    await db.insertInto("orders").values({ id: 1, status: "pending", total: 3 }).execute();
+    await client.insert("people", { id: 1, first_name: "Ada" });
+    await live.refresh();
+    // The dialect's decoding (numeric as number) and the plugin (camelCase) both applied.
+    await until(() =>
+      expect(orders.getSnapshot().rows).toEqual([{ id: 1, status: "pending", total: 3 }]),
+    );
+    await until(() => expect(people.getSnapshot().rows).toEqual([{ id: 1, firstName: "Ada" }]));
+    // The engine delivered; Kysely never executed either statement.
+    expect(selects).toBe(0);
+    unsubscribePeople();
+    unsubscribe();
+    await live.close();
+    await db.destroy();
+    await client.close();
+  });
+
+  it("refuses a db that is not on the Minnow dialect", () => {
+    expect(() =>
+      createKyselyLiveQueries({
+        driver: new MinnowDatabase(new MemoryBlockStore()),
+        db: { getExecutor: () => ({ adapter: {}, plugins: [] }) as never },
+      }),
+    ).toThrow(/Minnow dialect/);
+  });
+
   it("preserves typed invalidation and cleanup across the worker boundary", async () => {
     const { clientSide, workerSide } = createBoundary();
     attachDatabaseWorker(workerSide);

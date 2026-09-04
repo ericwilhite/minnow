@@ -775,6 +775,41 @@ describe("live queries", () => {
     live.close();
   });
 
+  it("answers a maintenance that fails with a full execution, never a stuck group", async () => {
+    const race = createRaceHost();
+    let maintainCalls = 0;
+    const host = {
+      ...race.host,
+      executeMaintainable: async (query: LiveQueryInput) => ({
+        result: await race.host.execute(query),
+        state: { planned: true },
+      }),
+      maintain: (): Promise<never> => {
+        maintainCalls += 1;
+        return Promise.reject(new Error("block vanished under the patch"));
+      },
+    };
+    const live = new LiveQuerySet(host);
+    const changes: QueryResult[] = [];
+    const errors: unknown[] = [];
+    await live.subscribe("A", {
+      onChange: (result) => changes.push(result),
+      onError: (error) => errors.push(error),
+    });
+    race.commit();
+    await live.refresh();
+    expect(maintainCalls).toBe(1);
+    expect(errors).toEqual([]);
+    expect(changes.at(-1)?.rows).toEqual([{ v: 2 }]);
+    expect(live.stats.maintained).toBe(0);
+    expect(live.stats.reruns).toBe(1);
+    // Nothing is left lagging: a refresh without a commit is a probe and no sweep.
+    const sweeps = live.stats.sweeps;
+    await live.refresh();
+    expect(live.stats.sweeps).toBe(sweeps);
+    live.close();
+  });
+
   it("visits only the groups whose tables the commits changed", async () => {
     let version = 1;
     const manifests: Manifest[] = [

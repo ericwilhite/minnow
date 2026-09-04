@@ -20,7 +20,19 @@ export interface MinnowDialectConfig {
   readonly resultDecoding?: MinnowResultDecoding;
 }
 
-class MinnowKyselyAdapter extends DialectAdapterBase {
+/**
+ * The dialect adapter, which also carries the dialect's result decoding: a Kysely instance
+ * exposes its adapter through `getExecutor().adapter`, and that is how the live-query wrapper
+ * decodes results the engine delivers to it the same way the driver decodes executed ones.
+ */
+export class MinnowKyselyAdapter extends DialectAdapterBase {
+  readonly resultDecoding: MinnowResultDecoding;
+
+  constructor(resultDecoding: MinnowResultDecoding) {
+    super();
+    this.resultDecoding = resultDecoding;
+  }
+
   // Minnow has one logical connection, but the driver serializes it through its own FIFO mutex.
   // Claiming a single connection here would add Kysely's RuntimeDriver mutex in front of ours,
   // and that lock only releases through releaseConnection — a `startTransaction()` whose BEGIN
@@ -58,7 +70,7 @@ export class MinnowDialect implements Dialect {
   }
 
   createAdapter(): DialectAdapter {
-    return new MinnowKyselyAdapter();
+    return new MinnowKyselyAdapter(this.#resultDecoding);
   }
 
   createDriver(): Driver {

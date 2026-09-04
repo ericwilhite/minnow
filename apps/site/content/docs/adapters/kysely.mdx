@@ -367,7 +367,7 @@ type. Use the callable directly or through Kysely's `$call`:
 ```ts
 import { createKyselyLiveQueries } from "@minnowdb/kysely";
 
-const live = createKyselyLiveQueries({ driver: database });
+const live = createKyselyLiveQueries({ driver: database, db });
 const openOrders = db
   .selectFrom("orders")
   .select(["order_id", "total"])
@@ -380,9 +380,12 @@ const unsubscribe = openOrders.subscribe(() => {
 });
 ```
 
-The wrapper compiles the statement once for dependency tracking, then executes through Kysely so
-result plugins and mapped row names survive. It also provides typed keyed changes and ordered,
-bounded windows. See [Live queries](/docs/extensions/live-queries) for those forms and the
+The wrapper compiles the statement once for dependency tracking. With `db`, a changed result is
+delivered by the engine and decoded here through the dialect's result decoding and the instance's
+plugins, so mapped row names survive and nothing executes twice; plugins added to a single builder
+with `withPlugin` are not applied to delivered results, so keep them on the instance. Without
+`db`, each change is answered by executing through Kysely again. It also provides typed keyed
+changes and ordered, bounded windows. See [Live queries](/docs/extensions/live-queries) for those forms and the
 adapter-neutral contract another query library can implement.
 
 ## Streaming

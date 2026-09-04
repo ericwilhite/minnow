@@ -993,11 +993,19 @@ class DatabaseRpcServer {
         let subscription: LiveQuerySubscription | undefined;
         try {
           subscription = await handle.set.subscribe(query, {
-            onChange: (result) => {
+            onChange: (result, delivery) => {
               const encoded = encodeQueryResult(result);
-              this.scope.postMessage(rpcEvent(subscriptionId, "change", encoded.payload), {
-                transfer: encoded.transfer,
-              });
+              // The provenance array is shared by every subscriber of the group, so each frame
+              // transfers its own copy rather than detaching the set's.
+              const retained = delivery.retained?.slice();
+              if (retained !== undefined) encoded.transfer.push(retained.buffer);
+              this.scope.postMessage(
+                rpcEvent(subscriptionId, "change", {
+                  result: encoded.payload,
+                  delivery: retained === undefined ? delivery : { ...delivery, retained },
+                }),
+                { transfer: encoded.transfer },
+              );
             },
             onError: (error) => {
               this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));

@@ -102,6 +102,7 @@ import {
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
 import type {
+  LiveQueryDelivery,
   LiveQueryInput,
   LiveQueryInvalidation,
   LiveQueryObserveOptions,
@@ -193,7 +194,7 @@ export interface ClientMigrationResult {
 }
 
 interface EventRoute {
-  onChange?: (result: QueryResult) => void;
+  onChange?: (result: QueryResult, delivery: LiveQueryDelivery) => void;
   onInvalidate?: (invalidation: LiveQueryInvalidation) => void;
   onError?: (error: unknown) => void;
   onComplete?: () => void;
@@ -1132,8 +1133,13 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     if (response.kind === "rpc-event") {
       const route = this.#events.get(response.handleId);
       if (route === undefined) return;
-      if (response.event === "change") route.onChange?.(decodeQueryResult(response.payload));
-      else if (response.event === "invalidate") {
+      if (response.event === "change") {
+        const { result, delivery } = response.payload as {
+          result: unknown;
+          delivery: LiveQueryDelivery;
+        };
+        route.onChange?.(decodeQueryResult(result), delivery);
+      } else if (response.event === "invalidate") {
         route.onInvalidate?.(response.payload as LiveQueryInvalidation);
       } else if (response.event === "error") {
         route.onError?.(rehydrateResponseError(response.payload));

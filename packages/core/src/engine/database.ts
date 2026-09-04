@@ -273,6 +273,8 @@ import {
   LiveQueryLimitError,
   LiveQuerySet,
   MAX_LIVE_QUERY_SETS_PER_DATABASE,
+  type LiveMaintainedChange,
+  type LiveMaintainedExecution,
   type LiveQueryExecuteContext,
   type LiveQueryInput,
   type LiveQuerySetOptions,
@@ -283,7 +285,7 @@ import {
   qualifyCorrelatedReferences,
   renderPlan,
 } from "./optimizer.js";
-import { encodeSqlEqualityValue, readUntypedText } from "./sql-semantics.js";
+import { encodeSqlEqualityValue, readUntypedText, compareSqlValues } from "./sql-semantics.js";
 import {
   exactNumericAsNumber,
   exactNumericValue,
@@ -617,12 +619,21 @@ interface MergeResolvedSource {
 }
 
 /** A table's part of a live proof window: see `#liveProofContext`. */
+interface LiveChangedKeys {
+  /** Every key the window touched, by identity token. */
+  readonly changedKeys: ReadonlyMap<string, QueryValue>;
+  /** The tokens of keys that named existing rows: updates, deletes, and upserts. */
+  readonly existingKeys: ReadonlySet<string>;
+}
+
 interface LiveProofTable {
   readonly table: TableRecord;
   /** Segments whose transaction committed inside the window, in store order. */
   readonly windowSegments: readonly SegmentRecord[];
   /** The committed versions those segments account for. */
   readonly coveredVersions: ReadonlySet<number>;
+  /** Decoded window keys per key column, filled in as maintainable statements ask. */
+  readonly changedKeys: Map<string, Promise<LiveChangedKeys | undefined>>;
 }
 
 /** What every live proof over one commit window shares: see `#liveProofContext`. */
@@ -6690,6 +6701,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           return new Set([...tables.values()].map((record) => record.id));
         },
         execute: (query, context) => this.#liveExecute(query, context),
+        executeMaintainable: (query, context) =>
+          this.#liveExecuteMaintainable(compileLiveQuery(query), context),
+        maintain: (_query, result, state, tableIds, after, until, probe) =>
+          this.#liveMaintain(result, state as LiveMaintenanceState, tableIds, after, until, probe),
         changeCanAffect: (query, tableIds, after, until) =>
           this.#liveChangeCanAffect(query, tableIds, after, until),
       },
@@ -6743,6 +6758,270 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     if (typeof query === "string") return this.#queryWithReadReservation(query, {}, probe, memoize);
     return this.#queryWithReadReservation(query.sql, { params: query.params }, probe, memoize);
+  }
+
+  /**
+   * Plans a live statement for incremental maintenance, or returns undefined when its shape
+   * cannot be maintained row by row. The maintainable shape is one base table with a visible,
+   * domain-free unique key; predicates, projections, and ORDER BY terms that are functions of
+   * the row alone; optional LIMIT/OFFSET; no joins, aggregates, DISTINCT, window functions,
+   * subqueries, full-text search, or clock reads. Such a statement's result changes only
+   * through rows whose key a commit touched, and the engine records exactly those keys.
+   *
+   * The plan it returns projects the key and every ORDER BY term as hidden columns, so the
+   * retained result carries what a later merge needs and the delta query returns rows the
+   * merge can place without re-deriving the ordering in JavaScript from scratch.
+   */
+  async #liveMaintenancePlan(
+    compiled: CompiledQuery,
+    probe: CatalogProbe,
+  ): Promise<LiveMaintenanceState | undefined> {
+    if (
+      compiled.usesStatementDatetime === true ||
+      compiled.usesVolatileFunctions === true ||
+      compiled.usesSequenceCalls === true
+    ) {
+      return undefined;
+    }
+    const plan = await this.#applyCatalogRewrites(compiled, probe);
+    const base = plan.base;
+    if (
+      plan.joins.length > 0 ||
+      base.derived !== undefined ||
+      base.union !== undefined ||
+      base.recursive !== undefined ||
+      base.windowed !== undefined ||
+      plan.pendingSelectShape !== undefined ||
+      plan.distinctWildcard === true ||
+      plan.groupBy.length > 0 ||
+      plan.having.length > 0 ||
+      plan.limitParameter !== undefined ||
+      plan.offsetParameter !== undefined ||
+      planReadsBeyondSingleScan(plan) ||
+      planContainsFts(plan)
+    ) {
+      return undefined;
+    }
+    const rowLocal = (expression: Expression): boolean => {
+      if (
+        expression.kind === "subquery" ||
+        expression.kind === "exists" ||
+        expression.kind === "window" ||
+        expression.kind === "wildcard" ||
+        expression.kind === "parameter" ||
+        hasAggregate(expression)
+      ) {
+        return false;
+      }
+      return childExpressions(expression).every(rowLocal);
+    };
+    if (!plan.select.every((item) => rowLocal(item.expression))) return undefined;
+    if (!plan.predicates.every(({ left, right }) => rowLocal(left) && rowLocal(right))) {
+      return undefined;
+    }
+    if (!plan.orderBy.every((term) => rowLocal(term.expression))) return undefined;
+    const table = await this.#findTable(base.table);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined || keyColumn.hidden === true || keyColumn.sqlDomain !== undefined) {
+      return undefined;
+    }
+    const publicColumns = plan.select.map((item) => item.alias);
+    if (publicColumns.some((name) => name.startsWith(LIVE_HIDDEN_PREFIX))) return undefined;
+    const fullPlan = clonePlanTree(plan);
+    const qualifiedKey = `${base.alias}.${keyColumn.name}`;
+    fullPlan.select.push({
+      expression: { kind: "column", reference: qualifiedKey },
+      alias: LIVE_KEY_ALIAS,
+    });
+    const orderTerms: LiveMaintenanceOrderTerm[] = [];
+    for (const [index, term] of plan.orderBy.entries()) {
+      let alias: string | undefined;
+      if (term.expression.kind === "column" && !term.expression.reference.includes(".")) {
+        // ORDER BY names an output column first, as SQL does; a table column of the same name
+        // projects under its own hidden alias below.
+        const output = term.expression.reference;
+        if (publicColumns.includes(output)) alias = output;
+      } else if (term.expression.kind === "literal" && typeof term.expression.value === "number") {
+        const position = term.expression.value;
+        if (!Number.isInteger(position) || position < 1 || position > publicColumns.length) {
+          return undefined;
+        }
+        alias = publicColumns[position - 1];
+      }
+      if (alias === undefined) {
+        alias = `${LIVE_ORDER_ALIAS}${String(index)}`;
+        fullPlan.select.push({ expression: clonePlanTree(term.expression), alias });
+      }
+      orderTerms.push({ alias, descending: term.direction === "desc", nulls: term.nulls });
+    }
+    const deltaPlan = clonePlanTree(fullPlan);
+    deltaPlan.orderBy = [];
+    delete deltaPlan.limit;
+    delete deltaPlan.offset;
+    const margin =
+      plan.limit === undefined || orderTerms.length === 0
+        ? 0
+        : Math.max(LIVE_WINDOW_MARGIN_MIN, Math.min(plan.limit, LIVE_WINDOW_MARGIN_MAX));
+    if (margin > 0) fullPlan.limit = (plan.limit ?? 0) + margin;
+    return {
+      tableId: table.id,
+      keyColumnId: keyColumn.id,
+      qualifiedKey,
+      fullPlan,
+      deltaPlan,
+      publicColumns,
+      columnDomains: [],
+      orderTerms,
+      limit: plan.limit,
+      offset: plan.offset ?? 0,
+      margin,
+      complete: true,
+      rows: [],
+      keys: [],
+      order: [],
+    };
+  }
+
+  /** Runs a maintainable plan and splits its hidden projections out of the public result. */
+  async #liveExecuteMaintainable(
+    compiled: CompiledQuery,
+    context: LiveQueryExecuteContext | undefined,
+  ): Promise<LiveMaintainedExecution | undefined> {
+    const probe = context?.probe ?? (await this.store.getCatalogProbe());
+    const state = await this.#liveMaintenancePlan(compiled, probe);
+    if (state === undefined) return undefined;
+    const executed = externalizeQueryResult(
+      await this.#withReadReservation(() => this.#queryCompiled(state.fullPlan, {}, probe)),
+    );
+    const split = splitLiveHiddenColumns(executed, state);
+    return liveMaintainedOutcome(
+      {
+        ...state,
+        columnDomains: split.result.columnDomains,
+        complete:
+          state.fullPlan.limit === undefined || split.result.rows.length < state.fullPlan.limit,
+        rows: split.result.rows,
+        keys: split.keys,
+        order: split.order,
+      },
+      undefined,
+    );
+  }
+
+  /**
+   * Patches a retained live result with one commit window's row changes instead of running the
+   * statement again. The keys a window touched come from the key blocks of the segments it
+   * committed: an insert or upsert carries every column, an update and a delete carry the key.
+   * Those keys leave the retained rows, the statement re-evaluates exactly those keys through
+   * the ordinary executor (so predicates, projections, and ORDER BY terms keep their SQL
+   * meaning), and the survivors merge back in order. Undefined means "run it in full": a
+   * window shape the merge cannot settle locally, more changed rows than a delta query should
+   * carry, or history the segments do not account for.
+   */
+  async #liveMaintain(
+    retained: QueryResult,
+    state: LiveMaintenanceState,
+    tableIds: readonly string[],
+    after: number | null,
+    until: number,
+    probe: CatalogProbe,
+  ): Promise<LiveMaintainedChange | undefined> {
+    if (tableIds.length !== 1 || tableIds[0] !== state.tableId) return undefined;
+    const context = await this.#liveProofContext(after, until);
+    const entry = await this.#liveProofTable(context, state.tableId);
+    if (entry === undefined) return undefined;
+    for (const version of context.changedVersions.get(state.tableId) ?? []) {
+      if (!entry.coveredVersions.has(version)) return undefined;
+    }
+    const changed = await this.#liveChangedKeys(entry, state.keyColumnId);
+    if (changed === undefined) return undefined;
+    const { changedKeys, existingKeys } = changed;
+    if (changedKeys.size === 0) return { result: retained, state, changed: false };
+    const affected = new Set<number>();
+    const retainedTokens = new Set<string>();
+    for (const [index, key] of state.keys.entries()) {
+      const token = liveKeyToken(key);
+      retainedTokens.add(token);
+      if (changedKeys.has(token)) affected.add(index);
+    }
+    // A truncated window without an ordering has no edge to reason about: a member that
+    // leaves is replaced by whichever row the executor reaches next.
+    const fullLimit = state.limit === undefined ? undefined : state.limit + state.margin;
+    const truncated = !state.complete;
+    if (truncated && affected.size > 0 && state.orderTerms.length === 0) return undefined;
+    if (state.offset > 0) {
+      // An existing row the window does not hold may sit before it, where any change to it
+      // shifts the window onto a row this result never held.
+      for (const token of existingKeys) if (!retainedTokens.has(token)) return undefined;
+    }
+    const deltaPlan: CompiledQuery = {
+      ...state.deltaPlan,
+      predicates: [
+        ...state.deltaPlan.predicates,
+        {
+          left: { kind: "column", reference: state.qualifiedKey },
+          operator: "IN",
+          right: {
+            kind: "list",
+            items: [...changedKeys.values()].map((value) => ({ kind: "literal", value })),
+          },
+        },
+      ],
+    };
+    const delta = splitLiveHiddenColumns(
+      externalizeQueryResult(
+        await this.#withReadReservation(() => this.#queryCompiled(deltaPlan, {}, probe)),
+      ),
+      state,
+    );
+    const compare = liveOrderComparator(state.orderTerms);
+    const added: LiveMaintainedRows = {
+      rows: delta.result.rows,
+      keys: delta.keys,
+      order: delta.order,
+      previousIndex: new Int32Array(delta.result.rows.length).fill(-1),
+    };
+    let merged: LiveMaintainedRows;
+    try {
+      const kept = filterLiveRows(state, (index) => !affected.has(index));
+      if (state.offset > 0 && added.rows.length > 0) {
+        // With an OFFSET, a row sorting ahead of the window's first member shifts the window
+        // onto a row this result never held.
+        if (
+          kept.rows.length === 0 ||
+          added.rows.some((_, index) => compare(added.order, index, kept.order, 0) < 0)
+        ) {
+          return undefined;
+        }
+      }
+      merged = mergeLiveRows(kept, added, compare, state.orderTerms.length > 0);
+    } catch {
+      // Incomparable ORDER BY values (a mixed-type term): the executor's own ordering rules
+      // settle those, so run the statement instead of guessing.
+      return undefined;
+    }
+    if (fullLimit !== undefined && merged.rows.length > fullLimit)
+      merged = trimLiveRows(merged, fullLimit);
+    if (truncated && affected.size > 0 && state.limit !== undefined) {
+      // Rows beyond the old retained edge are unknown here and all sort after it. The visible
+      // window is exact only if it is still full and ends no later than that edge; otherwise
+      // a row from beyond it belongs in the window, and only the full statement knows which.
+      const oldEdge = state.rows.length - 1;
+      const visibleEdge = Math.min(merged.rows.length, state.limit) - 1;
+      if (
+        merged.rows.length < state.limit ||
+        oldEdge < 0 ||
+        visibleEdge < 0 ||
+        compare(merged.order, visibleEdge, state.order, oldEdge) > 0
+      ) {
+        return undefined;
+      }
+    }
+    return liveMaintainedOutcome(
+      { ...state, rows: merged.rows, keys: merged.keys, order: merged.order },
+      retained,
+      merged.previousIndex,
+    );
   }
 
   /**
@@ -6887,6 +7166,52 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return context;
   }
 
+  /**
+   * The keys the window's segments touched, decoded from their key blocks once per sweep and
+   * table: every maintainable statement on the table asks for the same blocks.
+   */
+  #liveChangedKeys(
+    entry: LiveProofTable,
+    keyColumnId: string,
+  ): Promise<LiveChangedKeys | undefined> {
+    const cached = entry.changedKeys.get(keyColumnId);
+    if (cached !== undefined) return cached;
+    const pending = (async (): Promise<LiveChangedKeys | undefined> => {
+      const blockIds: string[] = [];
+      /** Blocks whose keys name rows that already existed: updates, deletes, and upserts. */
+      const existingBlockIds = new Set<string>();
+      let deltaRows = 0;
+      for (const segment of entry.windowSegments) {
+        // Compaction rewrites are visible-data-neutral by construction.
+        if (segment.kind === "base") continue;
+        const ids = segment.columnBlockIds[keyColumnId];
+        if (ids === undefined) return undefined;
+        deltaRows += segment.rowCount;
+        if (deltaRows > LIVE_MAINTENANCE_MAX_DELTA_ROWS) return undefined;
+        blockIds.push(...ids);
+        if (segment.kind !== "insert") for (const id of ids) existingBlockIds.add(id);
+      }
+      const changedKeys = new Map<string, QueryValue>();
+      const existingKeys = new Set<string>();
+      if (blockIds.length > 0) {
+        const decoded = await this.#loadDecodedBlocks([...new Set(blockIds)]);
+        for (const blockId of blockIds) {
+          const column = decoded.get(blockId);
+          if (column === undefined) return undefined;
+          for (const value of column.values) {
+            if (value === null) continue;
+            const token = liveKeyToken(value);
+            changedKeys.set(token, value);
+            if (existingBlockIds.has(blockId)) existingKeys.add(token);
+          }
+        }
+      }
+      return { changedKeys, existingKeys };
+    })();
+    entry.changedKeys.set(keyColumnId, pending);
+    return pending;
+  }
+
   #liveProofTable(context: LiveProofContext, tableId: string): Promise<LiveProofTable | undefined> {
     const cached = context.tables.get(tableId);
     if (cached !== undefined) return cached;
@@ -6909,7 +7234,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         coveredVersions.add(committed);
         windowSegments.push(segment);
       }
-      return { table, windowSegments, coveredVersions };
+      return { table, windowSegments, coveredVersions, changedKeys: new Map() };
     })();
     context.tables.set(tableId, entry);
     return entry;
@@ -22270,6 +22595,289 @@ function searchableFtsColumns(table: TableRecord | undefined): readonly string[]
   return visibleTableColumns(table)
     .filter((column) => column.type !== "boolean")
     .map((column) => column.name);
+}
+
+const LIVE_HIDDEN_PREFIX = "__minnow_live_";
+const LIVE_KEY_ALIAS = `${LIVE_HIDDEN_PREFIX}key`;
+const LIVE_ORDER_ALIAS = `${LIVE_HIDDEN_PREFIX}order_`;
+/** More changed rows than this per commit window and the full statement is the cheaper path. */
+const LIVE_MAINTENANCE_MAX_DELTA_ROWS = 2_048;
+/** Rows a window keeps beyond its visible edge: at least this many, at most the window itself. */
+const LIVE_WINDOW_MARGIN_MIN = 16;
+const LIVE_WINDOW_MARGIN_MAX = 64;
+
+interface LiveMaintenanceOrderTerm {
+  /** The result column the term's value is read from, public or hidden. */
+  readonly alias: string;
+  readonly descending: boolean;
+  readonly nulls: "first" | "last" | undefined;
+}
+
+/** Everything a live set hands back so a later commit can patch the result it retained. */
+interface LiveMaintenanceState {
+  readonly tableId: string;
+  readonly keyColumnId: string;
+  readonly qualifiedKey: string;
+  /** The statement with its key and ORDER BY terms projected under hidden aliases. */
+  readonly fullPlan: CompiledQuery;
+  /** The same without ORDER BY/LIMIT/OFFSET; a key list is appended per commit window. */
+  readonly deltaPlan: CompiledQuery;
+  readonly publicColumns: readonly string[];
+  readonly columnDomains: ReadonlyArray<SqlDomain | null>;
+  readonly orderTerms: readonly LiveMaintenanceOrderTerm[];
+  readonly limit: number | undefined;
+  readonly offset: number;
+  /**
+   * Rows fetched beyond a window's visible edge. A member that leaves a full window is then
+   * replaced from rows already held rather than by running the statement again; only when
+   * the margin runs dry does a full execution refill it.
+   */
+  readonly margin: number;
+  /**
+   * Whether the retained rows are every row the statement matches. False once a full
+   * execution filled the window and its margin to the brim: rows beyond the retained edge may
+   * exist, and a patch that would reach past that edge needs the statement again.
+   */
+  readonly complete: boolean;
+  /** Every retained row — the visible ones first, then the margin — in result order. */
+  readonly rows: readonly QueryRow[];
+  readonly keys: readonly QueryValue[];
+  /** One array per ORDER BY term, each holding that term's value for every retained row. */
+  readonly order: ReadonlyArray<readonly QueryValue[]>;
+}
+
+interface LiveMaintainedRows {
+  readonly rows: QueryRow[];
+  readonly keys: QueryValue[];
+  /** One array per ORDER BY term. */
+  readonly order: QueryValue[][];
+  /** For each row, its index among the rows the patch started from, or -1 for a new row. */
+  readonly previousIndex: Int32Array;
+}
+
+function sameLiveRow(left: QueryRow, right: QueryRow, columns: readonly string[]): boolean {
+  for (const column of columns) {
+    const a = left[column] ?? null;
+    const b = right[column] ?? null;
+    if (a instanceof Date || b instanceof Date) {
+      if (
+        !(a instanceof Date && b instanceof Date) ||
+        !Object.is(dateMilliseconds(a), dateMilliseconds(b))
+      ) {
+        return false;
+      }
+    } else if (!Object.is(a, b)) return false;
+  }
+  return true;
+}
+
+function liveKeyToken(value: QueryValue): string {
+  if (typeof value === "number") return `n:${String(value)}`;
+  if (typeof value === "string") return `s:${value}`;
+  if (typeof value === "boolean") return value ? "b:1" : "b:0";
+  if (value instanceof Date) return `d:${String(dateMilliseconds(value))}`;
+  return "z";
+}
+
+/** Strips a maintainable plan's hidden projections out of an executed result, keeping them aside. */
+function splitLiveHiddenColumns(
+  executed: QueryResult,
+  state: Pick<LiveMaintenanceState, "publicColumns" | "orderTerms">,
+): { result: QueryResult; keys: QueryValue[]; order: QueryValue[][] } {
+  const publicCount = state.publicColumns.length;
+  const hidden = executed.columns.slice(publicCount);
+  const count = executed.rows.length;
+  const keys = new Array<QueryValue>(count);
+  const order = state.orderTerms.map(() => new Array<QueryValue>(count));
+  for (let index = 0; index < count; index += 1) {
+    const row = executed.rows[index] ?? {};
+    keys[index] = row[LIVE_KEY_ALIAS] ?? null;
+    for (const [term, { alias }] of state.orderTerms.entries()) {
+      const values = order[term];
+      if (values !== undefined) values[index] = row[alias] ?? null;
+    }
+    for (const column of hidden) Reflect.deleteProperty(row, column);
+  }
+  return {
+    result: {
+      columns: executed.columns.slice(0, publicCount),
+      columnDomains: executed.columnDomains.slice(0, publicCount),
+      rows: executed.rows,
+    },
+    keys,
+    order,
+  };
+}
+
+/**
+ * The visible result for a maintenance state: its rows up to the window's limit. Against a
+ * previous result, an outcome whose visible rows are all what they were is reported unchanged
+ * with that result's objects. Otherwise every row the patch kept reports where it was, and a
+ * row that rewrote itself with the values it had keeps its previous object.
+ */
+function liveMaintainedOutcome(
+  state: LiveMaintenanceState,
+  previous: QueryResult | undefined,
+  previousIndex?: Int32Array,
+): LiveMaintainedChange {
+  const visibleCount =
+    state.limit === undefined ? state.rows.length : Math.min(state.rows.length, state.limit);
+  const visible = state.rows.slice(0, visibleCount);
+  if (previous === undefined) {
+    return {
+      result: {
+        columns: [...state.publicColumns],
+        columnDomains: [...state.columnDomains],
+        rows: visible,
+      },
+      state,
+      changed: true,
+    };
+  }
+  const previousCount = previous.rows.length;
+  const retained = new Int32Array(visibleCount);
+  let same = visibleCount === previousCount;
+  let kept = 0;
+  for (let index = 0; index < visibleCount; index += 1) {
+    const was = previousIndex?.[index] ?? -1;
+    if (was >= 0 && was < previousCount) {
+      retained[index] = was;
+      kept += 1;
+      if (was !== index) same = false;
+      continue;
+    }
+    retained[index] = -1;
+    const before = previous.rows[index];
+    const now = visible[index];
+    if (before !== undefined && now !== undefined && sameLiveRow(before, now, previous.columns)) {
+      visible[index] = before;
+      retained[index] = index;
+      kept += 1;
+    } else same = false;
+  }
+  if (same) return { result: previous, state, changed: false };
+  return {
+    result: {
+      columns: [...state.publicColumns],
+      columnDomains: [...state.columnDomains],
+      rows: visible,
+    },
+    state,
+    changed: true,
+    ...(kept > 0 ? { retained } : {}),
+  };
+}
+
+function filterLiveRows(
+  state: LiveMaintenanceState,
+  keep: (index: number) => boolean,
+): LiveMaintainedRows {
+  const rows: QueryRow[] = [];
+  const keys: QueryValue[] = [];
+  const order = state.order.map(() => new Array<QueryValue>());
+  const previous: number[] = [];
+  for (let index = 0; index < state.rows.length; index += 1) {
+    const row = state.rows[index];
+    if (row === undefined || !keep(index)) continue;
+    rows.push(row);
+    keys.push(state.keys[index] ?? null);
+    for (const [term, values] of state.order.entries()) {
+      order[term]?.push(values[index] ?? null);
+    }
+    previous.push(index);
+  }
+  return { rows, keys, order, previousIndex: Int32Array.from(previous) };
+}
+
+function trimLiveRows(rows: LiveMaintainedRows, count: number): LiveMaintainedRows {
+  return {
+    rows: rows.rows.slice(0, count),
+    keys: rows.keys.slice(0, count),
+    order: rows.order.map((values) => values.slice(0, count)),
+    previousIndex: rows.previousIndex.slice(0, count),
+  };
+}
+
+/** Compares the row at one index of one term-column set with the row at another index of another. */
+type LiveOrderCompare = (
+  leftOrder: ReadonlyArray<readonly QueryValue[]>,
+  leftIndex: number,
+  rightOrder: ReadonlyArray<readonly QueryValue[]>,
+  rightIndex: number,
+) => number;
+
+/**
+ * PostgreSQL's ORDER BY over the projected term values: direction negates the value comparison
+ * only, and NULLs go last for ASC and first for DESC unless the term says otherwise.
+ */
+function liveOrderComparator(terms: readonly LiveMaintenanceOrderTerm[]): LiveOrderCompare {
+  return (leftOrder, leftIndex, rightOrder, rightIndex) => {
+    for (const [term, { descending, nulls }] of terms.entries()) {
+      const a = leftOrder[term]?.[leftIndex] ?? null;
+      const b = rightOrder[term]?.[rightIndex] ?? null;
+      if (a === null || b === null) {
+        if (a === null && b === null) continue;
+        const nullsFirst = nulls === "first" || (nulls === undefined && descending);
+        return a === null ? (nullsFirst ? -1 : 1) : nullsFirst ? 1 : -1;
+      }
+      let comparison = compareSqlValues(a, b);
+      if (descending) comparison = -comparison;
+      if (comparison !== 0) return comparison;
+    }
+    return 0;
+  };
+}
+
+/** Merges rows a commit added into rows it kept; `kept` is already in order when `ordered`. */
+function mergeLiveRows(
+  kept: LiveMaintainedRows,
+  added: LiveMaintainedRows,
+  compare: LiveOrderCompare,
+  ordered: boolean,
+): LiveMaintainedRows {
+  if (added.rows.length === 0) return kept;
+  const terms = kept.order.length;
+  const total = kept.rows.length + added.rows.length;
+  const rows = new Array<QueryRow>(total);
+  const keys = new Array<QueryValue>(total);
+  const order = Array.from({ length: terms }, () => new Array<QueryValue>(total));
+  const previousIndex = new Int32Array(total);
+  const take = (source: LiveMaintainedRows, from: number, to: number): void => {
+    rows[to] = source.rows[from] ?? {};
+    keys[to] = source.keys[from] ?? null;
+    for (let term = 0; term < terms; term += 1) {
+      const values = order[term];
+      if (values !== undefined) values[to] = source.order[term]?.[from] ?? null;
+    }
+    previousIndex[to] = source.previousIndex[from] ?? -1;
+  };
+  if (!ordered) {
+    for (let index = 0; index < kept.rows.length; index += 1) take(kept, index, index);
+    for (let index = 0; index < added.rows.length; index += 1) {
+      take(added, index, kept.rows.length + index);
+    }
+    return { rows, keys, order, previousIndex };
+  }
+  const addedIndexes = added.rows.map((_, index) => index);
+  addedIndexes.sort((left, right) => compare(added.order, left, added.order, right));
+  let keptIndex = 0;
+  let addedPosition = 0;
+  for (let to = 0; to < total; to += 1) {
+    const addedIndex = addedIndexes[addedPosition];
+    // Ties keep the retained row ahead, as a stable sort keeps earlier input ahead.
+    const takeAdded =
+      addedIndex !== undefined &&
+      (keptIndex >= kept.rows.length ||
+        compare(added.order, addedIndex, kept.order, keptIndex) < 0);
+    if (takeAdded) {
+      take(added, addedIndex, to);
+      addedPosition += 1;
+    } else {
+      take(kept, keptIndex, to);
+      keptIndex += 1;
+    }
+  }
+  return { rows, keys, order, previousIndex };
 }
 
 function getUniqueKeyColumn(table: TableRecord): TableColumnRecord | undefined {

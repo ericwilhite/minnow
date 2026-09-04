@@ -1,11 +1,23 @@
 import { sameLiveValue } from "./live-equal.js";
-import type { LiveQueryInput, LiveQueryInvalidation, LiveQueryObserveOptions } from "./live.js";
+import type {
+  LiveQueryDelivery,
+  LiveQueryInput,
+  LiveQueryInvalidation,
+  LiveQueryObserveOptions,
+  LiveQuerySubscribeOptions,
+} from "./live.js";
+import type { QueryResult } from "./query.js";
 
 /** The structural live-query surface shared by MinnowDatabase and its worker client. */
 export interface LiveQueryBackend {
   observe(
     query: LiveQueryInput,
     options: LiveQueryObserveOptions,
+  ): Promise<LiveQuerySubscriptionLike>;
+  /** Result delivery, used when the source can decode the engine's result itself. */
+  subscribe?(
+    query: LiveQueryInput,
+    options: LiveQuerySubscribeOptions,
   ): Promise<LiveQuerySubscriptionLike>;
   refresh(): Promise<void>;
   close(): void | Promise<void>;
@@ -27,6 +39,14 @@ export interface LiveQueryDriver {
 export interface LiveQuerySource<out TRow> {
   readonly query: LiveQueryInput;
   execute(signal?: AbortSignal): Promise<readonly TRow[]>;
+  /**
+   * Turns a result the engine delivered into the adapter's rows. With it, the query subscribes
+   * for results rather than invalidations: the engine executes or patches the statement where
+   * the data is, compares, and hands over a changed result once — over a worker channel, as
+   * one columnar transfer — and `execute` is never called after the statement is registered.
+   * Without it, an invalidation is followed by `execute`, which the engine's memo serves.
+   */
+  decode?(result: QueryResult): readonly TRow[] | Promise<readonly TRow[]>;
 }
 
 export type LiveSnapshot<TRow> =
@@ -53,11 +73,22 @@ export type LiveSnapshot<TRow> =
 function reconcileRows<TRow>(
   previous: readonly TRow[],
   next: readonly TRow[],
+  retained: Int32Array | undefined,
 ): readonly TRow[] | undefined {
   const rows = new Array<TRow>(next.length);
   let changed = previous.length !== next.length;
+  // The engine's word on which rows it kept, when it kept any: a row it retained is equal to the
+  // one at that previous index whatever position it now holds, so a new row at the top does not
+  // cost every row below it its object.
+  const provenance = retained?.length === next.length ? retained : undefined;
   for (let index = 0; index < next.length; index += 1) {
     const row = next[index] as TRow;
+    const was = provenance?.[index] ?? -1;
+    if (was >= 0 && was < previous.length) {
+      rows[index] = previous[was] as TRow;
+      if (was !== index) changed = true;
+      continue;
+    }
     const before = previous[index];
     if (index < previous.length && sameLiveValue(before, row)) rows[index] = before as TRow;
     else {
@@ -84,7 +115,9 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   #snapshot: LiveSnapshot<TRow> = { status: "loading", rows: [] };
   #subscription: Promise<LiveQuerySubscriptionLike> | undefined;
   #observationGeneration = 0;
-  #queued: LiveQueryInvalidation | undefined;
+  #queued: QueuedWork | undefined;
+  /** The engine's last delivered result, so a decode failure can be retried without a commit. */
+  #lastDelivered: { result: QueryResult; delivery: LiveQueryDelivery } | undefined;
   #execution: Promise<void> | undefined;
   #executionAbort: AbortController | undefined;
   #invalidationSequence = 0;
@@ -128,9 +161,24 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     // when it did not, which preserves manual retry without running every refreshed query twice.
     if (this.#invalidationSequence === sequence) {
       const version = this.#snapshot.status === "loading" ? null : this.#snapshot.version;
-      this.#schedule({ manifestVersion: version, catalogEpoch: 0, initial: false });
+      if (this.#decodes()) {
+        // The engine retries a failed statement itself on refresh and delivers the outcome;
+        // what is left to retry here is a decode that failed on a result it did deliver.
+        const last = this.#lastDelivered;
+        if (this.#snapshot.status === "error" && last !== undefined) this.#schedule(last);
+      } else this.#schedule({ manifestVersion: version, catalogEpoch: 0, initial: false });
     }
     await this.#waitForIdle();
+  }
+
+  #decodes(): boolean {
+    return this.#source.decode !== undefined && this.#backend.subscribe !== undefined;
+  }
+
+  async #decodeDelivered(result: QueryResult): Promise<readonly TRow[]> {
+    const source = this.#source;
+    if (source.decode === undefined) throw new TypeError("Live query source lost its decoder");
+    return source.decode(result);
   }
 
   close(): void {
@@ -152,6 +200,29 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   #startObservation(): void {
     if (this.#subscription !== undefined || this.#closed) return;
     const generation = (this.#observationGeneration += 1);
+    if (this.#source.decode !== undefined && this.#backend.subscribe !== undefined) {
+      const subscription = this.#backend.subscribe(this.#source.query, {
+        onChange: (result, delivery) => {
+          if (generation !== this.#observationGeneration || this.#closed) return;
+          this.#schedule({ result, delivery });
+        },
+        onError: (error) => {
+          if (generation !== this.#observationGeneration || this.#closed) return;
+          this.#setError(error, this.#currentVersion());
+        },
+        onComplete: () => {
+          if (generation !== this.#observationGeneration) return;
+          this.#subscription = undefined;
+        },
+      });
+      this.#subscription = subscription;
+      subscription.catch((error: unknown) => {
+        if (generation !== this.#observationGeneration || this.#closed) return;
+        this.#subscription = undefined;
+        this.#setError(error, this.#currentVersion());
+      });
+      return;
+    }
     const subscription = this.#backend.observe(this.#source.query, {
       // The engine executes and compares before invalidating: a commit that leaves these rows
       // as they were never reaches this thread, and one that changes them is served from the
@@ -188,9 +259,9 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     }
   }
 
-  #schedule(invalidation: LiveQueryInvalidation): void {
+  #schedule(work: QueuedWork): void {
     this.#invalidationSequence += 1;
-    this.#queued = invalidation;
+    this.#queued = work;
     if (this.#execution !== undefined) return;
     const execution = this.#drain();
     this.#execution = execution;
@@ -202,18 +273,30 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
 
   async #drain(): Promise<void> {
     while (this.#queued !== undefined && !this.#closed) {
-      const invalidation = this.#queued;
+      const work = this.#queued;
       this.#queued = undefined;
       const abort = new AbortController();
       this.#executionAbort = abort;
+      const invalidation = "result" in work ? work.delivery : work;
       try {
-        const executed = await this.#source.execute(abort.signal);
+        let executed: readonly TRow[];
+        if ("result" in work) {
+          // Held only across a failed decode, so refresh() can retry it; a decoded result is
+          // not kept a second time beside the adapter's rows.
+          this.#lastDelivered = work;
+          executed = await this.#decodeDelivered(work.result);
+          this.#lastDelivered = undefined;
+        } else executed = await this.#source.execute(abort.signal);
         if (this.#executionWasCancelled(abort)) continue;
         // A newer invalidation arrived while this ran. Skip the intermediate snapshot and let
         // the loop execute once more against the newest durable state.
         if (this.#hasQueuedInvalidation()) continue;
         const previous = this.#snapshot.rows;
-        const rows = reconcileRows(previous, executed);
+        const rows = reconcileRows(
+          previous,
+          executed,
+          "result" in work ? work.delivery.retained : undefined,
+        );
         if (rows === undefined) {
           if (
             this.#snapshot.status === "ready" &&
@@ -336,6 +419,10 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     };
   }
 }
+
+/** What one drain step works from: an invalidation to execute, or a delivered result to decode. */
+type QueuedWork =
+  LiveQueryInvalidation | { readonly result: QueryResult; readonly delivery: LiveQueryDelivery };
 
 export interface LiveQueryManagerOptions {
   readonly channelName?: string;

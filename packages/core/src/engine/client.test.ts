@@ -54,19 +54,26 @@ function createBoundary(): {
   const clientListeners: Array<(event: MessageEvent<unknown>) => void> = [];
   const workerListeners: Array<(event: MessageEvent<unknown>) => void> = [];
   let chain = Promise.resolve();
+  // Transfer lists are honoured exactly as a worker honours them: a buffer transferred twice
+  // is detached the second time, and the clone fails the way postMessage would.
   const deliver = (
     listeners: Array<(event: MessageEvent<unknown>) => void>,
     message: unknown,
+    transfer?: ArrayBuffer[],
   ): void => {
-    const data = structuredClone(message);
+    const data = structuredClone(message, transfer === undefined ? undefined : { transfer });
     chain = chain.then(() => {
       for (const listener of listeners) listener({ data } as MessageEvent<unknown>);
     });
   };
   return {
     clientSide: {
-      postMessage: (message) => {
-        deliver(workerListeners, message);
+      postMessage: (message, options) => {
+        deliver(
+          workerListeners,
+          message,
+          (options as { transfer?: ArrayBuffer[] } | undefined)?.transfer,
+        );
       },
       addEventListener: (type: string, listener: (event: MessageEvent<unknown>) => void) => {
         if (type === "message") clientListeners.push(listener);
@@ -78,8 +85,12 @@ function createBoundary(): {
       },
     },
     workerSide: {
-      postMessage: (message) => {
-        deliver(clientListeners, message);
+      postMessage: (message, options) => {
+        deliver(
+          clientListeners,
+          message,
+          (options as { transfer?: ArrayBuffer[] } | undefined)?.transfer,
+        );
       },
       addEventListener: (_type, listener) => {
         workerListeners.push(listener);
@@ -2013,6 +2024,28 @@ describe("MinnowDatabaseClient", () => {
     await observerSet.refresh();
     expect(quiet).toHaveLength(2);
     expect(quiet.at(-1)).toMatchObject({ initial: false });
+    // Two subscribers of one statement each get their own copy of the provenance the engine
+    // attaches to a patched result; transferring one buffer twice would have silenced the
+    // second subscriber.
+    const twins: Array<Array<number[] | undefined>> = [[], []];
+    const twinSubscriptions = await Promise.all(
+      twins.map((seen) =>
+        observerSet.subscribe("SELECT id, value FROM rpc_surface ORDER BY id", {
+          onChange: (_result, delivery) => {
+            seen.push(delivery.retained === undefined ? undefined : [...delivery.retained]);
+          },
+        }),
+      ),
+    );
+    await client.insert("rpc_surface", { id: 0, value: "zero" });
+    await observerSet.refresh();
+    expect(twins[0]).toHaveLength(2);
+    expect(twins[1]).toHaveLength(2);
+    expect(twins[0]?.[1]).toEqual(twins[1]?.[1]);
+    expect(twins[0]?.[1]?.[0]).toBe(-1);
+    expect(twins[0]?.[1]?.slice(1).every((was, index) => was === index)).toBe(true);
+    for (const subscription of twinSubscriptions) await subscription.close();
+
     await quietObserver.close();
     await observer.close();
     expect(completed).toBe(1);

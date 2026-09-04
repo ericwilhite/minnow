@@ -39,6 +39,12 @@ export interface LiveQuerySetOptions {
    * per subscriber per change.
    */
   readonly sharedResults?: boolean;
+  /**
+   * Whether the set may patch a retained result from a commit's rows instead of re-running the
+   * statement, for statements the host can maintain that way. Defaults to true; false makes
+   * every relevant commit a full execution, which is useful when comparing the two.
+   */
+  readonly incremental?: boolean;
   /** Called once when the set closes; the owner uses this to drop its reference. */
   readonly onClosed?: () => void;
 }
@@ -57,8 +63,22 @@ const LIVE_QUERY_EXECUTION_CONCURRENCY = 8;
 
 export { LiveQueryLimitError } from "./errors.js";
 
+/** What a delivered result reflects: the probe it is current as of, and whether it is the first. */
+export interface LiveQueryDelivery {
+  readonly manifestVersion: number | null;
+  readonly catalogEpoch: number;
+  readonly initial: boolean;
+  /**
+   * For each row, the index it held in this subscription's previous delivery, or -1 for a row
+   * that is new or changed. Present when the engine kept row objects across the change — a
+   * patched result keeps every untouched row — and absent after a full execution or on the
+   * first delivery. A consumer that keys on row identity substitutes its own previous objects.
+   */
+  readonly retained?: Int32Array;
+}
+
 export interface LiveQuerySubscribeOptions {
-  onChange(result: QueryResult): void;
+  onChange(result: QueryResult, delivery: LiveQueryDelivery): void;
   onError?(error: unknown): void;
   /** Called once when the subscription ends because the subscription or its set closed. */
   onComplete?(): void;
@@ -102,8 +122,16 @@ export interface LiveQueryStats {
   notificationsSuppressed: number;
   /** Observer invalidations delivered. */
   invalidations: number;
+  /** Re-runs answered by patching the retained result with the commit's rows instead. */
+  maintained: number;
   /** Groups a sweep looked at: those whose tables the commits changed, plus any left lagging. */
   groupsVisited: number;
+  /**
+   * Rows the set currently retains across every group's last result — what its subscriptions
+   * display, counted once per distinct statement. A window's margin beyond its visible rows is
+   * bounded by the engine at 64 rows and is not included.
+   */
+  retainedRows: number;
   /** Work avoided because equal statements shared one query group or in-flight execution. */
   sharedExecutions: number;
   lastSweepMs: number;
@@ -131,6 +159,18 @@ export interface LiveQueryExecuteContext {
   readonly memoize: boolean;
 }
 
+/** A maintainable statement's execution: its result and the host's opaque state for patching it. */
+export interface LiveMaintainedExecution {
+  readonly result: QueryResult;
+  readonly state: unknown;
+}
+
+export interface LiveMaintainedChange extends LiveMaintainedExecution {
+  readonly changed: boolean;
+  /** For each row of `result`, its index in the previous result, or -1; see `LiveQueryDelivery`. */
+  readonly retained?: Int32Array;
+}
+
 export interface LiveQueryHost {
   currentProbe(): Promise<CatalogProbe>;
   manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;
@@ -138,6 +178,27 @@ export interface LiveQueryHost {
   dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;
   /** Executes the statement; the returned result belongs to the set and is never shared. */
   execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;
+  /**
+   * Executes a statement the host can later maintain incrementally, or returns undefined when
+   * the statement's shape rules that out; the set then executes it in full from then on.
+   */
+  executeMaintainable?(
+    query: LiveQueryInput,
+    context?: LiveQueryExecuteContext,
+  ): Promise<LiveMaintainedExecution | undefined>;
+  /**
+   * Patches a retained result with the row changes the commits in (after, until] made to
+   * `tableIds`, or returns undefined when only a full execution can answer.
+   */
+  maintain?(
+    query: LiveQueryInput,
+    result: QueryResult,
+    state: unknown,
+    tableIds: readonly string[],
+    after: number | null,
+    until: number,
+    probe: CatalogProbe,
+  ): Promise<LiveMaintainedChange | undefined>;
   /** Returns false only on proof that the commit window cannot affect the statement. */
   changeCanAffect?(
     query: LiveQueryInput,
@@ -152,6 +213,8 @@ interface ResultSubscriber {
   readonly options: LiveQuerySubscribeOptions;
   delivered: boolean;
   closed: boolean;
+  /** The group delivery this subscriber last received; `retained` applies only to the next one. */
+  seenDelivery: number;
 }
 
 interface ObserverSubscriber {
@@ -166,6 +229,7 @@ type Subscriber = ResultSubscriber | ObserverSubscriber;
 interface Execution {
   readonly result: QueryResult;
   readonly changed: boolean;
+  readonly retained?: Int32Array;
 }
 
 interface QueryGroup {
@@ -177,6 +241,12 @@ interface QueryGroup {
   seenProbe: CatalogProbe;
   result: QueryResult | undefined;
   execution: Promise<Execution> | undefined;
+  /** Counts results delivered to this group's subscribers, so `retained` only bridges consecutive ones. */
+  deliveries: number;
+  /** The host's state for patching `result`, when the host said the statement is maintainable. */
+  maintenance: unknown;
+  /** Set once the host declined to maintain the statement; the group executes in full after. */
+  unmaintainable: boolean;
 }
 
 function sameQueryValue(left: QueryValue, right: QueryValue): boolean {
@@ -361,6 +431,7 @@ export class LiveQuerySet {
   readonly #maxGroups: number;
   readonly #maxSubscriptions: number;
   readonly #sharedResults: boolean;
+  readonly #incremental: boolean;
   readonly #stats: LiveQueryStats = {
     hints: 0,
     versionChecks: 0,
@@ -370,7 +441,9 @@ export class LiveQuerySet {
     zoneSkips: 0,
     notificationsSuppressed: 0,
     invalidations: 0,
+    maintained: 0,
     groupsVisited: 0,
+    retainedRows: 0,
     sharedExecutions: 0,
     lastSweepMs: 0,
   };
@@ -406,6 +479,7 @@ export class LiveQuerySet {
       "subscription",
     );
     this.#sharedResults = options.sharedResults === true;
+    this.#incremental = options.incremental !== false;
     this.#host = host;
     if (options.channel !== undefined) {
       this.#channel = options.channel;
@@ -427,7 +501,9 @@ export class LiveQuerySet {
   }
 
   get stats(): LiveQueryStats {
-    return { ...this.#stats };
+    let retainedRows = 0;
+    for (const group of this.#groups.values()) retainedRows += group.result?.rows.length ?? 0;
+    return { ...this.#stats, retainedRows };
   }
 
   /**
@@ -478,6 +554,7 @@ export class LiveQuerySet {
         options,
         delivered: false,
         closed: false,
+        seenDelivery: -1,
       };
       group.subscribers.add(subscriber);
       await this.#settleGroup(group, opened.fresh, true);
@@ -485,7 +562,9 @@ export class LiveQuerySet {
       if (!subscriber.delivered) {
         const result = group.result ?? (await this.#executeGroup(group)).result;
         this.#throwIfClosed();
-        if (!subscriber.closed) this.#deliverResult(subscriber, result);
+        if (!subscriber.closed) {
+          this.#deliverResult(group, subscriber, result, { ...group.seenProbe, initial: true });
+        }
       }
     } catch (error) {
       if (group !== undefined && subscriber !== undefined) {
@@ -619,6 +698,9 @@ export class LiveQuerySet {
       seenProbe: after,
       result: undefined,
       execution: undefined,
+      deliveries: 0,
+      maintenance: undefined,
+      unmaintainable: false,
     };
     this.#groups.set(key, group);
     this.#indexGroup(group, dependencies);
@@ -685,9 +767,22 @@ export class LiveQuerySet {
     }
     const execution = (async (): Promise<Execution> => {
       await this.#acquireExecutionSlot();
-      let executed: QueryResult;
+      let executed: QueryResult | undefined;
+      let maintenance: unknown;
       try {
-        executed = await this.#host.execute(group.query, context);
+        if (
+          this.#incremental &&
+          this.#host.executeMaintainable !== undefined &&
+          !group.unmaintainable
+        ) {
+          const maintained = await this.#host.executeMaintainable(group.query, context);
+          if (maintained === undefined) group.unmaintainable = true;
+          else {
+            executed = maintained.result;
+            maintenance = maintained.state;
+          }
+        }
+        executed ??= await this.#host.execute(group.query, context);
       } finally {
         this.#releaseExecutionSlot();
       }
@@ -695,6 +790,7 @@ export class LiveQuerySet {
       const changed = previous === undefined || !sameResult(previous, executed);
       // The host hands over a result nobody else holds, so the set retains it as it is.
       group.result = executed;
+      group.maintenance = maintenance;
       return { result: executed, changed };
     })();
     group.execution = execution;
@@ -721,10 +817,91 @@ export class LiveQuerySet {
     this.#executionWaiters.shift()?.();
   }
 
-  #deliverResult(subscriber: ResultSubscriber, result: QueryResult): void {
+  /**
+   * Patches the group's retained result from the commit window instead of executing, when the
+   * host planned the statement for maintenance and the window allows it. Undefined leaves the
+   * decision to a full execution.
+   */
+  async #maintainGroup(
+    group: QueryGroup,
+    tableIds: readonly string[],
+    after: number | null,
+    until: number,
+    probe: CatalogProbe,
+  ): Promise<Execution | undefined> {
+    const host = this.#host;
+    if (
+      host.maintain === undefined ||
+      group.result === undefined ||
+      group.maintenance === undefined ||
+      group.execution !== undefined
+    ) {
+      return undefined;
+    }
+    const retained = group.result;
+    const state = group.maintenance;
+    const verdict = { declined: false };
+    const execution = (async (): Promise<Execution> => {
+      await this.#acquireExecutionSlot();
+      let maintained: LiveMaintainedChange | undefined;
+      try {
+        maintained = await host.maintain?.(
+          group.query,
+          retained,
+          state,
+          tableIds,
+          after,
+          until,
+          probe,
+        );
+      } catch {
+        // A patch that cannot be completed — a block the window's segment no longer has, a
+        // read that failed — is answered by the full statement, never by a stuck group.
+        maintained = undefined;
+      } finally {
+        this.#releaseExecutionSlot();
+      }
+      if (maintained === undefined) {
+        // The retained result is untouched; a full execution follows.
+        verdict.declined = true;
+        return { result: retained, changed: false };
+      }
+      group.result = maintained.result;
+      group.maintenance = maintained.state;
+      return {
+        result: maintained.result,
+        changed: maintained.changed,
+        ...(maintained.retained === undefined ? {} : { retained: maintained.retained }),
+      };
+    })();
+    group.execution = execution;
+    try {
+      const outcome = await execution;
+      return verdict.declined ? undefined : outcome;
+    } finally {
+      if (group.execution === execution) group.execution = undefined;
+    }
+  }
+
+  #deliverResult(
+    group: QueryGroup,
+    subscriber: ResultSubscriber,
+    result: QueryResult,
+    delivery: LiveQueryDelivery,
+    retained?: Int32Array,
+  ): void {
     if (subscriber.closed) return;
     subscriber.delivered = true;
-    subscriber.options.onChange(this.#sharedResults ? result : cloneResult(result));
+    // Rows the engine kept are the same objects as in the group's previous delivery; a
+    // subscriber that received that delivery can keep its own objects by the same map.
+    const consecutive = subscriber.seenDelivery === group.deliveries - 1;
+    subscriber.seenDelivery = group.deliveries;
+    subscriber.options.onChange(
+      this.#sharedResults ? result : cloneResult(result),
+      retained !== undefined && consecutive && !delivery.initial
+        ? { ...delivery, retained }
+        : delivery,
+    );
   }
 
   #deliverInvalidation(subscriber: ObserverSubscriber, invalidation: LiveQueryInvalidation): void {
@@ -848,6 +1025,9 @@ export class LiveQuerySet {
       const prior = this.#lagging.has(group) ? group.seenProbe : newerProbe(group.seenProbe, last);
       const catalogChanged = catalogChangedBetween(prior, current);
       if (catalogChanged) {
+        // The plan the host maintains was made against the old catalog.
+        group.maintenance = undefined;
+        group.unmaintainable = false;
         try {
           await this.#refreshDependencies(group);
         } catch (error) {
@@ -909,14 +1089,28 @@ export class LiveQuerySet {
             this.#lagging.add(group);
             continue;
           }
-          this.#stats.reruns += 1;
-          execution = await this.#executeGroup(group, {
-            probe: current,
-            memoize: groupMemoizes(group),
-          });
-          if (!this.#stillOpen() || this.#groups.get(group.key) !== group) continue;
+          if (!catalogChanged && relevant.length > 0 && current.manifestVersion !== null) {
+            execution = await this.#maintainGroup(
+              group,
+              relevant,
+              prior.manifestVersion,
+              current.manifestVersion,
+              current,
+            );
+            if (!this.#stillOpen() || this.#groups.get(group.key) !== group) continue;
+          }
+          if (execution !== undefined) this.#stats.maintained += 1;
+          else {
+            this.#stats.reruns += 1;
+            execution = await this.#executeGroup(group, {
+              probe: current,
+              memoize: groupMemoizes(group),
+            });
+            if (!this.#stillOpen() || this.#groups.get(group.key) !== group) continue;
+          }
         }
         const invalidation: LiveQueryInvalidation = { ...current, initial: false };
+        if (execution?.changed === true) group.deliveries += 1;
         for (const subscriber of [...group.subscribers]) {
           if (isObserver(subscriber)) {
             if (
@@ -939,7 +1133,13 @@ export class LiveQuerySet {
               continue;
             }
             try {
-              this.#deliverResult(subscriber, execution.result);
+              this.#deliverResult(
+                group,
+                subscriber,
+                execution.result,
+                invalidation,
+                execution.retained,
+              );
             } catch (error) {
               subscriber.options.onError?.(error);
             }

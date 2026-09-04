@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LiveQueryInput, LiveQueryObserveOptions } from "./live.js";
+import type { LiveQueryInput, LiveQueryObserveOptions, LiveQuerySubscribeOptions } from "./live.js";
 import {
   LiveQuery,
   LiveQueryManager,
@@ -23,8 +23,39 @@ async function until(assertion: () => void): Promise<void> {
 
 class TestBackend implements LiveQueryBackend {
   options: LiveQueryObserveOptions | undefined;
+  subscribeOptions: LiveQuerySubscribeOptions | undefined;
   opens = 0;
+  subscribed = 0;
   closes = 0;
+
+  async subscribe(
+    _query: LiveQueryInput,
+    options: LiveQuerySubscribeOptions,
+  ): Promise<LiveQuerySubscriptionLike> {
+    this.subscribed += 1;
+    this.subscribeOptions = options;
+    options.onChange(
+      { columns: ["id"], columnDomains: [null], rows: [{ id: 1 }] },
+      { manifestVersion: 1, catalogEpoch: 1, initial: true },
+    );
+    let closed = false;
+    return {
+      dependencyTableIds: ["table"],
+      close: () => {
+        if (closed) return;
+        closed = true;
+        this.closes += 1;
+        options.onComplete?.();
+      },
+    };
+  }
+
+  deliver(rows: Array<{ id: number }>, manifestVersion: number): void {
+    this.subscribeOptions?.onChange(
+      { columns: ["id"], columnDomains: [null], rows },
+      { manifestVersion, catalogEpoch: manifestVersion, initial: false },
+    );
+  }
 
   async observe(
     _query: LiveQueryInput,
@@ -174,6 +205,78 @@ describe("typed live query", () => {
     expect(third[0]).toBe(first[0]);
     expect(third[1]).toBe(second[1]);
     expect(emits.length).toBeGreaterThanOrEqual(3);
+    unsubscribe();
+    query.close();
+  });
+
+  it("subscribes for results and decodes them when the source can", async () => {
+    const backend = new TestBackend();
+    let executes = 0;
+    let decodes = 0;
+    const query = new LiveQuery(backend, {
+      query: "SELECT id FROM t",
+      execute: async () => {
+        executes += 1;
+        return [{ id: -1 }];
+      },
+      decode: (result) => {
+        decodes += 1;
+        return result.rows.map((row) => ({ id: row.id as number }));
+      },
+    });
+    const unsubscribe = query.subscribe(() => undefined);
+    await until(() => expect(query.getSnapshot().status).toBe("ready"));
+    expect(backend.subscribed).toBe(1);
+    expect(backend.opens).toBe(0);
+    expect(query.getSnapshot()).toMatchObject({ rows: [{ id: 1 }], version: 1 });
+
+    backend.deliver([{ id: 1 }, { id: 2 }], 2);
+    await until(() => expect(query.getSnapshot().rows).toHaveLength(2));
+    expect(query.getSnapshot()).toMatchObject({ version: 2 });
+    expect(executes).toBe(0);
+    expect(decodes).toBe(2);
+    unsubscribe();
+    query.close();
+  });
+
+  it("keeps a moved row's object when the engine says it kept the row", async () => {
+    const backend = new TestBackend();
+    const query = new LiveQuery(backend, {
+      query: "SELECT id FROM t",
+      execute: async () => [],
+      decode: (result) => result.rows.map((row) => ({ id: row.id as number })),
+    });
+    const unsubscribe = query.subscribe(() => undefined);
+    await until(() => expect(query.getSnapshot().status).toBe("ready"));
+    const first = query.getSnapshot().rows[0];
+    // Row 1 is now second, and the delivery says it was first; positional comparison alone
+    // would have made it a new object.
+    backend.subscribeOptions?.onChange(
+      { columns: ["id"], columnDomains: [null], rows: [{ id: 0 }, { id: 1 }] },
+      { manifestVersion: 2, catalogEpoch: 2, initial: false, retained: Int32Array.from([-1, 0]) },
+    );
+    await until(() => expect(query.getSnapshot().rows).toHaveLength(2));
+    expect(query.getSnapshot().rows[1]).toBe(first);
+    unsubscribe();
+    query.close();
+  });
+
+  it("retries a failed decode on refresh from the last delivered result", async () => {
+    const backend = new TestBackend();
+    let fail = true;
+    const query = new LiveQuery(backend, {
+      query: "SELECT id FROM t",
+      execute: async () => [],
+      decode: (result) => {
+        if (fail) throw new Error("bad decode");
+        return result.rows.map((row) => ({ id: row.id as number }));
+      },
+    });
+    const unsubscribe = query.subscribe(() => undefined);
+    await until(() => expect(query.getSnapshot().status).toBe("error"));
+    fail = false;
+    await query.refresh();
+    expect(query.getSnapshot()).toMatchObject({ status: "ready", rows: [{ id: 1 }] });
     unsubscribe();
     query.close();
   });

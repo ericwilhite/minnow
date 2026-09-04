@@ -89,7 +89,7 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
   cancellation frame; stats return as an ordered event before the result. Ordinary queries,
   cursor queries, buffered `execute()` statements, and reads inside `client.write()` support the
   same controls as the direct engine. The client and worker must speak the same protocol version
-  (5 since core 0.7.9); a mismatch fails every call loudly with "Unsupported protocol version"
+  (6 since core 0.7.10); a mismatch fails every call loudly with "Unsupported protocol version"
   rather than silently dropping a newer argument, so deploy the client and worker from the same
   package build and make sure a cached older worker cannot outlive its client.
 - **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and

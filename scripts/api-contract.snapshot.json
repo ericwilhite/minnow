@@ -1680,6 +1680,20 @@
               ]
             },
             {
+              "name": "LiveMaintainedChange",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveMaintainedChange extends LiveMaintainedExecution {\n    readonly changed: boolean;\n    readonly retained?: Int32Array;\n}"
+              ]
+            },
+            {
+              "name": "LiveMaintainedExecution",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveMaintainedExecution {\n    readonly result: QueryResult;\n    readonly state: unknown;\n}"
+              ]
+            },
+            {
               "name": "LiveQuery",
               "kind": "type-and-value",
               "declarations": [
@@ -1690,7 +1704,14 @@
               "name": "LiveQueryBackend",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryBackend {\n    observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<LiveQuerySubscriptionLike>;\n    refresh(): Promise<void>;\n    close(): void | Promise<void>;\n}"
+                "export interface LiveQueryBackend {\n    observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<LiveQuerySubscriptionLike>;\n    subscribe?(query: LiveQueryInput, options: LiveQuerySubscribeOptions): Promise<LiveQuerySubscriptionLike>;\n    refresh(): Promise<void>;\n    close(): void | Promise<void>;\n}"
+              ]
+            },
+            {
+              "name": "LiveQueryDelivery",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveQueryDelivery {\n    readonly manifestVersion: number | null;\n    readonly catalogEpoch: number;\n    readonly initial: boolean;\n    readonly retained?: Int32Array;\n}"
               ]
             },
             {
@@ -1718,7 +1739,7 @@
               "name": "LiveQueryHost",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
+                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    executeMaintainable?(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<LiveMaintainedExecution | undefined>;\n    maintain?(query: LiveQueryInput, result: QueryResult, state: unknown, tableIds: readonly string[], after: number | null, until: number, probe: CatalogProbe): Promise<LiveMaintainedChange | undefined>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
               ]
             },
             {
@@ -1774,28 +1795,28 @@
               "name": "LiveQuerySetOptions",
               "kind": "type",
               "declarations": [
-                "export interface LiveQuerySetOptions {\n    readonly channel?: LiveQueryHintChannel;\n    readonly channelName?: string;\n    readonly pollIntervalMs?: number;\n    readonly maxGroups?: number;\n    readonly maxSubscriptions?: number;\n    readonly sharedResults?: boolean;\n    readonly onClosed?: () => void;\n}"
+                "export interface LiveQuerySetOptions {\n    readonly channel?: LiveQueryHintChannel;\n    readonly channelName?: string;\n    readonly pollIntervalMs?: number;\n    readonly maxGroups?: number;\n    readonly maxSubscriptions?: number;\n    readonly sharedResults?: boolean;\n    readonly incremental?: boolean;\n    readonly onClosed?: () => void;\n}"
               ]
             },
             {
               "name": "LiveQuerySource",
               "kind": "type",
               "declarations": [
-                "export interface LiveQuerySource<out TRow> {\n    readonly query: LiveQueryInput;\n    execute(signal?: AbortSignal): Promise<readonly TRow[]>;\n}"
+                "export interface LiveQuerySource<out TRow> {\n    readonly query: LiveQueryInput;\n    execute(signal?: AbortSignal): Promise<readonly TRow[]>;\n    decode?(result: QueryResult): readonly TRow[] | Promise<readonly TRow[]>;\n}"
               ]
             },
             {
               "name": "LiveQueryStats",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    groupsVisited: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
+                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    maintained: number;\n    groupsVisited: number;\n    retainedRows: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
               ]
             },
             {
               "name": "LiveQuerySubscribeOptions",
               "kind": "type",
               "declarations": [
-                "export interface LiveQuerySubscribeOptions {\n    onChange(result: QueryResult): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n}"
+                "export interface LiveQuerySubscribeOptions {\n    onChange(result: QueryResult, delivery: LiveQueryDelivery): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n}"
               ]
             },
             {
@@ -8262,7 +8283,7 @@
               "name": "protocolVersion",
               "kind": "value",
               "declarations": [
-                "protocolVersion: 5"
+                "protocolVersion: 6"
               ]
             },
             {
@@ -8527,7 +8548,7 @@
               "name": "CreateKyselyLiveQueriesConfig",
               "kind": "type",
               "declarations": [
-                "export interface CreateKyselyLiveQueriesConfig extends LiveQueryManagerOptions {\n    readonly driver: LiveQueryDriver;\n}"
+                "export interface CreateKyselyLiveQueriesConfig extends LiveQueryManagerOptions {\n    readonly driver: LiveQueryDriver;\n    readonly db?: QueryExecutorProvider;\n}"
               ]
             },
             {

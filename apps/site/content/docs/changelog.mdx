@@ -8,6 +8,53 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.7.10 — September 3, 2026
+
+Published packages: `@minnowdb/core@0.7.10` and `@minnowdb/kysely@0.4.10`.
+
+Stored formats are unchanged and no migration is needed. The client/worker wire protocol moved
+from version 5 to 6: a delivered live result now carries the version it reflects and which of its
+rows the previous delivery already held. Deploy the client and worker from the same package build.
+
+### Added
+
+- Live queries over one table with a unique key are maintained incrementally. Filters,
+  projections, `ORDER BY`, `LIMIT`, and `OFFSET` qualify; joins, aggregates, `DISTINCT`, window
+  functions, and subqueries do not and re-execute as before. On a relevant commit the engine reads
+  the keys the commit touched from its segments, re-evaluates exactly those keys through the
+  executor, and patches the retained result: rows that left are removed, rows that entered or
+  changed are merged in order, untouched rows keep their objects. A window keeps a margin of rows
+  beyond its visible edge so a member that is deleted or edited out is replaced from rows already
+  held; only a patch that would reach past what is held runs the statement again. Measured in
+  Node over an in-memory store with ten windows over a 500,000-row table: one inserted row that
+  enters every window reaches every subscriber in 2.5 ms instead of 185 ms, and one edited row
+  inside every window in 18 ms instead of 188 ms. In Chromium with a hundred windowed subscriptions on a
+  100,000-row table, a row deleted from every window reaches every subscriber in 80 ms instead
+  of 293 ms over OPFS and in 159 ms instead of 403 ms over IndexedDB, with the page's heap
+  unchanged across the run; Firefox and WebKit complete the same run with every subscriber
+  notified and one snapshot per change. `LiveQueryStats.maintained` counts patched re-runs;
+  `liveQueries({ incremental: false })` turns patching off for a set. A `LiveQueryHost` may
+  implement `executeMaintainable` and `maintain` to supply it. The planner and merge add about
+  9 KiB raw (3 KiB gzipped) to the engine entry.
+- Typed live queries take the engine's result directly when the adapter can decode it.
+  `LiveQuerySource.decode(result)` maps a delivered result to the adapter's rows; with it the
+  query subscribes for results rather than invalidations, and `execute` is never called after
+  registration. `LiveQueryBackend.subscribe` is the optional backend half. Over a worker, a change
+  is one columnar transfer and no round trip. `createKyselyLiveQueries({ driver, db })` uses it:
+  given the Kysely instance, delivered rows go through the dialect's result decoding and every
+  plugin's `transformResult`, so `CamelCasePlugin` and numeric decoding apply as they do to an
+  executed query. Plugins added to a single builder with `withPlugin` are not applied to delivered
+  results. `MinnowKyselyAdapter` is exported and exposes `resultDecoding`.
+- `onChange` on a low-level subscription receives a second argument, `LiveQueryDelivery`: the
+  manifest version and catalog epoch the result reflects, whether it is the first delivery, and
+  `retained`, which names for each row the index it had in the previous delivery. Typed queries
+  use it to keep a row's object across a delivery that moved it, so a list keyed by row identity
+  re-renders only the rows a commit changed even when a new row shifts every other one down.
+- A live-query benchmark over real browser storage: `packages/core/browser/live/` drives a
+  module worker over IndexedDB or OPFS with tables of 100,000 rows and a hundred windowed
+  subscriptions, and `MINNOW_LIVE_BENCH=1 npx playwright test --config playwright.library.config.ts
+live-bench` reports the latency from each kind of commit to the last notified subscriber.
+
 ## Devtools 0.3.0 — September 3, 2026
 
 Published packages: `@minnowdb/devtools@0.3.0`.

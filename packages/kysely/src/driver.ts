@@ -48,7 +48,8 @@ function returnedResult(result: ExecuteResult): {
   return { rows: [], columns: [], columnDomains: [] };
 }
 
-function decodedRows<R>(
+/** Rows as the dialect hands them to Kysely: domain values decoded per `resultDecoding`. */
+export function decodedRows<R>(
   rows: Array<Record<string, QueryValue>>,
   columns: readonly string[],
   columnDomains: ReadonlyArray<{ readonly kind: string } | null>,

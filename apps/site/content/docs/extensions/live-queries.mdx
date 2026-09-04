@@ -7,12 +7,15 @@ Live queries re-run a SELECT only when a durable commit can affect it. The publi
 is adapter-neutral: Minnow tracks the SQL statement and its table dependencies, while the query
 adapter executes it. That split preserves the adapter's inferred row type and result plugins.
 
-For Kysely, install the adapter and create one shared live-query manager:
+For Kysely, install the adapter and create one shared live-query manager. Pass the Kysely
+instance as `db`: the wrapper then decodes results the engine delivers the way the dialect would,
+its result decoding and every plugin's `transformResult` included, instead of executing the
+statement a second time after each change.
 
 ```ts
 import { createKyselyLiveQueries } from "@minnowdb/kysely";
 
-const live = createKyselyLiveQueries({ driver: database });
+const live = createKyselyLiveQueries({ driver: database, db });
 
 const openOrders = db
   .selectFrom("orders")
@@ -64,8 +67,10 @@ another query-library adapter can expose the same `live(query)` shape by supplyi
 
 `@minnowdb/core/live` exports `LiveQuerySource`, `LiveQueryManager`, and `createLiveQueryManager`
 for that purpose. The adapter continues to execute its own query, so name mapping and other result
-transforms are not bypassed. A library-specific composition helper may call the wrapper, but is
-not required.
+transforms are not bypassed. A source may also supply `decode(result)`, which maps a result the
+engine delivers to the adapter's rows; with it, the engine delivers changed results itself and
+`execute` is never called after registration. A library-specific composition helper may call the
+wrapper, but is not required.
 
 ## Keyed changes
 
@@ -123,13 +128,48 @@ execution and dependency work. Typed adapters share dependency/invalidation work
 still executes through its own adapter so different result-plugin stacks cannot be merged
 incorrectly.
 
-A typed query asks the engine to compare before it invalidates. On a relevant commit the engine
-re-runs the statement where the data is, compares the rows with the ones it delivered last, and
-invalidates the adapter only when they differ; the re-run stays in the engine's result memo, so the
-adapter's own execution that follows is a cache hit at the same version. A commit that changes a
-table without changing the query's rows therefore costs one execution inside the engine and
-nothing else: nothing crosses a worker channel, no rows are rebuilt on the main thread, and no
-component re-renders.
+A typed query asks the engine to compare before anything reaches it. On a relevant commit the
+engine brings the statement's result up to date where the data is, compares it with the rows it
+delivered last, and delivers only when they differ. An adapter that can decode the engine's result
+— the Kysely wrapper, given its `db` — receives that result directly: one execution or patch in
+the engine, one transfer over a worker channel, and no round trip back to execute again. A commit
+that changes a table without changing the query's rows costs one patch or execution inside the
+engine and nothing else: nothing crosses the channel, no rows are rebuilt on the main thread, and
+no component re-renders.
+
+## Incremental maintenance
+
+A statement over one table with a unique key — filters, projections, `ORDER BY`, `LIMIT` and
+`OFFSET`, but no joins, aggregates, `DISTINCT`, window functions, or subqueries — is not
+re-executed when its table changes. The engine records which keys every commit touched; on a
+relevant commit it re-evaluates exactly those keys through the ordinary executor, so predicates,
+expressions, and ordering keep their SQL meaning, and patches them into the retained result: rows
+that left are removed, rows that entered or changed are merged in order, and every untouched row
+keeps its object. A commit that touches one row in a table of a million costs one keyed lookup
+per subscription, not one scan.
+
+A window (`ORDER BY … LIMIT n`) keeps a margin of rows beyond its visible edge, so a member that
+is deleted or edited out of the window is replaced from rows already held. The statement runs in
+full only when a patch would have to reach past what is held — the margin ran dry, an `OFFSET`
+window's start moved, a commit changed more than 2,048 rows, or history no surviving segment
+accounts for — and that execution refills the margin. `LiveQueryStats.maintained` counts patched
+re-runs beside `reruns`; `liveQueries({ incremental: false })` turns patching off for a set.
+
+Statements outside that shape — a join, a `GROUP BY`, a `COUNT(*)` — re-execute as before, and
+the zone-map proofs above still spare them the inserts that cannot match.
+
+## Memory
+
+What a live query holds is its last result: the engine keeps one copy per distinct statement,
+shared by every subscription to it, plus a window's margin of at most 64 rows and one key and
+one ordering value per retained row. The page holds the decoded rows of each typed query and
+nothing else; a delivered result is not kept beside them. So the memory a set of live queries
+takes is the size of what they show, and a windowed list costs the same on a table of ten rows
+as on a table of a million. An unbounded statement over a large table retains all of its rows,
+in the engine and again on the page — prefer `LIMIT` and `live.window()` for anything a user
+scrolls. Sweeps allocate per changed row, not per subscription, and a set executes at most eight
+statements at once, so a burst of commits or a page mounting hundreds of subscriptions on a slow
+machine queues work rather than multiplying it.
 
 Subscribing is cheap enough to do per component. A new statement resolves its dependencies and
 runs once; it needs no sweep, because the probe its dependencies were resolved under is what a
