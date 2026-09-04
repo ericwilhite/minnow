@@ -629,7 +629,10 @@ test("the devtools page opens the floating panel over itself", async ({ page }) 
   await expect(panel.locator(".notice.done")).toContainText("created index customers_by_city_id", {
     timeout: 60_000,
   });
-  await panel.getByRole("button", { name: "Expand customers" }).click();
+  // The explorer opens the table a new index landed on; expand it only if it is still closed.
+  const customers = panel.getByRole("button", { name: /^(Expand|Collapse) customers$/ });
+  await expect(customers).toBeVisible();
+  if ((await customers.getAttribute("aria-label")) === "Expand customers") await customers.click();
   await expect(panel.locator(".index", { hasText: "customers_by_city_id" })).toBeVisible();
 
   // Closing leaves the launcher behind, the way it does in an application.
