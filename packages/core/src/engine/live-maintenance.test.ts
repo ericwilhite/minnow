@@ -81,6 +81,10 @@ async function seededDatabase(
     },
   });
   await database.insertBatch("other", { columns: { id: [1, 2], amount: [5, 7] } });
+  await database.createView(
+    "recent_items",
+    "SELECT id, region, amount FROM items WHERE amount >= 50",
+  );
   let id = rows;
   return {
     database,
@@ -179,6 +183,9 @@ function plain(result: QueryResult, sql = "ORDER BY"): Array<Record<string, Quer
 }
 
 const MAINTAINABLE = [
+  "SELECT * FROM items WHERE amount < 30 ORDER BY id",
+  "SELECT id, amount FROM items ORDER BY id OFFSET 3",
+  "SELECT id, region FROM recent_items ORDER BY id",
   "SELECT id, region, amount FROM items WHERE amount >= 40 ORDER BY id",
   "SELECT region, amount FROM items WHERE active = TRUE ORDER BY amount DESC, id",
   "SELECT id, label FROM items WHERE region IS NULL ORDER BY label, id DESC",
@@ -248,6 +255,61 @@ describe("live query incremental maintenance", () => {
       await database.close();
     },
   );
+
+  it("declines every unmaintainable shape rather than patching it", async () => {
+    const { database } = await seededDatabase(13, 50);
+    for (const sql of NOT_MAINTAINABLE) {
+      const live = database.liveQueries();
+      await live.subscribe(sql, { onChange: () => undefined });
+      await database.updateBatch("items", { keys: [3], changes: { amount: [77] } });
+      await live.refresh();
+      expect(live.stats.maintained, sql).toBe(0);
+      expect(live.stats.reruns, sql).toBe(1);
+      live.close();
+    }
+    await database.close();
+  });
+
+  it("maintains parameterized statements and string-keyed tables", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    await database.createTable({
+      name: "skus",
+      uniqueKey: "sku",
+      columns: [
+        { name: "sku", type: "string" },
+        { name: "stock", type: "number" },
+        { name: "name", type: "string" },
+      ],
+    });
+    await database.insertBatch("skus", {
+      columns: {
+        sku: ["a-1", "b-2", "c-3", "d-4"],
+        stock: [5, 0, 12, 3],
+        name: ["ant", "bee", "cat", "dog"],
+      },
+    });
+    const live = database.liveQueries();
+    const results: QueryResult[] = [];
+    const query = {
+      kind: "sql-query" as const,
+      sql: "SELECT sku, name FROM skus WHERE stock > $1 ORDER BY name DESC LIMIT $2",
+      params: [2, 3],
+    };
+    await live.subscribe(query, { onChange: (result) => results.push(result) });
+    expect(last(results).rows.map((row) => row.sku)).toEqual(["d-4", "c-3", "a-1"]);
+    await database.upsertBatch("skus", {
+      columns: { sku: ["b-2", "e-5"], stock: [9, 1], name: ["bee", "eel"] },
+    });
+    await live.refresh();
+    expect(last(results).rows.map((row) => row.sku)).toEqual(["d-4", "c-3", "b-2"]);
+    await database.deleteBatch("skus", { keys: ["d-4"] });
+    await live.refresh();
+    expect(last(results).rows.map((row) => row.sku)).toEqual(["c-3", "b-2", "a-1"]);
+    expect(live.stats.maintained).toBe(2);
+    expect(live.stats.reruns).toBe(0);
+    live.close();
+    await database.close();
+  });
 
   it("refills a window from its margin, and executes only past it or for wide commits", async () => {
     const { database } = await seededDatabase(11, 200);

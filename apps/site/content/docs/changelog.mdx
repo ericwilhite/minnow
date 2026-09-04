@@ -50,6 +50,10 @@ rows the previous delivery already held. Deploy the client and worker from the s
   `retained`, which names for each row the index it had in the previous delivery. Typed queries
   use it to keep a row's object across a delivery that moved it, so a list keyed by row identity
   re-renders only the rows a commit changed even when a new row shifts every other one down.
+  The map is only ever relative to a delivery the receiver actually took: a subscriber whose
+  `onChange` threw, and a typed query whose decode failed or that skipped a delivery for a
+  newer one, get the next result without a map rather than with one that points at rows they
+  never held.
 - A live-query benchmark over real browser storage: `packages/core/browser/live/` drives a
   module worker over IndexedDB or OPFS with tables of 100,000 rows and a hundred windowed
   subscriptions, and `MINNOW_LIVE_BENCH=1 npx playwright test --config playwright.library.config.ts

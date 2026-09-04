@@ -810,6 +810,47 @@ describe("live queries", () => {
     live.close();
   });
 
+  it("does not map a delivery onto one a subscriber never received", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await database.createTable({
+      name: "events",
+      uniqueKey: "value",
+      columns: [
+        { name: "value", type: "number" },
+        { name: "label", type: "string", nullable: true },
+      ],
+    });
+    await database.insertBatch("events", { columns: { value: [1, 2, 3], label: ["a", "b", "c"] } });
+    const live = database.liveQueries({ sharedResults: true });
+    const sql = "SELECT value, label FROM events ORDER BY value";
+    const seen: Array<Int32Array | undefined> = [];
+    let refuse = false;
+    await live.subscribe(sql, {
+      onChange: (_result, delivery) => {
+        if (refuse) throw new Error("renderer busy");
+        seen.push(delivery.retained);
+      },
+      onError: () => undefined,
+    });
+    // The second delivery is thrown away by the subscriber; the third must not describe its
+    // rows relative to it.
+    refuse = true;
+    await database.insertBatch("events", { columns: { value: [10], label: ["x"] } });
+    await live.refresh();
+    refuse = false;
+    await database.insertBatch("events", { columns: { value: [11], label: ["y"] } });
+    await live.refresh();
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBeUndefined();
+    // A delivery that did arrive is a valid base for the next one.
+    await database.insertBatch("events", { columns: { value: [12], label: ["z"] } });
+    await live.refresh();
+    expect(seen[2]).toBeInstanceOf(Int32Array);
+    live.close();
+    store.close();
+  });
+
   it("visits only the groups whose tables the commits changed", async () => {
     let version = 1;
     const manifests: Manifest[] = [

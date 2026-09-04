@@ -893,15 +893,17 @@ export class LiveQuerySet {
     if (subscriber.closed) return;
     subscriber.delivered = true;
     // Rows the engine kept are the same objects as in the group's previous delivery; a
-    // subscriber that received that delivery can keep its own objects by the same map.
+    // subscriber that received that delivery can keep its own objects by the same map. The
+    // delivery counts as received only once onChange returns: one it threw on never reached it,
+    // so the next map must not be relative to it.
     const consecutive = subscriber.seenDelivery === group.deliveries - 1;
-    subscriber.seenDelivery = group.deliveries;
     subscriber.options.onChange(
       this.#sharedResults ? result : cloneResult(result),
       retained !== undefined && consecutive && !delivery.initial
         ? { ...delivery, retained }
         : delivery,
     );
+    subscriber.seenDelivery = group.deliveries;
   }
 
   #deliverInvalidation(subscriber: ObserverSubscriber, invalidation: LiveQueryInvalidation): void {
@@ -1012,149 +1014,163 @@ export class LiveQuerySet {
 
     const candidates = await this.#sweepCandidates(last, current, changedSince);
     if (candidates === undefined) return;
+    // One group at a time. Interleaving groups was measured and rejected: their patches share
+    // the engine's catalog snapshot and block cache, and running them together tripled the
+    // latency on IndexedDB rather than overlapping anything.
     for (const group of candidates) {
       if (!this.#stillOpen()) return;
-      if (group.subscribers.size === 0 || this.#groups.get(group.key) !== group) continue;
-      this.#stats.groupsVisited += 1;
-      if (sameProbe(group.seenProbe, current)) {
-        this.#lagging.delete(group);
-        continue;
-      }
-      // A group nobody had to visit since its last sweep is current as of that sweep's probe:
-      // its window starts there, not at the older probe it last executed under.
-      const prior = this.#lagging.has(group) ? group.seenProbe : newerProbe(group.seenProbe, last);
-      const catalogChanged = catalogChangedBetween(prior, current);
-      if (catalogChanged) {
-        // The plan the host maintains was made against the old catalog.
-        group.maintenance = undefined;
-        group.unmaintainable = false;
-        try {
-          await this.#refreshDependencies(group);
-        } catch (error) {
-          this.#lagging.add(group);
-          this.#notifyGroupError(group, error);
-          continue;
-        }
-      }
-
-      let relevant: string[] = [];
-      let affected = catalogChanged;
-      if (!affected && prior.manifestVersion !== current.manifestVersion) {
-        const changed = await changedSince(prior.manifestVersion);
-        if (!this.#stillOpen()) return;
-        if (changed === "all") affected = true;
-        else {
-          relevant = [...group.dependencies].filter((tableId) => changed.has(tableId));
-          affected = relevant.length > 0;
-        }
-      }
-      if (!affected) {
-        this.#settleProbe(group, current);
-        continue;
-      }
-
-      if (
-        !catalogChanged &&
-        relevant.length > 0 &&
-        current.manifestVersion !== null &&
-        this.#host.changeCanAffect !== undefined
-      ) {
-        let canAffect: boolean;
-        try {
-          canAffect = await this.#host.changeCanAffect(
-            group.query,
-            relevant,
-            prior.manifestVersion,
-            current.manifestVersion,
-          );
-        } catch {
-          canAffect = true;
-        }
-        if (!this.#stillOpen()) return;
-        if (!canAffect) {
-          this.#stats.zoneSkips += 1;
-          this.#settleProbe(group, current);
-          continue;
-        }
-      }
-
-      try {
-        let execution: Execution | undefined;
-        if (groupExecutes(group)) {
-          // An initial delivery may be executing against the pre-sweep snapshot. Waiting for it
-          // here can deadlock callers that intentionally hold that execute while awaiting this
-          // refresh. Leave the group lagging; once the initial delivery lands, the next refresh
-          // re-runs it against `current`.
-          if (group.result === undefined && group.execution !== undefined) {
-            this.#lagging.add(group);
-            continue;
-          }
-          if (!catalogChanged && relevant.length > 0 && current.manifestVersion !== null) {
-            execution = await this.#maintainGroup(
-              group,
-              relevant,
-              prior.manifestVersion,
-              current.manifestVersion,
-              current,
-            );
-            if (!this.#stillOpen() || this.#groups.get(group.key) !== group) continue;
-          }
-          if (execution !== undefined) this.#stats.maintained += 1;
-          else {
-            this.#stats.reruns += 1;
-            execution = await this.#executeGroup(group, {
-              probe: current,
-              memoize: groupMemoizes(group),
-            });
-            if (!this.#stillOpen() || this.#groups.get(group.key) !== group) continue;
-          }
-        }
-        const invalidation: LiveQueryInvalidation = { ...current, initial: false };
-        if (execution?.changed === true) group.deliveries += 1;
-        for (const subscriber of [...group.subscribers]) {
-          if (isObserver(subscriber)) {
-            if (
-              execution !== undefined &&
-              !execution.changed &&
-              subscriber.options.suppressUnchanged === true
-            ) {
-              this.#stats.notificationsSuppressed += 1;
-              continue;
-            }
-            try {
-              this.#deliverInvalidation(subscriber, invalidation);
-              this.#stats.invalidations += 1;
-            } catch (error) {
-              subscriber.options.onError?.(error);
-            }
-          } else if (isResultSubscriber(subscriber) && execution !== undefined) {
-            if (!execution.changed) {
-              this.#stats.notificationsSuppressed += 1;
-              continue;
-            }
-            try {
-              this.#deliverResult(
-                group,
-                subscriber,
-                execution.result,
-                invalidation,
-                execution.retained,
-              );
-            } catch (error) {
-              subscriber.options.onError?.(error);
-            }
-          }
-        }
-        this.#settleProbe(group, current);
-      } catch (error) {
-        // The group stays lagging. A refresh with no newer commit retries it.
-        this.#lagging.add(group);
-        this.#notifyGroupError(group, error);
-      }
+      await this.#sweepGroup(group, last, current, changedSince);
     }
     this.#lastProbe = current;
     this.#stats.rerunsAvoided += this.#groups.size - (this.#stats.reruns - rerunsBefore);
     this.#stats.lastSweepMs = performance.now() - started;
+  }
+
+  /** One candidate group's share of a sweep: see `#sweep`. */
+  async #sweepGroup(
+    group: QueryGroup,
+    last: CatalogProbe,
+    current: CatalogProbe,
+    changedSince: (after: number | null) => Promise<Set<string> | "all">,
+  ): Promise<void> {
+    if (!this.#stillOpen()) return;
+    if (group.subscribers.size === 0 || this.#groups.get(group.key) !== group) return;
+    this.#stats.groupsVisited += 1;
+    if (sameProbe(group.seenProbe, current)) {
+      this.#lagging.delete(group);
+      return;
+    }
+    // A group nobody had to visit since its last sweep is current as of that sweep's probe:
+    // its window starts there, not at the older probe it last executed under.
+    const prior = this.#lagging.has(group) ? group.seenProbe : newerProbe(group.seenProbe, last);
+    const catalogChanged = catalogChangedBetween(prior, current);
+    if (catalogChanged) {
+      // The plan the host maintains was made against the old catalog.
+      group.maintenance = undefined;
+      group.unmaintainable = false;
+      try {
+        await this.#refreshDependencies(group);
+      } catch (error) {
+        this.#lagging.add(group);
+        this.#notifyGroupError(group, error);
+        return;
+      }
+    }
+
+    let relevant: string[] = [];
+    let affected = catalogChanged;
+    if (!affected && prior.manifestVersion !== current.manifestVersion) {
+      const changed = await changedSince(prior.manifestVersion);
+      if (!this.#stillOpen()) return;
+      if (changed === "all") affected = true;
+      else {
+        relevant = [...group.dependencies].filter((tableId) => changed.has(tableId));
+        affected = relevant.length > 0;
+      }
+    }
+    if (!affected) {
+      this.#settleProbe(group, current);
+      return;
+    }
+
+    if (
+      !catalogChanged &&
+      relevant.length > 0 &&
+      current.manifestVersion !== null &&
+      this.#host.changeCanAffect !== undefined
+    ) {
+      let canAffect: boolean;
+      try {
+        canAffect = await this.#host.changeCanAffect(
+          group.query,
+          relevant,
+          prior.manifestVersion,
+          current.manifestVersion,
+        );
+      } catch {
+        canAffect = true;
+      }
+      if (!this.#stillOpen()) return;
+      if (!canAffect) {
+        this.#stats.zoneSkips += 1;
+        this.#settleProbe(group, current);
+        return;
+      }
+    }
+
+    try {
+      let execution: Execution | undefined;
+      if (groupExecutes(group)) {
+        // An initial delivery may be executing against the pre-sweep snapshot. Waiting for it
+        // here can deadlock callers that intentionally hold that execute while awaiting this
+        // refresh. Leave the group lagging; once the initial delivery lands, the next refresh
+        // re-runs it against `current`.
+        if (group.result === undefined && group.execution !== undefined) {
+          this.#lagging.add(group);
+          return;
+        }
+        if (!catalogChanged && relevant.length > 0 && current.manifestVersion !== null) {
+          execution = await this.#maintainGroup(
+            group,
+            relevant,
+            prior.manifestVersion,
+            current.manifestVersion,
+            current,
+          );
+          if (!this.#stillOpen() || this.#groups.get(group.key) !== group) return;
+        }
+        if (execution !== undefined) this.#stats.maintained += 1;
+        else {
+          this.#stats.reruns += 1;
+          execution = await this.#executeGroup(group, {
+            probe: current,
+            memoize: groupMemoizes(group),
+          });
+          if (!this.#stillOpen() || this.#groups.get(group.key) !== group) return;
+        }
+      }
+      const invalidation: LiveQueryInvalidation = { ...current, initial: false };
+      if (execution?.changed === true) group.deliveries += 1;
+      for (const subscriber of [...group.subscribers]) {
+        if (isObserver(subscriber)) {
+          if (
+            execution !== undefined &&
+            !execution.changed &&
+            subscriber.options.suppressUnchanged === true
+          ) {
+            this.#stats.notificationsSuppressed += 1;
+            return;
+          }
+          try {
+            this.#deliverInvalidation(subscriber, invalidation);
+            this.#stats.invalidations += 1;
+          } catch (error) {
+            subscriber.options.onError?.(error);
+          }
+        } else if (isResultSubscriber(subscriber) && execution !== undefined) {
+          if (!execution.changed) {
+            this.#stats.notificationsSuppressed += 1;
+            return;
+          }
+          try {
+            this.#deliverResult(
+              group,
+              subscriber,
+              execution.result,
+              invalidation,
+              execution.retained,
+            );
+          } catch (error) {
+            subscriber.options.onError?.(error);
+          }
+        }
+      }
+      this.#settleProbe(group, current);
+    } catch (error) {
+      // The group stays lagging. A refresh with no newer commit retries it.
+      this.#lagging.add(group);
+      this.#notifyGroupError(group, error);
+    }
   }
 
   #settleProbe(group: QueryGroup, probe: CatalogProbe): void {

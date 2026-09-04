@@ -117,7 +117,10 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   #observationGeneration = 0;
   #queued: QueuedWork | undefined;
   /** The engine's last delivered result, so a decode failure can be retried without a commit. */
-  #lastDelivered: { result: QueryResult; delivery: LiveQueryDelivery } | undefined;
+  #lastDelivered: Extract<QueuedWork, { result: QueryResult }> | undefined;
+  /** Deliveries received, and the one whose rows the snapshot currently holds (0 for none). */
+  #deliveriesReceived = 0;
+  #rowsFromDelivery = 0;
   #execution: Promise<void> | undefined;
   #executionAbort: AbortController | undefined;
   #invalidationSequence = 0;
@@ -204,7 +207,8 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
       const subscription = this.#backend.subscribe(this.#source.query, {
         onChange: (result, delivery) => {
           if (generation !== this.#observationGeneration || this.#closed) return;
-          this.#schedule({ result, delivery });
+          this.#deliveriesReceived += 1;
+          this.#schedule({ result, delivery, sequence: this.#deliveriesReceived });
         },
         onError: (error) => {
           if (generation !== this.#observationGeneration || this.#closed) return;
@@ -292,11 +296,15 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
         // the loop execute once more against the newest durable state.
         if (this.#hasQueuedInvalidation()) continue;
         const previous = this.#snapshot.rows;
-        const rows = reconcileRows(
-          previous,
-          executed,
-          "result" in work ? work.delivery.retained : undefined,
-        );
+        // The engine's row map is relative to the delivery before this one. It only applies
+        // when that is the delivery these rows came from — not after a decode that failed, and
+        // not after a delivery this drain skipped for a newer one.
+        const provenance =
+          "result" in work && this.#rowsFromDelivery === work.sequence - 1
+            ? work.delivery.retained
+            : undefined;
+        const rows = reconcileRows(previous, executed, provenance);
+        if ("result" in work) this.#rowsFromDelivery = work.sequence;
         if (rows === undefined) {
           if (
             this.#snapshot.status === "ready" &&
@@ -422,7 +430,13 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
 
 /** What one drain step works from: an invalidation to execute, or a delivered result to decode. */
 type QueuedWork =
-  LiveQueryInvalidation | { readonly result: QueryResult; readonly delivery: LiveQueryDelivery };
+  | LiveQueryInvalidation
+  | {
+      readonly result: QueryResult;
+      readonly delivery: LiveQueryDelivery;
+      /** The delivery's ordinal on this query, counted from one. */
+      readonly sequence: number;
+    };
 
 export interface LiveQueryManagerOptions {
   readonly channelName?: string;

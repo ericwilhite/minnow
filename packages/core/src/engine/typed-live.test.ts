@@ -261,6 +261,40 @@ describe("typed live query", () => {
     query.close();
   });
 
+  it("ignores a row map whose base delivery it did not apply", async () => {
+    const backend = new TestBackend();
+    let fail = false;
+    const query = new LiveQuery(backend, {
+      query: "SELECT id FROM t",
+      execute: async () => [],
+      decode: (result) => {
+        if (fail) throw new Error("bad decode");
+        return result.rows.map((row) => ({ id: row.id as number, tag: "fresh" }));
+      },
+    });
+    const unsubscribe = query.subscribe(() => undefined);
+    await until(() => expect(query.getSnapshot().status).toBe("ready"));
+    const first = query.getSnapshot().rows[0];
+    // Delivery two fails to decode; delivery three says its second row is delivery two's
+    // first row. The page never held delivery two, so that map must not resurrect `first`.
+    fail = true;
+    backend.subscribeOptions?.onChange(
+      { columns: ["id"], columnDomains: [null], rows: [{ id: 5 }] },
+      { manifestVersion: 2, catalogEpoch: 2, initial: false },
+    );
+    await until(() => expect(query.getSnapshot().status).toBe("error"));
+    fail = false;
+    backend.subscribeOptions?.onChange(
+      { columns: ["id"], columnDomains: [null], rows: [{ id: 6 }, { id: 5 }] },
+      { manifestVersion: 3, catalogEpoch: 3, initial: false, retained: Int32Array.from([-1, 0]) },
+    );
+    await until(() => expect(query.getSnapshot().rows).toHaveLength(2));
+    expect(query.getSnapshot().rows[1]).not.toBe(first);
+    expect(query.getSnapshot().rows[1]).toEqual({ id: 5, tag: "fresh" });
+    unsubscribe();
+    query.close();
+  });
+
   it("retries a failed decode on refresh from the last delivered result", async () => {
     const backend = new TestBackend();
     let fail = true;

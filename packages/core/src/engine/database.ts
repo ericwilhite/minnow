@@ -6890,9 +6890,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const probe = context?.probe ?? (await this.store.getCatalogProbe());
     const state = await this.#liveMaintenancePlan(compiled, probe);
     if (state === undefined) return undefined;
-    const executed = externalizeQueryResult(
-      await this.#withReadReservation(() => this.#queryCompiled(state.fullPlan, {}, probe)),
-    );
+    let executed: QueryResult;
+    try {
+      executed = externalizeQueryResult(
+        await this.#withReadReservation(() => this.#queryCompiled(state.fullPlan, {}, probe)),
+      );
+    } catch {
+      // The augmented plan failed where the statement itself may not — an ORDER BY term the
+      // projection cannot carry, say. Decline, and let the statement run as written; a fault
+      // the statement shares surfaces there, from the one execution the set will make.
+      return undefined;
+    }
     const split = splitLiveHiddenColumns(executed, state);
     return liveMaintainedOutcome(
       {
