@@ -87,17 +87,17 @@ From `@minnowdb/core`. See [Extending Minnow](/docs/reference/extending).
 
 From `@minnowdb/core/live`.
 
-| Export                                                               | Description                                                                                                                                                 |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class LiveQuery<TRow>`                                              | Typed external store and async iterable with `loading` / `ready` / `error` snapshots, stable identity, and `refresh()`.                                     |
-| `class KeyedLiveQuery<TRow, TKey>`                                   | Exact keyed `insert` / `update` / `delete` / `move` changes, with optional row-bound enforcement.                                                           |
-| `class LiveQueryManager` / `createLiveQueryManager`                  | Owns one shared observer backend and creates typed queries from adapter-provided `LiveQuerySource` values.                                                  |
-| `class LiveQuerySet`                                                 | Low-level SQL/plan set from `database.liveQueries()`: `subscribe`, observer-only `observe` (optionally `suppressUnchanged`), `refresh`, stats, and `close`. |
-| `LiveSnapshot / LiveChangesSnapshot / LiveResultChange / LiveKeyOf`  | Typed snapshot, patch, and key-selection types.                                                                                                             |
-| `LiveQuerySource / LiveQueryBackend / LiveQueryDriver`               | Structural contracts for query-library adapters.                                                                                                            |
-| `LiveQuerySetOptions / LiveQueryStats / LiveQueryInput`              | Hint/poll/`sharedResults` configuration, execution counters, and low-level query inputs.                                                                    |
-| `LiveQueryHost / LiveQueryExecuteContext`                            | The probe, manifest, dependency, execution, and incremental-maintenance contract a `LiveQuerySet` runs over.                                                |
-| `LiveQueryDelivery / LiveMaintainedExecution / LiveMaintainedChange` | What a delivered result reflects, and a maintainable execution's result and opaque state.                                                                   |
+| Export                                                               | Description                                                                                                                                                                     |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class LiveQuery<TRow>`                                              | Typed external store and async iterable with `loading` / `ready` / `error` snapshots, stable identity, and `refresh()`.                                                         |
+| `class KeyedLiveQuery<TRow, TKey>`                                   | Exact keyed `insert` / `update` / `delete` / `move` changes, with optional row-bound enforcement.                                                                               |
+| `class LiveQueryManager` / `createLiveQueryManager`                  | Owns one shared observer backend and creates typed queries from adapter-provided `LiveQuerySource` values.                                                                      |
+| `class LiveQuerySet`                                                 | Low-level SQL/plan set from `database.liveQueries()`: `subscribe`, `subscribePatches`, observer-only `observe` (optionally `suppressUnchanged`), `refresh`, stats, and `close`. |
+| `LiveSnapshot / LiveChangesSnapshot / LiveResultChange / LiveKeyOf`  | Typed snapshot, patch, and key-selection types.                                                                                                                                 |
+| `LiveQuerySource / LiveQueryBackend / LiveQueryDriver`               | Structural contracts for query-library adapters.                                                                                                                                |
+| `LiveQuerySetOptions / LiveQueryStats / LiveQueryInput`              | Hint/poll/`sharedResults` and `maxRetainedBytes` configuration, execution and retained-byte counters, and low-level query inputs.                                               |
+| `LiveQueryHost / LiveQueryExecuteContext`                            | The probe, manifest, dependency, execution, and incremental-maintenance contract a `LiveQuerySet` runs over.                                                                    |
+| `LiveQueryDelivery / LiveMaintainedExecution / LiveMaintainedChange` | What a delivered result reflects, and a maintainable execution's result and opaque state.                                                                                       |
 
 See [Live queries](/docs/extensions/live-queries) for Kysely composition, keyed changes, windows,
 cross-tab invalidation, and teardown.
@@ -394,3 +394,5 @@ report drift against it, so the docs and implementation stay aligned.
 The executable dialect overlay for the same feature IDs. It classifies each form as
 `compatible`, `different`, `extension`, `unsupported`, or `inapplicable`, records the PGlite
 oracle version, and explains every deliberate PostgreSQL divergence.
+
+`LiveQueryPatch` and `LiveQueryPatchOptions` describe low-level reset/patch delivery. Patches carry changed row payloads and a retained-position map; resets carry a complete result.

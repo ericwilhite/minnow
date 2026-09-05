@@ -558,7 +558,7 @@
               "name": "LiveQueryLimitError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class LiveQueryLimitError extends Error {\n    readonly resource: \"set\" | \"group\" | \"subscription\";\n    readonly limit: number;\n    readonly name = \"LiveQueryLimitError\";\n    constructor(resource: \"set\" | \"group\" | \"subscription\", limit: number);\n}"
+                "export declare class LiveQueryLimitError extends Error {\n    readonly resource: \"set\" | \"group\" | \"subscription\" | \"byte\";\n    readonly limit: number;\n    readonly name = \"LiveQueryLimitError\";\n    constructor(resource: \"set\" | \"group\" | \"subscription\" | \"byte\", limit: number);\n}"
               ]
             },
             {
@@ -943,7 +943,7 @@
               "name": "SqlColumnSchema",
               "kind": "type",
               "declarations": [
-                "export interface SqlColumnSchema {\n    name: string;\n    type: SqlColumnType;\n    integer?: true;\n    sqlDomain?: SqlDomain;\n}"
+                "export interface SqlColumnSchema {\n    name: string;\n    unknown?: true;\n    type: SqlColumnType;\n    integer?: true;\n    sqlDomain?: SqlDomain;\n}"
               ]
             },
             {
@@ -1565,7 +1565,7 @@
               "name": "ClientLiveQuerySet",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class ClientLiveQuerySet {\n    #private;\n    private readonly client;\n    private readonly handleId;\n    constructor(client: MinnowDatabaseClient, handleId: string, created: Promise<unknown>);\n    subscribe(query: LiveQueryInput, options: LiveQuerySubscribeOptions): Promise<ClientLiveSubscription>;\n    observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<ClientLiveSubscription>;\n    stats(): Promise<LiveQueryStats>;\n    notifyLocalCommit(): void;\n    refresh(): Promise<void>;\n    close(): Promise<void>;\n}"
+                "export declare class ClientLiveQuerySet {\n    #private;\n    private readonly client;\n    private readonly handleId;\n    constructor(client: MinnowDatabaseClient, handleId: string, created: Promise<unknown>);\n    subscribe(query: LiveQueryInput, options: LiveQuerySubscribeOptions): Promise<ClientLiveSubscription>;\n    subscribePatches(query: LiveQueryInput, options: LiveQueryPatchOptions): Promise<ClientLiveSubscription>;\n    observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<ClientLiveSubscription>;\n    stats(): Promise<LiveQueryStats>;\n    notifyLocalCommit(): void;\n    refresh(): Promise<void>;\n    close(): Promise<void>;\n}"
               ]
             },
             {
@@ -1690,7 +1690,7 @@
               "name": "LiveMaintainedExecution",
               "kind": "type",
               "declarations": [
-                "export interface LiveMaintainedExecution {\n    readonly result: QueryResult;\n    readonly state: unknown;\n}"
+                "export interface LiveMaintainedExecution {\n    readonly result: QueryResult;\n    readonly state: unknown;\n    readonly retainedBytes?: number;\n}"
               ]
             },
             {
@@ -1760,7 +1760,7 @@
               "name": "LiveQueryLimitError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class LiveQueryLimitError extends Error {\n    readonly resource: \"set\" | \"group\" | \"subscription\";\n    readonly limit: number;\n    readonly name = \"LiveQueryLimitError\";\n    constructor(resource: \"set\" | \"group\" | \"subscription\", limit: number);\n}"
+                "export declare class LiveQueryLimitError extends Error {\n    readonly resource: \"set\" | \"group\" | \"subscription\" | \"byte\";\n    readonly limit: number;\n    readonly name = \"LiveQueryLimitError\";\n    constructor(resource: \"set\" | \"group\" | \"subscription\" | \"byte\", limit: number);\n}"
               ]
             },
             {
@@ -1785,17 +1785,31 @@
               ]
             },
             {
+              "name": "LiveQueryPatch",
+              "kind": "type",
+              "declarations": [
+                "export type LiveQueryPatch = {\n    readonly type: \"reset\";\n    readonly result: QueryResult;\n} | {\n    readonly type: \"patch\";\n    readonly retained: Int32Array;\n    readonly changedRows: ReadonlyArray<{\n        readonly index: number;\n        readonly row: QueryRow;\n    }>;\n};"
+              ]
+            },
+            {
+              "name": "LiveQueryPatchOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveQueryPatchOptions {\n    onPatch(patch: LiveQueryPatch, delivery: LiveQueryDelivery): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n}"
+              ]
+            },
+            {
               "name": "LiveQuerySet",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class LiveQuerySet {\n    #private;\n    constructor(host: LiveQueryHost, options?: LiveQuerySetOptions);\n    get stats(): LiveQueryStats;\n    subscribe(query: LiveQueryInput, options: LiveQuerySubscribeOptions): Promise<LiveQuerySubscription>;\n    observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<LiveQuerySubscription>;\n    notifyLocalCommit(): void;\n    refresh(): Promise<void>;\n    close(): void;\n}"
+                "export declare class LiveQuerySet {\n    #private;\n    constructor(host: LiveQueryHost, options?: LiveQuerySetOptions);\n    get stats(): LiveQueryStats;\n    subscribe(query: LiveQueryInput, options: LiveQuerySubscribeOptions): Promise<LiveQuerySubscription>;\n    subscribePatches(query: LiveQueryInput, options: LiveQueryPatchOptions): Promise<LiveQuerySubscription>;\n    observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<LiveQuerySubscription>;\n    notifyLocalCommit(): void;\n    refresh(): Promise<void>;\n    close(): void;\n}"
               ]
             },
             {
               "name": "LiveQuerySetOptions",
               "kind": "type",
               "declarations": [
-                "export interface LiveQuerySetOptions {\n    readonly channel?: LiveQueryHintChannel;\n    readonly channelName?: string;\n    readonly pollIntervalMs?: number;\n    readonly maxGroups?: number;\n    readonly maxSubscriptions?: number;\n    readonly sharedResults?: boolean;\n    readonly incremental?: boolean;\n    readonly onClosed?: () => void;\n}"
+                "export interface LiveQuerySetOptions {\n    readonly channel?: LiveQueryHintChannel;\n    readonly channelName?: string;\n    readonly pollIntervalMs?: number;\n    readonly maxGroups?: number;\n    readonly maxSubscriptions?: number;\n    readonly maxRetainedBytes?: number;\n    readonly sharedResults?: boolean;\n    readonly incremental?: boolean;\n    readonly onClosed?: () => void;\n}"
               ]
             },
             {
@@ -1809,14 +1823,14 @@
               "name": "LiveQueryStats",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    maintained: number;\n    groupsVisited: number;\n    retainedRows: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
+                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    maintained: number;\n    groupsVisited: number;\n    retainedRows: number;\n    retainedBytes: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
               ]
             },
             {
               "name": "LiveQuerySubscribeOptions",
               "kind": "type",
               "declarations": [
-                "export interface LiveQuerySubscribeOptions {\n    onChange(result: QueryResult, delivery: LiveQueryDelivery): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n}"
+                "export interface LiveQuerySubscribeOptions {\n    readonly sharedResults?: boolean;\n    onChange(result: QueryResult, delivery: LiveQueryDelivery): void;\n    onError?(error: unknown): void;\n    onComplete?(): void;\n}"
               ]
             },
             {
@@ -2164,7 +2178,7 @@
               "name": "SqlColumnSchema",
               "kind": "type",
               "declarations": [
-                "export interface SqlColumnSchema {\n    name: string;\n    type: SqlColumnType;\n    integer?: true;\n    sqlDomain?: SqlDomain;\n}"
+                "export interface SqlColumnSchema {\n    name: string;\n    unknown?: true;\n    type: SqlColumnType;\n    integer?: true;\n    sqlDomain?: SqlDomain;\n}"
               ]
             },
             {

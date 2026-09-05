@@ -979,3 +979,134 @@ export function intervalDomainCompare(left: unknown, right: unknown): number | u
 export function isSqlDomainValue(value: unknown): value is string {
   return typeof value === "string" && value.startsWith(PREFIX);
 }
+
+/** SQL extraction from TIME and INTERVAL without collapsing calendar months into a timestamp. */
+export function temporalDomainPart(field: string, value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  let months = 0;
+  let days = 0;
+  let usecs: number;
+  const interval = value.startsWith(INTERVAL_VALUE);
+  if (interval) {
+    [months, days, usecs] = JSON.parse(value.slice(INTERVAL_VALUE.length)) as [
+      number,
+      number,
+      number,
+    ];
+  } else if (value.startsWith(TIME_VALUE)) {
+    const [hour = "0", minute = "0", second = "0"] = value.slice(TIME_VALUE.length).split(":");
+    usecs =
+      Number(hour) * 3_600_000_000 +
+      Number(minute) * 60_000_000 +
+      Math.round(Number(second) * 1_000_000);
+  } else return undefined;
+  switch (field) {
+    case "hour":
+      return Math.trunc(usecs / 3_600_000_000);
+    case "minute":
+      return Math.trunc(usecs / 60_000_000) % 60;
+    case "second":
+      return (usecs % 60_000_000) / 1_000_000;
+    case "milliseconds":
+      return (usecs % 60_000_000) / 1000;
+    case "microseconds":
+      return usecs % 60_000_000;
+    case "epoch":
+      return interval
+        ? (Math.trunc(months / 12) * 365.25 + (months % 12) * 30 + days) * 86_400 +
+            usecs / 1_000_000
+        : usecs / 1_000_000;
+  }
+  if (interval) {
+    const years = Math.trunc(months / 12);
+    switch (field) {
+      case "year":
+        return years;
+      case "month":
+        return months % 12;
+      case "day":
+        return days;
+      case "quarter":
+        return Math.trunc((months % 12) / 3) + 1;
+      case "decade":
+        return Math.trunc(years / 10);
+      case "century":
+        return Math.trunc(years / 100);
+      case "millennium":
+        return Math.trunc(years / 1000);
+    }
+  }
+  throw new TypeError(`Cannot extract ${field} from ${interval ? "INTERVAL" : "TIME"}`);
+}
+
+/** Structural ordering for shipped JSONB and one-dimensional ARRAY values. */
+export function structuredDomainCompare(left: unknown, right: unknown): number | undefined {
+  if (typeof left !== "string" || typeof right !== "string") return undefined;
+  const array = left.startsWith(ARRAY_VALUE) && right.startsWith(ARRAY_VALUE);
+  const jsonb = left.startsWith(JSONB_VALUE) && right.startsWith(JSONB_VALUE);
+  if (!array && !jsonb) return undefined;
+  if (left === right) return 0;
+  const prefix = array ? ARRAY_VALUE : JSONB_VALUE;
+  const a: unknown = JSON.parse(left.slice(prefix.length));
+  const b: unknown = JSON.parse(right.slice(prefix.length));
+  if (array && Array.isArray(a) && Array.isArray(b)) {
+    for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+      const x: unknown = a[index];
+      const y: unknown = b[index];
+      // SQL array NULL elements sort after non-NULL elements, unlike JSON null.
+      const order =
+        x === null || y === null ? (x === y ? 0 : x === null ? 1 : -1) : compareJsonStructure(x, y);
+      if (order !== 0) return order;
+    }
+    return a.length - b.length;
+  }
+  // PostgreSQL's historical empty top-level array sorts before every scalar.
+  if (Array.isArray(a) && a.length === 0) return Array.isArray(b) && b.length === 0 ? 0 : -1;
+  if (Array.isArray(b) && b.length === 0) return 1;
+  return compareJsonStructure(a, b);
+}
+
+function compareJsonStructure(left: unknown, right: unknown): number {
+  if (left === right) return 0;
+  const rank = (value: unknown): number =>
+    value === null
+      ? 0
+      : typeof value === "string"
+        ? 1
+        : typeof value === "number"
+          ? 2
+          : typeof value === "boolean"
+            ? 3
+            : Array.isArray(value)
+              ? 4
+              : 5;
+  const difference = rank(left) - rank(right);
+  if (difference !== 0) return difference;
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  if (typeof left === "string" && typeof right === "string") return left < right ? -1 : 1;
+  if (typeof left === "boolean" && typeof right === "boolean") return Number(left) - Number(right);
+  if (Array.isArray(left) && Array.isArray(right)) {
+    if (left.length !== right.length) return left.length - right.length;
+    for (let index = 0; index < left.length; index += 1) {
+      const order = compareJsonStructure(left[index], right[index]);
+      if (order !== 0) return order;
+    }
+    return 0;
+  }
+  const a = left as Record<string, unknown>;
+  const b = right as Record<string, unknown>;
+  const encoder = new TextEncoder();
+  const keyOrder = (x: string, y: string): number =>
+    encoder.encode(x).length - encoder.encode(y).length || (x === y ? 0 : x < y ? -1 : 1);
+  const keysA = Object.keys(a).sort(keyOrder);
+  const keysB = Object.keys(b).sort(keyOrder);
+  if (keysA.length !== keysB.length) return keysA.length - keysB.length;
+  for (let index = 0; index < keysA.length; index += 1) {
+    const x = keysA[index] ?? "";
+    const y = keysB[index] ?? "";
+    if (x !== y) return x < y ? -1 : 1;
+    const order = compareJsonStructure(a[x], b[y]);
+    if (order !== 0) return order;
+  }
+  return 0;
+}

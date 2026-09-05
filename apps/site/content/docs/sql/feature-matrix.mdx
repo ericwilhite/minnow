@@ -44,8 +44,8 @@ Minnow deliberately excludes three PostgreSQL server or storage-model features:
 - roles and `GRANT` privileges.
 
 The excluded-forms list below also records the narrower forms the engine rejects — `RIGHT JOIN`
-and `FULL JOIN` beyond their supported sole-join forms, numeric `RANGE` frame offsets, `DISTINCT` window
-aggregates, window functions outside the select list, and `ON DELETE SET DEFAULT` — each with the
+and `FULL JOIN` beyond their supported sole-join forms, temporal interval `RANGE` offsets, `DISTINCT`
+window aggregates, windows in `WHERE`/`GROUP BY`/`HAVING`, and `ON DELETE SET DEFAULT` — each with the
 exact error it raises.
 
 ## Supported SQL

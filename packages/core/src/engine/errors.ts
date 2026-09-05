@@ -32,13 +32,15 @@ export class LiveQueryLimitError extends Error {
   override readonly name = "LiveQueryLimitError";
 
   constructor(
-    readonly resource: "set" | "group" | "subscription",
+    readonly resource: "set" | "group" | "subscription" | "byte",
     readonly limit: number,
   ) {
     super(
       resource === "set"
         ? `A database cannot retain more than ${String(limit)} live-query sets`
-        : `A live-query set cannot retain more than ${String(limit)} ${resource} records`,
+        : resource === "byte"
+          ? `A live-query set cannot retain more than ${String(limit)} modeled bytes`
+          : `A live-query set cannot retain more than ${String(limit)} ${resource} records`,
     );
   }
 }

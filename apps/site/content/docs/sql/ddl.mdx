@@ -234,9 +234,13 @@ scale: a bare `NUMERIC` column with no declared scale, and derived arithmetic su
 
 `JSON` validates a document and preserves object key order; `JSONB` canonicalizes object keys.
 UUID values validate and normalize. Arrays use canonical JSON at the JavaScript boundary. Minnow
-does not support array subscripts or PostgreSQL array operators — including `||`, which is
-refused on array and JSONB operands rather than concatenating their text, matching PostgreSQL's
-resolution of `||` to text concatenation only when one side is text. Intervals retain separate
+supports one-based scalar array subscripts, `ARRAY_AGG` with ordering and `DISTINCT`, and typed
+`UNNEST(ARRAY[...])` constructor sources with optional `WITH ORDINALITY`. Array slices,
+multidimensional access, correlated UNNEST inputs, and PostgreSQL array operators such as `||`
+remain unsupported. Arrays compare their represented scalar elements lexicographically, with
+NULL elements last; JSONB compares structural values, using numeric comparison for JSON numbers.
+JSON continues to compare its text representation. `||` remains text concatenation and is
+refused on two array or JSONB operands. Intervals retain separate
 month, day, and microsecond fields, and a date or datetime accepts `+ INTERVAL` and
 `- INTERVAL`; interval-valued arithmetic such as interval-plus-interval is unsupported.
 

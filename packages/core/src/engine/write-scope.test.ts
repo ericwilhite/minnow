@@ -778,9 +778,10 @@ describe("atomic write scopes", () => {
       await tx.updateBatch("accounts", { keys: [2], changes: { balance: [151] } });
     });
     await live.refresh();
-    // One scope, one re-run, one notification — never an intermediate state.
+    // One scope, one maintained result, one notification — never an intermediate state.
     expect(changes).toEqual([[{ total: 600 }], [{ total: 601 }]]);
-    expect(live.stats.reruns).toBe(1);
+    expect(live.stats.maintained).toBe(1);
+    expect(live.stats.reruns).toBe(0);
     // The memo cannot serve the pre-scope answer: the scope moved the epoch.
     expect((await database.query(sql)).rows).toEqual([{ total: 601 }]);
     await database.write(async (tx) => {

@@ -1,3 +1,4 @@
+import { encodeQueryIdentity } from "./query-identity.js";
 import { copyDate, dateMilliseconds } from "../date-value.js";
 import { estimateValuesBytes } from "./byte-estimates.js";
 import { copyQueryResultExternalization, type QueryResult, type QueryRow } from "./query.js";
@@ -17,15 +18,7 @@ export function queryResultMemoKey(sql: string, params: readonly unknown[]): str
  * plans with the same key are the same query over the same literals.
  */
 export function planMemoKey(plan: unknown): string {
-  return JSON.stringify(plan, (_key, value: unknown) => {
-    if (value instanceof Date) return { $date: dateMilliseconds(value) };
-    if (typeof value === "bigint") return { $bigint: value.toString() };
-    if (typeof value === "number") {
-      if (Object.is(value, -0)) return { $number: "-0" };
-      if (!Number.isFinite(value)) return { $number: String(value) };
-    }
-    return value;
-  });
+  return encodeQueryIdentity(plan);
 }
 
 /**

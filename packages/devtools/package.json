@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/devtools",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "An embeddable SQL console and data browser for a Minnow database.",
   "license": "MIT",
   "author": "Eric Wilhite",
@@ -43,6 +43,6 @@
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.8",
     "@lezer/highlight": "^1.2.3",
-    "@minnowdb/core": ">=0.7.9 <1.0.0"
+    "@minnowdb/core": ">=0.8.0 <1.0.0"
   }
 }

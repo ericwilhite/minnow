@@ -354,7 +354,7 @@ describe("LIKE ESCAPE", () => {
       executeRowQuery(compileQuery("SELECT v FROM t WHERE v LIKE 'x!' ESCAPE '!'"), percents),
     ).toThrow("dangling escape");
     expect(() => compileQuery("SELECT v FROM t WHERE v LIKE 'x' ESCAPE '!!'")).toThrow(
-      "single character",
+      "at most one character",
     );
   });
 });

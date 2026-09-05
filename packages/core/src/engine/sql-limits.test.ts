@@ -248,7 +248,7 @@ describe("SQL scalar allocation limits", () => {
       /SIMILAR TO pattern exceeds/,
     );
     expect(() => compileSimilarPattern("\uD800")).toThrow(/unpaired surrogate/);
-    expect(() => compileLikePattern("x", false, "")).toThrow(/one character/);
+    expect(compileLikePattern("x", false, "").test("x")).toBe(true);
     expect(() => compileLikePattern("x", false, "ab")).toThrow(/one character/);
     expect(() => compileLikePattern("x", false, "😀")).not.toThrow();
   });

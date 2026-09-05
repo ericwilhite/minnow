@@ -2037,6 +2037,9 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
         "Which row of the group answers is implementation-dependent, so no two engines have to agree; SQLite has no ANY_VALUE either",
     },
   ],
+  ["aggregate.array-agg", { oracles: ["sqlite"], reason: "SQLite has no ARRAY_AGG" }],
+  ["type.array-subscript", { oracles: ["sqlite"], reason: "SQLite has no SQL arrays" }],
+  ["function.unnest", { oracles: ["sqlite"], reason: "SQLite has no UNNEST" }],
   ["aggregate.variance", { oracles: ["sqlite"], reason: "SQLite has no VAR_POP" }],
   ["aggregate.stddev", { oracles: ["sqlite"], reason: "SQLite has no STDDEV_POP" }],
   ["aggregate.boolean", { oracles: ["sqlite"], reason: "SQLite has no EVERY" }],
@@ -2486,7 +2489,12 @@ describe("SQL conformance against SQLite and PGlite", () => {
             continue;
           }
           const compareOrder = ordered && oracle.name === "pglite";
-          const minnowKeys = resultKeys(numericDecodedRows(minnowResult), compareOrder);
+          const minnowRows = numericDecodedRows(minnowResult);
+          if (feature.id === "aggregate.array-agg") {
+            for (const row of minnowRows)
+              if (typeof row.amounts === "string") row.amounts = JSON.parse(row.amounts) as unknown;
+          }
+          const minnowKeys = resultKeys(minnowRows, compareOrder);
           const oracleKeys = resultKeys(oracleResult.rows, compareOrder);
           if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
             failures.push(

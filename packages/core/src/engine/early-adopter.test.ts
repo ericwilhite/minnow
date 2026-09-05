@@ -55,8 +55,8 @@ describe("early-adopter engine contracts", () => {
         "SELECT day, day + INTERVAL '1 month' AS next_month, CURRENT_DATE AS today FROM sql_dates",
       ),
     ).resolves.toMatchObject({
-      columnDomains: [{ kind: "date" }, { kind: "date" }, { kind: "date" }],
-      rows: [{ day: "2026-01-31", next_month: "2026-02-28" }],
+      columnDomains: [{ kind: "date" }, null, { kind: "date" }],
+      rows: [{ day: "2026-01-31", next_month: new Date("2026-02-28T00:00:00.000Z") }],
     });
     const current = await database.query("SELECT CURRENT_DATE AS today");
     expect(current.rows[0]?.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);

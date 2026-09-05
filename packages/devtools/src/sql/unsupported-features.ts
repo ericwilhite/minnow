@@ -5,12 +5,6 @@ import type { UnsupportedFeatureRecord } from "./feature-matrix.js";
 /** Every feature the engine records as unsupported, with the error fragment that names it. */
 export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
   {
-    id: "aggregate.array-agg",
-    error: "Unsupported function: array_agg",
-    notes:
-      "array_agg is not supported because arrays are not; json_agg (JSON_ARRAYAGG) collects a group into a JSON array instead.",
-  },
-  {
     id: "aggregate.ordered-set",
     error: "Unsupported function: percentile_cont",
     notes:
@@ -175,7 +169,7 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     id: "expression.interval-values",
     error: "Date arithmetic requires a date or datetime value",
     notes:
-      "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, EXTRACT(EPOCH FROM interval), justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds.",
+      "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds.",
   },
   {
     id: "expression.row-constructor-value",
@@ -199,24 +193,6 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     error: "Unsupported function: version",
     notes:
       "version(), current_user, session_user, current_schema, pg_typeof, and setseed describe a server this engine is not; SHOW server_version answers the version question.",
-  },
-  {
-    id: "function.unnest",
-    error: "Expected )",
-    notes:
-      "Set-returning functions (unnest, generate_series, regexp_split_to_table, jsonb_array_elements) are not supported as FROM sources; use a VALUES source, a recursive CTE for a series, or JSON_TABLE for a JSON array.",
-  },
-  {
-    id: "join.full-compound-on",
-    error: "FULL JOIN requires a single equality ON condition",
-    notes:
-      "FULL JOIN takes a single equality ON condition; move the extra condition into a derived source.",
-  },
-  {
-    id: "join.full-grouped",
-    error: "FULL JOIN cannot be combined with grouping, DISTINCT, or window functions yet",
-    notes:
-      "FULL JOIN desugars into a union of two left joins, and grouping, DISTINCT, and window functions do not distribute over that union yet. Put the FULL JOIN in a derived table and group, deduplicate, or window in the outer block.",
   },
   {
     id: "join.right-multi",
@@ -368,12 +344,6 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     notes: "= ANY(array) is not supported; use IN (…) with a list or a subquery.",
   },
   {
-    id: "type.array-subscript",
-    error: "Array subscripts are not supported",
-    notes:
-      "PostgreSQL reads array elements with one-based subscripts and slices. Minnow arrays are opaque JSON text values; element access is refused at parse time.",
-  },
-  {
     id: "type.interval-arithmetic",
     error: "Date arithmetic requires a date or datetime value",
     notes:
@@ -384,17 +354,5 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     error: "DISTINCT window aggregates are not supported",
     notes:
       "An aggregate used as a window function cannot take DISTINCT; PostgreSQL rejects this form too. DISTINCT aggregates work in grouped aggregation, so aggregate in a grouped block and window over that.",
-  },
-  {
-    id: "window.frame-range-offset",
-    error: "RANGE frames take only UNBOUNDED and CURRENT ROW bounds; use ROWS",
-    notes:
-      "A numeric RANGE offset bounds the frame by ordering-value distance, which the engine does not implement. ROWS frames take numeric offsets; RANGE frames take UNBOUNDED and CURRENT ROW bounds only.",
-  },
-  {
-    id: "window.outside-select",
-    error: "Window functions are only allowed in the select list",
-    notes:
-      "PostgreSQL also evaluates window functions in ORDER BY; Minnow evaluates them only as select items. Alias the window in the select list and order by the alias.",
   },
 ];

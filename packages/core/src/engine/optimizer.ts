@@ -1,3 +1,4 @@
+import { encodeQueryIdentity } from "./query-identity.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { crossJoinPlan } from "../plan/model.js";
 import {
@@ -754,7 +755,7 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
     earlier.add(ownAlias);
   }
   if (pairs.length === 0) return;
-  const signature = (predicate: Predicate): string => JSON.stringify(predicate);
+  const signature = (predicate: Predicate): string => encodeQueryIdentity(predicate);
   const present = new Set(block.predicates.map(signature));
   const implied: Predicate[] = [];
   const constantSide = (predicate: Predicate): "left" | "right" | undefined => {
@@ -1060,14 +1061,14 @@ function decorrelateBlock(block: CompiledQuery, nextAlias: NextAlias): void {
   for (const item of block.select) {
     if (!expressionHasCorrelatedSubquery(item.expression)) continue;
     if (grouped) {
-      const groupedExpressions = new Set(block.groupBy.map((group) => JSON.stringify(group)));
+      const groupedExpressions = new Set(block.groupBy.map((group) => encodeQueryIdentity(group)));
       const outerReferences = correlatedOuterReferences(item.expression);
       if (
         containsAggregateCall(item.expression) ||
         outerReferences.some(
           (reference) =>
             !groupedExpressions.has(
-              JSON.stringify({ kind: "column", reference } satisfies Expression),
+              encodeQueryIdentity({ kind: "column", reference } satisfies Expression),
             ),
         )
       ) {
@@ -3345,33 +3346,46 @@ function foldExpression(expression: Expression): Expression {
             typeof target.value === "string"
               ? target.value
               : undefined;
+          const first = literalValues[0];
           const sqlDomain =
-            targetWord?.startsWith("numeric:") === true
-              ? (() => {
-                  const [, precisionWord = "", scaleWord = ""] = targetWord.split(":");
-                  return {
-                    kind: "numeric" as const,
-                    ...(precisionWord === "" ? {} : { precision: Number(precisionWord) }),
-                    ...(scaleWord === "" ? {} : { scale: Number(scaleWord) }),
-                  };
-                })()
-              : targetWord === "json" ||
-                  targetWord === "jsonb" ||
-                  targetWord === "uuid" ||
-                  targetWord === "date" ||
-                  targetWord === "time" ||
-                  targetWord === "interval"
-                ? ({ kind: targetWord } as const)
-                : expression.name === "JSON_QUERY" ||
-                    expression.name === "JSON_OBJECT" ||
-                    expression.name === "JSON_ARRAY" ||
-                    expression.name === "MINNOW_JSON_GET"
-                  ? ({ kind: "json" } as const)
-                  : simpleScalarFunctions.get(expression.name)?.returns === "date"
-                    ? ({ kind: "date" } as const)
-                    : simpleScalarFunctions.get(expression.name)?.returns === "interval"
-                      ? ({ kind: "interval" } as const)
-                      : undefined;
+            expression.name === "ARRAY"
+              ? {
+                  kind: "array" as const,
+                  element:
+                    typeof first === "number"
+                      ? "DOUBLE"
+                      : typeof first === "boolean"
+                        ? "BOOLEAN"
+                        : first instanceof Date
+                          ? "TIMESTAMP"
+                          : "TEXT",
+                }
+              : targetWord?.startsWith("numeric:") === true
+                ? (() => {
+                    const [, precisionWord = "", scaleWord = ""] = targetWord.split(":");
+                    return {
+                      kind: "numeric" as const,
+                      ...(precisionWord === "" ? {} : { precision: Number(precisionWord) }),
+                      ...(scaleWord === "" ? {} : { scale: Number(scaleWord) }),
+                    };
+                  })()
+                : targetWord === "json" ||
+                    targetWord === "jsonb" ||
+                    targetWord === "uuid" ||
+                    targetWord === "date" ||
+                    targetWord === "time" ||
+                    targetWord === "interval"
+                  ? ({ kind: targetWord } as const)
+                  : expression.name === "JSON_QUERY" ||
+                      expression.name === "JSON_OBJECT" ||
+                      expression.name === "JSON_ARRAY" ||
+                      expression.name === "MINNOW_JSON_GET"
+                    ? ({ kind: "json" } as const)
+                    : simpleScalarFunctions.get(expression.name)?.returns === "date"
+                      ? ({ kind: "date" } as const)
+                      : simpleScalarFunctions.get(expression.name)?.returns === "interval"
+                        ? ({ kind: "interval" } as const)
+                        : undefined;
           return {
             kind: "literal",
             value: folded,
@@ -3535,8 +3549,8 @@ function rewriteForInner(
     if (item === undefined || item.expression.kind === "wildcard") return undefined;
     if (containsAggregateOrWindow(item.expression)) return undefined;
     if (derived.groupBy.length > 0) {
-      const signature = JSON.stringify(item.expression);
-      if (!derived.groupBy.some((group) => JSON.stringify(group) === signature)) {
+      const signature = encodeQueryIdentity(item.expression);
+      if (!derived.groupBy.some((group) => encodeQueryIdentity(group) === signature)) {
         return undefined;
       }
     }

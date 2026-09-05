@@ -84,7 +84,7 @@ function reconcileRows<TRow>(
   for (let index = 0; index < next.length; index += 1) {
     const row = next[index] as TRow;
     const was = provenance?.[index] ?? -1;
-    if (was >= 0 && was < previous.length) {
+    if (was >= 0 && was < previous.length && sameLiveValue(previous[was], row)) {
       rows[index] = previous[was] as TRow;
       if (was !== index) changed = true;
       continue;
@@ -125,6 +125,7 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   #executionAbort: AbortController | undefined;
   #invalidationSequence = 0;
   #closed = false;
+  #refreshLeases = 0;
 
   constructor(backend: LiveQueryBackend, source: LiveQuerySource<TRow>, onClose?: () => void) {
     this.#backend = backend;
@@ -145,33 +146,41 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
       if (!subscribed) return;
       subscribed = false;
       this.#listeners.delete(registered);
-      if (this.#listeners.size === 0) this.#stopObservation();
+      if (this.#listeners.size === 0 && this.#refreshLeases === 0) this.#stopObservation();
     };
   };
 
   async refresh(): Promise<void> {
     if (this.#closed) throw new Error("Live query is closed");
-    const sequence = this.#invalidationSequence;
-    if (this.#listeners.size > 0) {
-      // A transient dependency/observer setup failure must not strand existing subscribers.
-      // Re-open first so this refresh and future commits reach the query again.
-      if (this.#subscription === undefined) this.#startObservation();
-      const opening = this.#subscription;
-      if (opening !== undefined) await opening.catch(() => undefined);
-      await this.#backend.refresh();
+    // A one-shot refresh must also load direct-delivery sources before any framework
+    // subscription commits (including React Suspense). Concurrent refreshes share the lease.
+    this.#refreshLeases += 1;
+    try {
+      const sequence = this.#invalidationSequence;
+      if (this.#listeners.size > 0 || this.#decodes()) {
+        // A transient dependency/observer setup failure must not strand existing subscribers.
+        // Re-open first so this refresh and future commits reach the query again.
+        if (this.#subscription === undefined) this.#startObservation();
+        const opening = this.#subscription;
+        if (opening !== undefined) await opening.catch(() => undefined);
+        await this.#backend.refresh();
+      }
+      // A backend refresh normally invalidates observers itself. Only synthesize an execution
+      // when it did not, which preserves manual retry without running every refreshed query twice.
+      if (this.#invalidationSequence === sequence) {
+        const version = this.#snapshot.status === "loading" ? null : this.#snapshot.version;
+        if (this.#decodes()) {
+          // The engine retries a failed statement itself on refresh and delivers the outcome;
+          // what is left to retry here is a decode that failed on a result it did deliver.
+          const last = this.#lastDelivered;
+          if (this.#snapshot.status === "error" && last !== undefined) this.#schedule(last);
+        } else this.#schedule({ manifestVersion: version, catalogEpoch: 0, initial: false });
+      }
+      await this.#waitForIdle();
+    } finally {
+      this.#refreshLeases -= 1;
+      if (this.#refreshLeases === 0 && this.#listeners.size === 0) this.#stopObservation();
     }
-    // A backend refresh normally invalidates observers itself. Only synthesize an execution
-    // when it did not, which preserves manual retry without running every refreshed query twice.
-    if (this.#invalidationSequence === sequence) {
-      const version = this.#snapshot.status === "loading" ? null : this.#snapshot.version;
-      if (this.#decodes()) {
-        // The engine retries a failed statement itself on refresh and delivers the outcome;
-        // what is left to retry here is a decode that failed on a result it did deliver.
-        const last = this.#lastDelivered;
-        if (this.#snapshot.status === "error" && last !== undefined) this.#schedule(last);
-      } else this.#schedule({ manifestVersion: version, catalogEpoch: 0, initial: false });
-    }
-    await this.#waitForIdle();
   }
 
   #decodes(): boolean {

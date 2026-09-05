@@ -183,6 +183,8 @@ function plain(result: QueryResult, sql = "ORDER BY"): Array<Record<string, Quer
 }
 
 const MAINTAINABLE = [
+  "SELECT i.id, o.amount FROM items AS i JOIN other AS o ON o.id = i.id ORDER BY i.id",
+
   "SELECT * FROM items WHERE amount < 30 ORDER BY id",
   "SELECT id, amount FROM items ORDER BY id OFFSET 3",
   "SELECT id, region FROM recent_items ORDER BY id",
@@ -199,13 +201,12 @@ const MAINTAINABLE = [
   "SELECT id, region FROM items WHERE amount > 70",
   "SELECT i.id, i.amount FROM items AS i WHERE i.active = TRUE ORDER BY i.amount, i.id",
   "SELECT id, amount FROM items ORDER BY 2 DESC, 1",
+  "SELECT COUNT(*) AS n, SUM(amount) AS total, AVG(amount) AS average FROM items WHERE active = TRUE",
+  "SELECT region, COUNT(*) AS n FROM items GROUP BY region ORDER BY region",
 ] as const;
 
 const NOT_MAINTAINABLE = [
-  "SELECT COUNT(*) AS n, SUM(amount) AS total FROM items WHERE active = TRUE",
-  "SELECT region, COUNT(*) AS n FROM items GROUP BY region ORDER BY region",
   "SELECT DISTINCT label FROM items ORDER BY label",
-  "SELECT i.id, o.amount FROM items AS i JOIN other AS o ON o.id = i.id ORDER BY i.id",
   "SELECT id FROM items WHERE amount > (SELECT AVG(amount) FROM other) ORDER BY id",
   "SELECT id, ROW_NUMBER() OVER (ORDER BY amount) AS rank FROM items ORDER BY id",
 ] as const;

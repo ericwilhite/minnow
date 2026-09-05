@@ -3015,3 +3015,25 @@ describe("MinnowDatabaseClient", () => {
     await expect(client.listTables()).rejects.toThrow(/closed/);
   });
 });
+
+it("keeps typed worker reads transaction-aware and externalizes SQL domains", async () => {
+  const client = connect();
+  try {
+    await client.execute(
+      "CREATE TABLE audited_worker (id INTEGER PRIMARY KEY, x NUMERIC(10,2), d DATE)",
+    );
+    await client.execute("INSERT INTO audited_worker VALUES (1,1.25,DATE '2026-01-01')");
+    const query = {
+      kind: "typed-query" as const,
+      plan: compileQuery("SELECT x,d FROM audited_worker"),
+    };
+    expect(await client.run(query)).toEqual([{ x: "1.25", d: "2026-01-01" }]);
+    await client.execute("BEGIN");
+    await client.execute("UPDATE audited_worker SET x=2.50");
+    expect(await client.run(query)).toEqual([{ x: "2.50", d: "2026-01-01" }]);
+    await client.execute("ROLLBACK");
+    expect(await client.run(query)).toEqual([{ x: "1.25", d: "2026-01-01" }]);
+  } finally {
+    await client.close();
+  }
+});

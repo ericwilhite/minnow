@@ -67,6 +67,9 @@ export type ScalarFunctionName =
   | "JSON_ARRAY"
   | "TO_JSON"
   | "IS_JSON"
+  | "MINNOW_ARRAY_AT"
+  | "MINNOW_ARRAY_FROM_JSON"
+  | "MINNOW_ARRAY_ELEMENT"
   | "ARRAY"
   /** Parser-produced `->` JSON member/element access returning a JSON value. */
   | "MINNOW_JSON_GET"

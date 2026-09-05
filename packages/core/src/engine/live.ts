@@ -1,3 +1,7 @@
+import { createLiveQueryPatch, type LiveQueryPatchOptions } from "./live-patch.js";
+export type { LiveQueryPatch, LiveQueryPatchOptions } from "./live-patch.js";
+import { queryResultRetainedBytes } from "./query-cache.js";
+import { encodeQueryIdentity } from "./query-identity.js";
 import { type CatalogProbe, type Manifest, type StoragePage } from "../storage/types.js";
 import { LiveQueryLimitError } from "./errors.js";
 import { type CompiledQuery, type QueryResult, type QueryRow, type QueryValue } from "./query.js";
@@ -31,6 +35,8 @@ export interface LiveQuerySetOptions {
   readonly maxGroups?: number;
   /** Maximum result/observer subscriptions retained by this set. Defaults to 1,024. */
   readonly maxSubscriptions?: number;
+  /** Maximum modeled resident result and maintenance bytes per set. Defaults to 64 MiB. */
+  readonly maxRetainedBytes?: number;
   /**
    * Hand `onChange` the set's retained result instead of a private copy. The result is shared
    * with every equal subscription and with the next change comparison, so a subscriber must
@@ -78,6 +84,8 @@ export interface LiveQueryDelivery {
 }
 
 export interface LiveQuerySubscribeOptions {
+  /** Borrow the read-only retained result for this subscription instead of copying it. */
+  readonly sharedResults?: boolean;
   onChange(result: QueryResult, delivery: LiveQueryDelivery): void;
   onError?(error: unknown): void;
   /** Called once when the subscription ends because the subscription or its set closed. */
@@ -132,6 +140,8 @@ export interface LiveQueryStats {
    * bounded by the engine at 64 rows and is not included.
    */
   retainedRows: number;
+  /** Modeled resident result and incremental maintenance bytes, counted once per group. */
+  retainedBytes: number;
   /** Work avoided because equal statements shared one query group or in-flight execution. */
   sharedExecutions: number;
   lastSweepMs: number;
@@ -163,6 +173,8 @@ export interface LiveQueryExecuteContext {
 export interface LiveMaintainedExecution {
   readonly result: QueryResult;
   readonly state: unknown;
+  /** Modeled total bytes retained by the result and opaque maintenance state. */
+  readonly retainedBytes?: number;
 }
 
 export interface LiveMaintainedChange extends LiveMaintainedExecution {
@@ -240,6 +252,7 @@ interface QueryGroup {
   /** The newest probe the retained result is known to reflect. */
   seenProbe: CatalogProbe;
   result: QueryResult | undefined;
+  retainedBytes: number;
   execution: Promise<Execution> | undefined;
   /** Counts results delivered to this group's subscribers, so `retained` only bridges consecutive ones. */
   deliveries: number;
@@ -310,43 +323,6 @@ function cloneResult(result: QueryResult): QueryResult {
   };
 }
 
-/** Type-tagged, length-delimited structural identity. Unlike JSON, it preserves Date vs string,
- * -0, non-finite numbers, and undefined fields, so deduplication cannot merge distinct plans. */
-function encodeQueryIdentity(value: unknown, ancestors = new Set<object>()): string {
-  if (value === null) return "z";
-  if (typeof value === "undefined") return "u";
-  if (typeof value === "boolean") return value ? "b1" : "b0";
-  if (typeof value === "number") {
-    if (Number.isNaN(value)) return "nNaN;";
-    if (Object.is(value, -0)) return "n-0;";
-    return `n${String(value)};`;
-  }
-  if (typeof value === "string") return `s${String(value.length)}:${value}`;
-  if (value instanceof Date) return `d${String(dateMilliseconds(value))};`;
-  if (typeof value !== "object") {
-    throw new TypeError(`Unsupported live-query identity value: ${typeof value}`);
-  }
-  if (ancestors.has(value)) throw new TypeError("Live-query identity contains a cycle");
-  ancestors.add(value);
-  let encoded: string;
-  if (Array.isArray(value)) {
-    encoded = `a${String(value.length)}[${value
-      .map((item) => encodeQueryIdentity(item, ancestors))
-      .join("")}]`;
-  } else {
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).sort();
-    encoded = `o${String(keys.length)}{${keys
-      .map(
-        (key) =>
-          `${encodeQueryIdentity(key, ancestors)}${encodeQueryIdentity(record[key], ancestors)}`,
-      )
-      .join("")}}`;
-  }
-  ancestors.delete(value);
-  return encoded;
-}
-
 function queryKey(query: LiveQueryInput): string {
   return encodeQueryIdentity(
     typeof query === "string"
@@ -413,6 +389,14 @@ function groupMemoizes(group: QueryGroup): boolean {
   return false;
 }
 
+function callLiveCallback(callback: (() => void) | undefined): void {
+  try {
+    callback?.();
+  } catch {
+    // Consumer callbacks cannot stop other subscriptions or database cleanup.
+  }
+}
+
 export class LiveQuerySet {
   readonly #host: LiveQueryHost;
   readonly #channel: LiveQueryHintChannel | undefined;
@@ -430,6 +414,7 @@ export class LiveQuerySet {
   readonly #lagging = new Set<QueryGroup>();
   readonly #maxGroups: number;
   readonly #maxSubscriptions: number;
+  readonly #maxRetainedBytes: number;
   readonly #sharedResults: boolean;
   readonly #incremental: boolean;
   readonly #stats: LiveQueryStats = {
@@ -444,6 +429,7 @@ export class LiveQuerySet {
     maintained: 0,
     groupsVisited: 0,
     retainedRows: 0,
+    retainedBytes: 0,
     sharedExecutions: 0,
     lastSweepMs: 0,
   };
@@ -478,6 +464,9 @@ export class LiveQuerySet {
       MAX_LIVE_QUERY_SUBSCRIPTIONS,
       "subscription",
     );
+    this.#maxRetainedBytes = options.maxRetainedBytes ?? 64 * 1024 * 1024;
+    if (!Number.isSafeInteger(this.#maxRetainedBytes) || this.#maxRetainedBytes < 0)
+      throw new RangeError("Live query retained byte limit must be a non-negative safe integer");
     this.#sharedResults = options.sharedResults === true;
     this.#incremental = options.incremental !== false;
     this.#host = host;
@@ -503,7 +492,9 @@ export class LiveQuerySet {
   get stats(): LiveQueryStats {
     let retainedRows = 0;
     for (const group of this.#groups.values()) retainedRows += group.result?.rows.length ?? 0;
-    return { ...this.#stats, retainedRows };
+    let retainedBytes = 0;
+    for (const group of this.#groups.values()) retainedBytes += group.retainedBytes;
+    return { ...this.#stats, retainedRows, retainedBytes };
   }
 
   /**
@@ -576,6 +567,20 @@ export class LiveQuerySet {
       throw error;
     }
     return this.#subscriptionHandle(group, subscriber);
+  }
+
+  /** Delivers resets or changed row payloads without constructing a private full row array per patch. */
+  subscribePatches(
+    query: LiveQueryInput,
+    options: LiveQueryPatchOptions,
+  ): Promise<LiveQuerySubscription> {
+    return this.subscribe(query, {
+      sharedResults: true,
+      onChange: (result, delivery) =>
+        options.onPatch(createLiveQueryPatch(result, delivery), delivery),
+      ...(options.onError === undefined ? {} : { onError: options.onError.bind(options) }),
+      ...(options.onComplete === undefined ? {} : { onComplete: options.onComplete.bind(options) }),
+    });
   }
 
   /** Observes invalidation; the statement executes inside the set only when asked to compare. */
@@ -652,7 +657,7 @@ export class LiveQuerySet {
     subscriber.closed = true;
     this.#subscriptionCount -= 1;
     group.subscribers.delete(subscriber);
-    if (complete) subscriber.options.onComplete?.();
+    if (complete) callLiveCallback(() => subscriber.options.onComplete?.());
     this.#removeEmptyGroup(group);
   }
 
@@ -697,6 +702,7 @@ export class LiveQuerySet {
       subscribers: new Set(),
       seenProbe: after,
       result: undefined,
+      retainedBytes: 0,
       execution: undefined,
       deliveries: 0,
       maintenance: undefined,
@@ -769,6 +775,7 @@ export class LiveQuerySet {
       await this.#acquireExecutionSlot();
       let executed: QueryResult | undefined;
       let maintenance: unknown;
+      let retainedBytes: number | undefined;
       try {
         if (
           this.#incremental &&
@@ -780,6 +787,7 @@ export class LiveQuerySet {
           else {
             executed = maintained.result;
             maintenance = maintained.state;
+            retainedBytes = maintained.retainedBytes;
           }
         }
         executed ??= await this.#host.execute(group.query, context);
@@ -789,8 +797,7 @@ export class LiveQuerySet {
       const previous = group.result;
       const changed = previous === undefined || !sameResult(previous, executed);
       // The host hands over a result nobody else holds, so the set retains it as it is.
-      group.result = executed;
-      group.maintenance = maintenance;
+      this.#retain(group, executed, maintenance, retainedBytes);
       return { result: executed, changed };
     })();
     group.execution = execution;
@@ -799,6 +806,20 @@ export class LiveQuerySet {
     } finally {
       if (group.execution === execution) group.execution = undefined;
     }
+  }
+
+  #retain(group: QueryGroup, result: QueryResult, state: unknown, hint?: number): void {
+    const bytes = Math.max(
+      queryResultRetainedBytes(result) + result.rows.length * 48,
+      hint ?? (state === group.maintenance ? group.retainedBytes : 0),
+    );
+    let total = bytes;
+    for (const other of this.#groups.values()) if (other !== group) total += other.retainedBytes;
+    if (!Number.isSafeInteger(total) || total > this.#maxRetainedBytes)
+      throw new LiveQueryLimitError("byte", this.#maxRetainedBytes);
+    group.result = result;
+    group.maintenance = state;
+    group.retainedBytes = bytes;
   }
 
   async #acquireExecutionSlot(): Promise<void> {
@@ -866,8 +887,7 @@ export class LiveQuerySet {
         verdict.declined = true;
         return { result: retained, changed: false };
       }
-      group.result = maintained.result;
-      group.maintenance = maintained.state;
+      this.#retain(group, maintained.result, maintained.state, maintained.retainedBytes);
       return {
         result: maintained.result,
         changed: maintained.changed,
@@ -898,7 +918,9 @@ export class LiveQuerySet {
     // so the next map must not be relative to it.
     const consecutive = subscriber.seenDelivery === group.deliveries - 1;
     subscriber.options.onChange(
-      this.#sharedResults ? result : cloneResult(result),
+      this.#sharedResults || subscriber.options.sharedResults === true
+        ? result
+        : cloneResult(result),
       retained !== undefined && consecutive && !delivery.initial
         ? { ...delivery, retained }
         : delivery,
@@ -941,10 +963,10 @@ export class LiveQuerySet {
         if (subscriber.closed) continue;
         subscriber.closed = true;
         this.#subscriptionCount -= 1;
-        subscriber.options.onComplete?.();
+        callLiveCallback(() => subscriber.options.onComplete?.());
       }
     }
-    this.#onClosed?.();
+    callLiveCallback(this.#onClosed);
   }
 
   #hint(): void {
@@ -1139,18 +1161,18 @@ export class LiveQuerySet {
             subscriber.options.suppressUnchanged === true
           ) {
             this.#stats.notificationsSuppressed += 1;
-            return;
+            continue;
           }
           try {
             this.#deliverInvalidation(subscriber, invalidation);
             this.#stats.invalidations += 1;
           } catch (error) {
-            subscriber.options.onError?.(error);
+            callLiveCallback(() => subscriber.options.onError?.(error));
           }
         } else if (isResultSubscriber(subscriber) && execution !== undefined) {
           if (!execution.changed) {
             this.#stats.notificationsSuppressed += 1;
-            return;
+            continue;
           }
           try {
             this.#deliverResult(
@@ -1161,7 +1183,7 @@ export class LiveQuerySet {
               execution.retained,
             );
           } catch (error) {
-            subscriber.options.onError?.(error);
+            callLiveCallback(() => subscriber.options.onError?.(error));
           }
         }
       }
@@ -1181,7 +1203,7 @@ export class LiveQuerySet {
   #notifyGroupError(group: QueryGroup, error: unknown): void {
     for (const subscriber of group.subscribers) {
       if (subscriber.closed) continue;
-      subscriber.options.onError?.(error);
+      callLiveCallback(() => subscriber.options.onError?.(error));
     }
   }
 

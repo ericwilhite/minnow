@@ -653,14 +653,13 @@
       "id": "window.frame",
       "status": "supported",
       "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount, joined ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS windowed FROM rows",
-      "notes": "ROWS frames take row-distance bounds; RANGE frames take UNBOUNDED and CURRENT ROW bounds, where CURRENT ROW spans the ordering peer group."
+      "notes": "ROWS frames use row distances; RANGE frames use peers or numeric ordering-value distances; GROUPS frames use peer-group distances. Exclusions are supported."
     },
     {
       "id": "window.frame-range-offset",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS windowed FROM rows",
-      "error": "RANGE frames take only UNBOUNDED and CURRENT ROW bounds; use ROWS",
-      "notes": "A numeric RANGE offset bounds the frame by ordering-value distance, which the engine does not implement. ROWS frames take numeric offsets; RANGE frames take UNBOUNDED and CURRENT ROW bounds only."
+      "notes": "Numeric RANGE offsets measure ordering-value distance and require one numeric ORDER BY expression. Temporal interval offsets are not supported."
     },
     {
       "id": "window.distinct-aggregate",
@@ -671,10 +670,9 @@
     },
     {
       "id": "window.outside-select",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT amount FROM rows ORDER BY ROW_NUMBER() OVER (ORDER BY amount)",
-      "error": "Window functions are only allowed in the select list",
-      "notes": "PostgreSQL also evaluates window functions in ORDER BY; Minnow evaluates them only as select items. Alias the window in the select list and order by the alias."
+      "notes": "Window functions work in SELECT and ORDER BY. WHERE, GROUP BY, and HAVING cannot contain windows."
     },
     {
       "id": "join.right",
@@ -843,7 +841,7 @@
       "id": "expression.cast",
       "status": "supported",
       "example": "SELECT CAST(amount AS INTEGER) AS whole, CAST(amount AS TEXT) AS label FROM rows",
-      "notes": "Common PostgreSQL type names map to the four stored value kinds; integer targets round to the nearest integer with ties to even, PostgreSQL's float8 cast (SQLite truncates), and non-numeric strings fail rather than becoming 0. The postfix spelling amount::INTEGER is the same cast."
+      "notes": "Integer casts round exact NUMERIC ties away from zero and floating-point ties to even. Integer text accepts signed decimal digits. Postfix :: and CAST use the same rules."
     },
     {
       "id": "identifier.quoted",
@@ -928,10 +926,9 @@
     },
     {
       "id": "join.full-grouped",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT r.region AS region, COUNT(*) AS matched FROM rows r FULL JOIN dims d ON d.region = r.region GROUP BY r.region",
-      "error": "FULL JOIN cannot be combined with grouping, DISTINCT, or window functions yet",
-      "notes": "FULL JOIN desugars into a union of two left joins, and grouping, DISTINCT, and window functions do not distribute over that union yet. Put the FULL JOIN in a derived table and group, deduplicate, or window in the outer block."
+      "notes": "The sole FULL JOIN composes with grouping, DISTINCT, wildcards, and window functions by applying these operations after both unmatched sides are included."
     },
     {
       "id": "order-by.ordinal",
@@ -1114,10 +1111,9 @@
     },
     {
       "id": "join.full-compound-on",
-      "status": "unsupported",
-      "example": "SELECT r.region FROM rows r FULL JOIN keyed k ON k.name = r.region AND k.score > 0",
-      "error": "FULL JOIN requires a single equality ON condition",
-      "notes": "FULL JOIN takes a single equality ON condition; move the extra condition into a derived source."
+      "status": "supported",
+      "example": "SELECT r.region FROM rows r FULL JOIN dims d ON d.region = r.region AND d.label <> ''",
+      "notes": "A sole FULL JOIN accepts compound ON predicates and preserves unmatched rows from both sides."
     },
     {
       "id": "datetime.current-date",
@@ -1552,10 +1548,9 @@
     },
     {
       "id": "aggregate.array-agg",
-      "status": "unsupported",
-      "example": "SELECT region, array_agg(amount) AS amounts FROM rows GROUP BY region",
-      "error": "Unsupported function: array_agg",
-      "notes": "array_agg is not supported because arrays are not; json_agg (JSON_ARRAYAGG) collects a group into a JSON array instead."
+      "status": "supported",
+      "example": "SELECT region, array_agg(amount ORDER BY amount) AS amounts FROM rows GROUP BY region ORDER BY region",
+      "notes": "ARRAY_AGG supports DISTINCT and aggregate-local ORDER BY, includes NULL elements, and returns NULL for empty input. Arrays cross the JavaScript boundary as canonical JSON text. FILTER and window use are not supported."
     },
     {
       "id": "aggregate.ordered-set",
@@ -1568,14 +1563,13 @@
       "id": "type.array",
       "status": "supported",
       "example": "SELECT ARRAY[1, 2] AS pair",
-      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. Subscripts and array operators are not supported (see type.array-subscript, type.array-any, and array.concat)."
+      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. One-based scalar subscripts and ARRAY_AGG are supported. Array operators such as concatenation and ANY/ALL remain unsupported."
     },
     {
       "id": "type.array-subscript",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT (ARRAY[1, 2, 3])[1] AS first_element",
-      "error": "Array subscripts are not supported",
-      "notes": "PostgreSQL reads array elements with one-based subscripts and slices. Minnow arrays are opaque JSON text values; element access is refused at parse time."
+      "notes": "One-based scalar subscripts return NULL for an out-of-range position. Slices and multidimensional access are not supported."
     },
     {
       "id": "type.array-any",
@@ -1748,7 +1742,7 @@
       "status": "unsupported",
       "example": "SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total FROM rows",
       "error": "Date arithmetic requires a date or datetime value",
-      "notes": "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, EXTRACT(EPOCH FROM interval), justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds."
+      "notes": "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds."
     },
     {
       "id": "expression.date-minus-date",
@@ -1828,10 +1822,9 @@
     },
     {
       "id": "function.unnest",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT x FROM unnest(ARRAY[3, 1, 2]) AS x",
-      "error": "Expected )",
-      "notes": "Set-returning functions (unnest, generate_series, regexp_split_to_table, jsonb_array_elements) are not supported as FROM sources; use a VALUES source, a recursive CTE for a series, or JSON_TABLE for a JSON array."
+      "notes": "UNNEST over an ARRAY constructor produces typed rows and supports WITH ORDINALITY and output column aliases. Table-correlated array inputs and arbitrary array expressions are not supported."
     },
     {
       "id": "function.generate-series",

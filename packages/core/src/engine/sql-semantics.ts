@@ -6,6 +6,7 @@ import {
   MAX_SQL_PATTERN_MATCH_STEPS,
 } from "./cache-limits.js";
 import {
+  structuredDomainCompare,
   collatedDomainCompare,
   enumDomainCompare,
   exactNumericCompare,
@@ -73,8 +74,8 @@ export function readUntypedText(
   }
   if (type === "boolean") {
     const lowered = text.trim().toLowerCase();
-    if (lowered === "t" || lowered === "true" || lowered === "1") return true;
-    if (lowered === "f" || lowered === "false" || lowered === "0") return false;
+    if (/^(?:t(?:r(?:u(?:e)?)?)?|y(?:e(?:s)?)?|on|1)$/.test(lowered)) return true;
+    if (/^(?:f(?:a(?:l(?:s(?:e)?)?)?)?|n(?:o)?|of(?:f)?|0)$/.test(lowered)) return false;
   }
   return text;
 }
@@ -129,6 +130,8 @@ export function compareSqlValues(left: unknown, right: unknown): number {
     }
     return compareSqlStrings(plainLeft, plainRight);
   }
+  const structured = structuredDomainCompare(left, right);
+  if (structured !== undefined) return structured;
   const collated = collatedDomainCompare(left, right);
   if (collated !== undefined) return collated;
   const interval = intervalDomainCompare(left, right);
@@ -429,7 +432,7 @@ export function compileLikePattern(
 ): SqlPatternMatcher {
   assertBoundedPattern(pattern, "LIKE pattern");
   const exactEscape =
-    escape === undefined ? undefined : exactSingleCharacter(escape, "LIKE escape");
+    escape === undefined || escape === "" ? undefined : exactSingleCharacter(escape, "LIKE escape");
   const key = JSON.stringify([caseInsensitive, exactEscape ?? null, pattern]);
   const cached = cachedPattern(likeCache, key);
   if (cached !== undefined) return cached;

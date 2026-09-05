@@ -248,7 +248,7 @@ describe("public SQL queries", () => {
           "SELECT CAST(2.5 AS INTEGER) AS a, CAST(3.5 AS INTEGER) AS b, CAST(-2.5 AS INTEGER) AS c, CAST(2.7 AS INTEGER) AS d",
         )
       ).rows,
-    ).toEqual([{ a: 2, b: 4, c: -2, d: 3 }]);
+    ).toEqual([{ a: 3, b: 4, c: -3, d: 3 }]);
     expect(
       (
         await database.query(
@@ -1969,6 +1969,30 @@ describe("identifier case folding", () => {
     expect(plan.select[0]?.expression).toEqual({ kind: "column", reference: "name" });
     const orders = foldIdentifierCase(compileQuery("SELECT total FROM ORDERS"), tables);
     expect(orders.base.table).toBe("Orders");
+  });
+
+  it("does not enumerate the catalog when table names match exactly", () => {
+    class CatalogMap extends Map<string, readonly string[]> {
+      iterations = 0;
+
+      override keys(): MapIterator<string> {
+        this.iterations += 1;
+        return super.keys();
+      }
+    }
+    const catalog = new CatalogMap([
+      ["data", ["id"]],
+      ["Orders", ["id"]],
+      ...Array.from({ length: 100 }, (_, index) => [`spare_${String(index)}`, ["id"]] as const),
+    ]);
+
+    const exact = compileQuery("SELECT COUNT(*) AS n FROM data");
+    expect(foldIdentifierCase(exact, catalog)).toBe(exact);
+    expect(catalog.iterations).toBe(0);
+
+    const folded = foldIdentifierCase(compileQuery("SELECT COUNT(*) AS n FROM ORDERS"), catalog);
+    expect(folded.base.table).toBe("Orders");
+    expect(catalog.iterations).toBe(1);
   });
 });
 

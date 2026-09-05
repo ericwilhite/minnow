@@ -140,7 +140,7 @@ no component re-renders.
 ## Incremental maintenance
 
 A statement over one table with a unique key — filters, projections, `ORDER BY`, `LIMIT` and
-`OFFSET`, but no joins, aggregates, `DISTINCT`, window functions, or subqueries — is not
+`OFFSET`, but no `DISTINCT`, window functions, or subqueries — is not
 re-executed when its table changes. The engine records which keys every commit touched; on a
 relevant commit it re-evaluates exactly those keys through the ordinary executor, so predicates,
 expressions, and ordering keep their SQL meaning, and patches them into the retained result: rows
@@ -155,21 +155,34 @@ window's start moved, a commit changed more than 2,048 rows, or history no survi
 accounts for — and that execution refills the margin. `LiveQueryStats.maintained` counts patched
 re-runs beside `reruns`; `liveQueries({ incremental: false })` turns patching off for a set.
 
-Statements outside that shape — a join, a `GROUP BY`, a `COUNT(*)` — re-execute as before, and
-the zone-map proofs above still spare them the inserts that cannot match.
+`COUNT`, `SUM`, and `AVG` can maintain per-key contributions, including grouped results. Exact
+`NUMERIC` inputs retain decimal semantics. Plain numbers qualify for SUM/AVG only while their
+integer values and absolute sum remain safely representable; other floating-point aggregates
+re-execute so incremental rounding cannot change an answer. DISTINCT aggregates and other
+aggregate functions re-execute.
+
+One inner or left join to a unique lookup key can patch base-table changes. A lookup-table change
+runs the statement again. More general joins also re-execute. The zone-map proofs above still
+spare these queries inserts that cannot match.
 
 ## Memory
 
-What a live query holds is its last result: the engine keeps one copy per distinct statement,
-shared by every subscription to it, plus a window's margin of at most 64 rows and one key and
-one ordering value per retained row. The page holds the decoded rows of each typed query and
-nothing else; a delivered result is not kept beside them. So the memory a set of live queries
-takes is the size of what they show, and a windowed list costs the same on a table of ten rows
-as on a table of a million. An unbounded statement over a large table retains all of its rows,
-in the engine and again on the page — prefer `LIMIT` and `live.window()` for anything a user
-scrolls. Sweeps allocate per changed row, not per subscription, and a set executes at most eight
-statements at once, so a burst of commits or a page mounting hundreds of subscriptions on a slow
-machine queues work rather than multiplying it.
+The engine retains one result per distinct statement, a key-position index, ordering values,
+and at most 64 margin rows for a bounded window. Aggregate maintenance also retains per-key
+contributions, so a small aggregate result can retain state proportional to its input.
+
+`liveQueries({ maxRetainedBytes })` bounds modeled resident results and maintenance state per
+set; the default is 64 MiB. `stats.retainedBytes` reports that accounting. An over-limit opening
+fails; a later over-limit result reports an error and keeps the previous good result. Closing
+subscriptions releases their group's accounting. This is a modeled payload limit, not a browser
+heap measurement.
+
+Full immutable result arrays still require work proportional to the retained rows. Prefer
+`LIMIT` and `live.window()` for scrolling lists. `subscribePatches(query, { onPatch })` delivers
+an initial reset and then changed row payloads plus a retained-position map, avoiding a private
+full row-array copy per patched subscriber. Full executions deliver resets. The worker transport
+still transfers a result snapshot; patch delivery reduces consumer copying rather than wire
+size. A set executes at most eight statements at once.
 
 Subscribing is cheap enough to do per component. A new statement resolves its dependencies and
 runs once; it needs no sweep, because the probe its dependencies were resolved under is what a
@@ -191,3 +204,9 @@ callbacks. Each `onChange` receives a private copy of the result; a set created 
 host uses because it encodes the result for the channel synchronously. Its `observe()` form
 reports invalidations without delivering rows; with `suppressUnchanged: true` the set executes the
 statement itself and invalidates only when the rows changed, which is what typed adapters use.
+
+A decoded typed query can load through `refresh()` before any listener subscribes, including
+React Suspense's first render. It uses a temporary subscription and releases it after loading.
+Decoder output is checked before reusing retained rows, so reordering and cross-row transforms
+cannot attach a newer version to stale values. Consumer error and completion callbacks are
+isolated so one throwing callback cannot stop other subscriptions or later sweeps.

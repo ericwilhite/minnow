@@ -1,3 +1,4 @@
+import { encodeQueryIdentity } from "./query-identity.js";
 import {
   civilFromDays,
   copyDate,
@@ -81,7 +82,8 @@ import {
   validateFtsQuery,
 } from "./fts.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
-import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
+import { applyWindowFunctions } from "./windows.js";
+export { applyWindowFunctions } from "./windows.js";
 import {
   coerceComparisonOperands,
   coercedComparable,
@@ -122,6 +124,7 @@ import {
   externalSqlDomainColumnValue,
   externalSqlDomainValue,
   intervalDomainValue,
+  temporalDomainPart,
   isDateDomainValue,
   isExactNumeric,
   isSqlDomainValue,
@@ -227,6 +230,9 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "TO_JSON",
   "IS_JSON",
   "ARRAY",
+  "MINNOW_ARRAY_AT",
+  "MINNOW_ARRAY_FROM_JSON",
+  "MINNOW_ARRAY_ELEMENT",
   "MINNOW_JSON_GET",
   "MINNOW_JSON_GET_TEXT",
   "MINNOW_TUPLE_KEY",
@@ -271,6 +277,7 @@ const functionSpellings: ReadonlyMap<string, string> = new Map([
   ["POW", "POWER"],
   // PostgreSQL's JSON spellings of the standard constructors and aggregate. jsonb and json
   // produce the same document text here, so both prefixes name one function.
+  ["ARRAY_AGG", "JSON_ARRAYAGG"],
   ["JSON_AGG", "JSON_ARRAYAGG"],
   ["JSONB_AGG", "JSON_ARRAYAGG"],
   ["JSON_BUILD_ARRAY", "JSON_ARRAY"],
@@ -356,6 +363,12 @@ function castValue(value: unknown, target: string): unknown {
     if (typeof value === "boolean") return protectedSqlTextValue(value ? "true" : "false");
     if (value instanceof Date) return protectedSqlTextValue(dateIsoString(value));
   }
+  if (target === "number-integer" && isExactNumeric(value)) {
+    const integer = Number(externalSqlDomainValue(exactNumericRounded(value, 0, "round")));
+    if (!Number.isSafeInteger(integer))
+      throw new RangeError("Integer cast is outside the exact safe range");
+    return integer;
+  }
   if (target === "number" || target === "number-integer") {
     // Externalize first, exactly as the string and datetime targets do: a NUMERIC (or other
     // domain) value is an internally tagged string, and CAST(numeric_column AS DOUBLE
@@ -366,6 +379,9 @@ function castValue(value: unknown, target: string): unknown {
     else if (typeof external === "boolean") parsed = external ? 1 : 0;
     else if (typeof external === "string") {
       const text = external.trim();
+      if (target === "number-integer" && !/^[+-]?\d+$/.test(text)) {
+        throw new TypeError(`Cannot cast this string to a number: ${text} (expected integer text)`);
+      }
       const candidate = text === "" ? Number.NaN : Number(text);
       if (!Number.isFinite(candidate)) {
         throw new TypeError(`Cannot cast this string to a number: ${text}`);
@@ -394,8 +410,8 @@ function castValue(value: unknown, target: string): unknown {
     if (typeof value === "string") {
       const external = externalSqlDomainValue(value);
       const text = typeof external === "string" ? external.trim().toLowerCase() : "";
-      if (text === "true" || text === "t" || text === "1") return true;
-      if (text === "false" || text === "f" || text === "0") return false;
+      const parsed = readUntypedText("boolean", text);
+      if (typeof parsed === "boolean") return parsed;
       throw new TypeError(
         `Cannot cast this string to a boolean: ${typeof external === "string" ? external : value}`,
       );
@@ -572,6 +588,31 @@ function scalarFunctionValueGeneric(
     return preservedJsonDomainValue(jsonConstructor(name, values));
   }
   if (name === "ARRAY") return arrayDomainValue(values);
+  if (name === "MINNOW_ARRAY_ELEMENT") {
+    const value = externalSqlDomainValue(values[0]);
+    return typeof value === "string" ? protectedSqlTextValue(value) : value;
+  }
+  if (name === "MINNOW_ARRAY_FROM_JSON") {
+    if (values[0] === null) return null;
+    return normalizeSqlDomainValue(
+      { kind: "array", element: "TEXT" },
+      externalSqlDomainValue(values[0]),
+    );
+  }
+  if (name === "MINNOW_ARRAY_AT") {
+    if (values[0] === null || values[1] === null) return null;
+    const source = externalSqlDomainValue(values[0]);
+    const index = values[1];
+    if (typeof source !== "string" || typeof index !== "number" || !Number.isSafeInteger(index))
+      throw new TypeError("Array subscripts require an array and an integer position");
+    const array: unknown = JSON.parse(source);
+    if (!Array.isArray(array)) throw new TypeError("Array subscripts require an array");
+    const selected: unknown = array[index - 1] ?? null;
+    if (typeof selected === "string") return protectedSqlTextValue(selected);
+    if (selected === null || typeof selected === "number" || typeof selected === "boolean")
+      return selected;
+    throw new TypeError("Array subscripts currently require one-dimensional scalar arrays");
+  }
   if (name === "MINNOW_COLLATE") return collatedDomainValue(values[0], values[1]);
   if (name === "NEXTVAL" || name === "CURRVAL") {
     throw new TypeError(`${name} must be resolved by the database catalog`);
@@ -995,9 +1036,7 @@ function dateAddValue(
     setDateUtcDate(shifted, Math.min(day, dateUtcDate(lastDay)));
   }
   const result = new Date(dateMilliseconds(shifted) + millisecondCount);
-  return calendarDate && millisecondCount % 86_400_000 === 0
-    ? dateDomainValue(dateIsoString(result).slice(0, 10))
-    : result;
+  return result;
 }
 
 export function dateTruncValue(unit: unknown, value: unknown): Date | null {
@@ -2799,6 +2838,8 @@ export type SqlColumnType = "boolean" | "number" | "string" | "datetime";
 
 export interface SqlColumnSchema {
   name: string;
+  /** An all-NULL expression awaiting a surrounding common SQL type. */
+  unknown?: true;
   type: SqlColumnType;
   /** Exact SQL whole-number domain, physically stored as a safe JavaScript number. */
   integer?: true;
@@ -2808,8 +2849,8 @@ export interface SqlColumnSchema {
 
 /**
  * Infers the typed output schema of one select block from typed source schemas. A column whose
- * type cannot be established (for example a bare NULL literal) is rejected explicitly, so a
- * derived table always has concrete column types even when its result is empty.
+ * type is still unknown (a bare NULL literal) carries that fact until a surrounding UNION or
+ * expression provides context. Its all-null physical vector uses string storage meanwhile.
  */
 export function inferBlockSchema(
   plan: CompiledQuery,
@@ -2827,6 +2868,7 @@ export function inferBlockSchema(
       .map((column) => ({
         name: multipleSources ? `${source.alias}.${column.name}` : column.name,
         type: column.type,
+        ...(column.unknown === true ? { unknown: true as const } : {}),
         ...(column.integer === true ? { integer: true } : {}),
         ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
       }));
@@ -2842,12 +2884,12 @@ export function inferBlockSchema(
       if (source === undefined) throw new TypeError(`Unknown table alias: ${parts[0] ?? ""}`);
       const column = (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1]);
       if (column === undefined) throw new TypeError(`Unknown column: ${reference}`);
-      return column.type;
+      return column.unknown === true ? "null" : column.type;
     }
     const matches = sources.flatMap((source) =>
       (schemas.get(source.table) ?? [])
         .filter(({ name }) => name === parts[0])
-        .map((column) => column.type),
+        .map((column) => (column.unknown === true ? ("null" as const) : column.type)),
     );
     if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
     return matches[0] ?? "string";
@@ -2958,6 +3000,28 @@ export function inferBlockSchema(
     }
     if (expression.kind !== "call") return undefined;
     if (expression.name === "CURRENT_DATE") return { kind: "date" };
+    if (expression.name === "ARRAY" || expression.name === "MINNOW_ARRAY_FROM_JSON") {
+      let argument =
+        expression.name === "ARRAY"
+          ? expression.arguments[0]
+          : expression.arguments[0]?.kind === "call"
+            ? expression.arguments[0].arguments[0]
+            : undefined;
+      if (argument?.kind === "call" && argument.name === "MINNOW_ARRAY_ELEMENT")
+        argument = argument.arguments[0];
+      const type = argument === undefined ? "string" : infer(argument);
+      return {
+        kind: "array",
+        element:
+          type === "number"
+            ? "DOUBLE"
+            : type === "boolean"
+              ? "BOOLEAN"
+              : type === "datetime"
+                ? "TIMESTAMP"
+                : "TEXT",
+      };
+    }
     const simple = simpleScalarFunctions.get(expression.name);
     if (simple?.returns === "date") return { kind: "date" };
     if (simple?.returns === "interval") return { kind: "interval" };
@@ -3007,16 +3071,7 @@ export function inferBlockSchema(
         ? numericResultDomain("%", sides)
         : undefined;
     }
-    if (expression.name === "DATE_ADD") {
-      const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
-      const milliseconds = expression.arguments[2];
-      return input?.kind === "date" &&
-        milliseconds?.kind === "literal" &&
-        typeof milliseconds.value === "number" &&
-        milliseconds.value % 86_400_000 === 0
-        ? input
-        : undefined;
-    }
+    if (expression.name === "DATE_ADD") return undefined;
     if (
       expression.name === "SUM" ||
       expression.name === "AVG" ||
@@ -3155,7 +3210,15 @@ export function inferBlockSchema(
     ) {
       return "number";
     }
+    if (expression.name === "MINNOW_ARRAY_AT") {
+      const argument = expression.arguments[0];
+      const domain = argument === undefined ? undefined : inferDomain(argument);
+      return domain?.kind === "array"
+        ? (createTableTypeNames.get(domain.element.toUpperCase()) ?? "string")
+        : "string";
+    }
     if (
+      expression.name === "MINNOW_ARRAY_FROM_JSON" ||
       expression.name === "JSON_ARRAYAGG" ||
       expression.name === "STRING_AGG" ||
       expression.name === "JSON_VALUE" ||
@@ -3186,9 +3249,7 @@ export function inferBlockSchema(
       return simple.returns === "date" || simple.returns === "interval" ? "string" : simple.returns;
     }
     if (expression.name === "DATE_TRUNC") return "datetime";
-    if (expression.name === "DATE_ADD") {
-      return inferDomain(expression)?.kind === "date" ? "string" : "datetime";
-    }
+    if (expression.name === "DATE_ADD") return "datetime";
     if (expression.name === "CURRENT_DATE") return "string";
     if (expression.name === "CURRENT_TIMESTAMP") return "datetime";
     // LOCALTIME is the statement clock's canonical 'HH:MM:SS' text; explicit TIME values use
@@ -3274,9 +3335,8 @@ export function inferBlockSchema(
       return wildcardSchema(source);
     }
     const type = infer(item.expression);
-    if (type === "null") {
-      throw new TypeError(`Cannot infer a column type for output ${item.alias}`);
-    }
+    if (type === "null")
+      return [{ name: item.alias, type: "string" as const, unknown: true as const }];
     const integer = integerTypedExpression(item.expression, resolveColumnInteger);
     const sqlDomain = inferDomain(item.expression);
     return [
@@ -4295,20 +4355,28 @@ export function foldIdentifierCase(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, readonly string[]>,
 ): CompiledQuery {
-  const lowerTables = new Map<string, string[]>();
-  for (const name of tables.keys()) {
-    const lowered = name.toLowerCase();
-    const bucket = lowerTables.get(lowered);
-    if (bucket === undefined) lowerTables.set(lowered, [name]);
-    else bucket.push(name);
-  }
+  // Exact names are overwhelmingly common. Build the catalog-wide fallback index only when a
+  // source misses exact lookup; otherwise even `SELECT COUNT(*) FROM t` becomes O(table count).
+  let lowerTables: ReadonlyMap<string, readonly string[]> | undefined;
+  const caseInsensitiveTables = (): ReadonlyMap<string, readonly string[]> => {
+    if (lowerTables !== undefined) return lowerTables;
+    const indexed = new Map<string, string[]>();
+    for (const name of tables.keys()) {
+      const lowered = name.toLowerCase();
+      const bucket = indexed.get(lowered);
+      if (bucket === undefined) indexed.set(lowered, [name]);
+      else bucket.push(name);
+    }
+    lowerTables = indexed;
+    return indexed;
+  };
   // PostgreSQL's own reading — the lower-cased name — wins when it exists (`NAME` over a table
   // with both `Name` and `name` is `name`); otherwise a unique case-insensitive match.
   const foldTable = (name: string): string | undefined => {
     if (tables.has(name)) return undefined;
     const lowered = name.toLowerCase();
     if (tables.has(lowered)) return lowered;
-    const candidates = lowerTables.get(lowered);
+    const candidates = caseInsensitiveTables().get(lowered);
     return candidates?.length === 1 ? candidates[0] : undefined;
   };
   const foldColumn = (columns: readonly string[], name: string): string | undefined => {
@@ -4451,14 +4519,7 @@ export function expandRowReferences(
   const pass = { probing: true, needed: false };
   const sourceColumns = (source: TableSource): readonly string[] => {
     if (source.columnAliases !== undefined) return source.columnAliases;
-    if (source.derived !== undefined) return source.derived.select.map((item) => item.alias);
-    if (source.union !== undefined) {
-      return source.union.blocks[0]?.select.map((item) => item.alias) ?? [];
-    }
-    if (source.windowed !== undefined)
-      return source.windowed.block.select.map((item) => item.alias);
-    if (source.recursive !== undefined) return [];
-    return tableColumns(source.table) ?? [];
+    return sourceWildcardColumns(source, tableColumns) ?? [];
   };
   const rewriteBlock = (block: CompiledQuery): void => {
     if (pass.probing && pass.needed) return;
@@ -4920,6 +4981,26 @@ function exactConstantFold(
  * for execution to report.
  */
 function resolveExactNumericConstants(expression: Expression): Expression {
+  if (expression.kind === "call" && expression.name === "CAST") {
+    const [source, target] = expression.arguments;
+    if (source !== undefined && target?.kind === "literal" && target.value === "number-integer") {
+      const exact = exactConstantFold(source);
+      if (exact?.seeded === true && exact.value !== null) {
+        return {
+          ...expression,
+          arguments: [
+            {
+              kind: "literal",
+              value: exactNumericValue(exact.value),
+              internalSqlValue: true,
+              sqlDomain: { kind: "numeric" },
+            },
+            target,
+          ],
+        };
+      }
+    }
+  }
   let folded: { value: string | number | null; seeded: boolean } | undefined;
   try {
     folded = exactConstantFold(expression);
@@ -5027,383 +5108,6 @@ function resolveStatementExactNumericConstants(statement: CompiledStatement): vo
   }
 }
 
-/**
- * Aggregates the frame members named by position, for the frames whose rows are not contiguous.
- * EXCLUDE puts a hole in the middle of a frame, which the prefix sums the common path uses
- * cannot represent, so those positions walk their members instead.
- */
-function aggregateWindowMembers(
-  window: WindowSpec,
-  values: readonly unknown[],
-  members: readonly number[],
-  avgScale?: number,
-): unknown {
-  const present = members.filter((member) => {
-    const value = values[member];
-    return value !== null && value !== undefined;
-  });
-  if (window.name === "COUNT") {
-    return window.argumentAlias === undefined ? members.length : present.length;
-  }
-  if (window.name === "FIRST_VALUE") return values[members[0] ?? -1] ?? null;
-  if (window.name === "LAST_VALUE") return values[members[members.length - 1] ?? -1] ?? null;
-  if (window.name === "NTH_VALUE") return values[members[(window.offset ?? 1) - 1] ?? -1] ?? null;
-  if (present.length === 0) return null;
-  if (window.name === "SUM" || window.name === "AVG") {
-    const exact = present.some((member) => isExactNumeric(values[member]));
-    if (exact) {
-      let total = exactNumericValue(0);
-      for (const member of present) {
-        const value = values[member];
-        if (!isExactNumeric(value)) {
-          throw new TypeError("Exact NUMERIC window input mixed with an approximate number");
-        }
-        const next = exactNumericBinary("+", total, value);
-        if (next === null || next === undefined) throw new Error("Exact NUMERIC sum disappeared");
-        total = next;
-      }
-      return window.name === "SUM"
-        ? total
-        : exactNumericBinary("/", total, present.length, avgScale);
-    }
-    const total = present.reduce<number>((sum, member) => sum + numeric(values[member]), 0);
-    return window.name === "SUM" ? total : total / present.length;
-  }
-  let best: unknown;
-  for (const member of present) {
-    const candidate = values[member];
-    if (
-      best === undefined ||
-      (window.name === "MIN"
-        ? compareValues(candidate, best) < 0
-        : compareValues(candidate, best) > 0)
-    ) {
-      best = candidate;
-    }
-  }
-  return best ?? null;
-}
-
-/**
- * Computes one aggregate window over partition-sorted row indexes. Without an explicit frame the
- * SQL default applies: no OVER ordering makes every partition row share the whole-partition
- * aggregate, and ordering gives each row the running aggregate through its ordering peers
- * (RANGE UNBOUNDED PRECEDING AND CURRENT ROW). Explicit ROWS frames bound by row distance;
- * RANGE frames take only UNBOUNDED and CURRENT ROW bounds, where CURRENT ROW spans the peer
- * group. COUNT of an empty frame is 0 and every other aggregate NULL.
- */
-function applyAggregateWindow(
-  rows: QueryRow[],
-  indexes: Uint32Array,
-  window: WindowSpec,
-  samePartition: (left: number, right: number) => boolean,
-  sameOrderKeys: (left: number, right: number) => boolean,
-  avgScale?: number,
-): void {
-  const frame: WindowFrame = window.frame ?? {
-    unit: "range",
-    start: { kind: "unbounded-preceding" },
-    end:
-      window.orderAliases.length === 0 ? { kind: "unbounded-following" } : { kind: "current-row" },
-  };
-  let start = 0;
-  while (start < indexes.length) {
-    let end = start + 1;
-    while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
-      end += 1;
-    }
-    applyAggregateWindowPartition(
-      rows,
-      indexes,
-      window,
-      frame,
-      sameOrderKeys,
-      start,
-      end,
-      avgScale,
-    );
-    start = end;
-  }
-}
-
-function applyAggregateWindowPartition(
-  rows: QueryRow[],
-  indexes: Uint32Array,
-  window: WindowSpec,
-  frame: WindowFrame,
-  sameOrderKeys: (left: number, right: number) => boolean,
-  start: number,
-  end: number,
-  avgScale?: number,
-): void {
-  const size = end - start;
-  // Peer-group bounds per position; with no OVER ordering the whole partition is one peer group.
-  const peerStart = new Array<number>(size).fill(0);
-  const peerEnd = new Array<number>(size).fill(size);
-  if (window.orderAliases.length > 0) {
-    let groupBegin = 0;
-    for (let position = 1; position <= size; position += 1) {
-      if (
-        position === size ||
-        !sameOrderKeys(indexes[start + groupBegin] ?? 0, indexes[start + position] ?? 0)
-      ) {
-        for (let member = groupBegin; member < position; member += 1) {
-          peerStart[member] = groupBegin;
-          peerEnd[member] = position;
-        }
-        groupBegin = position;
-      }
-    }
-  }
-  const values: unknown[] = [];
-  const sums = window.name === "SUM" || window.name === "AVG";
-  for (let position = 0; position < size; position += 1) {
-    const value =
-      window.argumentAlias === undefined
-        ? undefined
-        : (rows[indexes[start + position] ?? -1]?.[window.argumentAlias] ?? null);
-    values.push(value);
-  }
-  const exactSums = sums && values.some((value) => isExactNumeric(value));
-  const prefixNonNull = new Float64Array(size + 1);
-  const prefixSum = exactSums ? undefined : new Float64Array(size + 1);
-  const prefixExact = exactSums ? new Array<string>(size + 1) : undefined;
-  const exactZero = exactNumericValue(0);
-  if (exactZero === null) throw new Error("Exact NUMERIC zero disappeared");
-  if (prefixExact !== undefined) prefixExact[0] = exactZero;
-  for (let position = 0; position < size; position += 1) {
-    const value = values[position];
-    const nonNull = window.argumentAlias !== undefined && value !== null && value !== undefined;
-    prefixNonNull[position + 1] = (prefixNonNull[position] ?? 0) + (nonNull ? 1 : 0);
-    if (prefixExact !== undefined) {
-      if (nonNull && !isExactNumeric(value)) {
-        throw new TypeError("Exact NUMERIC window input mixed with an approximate number");
-      }
-      const previous = prefixExact[position] ?? exactZero;
-      const next = nonNull ? exactNumericBinary("+", previous, value) : previous;
-      if (next === null || next === undefined) throw new Error("Exact NUMERIC sum disappeared");
-      prefixExact[position + 1] = next;
-    } else if (prefixSum !== undefined) {
-      prefixSum[position + 1] = (prefixSum[position] ?? 0) + (sums && nonNull ? numeric(value) : 0);
-    }
-  }
-  // GROUPS frames count peer groups rather than rows, so each position needs its group's
-  // ordinal and the group boundaries to translate an offset back into row positions.
-  const groupOrdinal = new Array<number>(size).fill(0);
-  const groupStarts: number[] = [];
-  if (frame.unit === "groups") {
-    for (let position = 0; position < size; position += 1) {
-      if (position === 0 || peerStart[position] !== peerStart[position - 1]) {
-        groupStarts.push(peerStart[position] ?? position);
-      }
-      groupOrdinal[position] = groupStarts.length - 1;
-    }
-  }
-  const groupEdge = (ordinal: number, isStart: boolean): number => {
-    if (ordinal < 0) return isStart ? 0 : 0;
-    if (ordinal >= groupStarts.length) return size;
-    return isStart ? (groupStarts[ordinal] ?? 0) : (groupStarts[ordinal + 1] ?? size);
-  };
-  const bound = (edge: WindowFrameBound, position: number, isStart: boolean): number => {
-    switch (edge.kind) {
-      case "unbounded-preceding":
-        return 0;
-      case "unbounded-following":
-        return size;
-      case "preceding":
-        if (frame.unit === "groups") {
-          return groupEdge((groupOrdinal[position] ?? 0) - (edge.offset ?? 0), isStart);
-        }
-        return position - (edge.offset ?? 0) + (isStart ? 0 : 1);
-      case "following":
-        if (frame.unit === "groups") {
-          return groupEdge((groupOrdinal[position] ?? 0) + (edge.offset ?? 0), isStart);
-        }
-        return position + (edge.offset ?? 0) + (isStart ? 0 : 1);
-      case "current-row":
-        if (frame.unit === "range" || frame.unit === "groups") {
-          return (isStart ? peerStart[position] : peerEnd[position]) ?? position;
-        }
-        return position + (isStart ? 0 : 1);
-    }
-  };
-  /**
-   * The positions EXCLUDE removes from one frame: the current row, its whole peer group, or the
-   * peers other than the current row (T612).
-   */
-  const excluded = (position: number): { from: number; to: number; keepCurrent: boolean } => {
-    switch (frame.exclude) {
-      case "current-row":
-        return { from: position, to: position + 1, keepCurrent: false };
-      case "group":
-        return {
-          from: peerStart[position] ?? position,
-          to: peerEnd[position] ?? position + 1,
-          keepCurrent: false,
-        };
-      case "ties":
-        return {
-          from: peerStart[position] ?? position,
-          to: peerEnd[position] ?? position + 1,
-          keepCurrent: true,
-        };
-      default:
-        return { from: 0, to: 0, keepCurrent: true };
-    }
-  };
-  for (let position = 0; position < size; position += 1) {
-    const low = Math.max(0, Math.min(size, bound(frame.start, position, true)));
-    const high = Math.max(0, Math.min(size, bound(frame.end, position, false)));
-    let value: unknown;
-    if (frame.exclude !== undefined) {
-      const skip = excluded(position);
-      const members: number[] = [];
-      for (let member = low; member < high; member += 1) {
-        const dropped =
-          member >= skip.from && member < skip.to && !(skip.keepCurrent && member === position);
-        if (!dropped) members.push(member);
-      }
-      value = aggregateWindowMembers(window, values, members, avgScale);
-      const row = rows[indexes[start + position] ?? -1];
-      if (row !== undefined) row[window.alias] = asQueryValue(value);
-      continue;
-    }
-    if (high <= low) {
-      value = window.name === "COUNT" ? 0 : null;
-    } else if (window.name === "FIRST_VALUE") {
-      value = values[low] ?? null;
-    } else if (window.name === "NTH_VALUE") {
-      const position = low + (window.offset ?? 1) - 1;
-      value = position < high ? (values[position] ?? null) : null;
-    } else if (window.name === "LAST_VALUE") {
-      value = values[high - 1] ?? null;
-    } else if (window.name === "COUNT") {
-      value =
-        window.argumentAlias === undefined
-          ? high - low
-          : (prefixNonNull[high] ?? 0) - (prefixNonNull[low] ?? 0);
-    } else if (sums) {
-      const nonNull = (prefixNonNull[high] ?? 0) - (prefixNonNull[low] ?? 0);
-      if (nonNull === 0) {
-        value = null;
-      } else if (prefixExact !== undefined) {
-        const total = exactNumericBinary(
-          "-",
-          prefixExact[high] ?? exactZero,
-          prefixExact[low] ?? exactZero,
-        );
-        value = window.name === "SUM" ? total : exactNumericBinary("/", total, nonNull, avgScale);
-      } else {
-        const total = (prefixSum?.[high] ?? 0) - (prefixSum?.[low] ?? 0);
-        value = window.name === "SUM" ? total : total / nonNull;
-      }
-    } else {
-      let best: unknown;
-      for (let member = low; member < high; member += 1) {
-        const candidate = values[member];
-        if (candidate === null || candidate === undefined) continue;
-        if (
-          best === undefined ||
-          (window.name === "MIN"
-            ? compareValues(candidate, best) < 0
-            : compareValues(candidate, best) > 0)
-        ) {
-          best = candidate;
-        }
-      }
-      value = best ?? null;
-    }
-    const row = rows[indexes[start + position] ?? -1];
-    if (row !== undefined) row[window.alias] = asQueryValue(value);
-  }
-}
-
-/**
- * NTILE, PERCENT_RANK, and CUME_DIST over partition-sorted row indexes. NTILE deals rows into
- * `offset` buckets with the larger buckets first; PERCENT_RANK is (rank - 1) / (rows - 1) with a
- * lone row at 0; CUME_DIST is the fraction of partition rows at or before the current peer group.
- */
-function applyDistributionWindow(
-  rows: QueryRow[],
-  indexes: Uint32Array,
-  window: WindowSpec,
-  samePartition: (left: number, right: number) => boolean,
-  sameOrderKeys: (left: number, right: number) => boolean,
-): void {
-  let start = 0;
-  while (start < indexes.length) {
-    let end = start + 1;
-    while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
-      end += 1;
-    }
-    const size = end - start;
-    let groupBegin = 0;
-    const assign = (position: number, value: number): void => {
-      const row = rows[indexes[start + position] ?? -1];
-      if (row !== undefined) row[window.alias] = value;
-    };
-    for (let position = 1; position <= size; position += 1) {
-      if (
-        position === size ||
-        !sameOrderKeys(indexes[start + groupBegin] ?? 0, indexes[start + position] ?? 0)
-      ) {
-        for (let member = groupBegin; member < position; member += 1) {
-          if (window.name === "PERCENT_RANK") {
-            assign(member, size === 1 ? 0 : groupBegin / (size - 1));
-          } else if (window.name === "CUME_DIST") {
-            assign(member, position / size);
-          }
-        }
-        groupBegin = position;
-      }
-    }
-    if (window.name === "NTILE") {
-      const buckets = window.offset ?? 1;
-      const bucketSize = Math.floor(size / buckets);
-      const remainder = size % buckets;
-      let position = 0;
-      for (let bucket = 1; bucket <= buckets && position < size; bucket += 1) {
-        const width = bucketSize + (bucket <= remainder ? 1 : 0);
-        for (let member = 0; member < width && position < size; member += 1, position += 1) {
-          assign(position, bucket);
-        }
-      }
-    }
-    start = end;
-  }
-}
-
-/** Computes LAG/LEAD over partition-sorted row indexes: the argument value offset rows away. */
-function applyOffsetWindow(
-  rows: QueryRow[],
-  indexes: Uint32Array,
-  window: WindowSpec,
-  samePartition: (left: number, right: number) => boolean,
-): void {
-  const offset = window.offset ?? 1;
-  const fallback = window.fallback ?? null;
-  let start = 0;
-  while (start < indexes.length) {
-    let end = start + 1;
-    while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
-      end += 1;
-    }
-    for (let position = start; position < end; position += 1) {
-      const source = window.name === "LAG" ? position - offset : position + offset;
-      const row = rows[indexes[position] ?? -1];
-      if (row === undefined) continue;
-      if (source < start || source >= end) {
-        row[window.alias] = fallback;
-        continue;
-      }
-      const sourceRow = rows[indexes[source] ?? -1];
-      row[window.alias] =
-        window.argumentAlias === undefined ? fallback : (sourceRow?.[window.argumentAlias] ?? null);
-    }
-    start = end;
-  }
-}
-
 function containsDistinctCount(expression: Expression): boolean {
   if (expression.kind === "call" && expression.distinct === true) return true;
   return childExpressions(expression).some(containsDistinctCount);
@@ -5423,117 +5127,6 @@ function containsGrouping(expression: Expression): boolean {
 function containsFtsExpression(expression: Expression): boolean {
   if (expression.kind === "fts") return true;
   return childExpressions(expression).some(containsFtsExpression);
-}
-
-/**
- * Appends window-function columns to an executed inner-block result. Rows sort stably by the
- * hidden partition and ordering aliases with the same comparison semantics as ORDER BY;
- * ROW_NUMBER numbers rows per partition, RANK shares ranks across ordering ties with gaps, and
- * DENSE_RANK shares without gaps. Without OVER ordering every partition row is a peer.
- */
-export function applyWindowFunctions(
-  result: QueryResult,
-  windows: readonly WindowSpec[],
-  options: { copyRows?: boolean } = {},
-): QueryResult {
-  // The window aliases are written onto the rows. A result that may be shared — one a block
-  // cache also holds — is copied first; one computed for this call alone is written in place.
-  const rows = options.copyRows === false ? result.rows : result.rows.map((row) => ({ ...row }));
-  for (const window of windows) {
-    // Decorate before sorting: `comparable` was being re-run inside the comparator, so every
-    // key was converted O(n log n) times per alias instead of once per row. Precomputing the
-    // comparable value per row per alias makes the comparator pure array reads, and the
-    // partition/peer checks below read the same arrays.
-    const partitionKeys = window.partitionAliases.map((alias) =>
-      rows.map((row) => comparable(row[alias] ?? null)),
-    );
-    const orderKeys = window.orderAliases.map(({ alias }) =>
-      rows.map((row) => comparable(row[alias] ?? null)),
-    );
-    // A window sorts by partition then by its own ORDER BY, and then walks the result several
-    // times over — for peer groups, frame bounds, and the values themselves. Every one of those
-    // passes compares keys, so the terms are prepared once into comparison-ready columns rather
-    // than re-read and re-dispatched per comparison; see sort-keys.ts.
-    const partitionColumns = partitionKeys.map((keys) =>
-      buildSortKeyColumn(keys.length, (index) => keys[index]),
-    );
-    const orderColumns = orderKeys.map((keys) =>
-      buildSortKeyColumn(keys.length, (index) => keys[index]),
-    );
-    // The sort is stable, so arrival order breaks the remaining ties, which is what makes the
-    // walk deterministic.
-    const indexes = sortKeyIndexes(rows.length, [
-      ...partitionColumns.map((column) => ({ column, descending: false, nulls: undefined })),
-      ...orderColumns.map((column, index) => {
-        const term = window.orderAliases[index];
-        return { column, descending: term?.direction === "desc", nulls: term?.nulls };
-      }),
-    ]);
-    const samePartition = (left: number, right: number): boolean => {
-      for (const column of partitionColumns) {
-        if (column.compare(left, right) !== 0) return false;
-      }
-      return true;
-    };
-    const sameOrderKeys = (left: number, right: number): boolean => {
-      for (const column of orderColumns) {
-        if (column.compare(left, right) !== 0) return false;
-      }
-      return true;
-    };
-    if (window.name === "LAG" || window.name === "LEAD") {
-      applyOffsetWindow(rows, indexes, window, samePartition);
-      continue;
-    }
-    if (window.name === "NTILE" || window.name === "PERCENT_RANK" || window.name === "CUME_DIST") {
-      applyDistributionWindow(rows, indexes, window, samePartition, sameOrderKeys);
-      continue;
-    }
-    if (window.name !== "ROW_NUMBER" && window.name !== "RANK" && window.name !== "DENSE_RANK") {
-      // PostgreSQL computes a window AVG's quotient to at least the summed values' display
-      // scale; canonical NUMERIC values no longer carry it, so read the argument column's
-      // declared scale from the inner result the way the summed dscale would have carried it.
-      const argumentDomain =
-        window.name === "AVG" && window.argumentAlias !== undefined
-          ? result.columnDomains[result.columns.indexOf(window.argumentAlias)]
-          : undefined;
-      applyAggregateWindow(
-        rows,
-        indexes,
-        window,
-        samePartition,
-        sameOrderKeys,
-        argumentDomain?.kind === "numeric" ? argumentDomain.scale : undefined,
-      );
-      continue;
-    }
-    let rowNumber = 0;
-    let rank = 0;
-    let denseRank = 0;
-    for (const [position, index] of indexes.entries()) {
-      const previous = position > 0 ? indexes[position - 1] : undefined;
-      if (previous === undefined || !samePartition(previous, index)) {
-        rowNumber = 1;
-        rank = 1;
-        denseRank = 1;
-      } else {
-        rowNumber += 1;
-        if (!sameOrderKeys(previous, index)) {
-          rank = rowNumber;
-          denseRank += 1;
-        }
-      }
-      const row = rows[index];
-      if (row === undefined) continue;
-      row[window.alias] =
-        window.name === "ROW_NUMBER" ? rowNumber : window.name === "RANK" ? rank : denseRank;
-    }
-  }
-  return {
-    columns: [...result.columns, ...windows.map((window) => window.alias)],
-    columnDomains: [...result.columnDomains, ...windows.map(() => null)],
-    rows,
-  };
 }
 
 /** Executes each derived or set-operation source with the row reference. */
@@ -5620,7 +5213,7 @@ export function executeRowQuery(
   return externalizeQueryResult(executeRowQueryInternal(plan, cloneRowTables(tables, true)));
 }
 
-function executeRowQueryInternal(
+export function executeRowQueryInternal(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
   memory?: QueryMemoryContext,
@@ -6354,6 +5947,8 @@ function extractDatePart(field: string, value: unknown): number | null {
     throw new TypeError(`Unsupported EXTRACT field: ${field}`);
   }
   if (value === null || value === undefined) return null;
+  const domainPart = temporalDomainPart(normalized, value);
+  if (domainPart !== undefined) return domainPart;
   let milliseconds: number;
   if (value instanceof Date) milliseconds = dateMilliseconds(value);
   else {
@@ -6375,7 +5970,7 @@ function extractDatePart(field: string, value: unknown): number | null {
     case "minute":
       return Math.floor(timeOfDay / 60_000) % 60;
     case "second":
-      return Math.floor(timeOfDay / 1000) % 60;
+      return (timeOfDay % 60_000) / 1000;
     case "milliseconds":
       return timeOfDay % 60_000;
     case "microseconds":
@@ -6755,7 +6350,7 @@ export function isAggregateCall(
  * accepts `FLOOR(amount / 25) * 25` grouped by `FLOOR(amount / 25)` on exactly this rule.
  */
 function groupedExpression(expression: Expression, grouped: ReadonlySet<string>): boolean {
-  if (grouped.has(JSON.stringify(expression))) return true;
+  if (grouped.has(encodeQueryIdentity(expression))) return true;
   // A full-text node reads its row's searchable columns even when MATCH(*) lists none, so it
   // is only grouped when the GROUP BY names it outright.
   if (expression.kind === "column" || containsFtsExpression(expression)) return false;
@@ -6770,7 +6365,9 @@ function validateGrouping(plan: CompiledQuery): void {
   const grouped =
     plan.groupBy.length > 0 || plan.select.some((item) => hasAggregate(item.expression));
   if (!grouped) return;
-  const groupExpressions = new Set(plan.groupBy.map((expression) => JSON.stringify(expression)));
+  const groupExpressions = new Set(
+    plan.groupBy.map((expression) => encodeQueryIdentity(expression)),
+  );
   for (const item of plan.select) {
     if (hasAggregate(item.expression)) continue;
     // A constant expression is the same for every group, as PostgreSQL allows. A full-text
@@ -8829,7 +8426,7 @@ class Parser {
           : parts.select.find(
               (item) =>
                 item.expression.kind !== "wildcard" &&
-                JSON.stringify(item.expression) === JSON.stringify(expression),
+                encodeQueryIdentity(item.expression) === encodeQueryIdentity(expression),
             );
       let alias = output?.alias;
       if (alias === undefined) {
@@ -9350,6 +8947,67 @@ class Parser {
       // Two row-producing sources the executors have no operator for; both parse far enough to
       // say so, rather than failing on the punctuation that follows.
       const upper = table.toUpperCase();
+      if (upper === "UNNEST") {
+        this.#expectPunctuation("(");
+        const array = this.#expression();
+        this.#expectPunctuation(")");
+        if (array.kind !== "call" || array.name !== "ARRAY")
+          throw new TypeError("UNNEST currently requires an ARRAY constructor");
+        if (
+          array.arguments.some(
+            (argument) =>
+              expressionColumns(argument).length > 0 ||
+              hasAggregate(argument) ||
+              containsWindow(argument),
+          )
+        )
+          throw new TypeError("UNNEST ARRAY members cannot refer to table rows");
+        let ordinality = false;
+        if (this.#isKeyword("WITH")) {
+          this.#keyword("WITH");
+          this.#keyword("ORDINALITY");
+          ordinality = true;
+        }
+        const alias = this.#sourceAlias() ?? "unnest";
+        const blocks = (
+          array.arguments.length === 0
+            ? [{ kind: "literal", value: null } satisfies Expression]
+            : array.arguments
+        ).map((expression, index): CompiledQuery => ({
+          sql: "(unnest row)",
+          base: { table: DUAL_TABLE, alias: DUAL_TABLE },
+          joins: [],
+          select: [
+            { expression, alias },
+            ...(ordinality
+              ? [
+                  {
+                    expression: { kind: "literal" as const, value: index + 1 },
+                    alias: "ordinality",
+                  },
+                ]
+              : []),
+          ],
+          predicates: [],
+          groupBy: [],
+          having: [],
+          orderBy: [],
+          ...(array.arguments.length === 0 ? { limit: 0 } : {}),
+        }));
+        const derived =
+          blocks.length === 1
+            ? blocks[0]
+            : compoundSelectBlock(
+                "(unnest)",
+                blocks,
+                blocks.slice(1).map(() => "union all"),
+                { orderBy: [] },
+                this.nextDerivedSequence,
+              );
+        if (derived === undefined) throw new TypeError("UNNEST requires an ARRAY constructor");
+        if (this.#punctuation("(")) this.#applyColumnAliases(derived);
+        return this.#derivedSource(derived, alias);
+      }
       if (upper === "JSON_TABLE") {
         this.#expectPunctuation("(");
         const document = this.#expression();
@@ -9853,8 +9511,8 @@ class Parser {
       if (this.#isKeyword("ESCAPE")) {
         this.#keyword("ESCAPE");
         const token = this.#take("string");
-        if (Array.from(token.text).length !== 1) {
-          throw new TypeError("LIKE ESCAPE takes a single character");
+        if (Array.from(token.text).length > 1) {
+          throw new TypeError("LIKE ESCAPE takes at most one character");
         }
         escape = token.text;
       }
@@ -9933,7 +9591,11 @@ class Parser {
       // A bracket after a complete expression is PostgreSQL's array subscript, which has no
       // other reading in this grammar — name the missing feature instead of "Expected eof".
       if (operator === "[") {
-        throw new TypeError("Array subscripts are not supported");
+        this.#index += 1;
+        const index = this.#expression();
+        this.#expectPunctuation("]");
+        left = { kind: "call", name: "MINNOW_ARRAY_AT", arguments: [left, index] };
+        continue;
       }
       // || and the JSON arrows share PostgreSQL's loosest "any other operator" level, applying
       // left-to-right to whole arithmetic terms: `'a' || d ->> 'k'` is `('a' || d) ->> 'k'`.
@@ -10522,6 +10184,9 @@ class Parser {
       if (
         name === "MINNOW_TUPLE_KEY" ||
         name === "MINNOW_COLLATE" ||
+        name === "MINNOW_ARRAY_AT" ||
+        name === "MINNOW_ARRAY_FROM_JSON" ||
+        name === "MINNOW_ARRAY_ELEMENT" ||
         name === "MINNOW_SINGLE_VALUE" ||
         name === "MINNOW_JSON_GET" ||
         name === "MINNOW_JSON_GET_TEXT" ||
@@ -10730,13 +10395,19 @@ class Parser {
           ...(frame === undefined ? {} : { frame }),
         };
       }
-      return {
+      if (upper === "ARRAY_AGG" && args[0] !== undefined) {
+        args[0] = { kind: "call", name: "MINNOW_ARRAY_ELEMENT", arguments: [args[0]] };
+      }
+      const call: Expression = {
         kind: "call",
         name,
         arguments: args,
         ...(distinct ? { distinct: true } : {}),
         ...(aggregateOrderBy === undefined ? {} : { aggregateOrderBy }),
       };
+      return upper === "ARRAY_AGG"
+        ? { kind: "call", name: "MINNOW_ARRAY_FROM_JSON", arguments: [call] }
+        : call;
     }
     let reference = identifier;
     if (this.#punctuation(".")) {
@@ -10928,6 +10599,12 @@ class Parser {
       if (unit === "groups" && orderBy.length === 0) {
         throw new TypeError("GROUPS frames require ORDER BY inside OVER (...)");
       }
+      if (
+        unit === "range" &&
+        (start.offset !== undefined || end.offset !== undefined) &&
+        orderBy.length !== 1
+      )
+        throw new TypeError("Offset RANGE frames require exactly one ORDER BY expression");
       let exclude: WindowFrameExclusion | undefined;
       if (this.#isKeyword("EXCLUDE")) {
         this.#keyword("EXCLUDE");
@@ -10974,11 +10651,10 @@ class Parser {
       return { kind: "current-row" };
     }
     const offset = Number(this.#take("number").text);
-    if (!Number.isInteger(offset) || offset < 0) {
-      throw new TypeError("Window frame offsets must be non-negative integers");
-    }
-    if (unit === "range") {
-      throw new TypeError("RANGE frames take only UNBOUNDED and CURRENT ROW bounds; use ROWS");
+    if (!Number.isFinite(offset) || offset < 0 || (unit !== "range" && !Number.isInteger(offset))) {
+      throw new TypeError(
+        "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
+      );
     }
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
@@ -11101,7 +10777,7 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
       }
     }
   }
-  const signatureOf = (expression: Expression): string => JSON.stringify(expression);
+  const signatureOf = (expression: Expression): string => encodeQueryIdentity(expression);
   const universe = new Set(sets.flat().map(signatureOf));
   const members = sets.map((set) => {
     const setSignatures = new Set(set.map(signatureOf));
@@ -11455,6 +11131,139 @@ export function unifyPlanGroupedReferences(
  * carries the joined source's unmatched rows. Sound because an equality join key never matches
  * NULL, so "base side IS NULL" identifies exactly the null-extended rows.
  */
+/** Materialize joined columns first so grouping, DISTINCT, windows, and filters compose. */
+function desugarComposedFullJoin(
+  parts: SelectBlockParts,
+  join: JoinPlan,
+  nextSequence: () => number,
+): CompiledQuery {
+  const marker = `(full marker ${String(nextSequence())})`;
+  const plain = {
+    sql: parts.sql,
+    distinct: false,
+    predicates: [],
+    groupBy: [],
+    having: [],
+    orderBy: [],
+  };
+  const marked = derivedTableSource(
+    assembleSelectBlock(
+      {
+        ...plain,
+        base: parts.base,
+        joins: [],
+        select: [
+          { expression: { kind: "wildcard", table: parts.base.alias }, alias: "*" },
+          { expression: { kind: "literal", value: 1 }, alias: marker },
+        ],
+      },
+      nextSequence,
+    ),
+    parts.base.alias,
+    nextSequence,
+  );
+  const columns = new Map<string, string>();
+  const gather = (expression: Expression): void => {
+    if (expression.kind === "column" && !columns.has(expression.reference))
+      columns.set(expression.reference, `(full column ${String(columns.size)})`);
+    for (const child of childExpressions(expression)) gather(child);
+  };
+  for (const item of parts.select) gather(item.expression);
+  for (const expression of parts.groupBy) gather(expression);
+  for (const set of parts.groupingSets ?? []) for (const expression of set) gather(expression);
+  for (const predicate of [...parts.predicates, ...parts.having]) {
+    gather(predicate.left);
+    gather(predicate.right);
+  }
+  const outputs = new Set(parts.select.map((item) => item.alias));
+  for (const order of parts.orderBy)
+    if (order.expression.kind !== "column" || !outputs.has(order.expression.reference))
+      gather(order.expression);
+  const select: SelectItem[] = [...columns].map(([reference, alias]) => ({
+    expression: { kind: "column", reference },
+    alias,
+  }));
+  if (select.length === 0)
+    select.push({ expression: { kind: "literal", value: 1 }, alias: "(full row)" });
+  const { full, kind, left, right, on, ...rightSource } = join;
+  void full;
+  void kind;
+  const matched = assembleSelectBlock(
+    {
+      ...plain,
+      base: marked,
+      joins: [{ ...rightSource, kind: "left", left, right, ...(on === undefined ? {} : { on }) }],
+      select,
+    },
+    nextSequence,
+  );
+  const unmatched = assembleSelectBlock(
+    {
+      ...plain,
+      base: rightSource,
+      joins: [{ ...marked, kind: "left", left, right, ...(on === undefined ? {} : { on }) }],
+      select,
+      predicates: [
+        {
+          left: { kind: "column", reference: `${marked.alias}.${marker}` },
+          operator: "IS NULL",
+          right: { kind: "literal", value: null },
+        },
+      ],
+    },
+    nextSequence,
+  );
+  const combined = compoundSelectBlock(
+    parts.sql,
+    [matched, unmatched],
+    ["union all"],
+    { orderBy: [] },
+    nextSequence,
+  );
+  const source = derivedTableSource(
+    combined,
+    `(full result ${String(nextSequence())})`,
+    nextSequence,
+  );
+  const rewrite = (expression: Expression): Expression => {
+    if (expression.kind === "column") {
+      const column = columns.get(expression.reference);
+      if (column !== undefined) return { kind: "column", reference: `${source.alias}.${column}` };
+    }
+    return mapChildExpressions(expression, rewrite);
+  };
+  return assembleSelectBlock(
+    {
+      ...parts,
+      base: source,
+      joins: [],
+      select: parts.select.map((item) => ({ ...item, expression: rewrite(item.expression) })),
+      predicates: parts.predicates.map((predicate) => ({
+        ...predicate,
+        left: rewrite(predicate.left),
+        right: rewrite(predicate.right),
+      })),
+      groupBy: parts.groupBy.map(rewrite),
+      having: parts.having.map((predicate) => ({
+        ...predicate,
+        left: rewrite(predicate.left),
+        right: rewrite(predicate.right),
+      })),
+      orderBy: parts.orderBy.map((order) => ({
+        ...order,
+        expression:
+          order.expression.kind === "column" && outputs.has(order.expression.reference)
+            ? order.expression
+            : rewrite(order.expression),
+      })),
+      ...(parts.groupingSets === undefined
+        ? {}
+        : { groupingSets: parts.groupingSets.map((set) => set.map(rewrite)) }),
+    },
+    nextSequence,
+  );
+}
+
 function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
   const join = parts.joins[0];
   if (parts.joins.length !== 1 || join?.full !== true) {
@@ -11469,12 +11278,10 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
     parts.distinct ||
     parts.select.some((item) => hasAggregate(item.expression) || containsWindow(item.expression))
   ) {
-    throw new TypeError(
-      "FULL JOIN cannot be combined with grouping, DISTINCT, or window functions yet",
-    );
+    return desugarComposedFullJoin(parts, join, nextSequence);
   }
   if (join.on !== undefined) {
-    throw new TypeError("FULL JOIN requires a single equality ON condition");
+    return desugarComposedFullJoin(parts, join, nextSequence);
   }
   // The UNION ALL this desugars into resolves ORDER BY against the compound's output columns,
   // where the branches' table aliases no longer exist. Qualified references that name a select
@@ -11554,9 +11361,6 @@ export function assembleSelectBlock(
   nextSequence: () => number,
 ): CompiledQuery {
   if (parts.select.some((item) => item.expression.kind === "wildcard")) {
-    if (parts.joins.some((join) => join.full === true)) {
-      throw new TypeError("FULL JOIN cannot be combined with SELECT *");
-    }
     // A wildcard's width and names come from source schemas, but ordinals, hidden ORDER BY
     // columns, DISTINCT grouping, windows, grouping sets, and FULL JOIN lowering all depend on
     // that width. Preserve the raw block until schema binding instead of teaching each lowering
@@ -12383,9 +12187,6 @@ function assembleOrderByExpressionBlock(
   }
   for (const order of parts.orderBy) {
     if (!orderNeedsHiddenColumn(order.expression, parts)) continue;
-    if (containsWindow(order.expression)) {
-      throw new TypeError("Window functions are only allowed in the select list");
-    }
     // A bare literal is almost always a SQL ordinal (ORDER BY 2); sorting by a constant would
     // silently do nothing. Valid ordinals have already resolved; a remaining literal is invalid.
     if (order.expression.kind === "literal") {
@@ -12393,12 +12194,12 @@ function assembleOrderByExpressionBlock(
     }
   }
   const selectSignatures = new Map(
-    parts.select.map((item) => [JSON.stringify(item.expression), item.alias] as const),
+    parts.select.map((item) => [encodeQueryIdentity(item.expression), item.alias] as const),
   );
   const hiddenItems: SelectItem[] = [];
   const rewrittenOrder = parts.orderBy.map((order) => {
     if (!orderNeedsHiddenColumn(order.expression, parts)) return order;
-    const existingAlias = selectSignatures.get(JSON.stringify(order.expression));
+    const existingAlias = selectSignatures.get(encodeQueryIdentity(order.expression));
     if (existingAlias !== undefined) {
       return {
         ...order,
@@ -12688,7 +12489,7 @@ function desugarWindows(
   nextSequence: () => number,
 ): CompiledQuery {
   const grouped = groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
-  const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
+  const groupExpressions = new Set(groupBy.map((expression) => encodeQueryIdentity(expression)));
   /**
    * What a window may read once the rows it sees are groups: an aggregate over the group, a
    * GROUP BY expression, or a constant — the same rule the select list itself follows.
@@ -12696,7 +12497,7 @@ function desugarWindows(
   const readableWhenGrouped = (expression: Expression): boolean =>
     hasAggregate(expression) ||
     expressionColumns(expression).length === 0 ||
-    groupExpressions.has(JSON.stringify(expression));
+    groupExpressions.has(encodeQueryIdentity(expression));
   const internalAliases = select.map((item, index) =>
     item.alias.includes(".") ? `(window visible ${String(index + 1)})` : item.alias,
   );
@@ -12707,12 +12508,20 @@ function desugarWindows(
   );
   const windows: WindowSpec[] = [];
   let hidden = 0;
+  const hiddenExpressions = new Map<string, string>();
+  const repeatable = (expression: Expression): boolean =>
+    !(expression.kind === "call" && volatileScalarFunctionNames.has(expression.name)) &&
+    childExpressions(expression).every(repeatable);
 
   /** A name for one more column the inner block computes for the wrapper to read back. */
   const hide = (expression: Expression): string => {
+    const key = repeatable(expression) ? encodeQueryIdentity(expression) : undefined;
+    const existing = key === undefined ? undefined : hiddenExpressions.get(key);
+    if (existing !== undefined) return existing;
     hidden += 1;
     const alias = `(window ${String(hidden)})`;
     innerSelect.push({ expression, alias });
+    if (key !== undefined) hiddenExpressions.set(key, alias);
     return alias;
   };
 

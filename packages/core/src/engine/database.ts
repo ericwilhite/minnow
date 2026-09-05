@@ -1,3 +1,6 @@
+import { LiveAggregate } from "./live-aggregate.js";
+import { QueryGenerations } from "./query-generations.js";
+import { applyWindowFunctionsAsync } from "./windows.js";
 import { crossJoinPlan } from "../plan/model.js";
 import {
   definedVectors,
@@ -185,7 +188,6 @@ import {
   type TransactionCheckpoint,
 } from "../transactions/index.js";
 import {
-  applyWindowFunctions,
   bindPendingSelectShapes,
   bindPlanParameters,
   bindStatementParameters,
@@ -211,6 +213,7 @@ import {
   isDefaultInsertValue,
   referencedColumns,
   childExpressions,
+  mapChildExpressions,
   expandFtsColumns,
   expandNaturalJoins,
   expandSourceColumnAliases,
@@ -2092,6 +2095,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
   readonly #liveProofContexts = new Map<string, Promise<LiveProofContext>>();
   readonly #artifactCache: ArtifactCache;
+  readonly #queryGenerations: QueryGenerations;
   /** Finite default applied before every engine query path; MAX_SAFE is explicit unbounded mode. */
   readonly #queryExecutionMemoryBudgetBytes: number;
   readonly #ftsAutoIndexRows: number;
@@ -2257,6 +2261,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) {
       throw new RangeError("Transaction owner lease lifetime must be a positive whole number");
     }
+    this.#queryGenerations = new QueryGenerations((after, limit) =>
+      this.store.listManifestPage(after, limit),
+    );
     this.#artifactCache = new ArtifactCache(options.bufferPoolBytes ?? 64 * 1024 * 1024);
     const queryBudget = options.executionMemoryBudgetBytes;
     this.#queryExecutionMemoryBudgetBytes =
@@ -5311,6 +5318,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             memberSchema.forEach((column, index) => {
               const expected = schema?.[index];
               if (expected === undefined) return;
+              if (column.unknown === true) return;
+              if (expected.unknown === true) {
+                schema = schema?.map((entry, position) =>
+                  position === index ? { ...column, name: entry.name } : entry,
+                );
+                return;
+              }
               if (
                 column.type === expected.type &&
                 column.sqlDomain?.kind === "numeric" &&
@@ -5356,7 +5370,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const columnarKey =
           innerKey === undefined
             ? undefined
-            : `ctw|${JSON.stringify(source.windowed.windows)}|${innerKey}`;
+            : `ctw|${planMemoKey(source.windowed.windows)}|${innerKey}`;
         if (columnarKey !== undefined) {
           const hit = this.#cacheGet(columnarKey) as
             { table: ColumnarTable; schema: SqlColumnSchema[] } | undefined;
@@ -5379,8 +5393,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           spillPageRows,
           signal,
         );
-        const windowed = applyWindowFunctions(inner, source.windowed.windows, {
+        const windowed = await applyWindowFunctionsAsync(inner, source.windowed.windows, {
           copyRows: cacheResults,
+          memoryContext: memory,
+          ...(signal === undefined ? {} : { signal }),
         });
         const schema = [
           ...innerSchema,
@@ -5694,7 +5710,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /**
    * The result memo: a pure cache over the freshness probe, keyed by the statement and the
-   * catalog epoch it was answered at. The probe read before execution is handed down to the
+   * structural catalog epoch and dependency-table generations it was answered at. The probe read before execution is handed down to the
    * execution itself — the view lookup and the catalog state would otherwise each probe again,
    * and on IndexedDB every probe is a read transaction, a floor under every small query.
    */
@@ -5712,8 +5728,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // below still guards the cache, since a commit may have landed since either read.
     before ??= await probe();
     throwIfAborted(options.signal);
-    const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
-      QueryResult | undefined;
+    const dependencyKey = `deps ${String(before.schemaEpoch)} ${key}`;
+    let dependencies = this.#cacheGet(dependencyKey) as string[] | undefined;
+    if (dependencies === undefined) {
+      const rewritten = await this.#applyCatalogRewrites(plan, before);
+      dependencies = [...(await this.#findRealBlockTables(rewritten)).values()]
+        .map((table) => table.id)
+        .sort();
+      this.#cachePut(
+        dependencyKey,
+        dependencies,
+        64 + dependencies.reduce((bytes, id) => bytes + id.length * 2 + 16, 0),
+      );
+    }
+    const generation = await this.#queryGenerations.key(dependencies, before.manifestVersion);
+    const resultKey = `${key}\u0001${String(before.schemaEpoch)}\u0001${generation}`;
+    const cached = this.#cacheGet(resultKey) as QueryResult | undefined;
     if (cached !== undefined) {
       options.onStats?.({ peakMemoryBytes: 0 });
       return copyQueryResult(cached);
@@ -5728,11 +5758,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const after = await probe();
       throwIfAborted(options.signal);
       if (after.catalogEpoch === before.catalogEpoch) {
-        this.#cachePut(
-          `${key}\u0001${String(before.catalogEpoch)}`,
-          copyQueryResult(result),
-          bytes,
-        );
+        this.#cachePut(resultKey, copyQueryResult(result), bytes);
       }
     }
     return result;
@@ -5864,7 +5890,43 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (plan.base.table !== DUAL_TABLE || plan.joins.length > 0) {
       throw new TypeError("NEXTVAL and CURRVAL currently require a SELECT without FROM");
     }
-    const resolved = structuredClone(plan);
+    const resolved = resolveStatementDatetimes(structuredClone(plan), this.#now());
+    const evaluate = (expression: Expression): QueryValue =>
+      evaluateRowExpression(expression, DUAL_TABLE, {});
+    const literal = (value: QueryValue): Expression => ({
+      kind: "literal",
+      value,
+      internalSqlValue: true,
+    });
+    const omitted = resolved.limit === 0;
+    const matches =
+      !omitted &&
+      resolved.predicates.every(
+        (predicate) => evaluate({ kind: "condition", ...predicate }) === true,
+      );
+    // Freeze the single synthetic row's filter: volatile predicates must be evaluated once.
+    if (!omitted)
+      resolved.predicates = matches
+        ? []
+        : [
+            {
+              left: literal(false),
+              operator: "=",
+              right: literal(true),
+            },
+          ];
+    const discarded = !matches;
+    if (discarded) {
+      // No output row demands these expressions. Keep their numeric type without reading or
+      // advancing sequence state, and preserve the original row filter/limit.
+      const omit = (expression: Expression): Expression => {
+        if (expression.kind === "call" && sequenceFunctionNames.has(expression.name))
+          return literal(0);
+        return mapChildExpressions(expression, omit);
+      };
+      for (const item of resolved.select) item.expression = omit(item.expression);
+      return resolved;
+    }
     const rewrite = async (expression: Expression): Promise<Expression> => {
       if (
         expression.kind === "call" &&
@@ -5898,6 +5960,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         this.#sequenceCurrValues.set(name, value);
         return { kind: "literal", value };
       }
+      if (expression.kind === "case") {
+        for (const branch of expression.branches) {
+          if (evaluate(await rewrite(branch.when)) === true) return rewrite(branch.then);
+        }
+        return expression.otherwise === undefined ? literal(null) : rewrite(expression.otherwise);
+      }
+      if (expression.kind === "call" && expression.name === "COALESCE") {
+        for (const argument of expression.arguments) {
+          const value = evaluate(await rewrite(argument));
+          if (value !== null) return literal(value);
+        }
+        return literal(null);
+      }
       if (
         expression.kind === "binary" ||
         expression.kind === "condition" ||
@@ -5917,13 +5992,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       } else if (expression.kind === "not") {
         expression.operand = await rewrite(expression.operand);
-      } else if (expression.kind === "case") {
-        for (const branch of expression.branches) {
-          branch.when = await rewrite(branch.when);
-          branch.then = await rewrite(branch.then);
-        }
-        if (expression.otherwise !== undefined)
-          expression.otherwise = await rewrite(expression.otherwise);
       }
       return expression;
     };
@@ -6733,7 +6801,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<QueryResult> {
     if (context === undefined) {
       if (typeof query === "string") return this.query(query);
-      if (query.kind === "typed-query") return this.#queryCompiled(query.plan);
+      if (query.kind === "typed-query")
+        return externalizeQueryResult(
+          await this.#withReadReservation(() => this.#queryCompiled(query.plan)),
+        );
       return this.query(query.sql, { params: query.params });
     }
     const { probe, memoize } = context;
@@ -6743,17 +6814,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         plan.usesStatementDatetime !== true &&
         plan.usesVolatileFunctions !== true &&
         plan.usesSequenceCalls !== true;
-      return this.#withReadReservation(() =>
-        memoizable
-          ? this.#memoizedQuery(
-              plan,
-              `typed ${planMemoKey(plan)}`,
-              {},
-              this.store.getCatalogProbe.bind(this.store),
-              probe,
-              memoize,
-            )
-          : this.#queryCompiled(plan, {}, probe),
+      return externalizeQueryResult(
+        await this.#withReadReservation(() =>
+          memoizable
+            ? this.#memoizedQuery(
+                plan,
+                `typed ${planMemoKey(plan)}`,
+                {},
+                this.store.getCatalogProbe.bind(this.store),
+                probe,
+                memoize,
+              )
+            : this.#queryCompiled(plan, {}, probe),
+        ),
       );
     }
     if (typeof query === "string") return this.#queryWithReadReservation(query, {}, probe, memoize);
@@ -6786,15 +6859,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const plan = await this.#applyCatalogRewrites(compiled, probe);
     const base = plan.base;
     if (
-      plan.joins.length > 0 ||
+      base.table === DUAL_TABLE ||
       base.derived !== undefined ||
       base.union !== undefined ||
       base.recursive !== undefined ||
       base.windowed !== undefined ||
       plan.pendingSelectShape !== undefined ||
       plan.distinctWildcard === true ||
-      plan.groupBy.length > 0 ||
-      plan.having.length > 0 ||
       plan.limitParameter !== undefined ||
       plan.offsetParameter !== undefined ||
       planReadsBeyondSingleScan(plan) ||
@@ -6802,6 +6873,56 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) {
       return undefined;
     }
+    if (plan.joins.length > 0) {
+      // A unique lookup contributes at most one row per base key. Changes on the lookup side
+      // still execute in full; base-only changes can reuse the ordinary changed-key patch.
+      const join = plan.joins[0];
+      if (
+        plan.joins.length !== 1 ||
+        join === undefined ||
+        !["inner", "left"].includes(join.kind) ||
+        join.on !== undefined ||
+        join.derived !== undefined ||
+        join.union !== undefined ||
+        join.windowed !== undefined ||
+        join.recursive !== undefined
+      )
+        return undefined;
+      const lookup = await this.#findTable(join.table);
+      const lookupKey = getUniqueKeyColumn(lookup);
+      if (lookupKey === undefined || lookupKey.sqlDomain !== undefined) return undefined;
+      const lookupReference = `${join.alias}.${lookupKey.name}`;
+      const joinedKey = [join.left, join.right].find(
+        (expression) => expression.kind === "column" && expression.reference === lookupReference,
+      );
+      if (joinedKey === undefined) return undefined;
+    }
+    const table = await this.#findTable(base.table);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined || keyColumn.hidden === true || keyColumn.sqlDomain !== undefined)
+      return undefined;
+    const aggregate = LiveAggregate.plan(plan, `${base.alias}.${keyColumn.name}`);
+    if (aggregate !== undefined)
+      return {
+        tableId: table.id,
+        keyColumnId: keyColumn.id,
+        qualifiedKey: `${base.alias}.${keyColumn.name}`,
+        fullPlan: aggregate.inputPlan,
+        deltaPlan: aggregate.inputPlan,
+        publicColumns: plan.select.map((item) => item.alias),
+        columnDomains: [],
+        orderTerms: [],
+        limit: undefined,
+        offset: 0,
+        margin: 0,
+        complete: true,
+        rows: [],
+        keys: [],
+        positions: new Map(),
+        order: [],
+        aggregate,
+      };
+    if (plan.groupBy.length > 0 || plan.having.length > 0) return undefined;
     const rowLocal = (expression: Expression): boolean => {
       if (
         expression.kind === "subquery" ||
@@ -6820,11 +6941,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return undefined;
     }
     if (!plan.orderBy.every((term) => rowLocal(term.expression))) return undefined;
-    const table = await this.#findTable(base.table);
-    const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined || keyColumn.hidden === true || keyColumn.sqlDomain !== undefined) {
-      return undefined;
-    }
     const publicColumns = plan.select.map((item) => item.alias);
     if (publicColumns.some((name) => name.startsWith(LIVE_HIDDEN_PREFIX))) return undefined;
     const fullPlan = clonePlanTree(plan);
@@ -6878,6 +6994,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       complete: true,
       rows: [],
       keys: [],
+      positions: new Map(),
       order: [],
     };
   }
@@ -6890,6 +7007,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const probe = context?.probe ?? (await this.store.getCatalogProbe());
     const state = await this.#liveMaintenancePlan(compiled, probe);
     if (state === undefined) return undefined;
+    if (state.aggregate !== undefined) {
+      try {
+        const input = await this.#withReadReservation(() =>
+          this.#queryCompiled(state.fullPlan, {}, probe),
+        );
+        const aggregate = state.aggregate.patch(input, new Set(), liveKeyToken);
+        return {
+          result: aggregate.result(),
+          state: { ...state, aggregate },
+          retainedBytes: aggregate.retainedBytes,
+        };
+      } catch {
+        return undefined;
+      }
+    }
     let executed: QueryResult;
     try {
       executed = externalizeQueryResult(
@@ -6945,12 +7077,44 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (changed === undefined) return undefined;
     const { changedKeys, existingKeys } = changed;
     if (changedKeys.size === 0) return { result: retained, state, changed: false };
+    if (state.aggregate !== undefined) {
+      const deltaPlan: CompiledQuery = {
+        ...state.deltaPlan,
+        predicates: [
+          ...state.deltaPlan.predicates,
+          {
+            left: { kind: "column", reference: state.qualifiedKey },
+            operator: "IN",
+            right: {
+              kind: "list",
+              items: [...changedKeys.values()].map((value) => ({ kind: "literal", value })),
+            },
+          },
+        ],
+      };
+      const input = await this.#withReadReservation(() =>
+        this.#queryCompiled(deltaPlan, {}, probe),
+      );
+      const aggregate = state.aggregate.patch(input, new Set(changedKeys.keys()), liveKeyToken);
+      const result = aggregate.result();
+      const changed =
+        result.rows.length !== retained.rows.length ||
+        result.rows.some((row, index) => {
+          const previous = retained.rows[index];
+          return previous === undefined || !sameLiveRow(previous, row, result.columns);
+        });
+      return {
+        result,
+        state: { ...state, aggregate },
+        retainedBytes: aggregate.retainedBytes,
+        changed,
+      };
+    }
     const affected = new Set<number>();
-    const retainedTokens = new Set<string>();
-    for (const [index, key] of state.keys.entries()) {
-      const token = liveKeyToken(key);
-      retainedTokens.add(token);
-      if (changedKeys.has(token)) affected.add(index);
+    const retainedTokens = state.positions;
+    for (const token of changedKeys.keys()) {
+      const index = retainedTokens.get(token);
+      if (index !== undefined) affected.add(index);
     }
     // A truncated window without an ordering has no edge to reason about: a member that
     // leaves is replaced by whichever row the executor reaches next.
@@ -9307,14 +9471,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     plan: CompiledQuery;
     __row?: TRow;
   }): Promise<TRow[]> {
-    const probe = this.store.getCatalogProbe.bind(this.store);
-    // The same memo a SQL query gets, keyed by the plan: a typed query is compiled once by the
-    // builder and run many times, and it used to re-execute on every run.
-    if (query.plan.usesStatementDatetime === true || query.plan.usesVolatileFunctions === true) {
-      return (await this.#queryCompiled(query.plan)).rows as TRow[];
-    }
-    return (await this.#memoizedQuery(query.plan, `typed ${planMemoKey(query.plan)}`, {}, probe))
-      .rows as TRow[];
+    await this.#settleExpiredStatementTransaction();
+    const open = this.#openTransaction;
+    const plan = query.plan;
+    const execute = async (): Promise<QueryResult> => {
+      const probe = this.store.getCatalogProbe.bind(this.store);
+      return plan.usesStatementDatetime === true ||
+        plan.usesVolatileFunctions === true ||
+        plan.usesSequenceCalls === true
+        ? this.#queryCompiled(plan)
+        : this.#memoizedQuery(plan, `typed ${planMemoKey(plan)}`, {}, probe);
+    };
+    const result =
+      open === undefined
+        ? await this.#withReadReservation(execute)
+        : await this.#duringTransaction(open, () => open.session.queryPlan(plan));
+    return externalizeQueryResult(result).rows as TRow[];
   }
 
   /**
@@ -13626,13 +13798,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (const name of collectRealTableNames(block).sort()) {
       const table = realTables.get(name);
       if (table === undefined) return undefined;
-      // A manifest version is an exact immutable database identity. It deliberately invalidates
-      // a table result after an unrelated-table commit: that small hit-rate cost keeps key work
-      // and retained characters independent of the table's segment count.
-      parts.push(`${table.id}=${String(snapshot.version ?? -1)}`);
+      parts.push(`${table.id}:${String(table.revision)}`);
     }
     try {
-      return `blk\u0000${parts.join(";")}\u0000${JSON.stringify(block)}`;
+      const ids = collectRealTableNames(block)
+        .sort()
+        .map((name) => realTables.get(name)?.id ?? name);
+      const generation = await this.#queryGenerations.key(ids, snapshot.version);
+      return `blk\u0000${parts.join(";")}\u0000${generation}\u0000${planMemoKey(block)}`;
     } catch {
       return undefined;
     }
@@ -22623,6 +22796,7 @@ interface LiveMaintenanceOrderTerm {
 
 /** Everything a live set hands back so a later commit can patch the result it retained. */
 interface LiveMaintenanceState {
+  readonly aggregate?: LiveAggregate;
   readonly tableId: string;
   readonly keyColumnId: string;
   readonly qualifiedKey: string;
@@ -22650,6 +22824,8 @@ interface LiveMaintenanceState {
   /** Every retained row — the visible ones first, then the margin — in result order. */
   readonly rows: readonly QueryRow[];
   readonly keys: readonly QueryValue[];
+  /** Key lookup avoids scanning and re-encoding retained keys for each small delta. */
+  readonly positions: ReadonlyMap<string, number>;
   /** One array per ORDER BY term, each holding that term's value for every retained row. */
   readonly order: ReadonlyArray<readonly QueryValue[]>;
 }
@@ -22728,6 +22904,18 @@ function liveMaintainedOutcome(
   previous: QueryResult | undefined,
   previousIndex?: Int32Array,
 ): LiveMaintainedChange {
+  const positions = new Map<string, number>();
+  let retainedBytes =
+    128 + planMemoKey(state.fullPlan).length * 2 + planMemoKey(state.deltaPlan).length * 2;
+  for (const [index, key] of state.keys.entries()) {
+    const token = liveKeyToken(key);
+    positions.set(token, index);
+    retainedBytes += 64 + token.length * 2;
+  }
+  for (const row of state.rows) retainedBytes += 48 + estimateValuesBytes(Object.values(row)) * 2;
+  for (const values of state.order)
+    retainedBytes += values.length * 8 + estimateValuesBytes(values) * 2;
+  state = { ...state, positions };
   const visibleCount =
     state.limit === undefined ? state.rows.length : Math.min(state.rows.length, state.limit);
   const visible = state.rows.slice(0, visibleCount);
@@ -22739,6 +22927,7 @@ function liveMaintainedOutcome(
         rows: visible,
       },
       state,
+      retainedBytes,
       changed: true,
     };
   }
@@ -22763,7 +22952,7 @@ function liveMaintainedOutcome(
       kept += 1;
     } else same = false;
   }
-  if (same) return { result: previous, state, changed: false };
+  if (same) return { result: previous, state, retainedBytes, changed: false };
   return {
     result: {
       columns: [...state.publicColumns],
@@ -22771,6 +22960,7 @@ function liveMaintainedOutcome(
       rows: visible,
     },
     state,
+    retainedBytes,
     changed: true,
     ...(kept > 0 ? { retained } : {}),
   };

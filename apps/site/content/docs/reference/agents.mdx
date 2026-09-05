@@ -197,11 +197,14 @@ machines: https://minnowdb.com/llms.txt
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
   unquoted identifiers, `SET`/`RESET`/`SHOW` session settings (accepted and ignored, except a
   non-UTC time zone), `FOR UPDATE` (ignored), and `E'…'`/`$$…$$` strings.
+- Array values use canonical JSON text. Scalar subscripts, ARRAY_AGG, and typed UNNEST over
+  ARRAY constructors are supported. Numeric RANGE offsets need one numeric ordering expression.
+  FULL JOIN supports grouping, DISTINCT, wildcards, and compound ON in its sole-join form.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
   inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
-  grouping/order/limit, correlated JSON_TABLE documents, arrays beyond a JSON-text literal (no
-  subscripts, `ANY`/`ALL` over array values, `ARRAY(SELECT …)`, `unnest`, `array_agg`,
-  `generate_series`), `||` on array or JSONB operands and the `#>`/`@>`/`?` operators,
+  grouping/order/limit, correlated JSON_TABLE documents, array slices and multidimensional access,
+  `ANY`/`ALL` over array values, `ARRAY(SELECT …)`, UNNEST outside ARRAY constructor sources,
+  `generate_series`, `||` on array or JSONB operands and the `#>`/`@>`/`?` operators,
   `jsonb_set`/`jsonb_typeof`/`json_object_agg`, `regexp_match` and the other array-returning
   regex functions, `ROW(…)` as a value, bit-string literals, interval-valued arithmetic such as
   interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `version()` and other
@@ -212,9 +215,8 @@ machines: https://minnowdb.com/llms.txt
   lists and materialized views, `setval`, domains, functions, `EXCLUDE` constraints, schemas,
   schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set
   aggregates, bitwise operators, `bytea`, enum evolution, sequence options, `RIGHT JOIN` or
-  `FULL JOIN` beside another join or combined with `SELECT *`, `FULL JOIN` without a single
-  equality `ON` or with grouping, `DISTINCT`, or window functions, numeric `RANGE` frame offsets
-  (use `ROWS`), `DISTINCT` window aggregates, window functions outside the select list, and
+  `FULL JOIN` beside another join, `RIGHT JOIN` combined with `SELECT *`, temporal interval
+  `RANGE` frame offsets, `DISTINCT` window aggregates, windows in WHERE/GROUP BY/HAVING, and
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.

@@ -104,3 +104,9 @@ many databases are open at once. Set the database-wide default with
 `new MinnowDatabase(store, { executionMemoryBudgetBytes })`; pass `null` there only when an
 application deliberately accepts unbounded execution memory. The same database default applies
 to mutation selection, triggers, subqueries, and read-your-writes scopes, not only public SELECTs.
+
+Window execution reserves result, sort, peer, and aggregate buffers against the query budget.
+Database window passes yield to allow cancellation. These working buffers currently require
+resident memory; they do not spill. Result memos use bounded dependency-table generations and a
+structural schema identity, so unrelated-table writes preserve warm results. Missing commit
+history invalidates the memo rather than guessing.

@@ -38,17 +38,19 @@ describe("diagnose", () => {
 
   it("appends what the matrix knows, when it knows something", () => {
     const sql =
-      "SELECT SUM(a) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t";
+      "SELECT SUM(a) OVER (ORDER BY a, b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t";
     const explain = (message: string): string | undefined =>
-      message.includes("RANGE") ? "Use ROWS frames for row distances." : undefined;
+      message.includes("RANGE")
+        ? "Use one ordering expression for a numeric RANGE offset."
+        : undefined;
     const [explained] = diagnose(sql, explain);
-    expect(explained?.message).toContain("RANGE frames take only UNBOUNDED and CURRENT ROW");
-    expect(explained?.message).toContain("Use ROWS frames for row distances.");
+    expect(explained?.message).toContain(
+      "Offset RANGE frames require exactly one ORDER BY expression",
+    );
+    expect(explained?.message).toContain("Use one ordering expression for a numeric RANGE offset.");
 
     // Nothing to add leaves the compiler's own message alone.
     const [plain] = diagnose(sql, () => undefined);
-    expect(plain?.message).toBe(
-      "RANGE frames take only UNBOUNDED and CURRENT ROW bounds; use ROWS",
-    );
+    expect(plain?.message).toBe("Offset RANGE frames require exactly one ORDER BY expression");
   });
 });

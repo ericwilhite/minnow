@@ -8,6 +8,55 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.8.0 — September 5, 2026
+
+Published packages: `@minnowdb/core@0.8.0`, `@minnowdb/kysely@0.4.11`,
+`@minnowdb/react@0.2.2`, and `@minnowdb/devtools@0.3.1`.
+
+Stored formats and the client/worker wire protocol are unchanged. No stored-data migration is
+needed. Deploy matching client and worker builds. Kysely requires this core release. Use the new
+core with React to receive the cold-loading fix; devtools recognizes the newly supported SQL forms.
+
+Migration: exact NUMERIC-to-integer casts round ties away from zero; floating-point casts keep
+ties-to-even rounding. Fractional and exponent text no longer casts directly to INTEGER.
+`DATE ± INTERVAL` now always returns a timestamp (`Date`), including whole-day intervals.
+JSONB and array comparisons use structural scalar ordering rather than encoded-string ordering.
+Live sets have a default 64 MiB modeled retained-byte limit; use `maxRetainedBytes` to configure it
+or bound a large subscription. Window working buffers count toward the query memory budget and
+fail explicitly if they do not fit; they do not spill.
+
+### Fixed
+
+- Typed `run()` reads staged transaction writes and savepoint rollbacks, returns public domain
+  values, distinguishes Date parameters from ISO strings, and never memoizes sequence calls.
+- Decoded live queries validate retained output values after arbitrary transformations and can
+  load through cold `refresh()`, including React Suspense. Mixed suppressing/raw observers all
+  receive their intended notifications; throwing error/completion callbacks cannot stop sweeps.
+- Window SUM/AVG no longer subtract rounded cumulative totals, preserving small single-row
+  frames after a large value. Sequence calls in unused CASE/COALESCE branches, filtered rows,
+  and LIMIT 0 do not run. OFFSET still evaluates skipped rows, matching PostgreSQL.
+- EXTRACT preserves fractional timestamp seconds and supports TIME/INTERVAL fields. NULL-only
+  compound members can take their type from another member.
+
+### Added and improved
+
+- Compatible windows share sorting and peer preparation. Prefix and whole-partition aggregates
+  accumulate in linear time. Range aggregate trees remove repeated
+  MIN/MAX and exclusion scans; asynchronous database window passes yield for cancellation.
+- Query and nested-block memos retain hits across unrelated-table commits, using bounded table
+  generations proved by contiguous durable history. Missing history invalidates conservatively.
+- Live sets index retained keys, report `retainedBytes`, enforce retained-byte limits, and expose
+  `subscribePatches()` for reset/changed-row delivery. Immutable snapshots and worker transfers
+  still carry whole results. Additive aggregates maintain exact NUMERIC and safely summable
+  integer contributions; unique lookup joins can patch base-table changes. Other shapes fall
+  back to full execution.
+- Sole FULL JOINs compose with grouping, DISTINCT, wildcards, windows, and compound ON predicates.
+  Window functions work in ORDER BY; numeric RANGE offsets require one numeric ordering term.
+- ARRAY_AGG supports ordering and DISTINCT, scalar array subscripts are one-based, and UNNEST
+  supports typed ARRAY constructors plus WITH ORDINALITY. Array slices, multidimensional access,
+  arbitrary/correlated UNNEST inputs, and ARRAY_AGG FILTER/window use remain unsupported.
+- Empty LIKE ESCAPE disables escaping; boolean text accepts PostgreSQL's unambiguous spellings.
+
 ## 0.7.10 — September 3, 2026
 
 Published packages: `@minnowdb/core@0.7.10` and `@minnowdb/kysely@0.4.10`.

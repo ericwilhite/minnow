@@ -105,20 +105,18 @@ describe("FULL JOIN", () => {
     ]);
   });
 
-  it("rejects unsupported combinations explicitly", () => {
-    expect(() =>
-      compileQuery("SELECT * FROM rows r FULL JOIN dims d ON d.region = r.region"),
-    ).toThrow("SELECT *");
-    expect(() =>
-      compileQuery(
+  it("composes wildcards, grouping, and compound ON predicates", () => {
+    expect(run("SELECT * FROM rows r FULL JOIN dims d ON d.region = r.region")).toHaveLength(4);
+    expect(
+      run(
         "SELECT r.region AS g, COUNT(*) AS c FROM rows r FULL JOIN dims d ON d.region = r.region GROUP BY r.region",
       ),
-    ).toThrow("grouping");
-    expect(() =>
-      compileQuery(
+    ).toHaveLength(3);
+    expect(
+      run(
         "SELECT r.id AS id FROM rows r FULL JOIN dims d ON d.region = r.region AND d.label = r.region",
       ),
-    ).toThrow("single equality");
+    ).toHaveLength(5);
   });
 });
 
@@ -152,9 +150,9 @@ describe("LAG/LEAD and frames", () => {
     );
     expect(() =>
       compileQuery(
-        "SELECT SUM(amount) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM rows",
+        "SELECT SUM(amount) OVER (ORDER BY id, amount RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM rows",
       ),
-    ).toThrow("use ROWS");
+    ).toThrow("exactly one ORDER BY");
     expect(() =>
       compileQuery(
         "SELECT SUM(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) AS s FROM rows",

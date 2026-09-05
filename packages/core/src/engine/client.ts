@@ -1,3 +1,4 @@
+import { createLiveQueryPatch, type LiveQueryPatchOptions } from "./live-patch.js";
 import {
   BlockReadBatchTooLargeError,
   CompactionBacklogError,
@@ -1339,6 +1340,19 @@ export class ClientLiveQuerySet {
       this.client._unrouteEvents(subscriptionId);
       throw error;
     }
+  }
+
+  /** Delivers changed row payloads; the worker transport still sends its result snapshot. */
+  subscribePatches(
+    query: LiveQueryInput,
+    options: LiveQueryPatchOptions,
+  ): Promise<ClientLiveSubscription> {
+    return this.subscribe(query, {
+      onChange: (result, delivery) =>
+        options.onPatch(createLiveQueryPatch(result, delivery), delivery),
+      ...(options.onError === undefined ? {} : { onError: options.onError.bind(options) }),
+      ...(options.onComplete === undefined ? {} : { onComplete: options.onComplete.bind(options) }),
+    });
   }
 
   /** Registers dependency observation while leaving execution/result mapping to an adapter. */

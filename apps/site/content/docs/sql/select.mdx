@@ -53,7 +53,8 @@ has no other session to lock rows against.
 Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
 tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double
 precision value cast to an integer type rounds to the nearest integer with ties to even, as
-PostgreSQL's cast does. `||` concatenates text, and a number, boolean, or timestamp on the other
+PostgreSQL's cast does. Exact `NUMERIC` values and decimal literals round ties away from zero;
+integer text must contain signed decimal digits, so `'1.5'::INTEGER` and `'1e2'::INTEGER` fail. `||` concatenates text, and a number, boolean, or timestamp on the other
 side renders as text: `'order-' || order_id`.
 
 The scalar function surface follows PostgreSQL: `CONCAT`, `CONCAT_WS`, `LEFT`, `RIGHT`,
@@ -117,9 +118,9 @@ treat the group as one side.
 
 `RIGHT JOIN` must be the only join in its block and cannot be combined with `SELECT *` — both
 rejections come with explicit errors, and the mirrored `LEFT JOIN` is always available. `FULL
-JOIN` has the same two limits plus two more: it needs an equality `ON` condition, and it does not
-yet combine with grouping, `DISTINCT`, or window functions in the same block. Put the `FULL JOIN`
-in a derived table and group or window in the outer block.
+JOIN` must also be the only join in its block. It supports wildcards, grouping, `DISTINCT`, window
+functions, and compound `ON` predicates. Operations over its result run after unmatched rows from
+both sides have been included.
 
 An `ON` clause that carries more than its equality still hashes on that equality — `ON b.order_id
 = a.order_id AND b.product_id > a.product_id` builds on the order and applies the rest to the
@@ -316,7 +317,9 @@ names before its step runs, which is how the step reads `month` back. `DATE '202
 zoneless calendar date returned as `YYYY-MM-DD`; `TIMESTAMP '2025-01-01 09:30:00'` is an instant
 read as UTC, the way every datetime in a Minnow database is stored. `INTERVAL '1 month'` added to
 or subtracted from either does calendar arithmetic, so 31 January plus a month is the end of
-February.
+February. `DATE ± INTERVAL` always returns a timestamp, including whole-day and zero intervals.
+`EXTRACT` reads fractional seconds from timestamps and reads the stored fields of `TIME` and
+`INTERVAL` without converting them to dates.
 
 ## Window functions
 
@@ -332,11 +335,17 @@ FROM orders
 
 `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`,
 `NTH_VALUE`, and the aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and
-explicit `ROWS` / `RANGE` frames. Four limits carry explicit errors: `RANGE` frames take only
-`UNBOUNDED` and `CURRENT ROW` bounds, so a numeric offset needs a `ROWS` frame; a window
-aggregate does not take `DISTINCT`; `SELECT DISTINCT` does not combine with window functions; and
-a window function runs only in the select list — to order by one, alias it there and `ORDER BY`
-the alias.
+explicit `ROWS`, `RANGE`, and `GROUPS` frames, including exclusions. Numeric `RANGE` offsets
+measure ordering-value distance and require exactly one numeric `ORDER BY` expression. Temporal
+interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
+select list and `ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
+
+Compatible windows share sorting and peer preparation. Prefix and whole-partition aggregates
+accumulate in linear time. Frame aggregates combine only values
+inside the frame, avoiding rounded prefix subtraction and repeated whole-frame scans. Window
+working buffers count toward the query memory budget, and long database window passes yield for
+cancellation. Window working buffers do not spill: raise the query budget or bound the input if
+these buffers exceed it.
 
 A window runs after `GROUP BY` and `HAVING`, matching PostgreSQL, so it ranks the groups
 rather than the rows behind them and its `OVER` clause reads the group's own aggregates — that is
