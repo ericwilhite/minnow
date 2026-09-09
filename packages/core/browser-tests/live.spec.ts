@@ -1,3 +1,4 @@
+import { requireWorkerOpfs } from "./fixtures.js";
 import { chromium, firefox, webkit, test as base, type BrowserContext } from "@playwright/test";
 
 const test = base.extend<{ context: BrowserContext }>({
@@ -18,6 +19,7 @@ for (const store of ["indexeddb", "opfs"] as const) {
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto("/packages/core/browser/live/");
     await page.locator("#ready").filter({ hasText: "Live-query benchmark ready" }).waitFor();
+    if (store === "opfs") await requireWorkerOpfs(page);
     const result = await page.evaluate(async (storeKind) => {
       const target = window as typeof window & {
         runLiveCorrectness(

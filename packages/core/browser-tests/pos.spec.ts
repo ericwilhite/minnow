@@ -1,7 +1,7 @@
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright evidence writer; never shipped.
 import { writeFile } from "node:fs/promises";
 import { expect } from "@playwright/test";
-import { test } from "./fixtures.js";
+import { requireWorkerOpfs, test } from "./fixtures.js";
 
 // Run alone with `npm run test:browser:pos`; time thresholds are regression guards for a
 // controlled machine, not product SLAs. Correctness assertions apply to every measured sale.
@@ -24,6 +24,7 @@ for (const kind of ["indexeddb", "opfs"] as const) {
         console.log(`${info.project.name}: ${message.text()}`);
     });
     await page.goto("/packages/core/browser/");
+    if (kind === "opfs") await requireWorkerOpfs(page);
     const result = await page
       .evaluate(
         async ({ kind, count }) => {

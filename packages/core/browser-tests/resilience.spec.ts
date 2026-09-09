@@ -1,5 +1,5 @@
 import { expect, chromium } from "@playwright/test";
-import { test } from "./fixtures.js";
+import { requireWorkerOpfs, test } from "./fixtures.js";
 
 for (const kind of ["indexeddb", "opfs"] as const) {
   test(`strict ${kind}: multi-tab admission, staged reads, and worker crash recovery`, async ({
@@ -14,12 +14,14 @@ for (const kind of ["indexeddb", "opfs"] as const) {
       first.goto("/packages/core/browser/"),
       second.goto("/packages/core/browser/"),
     ]);
+    if (kind === "opfs") await requireWorkerOpfs(first);
     const open = async (page: typeof first) =>
       page.evaluate(
         async ({ name, kind }) => {
           const url = "/packages/core/browser/resilience.ts";
           const scenario = (await import(url)) as typeof import("../browser/resilience.js");
-          await scenario.open(name, kind);
+          // This test queues 32 durable writes per client; deadlines are tested separately.
+          await scenario.open(name, kind, 30_000);
         },
         { name, kind },
       );
@@ -150,6 +152,7 @@ for (const kind of ["indexeddb", "opfs"] as const) {
       first.goto("/packages/core/browser/"),
       second.goto("/packages/core/browser/"),
     ]);
+    if (kind === "opfs") await requireWorkerOpfs(first);
     const open = (page: typeof first) =>
       page.evaluate(
         async ({ name, kind }) => {
@@ -260,6 +263,7 @@ for (const kind of ["indexeddb", "opfs"] as const) {
     if (first === undefined) throw new Error("Missing first tab");
     const name = `many-tabs-${crypto.randomUUID()}`;
     await Promise.all(pages.map((page) => page.goto("/packages/core/browser/")));
+    if (kind === "opfs") await requireWorkerOpfs(first);
     const open = (page: typeof first) =>
       page.evaluate(
         async ({ name, kind }) => {

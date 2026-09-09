@@ -438,3 +438,9 @@ bundled client must stay smaller after gzip. The report and test share the same 
 code. Existing per-entry byte budgets still catch smaller increases before SQLite parity is at
 risk. This guards compressed download size; it does not claim a smaller uncompressed bundle or
 prove that every possible behavior is regression-free.
+
+OPFS browser cases check for the storage API inside a dedicated worker before running. Some
+Linux WebKit builds expose it only in the page; those cases are skipped for that missing
+capability, while IndexedDB cases still run. Worker startup errors and probe timeouts remain
+failures. Contention correctness tests allow queued durable writes a 30-second RPC deadline;
+the separate timeout and sustained-latency tests retain their own limits.
