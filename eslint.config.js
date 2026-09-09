@@ -78,6 +78,7 @@ export default tseslint.config(
       "packages/core/src/engine/decorrelate.test.ts",
       "packages/core/src/engine/delta-scan.test.ts",
       "packages/core/src/engine/scan-kernels.test.ts",
+      "packages/core/src/engine/window-execution.test.ts",
       // Reads the test sources and the soak runner off disk to prove every recorded regression
       // seed is iterated by exactly one suite the soak explores.
       "packages/core/src/testing/seeds.test.ts",

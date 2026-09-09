@@ -537,7 +537,7 @@ it("joins a retired shared-lease removal before database close returns", async (
   store.close();
 });
 
-it("waits for an active snapshot scope and its lease removal before close returns", async () => {
+it("cancels an active snapshot scope and waits for lease removal before close returns", async () => {
   const store = new DelayedRetiredSharedLeaseStore();
   store.delayLeaseRemoval = true;
   const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
@@ -557,13 +557,14 @@ it("waits for an active snapshot scope and its lease removal before close return
   await scopeEntered;
   expect(await store.listLeases()).toHaveLength(1);
 
+  const rejected = expect(scoped).rejects.toThrow("Database is closed");
   const closing = database.close();
   await expect(
     Promise.race([closing.then(() => "closed"), Promise.resolve("pending")]),
   ).resolves.toBe("pending");
   finishScope();
   await store.leaseRemovalStarted;
-  await expect(scoped).resolves.toBe("finished");
+  await rejected;
   await expect(
     Promise.race([closing.then(() => "closed"), Promise.resolve("pending")]),
   ).resolves.toBe("pending");
@@ -978,7 +979,7 @@ for (const implementation of implementations()) {
       ]);
 
       await database.write(async (session) => {
-        // The second stage flushes the first bounded batch and makes an active owner plus its
+        // Overflowing the bounded artifact batch makes an active owner plus its
         // segments visible to catalog reads. A concurrent ordinary read still sees only the
         // committed snapshot, and caching that state must not hide those segments after commit.
         await session.insertBatch("mutation_visibility", [{ id: 4, n: 40 }]);
@@ -986,6 +987,10 @@ for (const implementation of implementations()) {
           keys: [1, 3],
           changes: { n: [3, 21] },
         });
+        // Keep the same logical values while forcing the pending artifacts into storage.
+        for (let stage = 0; stage < 32; stage += 1) {
+          await session.updateBatch("mutation_visibility", { keys: [1], changes: { n: [3] } });
+        }
         expect(
           (
             await database.query("SELECT id, n FROM mutation_visibility ORDER BY id", {
@@ -3954,7 +3959,7 @@ it("keeps concurrent batch inserts from two browser connections", async () => {
   ]);
 
   expect(results.map((result) => result.version).sort()).toEqual([0, 1]);
-  expect(results.map((result) => result.metrics.retries).sort()).toEqual([0, 1]);
+  expect(results.map((result) => result.metrics.retries).sort()).toEqual([0, 0]);
   expect(await allVisibleSegments(left, "events")).toHaveLength(2);
   const tableId = (await leftStore.listTables())[0]?.id;
   const segments = tableId === undefined ? [] : await tableSegmentRecords(leftStore, tableId);
@@ -6157,7 +6162,7 @@ it("recovers a mutation-merge block whose durable cursor checkpoint was lost", a
 
 it("preserves logical row order when row-ID reservation order differs from commit order", async () => {
   const store = new FirstCommitBarrierMemoryBlockStore();
-  const database = new MinnowDatabase(store);
+  const database = new MinnowDatabase(store, { coordinateWrites: false });
   await database.createTable({
     name: "reverse_ids",
     uniqueKey: "email",
@@ -6171,7 +6176,7 @@ it("preserves logical row order when row-ID reservation order differs from commi
   await store.firstCommitReached;
   // One database runs its writes in turn, so the overtaking insert comes from a second
   // instance over the same store — another tab, whose commit lands while the first is held.
-  const overtaking = new MinnowDatabase(store);
+  const overtaking = new MinnowDatabase(store, { coordinateWrites: false });
   let second;
   try {
     second = await overtaking.insert("reverse_ids", { email: "second@example.com", score: 2 });
@@ -7909,6 +7914,26 @@ it("does not lose an age flush that fires behind an in-flight batch", async () =
   expect(writer.pendingRowCount).toBe(0);
   expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
   await writer.close();
+  store.close();
+});
+
+it("flushes queued adds and every accepted row behind an in-flight flush", async () => {
+  const store = new FirstCommitBarrierMemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.createTable({ name: "events", columns: [{ name: "value", type: "number" }] });
+  const writer = database.bufferedWriter("events", { maxAgeMs: 60_000, maxRows: 100 });
+  const add = writer.add({ value: 1 });
+  const firstFlush = writer.flush();
+  await store.firstCommitReached;
+  await add;
+  await writer.add({ value: 2 });
+  const secondFlush = writer.flush();
+  store.releaseFirstCommit();
+  await Promise.all([firstFlush, secondFlush]);
+  expect(writer.pendingRowCount).toBe(0);
+  expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
+  await writer.close();
+  await database.close();
   store.close();
 });
 

@@ -2660,6 +2660,36 @@ export class OpfsUncertainOutcomeError extends Error {
   }
 }
 
+/** Temporary OPFS coordination failure. No operation was admitted, or a read exhausted retries. */
+export class OpfsCoordinationError extends Error {
+  override readonly name = "OpfsCoordinationError";
+  readonly backend = "opfs";
+
+  constructor(
+    readonly reason:
+      "leader-unavailable" | "leader-queue-full" | "mutation-queue-full" | "follower-queue-full",
+    readonly method: string | null = null,
+  ) {
+    super(
+      reason === "leader-queue-full"
+        ? "The OPFS leader RPC queue is full"
+        : reason === "mutation-queue-full"
+          ? "The OPFS leader mutation queue is full"
+          : reason === "follower-queue-full"
+            ? "The OPFS follower request queue is full"
+            : "The OPFS store could not reach or become a leader",
+    );
+  }
+}
+
+/** Deletion was refused before removing files because another connection still owns the store. */
+export class OpfsDatabaseInUseError extends Error {
+  override readonly name = "OpfsDatabaseInUseError";
+  constructor(readonly databaseName: string) {
+    super(`The OPFS database ${databaseName} is open; close all connections before deleting it`);
+  }
+}
+
 /**
  * The commit input carries only the change: added blocks are the transaction's journaled pending
  * blocks, removals are the superseded ids. The store derives the published manifest from its

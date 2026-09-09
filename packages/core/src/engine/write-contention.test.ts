@@ -1,30 +1,4 @@
-/**
- * What happens when writes are issued concurrently instead of one after another.
- *
- * Every write commits optimistically: it reads a manifest version, stages its blocks, and
- * publishes only if the manifest has not moved. When it has, the write rebases and tries again,
- * up to `maxCommitRetries` times. Sequential writes never see this. Concurrent ones do, and the
- * behaviour depends on who the writers are.
- *
- * Writers issued through one database do not contend at all: the database runs its simple
- * writes one after another, so each starts from the version the one before it published, and
- * every one of them lands however many are queued — on every store.
- *
- * Writers in different database instances — different tabs, or two instances over one store —
- * do contend, and not in the way "retry a few times" suggests. Each starts from the same
- * manifest version, and every commit that succeeds invalidates the version every other in-flight
- * writer is holding — so one retry is spent per rival that gets there first. After
- * `maxCommitRetries` rivals have won, everyone still waiting is out of budget at once. The
- * ceiling is therefore `maxCommitRetries + 1` writers, *regardless of how many are queued*:
- * sixty-four concurrent instances do not fail more often than sixteen, they simply leave more
- * losers.
- *
- * These tests pin both shapes. The second is not an endorsement — tabs issuing parallel writes
- * to one table will lose most of them past the ceiling, and the durable fix across tabs is to
- * serialize commits rather than let them contend. What the tests guarantee meanwhile is that the
- * losses are *clean*: a rejected write leaves nothing behind, an accepted one is fully present,
- * and the split is deterministic rather than a race.
- */
+/** Coordinated autocommit admits all writers; the opt-out still exercises bounded CAS retries. */
 import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import {
@@ -46,9 +20,12 @@ const RETRIES = 8;
 async function contend(
   store: BlockStore,
   writers: number,
-  options: { separateInstances?: boolean } = {},
+  options: { separateInstances?: boolean; coordinateWrites?: boolean } = {},
 ): Promise<{ accepted: number; persisted: number; reasons: Set<string> }> {
-  const database = new MinnowDatabase(store, { maxCommitRetries: RETRIES });
+  const database = new MinnowDatabase(store, {
+    maxCommitRetries: RETRIES,
+    coordinateWrites: options.coordinateWrites ?? true,
+  });
   await database.createTable({
     name: "items",
     uniqueKey: "id",
@@ -63,7 +40,10 @@ async function contend(
     Array.from({ length: writers }, (_, index) => {
       const writer =
         options.separateInstances === true
-          ? new MinnowDatabase(store, { maxCommitRetries: RETRIES })
+          ? new MinnowDatabase(store, {
+              maxCommitRetries: RETRIES,
+              coordinateWrites: options.coordinateWrites ?? true,
+            })
           : database;
       return writer.insertBatch("items", [{ id: 1_000 + index, value: index }]).then(
         () => 1,
@@ -107,24 +87,32 @@ describe("concurrent writes to one table", () => {
     }
   });
 
-  it("admits exactly maxCommitRetries + 1 instances on IndexedDB, however many are queued", async () => {
-    // The number is the point: it does not grow with the queue. A caller who reacts to failures
-    // by issuing more parallel writes makes the losses larger, not smaller.
-    for (const writers of [16, 32, 64]) {
-      const store = await IndexedDbBlockStore.open({
-        name: crypto.randomUUID(),
-        indexedDB: new IDBFactory(),
-      });
-      const { accepted, persisted, reasons } = await contend(store, writers, {
-        separateInstances: true,
-      });
-      expect(accepted, `${String(writers)} writers`).toBe(RETRIES + 1);
-      expect(persisted, `${String(writers)} writers`).toBe(RETRIES + 1);
-      // A conflict, not a corruption or a quota failure -- the losers must be losing for the
-      // reason this test claims they are.
-      expect([...reasons].join(" | ")).toMatch(/Manifest changed/);
-    }
-  });
+  it.each([true, false])(
+    "handles separate IndexedDB instances with coordination=%s",
+    async (coordinateWrites) => {
+      // The fallback remains an explicit conflict, never partial or duplicated data.
+      for (const writers of [16, 32, 64]) {
+        const store = await IndexedDbBlockStore.open({
+          name: crypto.randomUUID(),
+          indexedDB: new IDBFactory(),
+        });
+        const { accepted, persisted, reasons } = await contend(store, writers, {
+          separateInstances: true,
+          coordinateWrites,
+        });
+        expect(accepted, `${String(writers)} writers`).toBe(
+          coordinateWrites ? writers : RETRIES + 1,
+        );
+        expect(persisted, `${String(writers)} writers`).toBe(
+          coordinateWrites ? writers : RETRIES + 1,
+        );
+        // A conflict, not a corruption or a quota failure -- the losers must be losing for the
+        // reason this test claims they are.
+        if (coordinateWrites) expect(reasons.size).toBe(0);
+        else expect([...reasons].join(" | ")).toMatch(/Manifest changed/);
+      }
+    },
+  );
 
   it("loses nothing and duplicates nothing, whichever writers win", async () => {
     const store = await IndexedDbBlockStore.open({

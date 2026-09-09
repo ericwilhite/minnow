@@ -4,7 +4,7 @@
  * foreground preference. The conformance suites prove the store behaves; this suite proves
  * the recovery and election rules by manufacturing the exact states they exist for.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { OpfsBlockStore } from "./index.js";
 import {
@@ -16,6 +16,7 @@ import {
   MAX_ACTIVE_FTS_BASE_BUILDS,
   MAX_CATALOG_RETAINED_BYTES,
   PostingBuildConflictError,
+  OpfsCoordinationError,
   SchemaConflictError,
   StorageCorruptionError,
   StorageFormatVersionError,
@@ -2751,6 +2752,67 @@ describe("OPFS write-ahead log crash shapes", () => {
     );
   });
 
+  it.each(["complete", "failure", "close"])(
+    "queues follower reads behind bounded result reservations (%s)",
+    async (ending) => {
+      const shim = new MemoryOpfs();
+      const leader = await OpfsBlockStore.open({ name: "queued-reads", root: shim.root });
+      const follower = await OpfsBlockStore.open({ name: "queued-reads", root: shim.root });
+      await follower.listTables();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let executing = 0;
+      let maximum = 0;
+      let sequence = 0;
+      const read = vi
+        .spyOn(
+          OpfsLeader.prototype as unknown as Pick<OpfsBlockStore, "getCurrentManifestVersion">,
+          "getCurrentManifestVersion",
+        )
+        .mockImplementation(async () => {
+          const index = sequence++;
+          executing++;
+          maximum = Math.max(maximum, executing);
+          await gate;
+          executing--;
+          if (ending === "failure" && index === 0) throw new Error("injected read failure");
+          return null;
+        });
+      try {
+        const pending = Array.from({ length: 128 }, () =>
+          follower.getCurrentManifestVersion().catch((error: unknown) => error),
+        );
+        await waitFor(() => maximum === 3, "three bounded read reservations");
+        if (ending === "close") {
+          follower.close();
+          leader.close();
+        }
+        release();
+        const outcomes = await Promise.all(pending);
+        expect(outcomes.filter((value) => value === null)).toHaveLength(
+          ending === "close" ? 0 : ending === "failure" ? 127 : 128,
+        );
+        const errors = outcomes.filter((value) => value instanceof Error);
+        expect(errors).toHaveLength(ending === "close" ? 128 : ending === "failure" ? 1 : 0);
+        for (const error of errors)
+          expect(error).toMatchObject({
+            message:
+              ending === "close" ? "This OPFS store connection is closed" : "injected read failure",
+          });
+        if (ending === "close") expect(leader._residentStateForTests().retainedRpcBytes).toBe(0);
+        expect(maximum).toBe(3);
+        expect(follower._residentStateForTests().pendingRequests).toBe(0);
+      } finally {
+        release();
+        read.mockRestore();
+        follower.close();
+        leader.close();
+      }
+    },
+  );
+
   it("never evicts in-flight mutation identities and bounds both RPC queues", async () => {
     const shim = new MemoryOpfs();
     const leader = await OpfsBlockStore.open({
@@ -2787,7 +2849,9 @@ describe("OPFS write-ahead log crash shapes", () => {
       () => undefined,
       (error: unknown) => error,
     );
+    expect(clientOverload).toBeInstanceOf(OpfsCoordinationError);
     expect(clientOverload).toMatchObject({
+      reason: "follower-queue-full",
       message: "The OPFS follower request queue is full",
     });
     // A duplicate of the oldest admitted identity attaches even while admission is full.
@@ -2796,7 +2860,9 @@ describe("OPFS write-ahead log crash shapes", () => {
       () => undefined,
       (error: unknown) => error,
     );
+    expect(serverOverload).toBeInstanceOf(OpfsCoordinationError);
     expect(serverOverload).toMatchObject({
+      reason: "mutation-queue-full",
       message: "The OPFS leader mutation queue is full",
     });
 
@@ -3721,6 +3787,28 @@ describe("OPFS leadership", () => {
     });
     follower.close();
     recovered.close();
+  });
+
+  it("never exposes a refused WAL mutation to reads already in flight", async () => {
+    const shim = new MemoryOpfs();
+    const store = await OpfsBlockStore.open({ name: "concurrent-refusal", root: shim.root });
+    await store.addTable(table("real"));
+    shim.setWriteFault((path) => {
+      if (path.endsWith("/wal")) throw new DOMException("quota", "QuotaExceededError");
+    });
+    const write = store.addTable(table("phantom"));
+    const reads = Promise.all([store.listTables(), store.getTableByName("phantom")]);
+    await expect(write).rejects.toMatchObject({ name: "QuotaExceededError" });
+    const [tables, phantom] = await reads;
+    expect(tables.map((record) => record.name)).toEqual(["real"]);
+    expect(phantom).toBeUndefined();
+    shim.setWriteFault(null);
+    expect((await store.listTables()).map((record) => record.name)).toEqual(["real"]);
+    await store.addTable(table("after"));
+    store._crashForTests();
+    const reopened = await OpfsBlockStore.open({ name: "concurrent-refusal", root: shim.root });
+    expect((await reopened.listTables()).map((record) => record.name)).toEqual(["after", "real"]);
+    reopened.close();
   });
 
   it("never serves state the disk refused, even to reads", async () => {

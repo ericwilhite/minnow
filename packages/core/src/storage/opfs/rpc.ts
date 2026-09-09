@@ -7,6 +7,8 @@ import {
   LeaseConflictError,
   LeaseExpiredError,
   LeaseOwnerConflictError,
+  OpfsCoordinationError,
+  OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
   PostingBuildConflictError,
   SnapshotImportConflictError,
@@ -300,6 +302,8 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     PostingBuildConflictError,
     StorageCorruptionError,
     StorageFormatVersionError,
+    OpfsCoordinationError,
+    OpfsDatabaseInUseError,
     OpfsUncertainOutcomeError,
   ].map((constructor) => [constructor.name, constructor]),
 );

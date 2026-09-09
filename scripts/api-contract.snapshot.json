@@ -408,6 +408,20 @@
               ]
             },
             {
+              "name": "DatabaseWorkerOutcomeUnknownError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class DatabaseWorkerOutcomeUnknownError extends Error {\n    readonly method: string;\n    readonly requestId: string;\n    readonly name = \"DatabaseWorkerOutcomeUnknownError\";\n    constructor(method: string, requestId: string, options?: ErrorOptions);\n}"
+              ]
+            },
+            {
+              "name": "DatabaseWorkerTimeoutError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class DatabaseWorkerTimeoutError extends Error {\n    readonly method: string;\n    readonly timeoutMs: number;\n    readonly name = \"DatabaseWorkerTimeoutError\";\n    constructor(method: string, timeoutMs: number);\n}"
+              ]
+            },
+            {
               "name": "declaredForeignKeys",
               "kind": "type",
               "declarations": [
@@ -733,7 +747,7 @@
               "name": "MinnowDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    now?: () => Date;\n    createId?: () => string;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
+                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    coordinateWrites?: boolean;\n    now?: () => Date;\n    createId?: () => string;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
               ]
             },
             {
@@ -755,6 +769,27 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare class MissingKeyError extends Error {\n    readonly tableName: string;\n    readonly columnName: string;\n    readonly value: ErrorValue;\n    readonly name = \"MissingKeyError\";\n    constructor(tableName: string, columnName: string, value: ErrorValue);\n}"
+              ]
+            },
+            {
+              "name": "OpfsCoordinationError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsCoordinationError extends Error {\n    readonly reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\";\n    readonly method: string | null;\n    readonly name = \"OpfsCoordinationError\";\n    readonly backend = \"opfs\";\n    constructor(reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\", method?: string | null);\n}"
+              ]
+            },
+            {
+              "name": "OpfsDatabaseInUseError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsDatabaseInUseError extends Error {\n    readonly databaseName: string;\n    readonly name = \"OpfsDatabaseInUseError\";\n    constructor(databaseName: string);\n}"
+              ]
+            },
+            {
+              "name": "OpfsUncertainOutcomeError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsUncertainOutcomeError extends Error {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
               ]
             },
             {
@@ -831,7 +866,7 @@
               "name": "QueryOptions",
               "kind": "type",
               "declarations": [
-                "export interface QueryOptions {\n    readonly signal?: AbortSignal;\n    readonly onStats?: (stats: QueryExecutionStats) => void;\n    memoize?: boolean;\n    readonly version?: number;\n    readonly params?: readonly QueryValue[];\n    readonly executionMemoryBudgetBytes?: number;\n    readonly spillToStorage?: boolean;\n    readonly spillPageRows?: number;\n}"
+                "export interface QueryOptions {\n    readonly signal?: AbortSignal;\n    readonly onStats?: (stats: QueryExecutionStats) => void;\n    memoize?: boolean;\n    readonly version?: number | null;\n    readonly params?: readonly QueryValue[];\n    readonly executionMemoryBudgetBytes?: number;\n    readonly spillToStorage?: boolean;\n    readonly spillPageRows?: number;\n}"
               ]
             },
             {
@@ -1050,6 +1085,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function toCatalog(records: readonly TableRecord[]): Catalog;"
+              ]
+            },
+            {
+              "name": "TransactionExpiredError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class TransactionExpiredError extends Error {\n    readonly name = \"TransactionExpiredError\";\n    constructor();\n}"
               ]
             },
             {
@@ -1607,7 +1649,7 @@
               "name": "CloseClientOptions",
               "kind": "type",
               "declarations": [
-                "export interface CloseClientOptions {\n    terminateWorker?: boolean;\n}"
+                "export interface CloseClientOptions {\n    terminateWorker?: boolean;\n    timeoutMs?: number;\n}"
               ]
             },
             {
@@ -1621,7 +1663,7 @@
               "name": "MinnowDatabaseClientOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n}"
+                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n    requestTimeoutMs?: number;\n}"
               ]
             }
           ]
@@ -1739,7 +1781,7 @@
               "name": "LiveQueryHost",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    executeMaintainable?(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<LiveMaintainedExecution | undefined>;\n    maintain?(query: LiveQueryInput, result: QueryResult, state: unknown, tableIds: readonly string[], after: number | null, until: number, probe: CatalogProbe): Promise<LiveMaintainedChange | undefined>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
+                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    memoize?(query: LiveQueryInput, result: QueryResult, probe: CatalogProbe): Promise<void>;\n    executeMaintainable?(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<LiveMaintainedExecution | undefined>;\n    maintain?(query: LiveQueryInput, result: QueryResult, state: unknown, tableIds: readonly string[], after: number | null, until: number, probe: CatalogProbe): Promise<LiveMaintainedChange | undefined>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
               ]
             },
             {
@@ -4150,7 +4192,7 @@
               "name": "OpfsBlockStore",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
+                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _pauseCoordinationForTests(): () => void;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
                 "export interface OpfsBlockStore extends Required<BlockStore> {\n}"
               ]
             },
@@ -4159,6 +4201,20 @@
               "kind": "type",
               "declarations": [
                 "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    rpcTimeoutMs?: number;\n}"
+              ]
+            },
+            {
+              "name": "OpfsCoordinationError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsCoordinationError extends Error {\n    readonly reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\";\n    readonly method: string | null;\n    readonly name = \"OpfsCoordinationError\";\n    readonly backend = \"opfs\";\n    constructor(reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\", method?: string | null);\n}"
+              ]
+            },
+            {
+              "name": "OpfsDatabaseInUseError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsDatabaseInUseError extends Error {\n    readonly databaseName: string;\n    readonly name = \"OpfsDatabaseInUseError\";\n    constructor(databaseName: string);\n}"
               ]
             },
             {
@@ -6492,6 +6548,20 @@
               ]
             },
             {
+              "name": "OpfsCoordinationError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsCoordinationError extends Error {\n    readonly reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\";\n    readonly method: string | null;\n    readonly name = \"OpfsCoordinationError\";\n    readonly backend = \"opfs\";\n    constructor(reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\", method?: string | null);\n}"
+              ]
+            },
+            {
+              "name": "OpfsDatabaseInUseError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsDatabaseInUseError extends Error {\n    readonly databaseName: string;\n    readonly name = \"OpfsDatabaseInUseError\";\n    constructor(databaseName: string);\n}"
+              ]
+            },
+            {
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
@@ -7318,7 +7388,7 @@
               "name": "OpfsBlockStore",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
+                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _pauseCoordinationForTests(): () => void;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
                 "export interface OpfsBlockStore extends Required<BlockStore> {\n}"
               ]
             },
@@ -7327,6 +7397,20 @@
               "kind": "type",
               "declarations": [
                 "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    rpcTimeoutMs?: number;\n}"
+              ]
+            },
+            {
+              "name": "OpfsCoordinationError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsCoordinationError extends Error {\n    readonly reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\";\n    readonly method: string | null;\n    readonly name = \"OpfsCoordinationError\";\n    readonly backend = \"opfs\";\n    constructor(reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\", method?: string | null);\n}"
+              ]
+            },
+            {
+              "name": "OpfsDatabaseInUseError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class OpfsDatabaseInUseError extends Error {\n    readonly databaseName: string;\n    readonly name = \"OpfsDatabaseInUseError\";\n    constructor(databaseName: string);\n}"
               ]
             },
             {
@@ -8084,14 +8168,14 @@
               "name": "BeginDeferredOptions",
               "kind": "type",
               "declarations": [
-                "export interface BeginDeferredOptions {\n    durableSnapshot?: boolean;\n}"
+                "export interface BeginDeferredOptions {\n    coalesceArtifacts?: boolean;\n    durableSnapshot?: boolean;\n}"
               ]
             },
             {
               "name": "DatabaseTransaction",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class DatabaseTransaction {\n    #private;\n    private readonly store;\n    private readonly now;\n    private readonly ttlMs;\n    constructor(store: BlockStore, record: TransactionRecord, now: () => Date, ttlMs: number, createWeakRef: (transaction: DatabaseTransaction) => {\n        deref(): DatabaseTransaction | undefined;\n    }, options?: {\n        persisted?: boolean;\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n        snapshotLease?: LeasedSnapshot;\n    });\n    get id(): string;\n    get status(): TransactionRecord[\"status\"];\n    get snapshotVersion(): number | null;\n    get pendingBlockIds(): string[];\n    get pendingSegmentIds(): string[];\n    get deferredSegments(): SegmentRecord[];\n    get pendingTableNextRowId(): bigint | undefined;\n    get initialCatalogProbe(): {\n        catalogEpoch: number;\n        manifestVersion: number | null;\n        schemaEpoch: number;\n    } | undefined;\n    get committedCatalogContribution(): {\n        transaction: TransactionRecord;\n        segments: SegmentRecord[];\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n    } | undefined;\n    get compactionSourceBlockIds(): string[];\n    renew(): Promise<void>;\n    get stagedWorkCount(): number;\n    checkpoint(): TransactionCheckpoint;\n    checkpointRetainedBytes(): number;\n    rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;\n    snapshot(): Promise<Snapshot>;\n    getBlock(id: string): Promise<Uint8Array | undefined>;\n    stageBlock(id: string, bytes: Uint8Array): Promise<void>;\n    stageBlocks(blocks: readonly BlockWrite[]): Promise<void>;\n    stageArtifacts(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<void>;\n    stageArtifactsAndCommit(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<ManifestSummary>;\n    stageExistingBlocks(blockIds: readonly string[]): Promise<void>;\n    stageSegment(record: SegmentRecord): Promise<void>;\n    stageExistingSegment(segmentId: string): Promise<void>;\n    adoptAbortedCompactionSegment(record: SegmentRecord, abortedOwner: TransactionRecord): Promise<void>;\n    markTableChanged(tableId: string): void;\n    markLogicallyUnchanged(): void;\n    get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[];\n    setUniqueKeyChanges(changes: UniqueKeyChanges): void;\n    setFtsChanges(changes: FtsChanges): void;\n    setCompactionIntent(compactionJobId: string, sourceBlockIds: readonly string[]): void;\n    limitLevelZeroSegments(tableId: string, limit: number): void;\n    commit(): Promise<ManifestSummary>;\n    rebase(): Promise<Snapshot>;\n    abort(): Promise<void>;\n}"
+                "export declare class DatabaseTransaction {\n    #private;\n    private readonly store;\n    private readonly now;\n    private readonly ttlMs;\n    constructor(store: BlockStore, record: TransactionRecord, now: () => Date, ttlMs: number, createWeakRef: (transaction: DatabaseTransaction) => {\n        deref(): DatabaseTransaction | undefined;\n    }, options?: {\n        persisted?: boolean;\n        coalesceArtifacts?: boolean;\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n        snapshotLease?: LeasedSnapshot;\n    });\n    get id(): string;\n    get status(): TransactionRecord[\"status\"];\n    get snapshotVersion(): number | null;\n    get pendingBlockIds(): string[];\n    get pendingSegmentIds(): string[];\n    get deferredSegments(): SegmentRecord[];\n    get pendingTableNextRowId(): bigint | undefined;\n    get initialCatalogProbe(): {\n        catalogEpoch: number;\n        manifestVersion: number | null;\n        schemaEpoch: number;\n    } | undefined;\n    get committedCatalogContribution(): {\n        transaction: TransactionRecord;\n        segments: SegmentRecord[];\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n    } | undefined;\n    get compactionSourceBlockIds(): string[];\n    renew(): Promise<void>;\n    get stagedWorkCount(): number;\n    checkpoint(): TransactionCheckpoint;\n    checkpointRetainedBytes(): number;\n    rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;\n    snapshot(): Promise<Snapshot>;\n    getBlock(id: string): Promise<Uint8Array | undefined>;\n    stageBlock(id: string, bytes: Uint8Array): Promise<void>;\n    stageBlocks(blocks: readonly BlockWrite[]): Promise<void>;\n    stageArtifacts(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<void>;\n    stageArtifactsAndCommit(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<ManifestSummary>;\n    stageExistingBlocks(blockIds: readonly string[]): Promise<void>;\n    stageSegment(record: SegmentRecord): Promise<void>;\n    stageExistingSegment(segmentId: string): Promise<void>;\n    adoptAbortedCompactionSegment(record: SegmentRecord, abortedOwner: TransactionRecord): Promise<void>;\n    markTableChanged(tableId: string): void;\n    markLogicallyUnchanged(): void;\n    get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[];\n    setUniqueKeyChanges(changes: UniqueKeyChanges): void;\n    setFtsChanges(changes: FtsChanges): void;\n    setCompactionIntent(compactionJobId: string, sourceBlockIds: readonly string[]): void;\n    limitLevelZeroSegments(tableId: string, limit: number): void;\n    commit(): Promise<ManifestSummary>;\n    rebase(): Promise<Snapshot>;\n    abort(): Promise<void>;\n}"
               ]
             },
             {
@@ -8249,7 +8333,7 @@
               "name": "WireDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export type WireDatabaseOptions = Pick<MinnowDatabaseOptions, \"compression\" | \"targetBlockBytes\" | \"rowsPerBlock\" | \"maxCommitRetries\" | \"spillOwnerLeaseMs\" | \"transactionOwnerLeaseMs\" | \"transactionIdleTimeoutMs\" | \"bufferPoolBytes\" | \"executionMemoryBudgetBytes\" | \"autoCollectDebtLimitCommits\" | \"autoCollect\" | \"autoCompact\">;"
+                "export type WireDatabaseOptions = Pick<MinnowDatabaseOptions, \"compression\" | \"targetBlockBytes\" | \"rowsPerBlock\" | \"maxCommitRetries\" | \"coordinateWrites\" | \"spillOwnerLeaseMs\" | \"transactionOwnerLeaseMs\" | \"transactionIdleTimeoutMs\" | \"bufferPoolBytes\" | \"executionMemoryBudgetBytes\" | \"autoCollectDebtLimitCommits\" | \"autoCollect\" | \"autoCompact\">;"
               ]
             },
             {
@@ -8297,7 +8381,7 @@
               "name": "protocolVersion",
               "kind": "value",
               "declarations": [
-                "protocolVersion: 6"
+                "protocolVersion: 7"
               ]
             },
             {

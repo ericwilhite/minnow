@@ -51,7 +51,11 @@ class CtasObservingStore extends MemoryBlockStore {
 }
 
 function database(store: MemoryBlockStore): MinnowDatabase {
-  return new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+  return new MinnowDatabase(store, {
+    autoCollect: false,
+    autoCompact: false,
+    coordinateWrites: false,
+  });
 }
 
 describe("SQL statement atomicity", () => {
@@ -531,6 +535,22 @@ describe("SQL statement atomicity", () => {
     ).rejects.toBeInstanceOf(SchemaConflictError);
 
     expect((await first.query("SELECT id, note FROM records")).rows).toEqual([]);
+    await first.close();
+    await rival.close();
+  });
+
+  it("re-evaluates VALUES scalar subqueries after a concurrent data commit", async () => {
+    const store = new CommitRaceStore();
+    const first = database(store);
+    const rival = database(store);
+    await first.execute("CREATE TABLE source(id INTEGER PRIMARY KEY, value INTEGER)");
+    await first.execute("CREATE TABLE copied(id INTEGER PRIMARY KEY, value INTEGER)");
+    await first.execute("INSERT INTO source VALUES (1, 10)");
+    store.beforeWrite = async () => {
+      await rival.updateBatch("source", { keys: [1], changes: { value: [20] } });
+    };
+    await first.execute("INSERT INTO copied VALUES (1, (SELECT value FROM source WHERE id = 1))");
+    expect((await first.query("SELECT * FROM copied")).rows).toEqual([{ id: 1, value: 20 }]);
     await first.close();
     await rival.close();
   });

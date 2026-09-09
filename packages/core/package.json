@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/core",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "A columnar SQL database for the browser: PostgreSQL-style SQL over durable IndexedDB or OPFS data, with no server or WebAssembly module.",
   "license": "MIT",
   "author": "Eric Wilhite",
@@ -32,7 +32,7 @@
     "./dist/engine/worker-memory.js"
   ],
   "scripts": {
-    "prepack": "node ../../scripts/strip-dist-comments.mjs dist"
+    "prepack": "node ../../scripts/prepare-package.mjs --strip-comments"
   },
   "exports": {
     ".": {

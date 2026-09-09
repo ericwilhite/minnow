@@ -42,15 +42,21 @@ await db.write(async (tx) => {
 Everything inside becomes visible at once, including to other tabs: nobody observes the stock
 decremented without the shipment. If the callback throws, nothing is published.
 
+Overlapping session calls are ordered: mutations wait for earlier calls, and adjacent reads may
+run together against the same staged state. Commit joins admitted calls before publishing. Await
+each call to handle its error. One engine admits at most 256 write/snapshot scopes; within a
+write scope, at most 64 mutations and 256 reads may be pending.
+
 Large writes are encoded and persisted with backpressure instead of retaining every encoded block
-in memory. One adapter call carries at most 64 blocks, 64 segment records, and 64 MiB of payload;
+in memory. Small successive stages share one bounded local batch and publish in one atomic
+storage call. Exceeding the batch limit moves artifacts into the recovery journal. One adapter call carries at most 64 blocks, 64 segment records, and 64 MiB of payload;
 one unpublished transaction may journal at most 4,096 pending blocks and 4,096 pending segments.
 Exceeding the transaction-wide limit fails the write before publication. Split a larger ingestion
 into several commits. A database also admits at most 64 pending write calls, and a buffered writer
 at most 64 unawaited `add()` calls, so a producer must await writes when it reaches backpressure.
 
 The scope durably pins its pre-scope version from the start. While its first bounded write batch is
-still process-local, a renewable reader lease owns that pin. If another stage persists a recovery
+still process-local, a renewable reader lease owns that pin. If an overflowing stage persists a recovery
 journal, ownership passes without a gap to the renewable transaction record. Compaction and
 garbage collection therefore cannot remove the base snapshot while user code is idle between
 statements, and a crashed scope leaves only deadline-bounded metadata behind.
@@ -71,7 +77,13 @@ try {
 }
 ```
 
-Reads inside the transaction see its earlier writes. A statement that violates a unique key fails
+An idle rollback leaves the connection in a failed state: later statements reject with
+`TransactionExpiredError` until an explicit `ROLLBACK` acknowledges it or `BEGIN` starts a new
+transaction. A delayed statement cannot silently become an autocommit. Calls to `execute()` on
+one connection run in invocation order, including `BEGIN`, mutations, and `COMMIT`.
+
+Reads inside the transaction see its earlier writes, including scalar subqueries in INSERT VALUES
+and trigger INSERT bodies. A statement that violates a unique key fails
 on that statement, as it does in PostgreSQL, whether the conflicting row was committed before the
 transaction or staged earlier in it; the transaction stays open, so the caller decides whether to
 roll back or continue. Schema changes are refused because they are saved outside the transaction. Savepoints checkpoint staged blocks, mutation deltas, unique-index
@@ -100,6 +112,26 @@ only part of the change.
 A statement that fails validation _before_ registering anything — updating a key that does not
 exist, say — leaves the scope clean and usable.
 
+## Recovering an interrupted checkout
+
+A lost worker reply does not tell the application whether a commit happened. Use a stable
+application ID, such as the retail schema's `order_id`, to reconcile the outcome:
+
+1. Persist a pending checkout intent with its ID and immutable purchase details before submitting
+   the checkout. Keeping the ID only in memory cannot recover it after a browser restart.
+2. In one write scope, look up that ID. If the order already exists, verify that its details match
+   and return the recorded result. Refuse reuse of the same ID for a different purchase.
+3. Otherwise, write the order, its `order_items`, inventory changes, and the intent's completed
+   state in the same scope. Unique constraints on operation IDs protect concurrent retries.
+4. On a confirmed write conflict, retry the database-only scope from a fresh snapshot with the
+   same ID. Bound these retries. On `DatabaseWorkerOutcomeUnknownError`, reopen the connection
+   and reconcile the durable intent and order before deciding whether to submit again.
+
+Two tabs can both find an order absent; one can then lose the commit race. The retry must repeat
+its lookup, not blindly replay the inserts. Keep external payment calls outside a retried database
+callback, and reconcile them separately using the payment system's own durable operation ID.
+Neither an RPC request ID nor a timeout establishes that a payment or database commit failed.
+
 ## Stable reads
 
 Every single query already executes against one version. A snapshot scope extends that to several:
@@ -113,30 +145,41 @@ const report = await db.snapshot(async (session) => {
 ```
 
 Both queries see the same version, so the counts are consistent with each other however many
-commits land while the scope is open.
+commits land while the scope is open. A scope opened before the first commit stays empty even
+when another connection publishes that first version.
 
 The scope holds a lease on that version so background collection cannot reclaim it underneath, and
-releases it when the callback returns. Hold one for as long as you need consistency and no longer:
-a scope kept open across a user's whole session pins every version since it started.
+renews it while the callback is open, and releases it when the callback returns. If the browser
+suspends execution beyond the lease deadline and collection expires it, the resumed scope fails
+explicitly; it does not switch to a newer version. Keep scopes short: a long-lived scope prevents
+reclamation of the history it needs. Closing the database cancels idle scopes and joins storage
+cleanup without waiting for user code to resume.
 
 ## Freshness
 
 Outside a snapshot scope, every query observes the latest committed state — including commits from
-another tab. Stale reads are not something you can accidentally get; they are unrepresentable.
+another tab — at the query's snapshot boundary. A concurrent commit may land after that boundary.
 
-That is a stronger guarantee than it sounds, and it is why cross-tab consistency does not depend on
+Cross-tab read consistency does not depend on
 `BroadcastChannel` or Web Locks. A reader checks the current version in the same storage
 transaction it reads through.
 
 ## Conflicts
 
-Readers never block writers and writers never block readers. One database runs its plain writes
-— `insertBatch`, `updateBatch`, `deleteBatch`, `upsertBatch` and the statements that become them —
-one after another, so they never conflict with each other however many are in flight. Writers in
-different tabs do conflict when they touch the same data. A plain one-statement write restarts from
-a fresh snapshot — up to `maxCommitRetries`, eight by default — so its predicates, constraints,
-foreign-key proofs, and trigger bodies are recomputed rather than rebasing stale derived values.
-Past that you get a `WriteConflictError` to handle yourself.
+Readers retain a stable version while writers publish a new one. Storage operations can still
+queue behind each other: snapshot isolation is not a promise of zero read/write latency.
+
+Autocommit writes share admission before reading their starting version. Engines over the same
+adapter or named store coordinate locally; Web Locks extend this coordination across tabs and
+workers where available. This avoids spending a retry for every competing autocommit. An engine
+closing while it waits for admission cancels that wait. Set `coordinateWrites: false` only when
+providing your own scheduler or deliberately using optimistic contention.
+
+Custom stores identify shared storage with `liveQueryChannelName`. Without a common identifier or
+cross-context Web Locks, writers still use storage compare-and-swap and bounded retries. A plain
+one-statement write restarts from a fresh snapshot — up to `maxCommitRetries`, eight by default —
+so predicates, constraints, foreign-key proofs, and trigger bodies are recomputed. Exhaustion
+returns `WriteConflictError`; it never acknowledges a rejected write.
 
 ```ts
 import { WriteConflictError } from "@minnowdb/core/storage/contracts";

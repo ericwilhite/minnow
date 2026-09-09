@@ -1,11 +1,12 @@
 import {
   MemoryBlockStore,
+  OpfsCoordinationError,
   type CommitTransactionInput,
   type Manifest,
   type StoragePage,
   type WriteTransactionInput,
 } from "../storage/index.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MinnowDatabase } from "./database.js";
 import {
   LiveQueryLimitError,
@@ -605,7 +606,17 @@ describe("live queries", () => {
         return Promise.resolve({
           columns: ["kind"],
           columnDomains: [null],
-          rows: [{ kind: query === dateQuery ? "date" : "text" }],
+          rows: [
+            {
+              kind:
+                typeof query !== "string" &&
+                query.kind === "typed-query" &&
+                query.plan.select[0]?.expression.kind === "literal" &&
+                query.plan.select[0].expression.value instanceof Date
+                  ? "date"
+                  : "text",
+            },
+          ],
         });
       },
     });
@@ -1133,5 +1144,103 @@ describe("live queries", () => {
     expect(changes).toHaveLength(2);
     live.close();
     store.close();
+  });
+});
+
+describe("transient OPFS live recovery", () => {
+  it.each(["probe", "history", "execute", "dependencies"] as const)(
+    "retains two subscriptions and retries a failed %s without another hint",
+    async (phase) => {
+      vi.useFakeTimers();
+      const race = createRaceHost();
+      let failure: Error | undefined;
+      let schemaEpoch = 0;
+      const host = {
+        ...race.host,
+        currentProbe: async () => {
+          if (phase === "probe" && failure !== undefined) throw failure;
+          return { ...(await race.host.currentProbe()), schemaEpoch };
+        },
+        manifestPage: async (after: number | null, limit: number) => {
+          if (phase === "history" && failure !== undefined) throw failure;
+          return race.host.manifestPage(after, limit);
+        },
+        execute: async (query: LiveQueryInput) => {
+          if (phase === "execute" && failure !== undefined) throw failure;
+          return race.host.execute(query);
+        },
+        dependencyTableIds: async () => {
+          if (phase === "dependencies" && failure !== undefined) throw failure;
+          return new Set(["table-1"]);
+        },
+      };
+      const live = new LiveQuerySet(host);
+      const results = [vi.fn(), vi.fn()] as const;
+      const errors = vi.fn();
+      try {
+        await live.subscribe("first", { onChange: results[0], onError: errors });
+        await live.subscribe("second", { onChange: results[1], onError: errors });
+        race.commit();
+        if (phase === "dependencies") schemaEpoch += 1;
+        failure = new OpfsCoordinationError("leader-unavailable", "getCatalogProbe");
+        await live.refresh();
+        expect(errors).not.toHaveBeenCalled();
+        for (const result of results) expect(result).toHaveBeenCalledTimes(1);
+        const checks = live.stats.versionChecks;
+        await Promise.all(Array.from({ length: 100 }, () => live.refresh()));
+        expect(live.stats.versionChecks).toBe(checks);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(errors).not.toHaveBeenCalled();
+        failure = undefined;
+        await vi.advanceTimersByTimeAsync(200);
+        for (const result of results) {
+          expect(result).toHaveBeenCalledTimes(2);
+          expect(result.mock.lastCall?.[0]).toMatchObject({ rows: [{ v: 2 }] });
+        }
+        expect(errors).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        live.close();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("caps retries, cancels them on close, and still reports real query errors", async () => {
+    vi.useFakeTimers();
+    const race = createRaceHost();
+    let failure: Error | undefined;
+    const live = new LiveQuerySet({
+      ...race.host,
+      execute: async (query) => {
+        if (failure !== undefined) throw failure;
+        return race.host.execute(query);
+      },
+    });
+    const errors = vi.fn();
+    try {
+      await live.subscribe("first", { onChange: vi.fn(), onError: errors });
+      race.commit();
+      failure = new TypeError("Unknown column");
+      await live.refresh();
+      expect(errors).toHaveBeenCalledWith(failure);
+      errors.mockClear();
+      failure = new OpfsCoordinationError("follower-queue-full");
+      await live.refresh();
+      for (const delay of [100, 200, 400, 800, 1600, 3200, 5000, 5000]) {
+        const checks = live.stats.versionChecks;
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(live.stats.versionChecks).toBe(checks);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(live.stats.versionChecks).toBe(checks + 1);
+        expect(vi.getTimerCount()).toBe(1);
+      }
+      expect(errors).not.toHaveBeenCalled();
+      live.close();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      live.close();
+      vi.useRealTimers();
+    }
   });
 });

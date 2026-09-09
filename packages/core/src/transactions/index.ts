@@ -69,6 +69,8 @@ export interface OpenLeasedSnapshotOptions {
 }
 
 export interface BeginDeferredOptions {
+  /** Keep successive stages local while their combined artifacts fit one storage batch. */
+  coalesceArtifacts?: boolean;
   /**
    * Pins the captured snapshot with a renewable durable reader lease until this transaction
    * either persists its own durable owner or finishes. Enabled by default; tightly bounded
@@ -249,6 +251,7 @@ export class DatabaseTransaction {
    * touches nothing.
    */
   #persisted: boolean;
+  readonly #coalesceArtifacts: boolean;
   /** Durable pin for a deferred transaction that has no transaction record yet. */
   #snapshotLease: LeasedSnapshot | undefined;
   /** Serializes revisioned operations against the one lease record. */
@@ -269,6 +272,7 @@ export class DatabaseTransaction {
     },
     options: {
       persisted?: boolean;
+      coalesceArtifacts?: boolean;
       initialCatalogProbe?: {
         catalogEpoch: number;
         manifestVersion: number | null;
@@ -279,6 +283,7 @@ export class DatabaseTransaction {
   ) {
     this.#record = structuredClone(record);
     this.#persisted = options.persisted ?? true;
+    this.#coalesceArtifacts = options.coalesceArtifacts ?? false;
     this.#initialCatalogProbe = options.initialCatalogProbe;
     this.#snapshotLease = options.snapshotLease;
     const reference = createWeakRef(this);
@@ -590,8 +595,14 @@ export class DatabaseTransaction {
     const batches = transactionArtifactBatches(blocks, ordered);
     if (
       !this.#persisted &&
-      this.#deferredBlocks.length === 0 &&
-      this.#deferredSegments.length === 0 &&
+      (this.#coalesceArtifacts ||
+        (this.#deferredBlocks.length === 0 && this.#deferredSegments.length === 0)) &&
+      this.#deferredBlocks.length + blocks.length <= MAX_TRANSACTION_STAGE_BLOCKS &&
+      this.#deferredSegments.length + ordered.length <= MAX_TRANSACTION_STAGE_SEGMENTS &&
+      [...this.#deferredBlocks, ...blocks].reduce(
+        (bytes, block) => bytes + block.bytes.byteLength,
+        0,
+      ) <= MAX_TRANSACTION_STAGE_BYTES &&
       batches.length === 1
     ) {
       assertTransactionArtifactBatchLimits(blocks, ordered);
@@ -1556,6 +1567,7 @@ export class TransactionManager {
         this.#createWeakRef,
         {
           persisted: false,
+          coalesceArtifacts: options.coalesceArtifacts ?? false,
           initialCatalogProbe: probe,
           ...(snapshotLease === undefined ? {} : { snapshotLease }),
         },

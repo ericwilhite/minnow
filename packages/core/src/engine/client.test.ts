@@ -1,6 +1,7 @@
 import {
   MemoryBlockStore,
   MAX_ACTIVE_LEASES,
+  OpfsCoordinationError,
   OpfsUncertainOutcomeError,
   SnapshotImportConflictError,
   StorageCorruptionError,
@@ -23,6 +24,8 @@ import { MinnowDatabase } from "./database.js";
 import * as engineErrors from "./errors.js";
 import {
   MaintenanceBacklogError,
+  DatabaseWorkerTimeoutError,
+  DatabaseWorkerOutcomeUnknownError,
   SqlCompileError,
   UnknownTableError,
   UniqueConstraintError,
@@ -41,6 +44,7 @@ import {
 import { attachWorkerHost } from "./worker-server.js";
 import { indexedDbWorkerStore } from "./worker-store-indexeddb.js";
 import { memoryWorkerStore } from "./worker-store-memory.js";
+import type { LiveQueryPatch } from "./live-patch.js";
 
 /**
  * An in-process stand-in for the worker boundary: two endpoints whose messages are
@@ -105,6 +109,96 @@ function connect(): MinnowDatabaseClient {
   attachDatabaseWorker(workerSide);
   return new MinnowDatabaseClient(clientSide, { store: { kind: "memory" } });
 }
+
+it("settles cancelled reads and forcibly terminates an unresponsive worker on close", async () => {
+  vi.useFakeTimers();
+  const terminate = vi.fn();
+  const client = new MinnowDatabaseClient({
+    postMessage: () => undefined,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    terminate,
+  });
+  try {
+    const controller = new AbortController();
+    const query = client.query("SELECT 1", { signal: controller.signal });
+    const cancelled = expect(query).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await cancelled;
+    const closing = client.close({ terminateWorker: true, timeoutMs: 20 });
+    const refused = expect(closing).rejects.toMatchObject({
+      name: "DatabaseWorkerOutcomeUnknownError",
+      cause: { name: "DatabaseWorkerTimeoutError" },
+    });
+    expect(client.close()).toBe(closing);
+    await vi.advanceTimersByTimeAsync(20);
+    await refused;
+    expect(terminate).toHaveBeenCalledTimes(1);
+    await expect(client.query("SELECT 1")).rejects.toThrow("closed");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("reports a lost mutation reply as unknown and never replays its committed write", async () => {
+  const boundary = createBoundary();
+  let drop = false;
+  const original = boundary.workerSide.postMessage.bind(boundary.workerSide);
+  boundary.workerSide.postMessage = (message, options) => {
+    if (!drop) original(message, options);
+  };
+  const database = new MinnowDatabase(new MemoryBlockStore(), {
+    autoCollect: false,
+    autoCompact: false,
+  });
+  exposeDatabase(database, boundary.workerSide);
+  const client = new MinnowDatabaseClient(boundary.clientSide, { requestTimeoutMs: 100 });
+  await client.ready();
+  await client.execute("CREATE TABLE sales(id INTEGER PRIMARY KEY)");
+  drop = true;
+  await expect(client.insertBatch("sales", [{ id: 7 }])).rejects.toBeInstanceOf(
+    DatabaseWorkerOutcomeUnknownError,
+  );
+  expect((await database.query("SELECT * FROM sales")).rows).toEqual([{ id: 7 }]);
+  await expect(client.close()).rejects.toBeInstanceOf(DatabaseWorkerTimeoutError);
+  await database.close();
+});
+
+it("orders parallel worker scope calls and keeps an empty worker snapshot stable", async () => {
+  const client = connect();
+  await client.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER)");
+  await client.snapshot(async (snapshot) => {
+    expect(snapshot.version).toBeNull();
+    await client.write(async (tx) => {
+      await Promise.all([
+        tx.insertBatch("items", [{ id: 1, value: 10 }]),
+        tx.insertBatch("items", [{ id: 2, value: 20 }]),
+        tx.insertBatch("items", [{ id: 3, value: 30 }]),
+      ]);
+    });
+    expect((await snapshot.query("SELECT COUNT(*) AS n FROM items")).rows).toEqual([{ n: 0 }]);
+  });
+  expect((await client.query("SELECT COUNT(*) AS n FROM items")).rows).toEqual([{ n: 3 }]);
+  await client.close();
+});
+
+it("keeps worker VALUES subqueries inside their write scope", async () => {
+  const client = connect();
+  try {
+    await client.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER)");
+    await client.execute("INSERT INTO items VALUES (1, 10)");
+    await client.write(async (tx) => {
+      await tx.execute("UPDATE items SET value = 20 WHERE id = 1");
+      await tx.execute("INSERT INTO items VALUES (2, (SELECT value FROM items WHERE id = 1))");
+    });
+    expect((await client.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+      { id: 1, value: 20 },
+      { id: 2, value: 20 },
+    ]);
+  } finally {
+    await client.close();
+  }
+});
 
 type MethodNames<T> = {
   [Name in keyof T]-?: T[Name] extends (...args: never[]) => unknown ? Name : never;
@@ -491,6 +585,12 @@ async function createWorkerWriteTable(database: MinnowDatabase): Promise<void> {
     columns: [
       { name: "id", type: "number" },
       { name: "value", type: "string" },
+      // Two stages exceed the 64-block local batch and exercise durable staging/abort.
+      ...Array.from({ length: 31 }, (_, index) => ({
+        name: `padding_${String(index)}`,
+        type: "number" as const,
+        nullable: true,
+      })),
     ],
   });
 }
@@ -788,7 +888,7 @@ describe("MinnowDatabaseClient", () => {
       });
       const order: string[] = [];
       const execute = raw
-        .call(null, "execute", ["INSERT INTO worker_writes VALUES (1, 'one')"])
+        .call(null, "execute", ["INSERT INTO worker_writes (id, value) VALUES (1, 'one')"])
         .then((result) => {
           order.push("execute");
           return result;
@@ -809,7 +909,7 @@ describe("MinnowDatabaseClient", () => {
       expect(storeClosed).toBe(true);
       await expectNoActiveWorkerOwners(store);
       const verifier = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
-      expect((await verifier.query("SELECT * FROM worker_writes")).rows).toEqual([
+      expect((await verifier.query("SELECT id, value FROM worker_writes")).rows).toEqual([
         { id: 1, value: "one" },
       ]);
       await verifier.close();
@@ -2859,6 +2959,99 @@ describe("MinnowDatabaseClient", () => {
     await live.close();
   });
 
+  it("transfers only changed rows to patch subscribers and keeps parallel baselines independent", async () => {
+    const { clientSide, workerSide } = createBoundary();
+    const frames: Array<{ event: string; payload: unknown }> = [];
+    clientSide.addEventListener("message", (event) => {
+      const frame = parseRpcResponse(event.data);
+      if (frame?.kind === "rpc-event") frames.push({ event: frame.event, payload: frame.payload });
+    });
+    const db = new MinnowDatabase(new MemoryBlockStore());
+    exposeDatabase(db, workerSide);
+    const client = new MinnowDatabaseClient(clientSide);
+    await client.ready();
+    const live = client.liveQueries();
+    try {
+      await client.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x NUMERIC(10,2), d TIMESTAMP)");
+      await client.execute(
+        "INSERT INTO t VALUES (1,2,'2026-01-01'),(2,10,'2026-01-02'),(3,20,'2026-01-03')",
+      );
+      const sql = "SELECT id,x,d FROM t ORDER BY x,id";
+      let rows: QueryResult["rows"] = [];
+      const apply = (patch: LiveQueryPatch): void => {
+        if (patch.type === "reset") rows = patch.result.rows;
+        else {
+          const changed = new Map(patch.changedRows.map(({ index, row }) => [index, row]));
+          rows = Array.from(patch.retained, (was, index) => {
+            const row = was >= 0 ? rows[was] : changed.get(index);
+            if (row === undefined) throw new Error("Patch did not provide a row");
+            return row;
+          });
+        }
+      };
+      const destructive = await live.subscribePatches(sql, {
+        onPatch: (patch) => {
+          if (patch.type === "patch") patch.retained.fill(-100);
+        },
+      });
+      const subscription = await live.subscribePatches(sql, { onPatch: apply });
+      let full: QueryResult | undefined;
+      await live.subscribe(sql, {
+        onChange: (result) => {
+          full = result;
+        },
+      });
+      for (const write of [
+        "UPDATE t SET x=30 WHERE id=1",
+        "DELETE FROM t WHERE id=2",
+        "INSERT INTO t VALUES (4,-2,'2026-01-04')",
+        "DELETE FROM t",
+      ]) {
+        frames.length = 0;
+        await client.execute(write);
+        await live.refresh();
+        const expected = await client.query(sql, { memoize: false });
+        expect(rows).toEqual(expected.rows);
+        expect(full).toEqual(expected);
+        expect(frames.filter((frame) => frame.event === "patch")).toHaveLength(2);
+        for (const frame of frames.filter((frame) => frame.event === "patch")) {
+          const payload = frame.payload as { result: { rowCount: number } };
+          expect(payload.result.rowCount).toBe(write.startsWith("DELETE") ? 0 : 1);
+        }
+      }
+      await destructive.close();
+      await subscription.close();
+      await client.execute("INSERT INTO t VALUES (5,5,'2026-01-05')");
+      await live.refresh();
+      const resets: LiveQueryPatch[] = [];
+      await live.subscribePatches(sql, { onPatch: (patch) => resets.push(patch) });
+      expect(resets[0]?.type).toBe("reset");
+    } finally {
+      await live.close();
+      await client.close();
+    }
+  });
+
+  it("captures live inputs while worker-set creation is still pending", async () => {
+    const client = connect();
+    const live = client.liveQueries();
+    try {
+      const input = { kind: "sql-query" as const, sql: "SELECT ? AS n", params: [2] };
+      let latest: QueryResult | undefined;
+      const opening = live.subscribe(input, {
+        onChange: (result) => {
+          latest = result;
+        },
+      });
+      input.params[0] = 3;
+      await opening;
+      expect(latest?.rows).toEqual([{ n: 2 }]);
+    } finally {
+      await live.close();
+      await client.close();
+    }
+  });
+
   it("serves a caller-constructed database through exposeDatabase", async () => {
     const { clientSide, workerSide } = createBoundary();
     let closeCalls = 0;
@@ -3034,6 +3227,41 @@ it("keeps typed worker reads transaction-aware and externalizes SQL domains", as
     await client.execute("ROLLBACK");
     expect(await client.run(query)).toEqual([{ x: "1.25", d: "2026-01-01" }]);
   } finally {
+    await client.close();
+  }
+});
+
+it("preserves transient migration classification through a worker and permits a clean retry", async () => {
+  class ContendedCatalogStore extends MemoryBlockStore {
+    unavailable = false;
+    override async getCatalogProbe() {
+      if (this.unavailable)
+        throw new OpfsCoordinationError("leader-unavailable", "getCatalogProbe");
+      return super.getCatalogProbe();
+    }
+  }
+  const store = new ContendedCatalogStore();
+  const boundary = createBoundary();
+  exposeDatabase(new MinnowDatabase(store), boundary.workerSide);
+  const client = new MinnowDatabaseClient(boundary.clientSide);
+  const definition = schema([
+    table("items", { id: column.number().unique(), value: column.string() }),
+  ]);
+  try {
+    await client.ready();
+    store.unavailable = true;
+    await expect(client.migrate(definition)).rejects.toBeInstanceOf(OpfsCoordinationError);
+    store.unavailable = false;
+    await client.migrate(definition);
+    await client.insert("items", { id: 1, value: "kept" });
+    const refusal = await client
+      .migrate(schema([table("items", { id: column.number().unique() })]))
+      .catch((error: unknown) => error);
+    expect(refusal).not.toBeInstanceOf(OpfsCoordinationError);
+    expect(refusal).toMatchObject({ name: "TypeError" });
+    expect((await client.query("SELECT * FROM items")).rows).toEqual([{ id: 1, value: "kept" }]);
+  } finally {
+    store.unavailable = false;
     await client.close();
   }
 });

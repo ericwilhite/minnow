@@ -97,6 +97,17 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
   }
 
   async flush(): Promise<BufferedFlushResult | undefined> {
+    // Capture the adds admitted before this call. Do not put the flush on #addTail: adds
+    // must still be able to accumulate the next batch while this one is being persisted.
+    const adds = this.#addTail;
+    await adds;
+    let result: BufferedFlushResult | undefined;
+    if (this.#inFlight !== undefined) result = await this.#inFlight;
+    if (this.#rows.length > 0) result = await this.#flushBatch();
+    return result;
+  }
+
+  async #flushBatch(): Promise<BufferedFlushResult | undefined> {
     if (this.#inFlight !== undefined) return this.#inFlight;
     if (this.#rows.length === 0) return undefined;
     this.#clearTimer();
@@ -152,7 +163,7 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
   async #flushPending(): Promise<void> {
     while (this.#inFlight !== undefined || this.#rows.length > 0) {
       if (this.#inFlight !== undefined) await this.#inFlight;
-      else await this.flush();
+      else await this.#flushBatch();
     }
   }
 
@@ -167,7 +178,7 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
       return undefined;
     }
     if (this.#inFlight !== undefined) await this.#inFlight;
-    return this.flush();
+    return this.#flushBatch();
   }
 
   #scheduleAgeFlush(): void {

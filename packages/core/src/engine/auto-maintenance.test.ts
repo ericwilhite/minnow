@@ -149,11 +149,15 @@ async function burst(
   reference: Map<number, Row>,
   updates: number,
   deletes: number,
+  yieldEvery = 0,
 ): Promise<void> {
   for (let index = 0; index < updates; index += 1) {
     const id = ((index * 37) % ROWS) + 1;
     const row = reference.get(id);
     if (row === undefined) continue;
+    if (yieldEvery > 0 && index % yieldEvery === 0) {
+      await new Promise((resolve) => setTimeout(resolve, index % 5));
+    }
     await database.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [id]);
     reference.set(id, { ...row, amount: row.amount + 1 });
   }
@@ -169,11 +173,21 @@ async function burst(
 async function footprint(store: MemoryBlockStore, database: MinnowDatabase) {
   const stats = await store.getStorageStats();
   const manifests = await manifestRecords(store);
+  const visible = await allVisibleSegments(database, "items");
+  const segments = (
+    await Promise.all(visible.map((segment) => store.getSegment(segment.id)))
+  ).filter((segment) => segment !== undefined);
   return {
-    visibleSegments: (await allVisibleSegments(database, "items")).length,
+    visibleSegments: segments.length,
+    levelZeroSegments: segments.filter((segment) => segment.level === 0).length,
+    deltaSegments: segments.filter(
+      (segment) => segment.kind !== "insert" && segment.kind !== "base",
+    ).length,
     liveBlocks: stats.liveBlockCount,
     storedBlocks: stats.liveBlockCount + stats.obsoleteBlockCount,
     storedBytes: stats.liveBlockBytes + stats.obsoleteBlockBytes,
+    liveBytes: stats.liveBlockBytes,
+    obsoleteBytes: stats.obsoleteBlockBytes,
     manifests: manifests.length,
     unprunedManifests: manifests.filter((manifest) => manifest.prunedAt === undefined).length,
     transactions: (await transactionRecords(store)).length,
@@ -181,10 +195,10 @@ async function footprint(store: MemoryBlockStore, database: MinnowDatabase) {
 }
 
 /**
- * Waits for the background loops to go quiet: no active job, the footprint not moving for half
+ * Waits for the background loops to go quiet: no active job, the footprint not moving for
  * a second, and — because a fold is only a job record once its planning is done, and planning
- * takes longer on a loaded machine — the table no longer due for one. Gives up after a minute,
- * leaving the assertions to say what did not happen.
+ * takes longer on a loaded machine — the table no longer due for one. Fails after a minute
+ * with the unsettled footprint.
  */
 async function settle(store: MemoryBlockStore, database: MinnowDatabase): Promise<void> {
   let previous = JSON.stringify(await footprint(store, database));
@@ -198,12 +212,21 @@ async function settle(store: MemoryBlockStore, database: MinnowDatabase): Promis
       (job) => job.state === "planned" || job.state === "running",
     );
     const current = await footprint(store, database);
-    const due = current.visibleSegments >= 32;
+    const due = current.levelZeroSegments >= 48 || current.deltaSegments >= 32;
+    const maintenance = database.maintenanceStatus();
     const serialized = JSON.stringify(current);
     quiet =
-      !activeCompaction && !activeCollection && !due && serialized === previous ? quiet + 1 : 0;
+      !activeCompaction &&
+      !activeCollection &&
+      !maintenance.collectionRunning &&
+      !maintenance.collectionRequested &&
+      !due &&
+      serialized === previous
+        ? quiet + 1
+        : 0;
     previous = serialized;
   }
+  expect(quiet, `Maintenance did not settle: ${previous}`).toBe(20);
 }
 
 async function expectContents(database: MinnowDatabase, reference: Map<number, Row>) {
@@ -404,6 +427,122 @@ describe("background maintenance", () => {
     ]);
     await database.close();
   });
+  it.each(["new", "manifest-blocks", "segments"] as const)(
+    "reclaims bounded retired history from %s discovery across reopen",
+    async (phase) => {
+      class CollectionCountingStore extends MemoryBlockStore {
+        retainedBlocks: string[] = [];
+        segmentPageCalls = 0;
+        override listSegmentPage(afterId: string | null, limit: number) {
+          this.segmentPageCalls += 1;
+          return super.listSegmentPage(afterId, limit);
+        }
+        override async runGarbageCollectionStep(
+          input: Parameters<MemoryBlockStore["runGarbageCollectionStep"]>[0],
+        ) {
+          const result = await super.runGarbageCollectionStep(input);
+          this.retainedBlocks.push(...result.retainedBlockIds);
+          return result;
+        }
+      }
+      const store = new CollectionCountingStore();
+      const options = { autoCompact: false, autoCollect: false };
+      let database = new MinnowDatabase(store, options);
+      try {
+        await database.execute("CREATE TABLE receipts(id INTEGER PRIMARY KEY, total INTEGER)");
+        for (let id = 0; id < 20; id += 1) await database.insert("receipts", { id, total: 100 });
+        expect((await database.compactTable("receipts")).compacted).toBe(true);
+        const before = await store.getStorageStats();
+        expect(before.obsoleteBlockCount).toBeGreaterThan(8);
+        if (phase !== "new") {
+          const version = await store.getCurrentManifestVersion();
+          await store.createGarbageCollectionJob({
+            id: "legacy-discovery",
+            candidateManifestVersions: [],
+            candidateSegmentIds: [],
+            candidateBlockIds: [],
+            candidateTransactionIds: [],
+            leaseCutoff: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            discovery: {
+              phase,
+              currentManifestVersion: version,
+              retainAboveVersion: version ?? 0,
+              retainAfter: Number.MIN_SAFE_INTEGER,
+              maxPlanningItems: 8,
+              manifestCursor: null,
+              segmentCursor: null,
+              transactionCursor: null,
+              compactionCursor: null,
+              visitedRecords: 0,
+              resumePhase: null,
+              postManifestPhase: null,
+              artifactCursor: null,
+            },
+          });
+        }
+        for (let pass = 0; pass < 40; pass += 1) {
+          await database.collectGarbage({ maxPlanningItems: 8, maxItemsPerStep: 8 });
+          await database.close();
+          database = new MinnowDatabase(store, options);
+          if ((await store.getStorageStats()).obsoleteBlockCount === 0) break;
+        }
+        expect((await store.getStorageStats()).obsoleteBlockCount).toBe(0);
+        if (phase === "new") {
+          expect(store.retainedBlocks).toEqual([]);
+          // Twenty retired segments should take bounded pages, not twenty durable planner updates.
+          expect(store.segmentPageCalls).toBeLessThan(10);
+        }
+        expect(
+          (await database.query("SELECT COUNT(*) AS n, SUM(total) AS total FROM receipts")).rows,
+        ).toEqual([{ n: 20, total: 2000 }]);
+      } finally {
+        await database.close();
+        store.close();
+      }
+    },
+  );
+
+  it("keeps the continuation destination while paging more than 64 retained manifests", async () => {
+    const store = new MemoryBlockStore();
+    const options = { autoCompact: false, autoCollect: false };
+    let database = new MinnowDatabase(store, options);
+    try {
+      await database.execute("CREATE TABLE receipts(id INTEGER PRIMARY KEY, total INTEGER)");
+      for (let id = 0; id < 80; id += 1) await database.insert("receipts", { id, total: 100 });
+      expect((await database.compactTable("receipts")).compacted).toBe(true);
+      expect((await manifestRecords(store)).length).toBeGreaterThan(64);
+      let completed = false;
+      for (let pass = 0; pass < 80; pass += 1) {
+        const result = await database.collectGarbage({
+          maxPlanningItems: 16,
+          maxItemsPerStep: 16,
+          retainRecentVersions: 128,
+        });
+        const job = await store.getGarbageCollectionJob(result.jobId);
+        if (job?.discovery?.resumePhase == null) {
+          completed = true;
+          break;
+        }
+        await database.close();
+        database = new MinnowDatabase(store, options);
+      }
+      expect(completed, "Discovery must advance past protected segment/block pages").toBe(true);
+      expect(
+        (await manifestRecords(store)).filter((record) => record.prunedAt === undefined).length,
+      ).toBeGreaterThan(64);
+      expect(
+        (await database.query("SELECT COUNT(*) AS n FROM receipts", { version: 0 })).rows,
+      ).toEqual([{ n: 1 }]);
+      expect(
+        (await database.query("SELECT COUNT(*) AS n, SUM(total) AS total FROM receipts")).rows,
+      ).toEqual([{ n: 80, total: 8000 }]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
   it("keeps tombstone provenance across bounded jobs and reopen", async () => {
     class CandidateReadCountingStore extends MemoryBlockStore {
       candidateReadCalls = 0;
@@ -491,36 +630,72 @@ describe("background maintenance", () => {
       (await database.listGarbageCollectionJobs()).some((job) => job.state === "completed"),
     ).toBe(true);
   });
-  it("keeps the footprint bounded across repeated bursts", async () => {
-    // The property that matters for a tab open all day: a second and third burst settle back
-    // to the same place the first did, rather than each leaving a residue the next builds on.
+  it("retains a fold triggered by the quiet-period write until its own history window expires", async () => {
     const { store, database, reference, clock } = await seeded();
-    const after: Array<Awaited<ReturnType<typeof footprint>>> = [];
-    for (let round = 0; round < 3; round += 1) {
-      await burst(database, reference, 200, 20);
+    try {
+      await burst(database, reference, 31, 0);
       await settle(store, database);
+      expect((await footprint(store, database)).deltaSegments).toBe(31);
       await quietMinute(database, reference, clock);
       await settle(store, database);
-      after.push(await footprint(store, database));
+      const retained = await footprint(store, database);
+      expect(retained.deltaSegments).toBe(0);
+      expect(retained.obsoleteBytes).toBeGreaterThan(0);
+      expect(retained.unprunedManifests).toBeGreaterThanOrEqual(2);
+      await quietMinute(database, reference, clock);
+      await settle(store, database);
+      expect((await footprint(store, database)).obsoleteBytes).toBe(0);
+      await expectContents(database, reference);
+    } finally {
+      await database.close();
     }
-    const [first, , third] = after;
-    if (first === undefined || third === undefined) throw new Error("Expected three rounds");
-    // Each round settles to the same place, within the last fold's leftovers; without
-    // collection each round would add its whole burst to the previous one. Blocks are compared
-    // as obsolete residue and live growth rather than as a ratio: the folded table's own block
-    // count depends on which sources its last fold merged, and how many sub-threshold deltas a
-    // burst leaves unfolded depends on when its last fold ran, so a first round that happened
-    // to end small would fail a later, equally clean one.
-    expect(third.storedBytes).toBeLessThanOrEqual(first.storedBytes * 1.5);
-    expect(third.storedBlocks - third.liveBlocks).toBeLessThanOrEqual(
-      first.storedBlocks - first.liveBlocks + 8,
-    );
-    expect(third.liveBlocks).toBeLessThanOrEqual(first.liveBlocks + 2 * 32 + 8);
-    expect(third.unprunedManifests).toBeLessThanOrEqual(64 + 2);
-    expect(third.visibleSegments).toBeLessThanOrEqual(33);
-    expect(third.transactions).toBeLessThanOrEqual(third.visibleSegments + 8);
-    await expectContents(database, reference);
   });
+  it.each([0, 7])(
+    "keeps the footprint bounded across repeated bursts (yield every %s writes)",
+    async (yieldEvery) => {
+      // The property that matters for a tab open all day: successive bursts settle back
+      // to the same place the first did, rather than each leaving a residue the next builds on.
+      const { store, database, reference, clock } = await seeded();
+      const after: Array<Awaited<ReturnType<typeof footprint>>> = [];
+      for (let round = 0; round < 5; round += 1) {
+        await burst(database, reference, 200, 20, yieldEvery);
+        await settle(store, database);
+        await quietMinute(database, reference, clock);
+        await settle(store, database);
+        // The quiet-period update can itself cross the delta fold threshold. Its new source
+        // version is intentionally retained for another minute; let that retention expire
+        // before measuring reclamation, without weakening the footprint bound.
+        if ((await footprint(store, database)).obsoleteBytes > 0) {
+          await quietMinute(database, reference, clock);
+          await settle(store, database);
+        }
+        after.push(await footprint(store, database));
+      }
+      const first = after[0];
+      const last = after.at(-1);
+      if (first === undefined || last === undefined) throw new Error("Expected five rounds");
+      // Each round settles to the same place, within the last fold's leftovers; without
+      // collection each round would add its whole burst to the previous one. Blocks are compared
+      // as obsolete residue and live growth rather than as a ratio: the folded table's own block
+      // count depends on which sources its last fold merged, and how many sub-threshold deltas a
+      // burst leaves unfolded depends on when its last fold ran, so a first round that happened
+      // to end small would fail a later, equally clean one.
+      for (const current of after) {
+        expect(current.storedBytes, JSON.stringify(after)).toBeLessThanOrEqual(
+          first.storedBytes * 1.5,
+        );
+      }
+      expect(last.storedBlocks - last.liveBlocks).toBeLessThanOrEqual(
+        first.storedBlocks - first.liveBlocks + 8,
+      );
+      expect(last.liveBlocks).toBeLessThanOrEqual(first.liveBlocks + 2 * 32 + 8);
+      expect(last.unprunedManifests).toBeLessThanOrEqual(64 + 2);
+      expect(last.visibleSegments).toBeLessThanOrEqual(33);
+      expect(last.transactions).toBeLessThanOrEqual(last.visibleSegments + 8);
+      await expectContents(database, reference);
+      await database.close();
+    },
+  );
   it("keeps recent versions readable and prunes old ones", async () => {
     const { store, database, reference, clock } = await seeded();
     const early = await store.getCurrentManifestVersion();

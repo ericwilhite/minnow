@@ -7828,8 +7828,8 @@ function assertGarbageCollectionCandidateProvenance(
   }
   const unprovenSegmentId = candidates.candidateSegmentIds.find((id) => {
     // The persisted segment record is sufficient provenance for nominating that exact id.
-    // Its blocks may already have been reclaimed by an earlier bounded pass, and terminal
-    // compaction records are intentionally aged out, so neither is a durable discovery source.
+    // Terminal compaction records are intentionally aged out, so they are not a durable
+    // discovery source. Blocks remain protected until this segment record is reclaimed.
     return !segments.has(id);
   });
   if (unprovenSegmentId !== undefined) {
@@ -7874,6 +7874,7 @@ function collectIndexedPhysicalRoots(
   };
   const rootedBlockIds = new Set<string>();
   const rootedSegmentIds = new Set<string>();
+  const candidateSegments = new Set(candidateSegmentIds);
   for (const id of candidateSegmentIds) {
     const segment = segments.get(id);
     if (segment !== undefined && isSegmentRoot(segment)) rootedSegmentIds.add(id);
@@ -7885,7 +7886,12 @@ function collectIndexedPhysicalRoots(
     }
     for (const segmentId of segments.segmentIdsForBlock(id)) {
       const segment = segments.get(segmentId);
-      if (segment !== undefined && isSegmentRoot(segment)) {
+      // Recovery validates every retained segment, including retired history. Only a
+      // segment reclaimed in this same atomic step may release its structural block roots.
+      if (
+        segment !== undefined &&
+        (!candidateSegments.has(segmentId) || rootedSegmentIds.has(segmentId))
+      ) {
         rootedBlockIds.add(id);
         break;
       }

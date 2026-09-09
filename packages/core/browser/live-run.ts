@@ -8,6 +8,7 @@
  * Not a test: `live-bench.spec.ts` drives it only when asked, and reports rather than asserts.
  */
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
+import { runLiveCorrectness } from "./live-check.js";
 import { LiveQueryManager, type LiveQuerySource } from "@minnowdb/core/live";
 import type { QueryResult, QueryValue } from "@minnowdb/core";
 
@@ -353,5 +354,7 @@ async function runLiveBench(options: LiveBenchOptions): Promise<LiveBenchReport>
 }
 
 (window as typeof window & { runLiveBench: typeof runLiveBench }).runLiveBench = runLiveBench;
+(window as typeof window & { runLiveCorrectness: typeof runLiveCorrectness }).runLiveCorrectness =
+  runLiveCorrectness;
 const ready = document.querySelector("#ready");
 if (ready !== null) ready.textContent = "Live-query benchmark ready";

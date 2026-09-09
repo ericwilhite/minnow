@@ -1,4 +1,6 @@
+import { coordinateWrite } from "./write-coordinator.js";
 import { LiveAggregate } from "./live-aggregate.js";
+import { stageLiveExecution } from "./live-accept.js";
 import { QueryGenerations } from "./query-generations.js";
 import { applyWindowFunctionsAsync } from "./windows.js";
 import { crossJoinPlan } from "../plan/model.js";
@@ -31,6 +33,7 @@ import {
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   DatabaseReadBacklogError,
+  TransactionExpiredError,
   MaintenanceBacklogError,
   MissingKeyError,
   SqlCompileError,
@@ -206,6 +209,7 @@ import {
   evaluateJoinedRowExpression,
   evaluateRowExpression,
   externalizeQueryResult,
+  markQueryResultExternal,
   expressionColumnNames,
   inferBlockSchema,
   inferResultColumnDomains,
@@ -265,6 +269,7 @@ import {
   queryResultMemoKey,
   queryResultRetainedBytes,
   RESULT_MEMO_MAX_BYTES,
+  sameQueryRow as sameLiveRow,
 } from "./query-cache.js";
 import {
   QueryMemoryBudgetError,
@@ -329,6 +334,7 @@ import {
 import {
   columnarTableFromRows,
   createColumnarTable,
+  createColumnVector,
   vectorValue,
   type ColumnarTable,
   type ColumnVector,
@@ -436,6 +442,7 @@ export const MAX_TRANSACTION_SAVEPOINTS = 64;
 export const MAX_TRANSACTION_SAVEPOINT_BYTES = 8 * 1024 * 1024;
 /** Outstanding simple writes retained by one database instance before callers must await. */
 export const MAX_DATABASE_PENDING_WRITES = 64;
+const MAX_DATABASE_ACTIVE_SCOPES = 256;
 /** Concurrent direct reads retained by one database instance. Reads still execute in parallel. */
 export const MAX_DATABASE_ACTIVE_READS = 256;
 /** Commits tolerated while collection fails before foreground writes assist and backpressure. */
@@ -1018,7 +1025,7 @@ export interface QueryOptions {
    * data with the default on measures cache lookups, not query execution.
    */
   memoize?: boolean;
-  readonly version?: number;
+  readonly version?: number | null;
   /**
    * Values for the statement's `?`/`$n` placeholders, in order. Required exactly when the
    * statement has placeholders; the compiled plan is cached on the SQL text and re-bound per
@@ -1273,6 +1280,8 @@ export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema
   targetBlockBytes?: number;
   rowsPerBlock?: number;
   maxCommitRetries?: number;
+  /** Coordinate autocommit writers across instances and, with Web Locks, tabs. Default true. */
+  coordinateWrites?: boolean;
   now?: () => Date;
   createId?: () => string;
   /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
@@ -2080,12 +2089,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   #openTransaction: OpenStatementTransaction | undefined;
   /** Joins the durable abort after an idle timer has detached the statement transaction. */
   #statementTransactionCleanup: Promise<void> | undefined;
+  #statementTransactionExpired = false;
+  #executeChain: Promise<unknown> = Promise.resolve();
+  #pendingExecutes = 0;
+  readonly #scopeTasks = new Set<Promise<unknown>>();
+  readonly #scopeControllers = new Set<AbortController>();
   readonly #compression: Compression;
   /** Per-column count since gzip last failed to repay itself; successful probes need no entry. */
   readonly #gzipVerdicts = new Map<string, number>();
   readonly #rowsPerBlock: number;
   readonly #targetBlockBytes: number;
   readonly #maxCommitRetries: number;
+  readonly #coordinateWrites: boolean;
+  readonly #shutdown = new AbortController();
+  readonly #exports = new Set<AsyncGenerator<Uint8Array, void, void>>();
   readonly #now: () => Date;
   readonly #spillOwnerLeaseMs: number;
   readonly #transactionOwnerLeaseMs: number;
@@ -2237,6 +2254,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         `Target block bytes must be a positive whole number no larger than ${String(MAX_PHYSICAL_COLUMN_BYTE_LENGTH)}`,
       );
     }
+    this.#coordinateWrites = options.coordinateWrites ?? true;
     this.#maxCommitRetries = options.maxCommitRetries ?? 8;
     if (!Number.isSafeInteger(this.#maxCommitRetries) || this.#maxCommitRetries < 0) {
       throw new RangeError("Commit retries must be a non-negative whole number");
@@ -2306,12 +2324,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   close(): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closed = true;
+    this.#shutdown.abort(new Error("Database is closed"));
     const closing = this.#closeResources();
     this.#closePromise = closing;
     return closing;
   }
 
   async #closeResources(): Promise<void> {
+    for (const controller of this.#scopeControllers) {
+      controller.abort(new Error("Database is closed"));
+    }
     if (this.#idleCompactionTimer !== undefined) {
       clearTimeout(this.#idleCompactionTimer);
       this.#idleCompactionTimer = undefined;
@@ -2337,6 +2359,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // No new background task can start after #closed flips. Join the tasks that already own
     // store work before releasing leases or allowing the caller to close the injected store.
     await Promise.allSettled([
+      ...[...this.#exports].map((iterator) => iterator.return(undefined)),
+      this.#writeChain,
+      this.#executeChain,
+      ...this.#scopeTasks,
+      ...this.#foregroundTasks,
       ...this.#autoCompactionsInFlight.values(),
       ...this.#ftsBuildsInFlight.values(),
       ...(this.#autoCollectionTask === undefined ? [] : [this.#autoCollectionTask]),
@@ -2410,320 +2437,327 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async createTable(input: CreateTableInput): Promise<void> {
-    const name = validateName(input.name, "Table");
-    if (input.columns.length === 0) throw new TypeError("A table needs at least one column");
-    const enumDomains = new Map<string, SqlDomain>();
-    for (const column of input.columns) {
-      if (column.sqlDomain?.kind !== "enum" || column.sqlDomain.values.length > 0) continue;
-      const record = await this.store.getTableByName(`${ENUM_TYPE_PREFIX}${column.sqlDomain.name}`);
-      if (record?.enumType === undefined) {
-        throw new TypeError(`Unsupported column type: ${column.sqlDomain.name}`);
-      }
-      enumDomains.set(column.name, {
-        kind: "enum",
-        name: record.enumType.name,
-        values: [...record.enumType.values],
-      });
-    }
-    const names = new Set<string>();
-    const columns: TableColumnRecord[] = input.columns.map((column) => {
-      const columnName = validateName(column.name, "Column");
-      if (names.has(columnName)) throw new TypeError(`Duplicate column: ${columnName}`);
-      names.add(columnName);
-      if (!simpleDataTypes.includes(column.type)) {
-        throw new TypeError(`Unsupported data type: ${column.type}`);
-      }
-      if (column.enumValues !== undefined && column.type !== "string") {
-        throw new TypeError(`Enum values require a string column: ${columnName}`);
-      }
-      const sqlDomain = enumDomains.get(column.name) ?? column.sqlDomain;
-      return {
-        id: this.#createId(),
-        name: columnName,
-        type: column.type,
-        ...(column.integer === true ? { integer: true } : {}),
-        ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
-        nullable: column.nullable ?? false,
-        ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
-        ...(column.generatedValue === undefined
-          ? {}
-          : { generatedValue: structuredClone(column.generatedValue) }),
-        ...(column.enumValues === undefined
-          ? {}
-          : { enumValues: validateEnumValues(column.enumValues, columnName) }),
-        ...(column.backfill === undefined
-          ? {}
-          : {
-              backfill: normalizedColumnBackfill(
-                {
-                  name: columnName,
-                  type: column.type,
-                  ...(column.integer === true ? { integer: true as const } : {}),
-                  ...(sqlDomain === undefined ? {} : { sqlDomain }),
-                  ...(column.enumValues === undefined ? {} : { enumValues: column.enumValues }),
-                },
-                column.backfill,
-              ),
-            }),
-      };
-    });
-    if (input.uniqueKey !== undefined && input.compositePrimaryKey !== undefined) {
-      throw new TypeError("A table cannot declare both scalar and composite primary keys");
-    }
-    const compositePrimaryColumns = (input.compositePrimaryKey ?? []).map((columnName) => {
-      const column = columns.find((candidate) => candidate.name === columnName);
-      if (column === undefined) {
-        throw new TypeError(`PRIMARY KEY column not found: ${columnName}`);
-      }
-      return column;
-    });
-    if (
-      input.compositePrimaryKey !== undefined &&
-      (compositePrimaryColumns.length < 2 ||
-        new Set(compositePrimaryColumns.map((column) => column.id)).size !==
-          compositePrimaryColumns.length)
-    ) {
-      throw new TypeError("A composite PRIMARY KEY needs at least two distinct columns");
-    }
-    for (const column of compositePrimaryColumns) {
-      if (column.nullable) throw new TypeError(`PRIMARY KEY cannot be nullable: ${column.name}`);
-    }
-    const hiddenCompositeKey =
-      compositePrimaryColumns.length === 0
-        ? undefined
-        : ({
-            id: this.#createId(),
-            name: COMPOSITE_KEY_COLUMN_NAME,
-            type: "string",
-            nullable: false,
-            hidden: true,
-          } satisfies TableColumnRecord);
-    if (hiddenCompositeKey !== undefined) columns.push(hiddenCompositeKey);
-    const uniqueKeyColumn =
-      hiddenCompositeKey ??
-      (input.uniqueKey === undefined
-        ? undefined
-        : columns.find((column) => column.name === input.uniqueKey));
-    if (input.uniqueKey !== undefined && uniqueKeyColumn === undefined) {
-      throw new TypeError(`Unique key column not found: ${input.uniqueKey}`);
-    }
-    if (uniqueKeyColumn?.nullable === true) {
-      throw new TypeError(`Unique key cannot be nullable: ${uniqueKeyColumn.name}`);
-    }
-    for (const column of columns) {
-      if (column.generatedValue !== undefined) {
-        if (column.defaultValue !== undefined || column.backfill !== undefined) {
-          throw new TypeError(
-            `A generated column cannot also have a default or backfill: ${name}.${column.name}`,
-          );
-        }
-        compileGeneratedColumnExpression(name, column.name, column.generatedValue.sql, columns);
-        if (column === uniqueKeyColumn || compositePrimaryColumns.includes(column)) {
-          throw new TypeError(
-            `Generated columns cannot be row-addressing keys: ${name}.${column.name}`,
-          );
-        }
-      }
-      if (column.defaultValue !== undefined) {
-        validateColumnDefault(
-          { ...column, isUniqueKey: column === uniqueKeyColumn },
-          column.defaultValue,
+    return this.#foreground(async () => {
+      const name = validateName(input.name, "Table");
+      if (input.columns.length === 0) throw new TypeError("A table needs at least one column");
+      const enumDomains = new Map<string, SqlDomain>();
+      for (const column of input.columns) {
+        if (column.sqlDomain?.kind !== "enum" || column.sqlDomain.values.length > 0) continue;
+        const record = await this.store.getTableByName(
+          `${ENUM_TYPE_PREFIX}${column.sqlDomain.name}`,
         );
-        if (column.defaultValue.kind === "literal" && column.sqlDomain !== undefined) {
-          normalizeSqlDomainValue(column.sqlDomain, column.defaultValue.value);
+        if (record?.enumType === undefined) {
+          throw new TypeError(`Unsupported column type: ${column.sqlDomain.name}`);
         }
-        if (column.defaultValue.kind === "expression") {
-          validateDefaultExpression(column.defaultValue.sql, {
-            name: `${name}.${column.name}`,
-            type: column.type,
-            ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
-          });
-        }
-      }
-    }
-    const constraintNames = new Set<string>();
-    const claimConstraintName = (rawName: string): string => {
-      const constraintName = validateName(rawName, "Constraint");
-      if (constraintNames.has(constraintName)) {
-        throw new TypeError(`Constraint already exists: ${constraintName}`);
-      }
-      constraintNames.add(constraintName);
-      return constraintName;
-    };
-    const foreignKeyNames = (input.foreignKeys ?? []).map((key) => claimConstraintName(key.name));
-    const checkNames = (input.checks ?? []).map((check) => claimConstraintName(check.name));
-    const uniqueConstraintNames = (input.uniqueConstraints ?? []).map((constraint) =>
-      claimConstraintName(constraint.name),
-    );
-    const foreignKeys = await Promise.all(
-      (input.foreignKeys ?? []).map(async (key, keyIndex) => {
-        if (key.enforced === false && key.onDelete !== "restrict") {
-          throw new TypeError(
-            `Informational FOREIGN KEY ${key.name} cannot declare ON DELETE actions`,
-          );
-        }
-        const childNames = key.columns ?? [key.column];
-        const children = childNames.map((columnName) => {
-          const column = columns.find((candidate) => candidate.name === columnName);
-          if (column === undefined) {
-            throw new TypeError(
-              `FOREIGN KEY ${key.name} names a column this table has no: ${columnName}`,
-            );
-          }
-          return column;
+        enumDomains.set(column.name, {
+          kind: "enum",
+          name: record.enumType.name,
+          values: [...record.enumType.values],
         });
-        // Self-references are allowed, and then the parent is this very table, which does not
-        // exist yet — its own declaration is the authority on the key.
-        const parent =
-          key.parentTable === name ? undefined : await this.store.getTableByName(key.parentTable);
-        if (key.parentTable !== name && parent === undefined) {
-          throw new TypeError(
-            `FOREIGN KEY ${key.name} references a table that does not exist: ${key.parentTable}`,
-          );
+      }
+      const names = new Set<string>();
+      const columns: TableColumnRecord[] = input.columns.map((column) => {
+        const columnName = validateName(column.name, "Column");
+        if (names.has(columnName)) throw new TypeError(`Duplicate column: ${columnName}`);
+        names.add(columnName);
+        if (!simpleDataTypes.includes(column.type)) {
+          throw new TypeError(`Unsupported data type: ${column.type}`);
         }
-        const parentColumns = parent === undefined ? columns : parent.columns;
-        const parentPrimaryIds =
-          parent === undefined
-            ? compositePrimaryColumns.length > 0
-              ? compositePrimaryColumns.map((column) => column.id)
-              : uniqueKeyColumn === undefined
-                ? []
-                : [uniqueKeyColumn.id]
-            : (parent.primaryKeyColumnIds ??
-              (parent.uniqueKeyColumnId === undefined ? [] : [parent.uniqueKeyColumnId]));
-        const parentPrimary = parentPrimaryIds
-          .map((columnId) => parentColumns.find((column) => column.id === columnId))
-          .filter((column): column is TableColumnRecord => column !== undefined && !column.hidden);
-        if (parentPrimary.length === 0) {
-          throw new TypeError(
-            `FOREIGN KEY ${key.name} references a table with no unique key: ${key.parentTable}`,
-          );
+        if (column.enumValues !== undefined && column.type !== "string") {
+          throw new TypeError(`Enum values require a string column: ${columnName}`);
         }
-        const requestedParentNames =
-          key.parentColumns ??
-          (key.parentColumn === undefined
-            ? parentPrimary.map((column) => column.name)
-            : [key.parentColumn]);
-        if (
-          requestedParentNames.length !== parentPrimary.length ||
-          requestedParentNames.some(
-            (columnName, index) => columnName !== parentPrimary[index]?.name,
-          )
-        ) {
-          throw new TypeError(
-            `FOREIGN KEY ${key.name} must reference ${key.parentTable}'s primary key (${parentPrimary.map((column) => column.name).join(", ")})`,
-          );
-        }
-        if (children.length !== parentPrimary.length) {
-          throw new TypeError(
-            `FOREIGN KEY ${key.name} has ${String(children.length)} child columns for ${String(parentPrimary.length)} parent columns`,
-          );
-        }
-        children.forEach((child, index) => {
-          const parentKey = parentPrimary[index];
-          if (parentKey === undefined) {
-            throw new TypeError(`FOREIGN KEY ${key.name} is missing a parent key column`);
-          }
-          if (child.type !== parentKey.type) {
-            throw new TypeError(
-              `FOREIGN KEY ${key.name} compares ${child.type} with ${parentKey.type}`,
-            );
-          }
-          if ((child.integer === true) !== (parentKey.integer === true)) {
-            throw new TypeError(
-              `FOREIGN KEY ${key.name} compares an integer domain with an approximate number domain`,
-            );
-          }
-          if (
-            JSON.stringify(child.sqlDomain ?? null) !== JSON.stringify(parentKey.sqlDomain ?? null)
-          ) {
-            throw new TypeError(`FOREIGN KEY ${key.name} compares different SQL value domains`);
-          }
-          if (key.onDelete === "set null" && !child.nullable) {
-            throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
-          }
-        });
-        const parentNames = parentPrimary.map((column) => column.name);
+        const sqlDomain = enumDomains.get(column.name) ?? column.sqlDomain;
         return {
-          name: foreignKeyNames[keyIndex] ?? key.name,
-          columns: childNames,
-          parentTable: key.parentTable,
-          parentColumns: parentNames,
-          onDelete: key.onDelete,
-          ...(key.enforced === false ? { enforced: false } : {}),
+          id: this.#createId(),
+          name: columnName,
+          type: column.type,
+          ...(column.integer === true ? { integer: true } : {}),
+          ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
+          nullable: column.nullable ?? false,
+          ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+          ...(column.generatedValue === undefined
+            ? {}
+            : { generatedValue: structuredClone(column.generatedValue) }),
+          ...(column.enumValues === undefined
+            ? {}
+            : { enumValues: validateEnumValues(column.enumValues, columnName) }),
+          ...(column.backfill === undefined
+            ? {}
+            : {
+                backfill: normalizedColumnBackfill(
+                  {
+                    name: columnName,
+                    type: column.type,
+                    ...(column.integer === true ? { integer: true as const } : {}),
+                    ...(sqlDomain === undefined ? {} : { sqlDomain }),
+                    ...(column.enumValues === undefined ? {} : { enumValues: column.enumValues }),
+                  },
+                  column.backfill,
+                ),
+              }),
         };
-      }),
-    );
-    const checks = (input.checks ?? []).map((check, checkIndex) => {
-      // Compiling here means a constraint the engine could never evaluate is refused at
-      // definition rather than on the first write.
-      const referencedColumns = expressionColumnNames(
-        compileCheckExpression(check.sql, check.name),
-      );
-      for (const reference of referencedColumns) {
-        const pieces = reference.split(".");
-        const columnName = pieces.at(-1) ?? reference;
-        const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
-        if (qualifier !== undefined && qualifier !== name) {
-          throw new TypeError(`CHECK ${check.name} references another table: ${reference}`);
-        }
-        if (!columns.some((column) => column.name === columnName && !column.hidden)) {
-          throw new TypeError(`CHECK ${check.name} names an unknown column: ${columnName}`);
-        }
+      });
+      if (input.uniqueKey !== undefined && input.compositePrimaryKey !== undefined) {
+        throw new TypeError("A table cannot declare both scalar and composite primary keys");
       }
-      return { name: checkNames[checkIndex] ?? check.name, sql: check.sql };
-    });
-    const tableId = this.#createId();
-    const currentVersion = (await this.store.getCurrentManifest())?.version ?? -1;
-    const secondaryIndexes: Record<string, SecondaryIndexRecord> = {};
-    for (const [constraintIndex, constraint] of (input.uniqueConstraints ?? []).entries()) {
-      const indexName = uniqueConstraintNames[constraintIndex] ?? constraint.name;
-      const indexedColumns = constraint.columns.map((columnName) => {
-        const column = columns.find(
-          (candidate) => candidate.name === columnName && !candidate.hidden,
-        );
+      const compositePrimaryColumns = (input.compositePrimaryKey ?? []).map((columnName) => {
+        const column = columns.find((candidate) => candidate.name === columnName);
         if (column === undefined) {
-          throw new TypeError(`UNIQUE ${indexName} names an unknown column: ${columnName}`);
+          throw new TypeError(`PRIMARY KEY column not found: ${columnName}`);
         }
         return column;
       });
       if (
-        indexedColumns.length === 0 ||
-        new Set(indexedColumns.map((column) => column.id)).size !== indexedColumns.length
+        input.compositePrimaryKey !== undefined &&
+        (compositePrimaryColumns.length < 2 ||
+          new Set(compositePrimaryColumns.map((column) => column.id)).size !==
+            compositePrimaryColumns.length)
       ) {
-        throw new TypeError(`UNIQUE ${indexName} needs distinct columns`);
+        throw new TypeError("A composite PRIMARY KEY needs at least two distinct columns");
       }
-      const indexId = this.#createId();
-      secondaryIndexes[indexId] = {
-        name: indexName,
-        columnId: indexedColumns[0]?.id ?? "",
-        columnIds: indexedColumns.map((column) => column.id),
-        directions: indexedColumns.map(() => "asc" as const),
-        unique: true,
-        uniqueEnforced: true,
-        termEncoding: "tuple-v1",
-        storage: "postings-v1",
-        storageColumnId: this.#createId(),
-        locator: uniqueKeyColumn === undefined ? "row-id" : "key-hash-v1",
-        state: "ready",
-        buildFromVersion: currentVersion,
+      for (const column of compositePrimaryColumns) {
+        if (column.nullable) throw new TypeError(`PRIMARY KEY cannot be nullable: ${column.name}`);
+      }
+      const hiddenCompositeKey =
+        compositePrimaryColumns.length === 0
+          ? undefined
+          : ({
+              id: this.#createId(),
+              name: COMPOSITE_KEY_COLUMN_NAME,
+              type: "string",
+              nullable: false,
+              hidden: true,
+            } satisfies TableColumnRecord);
+      if (hiddenCompositeKey !== undefined) columns.push(hiddenCompositeKey);
+      const uniqueKeyColumn =
+        hiddenCompositeKey ??
+        (input.uniqueKey === undefined
+          ? undefined
+          : columns.find((column) => column.name === input.uniqueKey));
+      if (input.uniqueKey !== undefined && uniqueKeyColumn === undefined) {
+        throw new TypeError(`Unique key column not found: ${input.uniqueKey}`);
+      }
+      if (uniqueKeyColumn?.nullable === true) {
+        throw new TypeError(`Unique key cannot be nullable: ${uniqueKeyColumn.name}`);
+      }
+      for (const column of columns) {
+        if (column.generatedValue !== undefined) {
+          if (column.defaultValue !== undefined || column.backfill !== undefined) {
+            throw new TypeError(
+              `A generated column cannot also have a default or backfill: ${name}.${column.name}`,
+            );
+          }
+          compileGeneratedColumnExpression(name, column.name, column.generatedValue.sql, columns);
+          if (column === uniqueKeyColumn || compositePrimaryColumns.includes(column)) {
+            throw new TypeError(
+              `Generated columns cannot be row-addressing keys: ${name}.${column.name}`,
+            );
+          }
+        }
+        if (column.defaultValue !== undefined) {
+          validateColumnDefault(
+            { ...column, isUniqueKey: column === uniqueKeyColumn },
+            column.defaultValue,
+          );
+          if (column.defaultValue.kind === "literal" && column.sqlDomain !== undefined) {
+            normalizeSqlDomainValue(column.sqlDomain, column.defaultValue.value);
+          }
+          if (column.defaultValue.kind === "expression") {
+            validateDefaultExpression(column.defaultValue.sql, {
+              name: `${name}.${column.name}`,
+              type: column.type,
+              ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+            });
+          }
+        }
+      }
+      const constraintNames = new Set<string>();
+      const claimConstraintName = (rawName: string): string => {
+        const constraintName = validateName(rawName, "Constraint");
+        if (constraintNames.has(constraintName)) {
+          throw new TypeError(`Constraint already exists: ${constraintName}`);
+        }
+        constraintNames.add(constraintName);
+        return constraintName;
       };
-    }
-    await this.store.addTable({
-      id: tableId,
-      name,
-      columns,
-      revision: 0,
-      managed: input.managed === true,
-      ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
-      ...(checks.length === 0 ? {} : { checks }),
-      ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
-      ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
-      ...(compositePrimaryColumns.length === 0
-        ? {}
-        : { primaryKeyColumnIds: compositePrimaryColumns.map((column) => column.id) }),
-      ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
-      createdAt: dateIsoString(this.#now()),
+      const foreignKeyNames = (input.foreignKeys ?? []).map((key) => claimConstraintName(key.name));
+      const checkNames = (input.checks ?? []).map((check) => claimConstraintName(check.name));
+      const uniqueConstraintNames = (input.uniqueConstraints ?? []).map((constraint) =>
+        claimConstraintName(constraint.name),
+      );
+      const foreignKeys = await Promise.all(
+        (input.foreignKeys ?? []).map(async (key, keyIndex) => {
+          if (key.enforced === false && key.onDelete !== "restrict") {
+            throw new TypeError(
+              `Informational FOREIGN KEY ${key.name} cannot declare ON DELETE actions`,
+            );
+          }
+          const childNames = key.columns ?? [key.column];
+          const children = childNames.map((columnName) => {
+            const column = columns.find((candidate) => candidate.name === columnName);
+            if (column === undefined) {
+              throw new TypeError(
+                `FOREIGN KEY ${key.name} names a column this table has no: ${columnName}`,
+              );
+            }
+            return column;
+          });
+          // Self-references are allowed, and then the parent is this very table, which does not
+          // exist yet — its own declaration is the authority on the key.
+          const parent =
+            key.parentTable === name ? undefined : await this.store.getTableByName(key.parentTable);
+          if (key.parentTable !== name && parent === undefined) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} references a table that does not exist: ${key.parentTable}`,
+            );
+          }
+          const parentColumns = parent === undefined ? columns : parent.columns;
+          const parentPrimaryIds =
+            parent === undefined
+              ? compositePrimaryColumns.length > 0
+                ? compositePrimaryColumns.map((column) => column.id)
+                : uniqueKeyColumn === undefined
+                  ? []
+                  : [uniqueKeyColumn.id]
+              : (parent.primaryKeyColumnIds ??
+                (parent.uniqueKeyColumnId === undefined ? [] : [parent.uniqueKeyColumnId]));
+          const parentPrimary = parentPrimaryIds
+            .map((columnId) => parentColumns.find((column) => column.id === columnId))
+            .filter(
+              (column): column is TableColumnRecord => column !== undefined && !column.hidden,
+            );
+          if (parentPrimary.length === 0) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} references a table with no unique key: ${key.parentTable}`,
+            );
+          }
+          const requestedParentNames =
+            key.parentColumns ??
+            (key.parentColumn === undefined
+              ? parentPrimary.map((column) => column.name)
+              : [key.parentColumn]);
+          if (
+            requestedParentNames.length !== parentPrimary.length ||
+            requestedParentNames.some(
+              (columnName, index) => columnName !== parentPrimary[index]?.name,
+            )
+          ) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} must reference ${key.parentTable}'s primary key (${parentPrimary.map((column) => column.name).join(", ")})`,
+            );
+          }
+          if (children.length !== parentPrimary.length) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} has ${String(children.length)} child columns for ${String(parentPrimary.length)} parent columns`,
+            );
+          }
+          children.forEach((child, index) => {
+            const parentKey = parentPrimary[index];
+            if (parentKey === undefined) {
+              throw new TypeError(`FOREIGN KEY ${key.name} is missing a parent key column`);
+            }
+            if (child.type !== parentKey.type) {
+              throw new TypeError(
+                `FOREIGN KEY ${key.name} compares ${child.type} with ${parentKey.type}`,
+              );
+            }
+            if ((child.integer === true) !== (parentKey.integer === true)) {
+              throw new TypeError(
+                `FOREIGN KEY ${key.name} compares an integer domain with an approximate number domain`,
+              );
+            }
+            if (
+              JSON.stringify(child.sqlDomain ?? null) !==
+              JSON.stringify(parentKey.sqlDomain ?? null)
+            ) {
+              throw new TypeError(`FOREIGN KEY ${key.name} compares different SQL value domains`);
+            }
+            if (key.onDelete === "set null" && !child.nullable) {
+              throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
+            }
+          });
+          const parentNames = parentPrimary.map((column) => column.name);
+          return {
+            name: foreignKeyNames[keyIndex] ?? key.name,
+            columns: childNames,
+            parentTable: key.parentTable,
+            parentColumns: parentNames,
+            onDelete: key.onDelete,
+            ...(key.enforced === false ? { enforced: false } : {}),
+          };
+        }),
+      );
+      const checks = (input.checks ?? []).map((check, checkIndex) => {
+        // Compiling here means a constraint the engine could never evaluate is refused at
+        // definition rather than on the first write.
+        const referencedColumns = expressionColumnNames(
+          compileCheckExpression(check.sql, check.name),
+        );
+        for (const reference of referencedColumns) {
+          const pieces = reference.split(".");
+          const columnName = pieces.at(-1) ?? reference;
+          const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
+          if (qualifier !== undefined && qualifier !== name) {
+            throw new TypeError(`CHECK ${check.name} references another table: ${reference}`);
+          }
+          if (!columns.some((column) => column.name === columnName && !column.hidden)) {
+            throw new TypeError(`CHECK ${check.name} names an unknown column: ${columnName}`);
+          }
+        }
+        return { name: checkNames[checkIndex] ?? check.name, sql: check.sql };
+      });
+      const tableId = this.#createId();
+      const currentVersion = (await this.store.getCurrentManifest())?.version ?? -1;
+      const secondaryIndexes: Record<string, SecondaryIndexRecord> = {};
+      for (const [constraintIndex, constraint] of (input.uniqueConstraints ?? []).entries()) {
+        const indexName = uniqueConstraintNames[constraintIndex] ?? constraint.name;
+        const indexedColumns = constraint.columns.map((columnName) => {
+          const column = columns.find(
+            (candidate) => candidate.name === columnName && !candidate.hidden,
+          );
+          if (column === undefined) {
+            throw new TypeError(`UNIQUE ${indexName} names an unknown column: ${columnName}`);
+          }
+          return column;
+        });
+        if (
+          indexedColumns.length === 0 ||
+          new Set(indexedColumns.map((column) => column.id)).size !== indexedColumns.length
+        ) {
+          throw new TypeError(`UNIQUE ${indexName} needs distinct columns`);
+        }
+        const indexId = this.#createId();
+        secondaryIndexes[indexId] = {
+          name: indexName,
+          columnId: indexedColumns[0]?.id ?? "",
+          columnIds: indexedColumns.map((column) => column.id),
+          directions: indexedColumns.map(() => "asc" as const),
+          unique: true,
+          uniqueEnforced: true,
+          termEncoding: "tuple-v1",
+          storage: "postings-v1",
+          storageColumnId: this.#createId(),
+          locator: uniqueKeyColumn === undefined ? "row-id" : "key-hash-v1",
+          state: "ready",
+          buildFromVersion: currentVersion,
+        };
+      }
+      await this.store.addTable({
+        id: tableId,
+        name,
+        columns,
+        revision: 0,
+        managed: input.managed === true,
+        ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
+        ...(checks.length === 0 ? {} : { checks }),
+        ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
+        ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
+        ...(compositePrimaryColumns.length === 0
+          ? {}
+          : { primaryKeyColumnIds: compositePrimaryColumns.map((column) => column.id) }),
+        ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
+        createdAt: dateIsoString(this.#now()),
+      });
     });
   }
 
@@ -2733,35 +2767,39 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * what a reader can select, this answers what a planner needs to diff.
    */
   async introspect(): Promise<Catalog> {
-    return toCatalog(await this.store.listTables());
+    return this.#foreground(async () => {
+      return toCatalog(await this.store.listTables());
+    });
   }
 
   async listTables(): Promise<TableDefinition[]> {
-    return (await this.store.listTables())
-      .filter((table) => table.enumType === undefined && table.sequence === undefined)
-      .map((table) => {
-        const uniqueKey = table.columns.find(
-          (column) => column.id === table.uniqueKeyColumnId,
-        )?.name;
-        return {
-          name: table.name,
-          columns: visibleTableColumns(table).map((column) => ({
-            name: column.name,
-            type: column.type,
-            ...(column.integer === true ? { integer: true } : {}),
-            ...(column.sqlDomain === undefined
-              ? {}
-              : { sqlDomain: structuredClone(column.sqlDomain) }),
-            nullable: column.nullable,
-            ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
-            ...(column.generatedValue === undefined
-              ? {}
-              : { generatedValue: column.generatedValue }),
-            ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
-          })),
-          ...(uniqueKey === undefined ? {} : { uniqueKey }),
-        };
-      });
+    return this.#foreground(async () => {
+      return (await this.store.listTables())
+        .filter((table) => table.enumType === undefined && table.sequence === undefined)
+        .map((table) => {
+          const uniqueKey = table.columns.find(
+            (column) => column.id === table.uniqueKeyColumnId,
+          )?.name;
+          return {
+            name: table.name,
+            columns: visibleTableColumns(table).map((column) => ({
+              name: column.name,
+              type: column.type,
+              ...(column.integer === true ? { integer: true } : {}),
+              ...(column.sqlDomain === undefined
+                ? {}
+                : { sqlDomain: structuredClone(column.sqlDomain) }),
+              nullable: column.nullable,
+              ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+              ...(column.generatedValue === undefined
+                ? {}
+                : { generatedValue: column.generatedValue }),
+              ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
+            })),
+            ...(uniqueKey === undefined ? {} : { uniqueKey }),
+          };
+        });
+    });
   }
 
   /**
@@ -2774,8 +2812,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * Writers issued concurrently from one database used to all read the same version and spend
    * a retry per rival that landed first, so past `maxCommitRetries + 1` of them the rest failed
    * for nothing — contention this database need not create, and the queue does not. Writers in
-   * other instances and other tabs still contend, and the retry loop is still what resolves
-   * them. Write scopes are not queued: a scope's callback may issue a plain write of its own,
+   * other instances share admission where available; uncoordinated writers still resolve
+   * conflicts through the retry loop. Write scopes are not queued: a scope's callback may issue a plain write of its own,
    * which must not wait on the scope that contains it.
    *
    * A complete background fold whose publication lost the manifest race takes its turn here
@@ -2805,7 +2843,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     };
     const previous = this.#writeChain;
-    const current = previous.then(restarting, restarting);
+    const coordinated = () => this.#coordinateWrite(restarting);
+    const current = previous.then(coordinated, coordinated);
     this.#writeChain = current;
     try {
       return await current;
@@ -2903,6 +2942,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #withWriteReservation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.#closed) throw new Error("Database is closed");
+    if (this.#statementTransactionExpired) throw new TransactionExpiredError();
     if (this.#pendingWriteReservations >= MAX_DATABASE_PENDING_WRITES) {
       throw new RangeError(
         `A database cannot queue more than ${String(MAX_DATABASE_PENDING_WRITES)} writes; await a write for backpressure`,
@@ -2916,7 +2957,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  readonly #foregroundTasks = new Set<Promise<unknown>>();
+
+  async #foreground<T>(run: () => Promise<T>): Promise<T> {
+    if (this.#closed) throw new Error("Database is closed");
+    const task = run();
+    this.#foregroundTasks.add(task);
+    try {
+      return await task;
+    } finally {
+      this.#foregroundTasks.delete(task);
+    }
+  }
+
   async #withReadReservation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.#closed) throw new Error("Database is closed");
     if (this.#activeReadReservations >= MAX_DATABASE_ACTIVE_READS) {
       throw new DatabaseReadBacklogError(MAX_DATABASE_ACTIVE_READS);
     }
@@ -2934,8 +2989,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     probe?: CatalogProbe,
     storeMemo = true,
   ): Promise<QueryResult> {
+    if (this.#closed) throw new Error("Database is closed");
     throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
+    if (this.#statementTransactionExpired) throw new TransactionExpiredError();
     throwIfAborted(options.signal);
     // An open statement transaction routes through its session, which owns the reservation for
     // the actual execution. Avoid charging the same query twice at this public boundary.
@@ -3046,123 +3103,127 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     sql: string,
     options: { orReplace?: boolean; managed?: boolean } = {},
   ): Promise<void> {
-    const viewName = validateName(name, "View");
-    const plan = compileQuery(sql);
-    let pinnedExistingId: string | null | undefined;
-    for (let attempt = 0; ; attempt += 1) {
-      const proof = await this.#stableCatalogProof();
-      const existing = proof.records.find((record) => record.name === viewName);
-      const existingId = existing?.id ?? null;
-      if (pinnedExistingId === undefined) pinnedExistingId = existingId;
-      else if (pinnedExistingId !== existingId) {
-        throw new TableRecordConflictError(viewName, 0, existing?.revision ?? null);
-      }
-      if (existing !== undefined) {
-        if (existing.view === undefined) throw new TypeError(`Table already exists: ${viewName}`);
-        if (options.orReplace !== true) throw new TypeError(`View already exists: ${viewName}`);
-      }
-      assertViewDefinitionAcyclic(proof.records, viewName, plan);
-      const schemas = catalogQuerySchemas(proof.records);
-      const inferred = inferBlockSchema(plan, schemas);
-      if (inferred.length === 0) {
-        throw new TypeError(`A view needs at least one column: ${viewName}`);
-      }
-      if (existing !== undefined) {
-        schemas.set(viewName, inferred);
-        assertDependentViewsKeepSchema(proof.records, existing, schemas);
-      }
-      const columns = inferred.map((column, index) => {
-        const previous = existing?.columns[index];
-        return {
-          id:
-            previous !== undefined && querySchemasEqual([column], [previous])
-              ? previous.id
-              : this.#createId(),
-          name: column.name,
-          type: column.type,
-          ...(column.integer === true ? { integer: true as const } : {}),
-          ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
-          nullable: true,
-        };
-      });
-      const view = { sql, managed: options.managed === true };
-      try {
+    return this.#foreground(async () => {
+      const viewName = validateName(name, "View");
+      const plan = compileQuery(sql);
+      let pinnedExistingId: string | null | undefined;
+      for (let attempt = 0; ; attempt += 1) {
+        const proof = await this.#stableCatalogProof();
+        const existing = proof.records.find((record) => record.name === viewName);
+        const existingId = existing?.id ?? null;
+        if (pinnedExistingId === undefined) pinnedExistingId = existingId;
+        else if (pinnedExistingId !== existingId) {
+          throw new TableRecordConflictError(viewName, 0, existing?.revision ?? null);
+        }
         if (existing !== undefined) {
-          await this.store.updateTable(existing.id, existing.revision, {
-            columns,
-            ftsColumns: null,
-            secondaryIndexes: null,
-            triggers: null,
-            view,
-            expectedCatalogEpoch: proof.catalogEpoch,
-          });
-        } else {
-          await this.store.addTable(
-            {
-              id: this.#createId(),
-              name: viewName,
+          if (existing.view === undefined) throw new TypeError(`Table already exists: ${viewName}`);
+          if (options.orReplace !== true) throw new TypeError(`View already exists: ${viewName}`);
+        }
+        assertViewDefinitionAcyclic(proof.records, viewName, plan);
+        const schemas = catalogQuerySchemas(proof.records);
+        const inferred = inferBlockSchema(plan, schemas);
+        if (inferred.length === 0) {
+          throw new TypeError(`A view needs at least one column: ${viewName}`);
+        }
+        if (existing !== undefined) {
+          schemas.set(viewName, inferred);
+          assertDependentViewsKeepSchema(proof.records, existing, schemas);
+        }
+        const columns = inferred.map((column, index) => {
+          const previous = existing?.columns[index];
+          return {
+            id:
+              previous !== undefined && querySchemasEqual([column], [previous])
+                ? previous.id
+                : this.#createId(),
+            name: column.name,
+            type: column.type,
+            ...(column.integer === true ? { integer: true as const } : {}),
+            ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+            nullable: true,
+          };
+        });
+        const view = { sql, managed: options.managed === true };
+        try {
+          if (existing !== undefined) {
+            await this.store.updateTable(existing.id, existing.revision, {
               columns,
+              ftsColumns: null,
+              secondaryIndexes: null,
+              triggers: null,
               view,
-              managed: false,
-              revision: 0,
-              createdAt: dateIsoString(this.#now()),
-            },
-            { expectedCatalogEpoch: proof.catalogEpoch },
-          );
-        }
-        this.#planCache.clear();
-        return;
-      } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
-          throw error;
-        }
-        if (existing !== undefined) {
-          const current = await this.store.getTable(existing.id);
-          if (current?.revision !== existing.revision) throw error;
+              expectedCatalogEpoch: proof.catalogEpoch,
+            });
+          } else {
+            await this.store.addTable(
+              {
+                id: this.#createId(),
+                name: viewName,
+                columns,
+                view,
+                managed: false,
+                revision: 0,
+                createdAt: dateIsoString(this.#now()),
+              },
+              { expectedCatalogEpoch: proof.catalogEpoch },
+            );
+          }
+          this.#planCache.clear();
+          return;
+        } catch (error) {
+          if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+            throw error;
+          }
+          if (existing !== undefined) {
+            const current = await this.store.getTable(existing.id);
+            if (current?.revision !== existing.revision) throw error;
+          }
         }
       }
-    }
+    });
   }
 
   /** Removes a view. Returns whether one was dropped; `ifExists` makes a missing one no error. */
   async dropView(name: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
-    let pinnedId: string | undefined;
-    for (let attempt = 0; ; attempt += 1) {
-      const proof = await this.#stableCatalogProof();
-      const record = proof.records.find((candidate) => candidate.name === name);
-      if (record?.view === undefined) {
-        if (pinnedId !== undefined) {
-          throw new TableRecordConflictError(pinnedId, 0, record?.revision ?? null);
+    return this.#foreground(async () => {
+      let pinnedId: string | undefined;
+      for (let attempt = 0; ; attempt += 1) {
+        const proof = await this.#stableCatalogProof();
+        const record = proof.records.find((candidate) => candidate.name === name);
+        if (record?.view === undefined) {
+          if (pinnedId !== undefined) {
+            throw new TableRecordConflictError(pinnedId, 0, record?.revision ?? null);
+          }
+          if (record !== undefined) throw new TypeError(`Not a view: ${name}`);
+          if (options.ifExists === true) return false;
+          throw new Error(`View not found: ${name}`);
         }
-        if (record !== undefined) throw new TypeError(`Not a view: ${name}`);
-        if (options.ifExists === true) return false;
-        throw new Error(`View not found: ${name}`);
-      }
-      pinnedId ??= record.id;
-      if (record.id !== pinnedId) {
-        throw new TableRecordConflictError(pinnedId, 0, record.revision);
-      }
-      const dependent = proof.records.find(
-        (candidate) =>
-          candidate.id !== record.id &&
-          candidate.view !== undefined &&
-          viewReadsTable(candidate.view.sql, record.name),
-      );
-      if (dependent !== undefined) {
-        throw new TypeError(`Cannot drop ${record.name}: view ${dependent.name} reads it`);
-      }
-      try {
-        await this.store.removeTable(record.id, record.revision, {
-          expectedCatalogEpoch: proof.catalogEpoch,
-        });
-        this.#planCache.clear();
-        return true;
-      } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
-          throw error;
+        pinnedId ??= record.id;
+        if (record.id !== pinnedId) {
+          throw new TableRecordConflictError(pinnedId, 0, record.revision);
+        }
+        const dependent = proof.records.find(
+          (candidate) =>
+            candidate.id !== record.id &&
+            candidate.view !== undefined &&
+            viewReadsTable(candidate.view.sql, record.name),
+        );
+        if (dependent !== undefined) {
+          throw new TypeError(`Cannot drop ${record.name}: view ${dependent.name} reads it`);
+        }
+        try {
+          await this.store.removeTable(record.id, record.revision, {
+            expectedCatalogEpoch: proof.catalogEpoch,
+          });
+          this.#planCache.clear();
+          return true;
+        } catch (error) {
+          if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+            throw error;
+          }
         }
       }
-    }
+    });
   }
 
   /** Reads all catalog records under one epoch proof, retrying only the bounded read window. */
@@ -3201,73 +3262,75 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     columnName: string,
     options: { ifExists?: boolean } = {},
   ): Promise<boolean> {
-    let pinnedTableId: string | undefined;
-    let pinnedColumnId: string | undefined;
-    for (let attempt = 0; ; attempt += 1) {
-      const catalogProof = await this.store.getCatalogProbe();
-      const records = await this.store.listTables();
-      if ((await this.store.getCatalogProbe()).catalogEpoch !== catalogProof.catalogEpoch) {
-        if (attempt >= this.#maxCommitRetries) {
-          throw new TableRecordConflictError(tableName, 0, null);
+    return this.#foreground(async () => {
+      let pinnedTableId: string | undefined;
+      let pinnedColumnId: string | undefined;
+      for (let attempt = 0; ; attempt += 1) {
+        const catalogProof = await this.store.getCatalogProbe();
+        const records = await this.store.listTables();
+        if ((await this.store.getCatalogProbe()).catalogEpoch !== catalogProof.catalogEpoch) {
+          if (attempt >= this.#maxCommitRetries) {
+            throw new TableRecordConflictError(tableName, 0, null);
+          }
+          continue;
         }
-        continue;
-      }
-      const table = records.find((record) => record.name === tableName);
-      if (table === undefined || table.view !== undefined) {
-        if (pinnedTableId !== undefined) {
-          throw new TableRecordConflictError(pinnedTableId, 0, table?.revision ?? null);
+        const table = records.find((record) => record.name === tableName);
+        if (table === undefined || table.view !== undefined) {
+          if (pinnedTableId !== undefined) {
+            throw new TableRecordConflictError(pinnedTableId, 0, table?.revision ?? null);
+          }
+          if (table?.view !== undefined) throw new TypeError(`${tableName} is a view, not a table`);
+          if (options.ifExists === true) return false;
+          throw new UnknownTableError(tableName);
         }
-        if (table?.view !== undefined) throw new TypeError(`${tableName} is a view, not a table`);
-        if (options.ifExists === true) return false;
-        throw new UnknownTableError(tableName);
-      }
-      pinnedTableId ??= table.id;
-      if (table.id !== pinnedTableId) {
-        throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
-      }
-      const column = table.columns.find((candidate) => candidate.name === columnName);
-      if (column === undefined) {
-        if (pinnedColumnId !== undefined) {
+        pinnedTableId ??= table.id;
+        if (table.id !== pinnedTableId) {
+          throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
+        }
+        const column = table.columns.find((candidate) => candidate.name === columnName);
+        if (column === undefined) {
+          if (pinnedColumnId !== undefined) {
+            throw new TableRecordConflictError(pinnedTableId, table.revision, table.revision);
+          }
+          if (options.ifExists === true) return false;
+          throw new TypeError(`Column not found: ${tableName}.${columnName}`);
+        }
+        pinnedColumnId ??= column.id;
+        if (column.id !== pinnedColumnId) {
           throw new TableRecordConflictError(pinnedTableId, table.revision, table.revision);
         }
-        if (options.ifExists === true) return false;
-        throw new TypeError(`Column not found: ${tableName}.${columnName}`);
-      }
-      pinnedColumnId ??= column.id;
-      if (column.id !== pinnedColumnId) {
-        throw new TableRecordConflictError(pinnedTableId, table.revision, table.revision);
-      }
-      this.#assertColumnDropSafe(records, table, column);
-      const buildKey = `${table.id}/${column.id}`;
-      this.#droppingFtsColumns.add(buildKey);
-      try {
-        await this.#cancelTableCompactions(table.id);
-        const manifest = await this.store.dropTableColumn({
-          tableId: table.id,
-          columnId: column.id,
-          expectedTableRevision: table.revision,
-          expectedManifestVersion: await this.store.getCurrentManifestVersion(),
-          expectedCatalogEpoch: catalogProof.catalogEpoch,
-          committedAt: dateIsoString(this.#now()),
-        });
-        this.#afterCommit(manifest);
-        this.#gzipVerdicts.delete(column.id);
-        this.#postingDeltaTailCounts.delete(buildKey);
-        this.#planCache.clear();
-        return true;
-      } catch (error) {
-        if (
-          (!(error instanceof TableRecordConflictError) &&
-            !(error instanceof TableInUseError) &&
-            !(error instanceof WriteConflictError)) ||
-          attempt >= this.#maxCommitRetries
-        ) {
-          throw error;
+        this.#assertColumnDropSafe(records, table, column);
+        const buildKey = `${table.id}/${column.id}`;
+        this.#droppingFtsColumns.add(buildKey);
+        try {
+          await this.#cancelTableCompactions(table.id);
+          const manifest = await this.store.dropTableColumn({
+            tableId: table.id,
+            columnId: column.id,
+            expectedTableRevision: table.revision,
+            expectedManifestVersion: await this.store.getCurrentManifestVersion(),
+            expectedCatalogEpoch: catalogProof.catalogEpoch,
+            committedAt: dateIsoString(this.#now()),
+          });
+          this.#afterCommit(manifest);
+          this.#gzipVerdicts.delete(column.id);
+          this.#postingDeltaTailCounts.delete(buildKey);
+          this.#planCache.clear();
+          return true;
+        } catch (error) {
+          if (
+            (!(error instanceof TableRecordConflictError) &&
+              !(error instanceof TableInUseError) &&
+              !(error instanceof WriteConflictError)) ||
+            attempt >= this.#maxCommitRetries
+          ) {
+            throw error;
+          }
+        } finally {
+          this.#droppingFtsColumns.delete(buildKey);
         }
-      } finally {
-        this.#droppingFtsColumns.delete(buildKey);
       }
-    }
+    });
   }
 
   /** Refuses every catalog edge a dropped column would leave dangling. */
@@ -3350,95 +3413,97 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * Returns whether a table was dropped; with `ifExists`, a missing table is not an error.
    */
   async dropTable(tableName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
-    let pinnedTableId: string | undefined;
-    for (let attempt = 0; ; attempt += 1) {
-      const catalogProof = await this.store.getCatalogProbe();
-      const records = await this.store.listTables();
-      if ((await this.store.getCatalogProbe()).catalogEpoch !== catalogProof.catalogEpoch) {
-        if (attempt >= this.#maxCommitRetries) {
-          throw new TableRecordConflictError(tableName, 0, null);
+    return this.#foreground(async () => {
+      let pinnedTableId: string | undefined;
+      for (let attempt = 0; ; attempt += 1) {
+        const catalogProof = await this.store.getCatalogProbe();
+        const records = await this.store.listTables();
+        if ((await this.store.getCatalogProbe()).catalogEpoch !== catalogProof.catalogEpoch) {
+          if (attempt >= this.#maxCommitRetries) {
+            throw new TableRecordConflictError(tableName, 0, null);
+          }
+          continue;
         }
-        continue;
-      }
-      const table = records.find((record) => record.name === tableName);
-      if (table === undefined) {
-        if (pinnedTableId !== undefined) {
-          throw new TableRecordConflictError(pinnedTableId, 0, null);
+        const table = records.find((record) => record.name === tableName);
+        if (table === undefined) {
+          if (pinnedTableId !== undefined) {
+            throw new TableRecordConflictError(pinnedTableId, 0, null);
+          }
+          if (options.ifExists === true) return false;
+          throw new UnknownTableError(tableName);
         }
-        if (options.ifExists === true) return false;
-        throw new UnknownTableError(tableName);
-      }
-      pinnedTableId ??= table.id;
-      if (table.id !== pinnedTableId) {
-        throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
-      }
-      if (table.view !== undefined) throw new TypeError(`${tableName} is a view; use DROP VIEW`);
-      // Anything that would be left pointing at the table refuses the drop. The catalog-epoch
-      // CAS below makes this complete-catalog proof serializable with concurrent DDL.
-      for (const owner of records) {
-        if (owner.id === table.id) continue;
-        if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
-          throw new TypeError(`Cannot drop ${table.name}: view ${owner.name} reads it`);
+        pinnedTableId ??= table.id;
+        if (table.id !== pinnedTableId) {
+          throw new TableRecordConflictError(pinnedTableId, 0, table.revision);
         }
-        for (const key of owner.foreignKeys ?? []) {
-          if (key.parentTable === table.name) {
-            throw new TypeError(
-              `Cannot drop ${table.name}: foreign key ${key.name} on ${owner.name} references it`,
-            );
+        if (table.view !== undefined) throw new TypeError(`${tableName} is a view; use DROP VIEW`);
+        // Anything that would be left pointing at the table refuses the drop. The catalog-epoch
+        // CAS below makes this complete-catalog proof serializable with concurrent DDL.
+        for (const owner of records) {
+          if (owner.id === table.id) continue;
+          if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
+            throw new TypeError(`Cannot drop ${table.name}: view ${owner.name} reads it`);
+          }
+          for (const key of owner.foreignKeys ?? []) {
+            if (key.parentTable === table.name) {
+              throw new TypeError(
+                `Cannot drop ${table.name}: foreign key ${key.name} on ${owner.name} references it`,
+              );
+            }
+          }
+          for (const trigger of owner.triggers ?? []) {
+            const writesHere = trigger.statements.some((triggerStatement) => {
+              const compiled = compileStatement(triggerStatement.sql);
+              return (
+                (compiled.kind === "insert" ||
+                  compiled.kind === "update" ||
+                  compiled.kind === "delete") &&
+                compiled.table === table.name
+              );
+            });
+            if (writesHere) {
+              throw new TypeError(
+                `Cannot drop ${table.name}: trigger ${trigger.name} on ${owner.name} writes to it`,
+              );
+            }
           }
         }
-        for (const trigger of owner.triggers ?? []) {
-          const writesHere = trigger.statements.some((triggerStatement) => {
-            const compiled = compileStatement(triggerStatement.sql);
-            return (
-              (compiled.kind === "insert" ||
-                compiled.kind === "update" ||
-                compiled.kind === "delete") &&
-              compiled.table === table.name
-            );
+        this.#droppingTables.add(table.id);
+        try {
+          await this.#cancelTableCompactions(table.id);
+          const manifest = await this.store.dropTable({
+            tableId: table.id,
+            expectedTableRevision: table.revision,
+            expectedManifestVersion: await this.store.getCurrentManifestVersion(),
+            expectedCatalogEpoch: catalogProof.catalogEpoch,
+            committedAt: dateIsoString(this.#now()),
           });
-          if (writesHere) {
-            throw new TypeError(
-              `Cannot drop ${table.name}: trigger ${trigger.name} on ${owner.name} writes to it`,
-            );
+          this.#afterCommit(manifest);
+          for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
+          this.#autoCompactionBackoff.delete(table.id);
+          this.#autoCompactionHints.delete(table.id);
+          this.#commitsSinceCompactionCheck.delete(table.id);
+          this.#idleCompactionTableIds.delete(table.id);
+          const postingPrefix = `${table.id}/`;
+          for (const key of this.#postingDeltaTailCounts.keys()) {
+            if (key.startsWith(postingPrefix)) this.#postingDeltaTailCounts.delete(key);
           }
+          this.#planCache.clear();
+          return true;
+        } catch (error) {
+          if (
+            (!(error instanceof TableRecordConflictError) &&
+              !(error instanceof TableInUseError) &&
+              !(error instanceof WriteConflictError)) ||
+            attempt >= this.#maxCommitRetries
+          ) {
+            throw error;
+          }
+        } finally {
+          this.#droppingTables.delete(table.id);
         }
       }
-      this.#droppingTables.add(table.id);
-      try {
-        await this.#cancelTableCompactions(table.id);
-        const manifest = await this.store.dropTable({
-          tableId: table.id,
-          expectedTableRevision: table.revision,
-          expectedManifestVersion: await this.store.getCurrentManifestVersion(),
-          expectedCatalogEpoch: catalogProof.catalogEpoch,
-          committedAt: dateIsoString(this.#now()),
-        });
-        this.#afterCommit(manifest);
-        for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
-        this.#autoCompactionBackoff.delete(table.id);
-        this.#autoCompactionHints.delete(table.id);
-        this.#commitsSinceCompactionCheck.delete(table.id);
-        this.#idleCompactionTableIds.delete(table.id);
-        const postingPrefix = `${table.id}/`;
-        for (const key of this.#postingDeltaTailCounts.keys()) {
-          if (key.startsWith(postingPrefix)) this.#postingDeltaTailCounts.delete(key);
-        }
-        this.#planCache.clear();
-        return true;
-      } catch (error) {
-        if (
-          (!(error instanceof TableRecordConflictError) &&
-            !(error instanceof TableInUseError) &&
-            !(error instanceof WriteConflictError)) ||
-          attempt >= this.#maxCommitRetries
-        ) {
-          throw error;
-        }
-      } finally {
-        this.#droppingTables.delete(table.id);
-      }
-    }
+    });
   }
 
   insertBatch<TName extends TableName<TSchema>>(
@@ -3539,6 +3604,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #materializeInsertExpressions(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
     statementNow: Date,
+    read: (plan: CompiledQuery) => Promise<QueryResult>,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     if (!statement.rows.some((row) => row.some(isDeferredInsertExpression))) return statement;
     const rows: InsertValue[][] = [];
@@ -3565,7 +3631,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // Every CURRENT_* occurrence in all rows sees the same statement clock. RANDOM,
         // GEN_RANDOM_UUID, and NEXTVAL remain per expression, as SQL requires.
         plan = resolveStatementDatetimes(plan, statementNow);
-        const result = await this.#queryCompiled(plan, { memoize: false });
+        const result = await read(plan);
         materialized.push(result.rows[0]?.value ?? null);
       }
       rows.push(materialized);
@@ -3578,7 +3644,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     row: BatchInsertRow<TSchema, TName>,
   ): Promise<InsertBatchResult>;
   async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
-    return this.#erased.insertBatch(tableName, [row]);
+    return this.#foreground(async () => {
+      return this.#erased.insertBatch(tableName, [row]);
+    });
   }
 
   upsertBatch<TName extends TableName<TSchema>>(
@@ -3651,7 +3719,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     row: BatchRow,
     options: UpsertOptions = {},
   ): Promise<UpsertBatchResult> {
-    return this.#erased.upsertBatch(tableName, [row], options);
+    return this.#foreground(async () => {
+      return this.#erased.upsertBatch(tableName, [row], options);
+    });
   }
 
   updateBatch<TName extends TableName<TSchema>>(
@@ -3701,13 +3771,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     key: Exclude<BatchValue, null>,
     changes: Readonly<Record<string, BatchValue | undefined>>,
   ): Promise<UpdateBatchResult> {
-    return this.#erased.updateBatch(tableName, {
-      keys: [key],
-      changes: Object.fromEntries(
-        Object.entries(changes).flatMap(([name, value]) =>
-          value === undefined ? [] : [[name, [value]]],
+    return this.#foreground(async () => {
+      return this.#erased.updateBatch(tableName, {
+        keys: [key],
+        changes: Object.fromEntries(
+          Object.entries(changes).flatMap(([name, value]) =>
+            value === undefined ? [] : [[name, [value]]],
+          ),
         ),
-      ),
+      });
     });
   }
 
@@ -3717,7 +3789,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     key: BatchKeyValue<TSchema, TName>,
   ): Promise<DeleteBatchResult>;
   async delete(tableName: string, key: Exclude<BatchValue, null>): Promise<DeleteBatchResult> {
-    return this.#erased.deleteBatch(tableName, { keys: [key] });
+    return this.#foreground(async () => {
+      return this.#erased.deleteBatch(tableName, { keys: [key] });
+    });
   }
 
   deleteBatch<TName extends TableName<TSchema>>(
@@ -4658,7 +4732,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     versionOrOptions?: number | ReadTableOptions,
   ): Promise<DatabaseRow[]> {
-    return this.#withReadReservation(() => this.#readTableUnreserved(tableName, versionOrOptions));
+    return this.#foreground(async () => {
+      return this.#withReadReservation(() =>
+        this.#readTableUnreserved(tableName, versionOrOptions),
+      );
+    });
   }
 
   async #readTableUnreserved(
@@ -4704,21 +4782,55 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * fresh, which is indistinguishable until the first commit.
    */
   async snapshot<T>(action: (session: SnapshotSession) => Promise<T>): Promise<T> {
+    return this.#ownScope((signal) => this.#snapshot(action, signal));
+  }
+
+  async #snapshot<T>(
+    action: (session: SnapshotSession) => Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T> {
     for (;;) {
       const version = await this.store.getCurrentManifestVersion();
       const entry = await this.#acquireSharedLease(version);
       if (entry === undefined) continue;
+      let active = true;
+      let renewalError: Error | undefined;
+      let renewal: Promise<void> | undefined;
+      const renew = (): Promise<void> => {
+        renewal ??= this.#renewInternalLeaseIfNeeded(entry.lease)
+          .catch((error: unknown) => {
+            renewalError =
+              error instanceof Error
+                ? error
+                : new Error("Snapshot renewal failed", { cause: error });
+          })
+          .finally(() => {
+            renewal = undefined;
+          });
+        return renewal;
+      };
+      const timer = setInterval(() => {
+        void renew();
+      }, INTERNAL_READ_LEASE_TTL_MS / 3);
+      (timer as { unref?: () => void }).unref?.();
       try {
         const session: SnapshotSession = {
           version,
-          query: (sql: string, options: QueryOptions = {}) =>
-            this.#queryWithReadReservation(sql, {
-              ...options,
-              ...(version === null ? {} : { version }),
-            }),
+          query: async (sql, options = {}) => {
+            signal.throwIfAborted();
+            if (!active) throw new Error("The snapshot scope has ended");
+            await renew();
+            if (renewalError !== undefined) throw renewalError;
+            return this.#queryWithReadReservation(sql, { ...options, version });
+          },
         };
-        return await action(session);
+        const result = await untilAborted(() => action(session), signal);
+        if (renewalError !== undefined) throw renewalError;
+        return result;
       } finally {
+        active = false;
+        clearInterval(timer);
+        await renewal;
         this.#releaseSharedLease(entry);
       }
     }
@@ -5521,7 +5633,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<QueryResult> {
     throwIfAborted(options.signal);
     const open = this.#openTransaction;
-    if (open !== undefined) {
+    if (open !== undefined && options.version === undefined) {
       // Read-your-writes: inside BEGIN … COMMIT a read sees the pre-scope snapshot plus what
       // this transaction has staged, and nothing another writer published in between.
       return externalizeQueryResult(
@@ -5560,8 +5672,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     const plan = bindPlanParameters(compiled, options.params);
-    // Result memoization is a pure cache over the freshness probe: the catalog epoch is part
-    // of the key, so any commit or DDL changes the key and a hit can never be stale. Only
+    // Result memoization is proved by schema identity and dependency-table generations, so
+    // unrelated writes preserve hits while relevant commits and DDL change the identity. Only
     // plain current-version queries memoize — explicit versions, budgets, and spill options
     // carry semantics of their own.
     const readProbe = this.store.getCatalogProbe.bind(this.store);
@@ -5602,6 +5714,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     sql: string,
     options: QueryCursorOptions = {},
   ): AsyncIterableIterator<QueryResult, undefined> {
+    if (this.#closed) throw new Error("Database is closed");
     const batchRows = positiveWholeNumber(options.batchRows ?? 2_048, "Query batch rows");
     const controller = new AbortController();
     const channel = new QueryBatchChannel();
@@ -5609,16 +5722,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     void _batchRows;
     let producer: Promise<void> | undefined;
     const abort = (): void => {
-      const reason = queryCursorError(signal?.reason, "Query cursor is closed");
+      const reason = queryCursorError(
+        signal?.reason ?? this.#shutdown.signal.reason,
+        "Query cursor is closed",
+      );
       controller.abort(reason);
       channel.fail(reason);
     };
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted === true) abort();
     const start = (): void => {
       if (producer !== undefined) return;
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted === true) abort();
+      this.#shutdown.signal.addEventListener("abort", abort, { once: true });
+      if (this.#closed) abort();
       if (controller.signal.aborted) {
         producer = Promise.resolve();
+        this.#shutdown.signal.removeEventListener("abort", abort);
+        signal?.removeEventListener("abort", abort);
         return;
       }
       producer = this.#withReadReservation(() =>
@@ -5631,6 +5751,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         () => channel.finish(),
         (error: unknown) => channel.fail(error),
       );
+      const task = producer;
+      this.#foregroundTasks.add(task);
+      void task.finally(() => {
+        this.#foregroundTasks.delete(task);
+        this.#shutdown.signal.removeEventListener("abort", abort);
+        signal?.removeEventListener("abort", abort);
+      });
     };
     const close = async (): Promise<void> => {
       if (!controller.signal.aborted) controller.abort(new Error("Query cursor is closed"));
@@ -5728,21 +5855,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // below still guards the cache, since a commit may have landed since either read.
     before ??= await probe();
     throwIfAborted(options.signal);
-    const dependencyKey = `deps ${String(before.schemaEpoch)} ${key}`;
-    let dependencies = this.#cacheGet(dependencyKey) as string[] | undefined;
-    if (dependencies === undefined) {
-      const rewritten = await this.#applyCatalogRewrites(plan, before);
-      dependencies = [...(await this.#findRealBlockTables(rewritten)).values()]
-        .map((table) => table.id)
-        .sort();
-      this.#cachePut(
-        dependencyKey,
-        dependencies,
-        64 + dependencies.reduce((bytes, id) => bytes + id.length * 2 + 16, 0),
-      );
-    }
-    const generation = await this.#queryGenerations.key(dependencies, before.manifestVersion);
-    const resultKey = `${key}\u0001${String(before.schemaEpoch)}\u0001${generation}`;
+    const resultKey = await this.#resultMemoIdentity(plan, key, before);
+    if (resultKey === undefined) return this.#queryCompiled(plan, options, before);
     const cached = this.#cacheGet(resultKey) as QueryResult | undefined;
     if (cached !== undefined) {
       options.onStats?.({ peakMemoryBytes: 0 });
@@ -5753,8 +5867,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (!store) return result;
     const bytes = queryResultRetainedBytes(result);
     if (bytes <= RESULT_MEMO_MAX_BYTES) {
-      // Cache only when the epoch did not move during execution: the result is then exactly
-      // that epoch's answer. A moved epoch simply skips the cache — never mis-files.
       const after = await probe();
       throwIfAborted(options.signal);
       if (after.catalogEpoch === before.catalogEpoch) {
@@ -5762,6 +5874,65 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     return result;
+  }
+
+  async #resultMemoIdentity(
+    plan: CompiledQuery,
+    key: string,
+    before: CatalogProbe,
+  ): Promise<string | undefined> {
+    const dependencyKey = `deps ${String(before.schemaEpoch)} ${key}`;
+    let proof = this.#cacheGet(dependencyKey) as
+      { dependencies: string[]; deterministic: boolean } | undefined;
+    if (proof === undefined) {
+      const rewritten = await this.#applyCatalogRewrites(plan, before);
+      const dependencies = [...(await this.#findRealBlockTables(rewritten)).values()]
+        .map((table) => table.id)
+        .sort();
+      proof = {
+        dependencies,
+        deterministic: !blockCallsFunctions(rewritten, nonDeterministicFunctionNames),
+      };
+      this.#cachePut(
+        dependencyKey,
+        proof,
+        64 + dependencies.reduce((bytes, id) => bytes + id.length * 2 + 16, 0),
+      );
+    }
+    // A catalog-free plan cannot reveal volatility inside a view. Keep this proof with the
+    // dependency record, under the schema epoch, and check it before any result-memo lookup.
+    if (!proof.deterministic) return undefined;
+    const generation = await this.#queryGenerations.key(proof.dependencies, before.manifestVersion);
+    return `${key}\u0001${String(before.schemaEpoch)}\u0001${generation}`;
+  }
+
+  /** An observer's adapter can reuse an accepted patch exactly as it reuses a full execution.
+   * The final epoch check refuses publication if any commit raced the sweep's lower-bound probe. */
+  async #memoizeLiveResult(
+    query: LiveQueryInput,
+    result: QueryResult,
+    before: CatalogProbe,
+  ): Promise<void> {
+    if (!this.#artifactCache.enabled) return;
+    const bytes = queryResultRetainedBytes(result);
+    if (bytes > RESULT_MEMO_MAX_BYTES) return;
+    const plan = this.#compileLiveQuery(query);
+    let key: string;
+    if (typeof query !== "string" && query.kind === "typed-query") {
+      key = `typed ${planMemoKey(plan)}`;
+    } else {
+      const sql = typeof query === "string" ? query : query.sql;
+      const params = typeof query === "string" ? [] : query.params;
+      if (!cacheableQueryInput(sql, params)) return;
+      key = `res ${queryResultMemoKey(sql, params)}`;
+    }
+    // Do not evaluate sequence calls while merely deciding cache eligibility.
+    if (plan.usesStatementDatetime || plan.usesVolatileFunctions || plan.usesSequenceCalls) return;
+    const resultKey = await this.#resultMemoIdentity(plan, key, before);
+    if (resultKey === undefined) return;
+    const after = await this.store.getCatalogProbe();
+    if (after.catalogEpoch !== before.catalogEpoch) return;
+    this.#cachePut(resultKey, markQueryResultExternal(copyQueryResult(result)), bytes);
   }
 
   /**
@@ -6178,7 +6349,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<QueryResult | undefined> {
     const table = realTables.get(shape.table);
     if (table === undefined || table.view !== undefined) return undefined;
-    const columnByName = new Map(table.columns.map((column) => [column.name, column]));
+    // Short projections cost fewer allocations as direct lookups. Wide projections keep
+    // a name map so SELECT * never turns catalog binding into quadratic work.
+    const byName =
+      shape.select === "*" || shape.select.length + shape.equalities.length > 8
+        ? new Map(table.columns.map((column) => [column.name, column]))
+        : undefined;
+    const findColumn = (name: string): TableColumnRecord | undefined =>
+      byName === undefined
+        ? table.columns.find((column) => column.name === name)
+        : byName.get(name);
     const matchesStorageType = (
       column: TableColumnRecord,
       value: PointReadEquality["value"],
@@ -6191,7 +6371,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         (column.type === "datetime" && value instanceof Date));
     const equalityColumns = new Map<string, TableColumnRecord>();
     for (const equality of shape.equalities) {
-      const column = columnByName.get(equality.column);
+      const column = findColumn(equality.column);
       if (column === undefined || !matchesStorageType(column, equality.value)) return undefined;
       equalityColumns.set(column.name, column);
     }
@@ -6214,7 +6394,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
         : shape.select;
     for (const item of selected) {
-      const column = columnByName.get(item.column);
+      const column = findColumn(item.column);
       if (column === undefined || column.hidden === true) return undefined;
       projected.push({ column, alias: item.alias });
     }
@@ -6291,47 +6471,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         });
       }
       if (blockIndexes.length === 0) continue;
-      const searchBlocks = await this.#decodedBlocksThroughCache(
+      const searchBlocks = await this.#pointReadVectors(
         blockIndexes.map((blockIndex) => searchBlockIds[blockIndex] ?? ""),
         snapshot,
       );
       for (const [position, blockIndex] of blockIndexes.entries()) {
         throwIfAborted(options.signal);
-        const decoded = searchBlocks[position];
-        if (decoded === undefined) return undefined;
+        const vector = searchBlocks[position];
+        if (vector === undefined) return undefined;
         const blockId = searchBlockIds[blockIndex] ?? "";
-        const vector = this.#blockColumnVector(blockId, decoded);
         if (vector.kind !== searchColumn.type) return undefined;
-        const candidates: number[] = [];
-        if (
-          (vector.kind === "number" || vector.kind === "datetime") &&
-          typeof searchTarget === "number"
-        ) {
-          if (decoded.description.nullCount === 0 && valuesAreAscending(vector.values)) {
-            const run = equalRunRange(vector.values, searchTarget);
-            for (let slot = run.begin; slot < run.end; slot += 1) candidates.push(slot);
-          } else {
-            for (let slot = 0; slot < vector.length; slot += 1) {
-              if (vector.values[slot] === searchTarget) {
-                // A null slot's backing value is unspecified; confirm through validity.
-                const value = vectorValue(vector, slot);
-                if (value !== null) candidates.push(slot);
-              }
-            }
-          }
-        } else if (vector.kind === "string" && typeof searchTarget === "string") {
-          const code = this.#dictionaryCode(blockId, vector, searchTarget);
-          if (code === undefined) continue;
-          for (let slot = 0; slot < vector.length; slot += 1) {
-            if (vector.codes[slot] === code) candidates.push(slot);
-          }
-        } else if (vector.kind === "boolean" && typeof searchTarget === "boolean") {
-          for (let slot = 0; slot < vector.length; slot += 1) {
-            if (vectorValue(vector, slot) === searchTarget) candidates.push(slot);
-          }
-        } else {
-          return undefined;
-        }
+        const candidates = this.#keySlotsInBlock(blockId, vector, searchTarget);
+        if (candidates === undefined) return undefined;
         if (candidates.length === 0) continue;
         candidateBudget -= candidates.length;
         if (candidateBudget < 0) return undefined;
@@ -6339,12 +6490,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const rowBlockIds = remainingColumns.map(
           (column) => segment.columnBlockIds[column.id]?.[blockIndex] ?? "",
         );
-        const rowBlocks = await this.#decodedBlocksThroughCache(rowBlockIds, snapshot);
+        const rowBlocks = await this.#pointReadVectors(rowBlockIds, snapshot);
         const vectors = new Map<string, ColumnVector>([[searchColumn.name, vector]]);
         for (const [index, column] of remainingColumns.entries()) {
-          const block = rowBlocks[index];
-          if (block === undefined) return undefined;
-          const columnVector = this.#blockColumnVector(rowBlockIds[index] ?? "", block);
+          const columnVector = rowBlocks[index];
+          if (columnVector === undefined) return undefined;
           if (columnVector.kind !== column.type) return undefined;
           vectors.set(column.name, columnVector);
         }
@@ -6400,15 +6550,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   #keySlotsInBlock(
     blockId: string,
-    decoded: DecodedPhysicalBlock,
-    column: TableColumnRecord,
+    vector: ColumnVector,
     target: number | string | boolean,
   ): number[] | undefined {
-    const vector = this.#blockColumnVector(blockId, decoded);
-    if (vector.kind !== column.type) return undefined;
     const slots: number[] = [];
     if ((vector.kind === "number" || vector.kind === "datetime") && typeof target === "number") {
-      if (decoded.description.nullCount === 0 && valuesAreAscending(vector.values)) {
+      if (vector.nullCount === 0 && valuesAreAscending(vector.values)) {
         const run = equalRunRange(vector.values, target);
         for (let slot = run.begin; slot < run.end; slot += 1) slots.push(slot);
       } else {
@@ -6479,15 +6626,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (blockIndexes.length === 0) continue;
       decodedBlocks += blockIndexes.length;
       if (decodedBlocks > MAX_POINT_READ_DELTA_BLOCKS) return undefined;
-      const keyBlocks = await this.#decodedBlocksThroughCache(
+      const keyBlocks = await this.#pointReadVectors(
         blockIndexes.map((blockIndex) => keyBlockIds[blockIndex] ?? ""),
         snapshot,
       );
       for (const [position, blockIndex] of blockIndexes.entries()) {
-        const decoded = keyBlocks[position];
-        if (decoded === undefined) return undefined;
+        const keyVector = keyBlocks[position];
+        if (keyVector === undefined) return undefined;
         const blockId = keyBlockIds[blockIndex] ?? "";
-        const slots = this.#keySlotsInBlock(blockId, decoded, keyColumn, target);
+        if (keyVector.kind !== keyColumn.type) return undefined;
+        const slots = this.#keySlotsInBlock(blockId, keyVector, target);
         if (slots === undefined) return undefined;
         if (slots.length === 0) continue;
         if (slots.length > 1) return undefined;
@@ -6508,21 +6656,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (blockIds.some((id) => id === undefined)) return undefined;
         decodedBlocks += blockIds.length;
         if (decodedBlocks > MAX_POINT_READ_DELTA_BLOCKS) return undefined;
-        const blocks = await this.#decodedBlocksThroughCache(blockIds as string[], snapshot);
+        const blocks = await this.#pointReadVectors(blockIds as string[], snapshot);
         const values =
           segment.kind === "update" && current !== undefined
             ? current
             : new Map<string, QueryValue>();
         if (segment.kind !== "update") {
           if (current !== undefined) return undefined;
-          values.set(keyColumn.name, vectorValue(this.#blockColumnVector(blockId, decoded), slot));
+          values.set(keyColumn.name, vectorValue(keyVector, slot));
         }
         for (const [index, column] of carried.entries()) {
-          const block = blocks[index];
-          const columnBlockId = blockIds[index];
-          if (block === undefined || columnBlockId === undefined) return undefined;
-          if (block.column.rowCount !== decoded.column.rowCount) return undefined;
-          const vector = this.#blockColumnVector(columnBlockId, block);
+          const vector = blocks[index];
+          if (vector?.length !== keyVector.length) return undefined;
           if (vector.kind !== column.type) return undefined;
           values.set(column.name, vectorValue(vector, slot));
         }
@@ -6673,35 +6818,37 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async cleanupQuerySpill(
     options: QuerySpillCleanupOptions = {},
   ): Promise<QuerySpillCleanupResult> {
-    const maxOwners =
-      options.maxOwners === undefined
-        ? Number.MAX_SAFE_INTEGER
-        : positiveWholeNumber(options.maxOwners, "Spill cleanup owner limit");
-    const cutoff = dateIsoString(this.#now());
-    const result: QuerySpillCleanupResult = {
-      ownersExamined: 0,
-      ownersReclaimed: 0,
-      ownersRetained: 0,
-    };
-    let cursor: string | null = null;
-    while (result.ownersExamined < maxOwners) {
-      const page = await this.store.listTempOwnerIdsPage(
-        cursor,
-        Math.min(64, maxOwners - result.ownersExamined),
-      );
-      for (const ownerId of page.records) {
-        result.ownersExamined += 1;
-        if (await this.store.removeTempOwnerIfExpired(ownerId, cutoff)) {
-          result.ownersReclaimed += 1;
-        } else {
-          result.ownersRetained += 1;
+    return this.#foreground(async () => {
+      const maxOwners =
+        options.maxOwners === undefined
+          ? Number.MAX_SAFE_INTEGER
+          : positiveWholeNumber(options.maxOwners, "Spill cleanup owner limit");
+      const cutoff = dateIsoString(this.#now());
+      const result: QuerySpillCleanupResult = {
+        ownersExamined: 0,
+        ownersReclaimed: 0,
+        ownersRetained: 0,
+      };
+      let cursor: string | null = null;
+      while (result.ownersExamined < maxOwners) {
+        const page = await this.store.listTempOwnerIdsPage(
+          cursor,
+          Math.min(64, maxOwners - result.ownersExamined),
+        );
+        for (const ownerId of page.records) {
+          result.ownersExamined += 1;
+          if (await this.store.removeTempOwnerIfExpired(ownerId, cutoff)) {
+            result.ownersReclaimed += 1;
+          } else {
+            result.ownersRetained += 1;
+          }
         }
+        if (page.nextCursor === null) break;
+        cursor = page.nextCursor;
+        await this.#yieldMaintenance();
       }
-      if (page.nextCursor === null) break;
-      cursor = page.nextCursor;
-      await this.#yieldMaintenance();
-    }
-    return result;
+      return result;
+    });
   }
 
   /** Automatic cleanup visits only actual expired candidates, so a live prefix cannot starve it. */
@@ -6738,8 +6885,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * Creates a live-query set over this database. Local commits hint it directly, an optional
    * channel carries cross-tab hints, and an optional poll interval bounds staleness without any
    * hint; every hint path converges on the durable manifest version, so missed messages delay a
-   * refresh but never produce a stale result. Equal subscriptions retain one private exact
-   * result snapshot plus a digest that rejects most inequality before exact comparison.
+   * refresh but never produce a stale result. Equal subscriptions retain one private result
+   * snapshot, compared exactly before delivery.
    */
   liveQueries(options: LiveQuerySetOptions = {}): LiveQuerySet {
     if (this.#closed) throw new Error("Database is closed");
@@ -6750,27 +6897,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       options.channel === undefined && options.channelName === undefined
         ? this.store.liveQueryChannelName
         : options.channelName;
-    const compileLiveQuery = (query: LiveQueryInput): CompiledQuery => {
-      if (typeof query === "string") return this.#compileCached(query);
-      if (query.kind === "typed-query") return query.plan;
-      return bindPlanParameters(this.#compileCached(query.sql), query.params);
-    };
     const set = new LiveQuerySet(
       {
-        currentProbe: async () => {
-          return this.store.getCatalogProbe();
-        },
+        currentProbe: () => this.store.getCatalogProbe(),
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
         dependencyTableIds: async (query, probe) => {
-          const compiled = compileLiveQuery(query);
+          const compiled = this.#compileLiveQuery(query);
           // A live query over a view depends on the tables behind it, not on the view's name.
           const plan = await this.#applyCatalogRewrites(compiled, probe);
           const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
         execute: (query, context) => this.#liveExecute(query, context),
+        memoize: (query, result, probe) => this.#memoizeLiveResult(query, result, probe),
         executeMaintainable: (query, context) =>
-          this.#liveExecuteMaintainable(compileLiveQuery(query), context),
+          this.#liveExecuteMaintainable(this.#compileLiveQuery(query), context),
         maintain: (_query, result, state, tableIds, after, until, probe) =>
           this.#liveMaintain(result, state as LiveMaintenanceState, tableIds, after, until, probe),
         changeCanAffect: (query, tableIds, after, until) =>
@@ -6787,6 +6928,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     this.#liveSets.add(set);
     return set;
+  }
+
+  #compileLiveQuery(query: LiveQueryInput): CompiledQuery {
+    if (typeof query === "string") return this.#compileCached(query);
+    if (query.kind === "typed-query") return query.plan;
+    return bindPlanParameters(this.#compileCached(query.sql), query.params);
   }
 
   /**
@@ -6857,6 +7004,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return undefined;
     }
     const plan = await this.#applyCatalogRewrites(compiled, probe);
+    if (blockCallsFunctions(plan, nonDeterministicFunctionNames)) return undefined;
     const base = plan.base;
     if (
       base.table === DUAL_TABLE ||
@@ -7013,19 +7161,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#queryCompiled(state.fullPlan, {}, probe),
         );
         const aggregate = state.aggregate.patch(input, new Set(), liveKeyToken);
-        return {
-          result: aggregate.result(),
-          state: { ...state, aggregate },
-          retainedBytes: aggregate.retainedBytes,
-        };
+        const result = aggregate.result();
+        return stageLiveExecution(
+          {
+            result,
+            state: { ...state, aggregate },
+            retainedBytes:
+              aggregate.retainedBytes + queryResultRetainedBytes(result) + result.rows.length * 48,
+          },
+          () => aggregate.accept(),
+        );
       } catch {
         return undefined;
       }
     }
     let executed: QueryResult;
     try {
-      executed = externalizeQueryResult(
-        await this.#withReadReservation(() => this.#queryCompiled(state.fullPlan, {}, probe)),
+      executed = await this.#withReadReservation(() =>
+        this.#queryCompiled(state.fullPlan, {}, probe),
       );
     } catch {
       // The augmented plan failed where the statement itself may not — an ORDER BY term the
@@ -7103,12 +7256,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           const previous = retained.rows[index];
           return previous === undefined || !sameLiveRow(previous, row, result.columns);
         });
-      return {
-        result,
-        state: { ...state, aggregate },
-        retainedBytes: aggregate.retainedBytes,
-        changed,
-      };
+      return stageLiveExecution(
+        {
+          result,
+          state: { ...state, aggregate },
+          retainedBytes:
+            aggregate.retainedBytes + queryResultRetainedBytes(result) + result.rows.length * 48,
+          changed,
+        },
+        () => aggregate.accept(),
+      );
     }
     const affected = new Set<number>();
     const retainedTokens = state.positions;
@@ -7141,11 +7298,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ],
     };
     const delta = splitLiveHiddenColumns(
-      externalizeQueryResult(
-        await this.#withReadReservation(() => this.#queryCompiled(deltaPlan, {}, probe)),
-      ),
+      await this.#withReadReservation(() => this.#queryCompiled(deltaPlan, {}, probe)),
       state,
     );
+    if (affected.size === 0 && delta.result.rows.length === 0)
+      return { result: retained, state, changed: false };
     const compare = liveOrderComparator(state.orderTerms);
     const added: LiveMaintainedRows = {
       rows: delta.result.rows,
@@ -7172,6 +7329,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // settle those, so run the statement instead of guessing.
       return undefined;
     }
+    let retainedBytes = state.retainedBytes;
+    if (retainedBytes !== undefined) {
+      for (const index of affected) retainedBytes -= liveRowStateBytes(state, index);
+      for (let index = 0; index < added.rows.length; index += 1)
+        retainedBytes += liveRowStateBytes(added, index);
+      if (fullLimit !== undefined) {
+        for (let index = fullLimit; index < merged.rows.length; index += 1)
+          retainedBytes -= liveRowStateBytes(merged, index);
+      }
+    }
+    const complete = state.complete && (fullLimit === undefined || merged.rows.length <= fullLimit);
     if (fullLimit !== undefined && merged.rows.length > fullLimit)
       merged = trimLiveRows(merged, fullLimit);
     if (truncated && affected.size > 0 && state.limit !== undefined) {
@@ -7190,7 +7358,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     return liveMaintainedOutcome(
-      { ...state, rows: merged.rows, keys: merged.keys, order: merged.order },
+      {
+        ...state,
+        complete,
+        rows: merged.rows,
+        keys: merged.keys,
+        order: merged.order,
+        ...(retainedBytes === undefined ? {} : { retainedBytes }),
+      },
       retained,
       merged.previousIndex,
     );
@@ -7211,12 +7386,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     after: number | null,
     until: number,
   ): Promise<boolean> {
-    const plan =
-      typeof query === "string"
-        ? this.#compileCached(query)
-        : query.kind === "typed-query"
-          ? query.plan
-          : bindPlanParameters(this.#compileCached(query.sql), query.params);
+    const plan = this.#compileLiveQuery(query);
     if (planContainsFts(plan)) return true;
     // Base-scan zone proofs are unsound when the plan reads the table anywhere else — a
     // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
@@ -8258,6 +8428,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const materialized = await this.#materializeInsertExpressions(
       { ...compiled, columns, rows: derivedRows },
       statementNow,
+      async (plan) => this.#sessionQueryPlan(transaction, await this.#applyCatalogRewrites(plan)),
     );
     const input = insertStatementBatch(materialized);
     coerceSqlWriteBatch(target, input);
@@ -8517,6 +8688,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * callers that need to read through it by plan rather than by SQL text — the keyed mutation
    * paths a statement-level transaction routes through.
    */
+  #coordinateWrite<T>(run: () => Promise<T>): Promise<T> {
+    return this.#coordinateWrites ? coordinateWrite(this.store, run, this.#shutdown.signal) : run();
+  }
+
   async #openWriteScope<T>(
     action: (
       session: WriteSession,
@@ -8525,6 +8700,36 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) => Promise<T>,
     options: { durableSnapshot?: boolean } = {},
   ): Promise<{ result: T; version: number | null }> {
+    return this.#ownScope((signal) => this.#runWriteScope(action, options, signal));
+  }
+
+  async #ownScope<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.#closed) throw new Error("Database is closed");
+    if (this.#scopeTasks.size >= MAX_DATABASE_ACTIVE_SCOPES) {
+      throw new RangeError("Too many active database scopes; await a scope before opening another");
+    }
+    const controller = new AbortController();
+    this.#scopeControllers.add(controller);
+    const task = run(controller.signal);
+    this.#scopeTasks.add(task);
+    try {
+      return await task;
+    } finally {
+      this.#scopeControllers.delete(controller);
+      this.#scopeTasks.delete(task);
+    }
+  }
+
+  async #runWriteScope<T>(
+    action: (
+      session: WriteSession,
+      transaction: DatabaseTransaction,
+      writer: TransactionStatementWriter,
+    ) => Promise<T>,
+    options: { durableSnapshot?: boolean },
+    signal: AbortSignal,
+  ): Promise<{ result: T; version: number | null }> {
+    signal.throwIfAborted();
     // A scope is not queued behind other writes, but it is a writer all the same, and SQL
     // statements are scopes: a fold waiting to publish takes its turn before the scope opens
     // its transaction (see #withCompactionPublicationSlot), where nothing of this scope's can
@@ -8532,12 +8737,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     await this.#publishPendingCompactions();
     await this.#assistAutomaticCollection();
     // Keep one storage-sized statement batch process-local. The common single-statement write
-    // then publishes through writeTransaction atomically; a second stage spills the first batch
-    // to the durable journal before accepting more, preserving bounded memory and recovery.
+    // then publishes through writeTransaction atomically. Stages share that bounded batch;
+    // exceeding its limit spills to the durable journal before accepting more.
     const transaction = await this.#transactions.beginDeferred({
       durableSnapshot: options.durableSnapshot ?? true,
+      coalesceArtifacts: true,
     });
     let closed = false;
+    let accepting = true;
+    let tail: Promise<unknown> = Promise.resolve();
+    let pendingReads = 0;
+    let pendingWrites = 0;
+    let writeBarrier: Promise<unknown> = tail;
     let staged = 0;
     /**
      * A stage that throws *after* registering part of its work (key membership, full-text
@@ -8548,6 +8759,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
      */
     let poisoned: unknown;
     const open = (): void => {
+      signal.throwIfAborted();
       if (closed) throw new Error("The write scope has ended");
       if (poisoned !== undefined) {
         throw new Error("The write scope already failed and can only roll back", {
@@ -8564,7 +8776,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         throw error;
       }
     };
-    const session: WriteSession = {
+    const operations: WriteSession = {
       query: async (sql, options) => {
         open();
         return this.#withReadReservation(() => this.#sessionQuery(transaction, sql, options));
@@ -8619,7 +8831,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       },
     };
     const writer: TransactionStatementWriter = {
-      ...session,
+      ...operations,
       queryPlan: (plan) =>
         this.#withReadReservation(async () => {
           // Before this scope stages anything, its view is exactly the catalog probe captured
@@ -8659,8 +8871,64 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         staged = transaction.stagedWorkCount === 0 ? 0 : 1;
       },
     };
+    const enqueue = <R>(
+      run: () => Promise<R>,
+      kind: "read" | "write" | "rollback" = "write",
+    ): Promise<R> => {
+      if (!accepting) return Promise.reject(new Error("The write scope has ended"));
+      const read = kind === "read";
+      if (read && pendingReads >= MAX_DATABASE_ACTIVE_READS) {
+        return Promise.reject(new DatabaseReadBacklogError(MAX_DATABASE_ACTIVE_READS));
+      }
+      if (!read && pendingWrites >= MAX_DATABASE_PENDING_WRITES) {
+        return Promise.reject(
+          new RangeError("Too many pending transaction operations; await a statement"),
+        );
+      }
+      if (read) pendingReads += 1;
+      else pendingWrites += 1;
+      // Adjacent reads share their preceding write barrier; a following write joins all of
+      // them. No mutation can change an overlay while a reader is materializing it.
+      const operation = (read ? writeBarrier : tail).then(() => {
+        if (kind === "rollback") {
+          signal.throwIfAborted();
+          if (closed) throw new Error("The write scope has ended");
+        } else open();
+        return run();
+      });
+      const settled = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+      tail = Promise.all([tail, settled]).then(() => undefined);
+      if (!read) writeBarrier = tail;
+      return operation.finally(() => {
+        if (read) pendingReads -= 1;
+        else pendingWrites -= 1;
+      });
+    };
+    const session: WriteSession = {
+      query: (sql, queryOptions) => enqueue(() => operations.query(sql, queryOptions), "read"),
+      execute: (sql, params) => enqueue(() => operations.execute(sql, params)),
+      insertBatch: (name, input) => enqueue(() => operations.insertBatch(name, input)),
+      upsertBatch: (name, input, upsertOptions) =>
+        enqueue(() => operations.upsertBatch(name, input, upsertOptions)),
+      updateBatch: (name, input) => enqueue(() => operations.updateBatch(name, input)),
+      deleteBatch: (name, input) => enqueue(() => operations.deleteBatch(name, input)),
+    };
+    const queuedWriter: TransactionStatementWriter = {
+      ...writer,
+      ...session,
+      queryPlan: (plan) => enqueue(() => writer.queryPlan(plan), "read"),
+      queryFirstColumn: (plan) => enqueue(() => writer.queryFirstColumn(plan), "read"),
+      executeStatement: (statement) => enqueue(() => writer.executeStatement(statement)),
+      rollbackTo: (checkpoint) => enqueue(() => writer.rollbackTo(checkpoint), "rollback"),
+    };
     try {
-      const result = await action(session, transaction, writer);
+      const result = await untilAborted(() => action(session, transaction, queuedWriter), signal);
+      accepting = false;
+      await tail;
+      signal.throwIfAborted();
       closed = true;
       if (poisoned !== undefined) {
         // The outer catch aborts the transaction.
@@ -8696,7 +8964,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
+      accepting = false;
       closed = true;
+      await tail;
       await transaction.abort().catch(() => undefined);
       throw await this.#translateUniqueConflict(error);
     }
@@ -9471,22 +9741,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     plan: CompiledQuery;
     __row?: TRow;
   }): Promise<TRow[]> {
-    await this.#settleExpiredStatementTransaction();
-    const open = this.#openTransaction;
-    const plan = query.plan;
-    const execute = async (): Promise<QueryResult> => {
-      const probe = this.store.getCatalogProbe.bind(this.store);
-      return plan.usesStatementDatetime === true ||
-        plan.usesVolatileFunctions === true ||
-        plan.usesSequenceCalls === true
-        ? this.#queryCompiled(plan)
-        : this.#memoizedQuery(plan, `typed ${planMemoKey(plan)}`, {}, probe);
-    };
-    const result =
-      open === undefined
-        ? await this.#withReadReservation(execute)
-        : await this.#duringTransaction(open, () => open.session.queryPlan(plan));
-    return externalizeQueryResult(result).rows as TRow[];
+    return this.#foreground(async () => {
+      await this.#settleExpiredStatementTransaction();
+      if (this.#statementTransactionExpired) throw new TransactionExpiredError();
+      const open = this.#openTransaction;
+      const plan = query.plan;
+      const execute = async (): Promise<QueryResult> => {
+        const probe = this.store.getCatalogProbe.bind(this.store);
+        return plan.usesStatementDatetime === true ||
+          plan.usesVolatileFunctions === true ||
+          plan.usesSequenceCalls === true
+          ? this.#queryCompiled(plan)
+          : this.#memoizedQuery(plan, `typed ${planMemoKey(plan)}`, {}, probe);
+      };
+      const result =
+        open === undefined
+          ? await this.#withReadReservation(execute)
+          : await this.#duringTransaction(open, () => open.session.queryPlan(plan));
+      return externalizeQueryResult(result).rows as TRow[];
+    });
   }
 
   /**
@@ -9504,32 +9777,34 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     definition: SchemaDefinition<readonly AnyTable[]> | undefined = this.#schema,
     options: MigrateOptions = {},
   ): Promise<MigrateResult> {
-    if (definition === undefined) {
-      throw new TypeError(
-        "migrate() needs a schema: pass a definition, or construct the database with { schema }",
-      );
-    }
-    // Table revisions also move under background full-text index activity (build stamps,
-    // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
-    // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
-    // a genuinely concurrent migrator still fails explicitly once the retries are exhausted.
-    let originalSteps: MigrationStep[] | undefined;
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        const result = await this.#migrateOnce(definition, options, (steps) => {
-          originalSteps ??= [...steps];
-        });
-        return originalSteps === undefined ? result : migrationResult(originalSteps);
-      } catch (error) {
-        if (
-          (!(error instanceof TableRecordConflictError) &&
-            !(error instanceof WriteConflictError)) ||
-          attempt >= this.#maxCommitRetries
-        ) {
-          throw error;
+    return this.#foreground(async () => {
+      if (definition === undefined) {
+        throw new TypeError(
+          "migrate() needs a schema: pass a definition, or construct the database with { schema }",
+        );
+      }
+      // Table revisions also move under background full-text index activity (build stamps,
+      // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
+      // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
+      // a genuinely concurrent migrator still fails explicitly once the retries are exhausted.
+      let originalSteps: MigrationStep[] | undefined;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const result = await this.#migrateOnce(definition, options, (steps) => {
+            originalSteps ??= [...steps];
+          });
+          return originalSteps === undefined ? result : migrationResult(originalSteps);
+        } catch (error) {
+          if (
+            (!(error instanceof TableRecordConflictError) &&
+              !(error instanceof WriteConflictError)) ||
+            attempt >= this.#maxCommitRetries
+          ) {
+            throw error;
+          }
         }
       }
-    }
+    });
   }
 
   /**
@@ -9968,114 +10243,122 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * the prepared execution would choose, without executing it.
    */
   async explain(sql: string): Promise<string> {
-    let plan = this.#compileCached(sql);
-    // Explain reports on the plan the engine would execute, so MATCH(*)/BM25(*) expand against
-    // the catalog exactly as preparation does (copy-on-write — the cache keeps "*").
-    if (planContainsFts(plan)) {
-      const realTables = await this.#findRealBlockTables(plan);
-      plan = expandFtsColumns(plan, (tableName) => searchableFtsColumns(realTables.get(tableName)));
-    }
-    // The ORDER-BY-expression desugar's transparent wrapper executes as its inner block plus a
-    // projection, so every execution-path note reports against the inner block.
-    const reported = transparentProjectionSource(plan)?.inner ?? plan;
-    const notes: string[] = [];
-    if (this.#canStreamPlanShape(reported, {})) {
-      notes.push("streams the base scan through resident block windows");
-    } else {
-      notes.push("materializes inputs at preparation");
-    }
-    const table =
-      reported.base.derived ??
-      reported.base.union ??
-      reported.base.windowed ??
-      reported.base.recursive;
-    // A FROM-less query reads the dual row, which has no catalog record to report on.
-    if (table === undefined && reported.joins.length === 0 && reported.base.table !== DUAL_TABLE) {
-      const record = await this.#findTable(reported.base.table);
-      const pointTemplate = record.view === undefined ? cachedPointReadTemplate(reported) : null;
-      if (pointTemplate !== null) {
-        const keyColumn = getUniqueKeyColumn(record);
-        const keyComponents =
-          keyColumn === undefined
-            ? []
-            : keyColumn.hidden === true
-              ? primaryKeyColumns(record)
-              : [keyColumn];
-        const covered = new Set(pointTemplate.equalities.map((equality) => equality.column));
-        if (
-          keyComponents.length > 0 &&
-          keyComponents.every((component) => covered.has(component.name))
-        ) {
-          notes.push(
-            "key-covering equality answers as a point read when the visible history allows",
-          );
-        }
+    return this.#foreground(async () => {
+      let plan = this.#compileCached(sql);
+      // Explain reports on the plan the engine would execute, so MATCH(*)/BM25(*) expand against
+      // the catalog exactly as preparation does (copy-on-write — the cache keeps "*").
+      if (planContainsFts(plan)) {
+        const realTables = await this.#findRealBlockTables(plan);
+        plan = expandFtsColumns(plan, (tableName) =>
+          searchableFtsColumns(realTables.get(tableName)),
+        );
       }
-      if (zonePredicates(reported, record).length > 0) {
-        notes.push("zone-map pruning applies to the unbudgeted scan");
+      // The ORDER-BY-expression desugar's transparent wrapper executes as its inner block plus a
+      // projection, so every execution-path note reports against the inner block.
+      const reported = transparentProjectionSource(plan)?.inner ?? plan;
+      const notes: string[] = [];
+      if (this.#canStreamPlanShape(reported, {})) {
+        notes.push("streams the base scan through resident block windows");
+      } else {
+        notes.push("materializes inputs at preparation");
       }
-      if (secondaryIndexPredicates(reported, record).length > 0) {
-        notes.push("a ready secondary index prunes the scan to candidate row groups");
-      }
-      const referenced = referencedColumns(
-        reported,
-        new Map([[record.name, record.columns.map((column) => column.name)]]),
-      ).get(record.name);
-      const projected =
-        referenced === undefined || referenced.length === 0
-          ? []
-          : resolveReadColumns(record, referenced);
-      if (secondaryIndexOrderForPlan(reported, record, projected, false) !== undefined) {
-        notes.push("a ready secondary index supplies ORDER BY without a sort");
-        if (secondaryIndexOrderForPlan(reported, record, projected) !== undefined) {
-          notes.push("a covering secondary-index scan avoids table blocks");
-        }
-      }
-    }
-    if (blockHasSubqueries(reported))
-      notes.push("resolves uncorrelated subqueries at one snapshot");
-    if (planContainsFts(reported)) {
-      notes.push("full-text MATCH evaluates via per-dictionary term tables on the scan");
-      if (table === undefined && reported.joins.length === 0) {
+      const table =
+        reported.base.derived ??
+        reported.base.union ??
+        reported.base.windowed ??
+        reported.base.recursive;
+      // A FROM-less query reads the dual row, which has no catalog record to report on.
+      if (
+        table === undefined &&
+        reported.joins.length === 0 &&
+        reported.base.table !== DUAL_TABLE
+      ) {
         const record = await this.#findTable(reported.base.table);
-        const readyColumnIds = new Set(
-          Object.entries(record.ftsColumns ?? {})
-            .filter(
-              ([, state]) =>
-                state.state === "ready" && state.tokenizerVersion === FTS_TOKENIZER_VERSION,
-            )
-            .map(([columnId]) => columnId),
-        );
-        const columnsByName = new Map(
-          record.columns.map((column) => [column.name, column] as const),
-        );
-        const scoringServed = [...this.#ftsBm25Nodes(reported).values()].every((node) =>
-          node.columns.every((expression) => {
-            if (expression.kind !== "column") return false;
-            const column = columnsByName.get(
-              expression.reference.split(".").at(-1) ?? expression.reference,
+        const pointTemplate = record.view === undefined ? cachedPointReadTemplate(reported) : null;
+        if (pointTemplate !== null) {
+          const keyColumn = getUniqueKeyColumn(record);
+          const keyComponents =
+            keyColumn === undefined
+              ? []
+              : keyColumn.hidden === true
+                ? primaryKeyColumns(record)
+                : [keyColumn];
+          const covered = new Set(pointTemplate.equalities.map((equality) => equality.column));
+          if (
+            keyComponents.length > 0 &&
+            keyComponents.every((component) => covered.has(component.name))
+          ) {
+            notes.push(
+              "key-covering equality answers as a point read when the visible history allows",
             );
-            return column !== undefined && readyColumnIds.has(column.id);
-          }),
-        );
-        const scoring = planContainsFts(reported, "bm25");
-        if (readyColumnIds.size > 0 && (!scoring || scoringServed)) {
-          notes.push("a ready full-text index prunes the base scan to candidate segments");
+          }
         }
-        if (scoring) {
+        if (zonePredicates(reported, record).length > 0) {
+          notes.push("zone-map pruning applies to the unbudgeted scan");
+        }
+        if (secondaryIndexPredicates(reported, record).length > 0) {
+          notes.push("a ready secondary index prunes the scan to candidate row groups");
+        }
+        const referenced = referencedColumns(
+          reported,
+          new Map([[record.name, record.columns.map((column) => column.name)]]),
+        ).get(record.name);
+        const projected =
+          referenced === undefined || referenced.length === 0
+            ? []
+            : resolveReadColumns(record, referenced);
+        if (secondaryIndexOrderForPlan(reported, record, projected, false) !== undefined) {
+          notes.push("a ready secondary index supplies ORDER BY without a sort");
+          if (secondaryIndexOrderForPlan(reported, record, projected) !== undefined) {
+            notes.push("a covering secondary-index scan avoids table blocks");
+          }
+        }
+      }
+      if (blockHasSubqueries(reported))
+        notes.push("resolves uncorrelated subqueries at one snapshot");
+      if (planContainsFts(reported)) {
+        notes.push("full-text MATCH evaluates via per-dictionary term tables on the scan");
+        if (table === undefined && reported.joins.length === 0) {
+          const record = await this.#findTable(reported.base.table);
+          const readyColumnIds = new Set(
+            Object.entries(record.ftsColumns ?? {})
+              .filter(
+                ([, state]) =>
+                  state.state === "ready" && state.tokenizerVersion === FTS_TOKENIZER_VERSION,
+              )
+              .map(([columnId]) => columnId),
+          );
+          const columnsByName = new Map(
+            record.columns.map((column) => [column.name, column] as const),
+          );
+          const scoringServed = [...this.#ftsBm25Nodes(reported).values()].every((node) =>
+            node.columns.every((expression) => {
+              if (expression.kind !== "column") return false;
+              const column = columnsByName.get(
+                expression.reference.split(".").at(-1) ?? expression.reference,
+              );
+              return column !== undefined && readyColumnIds.has(column.id);
+            }),
+          );
+          const scoring = planContainsFts(reported, "bm25");
+          if (readyColumnIds.size > 0 && (!scoring || scoringServed)) {
+            notes.push("a ready full-text index prunes the base scan to candidate segments");
+          }
+          if (scoring) {
+            notes.push(
+              scoringServed
+                ? "BM25 statistics come from the full-text index"
+                : "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
+            );
+          }
+        } else if (planContainsFts(reported, "bm25")) {
           notes.push(
-            scoringServed
-              ? "BM25 statistics come from the full-text index"
-              : "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
+            "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
           );
         }
-      } else if (planContainsFts(reported, "bm25")) {
-        notes.push(
-          "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
-        );
       }
-    }
-    return `${renderPlan(plan)}\n${notes.map((note) => `-- ${note}`).join("\n")}`;
+      return `${renderPlan(plan)}\n${notes.map((note) => `-- ${note}`).join("\n")}`;
+    });
   }
 
   /**
@@ -10093,9 +10376,43 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     params?: readonly QueryValue[],
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
+    if (this.#closed) throw new Error("Database is closed");
+    if (this.#pendingExecutes >= MAX_DATABASE_PENDING_WRITES) {
+      throw new RangeError("Too many pending SQL statements; await a statement");
+    }
+    this.#pendingExecutes += 1;
+    const run = () => this.#executeSerial(sql, params, options);
+    const operation = this.#executeChain.then(run, run);
+    this.#executeChain = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      return await operation;
+    } finally {
+      this.#pendingExecutes -= 1;
+    }
+  }
+
+  async #executeSerial(
+    sql: string,
+    params: readonly QueryValue[] | undefined,
+    options: ExecuteOptions,
+  ): Promise<ExecuteResult> {
+    if (this.#closed) throw new Error("Database is closed");
     throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
     const statement = this.#compileStatementCached(sql);
+    if (this.#statementTransactionExpired) {
+      if (
+        statement.kind !== "transaction" ||
+        (statement.action !== "begin" && statement.action !== "rollback")
+      ) {
+        throw new TransactionExpiredError();
+      }
+      this.#statementTransactionExpired = false;
+      if (statement.action === "rollback") return { kind: "transaction", action: "rollback" };
+    }
     if (statement.kind === "transaction") {
       return this.#runTransactionStatement(statement.action, statement.name);
     }
@@ -10456,6 +10773,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) {
       return;
     }
+    this.#statementTransactionExpired = true;
     await this.#rollbackStatementTransaction(open);
   }
 
@@ -10521,6 +10839,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (this.#openTransaction !== state || state.busy > 0) return;
           if (dateMilliseconds(this.#now()) - state.activeAt < this.#transactionIdleTimeoutMs)
             return;
+          this.#statementTransactionExpired = true;
           void this.#rollbackStatementTransaction(state).catch(() => undefined);
         }, this.#transactionIdleTimeoutMs),
       };
@@ -11197,300 +11516,329 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     statement: CompiledStatement,
     options: RunStatementOptions = {},
   ): Promise<ExecuteResult> {
-    const statementNow = this.#now();
-    statement = resolveMutationStatementDatetimes(statement, statementNow);
-    if (statement.kind === "select") {
-      return { kind: "rows", result: await this.query(statement.sql) };
-    }
-    if (statement.kind === "set") {
-      return { kind: "set", action: statement.action, name: statement.name };
-    }
-    if (statement.kind === "show") {
-      // The settings a driver or tool reads on connection, with the engine's fixed answers.
-      const settings: Record<string, string> = {
-        search_path: "public",
-        server_version: "16.0",
-        server_version_num: "160000",
-        timezone: "UTC",
-        time_zone: "UTC",
-        transaction_isolation: "repeatable read",
-        default_transaction_isolation: "repeatable read",
-        client_encoding: "UTF8",
-        server_encoding: "UTF8",
-        standard_conforming_strings: "on",
-        integer_datetimes: "on",
-        datestyle: "ISO, MDY",
-        intervalstyle: "postgres",
-        application_name: "",
-        is_superuser: "on",
-        max_identifier_length: "63",
-      };
-      const name = statement.name.toLowerCase();
-      const value = settings[name];
-      if (value === undefined) {
-        throw new TypeError(`unrecognized configuration parameter "${statement.name}"`);
+    return this.#foreground(async () => {
+      if (this.#closed) throw new Error("Database is closed");
+      if (this.#statementTransactionExpired && statement.kind !== "transaction")
+        throw new TransactionExpiredError();
+      const statementNow = this.#now();
+      statement = resolveMutationStatementDatetimes(statement, statementNow);
+      if (statement.kind === "select") {
+        return { kind: "rows", result: await this.query(statement.sql) };
       }
-      return {
-        kind: "rows",
-        result: await this.query(`SELECT $1 AS ${quoteIdentifier(name)}`, { params: [value] }),
-      };
-    }
-    if (statement.kind === "create-enum") {
-      const values = validateEnumValues(statement.values, statement.name);
-      const storageName = `${ENUM_TYPE_PREFIX}${statement.name}`;
-      if (await this.store.getTableByName(storageName)) {
-        throw new TypeError(`Type already exists: ${statement.name}`);
+      if (statement.kind === "set") {
+        return { kind: "set", action: statement.action, name: statement.name };
       }
-      await this.store.addTable({
-        id: this.#createId(),
-        name: storageName,
-        columns: [
-          {
-            id: this.#createId(),
-            name: "value",
-            type: "string",
-            nullable: false,
-            hidden: true,
-          },
-        ],
-        managed: false,
-        revision: 0,
-        enumType: { name: statement.name, values },
-        createdAt: dateIsoString(this.#now()),
-      });
-      this.#planCache.clear();
-      return { kind: "create-type", name: statement.name };
-    }
-    if (statement.kind === "create-sequence") {
-      const storageName = `${SEQUENCE_PREFIX}${statement.name}`;
-      if (await this.store.getTableByName(storageName)) {
-        throw new TypeError(`Sequence already exists: ${statement.name}`);
-      }
-      const columnId = this.#createId();
-      await this.store.addTable({
-        id: this.#createId(),
-        name: storageName,
-        columns: [
-          {
-            id: columnId,
-            name: "value",
-            type: "number",
-            integer: true,
-            nullable: false,
-            hidden: true,
-            defaultValue: { kind: "autoincrement" },
-          },
-        ],
-        managed: false,
-        revision: 0,
-        sequence: { name: statement.name, start: 1, columnId },
-        createdAt: dateIsoString(this.#now()),
-      });
-      return { kind: "create-sequence", name: statement.name };
-    }
-    if (statement.kind === "create-table") {
-      if (statement.ifNotExists === true) {
-        const existing = await this.store.getTableByName(statement.table);
-        if (existing !== undefined) return { kind: "create-table", table: statement.table };
-      }
-      try {
-        await this.createTable({
-          name: statement.table,
-          columns: statement.columns,
-          ...(statement.checks === undefined ? {} : { checks: statement.checks }),
-          ...(statement.foreignKeys === undefined ? {} : { foreignKeys: statement.foreignKeys }),
-          ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
-          ...(statement.compositePrimaryKey === undefined
-            ? {}
-            : { compositePrimaryKey: statement.compositePrimaryKey }),
-          ...(statement.uniqueConstraints === undefined
-            ? {}
-            : { uniqueConstraints: statement.uniqueConstraints }),
-          ...(statement.managed === undefined ? {} : { managed: statement.managed }),
-        });
-      } catch (error) {
-        // The optimistic existence read is not the admission point. When another engine wins
-        // after it, IF NOT EXISTS converges on that durable object instead of leaking the
-        // adapter's duplicate-name error.
-        if (
-          statement.ifNotExists !== true ||
-          (await this.store.getTableByName(statement.table)) === undefined
-        ) {
-          throw error;
-        }
-      }
-      return { kind: "create-table", table: statement.table };
-    }
-    if (statement.kind === "create-table-as") {
-      // T172: the catalog record is transaction-owned and invisible while its blocks and
-      // segments stage. The commit publishes the table, its row-id counter, and its first
-      // manifest together, so a crash/fault exposes either the complete result or no table.
-      for (let attempt = 0; ; attempt += 1) {
-        const before = await this.store.getCatalogProbe();
-        const existing = await this.store.getTableByName(statement.table);
-        if (existing !== undefined) {
-          if (statement.ifNotExists === true) {
-            return { kind: "create-table", table: statement.table };
-          }
-          throw new TypeError(`Table already exists: ${statement.table}`);
-        }
-        const records = await this.store.listTables();
-        const after = await this.store.getCatalogProbe();
-        if (after.catalogEpoch !== before.catalogEpoch) {
-          if (attempt >= this.#maxCommitRetries) {
-            throw new TableRecordConflictError(statement.table, 0, null);
-          }
-          continue;
-        }
-        const schemas = new Map(
-          records.map((record) => [
-            record.name,
-            record.columns.map(({ name, type, integer, sqlDomain }) => ({
-              name,
-              type,
-              ...(integer === true ? { integer: true as const } : {}),
-              ...(sqlDomain === undefined ? {} : { sqlDomain }),
-            })),
-          ]),
-        );
-        const plan = await this.#applyCatalogRewrites(statement.query, before);
-        const tableColumns: TableColumnRecord[] = inferBlockSchema(plan, schemas).map(
-          ({ name, type, integer, sqlDomain }) => ({
-            id: this.#createId(),
-            name: validateName(name, "Column"),
-            type,
-            ...(integer === true ? { integer: true as const } : {}),
-            ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
-            nullable: true,
-          }),
-        );
-        const pendingTable: TableRecord = {
-          id: this.#createId(),
-          name: validateName(statement.table, "Table"),
-          columns: tableColumns,
-          revision: 0,
-          managed: false,
-          createdAt: dateIsoString(this.#now()),
+      if (statement.kind === "show") {
+        // The settings a driver or tool reads on connection, with the engine's fixed answers.
+        const settings: Record<string, string> = {
+          search_path: "public",
+          server_version: "16.0",
+          server_version_num: "160000",
+          timezone: "UTC",
+          time_zone: "UTC",
+          transaction_isolation: "repeatable read",
+          default_transaction_isolation: "repeatable read",
+          client_encoding: "UTF8",
+          server_encoding: "UTF8",
+          standard_conforming_strings: "on",
+          integer_datetimes: "on",
+          datestyle: "ISO, MDY",
+          intervalstyle: "postgres",
+          application_name: "",
+          is_superuser: "on",
+          max_identifier_length: "63",
         };
-        const transaction = await this.#transactions.beginWithPendingTable(
-          pendingTable,
-          before.catalogEpoch,
-        );
+        const name = statement.name.toLowerCase();
+        const value = settings[name];
+        if (value === undefined) {
+          throw new TypeError(`unrecognized configuration parameter "${statement.name}"`);
+        }
+        return {
+          kind: "rows",
+          result: await this.query(`SELECT $1 AS ${quoteIdentifier(name)}`, { params: [value] }),
+        };
+      }
+      if (statement.kind === "create-enum") {
+        const values = validateEnumValues(statement.values, statement.name);
+        const storageName = `${ENUM_TYPE_PREFIX}${statement.name}`;
+        if (await this.store.getTableByName(storageName)) {
+          throw new TypeError(`Type already exists: ${statement.name}`);
+        }
+        await this.store.addTable({
+          id: this.#createId(),
+          name: storageName,
+          columns: [
+            {
+              id: this.#createId(),
+              name: "value",
+              type: "string",
+              nullable: false,
+              hidden: true,
+            },
+          ],
+          managed: false,
+          revision: 0,
+          enumType: { name: statement.name, values },
+          createdAt: dateIsoString(this.#now()),
+        });
+        this.#planCache.clear();
+        return { kind: "create-type", name: statement.name };
+      }
+      if (statement.kind === "create-sequence") {
+        const storageName = `${SEQUENCE_PREFIX}${statement.name}`;
+        if (await this.store.getTableByName(storageName)) {
+          throw new TypeError(`Sequence already exists: ${statement.name}`);
+        }
+        const columnId = this.#createId();
+        await this.store.addTable({
+          id: this.#createId(),
+          name: storageName,
+          columns: [
+            {
+              id: columnId,
+              name: "value",
+              type: "number",
+              integer: true,
+              nullable: false,
+              hidden: true,
+              defaultValue: { kind: "autoincrement" },
+            },
+          ],
+          managed: false,
+          revision: 0,
+          sequence: { name: statement.name, start: 1, columnId },
+          createdAt: dateIsoString(this.#now()),
+        });
+        return { kind: "create-sequence", name: statement.name };
+      }
+      if (statement.kind === "create-table") {
+        if (statement.ifNotExists === true) {
+          const existing = await this.store.getTableByName(statement.table);
+          if (existing !== undefined) return { kind: "create-table", table: statement.table };
+        }
         try {
-          const executionMemoryBudgetBytes = Math.min(
-            this.#queryExecutionMemoryBudgetBytes,
-            DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
-          );
-          const stageBatchRows = 16_384;
-          let nextRowId = 1n;
-          let stagedRows = 0;
-          transaction.limitLevelZeroSegments(pendingTable.id, MAX_LEVEL_ZERO_SEGMENTS);
-          const stageRows = async (rows: readonly QueryRow[]): Promise<void> => {
-            if (rows.length === 0) return;
-            const batchResult = {
-              columns: tableColumns.map(({ name }) => name),
-              columnDomains: tableColumns.map(({ sqlDomain }) => sqlDomain ?? null),
-              rows: [...rows],
-            };
-            if (queryResultRetainedBytes(batchResult) > executionMemoryBudgetBytes) {
-              throw new QueryMemoryBudgetError(
-                "CREATE TABLE AS result batch",
-                queryResultRetainedBytes(batchResult),
-                0,
-                executionMemoryBudgetBytes,
-              );
-            }
-            const batch: ColumnarBatch = {
-              columns: Object.fromEntries(
-                tableColumns.map((column) => [
-                  column.name,
-                  rows.map((row) => storedSqlValueFromExecution(column, row[column.name] ?? null)),
-                ]),
-              ),
-              rowCount: rows.length,
-            };
-            normalizeDomainBatch(pendingTable, batch);
-            validateBatch(pendingTable, batch);
-            const endExclusive = nextRowId + BigInt(rows.length);
-            await this.#stageInsertSegment(
-              transaction,
-              pendingTable,
-              batch,
-              rows.length,
-              "insert",
-              { start: nextRowId, endExclusive },
-            );
-            nextRowId = endExclusive;
-            stagedRows += rows.length;
-          };
-          const queryOptions: QueryOptions = {
-            ...(transaction.snapshotVersion === null
+          await this.createTable({
+            name: statement.table,
+            columns: statement.columns,
+            ...(statement.checks === undefined ? {} : { checks: statement.checks }),
+            ...(statement.foreignKeys === undefined ? {} : { foreignKeys: statement.foreignKeys }),
+            ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
+            ...(statement.compositePrimaryKey === undefined
               ? {}
-              : { version: transaction.snapshotVersion }),
-            executionMemoryBudgetBytes,
-            spillToStorage: true,
-            memoize: false,
-          };
-          let streamed: QueryResult | undefined;
-          if (
-            !compiledPlanIsGrouped(plan) &&
-            plan.orderBy.length === 0 &&
-            plan.joins.length === 0 &&
-            this.#canStreamPlanShape(plan, queryOptions)
-          ) {
-            streamed = await this.#queryStreamed(plan, queryOptions, undefined, undefined, {
-              batchRows: stageBatchRows,
-              signal: new AbortController().signal,
-              consume: async (batch) => stageRows(batch.rows),
-            });
-          }
-          if (streamed === undefined) {
-            if (stagedRows !== 0) {
-              throw new Error("CREATE TABLE AS streaming stopped after staging rows");
-            }
-            // Blocking shapes use the ordinary spillable executor under a CTAS-specific hard
-            // ceiling even when the database was configured with an unbounded query budget.
-            // The retained-result check is a second guard before the first durable artifact.
-            const result = await this.#sessionQueryPlan(transaction, plan, queryOptions);
-            const retainedBytes = queryResultRetainedBytes(result);
-            if (retainedBytes > executionMemoryBudgetBytes) {
-              throw new QueryMemoryBudgetError(
-                "CREATE TABLE AS result",
-                retainedBytes,
-                0,
-                executionMemoryBudgetBytes,
-              );
-            }
-            for (let start = 0; start < result.rows.length; start += stageBatchRows) {
-              await stageRows(result.rows.slice(start, start + stageBatchRows));
-            }
-          }
-          transaction.markTableChanged(pendingTable.id);
-          const manifest = await transaction.commit();
-          this.#afterCommit(manifest);
-          return { kind: "create-table", table: statement.table };
+              : { compositePrimaryKey: statement.compositePrimaryKey }),
+            ...(statement.uniqueConstraints === undefined
+              ? {}
+              : { uniqueConstraints: statement.uniqueConstraints }),
+            ...(statement.managed === undefined ? {} : { managed: statement.managed }),
+          });
         } catch (error) {
-          await transaction.abort().catch(() => undefined);
+          // The optimistic existence read is not the admission point. When another engine wins
+          // after it, IF NOT EXISTS converges on that durable object instead of leaking the
+          // adapter's duplicate-name error.
           if (
-            (error instanceof WriteConflictError ||
-              error instanceof SchemaConflictError ||
-              error instanceof TableRecordConflictError) &&
-            attempt < this.#maxCommitRetries
+            statement.ifNotExists !== true ||
+            (await this.store.getTableByName(statement.table)) === undefined
           ) {
+            throw error;
+          }
+        }
+        return { kind: "create-table", table: statement.table };
+      }
+      if (statement.kind === "create-table-as") {
+        // T172: the catalog record is transaction-owned and invisible while its blocks and
+        // segments stage. The commit publishes the table, its row-id counter, and its first
+        // manifest together, so a crash/fault exposes either the complete result or no table.
+        for (let attempt = 0; ; attempt += 1) {
+          const before = await this.store.getCatalogProbe();
+          const existing = await this.store.getTableByName(statement.table);
+          if (existing !== undefined) {
+            if (statement.ifNotExists === true) {
+              return { kind: "create-table", table: statement.table };
+            }
+            throw new TypeError(`Table already exists: ${statement.table}`);
+          }
+          const records = await this.store.listTables();
+          const after = await this.store.getCatalogProbe();
+          if (after.catalogEpoch !== before.catalogEpoch) {
+            if (attempt >= this.#maxCommitRetries) {
+              throw new TableRecordConflictError(statement.table, 0, null);
+            }
             continue;
           }
-          throw error;
+          const schemas = new Map(
+            records.map((record) => [
+              record.name,
+              record.columns.map(({ name, type, integer, sqlDomain }) => ({
+                name,
+                type,
+                ...(integer === true ? { integer: true as const } : {}),
+                ...(sqlDomain === undefined ? {} : { sqlDomain }),
+              })),
+            ]),
+          );
+          const plan = await this.#applyCatalogRewrites(statement.query, before);
+          const tableColumns: TableColumnRecord[] = inferBlockSchema(plan, schemas).map(
+            ({ name, type, integer, sqlDomain }) => ({
+              id: this.#createId(),
+              name: validateName(name, "Column"),
+              type,
+              ...(integer === true ? { integer: true as const } : {}),
+              ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
+              nullable: true,
+            }),
+          );
+          const pendingTable: TableRecord = {
+            id: this.#createId(),
+            name: validateName(statement.table, "Table"),
+            columns: tableColumns,
+            revision: 0,
+            managed: false,
+            createdAt: dateIsoString(this.#now()),
+          };
+          const transaction = await this.#transactions.beginWithPendingTable(
+            pendingTable,
+            before.catalogEpoch,
+          );
+          try {
+            const executionMemoryBudgetBytes = Math.min(
+              this.#queryExecutionMemoryBudgetBytes,
+              DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
+            );
+            const stageBatchRows = 16_384;
+            let nextRowId = 1n;
+            let stagedRows = 0;
+            transaction.limitLevelZeroSegments(pendingTable.id, MAX_LEVEL_ZERO_SEGMENTS);
+            const stageRows = async (rows: readonly QueryRow[]): Promise<void> => {
+              if (rows.length === 0) return;
+              const batchResult = {
+                columns: tableColumns.map(({ name }) => name),
+                columnDomains: tableColumns.map(({ sqlDomain }) => sqlDomain ?? null),
+                rows: [...rows],
+              };
+              if (queryResultRetainedBytes(batchResult) > executionMemoryBudgetBytes) {
+                throw new QueryMemoryBudgetError(
+                  "CREATE TABLE AS result batch",
+                  queryResultRetainedBytes(batchResult),
+                  0,
+                  executionMemoryBudgetBytes,
+                );
+              }
+              const batch: ColumnarBatch = {
+                columns: Object.fromEntries(
+                  tableColumns.map((column) => [
+                    column.name,
+                    rows.map((row) =>
+                      storedSqlValueFromExecution(column, row[column.name] ?? null),
+                    ),
+                  ]),
+                ),
+                rowCount: rows.length,
+              };
+              normalizeDomainBatch(pendingTable, batch);
+              validateBatch(pendingTable, batch);
+              const endExclusive = nextRowId + BigInt(rows.length);
+              await this.#stageInsertSegment(
+                transaction,
+                pendingTable,
+                batch,
+                rows.length,
+                "insert",
+                { start: nextRowId, endExclusive },
+              );
+              nextRowId = endExclusive;
+              stagedRows += rows.length;
+            };
+            const queryOptions: QueryOptions = {
+              ...(transaction.snapshotVersion === null
+                ? {}
+                : { version: transaction.snapshotVersion }),
+              executionMemoryBudgetBytes,
+              spillToStorage: true,
+              memoize: false,
+            };
+            let streamed: QueryResult | undefined;
+            if (
+              !compiledPlanIsGrouped(plan) &&
+              plan.orderBy.length === 0 &&
+              plan.joins.length === 0 &&
+              this.#canStreamPlanShape(plan, queryOptions)
+            ) {
+              streamed = await this.#queryStreamed(plan, queryOptions, undefined, undefined, {
+                batchRows: stageBatchRows,
+                signal: new AbortController().signal,
+                consume: async (batch) => stageRows(batch.rows),
+              });
+            }
+            if (streamed === undefined) {
+              if (stagedRows !== 0) {
+                throw new Error("CREATE TABLE AS streaming stopped after staging rows");
+              }
+              // Blocking shapes use the ordinary spillable executor under a CTAS-specific hard
+              // ceiling even when the database was configured with an unbounded query budget.
+              // The retained-result check is a second guard before the first durable artifact.
+              const result = await this.#sessionQueryPlan(transaction, plan, queryOptions);
+              const retainedBytes = queryResultRetainedBytes(result);
+              if (retainedBytes > executionMemoryBudgetBytes) {
+                throw new QueryMemoryBudgetError(
+                  "CREATE TABLE AS result",
+                  retainedBytes,
+                  0,
+                  executionMemoryBudgetBytes,
+                );
+              }
+              for (let start = 0; start < result.rows.length; start += stageBatchRows) {
+                await stageRows(result.rows.slice(start, start + stageBatchRows));
+              }
+            }
+            transaction.markTableChanged(pendingTable.id);
+            const manifest = await transaction.commit();
+            this.#afterCommit(manifest);
+            return { kind: "create-table", table: statement.table };
+          } catch (error) {
+            await transaction.abort().catch(() => undefined);
+            if (
+              (error instanceof WriteConflictError ||
+                error instanceof SchemaConflictError ||
+                error instanceof TableRecordConflictError) &&
+              attempt < this.#maxCommitRetries
+            ) {
+              continue;
+            }
+            throw error;
+          }
         }
       }
-    }
-    if (statement.kind === "create-index") {
-      const indexStatement = statement;
-      const existing = (await this.store.listTables()).some((table) =>
-        Object.values(table.secondaryIndexes ?? {}).some(
-          (index) => index.name === indexStatement.index,
-        ),
-      );
-      if (existing && statement.ifNotExists === true) {
+      if (statement.kind === "create-index") {
+        const indexStatement = statement;
+        const existing = (await this.store.listTables()).some((table) =>
+          Object.values(table.secondaryIndexes ?? {}).some(
+            (index) => index.name === indexStatement.index,
+          ),
+        );
+        if (existing && statement.ifNotExists === true) {
+          return {
+            kind: "create-index",
+            index: statement.index,
+            table: statement.table,
+            column: statement.columns[0]?.name ?? "",
+            columns: statement.columns.map((column) => column.name),
+            unique: statement.unique === true,
+          };
+        }
+        try {
+          await this.createIndex(statement.index, statement.table, statement.columns, {
+            unique: statement.unique === true,
+          });
+        } catch (error) {
+          const admitted =
+            statement.ifNotExists === true &&
+            (await this.store.listTables()).some((table) =>
+              Object.values(table.secondaryIndexes ?? {}).some(
+                (index) => index.name === indexStatement.index,
+              ),
+            );
+          if (!admitted) throw error;
+        }
         return {
           kind: "create-index",
           index: statement.index,
@@ -11500,623 +11848,613 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           unique: statement.unique === true,
         };
       }
-      try {
-        await this.createIndex(statement.index, statement.table, statement.columns, {
-          unique: statement.unique === true,
+      if (statement.kind === "drop-index") {
+        const dropped = await this.dropIndex(statement.index, {
+          ...(statement.ifExists === true ? { ifExists: true } : {}),
         });
-      } catch (error) {
-        const admitted =
-          statement.ifNotExists === true &&
-          (await this.store.listTables()).some((table) =>
-            Object.values(table.secondaryIndexes ?? {}).some(
-              (index) => index.name === indexStatement.index,
-            ),
-          );
-        if (!admitted) throw error;
+        return { kind: "drop-index", index: statement.index, dropped };
       }
-      return {
-        kind: "create-index",
-        index: statement.index,
-        table: statement.table,
-        column: statement.columns[0]?.name ?? "",
-        columns: statement.columns.map((column) => column.name),
-        unique: statement.unique === true,
-      };
-    }
-    if (statement.kind === "drop-index") {
-      const dropped = await this.dropIndex(statement.index, {
-        ...(statement.ifExists === true ? { ifExists: true } : {}),
-      });
-      return { kind: "drop-index", index: statement.index, dropped };
-    }
-    if (statement.kind === "add-column") {
-      // F031-04. Existing rows have no value for the new column, so it is always nullable;
-      // a DEFAULT fills the rows written afterwards.
-      let pinnedTableId: string | undefined;
-      const addColumnStatement = statement;
-      for (let attempt = 0; ; attempt += 1) {
-        const proof = await this.#stableCatalogProof();
-        try {
-          let added = addColumnStatement.column;
-          if (added.sqlDomain?.kind === "enum" && added.sqlDomain.values.length === 0) {
-            const enumName = added.sqlDomain.name;
-            const enumRecord = proof.records.find(
-              (record) => record.name === `${ENUM_TYPE_PREFIX}${enumName}`,
-            );
-            if (enumRecord?.enumType === undefined) {
-              throw new TypeError(`Unsupported column type: ${enumName}`);
+      if (statement.kind === "add-column") {
+        // F031-04. Existing rows have no value for the new column, so it is always nullable;
+        // a DEFAULT fills the rows written afterwards.
+        let pinnedTableId: string | undefined;
+        const addColumnStatement = statement;
+        for (let attempt = 0; ; attempt += 1) {
+          const proof = await this.#stableCatalogProof();
+          try {
+            let added = addColumnStatement.column;
+            if (added.sqlDomain?.kind === "enum" && added.sqlDomain.values.length === 0) {
+              const enumName = added.sqlDomain.name;
+              const enumRecord = proof.records.find(
+                (record) => record.name === `${ENUM_TYPE_PREFIX}${enumName}`,
+              );
+              if (enumRecord?.enumType === undefined) {
+                throw new TypeError(`Unsupported column type: ${enumName}`);
+              }
+              added = {
+                ...added,
+                sqlDomain: {
+                  kind: "enum",
+                  name: enumRecord.enumType.name,
+                  values: [...enumRecord.enumType.values],
+                },
+              };
             }
-            added = {
-              ...added,
-              sqlDomain: {
-                kind: "enum",
-                name: enumRecord.enumType.name,
-                values: [...enumRecord.enumType.values],
-              },
-            };
-          }
-          const record = proof.records.find(
-            (candidate) => candidate.name === addColumnStatement.table,
-          );
-          if (record === undefined) throw new UnknownTableError(addColumnStatement.table);
-          if (record.view !== undefined)
-            throw new TypeError(`${addColumnStatement.table} is a view, not a table`);
-          pinnedTableId ??= record.id;
-          if (record.id !== pinnedTableId) {
-            throw new TableRecordConflictError(pinnedTableId, 0, record.revision);
-          }
-          if (
-            added.nullable !== true &&
-            !(
-              addColumnStatement.allowNonNullableWithBackfill === true &&
-              added.backfill !== undefined
-            )
-          ) {
-            throw new TypeError(
-              "ALTER TABLE ADD COLUMN adds a nullable column; existing rows have no value for it",
+            const record = proof.records.find(
+              (candidate) => candidate.name === addColumnStatement.table,
             );
-          }
-          if (record.columns.some(({ name }) => name === added.name)) {
-            throw new TypeError(`Column already exists: ${addColumnStatement.table}.${added.name}`);
-          }
-          if (added.generatedValue !== undefined) {
-            throw new TypeError(
-              "ALTER TABLE cannot add a generated column without rewriting existing rows",
-            );
-          }
-          if (added.defaultValue !== undefined) {
-            validateColumnDefault(
+            if (record === undefined) throw new UnknownTableError(addColumnStatement.table);
+            if (record.view !== undefined)
+              throw new TypeError(`${addColumnStatement.table} is a view, not a table`);
+            pinnedTableId ??= record.id;
+            if (record.id !== pinnedTableId) {
+              throw new TableRecordConflictError(pinnedTableId, 0, record.revision);
+            }
+            if (
+              added.nullable !== true &&
+              !(
+                addColumnStatement.allowNonNullableWithBackfill === true &&
+                added.backfill !== undefined
+              )
+            ) {
+              throw new TypeError(
+                "ALTER TABLE ADD COLUMN adds a nullable column; existing rows have no value for it",
+              );
+            }
+            if (record.columns.some(({ name }) => name === added.name)) {
+              throw new TypeError(
+                `Column already exists: ${addColumnStatement.table}.${added.name}`,
+              );
+            }
+            if (added.generatedValue !== undefined) {
+              throw new TypeError(
+                "ALTER TABLE cannot add a generated column without rewriting existing rows",
+              );
+            }
+            if (added.defaultValue !== undefined) {
+              validateColumnDefault(
+                {
+                  name: added.name,
+                  type: added.type,
+                  ...(added.integer === true ? { integer: true as const } : {}),
+                  ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+                  nullable: added.nullable ?? false,
+                  isUniqueKey: false,
+                  ...(added.enumValues === undefined ? {} : { enumValues: added.enumValues }),
+                },
+                added.defaultValue,
+              );
+              if (added.defaultValue.kind === "literal" && added.sqlDomain !== undefined) {
+                normalizeSqlDomainValue(added.sqlDomain, added.defaultValue.value);
+              }
+              if (added.defaultValue.kind === "expression") {
+                validateDefaultExpression(added.defaultValue.sql, {
+                  name: `${addColumnStatement.table}.${added.name}`,
+                  type: added.type,
+                  ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+                });
+              }
+            }
+            const columns = [
+              ...structuredClone(record.columns),
               {
+                id: this.#createId(),
                 name: added.name,
                 type: added.type,
                 ...(added.integer === true ? { integer: true as const } : {}),
-                ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+                ...(added.sqlDomain === undefined
+                  ? {}
+                  : { sqlDomain: structuredClone(added.sqlDomain) }),
                 nullable: added.nullable ?? false,
-                isUniqueKey: false,
-                ...(added.enumValues === undefined ? {} : { enumValues: added.enumValues }),
+                ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
+                ...(added.enumValues === undefined ? {} : { enumValues: [...added.enumValues] }),
+                ...(added.backfill === undefined
+                  ? {}
+                  : { backfill: normalizedColumnBackfill(added, added.backfill) }),
               },
-              added.defaultValue,
-            );
-            if (added.defaultValue.kind === "literal" && added.sqlDomain !== undefined) {
-              normalizeSqlDomainValue(added.sqlDomain, added.defaultValue.value);
+            ];
+            assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
+            const candidateSchemas = catalogQuerySchemas(proof.records);
+            candidateSchemas.set(record.name, columns);
+            assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
+            await this.store.updateTable(record.id, record.revision, {
+              columns,
+              expectedCatalogEpoch: proof.catalogEpoch,
+            });
+            return { kind: "add-column", table: addColumnStatement.table, column: added.name };
+          } catch (error) {
+            if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+              throw error;
             }
-            if (added.defaultValue.kind === "expression") {
-              validateDefaultExpression(added.defaultValue.sql, {
-                name: `${addColumnStatement.table}.${added.name}`,
-                type: added.type,
-                ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
-              });
-            }
-          }
-          const columns = [
-            ...structuredClone(record.columns),
-            {
-              id: this.#createId(),
-              name: added.name,
-              type: added.type,
-              ...(added.integer === true ? { integer: true as const } : {}),
-              ...(added.sqlDomain === undefined
-                ? {}
-                : { sqlDomain: structuredClone(added.sqlDomain) }),
-              nullable: added.nullable ?? false,
-              ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
-              ...(added.enumValues === undefined ? {} : { enumValues: [...added.enumValues] }),
-              ...(added.backfill === undefined
-                ? {}
-                : { backfill: normalizedColumnBackfill(added, added.backfill) }),
-            },
-          ];
-          assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
-          const candidateSchemas = catalogQuerySchemas(proof.records);
-          candidateSchemas.set(record.name, columns);
-          assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
-          await this.store.updateTable(record.id, record.revision, {
-            columns,
-            expectedCatalogEpoch: proof.catalogEpoch,
-          });
-          return { kind: "add-column", table: addColumnStatement.table, column: added.name };
-        } catch (error) {
-          if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
-            throw error;
           }
         }
       }
-    }
-    if (statement.kind === "drop-column") {
-      const dropped = await this.dropColumn(statement.table, statement.column, {
-        ...(statement.ifExists === true ? { ifExists: true } : {}),
-      });
-      return {
-        kind: "drop-column",
-        table: statement.table,
-        column: statement.column,
-        dropped,
-      };
-    }
-    if (statement.kind === "merge") return this.#runMerge(statement);
-    if (statement.kind === "create-view") {
-      await this.createView(statement.view, statement.sql, {
-        ...(statement.orReplace === true ? { orReplace: true } : {}),
-        ...(statement.managed === true ? { managed: true } : {}),
-      });
-      return { kind: "create-view", view: statement.view };
-    }
-    if (statement.kind === "drop-view") {
-      const dropped = await this.dropView(statement.view, {
-        ...(statement.ifExists === true ? { ifExists: true } : {}),
-      });
-      return { kind: "drop-view", view: statement.view, dropped };
-    }
-    if (statement.kind === "drop-table") {
-      const dropped = await this.dropTable(statement.table, {
-        ...(statement.ifExists === true ? { ifExists: true } : {}),
-      });
-      return { kind: "drop-table", table: statement.table, dropped };
-    }
-    if (statement.kind === "create-trigger") {
-      await this.#createTrigger(statement.table, statement.trigger);
-      return { kind: "create-trigger", table: statement.table, name: statement.trigger.name };
-    }
-    if (statement.kind === "drop-trigger") {
-      await this.#dropTrigger(statement.name);
-      return { kind: "drop-trigger", name: statement.name };
-    }
-    if (statement.kind === "transaction") {
-      return this.#runTransactionStatement(statement.action, statement.name);
-    }
-    if (statement.kind === "insert") {
-      statement = await this.#materializeInsertExpressions(statement, statementNow);
-    }
-    if (options.writer === undefined) {
-      // Selection, assignment evaluation, constraint proofs, trigger derivation, and the write
-      // itself are one statement transaction. A genuine concurrent data commit does not rebase
-      // stale derived values: it aborts this scope, then the loop restarts the whole statement
-      // against a fresh snapshot. Maintenance-only commits are handled inside #openWriteScope.
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          const completed = await this.#openWriteScope(
-            (_session, _transaction, writer) =>
-              this.runStatement(statement, { ...options, writer }),
-            // A standalone statement has no user-controlled idle gap. Its selection reads hold
-            // their own lease and a data conflict restarts the complete statement, so retain the
-            // atomic one-write fast path; public write() scopes keep the durable pin by default.
-            { durableSnapshot: false },
-          );
-          const result = completed.result;
-          if (result.kind !== "insert" && result.kind !== "update" && result.kind !== "delete") {
-            throw new Error(`Mutation statement returned an unexpected result: ${result.kind}`);
+      if (statement.kind === "drop-column") {
+        const dropped = await this.dropColumn(statement.table, statement.column, {
+          ...(statement.ifExists === true ? { ifExists: true } : {}),
+        });
+        return {
+          kind: "drop-column",
+          table: statement.table,
+          column: statement.column,
+          dropped,
+        };
+      }
+      if (statement.kind === "merge") return this.#runMerge(statement);
+      if (statement.kind === "create-view") {
+        await this.createView(statement.view, statement.sql, {
+          ...(statement.orReplace === true ? { orReplace: true } : {}),
+          ...(statement.managed === true ? { managed: true } : {}),
+        });
+        return { kind: "create-view", view: statement.view };
+      }
+      if (statement.kind === "drop-view") {
+        const dropped = await this.dropView(statement.view, {
+          ...(statement.ifExists === true ? { ifExists: true } : {}),
+        });
+        return { kind: "drop-view", view: statement.view, dropped };
+      }
+      if (statement.kind === "drop-table") {
+        const dropped = await this.dropTable(statement.table, {
+          ...(statement.ifExists === true ? { ifExists: true } : {}),
+        });
+        return { kind: "drop-table", table: statement.table, dropped };
+      }
+      if (statement.kind === "create-trigger") {
+        await this.#createTrigger(statement.table, statement.trigger);
+        return { kind: "create-trigger", table: statement.table, name: statement.trigger.name };
+      }
+      if (statement.kind === "drop-trigger") {
+        await this.#dropTrigger(statement.name);
+        return { kind: "drop-trigger", name: statement.name };
+      }
+      if (statement.kind === "transaction") {
+        const action = statement.action === "rollback-to" ? "ROLLBACK TO" : statement.action;
+        return this.execute(
+          `${action}${statement.name === undefined ? "" : ` ${quoteIdentifier(statement.name)}`}`,
+        );
+      }
+      if (options.writer === undefined) {
+        // Selection, assignment evaluation, constraint proofs, trigger derivation, and the write
+        // itself are one statement transaction. A genuine concurrent data commit does not rebase
+        // stale derived values: it aborts this scope, then the loop restarts the whole statement
+        // against a fresh snapshot. Maintenance-only commits are handled inside #openWriteScope.
+        return this.#coordinateWrite(async () => {
+          for (let attempt = 0; ; attempt += 1) {
+            try {
+              const completed = await this.#openWriteScope(
+                (_session, _transaction, writer) =>
+                  this.runStatement(statement, { ...options, writer }),
+                // A standalone statement has no user-controlled idle gap. Its selection reads hold
+                // their own lease and a data conflict restarts the complete statement, so retain the
+                // atomic one-write fast path; public write() scopes keep the durable pin by default.
+                { durableSnapshot: false },
+              );
+              const result = completed.result;
+              if (
+                result.kind !== "insert" &&
+                result.kind !== "update" &&
+                result.kind !== "delete"
+              ) {
+                throw new Error(`Mutation statement returned an unexpected result: ${result.kind}`);
+              }
+              return result.rowCount === 0 || completed.version === null
+                ? result
+                : { ...result, version: completed.version };
+            } catch (error) {
+              if (
+                (!(error instanceof WriteConflictError) &&
+                  !(error instanceof SchemaConflictError)) ||
+                attempt >= this.#maxCommitRetries
+              ) {
+                throw error;
+              }
+            }
           }
-          return result.rowCount === 0 || completed.version === null
-            ? result
-            : { ...result, version: completed.version };
-        } catch (error) {
+        });
+      }
+      if (statement.kind === "insert" && statement.query !== undefined) {
+        statement = await this.#materializeInsertSelect(statement, options.writer);
+      }
+      if (statement.kind === "insert" && statement.columns.length === 0) {
+        const table = await this.#findTable(statement.table);
+        const columns = visibleTableColumns(table).map((column) => column.name);
+        if (statement.defaultValues === true) {
+          // Keep the empty column list: omission, not NULL, is what invokes catalog defaults.
+        } else if (statement.rows.some((row) => row.length !== columns.length)) {
+          throw new TypeError("Each INSERT row must match the table column count");
+        } else {
+          statement = { ...statement, columns };
+        }
+      }
+      if (statement.kind === "insert") {
+        const reader = options.writer;
+        statement = await this.#materializeInsertExpressions(statement, statementNow, (plan) =>
+          reader.queryPlan(plan),
+        );
+      }
+      // A RETURNING clause parsed from SQL text applies unless the caller overrides it. Expression
+      // items read every column of the affected rows here; execute() projects them afterwards.
+      if (statement.returning !== undefined && options.returning === undefined) {
+        options = { ...options, returning: statement.returning };
+      } else if (statement.returningItems !== undefined && options.returning === undefined) {
+        options = { ...options, returning: "*" };
+      }
+      if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
+        statement = await this.#filterConflictingInsertRows(statement, options.writer);
+      }
+      if (statement.kind === "insert" && statement.onConflict?.action === "update") {
+        return this.#mergeConflictingInsertRows(statement, options);
+      }
+      if (statement.kind === "insert" && statement.rows.length === 0) {
+        const table = await this.#findTable(statement.table);
+        const returningColumns =
+          options.returning === undefined
+            ? undefined
+            : options.returning === "*"
+              ? visibleTableColumns(table).map(({ name }) => name)
+              : [...options.returning];
+        return {
+          kind: "insert",
+          table: statement.table,
+          rowCount: 0,
+          ...(returningColumns === undefined
+            ? {}
+            : returningExecuteFields(table, returningColumns, [])),
+        };
+      }
+      if (statement.kind === "insert") {
+        const table = await this.#findTable(statement.table);
+        const viaUpsert = statement.onConflict?.action === "replace";
+        if (viaUpsert) {
+          const keyColumn = getUniqueKeyColumn(table);
+          const conflictColumns =
+            statement.onConflict?.columns ??
+            (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
+          const addressColumns =
+            keyColumn?.hidden === true
+              ? primaryKeyColumns(table).map(({ name }) => name)
+              : keyColumn === undefined
+                ? []
+                : [keyColumn.name];
           if (
-            (!(error instanceof WriteConflictError) && !(error instanceof SchemaConflictError)) ||
-            attempt >= this.#maxCommitRetries
+            keyColumn === undefined ||
+            conflictColumns.length !== addressColumns.length ||
+            conflictColumns.some((name, index) => name !== addressColumns[index])
           ) {
-            throw error;
+            throw new TypeError(
+              `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
+            );
           }
         }
+        // Narrowing does not survive a reassignment inside the closures below, so the folded
+        // spelling lives beside the statement rather than replacing it.
+        const spelledColumns = foldInsertColumns(table, statement).columns;
+        for (const name of spelledColumns) {
+          if (!table.columns.some((column) => column.name === name)) {
+            throw new TypeError(`INSERT column does not exist: ${name}`);
+          }
+        }
+        const input = insertStatementBatch({ ...statement, columns: spelledColumns });
+        // Normalize before dispatch as well as inside the write path so RETURNING echoes the exact
+        // stored/public domain value rather than the caller's unnormalized spelling.
+        coerceSqlWriteBatch(table, input);
+        normalizeDomainBatch(table, input);
+        let returningColumns: readonly string[] | undefined;
+        if (options.returning !== undefined) {
+          returningColumns =
+            options.returning === "*"
+              ? visibleTableColumns(table).map((column) => column.name)
+              : options.returning;
+          // RETURNING is statement validation, not result decoration. Reject it before the first
+          // byte or key-membership delta is staged so an invalid projection can never commit data.
+          for (const name of returningColumns) {
+            if (!table.columns.some((column) => column.name === name)) {
+              throw new TypeError(`RETURNING column does not exist: ${name}`);
+            }
+          }
+        }
+        const writer = options.writer;
+        const stagedKeyColumn = writer === undefined ? undefined : getUniqueKeyColumn(table);
+        if (writer !== undefined && !viaUpsert && stagedKeyColumn !== undefined) {
+          // Statement validity first, so an invalid projection reports as itself, not as a
+          // duplicate the invalid statement would also have hit.
+          const assignedGenerated = table.columns.find(
+            (column) => column.generatedValue !== undefined && spelledColumns.includes(column.name),
+          );
+          if (assignedGenerated !== undefined) {
+            throw new TypeError(`Generated column cannot be assigned: ${assignedGenerated.name}`);
+          }
+          // Inside BEGIN ... COMMIT a duplicate key must fail the INSERT itself, as it does in
+          // PostgreSQL, not surface at COMMIT after the application has moved on. The scope's
+          // read sees committed rows plus everything it staged, so one keyed lookup settles it;
+          // commit still re-validates as the last word.
+          await this.#assertStagedInsertKeysFree(table, stagedKeyColumn, input, writer);
+        }
+        // A scope stages and reports rows; a standalone write also publishes a version and any
+        // values the engine generated. Both shapes answer here, and the narrow one has less to
+        // report rather than something different.
+        const result: StagedWriteResult & {
+          version?: number;
+          generatedColumns?: Record<string, BatchValue[]>;
+        } = await (viaUpsert
+          ? (writer?.upsertBatch(statement.table, input) ??
+            this.#erased.upsertBatch(statement.table, input))
+          : (writer?.insertBatch(statement.table, input) ??
+            this.#erased.insertBatch(statement.table, input)));
+        const generated = "generatedColumns" in result ? (result.generatedColumns ?? {}) : {};
+        return {
+          kind: "insert",
+          table: statement.table,
+          rowCount: result.rowCount,
+          // A staged write has no version yet: the scope it belongs to has not published.
+          ...(result.version === undefined ? {} : { version: result.version }),
+          ...(returningColumns === undefined
+            ? {}
+            : {
+                ...returningExecuteFields(
+                  table,
+                  returningColumns,
+                  statement.rows.map((row, rowIndex) =>
+                    Object.fromEntries(
+                      returningColumns.map((name) => {
+                        const column = table.columns.find((candidate) => candidate.name === name);
+                        const position = spelledColumns.indexOf(name);
+                        const inserted = position < 0 ? undefined : row[position];
+                        const value =
+                          generated[name]?.[rowIndex] ??
+                          input.columns[name]?.[rowIndex] ??
+                          (inserted === undefined || isDefaultInsertValue(inserted)
+                            ? null
+                            : boundInsertValue(inserted));
+                        return [name, executionSqlValueFromInput(column, value)];
+                      }),
+                    ),
+                  ),
+                ),
+              }),
+        };
       }
-    }
-    if (statement.kind === "insert" && statement.query !== undefined) {
-      statement = await this.#materializeInsertSelect(statement, options.writer);
-    }
-    if (statement.kind === "insert" && statement.columns.length === 0) {
       const table = await this.#findTable(statement.table);
-      const columns = visibleTableColumns(table).map((column) => column.name);
-      if (statement.defaultValues === true) {
-        // Keep the empty column list: omission, not NULL, is what invokes catalog defaults.
-      } else if (statement.rows.some((row) => row.length !== columns.length)) {
-        throw new TypeError("Each INSERT row must match the table column count");
-      } else {
-        statement = { ...statement, columns };
+      const keyColumn = getUniqueKeyColumn(table);
+      if (keyColumn === undefined) {
+        throw new TypeError(
+          `${statement.kind === "update" ? "UPDATE" : "DELETE"} requires a table with a unique key: ${statement.table}`,
+        );
       }
-    }
-    if (statement.kind === "insert") {
-      statement = await this.#materializeInsertExpressions(statement, statementNow);
-    }
-    // A RETURNING clause parsed from SQL text applies unless the caller overrides it. Expression
-    // items read every column of the affected rows here; execute() projects them afterwards.
-    if (statement.returning !== undefined && options.returning === undefined) {
-      options = { ...options, returning: statement.returning };
-    } else if (statement.returningItems !== undefined && options.returning === undefined) {
-      options = { ...options, returning: "*" };
-    }
-    if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
-      statement = await this.#filterConflictingInsertRows(statement, options.writer);
-    }
-    if (statement.kind === "insert" && statement.onConflict?.action === "update") {
-      return this.#mergeConflictingInsertRows(statement, options);
-    }
-    if (statement.kind === "insert" && statement.rows.length === 0) {
-      const table = await this.#findTable(statement.table);
       const returningColumns =
         options.returning === undefined
           ? undefined
           : options.returning === "*"
             ? visibleTableColumns(table).map(({ name }) => name)
             : [...options.returning];
-      return {
-        kind: "insert",
-        table: statement.table,
-        rowCount: 0,
-        ...(returningColumns === undefined
-          ? {}
-          : returningExecuteFields(table, returningColumns, [])),
-      };
-    }
-    if (statement.kind === "insert") {
-      const table = await this.#findTable(statement.table);
-      const viaUpsert = statement.onConflict?.action === "replace";
-      if (viaUpsert) {
-        const keyColumn = getUniqueKeyColumn(table);
-        const conflictColumns =
-          statement.onConflict?.columns ??
-          (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
-        const addressColumns =
-          keyColumn?.hidden === true
-            ? primaryKeyColumns(table).map(({ name }) => name)
-            : keyColumn === undefined
-              ? []
-              : [keyColumn.name];
-        if (
-          keyColumn === undefined ||
-          conflictColumns.length !== addressColumns.length ||
-          conflictColumns.some((name, index) => name !== addressColumns[index])
-        ) {
-          throw new TypeError(
-            `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-          );
-        }
-      }
-      // Narrowing does not survive a reassignment inside the closures below, so the folded
-      // spelling lives beside the statement rather than replacing it.
-      const spelledColumns = foldInsertColumns(table, statement).columns;
-      for (const name of spelledColumns) {
-        if (!table.columns.some((column) => column.name === name)) {
-          throw new TypeError(`INSERT column does not exist: ${name}`);
-        }
-      }
-      const input = insertStatementBatch({ ...statement, columns: spelledColumns });
-      // Normalize before dispatch as well as inside the write path so RETURNING echoes the exact
-      // stored/public domain value rather than the caller's unnormalized spelling.
-      coerceSqlWriteBatch(table, input);
-      normalizeDomainBatch(table, input);
-      let returningColumns: readonly string[] | undefined;
-      if (options.returning !== undefined) {
-        returningColumns =
-          options.returning === "*"
-            ? visibleTableColumns(table).map((column) => column.name)
-            : options.returning;
-        // RETURNING is statement validation, not result decoration. Reject it before the first
-        // byte or key-membership delta is staged so an invalid projection can never commit data.
-        for (const name of returningColumns) {
-          if (!table.columns.some((column) => column.name === name)) {
-            throw new TypeError(`RETURNING column does not exist: ${name}`);
-          }
-        }
-      }
-      const writer = options.writer;
-      const stagedKeyColumn = writer === undefined ? undefined : getUniqueKeyColumn(table);
-      if (writer !== undefined && !viaUpsert && stagedKeyColumn !== undefined) {
-        // Statement validity first, so an invalid projection reports as itself, not as a
-        // duplicate the invalid statement would also have hit.
-        const assignedGenerated = table.columns.find(
-          (column) => column.generatedValue !== undefined && spelledColumns.includes(column.name),
-        );
-        if (assignedGenerated !== undefined) {
-          throw new TypeError(`Generated column cannot be assigned: ${assignedGenerated.name}`);
-        }
-        // Inside BEGIN ... COMMIT a duplicate key must fail the INSERT itself, as it does in
-        // PostgreSQL, not surface at COMMIT after the application has moved on. The scope's
-        // read sees committed rows plus everything it staged, so one keyed lookup settles it;
-        // commit still re-validates as the last word.
-        await this.#assertStagedInsertKeysFree(table, stagedKeyColumn, input, writer);
-      }
-      // A scope stages and reports rows; a standalone write also publishes a version and any
-      // values the engine generated. Both shapes answer here, and the narrow one has less to
-      // report rather than something different.
-      const result: StagedWriteResult & {
-        version?: number;
-        generatedColumns?: Record<string, BatchValue[]>;
-      } = await (viaUpsert
-        ? (writer?.upsertBatch(statement.table, input) ??
-          this.#erased.upsertBatch(statement.table, input))
-        : (writer?.insertBatch(statement.table, input) ??
-          this.#erased.insertBatch(statement.table, input)));
-      const generated = "generatedColumns" in result ? (result.generatedColumns ?? {}) : {};
-      return {
-        kind: "insert",
-        table: statement.table,
-        rowCount: result.rowCount,
-        // A staged write has no version yet: the scope it belongs to has not published.
-        ...(result.version === undefined ? {} : { version: result.version }),
-        ...(returningColumns === undefined
-          ? {}
-          : {
-              ...returningExecuteFields(
-                table,
-                returningColumns,
-                statement.rows.map((row, rowIndex) =>
-                  Object.fromEntries(
-                    returningColumns.map((name) => {
-                      const column = table.columns.find((candidate) => candidate.name === name);
-                      const position = spelledColumns.indexOf(name);
-                      const inserted = position < 0 ? undefined : row[position];
-                      const value =
-                        generated[name]?.[rowIndex] ??
-                        input.columns[name]?.[rowIndex] ??
-                        (inserted === undefined || isDefaultInsertValue(inserted)
-                          ? null
-                          : boundInsertValue(inserted));
-                      return [name, executionSqlValueFromInput(column, value)];
-                    }),
-                  ),
-                ),
-              ),
-            }),
-      };
-    }
-    const table = await this.#findTable(statement.table);
-    const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined) {
-      throw new TypeError(
-        `${statement.kind === "update" ? "UPDATE" : "DELETE"} requires a table with a unique key: ${statement.table}`,
-      );
-    }
-    const returningColumns =
-      options.returning === undefined
-        ? undefined
-        : options.returning === "*"
-          ? visibleTableColumns(table).map(({ name }) => name)
-          : [...options.returning];
-    const updateAssignments =
-      statement.kind !== "update"
-        ? []
-        : await (async () => {
-            const spelled = foldAssignmentColumns(table, statement.assignments);
-            if (!table.columns.some((column) => column.sqlDomain !== undefined)) {
-              return spelled;
+      const updateAssignments =
+        statement.kind !== "update"
+          ? []
+          : await (async () => {
+              const spelled = foldAssignmentColumns(table, statement.assignments);
+              if (!table.columns.some((column) => column.sqlDomain !== undefined)) {
+                return spelled;
+              }
+              const { domains } = await this.#catalogFacts();
+              if (!domains.has(table.name)) return statement.assignments;
+              const normalized = normalizePlanDomainLiterals(
+                {
+                  sql: `UPDATE ${table.name}`,
+                  base: { table: table.name, alias: table.name },
+                  joins: [],
+                  select: spelled.map((assignment) => ({
+                    expression: assignment.expression,
+                    alias: assignment.column,
+                  })),
+                  predicates: [],
+                  groupBy: [],
+                  having: [],
+                  orderBy: [],
+                },
+                domains,
+              );
+              return spelled.map((assignment, index) => ({
+                ...assignment,
+                expression: normalized.select[index]?.expression ?? assignment.expression,
+              }));
+            })();
+      const referenced = new Set([keyColumn.name, ...(returningColumns ?? [])]);
+      // Each assignment rides the read as a hidden select item, so a scalar subquery in SET —
+      // correlated or not — resolves through the ordinary query pipeline (decorrelation, one
+      // snapshot for the uncorrelated) instead of a per-row evaluator that cannot run one.
+      const assignmentAlias = (column: string): string => `\u0000set:${column}`;
+      // UPDATE … FROM / DELETE … USING: the extra sources join the target as a cross product that
+      // the WHERE filters, as PostgreSQL plans them; the target's own columns are then read
+      // qualified, since a source may share a column name.
+      const targetAlias = statement.alias ?? table.name;
+      const from = statement.from;
+      const plan = optimizePlan({
+        sql: `(${statement.kind})`,
+        base: { table: table.name, alias: targetAlias },
+        joins: from === undefined ? [] : [crossJoinPlan(from.base), ...from.joins],
+        select: [
+          ...[...referenced].map((name) => ({
+            expression: {
+              kind: "column" as const,
+              reference: from === undefined ? name : `${targetAlias}.${name}`,
+            },
+            alias: name,
+          })),
+          ...(statement.kind === "update"
+            ? updateAssignments.map((assignment) => ({
+                expression: assignment.expression,
+                alias: assignmentAlias(assignment.column),
+              }))
+            : []),
+        ],
+        predicates:
+          from === undefined ? statement.predicates : [...statement.predicates, ...from.predicates],
+        groupBy: [],
+        having: [],
+        orderBy: [],
+      });
+      if (statement.kind === "delete" && returningColumns === undefined && from === undefined) {
+        const internalWriter = options.writer as StatementWriter &
+          Partial<Pick<TransactionStatementWriter, "queryFirstColumn">>;
+        if (internalWriter.queryFirstColumn !== undefined) {
+          const selectedKeys = await internalWriter.queryFirstColumn(plan);
+          if (selectedKeys !== undefined) {
+            const keys = selectedKeys as BatchValue[];
+            if (keyColumn.type === "string" && keyColumn.sqlDomain === undefined) {
+              for (let index = 0; index < keys.length; index += 1) {
+                keys[index] = storedSqlValueFromExecution(keyColumn, keys[index] ?? null);
+              }
             }
-            const { domains } = await this.#catalogFacts();
-            if (!domains.has(table.name)) return statement.assignments;
-            const normalized = normalizePlanDomainLiterals(
-              {
-                sql: `UPDATE ${table.name}`,
-                base: { table: table.name, alias: table.name },
-                joins: [],
-                select: spelled.map((assignment) => ({
-                  expression: assignment.expression,
-                  alias: assignment.column,
-                })),
-                predicates: [],
-                groupBy: [],
-                having: [],
-                orderBy: [],
-              },
-              domains,
-            );
-            return spelled.map((assignment, index) => ({
-              ...assignment,
-              expression: normalized.select[index]?.expression ?? assignment.expression,
-            }));
-          })();
-    const referenced = new Set([keyColumn.name, ...(returningColumns ?? [])]);
-    // Each assignment rides the read as a hidden select item, so a scalar subquery in SET —
-    // correlated or not — resolves through the ordinary query pipeline (decorrelation, one
-    // snapshot for the uncorrelated) instead of a per-row evaluator that cannot run one.
-    const assignmentAlias = (column: string): string => `\u0000set:${column}`;
-    // UPDATE … FROM / DELETE … USING: the extra sources join the target as a cross product that
-    // the WHERE filters, as PostgreSQL plans them; the target's own columns are then read
-    // qualified, since a source may share a column name.
-    const targetAlias = statement.alias ?? table.name;
-    const from = statement.from;
-    const plan = optimizePlan({
-      sql: `(${statement.kind})`,
-      base: { table: table.name, alias: targetAlias },
-      joins: from === undefined ? [] : [crossJoinPlan(from.base), ...from.joins],
-      select: [
-        ...[...referenced].map((name) => ({
-          expression: {
-            kind: "column" as const,
-            reference: from === undefined ? name : `${targetAlias}.${name}`,
-          },
-          alias: name,
-        })),
-        ...(statement.kind === "update"
-          ? updateAssignments.map((assignment) => ({
-              expression: assignment.expression,
-              alias: assignmentAlias(assignment.column),
-            }))
-          : []),
-      ],
-      predicates:
-        from === undefined ? statement.predicates : [...statement.predicates, ...from.predicates],
-      groupBy: [],
-      having: [],
-      orderBy: [],
-    });
-    if (statement.kind === "delete" && returningColumns === undefined && from === undefined) {
-      const internalWriter = options.writer as StatementWriter &
-        Partial<Pick<TransactionStatementWriter, "queryFirstColumn">>;
-      if (internalWriter.queryFirstColumn !== undefined) {
-        const selectedKeys = await internalWriter.queryFirstColumn(plan);
-        if (selectedKeys !== undefined) {
-          const keys = selectedKeys as BatchValue[];
-          if (keyColumn.type === "string" && keyColumn.sqlDomain === undefined) {
-            for (let index = 0; index < keys.length; index += 1) {
-              keys[index] = storedSqlValueFromExecution(keyColumn, keys[index] ?? null);
+            if (keys.some((key) => key === null)) {
+              throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
             }
+            if (keys.length === 0) {
+              return { kind: "delete", table: table.name, rowCount: 0 };
+            }
+            const deleted = await internalWriter.deleteBatch(table.name, { keys });
+            return {
+              kind: "delete",
+              table: table.name,
+              rowCount: deleted.rowCount,
+            };
           }
-          if (keys.some((key) => key === null)) {
-            throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
-          }
-          if (keys.length === 0) {
-            return { kind: "delete", table: table.name, rowCount: 0 };
-          }
-          const deleted = await internalWriter.deleteBatch(table.name, { keys });
+        }
+      }
+      let rows: QueryResult["rows"];
+      if (options.writer !== undefined) {
+        // Inside a scope the rows to touch are the ones the scope can see, which includes what it
+        // has already staged — an UPDATE after an INSERT in the same transaction finds that row.
+        rows = (await options.writer.queryPlan(plan)).rows;
+      } else {
+        // The same streaming-first pipeline a SELECT takes: its zone pruning and ascending-range
+        // narrowing find the rows to touch, where the prepared path materialized the table's
+        // columns first — most of a bulk delete's cost, at 200k rows.
+        rows = (await this.#queryCompiled(plan)).rows;
+      }
+      if (from !== undefined) {
+        // A target row matched by several source rows is touched once, from its first match —
+        // PostgreSQL's rule for UPDATE … FROM, where the join may fan out.
+        const seen = new Set<string>();
+        rows = rows.filter((row) => {
+          const key = JSON.stringify(row[keyColumn.name] ?? null);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      }
+      const keys =
+        keyColumn.type === "string" && keyColumn.sqlDomain === undefined
+          ? rows.map((row) => storedSqlValueFromExecution(keyColumn, row[keyColumn.name] ?? null))
+          : rows.map((row) => row[keyColumn.name] ?? null);
+      if (keys.some((key) => key === null)) {
+        throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
+      }
+      if (statement.kind === "delete") {
+        const returnedRows =
+          returningColumns === undefined
+            ? undefined
+            : rows.map((row) =>
+                Object.fromEntries(returningColumns.map((name) => [name, row[name] ?? null])),
+              );
+        if (keys.length === 0) {
           return {
             kind: "delete",
             table: table.name,
-            rowCount: deleted.rowCount,
+            rowCount: 0,
+            ...(returnedRows === undefined || returningColumns === undefined
+              ? {}
+              : returningExecuteFields(table, returningColumns, returnedRows)),
           };
         }
-      }
-    }
-    let rows: QueryResult["rows"];
-    if (options.writer !== undefined) {
-      // Inside a scope the rows to touch are the ones the scope can see, which includes what it
-      // has already staged — an UPDATE after an INSERT in the same transaction finds that row.
-      rows = (await options.writer.queryPlan(plan)).rows;
-    } else {
-      // The same streaming-first pipeline a SELECT takes: its zone pruning and ascending-range
-      // narrowing find the rows to touch, where the prepared path materialized the table's
-      // columns first — most of a bulk delete's cost, at 200k rows.
-      rows = (await this.#queryCompiled(plan)).rows;
-    }
-    if (from !== undefined) {
-      // A target row matched by several source rows is touched once, from its first match —
-      // PostgreSQL's rule for UPDATE … FROM, where the join may fan out.
-      const seen = new Set<string>();
-      rows = rows.filter((row) => {
-        const key = JSON.stringify(row[keyColumn.name] ?? null);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    }
-    const keys =
-      keyColumn.type === "string" && keyColumn.sqlDomain === undefined
-        ? rows.map((row) => storedSqlValueFromExecution(keyColumn, row[keyColumn.name] ?? null))
-        : rows.map((row) => row[keyColumn.name] ?? null);
-    if (keys.some((key) => key === null)) {
-      throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
-    }
-    if (statement.kind === "delete") {
-      const returnedRows =
-        returningColumns === undefined
-          ? undefined
-          : rows.map((row) =>
-              Object.fromEntries(returningColumns.map((name) => [name, row[name] ?? null])),
-            );
-      if (keys.length === 0) {
+        const deleted: { deletedRowCount?: number; rowCount?: number; version?: number | null } =
+          options.writer === undefined
+            ? await this.#erased.deleteBatch(table.name, { keys })
+            : await options.writer.deleteBatch(table.name, { keys });
         return {
           kind: "delete",
           table: table.name,
-          rowCount: 0,
+          rowCount: deleted.deletedRowCount ?? deleted.rowCount ?? 0,
+          ...(deleted.version === undefined || deleted.version === null
+            ? {}
+            : { version: deleted.version }),
           ...(returnedRows === undefined || returningColumns === undefined
             ? {}
             : returningExecuteFields(table, returningColumns, returnedRows)),
         };
       }
-      const deleted: { deletedRowCount?: number; rowCount?: number; version?: number | null } =
+      if (keys.length === 0) {
+        return {
+          kind: "update",
+          table: table.name,
+          rowCount: 0,
+          ...(returningColumns === undefined
+            ? {}
+            : returningExecuteFields(table, returningColumns, [])),
+        };
+      }
+      const changes: Record<string, Array<BatchValue | null>> = {};
+      const returnedChanges: Record<string, Array<BatchValue | null>> | undefined =
+        returningColumns === undefined ? undefined : {};
+      for (const assignment of updateAssignments) {
+        const column = table.columns.find((candidate) => candidate.name === assignment.column);
+        if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
+        const executionValues = returnedChanges === undefined ? undefined : ([] as BatchValue[]);
+        changes[assignment.column] = rows.map((row) => {
+          const value = row[assignmentAlias(assignment.column)] ?? null;
+          if (typeof value === "number" && !Number.isFinite(value)) {
+            throw new TypeError(
+              `UPDATE assignment produced a non-finite number: ${assignment.column}`,
+            );
+          }
+          // The stored form: a plain-TEXT value unprotected, an untyped string constant read in
+          // the column's type. RETURNING echoes the same form, as PostgreSQL returns the typed value.
+          const stored = storedSqlValueFromExecution(column, value);
+          executionValues?.push(
+            column.type === "string" && column.sqlDomain === undefined ? value : stored,
+          );
+          return stored;
+        });
+        if (executionValues !== undefined && returnedChanges !== undefined) {
+          returnedChanges[assignment.column] = executionValues;
+        }
+      }
+      const updated: {
+        updatedRowCount?: number;
+        rowCount?: number;
+        version?: number | null;
+        generatedColumns?: Record<string, BatchValue[]>;
+      } =
         options.writer === undefined
-          ? await this.#erased.deleteBatch(table.name, { keys })
-          : await options.writer.deleteBatch(table.name, { keys });
+          ? await this.#erased.updateBatch(table.name, { keys, changes })
+          : await options.writer.updateBatch(table.name, { keys, changes });
+      const returnedRows =
+        returningColumns === undefined
+          ? undefined
+          : rows.map((row, index) =>
+              Object.fromEntries(
+                returningColumns.map((name) => [
+                  name,
+                  returnedChanges !== undefined && name in returnedChanges
+                    ? (returnedChanges[name]?.[index] ?? null)
+                    : updated.generatedColumns?.[name] !== undefined
+                      ? (updated.generatedColumns[name][index] ?? null)
+                      : (row[name] ?? null),
+                ]),
+              ),
+            );
       return {
-        kind: "delete",
+        kind: "update",
         table: table.name,
-        rowCount: deleted.deletedRowCount ?? deleted.rowCount ?? 0,
-        ...(deleted.version === undefined || deleted.version === null
+        rowCount: updated.updatedRowCount ?? updated.rowCount ?? 0,
+        ...(updated.version === undefined || updated.version === null
           ? {}
-          : { version: deleted.version }),
+          : { version: updated.version }),
         ...(returnedRows === undefined || returningColumns === undefined
           ? {}
           : returningExecuteFields(table, returningColumns, returnedRows)),
       };
-    }
-    if (keys.length === 0) {
-      return {
-        kind: "update",
-        table: table.name,
-        rowCount: 0,
-        ...(returningColumns === undefined
-          ? {}
-          : returningExecuteFields(table, returningColumns, [])),
-      };
-    }
-    const changes: Record<string, Array<BatchValue | null>> = {};
-    const returnedChanges: Record<string, Array<BatchValue | null>> | undefined =
-      returningColumns === undefined ? undefined : {};
-    for (const assignment of updateAssignments) {
-      const column = table.columns.find((candidate) => candidate.name === assignment.column);
-      if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
-      const executionValues = returnedChanges === undefined ? undefined : ([] as BatchValue[]);
-      changes[assignment.column] = rows.map((row) => {
-        const value = row[assignmentAlias(assignment.column)] ?? null;
-        if (typeof value === "number" && !Number.isFinite(value)) {
-          throw new TypeError(
-            `UPDATE assignment produced a non-finite number: ${assignment.column}`,
-          );
-        }
-        // The stored form: a plain-TEXT value unprotected, an untyped string constant read in
-        // the column's type. RETURNING echoes the same form, as PostgreSQL returns the typed value.
-        const stored = storedSqlValueFromExecution(column, value);
-        executionValues?.push(
-          column.type === "string" && column.sqlDomain === undefined ? value : stored,
-        );
-        return stored;
-      });
-      if (executionValues !== undefined && returnedChanges !== undefined) {
-        returnedChanges[assignment.column] = executionValues;
-      }
-    }
-    const updated: {
-      updatedRowCount?: number;
-      rowCount?: number;
-      version?: number | null;
-      generatedColumns?: Record<string, BatchValue[]>;
-    } =
-      options.writer === undefined
-        ? await this.#erased.updateBatch(table.name, { keys, changes })
-        : await options.writer.updateBatch(table.name, { keys, changes });
-    const returnedRows =
-      returningColumns === undefined
-        ? undefined
-        : rows.map((row, index) =>
-            Object.fromEntries(
-              returningColumns.map((name) => [
-                name,
-                returnedChanges !== undefined && name in returnedChanges
-                  ? (returnedChanges[name]?.[index] ?? null)
-                  : updated.generatedColumns?.[name] !== undefined
-                    ? (updated.generatedColumns[name][index] ?? null)
-                    : (row[name] ?? null),
-              ]),
-            ),
-          );
-    return {
-      kind: "update",
-      table: table.name,
-      rowCount: updated.updatedRowCount ?? updated.rowCount ?? 0,
-      ...(updated.version === undefined || updated.version === null
-        ? {}
-        : { version: updated.version }),
-      ...(returnedRows === undefined || returningColumns === undefined
-        ? {}
-        : returningExecuteFields(table, returningColumns, returnedRows)),
-    };
+    });
   }
 
   /**
@@ -12929,6 +13267,29 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return locators;
   }
 
+  /** Reuse the existing block-vector cache before loading decoded blocks. No second cache
+   * or retained row index: misses use the same validated decoding and byte admission path. */
+  async #pointReadVectors(
+    ids: readonly string[],
+    snapshot: LeasedSnapshot,
+  ): Promise<ColumnVector[]> {
+    const vectors = ids.map((id) => this.#cacheGet(`dbv ${id}`) as ColumnVector | undefined);
+    const missing: string[] = [];
+    const positions: number[] = [];
+    for (let index = 0; index < ids.length; index += 1) {
+      if (vectors[index] !== undefined) continue;
+      missing.push(ids[index] ?? "");
+      positions.push(index);
+    }
+    if (missing.length > 0) {
+      const decoded = await this.#decodedBlocksThroughCache(missing, snapshot);
+      for (const [index, block] of decoded.entries()) {
+        vectors[positions[index] ?? 0] = this.#blockColumnVector(missing[index] ?? "", block);
+      }
+    }
+    return vectors as ColumnVector[];
+  }
+
   #blockColumnVector(blockId: string, decoded: DecodedPhysicalBlock): ColumnVector {
     const cached = this.#cacheGet(`dbv ${blockId}`) as ColumnVector | undefined;
     if (cached !== undefined) return cached;
@@ -12945,11 +13306,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     codes?.fill(NULL_STRING_VECTOR_CODE);
     const builder = new StringDictionaryBuilder();
     appendPhysicalColumnToVector(column, 0, validity, values, codes, builder);
-    const vector = (
-      codes !== undefined
+    const vector = {
+      nullCount: decoded.description.nullCount,
+      ...(codes !== undefined
         ? { kind: "string", length: rows, validity, codes, dictionary: builder.dictionary }
-        : { kind: column.type, length: rows, validity, values }
-    ) as ColumnVector;
+        : { kind: column.type, length: rows, validity, values }),
+    } as ColumnVector;
     this.#cachePut(`dbv ${blockId}`, vector, blockVectorRetainedBytes(vector));
     return vector;
   }
@@ -13820,84 +14182,86 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     options: VisibleSegmentPageOptions = {},
   ): Promise<VisibleSegmentPage> {
-    const normalizedTableName = validateName(tableName, "Table");
-    const limit = positiveWholeNumber(
-      options.limit ?? MAX_VISIBLE_SEGMENT_PAGE_ITEMS,
-      "Visible segment page limit",
-    );
-    if (limit > MAX_VISIBLE_SEGMENT_PAGE_ITEMS) {
-      throw new RangeError(
-        `Visible segment page limit cannot exceed ${String(MAX_VISIBLE_SEGMENT_PAGE_ITEMS)}`,
+    return this.#foreground(async () => {
+      const normalizedTableName = validateName(tableName, "Table");
+      const limit = positiveWholeNumber(
+        options.limit ?? MAX_VISIBLE_SEGMENT_PAGE_ITEMS,
+        "Visible segment page limit",
       );
-    }
-
-    const rawCursor: unknown = options.cursor;
-    if (rawCursor !== undefined && (typeof rawCursor !== "object" || rawCursor === null)) {
-      throw new TypeError("A visible segment cursor must be an object");
-    }
-    const cursor = rawCursor as VisibleSegmentPageCursor | undefined;
-    if (cursor !== undefined && options.version !== undefined) {
-      throw new TypeError("A visible segment cursor cannot be combined with a version");
-    }
-    let tableId: string;
-    let version: number | null | undefined;
-    let afterId: string | null;
-    if (cursor === undefined) {
-      tableId = (await this.#findTable(normalizedTableName)).id;
-      version = visibleSegmentManifestVersion(options.version, "Visible segment version");
-      afterId = null;
-    } else {
-      if (cursor.tableName !== normalizedTableName) {
-        throw new TypeError("A visible segment cursor belongs to a different table name");
-      }
-      tableId = validateStorageId(cursor.tableId, "Visible segment cursor table ID");
-      version = visibleSegmentManifestVersion(cursor.version, "Visible segment cursor version");
-      if (version === undefined) throw new TypeError("A visible segment cursor needs a version");
-      afterId = validateStorageId(cursor.afterId, "Visible segment cursor ID");
-    }
-
-    return this.#withLeasedSnapshot(version, async (snapshot) => {
-      await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
-      const page = await this.store.listTableSegmentPage(tableId, afterId, limit);
-      // A drop can interleave with the async physical read and remove the old table's segment
-      // metadata. Check again so that race fails closed instead of returning a truncated page.
-      await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
-      const transactions = new Map(
-        (await this.#transactionRecordsForSegments(page.records)).map((record) => [
-          record.id,
-          record,
-        ]),
-      );
-      const versionEligible = page.records.filter((segment) => {
-        const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
-        return (
-          snapshot.version !== null &&
-          committedVersion !== null &&
-          committedVersion !== undefined &&
-          committedVersion <= snapshot.version
+      if (limit > MAX_VISIBLE_SEGMENT_PAGE_ITEMS) {
+        throw new RangeError(
+          `Visible segment page limit cannot exceed ${String(MAX_VISIBLE_SEGMENT_PAGE_ITEMS)}`,
         );
+      }
+
+      const rawCursor: unknown = options.cursor;
+      if (rawCursor !== undefined && (typeof rawCursor !== "object" || rawCursor === null)) {
+        throw new TypeError("A visible segment cursor must be an object");
+      }
+      const cursor = rawCursor as VisibleSegmentPageCursor | undefined;
+      if (cursor !== undefined && options.version !== undefined) {
+        throw new TypeError("A visible segment cursor cannot be combined with a version");
+      }
+      let tableId: string;
+      let version: number | null | undefined;
+      let afterId: string | null;
+      if (cursor === undefined) {
+        tableId = (await this.#findTable(normalizedTableName)).id;
+        version = visibleSegmentManifestVersion(options.version, "Visible segment version");
+        afterId = null;
+      } else {
+        if (cursor.tableName !== normalizedTableName) {
+          throw new TypeError("A visible segment cursor belongs to a different table name");
+        }
+        tableId = validateStorageId(cursor.tableId, "Visible segment cursor table ID");
+        version = visibleSegmentManifestVersion(cursor.version, "Visible segment cursor version");
+        if (version === undefined) throw new TypeError("A visible segment cursor needs a version");
+        afterId = validateStorageId(cursor.afterId, "Visible segment cursor ID");
+      }
+
+      return this.#withLeasedSnapshot(version, async (snapshot) => {
+        await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
+        const page = await this.store.listTableSegmentPage(tableId, afterId, limit);
+        // A drop can interleave with the async physical read and remove the old table's segment
+        // metadata. Check again so that race fails closed instead of returning a truncated page.
+        await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
+        const transactions = new Map(
+          (await this.#transactionRecordsForSegments(page.records)).map((record) => [
+            record.id,
+            record,
+          ]),
+        );
+        const versionEligible = page.records.filter((segment) => {
+          const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
+          return (
+            snapshot.version !== null &&
+            committedVersion !== null &&
+            committedVersion !== undefined &&
+            committedVersion <= snapshot.version
+          );
+        });
+        const visible = await filterSnapshotSegments(snapshot, versionEligible);
+        return {
+          records: visible.map((segment) => ({
+            id: segment.id,
+            rowCount: segment.rowCount,
+            columnBlockIds: structuredClone(segment.columnBlockIds),
+            logicalOrder: segment.logicalOrder,
+            committedVersion: transactions.get(segment.transactionId)?.committedVersion ?? -1,
+            commitOrdinal: segment.commitOrdinal,
+          })),
+          version: snapshot.version,
+          nextCursor:
+            page.nextCursor === null
+              ? null
+              : {
+                  tableName: normalizedTableName,
+                  tableId,
+                  version: snapshot.version,
+                  afterId: page.nextCursor,
+                },
+        };
       });
-      const visible = await filterSnapshotSegments(snapshot, versionEligible);
-      return {
-        records: visible.map((segment) => ({
-          id: segment.id,
-          rowCount: segment.rowCount,
-          columnBlockIds: structuredClone(segment.columnBlockIds),
-          logicalOrder: segment.logicalOrder,
-          committedVersion: transactions.get(segment.transactionId)?.committedVersion ?? -1,
-          commitOrdinal: segment.commitOrdinal,
-        })),
-        version: snapshot.version,
-        nextCursor:
-          page.nextCursor === null
-            ? null
-            : {
-                tableName: normalizedTableName,
-                tableId,
-                version: snapshot.version,
-                afterId: page.nextCursor,
-              },
-      };
     });
   }
 
@@ -13908,31 +14272,70 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * file/network transfer. See the snapshots guide for framing and durability guarantees.
    */
   async exportSnapshot(options: SnapshotExportOptions = {}): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = [];
-    let byteLength = 0;
-    for await (const chunk of this.exportSnapshotStream(options)) {
-      byteLength = safeWholeNumberSum([byteLength, chunk.byteLength], "Snapshot byte-array length");
-      if (byteLength > MAX_SNAPSHOT_BYTE_ARRAY_LENGTH) {
-        throw new RangeError("Snapshot exceeds the byte-array API's 4 GiB limit");
+    return this.#foreground(async () => {
+      const chunks: Uint8Array[] = [];
+      let byteLength = 0;
+      for await (const chunk of this.exportSnapshotStream(options)) {
+        byteLength = safeWholeNumberSum(
+          [byteLength, chunk.byteLength],
+          "Snapshot byte-array length",
+        );
+        if (byteLength > MAX_SNAPSHOT_BYTE_ARRAY_LENGTH) {
+          throw new RangeError("Snapshot exceeds the byte-array API's 4 GiB limit");
+        }
+        chunks.push(chunk);
       }
-      chunks.push(chunk);
-    }
-    const bytes = new Uint8Array(byteLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return bytes;
+      const bytes = new Uint8Array(byteLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    });
   }
 
   /**
    * Streams one pinned committed snapshot with at most one payload block resident. Stopping the
    * iterator releases its durable backup lease in `finally`.
    */
-  async *exportSnapshotStream(
+  exportSnapshotStream(
     options: SnapshotExportOptions = {},
   ): AsyncGenerator<Uint8Array, void, void> {
+    if (this.#closed) throw new Error("Database is closed");
+    if (this.#exports.size >= MAX_DATABASE_ACTIVE_SCOPES)
+      throw new RangeError("Too many open snapshot exports");
+    const iterator = this.#exportSnapshotChunks(options);
+    this.#exports.add(iterator);
+    const next = iterator.next.bind(iterator);
+    const end = iterator.return.bind(iterator);
+    const fail = iterator.throw.bind(iterator);
+    iterator.next = (...args) =>
+      this.#foreground(() => next(...args)).then(
+        (result) => {
+          if (result.done) this.#exports.delete(iterator);
+          return result;
+        },
+        (error: unknown) => {
+          this.#exports.delete(iterator);
+          throw error;
+        },
+      );
+    iterator.return = (value) =>
+      end(value).finally(() => {
+        this.#exports.delete(iterator);
+      });
+    iterator.throw = (error) =>
+      fail(error).finally(() => {
+        this.#exports.delete(iterator);
+      });
+    return iterator;
+  }
+
+  async *#exportSnapshotChunks(
+    options: SnapshotExportOptions,
+  ): AsyncGenerator<Uint8Array, void, void> {
+    if (this.#closed) throw new Error("Database is closed");
     const store = streamingSnapshotExportStore(this.store);
     throwIfSnapshotAborted(options.signal);
     options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
@@ -14064,7 +14467,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * store that already holds a database throws rather than merging two histories.
    */
   async importSnapshot(bytes: Uint8Array, options: SnapshotImportOptions = {}): Promise<void> {
-    await this.importSnapshotStream(singleSnapshotChunk(bytes), options);
+    return this.#foreground(async () => {
+      await this.importSnapshotStream(singleSnapshotChunk(bytes), options);
+    });
   }
 
   /** Incrementally validates and stages a snapshot; only the final adapter CAS makes it visible. */
@@ -14072,111 +14477,113 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     source: AsyncIterable<Uint8Array>,
     options: SnapshotImportOptions = {},
   ): Promise<void> {
-    const store = streamingSnapshotImportStore(this.store);
-    const ownerId = `snapshot-import/${crypto.randomUUID()}`;
-    let identity: string | undefined;
-    let acquired = false;
-    let totalBytes = 0;
-    let writtenBytes = 0;
-    let batchBytes = 0;
-    let metadataBatchBytes = 0;
-    let batchBlockCount = 0;
-    const batch: SnapshotFrame[] = [];
-    const flush = async (): Promise<void> => {
-      if (batch.length === 0 || identity === undefined) return;
-      throwIfSnapshotAborted(options.signal);
-      const times = snapshotSessionTimes(this.#now());
-      const session = await store.appendSnapshotImportFrames({
-        identity,
-        ownerId,
-        expiresAtCutoff: times.createdAt,
-        expiresAt: times.expiresAt,
-        frames: batch.splice(0),
-      });
-      batchBytes = 0;
-      metadataBatchBytes = 0;
-      batchBlockCount = 0;
-      writtenBytes = session.stagedBytes;
-      options.onProgress?.({ phase: "blocks", writtenBytes, totalBytes });
-    };
-    try {
-      throwIfSnapshotAborted(options.signal);
-      for await (const entry of decodeSnapshotFrameStream(
-        abortableSnapshotSource(source, options.signal),
-      )) {
+    return this.#foreground(async () => {
+      const store = streamingSnapshotImportStore(this.store);
+      const ownerId = `snapshot-import/${crypto.randomUUID()}`;
+      let identity: string | undefined;
+      let acquired = false;
+      let totalBytes = 0;
+      let writtenBytes = 0;
+      let batchBytes = 0;
+      let metadataBatchBytes = 0;
+      let batchBlockCount = 0;
+      const batch: SnapshotFrame[] = [];
+      const flush = async (): Promise<void> => {
+        if (batch.length === 0 || identity === undefined) return;
         throwIfSnapshotAborted(options.signal);
-        if (entry.type === "header") {
-          if (identity !== undefined) throw new Error("Snapshot stream repeats its header");
-          identity = snapshotFrameStreamHeaderIdentity(entry.header);
-          totalBytes = Object.values(entry.header.kinds).reduce(
-            (total, kind) =>
-              safeWholeNumberSum([total, kind.storedBytes], "Snapshot streamed payload length"),
-            0,
-          );
-          const times = snapshotSessionTimes(this.#now());
-          await store.beginSnapshotFrameImport({
-            identity,
-            ownerId,
-            ...times,
-            header: entry.header,
-          });
-          acquired = true;
-          options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
-          continue;
-        }
-        if (entry.type === "frame") {
-          if (identity === undefined) throw new Error("Snapshot frame precedes its header");
-          if (
-            batch.length > 0 &&
-            (batch.length >= MAX_SNAPSHOT_FRAME_BATCH_ITEMS ||
-              batchBytes + entry.frame.payload.byteLength > MAX_SNAPSHOT_FRAME_BATCH_BYTES ||
-              (entry.frame.kind === "block" && batchBlockCount > 0) ||
-              (entry.frame.kind !== "block" &&
-                metadataBatchBytes + entry.frame.payload.byteLength >
-                  MAX_SNAPSHOT_METADATA_BATCH_BYTES))
-          ) {
-            await flush();
-          }
-          batch.push(entry.frame);
-          batchBytes = safeWholeNumberSum(
-            [batchBytes, entry.frame.payload.byteLength],
-            "Snapshot import batch bytes",
-          );
-          if (entry.frame.kind !== "block") {
-            metadataBatchBytes = safeWholeNumberSum(
-              [metadataBatchBytes, entry.frame.payload.byteLength],
-              "Snapshot import metadata batch bytes",
-            );
-          } else {
-            batchBlockCount += 1;
-          }
-          continue;
-        }
-        if (identity === undefined) throw new Error("Snapshot footer precedes its header");
-        await flush();
-        throwIfSnapshotAborted(options.signal);
-        const cutoff = dateIsoString(this.#now());
-        options.onProgress?.({ phase: "catalog", writtenBytes, totalBytes });
-        await store.finishSnapshotFrameImport({
+        const times = snapshotSessionTimes(this.#now());
+        const session = await store.appendSnapshotImportFrames({
           identity,
           ownerId,
-          expiresAtCutoff: cutoff,
-          footer: entry.footer,
+          expiresAtCutoff: times.createdAt,
+          expiresAt: times.expiresAt,
+          frames: batch.splice(0),
         });
-        acquired = false;
+        batchBytes = 0;
+        metadataBatchBytes = 0;
+        batchBlockCount = 0;
+        writtenBytes = session.stagedBytes;
+        options.onProgress?.({ phase: "blocks", writtenBytes, totalBytes });
+      };
+      try {
+        throwIfSnapshotAborted(options.signal);
+        for await (const entry of decodeSnapshotFrameStream(
+          abortableSnapshotSource(source, options.signal),
+        )) {
+          throwIfSnapshotAborted(options.signal);
+          if (entry.type === "header") {
+            if (identity !== undefined) throw new Error("Snapshot stream repeats its header");
+            identity = snapshotFrameStreamHeaderIdentity(entry.header);
+            totalBytes = Object.values(entry.header.kinds).reduce(
+              (total, kind) =>
+                safeWholeNumberSum([total, kind.storedBytes], "Snapshot streamed payload length"),
+              0,
+            );
+            const times = snapshotSessionTimes(this.#now());
+            await store.beginSnapshotFrameImport({
+              identity,
+              ownerId,
+              ...times,
+              header: entry.header,
+            });
+            acquired = true;
+            options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
+            continue;
+          }
+          if (entry.type === "frame") {
+            if (identity === undefined) throw new Error("Snapshot frame precedes its header");
+            if (
+              batch.length > 0 &&
+              (batch.length >= MAX_SNAPSHOT_FRAME_BATCH_ITEMS ||
+                batchBytes + entry.frame.payload.byteLength > MAX_SNAPSHOT_FRAME_BATCH_BYTES ||
+                (entry.frame.kind === "block" && batchBlockCount > 0) ||
+                (entry.frame.kind !== "block" &&
+                  metadataBatchBytes + entry.frame.payload.byteLength >
+                    MAX_SNAPSHOT_METADATA_BATCH_BYTES))
+            ) {
+              await flush();
+            }
+            batch.push(entry.frame);
+            batchBytes = safeWholeNumberSum(
+              [batchBytes, entry.frame.payload.byteLength],
+              "Snapshot import batch bytes",
+            );
+            if (entry.frame.kind !== "block") {
+              metadataBatchBytes = safeWholeNumberSum(
+                [metadataBatchBytes, entry.frame.payload.byteLength],
+                "Snapshot import metadata batch bytes",
+              );
+            } else {
+              batchBlockCount += 1;
+            }
+            continue;
+          }
+          if (identity === undefined) throw new Error("Snapshot footer precedes its header");
+          await flush();
+          throwIfSnapshotAborted(options.signal);
+          const cutoff = dateIsoString(this.#now());
+          options.onProgress?.({ phase: "catalog", writtenBytes, totalBytes });
+          await store.finishSnapshotFrameImport({
+            identity,
+            ownerId,
+            expiresAtCutoff: cutoff,
+            footer: entry.footer,
+          });
+          acquired = false;
+        }
+        if (identity === undefined) throw new Error("Snapshot stream is empty");
+        if (acquired) throw new Error("Snapshot stream ended without its footer");
+      } catch (error) {
+        if (options.signal?.aborted === true && acquired && identity !== undefined) {
+          await store.cancelSnapshotFrameImport({ identity, ownerId });
+        }
+        throw error;
       }
-      if (identity === undefined) throw new Error("Snapshot stream is empty");
-      if (acquired) throw new Error("Snapshot stream ended without its footer");
-    } catch (error) {
-      if (options.signal?.aborted === true && acquired && identity !== undefined) {
-        await store.cancelSnapshotFrameImport({ identity, ownerId });
-      }
-      throw error;
-    }
-    this.#planCache.clear();
-    this.#catalogStateCache.clear();
-    this.#catalogStateEpoch = undefined;
-    options.onProgress?.({ phase: "done", writtenBytes, totalBytes });
+      this.#planCache.clear();
+      this.#catalogStateCache.clear();
+      this.#catalogStateEpoch = undefined;
+      options.onProgress?.({ phase: "done", writtenBytes, totalBytes });
+    });
   }
 
   /** Verifies adapter metadata, or metadata plus every live payload, without changing storage. */
@@ -14186,47 +14593,58 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       maxIssues?: number;
     } = {},
   ): Promise<StorageIntegrityReport> {
-    const check = this.store.checkIntegrity?.bind(this.store);
-    if (check === undefined) throw new Error("This database's block store cannot check integrity");
-    return check(options);
+    return this.#foreground(async () => {
+      const check = this.store.checkIntegrity?.bind(this.store);
+      if (check === undefined)
+        throw new Error("This database's block store cannot check integrity");
+      return check(options);
+    });
   }
 
   /** Explicit, potentially storage-scanning accounting for live, obsolete, temp, and WAL bytes. */
   async storageStats(): Promise<StorageStats> {
-    const inspect = this.store.getStorageStats?.bind(this.store);
-    if (inspect === undefined)
-      throw new Error("This database's block store cannot report storage stats");
-    return inspect();
+    return this.#foreground(async () => {
+      const inspect = this.store.getStorageStats?.bind(this.store);
+      if (inspect === undefined)
+        throw new Error("This database's block store cannot report storage stats");
+      return inspect();
+    });
   }
 
   async inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null> {
-    const inspect = this.store.inspectInterruptedImport?.bind(this.store);
-    if (inspect === undefined) return null;
-    return inspect();
+    return this.#foreground(async () => {
+      const inspect = this.store.inspectInterruptedImport?.bind(this.store);
+      if (inspect === undefined) return null;
+      return inspect();
+    });
   }
 
   async abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult> {
-    const abort = this.store.abortInterruptedImport?.bind(this.store);
-    if (abort === undefined) {
-      throw new Error("This database's block store cannot abort interrupted imports");
-    }
-    return abort(identity);
+    return this.#foreground(async () => {
+      const abort = this.store.abortInterruptedImport?.bind(this.store);
+      if (abort === undefined) {
+        throw new Error("This database's block store cannot abort interrupted imports");
+      }
+      return abort(identity);
+    });
   }
 
   async compactTable(
     tableName: string,
     options: CompactTableOptions = {},
   ): Promise<CompactTableResult> {
-    const maxBlocks = boundedMaintenanceBatchItems(
-      options.maxBlocksPerStep ?? 16,
-      "Compaction blocks per step",
-    );
-    let progress = await this.compactTableStep(tableName, { ...options, maxBlocks });
-    while (progress.result === null) {
-      if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
-      progress = await this.resumeCompactionJob(progress.jobId, { maxBlocks });
-    }
-    return progress.result;
+    return this.#foreground(async () => {
+      const maxBlocks = boundedMaintenanceBatchItems(
+        options.maxBlocksPerStep ?? 16,
+        "Compaction blocks per step",
+      );
+      let progress = await this.compactTableStep(tableName, { ...options, maxBlocks });
+      while (progress.result === null) {
+        if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
+        progress = await this.resumeCompactionJob(progress.jobId, { maxBlocks });
+      }
+      return progress.result;
+    });
   }
 
   /** Plans or advances one restart-safe physical compaction job. */
@@ -14234,20 +14652,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     options: CompactTableStepOptions = {},
   ): Promise<CompactionJobProgress> {
-    const maxBlocks = boundedMaintenanceBatchItems(
-      options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
-      "Compaction step block limit",
-    );
-    const table = await this.#findTable(tableName);
-    return this.#serializedCompactionStep(table.id, async () => {
-      const active = await this.#findActiveCompactionJob(table.id);
-      let job = active;
-      if (job === undefined) {
-        const planned = await this.#planCompaction(table, options);
-        if ("compacted" in planned) return compactionSkippedProgress(planned);
-        job = planned;
-      }
-      return this.#runCompactionJob(table, job, maxBlocks);
+    return this.#foreground(async () => {
+      const maxBlocks = boundedMaintenanceBatchItems(
+        options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
+        "Compaction step block limit",
+      );
+      const table = await this.#findTable(tableName);
+      return this.#serializedCompactionStep(table.id, async () => {
+        const active = await this.#findActiveCompactionJob(table.id);
+        let job = active;
+        if (job === undefined) {
+          const planned = await this.#planCompaction(table, options);
+          if ("compacted" in planned) return compactionSkippedProgress(planned);
+          job = planned;
+        }
+        return this.#runCompactionJob(table, job, maxBlocks);
+      });
     });
   }
 
@@ -14256,17 +14676,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     jobId: string,
     options: { maxBlocks?: number } = {},
   ): Promise<CompactionJobProgress> {
-    const maxBlocks = boundedMaintenanceBatchItems(
-      options.maxBlocks ?? 1,
-      "Compaction step block limit",
-    );
-    const job = await this.store.getCompactionJob(jobId);
-    if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
-    const table = await this.store.getTable(job.tableId);
-    if (table === undefined) throw new Error(`Compaction table not found: ${job.tableId}`);
-    return this.#serializedCompactionStep(table.id, () =>
-      this.#runCompactionJob(table, job, maxBlocks),
-    );
+    return this.#foreground(async () => {
+      const maxBlocks = boundedMaintenanceBatchItems(
+        options.maxBlocks ?? 1,
+        "Compaction step block limit",
+      );
+      const job = await this.store.getCompactionJob(jobId);
+      if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
+      const table = await this.store.getTable(job.tableId);
+      if (table === undefined) throw new Error(`Compaction table not found: ${job.tableId}`);
+      return this.#serializedCompactionStep(table.id, () =>
+        this.#runCompactionJob(table, job, maxBlocks),
+      );
+    });
   }
 
   /**
@@ -14303,28 +14725,32 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]> {
-    if (tableName === undefined) return this.store.listCompactionJobs();
-    const table = await this.#findTable(tableName);
-    return this.store.listCompactionJobs(table.id);
+    return this.#foreground(async () => {
+      if (tableName === undefined) return this.store.listCompactionJobs();
+      const table = await this.#findTable(tableName);
+      return this.store.listCompactionJobs(table.id);
+    });
   }
 
   /** Atomically prevents an unpublished compaction job from committing its transaction. */
   async cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult> {
-    for (;;) {
-      const job = await this.store.getCompactionJob(jobId);
-      if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
-      if (job.state === "cancelled" || job.state === "published" || job.state === "aborted") {
-        return compactionCancellationResult(job);
+    return this.#foreground(async () => {
+      for (;;) {
+        const job = await this.store.getCompactionJob(jobId);
+        if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
+        if (job.state === "cancelled" || job.state === "published" || job.state === "aborted") {
+          return compactionCancellationResult(job);
+        }
+        try {
+          return compactionCancellationResult(
+            await this.store.cancelCompactionJob(job.id, job.revision, dateIsoString(this.#now())),
+          );
+        } catch (error) {
+          if (error instanceof CompactionJobConflictError) continue;
+          throw error;
+        }
       }
-      try {
-        return compactionCancellationResult(
-          await this.store.cancelCompactionJob(job.id, job.revision, dateIsoString(this.#now())),
-        );
-      } catch (error) {
-        if (error instanceof CompactionJobConflictError) continue;
-        throw error;
-      }
-    }
+    });
   }
 
   async #cancelTableCompactions(tableId: string): Promise<void> {
@@ -14346,47 +14772,52 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Runs restart-safe lease-aware reclamation to completion in bounded durable steps. */
   async collectGarbage(options: CollectGarbageOptions = {}): Promise<GarbageCollectionResult> {
-    const maxItems = boundedMaintenanceBatchItems(
-      options.maxItemsPerStep ?? 64,
-      "Garbage collection items per step",
-    );
-    // Crash-left and abandoned compaction work first, over every job record, as a background
-    // pass does over a page: an owner past its lease is aborted and its job resumed or
-    // cancelled. An explicit call is how a caller repairs a store, and repair that only the
-    // background retry timer performed left a write at the level-zero ceiling failing on a
-    // dead owner after this call had returned.
-    let reconciliationCursor: string | null = null;
-    do {
-      reconciliationCursor = (await this.#reconcileCompactionPage(reconciliationCursor)).nextCursor;
-    } while (reconciliationCursor !== null);
-    let progress = await this.collectGarbageStep({
-      maxItems,
-      ...(options.maxPlanningItems === undefined
-        ? {}
-        : { maxPlanningItems: options.maxPlanningItems }),
-      ...(options.retainRecentVersions === undefined
-        ? {}
-        : { retainRecentVersions: options.retainRecentVersions }),
+    return this.#foreground(async () => {
+      const maxItems = boundedMaintenanceBatchItems(
+        options.maxItemsPerStep ?? 64,
+        "Garbage collection items per step",
+      );
+      // Crash-left and abandoned compaction work first, over every job record, as a background
+      // pass does over a page: an owner past its lease is aborted and its job resumed or
+      // cancelled. An explicit call is how a caller repairs a store, and repair that only the
+      // background retry timer performed left a write at the level-zero ceiling failing on a
+      // dead owner after this call had returned.
+      let reconciliationCursor: string | null = null;
+      do {
+        reconciliationCursor = (await this.#reconcileCompactionPage(reconciliationCursor))
+          .nextCursor;
+      } while (reconciliationCursor !== null);
+      let progress = await this.collectGarbageStep({
+        maxItems,
+        ...(options.maxPlanningItems === undefined
+          ? {}
+          : { maxPlanningItems: options.maxPlanningItems }),
+        ...(options.retainRecentVersions === undefined
+          ? {}
+          : { retainRecentVersions: options.retainRecentVersions }),
+      });
+      while (progress.result === null) {
+        progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
+      }
+      await this.#pruneFinishedJobRecords();
+      // An explicit successful pass is the caller accepting responsibility for manual mode. It
+      // reopens the generous write window; if the store cannot complete, the exception leaves the
+      // ceiling in place.
+      this.#autoCollectionDebtCommits = 0;
+      this.#manualCollectionDebtInitialized = true;
+      this.#commitsSinceCollection = 0;
+      this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
+      return progress.result;
     });
-    while (progress.result === null) {
-      progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
-    }
-    await this.#pruneFinishedJobRecords();
-    // An explicit successful pass is the caller accepting responsibility for manual mode. It
-    // reopens the generous write window; if the store cannot complete, the exception leaves the
-    // ceiling in place.
-    this.#autoCollectionDebtCommits = 0;
-    this.#manualCollectionDebtInitialized = true;
-    this.#commitsSinceCollection = 0;
-    this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
-    return progress.result;
   }
 
   /** Plans or advances one durable garbage-collection pass. */
   async collectGarbageStep(
     options: CollectGarbageStepOptions = {},
   ): Promise<GarbageCollectionProgress> {
-    return this.#collectGarbageStep(options);
+    return this.#foreground(async () => {
+      return this.#collectGarbageStep(options);
+    });
   }
 
   /** `collectGarbageStep`, with the age bound background collection adds to its retention. */
@@ -14432,14 +14863,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     jobId: string,
     options: CollectGarbageStepOptions = {},
   ): Promise<GarbageCollectionProgress> {
-    const job = await this.store.getGarbageCollectionJob(jobId);
-    if (job === undefined) throw new Error(`Garbage collection job not found: ${jobId}`);
-    return this.#serializedCollectionStep(() =>
-      this.#runGarbageCollectionJob(
-        job,
-        boundedMaintenanceBatchItems(options.maxItems ?? 1, "Garbage collection item limit"),
-      ),
-    );
+    return this.#foreground(async () => {
+      const job = await this.store.getGarbageCollectionJob(jobId);
+      if (job === undefined) throw new Error(`Garbage collection job not found: ${jobId}`);
+      return this.#serializedCollectionStep(() =>
+        this.#runGarbageCollectionJob(
+          job,
+          boundedMaintenanceBatchItems(options.maxItems ?? 1, "Garbage collection item limit"),
+        ),
+      );
+    });
   }
 
   /**
@@ -14566,9 +14999,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   async #runAutoCollection(): Promise<{ moreWork: boolean; reclaimed: boolean }> {
     const reconciliationMoreWork = await this.#reconcileCompactionMaintenance();
-    // One pass plans a bounded number of candidates, so a backlog — a burst of commits that
-    // outran the passes between them — takes several. Keep passing while a pass still finds
-    // something, up to a ceiling that keeps a pathological store from pinning the loop.
+    // A discovery cycle may span many bounded jobs. Finish its durable continuation, then
+    // wait for a fresh trigger; restarting full discovery just because a job reclaimed records
+    // repeatedly scans retained history while a steady writer keeps producing small changes.
     let moreWork = false;
     let reclaimed = false;
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
@@ -14589,16 +15022,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         });
       }
       const result = progress.result;
-      moreWork = !(
+      const madeProgress = !(
         result.prunedManifestCount === 0 &&
         result.reclaimedBlockCount === 0 &&
         result.reclaimedSegmentCount === 0 &&
         result.reclaimedTransactionCount === 0
       );
+      reclaimed ||= madeProgress;
+      // A bounded page can contain only protected artifacts while later discovery pages
+      // still contain garbage. Finish that durable cursor before declaring collection idle.
+      moreWork =
+        (await this.store.getGarbageCollectionJob(result.jobId))?.discovery?.resumePhase != null;
       if (!moreWork) {
         break;
       }
-      reclaimed = true;
       await this.#yieldMaintenance();
     }
     await this.#pruneFinishedJobRecords();
@@ -14800,7 +15237,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
-    return this.store.listGarbageCollectionJobs();
+    return this.#foreground(async () => {
+      return this.store.listGarbageCollectionJobs();
+    });
   }
 
   async #planGarbageCollection(
@@ -14999,10 +15438,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           phase: complete
             ? remaining <= 0
               ? "complete"
-              : (discovery.postManifestPhase ?? "manifest-blocks")
+              : (discovery.postManifestPhase ?? "segments")
             : "manifests",
           resumePhase: remaining <= 0 ? "manifests" : null,
-          postManifestPhase: remaining <= 0 ? (discovery.postManifestPhase ?? null) : null,
+          // Preserve a later-phase destination until manifest paging actually finishes.
+          postManifestPhase:
+            !complete || remaining <= 0 ? (discovery.postManifestPhase ?? null) : null,
           manifestCursor: remaining <= 0 ? lastVisited : complete ? null : page.nextCursor,
           visitedRecords: safeWholeNumberSum(
             [discovery.visitedRecords, page.records.length],
@@ -15032,7 +15473,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           scanned.nextIndex === 0 ? afterBlockId : (pageIds[scanned.nextIndex - 1] ?? afterBlockId);
         next = {
           ...next,
-          phase: remaining <= 0 ? "complete" : reachedEnd ? "segments" : "manifest-blocks",
+          phase: remaining <= 0 ? "complete" : reachedEnd ? "transactions" : "manifest-blocks",
           resumePhase: remaining <= 0 ? "manifest-blocks" : null,
           manifestCursor: null,
           artifactCursor:
@@ -15051,9 +15492,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ),
         };
       } else if (discovery.phase === "segments") {
-        const page = await this.store.listSegmentPage(discovery.segmentCursor, 1);
+        // Release retired structural roots before nominating their blocks. Otherwise a
+        // bounded block-only job must retain its whole page and rediscover it next cycle.
+        const page = await this.store.listSegmentPage(
+          discovery.segmentCursor,
+          Math.max(1, Math.min(MAINTENANCE_JOB_PAGE_SIZE, remaining)),
+        );
+        const ownerIds = [...new Set(page.records.map((segment) => segment.transactionId))];
+        const owners = new Map(
+          (await this.store.getTransactions(ownerIds))
+            .filter((owner) => owner !== undefined)
+            .map((owner) => [owner.id, owner]),
+        );
         for (const segment of page.records) {
-          const listedOwner = await this.store.getTransaction(segment.transactionId);
+          const listedOwner = owners.get(segment.transactionId);
           if (
             listedOwner?.status === "active" &&
             Date.parse(listedOwner.expiresAt) <= Date.parse(job.leaseCutoff)
@@ -15072,11 +15524,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (!touchesCurrent) addSegments([segment.id]);
           if (remaining <= 0) break;
         }
-        const record = page.records[0];
+        // The page fits the remaining candidate budget, so every listed segment was visited.
+        const record = page.records.at(-1);
         const filled = remaining <= 0;
         next = {
           ...next,
-          phase: record === undefined ? "transactions" : filled ? "complete" : "segments",
+          phase: record === undefined ? "manifest-blocks" : filled ? "complete" : "segments",
           resumePhase: filled ? "segments" : null,
           segmentCursor: record?.id ?? null,
           artifactCursor: null,
@@ -18216,75 +18669,80 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     requestedColumns: string | ReadonlyArray<{ name: string; direction: "asc" | "desc" }>,
     options: { unique?: boolean } = {},
   ): Promise<void> {
-    // Keep the original low-level single-column API source-compatible while SQL and new callers
-    // use the explicit ordered key shape.
-    const indexColumns =
-      typeof requestedColumns === "string"
-        ? [{ name: requestedColumns, direction: "asc" as const }]
-        : requestedColumns;
-    const tables = await this.store.listTables();
-    if (
-      tables.some((table) =>
-        Object.values(table.secondaryIndexes ?? {}).some((index) => index.name === indexName),
-      )
-    ) {
-      throw new TypeError(`Index already exists: ${indexName}`);
-    }
-    const table = tables.find((candidate) => candidate.name === tableName);
-    if (table === undefined || table.view !== undefined) {
-      throw new UnknownTableError(tableName);
-    }
-    if (indexColumns.length === 0) throw new TypeError("An index needs at least one column");
-    const duplicate = indexColumns.find(
-      (column, position) =>
-        indexColumns.findIndex((candidate) => candidate.name === column.name) !== position,
-    );
-    if (duplicate !== undefined) {
-      throw new TypeError(`Index column appears more than once: ${duplicate.name}`);
-    }
-    const columns = indexColumns.map(({ name }) => {
-      const column = table.columns.find((candidate) => candidate.name === name);
-      if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
-      return column;
-    });
-    const indexId = this.#createId();
-    const storageColumnId = `secondary-index:${indexId}`;
-    const buildId = this.#createId();
-    const marked = await this.store.updateTable(table.id, table.revision, {
-      secondaryIndexes: {
-        ...table.secondaryIndexes,
-        [indexId]: {
-          name: indexName,
-          columnId: columns[0]?.id ?? "",
-          columnIds: columns.map((column) => column.id),
-          directions: indexColumns.map((column) => column.direction),
-          ...(options.unique === true ? { unique: true as const } : {}),
-          termEncoding: "tuple-v1",
-          storage: "postings-v1",
-          storageColumnId,
-          locator: table.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
-          state: "building",
-          buildId,
-          buildFromVersion: -1,
+    return this.#foreground(async () => {
+      // Keep the original low-level single-column API source-compatible while SQL and new callers
+      // use the explicit ordered key shape.
+      const indexColumns =
+        typeof requestedColumns === "string"
+          ? [{ name: requestedColumns, direction: "asc" as const }]
+          : requestedColumns;
+      const tables = await this.store.listTables();
+      if (
+        tables.some((table) =>
+          Object.values(table.secondaryIndexes ?? {}).some((index) => index.name === indexName),
+        )
+      ) {
+        throw new TypeError(`Index already exists: ${indexName}`);
+      }
+      const table = tables.find((candidate) => candidate.name === tableName);
+      if (table === undefined || table.view !== undefined) {
+        throw new UnknownTableError(tableName);
+      }
+      if (indexColumns.length === 0) throw new TypeError("An index needs at least one column");
+      const duplicate = indexColumns.find(
+        (column, position) =>
+          indexColumns.findIndex((candidate) => candidate.name === column.name) !== position,
+      );
+      if (duplicate !== undefined) {
+        throw new TypeError(`Index column appears more than once: ${duplicate.name}`);
+      }
+      const columns = indexColumns.map(({ name }) => {
+        const column = table.columns.find((candidate) => candidate.name === name);
+        if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
+        return column;
+      });
+      const indexId = this.#createId();
+      const storageColumnId = `secondary-index:${indexId}`;
+      const buildId = this.#createId();
+      const marked = await this.store.updateTable(table.id, table.revision, {
+        secondaryIndexes: {
+          ...table.secondaryIndexes,
+          [indexId]: {
+            name: indexName,
+            columnId: columns[0]?.id ?? "",
+            columnIds: columns.map((column) => column.id),
+            directions: indexColumns.map((column) => column.direction),
+            ...(options.unique === true ? { unique: true as const } : {}),
+            termEncoding: "tuple-v1",
+            storage: "postings-v1",
+            storageColumnId,
+            locator: table.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
+            state: "building",
+            buildId,
+            buildFromVersion: -1,
+          },
         },
-      },
-    });
-    try {
-      await this.#buildSecondaryIndex(marked, indexId);
-    } catch (error) {
-      // A caller that sees CREATE INDEX fail must not inherit an unusable schema object. An
-      // abandoned tab is different: it never runs this catch, so the durable `building` marker
-      // remains available for another connection to take over.
-      await this.#removeSecondaryIndexIfOwned(marked.id, indexId, indexName, storageColumnId).catch(
-        (cleanupError: unknown) => {
+      });
+      try {
+        await this.#buildSecondaryIndex(marked, indexId);
+      } catch (error) {
+        // A caller that sees CREATE INDEX fail must not inherit an unusable schema object. An
+        // abandoned tab is different: it never runs this catch, so the durable `building` marker
+        // remains available for another connection to take over.
+        await this.#removeSecondaryIndexIfOwned(
+          marked.id,
+          indexId,
+          indexName,
+          storageColumnId,
+        ).catch((cleanupError: unknown) => {
           throw new AggregateError(
             [error, cleanupError],
             `CREATE INDEX ${indexName} failed and its catalog cleanup also failed`,
           );
-        },
-      );
-      throw error;
-    }
+        });
+        throw error;
+      }
+    });
   }
 
   /** Removes only the exact failed build this caller created, retrying catalog CAS races. */
@@ -18319,24 +18777,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Drops one globally named secondary index. */
   async dropIndex(indexName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
-    for (const table of await this.store.listTables()) {
-      const entry = Object.entries(table.secondaryIndexes ?? {}).find(
-        ([, index]) => index.name === indexName,
-      );
-      if (entry === undefined) continue;
-      const [indexId] = entry;
-      const indexes = Object.fromEntries(
-        Object.entries(table.secondaryIndexes ?? {}).filter(
-          ([candidateId]) => candidateId !== indexId,
-        ),
-      );
-      await this.store.updateTable(table.id, table.revision, {
-        secondaryIndexes: Object.keys(indexes).length === 0 ? null : indexes,
-      });
-      return true;
-    }
-    if (options.ifExists === true) return false;
-    throw new TypeError(`Unknown index: ${indexName}`);
+    return this.#foreground(async () => {
+      for (const table of await this.store.listTables()) {
+        const entry = Object.entries(table.secondaryIndexes ?? {}).find(
+          ([, index]) => index.name === indexName,
+        );
+        if (entry === undefined) continue;
+        const [indexId] = entry;
+        const indexes = Object.fromEntries(
+          Object.entries(table.secondaryIndexes ?? {}).filter(
+            ([candidateId]) => candidateId !== indexId,
+          ),
+        );
+        await this.store.updateTable(table.id, table.revision, {
+          secondaryIndexes: Object.keys(indexes).length === 0 ? null : indexes,
+        });
+        return true;
+      }
+      if (options.ifExists === true) return false;
+      throw new TypeError(`Unknown index: ${indexName}`);
+    });
   }
 
   async #buildSecondaryIndex(table: TableRecord, indexId: string): Promise<void> {
@@ -18877,22 +19337,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * a table crosses the auto-index threshold; calling it directly is just a warm-up.
    */
   async buildFtsIndex(tableName: string, columnName: string): Promise<void> {
-    const table = await this.#findTable(tableName);
-    const column = table.columns.find((candidate) => candidate.name === columnName);
-    if (column === undefined) throw new TypeError(`Unknown column: ${columnName}`);
-    const key = `${table.id}/${column.id}`;
-    if (this.#droppingFtsColumns.has(key)) {
-      throw new TypeError(`Column is being dropped: ${tableName}.${columnName}`);
-    }
-    const existing = this.#ftsBuildsInFlight.get(key);
-    if (existing !== undefined) return existing;
-    const build = this.#buildFtsIndex(table, column);
-    this.#ftsBuildsInFlight.set(key, build);
-    try {
-      await build;
-    } finally {
-      if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
-    }
+    return this.#foreground(async () => {
+      const table = await this.#findTable(tableName);
+      const column = table.columns.find((candidate) => candidate.name === columnName);
+      if (column === undefined) throw new TypeError(`Unknown column: ${columnName}`);
+      const key = `${table.id}/${column.id}`;
+      if (this.#droppingFtsColumns.has(key)) {
+        throw new TypeError(`Column is being dropped: ${tableName}.${columnName}`);
+      }
+      const existing = this.#ftsBuildsInFlight.get(key);
+      if (existing !== undefined) return existing;
+      const build = this.#buildFtsIndex(table, column);
+      this.#ftsBuildsInFlight.set(key, build);
+      try {
+        await build;
+      } finally {
+        if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
+      }
+    });
   }
 
   async #buildFtsIndex(table: TableRecord, column: TableColumnRecord): Promise<void> {
@@ -21068,6 +21530,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  readonly #retiredLeaseRenewals = new WeakMap<LeasedSnapshot, Promise<void>>();
+
   async #renewInternalLeaseIfNeeded(snapshot: LeasedSnapshot): Promise<void> {
     if (
       dateMilliseconds(snapshot.expiresAt) - dateMilliseconds(this.#now()) >
@@ -21087,7 +21551,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await this.#sharedLeaseRenewal;
       return;
     }
-    await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
+    let renewal = this.#retiredLeaseRenewals.get(snapshot);
+    if (renewal === undefined) {
+      renewal = snapshot.renew(INTERNAL_READ_LEASE_TTL_MS).then(() => undefined);
+      this.#retiredLeaseRenewals.set(snapshot, renewal);
+    }
+    try {
+      await renewal;
+    } finally {
+      if (this.#retiredLeaseRenewals.get(snapshot) === renewal)
+        this.#retiredLeaseRenewals.delete(snapshot);
+    }
   }
 
   /**
@@ -22823,7 +23297,9 @@ interface LiveMaintenanceState {
   readonly complete: boolean;
   /** Every retained row — the visible ones first, then the margin — in result order. */
   readonly rows: readonly QueryRow[];
-  readonly keys: readonly QueryValue[];
+  readonly keys: readonly string[];
+  /** Fixed plan cost plus row/key/order payload; updated only for changed and trimmed rows. */
+  readonly retainedBytes?: number;
   /** Key lookup avoids scanning and re-encoding retained keys for each small delta. */
   readonly positions: ReadonlyMap<string, number>;
   /** One array per ORDER BY term, each holding that term's value for every retained row. */
@@ -22832,27 +23308,11 @@ interface LiveMaintenanceState {
 
 interface LiveMaintainedRows {
   readonly rows: QueryRow[];
-  readonly keys: QueryValue[];
+  readonly keys: string[];
   /** One array per ORDER BY term. */
   readonly order: QueryValue[][];
   /** For each row, its index among the rows the patch started from, or -1 for a new row. */
   readonly previousIndex: Int32Array;
-}
-
-function sameLiveRow(left: QueryRow, right: QueryRow, columns: readonly string[]): boolean {
-  for (const column of columns) {
-    const a = left[column] ?? null;
-    const b = right[column] ?? null;
-    if (a instanceof Date || b instanceof Date) {
-      if (
-        !(a instanceof Date && b instanceof Date) ||
-        !Object.is(dateMilliseconds(a), dateMilliseconds(b))
-      ) {
-        return false;
-      }
-    } else if (!Object.is(a, b)) return false;
-  }
-  return true;
 }
 
 function liveKeyToken(value: QueryValue): string {
@@ -22867,15 +23327,15 @@ function liveKeyToken(value: QueryValue): string {
 function splitLiveHiddenColumns(
   executed: QueryResult,
   state: Pick<LiveMaintenanceState, "publicColumns" | "orderTerms">,
-): { result: QueryResult; keys: QueryValue[]; order: QueryValue[][] } {
+): { result: QueryResult; keys: string[]; order: QueryValue[][] } {
   const publicCount = state.publicColumns.length;
   const hidden = executed.columns.slice(publicCount);
   const count = executed.rows.length;
-  const keys = new Array<QueryValue>(count);
+  const keys = new Array<string>(count);
   const order = state.orderTerms.map(() => new Array<QueryValue>(count));
   for (let index = 0; index < count; index += 1) {
     const row = executed.rows[index] ?? {};
-    keys[index] = row[LIVE_KEY_ALIAS] ?? null;
+    keys[index] = liveKeyToken(row[LIVE_KEY_ALIAS] ?? null);
     for (const [term, { alias }] of state.orderTerms.entries()) {
       const values = order[term];
       if (values !== undefined) values[index] = row[alias] ?? null;
@@ -22883,11 +23343,13 @@ function splitLiveHiddenColumns(
     for (const column of hidden) Reflect.deleteProperty(row, column);
   }
   return {
-    result: {
+    // Keep SQL-domain tags in the private ordering arrays above. Only public rows cross the
+    // externalization boundary: decimal/interval ordering must never compare display strings.
+    result: externalizeQueryResult({
       columns: executed.columns.slice(0, publicCount),
       columnDomains: executed.columnDomains.slice(0, publicCount),
       rows: executed.rows,
-    },
+    }),
     keys,
     order,
   };
@@ -22906,16 +23368,14 @@ function liveMaintainedOutcome(
 ): LiveMaintainedChange {
   const positions = new Map<string, number>();
   let retainedBytes =
+    state.retainedBytes ??
     128 + planMemoKey(state.fullPlan).length * 2 + planMemoKey(state.deltaPlan).length * 2;
   for (const [index, key] of state.keys.entries()) {
-    const token = liveKeyToken(key);
-    positions.set(token, index);
-    retainedBytes += 64 + token.length * 2;
+    if (positions.has(key)) throw new TypeError("Duplicate live input key");
+    positions.set(key, index);
+    if (state.retainedBytes === undefined) retainedBytes += liveRowStateBytes(state, index);
   }
-  for (const row of state.rows) retainedBytes += 48 + estimateValuesBytes(Object.values(row)) * 2;
-  for (const values of state.order)
-    retainedBytes += values.length * 8 + estimateValuesBytes(values) * 2;
-  state = { ...state, positions };
+  state = { ...state, positions, retainedBytes };
   const visibleCount =
     state.limit === undefined ? state.rows.length : Math.min(state.rows.length, state.limit);
   const visible = state.rows.slice(0, visibleCount);
@@ -22934,12 +23394,10 @@ function liveMaintainedOutcome(
   const previousCount = previous.rows.length;
   const retained = new Int32Array(visibleCount);
   let same = visibleCount === previousCount;
-  let kept = 0;
   for (let index = 0; index < visibleCount; index += 1) {
     const was = previousIndex?.[index] ?? -1;
     if (was >= 0 && was < previousCount) {
       retained[index] = was;
-      kept += 1;
       if (was !== index) same = false;
       continue;
     }
@@ -22949,7 +23407,6 @@ function liveMaintainedOutcome(
     if (before !== undefined && now !== undefined && sameLiveRow(before, now, previous.columns)) {
       visible[index] = before;
       retained[index] = index;
-      kept += 1;
     } else same = false;
   }
   if (same) return { result: previous, state, retainedBytes, changed: false };
@@ -22962,8 +23419,20 @@ function liveMaintainedOutcome(
     state,
     retainedBytes,
     changed: true,
-    ...(kept > 0 ? { retained } : {}),
+    retained,
   };
+}
+
+function liveRowStateBytes(
+  state: Pick<LiveMaintenanceState, "rows" | "keys" | "order">,
+  index: number,
+): number {
+  let bytes =
+    112 +
+    (state.keys[index]?.length ?? 0) * 2 +
+    estimateValuesBytes(Object.values(state.rows[index] ?? {})) * 2;
+  for (const values of state.order) bytes += 8 + estimateValuesBytes([values[index]]) * 2;
+  return bytes;
 }
 
 function filterLiveRows(
@@ -22971,14 +23440,14 @@ function filterLiveRows(
   keep: (index: number) => boolean,
 ): LiveMaintainedRows {
   const rows: QueryRow[] = [];
-  const keys: QueryValue[] = [];
+  const keys: string[] = [];
   const order = state.order.map(() => new Array<QueryValue>());
   const previous: number[] = [];
   for (let index = 0; index < state.rows.length; index += 1) {
     const row = state.rows[index];
     if (row === undefined || !keep(index)) continue;
     rows.push(row);
-    keys.push(state.keys[index] ?? null);
+    keys.push(state.keys[index] ?? "z");
     for (const [term, values] of state.order.entries()) {
       order[term]?.push(values[index] ?? null);
     }
@@ -23037,12 +23506,12 @@ function mergeLiveRows(
   const terms = kept.order.length;
   const total = kept.rows.length + added.rows.length;
   const rows = new Array<QueryRow>(total);
-  const keys = new Array<QueryValue>(total);
+  const keys = new Array<string>(total);
   const order = Array.from({ length: terms }, () => new Array<QueryValue>(total));
   const previousIndex = new Int32Array(total);
   const take = (source: LiveMaintainedRows, from: number, to: number): void => {
     rows[to] = source.rows[from] ?? {};
-    keys[to] = source.keys[from] ?? null;
+    keys[to] = source.keys[from] ?? "z";
     for (let term = 0; term < terms; term += 1) {
       const values = order[term];
       if (values !== undefined) values[to] = source.order[term]?.[from] ?? null;
@@ -24125,25 +24594,20 @@ function derivedColumnarTable(
   result: QueryResult,
   schema: readonly SqlColumnSchema[],
 ): ColumnarTable {
-  const columns = new Map(
-    schema.map(({ name: columnName, type, sqlDomain }) => [
+  const columns = new Map<string, ColumnVector>();
+  for (const { name: columnName, type, sqlDomain } of schema) {
+    columns.set(
       columnName,
-      {
-        type,
-        values:
-          sqlDomain?.kind === "numeric"
-            ? // COALESCE(amount, 0) or a CASE branch can hand an exact NUMERIC column a plain
-              // number; PostgreSQL casts it to the column's type, and the string vector
-              // needs the tagged form.
-              result.rows.map((row) => {
-                const value = row[columnName] ?? null;
-                return typeof value === "number" ? exactNumericValue(value) : value;
-              })
-            : result.rows.map((row) => row[columnName] ?? null),
-      },
-    ]),
-  );
-  return createColumnarTable(name, columns);
+      createColumnVector(type, result.rows.length, (index) => {
+        const value = result.rows[index]?.[columnName] ?? null;
+        // Preserve NUMERIC coercion for plain-number fallbacks such as COALESCE(amount, 0).
+        return sqlDomain?.kind === "numeric" && typeof value === "number"
+          ? exactNumericValue(value)
+          : value;
+      }),
+    );
+  }
+  return { name, rowCount: result.rows.length, columns };
 }
 
 /**
@@ -26709,7 +27173,7 @@ const blockVectorRetainedBytesMemo = new WeakMap<ColumnVector, number>();
 function blockVectorRetainedBytes(vector: ColumnVector): number {
   const memoized = blockVectorRetainedBytesMemo.get(vector);
   if (memoized !== undefined) return memoized;
-  const bytes = columnVectorRetainedBytes(vector);
+  const bytes = 8 + columnVectorRetainedBytes(vector);
   blockVectorRetainedBytesMemo.set(vector, bytes);
   return bytes;
 }
@@ -27214,5 +27678,25 @@ function asColumnInput(type: LogicalType, values: readonly BatchValue[]): Column
       return { type, values: values as ReadonlyArray<string | null> };
     case "datetime":
       return { type, values: values as ReadonlyArray<Date | null> };
+  }
+}
+
+/** Close cancels idle user callbacks without leaving an unobserved callback rejection. */
+async function untilAborted<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let abort = (): void => undefined;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = () =>
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Database scope cancelled", { cause: signal.reason }),
+      );
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    return await Promise.race([run(), cancelled]);
+  } finally {
+    signal.removeEventListener("abort", abort);
   }
 }

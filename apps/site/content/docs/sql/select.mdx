@@ -340,7 +340,9 @@ measure ordering-value distance and require exactly one numeric `ORDER BY` expre
 interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
 select list and `ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
 
-Compatible windows share sorting and peer preparation. Prefix and whole-partition aggregates
+Compatible windows share sorting and prepare peer information only when a function or frame
+needs it. Positional functions and `ROWS` frames without peer exclusions skip those buffers.
+Prefix and whole-partition aggregates
 accumulate in linear time. Frame aggregates combine only values
 inside the frame, avoiding rounded prefix subtraction and repeated whole-frame scans. Window
 working buffers count toward the query memory budget, and long database window passes yield for

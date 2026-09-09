@@ -1,7 +1,7 @@
 /* eslint-disable no-restricted-imports -- Node-only test reads fixture provenance; this file is not shipped. */
 import { readFileSync } from "node:fs";
-import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it, vi } from "vitest";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CompactionJobConflictError,
   GarbageCollectionJobConflictError,
@@ -36,6 +36,10 @@ import {
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { crc32, encodeBlock, MAX_BLOCK_ROW_COUNT } from "../block-format/index.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
+
+// Exercise native batched IndexedDB reads; other engine suites retain the injected-factory fallback.
+beforeEach(() => vi.stubGlobal("IDBKeyRange", IDBKeyRange));
+afterEach(() => vi.unstubAllGlobals());
 
 vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
@@ -4545,6 +4549,51 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("retains a retired block until its remaining segment record is also reclaimed", async () => {
+      const store = await implementation.create();
+      const prefix = "segment-before-block";
+      try {
+        await createSupersededStorage(store, prefix);
+        const first = await store.createGarbageCollectionJob({
+          id: `${prefix}/blocks-first`,
+          candidateManifestVersions: [0],
+          candidateSegmentIds: [],
+          candidateBlockIds: [`${prefix}/old-block`],
+          candidateTransactionIds: [],
+          leaseCutoff: "2026-01-01T00:10:00.000Z",
+          createdAt: "2026-01-01T00:10:00.000Z",
+        });
+        const retained = await store.runGarbageCollectionStep({
+          jobId: first.id,
+          expectedRevision: first.revision,
+          maxItems: 2,
+          updatedAt: "2026-01-01T00:10:00.000Z",
+        });
+        expect(retained.retainedBlockIds).toEqual([`${prefix}/old-block`]);
+        expect(await store.getSegment(`${prefix}/old-segment`)).toBeDefined();
+        expect(await store.getBlock(`${prefix}/old-block`)).toEqual(Uint8Array.of(1, 2, 3));
+        const second = await store.createGarbageCollectionJob({
+          id: `${prefix}/segment-and-block`,
+          candidateManifestVersions: [],
+          candidateSegmentIds: [`${prefix}/old-segment`],
+          candidateBlockIds: [`${prefix}/old-block`],
+          candidateTransactionIds: [],
+          leaseCutoff: "2026-01-01T00:11:00.000Z",
+          createdAt: "2026-01-01T00:11:00.000Z",
+        });
+        const reclaimed = await store.runGarbageCollectionStep({
+          jobId: second.id,
+          expectedRevision: second.revision,
+          maxItems: 2,
+          updatedAt: "2026-01-01T00:11:00.000Z",
+        });
+        expect(reclaimed.reclaimedSegmentIds).toEqual([`${prefix}/old-segment`]);
+        expect(reclaimed.reclaimedBlockIds).toEqual([`${prefix}/old-block`]);
+      } finally {
+        store.close();
+      }
+    });
+
     it("prunes manifests and reclaims exact physical artifacts in bounded durable steps", async () => {
       const store = await implementation.create();
       const prefix = "bounded-gc";
@@ -4932,6 +4981,56 @@ for (const implementation of stores()) {
       ).toBe(true);
       expect(await store.getLease("expiry-cas-lease")).toBeUndefined();
       store.close();
+    });
+
+    it("preserves adopted blocks and reclaims orphans after the owner-root cache fills", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      try {
+        await stageTestArtifacts(store, {
+          transactionId: "a-padding-owner",
+          blocks: Array.from({ length: 4_096 }, (_, index) => ({
+            id: `padding-${String(index)}`,
+            bytes: Uint8Array.of(1),
+          })),
+        });
+        const original = await stageTestArtifacts(store, {
+          transactionId: "original-owner",
+          blocks: ["adopted-after-cache", "unrooted-after-cache"].map((id) => ({
+            id,
+            bytes: Uint8Array.of(7),
+          })),
+        });
+        await store.updateTransaction(original.id, original.revision, {
+          status: "aborted",
+          updatedAt: timestamp,
+        });
+        await store.createTransaction(activeTransaction("z-adopter"));
+        const job = await store.createGarbageCollectionJob({
+          id: "overflow-roots",
+          candidateManifestVersions: [],
+          candidateSegmentIds: [],
+          candidateBlockIds: ["adopted-after-cache", "unrooted-after-cache"],
+          leaseCutoff: timestamp,
+          createdAt: timestamp,
+        });
+        await store.updateTransaction("z-adopter", 0, {
+          pendingBlockIds: ["adopted-after-cache"],
+          updatedAt: timestamp,
+        });
+        const result = await store.runGarbageCollectionStep({
+          jobId: job.id,
+          expectedRevision: 0,
+          maxItems: 2,
+          updatedAt: timestamp,
+        });
+        expect(result.retainedBlockIds).toEqual(["adopted-after-cache"]);
+        expect(result.reclaimedBlockIds).toEqual(["unrooted-after-cache"]);
+        expect(await store.getBlock("adopted-after-cache")).toEqual(Uint8Array.of(7));
+        expect(await store.getBlock("unrooted-after-cache")).toBeUndefined();
+      } finally {
+        store.close();
+      }
     });
 
     it("does not turn a wide segment dependency set into a permanent garbage root", async () => {
@@ -5385,6 +5484,55 @@ it("pages IndexedDB framed block export without materializing all payloads", asy
   ).toBe(true);
   store.close();
 });
+
+it.each(["close", "crash"] as const)(
+  "reopens OPFS after block-only cleanup and %s",
+  async (shutdown) => {
+    const shim = new MemoryOpfs();
+    const name = crypto.randomUUID();
+    const prefix = "structural-root-recovery";
+    let store = await OpfsBlockStore.open({ name, root: shim.root });
+    try {
+      await createSupersededStorage(store, prefix);
+      const job = await store.createGarbageCollectionJob({
+        id: "blocks-first",
+        candidateManifestVersions: [0],
+        candidateSegmentIds: [],
+        candidateBlockIds: [`${prefix}/old-block`],
+        candidateTransactionIds: [],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:10:00.000Z",
+      });
+      await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: 0,
+        maxItems: 2,
+        updatedAt: "2026-01-01T00:10:00.000Z",
+      });
+      if (shutdown === "crash") store._crashForTests();
+      else store.close();
+      store = await OpfsBlockStore.open({ name, root: shim.root });
+      expect(await store.getBlock(`${prefix}/old-block`)).toEqual(Uint8Array.of(1, 2, 3));
+      expect(await store.getSegment(`${prefix}/old-segment`)).toBeDefined();
+      const cleanup = await createSupersededGarbageCollectionJob(store, prefix);
+      const result = await store.runGarbageCollectionStep({
+        jobId: cleanup.id,
+        expectedRevision: 0,
+        maxItems: 3,
+        updatedAt: "2026-01-01T00:11:00.000Z",
+      });
+      expect(result.reclaimedSegmentIds).toEqual([`${prefix}/old-segment`]);
+      expect(result.reclaimedBlockIds).toEqual([`${prefix}/old-block`]);
+      store._crashForTests();
+      store = await OpfsBlockStore.open({ name, root: shim.root });
+      expect(await store.getBlock(`${prefix}/old-block`)).toBeUndefined();
+      expect(await store.getSegment(`${prefix}/old-segment`)).toBeUndefined();
+      expect(await store.getCurrentManifestVersion()).toBe(1);
+    } finally {
+      store.close();
+    }
+  },
+);
 
 it("resumes a garbage collection job atomically after IndexedDB reopen", async () => {
   const indexedDB = new IDBFactory();

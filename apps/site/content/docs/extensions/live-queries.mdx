@@ -119,6 +119,10 @@ as the final ordering term so window membership and `move` patches are determini
 
 ## How invalidation works
 
+Low-level subscriptions capture parameters and compiled plans when registration starts, including
+a private copy of Date parameters. Changing an input afterwards does not change the registered
+query; create a new subscription to use different parameters.
+
 Broadcast messages are only latency hints. Every sweep reads the store's durable manifest and
 catalog probe, unions the tables changed by missed commits, and looks only at the subscriptions
 that read one of those tables: a commit to one table costs the subscriptions on that table, not a
@@ -161,6 +165,12 @@ integer values and absolute sum remain safely representable; other floating-poin
 re-execute so incremental rounding cannot change an answer. DISTINCT aggregates and other
 aggregate functions re-execute.
 
+Aggregate patches stage only changed contributions and publish them after result evaluation and
+memory admission succeed. A failed patch or an over-limit result leaves the previous contributions
+intact for retry. Contribution updates and their byte accounting do not scan every input row;
+grouped queries still rebuild their output groups. Ordered maintenance keeps SQL-domain values
+until comparison is complete, including exact NUMERIC ordering.
+
 One inner or left join to a unique lookup key can patch base-table changes. A lookup-table change
 runs the statement again. More general joins also re-execute. The zone-map proofs above still
 spare these queries inserts that cannot match.
@@ -180,9 +190,16 @@ heap measurement.
 Full immutable result arrays still require work proportional to the retained rows. Prefer
 `LIMIT` and `live.window()` for scrolling lists. `subscribePatches(query, { onPatch })` delivers
 an initial reset and then changed row payloads plus a retained-position map, avoiding a private
-full row-array copy per patched subscriber. Full executions deliver resets. The worker transport
-still transfers a result snapshot; patch delivery reduces consumer copying rather than wire
-size. A set executes at most eight statements at once.
+full row-array copy per patched subscriber. Full executions deliver resets. Worker patch
+subscriptions transfer only changed rows and retained positions after the reset, reducing wire
+payload as well as consumer copying. Ordinary `subscribe()` and typed snapshots still deliver full
+results. A patch consumer owns its reconstructed rows; the client keeps no additional full baseline.
+A set executes at most eight statements at once.
+
+Adapters without a decoder can reuse accepted maintained results from the ordinary result memo.
+Publication requires an unchanged durable probe and obeys the buffer pool and per-result caps;
+if a commit races publication or the result does not fit, the adapter executes normally. Supplying
+a decoder remains preferable because it avoids that extra request and memo copy.
 
 Subscribing is cheap enough to do per component. A new statement resolves its dependencies and
 runs once; it needs no sweep, because the probe its dependencies were resolved under is what a
@@ -193,6 +210,14 @@ subscriptions never exhausts the engine's read admission.
 Catalog-only changes, including replacing a view, refresh dependencies before execution. A failed
 query remains dirty so `refresh()` retries without requiring another commit. Results are compared
 exactly, row by row, and an unchanged result is never delivered.
+
+Established subscriptions treat `OpfsCoordinationError` as temporary unavailability: they keep
+the last good rows, suppress `onError` for that failure, and retry automatically without another
+commit or resubscription. One timer per set backs off from 100 milliseconds to a maximum of five
+seconds; poll and commit hints coalesce during the wait. Closing the set cancels the retry.
+This also covers failures while refreshing dependencies or executing a changed query. Query,
+schema, corruption, and uncertain mutation errors still reach `onError`. Initial registration
+can reject with the typed coordination error because it has no successful snapshot to retain.
 
 Built-in IndexedDB and OPFS stores derive a cross-tab channel name from the database name. Set
 `channelName` explicitly only to coordinate a custom store or naming scheme, and use

@@ -1,7 +1,32 @@
 import { describe, expect, it } from "vitest";
+import { externalizeQueryResult, markQueryResultExternal } from "./query.js";
+import { exactNumericValue, protectedSqlTextValue } from "./sql-domains.js";
 import { copyQueryResult, queryResultMemoKey } from "./query-cache.js";
 
 describe("query result cache helpers", () => {
+  it("preserves the externalization boundary across defensive cache copies", () => {
+    const publicText = exactNumericValue("12.50");
+    if (publicText === null) throw new Error("Expected a numeric domain value");
+    const internal = {
+      columns: ["text", "numeric"],
+      columnDomains: [null, null],
+      rows: [{ text: protectedSqlTextValue(publicText), numeric: exactNumericValue("42.25") }],
+    };
+    // Copying an internal result must still allow its first conversion.
+    const external = externalizeQueryResult(copyQueryResult(internal));
+    expect(external.rows).toEqual([{ text: publicText, numeric: "42.25" }]);
+    // Copying a public result must not interpret a legal TEXT tag prefix a second time.
+    const cached = copyQueryResult(external);
+    expect(externalizeQueryResult(cached)).toBe(cached);
+    expect(cached.rows).toEqual(external.rows);
+    const marked = markQueryResultExternal({
+      ...external,
+      rows: [{ text: publicText, numeric: "42.25" }],
+    });
+    const markedCopy = copyQueryResult(marked);
+    expect(externalizeQueryResult(markedCopy)).toBe(markedCopy);
+  });
+
   it("encodes parameter tuples without delimiter collisions", () => {
     const first = queryResultMemoKey("SELECT ? AS x, ? AS y", ["a\u0001string:b", "c"]);
     const second = queryResultMemoKey("SELECT ? AS x, ? AS y", ["a", "b\u0001string:c"]);

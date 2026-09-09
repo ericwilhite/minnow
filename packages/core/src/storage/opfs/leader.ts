@@ -1007,7 +1007,9 @@ export class OpfsLeader {
   /**
    * Reads answer from memory without the queue — but never from a poisoned instance, whose
    * memory ran ahead of a write the disk refused. The fast path is one boolean check; the
-   * poisoned path rides the queue, which reloads from the held handles first.
+   * poisoned path rides the queue, which reloads from the held handles first. Callers loop
+   * on #poisoned themselves: an unconditional await here would leave a microtask gap between
+   * the final health check and reading the core or reserving immutable extent bytes.
    */
   async #healthy(): Promise<void> {
     if (!this.#poisoned) return;
@@ -2819,7 +2821,7 @@ export class OpfsLeader {
 
   async getBlock(id: string): Promise<Uint8Array | undefined> {
     validateId(id);
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     const placement = this.#blockIndex.get(id);
     if (placement === undefined) return undefined;
     return this.#pool.read(placement);
@@ -2828,7 +2830,7 @@ export class OpfsLeader {
   async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
     assertStorageBulkReadItems(ids, "Block read");
     for (const id of ids) validateId(id);
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     const placements = ids.map((id) => this.#blockIndex.get(id));
     assertBlockReadBatchByteLimit(placements);
     // `read` takes its reader reservation synchronously. Starting the whole bounded batch in
@@ -2841,7 +2843,7 @@ export class OpfsLeader {
   }
 
   async readManifestBlock(version: number | null, id: string): Promise<Uint8Array | undefined> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     if (this.#core.hasManifestBlocks(version, [id])[0] !== true) return undefined;
     const placement = this.#blockIndex.get(id);
     if (placement === undefined) {
@@ -2865,7 +2867,7 @@ export class OpfsLeader {
   }
 
   async hasManifestBlocks(version: number | null, ids: readonly string[]): Promise<boolean[]> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     if (ids.length > MAX_MANIFEST_BLOCK_PRESENCE_IDS) {
       throw new RangeError(
         `Manifest block presence accepts at most ${String(MAX_MANIFEST_BLOCK_PRESENCE_IDS)} ids`,
@@ -2875,14 +2877,14 @@ export class OpfsLeader {
   }
 
   async listManifestBlockPage(input: ListManifestBlockPageInput): Promise<ManifestBlockPage> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     return this.#core.listManifestBlockPage(input);
   }
 
   async listRetiredManifestBlockPage(
     input: ListRetiredManifestBlockPageInput,
   ): Promise<ManifestBlockPage> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     return this.#core.listRetiredManifestBlockPage(input);
   }
 
@@ -2983,7 +2985,7 @@ export class OpfsLeader {
 
   /** @internal Shared implementation installed for direct RecordCore reads below. */
   async _readCoreGenerated(method: CoreReadMethod, args: unknown[]): Promise<unknown> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     const read = Reflect.get(this.#core, method) as (...call: unknown[]) => unknown;
     return Reflect.apply(read, this.#core, args);
   }
@@ -3007,7 +3009,7 @@ export class OpfsLeader {
     afterOwnerId: string | null,
     limit: number,
   ): Promise<StoragePage<string, string>> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     // Validate the cursor/limit before walking the physical namespace, then retain only the
     // smallest page of orphan owner names. Directory iteration may be arbitrarily large but
     // this method's heap is always O(limit).
@@ -3021,6 +3023,9 @@ export class OpfsLeader {
       physicalOwnerIds.splice(index, 0, ownerId);
       if (physicalOwnerIds.length > limit) physicalOwnerIds.pop();
     }
+    // Directory iteration yields to writers; TypeScript does not widen private state after await.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    while (this.#poisoned) await this.#healthy();
     return this.#core.listTempOwnerIdsPage(afterOwnerId, limit, physicalOwnerIds);
   }
 
@@ -3029,7 +3034,7 @@ export class OpfsLeader {
     afterCursor: string | null,
     limit: number,
   ): Promise<StoragePage<string, string>> {
-    await this.#healthy();
+    while (this.#poisoned) await this.#healthy();
     return this.#core.listExpiredTempOwnerPage(expiresAtCutoff, afterCursor, limit);
   }
 

@@ -61,11 +61,12 @@ await result; // rejects; no partial QueryResult is returned
 ```
 
 The signal is checked between bounded scan, execution, and spill-storage batches. Cancellation
-releases the reader lease and removes temporary spill pages before rejection. The worker client
-sends a cancellation frame, so an ordinary materialized query does not need a cursor handle just
+in the direct engine releases the reader lease and removes temporary spill pages before rejection.
+The worker client rejects locally and sends a cancellation frame; worker cleanup follows asynchronously, so an ordinary materialized query does not need a cursor handle just
 to be cancellable. A SELECT through `execute()` cancels exactly like a `query()`; any other
 statement checks the signal once before it starts running, so an already-aborted `execute()`
-never mutates anything, and a mutation that has begun publishes completely or fails.
+never mutates anything, and a mutation that has begun publishes completely or fails. Losing its worker reply can leave
+the outcome unknown; see [worker deadlines and cancellation](/docs/engine/workers).
 
 ## The buffer pool
 
@@ -80,6 +81,17 @@ db.bufferPoolStats(); // what is resident right now
 It holds decoded blocks, ready-to-read column batches, recorded value ranges, and reusable
 subquery results. Every entry belongs to an exact block or table version, so the cache cannot serve
 old data as new. Replaced entries simply stop matching and age out of the size-limited cache.
+
+The modeled pool charge includes each artifact's payload, its key at two bytes per character,
+and fixed entry overhead. Long SQL and plan identities therefore consume the same budget as the
+results they identify. This is a residency model, not a measurement of the JavaScript heap.
+Queries that read volatile functions or the clock, including through nested views, do not reuse
+result memos.
+
+Derived results, including window output, build their column vectors directly from result rows
+without retaining an intermediate value array for every column. Window execution also omits
+peer buffers when all functions sharing an ordering can operate by row position alone.
+Keyed reads use the pool's block vectors directly; they add no separate row cache or index.
 
 `0` disables it, which is the right setting for a one-shot import that will never re-read what it
 writes.

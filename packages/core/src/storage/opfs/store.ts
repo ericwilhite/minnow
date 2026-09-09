@@ -1,6 +1,8 @@
 import {
   assertStorageBulkReadItems,
   assertTempRunPageBatchLimits,
+  OpfsCoordinationError,
+  OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
   StorageCorruptionError,
   StorageFormatVersionError,
@@ -312,6 +314,7 @@ export class OpfsBlockStore {
   readonly #servedRequestLocks = new Map<string, Promise<void>>();
   #inFlightMutationBytes = 0;
   #inFlightReadBytes = 0;
+  #readCapacityChanged: { promise: Promise<void>; resolve: () => void } | undefined;
   #settledMutationBytes = 0;
   #pendingRpcBytes = 0;
   #servedRequestCount = 0;
@@ -330,24 +333,43 @@ export class OpfsBlockStore {
     this.liveQueryChannelName = `minnowdb-live:opfs:${options.name}`;
   }
 
+  #releaseConnectionLock: (() => void) | undefined;
+
   static async open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore> {
-    const tree = new OpfsTree(await resolveDatabaseRoot(options));
-    const store = new OpfsBlockStore(tree, options);
-    await store.#ensureFormatMarker();
-    if (typeof BroadcastChannel === "function") {
-      const onMessage = (event: MessageEvent<unknown>) => {
-        const message = parseStoreRpcMessage(event.data, RPC_METHODS);
-        if (message !== undefined) store.#onMessage(message);
-      };
-      const channel = new BroadcastChannel(store.#channelName);
-      channel.onmessage = onMessage;
-      const inbox = new BroadcastChannel(store.#inboxName(store.#instanceId));
-      inbox.onmessage = onMessage;
-      store.#channel = channel;
-      store.#inbox = inbox;
+    const ownedOptions = { ...options };
+    validateStorageDatabaseName(ownedOptions.name);
+    const release = await holdConnectionLock(ownedOptions.name);
+    let store: OpfsBlockStore;
+    try {
+      const tree = new OpfsTree(await resolveDatabaseRoot(ownedOptions));
+      store = new OpfsBlockStore(tree, ownedOptions);
+    } catch (error) {
+      release?.();
+      throw error;
     }
-    await store.#tryBecomeLeader();
-    return store;
+    // Once a store owns the lock, only its handle-cleanup path may release it. In particular,
+    // an announcement failure after recovery still has live handles to shut down.
+    store.#releaseConnectionLock = release;
+    try {
+      await store.#ensureFormatMarker();
+      if (typeof BroadcastChannel === "function") {
+        const onMessage = (event: MessageEvent<unknown>) => {
+          const message = parseStoreRpcMessage(event.data, RPC_METHODS);
+          if (message !== undefined) store.#onMessage(message);
+        };
+        const channel = new BroadcastChannel(store.#channelName);
+        channel.onmessage = onMessage;
+        store.#channel = channel;
+        const inbox = new BroadcastChannel(store.#inboxName(store.#instanceId));
+        inbox.onmessage = onMessage;
+        store.#inbox = inbox;
+      }
+      await store.#tryBecomeLeader();
+      return store;
+    } catch (error) {
+      store.close();
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -439,13 +461,15 @@ export class OpfsBlockStore {
     this.#leader = undefined;
     this.#knownLeader = undefined;
     this.#lastYieldAt = Date.now();
-    try {
-      await leader.shutdown();
-    } catch {
+    const shutdown = leader.shutdown().catch(() => {
       // Whatever failed, the handles must not outlive the leadership; crash-close is
       // idempotent and releases them.
       leader.crash();
-    }
+    });
+    this.#yielding = shutdown;
+    await shutdown;
+    if (this.#yielding === shutdown) this.#yielding = undefined;
+    if (this.#closed) return;
     // An open channel into a follower's inbox would hear the next leader's answers to it.
     this.#closeAnswerChannels();
     this.#post({ kind: "yield", to });
@@ -456,8 +480,11 @@ export class OpfsBlockStore {
     }, 1_500);
   }
 
+  #yielding: Promise<void> | undefined;
+
   #onMessage(message: StoreRpcMessage): void {
     if (this.#closed) return;
+    if (this.#coordinationPausedForTests) return;
     switch (message.kind) {
       case "op": {
         if (this.#leader !== undefined) {
@@ -470,7 +497,9 @@ export class OpfsBlockStore {
               kind: "result",
               requestId: message.requestId,
               ok: false,
-              error: { name: "Error", message: "The OPFS leader RPC queue is full" },
+              error: serializeStoreError(
+                new OpfsCoordinationError("leader-queue-full", message.method),
+              ),
             });
             return;
           }
@@ -632,26 +661,35 @@ export class OpfsBlockStore {
           kind: "result",
           requestId: message.requestId,
           ok: false,
-          error: { name: "Error", message: "The OPFS leader mutation queue is full" },
+          error: serializeStoreError(
+            new OpfsCoordinationError("mutation-queue-full", message.method),
+          ),
         });
         return;
       }
       if (isRead) {
         const reservation = Math.max(fingerprint.retainedBytes, MAX_OPFS_RPC_MESSAGE_BYTES);
-        if (this.#inFlightReadBytes + reservation > RPC_IN_FLIGHT_READ_BYTES) {
-          this.#answer(message.from, {
-            kind: "result",
-            requestId: message.requestId,
-            ok: false,
-            error: { name: "Error", message: "The OPFS leader read queue is full" },
-          });
-          return;
+        while (this.#inFlightReadBytes + reservation > RPC_IN_FLIGHT_READ_BYTES) {
+          // Incoming requests already have count/byte admission bounds. Reserve the maximum
+          // response only while executing, so four tiny metadata reads do not overload a leader.
+          this.#answer(message.from, { kind: "busy", requestId: message.requestId });
+          if (this.#readCapacityChanged === undefined) {
+            let resolve!: () => void;
+            const promise = new Promise<void>((done) => {
+              resolve = done;
+            });
+            this.#readCapacityChanged = { promise, resolve };
+          }
+          await this.#readCapacityChanged.promise;
+          if (this.#closed || this.#leader !== leader) return;
         }
+        if (this.#closed || this.#leader !== leader) return;
         this.#inFlightReadBytes += reservation;
         try {
           settled = await this.#executeServedOpAfterGate(leader, message, true);
         } finally {
           this.#inFlightReadBytes = Math.max(0, this.#inFlightReadBytes - reservation);
+          this.#wakeReadWaiters();
         }
       } else {
         this.#inFlightMutationBytes += fingerprint.retainedBytes;
@@ -731,6 +769,12 @@ export class OpfsBlockStore {
         message: "The OPFS RPC request identity was reused with different contents",
       },
     });
+  }
+
+  #wakeReadWaiters(): void {
+    const waiting = this.#readCapacityChanged;
+    this.#readCapacityChanged = undefined;
+    waiting?.resolve();
   }
 
   async #executeServedOpAfterGate(
@@ -877,7 +921,7 @@ export class OpfsBlockStore {
         throw error;
       }
     }
-    throw new Error("The OPFS store could not reach or become a leader");
+    throw new OpfsCoordinationError("leader-unavailable", method);
   }
 
   /** The channel can change #knownLeader between any two awaits; a method defeats narrowing. */
@@ -896,7 +940,7 @@ export class OpfsBlockStore {
       this.#pending.size >= RPC_IN_FLIGHT_LIMIT ||
       this.#pendingRpcBytes + retainedBytes > RPC_IN_FLIGHT_MUTATION_BYTES
     ) {
-      return Promise.reject(new Error("The OPFS follower request queue is full"));
+      return Promise.reject(new OpfsCoordinationError("follower-queue-full", method));
     }
     return new Promise<unknown>((resolve, reject) => {
       const message: OpMessage = { kind: "op", requestId, from: this.#instanceId, method, args };
@@ -977,6 +1021,7 @@ export class OpfsBlockStore {
     this.#pendingRpcBytes = 0;
     this.#inFlightMutationBytes = 0;
     this.#inFlightReadBytes = 0;
+    this.#wakeReadWaiters();
     this.#settledMutationBytes = 0;
     this.#servedRequestCount = 0;
     this.#servedRequestBytes = 0;
@@ -991,15 +1036,34 @@ export class OpfsBlockStore {
         .then(() => {
           this.#post({ kind: "released", leaderId: this.#instanceId });
           this.#closeChannels();
+          this.#releaseWhenHandlesClose();
         });
       return;
     }
     this.#closeChannels();
+    this.#releaseWhenHandlesClose();
+  }
+
+  #releaseWhenHandlesClose(): void {
+    const release = this.#releaseConnectionLock;
+    this.#releaseConnectionLock = undefined;
+    if (this.#electing === undefined && this.#yielding === undefined) release?.();
+    else void Promise.allSettled([this.#electing, this.#yielding]).then(() => release?.());
   }
 
   /** Test-only: whether this connection currently holds the database's handles. */
   _isLeaderForTests(): boolean {
     return this.#leader !== undefined;
+  }
+
+  #coordinationPausedForTests = false;
+
+  /** @internal Simulates a suspended leader without releasing its file handles. */
+  _pauseCoordinationForTests(): () => void {
+    this.#coordinationPausedForTests = true;
+    return () => {
+      this.#coordinationPausedForTests = false;
+    };
   }
 
   /** Test-only: the id that names this connection's inbox channel. */
@@ -1069,12 +1133,14 @@ export class OpfsBlockStore {
     this.#pendingRpcBytes = 0;
     this.#inFlightMutationBytes = 0;
     this.#inFlightReadBytes = 0;
+    this.#wakeReadWaiters();
     this.#settledMutationBytes = 0;
     this.#servedRequestCount = 0;
     this.#servedRequestBytes = 0;
     this.#leader?.crash();
     this.#leader = undefined;
     this.#closeChannels();
+    this.#releaseWhenHandlesClose();
   }
 
   async #ensureFormatMarker(): Promise<void> {
@@ -1186,13 +1252,44 @@ export async function deleteOpfsDatabase(options: {
   root?: FileSystemDirectoryHandle;
 }): Promise<void> {
   const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
-  const root = options.root ?? (await navigator.storage.getDirectory());
-  try {
-    const namespace = await root.getDirectoryHandle("minnowdb");
-    await namespace.removeEntry(encodedName, { recursive: true });
-  } catch (error) {
-    if (!isDomError(error, "NotFoundError")) throw error;
-  }
+  const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
+  if (locks === undefined) throw new Error("Deleting an OPFS database requires Web Locks");
+  await locks.request(
+    connectionLockName(options.name),
+    { mode: "exclusive", ifAvailable: true },
+    async (lock) => {
+      if (lock === null) throw new OpfsDatabaseInUseError(options.name);
+      const root = options.root ?? (await navigator.storage.getDirectory());
+      try {
+        const namespace = await root.getDirectoryHandle("minnowdb");
+        await namespace.removeEntry(encodedName, { recursive: true });
+      } catch (error) {
+        if (!isDomError(error, "NotFoundError")) throw error;
+      }
+    },
+  );
+}
+
+function connectionLockName(name: string): string {
+  return `minnowdb-opfs-connections:${name}`;
+}
+
+/** Shared lifetime locks keep deletion exclusive with both leaders and idle followers. */
+async function holdConnectionLock(name: string): Promise<(() => void) | undefined> {
+  const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
+  if (locks === undefined) return undefined;
+  return new Promise<() => void>((resolve, reject) => {
+    void locks
+      .request(
+        connectionLockName(name),
+        { mode: "shared" },
+        () =>
+          new Promise<void>((release) => {
+            resolve(release);
+          }),
+      )
+      .catch(reject);
+  });
 }
 
 const RPC_TIMED_OUT = new Error("The leader did not answer in time");

@@ -150,6 +150,13 @@ matches the engine — as the first step of both `npm run check` and CI. And the
 tarball carrying anything that is not part of the package: tests compile into `dist` beside the
 code, and `files` has to exclude them.
 
+The `prepack` hooks trace public type exports and exclude unreachable
+internal declarations through a generated `dist/.npmignore`. It keeps the local declarations
+intact for incremental builds and the docs editor. Core strips JavaScript comments, and devtools
+compacts its embedded CSS, while public type documentation remains available. Run the
+packed-consumer test after changing this preparation so both TypeScript module resolvers and
+the browser exercise the files users actually install.
+
 ## Where each version's documentation lives
 
 The documentation describes the engine, so it is listed by compatibility line: `0.x`, `1.x`,

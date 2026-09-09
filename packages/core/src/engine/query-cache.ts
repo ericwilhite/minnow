@@ -1,11 +1,29 @@
 import { encodeQueryIdentity } from "./query-identity.js";
 import { copyDate, dateMilliseconds } from "../date-value.js";
 import { estimateValuesBytes } from "./byte-estimates.js";
-import { copyQueryResultExternalization, type QueryResult, type QueryRow } from "./query.js";
+import type { QueryResult, QueryRow } from "./query.js";
+import { copyQueryResultExternalization } from "./result-state.js";
 import { defineSqlResultProperty } from "./sql-semantics.js";
 
 /** Modest per-entry cap so one giant result cannot thrash the shared artifact cache. */
 export const RESULT_MEMO_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Exact SQL-row equality, shared by full live comparisons and incremental reconciliation. */
+export function sameQueryRow(left: QueryRow, right: QueryRow, columns: readonly string[]): boolean {
+  if (left === right) return true;
+  for (const column of columns) {
+    const a = left[column] ?? null;
+    const b = right[column] ?? null;
+    if (a instanceof Date || b instanceof Date) {
+      if (
+        !(a instanceof Date && b instanceof Date) ||
+        !Object.is(dateMilliseconds(a), dateMilliseconds(b))
+      )
+        return false;
+    } else if (!Object.is(a, b)) return false;
+  }
+  return true;
+}
 
 /** Stable, collision-free memo-key encoding for bound SQL parameters. */
 export function queryResultMemoKey(sql: string, params: readonly unknown[]): string {

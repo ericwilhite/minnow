@@ -390,6 +390,20 @@ block statistics that drive data skipping:
   the migration without changing the catalog. Dropping generation is metadata-only; the stored
   values remain ordinary values and future writes stop recomputing them.
 
+## Retrying a busy OPFS store
+
+`migrate()` reads the catalog through the current OPFS leader. When leadership is temporarily
+unreachable or a request queue is full, it can reject with `OpfsCoordinationError`, exported from
+`@minnowdb/core`. The class and its `reason` survive a worker boundary, so boot code can classify
+it with `instanceof` and retry with bounded backoff. Two clients can migrate the same schema;
+a later call reads the already-applied catalog and has no remaining steps.
+
+Do not drop and rebuild a database simply because `migrate()` rejected. A schema refusal requires
+reviewing the intended schema change; a temporary coordination error requires retrying. An
+`OpfsUncertainOutcomeError` means a mutation may have committed and needs reconciliation before
+retry. Replacing a disposable cache is an explicit application policy, and all clients must close
+before [deleting its OPFS store](/docs/storage/opfs#what-it-creates).
+
 ## Dropping things
 
 Removing a column from a table you declare, or a table from a schema that speaks for the whole

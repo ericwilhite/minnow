@@ -76,6 +76,9 @@ index, migration, live-query, snapshot, and maintenance calls on the main thread
 
 The [worker guide](/docs/engine/workers) includes the ready-made worker entry and bundler setup.
 
+OPFS database deletion additionally requires Web Locks. Close every connection, including tabs
+running an older build, before deleting a store; see [OPFS storage](/docs/storage/opfs).
+
 ## Browser requirements
 
 Minnow needs `CompressionStream` and `DecompressionStream` plus a storage adapter. Current Chrome,

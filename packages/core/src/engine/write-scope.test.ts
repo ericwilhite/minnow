@@ -88,9 +88,13 @@ describe("atomic write scopes", () => {
     const database = await bank(store);
     await database.write(async (tx) => {
       await tx.insertBatch("accounts", { columns: { id: [30], balance: [11] } });
-      // A second stage flushes the first bounded batch to the transaction journal. That makes
+      // Exceed the bounded local batch to flush it to the transaction journal. That makes
       // its bytes durable-but-uncommitted and therefore able to expose a bulk-read bypass.
       await tx.insertBatch("accounts", { columns: { id: [31], balance: [12] } });
+      await tx.insertBatch(
+        "accounts",
+        Array.from({ length: 256 }, (_, i) => ({ id: 100 + i, balance: 1 })),
+      );
       // The key predicate takes the zone-map materializer: it first inspects the staged key
       // header, then decodes the staged projected value. Neither byte exists in the committed
       // manifest yet, so both reads must go through transaction.getBlock rather than store bulk.

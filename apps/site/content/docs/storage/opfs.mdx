@@ -63,11 +63,21 @@ serving. In-flight mutations are never evicted from deduplication; completed ans
 512-entry, 128 MiB cache that retains request fingerprints rather than request payloads. Each
 follower admits at most 512 pending requests or 128 MiB of request data. The leader admits at most
 1,024 requests in total, with separate 128 MiB mutation and 256 MiB read ceilings; an individual
-message cannot exceed 66 MiB. Overload is rejected before a timer, queue entry, or storage
-operation is created, so a stalled or hostile tab cannot create an unbounded message queue.
+message cannot exceed 66 MiB. Admitted reads wait for response capacity, reserving the maximum
+response size only while they execute. Small metadata bursts therefore queue behind the read
+memory limit. Request-count and request-byte overload is still rejected before creating more
+work, so a stalled tab cannot create an unbounded message queue.
 Request identity includes the follower, request id, method, and a canonical SHA fingerprint of
 the arguments. Reusing an identity with different arguments is refused.
-After failover, reads retry automatically. An in-flight mutation instead rejects with
+After failover, reads retry automatically within a bounded dispatch budget. Exhausting that
+budget throws `OpfsCoordinationError` with `reason: "leader-unavailable"`. Admission overload uses
+`"leader-queue-full"`, `"mutation-queue-full"`, or `"follower-queue-full"`. The error includes the
+store `method` and is exported from `@minnowdb/core` and the OPFS entry point; `instanceof` works
+through both follower and database worker RPC. Established live subscriptions retain their last
+good result and retry these errors with backoff. Initial subscription and explicit reads can
+reject with the typed error; boot code can retry, including a failed `migrate()` catalog read.
+
+An in-flight mutation instead rejects with
 `OpfsUncertainOutcomeError`: the old leader may have durably committed it before its reply was
 lost, so automatically sending it to the new leader could execute it twice. Reconcile the
 operation's stable ids or revisions before deciding whether to retry. Correctness never rides on
@@ -96,7 +106,20 @@ otherwise empty database directory. The locked marker is canonical: extra fields
 or alternate JSON spellings are corruption, not extension points. Posting row locators use a
 compact delta-varint encoding rather than JSON, so a secondary index does not spend most of its
 space spelling out bigint values. Deleting the directory deletes the database —
-`deleteOpfsDatabase({ name })` does exactly that.
+`deleteOpfsDatabase({ name })` does exactly that, but only when no participating connection is open.
+It requires Web Locks, holds an exclusive deletion lock, and refuses with
+`OpfsDatabaseInUseError` before removing files if a leader or follower holds a shared connection
+lock. Openers wait until deletion finishes. Close every client and store first; if asynchronous
+store shutdown is still releasing handles, retry the in-use refusal after it completes.
+
+Close tabs and workers running Minnow versions before 0.9.0 before deletion: those clients do not
+participate in this lock protocol. Normal reads and writes can still run without Web Locks;
+deletion is refused in that environment. Delete only data you have deliberately decided is
+disposable. A migration rejection does not authorize deleting the database.
+
+Collection keeps every retained segment’s block references intact, including retired history.
+Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
+automatically repair a store already affected by missing referenced blocks.
 
 Layout 5 is the locked native OPFS contract. Its checkpoint includes the structural `schemaEpoch`
 used to reject a staged write after incompatible DDL. An unknown or pre-v1 layout marker is rejected
@@ -231,16 +254,19 @@ enforced.
 ## Multiple tabs
 
 Several tabs may open the same database at once; every operation from every tab lands in one
-ordered log, so readers never see half of anything and competing writers conflict, rebase, and
-retry exactly as they do on IndexedDB. The moving parts differ from the IndexedDB adapter in one
+ordered log, so readers never see half of anything. Reads wait for recovery after a refused WAL
+append instead of observing its tentative state. Autocommit writers coordinate admission through
+Web Locks; explicit scopes and uncoordinated writers retain optimistic conflicts, as on IndexedDB. The moving parts differ from the IndexedDB adapter in one
 honest way: multi-tab _responsiveness_ uses `BroadcastChannel` (universal since 2022), while
 correctness rests entirely on the storage lock and the checksummed log. A browser with no
 channel at all would still be safe — one tab at a time would hold the database.
 
-The background-tab caveat is the same as IndexedDB's: browsers throttle hidden tabs, so a long
-compaction there stops until it is foregrounded — which is why
-[maintenance](/docs/storage/maintenance) is stepped and resumable. The foreground-leadership
-preference makes this mostly moot: the visible tab does its own storage work directly.
+Browsers can suspend a hidden leader while it still owns exclusive file handles. Foreground
+leadership preference is cooperative: the old leader must run and yield before another worker
+can take over. A frozen owner can therefore delay other tabs or cause a request timeout; durability
+does not guarantee uninterrupted availability. Resume or terminate that owner to release its
+handles, then reconcile any unknown write outcome before retrying. Background
+[maintenance](/docs/storage/maintenance) is stepped and resumable for the same reason.
 
 ## Choosing between OPFS and IndexedDB
 

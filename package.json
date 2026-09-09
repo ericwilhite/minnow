@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -25,6 +25,7 @@
     "test:coverage": "vitest run --coverage",
     "test:browser": "npm run test:browser:library && npm run test:browser:site",
     "test:browser:library": "tsc -b packages/core --force && playwright test --config playwright.library.config.ts",
+    "test:browser:pos": "tsc -b packages/core --force && MINNOW_POS_ACCEPTANCE=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/pos.spec.ts --workers=1",
     "test:browser:site": "tsc -b packages/core --force && playwright test --config playwright.site.config.ts",
     "api:check": "tsc -b --force --pretty false && vite-node scripts/api-contract.mts check",
     "api:report": "tsc -b --force --pretty false && vite-node scripts/api-contract.mts report",

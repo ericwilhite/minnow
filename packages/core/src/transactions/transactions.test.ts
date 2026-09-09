@@ -265,6 +265,28 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("coalesces bounded stages, spills overflow, and rolls back across that handoff", async () => {
+      const store = await implementation.create();
+      const manager = new TransactionManager(store);
+      const transaction = await manager.beginDeferred({ coalesceArtifacts: true });
+      const stage = (id: number) =>
+        transaction.stageArtifacts([{ id: `block-${String(id)}`, bytes: Uint8Array.of(id) }], []);
+      await stage(0);
+      const checkpoint = transaction.checkpoint();
+      for (let id = 1; id < 64; id += 1) await stage(id);
+      expect(await store.getTransaction(transaction.id)).toBeUndefined();
+      expect(await store.getBlock("block-0")).toBeUndefined();
+      expect(await transaction.getBlock("block-63")).toEqual(Uint8Array.of(63));
+      await stage(64);
+      expect(await store.getTransaction(transaction.id)).toMatchObject({ status: "active" });
+      expect(await store.getCurrentManifestVersion()).toBeNull();
+      await transaction.rollbackTo(checkpoint);
+      await transaction.commit();
+      expect(await currentManifestBlockIds(store)).toEqual(["block-0"]);
+      expect(await store.getBlock("block-64")).toBeUndefined();
+      store.close();
+    });
+
     it("commits a deferred transaction in one step, and a refused one leaves nothing", async () => {
       const store = await implementation.create();
       await addSegmentTable(store);

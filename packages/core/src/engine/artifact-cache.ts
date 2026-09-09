@@ -82,10 +82,13 @@ export class ArtifactCache {
   }
 
   put(key: string, payload: unknown, bytes: number): void {
-    if (!this.enabled || bytes > this.#limitBytes) return;
     if (!Number.isSafeInteger(bytes) || bytes < 0) {
       throw new RangeError("Artifact cache entry bytes must be a non-negative whole number");
     }
+    // Payload estimates belong to callers; keys and the LRU/Map entry belong to the cache.
+    // Tiny results with long SQL/plan keys must not escape the residency budget.
+    bytes += 96 + key.length * 2;
+    if (!this.enabled || !Number.isSafeInteger(bytes) || bytes > this.#limitBytes) return;
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
       this.#usedBytes -= existing.bytes;

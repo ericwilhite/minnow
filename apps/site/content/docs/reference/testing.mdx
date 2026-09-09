@@ -421,6 +421,7 @@ the installed packages rather than quoted, so refresh it whenever a dependency v
 public entry point changes:
 
 ```bash
+npx tsc -b packages/core --force
 npm run benchmark:sizes
 ```
 
@@ -430,3 +431,10 @@ measures Minnow, SQLite Wasm, and PGlite. The result lands in
 `apps/site/components/bench/library-sizes.json`, which is a scratch output — nothing imports it.
 The figure each measured engine shows on the page is the `download` field in
 `apps/site/components/bench/config.ts`, updated by hand from that run.
+
+The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
+Wasm file. Both the engine with OPFS and the generic worker with all stores plus its separately
+bundled client must stay smaller after gzip. The report and test share the same measurement
+code. Existing per-entry byte budgets still catch smaller increases before SQLite parity is at
+risk. This guards compressed download size; it does not claim a smaller uncompressed bundle or
+prove that every possible behavior is regression-free.

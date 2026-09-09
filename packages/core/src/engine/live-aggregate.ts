@@ -41,13 +41,37 @@ interface Group {
   absolute: number[];
 }
 
+interface Contributions {
+  readonly rows: Map<string, Contribution>;
+  revision: number;
+}
+
+function contributionBytes(key: string, row: Contribution): number {
+  return (
+    64 +
+    key.length * 2 +
+    row.group.length * 2 +
+    row.values.reduce<number>(
+      (sum, value) => sum + (typeof value === "string" ? value.length * 2 + 16 : 16),
+      0,
+    )
+  );
+}
+
+function groupBytes(key: string, group: Group): number {
+  return 96 + key.length * 2 + group.sums.reduce((sum, value) => sum + value.length * 2 + 24, 0);
+}
+
 /** Single-table COUNT/SUM/AVG contributions; SQL still evaluates filters and arguments. */
 export class LiveAggregate {
   readonly inputPlan: CompiledQuery;
   readonly #outputPlan: CompiledQuery;
   readonly #aggregates: Aggregate[];
   readonly #groupAliases: string[];
-  readonly #rows: Map<string, Contribution>;
+  readonly #contributions: Contributions;
+  #revision: number;
+  #pending: Map<string, Contribution | undefined> | undefined;
+  readonly #bytes: number;
   readonly #groups: Map<string, Group>;
   readonly #domains: ReadonlyArray<SqlDomain | null>;
   readonly keyAlias: string;
@@ -59,17 +83,24 @@ export class LiveAggregate {
     aggregates: Aggregate[],
     groupAliases: string[],
     keyAlias: string,
-    rows = new Map<string, Contribution>(),
+    contributions: Contributions = { rows: new Map(), revision: 0 },
     groups = new Map<string, Group>(),
     domains: ReadonlyArray<SqlDomain | null> = [],
     schema: SqlColumnSchema[] = [],
+    bytes = 256 +
+      encodeQueryIdentity(inputPlan).length * 2 +
+      encodeQueryIdentity(outputPlan).length * 2,
+    pending?: Map<string, Contribution | undefined>,
   ) {
     this.inputPlan = inputPlan;
     this.#outputPlan = outputPlan;
     this.#aggregates = aggregates;
     this.#groupAliases = groupAliases;
     this.keyAlias = keyAlias;
-    this.#rows = rows;
+    this.#contributions = contributions;
+    this.#revision = contributions.revision;
+    this.#pending = pending;
+    this.#bytes = bytes;
     this.#groups = groups;
     this.#domains = domains;
     this.#schema = schema;
@@ -93,7 +124,11 @@ export class LiveAggregate {
       const grouped = groupKeys.get(encodeQueryIdentity(expression));
       if (grouped !== undefined) return { kind: "column", reference: grouped };
       if (expression.kind === "call" && hasAggregate(expression)) {
-        if (!["COUNT", "SUM", "AVG"].includes(expression.name) || expression.arguments.length !== 1)
+        if (
+          !["COUNT", "SUM", "AVG"].includes(expression.name) ||
+          expression.arguments.length !== 1 ||
+          expression.distinct === true
+        )
           throw new TypeError("Not an additive live aggregate");
         const argument = expression.arguments[0];
         if (
@@ -172,11 +207,16 @@ export class LiveAggregate {
     changed: ReadonlySet<string>,
     token: (value: QueryValue) => string,
   ): LiveAggregate {
-    const rows = new Map(this.#rows);
+    if (this.#pending !== undefined || this.#revision !== this.#contributions.revision)
+      throw new Error("Unaccepted or stale aggregate");
+    const rows = this.#contributions.rows;
+    const pending = new Map<string, Contribution | undefined>();
+    let bytes = this.#bytes;
     const groups = new Map(this.#groups);
     const touched = new Set<string>();
     const groupFor = (key: string, keys: QueryValue[] = []): Group => {
       let group = groups.get(key);
+      if (group !== undefined && !touched.has(key)) bytes -= groupBytes(key, group);
       if (group === undefined) {
         group = {
           keys,
@@ -232,18 +272,27 @@ export class LiveAggregate {
       const old = rows.get(key);
       if (old === undefined) continue;
       apply(groupFor(old.group), old.values, -1);
-      rows.delete(key);
+      pending.set(key, undefined);
+      bytes -= contributionBytes(key, old);
     }
     for (const row of result.rows) {
       const key = token(row[this.keyAlias] ?? null);
+      if (pending.get(key) !== undefined || (rows.has(key) && !changed.has(key)))
+        throw new TypeError("Duplicate live input key");
       const keys = this.#groupAliases.map((alias) => row[alias] ?? null);
       const group = JSON.stringify(keys.map(encodeSqlEqualityValue));
       const values = this.#aggregates.map(({ alias }) => row[alias] ?? null);
       apply(groupFor(group, keys), values, 1);
-      rows.set(key, { group, values });
+      const contribution = { group, values };
+      pending.set(key, contribution);
+      bytes += contributionBytes(key, contribution);
     }
     if (this.#groupAliases.length === 0) groupFor("[]");
     else for (const key of touched) if (groups.get(key)?.members === 0) groups.delete(key);
+    for (const key of touched) {
+      const group = groups.get(key);
+      if (group !== undefined) bytes += groupBytes(key, group);
+    }
     const domains = this.#aggregates.map(
       ({ alias }, index) =>
         result.columnDomains[result.columns.indexOf(alias)] ?? this.#domains[index] ?? null,
@@ -254,7 +303,7 @@ export class LiveAggregate {
       this.#aggregates,
       this.#groupAliases,
       this.keyAlias,
-      rows,
+      this.#contributions,
       groups,
       domains,
       result.columns.map((name, index) => {
@@ -274,13 +323,31 @@ export class LiveAggregate {
                     ? "boolean"
                     : value instanceof Date
                       ? "datetime"
-                      : "string",
+                      : value === undefined || value === null
+                        ? (this.#schema[index]?.type ?? "string")
+                        : "string",
           ...(domain === null || domain === undefined || aggregate?.name === "COUNT"
             ? {}
             : { sqlDomain: domain }),
         };
       }),
+      bytes,
+      pending,
     );
+  }
+
+  /** Publish only after result evaluation and live-set admission succeed. Old revisions cannot
+   * be patched or accepted again, and rejected candidates never edit the shared contribution map. */
+  accept(): void {
+    const pending = this.#pending;
+    if (pending === undefined) return;
+    if (this.#revision !== this.#contributions.revision) throw new Error("Stale aggregate");
+    for (const [key, contribution] of pending) {
+      if (contribution === undefined) this.#contributions.rows.delete(key);
+      else this.#contributions.rows.set(key, contribution);
+    }
+    this.#revision = ++this.#contributions.revision;
+    this.#pending = undefined;
   }
 
   result(): QueryResult {
@@ -317,22 +384,6 @@ export class LiveAggregate {
   }
 
   get retainedBytes(): number {
-    let bytes =
-      256 +
-      encodeQueryIdentity(this.inputPlan).length * 2 +
-      encodeQueryIdentity(this.#outputPlan).length * 2;
-    for (const [key, row] of this.#rows)
-      bytes +=
-        64 +
-        key.length * 2 +
-        row.group.length * 2 +
-        row.values.reduce<number>(
-          (sum, value) => sum + (typeof value === "string" ? value.length * 2 + 16 : 16),
-          0,
-        );
-    for (const [key, group] of this.#groups)
-      bytes +=
-        96 + key.length * 2 + group.sums.reduce((sum, value) => sum + value.length * 2 + 24, 0);
-    return bytes;
+    return this.#bytes;
   }
 }

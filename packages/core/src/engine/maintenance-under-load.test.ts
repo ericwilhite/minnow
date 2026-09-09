@@ -32,6 +32,47 @@ async function publishedFolds(database: MinnowDatabase, table: string): Promise<
 }
 
 describe("maintenance under a writer that never pauses", () => {
+  it("does not restart completed discovery cycles for each arriving commit", async () => {
+    class CountingStore extends MemoryBlockStore {
+      cycles = 0;
+      override createGarbageCollectionJob(
+        input: Parameters<MemoryBlockStore["createGarbageCollectionJob"]>[0],
+      ) {
+        if (input.discovery?.postManifestPhase == null && input.discovery?.manifestCursor == null)
+          this.cycles += 1;
+        return super.createGarbageCollectionJob(input);
+      }
+    }
+    const store = new CountingStore();
+    const database = new MinnowDatabase(store, { autoCompact: false });
+    try {
+      await database.execute("CREATE TABLE receipts(id INTEGER PRIMARY KEY)");
+      for (let id = 0; id < 256; id += 1) {
+        await database.insert("receipts", { id });
+        expect((await database.query("SELECT COUNT(*) AS n FROM receipts")).rows).toEqual([
+          { n: id + 1 },
+        ]);
+      }
+      for (let attempt = 0; attempt < 2000; attempt += 1) {
+        const status = database.maintenanceStatus();
+        if (!status.collectionRunning && !status.collectionRequested) break;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      expect(database.maintenanceStatus()).toMatchObject({
+        collectionRunning: false,
+        collectionRequested: false,
+        lastError: null,
+      });
+      // Four 64-commit triggers, plus one request arriving while an earlier cycle finishes.
+      // Continuation jobs still run to exhaustion; only restarting full discovery is bounded.
+      expect(store.cycles).toBeLessThanOrEqual(5);
+      expect(store.cycles).toBeGreaterThan(0);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
   it("keeps folding and collecting through 4,200 back-to-back inserts on the memory store", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, a INTEGER, b TEXT)");

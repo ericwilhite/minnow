@@ -1,4 +1,8 @@
-import { createLiveQueryPatch, type LiveQueryPatchOptions } from "./live-patch.js";
+import {
+  createLiveQueryPatch,
+  type LiveQueryPatch,
+  type LiveQueryPatchOptions,
+} from "./live-patch.js";
 import {
   BlockReadBatchTooLargeError,
   CompactionBacklogError,
@@ -23,6 +27,8 @@ import {
   WriteConflictError,
   StorageCorruptionError,
   StorageFormatVersionError,
+  OpfsCoordinationError,
+  OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
   type CompactionJobRecord,
   type GarbageCollectionJobRecord,
@@ -95,6 +101,9 @@ import {
   CompactionWriteAmplificationError,
   MaintenanceBacklogError,
   DatabaseReadBacklogError,
+  TransactionExpiredError,
+  DatabaseWorkerTimeoutError,
+  DatabaseWorkerOutcomeUnknownError,
   LiveQueryLimitError,
   MissingKeyError,
   SqlCompileError,
@@ -111,7 +120,13 @@ import type {
   LiveQuerySubscribeOptions,
 } from "./live.js";
 import { QueryMemoryBudgetError } from "./memory.js";
-import type { CompiledQuery, CompiledStatement, QueryResult, QueryValue } from "./query.js";
+import type {
+  CompiledQuery,
+  CompiledStatement,
+  QueryResult,
+  QueryRow,
+  QueryValue,
+} from "./query.js";
 import { decodeQueryResult } from "./result-wire.js";
 import type {
   AnySchema,
@@ -172,6 +187,8 @@ export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = Untyped
   store?: StoreDescriptor;
   /** Cloneable database options applied when the worker constructs the database. */
   databaseOptions?: WireDatabaseOptions;
+  /** Maximum response wait, including initialization; defaults to 60 seconds. */
+  requestTimeoutMs?: number;
 }
 
 export interface ClientLiveQueryOptions {
@@ -183,6 +200,8 @@ export interface ClientLiveQueryOptions {
 export interface CloseClientOptions {
   /** Also terminate the worker after disposing; only meaningful when the transport can. */
   terminateWorker?: boolean;
+  /** Grace allowed for disposal before closing the transport; defaults to 5 seconds. */
+  timeoutMs?: number;
 }
 
 export interface ClientMigrationResult {
@@ -196,6 +215,7 @@ export interface ClientMigrationResult {
 
 interface EventRoute {
   onChange?: (result: QueryResult, delivery: LiveQueryDelivery) => void;
+  onPatch?: (patch: LiveQueryPatch, delivery: LiveQueryDelivery) => void;
   onInvalidate?: (invalidation: LiveQueryInvalidation) => void;
   onError?: (error: unknown) => void;
   onComplete?: () => void;
@@ -227,12 +247,16 @@ function throwIfClientSnapshotAborted(signal: AbortSignal | undefined): void {
 }
 
 interface PendingCall {
+  method: string;
+  requestId: string;
+  mayPublish: boolean;
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   cleanup?: () => void;
 }
 
 interface RpcCallControls {
+  timeoutMs?: number;
   signal?: AbortSignal | undefined;
   onStats?: ((stats: QueryExecutionStats) => void) | undefined;
 }
@@ -248,6 +272,9 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     CompactionJobCancelledError,
     MaintenanceBacklogError,
     DatabaseReadBacklogError,
+    TransactionExpiredError,
+    DatabaseWorkerTimeoutError,
+    DatabaseWorkerOutcomeUnknownError,
     LiveQueryLimitError,
     SqlCompileError,
     QueryMemoryBudgetError,
@@ -274,6 +301,8 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     PostingBuildConflictError,
     StorageCorruptionError,
     StorageFormatVersionError,
+    OpfsCoordinationError,
+    OpfsDatabaseInUseError,
     OpfsUncertainOutcomeError,
   ].map((constructor) => [constructor.name, constructor]),
 );
@@ -331,6 +360,8 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     return this;
   }
   readonly #transport: ClientTransport;
+  readonly #requestTimeoutMs: number;
+  #closePromise: Promise<void> | undefined;
   readonly #pending = new Map<string, PendingCall>();
   readonly #events = new Map<string, EventRoute>();
   readonly #ready: Promise<void>;
@@ -348,6 +379,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   };
 
   constructor(transport: ClientTransport, options: MinnowDatabaseClientOptions<TSchema> = {}) {
+    this.#requestTimeoutMs = clientDeadline(options.requestTimeoutMs ?? 60_000);
     this.#schema = options.schema;
     this.#transport = transport;
     transport.addEventListener("message", this.#onMessage);
@@ -704,11 +736,17 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     try {
       const session: ClientSnapshotSession = {
         version: opened.version,
-        query: (sql: string, options: QueryOptions = {}) =>
-          this.query(sql, {
-            ...options,
-            ...(opened.version === null ? {} : { version: opened.version }),
-          }),
+        query: async (sql: string, options: QueryOptions = {}) => {
+          const { signal, onStats, ...wireOptions } = options;
+          return decodeQueryResult(
+            await this._invokeControlled(
+              opened.handleId,
+              "query",
+              [sql, wireOptions, onStats !== undefined],
+              { signal, onStats },
+            ),
+          );
+        },
       };
       return await action(session);
     } finally {
@@ -726,36 +764,62 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     action: (session: ClientWriteSession<TSchema>) => Promise<T>,
   ): Promise<{ result: T; version: number | null }> {
     const opened = (await this.#call("writeOpen", [])) as { handleId: string };
+    let tail: Promise<unknown> = Promise.resolve();
+    let accepting = true;
+    let pending = 0;
+    const enqueue = <R>(run: () => Promise<R>): Promise<R> => {
+      if (!accepting) return Promise.reject(new Error("The write scope has ended"));
+      if (pending >= MAX_DATABASE_RPC_IN_FLIGHT)
+        return Promise.reject(
+          new RangeError("Too many pending write scope calls; await a statement"),
+        );
+      pending += 1;
+      const task = tail.then(run);
+      tail = task.then(
+        () => undefined,
+        () => undefined,
+      );
+      return task.finally(() => {
+        pending -= 1;
+      });
+    };
     const stage = (
       op: "insertBatch" | "upsertBatch" | "updateBatch" | "deleteBatch",
       tableName: string,
       input: unknown,
       options?: UpsertOptions,
     ): Promise<StagedWriteResult> =>
-      this._invoke(opened.handleId, "stage", [
-        op,
-        tableName,
-        input,
-        options,
-      ]) as Promise<StagedWriteResult>;
+      enqueue(
+        () =>
+          this._invoke(opened.handleId, "stage", [
+            op,
+            tableName,
+            input,
+            options,
+          ]) as Promise<StagedWriteResult>,
+      );
     const session: ClientWriteSession = {
-      query: async (sql, options = {}) => {
-        const { signal, onStats, ...wireOptions } = options;
-        return decodeQueryResult(
-          await this._invokeControlled(
-            opened.handleId,
-            "query",
-            [sql, wireOptions, onStats !== undefined],
-            { signal, onStats },
-          ),
-        );
-      },
+      query: (sql, options = {}) =>
+        enqueue(async () => {
+          const { signal, onStats, ...wireOptions } = options;
+          return decodeQueryResult(
+            await this._invokeControlled(
+              opened.handleId,
+              "query",
+              [sql, wireOptions, onStats !== undefined],
+              { signal, onStats },
+            ),
+          );
+        }),
       execute: (sql, params) =>
-        this._invoke(
-          opened.handleId,
-          "execute",
-          params === undefined ? [sql] : [sql, params],
-        ) as Promise<ExecuteResult>,
+        enqueue(
+          () =>
+            this._invoke(
+              opened.handleId,
+              "execute",
+              params === undefined ? [sql] : [sql, params],
+            ) as Promise<ExecuteResult>,
+        ),
       insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
       upsertBatch: (tableName, input, options) =>
         stage("upsertBatch", tableName, input, options) as Promise<StagedUpsertResult>,
@@ -765,11 +829,15 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     try {
       // The scope stages by runtime table name; the declaration only types the caller's view.
       const result = await action(session as ClientWriteSession<TSchema>);
+      accepting = false;
+      await tail;
       const committed = (await this._invoke(opened.handleId, "commit", [])) as {
         version: number | null;
       };
       return { result, version: committed.version };
     } catch (error) {
+      accepting = false;
+      await tail;
       await this._invoke(opened.handleId, "abort", []).catch(() => undefined);
       throw error;
     }
@@ -1019,16 +1087,22 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   // --- Lifecycle --------------------------------------------------------------------------------
 
   /** Disposes every worker-side handle, closes the store, and optionally terminates the worker. */
-  async close(options: CloseClientOptions = {}): Promise<void> {
-    if (this.#closed) return;
+  close(options: CloseClientOptions = {}): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    const timeoutMs = clientDeadline(options.timeoutMs ?? 5_000);
     this.#closed = true;
+    this.#closePromise = this.#closeTransport(options, timeoutMs);
+    return this.#closePromise;
+  }
+
+  async #closeTransport(options: CloseClientOptions, timeoutMs: number): Promise<void> {
     if (this.#onVisibilityChange !== undefined && typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", this.#onVisibilityChange);
     }
     try {
-      await this.#post("rpc-call", null, "dispose", []);
+      await this.#post("rpc-call", null, "dispose", [], undefined, true, { timeoutMs });
     } finally {
-      this.#events.clear();
+      this.#fail(new Error("Database client is closed"));
       this.#transport.removeEventListener?.("message", this.#onMessage);
       this.#transport.removeEventListener?.("error", this.#onError);
       this.#transport.removeEventListener?.("messageerror", this.#onMessageError);
@@ -1087,16 +1161,36 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       );
     }
     const requestId = crypto.randomUUID();
+    const timeoutMs = controls.timeoutMs ?? this.#requestTimeoutMs;
+    const mayPublish = rpcMayPublish(method, args);
     return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => this.#fail(new DatabaseWorkerTimeoutError(method, timeoutMs)),
+        timeoutMs,
+      );
+      (timer as { unref?: () => void }).unref?.();
       const onAbort = (): void => {
         try {
           this.#transport.postMessage({ version: protocolVersion, requestId, kind: "rpc-cancel" });
         } catch {
-          // The original RPC still owns completion. A transport failure also reaches #fail via
-          // its error event; throwing from an AbortSignal listener would only be unhandled noise.
+          // Local cancellation still settles even if the worker can no longer receive frames.
         }
+        const call = this.#pending.get(requestId);
+        if (call === undefined) return;
+        this.#pending.delete(requestId);
+        call.cleanup?.();
+        const error = new Error("Database request was cancelled", {
+          cause: controls.signal?.reason,
+        });
+        error.name = "AbortError";
+        call.reject(
+          mayPublish
+            ? new DatabaseWorkerOutcomeUnknownError(method, requestId, { cause: error })
+            : error,
+        );
       };
       const cleanup = (): void => {
+        clearTimeout(timer);
         controls.signal?.removeEventListener("abort", onAbort);
         if (controls.onStats !== undefined) this.#events.delete(requestId);
       };
@@ -1104,7 +1198,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       if (controls.onStats !== undefined) {
         this.#events.set(requestId, { onStats: controls.onStats });
       }
-      this.#pending.set(requestId, { resolve, reject, cleanup });
+      this.#pending.set(requestId, { resolve, reject, cleanup, method, requestId, mayPublish });
       try {
         this.#transport.postMessage(
           kind === "rpc-init"
@@ -1140,6 +1234,25 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
           delivery: LiveQueryDelivery;
         };
         route.onChange?.(decodeQueryResult(result), delivery);
+      } else if (response.event === "patch") {
+        const { result: payload, delivery } = response.payload as {
+          result: unknown;
+          delivery: LiveQueryDelivery;
+        };
+        const result = decodeQueryResult(payload);
+        const retained = delivery.retained;
+        if (!(retained instanceof Int32Array))
+          throw new TypeError("Live patch is missing retained positions");
+        const changedRows: Array<{ index: number; row: QueryRow }> = [];
+        for (let index = 0; index < retained.length; index += 1) {
+          if ((retained[index] ?? -1) >= 0) continue;
+          const row = result.rows[changedRows.length];
+          if (row === undefined) throw new TypeError("Live patch is missing a changed row");
+          changedRows.push({ index, row });
+        }
+        if (changedRows.length !== result.rows.length)
+          throw new TypeError("Live patch has excess rows");
+        route.onPatch?.({ type: "patch", retained, changedRows }, delivery);
       } else if (response.event === "invalidate") {
         route.onInvalidate?.(response.payload as LiveQueryInvalidation);
       } else if (response.event === "error") {
@@ -1180,7 +1293,11 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     }
     this.#pending.delete(requestId);
     pending.cleanup?.();
-    pending.reject(error);
+    pending.reject(
+      pending.mayPublish
+        ? new DatabaseWorkerOutcomeUnknownError(pending.method, requestId, { cause: error })
+        : error,
+    );
   }
 
   #fail(error: Error): void {
@@ -1190,9 +1307,27 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     this.#events.clear();
     for (const call of pending) {
       call.cleanup?.();
-      call.reject(error);
+      call.reject(
+        call.mayPublish
+          ? new DatabaseWorkerOutcomeUnknownError(call.method, call.requestId, { cause: error })
+          : error,
+      );
     }
   }
+}
+
+function clientDeadline(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647)
+    throw new RangeError("Worker timeout must be a positive timer interval");
+  return value;
+}
+
+function rpcMayPublish(method: string, args: unknown[]): boolean {
+  if (method === "execute" && typeof args[0] === "string" && /^\s*SELECT\b/iu.test(args[0]))
+    return false;
+  return /^(?:insert|upsert|update|delete|create|drop|migrate|commit|flush|execute|runStatement|import|finish|add|close|dispose)/u.test(
+    method,
+  );
 }
 
 /**
@@ -1309,6 +1444,15 @@ export class ClientLiveQuerySet {
     query: LiveQueryInput,
     options: LiveQuerySubscribeOptions,
   ): Promise<ClientLiveSubscription> {
+    return this.#subscribe(query, options);
+  }
+
+  async #subscribe(
+    query: LiveQueryInput,
+    options: LiveQuerySubscribeOptions,
+    onPatch?: LiveQueryPatchOptions["onPatch"],
+  ): Promise<ClientLiveSubscription> {
+    if (typeof query !== "string") query = structuredClone(query);
     await this.#created;
     const subscriptionId = crypto.randomUUID();
     // The worker tears down its handle when the subscription completes (set closed there);
@@ -1316,6 +1460,7 @@ export class ClientLiveQuerySet {
     const state = { completed: false };
     this.client._routeEvents(subscriptionId, {
       onChange: options.onChange.bind(options),
+      ...(onPatch === undefined ? {} : { onPatch }),
       ...(options.onError === undefined ? {} : { onError: options.onError.bind(options) }),
       onComplete: () => {
         state.completed = true;
@@ -1327,6 +1472,7 @@ export class ClientLiveQuerySet {
       const created = (await this.client._invoke(this.handleId, "subscribe", [
         subscriptionId,
         query,
+        ...(onPatch === undefined ? [] : [{ patches: true }]),
       ])) as { dependencyTableIds: string[] };
       this.#subscriptionIds.add(subscriptionId);
       return new ClientLiveSubscription(
@@ -1342,17 +1488,23 @@ export class ClientLiveQuerySet {
     }
   }
 
-  /** Delivers changed row payloads; the worker transport still sends its result snapshot. */
+  /** Transfers resets followed by changed row payloads and retained positions across the worker. */
   subscribePatches(
     query: LiveQueryInput,
     options: LiveQueryPatchOptions,
   ): Promise<ClientLiveSubscription> {
-    return this.subscribe(query, {
-      onChange: (result, delivery) =>
-        options.onPatch(createLiveQueryPatch(result, delivery), delivery),
-      ...(options.onError === undefined ? {} : { onError: options.onError.bind(options) }),
-      ...(options.onComplete === undefined ? {} : { onComplete: options.onComplete.bind(options) }),
-    });
+    return this.#subscribe(
+      query,
+      {
+        onChange: (result, delivery) =>
+          options.onPatch(createLiveQueryPatch(result, delivery), delivery),
+        ...(options.onError === undefined ? {} : { onError: options.onError.bind(options) }),
+        ...(options.onComplete === undefined
+          ? {}
+          : { onComplete: options.onComplete.bind(options) }),
+      },
+      options.onPatch.bind(options),
+    );
   }
 
   /** Registers dependency observation while leaving execution/result mapping to an adapter. */
@@ -1360,6 +1512,7 @@ export class ClientLiveQuerySet {
     query: LiveQueryInput,
     options: LiveQueryObserveOptions,
   ): Promise<ClientLiveSubscription> {
+    if (typeof query !== "string") query = structuredClone(query);
     await this.#created;
     const subscriptionId = crypto.randomUUID();
     const state = { completed: false };

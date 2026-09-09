@@ -2839,11 +2839,13 @@ export class IndexedDbBlockStore implements BlockStore {
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
     const records: TableRecord[] = [];
-    await visitObjectStoreSequentially(store, (value, key) => {
-      if (typeof key === "string" && key.startsWith(TABLE_ID_PREFIX)) {
-        records.push(asTableRecord(value, key));
-      }
-    });
+    await visitObjectStoreReadBatches(
+      store,
+      (value, key) => {
+        records.push(asTableRecord(value, storageKeyLocation(key)));
+      },
+      { prefix: TABLE_ID_PREFIX },
+    );
     await transactionDone(transaction);
     return records.sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -5942,7 +5944,7 @@ export class IndexedDbBlockStore implements BlockStore {
       const currentVersion =
         asOptionalManifestVersion(currentVersionValue, CURRENT_MANIFEST_KEY) ?? null;
       const leaseCutoff = Date.parse(current.leaseCutoff);
-      await assertGarbageCollectionPinsAvailableInTransaction(
+      const pinnedVersions = await garbageCollectionPinsInTransaction(
         transaction,
         currentVersion,
         leaseCutoff,
@@ -5976,15 +5978,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (manifestValue === undefined) missingManifestVersions.push(version);
         else if (asStoredManifestRecord(manifestValue, version).prunedAt !== undefined) {
           alreadyPrunedManifestVersions.push(version);
-        } else if (
-          await isManifestVersionPinnedInTransaction(
-            transaction,
-            version,
-            currentVersion,
-            leaseCutoff,
-          )
-        )
-          retainedManifestVersions.push(version);
+        } else if (pinnedVersions.has(version)) retainedManifestVersions.push(version);
         else {
           // The tombstone keeps the record's full content (checkpoint list or delta) so chains
           // above it keep resolving; it only stops counting as a reachability root.
@@ -5999,7 +5993,10 @@ export class IndexedDbBlockStore implements BlockStore {
       }
 
       const prunedManifestVersionSet = new Set(prunedManifestVersions);
-      await assertRemainingManifestRecordsAvailable(transaction, prunedManifestVersionSet);
+      const readableVersions = await assertRemainingManifestRecordsAvailable(
+        transaction,
+        prunedManifestVersionSet,
+      );
       let segmentIndex = current.cursor.segmentIndex;
       const segmentIdsToExamine =
         manifestIndex === current.candidateManifestVersions.length
@@ -6018,7 +6015,7 @@ export class IndexedDbBlockStore implements BlockStore {
         transaction,
         segmentIdsToExamine,
         blockIdsToExamine,
-        prunedManifestVersionSet,
+        readableVersions,
       );
       while (
         remaining > 0 &&
@@ -6056,7 +6053,7 @@ export class IndexedDbBlockStore implements BlockStore {
       ) {
         const candidates = new Set(current.candidateTransactionIds.slice(transactionIndex));
         const segmentOwners = new Set<string>();
-        await visitObjectStoreSequentially(segmentStore, (value) => {
+        await visitObjectStoreReadBatches(segmentStore, (value) => {
           const owner = asSegmentRecord(value).transactionId;
           if (candidates.has(owner)) segmentOwners.add(owner);
         });
@@ -9117,6 +9114,9 @@ export class IndexedDbBlockStore implements BlockStore {
       mode === "readwrite"
         ? this.#db.transaction(stores, mode, { durability: this.#durability })
         : this.#db.transaction(stores, mode);
+    // Observe completion before any request can fail. Catch paths may run after native abort
+    // dispatch (for example on quota exhaustion), when installing a new listener is too late.
+    void transactionDone(transaction).catch(() => undefined);
     const storeList = typeof stores === "string" ? [stores] : stores;
     if (mode === "readwrite" && !options.allowSnapshotImport && storeList.includes("catalog")) {
       // Queue this read before the caller can enqueue its writes. The import-preparation
@@ -9218,6 +9218,7 @@ async function validateCurrentIndexedDbSchema(database: IDBDatabase): Promise<vo
   let transaction: IDBTransaction | undefined;
   try {
     transaction = database.transaction([...indexedDbStoreNames], "readonly");
+    void transactionDone(transaction).catch(() => undefined);
     for (const storeName of indexedDbStoreNames) {
       const store = transaction.objectStore(storeName);
       if (store.keyPath !== null || store.autoIncrement) {
@@ -9624,6 +9625,65 @@ function visitObjectStoreSequentially(
   });
 }
 
+/** Read-only validation in bounded batches, avoiding a browser IPC turn for every row. */
+async function visitObjectStoreReadBatches(
+  store: IDBObjectStore,
+  visit: (value: unknown, key: IDBValidKey) => void | Promise<void>,
+  partition?: { kind: string } | { prefix: string },
+): Promise<void> {
+  const kind = partition !== undefined && "kind" in partition ? partition.kind : undefined;
+  const prefix = partition !== undefined && "prefix" in partition ? partition.prefix : undefined;
+  // Injected factories need not install the browser's key-range constructor globally.
+  if (typeof IDBKeyRange === "undefined") {
+    if (kind === MANIFEST_BLOCK) {
+      await visitManifestBlockRecords(store, (record) =>
+        Promise.resolve(visit(record, [kind, record.blockId])),
+      );
+      return;
+    }
+    await visitObjectStoreSequentially(store, (value, key) => {
+      if (prefix !== undefined) {
+        if (typeof key === "string" && key.startsWith(prefix)) return visit(value, key);
+      } else if (kind === undefined || compareStructuredKind(key, kind) === 0)
+        return visit(value, key);
+    });
+    return;
+  }
+  const limit = 128;
+  // String partitions used here end in ASCII '/', so its lexical successor bounds every ID.
+  const upper =
+    prefix !== undefined
+      ? prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1)
+      : kind === undefined
+        ? undefined
+        : [kind + "\u0000"];
+  let lower: IDBValidKey | undefined = prefix ?? (kind === undefined ? undefined : [kind]);
+  let exclusive = false;
+  for (;;) {
+    const range: IDBKeyRange | undefined =
+      lower === undefined
+        ? undefined
+        : upper === undefined
+          ? IDBKeyRange.lowerBound(lower, exclusive)
+          : IDBKeyRange.bound(lower, upper, exclusive, true);
+    const [keys, values]: [IDBValidKey[], unknown[]] = await Promise.all([
+      requestResult<IDBValidKey[]>(store.getAllKeys(range, limit)),
+      requestResult<unknown[]>(store.getAll(range, limit)),
+    ]);
+    // Both requests share this transaction and range, including when other connections write.
+    if (keys.length !== values.length)
+      throw corruption(store.name, "batch keys do not match values");
+    await Promise.all(
+      keys.map(async (key, index) => {
+        await visit(values[index], key);
+      }),
+    );
+    if (keys.length < limit) return;
+    lower = keys.at(-1);
+    exclusive = true;
+  }
+}
+
 /** Visits one exact secondary-index partition and reports the primary record key. */
 function visitIndexPartitionSequentially(
   index: IDBIndex,
@@ -9911,8 +9971,11 @@ function transactionFailure(transaction: IDBTransaction): Promise<never> {
   });
 }
 
+const transactionCompletions = new WeakMap<IDBTransaction, Promise<void>>();
 function transactionDone(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
+  const existing = transactionCompletions.get(transaction);
+  if (existing !== undefined) return existing;
+  const done = new Promise<void>((resolve, reject) => {
     transaction.addEventListener("complete", () => resolve(), { once: true });
     transaction.addEventListener(
       "abort",
@@ -9921,14 +9984,9 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
         once: true,
       },
     );
-    transaction.addEventListener(
-      "error",
-      () => reject(transaction.error ?? new Error("Transaction failed")),
-      {
-        once: true,
-      },
-    );
   });
+  transactionCompletions.set(transaction, done);
+  return done;
 }
 
 async function ignoreAbort(transaction: IDBTransaction): Promise<void> {
@@ -12121,11 +12179,27 @@ async function resolveManifestBlockSetInTransaction(
 ): Promise<Set<string>> {
   const blockIds = new Set<string>();
   if (version === null) return blockIds;
-  await visitManifestBlockRecords(catalog, (record) => {
+  await visitManifestBlockReadBatches(catalog, (record) => {
     if (manifestBlockVisibleAt(record, version)) blockIds.add(record.blockId);
     return undefined;
   });
   return blockIds;
+}
+
+async function visitManifestBlockReadBatches(
+  catalog: IDBObjectStore,
+  visit: (record: ManifestBlockRecord) => void,
+): Promise<void> {
+  await visitObjectStoreReadBatches(
+    catalog,
+    (value, key) => {
+      if (!Array.isArray(key) || key.length !== 2 || typeof key[1] !== "string") {
+        throw corruption(MANIFEST_BLOCK, "record key is invalid");
+      }
+      visit(asManifestBlockRecord(value, key[1]));
+    },
+    { kind: MANIFEST_BLOCK },
+  );
 }
 
 function visitManifestBlockRecords(
@@ -13399,30 +13473,36 @@ async function compactionJobRemovalPreservesProvenance(
   return true;
 }
 
-async function assertGarbageCollectionPinsAvailableInTransaction(
+async function garbageCollectionPinsInTransaction(
   transaction: IDBTransaction,
   currentVersion: number | null,
   leaseCutoff: number,
-): Promise<void> {
-  await assertSnapshotAvailableInTransaction(transaction, currentVersion);
-  await visitObjectStoreSequentially(transaction.objectStore("transactions"), async (value) => {
+): Promise<Set<number>> {
+  const versions = new Set<number>();
+  const pin = (version: number | null): void => {
+    if (version !== null) versions.add(version);
+  };
+  pin(currentVersion);
+  // Validate every status once before using the active index for physical roots below. A
+  // malformed status must not disappear from reachability merely because it misses that index.
+  await visitObjectStoreReadBatches(transaction.objectStore("transactions"), (value) => {
     const record = asTransactionRecord(value);
     if (record.status === "active") {
-      await assertSnapshotAvailableInTransaction(transaction, record.snapshotVersion);
+      pin(record.snapshotVersion);
     }
   });
-  await visitObjectStoreSequentially(transaction.objectStore("leases"), async (value) => {
+  await visitObjectStoreSequentially(transaction.objectStore("leases"), (value) => {
     const lease = asLeaseRecord(value);
     const expiresAt = Date.parse(lease.expiresAt);
     if (!Number.isFinite(expiresAt) || expiresAt > leaseCutoff) {
-      await assertSnapshotAvailableInTransaction(transaction, lease.manifestVersion);
+      pin(lease.manifestVersion);
     }
   });
   await visitObjectStoreSequentially(transaction.objectStore("gc"), async (value, key) => {
     const job = asCompactionJobAtMaintenanceKey(value, key);
     if (job === undefined) return;
     if (isTerminalCompactionJob(job)) return;
-    await assertSnapshotAvailableInTransaction(transaction, job.sourceManifestVersion);
+    pin(job.sourceManifestVersion);
     if (job.transactionId === null) return;
     const transactionValue: unknown = await requestResult(
       transaction.objectStore("transactions").get(job.transactionId),
@@ -13433,8 +13513,10 @@ async function assertGarbageCollectionPinsAvailableInTransaction(
     if (linkedTransaction.committedVersion === null) {
       throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
     }
-    await assertSnapshotAvailableInTransaction(transaction, linkedTransaction.committedVersion);
+    pin(linkedTransaction.committedVersion);
   });
+  for (const version of versions) await assertSnapshotAvailableInTransaction(transaction, version);
+  return versions;
 }
 
 async function assertPendingArtifactsAvailableInTransaction(
@@ -13526,35 +13608,38 @@ async function assertPendingArtifactsAvailableInTransaction(
   }
 }
 
-/**
- * After pruning, every remaining manifest must still be fully readable. One ascending pass
- * resolves the whole chain with a single running set (pruned records still contribute their
- * deltas), unions the blocks referenced by any remaining manifest, and verifies each referenced
- * block once instead of once per manifest.
- */
+/** Validate all retained blocks once, in bounded parallel read batches. */
 async function assertRemainingManifestRecordsAvailable(
   transaction: IDBTransaction,
   newlyPrunedVersions: ReadonlySet<number>,
-): Promise<void> {
+): Promise<number[]> {
   const readableVersions: number[] = [];
-  await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value, key) => {
+  await visitObjectStoreReadBatches(transaction.objectStore("manifests"), (value, key) => {
     if (typeof key !== "number") throw corruption("manifests", "record key is invalid");
     const record = asStoredManifestRecord(value, key);
-    if (record.prunedAt !== undefined || newlyPrunedVersions.has(record.version)) return;
-    readableVersions.push(record.version);
-  });
-  const referenced = new Map<string, number>();
-  await visitManifestBlockRecords(transaction.objectStore("catalog"), (record) => {
-    const version = firstOverlappingManifestVersion(record, readableVersions);
-    if (version !== undefined) referenced.set(record.blockId, version);
-    return undefined;
-  });
-  const blockStore = transaction.objectStore("blocks");
-  for (const [id, version] of referenced) {
-    if ((await requestResult(blockStore.getKey(id))) === undefined) {
-      throw new SnapshotManifestMissingError(version);
+    if (record.prunedAt === undefined && !newlyPrunedVersions.has(record.version)) {
+      readableVersions.push(record.version);
     }
-  }
+  });
+  await visitObjectStoreReadBatches(
+    transaction.objectStore("catalog"),
+    async (value, key) => {
+      if (!Array.isArray(key) || key.length !== 2 || typeof key[1] !== "string") {
+        throw corruption(MANIFEST_BLOCK, "record key is invalid");
+      }
+      const record = asManifestBlockRecord(value, key[1]);
+      const version = firstOverlappingManifestVersion(record, readableVersions);
+      if (
+        version !== undefined &&
+        (await requestResult(transaction.objectStore("blocks").getKey(record.blockId))) ===
+          undefined
+      ) {
+        throw new SnapshotManifestMissingError(version);
+      }
+    },
+    { kind: MANIFEST_BLOCK },
+  );
+  return readableVersions;
 }
 
 function compactionJobKey(id: string): string {
@@ -14139,71 +14224,42 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   }
 }
 
-async function isManifestVersionPinnedInTransaction(
-  transaction: IDBTransaction,
-  version: number,
-  currentVersion: number | null,
-  leaseCutoff: number,
-): Promise<boolean> {
-  if (currentVersion === version) return true;
-  const transactionPinned = await visitObjectStoreSequentially(
-    transaction.objectStore("transactions"),
-    (value) => {
-      const record = asTransactionRecord(value);
-      return record.status === "active" && record.snapshotVersion === version;
-    },
-  );
-  if (transactionPinned) return true;
-  const leasePinned = await visitObjectStoreSequentially(
-    transaction.objectStore("leases"),
-    (value) => {
-      const lease = asLeaseRecord(value);
-      const expiresAt = Date.parse(lease.expiresAt);
-      return (
-        lease.manifestVersion === version &&
-        (!Number.isFinite(expiresAt) || expiresAt > leaseCutoff)
-      );
-    },
-  );
-  if (leasePinned) return true;
-  return visitObjectStoreSequentially(transaction.objectStore("gc"), async (value, key) => {
-    const job = asCompactionJobAtMaintenanceKey(value, key);
-    if (job === undefined) return false;
-    if (isTerminalCompactionJob(job)) return false;
-    if (job.sourceManifestVersion === version) return true;
-    if (job.transactionId === null) return false;
-    const transactionValue: unknown = await requestResult(
-      transaction.objectStore("transactions").get(job.transactionId),
-    );
-    if (transactionValue === undefined) return false;
-    const linkedTransaction = asTransactionRecord(transactionValue);
-    if (linkedTransaction.status !== "committed") return false;
-    if (linkedTransaction.committedVersion === null) {
-      throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
-    }
-    return linkedTransaction.committedVersion === version;
-  });
-}
-
 async function collectBoundedPhysicalRootsInTransaction(
   transaction: IDBTransaction,
   candidateSegmentIds: readonly string[],
   candidateBlockIds: readonly string[],
-  newlyPrunedVersions: ReadonlySet<number>,
+  readableVersions: readonly number[],
 ): Promise<{ blockIds: Set<string>; segmentIds: Set<string> }> {
   const candidateSegments = new Set(candidateSegmentIds);
   const candidateBlocks = new Set(candidateBlockIds);
   const directSegmentRoots = new Set<string>();
-  await visitObjectStoreSequentially(transaction.objectStore("transactions"), (value) => {
-    const record = asTransactionRecord(value);
-    if (record.status !== "active") return;
-    for (const id of record.pendingSegmentIds)
-      if (candidateSegments.has(id)) directSegmentRoots.add(id);
-  });
+  // Ownership is fixed for this storage transaction. Retain a bounded positive projection;
+  // if it overflows, uncached IDs still take the exact scan below rather than becoming roots.
+  const ownerBlockRoots = new Set<string>();
+  let ownerBlockRootsComplete = true;
+  const rememberOwnerBlocks = (ids: readonly string[]): void => {
+    for (const id of ids) {
+      if (ownerBlockRoots.size < 4_096) ownerBlockRoots.add(id);
+      else if (!ownerBlockRoots.has(id)) ownerBlockRootsComplete = false;
+    }
+  };
+  await visitIndexPartitionSequentially(
+    transaction.objectStore("transactions").index(TRANSACTION_STATUS_INDEX),
+    "active",
+    (value) => {
+      const record = asTransactionRecord(value);
+      if (record.status !== "active") return;
+      rememberOwnerBlocks(record.pendingBlockIds);
+      for (const id of record.pendingSegmentIds)
+        if (candidateSegments.has(id)) directSegmentRoots.add(id);
+    },
+  );
   await visitObjectStoreSequentially(transaction.objectStore("gc"), (value, key) => {
     const job = asCompactionJobAtMaintenanceKey(value, key);
     if (job === undefined) return;
     if (isTerminalCompactionJob(job)) return;
+    rememberOwnerBlocks(job.sourceBlockIds);
+    rememberOwnerBlocks(job.outputBlockIds);
     for (const id of job.sourceSegmentIds)
       if (candidateSegments.has(id)) directSegmentRoots.add(id);
     for (const outputId of compactionOutputSegmentIds(job)) {
@@ -14218,26 +14274,35 @@ async function collectBoundedPhysicalRootsInTransaction(
   const isDirectBlockRoot = async (id: string): Promise<boolean> => {
     const cached = directBlockRootCache.get(id);
     if (cached !== undefined) return cached;
-    let rooted = await visitObjectStoreSequentially(
-      transaction.objectStore("transactions"),
-      (value) => {
-        const record = asTransactionRecord(value);
-        return record.status === "active" && record.pendingBlockIds.includes(id);
-      },
-    );
-    if (!rooted) {
-      rooted = await visitObjectStoreSequentially(transaction.objectStore("gc"), (value, key) => {
-        const job = asCompactionJobAtMaintenanceKey(value, key);
-        if (job === undefined) return false;
-        return (
-          !isTerminalCompactionJob(job) &&
-          (job.sourceBlockIds.includes(id) || job.outputBlockIds.includes(id))
-        );
-      });
+    let rooted = ownerBlockRoots.has(id);
+    if (!rooted && !ownerBlockRootsComplete) {
+      rooted = await visitIndexPartitionSequentially(
+        transaction.objectStore("transactions").index(TRANSACTION_STATUS_INDEX),
+        "active",
+        (value) => {
+          const record = asTransactionRecord(value);
+          return record.status === "active" && record.pendingBlockIds.includes(id);
+        },
+      );
+      if (!rooted) {
+        rooted = await visitObjectStoreSequentially(transaction.objectStore("gc"), (value, key) => {
+          const job = asCompactionJobAtMaintenanceKey(value, key);
+          if (job === undefined) return false;
+          return (
+            !isTerminalCompactionJob(job) &&
+            (job.sourceBlockIds.includes(id) || job.outputBlockIds.includes(id))
+          );
+        });
+      }
     }
     if (!rooted) {
+      const value: unknown = await requestResult(
+        transaction.objectStore("catalog").get(manifestBlockKey(id)),
+      );
       rooted =
-        (await findReadableManifestBlock(transaction, [id], newlyPrunedVersions)) !== undefined;
+        value !== undefined &&
+        firstOverlappingManifestVersion(asManifestBlockRecord(value, id), readableVersions) !==
+          undefined;
     }
     if (directBlockRootCache.size < 4_096) directBlockRootCache.set(id, rooted);
     return rooted;
@@ -14267,6 +14332,18 @@ async function collectBoundedPhysicalRootsInTransaction(
   }
   for (const id of candidateBlockIds) if (await isDirectBlockRoot(id)) rootedBlockIds.add(id);
   for (const id of directSegmentRoots) rootedSegmentIds.add(id);
+  if (candidateBlocks.size > 0) {
+    // Segment metadata is a structural root until it is deleted. A separately planned
+    // block page must not leave a dangling reference that makes recovery reject the store.
+    // Batch the scan and retain only this step's bounded candidate projection.
+    await visitObjectStoreReadBatches(segmentStore, (value) => {
+      const segment = asSegmentRecord(value);
+      if (candidateSegments.has(segment.id) && !rootedSegmentIds.has(segment.id)) return;
+      for (const id of segmentBlockIds(segment)) {
+        if (candidateBlocks.has(id)) rootedBlockIds.add(id);
+      }
+    });
+  }
   return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
 }
 
@@ -15840,7 +15917,7 @@ async function assertPinnedHistoryAdmission(
   if (pinnedVersions.length === 0) return;
   let pinnedBlockCount = 0;
   let pinnedBytes = 0;
-  await visitManifestBlockRecords(transaction.objectStore("catalog"), (record) => {
+  await visitManifestBlockReadBatches(transaction.objectStore("catalog"), (record) => {
     const removedVersion = input.prospectiveRemovedBlockIds?.has(record.blockId)
       ? input.currentVersion
       : record.removedVersion;

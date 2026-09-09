@@ -11,6 +11,7 @@ import {
 } from "../worker-protocol/index.js";
 import {
   type WriteSession,
+  type SnapshotSession,
   MinnowDatabase,
   type MinnowDatabaseOptions,
   type BufferedTableWriter,
@@ -59,6 +60,7 @@ export type WireDatabaseOptions = Pick<
   | "targetBlockBytes"
   | "rowsPerBlock"
   | "maxCommitRetries"
+  | "coordinateWrites"
   | "spillOwnerLeaseMs"
   | "transactionOwnerLeaseMs"
   | "transactionIdleTimeoutMs"
@@ -312,7 +314,7 @@ export type WorkerStoreFactory = (
 ) => BlockStore | Promise<BlockStore>;
 
 type Handle =
-  | { type: "snapshot"; release: () => void; done: Promise<void> }
+  | { type: "snapshot"; session: SnapshotSession; release: () => void; done: Promise<void> }
   | {
       type: "snapshot-export";
       iterator: AsyncIterator<Uint8Array>;
@@ -722,7 +724,9 @@ class DatabaseRpcServer {
       resolveVersion = resolve;
       rejectVersion = reject;
     });
+    let snapshotSession!: SnapshotSession;
     const done = this.database.snapshot(async (session) => {
+      snapshotSession = session;
       resolveVersion(session.version);
       await new Promise<void>((resolveRelease) => {
         release = resolveRelease;
@@ -734,7 +738,7 @@ class DatabaseRpcServer {
     try {
       const version = await versionReady;
       if (release === undefined) throw new Error("Snapshot scope did not install its release");
-      this.#publishHandle(handleId, { type: "snapshot", release, done });
+      this.#publishHandle(handleId, { type: "snapshot", session: snapshotSession, release, done });
       return { handleId, version };
     } catch (error) {
       release?.();
@@ -771,6 +775,9 @@ class DatabaseRpcServer {
     }
     switch (handle.type) {
       case "snapshot": {
+        if (method === "query") {
+          return this.#querySession(handle.session, args, context);
+        }
         if (method !== "close") throw new Error(`Unsupported snapshot method: ${method}`);
         handle.release();
         this.#handles.delete(handleId);
@@ -812,6 +819,33 @@ class DatabaseRpcServer {
     }
   }
 
+  async #querySession(
+    session: Pick<SnapshotSession, "query">,
+    args: unknown[],
+    context: RpcCallContext,
+  ): Promise<ColumnarResult> {
+    const [sql, options, reportStats = false] = args as [
+      string,
+      QueryOptions | undefined,
+      boolean | undefined,
+    ];
+    return new ColumnarResult(
+      encodeQueryResult(
+        await session.query(sql, {
+          ...options,
+          signal: context.signal,
+          ...(reportStats
+            ? {
+                onStats: (stats) => {
+                  this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
+                },
+              }
+            : {}),
+        }),
+      ),
+    );
+  }
+
   async #callWriteHandle(
     handleId: string,
     handle: Extract<Handle, { type: "write" }>,
@@ -819,28 +853,7 @@ class DatabaseRpcServer {
     args: unknown[],
     context: RpcCallContext,
   ): Promise<unknown> {
-    if (method === "query") {
-      const [sql, options, reportStats = false] = args as [
-        string,
-        QueryOptions | undefined,
-        boolean | undefined,
-      ];
-      return new ColumnarResult(
-        encodeQueryResult(
-          await handle.session.query(sql, {
-            ...options,
-            signal: context.signal,
-            ...(reportStats
-              ? {
-                  onStats: (stats) => {
-                    this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
-                  },
-                }
-              : {}),
-          }),
-        ),
-      );
-    }
+    if (method === "query") return this.#querySession(handle.session, args, context);
     if (method === "execute") {
       const [sql, params] = args as [string, readonly QueryValue[] | undefined];
       return handle.session.execute(sql, params);
@@ -990,17 +1003,29 @@ class DatabaseRpcServer {
         // posted before this call's own result frame.
         const subscriptionId = this.#claimHandleId(args[0]);
         const query = args[1] as LiveQueryInput;
+        const patches = (args[2] as { patches?: boolean } | undefined)?.patches === true;
         let subscription: LiveQuerySubscription | undefined;
         try {
           subscription = await handle.set.subscribe(query, {
             onChange: (result, delivery) => {
-              const encoded = encodeQueryResult(result);
+              const patch = patches && !delivery.initial && delivery.retained !== undefined;
+              const encoded = encodeQueryResult(
+                patch
+                  ? {
+                      columns: result.columns,
+                      columnDomains: result.columnDomains,
+                      rows: result.rows.filter(
+                        (_, index) => (delivery.retained?.[index] ?? -1) < 0,
+                      ),
+                    }
+                  : result,
+              );
               // The provenance array is shared by every subscriber of the group, so each frame
               // transfers its own copy rather than detaching the set's.
               const retained = delivery.retained?.slice();
               if (retained !== undefined) encoded.transfer.push(retained.buffer);
               this.scope.postMessage(
-                rpcEvent(subscriptionId, "change", {
+                rpcEvent(subscriptionId, patch ? "patch" : "change", {
                   result: encoded.payload,
                   delivery: retained === undefined ? delivery : { ...delivery, retained },
                 }),

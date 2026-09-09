@@ -1,4 +1,6 @@
 import { encodeQueryIdentity } from "./query-identity.js";
+import { alreadyExternalResults, copyQueryResultExternalization } from "./result-state.js";
+export { copyQueryResultExternalization, markQueryResultExternal } from "./result-state.js";
 import {
   civilFromDays,
   copyDate,
@@ -6484,23 +6486,12 @@ function asQueryValue(value: unknown): QueryValue {
   throw new TypeError("Query produced an unsupported value");
 }
 
-const alreadyExternalResults = new WeakSet<QueryResult>();
-
 function markExternalizationState(
   result: QueryResult,
   outputNeedsExternalization: boolean | undefined,
 ): QueryResult {
   if (outputNeedsExternalization === false) alreadyExternalResults.add(result);
   return result;
-}
-
-/** Carries the internal no-conversion proof across a defensive result copy. */
-export function copyQueryResultExternalization(
-  source: QueryResult,
-  copy: QueryResult,
-): QueryResult {
-  if (alreadyExternalResults.has(source)) alreadyExternalResults.add(copy);
-  return copy;
 }
 
 /** Removes internal domain tags only after every comparison, group, join, and sort is complete. */

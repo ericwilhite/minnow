@@ -35,17 +35,18 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // uncorrelated IN subqueries planned as joins, dictionary-decided CASE aggregate branches, and
 // exact NUMERIC ROUND/TRUNC/ABS/FLOOR/CEIL/MOD/SIGN with PostgreSQL display-scale inference
 // intentionally expand the complete engine surface.
-// Measured after the 0.8 SQL/live audit: 868.5 KiB raw / 251.1 KiB gzip. Pin both with less than 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 871 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 253 * 1024;
-// Measured with the larger durable adapter: 1202.4 KiB raw / 334.7 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1206 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 337 * 1024;
+// Lifecycle queues, RPC deadlines, snapshot renewal, and write admission add about 3 KiB gzip.
+// Measured after the resilience audit: 878.3 KiB raw / 254.1 KiB gzip; under 1% headroom.
+const COMPLETE_ENTRY_RAW_BUDGET = 880 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 255 * 1024;
+// Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1214 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 339 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
-// same way measured 1536.7 KiB raw / 419.4 KiB gzip. Measured: 1228.9 KiB raw / 340.3 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1233 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 343 * 1024;
+// same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1241 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 345 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
@@ -145,6 +146,31 @@ describe("core packaging", () => {
       `import { KeyedLiveQuery } from "@minnowdb/core/live"; console.log(KeyedLiveQuery);`,
     );
     expect(live).toContain(KEYED_LIVE_MARKER);
+  });
+
+  it("keeps SQL evaluators out of the complete standalone live entry", async () => {
+    const result = await build({
+      entryPoints: ["@minnowdb/core/live"],
+      absWorkingDir: repoRoot,
+      bundle: true,
+      write: false,
+      minify: true,
+      format: "esm",
+      platform: "browser",
+      target: "es2022",
+      metafile: true,
+    });
+    const inputs = Object.keys(result.metafile.inputs);
+    expect(
+      inputs.some((file) => /engine\/(query|sql-functions|vector|database)\.js$/u.test(file)),
+    ).toBe(false);
+    const output = result.outputFiles[0];
+    expect(output).toBeDefined();
+    if (output === undefined) throw new Error("Missing live bundle");
+    // Measured 8.1 KiB gzip with typed coordination errors and bounded live recovery.
+    expect(
+      gzipSync(output.contents, { level: constants.Z_BEST_COMPRESSION }).byteLength,
+    ).toBeLessThanOrEqual(8.25 * 1024);
   });
 
   it("keeps the optional typed-table renderer on the schema entry", async () => {

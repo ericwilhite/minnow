@@ -25,7 +25,8 @@ WHERE placed_at < TIMESTAMP '2024-01-01'
 
 Any query expression can feed the insert — a `WITH`, a `UNION`, a parenthesized member — and
 `ON CONFLICT` applies to the rows it produces exactly as to a `VALUES` list. A `VALUES` row may
-carry scalar subqueries, evaluated when the statement runs:
+carry scalar subqueries, evaluated against the statement snapshot and any earlier staged writes
+in its transaction. Autocommit retries recompute them after a concurrent commit:
 
 ```sql
 INSERT INTO invoices (invoice_no, customer_id)

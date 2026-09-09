@@ -131,7 +131,9 @@ describe("published core tarball", () => {
     const manifest = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8")) as {
       scripts?: Record<string, string>;
     };
-    expect(manifest.scripts?.prepack).toBe("node ../../scripts/strip-dist-comments.mjs dist");
+    expect(manifest.scripts?.prepack).toBe(
+      "node ../../scripts/prepare-package.mjs --strip-comments",
+    );
     const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
       cwd: coreRoot,
       encoding: "utf8",
@@ -140,8 +142,11 @@ describe("published core tarball", () => {
     const [report] = JSON.parse(output.slice(output.indexOf("["))) as Array<{
       size: number;
       unpackedSize: number;
+      files: Array<{ path: string }>;
     }>;
-    // Measured after stripping: 799 KB packed / 3.98 MB unpacked (1,003 KB / 4.89 MB before).
+    expect(report?.files.map(({ path }) => path)).not.toContain("dist/engine/query-cache.d.ts");
+    expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
+    // Existing publication budgets also cover declaration pruning.
     expect(report?.size, "packed bytes").toBeLessThanOrEqual(850_000);
     expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_200_000);
     const emitted = await readFile(join(coreRoot, "dist", "engine", "optimizer.js"), "utf8");

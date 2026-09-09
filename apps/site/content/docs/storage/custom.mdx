@@ -186,8 +186,9 @@ begin/renew/append/finish/cancel frame import. Do not expose a partial family. E
 version and page all six frame kinds; import must compare same-sequence replay bytes and publish
 only after the footer totals and rolling checksum match. See [Snapshots](/docs/storage/snapshots).
 
-**Tabs are plural and mortal.** Several connections may open one database; readers never block
-writers; a connection can die between any two operations without corrupting anything. How you
+**Tabs are plural and mortal.** Several connections may open one database; readers keep a stable
+version while writers publish new versions. Physical I/O may queue. A connection can die between
+any two operations without corrupting anything. How you
 achieve that is yours: the IndexedDB adapter leans on storage transactions, the OPFS adapter
 on a write-ahead log behind a browser-arbitrated leader. (An adapter for a single-process
 environment — Node, React Native — has an easier version of this problem, but follows the same

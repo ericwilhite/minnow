@@ -44,7 +44,7 @@ Download size affects cold starts, and Wasm engines also compile a module before
 | Engine           | Download (gzip) | Raw     | Wasm compile step |
 | ---------------- | --------------- | ------- | ----------------- |
 | IndexedDB        | 0               | 0       | No                |
-| **Minnow**       | **335 KB**      | 1.2 MB  | No                |
+| **Minnow**       | **338 KB**      | 1.2 MB  | No                |
 | SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes               |
 | PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes               |
 
@@ -53,6 +53,8 @@ It uses identical esbuild settings and includes the Wasm modules and packed runt
 package downloads. IndexedDB is built into the browser. Minnow's number includes the engine and
 its larger durable adapter, OPFS; an IndexedDB build is slightly smaller, and unused adapters stay
 out of the application bundle.
+The size advantage over this SQLite Wasm build is for compressed downloads; Minnow is larger
+uncompressed. Sizes use binary units (1 KB = 1,024 bytes).
 
 ## IndexedDB
 

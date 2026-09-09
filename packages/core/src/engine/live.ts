@@ -1,10 +1,16 @@
 import { createLiveQueryPatch, type LiveQueryPatchOptions } from "./live-patch.js";
+import { acceptLiveExecution } from "./live-accept.js";
 export type { LiveQueryPatch, LiveQueryPatchOptions } from "./live-patch.js";
-import { queryResultRetainedBytes } from "./query-cache.js";
+import { copyQueryResult, queryResultRetainedBytes, sameQueryRow } from "./query-cache.js";
 import { encodeQueryIdentity } from "./query-identity.js";
-import { type CatalogProbe, type Manifest, type StoragePage } from "../storage/types.js";
+import {
+  OpfsCoordinationError,
+  type CatalogProbe,
+  type Manifest,
+  type StoragePage,
+} from "../storage/types.js";
 import { LiveQueryLimitError } from "./errors.js";
-import { type CompiledQuery, type QueryResult, type QueryRow, type QueryValue } from "./query.js";
+import { type CompiledQuery, type QueryResult, type QueryValue } from "./query.js";
 
 /**
  * Live-query invalidation is a hint-driven cache-coherence problem, not a notification problem.
@@ -190,6 +196,8 @@ export interface LiveQueryHost {
   dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;
   /** Executes the statement; the returned result belongs to the set and is never shared. */
   execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;
+  /** Optionally publishes an accepted result for adapters that re-execute after invalidation. */
+  memoize?(query: LiveQueryInput, result: QueryResult, probe: CatalogProbe): Promise<void>;
   /**
    * Executes a statement the host can later maintain incrementally, or returns undefined when
    * the statement's shape rules that out; the set then executes it in full from then on.
@@ -249,6 +257,8 @@ interface QueryGroup {
   readonly query: LiveQueryInput;
   dependencies: ReadonlySet<string>;
   readonly subscribers: Set<Subscriber>;
+  /** Registrations that claimed this group but have not yet installed their subscriber. */
+  pendingSubscriptions: number;
   /** The newest probe the retained result is known to reflect. */
   seenProbe: CatalogProbe;
   result: QueryResult | undefined;
@@ -260,17 +270,6 @@ interface QueryGroup {
   maintenance: unknown;
   /** Set once the host declined to maintain the statement; the group executes in full after. */
   unmaintainable: boolean;
-}
-
-function sameQueryValue(left: QueryValue, right: QueryValue): boolean {
-  if (left instanceof Date || right instanceof Date) {
-    return (
-      left instanceof Date &&
-      right instanceof Date &&
-      Object.is(dateMilliseconds(left), dateMilliseconds(right))
-    );
-  }
-  return Object.is(left, right);
 }
 
 /** Exact structural equality; stops at the first difference. */
@@ -289,38 +288,9 @@ function sameResult(left: QueryResult, right: QueryResult): boolean {
     const leftRow = left.rows[rowIndex];
     const rightRow = right.rows[rowIndex];
     if (leftRow === undefined || rightRow === undefined) return false;
-    if (leftRow === rightRow) continue;
-    for (const column of columns) {
-      if (!sameQueryValue(leftRow[column] ?? null, rightRow[column] ?? null)) return false;
-    }
+    if (!sameQueryRow(leftRow, rightRow, columns)) return false;
   }
   return true;
-}
-
-function cloneRow(row: QueryRow, columns: readonly string[]): QueryRow {
-  const cloned: QueryRow = {};
-  for (const column of columns) {
-    const value = row[column] ?? null;
-    const copy = value instanceof Date ? copyDate(value) : value;
-    if (column === "__proto__") {
-      Object.defineProperty(cloned, column, {
-        value: copy,
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
-    } else cloned[column] = copy;
-  }
-  return cloned;
-}
-
-function cloneResult(result: QueryResult): QueryResult {
-  const columns = [...result.columns];
-  return {
-    columns,
-    columnDomains: structuredClone(result.columnDomains),
-    rows: result.rows.map((row) => cloneRow(row, columns)),
-  };
 }
 
 function queryKey(query: LiveQueryInput): string {
@@ -382,9 +352,14 @@ function groupExecutes(group: QueryGroup): boolean {
 }
 
 /** Whether an adapter will re-execute this statement after an invalidation and expect a memo hit. */
-function groupMemoizes(group: QueryGroup): boolean {
+function groupMemoizes(group: QueryGroup, changed = true): boolean {
   for (const subscriber of group.subscribers) {
-    if (!subscriber.closed && subscriber.kind === "observer") return true;
+    if (
+      !subscriber.closed &&
+      subscriber.kind === "observer" &&
+      (changed || subscriber.options.suppressUnchanged !== true)
+    )
+      return true;
   }
   return false;
 }
@@ -441,9 +416,12 @@ export class LiveQuerySet {
   readonly #executionWaiters: Array<() => void> = [];
   #sweepChain = Promise.resolve();
   #sweepQueued = false;
+  #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  #retryDelayMs = 100;
   #pollTimer: ReturnType<typeof setInterval> | undefined;
   #closed = false;
   #subscriptionCount = 0;
+  #retainedBytes = 0;
   readonly #ownsChannel: boolean;
   readonly #onClosed: (() => void) | undefined;
 
@@ -492,9 +470,7 @@ export class LiveQuerySet {
   get stats(): LiveQueryStats {
     let retainedRows = 0;
     for (const group of this.#groups.values()) retainedRows += group.result?.rows.length ?? 0;
-    let retainedBytes = 0;
-    for (const group of this.#groups.values()) retainedBytes += group.retainedBytes;
-    return { ...this.#stats, retainedRows, retainedBytes };
+    return { ...this.#stats, retainedRows, retainedBytes: this.#retainedBytes };
   }
 
   /**
@@ -528,45 +504,17 @@ export class LiveQuerySet {
   }
 
   /** Registers a query, delivers its current result, and shares work with equal statements. */
-  async subscribe(
+  subscribe(
     query: LiveQueryInput,
     options: LiveQuerySubscribeOptions,
   ): Promise<LiveQuerySubscription> {
-    this.#throwIfClosed();
-    this.#reserveSubscription();
-    let group: QueryGroup | undefined;
-    let subscriber: ResultSubscriber | undefined;
-    try {
-      const opened = await this.#getOrOpenGroup(query);
-      group = opened.group;
-      this.#throwIfClosed();
-      subscriber = {
-        kind: "result",
-        options,
-        delivered: false,
-        closed: false,
-        seenDelivery: -1,
-      };
-      group.subscribers.add(subscriber);
-      await this.#settleGroup(group, opened.fresh, true);
-      this.#throwIfClosed();
-      if (!subscriber.delivered) {
-        const result = group.result ?? (await this.#executeGroup(group)).result;
-        this.#throwIfClosed();
-        if (!subscriber.closed) {
-          this.#deliverResult(group, subscriber, result, { ...group.seenProbe, initial: true });
-        }
-      }
-    } catch (error) {
-      if (group !== undefined && subscriber !== undefined) {
-        this.#removeSubscriber(group, subscriber, false);
-      } else {
-        this.#subscriptionCount -= 1;
-        if (group !== undefined) this.#removeEmptyGroup(group);
-      }
-      throw error;
-    }
-    return this.#subscriptionHandle(group, subscriber);
+    return this.#register(query, {
+      kind: "result",
+      options,
+      delivered: false,
+      closed: false,
+      seenDelivery: -1,
+    });
   }
 
   /** Delivers resets or changed row payloads without constructing a private full row array per patch. */
@@ -584,36 +532,48 @@ export class LiveQuerySet {
   }
 
   /** Observes invalidation; the statement executes inside the set only when asked to compare. */
-  async observe(
-    query: LiveQueryInput,
-    options: LiveQueryObserveOptions,
-  ): Promise<LiveQuerySubscription> {
+  observe(query: LiveQueryInput, options: LiveQueryObserveOptions): Promise<LiveQuerySubscription> {
+    return this.#register(query, { kind: "observer", options, delivered: false, closed: false });
+  }
+
+  /** Registration and cleanup use one ownership path for observers and result subscribers. */
+  async #register(query: LiveQueryInput, subscriber: Subscriber): Promise<LiveQuerySubscription> {
     this.#throwIfClosed();
     this.#reserveSubscription();
     let group: QueryGroup | undefined;
-    let subscriber: ObserverSubscriber | undefined;
+    let installed = false;
     try {
       const opened = await this.#getOrOpenGroup(query);
       group = opened.group;
       this.#throwIfClosed();
-      subscriber = {
-        kind: "observer",
-        options,
-        delivered: false,
-        closed: false,
-      };
       group.subscribers.add(subscriber);
-      await this.#settleGroup(group, opened.fresh, options.suppressUnchanged === true);
+      group.pendingSubscriptions -= 1;
+      installed = true;
+      await this.#settleGroup(
+        group,
+        opened.fresh,
+        subscriber.kind === "result" || subscriber.options.suppressUnchanged === true,
+      );
       this.#throwIfClosed();
       if (!subscriber.delivered) {
-        this.#deliverInvalidation(subscriber, { ...group.seenProbe, initial: true });
+        if (subscriber.kind === "observer")
+          this.#deliverInvalidation(subscriber, { ...group.seenProbe, initial: true });
+        else {
+          const result = group.result ?? (await this.#executeGroup(group)).result;
+          this.#throwIfClosed();
+          if (!subscriber.closed)
+            this.#deliverResult(group, subscriber, result, { ...group.seenProbe, initial: true });
+        }
       }
     } catch (error) {
-      if (group !== undefined && subscriber !== undefined) {
+      if (group !== undefined && installed) {
         this.#removeSubscriber(group, subscriber, false);
       } else {
         this.#subscriptionCount -= 1;
-        if (group !== undefined) this.#removeEmptyGroup(group);
+        if (group !== undefined) {
+          group.pendingSubscriptions -= 1;
+          this.#removeEmptyGroup(group);
+        }
       }
       throw error;
     }
@@ -657,29 +617,39 @@ export class LiveQuerySet {
     subscriber.closed = true;
     this.#subscriptionCount -= 1;
     group.subscribers.delete(subscriber);
-    if (complete) callLiveCallback(() => subscriber.options.onComplete?.());
     this.#removeEmptyGroup(group);
+    if (complete) callLiveCallback(() => subscriber.options.onComplete?.());
   }
 
   #removeEmptyGroup(group: QueryGroup): void {
-    if (group.subscribers.size !== 0) return;
+    if (group.subscribers.size !== 0 || group.pendingSubscriptions !== 0) return;
     if (this.#groups.get(group.key) !== group) return;
     this.#groups.delete(group.key);
+    this.#retainedBytes -= group.retainedBytes;
+    group.retainedBytes = 0;
+    group.result = undefined;
+    group.maintenance = undefined;
     this.#lagging.delete(group);
     this.#unindexGroup(group, group.dependencies);
   }
 
   async #getOrOpenGroup(query: LiveQueryInput): Promise<{ group: QueryGroup; fresh: boolean }> {
+    // Capture ownership before the first await. A caller may reuse its parameter array or
+    // edit a compiled plan after subscribing; neither may change a group's fixed identity.
+    if (typeof query !== "string") query = structuredClone(query);
     const key = queryKey(query);
     const existing = this.#groups.get(key);
     if (existing !== undefined) {
       this.#stats.sharedExecutions += 1;
+      existing.pendingSubscriptions += 1;
       return { group: existing, fresh: false };
     }
     const opening = this.#opening.get(key);
     if (opening !== undefined) {
       this.#stats.sharedExecutions += 1;
-      return { group: await opening, fresh: false };
+      const group = await opening;
+      group.pendingSubscriptions += 1;
+      return { group, fresh: false };
     }
     if (this.#groups.size + this.#opening.size >= this.#maxGroups) {
       throw new LiveQueryLimitError("group", this.#maxGroups);
@@ -687,7 +657,9 @@ export class LiveQuerySet {
     const created = this.#openGroup(key, query);
     this.#opening.set(key, created);
     try {
-      return { group: await created, fresh: true };
+      const group = await created;
+      group.pendingSubscriptions += 1;
+      return { group, fresh: true };
     } finally {
       this.#opening.delete(key);
     }
@@ -700,6 +672,7 @@ export class LiveQuerySet {
       query,
       dependencies,
       subscribers: new Set(),
+      pendingSubscriptions: 0,
       seenProbe: after,
       result: undefined,
       retainedBytes: 0,
@@ -776,6 +749,7 @@ export class LiveQuerySet {
       let executed: QueryResult | undefined;
       let maintenance: unknown;
       let retainedBytes: number | undefined;
+      let candidate: LiveMaintainedExecution | undefined;
       try {
         if (
           this.#incremental &&
@@ -785,6 +759,7 @@ export class LiveQuerySet {
           const maintained = await this.#host.executeMaintainable(group.query, context);
           if (maintained === undefined) group.unmaintainable = true;
           else {
+            candidate = maintained;
             executed = maintained.result;
             maintenance = maintained.state;
             retainedBytes = maintained.retainedBytes;
@@ -797,7 +772,9 @@ export class LiveQuerySet {
       const previous = group.result;
       const changed = previous === undefined || !sameResult(previous, executed);
       // The host hands over a result nobody else holds, so the set retains it as it is.
-      this.#retain(group, executed, maintenance, retainedBytes);
+      this.#retain(group, executed, maintenance, retainedBytes, candidate);
+      if (candidate !== undefined && context !== undefined && groupMemoizes(group, changed))
+        await this.#memoizeGroup(group, executed, context.probe);
       return { result: executed, changed };
     })();
     group.execution = execution;
@@ -808,18 +785,43 @@ export class LiveQuerySet {
     }
   }
 
-  #retain(group: QueryGroup, result: QueryResult, state: unknown, hint?: number): void {
-    const bytes = Math.max(
-      queryResultRetainedBytes(result) + result.rows.length * 48,
-      hint ?? (state === group.maintenance ? group.retainedBytes : 0),
-    );
-    let total = bytes;
-    for (const other of this.#groups.values()) if (other !== group) total += other.retainedBytes;
-    if (!Number.isSafeInteger(total) || total > this.#maxRetainedBytes)
+  async #memoizeGroup(group: QueryGroup, result: QueryResult, probe: CatalogProbe): Promise<void> {
+    if (this.#closed || this.#groups.get(group.key) !== group) return;
+    try {
+      await this.#host.memoize?.(group.query, result, probe);
+    } catch {
+      // Memo publication is optional. Storage failure here cannot invalidate an accepted result.
+    }
+  }
+
+  #retain(
+    group: QueryGroup,
+    result: QueryResult,
+    state: unknown,
+    hint?: number,
+    candidate?: LiveMaintainedExecution,
+  ): void {
+    if (this.#closed || this.#groups.get(group.key) !== group) return;
+    // Hosts supplying a cost account for both result and state. A no-op patch can reuse its
+    // previous charge; full executions without a cost are measured at this boundary.
+    const bytes =
+      hint ??
+      (result === group.result && state === group.maintenance
+        ? group.retainedBytes
+        : queryResultRetainedBytes(result) + result.rows.length * 48);
+    const total = this.#retainedBytes - group.retainedBytes + bytes;
+    if (
+      !Number.isSafeInteger(bytes) ||
+      bytes < 0 ||
+      !Number.isSafeInteger(total) ||
+      total > this.#maxRetainedBytes
+    )
       throw new LiveQueryLimitError("byte", this.#maxRetainedBytes);
+    if (candidate !== undefined) acceptLiveExecution(candidate);
     group.result = result;
     group.maintenance = state;
     group.retainedBytes = bytes;
+    this.#retainedBytes = total;
   }
 
   async #acquireExecutionSlot(): Promise<void> {
@@ -887,7 +889,15 @@ export class LiveQuerySet {
         verdict.declined = true;
         return { result: retained, changed: false };
       }
-      this.#retain(group, maintained.result, maintained.state, maintained.retainedBytes);
+      this.#retain(
+        group,
+        maintained.result,
+        maintained.state,
+        maintained.retainedBytes,
+        maintained,
+      );
+      if (groupMemoizes(group, maintained.changed))
+        await this.#memoizeGroup(group, maintained.result, probe);
       return {
         result: maintained.result,
         changed: maintained.changed,
@@ -920,7 +930,7 @@ export class LiveQuerySet {
     subscriber.options.onChange(
       this.#sharedResults || subscriber.options.sharedResults === true
         ? result
-        : cloneResult(result),
+        : copyQueryResult(result),
       retained !== undefined && consecutive && !delivery.initial
         ? { ...delivery, retained }
         : delivery,
@@ -952,11 +962,16 @@ export class LiveQuerySet {
     this.#channel?.removeEventListener("message", this.#channelListener);
     if (this.#ownsChannel) this.#channel?.close?.();
     if (this.#pollTimer !== undefined) clearInterval(this.#pollTimer);
+    if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     const groups = [...this.#groups.values()];
     this.#groups.clear();
+    this.#retainedBytes = 0;
     this.#groupsByTable.clear();
     this.#lagging.clear();
     for (const group of groups) {
+      group.result = undefined;
+      group.maintenance = undefined;
+      group.retainedBytes = 0;
       const subscribers = [...group.subscribers];
       group.subscribers.clear();
       for (const subscriber of subscribers) {
@@ -972,16 +987,33 @@ export class LiveQuerySet {
   #hint(): void {
     if (this.#closed) return;
     this.#stats.hints += 1;
+    if (this.#retryTimer !== undefined) return;
     if (this.#sweepQueued) return;
     this.#sweepQueued = true;
     this.#sweepChain = this.#sweepChain.then(async () => {
       this.#sweepQueued = false;
+      if (this.#retryTimer !== undefined) return;
       try {
         await this.#sweep();
+        this.#retryDelayMs = 100;
       } catch (error) {
+        if (error instanceof OpfsCoordinationError) {
+          this.#retrySweep();
+          return;
+        }
         for (const group of this.#groups.values()) this.#notifyGroupError(group, error);
       }
     });
+  }
+
+  /** One timer per set; poll and commit hints cannot bypass coordination backpressure. */
+  #retrySweep(): void {
+    if (this.#closed || this.#groups.size === 0 || this.#retryTimer !== undefined) return;
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#hint();
+    }, this.#retryDelayMs);
+    this.#retryDelayMs = Math.min(this.#retryDelayMs * 2, 5_000);
   }
 
   #stillOpen(): boolean {
@@ -1074,6 +1106,7 @@ export class LiveQuerySet {
         await this.#refreshDependencies(group);
       } catch (error) {
         this.#lagging.add(group);
+        if (error instanceof OpfsCoordinationError) throw error;
         this.#notifyGroupError(group, error);
         return;
       }
@@ -1191,6 +1224,7 @@ export class LiveQuerySet {
     } catch (error) {
       // The group stays lagging. A refresh with no newer commit retries it.
       this.#lagging.add(group);
+      if (error instanceof OpfsCoordinationError) throw error;
       this.#notifyGroupError(group, error);
     }
   }
@@ -1230,4 +1264,3 @@ export class LiveQuerySet {
     }
   }
 }
-import { copyDate, dateMilliseconds } from "../date-value.js";

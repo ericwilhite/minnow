@@ -676,6 +676,8 @@ describe("statement transactions", () => {
     await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
     // Nothing touches it for longer than the idle bound: the scope ends itself.
     await new Promise((resolve) => setTimeout(resolve, 40));
+    await expect(database.query("SELECT COUNT(*) AS n FROM t")).rejects.toThrow(/expired/);
+    await database.execute("ROLLBACK");
     expect((await database.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 0 }]);
     // And the next BEGIN is allowed, because the abandoned one is no longer open.
     await database.execute("BEGIN");

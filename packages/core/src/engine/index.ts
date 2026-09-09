@@ -50,3 +50,9 @@ export type {
   QuerySpillStore,
 } from "./vector.js";
 export type { MinnowSqlDriver, MinnowSqlExecutor } from "./sql-driver.js";
+
+export {
+  OpfsCoordinationError,
+  OpfsDatabaseInUseError,
+  OpfsUncertainOutcomeError,
+} from "../storage/types.js";

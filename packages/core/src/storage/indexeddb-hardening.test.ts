@@ -1,5 +1,5 @@
-import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it, vi } from "vitest";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { crc32, encodeBlock } from "../block-format/index.js";
 import {
   decodeSnapshotMetadataItems,
@@ -59,6 +59,10 @@ import {
   type TableRecord,
 } from "./index.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
+
+// Exercise native batched IndexedDB reads; other engine suites retain the injected-factory fallback.
+beforeEach(() => vi.stubGlobal("IDBKeyRange", IDBKeyRange));
+afterEach(() => vi.unstubAllGlobals());
 
 vi.setConfig({ testTimeout: heavyTestTimeout(300_000) });
 

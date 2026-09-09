@@ -5,6 +5,41 @@
 
 type ErrorValue = boolean | number | string | Date;
 
+/** An idle SQL transaction rolled back; later statements must not become autocommits. */
+export class TransactionExpiredError extends Error {
+  override readonly name = "TransactionExpiredError";
+
+  constructor() {
+    super("The SQL transaction expired and rolled back; issue ROLLBACK or BEGIN before continuing");
+  }
+}
+
+/** The worker stopped responding within the configured request deadline. */
+export class DatabaseWorkerTimeoutError extends Error {
+  override readonly name = "DatabaseWorkerTimeoutError";
+  constructor(
+    readonly method: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`Database worker ${method} did not respond within ${String(timeoutMs)}ms`);
+  }
+}
+
+/** A transport failure cannot prove whether this operation published before its reply was lost. */
+export class DatabaseWorkerOutcomeUnknownError extends Error {
+  override readonly name = "DatabaseWorkerOutcomeUnknownError";
+  constructor(
+    readonly method: string,
+    readonly requestId: string,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Database worker outcome is unknown for ${method}; reconcile durable application IDs before retrying`,
+      options,
+    );
+  }
+}
+
 function formatValue(value: ErrorValue): string {
   return value instanceof Date ? dateIsoString(value) : String(value);
 }

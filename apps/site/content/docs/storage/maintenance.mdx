@@ -1,6 +1,6 @@
 ---
 title: Compaction and collection
-description: Merging small segments and reclaiming superseded blocks, without blocking anything.
+description: Merging small segments and reclaiming superseded blocks with resumable background work.
 ---
 
 Writes append. A table written in many small batches ends up as many small segments, and every
@@ -29,7 +29,7 @@ rather than the fold racing every write for the manifest.
 Setting `autoCompact: false` transfers that responsibility to the caller. Small-write segments
 then accumulate, so scans become progressively slower and writes eventually meet the fixed
 segment-history ceiling unless the application drives `compactTable` or `compactTableStep`. To
-drive it yourself — a slice per idle callback, so it never holds the main thread:
+drive it yourself with a slice per idle callback. Use a worker to keep encoding off the main thread:
 
 ```ts
 const db = new MinnowDatabase(store, { autoCompact: false });
@@ -126,6 +126,11 @@ non-terminal job still roots it. That is what makes collection safe while a repo
 [snapshot scope](/docs/engine/transactions#stable-reads) pins its version, and collection skips
 everything that version needs.
 
+Isolation does not eliminate storage contention. IndexedDB collection validates retained records
+and deletes candidates in one read/write transaction; foreground operations can wait for it.
+Validation uses bounded batches and reuses ownership information within that transaction, but a
+candidate-count limit is not a wall-clock deadline. See [IndexedDB collection cost](/docs/storage/indexeddb#collection-cost).
+
 The completed pass also removes expired reader leases, abandoned query-spill owners and pages,
 old manifest summaries below the earliest readable checkpoint, and finished maintenance-job
 records beyond the small diagnostic tail. Retired block intervals live in a separate paged
@@ -135,6 +140,13 @@ not just block-byte bounds: normal
 commits, cancelled folds, and crashed readers do not leave one permanent metadata record per
 event. Segment discovery reads bounded `listSegmentPage()` windows directly, so reclaiming old
 segment and transaction records does not depend on keeping an unbounded compaction-job history.
+Segment discovery reads at most 64 records per page, batches owner lookups, and persists the
+last visited ID once per page. A page never exceeds its remaining candidate budget.
+A retained segment record protects every block it references, including retired history. Collection
+removes the segment before its blocks, or removes both in the same atomic step. A block nominated
+before its segment is retained for a later pass, keeping recovery valid between cleanup steps.
+New discovery cycles visit segments before retired blocks to avoid spending an extra cycle on
+blocks still protected by segment metadata. Existing durable discovery cursors remain resumable.
 Only one planned/running collection job may exist. Its durable cursor advances across the
 ID-ordered retired-provenance and segment pages, so a large obsolete history is read once across
 bounded steps and reopen—not rescanned from its first ID on every step.
@@ -143,7 +155,11 @@ It runs automatically by default. `autoCollect` is independent of `autoCompact`:
 must not also disable reclamation of manifests, expired leases, abandoned transactions, spill,
 or job records. A pass follows every background fold, runs every 64 commits, and runs a minute
 after open or the last commit so a reopened, read-only tab still shrinks. A large backlog schedules another
-bounded pass until it settles instead of stopping at one internal batch. Background passes keep
+bounded pass until its durable discovery cursor finishes instead of stopping at one internal batch.
+After a complete discovery cycle, collection waits for the next commit, compaction, or idle trigger;
+it does not repeatedly scan retained history merely because the last cycle reclaimed something.
+A continuation keeps its destination while paging retained manifests, so a long history cannot
+restart completed segment discovery and starve later cleanup phases. Background passes keep
 the 64 most recent versions readable for up to a minute, so `query({ version })` on a version you
 were just handed still finds it. An explicit `collectGarbage()` reclaims everything no lease or
 job pins; pass `retainRecentVersions` to keep a window. It first reconciles compaction jobs the
@@ -159,7 +175,7 @@ first assists collection and, if that pass still reclaims nothing, throws
 
 Active writers are durable but not immortal. A one-stage explicit scope starts with a renewable
 reader lease on its pre-scope manifest, so compaction and collection cannot reclaim that snapshot
-while its only staged batch is still process-local. When a second stage makes the journal durable,
+while its only staged batch is still process-local. When staged artifacts exceed one local batch and make the journal durable,
 ownership passes without a gap to the transaction record. The live scope renews whichever owner is
 current, including while an awaited `write()` callback or SQL transaction is idle. A deadline that
 has passed cannot be resurrected. Collection atomically races record renewal against expiry-abort,

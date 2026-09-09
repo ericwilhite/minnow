@@ -110,6 +110,8 @@ export interface VectorWindow {
 }
 
 interface VectorBase {
+  /** Present on immutable block vectors, so keyed reads need no decoded-block lookup. */
+  readonly nullCount?: number;
   readonly validity: Uint8Array;
   readonly length: number;
   readonly window?: VectorWindow;
@@ -654,7 +656,10 @@ export function createColumnarTable(
     if (column.values.length !== rowCount) {
       throw new Error(`Column row count mismatch: ${name}.${columnName}`);
     }
-    vectors.set(columnName, createVector(column));
+    vectors.set(
+      columnName,
+      createColumnVector(column.type, rowCount, (index) => column.values[index]),
+    );
   }
   if (uniqueKey !== undefined && !vectors.has(uniqueKey)) {
     throw new Error(`Unique-key vector is missing: ${name}.${uniqueKey}`);
@@ -779,19 +784,23 @@ export function prepareVectorQuery(
   }
 }
 
-function createVector(input: ColumnarColumnInput): ColumnVector {
-  validateVectorType(input.type);
-  const length = input.values.length;
+/** Builds directly from a row/column reader without retaining an intermediate value array. */
+export function createColumnVector(
+  type: VectorType,
+  length: number,
+  valueAt: (index: number) => unknown,
+): ColumnVector {
+  validateVectorType(type);
   const validity = new Uint8Array(Math.ceil(length / 8));
-  if (input.type === "string") {
+  if (type === "string") {
     const dictionary: string[] = [];
     const dictionaryIndex = new Map<string, number>();
     const codes = new Uint32Array(length);
     codes.fill(NULL_STRING_CODE);
     for (let index = 0; index < length; index += 1) {
-      const value = input.values[index];
+      const value = valueAt(index);
       if (value === null) continue;
-      if (typeof value !== "string") throw vectorTypeError(input.type, value);
+      if (typeof value !== "string") throw vectorTypeError(type, value);
       setValid(validity, index);
       let code = dictionaryIndex.get(value);
       if (code === undefined) {
@@ -803,12 +812,12 @@ function createVector(input: ColumnarColumnInput): ColumnVector {
     }
     return { kind: "string", length, validity, codes, dictionary };
   }
-  if (input.type === "boolean") {
+  if (type === "boolean") {
     const values = new Uint8Array(length);
     for (let index = 0; index < length; index += 1) {
-      const value = input.values[index];
+      const value = valueAt(index);
       if (value === null) continue;
-      if (typeof value !== "boolean") throw vectorTypeError(input.type, value);
+      if (typeof value !== "boolean") throw vectorTypeError(type, value);
       setValid(validity, index);
       values[index] = value ? 1 : 0;
     }
@@ -816,21 +825,21 @@ function createVector(input: ColumnarColumnInput): ColumnVector {
   }
   const values = new Float64Array(length);
   for (let index = 0; index < length; index += 1) {
-    const value = input.values[index];
+    const value = valueAt(index);
     if (value === null) continue;
     const numericValue =
-      input.type === "datetime"
+      type === "datetime"
         ? value instanceof Date
           ? dateMilliseconds(value)
           : Number.NaN
         : typeof value === "number"
           ? value
           : Number.NaN;
-    if (!Number.isFinite(numericValue)) throw vectorTypeError(input.type, value);
+    if (!Number.isFinite(numericValue)) throw vectorTypeError(type, value);
     setValid(validity, index);
     values[index] = numericValue;
   }
-  return input.type === "datetime"
+  return type === "datetime"
     ? { kind: "datetime", length, validity, values }
     : { kind: "number", length, validity, values };
 }

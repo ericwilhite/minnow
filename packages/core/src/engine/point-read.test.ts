@@ -7,11 +7,12 @@
  * back (mutation histories, views, type coercion, NULL parameters) and the canonical errors
  * the ordinary path owns.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase, type QueryOptions } from "./database.js";
 import type { QueryValue } from "./query.js";
 import { pointReadTestHooks } from "./point-read.js";
+import { ArtifactCache } from "./artifact-cache.js";
 
 afterEach(() => {
   pointReadTestHooks.disabled = false;
@@ -130,6 +131,125 @@ async function domainDatabase(options: { rowsPerBlock?: number } = {}): Promise<
 }
 
 describe("point-read fast path", () => {
+  it("renews and replaces reader leases even when every block vector is cached", async () => {
+    let now = Date.now();
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { now: () => new Date(now), autoCompact: false });
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)");
+      await database.execute("INSERT INTO t VALUES (1,10)");
+      const read = () =>
+        database.query("SELECT x FROM t WHERE id=?", { params: [1], memoize: false });
+      expect((await read()).rows).toEqual([{ x: 10 }]);
+      const first = (await store.listLeases()).find((lease) => lease.kind === "reader");
+      expect(first).toBeDefined();
+      now += 45000;
+      expect((await read()).rows).toEqual([{ x: 10 }]);
+      const renewed = (await store.listLeases()).find((lease) => lease.id === first?.id);
+      expect(Date.parse(renewed?.expiresAt ?? "")).toBeGreaterThan(
+        Date.parse(first?.expiresAt ?? ""),
+      );
+      now += 120000;
+      expect((await read()).rows).toEqual([{ x: 10 }]);
+      const leases = await store.listLeases();
+      expect(
+        leases.some(
+          (lease) =>
+            lease.kind === "reader" && lease.id !== first?.id && Date.parse(lease.expiresAt) > now,
+        ),
+      ).toBe(true);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it("reads warm block vectors without looking up decoded blocks", async () => {
+    const database = await scalarDatabase();
+    const sql = "SELECT email,score,joined FROM users WHERE email=?";
+    const options = { params: ["user-10@example.com"], memoize: false };
+    try {
+      const expected = await database.query(sql, options);
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- Called below with each cache instance as its receiver.
+      const original = ArtifactCache.prototype.get;
+      const lookup = vi.spyOn(ArtifactCache.prototype, "get").mockImplementation(function (
+        this: ArtifactCache,
+        key: string,
+      ) {
+        if (key.startsWith("dpb\0")) throw new Error("Warm point read looked up a decoded block");
+        return original.call(this, key);
+      });
+      try {
+        expect(await database.query(sql, options)).toEqual(expected);
+        // Different parameters share vectors, never a cached answer for the previous key.
+        expect(
+          (await database.query(sql, { ...options, params: ["user-11@example.com"] })).rows[0]
+            ?.score,
+        ).toBe(7);
+      } finally {
+        lookup.mockRestore();
+      }
+    } finally {
+      await database.close();
+    }
+  });
+
+  it.each([0, 512, 65536])(
+    "keeps vector reads exact through eviction and peer commits (pool=%s)",
+    async (bufferPoolBytes) => {
+      const store = new MemoryBlockStore();
+      const database = new MinnowDatabase(store, { bufferPoolBytes, autoCompact: false });
+      const peer = new MinnowDatabase(store, { autoCompact: false });
+      try {
+        await peer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)");
+        await peer.insertBatch(
+          "t",
+          Array.from({ length: 40 }, (_, id) => ({ id, x: `value-${String(id)}` })),
+        );
+        const sql = "SELECT id,x FROM t WHERE id=?";
+        for (const write of [
+          "UPDATE t SET x='changed' WHERE id=10",
+          "DELETE FROM t WHERE id=10",
+          "INSERT INTO t VALUES (10,'reinserted')",
+          "UPDATE t SET x=NULL WHERE id=10",
+        ]) {
+          await differential(database, sql, [10]);
+          await peer.execute(write);
+          await differential(database, sql, [10]);
+          expect(database.bufferPoolStats().usedBytes).toBeLessThanOrEqual(bufferPoolBytes);
+        }
+        await peer.compactTable("t");
+        await differential(database, sql, [10]);
+      } finally {
+        await peer.close();
+        await database.close();
+      }
+    },
+  );
+
+  it("keeps wide wildcard and explicit projections exact without retaining extra binding state", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    try {
+      const names = Array.from({ length: 64 }, (_, index) => `c${String(index)}`);
+      await database.execute(
+        `CREATE TABLE wide (id INTEGER PRIMARY KEY, ${names.map((name) => `${name} INTEGER`).join(",")})`,
+      );
+      await database.insertBatch("wide", [
+        Object.fromEntries([["id", 1], ...names.map((name, index) => [name, index])]),
+      ]);
+      for (const projection of ["*", names.join(","), names.slice().reverse().join(",")]) {
+        const { served, rows } = await differential(
+          database,
+          `SELECT ${projection} FROM wide WHERE id=?`,
+          [1],
+        );
+        expect(served).toBe(true);
+        expect(rows[0]?.c63).toBe(63);
+      }
+    } finally {
+      await database.close();
+    }
+  });
+
   it("serves a composite-key lookup identically to the ordinary executor", async () => {
     const database = await compositeDatabase();
     const { served, rows } = await differential(

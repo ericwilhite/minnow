@@ -89,7 +89,7 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
   cancellation frame; stats return as an ordered event before the result. Ordinary queries,
   cursor queries, buffered `execute()` statements, and reads inside `client.write()` support the
   same controls as the direct engine. The client and worker must speak the same protocol version
-  (6 since core 0.7.10); a mismatch fails every call loudly with "Unsupported protocol version"
+  (7 in core 0.9.0); a mismatch fails every call loudly with "Unsupported protocol version"
   rather than silently dropping a newer argument, so deploy the client and worker from the same
   package build and make sure a cached older worker cannot outlive its client.
 - **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and
@@ -117,10 +117,29 @@ controller.abort();
 await pending; // rejects with an AbortError
 ```
 
-Cancellation is checked between bounded execution and storage batches. It returns no partial
-result, releases the reader lease, and removes the query's temporary spill owner before rejecting.
+The client rejects a cancelled read promptly, even if its worker cannot respond. Worker cleanup
+then cooperatively releases leases and temporary spill pages; local rejection does not acknowledge
+that cleanup. Direct-engine cancellation joins cleanup before rejecting. Neither returns a partial
+query result. Cancellation is checked between bounded execution and storage batches.
 It cannot preempt JavaScript in the middle of one synchronous batch; keep the engine in a worker
 when a large batch must not share the UI thread.
+
+Each RPC has a deadline: `requestTimeoutMs` on the client defaults to 60,000 ms and also covers
+startup. Increase it for intentionally long imports or queries. Expiry closes the connection to
+further work and rejects pending calls with `DatabaseWorkerTimeoutError`, or
+`DatabaseWorkerOutcomeUnknownError` when an operation could have published before its reply was
+lost. Transport failures and cancellation of a dispatched mutation use the same unknown-outcome
+error. The client never replays a mutation automatically. Reopen a client and reconcile a durable
+application ID (for example, a unique sale ID) before retrying; a lost reply is not proof of rollback.
+The [checkout recovery pattern](/docs/engine/transactions#recovering-an-interrupted-checkout)
+keeps that identity durable across a browser restart and handles concurrent retries.
+
+`client.close({ terminateWorker: true, timeoutMs: 5000 })` attempts graceful disposal, then
+terminates the worker even if disposal times out. The timeout defaults to five seconds. A rejected
+close is not a successful flush; pending buffered writes may have an unknown outcome. Repeated
+close calls share one promise. Explicit `client.write()` callbacks are not replayed, and their
+parallel session calls run in order before commit. Snapshot queries use the live worker scope, so
+an expired or closed scope cannot silently read through a replacement lease.
 
 Client adapters can wrap the same worker client because it implements `MinnowSqlDriver`. The
 [Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker
@@ -196,8 +215,8 @@ The generic entry loads each storage adapter with a dynamic `import()` when the 
 frame asks for it. That downloads only the store the worker opens when the bundler splits worker
 code into chunks — esbuild `--splitting`, Vite with `worker: { format: "es" }`, webpack 5. A
 bundler that cannot split a worker inlines all three adapters: with Vite's default `iife` worker
-format the generic worker is about 1.5 MB minified (419 KB gzipped), against about 1.2 MB
-(340 KB gzipped) for the IndexedDB store alone.
+format the generic worker is about 1.5 MB minified (422 KB gzipped), against about 1.2 MB
+(343 KB gzipped) for the IndexedDB store alone.
 
 When the worker always opens the same kind of store, import the entry that bundles only that
 store:
@@ -229,36 +248,39 @@ ships one worker file per store and picks the file before constructing the clien
 ## Custom worker entries
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
-`opfs`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`,
+`opfs`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`, `coordinateWrites`,
 `spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, `bufferPoolBytes`,
 `executionMemoryBudgetBytes`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
 It loads each storage adapter only when its descriptor asks for it; whether that becomes a
-separate download depends on the bundler, as described [above](#per-store-worker-entries). For
-anything a message can't carry — a custom `BlockStore`, deterministic `now`/`createId` — write
-your own entry:
+separate download depends on the bundler, as described [above](#per-store-worker-entries). For a custom store, register the worker host synchronously and open the store inside its
+factory. This installs the init listener before asynchronous storage work begins:
 
 ```ts
 // my-worker.ts
-import { MinnowDatabase } from "@minnowdb/core";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
-import { exposeDatabase } from "@minnowdb/core/worker-host";
+import { attachDatabaseWorker, singleStoreFactory } from "@minnowdb/core/worker-host";
 
-const store = await IndexedDbBlockStore.open({ name: "app-db", durability: "strict" });
-const databaseOptions = { compression: "gzip", transactionIdleTimeoutMs: 30_000 } as const;
-exposeDatabase(new MinnowDatabase(store, databaseOptions), self, {
-  // Keep the custom host's abandoned-handle deadline aligned with its database.
-  writeHandleIdleTimeoutMs: databaseOptions.transactionIdleTimeoutMs,
-  onDispose: () => store.close(),
+attachDatabaseWorker(self, {
+  createStore: singleStoreFactory("indexeddb", async () =>
+    IndexedDbBlockStore.open({ name: "app-db", durability: "strict" }),
+  ),
 });
 ```
 
-`exposeDatabase()` speaks the same protocol as the stock entry, so the main-thread code doesn't
-change. To keep the stock entry's init-frame handling but own the store's open call, pass
-`attachDatabaseWorker(self, { createStore })` a `WorkerStoreFactory` instead;
-`singleStoreFactory(kind, open)` builds one that refuses every other kind, as the per-store
-entries do. On disposal it closes the engine before calling `onDispose`, so the hook only owns the
-injected store. Its `writeHandleIdleTimeoutMs` option defaults to 30 seconds; pass the same value
-as the constructed database's `transactionIdleTimeoutMs` when you customize either deadline.
+The client still sends its database options in the init frame. `singleStoreFactory()` refuses
+other store kinds, as the per-store entries do. Disposal closes the engine and then the store.
+
+For function-valued engine options such as deterministic `now`/`createId`, construct a
+`MinnowDatabase` yourself and pass it to `exposeDatabase(database, self, options)`. If opening
+its store requires an `await`, establish an explicit ready handshake: the worker sends a ready
+message **after** calling `exposeDatabase`, and the main thread waits for that message **before**
+constructing `MinnowDatabaseClient`. Opening storage before installing a listener can otherwise
+lose an early init frame. `attachDatabaseWorker` handles this ordering for the factory example
+above.
+
+`exposeDatabase` closes the engine before calling its `onDispose` hook, so that hook only owns
+the injected store. Its `writeHandleIdleTimeoutMs` option defaults to 30 seconds; pass the same
+value as the constructed database's `transactionIdleTimeoutMs` when customizing either deadline.
 Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe RPC where
 each handle answers a fixed list of methods — never arbitrary property access.
 

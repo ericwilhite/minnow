@@ -7,7 +7,7 @@ import type {
 } from "../plan/model.js";
 import { QueryMemoryContext } from "./memory.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
-import { compareSqlValues } from "./sql-semantics.js";
+import { compareSqlValues, defineSqlResultProperty } from "./sql-semantics.js";
 import { exactNumericBinary, exactNumericValue, isExactNumeric } from "./sql-domains.js";
 import { throwIfAborted } from "./cancellation.js";
 
@@ -313,13 +313,10 @@ function* applyPartition(
       }
     }
     const row = rows[indexes[position] ?? -1];
-    if (row !== undefined)
-      Object.defineProperty(row, window.alias, {
-        value,
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
+    if (row !== undefined) {
+      if (window.alias in row) defineSqlResultProperty(row, window.alias, value);
+      else row[window.alias] = value;
+    }
   }
 }
 
@@ -360,7 +357,21 @@ function* windowSteps(
           ...window.partitionAliases,
           ...window.orderAliases.map(({ alias }) => alias),
         ];
-        work.tally(rows.length * (48 + aliases.length * 40), "Window sort and partition buffers");
+        // ROWS frames and positional functions do not inspect peers. Keep their ordered
+        // indexes, but omit the three peer arrays and the per-row peer comparisons.
+        const peers = group.some(
+          (member) =>
+            !["ROW_NUMBER", "NTILE", "LAG", "LEAD"].includes(member.name) &&
+            (["RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST"].includes(member.name) ||
+              member.frame?.unit !== "rows" ||
+              member.frame.exclude === "group" ||
+              member.frame.exclude === "ties"),
+        );
+        const range = group.some((member) => member.frame?.unit === "range");
+        work.tally(
+          rows.length * (20 + (peers ? 20 : 0) + (range ? 8 : 0) + aliases.length * 40),
+          "Window sort and partition buffers",
+        );
         const columns = aliases.map((alias) =>
           buildSortKeyColumn(rows.length, (index) => rows[index]?.[alias] ?? null),
         );
@@ -389,17 +400,19 @@ function* windowSteps(
           const size = end - start;
           const partition: Partition = {
             indexes: indexes.subarray(start, end),
-            peerStart: new Int32Array(size),
-            peerEnd: new Int32Array(size),
-            groupOrdinal: new Int32Array(size),
+            peerStart: new Int32Array(peers ? size : 0),
+            peerEnd: new Int32Array(peers ? size : 0),
+            groupOrdinal: new Int32Array(peers ? size : 0),
             groupStarts: [],
-            orderValues: Array.from(
-              indexes.subarray(start, end),
-              (index) => rows[index]?.[window.orderAliases[0]?.alias ?? ""] ?? null,
-            ),
+            orderValues: range
+              ? Array.from(
+                  indexes.subarray(start, end),
+                  (index) => rows[index]?.[window.orderAliases[0]?.alias ?? ""] ?? null,
+                )
+              : [],
           };
           let begin = 0;
-          for (let position = 1; position <= size; position += 1) {
+          for (let position = 1; peers && position <= size; position += 1) {
             if (position % 2048 === 0) yield;
             if (
               position === size ||

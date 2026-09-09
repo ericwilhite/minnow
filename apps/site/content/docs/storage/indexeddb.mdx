@@ -162,12 +162,29 @@ collectable. The checked ledgers are updated in the same IndexedDB transaction a
 full integrity mode recomputes them from the underlying stores and reports a mismatch as
 corruption.
 
+## Collection cost
+
+Collection retains corruption and snapshot-pin checks inside the same atomic transaction as
+reclamation. On browsers, metadata validation reads at most 128 records per batch and pipelines
+block-presence checks. A step builds its pinned-version set once and keeps at most 4,096 cached
+ownership roots; overflow falls back to exact probes. That cache lasts only for the current
+IndexedDB transaction, so another tab cannot make a cached root decision stale.
+
+The candidate item limit bounds reclamation, not every validation read. Validation still depends
+on retained history, and readers and writes can wait behind a collection transaction. Measure
+sustained writes with maintenance enabled on the devices you support; the memory adapter's
+throughput does not describe strict IndexedDB latency.
+
+Table listing reads only table metadata keys. Full snapshot pin and compaction-source checks
+also use bounded read batches, so each retained block does not require a separate cursor turn.
+
 ## Multiple tabs
 
-Several tabs may open the same database at once. Readers never block writers; competing writers
-conflict, rebase, and retry. No coordination channel is involved — correctness comes from the
-storage transactions themselves, so it holds even when `BroadcastChannel` is unavailable or a
-message is lost.
+Several tabs may open the same database at once. Engine snapshots keep reads consistent while
+other connections publish. Physical IndexedDB operations can queue behind overlapping read/write
+transactions, including collection. Autocommit admission uses Web Locks when available to reduce
+conflicts; storage compare-and-swap remains the correctness boundary when coordination is absent
+or a message is lost. Explicit write scopes report conflicts for the application to handle.
 
 When a newer build requests an IndexedDB schema version, every Minnow connection closes itself on
 the browser's `versionchange` event so it cannot strand the open. If a non-cooperating connection
@@ -175,6 +192,9 @@ blocks the open, `open()` rejects with `IndexedDbSchemaUpgradeBlockedError` inst
 forever. The error carries the database name and old/requested versions; close the older tab and
 retry. A request that already reported this error is marked abandoned, so it cannot wake later and
 silently upgrade or rebuild the database after its caller has moved on.
+
+Transaction completion is observed before requests are submitted. An abort remains observable
+even if quota or request-failure processing resumes after the abort event.
 
 ## Schema compatibility and recovery
 

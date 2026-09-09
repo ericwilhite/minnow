@@ -8,6 +8,93 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.9.0 — September 9, 2026
+
+Published packages: `@minnowdb/core@0.9.0`, `@minnowdb/kysely@0.4.12`,
+`@minnowdb/devtools@0.3.2`, and `@minnowdb/export@0.1.1`.
+
+Stored formats are unchanged; no stored-data migration is needed. Worker protocol is now 7:
+deploy matching client and worker builds. Patch delivery remains opt-in per subscription; ordinary
+full-result delivery remains supported. Close tabs running older builds before deleting an OPFS
+store: coordinated deletion requires Web Locks and all connections must participate in the new
+lifetime-lock protocol. Ordinary OPFS reads and writes retain their existing requirements.
+
+- OPFS leader discovery exhaustion and request queue overload now throw root-exported
+  `OpfsCoordinationError`, with a structured `reason` and `method`. Its identity survives OPFS
+  and database worker RPC. `migrate()` propagates it so boot code can retry without deleting data.
+  `OpfsUncertainOutcomeError` remains separate and is also root-exported: reconcile a potentially
+  committed mutation before retrying it.
+- Established live subscriptions retain their last good result through OPFS coordination failures
+  and retry automatically, with one backoff timer per set capped at five seconds. Query, schema,
+  corruption, and uncertain mutation errors still surface. Recovery needs no resubscription.
+- `deleteOpfsDatabase()` refuses with root-exported `OpfsDatabaseInUseError` before removing files
+  when a participating connection is open, including an idle follower. Openers wait while deletion
+  owns the exclusive lock. Deletion without Web Locks is refused.
+- Published core, Kysely, devtools, and export tarballs prepare their package contents before
+  packing; the consumer smoke test validates the packed artifacts.
+
+- Collection retains a block while any segment record still references it. Segments and their
+  blocks can be reclaimed together in one atomic step; separately planned cleanup pages cannot
+  leave dangling segment references that prevent OPFS recovery. This prevents new damage; it
+  does not repair stores already left with missing referenced blocks. Discovery visits retired
+  segments before blocks to avoid repeating protected block pages. Automatic collection
+  follows pending discovery cursors even when a page contains only protected artifacts. Segment
+  discovery batches up to 64 records and their owners instead of persisting one cursor update
+  per segment; restart and candidate bounds remain enforced. A completed discovery cycle waits
+  for a fresh scheduling trigger instead of repeatedly scanning retained history during writes.
+  Later-phase destinations survive every retained-manifest page; histories over 64 manifests
+  no longer restart segment discovery and starve later cleanup phases.
+- IndexedDB collection validates retained records in 128-record batches and reuses bounded
+  transaction-local ownership sets. Atomic corruption checks, leases, and active-write roots
+  remain in force; retained history still affects collection latency. Table listing reads its
+  own key range, and full snapshot pin and compaction-source checks use the same batch reader.
+- OPFS follower reads queue within existing request limits while waiting for bounded response
+  capacity. Bursts of small metadata reads no longer fail just because three reads are executing.
+- IndexedDB observes transaction completion before submitting requests, so delayed failure
+  processing cannot miss an already-dispatched abort.
+- The checkout recovery guide describes durable intents, stable sale IDs, payload checks, and
+  reconciliation after a lost commit reply. Browser tests exercise recovery with foreign keys,
+  an index, and a stock-audit trigger.
+- Scalar subqueries in INSERT VALUES and trigger INSERT bodies read the transaction snapshot
+  and its staged writes. Autocommit retries recompute scalar subqueries after a competing commit.
+- OPFS reads cannot observe a tentative mutation after a refused WAL append. SQL idle expiry
+  remains failed until explicit acknowledgement, and transaction operations are ordered before commit.
+- Empty snapshots stay empty across the first commit. Runnable idle snapshots renew their leases;
+  close cancels idle scopes, closes paused cursors and exports, joins admitted storage work, and
+  rejects late operations.
+- Worker RPCs have configurable deadlines and prompt local read cancellation. Potentially published
+  mutations report an unknown outcome after transport loss; reconcile durable IDs before retrying.
+  Worker close attempts termination even when graceful disposal times out.
+- Buffered flush includes earlier queued adds and pending rows behind an in-flight flush. Small
+  multi-table writes share one bounded artifact batch; a three-table checkout uses six strict
+  IndexedDB write transactions instead of ten. Autocommit admission coordinates across instances
+  and, where available, tabs using Web Locks; `coordinateWrites: false` retains optimistic admission.
+
+- Packages omit internal declaration files that are unreachable from public type exports. Public
+  types and editor documentation remain available. Devtools compacts embedded CSS whitespace
+  when packed. The standalone live-query entry no longer loads SQL evaluators just to copy
+  result-boundary metadata; result ownership and conversion behavior are unchanged. These
+  packaging changes require no application changes and do not alter stored formats.
+- Live DISTINCT aggregates correctly fall back to full execution. Maintained NUMERIC ordering
+  preserves numeric semantics, and windows that grow beyond their retained margin correctly
+  refill after later deletions.
+- Result memo eligibility includes volatile functions in nested views. Subscriptions capture
+  mutable parameters, Dates, and compiled plans before asynchronous registration.
+- Closing the last active subscription preserves another registration already joining its group.
+  Closing an unused group releases its result and maintenance state even if its handle is retained.
+- Buffer pool accounting includes cache keys and fixed entry overhead. Aggregate patches stage
+  only changed contributions, preserve accepted state on failure, and update byte totals without
+  scanning the retained input. Ordinary patches reuse key tokens and update payload totals only
+  for changed rows.
+- Adapters can reuse accepted maintenance from the result memo. Worker `subscribePatches()`
+  transfers changed rows and retained positions after its initial reset, without retaining an
+  extra full result in the client.
+- Window execution skips unused peer buffers and comparisons for positional functions and
+  `ROWS` frames, while preserving peer preparation for ranking and exclusions. Derived output
+  builds column vectors directly from rows. Keyed reads reduce binding allocations for short
+  projections, read cached block vectors without redundant decoded-block lookups, and share
+  key-search logic across append and mutation histories.
+
 ## 0.8.0 — September 5, 2026
 
 Published packages: `@minnowdb/core@0.8.0`, `@minnowdb/kysely@0.4.11`,

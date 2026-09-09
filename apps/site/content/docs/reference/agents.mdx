@@ -123,6 +123,12 @@ machines: https://minnowdb.com/llms.txt
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
   This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
   releases reader leases, and drops resident caches.
+  Worker calls have a 60-second default `requestTimeoutMs`; close has a five-second default
+  `timeoutMs`. An unknown mutation outcome requires reconciliation by durable application ID,
+  never blind replay. Deploy matching client/worker builds (wire protocol 7 in core 0.9.0).
+- An idle SQL transaction rolls back and rejects subsequent statements with
+  `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. Keep transaction callbacks
+  short; readers use renewable leases, and a scope suspended past an expired lease fails explicitly.
 - For anything interactive, run the engine in a worker. Put
   `import "@minnowdb/core/worker"` in a local `db-worker.ts`, then pass
   `new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })` to
@@ -220,6 +226,14 @@ machines: https://minnowdb.com/llms.txt
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
+- OPFS coordination exhaustion and queue overload throw `OpfsCoordinationError` from
+  `@minnowdb/core`; `instanceof` survives worker RPC. Retry boot/migrate with bounded backoff;
+  never delete a database merely because migration rejected. Established live queries retain
+  their last good result and retry coordination errors automatically. An
+  `OpfsUncertainOutcomeError` needs reconciliation because its mutation may have committed.
+- OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
+  deletion while a current client is open. Close pre-0.9.0 clients too: they do not participate
+  in the deletion lock protocol.
 ```
 
 ## Why those rules
