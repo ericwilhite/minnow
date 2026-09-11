@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { OpfsLeader } from "./leader.js";
+import { heavyTestTimeout } from "../../engine/storage-test-helpers.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { deleteOpfsDatabase, OpfsBlockStore, OpfsDatabaseInUseError } from "./index.js";
+
+// Each refusal waits out the deletion grace period before it is reported.
+vi.setConfig({ testTimeout: heavyTestTimeout(30_000) });
 
 // Node 22 has no Web Locks; the browser suite also exercises this across real workers.
 describe.skipIf(
@@ -22,13 +26,25 @@ describe.skipIf(
       leader._crashForTests();
       follower._crashForTests();
     }
-    await vi.waitFor(() => deleteOpfsDatabase(options));
+    await deleteOpfsDatabase(options);
     expect(shim.readFileBytes(`minnowdb/${options.name}/wal`)).toBeUndefined();
     const reopened = await OpfsBlockStore.open(options);
     expect(await reopened.listTables()).toEqual([]);
     reopened._crashForTests();
-    await vi.waitFor(() => deleteOpfsDatabase(options));
-    await vi.waitFor(() => deleteOpfsDatabase(options));
+    await deleteOpfsDatabase(options);
+    await deleteOpfsDatabase(options);
+  });
+
+  it("waits for a closing leader to let go of its lock instead of refusing", async () => {
+    const shim = new MemoryOpfs();
+    const options = { name: `close-then-delete-${crypto.randomUUID()}`, root: shim.root };
+    const leader = await OpfsBlockStore.open(options);
+    expect(shim.readFileBytes(`minnowdb/${options.name}/wal`)).toBeDefined();
+    // close() returns before the leader has shut down and released the connection lock — the
+    // order a worker's dispose reply and a host's delete arrive in. No retry loop here.
+    leader.close();
+    await deleteOpfsDatabase(options);
+    expect(shim.readFileBytes(`minnowdb/${options.name}/wal`)).toBeUndefined();
   });
 
   it("keeps deletion blocked when close races a leadership handoff", async () => {
@@ -59,7 +75,7 @@ describe.skipIf(
       leader.close();
       await expect(deleteOpfsDatabase(options)).rejects.toBeInstanceOf(OpfsDatabaseInUseError);
       resume();
-      await vi.waitFor(() => deleteOpfsDatabase(options));
+      await deleteOpfsDatabase(options);
     } finally {
       resume();
       shutdown.mockRestore();
@@ -92,7 +108,7 @@ describe.skipIf(
       resume();
       post.mockRestore();
       shutdown.mockRestore();
-      await vi.waitFor(() => deleteOpfsDatabase(options));
+      await deleteOpfsDatabase(options);
     }
   });
 
@@ -121,13 +137,13 @@ describe.skipIf(
     release();
     await held;
     (await pending)._crashForTests();
-    await vi.waitFor(() => deleteOpfsDatabase(options));
+    await deleteOpfsDatabase(options);
     shim.setWriteFault(() => {
       throw new Error("injected open failure");
     });
     await expect(OpfsBlockStore.open(options)).rejects.toThrow("injected open failure");
     shim.setWriteFault(null);
-    await vi.waitFor(() => deleteOpfsDatabase(options));
+    await deleteOpfsDatabase(options);
   });
 });
 

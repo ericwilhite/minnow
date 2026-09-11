@@ -8,6 +8,22 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.9.1 — September 11, 2026
+
+Published packages: `@minnowdb/core@0.9.1`.
+
+Stored formats and the worker protocol are unchanged; no migration is needed.
+
+### Fixed
+
+- **Deleting an OPFS database right after closing it.** A connection releases its lock only once
+  its shutdown has closed its handles, which finishes after `close()` returns and after a
+  worker's dispose reply. `deleteOpfsDatabase()` checked the lock instantly, so a delete that
+  followed a close by a few milliseconds was refused with `OpfsDatabaseInUseError` as if a
+  connection were still open. Deletion now waits up to one second for a lock that is being let
+  go; a connection that stays open is still refused. The retry the storage guide asked for is
+  no longer needed.
+
 ## Devtools 0.3.3 — September 11, 2026
 
 Published packages: `@minnowdb/devtools@0.3.3`.

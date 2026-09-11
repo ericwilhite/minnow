@@ -109,8 +109,10 @@ space spelling out bigint values. Deleting the directory deletes the database â€
 `deleteOpfsDatabase({ name })` does exactly that, but only when no participating connection is open.
 It requires Web Locks, holds an exclusive deletion lock, and refuses with
 `OpfsDatabaseInUseError` before removing files if a leader or follower holds a shared connection
-lock. Openers wait until deletion finishes. Close every client and store first; if asynchronous
-store shutdown is still releasing handles, retry the in-use refusal after it completes.
+lock. Openers wait until deletion finishes. Close every client and store first. A connection
+releases its lock only after its shutdown has closed its handles, which finishes shortly after
+`close()` returns, so deletion waits up to one second for a lock that is being let go before it
+refuses. A refusal therefore means a connection is still open.
 
 Close tabs and workers running Minnow versions before 0.9.0 before deletion: those clients do not
 participate in this lock protocol. Normal reads and writes can still run without Web Locks;

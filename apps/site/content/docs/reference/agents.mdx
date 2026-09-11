@@ -232,8 +232,8 @@ machines: https://minnowdb.com/llms.txt
   their last good result and retry coordination errors automatically. An
   `OpfsUncertainOutcomeError` needs reconciliation because its mutation may have committed.
 - OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
-  deletion while a current client is open. Close pre-0.9.0 clients too: they do not participate
-  in the deletion lock protocol.
+  deletion while a current client is open; a client just closed is waited for, not refused. Close
+  pre-0.9.0 clients too: they do not participate in the deletion lock protocol.
 ```
 
 ## Why those rules

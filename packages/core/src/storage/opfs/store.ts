@@ -1246,6 +1246,15 @@ for (const method of RPC_METHODS) {
   });
 }
 
+/**
+ * How long deletion waits for a closing connection to let go of its lock. A store releases the
+ * lock only once its leader has shut down and its handles are closed, which finishes after
+ * `close()` returns and after a worker's dispose reply, so a delete that follows a close by a
+ * few milliseconds must not read the lingering lock as an open connection. A connection that is
+ * genuinely open holds the lock for its whole life, and is refused once the wait runs out.
+ */
+const DELETE_LOCK_WAIT_MS = 1_000;
+
 /** Removes every file of a database created by `OpfsBlockStore.open` under this name. */
 export async function deleteOpfsDatabase(options: {
   name: string;
@@ -1254,20 +1263,34 @@ export async function deleteOpfsDatabase(options: {
   const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
   const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
   if (locks === undefined) throw new Error("Deleting an OPFS database requires Web Locks");
-  await locks.request(
-    connectionLockName(options.name),
-    { mode: "exclusive", ifAvailable: true },
-    async (lock) => {
-      if (lock === null) throw new OpfsDatabaseInUseError(options.name);
-      const root = options.root ?? (await navigator.storage.getDirectory());
-      try {
-        const namespace = await root.getDirectoryHandle("minnowdb");
-        await namespace.removeEntry(encodedName, { recursive: true });
-      } catch (error) {
-        if (!isDomError(error, "NotFoundError")) throw error;
-      }
-    },
-  );
+  const abort = new AbortController();
+  const timer = setTimeout(() => {
+    abort.abort();
+  }, DELETE_LOCK_WAIT_MS);
+  try {
+    await locks.request(
+      connectionLockName(options.name),
+      { mode: "exclusive", signal: abort.signal },
+      async () => {
+        const root = options.root ?? (await navigator.storage.getDirectory());
+        try {
+          const namespace = await root.getDirectoryHandle("minnowdb");
+          await namespace.removeEntry(encodedName, { recursive: true });
+        } catch (error) {
+          if (!isDomError(error, "NotFoundError")) throw error;
+        }
+      },
+    );
+  } catch (error) {
+    // Aborting a request that was never granted rejects it; one granted before the abort runs
+    // to completion. So an abort here means the wait ran out with the lock still held.
+    if (abort.signal.aborted && isDomError(error, "AbortError")) {
+      throw new OpfsDatabaseInUseError(options.name);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function connectionLockName(name: string): string {
