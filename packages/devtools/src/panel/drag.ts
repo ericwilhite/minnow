@@ -15,14 +15,17 @@ export interface DragDeps {
  * it throws for a pointer the browser does not consider active, and losing it must not cost the
  * drag.
  *
- * A press that lands on a control is left alone, because starting a drag calls preventDefault and
- * that cancels the click which would otherwise follow.
+ * A press that lands on a control inside the handle is left alone, because starting a drag calls
+ * preventDefault and that cancels the click which would otherwise follow. A handle that itself
+ * sits inside a control — the column resizer on a sortable header, which is a button — still
+ * drags: the press was on the handle, not on the control around it.
  */
 export function draggable(handle: HTMLElement, deps: DragDeps): void {
   handle.addEventListener("pointerdown", (event: PointerEvent) => {
     if (event.button !== 0) return;
-    if (event.target instanceof Element && event.target.closest("button, input, select, a")) {
-      return;
+    if (event.target instanceof Element) {
+      const control = event.target.closest("button, input, select, a");
+      if (control !== null && control !== handle && handle.contains(control)) return;
     }
     if (deps.onStart !== undefined && !deps.onStart()) return;
 

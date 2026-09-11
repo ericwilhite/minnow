@@ -548,19 +548,20 @@ input.mini.value { width: 110px; }
 .grid-resize {
   position: absolute;
   top: 0;
-  right: -3px;
-  width: 7px;
+  right: 0;
+  width: 8px;
   height: 100%;
   cursor: col-resize;
   touch-action: none;
   z-index: 1;
 }
+/* The header clips its overflow, so the handle sits wholly inside it with its line on the edge. */
 .grid-resize::after {
   content: "";
   position: absolute;
   top: 6px;
   bottom: 6px;
-  left: 3px;
+  right: 0;
   width: 1px;
   background: var(--mdt-border);
 }

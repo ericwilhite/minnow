@@ -8,6 +8,22 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Devtools 0.3.3 — September 11, 2026
+
+Published packages: `@minnowdb/devtools@0.3.3`.
+
+A devtools-only release: `@minnowdb/core` stays at 0.9.0, stored formats are unchanged, and no
+migration is needed.
+
+### Fixed
+
+- **Column resizing on the Data tab.** Dragging a header's trailing edge did nothing on a
+  sortable column, which every column of a table on the Data tab is. The panel's shared drag
+  helper refused any press inside a button, and a sortable header is a button. It now refuses
+  only a control inside the handle itself. Query-result columns, which are not sortable, were
+  already resizable. The handle also sits wholly inside the header, which clips its overflow, so
+  the full 8px hit area is reachable.
+
 ## 0.9.0 — September 9, 2026
 
 Published packages: `@minnowdb/core@0.9.0`, `@minnowdb/kysely@0.4.12`,

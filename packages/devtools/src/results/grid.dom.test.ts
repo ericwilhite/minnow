@@ -94,6 +94,36 @@ describe("header", () => {
       "150px minmax(120px, 260px)",
     );
   });
+
+  it("resizes a sortable column too, whose header is a button, without sorting it", () => {
+    const onSort = vi.fn();
+    const view = createGrid({ onSort });
+    document.body.append(view.node);
+    Object.defineProperty(view.node.querySelector(".grid-viewport"), "clientHeight", {
+      value: 400,
+    });
+    view.setColumns([{ name: "id", type: "number", sortable: true }, { name: "name" }]);
+    view.setRows(rows);
+    const header = document.querySelector<HTMLElement>("button.grid-th");
+    const handle = header?.querySelector<HTMLElement>(".grid-resize");
+    if (handle === null || handle === undefined || header === null) throw new Error("no handle");
+    header.getBoundingClientRect = () => ({ width: 100 }) as DOMRect;
+    handle.dispatchEvent(
+      new PointerEvent("pointerdown", { button: 0, clientX: 10, clientY: 0, bubbles: true }),
+    );
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 40, clientY: 0 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 40, clientY: 0 }));
+    // The click a press-and-release raises lands on the handle and must not reach the button.
+    handle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(document.querySelector<HTMLElement>(".grid-head")?.style.gridTemplateColumns).toBe(
+      "130px minmax(120px, 260px)",
+    );
+    expect(rowNode(0).style.gridTemplateColumns).toBe("130px minmax(120px, 260px)");
+    expect(onSort).not.toHaveBeenCalled();
+    // A press on the header itself still sorts.
+    header.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(onSort).toHaveBeenCalledWith("id");
+  });
 });
 
 describe("copy", () => {
