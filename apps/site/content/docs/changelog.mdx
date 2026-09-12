@@ -27,6 +27,26 @@ durability, found the defects below. Every one is fixed here and pinned by a tes
 
 ### Fixed
 
+- **A frozen write-lock holder no longer costs every later write the whole wait.** Autocommit
+  writes take a cross-tab admission lock, and a tab the browser paused with the lock in hand
+  made every write in every other tab wait the full ten seconds — serially, one after the
+  other. Once one write has waited the wait out, the writes after it take the lock only if it
+  is free that instant and otherwise go ahead uncoordinated at once; the first ordinary grant
+  restores coordination. Correctness never depended on the lock: every commit is still a
+  compare-and-swap.
+- **Write scopes cost fewer store round trips per statement.** A scope resolves each table
+  record once, a keyed `UPDATE` probes its keys once instead of twice, and a guarded upsert or
+  keyed pre-image read over a long committed history answers by point reads of the scope's
+  pinned snapshot instead of leasing, listing every segment and owner, and scanning the table's
+  delta history per statement (8.5 ms per guarded upsert over 600 delta segments before).
+- **Write scopes: an UPDATE onto a held UNIQUE term fails its statement.** Moving a row onto a
+  UNIQUE index term another row holds — committed, or staged earlier in the scope — was accepted
+  and refused at commit, losing the whole scope; it now fails the statement alone, as an insert
+  does, while a swap within one statement and a move onto a term the scope retired go through.
+- **OPFS: an over-cap checkpoint is a typed refusal.** The 256 MiB checkpoint bound is the one
+  every per-resource limit shares; a write the encoded metadata can no longer fit now fails
+  with `StorageResourceLimitError` (`resource: "checkpoint byte"`) instead of a plain `Error`,
+  and the storage guide says so.
 - **OPFS: a leader's own writes no longer fail during a handover.** A hidden leader's
   operations queued behind an in-flight write, when a foreground tab bid for the handles or the
   idle release let them go, failed with "This OPFS store connection is closed" while the store was

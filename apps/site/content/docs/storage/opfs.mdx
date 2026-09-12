@@ -178,10 +178,11 @@ without changing block IDs, and the source extent is deleted only after all of i
 have moved.
 
 The WAL and either checkpoint are each capped at 256 MiB. The log is folded into a checkpoint slot
-before approaching that bound. A database whose validated metadata no longer fits a checkpoint
-refuses the writes that would grow it, while aborts, rollbacks, and collection steps still go
-through, so it can always be brought back under the bound; `getStorageStats()` reports the failed
-checkpoint meanwhile. Relaxed payload writes are flushed first, then the new
+before approaching that bound. The per-resource limits below share it: everything they admit
+must still encode into one checkpoint slot, and a write that would push the encoded metadata
+past it is refused with `StorageResourceLimitError` (`resource: "checkpoint byte"`), while
+aborts, rollbacks, and collection steps still go through, so the database can always be brought
+back under the bound; `getStorageStats()` reports the failed checkpoint meanwhile. Relaxed payload writes are flushed first, then the new
 checkpoint is written and flushed, and only then is the log reset. A crash at any moment therefore
 leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
 slot and the un-reset log still holding everything. A power loss that persists a file's new length

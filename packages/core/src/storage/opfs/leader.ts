@@ -2706,9 +2706,12 @@ export class OpfsLeader {
     };
     const bytes = encodeSyncCheckpoint(state);
     if (bytes.byteLength > MAX_OPFS_CHECKPOINT_BYTES) {
-      throw new Error(
-        `OPFS checkpoint exceeds its ${String(MAX_OPFS_CHECKPOINT_BYTES)} byte limit: ` +
-          String(bytes.byteLength),
+      // The one bound the per-resource limits share: everything they admit must still encode
+      // into one checkpoint slot. Typed like the rest, so a caller can tell it from corruption.
+      throw new StorageResourceLimitError(
+        "checkpoint byte",
+        bytes.byteLength,
+        MAX_OPFS_CHECKPOINT_BYTES,
       );
     }
     const slotIndex = this.#newestSlot === 0 ? 1 : 0;

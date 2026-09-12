@@ -38,8 +38,9 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // Lifecycle queues, RPC deadlines, snapshot renewal, and write admission add about 3 KiB gzip.
 // Measured after the resilience audit: 878.3 KiB raw / 254.1 KiB gzip; under 1% headroom. The
 // scope write set (per-key memtable, mirror lookups, keyed SQL path) adds about 7 KiB raw:
-// 898.9 KiB raw / 260.5 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 904 * 1024;
+// 898.9 KiB raw / 260.5 KiB gzip. The 0.10.1 audit fixes (scope pre-checks, point-read key
+// lookups, admission bypass) add about 6 KiB raw: 904.7 KiB raw.
+const COMPLETE_ENTRY_RAW_BUDGET = 910 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 264 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope

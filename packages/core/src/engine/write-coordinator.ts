@@ -2,6 +2,15 @@ import type { BlockStore } from "../storage/types.js";
 
 const anonymous = new WeakMap<BlockStore, { tail: Promise<unknown> }>();
 const named = new Map<string, { tail: Promise<unknown> }>();
+/**
+ * Lock names whose holder would not let go: once one write has waited the whole admission
+ * wait for nothing, the writes after it ask for the lock only if it is free right now, and go
+ * ahead uncoordinated otherwise, instead of each waiting the full wait in turn. The first
+ * ordinary grant clears the mark, because a grant proves the holder let go.
+ */
+const bypassing = new Set<string>();
+/** What an `ifAvailable` request answers when the lock is held: nothing ran under it. */
+const NOT_GRANTED: unique symbol = Symbol("write admission lock not granted");
 
 /**
  * How long a write waits for the cross-tab admission lock before going ahead without it. The
@@ -12,6 +21,11 @@ const named = new Map<string, { tail: Promise<unknown> }>();
  * in hand) must therefore not stall every other tab's writes until each of them times out.
  */
 export const WRITE_ADMISSION_WAIT_MS = 10_000;
+
+/** Test-only: forgets every lock name marked as held by a holder that would not let go. */
+export function _resetWriteAdmissionForTests(): void {
+  bypassing.clear();
+}
 
 export interface CoordinateWriteOptions {
   /** Test seam: the cross-tab lock wait; default `WRITE_ADMISSION_WAIT_MS`. */
@@ -48,6 +62,24 @@ export async function coordinateWrite<T>(
   const operation = queue.tail.then(async () => {
     signal.throwIfAborted();
     if (name === undefined || locks === undefined) return enter();
+    const lockName = `minnowdb-write:${name}`;
+    if (bypassing.has(name)) {
+      // A holder that would not let go was already waited out once. Take the lock only if it
+      // is free this instant — a grant means the holder is gone, and coordination resumes —
+      // and otherwise go ahead uncoordinated at once rather than wait the whole wait again.
+      const result = await locks.request(
+        lockName,
+        { ifAvailable: true },
+        async (lock): Promise<T | typeof NOT_GRANTED> => {
+          if (lock === null) return NOT_GRANTED;
+          bypassing.delete(name);
+          return enter();
+        },
+      );
+      if (result !== NOT_GRANTED) return result;
+      signal.throwIfAborted();
+      return await enter();
+    }
     const startedAt = Date.now();
     const wait = { ranOut: false };
     const waitTimer = setTimeout(() => {
@@ -56,17 +88,14 @@ export async function coordinateWrite<T>(
     }, admissionWaitMs);
     (waitTimer as { unref?: () => void }).unref?.();
     try {
-      return await locks.request(
-        `minnowdb-write:${name}`,
-        { signal: lockController.signal },
-        enter,
-      );
+      return await locks.request(lockName, { signal: lockController.signal }, enter);
     } catch (error) {
       // The lock may still have been granted in the same instant the wait ran out; then the
       // callback ran and its outcome is what surfaces. Only a refusal to grant is retried
       // without the lock.
       if (!wait.ranOut || admitted) throw error;
       signal.throwIfAborted();
+      bypassing.add(name);
       options.onAdmissionWaitExceeded?.(Date.now() - startedAt);
       return await enter();
     } finally {

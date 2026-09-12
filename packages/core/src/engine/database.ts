@@ -8960,7 +8960,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // table: its rows join the write set directly instead of first encoding everything the
         // scope holds for the table.
         if (statement.kind === "update" || statement.kind === "delete") {
-          const keyed = await this.#scopeKeyedMutation(statement);
+          const keyed = await this.#scopeKeyedMutation(transaction, statement);
           if (keyed !== undefined) {
             return guarded(() =>
               this.#runScopeKeyedMutation(transaction, keyed, () => {
@@ -9196,7 +9196,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           let point: QueryResult | undefined;
           try {
             pointReadTestHooks.attempted += 1;
-            const table = await this.#findTable(shape.table);
+            const table = await this.#findTable(shape.table, transaction);
             point = await this.#withSessionVisibility(
               transaction,
               [table],
@@ -9234,7 +9234,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
     const names = collectRealTableNames(plan);
-    const tables = await Promise.all(names.map((name) => this.#findTable(name)));
+    const tables = await Promise.all(names.map((name) => this.#findTable(name, transaction)));
     throwIfAborted(options.signal);
     return this.#withSessionVisibility(
       transaction,
@@ -9945,8 +9945,36 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       answered.set(token, row);
     }
     if (committed.length > 0 && transaction.snapshotVersion !== null) {
-      for (let start = 0; start < committed.length; start += SCOPE_KEY_LOOKUP_WINDOW) {
-        const window = committed.slice(start, start + SCOPE_KEY_LOOKUP_WINDOW);
+      const pointRows = await this.#scopeCommittedRowsByKey(
+        transaction,
+        table,
+        keyColumn,
+        committed,
+        names,
+      );
+      const windows: Array<Array<Exclude<BatchValue, null>>> = [];
+      if (pointRows === undefined) {
+        for (let start = 0; start < committed.length; start += SCOPE_KEY_LOOKUP_WINDOW) {
+          windows.push(committed.slice(start, start + SCOPE_KEY_LOOKUP_WINDOW));
+        }
+      }
+      const patched = (rows: QueryRow[]): void => {
+        for (const row of rows) {
+          const key = row[keyColumn.name] ?? null;
+          if (key === null) continue;
+          const token = keyToken(keyColumn.type, key);
+          const patch = patches.get(token);
+          if (patch !== undefined) {
+            table.columns.forEach((column, position) => {
+              const value = patch.values[position];
+              if (value !== undefined && wanted.has(column.name)) row[column.name] = value;
+            });
+          }
+          answered.set(token, row);
+        }
+      };
+      if (pointRows !== undefined) patched(pointRows);
+      for (const window of windows) {
         const plan: CompiledQuery = {
           sql: "(scope keyed lookup)",
           base: { table: table.name, alias: table.name },
@@ -9971,24 +9999,64 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           version: transaction.snapshotVersion,
           memoize: false,
         });
-        for (const row of result.rows) {
-          const key = row[keyColumn.name] ?? null;
-          if (key === null) continue;
-          const token = keyToken(keyColumn.type, key);
-          const patch = patches.get(token);
-          if (patch !== undefined) {
-            table.columns.forEach((column, position) => {
-              const value = patch.values[position];
-              if (value !== undefined && wanted.has(column.name)) row[column.name] = value;
-            });
-          }
-          answered.set(token, row);
-        }
+        patched(result.rows);
       }
     }
     // Stored form throughout, as the overlay read returns: the terms a unique secondary index
     // retires are computed from these images and must match the ones staged from batch values.
     return [...answered.values()];
+  }
+
+  /**
+   * Committed rows for keys the write set cannot vouch for, read the way a keyed SELECT is
+   * read: one point read per key over the scope's pinned snapshot and its once-listed
+   * committed segments, replaying only that key's history. The general path this replaces
+   * leased, listed every segment and owner, and scanned the table's whole delta history per
+   * call, so a guarded upsert over a long history cost milliseconds. Undefined when a key's
+   * value or the table's layout keeps the point read from answering; the caller scans then.
+   */
+  async #scopeCommittedRowsByKey(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: ReadonlyArray<Exclude<BatchValue, null>>,
+    names: readonly string[],
+  ): Promise<QueryRow[] | undefined> {
+    if (pointReadTestHooks.disabled) return undefined;
+    const values: Array<PointReadEquality["value"]> = [];
+    for (const key of keys) {
+      if (
+        typeof key !== "number" &&
+        typeof key !== "string" &&
+        typeof key !== "boolean" &&
+        !(key instanceof Date)
+      ) {
+        return undefined;
+      }
+      values.push(key);
+    }
+    const { segments, records } = await this.#scopeCommittedSegments(transaction, table);
+    const visibility: SegmentVisibilityCatalog = {
+      transactions: new Map(records.map((record) => [record.id, record] as const)),
+      segmentsByTable: new Map([[table.id, segments]]),
+    };
+    const realTables = new Map([[table.name, table]]);
+    const select = names.map((name) => ({ column: name, alias: name }));
+    return this.#withLeasedSnapshot(transaction.snapshotVersion, async (snapshot) => {
+      const rows: QueryRow[] = [];
+      for (const value of values) {
+        const result = await this.#pointReadAtSnapshot(
+          { table: table.name, equalities: [{ column: keyColumn.name, value }], select },
+          snapshot,
+          realTables,
+          visibility,
+          {},
+        );
+        if (result === undefined) return undefined;
+        rows.push(...result.rows);
+      }
+      return rows;
+    });
   }
 
   /** The scope's keyed reader: the write set where it can vouch, the overlay read otherwise. */
@@ -10021,6 +10089,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * column — takes the general path, whose read decides the same rows.
    */
   async #scopeKeyedMutation(
+    transaction: DatabaseTransaction,
     statement: Extract<CompiledStatement, { kind: "update" | "delete" }>,
   ): Promise<ScopeKeyedMutation | undefined> {
     if (
@@ -10031,7 +10100,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) {
       return undefined;
     }
-    const table = await this.#findTable(statement.table);
+    const table = await this.#findTable(statement.table, transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined || keyColumn.hidden === true || keyColumn.sqlDomain !== undefined) {
       return undefined;
@@ -10153,6 +10222,62 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  /**
+   * An UPDATE's new UNIQUE index terms, checked against what the scope holds and what is
+   * committed before anything registers. A term a row of this same statement gives up is free
+   * to take — a swap is one statement — and a term the scope itself retired earlier is free
+   * too; a term the batch repeats fails the way an insert's repeat does.
+   */
+  async #assertUpdateUniqueTermsAbsent(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    input: UpdateBatchInput,
+    preImages: ReadonlyArray<Record<string, BatchValue> | undefined>,
+  ): Promise<void> {
+    for (const { indexId, index, columns } of readyUniqueSecondaryIndexes(table)) {
+      if (!columns.some((column) => input.changes[column.name] !== undefined)) continue;
+      const namespaceId = secondaryUniqueKeyNamespace(table.id, indexId);
+      const released = new Set<string>();
+      const taken: string[] = [];
+      preImages.forEach((old, row) => {
+        if (old === undefined) return;
+        const before = secondaryUniqueTerm(
+          index,
+          columns,
+          columns.map((column) => old[column.name] ?? null),
+        );
+        const after = secondaryUniqueTerm(
+          index,
+          columns,
+          columns.map((column) => {
+            const assigned = input.changes[column.name];
+            return assigned === undefined ? (old[column.name] ?? null) : (assigned[row] ?? null);
+          }),
+        );
+        if (before === after) return;
+        if (before !== undefined) released.add(before);
+        if (after !== undefined) taken.push(after);
+      });
+      assertNoDuplicateUniqueTerms(index, taken);
+      const overlay = this.#stagedKeyOverlay(transaction, namespaceId);
+      const unresolved: string[] = [];
+      for (const term of taken) {
+        if (released.has(term)) continue;
+        if (overlay.added.has(term)) {
+          throw await this.#translateUniqueConflict(new UniqueKeyConflictError(namespaceId, term));
+        }
+        if (!overlay.removed.has(term)) unresolved.push(term);
+      }
+      if (unresolved.length === 0) continue;
+      const [existing] = await this.#existingUniqueKeysWindowed(namespaceId, unresolved);
+      if (existing !== undefined) {
+        throw await this.#translateUniqueConflict(
+          new UniqueKeyConflictError(namespaceId, existing),
+        );
+      }
+    }
+  }
+
   async #scopeKeyPresence(
     transaction: DatabaseTransaction,
     table: TableRecord,
@@ -10204,7 +10329,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const changes = Object.fromEntries(
       Object.entries(keyed.changes).map(([name, value]) => [name, present.map(() => value)]),
     );
-    const updated = await this.#sessionUpdate(transaction, table.name, { keys: present, changes });
+    const updated = await this.#sessionUpdate(
+      transaction,
+      table.name,
+      { keys: present, changes },
+      1,
+      // Presence was just decided against the same overlay and snapshot; probing again would
+      // cost a second unique-key read per statement for the answer already in hand.
+      true,
+    );
     return { kind: "update", table: table.name, rowCount: updated.rowCount };
   }
 
@@ -10396,8 +10529,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     input: UpdateBatchInput,
     cascadeBudget = 1,
+    /** The caller already proved every key present against the overlay and the snapshot. */
+    keysVerified = false,
   ): Promise<StagedWriteResult> {
-    const table = await this.#findTable(tableName);
+    const table = await this.#findTable(tableName, transaction);
     await this.#assertCompactionCapacity(table, transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
@@ -10409,14 +10544,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // Read-your-writes membership: keys staged by this scope pass, keys the scope removed
     // fail, and everything else checks against the committed snapshot as usual.
     const overlay = this.#stagedKeyOverlay(transaction, table.id);
-    for (const [token, value] of keys) {
-      if (overlay.removed.has(token)) {
-        throw new MissingKeyError(table.name, keyColumn.name, value);
+    if (!keysVerified) {
+      for (const [token, value] of keys) {
+        if (overlay.removed.has(token)) {
+          throw new MissingKeyError(table.name, keyColumn.name, value);
+        }
       }
-    }
-    const committedKeys = new Map([...keys].filter(([token]) => !overlay.added.has(token)));
-    if (committedKeys.size > 0) {
-      await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
+      const committedKeys = new Map([...keys].filter(([token]) => !overlay.added.has(token)));
+      if (committedKeys.size > 0) {
+        await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
+      }
     }
     const sessionChecks = table.checks ?? [];
     let changedForeignKey = (table.foreignKeys ?? []).some(
@@ -10446,6 +10583,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         key.enforced !== false &&
         foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
     );
+    // Inside a scope a move onto a UNIQUE index term another row holds fails this statement,
+    // before anything registers, as an insert's conflict does; commit re-validates atomically.
+    if (this.#scopeWrites.has(transaction)) {
+      await this.#assertUpdateUniqueTermsAbsent(transaction, table, input, preImages);
+    }
     stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
     const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
     if (secondaryDeltas.length > 0) {
@@ -10537,7 +10679,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     cascadeBudget = 1,
     referentialBudget = REFERENTIAL_CASCADES,
   ): Promise<StagedWriteResult> {
-    const table = await this.#findTable(tableName);
+    const table = await this.#findTable(tableName, transaction);
     await this.#assertCompactionCapacity(table, transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
@@ -22905,8 +23047,27 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return bytes;
   }
 
-  async #findTable(name: string): Promise<TableRecord> {
+  /**
+   * Table records a write scope resolved, kept for the scope's lifetime: DDL is refused inside
+   * a scope, and DDL from another connection fails the scope's commit on the structural epoch,
+   * so a record cannot go stale in a way the scope could act on. Without it every statement in
+   * a scope paid one or two catalog reads — an IndexedDB transaction each — before its work.
+   */
+  readonly #scopeTableRecords = new WeakMap<DatabaseTransaction, Map<string, TableRecord>>();
+
+  async #findTable(name: string, scope?: DatabaseTransaction): Promise<TableRecord> {
     validateName(name, "Table");
+    const cache =
+      scope === undefined || !this.#scopeWrites.has(scope)
+        ? undefined
+        : (this.#scopeTableRecords.get(scope) ??
+          (() => {
+            const created = new Map<string, TableRecord>();
+            this.#scopeTableRecords.set(scope, created);
+            return created;
+          })());
+    const cached = cache?.get(name);
+    if (cached !== undefined) return cached;
     const table =
       (await this.store.getTableByName(name)) ??
       (await this.store.getTableByName(await this.#foldTableName(name)));
@@ -22914,6 +23075,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // Reads resolve a view into its query before reaching here, so a view arriving at this
     // point is a write, a DDL statement, or a path that forgot to rewrite: all of them errors.
     if (table.view !== undefined) throw new TypeError(`${name} is a view, not a table`);
+    cache?.set(name, table);
     return table;
   }
 
