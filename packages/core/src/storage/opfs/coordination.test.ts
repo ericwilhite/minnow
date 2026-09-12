@@ -15,6 +15,7 @@ it("classifies exhausted follower catalog reads and resumes migration without lo
     name: `coordination-${crypto.randomUUID()}`,
     root: new MemoryOpfs().root,
     rpcTimeoutMs: 5,
+    dispatchBudgetMs: 500,
   };
   const leader = await OpfsBlockStore.open(options);
   const follower = await OpfsBlockStore.open(options);

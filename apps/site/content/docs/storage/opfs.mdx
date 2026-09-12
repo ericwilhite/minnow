@@ -72,8 +72,11 @@ memory limit. Request-count and request-byte overload is still rejected before c
 work, so a stalled tab cannot create an unbounded message queue.
 Request identity includes the follower, request id, method, and a canonical SHA fingerprint of
 the arguments. Reusing an identity with different arguments is refused.
-After failover, reads retry automatically within a bounded dispatch budget. Exhausting that
-budget throws `OpfsCoordinationError` with `reason: "leader-unavailable"`. Admission overload uses
+After failover, an operation keeps looking for a leader — discovering, calling, electing — for
+ten seconds. That budget restarts whenever a connection holding the handles answers that it is
+still recovering the log or checkpointing on its way out, so a long recovery of a large database
+is waited out while a leader frozen with the handles is not. Exhausting the budget throws
+`OpfsCoordinationError` with `reason: "leader-unavailable"`. Admission overload uses
 `"leader-queue-full"`, `"mutation-queue-full"`, or `"follower-queue-full"`. The error includes the
 store `method` and is exported from `@minnowdb/core` and the OPFS entry point; `instanceof` works
 through both follower and database worker RPC. Established live subscriptions retain their last
@@ -87,7 +90,8 @@ connection that is asked to run a request while it is not leading — after a ha
 closing, or when leadership moved while the request waited — answers with a decline, which
 proves the request never ran, so the follower simply finds the leader and sends it again. A
 leader that hands over or closes says goodbye first, and answers or declines everything it still
-holds. Even when a leader does fall silent, a mutation is not given up on at once: the follower
+holds; its own operations queued behind the handover go to whoever leads next, never failed.
+Even when a leader does fall silent, a mutation is not given up on at once: the follower
 pings, and a leader that answers the ping is alive and still holds the request. When the leader
 really is gone, the request goes to whoever leads next, with the same identity and the time it
 was first sent, and the log decides. Every frame a follower's mutation appended carries that
@@ -174,12 +178,16 @@ without changing block IDs, and the source extent is deleted only after all of i
 have moved.
 
 The WAL and either checkpoint are each capped at 256 MiB. The log is folded into a checkpoint slot
-before approaching that bound; a database whose validated metadata cannot fit is refused rather
-than opened or partially checkpointed. Relaxed payload writes are flushed first, then the new
+before approaching that bound. A database whose validated metadata no longer fits a checkpoint
+refuses the writes that would grow it, while aborts, rollbacks, and collection steps still go
+through, so it can always be brought back under the bound; `getStorageStats()` reports the failed
+checkpoint meanwhile. Relaxed payload writes are flushed first, then the new
 checkpoint is written and flushed, and only then is the log reset. A crash at any moment therefore
 leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
-slot and the un-reset log still holding everything. Opening the database is the recovery; there is
-no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
+slot and the un-reset log still holding everything. A power loss that persists a file's new length
+ahead of its bytes leaves a zero-filled tail where the unacknowledged frame was to go, or a slot
+whose magic landed ahead of its header; both are read as unwritten, never as corruption or as
+another format version. Opening the database is the recovery; there is no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
 from the fully validated current layout. A recognized but unsupported envelope or checkpoint
 version stops before redundant-slot fallback and before any truncation or deletion.
 

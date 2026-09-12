@@ -4256,7 +4256,7 @@
               "name": "OpfsBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
+                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    dispatchBudgetMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -4264,6 +4264,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare class OpfsCoordinationError extends Error {\n    readonly reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\";\n    readonly method: string | null;\n    readonly name = \"OpfsCoordinationError\";\n    readonly backend = \"opfs\";\n    constructor(reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\", method?: string | null);\n}"
+              ]
+            },
+            {
+              "name": "opfsDatabaseExists",
+              "kind": "value",
+              "declarations": [
+                "export declare function opfsDatabaseExists(options: {\n    name: string;\n    root?: FileSystemDirectoryHandle;\n}): Promise<boolean>;"
               ]
             },
             {
@@ -7459,7 +7466,7 @@
               "name": "OpfsBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
+                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    dispatchBudgetMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -7467,6 +7474,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare class OpfsCoordinationError extends Error {\n    readonly reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\";\n    readonly method: string | null;\n    readonly name = \"OpfsCoordinationError\";\n    readonly backend = \"opfs\";\n    constructor(reason: \"leader-unavailable\" | \"leader-queue-full\" | \"mutation-queue-full\" | \"follower-queue-full\", method?: string | null);\n}"
+              ]
+            },
+            {
+              "name": "opfsDatabaseExists",
+              "kind": "value",
+              "declarations": [
+                "export declare function opfsDatabaseExists(options: {\n    name: string;\n    root?: FileSystemDirectoryHandle;\n}): Promise<boolean>;"
               ]
             },
             {
@@ -8238,7 +8252,7 @@
               "name": "DatabaseTransaction",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class DatabaseTransaction {\n    #private;\n    private readonly store;\n    private readonly now;\n    private readonly ttlMs;\n    constructor(store: BlockStore, record: TransactionRecord, now: () => Date, ttlMs: number, createWeakRef: (transaction: DatabaseTransaction) => {\n        deref(): DatabaseTransaction | undefined;\n    }, options?: {\n        persisted?: boolean;\n        coalesceArtifacts?: boolean;\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n        snapshotLease?: LeasedSnapshot;\n    });\n    get id(): string;\n    get status(): TransactionRecord[\"status\"];\n    get snapshotVersion(): number | null;\n    get pendingBlockIds(): string[];\n    get pendingSegmentIds(): string[];\n    hasPendingBlock(id: string): boolean;\n    get stagedSegments(): readonly SegmentRecord[];\n    get pendingBlockCount(): number;\n    get pendingSegmentCount(): number;\n    get deferredSegments(): SegmentRecord[];\n    get pendingTableNextRowId(): bigint | undefined;\n    get initialCatalogProbe(): {\n        catalogEpoch: number;\n        manifestVersion: number | null;\n        schemaEpoch: number;\n    } | undefined;\n    get committedCatalogContribution(): {\n        transaction: TransactionRecord;\n        segments: SegmentRecord[];\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n    } | undefined;\n    get compactionSourceBlockIds(): string[];\n    renew(): Promise<void>;\n    get stagedWorkCount(): number;\n    checkpoint(): TransactionCheckpoint;\n    checkpointRetainedBytes(): number;\n    rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;\n    snapshot(): Promise<Snapshot>;\n    getBlock(id: string): Promise<Uint8Array | undefined>;\n    stageBlock(id: string, bytes: Uint8Array): Promise<void>;\n    stageBlocks(blocks: readonly BlockWrite[]): Promise<void>;\n    stageArtifacts(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<void>;\n    stageArtifactsAndCommit(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<ManifestSummary>;\n    stageExistingBlocks(blockIds: readonly string[]): Promise<void>;\n    stageSegment(record: SegmentRecord): Promise<void>;\n    stageExistingSegment(segmentId: string): Promise<void>;\n    adoptAbortedCompactionSegment(record: SegmentRecord, abortedOwner: TransactionRecord): Promise<void>;\n    markTableChanged(tableId: string): void;\n    markLogicallyUnchanged(): void;\n    get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[];\n    setUniqueKeyChanges(changes: UniqueKeyChanges): void;\n    setFtsChanges(changes: FtsChanges): void;\n    setCompactionIntent(compactionJobId: string, sourceBlockIds: readonly string[]): void;\n    limitLevelZeroSegments(tableId: string, limit: number): void;\n    commit(): Promise<ManifestSummary>;\n    rebase(): Promise<Snapshot>;\n    abort(): Promise<void>;\n}"
+                "export declare class DatabaseTransaction {\n    #private;\n    private readonly store;\n    private readonly now;\n    private readonly ttlMs;\n    constructor(store: BlockStore, record: TransactionRecord, now: () => Date, ttlMs: number, createWeakRef: (transaction: DatabaseTransaction) => {\n        deref(): DatabaseTransaction | undefined;\n    }, options?: {\n        persisted?: boolean;\n        coalesceArtifacts?: boolean;\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n        snapshotLease?: LeasedSnapshot;\n    });\n    get id(): string;\n    get status(): TransactionRecord[\"status\"];\n    get snapshotVersion(): number | null;\n    get pendingBlockIds(): string[];\n    get pendingSegmentIds(): string[];\n    hasPendingBlock(id: string): boolean;\n    get stagedSegments(): readonly SegmentRecord[];\n    get pendingBlockCount(): number;\n    get pendingSegmentCount(): number;\n    get deferredSegments(): SegmentRecord[];\n    get pendingTableNextRowId(): bigint | undefined;\n    get initialCatalogProbe(): {\n        catalogEpoch: number;\n        manifestVersion: number | null;\n        schemaEpoch: number;\n    } | undefined;\n    get committedCatalogContribution(): {\n        transaction: TransactionRecord;\n        segments: SegmentRecord[];\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n    } | undefined;\n    get compactionSourceBlockIds(): string[];\n    renew(): Promise<void>;\n    renewIfDue(): Promise<void>;\n    get stagedWorkCount(): number;\n    checkpoint(): TransactionCheckpoint;\n    checkpointRetainedBytes(): number;\n    rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;\n    snapshot(): Promise<Snapshot>;\n    getBlock(id: string): Promise<Uint8Array | undefined>;\n    stageBlock(id: string, bytes: Uint8Array): Promise<void>;\n    stageBlocks(blocks: readonly BlockWrite[]): Promise<void>;\n    stageArtifacts(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<void>;\n    stageArtifactsAndCommit(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<ManifestSummary>;\n    stageExistingBlocks(blockIds: readonly string[]): Promise<void>;\n    stageSegment(record: SegmentRecord): Promise<void>;\n    stageExistingSegment(segmentId: string): Promise<void>;\n    adoptAbortedCompactionSegment(record: SegmentRecord, abortedOwner: TransactionRecord): Promise<void>;\n    markTableChanged(tableId: string): void;\n    markLogicallyUnchanged(): void;\n    get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[];\n    setUniqueKeyChanges(changes: UniqueKeyChanges): void;\n    setFtsChanges(changes: FtsChanges): void;\n    setCompactionIntent(compactionJobId: string, sourceBlockIds: readonly string[]): void;\n    limitLevelZeroSegments(tableId: string, limit: number): void;\n    commit(): Promise<ManifestSummary>;\n    rebase(): Promise<Snapshot>;\n    abort(): Promise<void>;\n}"
               ]
             },
             {
@@ -8389,7 +8403,7 @@
               "name": "openAutoStore",
               "kind": "value",
               "declarations": [
-                "export declare function openAutoStore<Store>(name: string, open: (kind: AutoStoreKind) => Promise<Store>): Promise<{\n    store: Store;\n    kind: AutoStoreKind;\n}>;"
+                "export declare function openAutoStore<Store>(name: string, open: (kind: AutoStoreKind) => Promise<Store>, probes?: AutoStoreProbes): Promise<{\n    store: Store;\n    kind: AutoStoreKind;\n}>;"
               ]
             },
             {
@@ -8410,7 +8424,7 @@
               "name": "resolveAutoStoreKind",
               "kind": "value",
               "declarations": [
-                "export declare function resolveAutoStoreKind(name: string): Promise<{\n    kind: AutoStoreKind;\n    reserved: boolean;\n}>;"
+                "export declare function resolveAutoStoreKind(name: string, probes?: AutoStoreProbes): Promise<{\n    kind: AutoStoreKind;\n    reserved: boolean;\n}>;"
               ]
             },
             {

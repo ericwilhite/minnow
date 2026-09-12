@@ -27,6 +27,7 @@ import {
   type FtsChanges,
   type FtsPosting,
   type UniqueKeyChanges,
+  UnknownOutcomeError,
   WriteConflictError,
 } from "../storage/types.js";
 
@@ -460,6 +461,17 @@ export class DatabaseTransaction {
   }
 
   /**
+   * Renews the lease and record only when a third of their lifetime has gone: an O(1) deadline
+   * check otherwise. A scope that buffers statement after statement stages nothing, so nothing
+   * renews inline, and a loop that never yields to the event loop never lets the heartbeat
+   * timer fire either — the buffered path calls this per statement instead.
+   */
+  async renewIfDue(): Promise<void> {
+    if (this.#record.status !== "active") return;
+    await this.#renewOwnership(false);
+  }
+
+  /**
    * Counts every registration this transaction carries: staged blocks and segments, unique-key
    * entries, full-text entries, and supersessions. A caller that fails part-way through a
    * multi-step stage compares this before and after to tell "nothing was registered" (the
@@ -650,7 +662,7 @@ export class DatabaseTransaction {
         updatedAt: dateIsoString(this.now()),
       });
     } catch (error) {
-      await this.#recoverStagedAcknowledgement(error, blocks, segments);
+      this.#record = await this.#recoverStagedAcknowledgement(error, blocks, segments);
     }
     this.#journalAppended(
       previous,
@@ -1324,7 +1336,28 @@ export class DatabaseTransaction {
           await this.store.getCurrentManifestVersion(),
         );
       }
-      throw error;
+      // The store may have created the record and lost the acknowledgement. Only this
+      // transaction knows its id, so a persisted record that matches what was sent is ours:
+      // adopt it, and the staging call goes on as if the acknowledgement had arrived. Left
+      // unadopted, the record would stay active — its pin held — until its expiry, and the
+      // scope's abort would find nothing to mark.
+      const persisted = await this.store.getTransaction(this.id).catch(() => undefined);
+      if (
+        persisted?.status !== "active" ||
+        persisted.ownerId !== this.#record.ownerId ||
+        persisted.revision !== this.#record.revision ||
+        persisted.snapshotVersion !== this.#record.snapshotVersion ||
+        persisted.pendingBlockIds.length !== 0 ||
+        persisted.pendingSegmentIds.length !== 0
+      ) {
+        throw error;
+      }
+      // Ours, durably: adopt it, so a later abort marks it instead of leaving it active until
+      // it expires. The call goes on only when the error says the acknowledgement may simply
+      // have been lost; a definite refusal after the write still fails it.
+      this.#record = persisted;
+      this.#persisted = true;
+      if (!(error instanceof UnknownOutcomeError)) throw error;
     }
     this.#persisted = true;
     // The transaction record now owns the same durable pin and renews on this heartbeat. Keep
@@ -1494,15 +1527,18 @@ export class DatabaseTransaction {
   }
 
   /**
-   * An adapter can durably stage the artifacts and lose the acknowledgement afterwards. Refresh
-   * the local revision only when the persisted journal is exactly the one this call would have
-   * produced, so the caller's abort/rollback can clean it up without masking the original error.
+   * An adapter can durably stage the artifacts and lose the acknowledgement afterwards. When
+   * the persisted journal is exactly the one this call would have produced — the record
+   * advanced by one revision, the ids appended, the bytes identical — the staging happened,
+   * and the call resumes with that record: a stage publishes nothing, so nothing about its
+   * outcome is uncertain. Anything else rethrows the operation error, and the caller's
+   * abort/rollback cleans up whatever the store holds.
    */
   async #recoverStagedAcknowledgement(
     error: unknown,
     blocks: readonly BlockWrite[],
     segments: readonly SegmentRecord[],
-  ): Promise<never> {
+  ): Promise<TransactionRecord> {
     try {
       const persisted = await this.store.getTransaction(this.id);
       const expectedBlocks = [...this.#record.pendingBlockIds, ...blocks.map((block) => block.id)];
@@ -1529,6 +1565,10 @@ export class DatabaseTransaction {
         ) {
           this.#record = persisted;
           this.#persisted = true;
+          // Resume only when the error says the acknowledgement may have been lost. A definite
+          // failure after a durable stage still fails the call; the adopted record lets the
+          // caller's abort or rollback clean up exactly what the store holds.
+          if (error instanceof UnknownOutcomeError) return persisted;
         }
       }
     } catch {

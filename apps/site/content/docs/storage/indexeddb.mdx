@@ -215,9 +215,9 @@ records with their counts. There are no pre-contract schemas or compatibility br
 schema change adds one ordered migration for every integer version between the database and the
 current build. All of those migrations run inside the browser's single `versionchange`
 transaction: either the complete chain and its data changes commit, or the old database remains
-byte-for-byte logical state. A frozen database of every stable schema is opened, migrated, written,
-and checked in CI, and the migration registry refuses to load if a schema bump omitted or
-reordered a step.
+byte-for-byte logical state. A database laid out in every stable schema is opened, migrated, and
+checked in CI, and the migration registry refuses to load if a schema bump omitted or reordered a
+step.
 
 A build older than the database throws `StorageFormatVersionError` and leaves every store, index,
 and record untouched; it never downgrades or recreates the database. Malformed current-schema

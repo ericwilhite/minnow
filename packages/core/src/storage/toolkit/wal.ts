@@ -139,6 +139,11 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
   while (offset + FRAME_HEADER_BYTES <= size) {
     readFully(handle, header, offset, "reading a WAL frame header for recovery");
     if (headerView.getUint32(0, true) !== FRAME_MAGIC) {
+      // A power loss can persist the file's new length without the appended bytes, leaving a
+      // zero-filled tail where the in-flight frame was to go. That frame was never
+      // acknowledged, so an all-zero remainder is the end of the log, exactly like a short
+      // tail; anything else in its place is foreign bytes, and fails closed.
+      if (isZeroFilled(handle, offset, size)) break;
       throw new Error(`WAL frame marker mismatch at offset ${String(offset)}`);
     }
     const length = headerView.getUint32(4, true);
@@ -159,9 +164,23 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
       "reading a WAL frame payload for recovery",
     );
     if (crc32(payloadBytes) !== checksum) {
+      // The header landed but the payload page did not: the same unacknowledged tail.
+      if (payloadBytes.every((byte) => byte === 0) && isZeroFilled(handle, end, size)) break;
       throw new Error(`WAL frame checksum mismatch at offset ${String(offset)}`);
     }
     yield { payload: decodeRecordJson(payloadBytes), frameEnd: end };
     offset = end;
   }
+}
+
+/** Whether every byte from `offset` to `size` is zero, read in bounded chunks. */
+function isZeroFilled(handle: SyncFileHandle, offset: number, size: number): boolean {
+  const chunk = new Uint8Array(Math.min(64 * 1024, Math.max(0, size - offset)));
+  for (let at = offset; at < size; at += chunk.byteLength) {
+    const length = Math.min(chunk.byteLength, size - at);
+    const window = length === chunk.byteLength ? chunk : chunk.subarray(0, length);
+    readFully(handle, window, at, "reading a WAL tail for recovery");
+    for (let index = 0; index < length; index += 1) if (window[index] !== 0) return false;
+  }
+  return true;
 }

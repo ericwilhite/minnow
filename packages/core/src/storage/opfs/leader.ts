@@ -611,6 +611,44 @@ type LoggedMethod = keyof typeof LOGGED_BODY_BUILDERS;
  * and a crash mid-checkpoint corrupts only the slot being written while the other slot plus
  * the un-reset WAL still reconstruct everything.
  */
+/** Bodies that only retire or discard state, and so shrink the checkpoint that encodes it. */
+const STATE_SHRINKING_OPS: ReadonlySet<WalEntryBody["op"]> = new Set<WalEntryBody["op"]>([
+  "rollbackTransactionArtifacts",
+  "abortTransactionIfExpired",
+  "removeLease",
+  "removeLeaseIfExpired",
+  "removeTempRun",
+  "removeTempOwner",
+  "removeTempOwnerIfExpired",
+  "removeCompactionJob",
+  "cancelCompactionJob",
+  "removeGarbageCollectionJob",
+  "removePrunedManifestRecords",
+  "removeAbortedSegment",
+  "abortFtsBaseBuild",
+  "abortUniqueKeyBuild",
+  "cancelSnapshotFrameImport",
+  "closeSnapshotFrameExport",
+  "garbageCollectionStep",
+]);
+
+function shrinksLoggedState(body: WalEntryBody): boolean {
+  if (body.op === "updateTransaction") return body.update.status === "aborted";
+  return STATE_SHRINKING_OPS.has(body.op);
+}
+
+/**
+ * Refused by a leader's queue: the work reached it after the leader shut down — a handover, an
+ * idle release, a close — and none of it ran. The store re-dispatches such an operation to
+ * whoever leads next, because this error proves nothing happened.
+ */
+export class OpfsLeaderClosedError extends Error {
+  override readonly name = "OpfsLeaderClosedError";
+  constructor() {
+    super("This OPFS store connection is closed");
+  }
+}
+
 export class OpfsLeader {
   readonly #tree: OpfsTree;
   readonly #strict: boolean;
@@ -1114,7 +1152,7 @@ export class OpfsLeader {
 
   #run<T>(work: () => Promise<T> | T): Promise<T> {
     const result = this.#chain.then(async () => {
-      if (this.#closed) throw new Error("This OPFS store connection is closed");
+      if (this.#closed) throw new OpfsLeaderClosedError();
       if (this.#poisoned) await this.#loadFromDisk();
       return work();
     });
@@ -1182,10 +1220,14 @@ export class OpfsLeader {
    * requester anyway, and a lost result frame turns a re-send into an uncertain answer.
    */
   async completeServed(key: string, result: unknown): Promise<void> {
-    const entry = this.#servedLedger.get(key);
-    if (entry === undefined || entry.settled) return;
+    if (!this.#servedLedger.has(key)) return;
     const bytes = estimateRpcValueBytes(result);
     await this.#run(() => {
+      // Looked up inside the step: a poisoned leader reloads from disk first, and the ledger
+      // it rebuilds holds a new object for this key — settling the old one would leave the
+      // live entry unsettled, and the next checkpoint would forget the value.
+      const entry = this.#servedLedger.get(key);
+      if (entry === undefined || entry.settled) return;
       if (bytes > this.#servedLedgerResultBytes) {
         this.#appendFrame({ op: "servedResult", key, withheld: true }, false);
         entry.settled = true;
@@ -1227,7 +1269,20 @@ export class OpfsLeader {
     if (this.#wal.byteLength >= MAX_OPFS_WAL_BYTES - 64 * 1024 * 1024) {
       // Keep one maximum-sized frame of headroom. A checkpoint refusal happens before the
       // record state mutates, applying bounded backpressure instead of growing forever.
-      this.checkpointNow();
+      try {
+        this.checkpointNow();
+      } catch (error) {
+        // A checkpoint that no longer fits its slot must not trap the operations that shrink
+        // the state it encodes. An abort, a rollback, or a removal is a small frame; it goes
+        // into the remaining headroom, so an over-limit database can always be brought back
+        // under the limit instead of refusing every write, including the ones that would fix it.
+        if (
+          !shrinksLoggedState(body) ||
+          this.#wal.byteLength >= MAX_OPFS_WAL_BYTES - 16 * 1024 * 1024
+        ) {
+          throw error;
+        }
+      }
     }
     // Strict durability is per published frame, not per payload. A batch may append many
     // blocks into the tail; flush that dirty tail once after all writes complete and before

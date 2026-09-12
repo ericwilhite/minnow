@@ -1,5 +1,5 @@
 import { IndexedDbBlockStore } from "../storage/indexeddb.js";
-import { OpfsBlockStore } from "../storage/opfs/index.js";
+import { OpfsBlockStore, opfsDatabaseExists } from "../storage/opfs/index.js";
 import { openAutoStore } from "./auto-store.js";
 import type { BlockStore } from "../storage/types.js";
 import { unsupportedStoreKindError, type WorkerStoreFactory } from "./worker-server.js";
@@ -28,24 +28,27 @@ export const autoWorkerStore: WorkerStoreFactory = async (descriptor, options) =
           : { uniqueKeyCacheBytes: descriptor.uniqueKeyCacheBytes }),
       });
     case "auto":
-      return openAutoStore(descriptor.name, (kind): Promise<BlockStore> =>
-        kind === "opfs"
-          ? OpfsBlockStore.open({
-              name: descriptor.name,
-              ...(descriptor.opfs?.durability === undefined
-                ? {}
-                : { durability: descriptor.opfs.durability }),
-              ...diagnostic,
-            })
-          : IndexedDbBlockStore.open({
-              name: descriptor.name,
-              ...(descriptor.indexeddb?.durability === undefined
-                ? {}
-                : { durability: descriptor.indexeddb.durability }),
-              ...(descriptor.indexeddb?.uniqueKeyCacheBytes === undefined
-                ? {}
-                : { uniqueKeyCacheBytes: descriptor.indexeddb.uniqueKeyCacheBytes }),
-            }),
+      return openAutoStore(
+        descriptor.name,
+        (kind): Promise<BlockStore> =>
+          kind === "opfs"
+            ? OpfsBlockStore.open({
+                name: descriptor.name,
+                ...(descriptor.opfs?.durability === undefined
+                  ? {}
+                  : { durability: descriptor.opfs.durability }),
+                ...diagnostic,
+              })
+            : IndexedDbBlockStore.open({
+                name: descriptor.name,
+                ...(descriptor.indexeddb?.durability === undefined
+                  ? {}
+                  : { durability: descriptor.indexeddb.durability }),
+                ...(descriptor.indexeddb?.uniqueKeyCacheBytes === undefined
+                  ? {}
+                  : { uniqueKeyCacheBytes: descriptor.indexeddb.uniqueKeyCacheBytes }),
+              }),
+        { opfsDatabaseExists: (name) => opfsDatabaseExists({ name }) },
       );
     default:
       throw unsupportedStoreKindError("auto", descriptor.kind);

@@ -77,7 +77,10 @@ function encodeEnvelope(magic: string, payload: Uint8Array): Uint8Array {
 /**
  * `undefined` means the bytes are torn or foreign — treat as "not written". A recognized magic
  * with an unknown format version throws instead: reading a different layout as the current one
- * would silently corrupt or roll back the database.
+ * would silently corrupt or roll back the database. The version is only believed once the
+ * length and checksum vouch for the envelope: a slot whose magic landed ahead of the rest of
+ * the write (zeros where the header should be) is torn, not a version-0 database, and a torn
+ * slot must leave its mirror and the un-reset log to answer instead.
  */
 function decodeEnvelope(magic: string, bytes: Uint8Array): Uint8Array | undefined {
   if (bytes.byteLength < ENVELOPE_HEADER_BYTES) return undefined;
@@ -86,6 +89,10 @@ function decodeEnvelope(magic: string, bytes: Uint8Array): Uint8Array | undefine
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const version = view.getUint32(8, true);
+  const payloadLength = view.getUint32(12, true);
+  if (bytes.byteLength !== ENVELOPE_HEADER_BYTES + payloadLength) return undefined;
+  const payload = bytes.subarray(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + payloadLength);
+  if (crc32(payload) !== view.getUint32(16, true)) return undefined;
   if (version !== LOG_FORMAT_VERSION) {
     throw new StorageFormatVersionError(
       "opfs",
@@ -95,10 +102,6 @@ function decodeEnvelope(magic: string, bytes: Uint8Array): Uint8Array | undefine
       version < LOG_FORMAT_VERSION ? "older" : "newer",
     );
   }
-  const payloadLength = view.getUint32(12, true);
-  if (bytes.byteLength !== ENVELOPE_HEADER_BYTES + payloadLength) return undefined;
-  const payload = bytes.subarray(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + payloadLength);
-  if (crc32(payload) !== view.getUint32(16, true)) return undefined;
   return payload;
 }
 

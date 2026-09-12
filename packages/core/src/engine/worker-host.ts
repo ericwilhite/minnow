@@ -70,21 +70,28 @@ async function createStore(
 ): Promise<BlockStore | OpenedStore> {
   if (descriptor.kind === "auto") {
     const { openAutoStore } = await import("./auto-store.js");
-    return openAutoStore(descriptor.name, async (kind) => {
-      const opened = await createStore(
-        kind === "opfs"
-          ? {
-              kind,
-              name: descriptor.name,
-              ...(descriptor.opfs?.durability === undefined
-                ? {}
-                : { durability: descriptor.opfs.durability }),
-            }
-          : { kind, name: descriptor.name, ...descriptor.indexeddb },
-        options,
-      );
-      return opened as BlockStore;
-    });
+    return openAutoStore(
+      descriptor.name,
+      async (kind) => {
+        const opened = await createStore(
+          kind === "opfs"
+            ? {
+                kind,
+                name: descriptor.name,
+                ...(descriptor.opfs?.durability === undefined
+                  ? {}
+                  : { durability: descriptor.opfs.durability }),
+              }
+            : { kind, name: descriptor.name, ...descriptor.indexeddb },
+          options,
+        );
+        return opened as BlockStore;
+      },
+      {
+        opfsDatabaseExists: async (name) =>
+          (await import("../storage/opfs/index.js")).opfsDatabaseExists({ name }),
+      },
+    );
   }
   if (descriptor.kind === "memory") {
     const { MemoryBlockStore } = await import("../storage/memory.js");

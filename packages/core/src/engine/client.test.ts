@@ -96,8 +96,8 @@ function createBoundary(): {
           (options as { transfer?: ArrayBuffer[] } | undefined)?.transfer,
         );
       },
-      addEventListener: (_type, listener) => {
-        workerListeners.push(listener);
+      addEventListener: (type: string, listener) => {
+        if (type === "message") workerListeners.push(listener);
       },
     },
     clientListenerCount: () => clientListeners.length,
@@ -1122,21 +1122,20 @@ describe("MinnowDatabaseClient", () => {
       ]);
       await store.stageStarted;
       await vi.advanceTimersByTimeAsync(100);
-      for (const [method, args] of [
-        ["commit", []],
-        [
-          "stage",
-          ["insertBatch", "worker_writes", { columns: { id: [3], value: ["must-not-land"] } }],
-        ],
-      ] as const) {
-        const overlap = await raw.call(handleId, method, [...args]);
-        expect(overlap.kind).toBe("rpc-failure");
-        if (overlap.kind === "rpc-failure") {
-          expect(overlap.error.message).toContain("already has a call in flight");
-        }
-      }
+      // A call that overlaps the slow one — which only happens when the client gave up on a
+      // cancelled read — queues behind it rather than being refused, so the scope keeps working.
+      const overlap = raw.call(handleId, "stage", [
+        "insertBatch",
+        "worker_writes",
+        { columns: { id: [3], value: ["three"] } },
+      ]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await database.query("SELECT COUNT(*) AS n FROM worker_writes")).toMatchObject({
+        rows: [{ n: 0 }],
+      });
       store.resumeStages();
       expect((await slowStage).kind).toBe("rpc-result");
+      expect((await overlap).kind).toBe("rpc-result");
       const transactionId = await openTransactionId(store);
       expect((await store.getTransaction(transactionId))?.status).toBe("active");
 
@@ -1149,6 +1148,7 @@ describe("MinnowDatabaseClient", () => {
       expect((await database.query("SELECT id FROM worker_writes ORDER BY id")).rows).toEqual([
         { id: 1 },
         { id: 2 },
+        { id: 3 },
       ]);
       const lateCommit = await raw.call(handleId, "commit");
       expect(lateCommit.kind).toBe("rpc-failure");

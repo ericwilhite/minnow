@@ -121,10 +121,11 @@ transaction. A delayed statement cannot silently become an autocommit. Calls to 
 one connection run in invocation order, including `BEGIN`, mutations, and `COMMIT`.
 
 Reads inside the transaction see its earlier writes, including scalar subqueries in INSERT VALUES
-and trigger INSERT bodies. A statement that violates a unique key fails
+and trigger INSERT bodies. An insert that violates a unique key or a UNIQUE index fails
 on that statement, as it does in PostgreSQL, whether the conflicting row was committed before the
 transaction or staged earlier in it; the transaction stays open, so the caller decides whether to
-roll back or continue. Schema changes are refused because they are saved outside the transaction. Savepoints checkpoint staged blocks, mutation deltas, unique-index
+roll back or continue. An update that moves a row onto a UNIQUE index term another row holds is
+reported at commit, which then publishes nothing. Schema changes are refused because they are saved outside the transaction. Savepoints checkpoint staged blocks, mutation deltas, unique-index
 membership, and trigger effects:
 
 ```sql

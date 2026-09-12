@@ -13,7 +13,7 @@ import {
 import { validateTempRunPage, validateTempRunPageIdentity } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, isDomError } from "./files.js";
 import { LOG_FORMAT_VERSION } from "../toolkit/wire.js";
-import { OpfsLeader, type ServedMutationRequest } from "./leader.js";
+import { OpfsLeader, OpfsLeaderClosedError, type ServedMutationRequest } from "./leader.js";
 import {
   rehydrateStoreError,
   estimateRpcValueBytes,
@@ -30,8 +30,14 @@ import {
 const RPC_TIMEOUT_MS = 1_000;
 /** How long a ping waits for a leadership announcement. */
 const DISCOVERY_WAIT_MS = 150;
-/** Attempts across the discover → call → elect loop before an operation gives up. */
-const DISPATCH_ATTEMPTS = 10;
+/**
+ * How long an operation keeps looking for a leader — discover, call, elect, again — before it
+ * gives up. Measured from the last sign that the database is changing hands: a connection
+ * that holds the handles while it recovers the log or checkpoints on its way out answers
+ * pings with `wait`, and each such answer restarts this budget, so a long recovery of a big
+ * database is waited out while a leader that is frozen with the handles is not.
+ */
+const DISPATCH_BUDGET_MS = 10_000;
 /** A leader yields to a foreground bidder at most this often; a bid inside it is deferred. */
 const YIELD_COOLDOWN_MS = 3_000;
 /** After yielding, the ex-leader stays out of elections this long so the bidder can win. */
@@ -97,6 +103,8 @@ export interface OpfsBlockStoreOptions {
   hiddenIdleReleaseMs?: number;
   /** @internal Test seam: how long an ex-leader stays out of elections (default 1500ms). */
   handoverGraceMs?: number;
+  /** @internal Test seam: how long an operation looks for a leader (default 10000ms). */
+  dispatchBudgetMs?: number;
   /**
    * Hears failures no operation reports: a background checkpoint or cleanup that failed, an
    * election or handover that threw, a served request that could not be answered. The worker
@@ -337,6 +345,7 @@ export class OpfsBlockStore {
   readonly #yieldCooldownMs: number;
   readonly #hiddenIdleReleaseMs: number;
   readonly #handoverGraceMs: number;
+  readonly #dispatchBudgetMs: number;
   readonly #onDiagnostic: ((error: unknown, context: string) => void) | undefined;
   readonly #instanceId = crypto.randomUUID();
   readonly #channelName: string;
@@ -352,6 +361,10 @@ export class OpfsBlockStore {
   #closed = false;
   #lastYieldAt = 0;
   #electing: Promise<boolean> | undefined;
+  /** Holding the handles and recovering the log: the moment between winning and leading. */
+  #recovering = false;
+  /** When a connection holding the handles last said it was still recovering or leaving. */
+  #waitHeardAt = 0;
   readonly #pending = new Map<string, PendingRpc>();
   readonly #inFlightMutations = new Map<string, ServedMutation<Promise<ServedOutcome>>>();
   readonly #settledMutations = new Map<string, ServedMutation<ServedOutcome>>();
@@ -394,6 +407,7 @@ export class OpfsBlockStore {
     this.#yieldCooldownMs = options.yieldCooldownMs ?? YIELD_COOLDOWN_MS;
     this.#hiddenIdleReleaseMs = options.hiddenIdleReleaseMs ?? HIDDEN_IDLE_RELEASE_MS;
     this.#handoverGraceMs = options.handoverGraceMs ?? HANDOVER_GRACE_MS;
+    this.#dispatchBudgetMs = options.dispatchBudgetMs ?? DISPATCH_BUDGET_MS;
     this.#onDiagnostic = options.onDiagnostic;
     this.#channelName = `minnowdb-store:${options.name}`;
     this.liveQueryChannelName = `minnowdb-live:opfs:${options.name}`;
@@ -488,7 +502,11 @@ export class OpfsBlockStore {
     }
     let slotA: FileSystemSyncAccessHandle | undefined;
     let slotB: FileSystemSyncAccessHandle | undefined;
+    // The handles are held from here on: nobody else can lead until recovery ends, so every
+    // connection looking for a leader is told to wait rather than run out its patience.
+    this.#recovering = true;
     try {
+      this.#post({ kind: "wait", leaderId: this.#instanceId });
       // A dying ex-leader releases all its handles at once, but a graceful demotion closes
       // them in sequence; the brief retry covers the gap.
       slotA = await this.#openWithRetry(["checkpoint-a"]);
@@ -509,6 +527,8 @@ export class OpfsBlockStore {
       slotB?.close();
       if (isLockContention(error)) return false;
       throw error;
+    } finally {
+      this.#recovering = false;
     }
     if (this.#closed) {
       // close() ran while this election was in flight; a leader installed now would hold the
@@ -615,7 +635,7 @@ export class OpfsBlockStore {
     if (leader === undefined) return;
     this.#leader = undefined;
     this.#knownLeader = undefined;
-    const shutdown = leader.shutdown().catch((error: unknown) => {
+    const shutdown = this.#shutdownAfterMutations(leader).catch((error: unknown) => {
       this.#diagnostic(error, "opfs idle release shutdown");
       leader.crash();
     });
@@ -700,7 +720,7 @@ export class OpfsBlockStore {
     this.#leader = undefined;
     this.#knownLeader = undefined;
     this.#lastYieldAt = Date.now();
-    const shutdown = leader.shutdown().catch((error: unknown) => {
+    const shutdown = this.#shutdownAfterMutations(leader).catch((error: unknown) => {
       // Whatever failed, the handles must not outlive the leadership; crash-close is
       // idempotent and releases them.
       this.#diagnostic(error, "opfs yield shutdown");
@@ -725,6 +745,23 @@ export class OpfsBlockStore {
   }
 
   #yielding: Promise<void> | undefined;
+
+  /**
+   * Shuts a leader down from its place in the mutation queue, so a served mutation still
+   * running finishes whole first — its result frame in the log, its answer on its way — and
+   * the checkpoint the shutdown writes carries that request as settled. Shutting down from
+   * outside the queue would land the checkpoint between the mutation's frame and its result,
+   * and the next leader would have to call a durable, known-value write uncertain.
+   */
+  #shutdownAfterMutations(leader: OpfsLeader): Promise<void> {
+    return this.#withMutationTurn(() => leader.shutdown());
+  }
+
+  /** Resolves once every request this connection admitted is answered, or the linger ends. */
+  async #servedDrained(): Promise<void> {
+    const deadline = Date.now() + DECLINE_AFTER_CLOSE_MS;
+    while (this.#served.size > 0 && Date.now() < deadline) await sleep(5);
+  }
 
   #onMessage(message: StoreRpcMessage): void {
     if (this.#closed) {
@@ -869,7 +906,13 @@ export class OpfsBlockStore {
       case "ping": {
         if (this.#leader !== undefined) {
           this.#post({ kind: "leader", leaderId: this.#instanceId });
+        } else if (this.#recovering || this.#yielding !== undefined) {
+          this.#post({ kind: "wait", leaderId: this.#instanceId });
         }
+        return;
+      }
+      case "wait": {
+        if (message.leaderId !== this.#instanceId) this.#waitHeardAt = Date.now();
         return;
       }
       case "bid": {
@@ -1378,7 +1421,8 @@ export class OpfsBlockStore {
     // proof that it did not.
     let mayHaveRun = false;
     this.#lastActivityAt = sentAt;
-    for (let attempt = 0; attempt < DISPATCH_ATTEMPTS; attempt += 1) {
+    // The budget runs from the last sign of a handover in progress, not from the first attempt.
+    while (Date.now() - Math.max(sentAt, this.#waitHeardAt) < this.#dispatchBudgetMs) {
       // Re-checked each attempt: the awaits below (elections, RPC round trips) give close()
       // every opportunity to run.
       this.#assertOpen();
@@ -1403,7 +1447,19 @@ export class OpfsBlockStore {
             }
             if (sentAt < leader.servedCoverageSince) throw new OpfsUncertainOutcomeError(method);
           }
-          return await this.#withMutationTurn(() => bound.apply(leader, args));
+          return await this.#withMutationTurn(() => {
+            if (leader.isClosed() || !this.#leads(leader)) throw new OpfsLeaderClosedError();
+            return bound.apply(leader, args);
+          });
+        } catch (error) {
+          // The leader shut down — yielding to a foreground tab, releasing idle handles —
+          // while this operation waited for its turn on the queue, and the queue refused it
+          // before anything ran; a read on closed handles ran nothing either. Whoever leads
+          // next answers it, possibly this connection once it holds the handles again.
+          if (!this.#leads(leader) && (isRead || error instanceof OpfsLeaderClosedError)) {
+            continue;
+          }
+          throw error;
         } finally {
           this.#lastActivityAt = Date.now();
         }
@@ -1555,13 +1611,17 @@ export class OpfsBlockStore {
     const leader = this.#leader;
     this.#leader = undefined;
     if (leader !== undefined) {
-      void leader
-        .shutdown()
+      // A served mutation still running finishes and is answered before the goodbye: the
+      // shutdown takes its turn on the mutation queue, and the channels stay open — keepalives
+      // included — until every admitted request has its result or decline.
+      void this.#shutdownAfterMutations(leader)
         .catch((error: unknown) => {
           this.#diagnostic(error, "opfs close shutdown");
           leader.crash();
         })
+        .then(() => this.#servedDrained())
         .then(() => {
+          this.#stopKeepalive();
           this.#post({ kind: "released", leaderId: this.#instanceId });
           this.#closeChannels();
           this.#releaseWhenHandlesClose();
@@ -1570,24 +1630,27 @@ export class OpfsBlockStore {
     }
     if (this.#yielding !== undefined) {
       // Closing mid-handover: the followers still need to hear that this leader is gone.
-      void this.#yielding.then(() => {
-        this.#post({ kind: "released", leaderId: this.#instanceId });
-        this.#closeChannels();
-        this.#releaseWhenHandlesClose();
-      });
+      void this.#yielding
+        .then(() => this.#servedDrained())
+        .then(() => {
+          this.#stopKeepalive();
+          this.#post({ kind: "released", leaderId: this.#instanceId });
+          this.#closeChannels();
+          this.#releaseWhenHandlesClose();
+        });
       return;
     }
+    this.#stopKeepalive();
     this.#closeChannels();
     this.#releaseWhenHandlesClose();
   }
 
+  /** Stops the timers that would elect, yield, or release; keepalives stop when served drains. */
   #clearCoordinationTimers(): void {
     if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
     this.#reacquireTimer = undefined;
-    this.#stopKeepalive();
     this.#clearDeferredBid();
     this.#clearHiddenIdleTimer();
-    this.#served.clear();
   }
 
   #releaseWhenHandlesClose(): void {
@@ -1676,6 +1739,8 @@ export class OpfsBlockStore {
   _crashForTests(): void {
     this.#closed = true;
     this.#clearCoordinationTimers();
+    this.#stopKeepalive();
+    this.#served.clear();
     for (const pending of this.#pending.values()) clearTimeout(pending.timer);
     this.#pending.clear();
     this.#inFlightMutations.clear();
@@ -1888,6 +1953,27 @@ async function resolveDatabaseRoot(
   const root = options.root ?? (await navigator.storage.getDirectory());
   const namespace = await root.getDirectoryHandle("minnowdb", { create: true });
   return namespace.getDirectoryHandle(encodedName, { create: true });
+}
+
+/**
+ * Whether a database directory of this name exists in the origin's private file system (or
+ * under `root`). Nothing is created: an `auto` descriptor asks this before choosing a store for
+ * a name it has no record of, so a database an explicit `opfs` descriptor created is found
+ * rather than shadowed by an empty one.
+ */
+export async function opfsDatabaseExists(options: {
+  name: string;
+  root?: FileSystemDirectoryHandle;
+}): Promise<boolean> {
+  const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
+  try {
+    const root = options.root ?? (await navigator.storage.getDirectory());
+    const namespace = await root.getDirectoryHandle("minnowdb");
+    await namespace.getDirectoryHandle(encodedName);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isLockContention(error: unknown): boolean {

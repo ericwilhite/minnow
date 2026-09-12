@@ -634,8 +634,12 @@ describe("secondary-index SQL", () => {
       await database.execute("CREATE UNIQUE INDEX scoped_code ON scoped_unique(code)");
       await database.execute("BEGIN");
       await database.execute("INSERT INTO scoped_unique VALUES (1, 'duplicate')");
-      await database.execute("INSERT INTO scoped_unique VALUES (2, 'duplicate')");
-      await expect(database.execute("COMMIT")).rejects.toBeInstanceOf(UniqueConstraintError);
+      // The conflict with a row the transaction staged fails the statement itself, and the
+      // transaction stays open for the caller to decide; here it rolls back.
+      await expect(
+        database.execute("INSERT INTO scoped_unique VALUES (2, 'duplicate')"),
+      ).rejects.toBeInstanceOf(UniqueConstraintError);
+      await database.execute("ROLLBACK");
       expect((await database.query("SELECT id FROM scoped_unique")).rows).toEqual([]);
 
       await database.execute("INSERT INTO scoped_unique VALUES (1, 'a'), (2, 'b')");

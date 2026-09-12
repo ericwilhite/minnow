@@ -85,6 +85,12 @@ export type StoreRpcMessage =
   | { kind: "uncertain"; requestId: string }
   /** The leader exists (sent on takeover and in answer to pings). */
   | { kind: "leader"; leaderId: string }
+  /**
+   * The sender holds the database's handles but cannot serve yet: it is recovering the log
+   * after winning them, or checkpointing on its way out. Nobody else can lead until it is
+   * done, so a follower looking for a leader waits instead of running out its patience.
+   */
+  | { kind: "wait"; leaderId: string }
   /** The leader's visibility, so a foreground follower knows when to bid. */
   | { kind: "state"; leaderId: string; foreground: boolean }
   | { kind: "ping" }
@@ -261,6 +267,7 @@ export function parseStoreRpcMessage(
           ? (record as StoreRpcMessage)
           : undefined;
       case "leader":
+      case "wait":
       case "released":
         return exactKeys(record, ["kind", "leaderId"]) && boundedRpcString(record.leaderId)
           ? (record as StoreRpcMessage)

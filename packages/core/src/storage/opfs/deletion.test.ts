@@ -98,8 +98,19 @@ describe.skipIf(
       await gate;
       await original.call(this);
     });
-    const post = vi.spyOn(BroadcastChannel.prototype, "postMessage").mockImplementationOnce(() => {
-      throw new Error("injected announcement failure");
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with the mock receiver below.
+    const originalPost = BroadcastChannel.prototype.postMessage;
+    let announced = false;
+    const post = vi.spyOn(BroadcastChannel.prototype, "postMessage").mockImplementation(function (
+      this: BroadcastChannel,
+      message: unknown,
+    ) {
+      // The leadership announcement, after recovery: the handles are live when it throws.
+      if (!announced && (message as { kind?: unknown }).kind === "leader") {
+        announced = true;
+        throw new Error("injected announcement failure");
+      }
+      originalPost.call(this, message);
     });
     try {
       await expect(OpfsBlockStore.open(options)).rejects.toThrow("injected announcement failure");

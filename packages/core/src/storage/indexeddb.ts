@@ -756,8 +756,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return result;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -795,8 +794,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return bytes;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -825,8 +823,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return result;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -865,8 +862,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -898,8 +894,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -919,8 +914,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -949,8 +943,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -963,8 +956,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -988,8 +980,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1191,8 +1182,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1476,8 +1466,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return updated;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1551,8 +1540,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(record);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1599,8 +1587,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(record);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1713,8 +1700,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(record);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1845,8 +1831,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(updated);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -1877,8 +1862,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
     await this.#cleanupUniqueKeyBuildArtifacts(input.buildId);
     return true;
@@ -1920,8 +1904,7 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -2047,8 +2030,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return manifest;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -2211,8 +2193,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return manifest;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -2404,8 +2385,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -2982,8 +2962,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3090,8 +3069,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return true;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3303,8 +3281,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(updatedReplacement);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3327,8 +3304,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return { start, endExclusive };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3359,8 +3335,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return { start, endExclusive };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3488,8 +3463,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3673,8 +3647,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3752,8 +3725,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3865,11 +3837,15 @@ export class IndexedDbBlockStore implements BlockStore {
         });
       }
       if (addedBlocks.length > 0 || addedSegments.length > 0) {
-        // The tail chunk is what the assembled ids end with; no second read of it is needed.
+        // The stored tail chunk, never a repack of the assembled ids: appends top up whatever
+        // chunk the journal actually ends with, and once a closed chunk holds segments, a
+        // repack (blocks first, then segments) ends differently from the stored layout.
+        // Topping up that phantom tail overwrote the real one — losing its blocks and
+        // duplicating segments — and the next read reported the journal as corrupt.
         appendTransactionJournalChunks(
           transaction,
           stored,
-          packTransactionJournal(current.pendingBlockIds, current.pendingSegmentIds).at(-1),
+          await readTransactionJournalTail(transaction, stored),
           addedBlocks,
           addedSegments,
         );
@@ -3879,8 +3855,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return updated;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3927,8 +3902,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return true;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -3972,8 +3946,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(updated);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -4126,8 +4099,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return transactionRecordWithJournal(updated, journal.blockIds, journal.segmentIds);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -4357,8 +4329,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(updated);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -4393,8 +4364,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return outcome.manifest;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -4575,8 +4545,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return outcome.manifest;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -4669,7 +4638,6 @@ export class IndexedDbBlockStore implements BlockStore {
     if (pendingRemovedBlock !== undefined) {
       throw new Error(`Cannot supersede a pending block: ${pendingRemovedBlock}`);
     }
-    let baseBlockIdSet: Set<string> | undefined;
     const removedMembership = await manifestBlockMembershipInTransaction(
       catalog,
       input.expectedManifestVersion,
@@ -4679,12 +4647,6 @@ export class IndexedDbBlockStore implements BlockStore {
     if (invalidRemovedIndex >= 0) {
       throw new Error(
         `Cannot supersede a block outside the transaction snapshot: ${removedBlockIds[invalidRemovedIndex] ?? ""}`,
-      );
-    }
-    if ((input.levelZeroSegmentLimits?.length ?? 0) > 0) {
-      baseBlockIdSet = await resolveManifestBlockSetInTransaction(
-        catalog,
-        input.expectedManifestVersion,
       );
     }
     if (removedBlockIds.length > 0) {
@@ -4727,7 +4689,7 @@ export class IndexedDbBlockStore implements BlockStore {
       transaction,
       input.levelZeroSegmentLimits ?? [],
       pendingSegments,
-      baseBlockIdSet ?? new Set(),
+      input.expectedManifestVersion,
       pendingTable,
     );
 
@@ -5389,8 +5351,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -5492,8 +5453,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(renewed);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -5544,8 +5504,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(moved);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -5906,8 +5865,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return true;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -5972,8 +5930,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(record);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -6011,8 +5968,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return structuredClone(updated);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -6369,8 +6325,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -6444,8 +6399,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return removed;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -6564,8 +6518,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8198,8 +8151,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return { sessionId, ownerId: input.ownerId, expiresAt: input.expiresAt, header };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8322,8 +8274,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return frame;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8358,8 +8309,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return true;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8538,8 +8488,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return snapshotFrameImportSession(marker);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8570,8 +8519,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return snapshotFrameImportSession(renewed);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8778,8 +8726,7 @@ export class IndexedDbBlockStore implements BlockStore {
       return snapshotFrameImportSession(marker);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8851,8 +8798,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#journalCache = undefined;
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8905,8 +8851,7 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -8993,8 +8938,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (end === marker.boundaries.length) return true;
       } catch (error) {
         abortIfActive(transaction);
-        await ignoreAbort(transaction);
-        throw error;
+        throw await refusalBehindAbort(transaction, error);
       }
     }
   }
@@ -9013,8 +8957,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (complete) return;
       } catch (error) {
         abortIfActive(transaction);
-        await ignoreAbort(transaction);
-        throw error;
+        throw await refusalBehindAbort(transaction, error);
       }
     }
   }
@@ -9050,8 +8993,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
     if (cleanup) await this.#cleanupUniqueKeyBuildArtifacts(buildId);
   }
@@ -9080,8 +9022,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (complete) return;
       } catch (error) {
         abortIfActive(transaction);
-        await ignoreAbort(transaction);
-        throw error;
+        throw await refusalBehindAbort(transaction, error);
       }
     }
   }
@@ -9260,8 +9201,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -9281,8 +9221,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
-      await ignoreAbort(transaction);
-      throw error;
+      throw await refusalBehindAbort(transaction, error);
     }
   }
 
@@ -10182,6 +10121,22 @@ async function ignoreAbort(transaction: IDBTransaction): Promise<void> {
   } catch {
     // The caller reports the more useful domain error.
   }
+}
+
+/**
+ * The error a failed readwrite transaction surfaces. When a write is refused — a quota
+ * failure, most plausibly — IndexedDB aborts the transaction and fails every request still
+ * queued behind the write with `AbortError` before the transaction's own abort event, so the
+ * first rejection a caller awaits can be that `AbortError` rather than the refusal itself.
+ * The transaction remembers the refusal; an abort this code requested leaves it `null`.
+ */
+async function refusalBehindAbort(transaction: IDBTransaction, error: unknown): Promise<unknown> {
+  await ignoreAbort(transaction);
+  const refusal = transaction.error;
+  if (refusal !== null && error instanceof DOMException && error.name === "AbortError") {
+    return refusal;
+  }
+  return error;
 }
 
 function corruption(location: string, message: string): StorageCorruptionError {
@@ -13088,9 +13043,17 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
           "backfill",
           "enumValues",
           "hidden",
+          "generatedValue",
         ],
         `${location}/columns/${String(index)}`,
       );
+      if (isRecord(column.generatedValue)) {
+        assertKnownFields(
+          column.generatedValue,
+          ["kind", "sql"],
+          `${location}/columns/${String(index)}/generatedValue`,
+        );
+      }
       if (isRecord(column.sqlDomain)) {
         const domainFields =
           column.sqlDomain.kind === "numeric"
@@ -13897,7 +13860,7 @@ async function assertLevelZeroSegmentLimits(
   transaction: IDBTransaction,
   limits: ReadonlyArray<{ tableId: string; limit: number }>,
   pendingSegments: readonly SegmentRecord[],
-  currentBlockIds: ReadonlySet<string>,
+  version: number | null,
   pendingTable?: TableRecord,
 ): Promise<void> {
   const pendingTables = new Set(
@@ -13936,8 +13899,9 @@ async function assertLevelZeroSegmentLimits(
     const existing = await countVisibleLevelZeroSegments(
       segmentIndex,
       transaction.objectStore("transactions"),
+      catalog,
+      version,
       entry.tableId,
-      currentBlockIds,
     );
     const added = pendingSegments.reduce(
       (count, segment) =>
@@ -13951,73 +13915,70 @@ async function assertLevelZeroSegmentLimits(
   }
 }
 
-function countVisibleLevelZeroSegments(
+/**
+ * How many committed level-zero segments of a table are live at `version`. Visibility is
+ * decided per segment from point reads of its block records — the level-zero limit times the
+ * column count — never from the manifest's whole block set, so an insert's commit costs what
+ * the table holds unfolded, not what the database holds.
+ */
+async function countVisibleLevelZeroSegments(
   index: IDBIndex,
   transactions: IDBObjectStore,
+  catalog: IDBObjectStore,
+  version: number | null,
   tableId: string,
-  currentBlockIds: ReadonlySet<string>,
 ): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const statuses = new Map<string, TransactionRecord["status"]>();
-    let count = 0;
+  const candidates = await new Promise<SegmentRecord[]>((resolve, reject) => {
+    const found: SegmentRecord[] = [];
     const request = index.openCursor(tableId);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB segment cursor failed"));
     request.onsuccess = () => {
       const cursor = request.result;
       if (cursor === null) {
-        resolve(count);
+        resolve(found);
         return;
       }
-      let segment: SegmentRecord;
       try {
-        segment = asSegmentRecord(cursor.value);
+        const segment = asSegmentRecord(cursor.value);
         if (segment.id !== cursor.primaryKey || segment.tableId !== tableId) {
           throw corruption(`segments/${segment.id}`, "table index does not match its record");
         }
-        if (segment.level !== 0) {
-          cursor.continue();
-          return;
-        }
-        const blockIds = segmentBlockIds(segment);
-        const visibleBlockCount = blockIds.filter((id) => currentBlockIds.has(id)).length;
-        if (visibleBlockCount > 0 && visibleBlockCount < blockIds.length) {
-          throw corruption(`segments/${segment.id}`, "only part of the segment is manifest-live");
-        }
-        if (blockIds.length > 0 && visibleBlockCount === 0) {
-          cursor.continue();
-          return;
-        }
+        if (segment.level === 0) found.push(segment);
+        cursor.continue();
       } catch (error) {
         reject(error instanceof Error ? error : new Error(String(error)));
-        return;
       }
-      const knownStatus = statuses.get(segment.transactionId);
-      if (knownStatus !== undefined) {
-        if (knownStatus === "committed") count += 1;
-        cursor.continue();
-        return;
-      }
-      const ownerRequest = transactions.get(segment.transactionId);
-      ownerRequest.onerror = () =>
-        reject(ownerRequest.error ?? new Error("IndexedDB transaction lookup failed"));
-      ownerRequest.onsuccess = () => {
-        try {
-          if (ownerRequest.result === undefined) {
-            throw corruption(
-              `segments/${segment.id}`,
-              `owning transaction ${segment.transactionId} is missing`,
-            );
-          }
-          const owner = asStoredTransactionRecord(ownerRequest.result, segment.transactionId);
-          statuses.set(owner.id, owner.status);
-          if (owner.status === "committed") count += 1;
-          cursor.continue();
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      };
     };
   });
+  const memberships = await Promise.all(
+    candidates.map((segment) =>
+      manifestBlockMembershipInTransaction(catalog, version, segmentBlockIds(segment)),
+    ),
+  );
+  const statuses = new Map<string, TransactionRecord["status"]>();
+  let count = 0;
+  for (const [position, segment] of candidates.entries()) {
+    const membership = memberships[position] ?? [];
+    const visibleBlockCount = membership.filter((present) => present).length;
+    if (visibleBlockCount > 0 && visibleBlockCount < membership.length) {
+      throw corruption(`segments/${segment.id}`, "only part of the segment is manifest-live");
+    }
+    if (membership.length > 0 && visibleBlockCount === 0) continue;
+    let status = statuses.get(segment.transactionId);
+    if (status === undefined) {
+      const owner = await requestResult<unknown>(transactions.get(segment.transactionId));
+      if (owner === undefined) {
+        throw corruption(
+          `segments/${segment.id}`,
+          `owning transaction ${segment.transactionId} is missing`,
+        );
+      }
+      status = asStoredTransactionRecord(owner, segment.transactionId).status;
+      statuses.set(segment.transactionId, status);
+    }
+    if (status === "committed") count += 1;
+  }
+  return count;
 }
 
 async function compactionJobRemovalPreservesProvenance(

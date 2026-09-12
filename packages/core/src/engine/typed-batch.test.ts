@@ -58,8 +58,8 @@ function boundary(): { clientSide: ClientTransport; workerSide: RpcScope } {
     },
     workerSide: {
       postMessage: (message) => deliver(clientListeners, message),
-      addEventListener: (_type, listener) => {
-        workerListeners.push(listener);
+      addEventListener: (type: string, listener) => {
+        if (type === "message") workerListeners.push(listener);
       },
     },
   };

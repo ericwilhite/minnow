@@ -146,9 +146,10 @@ describe("published core tarball", () => {
     }>;
     expect(report?.files.map(({ path }) => path)).not.toContain("dist/engine/query-cache.d.ts");
     expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
-    // Existing publication budgets also cover declaration pruning.
-    expect(report?.size, "packed bytes").toBeLessThanOrEqual(870_000);
-    expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_300_000);
+    // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
+    // 4,300,000 with 0.10.1's coordination and recovery fixes; ratchets, not targets.
+    expect(report?.size, "packed bytes").toBeLessThanOrEqual(880_000);
+    expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_350_000);
     const emitted = await readFile(join(coreRoot, "dist", "engine", "optimizer.js"), "utf8");
     expect(emitted).not.toContain("/**");
     expect(emitted).not.toMatch(/^\s*\/\//mu);

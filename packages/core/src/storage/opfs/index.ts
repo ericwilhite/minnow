@@ -1,4 +1,9 @@
-export { OpfsBlockStore, deleteOpfsDatabase, type OpfsBlockStoreOptions } from "./store.js";
+export {
+  OpfsBlockStore,
+  deleteOpfsDatabase,
+  opfsDatabaseExists,
+  type OpfsBlockStoreOptions,
+} from "./store.js";
 export {
   OpfsCoordinationError,
   OpfsDatabaseInUseError,

@@ -893,7 +893,7 @@ class DatabaseRpcServer {
     const handle = this.#handles.get(handleId);
     if (handle === undefined) throw new Error(`Unknown handle: ${handleId}`);
     if (handle.type === "write") {
-      this.#beginWriteHandleCall(handle);
+      await this.#beginWriteHandleCall(handle);
       try {
         return await this.#callWriteHandle(handleId, handle, method, args, context);
       } finally {
@@ -1269,11 +1269,15 @@ class DatabaseRpcServer {
     this.#reservedHandleIds.delete(id);
   }
 
-  #beginWriteHandleCall(handle: Extract<Handle, { type: "write" }>): void {
+  /**
+   * The client serialises a scope's calls, so two only overlap when the client gave up on the
+   * first — a cancelled read whose worker-side execution is still winding down — and then the
+   * next call waits for it rather than being refused, or the scope's remaining statements and
+   * its commit would all fail on a read the application deliberately abandoned.
+   */
+  async #beginWriteHandleCall(handle: Extract<Handle, { type: "write" }>): Promise<void> {
+    while (handle.activeCalls !== 0) await handle.activeCallDone;
     if (!handle.open) throw new Error("Write handle is closed");
-    if (handle.activeCalls !== 0) {
-      throw new Error("Write handle already has a call in flight");
-    }
     handle.activeCalls = 1;
     handle.activeCallDone = new Promise<void>((resolve) => {
       handle.finishActiveCall = resolve;

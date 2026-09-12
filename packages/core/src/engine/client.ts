@@ -546,6 +546,11 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     this.#events.clear();
     this.#transport = next;
     this.#ready = this.#attach(next);
+    // close() removed the listener; a client reopened after closing reports visibility again.
+    // Registering the same function twice is a no-op, so a reopen without a close is safe too.
+    if (this.#onVisibilityChange !== undefined && typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.#onVisibilityChange);
+    }
     this.#onVisibilityChange?.();
     await this.#ready;
   }
@@ -1270,7 +1275,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     try {
       await this.#post("rpc-call", null, "dispose", [], undefined, true, { timeoutMs });
     } finally {
-      this.#fail(new Error("Database client is closed"));
+      this.#fail(new Error("Database client is closed"), true);
       this.#transport.removeEventListener?.("message", this.#onMessage);
       this.#transport.removeEventListener?.("error", this.#onError);
       this.#transport.removeEventListener?.("messageerror", this.#onMessageError);
@@ -1479,15 +1484,16 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
    */
   #rejectUnreadable(message: unknown, cause: unknown): void {
     const reason = cause instanceof Error ? cause.message : String(cause);
-    const error = new Error(`The database worker sent a frame this client cannot read: ${reason}`, {
-      cause,
-    });
+    const text = `The database worker sent a frame this client cannot read: ${reason}`;
     const requestId = (message as { requestId?: unknown }).requestId;
     const pending = typeof requestId === "string" ? this.#pending.get(requestId) : undefined;
     if (pending === undefined || typeof requestId !== "string") {
-      this.#fail(error);
+      // Lost in every sense that matters: nothing this worker sends can be trusted, so it is
+      // reported as a transport failure, which `classifyError` and `onConnectionLost` recognise.
+      this.#fail(new DatabaseWorkerFailedError("messageerror", text, { cause }));
       return;
     }
+    const error = new Error(text, { cause });
     this.#pending.delete(requestId);
     pending.cleanup?.();
     pending.reject(
@@ -1497,12 +1503,33 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     );
   }
 
-  #fail(error: Error): void {
+  /**
+   * Fails every pending call and ends every event route. A live subscription, patch stream,
+   * observer, or buffered writer hears that its worker is gone the way it would hear the worker
+   * close its set: `onError` with the loss, then `onComplete`. A clean `close()` passes
+   * `closing`, and the routes the worker did not already complete hear only `onComplete`.
+   */
+  #fail(error: Error, closing = false): void {
     const first = this.#fatal === undefined;
     this.#fatal = error;
     const pending = [...this.#pending.values()];
     this.#pending.clear();
+    const routes = [...this.#events.values()];
     this.#events.clear();
+    for (const route of routes) {
+      if (!closing) {
+        try {
+          route.onError?.(error);
+        } catch {
+          // A listener that throws must not keep the others from hearing the loss.
+        }
+      }
+      try {
+        route.onComplete?.();
+      } catch {
+        // Same: every route hears the end.
+      }
+    }
     for (const call of pending) {
       call.cleanup?.();
       call.reject(

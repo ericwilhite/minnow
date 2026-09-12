@@ -123,7 +123,8 @@ it("keeps a follower's slow write alive with keepalives instead of timing it out
 
 it("asks a silent leader whether it is alive before giving a write up as uncertain", async () => {
   const shim = new MemoryOpfs();
-  const open = opener(shim, "patience");
+  // A short search budget: the second half measures a leader that never answers again.
+  const open = opener(shim, "patience", { dispatchBudgetMs: 1_500 });
   const leader = await open();
   const follower = await open();
   try {

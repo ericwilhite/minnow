@@ -8873,6 +8873,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       tables: new Map(),
       mirrored: true,
       generation: 0,
+      flushedWork: 0,
       flushing: Promise.resolve(),
     });
     let closed = false;
@@ -8902,25 +8903,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     };
     // Work that was staged or buffered by a statement that then failed cannot be undone in
     // place, so the scope closes to everything but a rollback.
+    // Work the statement's own read forced out of the write sets is not the statement's: a
+    // read-first UPDATE encodes what earlier statements buffered before it validates, and a
+    // validation failure after that must leave the scope as usable as it would have been with
+    // nothing pending. Only staging the statement did itself, or rows it buffered, poisons.
+    const ownStagedWork = (): number =>
+      transaction.stagedWorkCount - (this.#scopeWrites.get(transaction)?.flushedWork ?? 0);
     const guarded = async <T>(run: () => Promise<T>): Promise<T> => {
-      const before = transaction.stagedWorkCount;
+      const before = ownStagedWork();
       const generation = this.#scopeWriteGeneration(transaction);
       try {
         return await run();
       } catch (error) {
-        if (
-          transaction.stagedWorkCount !== before ||
-          this.#scopeWriteGeneration(transaction) !== generation
-        ) {
+        if (ownStagedWork() !== before || this.#scopeWriteGeneration(transaction) !== generation) {
           poisoned ??= error;
         }
         throw error;
       }
     };
     const operations: WriteSession = {
+      // Results cross the application boundary here, as db.query's do: the internal tagged
+      // forms (NUMERIC domains, above all) are for the engine's own readers — trigger bodies
+      // and keyed lookups share #sessionQuery — never for the callback's code.
       query: async (sql, options) => {
         open();
-        return this.#withReadReservation(() => this.#sessionQuery(transaction, sql, options));
+        return externalizeQueryResult(
+          await this.#withReadReservation(() => this.#sessionQuery(transaction, sql, options)),
+        );
       },
       execute: async (sql, params) => {
         open();
@@ -8928,10 +8937,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (compiled.kind === "select") {
           return this.#withReadReservation(async () => ({
             kind: "rows" as const,
-            result: await this.#sessionQuery(
-              transaction,
-              compiled.sql,
-              params === undefined ? {} : { params },
+            result: externalizeQueryResult(
+              await this.#sessionQuery(
+                transaction,
+                compiled.sql,
+                params === undefined ? {} : { params },
+              ),
             ),
           }));
         }
@@ -8961,7 +8972,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // Guard the whole SQL statement as one stage. Some INSERT forms perform more than one
         // batch operation; if a later step fails after an earlier one staged work, the caller
         // must not be able to catch the error and commit only part of the statement.
-        return writer.executeStatement(statement);
+        return externalizeExecuteResult(await writer.executeStatement(statement));
       },
       insertBatch: async (tableName, input) => {
         open();
@@ -9699,6 +9710,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Encodes a table's set at a block's worth of rows, or every set at the scope's byte budget. */
   async #settleScopeWriteSet(transaction: DatabaseTransaction, set: ScopeWriteSet): Promise<void> {
+    // Buffering stages nothing, so nothing on this path renews the scope's ownership inline,
+    // and a statement loop that never yields starves the heartbeat timer: a long buffered
+    // scope would reach its commit with an expired lease. The check is O(1) until renewal is due.
+    await transaction.renewIfDue();
     if (set.pendingRows >= this.#rowsPerBlock) {
       await this.#flushScopeWriteSets(transaction, [set.table.id]);
       return;
@@ -9740,12 +9755,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (const tableId of ids) {
       const set = state.tables.get(tableId);
       if (set === undefined || set.pendingRows === 0) continue;
+      const before = transaction.stagedWorkCount;
       try {
         await this.#stageScopeWriteSet(transaction, state, set);
       } catch (error) {
         // Part of the set may have staged: the scope can only roll back from here.
         state.failure ??= error;
         throw error;
+      } finally {
+        // Accounted to the sets, not to whichever statement's read forced the encoding.
+        state.flushedWork += transaction.stagedWorkCount - before;
       }
     }
     if (!state.mirrored) return;
@@ -9875,6 +9894,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       tables: new Map(),
       mirrored: false,
       generation,
+      flushedWork: 0,
       flushing: Promise.resolve(),
     });
     this.#stagedKeyOverlays.delete(transaction);
@@ -10076,6 +10096,63 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * since, or committed and not removed. The scope's key overlay settles most keys; the rest are
    * probed at the scope's snapshot with a keyed read that needs none of the write set encoded.
    */
+  /**
+   * An INSERT's keys — the table key and every ready UNIQUE index term — checked against what
+   * the scope holds and, inside a scope, what is committed, before anything registers: a
+   * conflict then fails the statement alone, as the transaction guide promises, and the scope
+   * stays usable. Outside a scope only the staged overlay is consulted; the commit's atomic
+   * check answers for committed rows there, without a probe per statement.
+   */
+  async #assertInsertKeysAbsent(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    batch: ColumnarBatch,
+    keys: ReadonlyMap<string, Exclude<BatchValue, null>> | undefined,
+  ): Promise<void> {
+    const inScope = this.#scopeWrites.has(transaction);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keys !== undefined && keyColumn !== undefined) {
+      const present = inScope
+        ? await this.#scopeKeyPresence(transaction, table, keyColumn, [...keys.values()])
+        : this.#stagedKeyOverlay(transaction, table.id).added;
+      for (const [token, value] of keys) {
+        if (present.has(token)) {
+          throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
+        }
+      }
+    }
+    if (!inScope) return;
+    const rowCount = batch.rowCount ?? Object.values(batch.columns)[0]?.length ?? 0;
+    for (const { indexId, index, columns } of readyUniqueSecondaryIndexes(table)) {
+      const namespaceId = secondaryUniqueKeyNamespace(table.id, indexId);
+      const terms: string[] = [];
+      for (let row = 0; row < rowCount; row += 1) {
+        const term = secondaryUniqueTerm(
+          index,
+          columns,
+          columns.map((column) => batch.columns[column.name]?.[row] ?? null),
+        );
+        if (term !== undefined) terms.push(term);
+      }
+      assertNoDuplicateUniqueTerms(index, terms);
+      const overlay = this.#stagedKeyOverlay(transaction, namespaceId);
+      const unresolved: string[] = [];
+      for (const term of terms) {
+        if (overlay.added.has(term)) {
+          throw await this.#translateUniqueConflict(new UniqueKeyConflictError(namespaceId, term));
+        }
+        if (!overlay.removed.has(term)) unresolved.push(term);
+      }
+      if (unresolved.length === 0) continue;
+      const [existing] = await this.#existingUniqueKeysWindowed(namespaceId, unresolved);
+      if (existing !== undefined) {
+        throw await this.#translateUniqueConflict(
+          new UniqueKeyConflictError(namespaceId, existing),
+        );
+      }
+    }
+  }
+
   async #scopeKeyPresence(
     transaction: DatabaseTransaction,
     table: TableRecord,
@@ -10208,31 +10285,27 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     await this.#assertCompactionCapacity(table, transaction);
-    const keys = batchKeys(table, batch);
-    if (keys !== undefined) {
-      if (kind === "insert") {
-        // A key the scope already holds fails this statement, before it registers anything,
-        // so the scope stays usable; commit still re-validates against committed rows.
-        const keyColumn = getUniqueKeyColumn(table);
-        const overlay = this.#stagedKeyOverlay(transaction, table.id);
-        for (const [token, value] of keys) {
-          if (overlay.added.has(token) && keyColumn !== undefined) {
-            throw new UniqueConstraintError(table.name, keyColumn.name, value);
-          }
-        }
-      }
-      transaction.setUniqueKeyChanges({
-        tableId: table.id,
-        keyTokens: [...keys.keys()],
-        requireAbsent: kind === "insert",
-      });
-    }
+    // Proven before anything registers: a missing parent fails this statement alone, and the
+    // scope stays usable. Registering the keys first would turn the refusal into a poisoned scope.
     await this.#assertForeignKeysPresent(
       table,
       (column) => batch.columns[column] ?? [],
       (sql, params) => this.#sessionQuery(transaction, sql, { params }),
       transaction,
     );
+    const keys = batchKeys(table, batch);
+    // A key or UNIQUE term the scope already holds, or that is committed, fails this statement
+    // before it registers anything, so the scope stays usable; commit re-validates atomically.
+    // An upsert replaces rows, so only a term the batch repeats within itself refuses it here.
+    if (kind === "insert") await this.#assertInsertKeysAbsent(transaction, table, batch, keys);
+    else assertBatchSecondaryTermsDistinct(table, batch);
+    if (keys !== undefined) {
+      transaction.setUniqueKeyChanges({
+        tableId: table.id,
+        keyTokens: [...keys.keys()],
+        requireAbsent: kind === "insert",
+      });
+    }
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
     stageSecondaryUniqueInsertChanges(
@@ -13656,18 +13729,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibleByTable.get(freshBaseTable.name) ??
         (await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility));
       this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments);
-      const ftsSegments = await this.#ftsPrunedSegments(
+      const indexed = await this.#indexPrunedSegments(
         freshBaseTable,
         visibleBaseSegments,
         plan,
         snapshot,
-      );
-      throwIfAborted(options.signal);
-      const indexed = await this.#secondaryIndexPrunedSegments(
-        freshBaseTable,
-        ftsSegments,
-        plan,
-        snapshot,
+        visibility,
       );
       throwIfAborted(options.signal);
       const baseSegments = indexed.segments;
@@ -20942,6 +21009,36 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * stable row locators; the locator selects blocks, and the ordinary executor still evaluates
    * every SQL predicate in each surviving row. Stale entries therefore cost I/O only.
    */
+  /**
+   * Full-text and index pruning over the committed segments only. A scope's own staged
+   * segments are in no index — the postings have never seen their rows — so they are never
+   * pruned; they follow the pruned committed segments unchanged. Once the scope has staged an
+   * update, delete, or upsert for the table, nothing is pruned at all: those rows replay onto
+   * committed rows the index would otherwise let the scan skip.
+   */
+  async #indexPrunedSegments(
+    table: TableRecord,
+    segments: SegmentRecord[],
+    plan: CompiledQuery,
+    snapshot: LeasedSnapshot,
+    visibility: { readonly overlayTransactionId?: string } | undefined,
+  ): Promise<{ segments: SegmentRecord[]; pruned: boolean; rows?: number[] }> {
+    const own = overlayOwnedSegments(segments, visibility);
+    if (own.length === 0) {
+      const ftsSegments = await this.#ftsPrunedSegments(table, segments, plan, snapshot);
+      return this.#secondaryIndexPrunedSegments(table, ftsSegments, plan, snapshot);
+    }
+    if (own.some((segment) => segment.kind !== "insert")) return { segments, pruned: false };
+    const committed = segments.filter(
+      (segment) => segment.transactionId !== visibility?.overlayTransactionId,
+    );
+    const ftsSegments = await this.#ftsPrunedSegments(table, committed, plan, snapshot);
+    const indexed = await this.#secondaryIndexPrunedSegments(table, ftsSegments, plan, snapshot);
+    // An exact row selection is numbered without the scope's rows; block pruning is all that
+    // carries over.
+    return { segments: [...indexed.segments, ...own], pruned: indexed.pruned };
+  }
+
   async #secondaryIndexPrunedSegments(
     table: TableRecord,
     segments: SegmentRecord[],
@@ -21295,7 +21392,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     plan?: CompiledQuery,
   ): Promise<ColumnarTable> {
     const visibleSegments = await this.#visibleSegmentRecords(table, snapshot, visibility);
-    if (plan !== undefined) {
+    // A covering read answers from the index alone, which has never seen a scope's own rows.
+    if (plan !== undefined && overlayOwnedSegments(visibleSegments, visibility).length === 0) {
       const covering = await this.#secondaryIndexCoveringTable(
         table,
         projectedColumns,
@@ -21305,14 +21403,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
       if (covering !== undefined) return covering;
     }
-    const ftsSegments =
-      plan === undefined
-        ? visibleSegments
-        : await this.#ftsPrunedSegments(table, visibleSegments, plan, snapshot);
     const indexed =
       plan === undefined
-        ? { segments: ftsSegments, pruned: false }
-        : await this.#secondaryIndexPrunedSegments(table, ftsSegments, plan, snapshot);
+        ? { segments: visibleSegments, pruned: false }
+        : await this.#indexPrunedSegments(table, visibleSegments, plan, snapshot, visibility);
     const segments = indexed.segments;
     const keyColumn = getUniqueKeyColumn(table);
     if (
@@ -24322,6 +24416,27 @@ function assertNoDuplicateUniqueTerms(index: SecondaryIndexRecord, terms: readon
   }
 }
 
+/**
+ * Refuses a batch that repeats a ready UNIQUE index term within itself, before the statement
+ * registers anything: found later, after the table key is registered, the same duplicate
+ * would poison the whole scope instead of failing the one statement.
+ */
+function assertBatchSecondaryTermsDistinct(table: TableRecord, input: ColumnarBatch): void {
+  const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
+  for (const { index, columns } of readyUniqueSecondaryIndexes(table)) {
+    const terms: string[] = [];
+    for (let row = 0; row < rowCount; row += 1) {
+      const term = secondaryUniqueTerm(
+        index,
+        columns,
+        columns.map((column) => input.columns[column.name]?.[row] ?? null),
+      );
+      if (term !== undefined) terms.push(term);
+    }
+    assertNoDuplicateUniqueTerms(index, terms);
+  }
+}
+
 function stageSecondaryUniqueInsertChanges(
   transaction: DatabaseTransaction,
   table: TableRecord,
@@ -24398,7 +24513,13 @@ function stageSecondaryUniqueMutationChanges(
       const term = secondaryUniqueTerm(
         index,
         columns,
-        columns.map((column) => input.changes[column.name]?.[row] ?? old[column.name] ?? null),
+        // A column the statement assigns takes the assigned value even when that value is
+        // NULL: falling back to the old value there would re-register the term the row is
+        // giving up, and the phantom would refuse every later row that wants it.
+        columns.map((column) => {
+          const assigned = input.changes[column.name];
+          return assigned === undefined ? (old[column.name] ?? null) : (assigned[row] ?? null);
+        }),
       );
       return term === undefined ? [] : [term];
     });
@@ -28331,6 +28452,15 @@ function firesAfterTriggers(
 }
 
 /** Collects every real table name referenced by a block, its derived sources, or its subqueries. */
+/** The segments a write scope staged itself, among the ones visible to it. */
+function overlayOwnedSegments(
+  segments: readonly SegmentRecord[],
+  visibility: { readonly overlayTransactionId?: string } | undefined,
+): SegmentRecord[] {
+  const id = visibility?.overlayTransactionId;
+  return id === undefined ? [] : segments.filter((segment) => segment.transactionId === id);
+}
+
 function collectRealTableNames(plan: CompiledQuery): string[] {
   const names = new Set<string>();
   const excluded = new Set<string>();

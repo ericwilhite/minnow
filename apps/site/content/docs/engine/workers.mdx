@@ -293,9 +293,12 @@ The `opfs` and `indexeddb` fields carry each store's own options and apply to wh
 opens. The choice is made once per database name and remembered in a small IndexedDB record
 (`minnowdb-store-choice`), so a database created on one store is never reopened, empty, on the
 other: if the remembered store cannot open — OPFS in a context that has lost it — `ready()`
-rejects with `DatabaseStoreUnavailableError` rather than starting over. When you delete the
-database, call `forgetStoreChoice(name)` from `@minnowdb/core` as well, so the name can decide
-afresh.
+rejects with `DatabaseStoreUnavailableError` rather than starting over. A name with no record
+that already holds a database on one store — created through an explicit `{ kind: "indexeddb" }`
+or `{ kind: "opfs" }` descriptor before the application switched to `auto`, or whose record was
+cleared — opens that database and records the store then, so the switch never starts an empty
+one beside it. When you delete the database, call `forgetStoreChoice(name)` from
+`@minnowdb/core` as well, so the name can decide afresh.
 
 `auto` is served by the generic entry and by `@minnowdb/core/worker/auto`, which bundles the two
 durable stores and nothing else — the right entry when the bundler cannot split worker code.

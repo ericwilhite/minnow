@@ -55,6 +55,12 @@ export interface ScopeWriteState {
   mirrored: boolean;
   /** Bumped before any set changes, so a statement that fails after buffering poisons its scope. */
   generation: number;
+  /**
+   * Staged work the flushes did — encoding buffered sets because a read, a savepoint, or the
+   * budget asked — as opposed to work a statement staged directly. A statement whose read
+   * forced a flush and then failed validation did not stage anything itself.
+   */
+  flushedWork: number;
   /** An encoding that failed part-way: the scope can only roll back. */
   failure?: unknown;
   /** The flush in progress, if any; the next one waits for it. */

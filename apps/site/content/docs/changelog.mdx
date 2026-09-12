@@ -8,6 +8,114 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.10.1 — September 12, 2026
+
+Published packages: `@minnowdb/core@0.10.1`.
+
+**Stored formats are unchanged**: OPFS layout 6, IndexedDB schema 2, block format 2, snapshot
+format 1, worker protocol 7. The OPFS follower protocol gains one broadcast kind, `wait`, which a
+0.10.0 tab ignores; a mixed origin keeps working, and only the new tabs wait out a long recovery.
+
+An audit of the 0.10.0 release, with emphasis on multi-tab coordination, leader failure, and
+durability, found the defects below. Every one is fixed here and pinned by a test.
+
+### Added
+
+- **`opfsDatabaseExists({ name })`** on `@minnowdb/core/storage/opfs`: whether a database
+  directory of that name exists, without creating one. The `auto` descriptor uses it to find a
+  database an explicit `opfs` descriptor created; it sits beside `deleteOpfsDatabase`.
+
+### Fixed
+
+- **OPFS: a leader's own writes no longer fail during a handover.** A hidden leader's
+  operations queued behind an in-flight write, when a foreground tab bid for the handles or the
+  idle release let them go, failed with "This OPFS store connection is closed" while the store was
+  open. They are now re-dispatched to whoever leads next, and the log proves nothing ran twice.
+- **OPFS: a graceful close mid-write answers the write.** Closing a leader while it served a
+  follower's mutation shut the log down between the mutation's frame and its result frame and
+  dropped the answer, so the follower re-sent and was told the outcome was uncertain for a write
+  that was durable and known. The shutdown now takes its turn behind the mutation, and the
+  channels stay open until every admitted request has its result or decline.
+- **OPFS: a slow successor no longer fails every other tab.** Followers looked for a leader
+  through a fixed ten attempts, about two seconds; a successor still recovering a large log, or a
+  leader checkpointing on its way out, left every other tab's operation failing with
+  `leader-unavailable`, and a follower's mutation with `OpfsUncertainOutcomeError` although
+  nothing had run. The search is now a ten-second budget that restarts on each `wait` answer from
+  the connection holding the handles, so a live recovery is waited out and a frozen leader is not.
+- **OPFS: power-loss artifacts are read as unwritten.** A zero-filled WAL tail — the file's new
+  length persisted, the appended frame not — refused to open the database as corruption, and a
+  checkpoint slot whose magic landed ahead of its header was reported as a version-0 database,
+  which stopped recovery before the intact mirror slot was consulted. Both now mean "not
+  written": the zero tail ends the log, and a slot's version is believed only once its length
+  and checksum verify.
+- **OPFS: an over-limit checkpoint no longer wedges the database.** Once the encoded state
+  exceeded the 256 MiB checkpoint cap, every write — including the abort or rollback that would
+  have shrunk the state — was refused forever. Operations that only retire state now go through
+  the remaining log headroom, so the database can always be brought back under the cap.
+- **OPFS: a served result recorded on a poisoned leader settled a stale ledger entry**, and the
+  next checkpoint forgot the value; the entry is now looked up inside the logged step.
+- **IndexedDB: appending to a chunked journal through `updateTransaction` corrupted it** once a
+  closed chunk held segments — the stored tail was overwritten by a repacked one, losing blocks
+  and duplicating segments, and every later read of the record reported the journal as corrupt.
+  The engine reaches that path in compaction recovery. The stored tail chunk is now read, as
+  `stageTransactionArtifacts` always did.
+- **IndexedDB: a quota failure surfaced as `AbortError`.** A refused write aborts the
+  transaction and fails every queued request with `AbortError` first; commits now report the
+  transaction's own error, the `QuotaExceededError`, as the documentation promised.
+- **IndexedDB: commit cost no longer grows with the database.** Every insert's commit walked the
+  manifest's whole block set to count level-zero segments; the count now probes the block
+  records of the table's unfolded segments only, so at two hundred prior commits a single-shot
+  commit dropped from 537 ms to 94 ms in the fake-IndexedDB harness, and what remains scales with
+  the segments compaction has not yet folded.
+- **IndexedDB: tables with generated columns are accepted.** The record validator rejected
+  `generatedValue` as an unknown field, so `CREATE TABLE … GENERATED ALWAYS AS (…) STORED` failed on
+  this store with a storage-corruption error.
+- **Write scopes: a failing read-first statement no longer poisons the scope.** An `UPDATE` that
+  read the table — encoding what earlier statements had buffered — and then failed validation was
+  classified as having failed mid-stage, and the scope could only roll back. Work the flush did is
+  now accounted to the sets, not to the statement.
+- **Write scopes: long buffered scopes keep their lease.** Buffered statements stage nothing, so
+  nothing renewed the transaction's ownership inline, and a statement loop that never yielded to
+  the event loop starved the heartbeat timer; the scope reached its commit with an expired lease.
+  The buffered path now renews when a third of the lease has elapsed, through the new
+  `DatabaseTransaction.renewIfDue()` on the transactions entry point.
+- **Write scopes: index-backed reads see the scope's own rows.** A secondary-index or full-text
+  lookup inside a scope pruned the scope's staged segments along with the committed ones the
+  index ruled out, so a row inserted in the scope was missing from `WHERE indexed = ?`, `IN`,
+  ranges, and `COUNT`, and an updated row vanished from both its old and new value once the
+  committed table spanned more than one row group. The scope's segments are never pruned, and
+  nothing is pruned once the scope has staged an update or delete for the table.
+- **Write scopes: `tx.query` and `tx.execute` return NUMERIC values in their public form**, as
+  `db.query` does, instead of the engine's internal tagged strings.
+- **Write scopes: unique violations fail the statement, not the scope.** An insert whose key or
+  UNIQUE index term conflicts with a row the scope holds or a committed row, a batch that repeats
+  a UNIQUE term, and a foreign-key violation now fail that statement alone and leave the scope
+  usable, as the transactions guide describes; commit still re-validates atomically.
+- **Setting a UNIQUE-indexed column to NULL retires its term.** The old value was re-registered
+  instead, so after `UPDATE … SET code = NULL` no other row could take that code, and a scope that
+  nulled a value and gave it to another row failed at commit.
+- **Worker client: live subscriptions hear a lost connection.** A transport error, timeout, or
+  reopen rejected pending calls but silently dropped every live query, patch stream, observer, and
+  buffered-writer route, so a typed live query stayed `ready` with stale rows for good. Each route
+  now gets `onError` with the loss and then `onComplete`; a clean `close()` completes them.
+- **Worker client: cancelling a read inside `write()` no longer fails the scope.** The next
+  scope call, or the commit itself, was refused with "Write handle already has a call in flight"
+  while the cancelled read wound down on the worker; it now waits for it.
+- **Worker client: a lost staging or transaction-record acknowledgement is recovered.** `write()`
+  reported `OpfsUncertainOutcomeError` for a stage whose artifacts were durable — a stage
+  publishes nothing, so nothing was uncertain — and a record created without its acknowledgement
+  stayed active until it expired. The transaction layer now reads the record back, adopts it,
+  and continues when the error said the acknowledgement may have been lost.
+- **Worker client: an unreadable frame that names no request is a connection loss.** It now
+  fails the client with `DatabaseWorkerFailedError` (`reason: "messageerror"`) so
+  `onConnectionLost` fires and `classifyError` reports the connection unusable, instead of a
+  plain `Error` that neither recognised. A client reopened after `close()` reports page
+  visibility again.
+- **`{ kind: "auto" }` finds an existing database.** A name with no remembered choice that
+  already held a database — created through an explicit store descriptor before the switch to
+  `auto` — was opened empty on OPFS. The existing store now decides, and a reservation is only
+  forgotten after a failed open when no database exists on that store.
+
 ## 0.10.0 — September 12, 2026
 
 Published packages: `@minnowdb/core@0.10.0`.
