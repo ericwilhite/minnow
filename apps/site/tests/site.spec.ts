@@ -89,7 +89,7 @@ test("the console reopens an existing database instead of rebuilding it", async 
           );
         }),
     ),
-  ).toBe(1);
+  ).toBe(2);
 
   await page.reload();
   await expect(page.getByText("this database was already on your machine")).toBeVisible({
@@ -104,11 +104,12 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
   await page.evaluate(
     () =>
       new Promise<void>((resolve, reject) => {
-        const request = indexedDB.open("minnow-playground", 2);
+        // One past the schema this build writes: a database a newer build left behind.
+        const request = indexedDB.open("minnow-playground", 3);
         request.addEventListener(
           "upgradeneeded",
           () => {
-            request.result.createObjectStore("future-v2-sentinel");
+            request.result.createObjectStore("future-v3-sentinel");
           },
           { once: true },
         );
@@ -143,7 +144,7 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
             const database = request.result;
             resolve({
               version: database.version,
-              hasFutureSentinel: database.objectStoreNames.contains("future-v2-sentinel"),
+              hasFutureSentinel: database.objectStoreNames.contains("future-v3-sentinel"),
             });
             database.close();
           },
@@ -156,7 +157,7 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
         );
       }),
   );
-  expect(untouched).toEqual({ version: 2, hasFutureSentinel: true });
+  expect(untouched).toEqual({ version: 3, hasFutureSentinel: true });
 });
 
 test("the TypeScript tab checks a snippet against the schema and runs it", async ({ page }) => {
