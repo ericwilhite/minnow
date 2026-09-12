@@ -59,7 +59,6 @@ it("reads a guarded upsert's pre-images by point read over a long committed hist
     await db.upsertBatch("items", [{ id: index, revision: 1, note: `r${String(index)}` }]);
   }
   reset();
-  const started = performance.now();
   await db.write(async (tx) => {
     for (let index = 0; index < 50; index += 1) {
       await tx.upsertBatch("items", [{ id: index, revision: 2, note: "guarded" }], {
@@ -67,12 +66,11 @@ it("reads a guarded upsert's pre-images by point read over a long committed hist
       });
     }
   });
-  const perStatementMs = (performance.now() - started) / 50;
   // The delta history is never scanned: the committed segments and their owners are listed
   // once for the scope, not once per statement (fifty statements used to mean fifty listings).
+  // The store calls are the measure; wall-clock time belongs to the benchmark gate.
   expect(calls.get("listTableSegmentPage") ?? 0).toBeLessThanOrEqual(5);
   expect(calls.get("getTransactions") ?? 0).toBeLessThanOrEqual(5);
-  expect(perStatementMs).toBeLessThan(5);
   expect((await db.query("SELECT COUNT(*) AS n FROM items WHERE revision = 2")).rows).toEqual([
     { n: 50 },
   ]);
