@@ -5,9 +5,12 @@
 import { OpfsBlockStore } from "../storage/opfs/index.js";
 import { singleStoreFactory, type WorkerStoreFactory } from "./worker-server.js";
 
-export const opfsWorkerStore: WorkerStoreFactory = singleStoreFactory("opfs", (descriptor) =>
-  OpfsBlockStore.open({
-    name: descriptor.name,
-    ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
-  }),
+export const opfsWorkerStore: WorkerStoreFactory = singleStoreFactory(
+  "opfs",
+  (descriptor, options) =>
+    OpfsBlockStore.open({
+      name: descriptor.name,
+      ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
+      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+    }),
 );

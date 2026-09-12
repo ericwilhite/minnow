@@ -54,8 +54,8 @@ machines: https://minnowdb.com/llms.txt
   `MinnowDatabase` from `@minnowdb/core`, `IndexedDbBlockStore` from
   `@minnowdb/core/storage/indexeddb`.
   `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
-  exist in Safari private browsing, so fall back to IndexedDB when
-  `navigator.storage?.getDirectory` is missing or rejects.
+  exist in Safari private browsing. Through the worker client, `{ kind: "auto", name }` picks
+  OPFS where the worker can hold it and IndexedDB elsewhere, remembering the choice per name.
 - Durable adapters default to `durability: "strict"`. Use `strict` whenever losing an acknowledged
   write is unacceptable. Use `"relaxed"` only when every acknowledged write can be reconstructed,
   replayed, or recovered from another durable source. For browser-local data that must be preserved,
@@ -123,7 +123,10 @@ machines: https://minnowdb.com/llms.txt
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
   This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
   releases reader leases, and drops resident caches.
-  Worker calls have a 60-second default `requestTimeoutMs`; close has a five-second default
+  Never chunk a write to suit the engine: hand `insertBatch`/`upsertBatch` the whole batch, and
+  inside `write()` single-row inserts, updates, deletes, upserts, and keyed constant `UPDATE`/
+  `DELETE` statements coalesce into a few segments per table. Chunking only multiplies commits. Worker calls have a 60-second default `requestTimeoutMs` that counts
+  silence, not wall time; close has a five-second default
   `timeoutMs`. An unknown mutation outcome requires reconciliation by durable application ID,
   never blind replay. Deploy matching client/worker builds (wire protocol 7 in core 0.9.0).
 - An idle SQL transaction rolls back and rejects subsequent statements with
@@ -132,8 +135,9 @@ machines: https://minnowdb.com/llms.txt
 - For anything interactive, run the engine in a worker. Put
   `import "@minnowdb/core/worker"` in a local `db-worker.ts`, then pass
   `new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })` to
-  `MinnowDatabaseClient` with `{ store: { kind: "indexeddb", name: "app-db" } }`, or
-  `{ kind: "opfs", name: "app-db" }` for the OPFS store. Import the client from
+  `MinnowDatabaseClient` with `{ store: { kind: "auto", name: "app-db" } }` — OPFS where
+  available, else IndexedDB, chosen once per name — or name `indexeddb` or `opfs` outright.
+  `client.storeKind()` reports what opened. Import the client from
   `@minnowdb/core/client`. Queries, writes, migrations, cursors, live queries, snapshots, and
   maintenance use the same calls as `MinnowDatabase`.
 - When the worker always opens one kind of store, import `@minnowdb/core/worker/indexeddb`,
@@ -141,6 +145,16 @@ machines: https://minnowdb.com/llms.txt
   `@minnowdb/core/worker`: it bundles that store alone, which matters under Vite's default
   `iife` worker format, where the generic entry carries all three. It refuses any other store
   kind in the client's options.
+- Live queries stay fast only when the engine can maintain them incrementally: one base
+  table with a unique key, at most one inner or left join whose `ON` is a single equality on
+  the joined table's unique key, no subquery, `DISTINCT`, or window function. Anything else re-executes on every relevant
+  commit. Add `CREATE INDEX` for every non-key column a live query filters on. Aggregate in
+  SQL (`COUNT`, `SUM`, `GROUP BY`) rather than reducing a live result in application code. A
+  live list with `ORDER BY` and no `LIMIT` should be `live.window()`. Do not set
+  `pollIntervalMs` with a built-in store; commit hints already cross tabs. Never create
+  per-run tables inside a sync; DDL bumps the schema epoch and conflicts every open scope.
+  `explain(sql)` ends with a `-- live:` line saying whether the statement is maintained and
+  why not; `liveSet.stats().groups` reports the same per statement with rerun counts.
 - For typed Kysely live queries, create one `createKyselyLiveQueries({ driver, db })` manager
   and wrap a selectable query with `query.$call(live)` or `live(query)`. Prefer `live.window()`
   with a unique result key, `ORDER BY`, and a limit for UI lists: single-table statements with a
@@ -230,7 +244,15 @@ machines: https://minnowdb.com/llms.txt
   `@minnowdb/core`; `instanceof` survives worker RPC. Retry boot/migrate with bounded backoff;
   never delete a database merely because migration rejected. Established live queries retain
   their last good result and retry coordination errors automatically. An
-  `OpfsUncertainOutcomeError` needs reconciliation because its mutation may have committed.
+  `OpfsUncertainOutcomeError` needs reconciliation because its mutation may have committed; it
+  is raised only when a leader vanished mid-flight and the recovered log can neither answer the
+  re-sent request nor prove it never ran — never during a handover, a slow write, or an ordinary
+  failover, which the log resolves.
+- Pass `onWorkerError` to `MinnowDatabaseClient` to hear worker failures that belong to no call
+  (uncaught errors, unhandled rejections, failed maintenance, coordination errors); without it
+  they go to `console.error`. They are not fatal. `DatabaseWorkerFailedError` is: it means the
+  Worker itself raised an unhandled error or an unreadable frame, and the client must be
+  replaced.
 - OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
   deletion while a current client is open; a client just closed is waited for, not refused. Close
   pre-0.9.0 clients too: they do not participate in the deletion lock protocol.

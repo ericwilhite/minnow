@@ -11,7 +11,6 @@ import {
   MAX_SNAPSHOT_IMPORT_ACCELERATOR_RETAINED_ENTRIES,
   SNAPSHOT_FRAME_KINDS,
   MAX_STORAGE_ID_CHARACTERS,
-  MAX_TRANSACTION_PENDING_BLOCKS,
   CompactionJobConflictError,
   GarbageCollectionJobConflictError,
   StorageResourceLimitError,
@@ -1209,32 +1208,35 @@ describe("RecordCore hardening", () => {
     expect(core.dump()).toEqual(before);
   });
 
-  it("refuses journal growth at the durable ceiling without mutating the transaction", () => {
-    const blockIds = Array.from(
-      { length: MAX_TRANSACTION_PENDING_BLOCKS },
-      (_, index) => `pending-${String(index)}`,
-    );
-    const physical = new Set(blockIds);
+  it("journals well past the old 4,096-artifact ceiling and reads the journal back in order", () => {
+    const physical = new Set<string>();
     const core = new RecordCore({
       hasBlock: (id) => physical.has(id),
       blockByteLength: (id) => (physical.has(id) ? 1 : undefined),
     });
-    core.createTransaction(transaction("bounded-journal", null));
-    const current = core.updateTransaction("bounded-journal", 0, {
-      pendingBlockIds: blockIds,
-      updatedAt: "2026-08-24T00:00:00.000Z",
-    });
-    expect(() =>
-      core.stageTransactionArtifacts({
+    core.createTransaction(transaction("unbounded-journal", null));
+    let current = core.getTransaction("unbounded-journal");
+    if (current === undefined) throw new Error("Expected the transaction");
+    const expected: string[] = [];
+    for (let batch = 0; batch < 80; batch += 1) {
+      const blocks = Array.from({ length: 64 }, (_, index) => {
+        const id = `pending-${String(batch)}-${String(index)}`;
+        expected.push(id);
+        return { id, bytes: Uint8Array.of(1) };
+      });
+      current = core.stageTransactionArtifacts({
         transactionId: current.id,
         expectedRevision: current.revision,
-        blocks: [{ id: "one-too-many", bytes: Uint8Array.of(1) }],
+        blocks,
         segments: [],
         updatedAt: "2026-08-24T00:00:01.000Z",
-      }),
-    ).toThrow(/journal exceeds 4096 pending blocks/);
-    expect(core.getTransaction(current.id)).toEqual(current);
-    expect(core.getSegment("one-too-many")).toBeUndefined();
+      });
+      // The enclosing store writes the bytes; the core only journals them.
+      for (const block of blocks) physical.add(block.id);
+    }
+    expect(expected.length).toBeGreaterThan(4_096);
+    expect(core.getTransaction(current.id)?.pendingBlockIds).toEqual(expected);
+    expect(current.pendingBlockIds).toEqual(expected);
   });
 
   it("removes pruned manifest descriptors in bounded convergent pages", () => {

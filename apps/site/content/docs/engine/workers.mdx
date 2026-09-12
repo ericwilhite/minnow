@@ -71,7 +71,9 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
 - **`migrate()` takes the same schema DSL** — it's serialized over the wire automatically.
 - **Typed errors survive the trip.** `instanceof UniqueConstraintError` and
   `instanceof UnknownTableError` work on the client, with their fields; stack traces point into
-  the worker.
+  the worker. The `cause` chain crosses too (eight links deep), a platform exception such as a
+  quota refusal is still a `DOMException` named `QuotaExceededError`, and a built-in subclass
+  (`TypeError`, `RangeError`) keeps its prototype.
 - **Results cross as columns, not rows.** A query result leaves the worker as one array per
   column — typed arrays for numbers, booleans, and datetimes, transferred rather than copied, and
   strings as one flat text with offsets — and the client rebuilds the row objects on the main
@@ -125,7 +127,9 @@ It cannot preempt JavaScript in the middle of one synchronous batch; keep the en
 when a large batch must not share the UI thread.
 
 Each RPC has a deadline: `requestTimeoutMs` on the client defaults to 60,000 ms and also covers
-startup. Increase it for intentionally long imports or queries. Expiry closes the connection to
+startup. The deadline measures silence, not wall time: the worker reports every five seconds on
+each call it is still working on, so a large batch write or a slow query is bounded by progress
+rather than by size, up to ten times the deadline in all. Expiry closes the connection to
 further work and rejects pending calls with `DatabaseWorkerTimeoutError`, or
 `DatabaseWorkerOutcomeUnknownError` when an operation could have published before its reply was
 lost. Transport failures and cancellation of a dispatched mutation use the same unknown-outcome
@@ -133,6 +137,33 @@ error. The client never replays a mutation automatically. Reopen a client and re
 application ID (for example, a unique sale ID) before retrying; a lost reply is not proof of rollback.
 The [checkout recovery pattern](/docs/engine/transactions#recovering-an-interrupted-checkout)
 keeps that identity durable across a browser restart and handles concurrent retries.
+
+Nothing that goes wrong inside the worker stays there. A failure that belongs to no call — an
+uncaught exception in a timer or channel listener, an unhandled promise rejection, a background
+checkpoint or collection step that failed, a multi-tab election that threw — is caught by the
+worker host and delivered to the client's `onWorkerError` option as a
+`DatabaseWorkerErrorEvent`: a `kind` (`uncaught`, `unhandled-rejection`, `messageerror`,
+`maintenance`, `coordination`, or `transport`), a `context` naming where it happened, and the
+rehydrated `error`. Without a handler each one is written to `console.error` on the main thread.
+These reports are not fatal: the connection keeps working, and the calls it was serving settle on
+their own. The Worker object's own `error` and `messageerror` events are different — they mean
+the channel's state is unknown, so every pending call rejects with `DatabaseWorkerFailedError`
+(its message names the event's message, file, and line; the thrown error is its `cause`) and
+later calls throw it too — a `worker.onerror` handler of your own no longer sees those events,
+since the entry marks them handled; open a new
+client. The stock worker entry marks the errors it reports as handled, so the browser does not
+log them a second time under the worker's name.
+
+```ts
+const client = new MinnowDatabaseClient(worker, {
+  store: { kind: "opfs", name: "shop" },
+  onWorkerError: ({ kind, context, error }) => report(`worker ${kind} in ${context}`, error),
+});
+```
+
+A direct engine has the same seam as `MinnowDatabaseOptions.onBackgroundError`, and a directly
+opened OPFS store as `OpfsBlockStoreOptions.onDiagnostic`; the worker host wires both into the
+event above.
 
 `client.close({ terminateWorker: true, timeoutMs: 5000 })` attempts graceful disposal, then
 terminates the worker even if disposal times out. The timeout defaults to five seconds. A rejected
@@ -215,17 +246,19 @@ The generic entry loads each storage adapter with a dynamic `import()` when the 
 frame asks for it. That downloads only the store the worker opens when the bundler splits worker
 code into chunks — esbuild `--splitting`, Vite with `worker: { format: "es" }`, webpack 5. A
 bundler that cannot split a worker inlines all three adapters: with Vite's default `iife` worker
-format the generic worker is about 1.5 MB minified (422 KB gzipped), against about 1.2 MB
-(343 KB gzipped) for the IndexedDB store alone.
+format the generic worker is about 1.6 MB minified (438 KB gzipped), against about 1.3 MB
+(353 KB gzipped) for the IndexedDB store alone and 1.5 MB (430 KB gzipped) for the two durable
+stores the `auto` entry bundles.
 
 When the worker always opens the same kind of store, import the entry that bundles only that
 store:
 
-| Entry                             | Bundles         |
-| --------------------------------- | --------------- |
-| `@minnowdb/core/worker/indexeddb` | IndexedDB store |
-| `@minnowdb/core/worker/opfs`      | OPFS store      |
-| `@minnowdb/core/worker/memory`    | In-memory store |
+| Entry                             | Bundles                                           |
+| --------------------------------- | ------------------------------------------------- |
+| `@minnowdb/core/worker/indexeddb` | IndexedDB store                                   |
+| `@minnowdb/core/worker/opfs`      | OPFS store                                        |
+| `@minnowdb/core/worker/memory`    | In-memory store                                   |
+| `@minnowdb/core/worker/auto`      | OPFS and IndexedDB stores, for `{ kind: "auto" }` |
 
 ```ts
 // db-worker.ts
@@ -242,13 +275,36 @@ This worker bundles only the IndexedDB store and cannot open the OPFS store; imp
 "@minnowdb/core/worker" for every adapter or "@minnowdb/core/worker/opfs" for the OPFS store.
 ```
 
-An app that decides between OPFS and IndexedDB at runtime therefore keeps the generic entry, or
-ships one worker file per store and picks the file before constructing the client.
+## Choosing the store at runtime
+
+An app that wants OPFS wherever it exists and IndexedDB everywhere else does not have to probe
+for it. The `auto` descriptor makes the choice inside the worker, which is the only place it can
+be made — synchronous access handles exist in dedicated workers alone, and not at all in Safari's
+private browsing:
+
+```ts
+const client = new MinnowDatabaseClient(worker, {
+  store: { kind: "auto", name: "app-db", indexeddb: { durability: "relaxed" } },
+});
+console.log(await client.storeKind()); // "opfs" or "indexeddb"
+```
+
+The `opfs` and `indexeddb` fields carry each store's own options and apply to whichever one
+opens. The choice is made once per database name and remembered in a small IndexedDB record
+(`minnowdb-store-choice`), so a database created on one store is never reopened, empty, on the
+other: if the remembered store cannot open — OPFS in a context that has lost it — `ready()`
+rejects with `DatabaseStoreUnavailableError` rather than starting over. When you delete the
+database, call `forgetStoreChoice(name)` from `@minnowdb/core` as well, so the name can decide
+afresh.
+
+`auto` is served by the generic entry and by `@minnowdb/core/worker/auto`, which bundles the two
+durable stores and nothing else — the right entry when the bundler cannot split worker code.
+A per-store entry refuses it, since it could only ever open one of the two.
 
 ## Custom worker entries
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
-`opfs`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`, `coordinateWrites`,
+`opfs`, `auto`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`, `coordinateWrites`,
 `spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, `bufferPoolBytes`,
 `executionMemoryBudgetBytes`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
 It loads each storage adapter only when its descriptor asks for it; whether that becomes a

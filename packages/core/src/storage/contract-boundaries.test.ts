@@ -75,8 +75,9 @@ describe("storage contract boundaries", () => {
 
   it("the engine reaches storage only through its public surface", () => {
     // The composition roots are the only modules allowed to name the adapter entry modules: the
-    // worker host names all three so its dynamic imports can code-split them, and each per-store
-    // worker factory names exactly the one adapter its entry bundles.
+    // worker host names all three so its dynamic imports can code-split them, each per-store
+    // worker factory names exactly the one adapter its entry bundles, and the auto factory names
+    // the two durable adapters its descriptor can resolve to.
     const engine = join(SRC, "engine");
     const compositionRoots = new Map<string, readonly string[]>([
       [
@@ -86,6 +87,7 @@ describe("storage contract boundaries", () => {
       [join(engine, "worker-store-indexeddb.ts"), ["storage/indexeddb.js"]],
       [join(engine, "worker-store-memory.ts"), ["storage/memory.js"]],
       [join(engine, "worker-store-opfs.ts"), ["storage/opfs/index.js"]],
+      [join(engine, "worker-store-auto.ts"), ["storage/indexeddb.js", "storage/opfs/index.js"]],
     ]);
     const layers = ["engine", "plan", "transactions"].map((name) => join(SRC, name));
     for (const file of layers.flatMap(sourceFiles)) {

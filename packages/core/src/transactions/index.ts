@@ -1,7 +1,6 @@
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import {
   assertTransactionArtifactBatchLimits,
-  assertTransactionArtifactJournalLimits,
   type BlockStore,
   type BlockWrite,
   GarbageCollectionJobConflictError,
@@ -220,6 +219,16 @@ export class LeasedSnapshot extends Snapshot {
   }
 }
 
+/** A transaction's journal as its caller sees it, memoized on the state it was built from. */
+interface JournalView {
+  record: TransactionRecord;
+  deferredBlocks: number;
+  deferredSegments: number;
+  blockIds: string[];
+  segmentIds: string[];
+  journaledBlocks: Set<string>;
+}
+
 export class DatabaseTransaction {
   #record: TransactionRecord;
   readonly #uniqueKeyChanges: UniqueKeyChanges[] = [];
@@ -244,6 +253,7 @@ export class DatabaseTransaction {
   readonly #deferredSegments: SegmentRecord[] = [];
   /** Segment metadata retained for local post-commit catalog-cache advancement. */
   readonly #knownSegments = new Map<string, SegmentRecord>();
+  #stagedSegmentsView: readonly SegmentRecord[] | undefined;
   /**
    * Whether the record exists in the store. A deferred transaction (`beginDeferred`) starts
    * without one: it is written on the first two-step staging call, or folded into the
@@ -314,15 +324,93 @@ export class DatabaseTransaction {
     return this.#record.snapshotVersion;
   }
 
+  /**
+   * The journal as the caller sees it: what the store holds plus the process-local batch. A
+   * scope consults these on every statement and every read, and the journal is unbounded now,
+   * so the concatenations and the membership set are memoized on the record and batch they
+   * were built from rather than rebuilt per call.
+   */
+  #journalView: JournalView | undefined;
+
+  #journal(): JournalView {
+    const view = this.#journalView;
+    if (
+      view?.record === this.#record &&
+      view.deferredBlocks === this.#deferredBlocks.length &&
+      view.deferredSegments === this.#deferredSegments.length
+    ) {
+      return view;
+    }
+    const journaledBlocks =
+      view?.record === this.#record ? view.journaledBlocks : new Set(this.#record.pendingBlockIds);
+    const next = {
+      record: this.#record,
+      deferredBlocks: this.#deferredBlocks.length,
+      deferredSegments: this.#deferredSegments.length,
+      blockIds: [...this.#record.pendingBlockIds, ...this.#deferredBlocks.map((block) => block.id)],
+      segmentIds: [
+        ...this.#record.pendingSegmentIds,
+        ...this.#deferredSegments.map((segment) => segment.id),
+      ],
+      journaledBlocks,
+    };
+    this.#journalView = next;
+    return next;
+  }
+
+  /**
+   * The store answered an append with the extended record: carry the memoized block set
+   * forward by exactly the appended ids instead of rebuilding it from the whole journal. Any
+   * other shape of change drops the memo, and the next use rebuilds it.
+   */
+  #journalAppended(previous: TransactionRecord, blockIds: readonly string[]): void {
+    const view = this.#journalView;
+    if (
+      view?.record !== previous ||
+      this.#record.pendingBlockIds.length !== previous.pendingBlockIds.length + blockIds.length
+    ) {
+      this.#journalView = undefined;
+      return;
+    }
+    for (const id of blockIds) view.journaledBlocks.add(id);
+    view.record = this.#record;
+    view.deferredBlocks = -1;
+  }
+
   get pendingBlockIds(): string[] {
-    return [...this.#record.pendingBlockIds, ...this.#deferredBlocks.map((block) => block.id)];
+    return [...this.#journal().blockIds];
   }
 
   get pendingSegmentIds(): string[] {
-    return [
-      ...this.#record.pendingSegmentIds,
-      ...this.#deferredSegments.map((segment) => segment.id),
-    ];
+    return [...this.#journal().segmentIds];
+  }
+
+  /** Whether the journal, persisted or process-local, holds the block. */
+  hasPendingBlock(id: string): boolean {
+    return (
+      this.#journal().journaledBlocks.has(id) ||
+      this.#deferredBlocks.some((block) => block.id === id)
+    );
+  }
+
+  /**
+   * Every segment this transaction has staged, persisted or process-local, as the records it
+   * staged them with. One shared array, rebuilt only when the set changes: a scope reads it on
+   * every statement, and copying a long journal's records each time would cost more than the
+   * read. Callers must not mutate it.
+   */
+  get stagedSegments(): readonly SegmentRecord[] {
+    this.#stagedSegmentsView ??= [...this.#knownSegments.values()];
+    return this.#stagedSegmentsView;
+  }
+
+  /** Journal sizes without materializing the id lists. */
+  get pendingBlockCount(): number {
+    return this.#record.pendingBlockIds.length + this.#deferredBlocks.length;
+  }
+
+  get pendingSegmentCount(): number {
+    return this.#record.pendingSegmentIds.length + this.#deferredSegments.length;
   }
 
   /** Process-local segments retained for a bounded single-shot commit. */
@@ -380,8 +468,8 @@ export class DatabaseTransaction {
    */
   get stagedWorkCount(): number {
     return (
-      this.pendingBlockIds.length +
-      this.pendingSegmentIds.length +
+      this.pendingBlockCount +
+      this.pendingSegmentCount +
       this.#uniqueKeyChanges.length +
       this.#ftsChanges.size +
       this.#compactionSourceBlockIds.size
@@ -416,8 +504,8 @@ export class DatabaseTransaction {
       bytes = checkpointByteSum(bytes, 16 + value.length * 2);
     };
     addString(this.id);
-    for (const id of this.pendingBlockIds) addString(id);
-    for (const id of this.pendingSegmentIds) addString(id);
+    for (const id of this.#journal().blockIds) addString(id);
+    for (const id of this.#journal().segmentIds) addString(id);
     for (const change of this.#uniqueKeyChanges) {
       addString(change.tableId);
       for (const token of change.keyTokens) addString(token);
@@ -451,11 +539,13 @@ export class DatabaseTransaction {
     const segmentPrefix = checkpoint.pendingSegmentIds;
     const retainedBlocks = new Set(blockPrefix);
     const retainedSegments = new Set(segmentPrefix);
-    const currentBlockIds = this.pendingBlockIds;
-    const currentSegmentIds = this.pendingSegmentIds;
+    const currentBlockIds = this.#journal().blockIds;
+    const currentSegmentIds = this.#journal().segmentIds;
+    const currentBlocks = new Set(currentBlockIds);
+    const currentSegments = new Set(currentSegmentIds);
     if (
-      blockPrefix.some((id) => !currentBlockIds.includes(id)) ||
-      segmentPrefix.some((id) => !currentSegmentIds.includes(id))
+      blockPrefix.some((id) => !currentBlocks.has(id)) ||
+      segmentPrefix.some((id) => !currentSegments.has(id))
     ) {
       throw new TypeError("A transaction checkpoint is no longer reachable");
     }
@@ -485,6 +575,7 @@ export class DatabaseTransaction {
       }
     }
     for (const id of removedSegmentIds) this.#knownSegments.delete(id);
+    this.#stagedSegmentsView = undefined;
     this.#uniqueKeyChanges.splice(0);
     this.#ftsChanges.clear();
     this.#commitDeltaBytes = 0;
@@ -511,7 +602,7 @@ export class DatabaseTransaction {
     this.#assertActive();
     const deferred = this.#deferredBlocks.find((block) => block.id === id);
     if (deferred !== undefined) return new Uint8Array(deferred.bytes);
-    if (this.#record.pendingBlockIds.includes(id)) return this.store.getBlock(id);
+    if (this.#journal().journaledBlocks.has(id)) return this.store.getBlock(id);
     return (await this.snapshot()).getBlock(id);
   }
 
@@ -519,19 +610,26 @@ export class DatabaseTransaction {
     blocks: readonly BlockWrite[],
     segments: readonly SegmentRecord[],
   ): void {
-    const blockIds = new Set(this.pendingBlockIds);
-    const segmentIds = new Set(this.pendingSegmentIds);
+    const journal = this.#journal();
+    const blockIds = new Set<string>();
+    const deferredBlocks = new Set(this.#deferredBlocks.map((block) => block.id));
     for (const block of blocks) {
       if (block.id.length === 0) throw new TypeError("Block ID cannot be empty");
-      if (blockIds.has(block.id)) throw new Error(`Block already exists: ${block.id}`);
+      if (
+        journal.journaledBlocks.has(block.id) ||
+        deferredBlocks.has(block.id) ||
+        blockIds.has(block.id)
+      ) {
+        throw new Error(`Block already exists: ${block.id}`);
+      }
       blockIds.add(block.id);
     }
+    const segmentIds = new Set(journal.segmentIds);
     for (const segment of segments) {
       if (segment.id.length === 0) throw new TypeError("Segment ID cannot be empty");
       if (segmentIds.has(segment.id)) throw new Error(`Segment already exists: ${segment.id}`);
       segmentIds.add(segment.id);
     }
-    assertTransactionArtifactJournalLimits([...blockIds], [...segmentIds]);
   }
 
   async #stageArtifactBatch(
@@ -542,6 +640,7 @@ export class DatabaseTransaction {
     assertTransactionArtifactBatchLimits(blocks, segments);
     await this.#ensurePersisted();
     await this.#renewOwnership();
+    const previous = this.#record;
     try {
       this.#record = await this.store.stageTransactionArtifacts({
         transactionId: this.id,
@@ -553,6 +652,10 @@ export class DatabaseTransaction {
     } catch (error) {
       await this.#recoverStagedAcknowledgement(error, blocks, segments);
     }
+    this.#journalAppended(
+      previous,
+      blocks.map((block) => block.id),
+    );
   }
 
   async stageBlock(id: string, bytes: Uint8Array): Promise<void> {
@@ -584,7 +687,7 @@ export class DatabaseTransaction {
     // The journal is an append-only ordered sequence. Stamp the same position on each segment:
     // reads and recovery use the redundant pair to reject reordering or ambiguous same-commit
     // folds before publication.
-    const ordinalBase = this.pendingSegmentIds.length;
+    const ordinalBase = this.pendingSegmentCount;
     const ordered = segments.map((segment, index) => ({
       ...segment,
       commitOrdinal: ordinalBase + index,
@@ -611,6 +714,7 @@ export class DatabaseTransaction {
       );
       this.#deferredSegments.push(...structuredClone(ordered));
       for (const segment of ordered) this.#knownSegments.set(segment.id, structuredClone(segment));
+      this.#stagedSegmentsView = undefined;
       for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
       return;
     }
@@ -619,6 +723,7 @@ export class DatabaseTransaction {
       await this.#stageArtifactBatch(batch.blocks, batch.segments);
     }
     for (const segment of ordered) this.#knownSegments.set(segment.id, structuredClone(segment));
+    this.#stagedSegmentsView = undefined;
     for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
   }
 
@@ -639,6 +744,24 @@ export class DatabaseTransaction {
     for (const segment of segments) {
       if (segment.transactionId !== this.id) {
         throw new Error(`Segment ${segment.id} belongs to another transaction`);
+      }
+    }
+    // Artifacts an earlier stage left in the process-local batch are part of this commit too:
+    // a segment handed in here may reference blocks that a bounded stager flushed ahead of it.
+    // They ride the single storage write when the combined batch still fits one; otherwise
+    // they are journaled first, exactly as an overflowing stage would have journaled them.
+    if (this.#deferredBlocks.length > 0 || this.#deferredSegments.length > 0) {
+      const combined = transactionArtifactBatches(
+        [...this.#deferredBlocks, ...blocks],
+        [...this.#deferredSegments, ...segments],
+      );
+      if (combined.length === 1) {
+        blocks = [...this.#deferredBlocks, ...blocks];
+        segments = [...this.#deferredSegments, ...segments];
+        this.#deferredBlocks.length = 0;
+        this.#deferredSegments.length = 0;
+      } else {
+        await this.#persistDeferredArtifacts();
       }
     }
     const pendingBlockIds = new Set(this.#record.pendingBlockIds);
@@ -684,6 +807,7 @@ export class DatabaseTransaction {
     // recording this only after the await would make the caller's local catalog advancement
     // omit segments that are already durable.
     for (const segment of ordered) this.#knownSegments.set(segment.id, structuredClone(segment));
+    this.#stagedSegmentsView = undefined;
     for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
     try {
       const manifest = await single({
@@ -749,10 +873,6 @@ export class DatabaseTransaction {
     if (additions.some((id) => id.length === 0)) {
       throw new TypeError("Block ID cannot be empty");
     }
-    assertTransactionArtifactJournalLimits(
-      [...this.#record.pendingBlockIds, ...additions],
-      this.#record.pendingSegmentIds,
-    );
     for (const id of additions) {
       if ((await this.store.getBlock(id)) === undefined) {
         throw new Error(`Cannot stage a missing existing block: ${id}`);
@@ -788,10 +908,6 @@ export class DatabaseTransaction {
     if (record.commitOrdinal !== this.#record.pendingSegmentIds.length) {
       throw new Error(`Existing segment ${segmentId} is not the next journal ordinal`);
     }
-    assertTransactionArtifactJournalLimits(this.#record.pendingBlockIds, [
-      ...this.#record.pendingSegmentIds,
-      segmentId,
-    ]);
     this.#registerLevelZeroSegments([record]);
     this.#changedTableIds.add(record.tableId);
     await this.#ensurePersisted();
@@ -1168,6 +1284,7 @@ export class DatabaseTransaction {
       this.#deferredBlocks.length = 0;
       this.#deferredSegments.length = 0;
       this.#knownSegments.clear();
+      this.#stagedSegmentsView = undefined;
       this.#record = { ...this.#record, status: "aborted", updatedAt: dateIsoString(this.now()) };
       this.#stopHeartbeat();
       await this.#releaseSnapshotLease().catch(() => undefined);

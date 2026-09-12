@@ -8,6 +8,195 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.10.0 — September 12, 2026
+
+Published packages: `@minnowdb/core@0.10.0`.
+
+**Stored format changes: OPFS layout 6 and IndexedDB schema 2.** The OPFS write-ahead log and
+checkpoint gained the served-request ledger described below; a layout-5 store is refused with
+`StorageFormatVersionError`, with no in-place upgrade — export it with a build that reads it, or
+delete it and re-sync. IndexedDB schema 2 moves each transaction's artifact journal into chunked
+records; a schema-1 database is migrated in place on open, and an older build then refuses it
+with `StorageFormatVersionError`. Block format 2 and snapshot format 1 are unchanged. The worker protocol stays at version 7: the new diagnostic frame is an event on a
+reserved handle that an older client ignores. The OPFS follower protocol changes shape
+(`op` carries `sentAt`; new kinds `declined`, `hold`, `state`, `uncertain`), so every tab of one
+origin must run this release together.
+
+### Added
+
+- **Every worker failure reaches the main thread.** The worker host now catches uncaught
+  exceptions, unhandled rejections, and unreadable frames on the worker global, and every
+  failure that belongs to no call — a failed background checkpoint, cleanup, or collection step,
+  an election or handover that threw, a served request that could not be answered, a buffered
+  writer flush with no `onError` — and posts each one to the client as a
+  `DatabaseWorkerErrorEvent`. Pass `onWorkerError` to `MinnowDatabaseClient` to hear them;
+  without it they are written to `console.error`. Reports are not fatal. The same seam is
+  `MinnowDatabaseOptions.onBackgroundError` for a direct engine and
+  `OpfsBlockStoreOptions.onDiagnostic` for a directly opened OPFS store.
+- **`DatabaseWorkerFailedError`.** The Worker object's own `error` and `messageerror` events
+  used to fail every call with a generic message that pointed at the worker's console. They now
+  reject with this class, carrying `reason` and the thrown error as `cause`, with a message that
+  names the event's message, file, and line.
+- **Errors keep their `cause`, their platform identity, and their built-in class across the
+  worker and follower hops.** A quota refusal arrives as a `DOMException` named
+  `QuotaExceededError`; a `TypeError` is still a `TypeError`; a call pipelined behind a failed
+  init carries the typed failure as its `cause`.
+
+- **Every error answers three questions.** `classifyError(error)` from `@minnowdb/core`
+  returns `{ kind, mayHavePublished, retry, connectionUsable }` for any error, including one
+  rehydrated across the worker or the OPFS follower hop and the platform's own
+  `QuotaExceededError`. Two marker bases make the decisive cases an `instanceof`:
+  `UnknownOutcomeError` (the operation may have happened; reconcile before retrying) is now the
+  base of `DatabaseWorkerOutcomeUnknownError` and `OpfsUncertainOutcomeError`, and
+  `ConnectionLostError` (this connection is finished) the base of `DatabaseWorkerTimeoutError`
+  and `DatabaseWorkerFailedError`. The [Errors](/docs/engine/errors) page holds the matrix.
+- **A lost connection can be reopened.** `MinnowDatabaseClient` accepts a transport factory
+  (`new MinnowDatabaseClient(() => new Worker(...))`), reports a lost connection once through
+  `onConnectionLost`, and `reopen(transport?)` puts a fresh worker behind the same client with
+  the same store and options. Handles from before the loss must be recreated.
+- **Why a live statement re-executes.** `explain()` ends with a `-- live:` line saying whether
+  the statement is maintained incrementally and, when not, why in plain terms.
+  `LiveQueryStats.groups` reports the same per distinct statement together with its own
+  `reruns`, `maintained`, and `fallbacks` counts, across the worker client.
+- **Buffered writers flush when the page hides.** A `client.bufferedWriter()` asks the worker to
+  flush on `visibilitychange` to hidden and on `pagehide`, so rows younger than `maxAgeMs` are
+  not lost to a tab switch or close.
+
+### Fixed
+
+- **Reads after an upsert stay fast.** A table whose history held an upsert segment fell off
+  every fast read path — the streamed scan, the keyed point read, index and zone pruning —
+  until compaction folded it, and every query replayed the whole table cell by cell in the
+  meantime: 800 ms for a keyed lookup on a 102-column table after three upsert passes. Upsert
+  segments now ride the streamed scan's overlay and the point-read replay like update deltas
+  do, with the same in-place semantics as the materialized replay and the compaction fold, so
+  a table freshly synced with upserts reads like one freshly inserted.
+- **Wide tables with wide histories fit the query budget.** A streamed scan over update or
+  upsert deltas held every changed column of every delta resident, compacted each patched
+  window over the block's whole remaining suffix for every projected column, and copied and
+  indexed the block's entire string dictionary per column per window. A 100-column table whose
+  rows had all been updated once could not be read at all ("Streamed window requested … bytes
+  with 67108864 already reserved"). The overlay now keeps one reference per patched row and
+  resolves values per window through the buffer pool, a patched window is bounded to the rows
+  the scan asked for, and a patched string window is re-encoded into a dictionary of its own
+  rows. Memory is bounded by the window, not by the table's width or history.
+- **Wide updates commit.** An autocommit `updateBatch` or `upsertBatch` whose statement staged
+  more blocks than one storage batch holds (64 or more changed columns) failed at commit with
+  "references block outside its transaction", because the single-shot commit did not carry the
+  blocks the stager had flushed ahead of it. The same write inside a scope worked. Both paths
+  now commit. On IndexedDB the same write did not fail: the store's single-shot write skipped
+  the check its two-step stage makes, so the update committed with a segment whose blocks were
+  never written and every read of those rows answered with the values it was meant to replace.
+  That store now refuses such a segment, and the storage conformance suite checks the rule on
+  every store.
+- **IndexedDB journal updates scale.** Updating a transaction record diffed its pending block
+  and segment ids with nested array scans, quadratic in the journal size; the diff is now
+  linear.
+- **A lost reply no longer means a lost outcome.** Every frame a follower's mutation appends
+  now carries the request's identity, and each checkpoint carries a ledger of recently served
+  requests and the values they returned. A follower whose leader vanished mid-request re-sends
+  the same request, with the time it was first sent, to whoever leads next; the recovered log
+  answers it with the value it already returned, or runs it fresh when the log proves it never
+  ran. `OpfsUncertainOutcomeError` remains for three cases: a request first sent before the
+  recovered ledger's coverage begins (ten minutes, 65,536 requests, or 8 MiB of retained
+  values), a request whose frame was durable but whose leader died in the instant before
+  recording its return value, and a request whose return value exceeded 64 KiB — a staging
+  call answers with the whole transaction record, which the ledger does not retain; the
+  engine's transaction layer recovers that case by reading the record back. A
+  connection that becomes the leader with its own request outstanding answers itself the same
+  way. Mutations run through the leader one at a time, from call to completion, so no frame can
+  carry another request's identity.
+- **Spurious `OpfsUncertainOutcomeError` from a follower tab.** Three paths reported a write as
+  uncertain when nothing was in doubt, all reproduced and now covered by tests. A write that
+  the leader took longer than one second to run (queued behind a checkpoint, a large strict
+  transaction, or a compaction step) timed out on the follower although it committed: the
+  leader now posts a keepalive for every request it holds and announces a hold before a
+  synchronous checkpoint. A write that reached a leader in the middle of a foreground handover
+  was silently dropped and then reported uncertain although it never ran: a connection that is
+  not leading now answers with a decline, a handover or close says goodbye to every follower
+  first, and a declined request is sent again. A write whose leader fell silent now first pings;
+  a leader that answers is alive and still holds the request. The error is now raised only when
+  the leader vanished — crashed, or frozen by the browser — with the request in hand.
+- **Leadership never moved to a visible tab.** A leader that went hidden while another tab
+  stayed visible kept the handles indefinitely, and a bid that arrived inside the three-second
+  yield cooldown was dropped for good. A hidden leader now announces its state so the visible
+  tab bids, a bid inside the cooldown is honored when it ends, the old leader stays out of
+  elections for a grace period so the bidder can win, and a hidden leader with nothing to do for
+  fifteen seconds while other tabs exist releases its handles before the browser can freeze it.
+- **Writes that never completed.** Every autocommit write took a cross-tab Web Lock with no
+  bound, so one tab paused by the browser with the lock in hand queued every other tab's writes
+  until each client's 60-second deadline made it permanently fatal. A write now waits ten
+  seconds for the lock, then goes ahead without it and reports the wait; correctness never
+  depended on the lock, only contention did.
+- **An unguarded upsert retires the unique-index term it replaces.** An `upsertBatch` on a
+  table with a `CREATE UNIQUE INDEX` but no trigger and no `conflictWhere` skipped the read of
+  the rows it replaced, so a value the upsert changed stayed claimed in the index and a later
+  row could never take it. The old images are read whenever a unique secondary index exists;
+  inside a scope they come from the write set.
+- **`INSERT … ON CONFLICT DO NOTHING` inside a scope no longer reads the table.** It asks the
+  scope which keys exist — the key overlay plus a keyed probe of the committed snapshot — the
+  same way a plain INSERT checks for a duplicate, so a loop of them coalesces like the rest.
+- **The worker picks the store.** `{ kind: "auto", name }` opens OPFS where the worker can hold
+  synchronous access handles and IndexedDB everywhere else, with each store's options under
+  `opfs` and `indexeddb`. The choice is made once per name and remembered in a small IndexedDB
+  record, so a database never silently reopens empty on the other store: a remembered store that
+  cannot open rejects `ready()` with `DatabaseStoreUnavailableError`. `client.storeKind()` reports
+  what opened, `forgetStoreChoice(name)` clears the memory when a database is deleted, and
+  `@minnowdb/core/worker/auto` bundles the two durable stores for bundlers that cannot split
+  worker code.
+- **Reads inside a long scope no longer grow with it.** A keyed `SELECT … WHERE key = ?` inside
+  `write()` now takes the point-read path under the scope's overlay, replaying the key through the
+  scope's staged segments instead of scanning them; the scope lists a table's committed segments
+  once rather than on every read, checks block presence only for committed segments, and
+  RecordCore accounts a staging call by what it appends rather than re-walking the journal. On
+  the memory store, a keyed read with 1,000 segments staged went from 26 ms to under 1 ms, and
+  1,500 read-then-upsert cycles on a 60-column table from 44 ms to 7 ms per cycle.
+- **The transaction journal has no length limit.** An unpublished transaction used to be
+  refused at 4,096 pending blocks or segments, because every adapter re-verified and rewrote the
+  whole journal on each staging call. Staging now costs what it stages: the IndexedDB store keeps
+  a transaction's journal in append-only chunks in a new `transactionJournal` object store
+  (schema version 2, migrated in place on open), RecordCore — behind the OPFS and memory stores —
+  memoizes the journal's block set and staged bytes on the journal it was built from, and the
+  engine's transaction layer no longer rebuilds its id lists on every statement. The exported
+  `MAX_TRANSACTION_PENDING_BLOCKS`, `MAX_TRANSACTION_PENDING_SEGMENTS`, and
+  `assertTransactionArtifactJournalLimits` are gone; `appendTransactionJournal` joins the storage
+  toolkit for adapters that stage. The aggregate quotas remain — 512 MiB of staged artifact bytes
+  across active transactions, and now 1,048,576 staged blocks or segments — as the only ceiling.
+- **Nobody has to chunk a write.** A `write()` scope used to stage one segment — one block per
+  column — per statement, so the 41st single-row INSERT on a 100-column table failed with
+  "Transaction journal exceeds 4096 pending blocks", and the guide told readers to split large
+  ingestions themselves. Every plain statement inside a scope now joins the table's write set,
+  a per-key memtable: inserts, updates, deletes, and upserts of one key fold into a single net
+  effect, and the set is encoded — at most one insert, one upsert, one delete, and one update
+  segment per distinct column set — when the scope reads the table, takes a savepoint, commits,
+  or has a block's worth waiting. Each statement still validates, fills defaults, reserves
+  identity values, registers its unique keys, and proves its foreign keys immediately; an
+  `insertBatch` of a key the scope already holds now fails on that statement, before it
+  registers anything, so the scope stays usable. The lookups the engine makes for itself — which keys a guarded upsert
+  updates, the pre-image behind a `CHECK` constraint — answer from the write set and the
+  committed snapshot, and a keyed `UPDATE … SET column = constant WHERE key = ?` or
+  `DELETE … WHERE key = ?` joins the set without reading the table, so a loop of those stages
+  as one segment. A statement of 4,096 rows or more is encoded on the spot, after whatever the
+  set held for its table. A staged insert, update, or delete reports `segmentId: null` until its
+  segment exists. Tables with triggers keep per-statement staging. The scope's key overlay is also
+  replayed incrementally now; a scope of many statements consulted it on each one and had
+  turned quadratic.
+- **A large write no longer looks like a dead worker.** The worker reports every five seconds
+  on each call it is still working on, and the client's `requestTimeoutMs` now counts silence
+  rather than wall time, up to ten deadlines in all. A big batch write on a slow device used to
+  hit the 60-second deadline and leave the client permanently failed.
+- **Guarded upserts on wide tables.** `upsertBatch` with `conflictWhere` classified every
+  conflicting row by reading it back with `SELECT *`, so a 100-column table paid for decoding
+  every column of every existing row before writing a single one, and the cost grew with each
+  pass as history accumulated. When no insert or update trigger fires, the read now projects
+  only the key, the guard column, and any unique secondary-index columns. A guarded upsert of
+  5,000 existing rows on a 102-column table went from 1.9 to 5.2 seconds down to 0.4 seconds
+  in the engine's own measurement; narrow tables gain about 2x.
+- **Elections and handovers no longer fail silently.** A corruption or quota error thrown by a
+  fire-and-forget election was an unhandled rejection inside the worker; it is now reported.
+  The store opened for a database whose construction failed is closed instead of leaking its
+  handles and lock.
+
 ## 0.9.1 — September 11, 2026
 
 Published packages: `@minnowdb/core@0.9.1`.

@@ -118,7 +118,16 @@ const frozenIndexedDbSchemas: ReadonlyArray<{
   version: number;
   writerPackageVersion: string;
   install: (request: IDBOpenDBRequest) => void;
-}> = [{ version: 1, writerPackageVersion: "0.3.0", install: installFrozenIndexedDbV1 }];
+}> = [
+  { version: 1, writerPackageVersion: "0.3.0", install: installFrozenIndexedDbV1 },
+  { version: 2, writerPackageVersion: "0.10.0", install: installFrozenIndexedDbV2 },
+];
+
+/** Schema 2 adds the chunked transaction journal store; everything else is schema 1. */
+function installFrozenIndexedDbV2(request: IDBOpenDBRequest): void {
+  installFrozenIndexedDbV1(request);
+  request.result.createObjectStore("transactionJournal");
+}
 
 function openNativeIndexedDb(
   indexedDB: IDBFactory,
@@ -1716,6 +1725,55 @@ for (const implementation of stores()) {
           updatedAt: "2026-01-01T00:00:00.000Z",
         }),
       ).rejects.toThrow();
+      store.close();
+    });
+
+    it("refuses a single-shot write whose segment names a block outside its journal", async () => {
+      const store = await implementation.create();
+      if (store.writeTransaction === undefined) throw new Error("store has no single-shot write");
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      await store.addTable({
+        managed: false,
+        id: "journal-guard-table",
+        name: "journal_guard_table",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        revision: 0,
+        createdAt: timestamp,
+      });
+      const { snapshotVersion: _snapshotVersion, ...fresh } = activeTransaction("journal-guard");
+      void _snapshotVersion;
+      fresh.schemaEpochGuard = (await store.getCatalogProbe()).schemaEpoch;
+      // The two-step stage already refuses this; the single-shot write must too, or a segment
+      // whose blocks were never written commits and reads answer from the rows it replaced.
+      await expect(
+        store.writeTransaction({
+          transaction: { record: fresh },
+          blocks: [{ id: "journal-guard-block", bytes: Uint8Array.of(1) }],
+          segments: [
+            {
+              id: "journal-guard-segment",
+              tableId: "journal-guard-table",
+              transactionId: "journal-guard",
+              rowCount: 2,
+              rowIdStart: 1n,
+              rowIdEndExclusive: 3n,
+              columnBlockIds: { value: ["journal-guard-block", "journal-guard-missing"] },
+              kind: "insert",
+              level: 0,
+              logicalOrder: 0,
+              commitOrdinal: 0,
+              rowIdSpans: [],
+              createdAt: timestamp,
+            },
+          ],
+          expectedManifestVersion: null,
+          levelZeroSegmentLimits: [{ tableId: "journal-guard-table", limit: 4096 }],
+          committedAt: timestamp,
+        }),
+      ).rejects.toThrow("journal-guard-missing");
+      expect(await store.getBlock("journal-guard-block")).toBeUndefined();
+      expect(await store.getTransaction("journal-guard")).toBeUndefined();
+      expect(await store.getCurrentManifestVersion()).toBeNull();
       store.close();
     });
 
@@ -5382,7 +5440,7 @@ it("retains, migrates, and writes every stable IndexedDB schema fixture", async 
 it("rejects a newer IndexedDB schema without mutating it", async () => {
   const indexedDB = new IDBFactory();
   const name = crypto.randomUUID();
-  const newer = await openNativeIndexedDb(indexedDB, name, 2, (request) => {
+  const newer = await openNativeIndexedDb(indexedDB, name, 3, (request) => {
     request.result.createObjectStore("future");
   });
   await new Promise<void>((resolve, reject) => {
@@ -5401,11 +5459,11 @@ it("rejects a newer IndexedDB schema without mutating it", async () => {
     name: "StorageFormatVersionError",
     backend: "indexeddb",
     location: name,
-    actualVersion: 2,
-    supportedVersion: 1,
+    actualVersion: 3,
+    supportedVersion: 2,
     relation: "newer",
   });
-  const unchanged = await openNativeIndexedDb(indexedDB, name, 2);
+  const unchanged = await openNativeIndexedDb(indexedDB, name, 3);
   expect(unchanged.objectStoreNames.contains("future")).toBe(true);
   unchanged.close();
 });
@@ -5434,7 +5492,7 @@ it("closes an IndexedDB connection when a newer schema version arrives", async (
   const name = crypto.randomUUID();
   const store = await IndexedDbBlockStore.open({ name, indexedDB });
   const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(name, 2);
+    const request = indexedDB.open(name, 3);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
   });

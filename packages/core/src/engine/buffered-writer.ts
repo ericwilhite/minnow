@@ -9,6 +9,8 @@ export interface BufferedWriterOptions {
   maxBytes?: number;
   maxAgeMs?: number;
   onError?: (error: unknown) => void;
+  /** @internal The database's background-error hook, heard when no `onError` is given. */
+  onBackgroundError?: (error: unknown, context: string) => void;
 }
 
 export type BufferedFlushResult = InsertBatchResult | UpsertBatchResult;
@@ -46,6 +48,7 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
   readonly #maxBytes: number;
   readonly #maxAgeMs: number;
   readonly #onError: ((error: unknown) => void) | undefined;
+  readonly #onBackgroundError: ((error: unknown, context: string) => void) | undefined;
   readonly #rows: Array<Readonly<Record<string, BatchValue>>> = [];
   #estimatedBytes = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -65,6 +68,7 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
     this.#maxBytes = positiveWholeNumber(options.maxBytes ?? 1024 * 1024, "Buffered byte limit");
     this.#maxAgeMs = positiveWholeNumber(options.maxAgeMs ?? 1_000, "Buffered age limit");
     this.#onError = options.onError;
+    this.#onBackgroundError = options.onBackgroundError;
   }
 
   get pendingRowCount(): number {
@@ -131,7 +135,21 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
 
   requestFlush(): void {
     if (this.#closed) return;
-    void this.#flushPending().catch((error: unknown) => this.#onError?.(error));
+    void this.#flushPending().catch((error: unknown) => {
+      this.#reportFlushError(error);
+    });
+  }
+
+  /**
+   * A flush nobody awaits failed. The writer's own `onError` hears it when given; otherwise the
+   * database's background-error hook does, so rows that never land are never silent.
+   */
+  #reportFlushError(error: unknown): void {
+    if (this.#onError !== undefined) {
+      this.#onError(error);
+      return;
+    }
+    this.#onBackgroundError?.(error, `buffered writer flush for ${this.tableName}`);
   }
 
   async close(): Promise<BufferedFlushResult | undefined> {
@@ -185,7 +203,9 @@ export class BufferedTableWriter<TRow extends BatchRow = BatchRow> {
     if (this.#timer !== undefined || this.#rows.length === 0 || this.#closed) return;
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
-      void this.#flushPending().catch((error: unknown) => this.#onError?.(error));
+      void this.#flushPending().catch((error: unknown) => {
+        this.#reportFlushError(error);
+      });
     }, this.#maxAgeMs);
   }
 

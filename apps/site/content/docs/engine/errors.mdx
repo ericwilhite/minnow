@@ -1,0 +1,64 @@
+---
+title: Errors
+description: What each error means, whether the write may have happened, and what to do next.
+---
+
+Every error Minnow throws answers three questions: may the operation have happened anyway, is
+repeating the call sound, and is the connection still usable. `classifyError()` from
+`@minnowdb/core` answers them for any error, including one rehydrated across the worker or the
+OPFS follower hop and the platform's own `QuotaExceededError`:
+
+```ts
+import { classifyError } from "@minnowdb/core";
+
+try {
+  await client.insert("orders", order);
+} catch (error) {
+  const { kind, mayHavePublished, retry, connectionUsable } = classifyError(error);
+  if (mayHavePublished)
+    await reconcileBySaleId(sale.id); // never blindly resend
+  else if (retry === "safe") await backoffAndRetry();
+  if (!connectionUsable) await client.reopen();
+}
+```
+
+## The matrix
+
+| Kind              | Errors                                                                                                                                                                                                                                                  | May have published | Retry                                            | Connection usable |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------------ | ----------------- |
+| `unknown-outcome` | `DatabaseWorkerOutcomeUnknownError`, `OpfsUncertainOutcomeError` — both extend `UnknownOutcomeError`                                                                                                                                                    | **yes**            | after reconciling                                | see below         |
+| `connection-lost` | `DatabaseWorkerTimeoutError`, `DatabaseWorkerFailedError` — both extend `ConnectionLostError`                                                                                                                                                           | no                 | never on this client                             | **no**            |
+| `conflict`        | `WriteConflictError`, `SchemaConflictError`, `TableRecordConflictError`, `TransactionRecordConflictError`, lease, compaction, collection, temp-owner, index-build, and snapshot-import conflicts, `TableInUseError`, `OpfsDatabaseInUseError`           | no                 | as is                                            | yes               |
+| `rejected`        | `UniqueConstraintError`, `UniqueKeyConflictError`, `UniqueIndexCoverageError`, `MissingKeyError`, `UnknownTableError`, `SqlCompileError`, `CompactionJobCancelledError`, any `TypeError`, `RangeError`, `SyntaxError`                                   | no                 | never as written                                 | yes               |
+| `transient`       | `OpfsCoordinationError`, `DatabaseReadBacklogError`, `MaintenanceBacklogError`, `CompactionBacklogError`, `LiveQueryLimitError`, `LeaseExpiredError`, `TransactionExpiredError`, `IndexedDbSchemaUpgradeBlockedError`, `VisibleSegmentCursorStaleError` | no                 | with backoff                                     | yes               |
+| `resource`        | `QuotaExceededError`, `StorageResourceLimitError`, `BlockReadBatchTooLargeError`, `CompactionMemoryBudgetError`, `CompactionWriteAmplificationError`                                                                                                    | no                 | after freeing space (`retry: "after-reconcile"`) | yes               |
+| `corruption`      | `StorageCorruptionError`, `StorageFormatVersionError`                                                                                                                                                                                                   | no                 | never                                            | yes               |
+| `cancelled`       | An `AbortError` from the caller's own signal                                                                                                                                                                                                            | no                 | as is                                            | yes               |
+| `other`           | Anything else — a plain `Error`, a `QueryMemoryBudgetError`, a platform error the engine does not classify                                                                                                                                              | no                 | never as written                                 | yes               |
+
+An unknown-outcome error is the one case where "the call threw" does not mean "nothing
+happened". The engine never replays a mutation on its own; reconcile a stable identity (a sale
+id, a revision) before deciding whether to send it again. Its `cause` tells you whether the
+connection survived: a mutation cancelled by its own signal leaves the connection usable, one
+rejected because the worker fell silent does not.
+
+## Losing and reopening a connection
+
+`DatabaseWorkerTimeoutError` and `DatabaseWorkerFailedError` are fatal for the client: every
+later call throws the same error. The client reports the loss once through `onConnectionLost`,
+and `reopen()` puts a fresh worker behind the same client with the same store and options:
+
+```ts
+const client = new MinnowDatabaseClient(() => new Worker(workerUrl, { type: "module" }), {
+  store: { kind: "opfs", name: "shop" },
+  onConnectionLost: () => void client.reopen().then(rebuildHandles),
+});
+```
+
+Handles from before the loss — write scopes, live sets, cursors, buffered writers — belonged to
+the old worker and must be recreated. A mutation that was in flight was already reported as an
+unknown outcome.
+
+Background failures that belong to no call — an uncaught exception in the worker, a failed
+checkpoint, an election that threw — are not errors on any promise. They arrive through
+`onWorkerError`, described under [Workers](/docs/engine/workers).

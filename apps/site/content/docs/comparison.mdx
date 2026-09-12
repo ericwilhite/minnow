@@ -44,7 +44,7 @@ Download size affects cold starts, and Wasm engines also compile a module before
 | Engine           | Download (gzip) | Raw     | Wasm compile step |
 | ---------------- | --------------- | ------- | ----------------- |
 | IndexedDB        | 0               | 0       | No                |
-| **Minnow**       | **338 KB**      | 1.2 MB  | No                |
+| **Minnow**       | **353 KB**      | 1.3 MB  | No                |
 | SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes               |
 | PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes               |
 
@@ -134,7 +134,7 @@ adapter ships with the project.
 ## Minnow's limits
 
 - Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Block format 2,
-  snapshot format 1, IndexedDB schema 1, and native OPFS layout 5 are separately versioned and
+  snapshot format 1, IndexedDB schema 2, and native OPFS layout 6 are separately versioned and
   locked.
 - Its SQL dialect is an embedded PostgreSQL subset, not the PostgreSQL server.
 - `UPDATE` and `DELETE` require row identity: a primary key or one inline unique column.

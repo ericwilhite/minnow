@@ -166,7 +166,7 @@
               "name": "BufferedWriterOptions",
               "kind": "type",
               "declarations": [
-                "export interface BufferedWriterOptions {\n    mode?: \"insert\" | \"upsert\";\n    maxRows?: number;\n    maxBytes?: number;\n    maxAgeMs?: number;\n    onError?: (error: unknown) => void;\n}"
+                "export interface BufferedWriterOptions {\n    mode?: \"insert\" | \"upsert\";\n    maxRows?: number;\n    maxBytes?: number;\n    maxAgeMs?: number;\n    onError?: (error: unknown) => void;\n    onBackgroundError?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -237,6 +237,13 @@
               "kind": "type",
               "declarations": [
                 "export interface CatalogView {\n    readonly name: string;\n    readonly sql: string;\n    readonly columns: readonly CatalogColumn[];\n    readonly managed: boolean;\n}"
+              ]
+            },
+            {
+              "name": "classifyError",
+              "kind": "value",
+              "declarations": [
+                "export declare function classifyError(error: unknown): ErrorClassification;"
               ]
             },
             {
@@ -408,17 +415,31 @@
               ]
             },
             {
+              "name": "DatabaseStoreUnavailableError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class DatabaseStoreUnavailableError extends Error {\n    readonly store: \"opfs\" | \"indexeddb\";\n    readonly databaseName: string;\n    readonly name = \"DatabaseStoreUnavailableError\";\n    constructor(store: \"opfs\" | \"indexeddb\", databaseName: string, message: string);\n}"
+              ]
+            },
+            {
+              "name": "DatabaseWorkerFailedError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class DatabaseWorkerFailedError extends ConnectionLostError {\n    readonly reason: \"error\" | \"messageerror\" | \"reopened\";\n    readonly name = \"DatabaseWorkerFailedError\";\n    constructor(reason: \"error\" | \"messageerror\" | \"reopened\", message: string, options?: ErrorOptions);\n}"
+              ]
+            },
+            {
               "name": "DatabaseWorkerOutcomeUnknownError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class DatabaseWorkerOutcomeUnknownError extends Error {\n    readonly method: string;\n    readonly requestId: string;\n    readonly name = \"DatabaseWorkerOutcomeUnknownError\";\n    constructor(method: string, requestId: string, options?: ErrorOptions);\n}"
+                "export declare class DatabaseWorkerOutcomeUnknownError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly requestId: string;\n    readonly name = \"DatabaseWorkerOutcomeUnknownError\";\n    constructor(method: string, requestId: string, options?: ErrorOptions);\n}"
               ]
             },
             {
               "name": "DatabaseWorkerTimeoutError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class DatabaseWorkerTimeoutError extends Error {\n    readonly method: string;\n    readonly timeoutMs: number;\n    readonly name = \"DatabaseWorkerTimeoutError\";\n    constructor(method: string, timeoutMs: number);\n}"
+                "export declare class DatabaseWorkerTimeoutError extends ConnectionLostError {\n    readonly method: string;\n    readonly timeoutMs: number;\n    readonly name = \"DatabaseWorkerTimeoutError\";\n    constructor(method: string, timeoutMs: number);\n}"
               ]
             },
             {
@@ -443,6 +464,20 @@
               ]
             },
             {
+              "name": "ErrorClassification",
+              "kind": "type",
+              "declarations": [
+                "export interface ErrorClassification {\n    kind: ErrorKind;\n    mayHavePublished: boolean;\n    retry: \"safe\" | \"after-reconcile\" | \"never\";\n    connectionUsable: boolean;\n}"
+              ]
+            },
+            {
+              "name": "ErrorKind",
+              "kind": "type",
+              "declarations": [
+                "export type ErrorKind = \"unknown-outcome\" | \"connection-lost\" | \"conflict\" | \"rejected\" | \"transient\" | \"resource\" | \"corruption\" | \"cancelled\" | \"other\";"
+              ]
+            },
+            {
               "name": "ExecuteOptions",
               "kind": "type",
               "declarations": [
@@ -461,6 +496,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare function foreignKeyName(tableName: string, columnName: string): string;"
+              ]
+            },
+            {
+              "name": "forgetStoreChoice",
+              "kind": "value",
+              "declarations": [
+                "export declare function forgetStoreChoice(name: string): Promise<void>;"
               ]
             },
             {
@@ -747,7 +789,7 @@
               "name": "MinnowDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    coordinateWrites?: boolean;\n    now?: () => Date;\n    createId?: () => string;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
+                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    coordinateWrites?: boolean;\n    now?: () => Date;\n    createId?: () => string;\n    onBackgroundError?: (error: unknown, context: string) => void;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
               ]
             },
             {
@@ -789,7 +831,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends Error {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
               ]
             },
             {
@@ -1013,7 +1055,7 @@
               "name": "StatementWriter",
               "kind": "type",
               "declarations": [
-                "export interface StatementWriter extends WriteSession {\n    queryPlan(plan: CompiledQuery): Promise<QueryResult>;\n}"
+                "export interface StatementWriter extends WriteSession {\n    queryPlan(plan: CompiledQuery): Promise<QueryResult>;\n    stagedKeyPresence?(table: TableRecord, keyColumn: TableColumnRecord, keys: ReadonlyArray<Exclude<BatchValue, null>>): Promise<ReadonlySet<string> | undefined>;\n}"
               ]
             },
             {
@@ -1593,7 +1635,7 @@
               "name": "ClientBufferedWriter",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class ClientBufferedWriter<TRow extends BatchRow = BatchRow> {\n    #private;\n    private readonly client;\n    private readonly handleId;\n    constructor(client: MinnowDatabaseClient, handleId: string, created: Promise<unknown>);\n    add(row: TRow): Promise<BufferedFlushResult | undefined>;\n    flush(): Promise<BufferedFlushResult | undefined>;\n    requestFlush(): void;\n    stats(): Promise<{\n        pendingRowCount: number;\n        estimatedBytes: number;\n    }>;\n    discard(): Promise<number>;\n    close(): Promise<BufferedFlushResult | undefined>;\n}"
+                "export declare class ClientBufferedWriter<TRow extends BatchRow = BatchRow> {\n    #private;\n    private readonly client;\n    private readonly handleId;\n    constructor(client: MinnowDatabaseClient, handleId: string, created: Promise<unknown>);\n    _onClose(cleanup: () => void): void;\n    add(row: TRow): Promise<BufferedFlushResult | undefined>;\n    flush(): Promise<BufferedFlushResult | undefined>;\n    requestFlush(): void;\n    stats(): Promise<{\n        pendingRowCount: number;\n        estimatedBytes: number;\n    }>;\n    discard(): Promise<number>;\n    close(): Promise<BufferedFlushResult | undefined>;\n}"
               ]
             },
             {
@@ -1635,7 +1677,7 @@
               "name": "ClientTransport",
               "kind": "type",
               "declarations": [
-                "export interface ClientTransport {\n    postMessage(message: unknown, options?: {\n        transfer: ArrayBuffer[];\n    }): void;\n    addEventListener(type: \"message\", listener: (event: MessageEvent<unknown>) => void): void;\n    addEventListener(type: \"error\" | \"messageerror\", listener: () => void): void;\n    removeEventListener?(type: \"message\", listener: (event: MessageEvent<unknown>) => void): void;\n    removeEventListener?(type: \"error\" | \"messageerror\", listener: () => void): void;\n    terminate?(): void;\n}"
+                "export interface ClientTransport {\n    postMessage(message: unknown, options?: {\n        transfer: ArrayBuffer[];\n    }): void;\n    addEventListener(type: \"message\", listener: (event: MessageEvent<unknown>) => void): void;\n    addEventListener(type: \"error\" | \"messageerror\", listener: (event?: ErrorEvent | MessageEvent<unknown>) => void): void;\n    removeEventListener?(type: \"message\", listener: (event: MessageEvent<unknown>) => void): void;\n    removeEventListener?(type: \"error\" | \"messageerror\", listener: (event?: ErrorEvent | MessageEvent<unknown>) => void): void;\n    terminate?(): void;\n}"
               ]
             },
             {
@@ -1653,17 +1695,24 @@
               ]
             },
             {
+              "name": "DatabaseWorkerErrorEvent",
+              "kind": "type",
+              "declarations": [
+                "export interface DatabaseWorkerErrorEvent {\n    kind: WorkerErrorKind | \"transport\";\n    context: string;\n    error: Error;\n}"
+              ]
+            },
+            {
               "name": "MinnowDatabaseClient",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {\n    #private;\n    constructor(transport: ClientTransport, options?: MinnowDatabaseClientOptions<TSchema>);\n    ready(): Promise<void>;\n    createTable(input: CreateTableInput): Promise<void>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    migrate(definition?: SchemaDefinition<readonly AnyTable[]> | undefined, options?: MigrateOptions): Promise<ClientMigrationResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<InsertBatchResult>;\n    insert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>): Promise<InsertBatchResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    upsert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<UpdateBatchResult>;\n    update<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>, changes: BatchUpdateChanges<TSchema, TName>): Promise<UpdateBatchResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<DeleteBatchResult>;\n    delete<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>): Promise<DeleteBatchResult>;\n    bufferedWriter<TName extends TableName<TSchema>>(tableName: TName, options?: BufferedWriterOptions): ClientBufferedWriter<BatchInsertRow<TSchema, TName>>;\n    readTable<TName extends TableName<TSchema>, const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>>(tableName: TName, options: BatchReadOptions<TSchema, TName, TColumns> & {\n        readonly columns: TColumns;\n    }): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;\n    readTable<TName extends TableName<TSchema>>(tableName: TName, versionOrOptions?: number | BatchReadOptions<TSchema, TName>): Promise<Array<BatchReadRow<TSchema, TName>>>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryValue[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T>;\n    write<T>(action: (session: ClientWriteSession<TSchema>) => Promise<T>): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    bufferPoolStats(): Promise<BufferPoolStats>;\n    maintenanceStatus(): Promise<MaintenanceStatus>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    liveQueries(options?: ClientLiveQueryOptions): ClientLiveQuerySet;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: {\n        maxItems?: number;\n    }): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    close(options?: CloseClientOptions): Promise<void>;\n    _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;\n    _invokeControlled(handleId: string, method: string, args: unknown[], controls: RpcCallControls): Promise<unknown>;\n    _routeEvents(handleId: string, route: EventRoute): void;\n    _unrouteEvents(handleId: string): void;\n}"
+                "export declare class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {\n    #private;\n    constructor(transport: ClientTransport | (() => ClientTransport), options?: MinnowDatabaseClientOptions<TSchema>);\n    reopen(transport?: ClientTransport): Promise<void>;\n    ready(): Promise<void>;\n    storeKind(): Promise<OpenedStoreKind | undefined>;\n    createTable(input: CreateTableInput): Promise<void>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    migrate(definition?: SchemaDefinition<readonly AnyTable[]> | undefined, options?: MigrateOptions): Promise<ClientMigrationResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<InsertBatchResult>;\n    insert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>): Promise<InsertBatchResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    upsert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<UpdateBatchResult>;\n    update<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>, changes: BatchUpdateChanges<TSchema, TName>): Promise<UpdateBatchResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<DeleteBatchResult>;\n    delete<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>): Promise<DeleteBatchResult>;\n    bufferedWriter<TName extends TableName<TSchema>>(tableName: TName, options?: BufferedWriterOptions): ClientBufferedWriter<BatchInsertRow<TSchema, TName>>;\n    readTable<TName extends TableName<TSchema>, const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>>(tableName: TName, options: BatchReadOptions<TSchema, TName, TColumns> & {\n        readonly columns: TColumns;\n    }): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;\n    readTable<TName extends TableName<TSchema>>(tableName: TName, versionOrOptions?: number | BatchReadOptions<TSchema, TName>): Promise<Array<BatchReadRow<TSchema, TName>>>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryValue[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T>;\n    write<T>(action: (session: ClientWriteSession<TSchema>) => Promise<T>): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    bufferPoolStats(): Promise<BufferPoolStats>;\n    maintenanceStatus(): Promise<MaintenanceStatus>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    liveQueries(options?: ClientLiveQueryOptions): ClientLiveQuerySet;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: {\n        maxItems?: number;\n    }): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    close(options?: CloseClientOptions): Promise<void>;\n    _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;\n    _invokeControlled(handleId: string, method: string, args: unknown[], controls: RpcCallControls): Promise<unknown>;\n    _routeEvents(handleId: string, route: EventRoute): void;\n    _unrouteEvents(handleId: string): void;\n}"
               ]
             },
             {
               "name": "MinnowDatabaseClientOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n    requestTimeoutMs?: number;\n}"
+                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n    requestTimeoutMs?: number;\n    onWorkerError?: (event: DatabaseWorkerErrorEvent) => void;\n    onConnectionLost?: (error: ConnectionLostError) => void;\n}"
               ]
             }
           ]
@@ -1736,6 +1785,13 @@
               ]
             },
             {
+              "name": "LiveMaintenanceDeclined",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveMaintenanceDeclined {\n    readonly declined: readonly string[];\n}"
+              ]
+            },
+            {
               "name": "LiveQuery",
               "kind": "type-and-value",
               "declarations": [
@@ -1771,6 +1827,13 @@
               ]
             },
             {
+              "name": "LiveQueryGroupStats",
+              "kind": "type",
+              "declarations": [
+                "export interface LiveQueryGroupStats {\n    readonly sql: string | undefined;\n    readonly subscribers: number;\n    readonly maintainable: boolean;\n    readonly reasons: readonly string[];\n    readonly reruns: number;\n    readonly maintained: number;\n    readonly fallbacks: number;\n    readonly retainedRows: number;\n}"
+              ]
+            },
+            {
               "name": "LiveQueryHintChannel",
               "kind": "type",
               "declarations": [
@@ -1781,7 +1844,7 @@
               "name": "LiveQueryHost",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    memoize?(query: LiveQueryInput, result: QueryResult, probe: CatalogProbe): Promise<void>;\n    executeMaintainable?(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<LiveMaintainedExecution | undefined>;\n    maintain?(query: LiveQueryInput, result: QueryResult, state: unknown, tableIds: readonly string[], after: number | null, until: number, probe: CatalogProbe): Promise<LiveMaintainedChange | undefined>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
+                "export interface LiveQueryHost {\n    currentProbe(): Promise<CatalogProbe>;\n    manifestPage(afterVersion: number | null, limit: number): Promise<StoragePage<Manifest, number>>;\n    dependencyTableIds(query: LiveQueryInput, probe?: CatalogProbe): Promise<Set<string>>;\n    execute(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<QueryResult>;\n    memoize?(query: LiveQueryInput, result: QueryResult, probe: CatalogProbe): Promise<void>;\n    executeMaintainable?(query: LiveQueryInput, context?: LiveQueryExecuteContext): Promise<LiveMaintainedExecution | LiveMaintenanceDeclined | undefined>;\n    maintain?(query: LiveQueryInput, result: QueryResult, state: unknown, tableIds: readonly string[], after: number | null, until: number, probe: CatalogProbe): Promise<LiveMaintainedChange | undefined>;\n    changeCanAffect?(query: LiveQueryInput, tableIds: readonly string[], after: number | null, until: number): Promise<boolean>;\n}"
               ]
             },
             {
@@ -1865,7 +1928,7 @@
               "name": "LiveQueryStats",
               "kind": "type",
               "declarations": [
-                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    maintained: number;\n    groupsVisited: number;\n    retainedRows: number;\n    retainedBytes: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n}"
+                "export interface LiveQueryStats {\n    hints: number;\n    versionChecks: number;\n    sweeps: number;\n    reruns: number;\n    rerunsAvoided: number;\n    zoneSkips: number;\n    notificationsSuppressed: number;\n    invalidations: number;\n    maintained: number;\n    groupsVisited: number;\n    retainedRows: number;\n    retainedBytes: number;\n    sharedExecutions: number;\n    lastSweepMs: number;\n    groups: readonly LiveQueryGroupStats[];\n}"
               ]
             },
             {
@@ -2726,6 +2789,13 @@
               ]
             },
             {
+              "name": "appendTransactionJournal",
+              "kind": "value",
+              "declarations": [
+                "export declare function appendTransactionJournal(record: TransactionRecord, additions: {\n    blockIds: readonly string[];\n    segmentIds: readonly string[];\n    updatedAt: string;\n    pendingTableNextRowId?: bigint;\n}): TransactionRecord;"
+              ]
+            },
+            {
               "name": "AppendUniqueKeyBuildChunkInput",
               "kind": "type",
               "declarations": [
@@ -2765,13 +2835,6 @@
               "kind": "value",
               "declarations": [
                 "export declare function assertTransactionArtifactBatchLimits(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): void;"
-              ]
-            },
-            {
-              "name": "assertTransactionArtifactJournalLimits",
-              "kind": "value",
-              "declarations": [
-                "export declare function assertTransactionArtifactJournalLimits(pendingBlockIds: readonly string[], pendingSegmentIds: readonly string[]): void;"
               ]
             },
             {
@@ -3031,6 +3094,13 @@
               "kind": "type",
               "declarations": [
                 "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan;"
+              ]
+            },
+            {
+              "name": "ConnectionLostError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class ConnectionLostError extends Error {\n    readonly name: string;\n}"
               ]
             },
             {
@@ -3674,14 +3744,14 @@
               "name": "MAX_GLOBAL_STAGED_BLOCKS",
               "kind": "value",
               "declarations": [
-                "MAX_GLOBAL_STAGED_BLOCKS = 65536"
+                "MAX_GLOBAL_STAGED_BLOCKS = 1048576"
               ]
             },
             {
               "name": "MAX_GLOBAL_STAGED_SEGMENTS",
               "kind": "value",
               "declarations": [
-                "MAX_GLOBAL_STAGED_SEGMENTS = 65536"
+                "MAX_GLOBAL_STAGED_SEGMENTS = 1048576"
               ]
             },
             {
@@ -4028,20 +4098,6 @@
               ]
             },
             {
-              "name": "MAX_TRANSACTION_PENDING_BLOCKS",
-              "kind": "value",
-              "declarations": [
-                "MAX_TRANSACTION_PENDING_BLOCKS = 4096"
-              ]
-            },
-            {
-              "name": "MAX_TRANSACTION_PENDING_SEGMENTS",
-              "kind": "value",
-              "declarations": [
-                "MAX_TRANSACTION_PENDING_SEGMENTS = 4096"
-              ]
-            },
-            {
               "name": "MAX_TRANSACTION_STAGE_BLOCKS",
               "kind": "value",
               "declarations": [
@@ -4192,7 +4248,7 @@
               "name": "OpfsBlockStore",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _pauseCoordinationForTests(): () => void;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
+                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    _suppressKeepaliveForTests(): void;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _pauseCoordinationForTests(): () => void;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _oldestPendingRequestIdForTests(): string | undefined;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
                 "export interface OpfsBlockStore extends Required<BlockStore> {\n}"
               ]
             },
@@ -4200,7 +4256,7 @@
               "name": "OpfsBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    rpcTimeoutMs?: number;\n}"
+                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -4228,7 +4284,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends Error {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
               ]
             },
             {
@@ -4953,6 +5009,13 @@
               ]
             },
             {
+              "name": "UnknownOutcomeError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class UnknownOutcomeError extends Error {\n    readonly name: string;\n}"
+              ]
+            },
+            {
               "name": "updateCompactionJobRecord",
               "kind": "value",
               "declarations": [
@@ -5176,6 +5239,13 @@
               ]
             },
             {
+              "name": "appendTransactionJournal",
+              "kind": "value",
+              "declarations": [
+                "export declare function appendTransactionJournal(record: TransactionRecord, additions: {\n    blockIds: readonly string[];\n    segmentIds: readonly string[];\n    updatedAt: string;\n    pendingTableNextRowId?: bigint;\n}): TransactionRecord;"
+              ]
+            },
+            {
               "name": "AppendUniqueKeyBuildChunkInput",
               "kind": "type",
               "declarations": [
@@ -5215,13 +5285,6 @@
               "kind": "value",
               "declarations": [
                 "export declare function assertTransactionArtifactBatchLimits(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): void;"
-              ]
-            },
-            {
-              "name": "assertTransactionArtifactJournalLimits",
-              "kind": "value",
-              "declarations": [
-                "export declare function assertTransactionArtifactJournalLimits(pendingBlockIds: readonly string[], pendingSegmentIds: readonly string[]): void;"
               ]
             },
             {
@@ -5481,6 +5544,13 @@
               "kind": "type",
               "declarations": [
                 "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan;"
+              ]
+            },
+            {
+              "name": "ConnectionLostError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class ConnectionLostError extends Error {\n    readonly name: string;\n}"
               ]
             },
             {
@@ -6047,14 +6117,14 @@
               "name": "MAX_GLOBAL_STAGED_BLOCKS",
               "kind": "value",
               "declarations": [
-                "MAX_GLOBAL_STAGED_BLOCKS = 65536"
+                "MAX_GLOBAL_STAGED_BLOCKS = 1048576"
               ]
             },
             {
               "name": "MAX_GLOBAL_STAGED_SEGMENTS",
               "kind": "value",
               "declarations": [
-                "MAX_GLOBAL_STAGED_SEGMENTS = 65536"
+                "MAX_GLOBAL_STAGED_SEGMENTS = 1048576"
               ]
             },
             {
@@ -6394,20 +6464,6 @@
               ]
             },
             {
-              "name": "MAX_TRANSACTION_PENDING_BLOCKS",
-              "kind": "value",
-              "declarations": [
-                "MAX_TRANSACTION_PENDING_BLOCKS = 4096"
-              ]
-            },
-            {
-              "name": "MAX_TRANSACTION_PENDING_SEGMENTS",
-              "kind": "value",
-              "declarations": [
-                "MAX_TRANSACTION_PENDING_SEGMENTS = 4096"
-              ]
-            },
-            {
               "name": "MAX_TRANSACTION_STAGE_BLOCKS",
               "kind": "value",
               "declarations": [
@@ -6565,7 +6621,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends Error {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
               ]
             },
             {
@@ -7192,6 +7248,13 @@
               ]
             },
             {
+              "name": "UnknownOutcomeError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class UnknownOutcomeError extends Error {\n    readonly name: string;\n}"
+              ]
+            },
+            {
               "name": "updateCompactionJobRecord",
               "kind": "value",
               "declarations": [
@@ -7388,7 +7451,7 @@
               "name": "OpfsBlockStore",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _pauseCoordinationForTests(): () => void;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
+                "export declare class OpfsBlockStore {\n    #private;\n    readonly liveQueryChannelName: string;\n    private constructor();\n    static open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore>;\n    _suppressKeepaliveForTests(): void;\n    setForeground(foreground: boolean): void;\n    putTempRunPage(page: TempRunPage): Promise<void>;\n    putTempRunPages(pages: readonly TempRunPage[]): Promise<void>;\n    getTempRunPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;\n    removeTempRun(ownerId: string, runId: string): Promise<void>;\n    _dispatchGenerated(method: string, args: unknown[]): Promise<unknown>;\n    close(): void;\n    _isLeaderForTests(): boolean;\n    _pauseCoordinationForTests(): () => void;\n    _instanceIdForTests(): string;\n    _dropNextRpcResultForTests(): void;\n    _holdServedMutationsForTests(): () => void;\n    _oldestPendingRequestIdForTests(): string | undefined;\n    _resendOldestPendingForTests(): void;\n    _residentStateForTests(): {\n        answerChannels: number;\n        dedupeEntries: number;\n        inFlightMutations: number;\n        pendingRequests: number;\n        retainedRpcBytes: number;\n        closed: boolean;\n    };\n    _crashForTests(): void;\n}",
                 "export interface OpfsBlockStore extends Required<BlockStore> {\n}"
               ]
             },
@@ -7396,7 +7459,7 @@
               "name": "OpfsBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    rpcTimeoutMs?: number;\n}"
+                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -7424,7 +7487,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends Error {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
               ]
             },
             {
@@ -7736,7 +7799,7 @@
               "name": "LOG_FORMAT_VERSION",
               "kind": "value",
               "declarations": [
-                "LOG_FORMAT_VERSION = 5"
+                "LOG_FORMAT_VERSION = 6"
               ]
             },
             {
@@ -8175,7 +8238,7 @@
               "name": "DatabaseTransaction",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class DatabaseTransaction {\n    #private;\n    private readonly store;\n    private readonly now;\n    private readonly ttlMs;\n    constructor(store: BlockStore, record: TransactionRecord, now: () => Date, ttlMs: number, createWeakRef: (transaction: DatabaseTransaction) => {\n        deref(): DatabaseTransaction | undefined;\n    }, options?: {\n        persisted?: boolean;\n        coalesceArtifacts?: boolean;\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n        snapshotLease?: LeasedSnapshot;\n    });\n    get id(): string;\n    get status(): TransactionRecord[\"status\"];\n    get snapshotVersion(): number | null;\n    get pendingBlockIds(): string[];\n    get pendingSegmentIds(): string[];\n    get deferredSegments(): SegmentRecord[];\n    get pendingTableNextRowId(): bigint | undefined;\n    get initialCatalogProbe(): {\n        catalogEpoch: number;\n        manifestVersion: number | null;\n        schemaEpoch: number;\n    } | undefined;\n    get committedCatalogContribution(): {\n        transaction: TransactionRecord;\n        segments: SegmentRecord[];\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n    } | undefined;\n    get compactionSourceBlockIds(): string[];\n    renew(): Promise<void>;\n    get stagedWorkCount(): number;\n    checkpoint(): TransactionCheckpoint;\n    checkpointRetainedBytes(): number;\n    rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;\n    snapshot(): Promise<Snapshot>;\n    getBlock(id: string): Promise<Uint8Array | undefined>;\n    stageBlock(id: string, bytes: Uint8Array): Promise<void>;\n    stageBlocks(blocks: readonly BlockWrite[]): Promise<void>;\n    stageArtifacts(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<void>;\n    stageArtifactsAndCommit(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<ManifestSummary>;\n    stageExistingBlocks(blockIds: readonly string[]): Promise<void>;\n    stageSegment(record: SegmentRecord): Promise<void>;\n    stageExistingSegment(segmentId: string): Promise<void>;\n    adoptAbortedCompactionSegment(record: SegmentRecord, abortedOwner: TransactionRecord): Promise<void>;\n    markTableChanged(tableId: string): void;\n    markLogicallyUnchanged(): void;\n    get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[];\n    setUniqueKeyChanges(changes: UniqueKeyChanges): void;\n    setFtsChanges(changes: FtsChanges): void;\n    setCompactionIntent(compactionJobId: string, sourceBlockIds: readonly string[]): void;\n    limitLevelZeroSegments(tableId: string, limit: number): void;\n    commit(): Promise<ManifestSummary>;\n    rebase(): Promise<Snapshot>;\n    abort(): Promise<void>;\n}"
+                "export declare class DatabaseTransaction {\n    #private;\n    private readonly store;\n    private readonly now;\n    private readonly ttlMs;\n    constructor(store: BlockStore, record: TransactionRecord, now: () => Date, ttlMs: number, createWeakRef: (transaction: DatabaseTransaction) => {\n        deref(): DatabaseTransaction | undefined;\n    }, options?: {\n        persisted?: boolean;\n        coalesceArtifacts?: boolean;\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n        snapshotLease?: LeasedSnapshot;\n    });\n    get id(): string;\n    get status(): TransactionRecord[\"status\"];\n    get snapshotVersion(): number | null;\n    get pendingBlockIds(): string[];\n    get pendingSegmentIds(): string[];\n    hasPendingBlock(id: string): boolean;\n    get stagedSegments(): readonly SegmentRecord[];\n    get pendingBlockCount(): number;\n    get pendingSegmentCount(): number;\n    get deferredSegments(): SegmentRecord[];\n    get pendingTableNextRowId(): bigint | undefined;\n    get initialCatalogProbe(): {\n        catalogEpoch: number;\n        manifestVersion: number | null;\n        schemaEpoch: number;\n    } | undefined;\n    get committedCatalogContribution(): {\n        transaction: TransactionRecord;\n        segments: SegmentRecord[];\n        initialCatalogProbe?: {\n            catalogEpoch: number;\n            manifestVersion: number | null;\n            schemaEpoch: number;\n        };\n    } | undefined;\n    get compactionSourceBlockIds(): string[];\n    renew(): Promise<void>;\n    get stagedWorkCount(): number;\n    checkpoint(): TransactionCheckpoint;\n    checkpointRetainedBytes(): number;\n    rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;\n    snapshot(): Promise<Snapshot>;\n    getBlock(id: string): Promise<Uint8Array | undefined>;\n    stageBlock(id: string, bytes: Uint8Array): Promise<void>;\n    stageBlocks(blocks: readonly BlockWrite[]): Promise<void>;\n    stageArtifacts(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<void>;\n    stageArtifactsAndCommit(blocks: readonly BlockWrite[], segments: readonly SegmentRecord[]): Promise<ManifestSummary>;\n    stageExistingBlocks(blockIds: readonly string[]): Promise<void>;\n    stageSegment(record: SegmentRecord): Promise<void>;\n    stageExistingSegment(segmentId: string): Promise<void>;\n    adoptAbortedCompactionSegment(record: SegmentRecord, abortedOwner: TransactionRecord): Promise<void>;\n    markTableChanged(tableId: string): void;\n    markLogicallyUnchanged(): void;\n    get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[];\n    setUniqueKeyChanges(changes: UniqueKeyChanges): void;\n    setFtsChanges(changes: FtsChanges): void;\n    setCompactionIntent(compactionJobId: string, sourceBlockIds: readonly string[]): void;\n    limitLevelZeroSegments(tableId: string, limit: number): void;\n    commit(): Promise<ManifestSummary>;\n    rebase(): Promise<Snapshot>;\n    abort(): Promise<void>;\n}"
               ]
             },
             {
@@ -8281,10 +8344,17 @@
               ]
             },
             {
+              "name": "AutoStoreKind",
+              "kind": "type",
+              "declarations": [
+                "export type AutoStoreKind = \"opfs\" | \"indexeddb\";"
+              ]
+            },
+            {
               "name": "DatabaseInitPayload",
               "kind": "type",
               "declarations": [
-                "export interface DatabaseInitPayload {\n    store: StoreDescriptor;\n    options?: WireDatabaseOptions;\n}"
+                "export interface DatabaseInitPayload {\n    store: StoreDescriptor;\n    options?: WireDatabaseOptions;\n    keepaliveIntervalMs?: number;\n}"
               ]
             },
             {
@@ -8298,7 +8368,14 @@
               "name": "ExposeDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export interface ExposeDatabaseOptions {\n    onDispose?: () => void | Promise<void>;\n    writeHandleIdleTimeoutMs?: number;\n    onVisibility?: (visible: boolean) => void;\n}"
+                "export interface ExposeDatabaseOptions {\n    onDispose?: () => void | Promise<void>;\n    writeHandleIdleTimeoutMs?: number;\n    onVisibility?: (visible: boolean) => void;\n    storeKind?: OpenedStoreKind;\n    keepaliveIntervalMs?: number;\n}"
+              ]
+            },
+            {
+              "name": "forgetStoreChoice",
+              "kind": "value",
+              "declarations": [
+                "export declare function forgetStoreChoice(name: string): Promise<void>;"
               ]
             },
             {
@@ -8306,6 +8383,34 @@
               "kind": "value",
               "declarations": [
                 "MAX_WORKER_HANDLES_PER_CONNECTION = 256"
+              ]
+            },
+            {
+              "name": "openAutoStore",
+              "kind": "value",
+              "declarations": [
+                "export declare function openAutoStore<Store>(name: string, open: (kind: AutoStoreKind) => Promise<Store>): Promise<{\n    store: Store;\n    kind: AutoStoreKind;\n}>;"
+              ]
+            },
+            {
+              "name": "OpenedStore",
+              "kind": "type",
+              "declarations": [
+                "export interface OpenedStore {\n    store: BlockStore;\n    kind: OpenedStoreKind;\n}"
+              ]
+            },
+            {
+              "name": "OpenedStoreKind",
+              "kind": "type",
+              "declarations": [
+                "export type OpenedStoreKind = \"indexeddb\" | \"opfs\" | \"memory\";"
+              ]
+            },
+            {
+              "name": "resolveAutoStoreKind",
+              "kind": "value",
+              "declarations": [
+                "export declare function resolveAutoStoreKind(name: string): Promise<{\n    kind: AutoStoreKind;\n    reserved: boolean;\n}>;"
               ]
             },
             {
@@ -8326,7 +8431,7 @@
               "name": "StoreDescriptor",
               "kind": "type",
               "declarations": [
-                "export type StoreDescriptor = {\n    kind: \"memory\";\n} | {\n    kind: \"indexeddb\";\n    name: string;\n    durability?: IDBTransactionDurability;\n    uniqueKeyCacheBytes?: number;\n} | {\n    kind: \"opfs\";\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n};"
+                "export type StoreDescriptor = {\n    kind: \"memory\";\n} | {\n    kind: \"indexeddb\";\n    name: string;\n    durability?: IDBTransactionDurability;\n    uniqueKeyCacheBytes?: number;\n} | {\n    kind: \"opfs\";\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n} | {\n    kind: \"auto\";\n    name: string;\n    opfs?: {\n        durability?: \"relaxed\" | \"strict\";\n    };\n    indexeddb?: {\n        durability?: IDBTransactionDurability;\n        uniqueKeyCacheBytes?: number;\n    };\n};"
               ]
             },
             {
@@ -8340,14 +8445,14 @@
               "name": "WorkerStoreFactory",
               "kind": "type",
               "declarations": [
-                "export type WorkerStoreFactory = (descriptor: StoreDescriptor, options: WorkerStoreOptions) => BlockStore | Promise<BlockStore>;"
+                "export type WorkerStoreFactory = (descriptor: StoreDescriptor, options: WorkerStoreOptions) => BlockStore | OpenedStore | Promise<BlockStore | OpenedStore>;"
               ]
             },
             {
               "name": "WorkerStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface WorkerStoreOptions {\n    indexedDB?: IDBFactory;\n}"
+                "export interface WorkerStoreOptions {\n    indexedDB?: IDBFactory;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             }
           ]
@@ -8357,10 +8462,38 @@
           "audience": "extension",
           "exports": [
             {
+              "name": "ErrorRegistry",
+              "kind": "type",
+              "declarations": [
+                "export type ErrorRegistry = ReadonlyMap<string, new (...args: never[]) => Error>;"
+              ]
+            },
+            {
+              "name": "isWorkerErrorReport",
+              "kind": "value",
+              "declarations": [
+                "export declare function isWorkerErrorReport(value: unknown): value is WorkerErrorReport;"
+              ]
+            },
+            {
               "name": "MAX_DATABASE_RPC_IN_FLIGHT",
               "kind": "value",
               "declarations": [
                 "MAX_DATABASE_RPC_IN_FLIGHT = 256"
+              ]
+            },
+            {
+              "name": "MAX_SERIALIZED_CAUSE_DEPTH",
+              "kind": "value",
+              "declarations": [
+                "MAX_SERIALIZED_CAUSE_DEPTH = 8"
+              ]
+            },
+            {
+              "name": "MIN_WORKER_KEEPALIVE_INTERVAL_MS",
+              "kind": "value",
+              "declarations": [
+                "MIN_WORKER_KEEPALIVE_INTERVAL_MS = 100"
               ]
             },
             {
@@ -8382,6 +8515,13 @@
               "kind": "value",
               "declarations": [
                 "protocolVersion: 7"
+              ]
+            },
+            {
+              "name": "rehydrateError",
+              "kind": "value",
+              "declarations": [
+                "export declare function rehydrateError(serialized: SerializedError, registry: ErrorRegistry): Error;"
               ]
             },
             {
@@ -8423,17 +8563,64 @@
               "name": "SerializedError",
               "kind": "type",
               "declarations": [
-                "export interface SerializedError {\n    name: string;\n    message: string;\n    stack?: string;\n    props?: Record<string, unknown>;\n}"
+                "export interface SerializedError {\n    name: string;\n    message: string;\n    stack?: string;\n    props?: Record<string, unknown>;\n    domException?: true;\n    cause?: SerializedError;\n}"
               ]
             },
             {
               "name": "serializeError",
               "kind": "value",
               "declarations": [
-                "export declare function serializeError(error: unknown): SerializedError;"
+                "export declare function serializeError(error: unknown, depth?: number): SerializedError;"
+              ]
+            },
+            {
+              "name": "WORKER_DIAGNOSTIC_HANDLE_ID",
+              "kind": "value",
+              "declarations": [
+                "WORKER_DIAGNOSTIC_HANDLE_ID = \"$worker\""
+              ]
+            },
+            {
+              "name": "WORKER_KEEPALIVE_INTERVAL_MS",
+              "kind": "value",
+              "declarations": [
+                "WORKER_KEEPALIVE_INTERVAL_MS = 5000"
+              ]
+            },
+            {
+              "name": "workerErrorEvent",
+              "kind": "value",
+              "declarations": [
+                "export declare function workerErrorEvent(report: WorkerErrorReport): RpcResponse;"
+              ]
+            },
+            {
+              "name": "WorkerErrorKind",
+              "kind": "type",
+              "declarations": [
+                "export type WorkerErrorKind = \"uncaught\" | \"unhandled-rejection\" | \"messageerror\" | \"maintenance\" | \"coordination\";"
+              ]
+            },
+            {
+              "name": "WorkerErrorReport",
+              "kind": "type",
+              "declarations": [
+                "export interface WorkerErrorReport {\n    kind: WorkerErrorKind;\n    context: string;\n    error: SerializedError;\n}"
+              ]
+            },
+            {
+              "name": "workerKeepaliveEvent",
+              "kind": "value",
+              "declarations": [
+                "export declare function workerKeepaliveEvent(requestId: string): RpcResponse;"
               ]
             }
           ]
+        },
+        {
+          "subpath": "./worker/auto",
+          "audience": "runtime",
+          "exports": []
         },
         {
           "subpath": "./worker/indexeddb",

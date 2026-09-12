@@ -269,6 +269,24 @@ class ShimDirectoryHandle {
   }
 }
 
+/**
+ * The file's bytes are a view onto a backing buffer that grows geometrically, so an append is
+ * amortized constant like a real file's, not a copy of everything written so far. A file that
+ * was handed in as a view onto someone else's buffer is copied out first.
+ */
+function grownFileBytes(bytes: Uint8Array, length: number): Uint8Array {
+  const owned = bytes.byteOffset === 0 && bytes.buffer instanceof ArrayBuffer;
+  const capacity = owned ? bytes.buffer.byteLength : bytes.byteLength;
+  if (owned && length <= capacity) {
+    const grown = new Uint8Array(bytes.buffer, 0, length);
+    grown.fill(0, bytes.byteLength);
+    return grown;
+  }
+  const backing = new Uint8Array(Math.max(length, capacity * 2, 4096));
+  backing.set(bytes);
+  return new Uint8Array(backing.buffer, 0, length);
+}
+
 function assertSubtreeUnlocked(node: DirectoryNode, name: string): void {
   for (const child of node.children.values()) {
     if (child.kind === "file") {
@@ -360,9 +378,7 @@ class ShimSyncAccessHandle {
     const source = requested.subarray(0, limit);
     const end = at + source.byteLength;
     if (source.byteLength > 0 && end > this.#node.bytes.byteLength) {
-      const grown = new Uint8Array(end);
-      grown.set(this.#node.bytes);
-      this.#node.bytes = grown;
+      this.#node.bytes = grownFileBytes(this.#node.bytes, end);
     }
     this.#node.bytes.set(source, at);
     return source.byteLength;
@@ -375,9 +391,7 @@ class ShimSyncAccessHandle {
       this.#node.bytes = this.#node.bytes.slice(0, size);
       return;
     }
-    const grown = new Uint8Array(size);
-    grown.set(this.#node.bytes);
-    this.#node.bytes = grown;
+    this.#node.bytes = grownFileBytes(this.#node.bytes, size);
   }
 
   flush(): void {

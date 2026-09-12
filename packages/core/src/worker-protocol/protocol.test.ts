@@ -1,5 +1,16 @@
 import { expect, it } from "vitest";
-import { parseRpcRequest, parseRpcResponse, protocolVersion, serializeError } from "./index.js";
+import {
+  MAX_SERIALIZED_CAUSE_DEPTH,
+  WORKER_DIAGNOSTIC_HANDLE_ID,
+  isWorkerErrorReport,
+  parseRpcRequest,
+  parseRpcResponse,
+  protocolVersion,
+  rehydrateError,
+  serializeError,
+  workerErrorEvent,
+  type SerializedError,
+} from "./index.js";
 
 it("validates every RPC request boundary", () => {
   expect(parseRpcRequest(null)).toBeNull();
@@ -74,4 +85,84 @@ it("rejects malformed RPC responses and serializes only cloneable error state", 
     message: "broken",
     props: { code: 7 },
   });
+});
+
+it("carries the cause chain, platform identity, and built-in subclasses across the wire", () => {
+  const registry = new Map<string, new (...args: never[]) => Error>();
+  const quota = new DOMException("disk full", "QuotaExceededError");
+  const inner = new TypeError("bad shape", { cause: quota });
+  const outer = new Error("write failed", { cause: inner });
+  const serialized = serializeError(outer);
+  expect(serialized.cause?.name).toBe("TypeError");
+  expect(serialized.cause?.cause).toMatchObject({
+    name: "QuotaExceededError",
+    message: "disk full",
+    domException: true,
+  });
+
+  const rehydrated = rehydrateError(serialized, registry);
+  expect(rehydrated).toBeInstanceOf(Error);
+  expect(rehydrated.message).toBe("write failed");
+  expect(rehydrated.cause).toBeInstanceOf(TypeError);
+  expect((rehydrated.cause as Error).message).toBe("bad shape");
+  const platform = (rehydrated.cause as Error).cause;
+  expect(platform).toBeInstanceOf(DOMException);
+  expect(platform).toMatchObject({ name: "QuotaExceededError", message: "disk full" });
+
+  // A registered class wins over the built-in fallback and keeps its fields.
+  class TypedError extends TypeError {
+    override readonly name = "TypedError";
+    constructor(readonly code: number) {
+      super(`typed ${String(code)}`);
+    }
+  }
+  registry.set("TypedError", TypedError);
+  const typed = rehydrateError(serializeError(new TypedError(4)), registry);
+  expect(typed).toBeInstanceOf(TypedError);
+  expect(typed).toBeInstanceOf(TypeError);
+  expect(typed).toMatchObject({ code: 4, message: "typed 4" });
+
+  // Non-Error causes and unknown names survive as plain errors.
+  const odd = rehydrateError(
+    serializeError(new Error("odd", { cause: "just a string" })),
+    registry,
+  );
+  expect(odd.cause).toBeInstanceOf(Error);
+  expect((odd.cause as Error).message).toBe("just a string");
+});
+
+it("cuts a cause chain at the depth limit instead of walking it forever", () => {
+  let error: Error = new Error("leaf");
+  for (let depth = 0; depth < MAX_SERIALIZED_CAUSE_DEPTH + 5; depth += 1) {
+    error = new Error(`level ${String(depth)}`, { cause: error });
+  }
+  let serialized: SerializedError = serializeError(error);
+  let links = 0;
+  while (serialized.cause !== undefined) {
+    serialized = serialized.cause;
+    links += 1;
+  }
+  expect(links).toBe(MAX_SERIALIZED_CAUSE_DEPTH);
+
+  // A self-referential cause terminates too.
+  const loop = new Error("loop");
+  loop.cause = loop;
+  expect(() => serializeError(loop)).not.toThrow();
+});
+
+it("recognizes a worker error report frame and nothing else", () => {
+  const frame = workerErrorEvent({
+    kind: "unhandled-rejection",
+    context: "worker global scope",
+    error: serializeError(new RangeError("out of range")),
+  });
+  expect(frame).toMatchObject({
+    kind: "rpc-event",
+    handleId: WORKER_DIAGNOSTIC_HANDLE_ID,
+    event: "error",
+  });
+  expect(isWorkerErrorReport((frame as { payload: unknown }).payload)).toBe(true);
+  expect(isWorkerErrorReport({ kind: "uncaught", context: "x" })).toBe(false);
+  expect(isWorkerErrorReport({ kind: "uncaught", context: "x", error: { name: "E" } })).toBe(false);
+  expect(isWorkerErrorReport(null)).toBe(false);
 });

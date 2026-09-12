@@ -2,6 +2,7 @@ import {
   BlockReadBatchTooLargeError,
   CompactionBacklogError,
   CompactionJobConflictError,
+  ConnectionLostError,
   GarbageCollectionJobConflictError,
   IndexedDbSchemaUpgradeBlockedError,
   LeaseConflictError,
@@ -11,6 +12,7 @@ import {
   OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
   PostingBuildConflictError,
+  SchemaConflictError,
   SnapshotImportConflictError,
   SnapshotManifestMissingError,
   StorageCorruptionError,
@@ -20,24 +22,32 @@ import {
   TableRecordConflictError,
   TempOwnerConflictError,
   TransactionRecordConflictError,
+  UniqueIndexCoverageError,
   UniqueKeyBuildConflictError,
   UniqueKeyConflictError,
-  UniqueIndexCoverageError,
+  UnknownOutcomeError,
   WriteConflictError,
-  SchemaConflictError,
 } from "../types.js";
 import { dateIsoString } from "../../date-value.js";
+import {
+  MAX_SERIALIZED_CAUSE_DEPTH,
+  rehydrateError,
+  serializeError,
+  type SerializedError,
+} from "../../worker-protocol/index.js";
 
 /**
- * The follower↔leader message vocabulary. Leadership traffic (`leader`, `ping`, `bid`, `yield`,
- * `released`) travels a `BroadcastChannel` named for the database, which every connection
- * hears. Request traffic is addressed: an `op` is posted into the leader's own channel (named
- * for the database plus the leader's instance id) and its `result` or `busy` into the
- * requester's, so block bytes are cloned once, into the tab that asked, rather than into every
- * tab. Correctness never rides on delivery: an operation is acknowledged only after the
- * leader's write-ahead log holds it. Reads retry after failover; mutations surface an uncertain
- * outcome instead of being executed twice. Leadership is arbitrated by the storage lock, not
- * by these messages.
+ * The follower↔leader message vocabulary. Leadership traffic (`leader`, `state`, `ping`, `bid`,
+ * `yield`, `released`) travels a `BroadcastChannel` named for the database, which every
+ * connection hears. Request traffic is addressed: an `op` is posted into the leader's own
+ * channel (named for the database plus the leader's instance id) and its `result`, `busy`,
+ * `hold`, or `declined` into the requester's, so block bytes are cloned once, into the tab that
+ * asked, rather than into every tab. Correctness never rides on delivery: an operation is
+ * acknowledged only after the leader's write-ahead log holds it. A declined request provably
+ * never ran and is simply sent again; reads retry after failover; a mutation whose leader
+ * vanished mid-flight surfaces an uncertain outcome instead of being executed twice. Every kind
+ * is parsed by exact shape, so a connection from another release ignores what it does not
+ * know. Leadership is arbitrated by the storage lock, not by these messages.
  */
 
 export type StoreRpcMessage =
@@ -45,13 +55,38 @@ export type StoreRpcMessage =
    * A follower's operation request. `requestId` doubles as the retry-dedupe key; `from` is the
    * requester's instance id, naming the channel its answer goes to.
    */
-  | { kind: "op"; requestId: string; from: string; method: string; args: unknown[] }
+  | {
+      kind: "op";
+      requestId: string;
+      from: string;
+      method: string;
+      args: unknown[];
+      /** When the requester first sent it; a re-send keeps it, so the ledger can vouch. */
+      sentAt: number;
+    }
   | { kind: "result"; requestId: string; ok: true; value: unknown }
   | { kind: "result"; requestId: string; ok: false; error: SerializedStoreError }
   /** The leader is still executing this request — reset the caller's patience. */
   | { kind: "busy"; requestId: string }
+  /**
+   * The leader is about to do something synchronous and long (a checkpoint); wait at least
+   * this long before assuming it is gone.
+   */
+  | { kind: "hold"; requestId: string; ms: number }
+  /**
+   * The receiver is not leading, so the request did not run and never will here. The follower
+   * re-discovers the leader and sends it again — safely, because nothing happened.
+   */
+  | { kind: "declined"; requestId: string; reason: "not-leader" }
+  /**
+   * A re-sent mutation the leader's ledger neither holds nor can rule out: it was first sent
+   * before the ledger's coverage begins, so an earlier leader may have executed it.
+   */
+  | { kind: "uncertain"; requestId: string }
   /** The leader exists (sent on takeover and in answer to pings). */
   | { kind: "leader"; leaderId: string }
+  /** The leader's visibility, so a foreground follower knows when to bid. */
+  | { kind: "state"; leaderId: string; foreground: boolean }
   | { kind: "ping" }
   /** A foreground follower asks the (background) leader to hand over. */
   | { kind: "bid"; bidderId: string; foreground: boolean }
@@ -60,16 +95,16 @@ export type StoreRpcMessage =
   /** The leader closed or demoted; followers may race for the lock. */
   | { kind: "released"; leaderId: string };
 
-export interface SerializedStoreError {
-  name: string;
-  message: string;
-  /** True for platform exceptions (quota!), whose `instanceof DOMException` must survive. */
-  domException?: boolean;
-  props?: Record<string, unknown>;
-}
+/** The wire form of a served operation's failure; the worker protocol's shape, validated. */
+export type SerializedStoreError = SerializedError;
+
+/** Stack text longer than this is not a stack; it is a payload wearing one. */
+const MAX_OPFS_RPC_STACK_CHARACTERS = 64 * 1024;
 
 /** One legal maximum payload plus bounded envelope/catalog metadata. */
 export const MAX_OPFS_RPC_MESSAGE_BYTES = 66 * 1024 * 1024;
+/** The longest patience a `hold` may ask for; a leader busier than this is treated as gone. */
+export const MAX_OPFS_RPC_HOLD_MS = 60_000;
 export const MAX_OPFS_RPC_IDENTIFIER_CHARACTERS = 1024;
 const MAX_OPFS_RPC_DEPTH = 64;
 const MAX_OPFS_RPC_NODES = 1_100_000;
@@ -139,25 +174,25 @@ export function estimateRpcValueBytes(value: unknown): number {
   return bytes;
 }
 
-function validSerializedError(value: unknown): value is SerializedStoreError {
+function validSerializedError(value: unknown, depth = 0): value is SerializedStoreError {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  const allowed =
-    record.props === undefined
-      ? record.domException === undefined
-        ? ["name", "message"]
-        : ["name", "message", "domException"]
-      : record.domException === undefined
-        ? ["name", "message", "props"]
-        : ["name", "message", "domException", "props"];
+  const optional = ["stack", "domException", "props", "cause"] as const;
+  const allowed = ["name", "message", ...optional.filter((key) => record[key] !== undefined)];
   return (
     exactKeys(record, allowed) &&
     boundedRpcString(record.name) &&
     typeof record.message === "string" &&
     record.message.length <= MAX_OPFS_RPC_IDENTIFIER_CHARACTERS * 4 &&
+    (record.stack === undefined ||
+      (typeof record.stack === "string" && record.stack.length <= MAX_OPFS_RPC_STACK_CHARACTERS)) &&
     (record.domException === undefined || record.domException === true) &&
     (record.props === undefined ||
-      (typeof record.props === "object" && record.props !== null && !Array.isArray(record.props)))
+      (typeof record.props === "object" &&
+        record.props !== null &&
+        !Array.isArray(record.props))) &&
+    (record.cause === undefined ||
+      (depth < MAX_SERIALIZED_CAUSE_DEPTH && validSerializedError(record.cause, depth + 1)))
   );
 }
 
@@ -173,12 +208,14 @@ export function parseStoreRpcMessage(
     switch (record.kind) {
       case "op":
         if (
-          !exactKeys(record, ["kind", "requestId", "from", "method", "args"]) ||
+          !exactKeys(record, ["kind", "requestId", "from", "method", "args", "sentAt"]) ||
           !boundedRpcString(record.requestId) ||
           !boundedRpcString(record.from) ||
           !boundedRpcString(record.method) ||
           !knownMethods.has(record.method) ||
           !Array.isArray(record.args) ||
+          !Number.isSafeInteger(record.sentAt) ||
+          (record.sentAt as number) < 0 ||
           estimateRpcValueBytes(record.args) > MAX_OPFS_RPC_MESSAGE_BYTES
         )
           return undefined;
@@ -196,6 +233,31 @@ export function parseStoreRpcMessage(
         return record as StoreRpcMessage;
       case "busy":
         return exactKeys(record, ["kind", "requestId"]) && boundedRpcString(record.requestId)
+          ? (record as StoreRpcMessage)
+          : undefined;
+      case "hold":
+        return exactKeys(record, ["kind", "requestId", "ms"]) &&
+          boundedRpcString(record.requestId) &&
+          typeof record.ms === "number" &&
+          Number.isSafeInteger(record.ms) &&
+          record.ms >= 0 &&
+          record.ms <= MAX_OPFS_RPC_HOLD_MS
+          ? (record as StoreRpcMessage)
+          : undefined;
+      case "uncertain":
+        return exactKeys(record, ["kind", "requestId"]) && boundedRpcString(record.requestId)
+          ? (record as StoreRpcMessage)
+          : undefined;
+      case "declined":
+        return exactKeys(record, ["kind", "requestId", "reason"]) &&
+          boundedRpcString(record.requestId) &&
+          record.reason === "not-leader"
+          ? (record as StoreRpcMessage)
+          : undefined;
+      case "state":
+        return exactKeys(record, ["kind", "leaderId", "foreground"]) &&
+          boundedRpcString(record.leaderId) &&
+          typeof record.foreground === "boolean"
           ? (record as StoreRpcMessage)
           : undefined;
       case "leader":
@@ -305,50 +367,15 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     OpfsCoordinationError,
     OpfsDatabaseInUseError,
     OpfsUncertainOutcomeError,
+    UnknownOutcomeError,
+    ConnectionLostError,
   ].map((constructor) => [constructor.name, constructor]),
 );
 
 export function serializeStoreError(error: unknown): SerializedStoreError {
-  if (error instanceof DOMException) {
-    return { name: error.name, message: error.message, domException: true };
-  }
-  if (!(error instanceof Error)) return { name: "Error", message: String(error) };
-  const props: Record<string, unknown> = {};
-  for (const key of Object.keys(error)) {
-    const value = (error as unknown as Record<string, unknown>)[key];
-    try {
-      structuredClone(value);
-      props[key] = value;
-    } catch {
-      // A non-cloneable field would poison the whole message; drop it.
-    }
-  }
-  return {
-    name: error.name,
-    message: error.message,
-    ...(Object.keys(props).length === 0 ? {} : { props }),
-  };
+  return serializeError(error);
 }
 
 export function rehydrateStoreError(serialized: SerializedStoreError): Error {
-  if (serialized.domException === true) {
-    return new DOMException(serialized.message, serialized.name);
-  }
-  const constructor = errorRegistry.get(serialized.name);
-  const error: Error =
-    constructor === undefined
-      ? new Error(serialized.message)
-      : (Object.create(constructor.prototype as object) as Error);
-  Object.defineProperty(error, "message", {
-    value: serialized.message,
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(error, "name", {
-    value: serialized.name,
-    writable: true,
-    configurable: true,
-  });
-  if (serialized.props !== undefined) Object.assign(error, serialized.props);
-  return error;
+  return rehydrateError(serialized, errorRegistry);
 }

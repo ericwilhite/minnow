@@ -3,7 +3,6 @@ import {
   advanceGarbageCollectionJobRecord,
   assertSnapshotImportAcceleratorUsage,
   assertTransactionArtifactBatchLimits,
-  assertTransactionArtifactJournalLimits,
   catalogRecordRetainedBytes,
   createGarbageCollectionJobRecord,
   invalidateUncoveredFtsColumns,
@@ -24,7 +23,6 @@ import {
   MAX_TABLE_RECORD_CHARACTERS,
   MAX_TEMP_RUN_PAGE_BYTES,
   MAX_TEMP_RUN_PAGES_PER_BATCH,
-  MAX_TRANSACTION_PENDING_SEGMENTS,
   normalizeGarbageCollectionJobRecord,
   StorageFormatVersionError,
   updateGarbageCollectionPlanningRecord,
@@ -273,12 +271,6 @@ describe("storage metadata admission validation", () => {
         [],
       ),
     ).toThrow("must be a Uint8Array");
-    expect(() =>
-      assertTransactionArtifactJournalLimits(
-        [],
-        new Array<string>(MAX_TRANSACTION_PENDING_SEGMENTS + 1).fill("segment"),
-      ),
-    ).toThrow("pending segments");
     expect(() => assertSnapshotImportAcceleratorUsage(-1, 0)).toThrow("bytes are invalid");
     expect(() => assertSnapshotImportAcceleratorUsage(0, -1)).toThrow("entries are invalid");
     expect(() => validateCatalogName(null)).toThrow("cannot be empty");

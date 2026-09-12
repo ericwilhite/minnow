@@ -13,7 +13,7 @@ import { MAX_ROW_ID_EXCLUSIVE_END, StorageFormatVersionError } from "../types.js
  * and the reviver only converts an object whose sole key is `$n`.
  */
 
-export const LOG_FORMAT_VERSION = 5;
+export const LOG_FORMAT_VERSION = 6;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });

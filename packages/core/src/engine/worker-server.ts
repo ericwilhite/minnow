@@ -1,13 +1,18 @@
 import type { BlockStore } from "../storage/types.js";
 import { MAX_SNAPSHOT_STREAM_CHUNK_BYTES } from "../storage/snapshot.js";
 import {
-  parseRpcRequest,
   MAX_DATABASE_RPC_IN_FLIGHT,
+  parseRpcRequest,
   rpcEvent,
   rpcFailure,
   rpcResult,
   serializeError,
   type RpcRequest,
+  type WorkerErrorKind,
+  MIN_WORKER_KEEPALIVE_INTERVAL_MS,
+  WORKER_KEEPALIVE_INTERVAL_MS,
+  workerErrorEvent,
+  workerKeepaliveEvent,
 } from "../worker-protocol/index.js";
 import {
   type WriteSession,
@@ -51,7 +56,27 @@ export type StoreDescriptor =
       durability?: IDBTransactionDurability;
       uniqueKeyCacheBytes?: number;
     }
-  | { kind: "opfs"; name: string; durability?: "relaxed" | "strict" };
+  | { kind: "opfs"; name: string; durability?: "relaxed" | "strict" }
+  /**
+   * OPFS where the worker can hold synchronous access handles, IndexedDB elsewhere. The choice
+   * is made once per name and remembered, so the database never reopens empty on the other
+   * store; `client.storeKind()` reports which one opened.
+   */
+  | {
+      kind: "auto";
+      name: string;
+      opfs?: { durability?: "relaxed" | "strict" };
+      indexeddb?: { durability?: IDBTransactionDurability; uniqueKeyCacheBytes?: number };
+    };
+
+/** The store kinds a worker can actually open; `auto` resolves to one of the durable two. */
+export type OpenedStoreKind = "indexeddb" | "opfs" | "memory";
+
+/** What a store factory may return when the descriptor did not name the kind it opened. */
+export interface OpenedStore {
+  store: BlockStore;
+  kind: OpenedStoreKind;
+}
 
 /** The cloneable subset of MinnowDatabaseOptions; function-valued seams stay worker-side. */
 export type WireDatabaseOptions = Pick<
@@ -74,6 +99,11 @@ export type WireDatabaseOptions = Pick<
 export interface DatabaseInitPayload {
   store: StoreDescriptor;
   options?: WireDatabaseOptions;
+  /**
+   * How often the worker reports on a call it is still working on; the client derives it
+   * from its own deadline so a short deadline still hears from a long call in time.
+   */
+  keepaliveIntervalMs?: number;
 }
 
 interface RpcCallContext {
@@ -281,6 +311,71 @@ export interface RpcScope {
   postMessage(message: unknown, options?: { transfer: ArrayBuffer[] }): void;
 }
 
+/** Reports a worker failure that belongs to no request to the main thread. */
+export type WorkerErrorReporter = (kind: WorkerErrorKind, error: unknown, context: string) => void;
+
+const errorSinks = new WeakMap<RpcScope, WorkerErrorReporter>();
+
+/**
+ * The one place every failure that is nobody's call answer goes. It posts a diagnostic event
+ * frame the client turns into `onWorkerError` (or a `console.error` on the main thread), and on
+ * a real worker global it also catches what would otherwise be an uncaught exception, an
+ * unhandled rejection, or an unreadable inbound frame. Those three are marked handled so the
+ * browser does not log them a second time under the worker's own name; the main thread's copy
+ * carries the same message, stack, and cause.
+ */
+export function workerErrorReporter(scope: RpcScope): WorkerErrorReporter {
+  const existing = errorSinks.get(scope);
+  if (existing !== undefined) return existing;
+  const report: WorkerErrorReporter = (kind, error, context) => {
+    try {
+      scope.postMessage(workerErrorEvent({ kind, context, error: serializeError(error) }));
+    } catch {
+      // The channel is gone; there is nobody left to tell.
+    }
+  };
+  errorSinks.set(scope, report);
+  const listen = (
+    type: string,
+    listener: (event: { preventDefault?: () => void } & Record<string, unknown>) => void,
+  ): void => {
+    try {
+      (
+        scope as unknown as {
+          addEventListener: (type: string, listener: (event: never) => void) => void;
+        }
+      ).addEventListener(type, listener);
+    } catch {
+      // A scope that only knows "message" (an in-process test boundary) has no global errors.
+    }
+  };
+  listen("error", (event) => {
+    const where =
+      typeof event.filename === "string" && event.filename !== ""
+        ? `${event.filename}:${String(event.lineno)}:${String(event.colno)}`
+        : "worker global scope";
+    const error =
+      event.error instanceof Error
+        ? event.error
+        : new Error(typeof event.message === "string" ? event.message : "Uncaught error");
+    report("uncaught", error, where);
+    event.preventDefault?.();
+  });
+  listen("unhandledrejection", (event) => {
+    report("unhandled-rejection", event.reason, "worker global scope");
+    event.preventDefault?.();
+  });
+  listen("messageerror", (event) => {
+    report(
+      "messageerror",
+      new Error("A frame sent to the database worker could not be deserialized"),
+      "worker inbound channel",
+    );
+    event.preventDefault?.();
+  });
+  return report;
+}
+
 export interface ExposeDatabaseOptions {
   /** Called when the client sends its dispose frame, after every handle has been closed. */
   onDispose?: () => void | Promise<void>;
@@ -295,12 +390,22 @@ export interface ExposeDatabaseOptions {
    * on the tab the user is looking at.
    */
   onVisibility?: (visible: boolean) => void;
+  /** The kind of store behind the database, reported to the client when it connects. */
+  storeKind?: OpenedStoreKind;
+  /** Milliseconds between keepalive reports on a call in progress; defaults to five seconds. */
+  keepaliveIntervalMs?: number;
 }
 
 /** What a worker store factory may need beyond the descriptor itself. */
 export interface WorkerStoreOptions {
   /** Test seam for environments without a global IndexedDB (e.g. fake-indexeddb). */
   indexedDB?: IDBFactory;
+  /**
+   * Hears a store's background failures — a failed checkpoint, a broken election — so they reach
+   * the main thread. The stock host wires it to the worker error reporter; a factory passes it
+   * to a store that accepts one (`OpfsBlockStoreOptions.onDiagnostic`).
+   */
+  onDiagnostic?: (error: unknown, context: string) => void;
 }
 
 /**
@@ -311,7 +416,7 @@ export interface WorkerStoreOptions {
 export type WorkerStoreFactory = (
   descriptor: StoreDescriptor,
   options: WorkerStoreOptions,
-) => BlockStore | Promise<BlockStore>;
+) => BlockStore | OpenedStore | Promise<BlockStore | OpenedStore>;
 
 type Handle =
   | { type: "snapshot"; session: SnapshotSession; release: () => void; done: Promise<void> }
@@ -361,12 +466,18 @@ class DatabaseRpcServer {
   #inFlightRpcDrain: Promise<void> | undefined;
   #resolveInFlightRpcDrain: (() => void) | undefined;
   readonly #writeHandleIdleTimeoutMs: number;
+  readonly #report: WorkerErrorReporter;
+  readonly #storeKind: OpenedStoreKind | undefined;
+  readonly #keepaliveIntervalMs: number;
 
   constructor(
     private readonly database: MinnowDatabase,
     private readonly scope: RpcScope,
     private readonly options: ExposeDatabaseOptions,
   ) {
+    this.#report = workerErrorReporter(scope);
+    this.#storeKind = options.storeKind;
+    this.#keepaliveIntervalMs = keepaliveInterval(options.keepaliveIntervalMs);
     this.#writeHandleIdleTimeoutMs =
       options.writeHandleIdleTimeoutMs ?? DEFAULT_WRITE_HANDLE_IDLE_TIMEOUT_MS;
     if (
@@ -382,7 +493,12 @@ class DatabaseRpcServer {
 
   async handle(request: RpcRequest): Promise<void> {
     if (request.kind === "rpc-init") {
-      this.scope.postMessage(rpcResult(request.requestId, { ready: true }));
+      this.scope.postMessage(
+        rpcResult(request.requestId, {
+          ready: true,
+          ...(this.#storeKind === undefined ? {} : { store: this.#storeKind }),
+        }),
+      );
       return;
     }
     if (request.kind === "rpc-cancel") {
@@ -404,6 +520,16 @@ class DatabaseRpcServer {
       return;
     }
     if (!bypassLimit) this.#inFlightRpcCount += 1;
+    // A long call — a large batch write, a slow query — must not look like a dead worker to the
+    // client's deadline. Marked unref so an idle Node scope can still exit.
+    const keepalive = setInterval(() => {
+      try {
+        this.scope.postMessage(workerKeepaliveEvent(request.requestId));
+      } catch {
+        // The scope is gone; the call's own outcome can no longer be delivered either.
+      }
+    }, this.#keepaliveIntervalMs);
+    unrefTimer(keepalive);
     const abort =
       request.method === "query" || request.method === "execute"
         ? new AbortController()
@@ -443,6 +569,7 @@ class DatabaseRpcServer {
     } catch (error) {
       this.scope.postMessage(rpcFailure(request.requestId, error));
     } finally {
+      clearInterval(keepalive);
       if (abort !== undefined) this.#requestAborts.delete(request.requestId);
       if (!bypassLimit) this.#inFlightRpcCount -= 1;
       if (this.#inFlightRpcCount === 0 && this.#resolveInFlightRpcDrain !== undefined) {
@@ -1176,7 +1303,9 @@ class DatabaseRpcServer {
         return;
       // Delete first: a late commit or stage frame must fail rather than revive an expired scope
       // while its asynchronous durable rollback is still joining.
-      void this.#settleWriteHandle(handleId, handle, false).catch(() => undefined);
+      void this.#settleWriteHandle(handleId, handle, false).catch((error: unknown) => {
+        this.#report("maintenance", error, "idle write handle rollback");
+      });
     }, this.#writeHandleIdleTimeoutMs);
     unrefTimer(handle.idleTimer);
   }
@@ -1256,8 +1385,9 @@ class DatabaseRpcServer {
           handle.queue.fail(new Error("Database connection was disposed"));
           handleCleanup.push(handle.task.catch(() => undefined));
         } else if (handle.type === "live-set") this.#closeLiveSet(handleId, handle);
-      } catch {
+      } catch (error) {
         // Dispose every handle even when one close fails; the client is already gone.
+        this.#report("maintenance", error, "dispose handle");
       }
     }
     await Promise.allSettled(handleCleanup);
@@ -1297,6 +1427,7 @@ export function exposeDatabase(
   options: ExposeDatabaseOptions = {},
 ): void {
   const server = new DatabaseRpcServer(database, scope, options);
+  const report = workerErrorReporter(scope);
   scope.addEventListener("message", (event: MessageEvent<unknown>) => {
     let request: RpcRequest | null;
     try {
@@ -1304,9 +1435,14 @@ export function exposeDatabase(
     } catch (error) {
       const requestId = requestIdOf(event.data);
       if (requestId !== undefined) scope.postMessage(rpcFailure(requestId, error));
+      else report("messageerror", error, "unreadable request frame");
       return;
     }
-    if (request !== null) void server.handle(request);
+    if (request !== null) {
+      void server.handle(request).catch((error: unknown) => {
+        report("uncaught", error, `${request.kind} dispatch`);
+      });
+    }
   });
 }
 
@@ -1323,6 +1459,14 @@ export function attachWorkerHost(
 ): void {
   let initialized: Promise<DatabaseRpcServer> | undefined;
   let initFailure: unknown;
+  const report = workerErrorReporter(scope);
+  const storeOptions: WorkerStoreOptions = {
+    ...options,
+    onDiagnostic: (error, context) => {
+      report("coordination", error, context);
+      options.onDiagnostic?.(error, context);
+    },
+  };
   scope.addEventListener("message", (event: MessageEvent<unknown>) => {
     let request: RpcRequest | null;
     try {
@@ -1330,6 +1474,7 @@ export function attachWorkerHost(
     } catch (error) {
       const requestId = requestIdOf(event.data);
       if (requestId !== undefined) scope.postMessage(rpcFailure(requestId, error));
+      else report("messageerror", error, "unreadable request frame");
       return;
     }
     if (request === null) return;
@@ -1339,7 +1484,8 @@ export function attachWorkerHost(
         scope,
         request.payload as DatabaseInitPayload,
         createStore,
-        options,
+        storeOptions,
+        report,
       );
       initialized = attempt;
       attempt.catch((error: unknown) => {
@@ -1373,7 +1519,11 @@ export function attachWorkerHost(
     void pending
       .then((server) => server.handle(request))
       .catch((error: unknown) => {
-        scope.postMessage(rpcFailure(request.requestId, error));
+        try {
+          scope.postMessage(rpcFailure(request.requestId, error));
+        } catch (postError) {
+          report("uncaught", postError, `${request.kind} failure frame`);
+        }
       });
   });
 }
@@ -1383,9 +1533,27 @@ async function createServer(
   payload: DatabaseInitPayload,
   createStore: WorkerStoreFactory,
   options: WorkerStoreOptions,
+  report: WorkerErrorReporter,
 ): Promise<DatabaseRpcServer> {
-  const store = await createStore(payload.store, options);
-  const database = new MinnowDatabase(store, payload.options ?? {});
+  const opened = await createStore(payload.store, options);
+  const { store, kind } = isOpenedStore(opened)
+    ? opened
+    : { store: opened, kind: payload.store.kind === "auto" ? undefined : payload.store.kind };
+  let database: MinnowDatabase;
+  try {
+    database = new MinnowDatabase(store, {
+      ...(payload.options ?? {}),
+      onBackgroundError: (error, context) => report("maintenance", error, context),
+    });
+  } catch (error) {
+    // The store opened for a database that will never exist; release its handles and locks.
+    try {
+      store.close();
+    } catch (closeError) {
+      report("maintenance", closeError, "store close after failed construction");
+    }
+    throw error;
+  }
   return new DatabaseRpcServer(database, scope, {
     ...(payload.options?.transactionIdleTimeoutMs === undefined
       ? {}
@@ -1394,13 +1562,31 @@ async function createServer(
     onVisibility: (visible) => {
       (store as { setForeground?: (foreground: boolean) => void }).setForeground?.(visible);
     },
+    ...(kind === undefined ? {} : { storeKind: kind }),
+    ...(payload.keepaliveIntervalMs === undefined
+      ? {}
+      : { keepaliveIntervalMs: payload.keepaliveIntervalMs }),
   });
+}
+
+/** A wire-supplied interval is clamped to a sane range; anything else means the default. */
+function keepaliveInterval(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return WORKER_KEEPALIVE_INTERVAL_MS;
+  return Math.min(WORKER_KEEPALIVE_INTERVAL_MS, Math.max(MIN_WORKER_KEEPALIVE_INTERVAL_MS, value));
+}
+
+function isOpenedStore(value: BlockStore | OpenedStore): value is OpenedStore {
+  return (
+    typeof (value as { kind?: unknown }).kind === "string" &&
+    typeof (value as { store?: unknown }).store === "object"
+  );
 }
 
 const storeKindLabels: Record<StoreDescriptor["kind"], string> = {
   indexeddb: "IndexedDB",
   opfs: "OPFS",
   memory: "memory",
+  auto: "OPFS-or-IndexedDB",
 };
 
 /**
@@ -1421,6 +1607,14 @@ export function singleStoreFactory<Kind extends StoreDescriptor["kind"]>(
     }
     return open(descriptor as Extract<StoreDescriptor, { kind: Kind }>, options);
   };
+}
+
+/** The refusal a worker entry gives an init frame for a store it does not bundle. */
+export function unsupportedStoreKindError(
+  bundled: StoreDescriptor["kind"],
+  requested: string,
+): Error {
+  return new Error(unsupportedStoreKindMessage(bundled, requested));
 }
 
 function unsupportedStoreKindMessage(bundled: StoreDescriptor["kind"], requested: string): string {

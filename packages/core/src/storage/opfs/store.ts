@@ -13,11 +13,12 @@ import {
 import { validateTempRunPage, validateTempRunPageIdentity } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, isDomError } from "./files.js";
 import { LOG_FORMAT_VERSION } from "../toolkit/wire.js";
-import { OpfsLeader } from "./leader.js";
+import { OpfsLeader, type ServedMutationRequest } from "./leader.js";
 import {
   rehydrateStoreError,
   estimateRpcValueBytes,
   fingerprintStoreRequest,
+  MAX_OPFS_RPC_HOLD_MS,
   MAX_OPFS_RPC_MESSAGE_BYTES,
   parseStoreRpcMessage,
   serializeStoreError,
@@ -31,8 +32,25 @@ const RPC_TIMEOUT_MS = 1_000;
 const DISCOVERY_WAIT_MS = 150;
 /** Attempts across the discover → call → elect loop before an operation gives up. */
 const DISPATCH_ATTEMPTS = 10;
-/** A leader yields to a foreground bidder at most this often. */
+/** A leader yields to a foreground bidder at most this often; a bid inside it is deferred. */
 const YIELD_COOLDOWN_MS = 3_000;
+/** After yielding, the ex-leader stays out of elections this long so the bidder can win. */
+const HANDOVER_GRACE_MS = 1_500;
+/**
+ * A hidden leader with other connections around lets go of its handles after this long with
+ * nothing to do. A browser may freeze a hidden tab, worker and all, and a frozen leader can
+ * neither serve nor yield; releasing while idle keeps the database available to the tabs that
+ * are awake. Its own next operation simply elects again.
+ */
+const HIDDEN_IDLE_RELEASE_MS = 15_000;
+/**
+ * A mutation whose leader falls silent is not given up on at once: the follower pings, and a
+ * leader that answers the ping is alive and still holds the request. This many extra rounds
+ * of patience are allowed before the outcome is declared uncertain.
+ */
+const MUTATION_PATIENCE_ROUNDS = 3;
+/** How long a closed connection keeps declining requests that were already on their way. */
+const DECLINE_AFTER_CLOSE_MS = 1_000;
 /** Results remembered for retried requests whose acknowledgement was lost. */
 const DEDUPE_CACHE_SIZE = 512;
 /** Requests admitted concurrently by either side of the follower protocol. */
@@ -67,8 +85,24 @@ export interface OpfsBlockStoreOptions {
   checkpointEntries?: number;
   /** @internal Test seam: cleanup-debt backpressure limit (default 64 MiB). */
   cleanupLimitBytes?: number;
+  /** @internal Test seam: how long served requests stay answerable (default 10 minutes). */
+  servedLedgerAgeMs?: number;
+  /** @internal Test seam: the largest served result the ledger retains (default 64 KiB). */
+  servedLedgerResultBytes?: number;
   /** @internal Test seam: how long a follower waits for the leader (default 1000ms). */
   rpcTimeoutMs?: number;
+  /** @internal Test seam: minimum spacing between foreground yields (default 3000ms). */
+  yieldCooldownMs?: number;
+  /** @internal Test seam: idle time before a hidden leader releases (default 15000ms). */
+  hiddenIdleReleaseMs?: number;
+  /** @internal Test seam: how long an ex-leader stays out of elections (default 1500ms). */
+  handoverGraceMs?: number;
+  /**
+   * Hears failures no operation reports: a background checkpoint or cleanup that failed, an
+   * election or handover that threw, a served request that could not be answered. The worker
+   * host wires it to the client's `onWorkerError`; a direct caller may log it.
+   */
+  onDiagnostic?: (error: unknown, context: string) => void;
 }
 
 /** Methods a follower may invoke on the leader. Temp-page IO is instance-local by design. */
@@ -255,6 +289,10 @@ interface PendingRpc {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** Timeouts survived so far by pinging a leader that turned out to be alive. */
+  patienceRounds: number;
+  /** A ping is out; the leader's own announcement, not a stranger's, restores the timer. */
+  awaitingPing: boolean;
 }
 
 /**
@@ -293,7 +331,13 @@ export class OpfsBlockStore {
   readonly #durability: "relaxed" | "strict";
   readonly #checkpointEntries: number | undefined;
   readonly #cleanupLimitBytes: number | undefined;
+  readonly #servedLedgerAgeMs: number | undefined;
+  readonly #servedLedgerResultBytes: number | undefined;
   readonly #rpcTimeoutMs: number;
+  readonly #yieldCooldownMs: number;
+  readonly #hiddenIdleReleaseMs: number;
+  readonly #handoverGraceMs: number;
+  readonly #onDiagnostic: ((error: unknown, context: string) => void) | undefined;
   readonly #instanceId = crypto.randomUUID();
   readonly #channelName: string;
   /** The database-wide channel: leadership traffic every connection listens to. */
@@ -322,13 +366,35 @@ export class OpfsBlockStore {
   #servedMutationGateForTests: Promise<void> | undefined;
   #dropNextRpcResultForTests = false;
   #reacquireTimer: ReturnType<typeof setTimeout> | undefined;
+  /** While leading: every admitted request, so keepalives and holds reach its requester. */
+  readonly #served = new Map<string, string>();
+  #keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  /** A foreground bid that arrived inside the yield cooldown, honored when it ends. */
+  #deferredBid: { bidderId: string; timer: ReturnType<typeof setTimeout> } | undefined;
+  #hiddenIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  #inboxLingerTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When this connection last did storage work of its own or for a follower. */
+  #lastActivityAt = Date.now();
+  /** Whether any other connection has ever spoken; a lone leader never releases for idleness. */
+  #othersSeen = false;
+  /**
+   * Leaders that said goodbye. A request they still hold is answered — with its result or a
+   * decline — so it waits, where a request to a leader that vanished cannot.
+   */
+  readonly #gracefulLeaders = new Set<string>();
 
   private constructor(tree: OpfsTree, options: OpfsBlockStoreOptions) {
     this.#tree = tree;
     this.#durability = options.durability ?? "strict";
     this.#checkpointEntries = options.checkpointEntries;
     this.#cleanupLimitBytes = options.cleanupLimitBytes;
+    this.#servedLedgerAgeMs = options.servedLedgerAgeMs;
+    this.#servedLedgerResultBytes = options.servedLedgerResultBytes;
     this.#rpcTimeoutMs = options.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
+    this.#yieldCooldownMs = options.yieldCooldownMs ?? YIELD_COOLDOWN_MS;
+    this.#hiddenIdleReleaseMs = options.hiddenIdleReleaseMs ?? HIDDEN_IDLE_RELEASE_MS;
+    this.#handoverGraceMs = options.handoverGraceMs ?? HANDOVER_GRACE_MS;
+    this.#onDiagnostic = options.onDiagnostic;
     this.#channelName = `minnowdb-store:${options.name}`;
     this.liveQueryChannelName = `minnowdb-live:opfs:${options.name}`;
   }
@@ -376,9 +442,32 @@ export class OpfsBlockStore {
   // Leadership.
   // ---------------------------------------------------------------------------------------
 
-  async #tryBecomeLeader(): Promise<boolean> {
+  /** Reports a failure no caller awaits; a throwing hook is contained. */
+  #diagnostic(error: unknown, context: string): void {
+    try {
+      this.#onDiagnostic?.(error, context);
+    } catch {
+      // A diagnostic hook must never turn a background failure into a second one.
+    }
+  }
+
+  /** Fire-and-forget election: a failure is reported, never left as an unhandled rejection. */
+  #electInBackground(context: string, force = false): void {
+    this.#tryBecomeLeader(force).catch((error: unknown) => {
+      this.#diagnostic(error, context);
+    });
+  }
+
+  /**
+   * `force` skips the handover grace: only the reacquire timer, whose job is to make sure the
+   * database is held by someone when the bidder never turns up, may take the handles back
+   * this soon after yielding them.
+   */
+  async #tryBecomeLeader(force = false): Promise<boolean> {
     if (this.#closed) return false;
     if (this.#leader !== undefined) return true;
+    if (this.#yielding !== undefined) return false;
+    if (!force && Date.now() - this.#lastYieldAt < this.#handoverGraceMs) return false;
     if (this.#electing !== undefined) return this.#electing;
     const election = this.#elect();
     this.#electing = election;
@@ -410,6 +499,9 @@ export class OpfsBlockStore {
         { wal, slotA, slotB },
         this.#checkpointEntries,
         this.#cleanupLimitBytes,
+        this.#onDiagnostic,
+        this.#servedLedgerAgeMs,
+        this.#servedLedgerResultBytes,
       );
     } catch (error) {
       wal.close();
@@ -423,14 +515,116 @@ export class OpfsBlockStore {
       // browser's file lock with no owner to ever release it.
       const leader = this.#leader;
       this.#leader = undefined;
-      await leader.shutdown().catch(() => {
+      await leader.shutdown().catch((error: unknown) => {
+        this.#diagnostic(error, "opfs shutdown after close during election");
         leader.crash();
       });
       return false;
     }
     this.#knownLeader = this.#instanceId;
+    this.#leader.onBeforeCheckpoint = (expectedMs) => {
+      this.#holdServed(expectedMs);
+    };
     this.#post({ kind: "leader", leaderId: this.#instanceId });
+    this.#post({ kind: "state", leaderId: this.#instanceId, foreground: this.#foreground });
+    if (!this.#foreground) this.#armHiddenIdleTimer();
     return true;
+  }
+
+  /** Tells every requester the leader holds that a long synchronous step is about to run. */
+  #holdServed(expectedMs: number): void {
+    if (this.#served.size === 0) return;
+    const ms = Math.min(MAX_OPFS_RPC_HOLD_MS, expectedMs * 2 + this.#rpcTimeoutMs);
+    for (const [requestId, from] of this.#served)
+      this.#answer(from, { kind: "hold", requestId, ms });
+  }
+
+  #keepaliveSuppressedForTests = false;
+
+  /** @internal Simulates a leader from a release without keepalives. */
+  _suppressKeepaliveForTests(): void {
+    this.#keepaliveSuppressedForTests = true;
+    this.#stopKeepalive();
+  }
+
+  #startKeepalive(): void {
+    if (this.#keepaliveTimer !== undefined || this.#keepaliveSuppressedForTests) return;
+    const timer = setInterval(
+      () => {
+        if (this.#served.size === 0) {
+          clearInterval(timer);
+          if (this.#keepaliveTimer === timer) this.#keepaliveTimer = undefined;
+          return;
+        }
+        for (const [requestId, from] of this.#served) {
+          this.#answer(from, { kind: "busy", requestId });
+        }
+      },
+      Math.max(1, Math.floor(this.#rpcTimeoutMs / 2)),
+    );
+    (timer as { unref?: () => void }).unref?.();
+    this.#keepaliveTimer = timer;
+  }
+
+  #stopKeepalive(): void {
+    if (this.#keepaliveTimer === undefined) return;
+    clearInterval(this.#keepaliveTimer);
+    this.#keepaliveTimer = undefined;
+  }
+
+  /**
+   * A hidden leader that has been idle for the whole release window, with other connections
+   * around, lets go of its handles. Activity of any kind restarts the window.
+   */
+  #armHiddenIdleTimer(): void {
+    this.#clearHiddenIdleTimer();
+    if (this.#foreground || this.#leader === undefined || this.#closed) return;
+    const elapsed = Date.now() - this.#lastActivityAt;
+    const timer = setTimeout(
+      () => {
+        this.#hiddenIdleTimer = undefined;
+        if (this.#closed || this.#leader === undefined || this.#foreground) return;
+        if (
+          this.#othersSeen &&
+          this.#served.size === 0 &&
+          this.#yielding === undefined &&
+          Date.now() - this.#lastActivityAt >= this.#hiddenIdleReleaseMs
+        ) {
+          this.#demote().catch((error: unknown) => {
+            this.#diagnostic(error, "opfs idle release");
+          });
+          return;
+        }
+        this.#armHiddenIdleTimer();
+      },
+      Math.max(0, this.#hiddenIdleReleaseMs - elapsed),
+    );
+    (timer as { unref?: () => void }).unref?.();
+    this.#hiddenIdleTimer = timer;
+  }
+
+  #clearHiddenIdleTimer(): void {
+    if (this.#hiddenIdleTimer === undefined) return;
+    clearTimeout(this.#hiddenIdleTimer);
+    this.#hiddenIdleTimer = undefined;
+  }
+
+  /** Releases the handles with no successor named; whoever next needs the database elects. */
+  async #demote(): Promise<void> {
+    const leader = this.#leader;
+    if (leader === undefined) return;
+    this.#leader = undefined;
+    this.#knownLeader = undefined;
+    const shutdown = leader.shutdown().catch((error: unknown) => {
+      this.#diagnostic(error, "opfs idle release shutdown");
+      leader.crash();
+    });
+    this.#yielding = shutdown;
+    await shutdown;
+    if (this.#yielding === shutdown) this.#yielding = undefined;
+    if (this.#closed) return;
+    this.#closeAnswerChannels();
+    this.#post({ kind: "released", leaderId: this.#instanceId });
   }
 
   async #openWithRetry(path: string[]): Promise<FileSystemSyncAccessHandle> {
@@ -449,21 +643,67 @@ export class OpfsBlockStore {
 
   /** Marks this connection as the one the user is looking at — a leadership preference. */
   setForeground(foreground: boolean): void {
+    if (this.#closed) return;
+    const changed = this.#foreground !== foreground;
     this.#foreground = foreground;
-    if (foreground && this.#leader === undefined && !this.#closed) {
-      this.#post({ kind: "bid", bidderId: this.#instanceId, foreground: true });
+    if (this.#leader !== undefined) {
+      if (foreground) {
+        this.#clearHiddenIdleTimer();
+        this.#clearDeferredBid();
+      } else {
+        this.#lastActivityAt = Date.now();
+        this.#armHiddenIdleTimer();
+      }
+      // Foreground followers bid on hearing a background leader; a leader that just went
+      // hidden while another tab stayed visible would otherwise keep the fast path for good.
+      if (changed) this.#post({ kind: "state", leaderId: this.#instanceId, foreground });
+      return;
     }
+    if (foreground) this.#post({ kind: "bid", bidderId: this.#instanceId, foreground: true });
+  }
+
+  #clearDeferredBid(): void {
+    if (this.#deferredBid === undefined) return;
+    clearTimeout(this.#deferredBid.timer);
+    this.#deferredBid = undefined;
+  }
+
+  /** Yields now when the cooldown allows it, otherwise when the cooldown ends. */
+  #considerBid(bidderId: string): void {
+    if (this.#leader === undefined || this.#foreground || this.#yielding !== undefined) return;
+    const remaining = this.#yieldCooldownMs - (Date.now() - this.#lastYieldAt);
+    if (remaining <= 0) {
+      this.#clearDeferredBid();
+      this.#yieldLeadership(bidderId).catch((error: unknown) => {
+        this.#diagnostic(error, "opfs yield");
+      });
+      return;
+    }
+    if (this.#deferredBid !== undefined) {
+      this.#deferredBid.bidderId = bidderId;
+      return;
+    }
+    const timer = setTimeout(() => {
+      const deferred = this.#deferredBid;
+      this.#deferredBid = undefined;
+      if (deferred !== undefined && !this.#closed) this.#considerBid(deferred.bidderId);
+    }, remaining);
+    (timer as { unref?: () => void }).unref?.();
+    this.#deferredBid = { bidderId, timer };
   }
 
   async #yieldLeadership(to: string): Promise<void> {
     const leader = this.#leader;
     if (leader === undefined) return;
+    this.#clearHiddenIdleTimer();
+    this.#clearDeferredBid();
     this.#leader = undefined;
     this.#knownLeader = undefined;
     this.#lastYieldAt = Date.now();
-    const shutdown = leader.shutdown().catch(() => {
+    const shutdown = leader.shutdown().catch((error: unknown) => {
       // Whatever failed, the handles must not outlive the leadership; crash-close is
       // idempotent and releases them.
+      this.#diagnostic(error, "opfs yield shutdown");
       leader.crash();
     });
     this.#yielding = shutdown;
@@ -473,21 +713,36 @@ export class OpfsBlockStore {
     // An open channel into a follower's inbox would hear the next leader's answers to it.
     this.#closeAnswerChannels();
     this.#post({ kind: "yield", to });
+    // Every other follower must stop posting into this inbox and discover the next leader.
+    this.#post({ kind: "released", leaderId: this.#instanceId });
     // If the bidder loses the race or vanishes, someone must still hold the database.
     if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
     this.#reacquireTimer = setTimeout(() => {
-      if (this.#knownLeader === undefined && !this.#closed) void this.#tryBecomeLeader();
-    }, 1_500);
+      if (this.#knownLeader === undefined && !this.#closed) {
+        this.#electInBackground("opfs reacquire after yield", true);
+      }
+    }, this.#handoverGraceMs);
   }
 
   #yielding: Promise<void> | undefined;
 
   #onMessage(message: StoreRpcMessage): void {
-    if (this.#closed) return;
+    if (this.#closed) {
+      // A request that was already on its way when this connection closed never ran here.
+      // Saying so lets the requester send it to the next leader instead of waiting out a
+      // timeout and reporting an outcome it cannot know.
+      if (message.kind === "op") this.#decline(message);
+      return;
+    }
     if (this.#coordinationPausedForTests) return;
+    this.#othersSeen = true;
     switch (message.kind) {
       case "op": {
-        if (this.#leader !== undefined) {
+        if (this.#leader === undefined) {
+          this.#decline(message);
+          return;
+        }
+        {
           const requestBytes = estimateRpcValueBytes(message.args);
           if (
             this.#servedRequestCount >= RPC_SERVER_ADMISSION_LIMIT ||
@@ -505,11 +760,48 @@ export class OpfsBlockStore {
           }
           this.#servedRequestCount += 1;
           this.#servedRequestBytes += requestBytes;
-          void this.#serveOp(message).finally(() => {
-            this.#servedRequestCount = Math.max(0, this.#servedRequestCount - 1);
-            this.#servedRequestBytes = Math.max(0, this.#servedRequestBytes - requestBytes);
-          });
+          this.#lastActivityAt = Date.now();
+          const alreadyServing = this.#served.has(message.requestId);
+          this.#served.set(message.requestId, message.from);
+          this.#startKeepalive();
+          void this.#serveOp(message)
+            .catch((error: unknown) => {
+              // The requester must not wait out its timeout for an answer that will never come.
+              this.#diagnostic(error, `opfs served ${message.method}`);
+              this.#answer(message.from, {
+                kind: "result",
+                requestId: message.requestId,
+                ok: false,
+                error: serializeStoreError(error),
+              });
+            })
+            .finally(() => {
+              this.#servedRequestCount = Math.max(0, this.#servedRequestCount - 1);
+              this.#servedRequestBytes = Math.max(0, this.#servedRequestBytes - requestBytes);
+              if (!alreadyServing) this.#served.delete(message.requestId);
+              this.#lastActivityAt = Date.now();
+            });
         }
+        return;
+      }
+      case "declined": {
+        const pending = this.#takePending(message.requestId);
+        if (pending === undefined) return;
+        clearTimeout(pending.timer);
+        pending.reject(RPC_DECLINED);
+        return;
+      }
+      case "uncertain": {
+        const pending = this.#takePending(message.requestId);
+        if (pending === undefined) return;
+        clearTimeout(pending.timer);
+        pending.reject(new OpfsUncertainOutcomeError(pending.message.method));
+        return;
+      }
+      case "hold": {
+        const pending = this.#pending.get(message.requestId);
+        if (pending === undefined) return;
+        this.#armPendingTimer(pending, Math.max(message.ms, this.#rpcTimeoutMs));
         return;
       }
       case "result": {
@@ -523,27 +815,35 @@ export class OpfsBlockStore {
       case "busy": {
         const pending = this.#pending.get(message.requestId);
         if (pending === undefined) return;
-        clearTimeout(pending.timer);
-        pending.timer = setTimeout(() => {
-          const expired = this.#takePending(message.requestId);
-          expired?.reject(RPC_TIMED_OUT);
-        }, this.#rpcTimeoutMs);
+        this.#armPendingTimer(pending, this.#rpcTimeoutMs);
         return;
       }
       case "leader": {
         this.#knownLeader = message.leaderId;
+        this.#gracefulLeaders.delete(message.leaderId);
         if (this.#reacquireTimer !== undefined) {
           clearTimeout(this.#reacquireTimer);
           this.#reacquireTimer = undefined;
         }
-        // Reads can move to the new leader. A mutation may already be durable on the old one;
-        // never execute it twice merely because its acknowledgement was lost.
-        for (const [requestId, pending] of this.#pending) {
-          if (pending.sentTo === message.leaderId) continue;
-          if (!READ_METHODS.has(pending.message.method)) {
-            this.#takePending(requestId);
-            clearTimeout(pending.timer);
-            pending.reject(new OpfsUncertainOutcomeError(pending.message.method));
+        for (const pending of this.#pending.values()) {
+          if (pending.sentTo === message.leaderId) {
+            // The leader we were waiting on is alive; it still holds the request.
+            if (pending.awaitingPing) this.#armPendingTimer(pending, this.#rpcTimeoutMs);
+            continue;
+          }
+          if (pending.sentTo === undefined) {
+            pending.sentTo = message.leaderId;
+            this.#send(message.leaderId, pending.message);
+            continue;
+          }
+          // A leader that said goodbye answers everything it holds, with a result or a decline,
+          // so a mutation waits for that answer. One on a leader that vanished goes to the new
+          // leader with the same identity and first-send time: the log it recovered either
+          // holds the outcome, proves the request never ran, or says it cannot tell.
+          if (
+            !READ_METHODS.has(pending.message.method) &&
+            this.#gracefulLeaders.has(pending.sentTo)
+          ) {
             continue;
           }
           pending.sentTo = message.leaderId;
@@ -555,6 +855,17 @@ export class OpfsBlockStore {
         }
         return;
       }
+      case "state": {
+        if (
+          !message.foreground &&
+          this.#foreground &&
+          this.#leader === undefined &&
+          message.leaderId !== this.#instanceId
+        ) {
+          this.#post({ kind: "bid", bidderId: this.#instanceId, foreground: true });
+        }
+        return;
+      }
       case "ping": {
         if (this.#leader !== undefined) {
           this.#post({ kind: "leader", leaderId: this.#instanceId });
@@ -562,26 +873,73 @@ export class OpfsBlockStore {
         return;
       }
       case "bid": {
-        if (
-          this.#leader !== undefined &&
-          !this.#foreground &&
-          message.foreground &&
-          message.bidderId !== this.#instanceId &&
-          Date.now() - this.#lastYieldAt > YIELD_COOLDOWN_MS
-        ) {
-          void this.#yieldLeadership(message.bidderId);
+        if (message.foreground && message.bidderId !== this.#instanceId) {
+          this.#considerBid(message.bidderId);
         }
         return;
       }
       case "yield": {
-        if (message.to === this.#instanceId) void this.#tryBecomeLeader();
+        if (message.to === this.#instanceId) {
+          this.#knownLeader = undefined;
+          this.#electInBackground("opfs election after yield", true);
+        }
         return;
       }
       case "released": {
         if (this.#knownLeader === message.leaderId) this.#knownLeader = undefined;
+        this.#gracefulLeaders.add(message.leaderId);
+        if (this.#gracefulLeaders.size > 16) {
+          const [oldest] = this.#gracefulLeaders;
+          if (oldest !== undefined) this.#gracefulLeaders.delete(oldest);
+        }
         return;
       }
     }
+  }
+
+  /** Answers a request this connection will not run: it is not the leader. */
+  #decline(message: OpMessage): void {
+    this.#postOnce(message.from, {
+      kind: "declined",
+      requestId: message.requestId,
+      reason: "not-leader",
+    });
+  }
+
+  /** Restarts a pending request's patience from a live signal (busy, hold, announce). */
+  #armPendingTimer(pending: PendingRpc, ms: number): void {
+    clearTimeout(pending.timer);
+    pending.awaitingPing = false;
+    pending.timer = setTimeout(() => {
+      this.#onPendingTimeout(pending.message.requestId);
+    }, ms);
+  }
+
+  /**
+   * The leader has been silent for a whole timeout. A read simply fails over. A mutation first
+   * asks whether the leader is still there: one that answers the ping is alive and still holds
+   * the request, so the wait continues; only silence to the ping too, or exhausted patience,
+   * makes the outcome uncertain.
+   */
+  #onPendingTimeout(requestId: string): void {
+    const pending = this.#pending.get(requestId);
+    if (pending === undefined) return;
+    if (
+      READ_METHODS.has(pending.message.method) ||
+      pending.awaitingPing ||
+      pending.patienceRounds >= MUTATION_PATIENCE_ROUNDS ||
+      this.#channel === undefined
+    ) {
+      this.#takePending(requestId);
+      pending.reject(RPC_TIMED_OUT);
+      return;
+    }
+    pending.patienceRounds += 1;
+    pending.awaitingPing = true;
+    this.#post({ kind: "ping" });
+    pending.timer = setTimeout(() => {
+      this.#onPendingTimeout(requestId);
+    }, DISCOVERY_WAIT_MS);
   }
 
   #takePending(requestId: string): PendingRpc | undefined {
@@ -593,7 +951,7 @@ export class OpfsBlockStore {
   }
 
   async #serveOp(message: OpMessage): Promise<void> {
-    const requestKey = `${String(message.from.length)}:${message.from}${message.requestId}`;
+    const requestKey = servedRequestKey(message.from, message.requestId);
     // Once an identity is admitted, duplicates can compare their fingerprint immediately and
     // either attach to the exact execution or fail closed. The short lock below exists only for
     // the pre-admission fingerprint race between two first deliveries.
@@ -626,10 +984,48 @@ export class OpfsBlockStore {
     let fingerprint: { signature: string; retainedBytes: number };
     try {
       fingerprint = await fingerprintStoreRequest(message.method, message.args);
-    } catch {
+    } catch (error) {
+      this.#answer(message.from, {
+        kind: "result",
+        requestId: message.requestId,
+        ok: false,
+        error: serializeStoreError(error),
+      });
       return;
     }
-    const remembered = isRead ? undefined : this.#settledMutations.get(requestKey);
+    let remembered = isRead ? undefined : this.#settledMutations.get(requestKey);
+    const inFlight =
+      isRead || remembered !== undefined ? undefined : this.#inFlightMutations.get(requestKey);
+    if (remembered === undefined && inFlight === undefined && !isRead) {
+      // The log outlives the leader that served it: a re-send after a failover finds its
+      // outcome here, or learns that it happened but that its answer died with that leader.
+      // A mutation this leader is still running is not "unsettled" in that sense — its first
+      // frame is durable while its value is still coming — so the in-flight check came first.
+      const logged = leader.servedOutcome(requestKey);
+      if (logged !== undefined) {
+        if (logged.method !== message.method || logged.signature !== fingerprint.signature) {
+          this.#rejectReusedRequestIdentity(message);
+          return;
+        }
+        if (!logged.settled || logged.withheld === true) {
+          this.#answer(message.from, { kind: "uncertain", requestId: message.requestId });
+          return;
+        }
+        const outcome: ServedOutcome = { ok: true, value: logged.result };
+        this.#rememberSettledMutation(
+          requestKey,
+          logged.method,
+          { signature: logged.signature, retainedBytes: logged.requestBytes },
+          outcome,
+        );
+        remembered = this.#settledMutations.get(requestKey) ?? {
+          method: logged.method,
+          signature: logged.signature,
+          requestBytes: logged.requestBytes,
+          outcome,
+        };
+      }
+    }
     let settled: ServedOutcome;
     if (remembered !== undefined) {
       if (!sameServedRequest(remembered, message, fingerprint.signature)) {
@@ -640,9 +1036,7 @@ export class OpfsBlockStore {
       this.#settledMutations.delete(requestKey);
       this.#settledMutations.set(requestKey, remembered);
       settled = remembered.outcome;
-    } else if (!isRead && this.#inFlightMutations.has(requestKey)) {
-      const inFlight = this.#inFlightMutations.get(requestKey);
-      if (inFlight === undefined) throw new Error("In-flight RPC identity disappeared");
+    } else if (inFlight !== undefined) {
       if (!sameServedRequest(inFlight, message, fingerprint.signature)) {
         this.#rejectReusedRequestIdentity(message);
         return;
@@ -652,6 +1046,12 @@ export class OpfsBlockStore {
       this.#answer(message.from, { kind: "busy", requestId: message.requestId });
       settled = await inFlight.outcome;
     } else {
+      if (!isRead && message.sentAt < leader.servedCoverageSince) {
+        // First sent before this leader's ledger begins: an earlier leader may have executed
+        // it and the log no longer says. Only the requester can reconcile that.
+        this.#answer(message.from, { kind: "uncertain", requestId: message.requestId });
+        return;
+      }
       if (
         !isRead &&
         (this.#inFlightMutations.size >= RPC_IN_FLIGHT_LIMIT ||
@@ -681,9 +1081,15 @@ export class OpfsBlockStore {
             this.#readCapacityChanged = { promise, resolve };
           }
           await this.#readCapacityChanged.promise;
-          if (this.#closed || this.#leader !== leader) return;
+          if (this.#closed || this.#leader !== leader) {
+            this.#decline(message);
+            return;
+          }
         }
-        if (this.#closed || this.#leader !== leader) return;
+        if (this.#closed || this.#leader !== leader) {
+          this.#decline(message);
+          return;
+        }
         this.#inFlightReadBytes += reservation;
         try {
           settled = await this.#executeServedOpAfterGate(leader, message, true);
@@ -693,14 +1099,22 @@ export class OpfsBlockStore {
         }
       } else {
         this.#inFlightMutationBytes += fingerprint.retainedBytes;
-        const execution = this.#executeServedOpAfterGate(leader, message, false);
+        const execution = this.#executeServedOpAfterGate(leader, message, false, {
+          key: requestKey,
+          method: message.method,
+          signature: fingerprint.signature,
+          requestBytes: fingerprint.retainedBytes,
+          // The requester's clock decides coverage; one running ahead must not evict the ledger
+          // and pin coverage in the future, so it is read no later than now.
+          sentAt: Math.min(message.sentAt, Date.now()),
+        });
         const outcome = execution.then((result) => {
           this.#inFlightMutations.delete(requestKey);
           this.#inFlightMutationBytes = Math.max(
             0,
             this.#inFlightMutationBytes - fingerprint.retainedBytes,
           );
-          if (!this.#closed) {
+          if (!this.#closed && result !== DECLINED_OUTCOME) {
             this.#rememberSettledMutation(requestKey, message.method, fingerprint, result);
           }
           return result;
@@ -714,6 +1128,7 @@ export class OpfsBlockStore {
         settled = await outcome;
       }
     }
+    if (settled === DECLINED_OUTCOME) return;
     if (this.#dropNextRpcResultForTests) {
       this.#dropNextRpcResultForTests = false;
       return;
@@ -781,13 +1196,45 @@ export class OpfsBlockStore {
     leader: OpfsLeader,
     message: OpMessage,
     isRead: boolean,
+    request?: ServedMutationRequest,
   ): Promise<ServedOutcome> {
     const gate = this.#servedMutationGateForTests;
     if (!isRead && gate !== undefined) await gate;
-    return this.#executeServedOp(leader, message);
+    return this.#executeServedOp(leader, message, request);
   }
 
-  async #executeServedOp(leader: OpfsLeader, message: OpMessage): Promise<ServedOutcome> {
+  /** The channel can replace #leader between any two awaits; a method defeats narrowing. */
+  #leads(leader: OpfsLeader): boolean {
+    return this.#leader === leader;
+  }
+
+  #mutationTail: Promise<void> = Promise.resolve();
+
+  /**
+   * Mutations run through the leader one at a time, from call to completion, whether a
+   * follower sent them or this connection issued them. The leader appends each one's frame
+   * from its own queue anyway; what the turn adds is that the request identity the leader is
+   * handed belongs to exactly one operation, so no frame can ever carry another's.
+   */
+  #withMutationTurn<T>(run: () => Promise<T>): Promise<T> {
+    const turn = this.#mutationTail.then(run);
+    this.#mutationTail = turn.then(
+      () => undefined,
+      () => undefined,
+    );
+    return turn;
+  }
+
+  async #executeServedOp(
+    leader: OpfsLeader,
+    message: OpMessage,
+    request?: ServedMutationRequest,
+  ): Promise<ServedOutcome> {
+    if (leader.isClosed() || !this.#leads(leader)) {
+      // Leadership moved while this request waited at the gate; nothing ran.
+      this.#decline(message);
+      return DECLINED_OUTCOME;
+    }
     try {
       const method = (
         leader as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
@@ -795,8 +1242,36 @@ export class OpfsBlockStore {
       if (method === undefined) {
         return { ok: false, error: { name: "Error", message: "Unknown store operation" } };
       }
-      return { ok: true, value: await method.apply(leader, message.args) };
+      if (request === undefined) {
+        return { ok: true, value: await method.apply(leader, message.args) };
+      }
+      return await this.#withMutationTurn(async () => {
+        if (leader.isClosed() || !this.#leads(leader)) {
+          this.#decline(message);
+          return DECLINED_OUTCOME;
+        }
+        leader.servingRequest = request;
+        try {
+          const value: unknown = await method.apply(leader, message.args);
+          // The identity is consumed by the first frame the mutation appends; one that appended
+          // nothing (a refusal, a no-op) leaves it, and the log then holds nothing to answer.
+          if (leader.servingRequest !== request) {
+            await leader.completeServed(request.key, value).catch((error: unknown) => {
+              this.#diagnostic(error, `opfs served result for ${message.method}`);
+            });
+          }
+          return { ok: true, value };
+        } finally {
+          if (leader.servingRequest === request) leader.servingRequest = undefined;
+        }
+      });
     } catch (error) {
+      if (leader.isClosed() && !this.#leads(leader)) {
+        // The leader shut down before this request's turn on its queue came; work queued
+        // behind a shutdown is refused before it runs, so nothing happened.
+        this.#decline(message);
+        return DECLINED_OUTCOME;
+      }
       return { ok: false, error: serializeStoreError(error) };
     }
   }
@@ -863,13 +1338,26 @@ export class OpfsBlockStore {
     return `${this.#channelName}:${instanceId}`;
   }
 
-  /** Closes every channel; nothing is posted or delivered after this. */
+  /**
+   * Closes the shared channel now and the inbox a moment later. A request posted into this
+   * inbox just before it closed would otherwise vanish, and its follower could only wait out
+   * a timeout; for that moment the inbox stays open to answer each one with a decline.
+   */
   #closeChannels(): void {
     this.#channel?.close();
     this.#channel = undefined;
-    this.#inbox?.close();
-    this.#inbox = undefined;
     this.#closeAnswerChannels();
+    const inbox = this.#inbox;
+    this.#inbox = undefined;
+    if (inbox === undefined) return;
+    if (this.#inboxLingerTimer !== undefined) clearTimeout(this.#inboxLingerTimer);
+    const timer = setTimeout(() => {
+      this.#inboxLingerTimer = undefined;
+      inbox.close();
+    }, DECLINE_AFTER_CLOSE_MS);
+    (timer as { unref?: () => void }).unref?.();
+    (inbox as { unref?: () => void }).unref?.();
+    this.#inboxLingerTimer = timer;
   }
 
   // ---------------------------------------------------------------------------------------
@@ -883,6 +1371,13 @@ export class OpfsBlockStore {
   async #dispatch(method: string, args: unknown[]): Promise<unknown> {
     this.#assertOpen();
     const requestId = crypto.randomUUID();
+    const sentAt = Date.now();
+    const isRead = READ_METHODS.has(method);
+    let sentRemotely = false;
+    // Set once an attempt may have executed somewhere: a timed-out delivery. A decline is a
+    // proof that it did not.
+    let mayHaveRun = false;
+    this.#lastActivityAt = sentAt;
     for (let attempt = 0; attempt < DISPATCH_ATTEMPTS; attempt += 1) {
       // Re-checked each attempt: the awaits below (elections, RPC round trips) give close()
       // every opportunity to run.
@@ -893,7 +1388,25 @@ export class OpfsBlockStore {
           leader as unknown as Record<string, (...call: unknown[]) => Promise<unknown>>
         )[method];
         if (bound === undefined) throw new Error(`Unknown store operation: ${method}`);
-        return bound.apply(leader, args);
+        try {
+          if (isRead) return await bound.apply(leader, args);
+          if (sentRemotely) {
+            // This connection became the leader with its own request outstanding on a leader
+            // that vanished. Its recovered log answers exactly like it would a follower's.
+            const key = servedRequestKey(this.#instanceId, requestId);
+            const logged = leader.servedOutcome(key);
+            if (logged !== undefined) {
+              if (!logged.settled || logged.withheld === true) {
+                throw new OpfsUncertainOutcomeError(method);
+              }
+              return logged.result;
+            }
+            if (sentAt < leader.servedCoverageSince) throw new OpfsUncertainOutcomeError(method);
+          }
+          return await this.#withMutationTurn(() => bound.apply(leader, args));
+        } finally {
+          this.#lastActivityAt = Date.now();
+        }
       }
       if (this.#channel === undefined) {
         if (await this.#tryBecomeLeader()) continue;
@@ -911,16 +1424,22 @@ export class OpfsBlockStore {
         }
       }
       try {
-        return await this.#rpc(requestId, method, args);
+        sentRemotely = true;
+        return await this.#rpc(requestId, method, args, sentAt);
       } catch (error) {
-        if (error === RPC_TIMED_OUT) {
+        if (error === RPC_DECLINED || error === RPC_TIMED_OUT) {
+          // Declined: provably never ran there. Timed out: the leader is gone; whoever leads
+          // next recovered its log and answers the same request from it.
+          if (error === RPC_TIMED_OUT) mayHaveRun = true;
           this.#knownLeader = undefined;
-          if (!READ_METHODS.has(method)) throw new OpfsUncertainOutcomeError(method);
           continue;
         }
         throw error;
       }
     }
+    // A mutation whose delivery went silent may have run there; a read cannot have changed
+    // anything, and neither can a mutation every leader declined.
+    if (!isRead && mayHaveRun) throw new OpfsUncertainOutcomeError(method);
     throw new OpfsCoordinationError("leader-unavailable", method);
   }
 
@@ -929,7 +1448,7 @@ export class OpfsBlockStore {
     return this.#knownLeader !== undefined;
   }
 
-  #rpc(requestId: string, method: string, args: unknown[]): Promise<unknown> {
+  #rpc(requestId: string, method: string, args: unknown[], sentAt: number): Promise<unknown> {
     let retainedBytes: number;
     try {
       retainedBytes = estimateRpcValueBytes(args);
@@ -943,10 +1462,16 @@ export class OpfsBlockStore {
       return Promise.reject(new OpfsCoordinationError("follower-queue-full", method));
     }
     return new Promise<unknown>((resolve, reject) => {
-      const message: OpMessage = { kind: "op", requestId, from: this.#instanceId, method, args };
+      const message: OpMessage = {
+        kind: "op",
+        requestId,
+        from: this.#instanceId,
+        method,
+        args,
+        sentAt,
+      };
       const timer = setTimeout(() => {
-        const expired = this.#takePending(requestId);
-        expired?.reject(RPC_TIMED_OUT);
+        this.#onPendingTimeout(requestId);
       }, this.#rpcTimeoutMs);
       const leaderId = this.#knownLeader;
       this.#pending.set(requestId, {
@@ -956,6 +1481,8 @@ export class OpfsBlockStore {
         resolve,
         reject,
         timer,
+        patienceRounds: 0,
+        awaitingPing: false,
       });
       this.#pendingRpcBytes += retainedBytes;
       // The dispatch loop only gets here with a leader known; should it have slipped away in
@@ -1009,7 +1536,7 @@ export class OpfsBlockStore {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
+    this.#clearCoordinationTimers();
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("This OPFS store connection is closed"));
@@ -1030,7 +1557,8 @@ export class OpfsBlockStore {
     if (leader !== undefined) {
       void leader
         .shutdown()
-        .catch(() => {
+        .catch((error: unknown) => {
+          this.#diagnostic(error, "opfs close shutdown");
           leader.crash();
         })
         .then(() => {
@@ -1040,8 +1568,26 @@ export class OpfsBlockStore {
         });
       return;
     }
+    if (this.#yielding !== undefined) {
+      // Closing mid-handover: the followers still need to hear that this leader is gone.
+      void this.#yielding.then(() => {
+        this.#post({ kind: "released", leaderId: this.#instanceId });
+        this.#closeChannels();
+        this.#releaseWhenHandlesClose();
+      });
+      return;
+    }
     this.#closeChannels();
     this.#releaseWhenHandlesClose();
+  }
+
+  #clearCoordinationTimers(): void {
+    if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
+    this.#reacquireTimer = undefined;
+    this.#stopKeepalive();
+    this.#clearDeferredBid();
+    this.#clearHiddenIdleTimer();
+    this.#served.clear();
   }
 
   #releaseWhenHandlesClose(): void {
@@ -1091,6 +1637,11 @@ export class OpfsBlockStore {
     };
   }
 
+  /** Test-only: the request id of the oldest pending request, for hand-posted answers. */
+  _oldestPendingRequestIdForTests(): string | undefined {
+    return this.#pending.keys().next().value;
+  }
+
   /** Test-only: retransmits the oldest request with its stable deduplication identity. */
   _resendOldestPendingForTests(): void {
     const pending = this.#pending.values().next().value;
@@ -1124,7 +1675,7 @@ export class OpfsBlockStore {
   /** Test-only: what tab death looks like — locks release, nothing flushes, no goodbyes. */
   _crashForTests(): void {
     this.#closed = true;
-    if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
+    this.#clearCoordinationTimers();
     for (const pending of this.#pending.values()) clearTimeout(pending.timer);
     this.#pending.clear();
     this.#inFlightMutations.clear();
@@ -1139,7 +1690,12 @@ export class OpfsBlockStore {
     this.#servedRequestBytes = 0;
     this.#leader?.crash();
     this.#leader = undefined;
-    this.#closeChannels();
+    // Tab death closes every channel at once; nothing lingers to decline.
+    this.#channel?.close();
+    this.#channel = undefined;
+    this.#inbox?.close();
+    this.#inbox = undefined;
+    this.#closeAnswerChannels();
     this.#releaseWhenHandlesClose();
   }
 
@@ -1315,7 +1871,15 @@ async function holdConnectionLock(name: string): Promise<(() => void) | undefine
   });
 }
 
+/** The dedupe and ledger key of a request: requester instance id plus request id, unambiguous. */
+function servedRequestKey(from: string, requestId: string): string {
+  return `${String(from.length)}:${from}${requestId}`;
+}
+
 const RPC_TIMED_OUT = new Error("The leader did not answer in time");
+const RPC_DECLINED = new Error("The connection asked is not the leader");
+/** A served request that was declined rather than executed; never answered as a result. */
+const DECLINED_OUTCOME: ServedOutcome = { ok: false };
 
 async function resolveDatabaseRoot(
   options: OpfsBlockStoreOptions,

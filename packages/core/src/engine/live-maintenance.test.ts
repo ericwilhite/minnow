@@ -498,3 +498,59 @@ describe("live query incremental maintenance", () => {
     await database.close();
   });
 });
+
+describe("why a live statement re-executes", () => {
+  it("names the reason per group and in EXPLAIN, and none for a maintained statement", async () => {
+    const { database } = await seededDatabase(17, 20);
+    await database.execute('CREATE TABLE "keyless" ("note" TEXT)');
+    const shapes: Array<[string, string]> = [
+      ["SELECT DISTINCT label FROM items ORDER BY label", "GROUP BY or HAVING"],
+      [
+        "SELECT id FROM items WHERE amount > (SELECT AVG(amount) FROM other) ORDER BY id",
+        "subquery",
+      ],
+      ["SELECT id, ROW_NUMBER() OVER (ORDER BY amount) AS rank FROM items ORDER BY id", "window"],
+      [
+        "SELECT i.id FROM items AS i JOIN other AS o ON o.id = i.id JOIN other AS p ON p.id = i.id",
+        "2 joins",
+      ],
+      ['SELECT "note" FROM "keyless"', "no unique key"],
+      ["SELECT id, NOW() AS at FROM items", "clock"],
+    ];
+    const live = database.liveQueries({ maxGroups: 64 });
+    try {
+      for (const [sql] of shapes) await live.subscribe(sql, { onChange: () => undefined });
+      await live.subscribe("SELECT id, amount FROM items WHERE amount > 5 ORDER BY id", {
+        onChange: () => undefined,
+      });
+      const groups = new Map(live.stats.groups.map((group) => [group.sql, group]));
+      for (const [sql, reason] of shapes) {
+        const group = groups.get(sql);
+        expect(group?.maintainable, sql).toBe(false);
+        expect(group?.reasons.join("; "), sql).toContain(reason);
+        expect(await database.explain(sql), sql).toContain(`-- live: re-executes on change: `);
+        expect(await database.explain(sql), sql).toContain(reason);
+      }
+      const maintained = groups.get("SELECT id, amount FROM items WHERE amount > 5 ORDER BY id");
+      expect(maintained?.maintainable).toBe(true);
+      expect(maintained?.reasons).toEqual([]);
+      expect(
+        await database.explain("SELECT id, amount FROM items WHERE amount > 5 ORDER BY id"),
+      ).toContain("-- live: maintained incrementally on change");
+
+      // Counters live on the group: a commit patches the maintained one and re-runs the rest.
+      await database.updateBatch("items", { keys: [3], changes: { amount: [77] } });
+      await live.refresh();
+      const after = new Map(live.stats.groups.map((group) => [group.sql, group]));
+      expect(after.get("SELECT id, amount FROM items WHERE amount > 5 ORDER BY id")).toMatchObject({
+        maintained: 1,
+        reruns: 0,
+        fallbacks: 0,
+      });
+      expect(after.get(shapes[0]?.[0] ?? "")).toMatchObject({ maintained: 0, reruns: 1 });
+    } finally {
+      live.close();
+      await database.close();
+    }
+  });
+});

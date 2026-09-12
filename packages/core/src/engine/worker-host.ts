@@ -13,13 +13,22 @@ import {
   type WorkerStoreFactory,
   type WorkerStoreOptions,
 } from "./worker-server.js";
+import type { OpenedStore } from "./worker-server.js";
 
+export {
+  forgetStoreChoice,
+  openAutoStore,
+  resolveAutoStoreKind,
+  type AutoStoreKind,
+} from "./auto-store.js";
 export {
   exposeDatabase,
   singleStoreFactory,
   MAX_WORKER_HANDLES_PER_CONNECTION,
   type DatabaseInitPayload,
   type ExposeDatabaseOptions,
+  type OpenedStore,
+  type OpenedStoreKind,
   type RpcScope,
   type StoreDescriptor,
   type WireDatabaseOptions,
@@ -58,7 +67,25 @@ export function attachDatabaseWorker(
 async function createStore(
   descriptor: StoreDescriptor,
   options: WorkerStoreOptions,
-): Promise<BlockStore> {
+): Promise<BlockStore | OpenedStore> {
+  if (descriptor.kind === "auto") {
+    const { openAutoStore } = await import("./auto-store.js");
+    return openAutoStore(descriptor.name, async (kind) => {
+      const opened = await createStore(
+        kind === "opfs"
+          ? {
+              kind,
+              name: descriptor.name,
+              ...(descriptor.opfs?.durability === undefined
+                ? {}
+                : { durability: descriptor.opfs.durability }),
+            }
+          : { kind, name: descriptor.name, ...descriptor.indexeddb },
+        options,
+      );
+      return opened as BlockStore;
+    });
+  }
   if (descriptor.kind === "memory") {
     const { MemoryBlockStore } = await import("../storage/memory.js");
     return new MemoryBlockStore();
@@ -68,6 +95,7 @@ async function createStore(
     return OpfsBlockStore.open({
       name: descriptor.name,
       ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
+      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
     });
   }
   const { IndexedDbBlockStore } = await import("../storage/indexeddb.js");

@@ -1474,3 +1474,71 @@ describe("secondary-index SQL", () => {
     });
   }
 });
+
+describe("unique secondary indexes under upserts", () => {
+  it("retires terms on domain columns from stored-form old images, in and out of a scope", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), {});
+    await database.execute(
+      'CREATE TABLE "prices" ("id" INTEGER PRIMARY KEY, "amount" NUMERIC(10, 2), "tag" UUID)',
+    );
+    await database.execute('CREATE UNIQUE INDEX "prices_amount" ON "prices" ("amount")');
+    await database.execute('CREATE UNIQUE INDEX "prices_tag" ON "prices" ("tag")');
+    const tagA = "0f4c1c6e-9c1a-4d6e-8f0e-1f3d2b4a5c6d";
+    const tagB = "1f4c1c6e-9c1a-4d6e-8f0e-1f3d2b4a5c6d";
+    const tagC = "2f4c1c6e-9c1a-4d6e-8f0e-1f3d2b4a5c6d";
+    await database.execute(
+      `INSERT INTO "prices" ("id", "amount", "tag") VALUES (1, 10.50, '${tagA}')`,
+    );
+    // ON CONFLICT DO UPDATE, a standalone upsertBatch, and a scope upsert each replace the
+    // indexed values; the old images they retire must be in stored form, or a NUMERIC or UUID
+    // term stays claimed.
+    await database.execute(
+      `INSERT INTO "prices" ("id", "amount", "tag") VALUES (1, 11.75, '${tagB}') ON CONFLICT ("id") DO UPDATE SET "amount" = EXCLUDED."amount", "tag" = EXCLUDED."tag"`,
+    );
+    await database.execute(
+      `INSERT INTO "prices" ("id", "amount", "tag") VALUES (2, 10.50, '${tagA}')`,
+    );
+    await database.upsertBatch("prices", [{ id: 2, amount: "12.00", tag: tagC }]);
+    await database.insertBatch("prices", [{ id: 3, amount: "10.50", tag: tagA }]);
+    await database.write(async (tx) => {
+      await tx.upsertBatch("prices", [{ id: 3, amount: "13.00", tag: tagB.replace("1f", "3f") }]);
+      await tx.insertBatch("prices", [{ id: 4, amount: "10.50", tag: tagA }]);
+    });
+    await expect(
+      database.insertBatch("prices", [{ id: 5, amount: "11.75", tag: tagB }]),
+    ).rejects.toBeInstanceOf(UniqueConstraintError);
+    expect(
+      (await database.query('SELECT "id", "amount" FROM "prices" ORDER BY "id"')).rows,
+    ).toEqual([
+      { id: 1, amount: "11.75" },
+      { id: 2, amount: "12.00" },
+      { id: 3, amount: "13.00" },
+      { id: 4, amount: "10.50" },
+    ]);
+    await database.close();
+  });
+
+  it("retires the old term when an unguarded upsert changes an indexed value", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), {});
+    await database.execute('CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "email" TEXT)');
+    await database.execute('CREATE UNIQUE INDEX "users_email" ON "users" ("email")');
+    await database.insertBatch("users", [{ id: 1, email: "a@x" }]);
+    // No trigger and no guard: the upsert used to skip the old-image read that retires "a@x".
+    await database.upsertBatch("users", [{ id: 1, email: "b@x" }]);
+    await database.insertBatch("users", [{ id: 2, email: "a@x" }]);
+    // The same inside a write scope, where the old image comes from the scope's write set.
+    await database.write(async (tx) => {
+      await tx.upsertBatch("users", [{ id: 2, email: "c@x" }]);
+      await tx.insertBatch("users", [{ id: 3, email: "a@x" }]);
+    });
+    await expect(database.insertBatch("users", [{ id: 4, email: "b@x" }])).rejects.toBeInstanceOf(
+      UniqueConstraintError,
+    );
+    expect((await database.query('SELECT "id", "email" FROM "users" ORDER BY "id"')).rows).toEqual([
+      { id: 1, email: "b@x" },
+      { id: 2, email: "c@x" },
+      { id: 3, email: "a@x" },
+    ]);
+    await database.close();
+  });
+});

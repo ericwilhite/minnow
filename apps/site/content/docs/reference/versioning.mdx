@@ -40,7 +40,7 @@ A change is breaking when it is one of these:
   differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
 - **Stored data.** A database written by the old version that the new one cannot open. The locked
   byte contracts below narrow this category: a release cannot reinterpret or drop an existing
-  block-format-2, snapshot-format-1, IndexedDB-schema-1, or OPFS-layout-5 reader.
+  block-format-2, snapshot-format-1, IndexedDB-schema-2, or OPFS-layout-6 reader.
 
 From 1.0 onwards these move the major version — every package's, together — and minor releases
 stay additive.
@@ -76,21 +76,26 @@ implementations may produce different valid gzip streams, so compressed payload 
 derived stored-byte checksums are compared after decompression. An incompatible snapshot writer
 must use a new snapshot format number and keep the format-1 reader.
 
-IndexedDB schema 1 is its first locked native layout; no pre-contract schema readers or recreation
-policy ship. Every future integer schema version must add one ordered migration to the explicit
-registry and a frozen fixture for the version it supersedes. The browser runs the complete chain
+IndexedDB schema 1 was its first locked native layout; schema 2 (core 0.10.0) moved each
+transaction's artifact journal into chunked records and migrates a schema-1 database in place on
+open. No pre-contract schema readers or recreation policy ship. Every future integer schema
+version must add one ordered migration to the explicit registry and a frozen fixture for the
+version it supersedes. The browser runs the complete chain
 inside one `versionchange` transaction, so either every schema and data step commits or the old
 database remains intact. An older application build refuses a newer database without mutation.
 
-OPFS native layout 5 is locked separately. Its fixture freezes the format marker, checkpoint,
+OPFS native layout 6 is locked separately. Its fixture freezes the format marker, checkpoint,
 WAL tail, and extent payloads, including the structural `schemaEpoch` required to reject a staged
-write after incompatible DDL. It then proves the current adapter can reopen and continue writing
-the tree. A future incompatible OPFS layout uses a new marker and keeps the layout-5 reader or an
-explicit conversion path; it never guesses old control bytes into the current record shape.
+write after incompatible DDL and the served-request ledger. It then proves the current adapter
+can reopen and continue writing the tree. From 1.0, a future incompatible OPFS layout uses a new
+marker and keeps the previous layout's reader or an explicit conversion path; it never guesses
+old control bytes into the current record shape. Before 1.0 a layout bump may instead refuse the
+previous layout outright, as 0.10.0 refused layout 5 — no layout-5 store had shipped to
+production — and an older build refuses the newer layout the same way.
 
 An OPFS conversion is version-preserving until its new marker is durable: an old reader must see an
 unsupported marker before any new-format checkpoint, WAL, extent, or recovery-cleanup rule can
-appear. The new reader must either keep writing layout 5 while it has a layout-5 tree open, or run an
+appear. The new reader must either keep writing the previous layout while it has such a tree open, or run an
 explicit crash-resumable conversion and validate the complete result before publishing it. It never
 rewrites, repairs, downgrades, or deletes a tree merely because its version differs. A portable
 snapshot imported into a separate database is the simplest conversion when an atomic directory

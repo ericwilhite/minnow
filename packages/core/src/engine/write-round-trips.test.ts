@@ -70,10 +70,11 @@ it("costs the budgeted number of readwrite transactions per simple write and rea
     await work();
     return log.filter((entry) => entry.startsWith("rw"));
   };
+  // Every scope that touches transactions also opens their chunked journal store.
   const WRITE =
-    "rw[blocks+catalog+leases+manifests+segments+snapshotHeaders+statistics+transactions]";
-  const BEGIN = "rw[catalog+leases+manifests+statistics+transactions]";
-  const REPIN_READER = "rw[blocks+catalog+leases+manifests+transactions]";
+    "rw[blocks+catalog+leases+manifests+segments+snapshotHeaders+statistics+transactionJournal+transactions]";
+  const BEGIN = "rw[catalog+leases+manifests+statistics+transactionJournal+transactions]";
+  const REPIN_READER = "rw[blocks+catalog+leases+manifests+transactionJournal+transactions]";
 
   // Inserts reserve row ids at begin, then stage and commit as one step.
   expect(

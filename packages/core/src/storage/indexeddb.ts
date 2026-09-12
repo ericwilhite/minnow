@@ -56,7 +56,6 @@ import {
   assertTempRunPageBatchLimits,
   assertStorageBulkReadItems,
   assertTransactionArtifactBatchLimits,
-  assertTransactionArtifactJournalLimits,
   boundedMaintenanceBatchItems,
   canonicalManifestChangedTableIds,
   catalogRecordRetainedBytes,
@@ -221,7 +220,7 @@ import {
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -235,7 +234,18 @@ const SNAPSHOT_UNIQUE_OWNER_PREFIX = "snapshot/frame-import/unique-owner/";
 const SNAPSHOT_POSTING_STAGING_PREFIX = "snapshot/frame-import/posting/";
 const SNAPSHOT_POSTING_OWNER_PREFIX = "snapshot/frame-import/posting-owner/";
 const SNAPSHOT_HEADER_STORE = "snapshotHeaders";
-const indexedDbStoreNames = [...storeNames, SNAPSHOT_HEADER_STORE] as const;
+/**
+ * Transaction journals, one chunk per `[transactionId, chunkIndex]`; see StoredTransactionRecord.
+ * Adapter-local like the snapshot header store, so the contract's store list does not change.
+ */
+const TRANSACTION_JOURNAL_STORE = "transactionJournal";
+const indexedDbStoreNames = [
+  ...storeNames,
+  SNAPSHOT_HEADER_STORE,
+  TRANSACTION_JOURNAL_STORE,
+] as const;
+/** Ids per journal chunk, blocks and segments together. */
+const TRANSACTION_JOURNAL_CHUNK_ENTRIES = 1_024;
 const SEGMENT_TABLE_INDEX = "byTable";
 const LEASE_EXPIRY_INDEX = "byExpiry";
 const TRANSACTION_STATUS_INDEX = "byStatus";
@@ -457,7 +467,12 @@ interface RecordResourceLedgerRecord {
 
 type IndexedDbSchemaMigration = Readonly<{
   targetVersion: number;
-  migrate(database: IDBDatabase, transaction: IDBTransaction): void;
+  /**
+   * Runs inside the `versionchange` transaction. Request callbacks may continue the work after
+   * it returns; a failure they detect is reported through `fail`, which aborts the upgrade and
+   * makes `open()` reject with that error instead of a bare AbortError.
+   */
+  migrate(database: IDBDatabase, transaction: IDBTransaction, fail: (error: Error) => void): void;
 }>;
 
 /**
@@ -466,7 +481,70 @@ type IndexedDbSchemaMigration = Readonly<{
  * explicit prevents an accidental version bump from silently accepting an unmigrated stable
  * database. Schema 1 is the clean first release; there are no pre-contract schemas to support.
  */
-const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [];
+const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
+  {
+    // Schema 2 moves each transaction's id arrays out of its record into journal chunks.
+    targetVersion: 2,
+    migrate: migrateTransactionJournalsToChunks,
+  },
+];
+
+/**
+ * Schema 1 kept `pendingBlockIds` / `pendingSegmentIds` on the record itself, which made every
+ * staging step reread and rewrite the whole journal. Each record's arrays become packed chunks
+ * in the new store and the record keeps only their counts. The cursor and its writes all belong
+ * to the upgrade transaction, so a browser that fails mid-way leaves schema 1 intact.
+ */
+function migrateTransactionJournalsToChunks(
+  database: IDBDatabase,
+  upgrade: IDBTransaction,
+  fail: (error: Error) => void,
+): void {
+  // A database at version 1 without the schema-1 stores is a broken layout, not a migratable
+  // one; say so rather than surfacing the NotFoundError the store lookup would raise.
+  if (
+    !database.objectStoreNames.contains("transactions") ||
+    database.objectStoreNames.contains(TRANSACTION_JOURNAL_STORE)
+  ) {
+    throw corruption("schema", "schema 1 layout cannot be migrated to schema 2");
+  }
+  database.createObjectStore(TRANSACTION_JOURNAL_STORE);
+  const transactionStore = upgrade.objectStore("transactions");
+  const journalStore = upgrade.objectStore(TRANSACTION_JOURNAL_STORE);
+  const request = transactionStore.openCursor();
+  request.onerror = () => fail(request.error ?? new Error("IndexedDB migration cursor failed"));
+  request.onsuccess = () => {
+    const cursor = request.result;
+    if (cursor === null) return;
+    try {
+      const key = cursor.key;
+      if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
+      const value: unknown = cursor.value;
+      if (!isRecord(value)) throw corruption(`transactions/${key}`, "record is not an object");
+      const { pendingBlockIds, pendingSegmentIds, ...header } = value;
+      const blockIds = requiredUniqueStringArray(
+        pendingBlockIds,
+        `transactions/${key}/pendingBlockIds`,
+      );
+      const segmentIds = requiredUniqueStringArray(
+        pendingSegmentIds,
+        `transactions/${key}/pendingSegmentIds`,
+      );
+      packTransactionJournal(blockIds, segmentIds).forEach((chunk, index) => {
+        journalStore.add(chunk, transactionJournalChunkKey(key, index));
+      });
+      cursor.update({
+        ...header,
+        journalChunkCount: transactionJournalChunkCount(blockIds.length, segmentIds.length),
+        pendingBlockCount: blockIds.length,
+        pendingSegmentCount: segmentIds.length,
+      });
+      cursor.continue();
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
+}
 
 assertIndexedDbSchemaMigrationRegistry();
 
@@ -515,6 +593,14 @@ export class IndexedDbBlockStore implements BlockStore {
    * version) re-resolves from storage inside the committing transaction.
    */
   #manifestCache: { version: number; blockIds: Set<string> } | undefined;
+  /**
+   * The journal of the transaction this instance last staged into, so a stage call can hand
+   * back the contract's complete id arrays without rereading every chunk. Valid only while the
+   * stored record still carries the revision written here and its tail chunk matches; a write
+   * from another instance or tab moves the revision and the next stage rebuilds it from the
+   * chunks. The arrays are appended in place, so callers always receive copies.
+   */
+  #journalCache: TransactionJournalCache | undefined;
   #snapshotPeakRetainedItems = 0;
   #snapshotPeakRetainedBytes = 0;
   #closed = false;
@@ -558,7 +644,10 @@ export class IndexedDbBlockStore implements BlockStore {
           createCurrentIndexedDbSchema(request.result, upgrade);
           return;
         }
-        applyIndexedDbSchemaMigrations(request.result, upgrade, event.oldVersion);
+        applyIndexedDbSchemaMigrations(request.result, upgrade, event.oldVersion, (error) => {
+          upgradeError ??= error;
+          abortIfActive(upgrade);
+        });
       } catch (error) {
         upgradeError = error instanceof Error ? error : new Error(String(error));
         request.transaction?.abort();
@@ -1945,6 +2034,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await bumpSchemaEpoch(catalog);
       await transactionDone(transaction);
       this.#manifestCache = undefined;
+      this.#journalCache = undefined;
       if (
         this.#uniqueKeyCache?.tableId === input.tableId ||
         this.#uniqueKeyCache?.tableId.startsWith(`${input.tableId}\u0000secondary-index\u0000`) ===
@@ -2116,6 +2206,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await bumpSchemaEpoch(catalog);
       await transactionDone(transaction);
       this.#manifestCache = undefined;
+      this.#journalCache = undefined;
       if (this.#uniqueKeyCache !== undefined) this.#uniqueKeyCache.version = manifest.version;
       return manifest;
     } catch (error) {
@@ -2916,15 +3007,13 @@ export class IndexedDbBlockStore implements BlockStore {
           `Segment ${segmentId} is not owned by transaction ${expectedTransactionId}`,
         );
       }
-      const transactionStore = transaction.objectStore("transactions");
-      const ownerValue: unknown = await requestResult(transactionStore.get(expectedTransactionId));
-      if (ownerValue === undefined) {
+      const owner = await readTransactionRecord(transaction, expectedTransactionId);
+      if (owner === undefined) {
         throw corruption(
           `segments/${segmentId}`,
           `owning transaction ${expectedTransactionId} is missing`,
         );
       }
-      const owner = asTransactionRecord(ownerValue, expectedTransactionId);
       if (owner.status !== "aborted") {
         throw new Error(`Segment ${segmentId} owner must be aborted; found ${owner.status}`);
       }
@@ -2940,9 +3029,7 @@ export class IndexedDbBlockStore implements BlockStore {
           `Segment ${segmentId} is published by manifest ${String(published.version)}`,
         );
       }
-      await visitObjectStoreSequentially(transactionStore, (candidateValue, key) => {
-        if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-        const candidate = asTransactionRecord(candidateValue, key);
+      await visitTransactionRecords(transaction, (candidate) => {
         if (candidate.status === "active" && candidate.pendingSegmentIds.includes(segmentId)) {
           throw new Error(
             `Segment ${segmentId} is referenced by active transaction ${candidate.id}`,
@@ -2998,7 +3085,7 @@ export class IndexedDbBlockStore implements BlockStore {
       });
       segmentStore.delete(segmentId);
       for (const { next } of rebasedSegments) segmentStore.put(next, next.id);
-      transactionStore.put(updatedOwner, owner.id);
+      putTransactionRecord(transaction, updatedOwner, journalChunkCountOf(owner));
       await transactionDone(transaction);
       return true;
     } catch (error) {
@@ -3027,11 +3114,10 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     try {
       const segmentStore = transaction.objectStore("segments");
-      const transactionStore = transaction.objectStore("transactions");
-      const [storedValue, abortedValue, replacementValue] = await Promise.all([
+      const [storedValue, aborted, replacement] = await Promise.all([
         requestResult<unknown>(segmentStore.get(desired.id)),
-        requestResult<unknown>(transactionStore.get(input.expectedAbortedTransactionId)),
-        requestResult<unknown>(transactionStore.get(input.replacementTransactionId)),
+        readTransactionRecord(transaction, input.expectedAbortedTransactionId),
+        readTransactionRecord(transaction, input.replacementTransactionId),
       ]);
       if (storedValue === undefined) throw new Error(`Segment does not exist: ${desired.id}`);
       const stored = asSegmentRecord(storedValue);
@@ -3055,10 +3141,6 @@ export class IndexedDbBlockStore implements BlockStore {
       ) {
         throw new Error(`Segment ${desired.id} does not match the immutable adoption record`);
       }
-      const aborted =
-        abortedValue === undefined
-          ? undefined
-          : asTransactionRecord(abortedValue, input.expectedAbortedTransactionId);
       if (aborted?.revision !== input.expectedAbortedTransactionRevision) {
         throw new TransactionRecordConflictError(
           input.expectedAbortedTransactionId,
@@ -3066,10 +3148,6 @@ export class IndexedDbBlockStore implements BlockStore {
           aborted?.revision ?? null,
         );
       }
-      const replacement =
-        replacementValue === undefined
-          ? undefined
-          : asTransactionRecord(replacementValue, input.replacementTransactionId);
       if (replacement?.revision !== input.expectedReplacementTransactionRevision) {
         throw new TransactionRecordConflictError(
           input.replacementTransactionId,
@@ -3132,9 +3210,7 @@ export class IndexedDbBlockStore implements BlockStore {
       if ((await findReadableManifestBlock(transaction, segmentBlockIds(stored))) !== undefined) {
         throw new Error(`Segment ${desired.id} is still reachable from a readable manifest`);
       }
-      await visitObjectStoreSequentially(transactionStore, (candidateValue, key) => {
-        if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-        const candidate = asTransactionRecord(candidateValue, key);
+      await visitTransactionRecords(transaction, (candidate) => {
         if (
           candidate.id !== aborted.id &&
           candidate.id !== replacement.id &&
@@ -3205,10 +3281,6 @@ export class IndexedDbBlockStore implements BlockStore {
         revision: incrementSafeInteger(replacement.revision, "Transaction revision"),
         updatedAt: input.updatedAt,
       };
-      assertTransactionArtifactJournalLimits(
-        updatedReplacement.pendingBlockIds,
-        updatedReplacement.pendingSegmentIds,
-      );
       const statistics = transaction.objectStore("statistics");
       await updateTransactionResourceLedger(statistics, aborted.id, {
         blockCount: 0,
@@ -3225,8 +3297,8 @@ export class IndexedDbBlockStore implements BlockStore {
       });
       segmentStore.put(desired, desired.id);
       for (const { next } of rebasedAbortedSegments) segmentStore.put(next, next.id);
-      transactionStore.put(updatedAborted, updatedAborted.id);
-      transactionStore.put(updatedReplacement, updatedReplacement.id);
+      putTransactionRecord(transaction, updatedAborted, journalChunkCountOf(aborted));
+      putTransactionRecord(transaction, updatedReplacement, journalChunkCountOf(replacement));
       await transactionDone(transaction);
       return structuredClone(updatedReplacement);
     } catch (error) {
@@ -3399,19 +3471,12 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       segments.sort((left, right) => left.id.localeCompare(right.id));
       const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
-      const transactionStore = transaction.objectStore("transactions");
       const transactions: TransactionRecord[] = [];
       for (let start = 0; start < transactionIds.length; start += 64) {
         const window = transactionIds.slice(start, start + 64);
-        const values = await Promise.all(
-          window.map((id) => requestResult<unknown>(transactionStore.get(id))),
-        );
-        values.forEach((value, index) => {
-          const id = window[index];
-          if (value !== undefined && id !== undefined) {
-            transactions.push(asTransactionRecord(value, id));
-          }
-        });
+        for (const record of await readTransactionRecords(transaction, window)) {
+          if (record !== undefined) transactions.push(record);
+        }
       }
       await transactionDone(transaction);
       return {
@@ -3567,7 +3632,8 @@ export class IndexedDbBlockStore implements BlockStore {
         currentVersion: current ?? null,
         replacementTransaction: normalized,
       });
-      transaction.objectStore("transactions").add(normalized, normalized.id);
+      addTransactionRecord(transaction, normalized);
+      if (this.#journalCache?.transactionId === normalized.id) this.#journalCache = undefined;
       let rowIds: RowIdRange | undefined;
       if (input.reserveRowIds !== undefined) {
         validateCount(input.reserveRowIds.count);
@@ -3682,7 +3748,7 @@ export class IndexedDbBlockStore implements BlockStore {
           },
         );
       }
-      transaction.objectStore("transactions").add(normalized, normalized.id);
+      addTransactionRecord(transaction, normalized);
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
@@ -3694,37 +3760,35 @@ export class IndexedDbBlockStore implements BlockStore {
   async getTransaction(id: string): Promise<TransactionRecord | undefined> {
     validateId(id, "Transaction ID");
     const transaction = this.#transaction("transactions", "readonly");
-    const value: unknown = await requestResult<unknown>(
-      transaction.objectStore("transactions").get(id),
-    );
+    const record = await readTransactionRecord(transaction, id);
     await transactionDone(transaction);
-    return value === undefined ? undefined : asTransactionRecord(value, id);
+    return record;
   }
 
   async getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>> {
     assertStorageBulkReadItems(ids, "Transaction read");
     for (const id of ids) validateId(id, "Transaction ID");
     const transaction = this.#transaction("transactions", "readonly");
-    const store = transaction.objectStore("transactions");
-    const values = await Promise.all(ids.map((id) => requestResult<unknown>(store.get(id))));
+    const records = await readTransactionRecords(transaction, ids);
     await transactionDone(transaction);
-    return values.map((value, index) =>
-      value === undefined ? undefined : asTransactionRecord(value, ids[index]),
-    );
+    return records;
   }
 
   async listTransactionPage(afterId: string | null, limit: number) {
     validatePageLimit(limit);
     const transaction = this.#transaction("transactions", "readonly");
-    const records = await readCursorPage(
+    const page = await readCursorPage(
       transaction.objectStore("transactions"),
       limit,
       (value, key) => {
         if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-        return asTransactionRecord(value, key);
+        return asStoredTransactionRecord(value, key);
       },
       (key) => typeof key === "string" && (afterId === null || key > afterId),
       afterId ?? undefined,
+    );
+    const records = await Promise.all(
+      page.map((stored) => assembleTransactionRecord(transaction, stored)),
     );
     await transactionDone(transaction);
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
@@ -3740,15 +3804,16 @@ export class IndexedDbBlockStore implements BlockStore {
       ["transactions", "manifests", "blocks", "catalog", "segments", "statistics"],
       "readwrite",
     );
-    const store = transaction.objectStore("transactions");
-    const value: unknown = await requestResult<unknown>(store.get(id));
-    const current = value === undefined ? undefined : asTransactionRecord(value, id);
-    if (current?.revision !== expectedRevision) {
-      transaction.abort();
+    const stored = await readStoredTransactionRecord(transaction, id);
+    if (stored?.revision !== expectedRevision) {
+      abortIfActive(transaction);
       await ignoreAbort(transaction);
-      throw new TransactionRecordConflictError(id, expectedRevision, current?.revision ?? null);
+      throw new TransactionRecordConflictError(id, expectedRevision, stored?.revision ?? null);
     }
     try {
+      // A rare recovery path, so the full journal is read here to prove the update only
+      // extends it; the hot staging path goes through stageTransactionArtifacts instead.
+      const current = await assembleTransactionRecord(transaction, stored);
       assertGenericTransactionUpdateAllowed(current, update);
       const updated = updateTransactionRecord(current, update);
       if (update.snapshotVersion !== undefined) {
@@ -3761,22 +3826,24 @@ export class IndexedDbBlockStore implements BlockStore {
         update.pendingSegmentIds !== undefined,
         update.pendingSegmentIds !== undefined,
       );
-      const addedBlocks = updated.pendingBlockIds.filter(
-        (blockId) => !current.pendingBlockIds.includes(blockId),
-      );
-      const addedSegments = updated.pendingSegmentIds.filter(
-        (segmentId) => !current.pendingSegmentIds.includes(segmentId),
-      );
+      // The journal is append-only and its chunks are appended in place below, so the update
+      // must keep every journaled id in its existing position and only add after it.
+      const updatedBlocks = new Set(updated.pendingBlockIds);
+      const updatedSegments = new Set(updated.pendingSegmentIds);
       if (
-        (update.pendingBlockIds !== undefined &&
-          current.pendingBlockIds.some((blockId) => !updated.pendingBlockIds.includes(blockId))) ||
-        (update.pendingSegmentIds !== undefined &&
-          current.pendingSegmentIds.some(
-            (segmentId) => !updated.pendingSegmentIds.includes(segmentId),
-          ))
+        current.pendingBlockIds.some((blockId) => !updatedBlocks.has(blockId)) ||
+        current.pendingSegmentIds.some((segmentId) => !updatedSegments.has(segmentId))
       ) {
         throw new TypeError("Use rollbackTransactionArtifacts to remove journaled artifacts");
       }
+      if (
+        !extendsJournalOrder(current.pendingBlockIds, updated.pendingBlockIds) ||
+        !extendsJournalOrder(current.pendingSegmentIds, updated.pendingSegmentIds)
+      ) {
+        throw new TypeError("Transaction journal updates must append after the journaled ids");
+      }
+      const addedBlocks = updated.pendingBlockIds.slice(current.pendingBlockIds.length);
+      const addedSegments = updated.pendingSegmentIds.slice(current.pendingSegmentIds.length);
       if (addedBlocks.length > 0 || addedSegments.length > 0) {
         let retainedBytes = 0;
         for (const id of addedBlocks) {
@@ -3797,9 +3864,19 @@ export class IndexedDbBlockStore implements BlockStore {
           retainedBytes,
         });
       }
-      store.put(updated, id);
+      if (addedBlocks.length > 0 || addedSegments.length > 0) {
+        // The tail chunk is what the assembled ids end with; no second read of it is needed.
+        appendTransactionJournalChunks(
+          transaction,
+          stored,
+          packTransactionJournal(current.pendingBlockIds, current.pendingSegmentIds).at(-1),
+          addedBlocks,
+          addedSegments,
+        );
+      }
+      putStoredTransactionRecord(transaction, storedTransactionRecord(updated));
       await transactionDone(transaction);
-      return structuredClone(updated);
+      return updated;
     } catch (error) {
       abortIfActive(transaction);
       await ignoreAbort(transaction);
@@ -3817,13 +3894,11 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     const transaction = this.#transaction(["transactions", "catalog", "leases"], "readwrite");
     try {
-      const store = transaction.objectStore("transactions");
-      const value: unknown = await requestResult(store.get(input.transactionId));
-      if (value === undefined) {
+      const record = await readStoredTransactionRecord(transaction, input.transactionId);
+      if (record === undefined) {
         await transactionDone(transaction);
         return false;
       }
-      const record = asTransactionRecord(value, input.transactionId);
       if (
         record.status !== "active" ||
         record.ownerId !== input.ownerId ||
@@ -3832,6 +3907,7 @@ export class IndexedDbBlockStore implements BlockStore {
         await transactionDone(transaction);
         return false;
       }
+      // Liveness renewal touches the header only; the journal chunks stay as they are.
       const renewed = { ...record, expiresAt: input.expiresAt };
       const currentVersion =
         asOptionalManifestVersion(
@@ -3846,7 +3922,7 @@ export class IndexedDbBlockStore implements BlockStore {
         replacementTransaction: renewed,
         excludeTransactionId: record.id,
       });
-      store.put(renewed, input.transactionId);
+      putStoredTransactionRecord(transaction, renewed);
       await transactionDone(transaction);
       return true;
     } catch (error) {
@@ -3871,27 +3947,27 @@ export class IndexedDbBlockStore implements BlockStore {
     const transaction = this.#transaction("transactions", "readwrite");
     try {
       const store = transaction.objectStore("transactions");
-      const value: unknown = await requestResult(store.get(input.transactionId));
-      if (value === undefined) {
+      const stored = await readStoredTransactionRecord(transaction, input.transactionId);
+      if (stored === undefined) {
         await transactionDone(transaction);
         return undefined;
       }
-      const current = asTransactionRecord(value, input.transactionId);
       if (
-        current.status !== "active" ||
-        current.ownerId !== input.expectedOwnerId ||
-        Date.parse(current.expiresAt) > cutoff
+        stored.status !== "active" ||
+        stored.ownerId !== input.expectedOwnerId ||
+        Date.parse(stored.expiresAt) > cutoff
       ) {
         await transactionDone(transaction);
         return undefined;
       }
+      const current = await assembleTransactionRecord(transaction, stored);
       const updated = updateTransactionRecord(current, {
         status: "aborted",
         updatedAt: input.updatedAt,
         committedVersion: null,
       });
       await assertTerminalTransactionAdmission(store);
-      store.put(updated, updated.id);
+      putStoredTransactionRecord(transaction, storedTransactionRecord(updated));
       await transactionDone(transaction);
       return structuredClone(updated);
     } catch (error) {
@@ -3911,12 +3987,7 @@ export class IndexedDbBlockStore implements BlockStore {
       "readwrite",
     );
     try {
-      const transactionStore = transaction.objectStore("transactions");
-      const value: unknown = await requestResult<unknown>(
-        transactionStore.get(input.transactionId),
-      );
-      const current =
-        value === undefined ? undefined : asTransactionRecord(value, input.transactionId);
+      const current = await readStoredTransactionRecord(transaction, input.transactionId);
       if (current?.revision !== input.expectedRevision || current.status !== "active") {
         throw new TransactionRecordConflictError(
           input.transactionId,
@@ -3943,7 +4014,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (normalized.transactionId !== input.transactionId) {
           throw new Error(`Segment ${normalized.id} belongs to another transaction`);
         }
-        const expectedCommitOrdinal = current.pendingSegmentIds.length + normalizedSegments.length;
+        const expectedCommitOrdinal = current.pendingSegmentCount + normalizedSegments.length;
         if (normalized.commitOrdinal !== expectedCommitOrdinal) {
           throw new TypeError(
             `Segment ${normalized.id} commit ordinal must be ${String(expectedCommitOrdinal)}`,
@@ -3957,14 +4028,9 @@ export class IndexedDbBlockStore implements BlockStore {
         segmentIds.add(normalized.id);
         normalizedSegments.push(normalized);
       }
-      const update: TransactionRecordUpdate = {
-        pendingBlockIds: [...current.pendingBlockIds, ...input.blocks.map((block) => block.id)],
-        pendingSegmentIds: [
-          ...current.pendingSegmentIds,
-          ...normalizedSegments.map((segment) => segment.id),
-        ],
-        updatedAt: input.updatedAt,
-      };
+      const addedBlockIds = input.blocks.map((block) => block.id);
+      const addedSegmentIds = normalizedSegments.map((segment) => segment.id);
+      const update: TransactionRecordUpdate = { updatedAt: input.updatedAt };
       if (current.pendingTable !== undefined) {
         let nextRowId = current.pendingTableNextRowId;
         if (nextRowId === undefined) throw corruption("transactions", "pending row state missing");
@@ -3984,20 +4050,25 @@ export class IndexedDbBlockStore implements BlockStore {
         update.pendingTableNextRowId = nextRowId;
       }
       assertGenericTransactionUpdateAllowed(current, update);
-      const updated = updateTransactionRecord(current, update);
-      assertTransactionArtifactJournalLimits(updated.pendingBlockIds, updated.pendingSegmentIds);
-      const updatedBlockIds = new Set(updated.pendingBlockIds);
+      // Only the journal's tail chunk is read and only the added ids are written, so a stage
+      // costs what it stages, however long the journal has grown. Nothing already journaled is
+      // probed again here: commit, abort, and rollback validate the whole journal.
+      const tail = await readTransactionJournalTail(transaction, current);
+      const journal = await this.#journaledIds(transaction, current, tail);
+      const rejournaled = addedBlockIds.find((id) => journal.blockIdSet.has(id));
+      if (rejournaled !== undefined) throw new Error(`Block already exists: ${rejournaled}`);
+      // A segment may only name blocks this call carries or the journal already holds. The
+      // common case resolves from this call alone; the rest consult the journal membership.
       for (const segment of normalizedSegments) {
-        const unjournaledBlock = segmentBlockIds(segment).find((id) => !updatedBlockIds.has(id));
+        const unjournaledBlock = segmentBlockIds(segment).find(
+          (id) => !ids.has(id) && !journal.blockIdSet.has(id),
+        );
         if (unjournaledBlock !== undefined) {
           throw new Error(
             `Segment ${segment.id} references block absent from the transaction journal: ${unjournaledBlock}`,
           );
         }
       }
-      // Only previously journaled artifacts need existence probes: the ones added below commit
-      // or fail atomically with the journal update itself.
-      await assertPendingArtifactsAvailableInTransaction(transaction, current);
       await updateTransactionResourceLedger(
         transaction.objectStore("statistics"),
         input.transactionId,
@@ -4027,14 +4098,68 @@ export class IndexedDbBlockStore implements BlockStore {
       for (const segment of normalizedSegments) {
         segmentStore.add(segment, segment.id);
       }
-      transactionStore.put(updated, input.transactionId);
+      const updated: StoredTransactionRecord = {
+        ...appendTransactionJournalChunks(
+          transaction,
+          current,
+          tail,
+          addedBlockIds,
+          addedSegmentIds,
+        ),
+        ...(update.pendingTableNextRowId === undefined
+          ? {}
+          : { pendingTableNextRowId: update.pendingTableNextRowId }),
+        updatedAt: input.updatedAt,
+        revision: incrementSafeInteger(current.revision, "Transaction revision"),
+      };
+      putStoredTransactionRecord(transaction, updated);
       await transactionDone(transaction);
-      return structuredClone(updated);
+      // The journal is extended only once the write is durable, so a refused or aborted stage
+      // leaves the cache describing the record exactly as storage still holds it.
+      for (const id of addedBlockIds) {
+        journal.blockIds.push(id);
+        journal.blockIdSet.add(id);
+      }
+      for (const id of addedSegmentIds) journal.segmentIds.push(id);
+      journal.revision = updated.revision;
+      this.#journalCache = journal;
+      return transactionRecordWithJournal(updated, journal.blockIds, journal.segmentIds);
     } catch (error) {
       abortIfActive(transaction);
       await ignoreAbort(transaction);
       throw error;
     }
+  }
+
+  /**
+   * The complete journal of an active record, from #journalCache when the record still carries
+   * the revision the cache was written at and its stored tail chunk agrees with the cached
+   * arrays, otherwise assembled from every chunk. The result is the instance's own working
+   * copy: callers may extend it in place and must hand copies to the outside.
+   */
+  async #journaledIds(
+    transaction: IDBTransaction,
+    stored: StoredTransactionRecord,
+    tail: TransactionJournalChunk | undefined,
+  ): Promise<TransactionJournalCache> {
+    const cached = this.#journalCache;
+    if (
+      cached?.transactionId === stored.id &&
+      cached.revision === stored.revision &&
+      cached.blockIds.length === stored.pendingBlockCount &&
+      cached.segmentIds.length === stored.pendingSegmentCount &&
+      journalTailMatches(cached, tail)
+    ) {
+      return cached;
+    }
+    const record = await assembleTransactionRecord(transaction, stored);
+    return {
+      transactionId: record.id,
+      revision: record.revision,
+      blockIds: record.pendingBlockIds,
+      segmentIds: record.pendingSegmentIds,
+      blockIdSet: new Set(record.pendingBlockIds),
+    };
   }
 
   async rollbackTransactionArtifacts(
@@ -4052,10 +4177,7 @@ export class IndexedDbBlockStore implements BlockStore {
       "readwrite",
     );
     try {
-      const transactionStore = transaction.objectStore("transactions");
-      const value: unknown = await requestResult(transactionStore.get(input.transactionId));
-      const current =
-        value === undefined ? undefined : asTransactionRecord(value, input.transactionId);
+      const current = await readTransactionRecord(transaction, input.transactionId);
       if (current?.revision !== input.expectedRevision || current.status !== "active") {
         throw new TransactionRecordConflictError(
           input.transactionId,
@@ -4104,10 +4226,8 @@ export class IndexedDbBlockStore implements BlockStore {
           `rollback journal names block ${publishedBlock.blockId} reachable by manifest ${String(publishedBlock.version)}`,
         );
       }
-      await visitObjectStoreSequentially(transactionStore, (recordValue, key) => {
-        if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
+      await visitTransactionRecords(transaction, (record, key) => {
         if (key === input.transactionId) return;
-        const record = asTransactionRecord(recordValue, key);
         const shared = record.pendingBlockIds.find((id) => removedBlocks.has(id));
         const sharedSegment = record.pendingSegmentIds.find((id) => removedSegments.has(id));
         if (shared !== undefined || sharedSegment !== undefined) {
@@ -4224,8 +4344,16 @@ export class IndexedDbBlockStore implements BlockStore {
         transaction.objectStore("catalog").delete(blockMetadataKey(id));
       }
       for (const id of input.removeSegmentIds) segmentStore.delete(id);
-      transactionStore.put(updated, input.transactionId);
+      // The truncated journal is rewritten whole; a savepoint rewind is rare and O(journal).
+      putTransactionRecord(transaction, updated, journalChunkCountOf(current));
       await transactionDone(transaction);
+      this.#journalCache = {
+        transactionId: updated.id,
+        revision: updated.revision,
+        blockIds: [...updated.pendingBlockIds],
+        segmentIds: [...updated.pendingSegmentIds],
+        blockIdSet: new Set(updated.pendingBlockIds),
+      };
       return structuredClone(updated);
     } catch (error) {
       abortIfActive(transaction);
@@ -4259,7 +4387,7 @@ export class IndexedDbBlockStore implements BlockStore {
         input.transactionId,
         input.expectedTransactionRevision,
       );
-      const outcome = await this.#commitInTransaction(transaction, record, input);
+      const outcome = await this.#commitInTransaction(transaction, record, "stored", input);
       await transactionDone(transaction);
       outcome.settle();
       return outcome.manifest;
@@ -4321,7 +4449,6 @@ export class IndexedDbBlockStore implements BlockStore {
     if ((input.removedBlockIds?.length ?? 0) > 0) storeNames.push("gc");
     const transaction = this.#transaction(storeNames, "readwrite");
     try {
-      const transactionStore = transaction.objectStore("transactions");
       let base: TransactionRecord;
       if ("record" in input.transaction) {
         const id = input.transaction.record.id;
@@ -4329,7 +4456,9 @@ export class IndexedDbBlockStore implements BlockStore {
           ...input.transaction.record,
           snapshotVersion: input.expectedManifestVersion,
         });
-        if ((await requestResult(transactionStore.getKey(id))) !== undefined) {
+        if (
+          (await requestResult(transaction.objectStore("transactions").getKey(id))) !== undefined
+        ) {
           throw new Error(`Transaction already exists: ${id}`);
         }
         // The fresh record pins the version the caller prepared against, so the commit below
@@ -4403,7 +4532,18 @@ export class IndexedDbBlockStore implements BlockStore {
         stageUpdate.pendingTableNextRowId = nextRowId;
       }
       const staged = updateTransactionRecord(base, stageUpdate);
-      assertTransactionArtifactJournalLimits(staged.pendingBlockIds, staged.pendingSegmentIds);
+      // The same rule the two-step stage enforces: a segment may only name blocks this write
+      // carries or the journal already holds. Without it a segment whose blocks were never
+      // written commits, and every read of it answers from the rows it was meant to replace.
+      const stagedBlockIds = new Set(staged.pendingBlockIds);
+      for (const segment of normalizedSegments) {
+        const unjournaledBlock = segmentBlockIds(segment).find((id) => !stagedBlockIds.has(id));
+        if (unjournaledBlock !== undefined) {
+          throw new Error(
+            `Segment ${segment.id} references block absent from the transaction journal: ${unjournaledBlock}`,
+          );
+        }
+      }
       // Only previously journaled artifacts need existence probes; the ones added below commit
       // or fail atomically with everything else.
       await assertPendingArtifactsAvailableInTransaction(transaction, base);
@@ -4424,7 +4564,12 @@ export class IndexedDbBlockStore implements BlockStore {
       for (const segment of normalizedSegments) {
         segmentStore.add(segment, segment.id);
       }
-      const outcome = await this.#commitInTransaction(transaction, staged, input);
+      const outcome = await this.#commitInTransaction(
+        transaction,
+        staged,
+        { replacedChunkCount: journalChunkCountOf(base) },
+        input,
+      );
       await transactionDone(transaction);
       outcome.settle();
       return outcome.manifest;
@@ -4440,11 +4585,15 @@ export class IndexedDbBlockStore implements BlockStore {
    * record the caller already resolved as active at the expected revision — the journaled
    * record for `commitTransaction`, the freshly staged one for `writeTransaction`. Throws to
    * refuse (the caller aborts the storage transaction); returns the summary plus the cache
-   * advances to apply once the transaction has proven durable.
+   * advances to apply once the transaction has proven durable. `journal` says what the commit
+   * must do with the journal chunks: nothing for a journaled record, whose ids are already
+   * stored, or a rewrite replacing that many chunks for a single-shot write whose freshly
+   * staged ids have no chunks yet.
    */
   async #commitInTransaction(
     transaction: IDBTransaction,
     record: TransactionRecord,
+    journal: "stored" | { replacedChunkCount: number },
     input: Omit<CommitTransactionInput, "transactionId" | "expectedTransactionRevision">,
   ): Promise<{ manifest: ManifestSummary; settle: () => void }> {
     incrementSafeInteger(record.revision, "Transaction revision");
@@ -5108,7 +5257,13 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     if (ftsDeltaCounts.length > 0) manifest.ftsDeltaCounts = ftsDeltaCounts;
     await clearTransactionResourceLedger(transaction.objectStore("statistics"), committed.id);
-    transactionStore.put(committed, committed.id);
+    // A journaled record's ids do not change at commit, so only its header is rewritten; a
+    // single-shot write's ids have no chunks yet and are written here with the record.
+    if (journal === "stored") {
+      putStoredTransactionRecord(transaction, storedTransactionRecord(committed));
+    } else {
+      putTransactionRecord(transaction, committed, journal.replacedChunkCount);
+    }
     const settle = (): void => {
       if (pendingTable !== undefined) {
         this.#tableIdsByName.set(pendingTable.name, pendingTable.id);
@@ -5195,6 +5350,7 @@ export class IndexedDbBlockStore implements BlockStore {
         this.#uniqueKeyCache.version = manifest.version;
       }
       this.#manifestCache = undefined;
+      this.#journalCache = undefined;
     };
     return { manifest, settle };
   }
@@ -5644,12 +5800,10 @@ export class IndexedDbBlockStore implements BlockStore {
     await assertActiveCompactionMarker(jobStore, current);
     incrementSafeInteger(current.revision, "Compaction job revision");
 
-    const transactionValue: unknown =
+    const linkedTransaction =
       current.transactionId === null
         ? undefined
-        : await requestResult(transactionStore.get(current.transactionId));
-    const linkedTransaction =
-      transactionValue === undefined ? undefined : asTransactionRecord(transactionValue);
+        : await readTransactionRecord(transaction, current.transactionId);
     let updated: CompactionJobRecord;
     let updatedLinkedTransaction: TransactionRecord | undefined;
     try {
@@ -5694,7 +5848,7 @@ export class IndexedDbBlockStore implements BlockStore {
       MAX_TERMINAL_COMPACTION_JOB_RECORDS,
     );
     if (updatedLinkedTransaction !== undefined) {
-      transactionStore.put(updatedLinkedTransaction, updatedLinkedTransaction.id);
+      putStoredTransactionRecord(transaction, storedTransactionRecord(updatedLinkedTransaction));
     }
     jobStore.put(compactionJobEnvelope(updated), key);
     jobStore.put(
@@ -5939,7 +6093,6 @@ export class IndexedDbBlockStore implements BlockStore {
       const manifestStore = transaction.objectStore("manifests");
       const segmentStore = transaction.objectStore("segments");
       const blockStore = transaction.objectStore("blocks");
-      const transactionStore = transaction.objectStore("transactions");
       const currentVersionValue: unknown = await requestResult(catalog.get(CURRENT_MANIFEST_KEY));
       const currentVersion =
         asOptionalManifestVersion(currentVersionValue, CURRENT_MANIFEST_KEY) ?? null;
@@ -6074,9 +6227,7 @@ export class IndexedDbBlockStore implements BlockStore {
           if (id === undefined) {
             throw new Error("Garbage collection transaction cursor is invalid");
           }
-          const transactionValue: unknown = await requestResult(transactionStore.get(id));
-          const record =
-            transactionValue === undefined ? undefined : asTransactionRecord(transactionValue, id);
+          const record = await readTransactionRecord(transaction, id);
           const manifestValue: unknown =
             record?.committedVersion === null || record?.committedVersion === undefined
               ? undefined
@@ -6098,7 +6249,8 @@ export class IndexedDbBlockStore implements BlockStore {
             retainedTransactionIds.push(id);
           } else {
             await clearTransactionResourceLedger(transaction.objectStore("statistics"), id);
-            transactionStore.delete(id);
+            deleteTransactionRecord(transaction, storedTransactionRecord(record));
+            if (this.#journalCache?.transactionId === id) this.#journalCache = undefined;
             reclaimedTransactionIds.push(id);
           }
           transactionIndex += 1;
@@ -6404,6 +6556,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#tableIdsByName.clear();
       this.#uniqueKeyCache = undefined;
       this.#manifestCache = undefined;
+      this.#journalCache = undefined;
       return {
         identity,
         removedBlockCount: marker.kindItemCounts[SNAPSHOT_FRAME_KINDS.indexOf("block")] ?? 0,
@@ -7142,16 +7295,13 @@ export class IndexedDbBlockStore implements BlockStore {
           "Integrity segment bytes",
         );
         if (segment.id !== key) throw corruption(`segments/${key}`, "record id differs from key");
-        const ownerValue: unknown = await requestResult(
-          transactionStore.get(segment.transactionId),
-        );
-        if (ownerValue === undefined) {
+        const owner = await readTransactionRecord(transaction, segment.transactionId);
+        if (owner === undefined) {
           throw corruption(
             `segments/${key}`,
             `owning transaction ${segment.transactionId} is missing`,
           );
         }
-        const owner = asTransactionRecord(ownerValue, segment.transactionId);
         const segmentTable =
           tablesById.get(segment.tableId) ??
           (owner.status === "active" && owner.pendingTable?.id === segment.tableId
@@ -7183,7 +7333,10 @@ export class IndexedDbBlockStore implements BlockStore {
       checkedRecords += 1;
       try {
         if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-        const record = asTransactionRecord(value, key);
+        const record = await assembleTransactionRecord(
+          transaction,
+          asStoredTransactionRecord(value, key),
+        );
         for (const [commitOrdinal, segmentId] of record.pendingSegmentIds.entries()) {
           const segmentValue: unknown = await requestResult(segmentStore.get(segmentId));
           if (segmentValue === undefined) {
@@ -7228,19 +7381,12 @@ export class IndexedDbBlockStore implements BlockStore {
                 `pending block ${blockId} is already live in the current manifest`,
               );
             }
-            const journaledByAnotherActiveTransaction = await visitObjectStoreSequentially(
-              transactionStore,
-              (candidateValue, candidateKey) => {
-                if (typeof candidateKey !== "string") {
-                  throw corruption("transactions", "record key is invalid");
-                }
-                const candidate = asTransactionRecord(candidateValue, candidateKey);
-                return (
-                  candidate.id !== record.id &&
-                  candidate.status === "active" &&
-                  candidate.pendingBlockIds.includes(blockId)
-                );
-              },
+            const journaledByAnotherActiveTransaction = await visitTransactionRecords(
+              transaction,
+              (candidate) =>
+                candidate.id !== record.id &&
+                candidate.status === "active" &&
+                candidate.pendingBlockIds.includes(blockId),
             );
             if (journaledByAnotherActiveTransaction) {
               throw corruption(
@@ -7357,6 +7503,46 @@ export class IndexedDbBlockStore implements BlockStore {
     } catch (error) {
       issue("invalid-pending-catalog", "transactions", error);
     }
+    // Every record's own chunks were checked above; this pass finds chunks with no record, or
+    // beyond the count their record declares, which a deleted record must never leave behind.
+    await visitObjectStoreSequentially(
+      transaction.objectStore(TRANSACTION_JOURNAL_STORE),
+      async (value, key) => {
+        checkedRecords += 1;
+        try {
+          if (
+            !Array.isArray(key) ||
+            key.length !== 2 ||
+            typeof key[0] !== "string" ||
+            typeof key[1] !== "number" ||
+            !Number.isSafeInteger(key[1]) ||
+            key[1] < 0
+          ) {
+            throw corruption(TRANSACTION_JOURNAL_STORE, "journal chunk key is invalid");
+          }
+          const [transactionId, chunkIndex] = key;
+          asTransactionJournalChunk(
+            value,
+            `transactions/${transactionId}/journal/${String(chunkIndex)}`,
+          );
+          const owner = await readStoredTransactionRecord(transaction, transactionId);
+          if (owner === undefined) {
+            throw corruption(
+              `transactions/${transactionId}`,
+              `journal chunk ${String(chunkIndex)} has no transaction record`,
+            );
+          }
+          if (chunkIndex >= owner.journalChunkCount) {
+            throw corruption(
+              `transactions/${transactionId}`,
+              `journal chunk ${String(chunkIndex)} lies beyond the declared ${String(owner.journalChunkCount)}`,
+            );
+          }
+        } catch (error) {
+          issue("orphan-transaction-journal", storageKeyLocation(key), error);
+        }
+      },
+    );
     const leaseIds = new Set<string>();
     await visitObjectStoreSequentially(transaction.objectStore("leases"), async (value, key) => {
       checkedRecords += 1;
@@ -7432,13 +7618,10 @@ export class IndexedDbBlockStore implements BlockStore {
               }
             }
             if (job.transactionId !== null) {
-              const transactionValue: unknown = await requestResult(
-                transactionStore.get(job.transactionId),
-              );
-              if (transactionValue === undefined) {
+              const owner = await readTransactionRecord(transaction, job.transactionId);
+              if (owner === undefined) {
                 throw corruption(`gc/${key}`, "linked transaction is missing");
               }
-              const owner = asTransactionRecord(transactionValue, job.transactionId);
               if (job.state === "ready" || owner.pendingSegmentIds.length > 0) {
                 const table = tablesById.get(job.tableId);
                 if (table === undefined) throw corruption(`gc/${key}`, "table is missing");
@@ -7491,10 +7674,8 @@ export class IndexedDbBlockStore implements BlockStore {
             const candidate: unknown = await requestResult(blockStore.get(id));
             if (candidate !== undefined) asBytes(candidate, `blocks/${id}`);
           }
-          for (const id of job.candidateTransactionIds) {
-            const candidate: unknown = await requestResult(transactionStore.get(id));
-            if (candidate !== undefined) asTransactionRecord(candidate, id);
-          }
+          for (const id of job.candidateTransactionIds)
+            await readTransactionRecord(transaction, id);
         } else if (key.startsWith(ACTIVE_COMPACTION_KEY_PREFIX)) {
           let tableId: string;
           try {
@@ -7772,13 +7953,10 @@ export class IndexedDbBlockStore implements BlockStore {
           const ledger = asOptionalTransactionResourceLedger(value, transactionId);
           if (ledger === undefined)
             throw corruption(`statistics/${key}`, "transaction ledger is missing");
-          const transactionValue: unknown = await requestResult(
-            transactionStore.get(transactionId),
-          );
-          if (transactionValue === undefined) {
+          const owner = await readTransactionRecord(transaction, transactionId);
+          if (owner === undefined) {
             throw corruption(`statistics/${key}`, "transaction resource ledger has no transaction");
           }
-          const owner = asTransactionRecord(transactionValue, transactionId);
           if (
             owner.status === "committed" ||
             ledger.blockCount !== owner.pendingBlockIds.length ||
@@ -8329,6 +8507,7 @@ export class IndexedDbBlockStore implements BlockStore {
         transaction.objectStore("manifests").clear();
         transaction.objectStore("segments").clear();
         transaction.objectStore("transactions").clear();
+        transaction.objectStore(TRANSACTION_JOURNAL_STORE).clear();
         transaction.objectStore(SNAPSHOT_HEADER_STORE).clear();
         const statistics = transaction.objectStore("statistics");
         statistics.clear();
@@ -8669,6 +8848,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#tableIdsByName.clear();
       this.#uniqueKeyCache = undefined;
       this.#manifestCache = undefined;
+      this.#journalCache = undefined;
     } catch (error) {
       abortIfActive(transaction);
       await ignoreAbort(transaction);
@@ -8717,6 +8897,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#tableIdsByName.clear();
       this.#uniqueKeyCache = undefined;
       this.#manifestCache = undefined;
+      this.#journalCache = undefined;
       return {
         identity: marker.identity,
         removedBlockCount: marker.kindItemCounts[SNAPSHOT_FRAME_KINDS.indexOf("block")] ?? 0,
@@ -8738,6 +8919,7 @@ export class IndexedDbBlockStore implements BlockStore {
     this.#tableIdsByName.clear();
     this.#uniqueKeyCache = undefined;
     this.#manifestCache = undefined;
+    this.#journalCache = undefined;
     this.#db.close();
   }
 
@@ -9110,14 +9292,20 @@ export class IndexedDbBlockStore implements BlockStore {
     options: { allowSnapshotImport?: boolean } = {},
   ): IDBTransaction {
     if (this.#closed) throw new Error("This IndexedDB store connection is closed");
+    // A transaction record is only meaningful with its journal chunks, so the journal store
+    // travels with the transactions store in every scope rather than at every call site.
+    const requested = typeof stores === "string" ? [stores] : stores;
+    const storeList =
+      requested.includes("transactions") && !requested.includes(TRANSACTION_JOURNAL_STORE)
+        ? [...requested, TRANSACTION_JOURNAL_STORE]
+        : requested;
     const transaction =
       mode === "readwrite"
-        ? this.#db.transaction(stores, mode, { durability: this.#durability })
-        : this.#db.transaction(stores, mode);
+        ? this.#db.transaction(storeList, mode, { durability: this.#durability })
+        : this.#db.transaction(storeList, mode);
     // Observe completion before any request can fail. Catch paths may run after native abort
     // dispatch (for example on quota exhaustion), when installing a new listener is too late.
     void transactionDone(transaction).catch(() => undefined);
-    const storeList = typeof stores === "string" ? [stores] : stores;
     if (mode === "readwrite" && !options.allowSnapshotImport && storeList.includes("catalog")) {
       // Queue this read before the caller can enqueue its writes. The import-preparation
       // transaction covers every object store, so it cannot publish the marker until any older
@@ -9158,8 +9346,7 @@ function assertIndexedDbSchemaMigrationRegistry(): void {
 }
 
 function createCurrentIndexedDbSchema(database: IDBDatabase, upgrade: IDBTransaction): void {
-  for (const storeName of storeNames) database.createObjectStore(storeName);
-  database.createObjectStore(SNAPSHOT_HEADER_STORE);
+  for (const storeName of indexedDbStoreNames) database.createObjectStore(storeName);
   // Creation is driven by the same declaration validateCurrentIndexedDbSchema verifies
   // against, so the two can never disagree about what the current schema is.
   for (const [storeName, indexes] of Object.entries(indexedDbIndexSchema)) {
@@ -9179,9 +9366,10 @@ function applyIndexedDbSchemaMigrations(
   database: IDBDatabase,
   upgrade: IDBTransaction,
   oldVersion: number,
+  fail: (error: Error) => void,
 ): void {
   for (const migration of indexedDbSchemaMigrations) {
-    if (migration.targetVersion > oldVersion) migration.migrate(database, upgrade);
+    if (migration.targetVersion > oldVersion) migration.migrate(database, upgrade, fail);
   }
 }
 
@@ -9781,7 +9969,7 @@ async function assertTableRemovalAllowed(
   );
   const transactionStore = transaction.objectStore("transactions");
   await visitObjectStoreSequentially(transactionStore, (candidateValue, key) => {
-    const candidate = asTransactionRecord(candidateValue, storageKeyLocation(key));
+    const candidate = asStoredTransactionRecord(candidateValue, storageKeyLocation(key));
     const pendingTable = candidate.status === "active" ? candidate.pendingTable : undefined;
     const foreignKey = (pendingTable?.foreignKeys ?? []).find(
       (constraint) => constraint.parentTable === record.name,
@@ -9794,19 +9982,18 @@ async function assertTableRemovalAllowed(
       );
     }
   });
-  const owners = new Map<string, TransactionRecord>();
+  const owners = new Map<string, StoredTransactionRecord>();
   const activeTransactionIds = new Set<string>();
   for (const segment of segments) {
     let owner = owners.get(segment.transactionId);
     if (owner === undefined) {
-      const ownerValue: unknown = await requestResult(transactionStore.get(segment.transactionId));
-      if (ownerValue === undefined) {
+      owner = await readStoredTransactionRecord(transaction, segment.transactionId);
+      if (owner === undefined) {
         throw corruption(
           `segments/${segment.id}`,
           `references missing transaction ${segment.transactionId}`,
         );
       }
-      owner = asTransactionRecord(ownerValue, segment.transactionId);
       owners.set(segment.transactionId, owner);
     }
     if (owner.status === "active") activeTransactionIds.add(owner.id);
@@ -10152,6 +10339,11 @@ function requiredUniqueStringArray(value: unknown, location: string): string[] {
     throw corruption(location, "identifier list is invalid");
   }
   return [...value];
+}
+
+/** True when `updated` is `current` followed by zero or more ids, in the same order. */
+function extendsJournalOrder(current: readonly string[], updated: readonly string[]): boolean {
+  return current.length <= updated.length && current.every((id, index) => updated[index] === id);
 }
 
 function validateArtifactPartition(
@@ -11285,7 +11477,7 @@ async function stageSnapshotMetadataFrame(
       await assertCatalogReservationAdmission(transaction, record.pendingTable);
       await assertTableForeignKeysInTransaction(catalog, record.pendingTable);
     }
-    transaction.objectStore("transactions").add(record, record.id);
+    addTransactionRecord(transaction, record);
     return;
   }
   if (item.kind === "unique-generation") {
@@ -11430,7 +11622,6 @@ async function validateAndPromoteStagedSnapshot(
 ): Promise<void> {
   const catalog = transaction.objectStore("catalog");
   const segments = transaction.objectStore("segments");
-  const transactions = transaction.objectStore("transactions");
   const blocks = transaction.objectStore("blocks");
   await visitObjectStoreSequentially(catalog, async (value, key) => {
     if (typeof key !== "string" || !key.startsWith(TABLE_ID_PREFIX)) return;
@@ -11506,10 +11697,7 @@ async function validateAndPromoteStagedSnapshot(
       );
     }
   });
-  await visitObjectStoreSequentially(transactions, (value, key) => {
-    if (typeof key !== "string")
-      throw corruption("transactions", "snapshot transaction key is invalid");
-    const record = asTransactionRecord(value, key);
+  await visitTransactionRecords(transaction, (record, key) => {
     if (
       record.status !== "committed" ||
       record.committedVersion === null ||
@@ -11533,10 +11721,9 @@ async function validateAndPromoteStagedSnapshot(
     ) {
       throw corruption(`segments/${key}`, "snapshot segment table is missing");
     }
-    const ownerValue: unknown = await requestResult(transactions.get(segment.transactionId));
-    if (ownerValue === undefined)
+    if ((await readTransactionRecord(transaction, segment.transactionId)) === undefined) {
       throw corruption(`segments/${key}`, "snapshot segment owner is missing");
-    asTransactionRecord(ownerValue, segment.transactionId);
+    }
     for (const blockId of segmentBlockIds(segment)) {
       const provenance = asManifestBlockRecord(
         await requestResult<unknown>(catalog.get(manifestBlockKey(blockId))),
@@ -11949,11 +12136,8 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
   });
   await visitObjectStoreSequentially(input.transaction.objectStore("segments"), async (value) => {
     const record = asSegmentRecord(value);
-    const ownerValue: unknown = await requestResult(
-      input.transaction.objectStore("transactions").get(record.transactionId),
-    );
-    if (ownerValue === undefined) return;
-    const owner = asTransactionRecord(ownerValue, record.transactionId);
+    const owner = await readStoredTransactionRecord(input.transaction, record.transactionId);
+    if (owner === undefined) return;
     if (
       owner.status !== "committed" ||
       owner.committedVersion === null ||
@@ -11977,7 +12161,7 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
     input.transaction.objectStore("transactions"),
     (value, key) => {
       if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-      const record = asTransactionRecord(value, key);
+      const record = asStoredTransactionRecord(value, key);
       if (
         record.status !== "committed" ||
         record.committedVersion === null ||
@@ -11986,9 +12170,10 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
         return;
       }
       input.observeRetainedItems(1);
+      // Exported history carries no journal, so the chunks are never read here.
       writeItem("transaction-page", {
         kind: "transaction",
-        record: { ...record, pendingBlockIds: [], pendingSegmentIds: [] },
+        record: transactionRecordWithJournal(record, [], []),
       } satisfies SnapshotTransactionItem);
     },
   );
@@ -12304,29 +12489,129 @@ async function findReadableManifestBlock(
   return found;
 }
 
-function asTransactionRecord(value: unknown, expectedId?: string): TransactionRecord {
-  if (!isRecord(value)) throw corruption("transactions", "record is not an object");
-  assertKnownFields(
-    value,
-    [
-      "id",
-      "ownerId",
-      "expiresAt",
-      "snapshotVersion",
-      "pendingBlockIds",
-      "pendingSegmentIds",
-      "status",
-      "revision",
-      "startedAt",
-      "updatedAt",
-      "committedVersion",
-      "schemaEpochGuard",
-      "pendingTable",
-      "pendingTableNextRowId",
-      "catalogEpochGuard",
-    ],
-    "transactions",
+/**
+ * The `transactions` store value. The contract's `pendingBlockIds` / `pendingSegmentIds` live
+ * as ordered chunks in TRANSACTION_JOURNAL_STORE instead, so staging appends to the journal's
+ * tail without reading or rewriting every id journaled so far. The counts are redundant with
+ * the chunks and are checked against them whenever a full record is assembled.
+ */
+type StoredTransactionRecord = Omit<TransactionRecord, "pendingBlockIds" | "pendingSegmentIds"> &
+  Readonly<{
+    journalChunkCount: number;
+    pendingBlockCount: number;
+    pendingSegmentCount: number;
+  }>;
+
+/**
+ * One journal chunk, keyed `[transactionId, chunkIndex]`. Concatenating `blockIds` over the
+ * chunks in key order yields `pendingBlockIds`; likewise `segmentIds`. Chunks are packed: every
+ * chunk but the last holds exactly TRANSACTION_JOURNAL_CHUNK_ENTRIES ids, so the chunk count
+ * follows from the id counts and a stray or missing chunk is detectable without a range scan.
+ */
+interface TransactionJournalChunk {
+  blockIds: string[];
+  segmentIds: string[];
+}
+
+/** See IndexedDbBlockStore.#journalCache. */
+interface TransactionJournalCache {
+  transactionId: string;
+  revision: number;
+  blockIds: string[];
+  segmentIds: string[];
+  blockIdSet: Set<string>;
+}
+
+/** The stored tail chunk holds the journal's last ids, so it must end the cached arrays. */
+function journalTailMatches(
+  cached: TransactionJournalCache,
+  tail: TransactionJournalChunk | undefined,
+): boolean {
+  if (tail === undefined) return cached.blockIds.length === 0 && cached.segmentIds.length === 0;
+  const endsWith = (ids: readonly string[], suffix: readonly string[]): boolean =>
+    suffix.every((id, index) => ids[ids.length - suffix.length + index] === id);
+  return endsWith(cached.blockIds, tail.blockIds) && endsWith(cached.segmentIds, tail.segmentIds);
+}
+
+const TRANSACTION_RECORD_FIELDS = [
+  "id",
+  "ownerId",
+  "expiresAt",
+  "snapshotVersion",
+  "status",
+  "revision",
+  "startedAt",
+  "updatedAt",
+  "committedVersion",
+  "schemaEpochGuard",
+  "pendingTable",
+  "pendingTableNextRowId",
+  "catalogEpochGuard",
+] as const;
+
+function transactionJournalChunkKey(transactionId: string, chunkIndex: number): [string, number] {
+  return [transactionId, chunkIndex];
+}
+
+function transactionJournalEntryCount(blockCount: number, segmentCount: number): number {
+  const total = blockCount + segmentCount;
+  if (!Number.isSafeInteger(total)) throw new RangeError("Transaction journal is too large");
+  return total;
+}
+
+function transactionJournalChunkCount(blockCount: number, segmentCount: number): number {
+  return Math.ceil(
+    transactionJournalEntryCount(blockCount, segmentCount) / TRANSACTION_JOURNAL_CHUNK_ENTRIES,
   );
+}
+
+function journalChunkCountOf(
+  record: Pick<TransactionRecord, "pendingBlockIds" | "pendingSegmentIds">,
+): number {
+  return transactionJournalChunkCount(
+    record.pendingBlockIds.length,
+    record.pendingSegmentIds.length,
+  );
+}
+
+/** Packs the ids into chunks, blocks before segments, every chunk but the last full. */
+function packTransactionJournal(
+  blockIds: readonly string[],
+  segmentIds: readonly string[],
+): TransactionJournalChunk[] {
+  const chunks: TransactionJournalChunk[] = [];
+  let blockOffset = 0;
+  let segmentOffset = 0;
+  while (blockOffset < blockIds.length || segmentOffset < segmentIds.length) {
+    const blocks = blockIds.slice(blockOffset, blockOffset + TRANSACTION_JOURNAL_CHUNK_ENTRIES);
+    blockOffset += blocks.length;
+    const segments = segmentIds.slice(
+      segmentOffset,
+      segmentOffset + TRANSACTION_JOURNAL_CHUNK_ENTRIES - blocks.length,
+    );
+    segmentOffset += segments.length;
+    chunks.push({ blockIds: blocks, segmentIds: segments });
+  }
+  return chunks;
+}
+
+function asTransactionJournalChunk(value: unknown, location: string): TransactionJournalChunk {
+  if (!isRecord(value)) throw corruption(location, "journal chunk is not an object");
+  assertKnownFields(value, ["blockIds", "segmentIds"], location);
+  const blockIds = requiredUniqueStringArray(value.blockIds, `${location}/blockIds`);
+  const segmentIds = requiredUniqueStringArray(value.segmentIds, `${location}/segmentIds`);
+  const entries = blockIds.length + segmentIds.length;
+  if (entries === 0 || entries > TRANSACTION_JOURNAL_CHUNK_ENTRIES) {
+    throw corruption(location, `journal chunk holds ${String(entries)} ids`);
+  }
+  return { blockIds, segmentIds };
+}
+
+/** The fields shared by the contract record and its stored header, validated once. */
+function asTransactionRecordBase(
+  value: Record<string, unknown>,
+  expectedId: string | undefined,
+): Omit<TransactionRecord, "pendingBlockIds" | "pendingSegmentIds"> {
   const id = nonEmptyStoredString(value.id, "transactions/id");
   if (expectedId !== undefined && id !== expectedId) {
     throw corruption(`transactions/${expectedId}`, `record declares id ${id}`);
@@ -12338,14 +12623,6 @@ function asTransactionRecord(value: unknown, expectedId?: string): TransactionRe
   const committedVersion = asNullableStoredVersion(
     value.committedVersion,
     `transactions/${id}/committedVersion`,
-  );
-  const pendingBlockIds = requiredUniqueStringArray(
-    value.pendingBlockIds,
-    `transactions/${id}/pendingBlockIds`,
-  );
-  const pendingSegmentIds = requiredUniqueStringArray(
-    value.pendingSegmentIds,
-    `transactions/${id}/pendingSegmentIds`,
   );
   if (!(["active", "committed", "aborted"] as unknown[]).includes(value.status)) {
     throw corruption(`transactions/${id}/status`, "status is invalid");
@@ -12400,8 +12677,6 @@ function asTransactionRecord(value: unknown, expectedId?: string): TransactionRe
     ownerId,
     expiresAt,
     snapshotVersion,
-    pendingBlockIds,
-    pendingSegmentIds,
     status,
     revision,
     startedAt,
@@ -12414,6 +12689,357 @@ function asTransactionRecord(value: unknown, expectedId?: string): TransactionRe
     throw corruption(`transactions/${id}`, "pending-table fields are incomplete");
   }
   return { ...base, pendingTable, pendingTableNextRowId, catalogEpochGuard };
+}
+
+/** Validates a contract-shaped record: caller input, snapshot items, and assembled journals. */
+function asTransactionRecord(value: unknown, expectedId?: string): TransactionRecord {
+  if (!isRecord(value)) throw corruption("transactions", "record is not an object");
+  assertKnownFields(
+    value,
+    [...TRANSACTION_RECORD_FIELDS, "pendingBlockIds", "pendingSegmentIds"],
+    "transactions",
+  );
+  const base = asTransactionRecordBase(value, expectedId);
+  const pendingBlockIds = requiredUniqueStringArray(
+    value.pendingBlockIds,
+    `transactions/${base.id}/pendingBlockIds`,
+  );
+  const pendingSegmentIds = requiredUniqueStringArray(
+    value.pendingSegmentIds,
+    `transactions/${base.id}/pendingSegmentIds`,
+  );
+  transactionJournalEntryCount(pendingBlockIds.length, pendingSegmentIds.length);
+  return { ...base, pendingBlockIds, pendingSegmentIds };
+}
+
+/** Validates the stored header alone; the journal chunks are checked when they are read. */
+function asStoredTransactionRecord(value: unknown, expectedId?: string): StoredTransactionRecord {
+  if (!isRecord(value)) throw corruption("transactions", "record is not an object");
+  assertKnownFields(
+    value,
+    [...TRANSACTION_RECORD_FIELDS, "journalChunkCount", "pendingBlockCount", "pendingSegmentCount"],
+    "transactions",
+  );
+  const base = asTransactionRecordBase(value, expectedId);
+  const pendingBlockCount = nonNegativeStoredInteger(
+    value.pendingBlockCount,
+    `transactions/${base.id}/pendingBlockCount`,
+  );
+  const pendingSegmentCount = nonNegativeStoredInteger(
+    value.pendingSegmentCount,
+    `transactions/${base.id}/pendingSegmentCount`,
+  );
+  const journalChunkCount = nonNegativeStoredInteger(
+    value.journalChunkCount,
+    `transactions/${base.id}/journalChunkCount`,
+  );
+  let expectedChunkCount: number;
+  try {
+    expectedChunkCount = transactionJournalChunkCount(pendingBlockCount, pendingSegmentCount);
+  } catch {
+    throw corruption(`transactions/${base.id}`, "journal counts are unsafe");
+  }
+  if (journalChunkCount !== expectedChunkCount) {
+    throw corruption(
+      `transactions/${base.id}/journalChunkCount`,
+      `chunk count ${String(journalChunkCount)} disagrees with ${String(pendingBlockCount)} blocks and ${String(pendingSegmentCount)} segments`,
+    );
+  }
+  return { ...base, journalChunkCount, pendingBlockCount, pendingSegmentCount };
+}
+
+function storedTransactionRecord(record: TransactionRecord): StoredTransactionRecord {
+  const { pendingBlockIds, pendingSegmentIds, ...header } = record;
+  return {
+    ...header,
+    journalChunkCount: journalChunkCountOf(record),
+    pendingBlockCount: pendingBlockIds.length,
+    pendingSegmentCount: pendingSegmentIds.length,
+  };
+}
+
+/** The contract record for a header whose journal the caller already holds; copies the ids. */
+function transactionRecordWithJournal(
+  stored: StoredTransactionRecord,
+  pendingBlockIds: readonly string[],
+  pendingSegmentIds: readonly string[],
+): TransactionRecord {
+  const {
+    journalChunkCount: _chunkCount,
+    pendingBlockCount: _blockCount,
+    pendingSegmentCount: _segmentCount,
+    ...header
+  } = stored;
+  void _chunkCount;
+  void _blockCount;
+  void _segmentCount;
+  return {
+    ...header,
+    pendingBlockIds: [...pendingBlockIds],
+    pendingSegmentIds: [...pendingSegmentIds],
+  };
+}
+
+/** Assembles the contract record from a validated header and its chunks in key order. */
+function transactionRecordFromJournal(
+  stored: StoredTransactionRecord,
+  chunks: readonly TransactionJournalChunk[],
+): TransactionRecord {
+  const location = `transactions/${stored.id}`;
+  if (chunks.length !== stored.journalChunkCount) {
+    throw corruption(location, "journal chunk count disagrees with its record");
+  }
+  const pendingBlockIds: string[] = [];
+  const pendingSegmentIds: string[] = [];
+  for (const [index, chunk] of chunks.entries()) {
+    const entries = chunk.blockIds.length + chunk.segmentIds.length;
+    if (index < chunks.length - 1 && entries !== TRANSACTION_JOURNAL_CHUNK_ENTRIES) {
+      throw corruption(`${location}/journal/${String(index)}`, "journal chunk is not packed");
+    }
+    for (const id of chunk.blockIds) pendingBlockIds.push(id);
+    for (const id of chunk.segmentIds) pendingSegmentIds.push(id);
+  }
+  if (
+    pendingBlockIds.length !== stored.pendingBlockCount ||
+    pendingSegmentIds.length !== stored.pendingSegmentCount
+  ) {
+    throw corruption(location, "journal counts disagree with its chunks");
+  }
+  if (
+    new Set(pendingBlockIds).size !== pendingBlockIds.length ||
+    new Set(pendingSegmentIds).size !== pendingSegmentIds.length
+  ) {
+    throw corruption(location, "journal repeats an id");
+  }
+  return transactionRecordWithJournal(stored, pendingBlockIds, pendingSegmentIds);
+}
+
+async function readTransactionJournalChunk(
+  journalStore: IDBObjectStore,
+  transactionId: string,
+  chunkIndex: number,
+): Promise<TransactionJournalChunk | undefined> {
+  const value: unknown = await requestResult(
+    journalStore.get(transactionJournalChunkKey(transactionId, chunkIndex)),
+  );
+  return value === undefined
+    ? undefined
+    : asTransactionJournalChunk(
+        value,
+        `transactions/${transactionId}/journal/${String(chunkIndex)}`,
+      );
+}
+
+/**
+ * Every chunk the header declares, by key; one probe past the end proves the store holds no
+ * more. Keyed gets rather than a range so injected factories need no IDBKeyRange global.
+ */
+async function readTransactionJournalChunks(
+  transaction: IDBTransaction,
+  stored: StoredTransactionRecord,
+): Promise<TransactionJournalChunk[]> {
+  const journalStore = transaction.objectStore(TRANSACTION_JOURNAL_STORE);
+  const values = await Promise.all(
+    Array.from({ length: stored.journalChunkCount + 1 }, (_, index) =>
+      readTransactionJournalChunk(journalStore, stored.id, index),
+    ),
+  );
+  const extra = values.pop();
+  if (extra !== undefined) {
+    throw corruption(
+      `transactions/${stored.id}`,
+      "journal has more chunks than its record declares",
+    );
+  }
+  return values.map((chunk, index) => {
+    if (chunk === undefined) {
+      throw corruption(`transactions/${stored.id}/journal/${String(index)}`, "chunk is missing");
+    }
+    return chunk;
+  });
+}
+
+async function assembleTransactionRecord(
+  transaction: IDBTransaction,
+  stored: StoredTransactionRecord,
+): Promise<TransactionRecord> {
+  return transactionRecordFromJournal(
+    stored,
+    await readTransactionJournalChunks(transaction, stored),
+  );
+}
+
+async function readStoredTransactionRecord(
+  transaction: IDBTransaction,
+  id: string,
+): Promise<StoredTransactionRecord | undefined> {
+  const value: unknown = await requestResult(transaction.objectStore("transactions").get(id));
+  return value === undefined ? undefined : asStoredTransactionRecord(value, id);
+}
+
+async function readTransactionRecord(
+  transaction: IDBTransaction,
+  id: string,
+): Promise<TransactionRecord | undefined> {
+  const stored = await readStoredTransactionRecord(transaction, id);
+  return stored === undefined ? undefined : assembleTransactionRecord(transaction, stored);
+}
+
+async function readTransactionRecords(
+  transaction: IDBTransaction,
+  ids: readonly string[],
+): Promise<Array<TransactionRecord | undefined>> {
+  const stored = await Promise.all(ids.map((id) => readStoredTransactionRecord(transaction, id)));
+  return Promise.all(
+    stored.map((record) =>
+      record === undefined
+        ? Promise.resolve(undefined)
+        : assembleTransactionRecord(transaction, record),
+    ),
+  );
+}
+
+/** Cursors the transactions store, handing each visitor the assembled contract record. */
+function visitTransactionRecords(
+  transaction: IDBTransaction,
+  visit: (record: TransactionRecord, key: string) => unknown,
+): Promise<boolean> {
+  return visitObjectStoreSequentially(
+    transaction.objectStore("transactions"),
+    async (value, key) => {
+      if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
+      const record = await assembleTransactionRecord(
+        transaction,
+        asStoredTransactionRecord(value, key),
+      );
+      return visit(record, key);
+    },
+  );
+}
+
+/** The bounded active partition, by status index, with each journal assembled. */
+function visitActiveTransactionRecords(
+  transaction: IDBTransaction,
+  visit: (record: TransactionRecord, key: string) => unknown,
+): Promise<boolean> {
+  return visitIndexPartitionSequentially(
+    transaction.objectStore("transactions").index(TRANSACTION_STATUS_INDEX),
+    "active",
+    async (value, key) => {
+      if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
+      const record = await assembleTransactionRecord(
+        transaction,
+        asStoredTransactionRecord(value, key),
+      );
+      return visit(record, key);
+    },
+  );
+}
+
+/** Writes the header only; the caller guarantees the journal chunks are unchanged. */
+function putStoredTransactionRecord(
+  transaction: IDBTransaction,
+  stored: StoredTransactionRecord,
+): void {
+  transaction.objectStore("transactions").put(stored, stored.id);
+}
+
+/**
+ * Rewrites the record and its whole journal: chunks beyond the new count are deleted, the rest
+ * overwritten. `replacedChunkCount` is what the stored record held before this write (zero for a
+ * record that did not exist). O(journal); the staging path appends instead.
+ */
+function putTransactionRecord(
+  transaction: IDBTransaction,
+  record: TransactionRecord,
+  replacedChunkCount: number,
+): void {
+  const journalStore = transaction.objectStore(TRANSACTION_JOURNAL_STORE);
+  const chunks = packTransactionJournal(record.pendingBlockIds, record.pendingSegmentIds);
+  for (let index = chunks.length; index < replacedChunkCount; index += 1) {
+    journalStore.delete(transactionJournalChunkKey(record.id, index));
+  }
+  chunks.forEach((chunk, index) => {
+    journalStore.put(chunk, transactionJournalChunkKey(record.id, index));
+  });
+  putStoredTransactionRecord(transaction, storedTransactionRecord(record));
+}
+
+/** Creates the record; a duplicate id fails on the header's `add`, before any chunk lands. */
+function addTransactionRecord(transaction: IDBTransaction, record: TransactionRecord): void {
+  transaction.objectStore("transactions").add(storedTransactionRecord(record), record.id);
+  const journalStore = transaction.objectStore(TRANSACTION_JOURNAL_STORE);
+  packTransactionJournal(record.pendingBlockIds, record.pendingSegmentIds).forEach(
+    (chunk, index) => {
+      journalStore.put(chunk, transactionJournalChunkKey(record.id, index));
+    },
+  );
+}
+
+function deleteTransactionRecord(
+  transaction: IDBTransaction,
+  stored: StoredTransactionRecord,
+): void {
+  const journalStore = transaction.objectStore(TRANSACTION_JOURNAL_STORE);
+  for (let index = 0; index < stored.journalChunkCount; index += 1) {
+    journalStore.delete(transactionJournalChunkKey(stored.id, index));
+  }
+  transaction.objectStore("transactions").delete(stored.id);
+}
+
+/** The journal's last chunk, which an append tops up; undefined for an empty journal. */
+async function readTransactionJournalTail(
+  transaction: IDBTransaction,
+  stored: StoredTransactionRecord,
+): Promise<TransactionJournalChunk | undefined> {
+  const lastIndex = stored.journalChunkCount - 1;
+  if (lastIndex < 0) return undefined;
+  const tail = await readTransactionJournalChunk(
+    transaction.objectStore(TRANSACTION_JOURNAL_STORE),
+    stored.id,
+    lastIndex,
+  );
+  if (tail === undefined) {
+    throw corruption(`transactions/${stored.id}/journal/${String(lastIndex)}`, "chunk is missing");
+  }
+  return tail;
+}
+
+/**
+ * Appends ids after the journal's tail: the tail (as readTransactionJournalTail returned it) is
+ * topped up and followed by new chunks, so the cost follows the ids added rather than the ids
+ * already journaled. Returns the header with its counts advanced; revision and timestamps are
+ * the caller's.
+ */
+function appendTransactionJournalChunks(
+  transaction: IDBTransaction,
+  stored: StoredTransactionRecord,
+  tail: TransactionJournalChunk | undefined,
+  addedBlockIds: readonly string[],
+  addedSegmentIds: readonly string[],
+): StoredTransactionRecord {
+  const journalStore = transaction.objectStore(TRANSACTION_JOURNAL_STORE);
+  const lastIndex = stored.journalChunkCount - 1;
+  const pendingBlockCount = stored.pendingBlockCount + addedBlockIds.length;
+  const pendingSegmentCount = stored.pendingSegmentCount + addedSegmentIds.length;
+  const journalChunkCount = transactionJournalChunkCount(pendingBlockCount, pendingSegmentCount);
+  // A partial tail absorbs the first ids; a full tail (or no tail) starts the next chunk. The
+  // repacked tail keeps blocks before segments, the layout packTransactionJournal produces, so
+  // an append and a rewrite agree about what a chunk may hold.
+  const tailEntries = tail === undefined ? 0 : tail.blockIds.length + tail.segmentIds.length;
+  const topUp = tail !== undefined && tailEntries < TRANSACTION_JOURNAL_CHUNK_ENTRIES;
+  const firstIndex = topUp ? lastIndex : lastIndex + 1;
+  const chunks = packTransactionJournal(
+    [...(topUp ? tail.blockIds : []), ...addedBlockIds],
+    [...(topUp ? tail.segmentIds : []), ...addedSegmentIds],
+  );
+  if (firstIndex + chunks.length !== journalChunkCount) {
+    throw corruption(`transactions/${stored.id}`, "journal append does not reach the chunk count");
+  }
+  chunks.forEach((chunk, offset) => {
+    journalStore.put(chunk, transactionJournalChunkKey(stored.id, firstIndex + offset));
+  });
+  return { ...stored, journalChunkCount, pendingBlockCount, pendingSegmentCount };
 }
 
 function asTableRecord(value: unknown, location = "catalog/table"): TableRecord {
@@ -13023,10 +13649,7 @@ async function readActiveTransactionRecord(
   id: string,
   expectedRevision: number,
 ): Promise<TransactionRecord> {
-  const value: unknown = await requestResult<unknown>(
-    transaction.objectStore("transactions").get(id),
-  );
-  const record = value === undefined ? undefined : asTransactionRecord(value);
+  const record = await readTransactionRecord(transaction, id);
   if (record?.revision !== expectedRevision || record.status !== "active") {
     throw new TransactionRecordConflictError(id, expectedRevision, record?.revision ?? null);
   }
@@ -13097,15 +13720,11 @@ async function assertCompactionJobReferences(
     }
   }
   if (job.transactionId !== null) {
-    const value: unknown = await requestResult(
-      transaction.objectStore("transactions").get(job.transactionId),
-    );
-    if (value === undefined) {
+    if ((await readTransactionRecord(transaction, job.transactionId)) === undefined) {
       throw new Error(
         `Compaction job ${job.id} references missing transaction: ${job.transactionId}`,
       );
     }
-    asTransactionRecord(value, job.transactionId);
   }
   if (job.state === "ready" || job.state === "published") {
     for (const outputId of compactionOutputSegmentIds(job)) {
@@ -13389,7 +14008,7 @@ function countVisibleLevelZeroSegments(
               `owning transaction ${segment.transactionId} is missing`,
             );
           }
-          const owner = asTransactionRecord(ownerRequest.result, segment.transactionId);
+          const owner = asStoredTransactionRecord(ownerRequest.result, segment.transactionId);
           statuses.set(owner.id, owner.status);
           if (owner.status === "committed") count += 1;
           cursor.continue();
@@ -13427,9 +14046,7 @@ async function compactionJobRemovalPreservesProvenance(
     if (segment.id !== key) throw corruption(`segments/${key}`, `record declares id ${segment.id}`);
     for (const blockId of segmentBlockIds(segment)) rootedBlocks.add(blockId);
   });
-  await visitObjectStoreSequentially(transaction.objectStore("transactions"), (value, key) => {
-    if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-    const record = asTransactionRecord(value, key);
+  await visitTransactionRecords(transaction, (record) => {
     for (const blockId of record.pendingBlockIds) rootedBlocks.add(blockId);
     for (const segmentId of record.pendingSegmentIds) rootedSegments.add(segmentId);
   });
@@ -13486,7 +14103,7 @@ async function garbageCollectionPinsInTransaction(
   // Validate every status once before using the active index for physical roots below. A
   // malformed status must not disappear from reachability merely because it misses that index.
   await visitObjectStoreReadBatches(transaction.objectStore("transactions"), (value) => {
-    const record = asTransactionRecord(value);
+    const record = asStoredTransactionRecord(value);
     if (record.status === "active") {
       pin(record.snapshotVersion);
     }
@@ -13504,11 +14121,8 @@ async function garbageCollectionPinsInTransaction(
     if (isTerminalCompactionJob(job)) return;
     pin(job.sourceManifestVersion);
     if (job.transactionId === null) return;
-    const transactionValue: unknown = await requestResult(
-      transaction.objectStore("transactions").get(job.transactionId),
-    );
-    if (transactionValue === undefined) return;
-    const linkedTransaction = asTransactionRecord(transactionValue);
+    const linkedTransaction = await readStoredTransactionRecord(transaction, job.transactionId);
+    if (linkedTransaction === undefined) return;
     if (linkedTransaction.status !== "committed") return;
     if (linkedTransaction.committedVersion === null) {
       throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
@@ -14137,7 +14751,7 @@ function isTerminalCompactionJob(record: CompactionJobRecord): boolean {
 }
 
 function assertGenericTransactionUpdateAllowed(
-  record: TransactionRecord,
+  record: Pick<TransactionRecord, "status">,
   update: TransactionRecordUpdate,
 ): void {
   if (record.status !== "active") {
@@ -14171,8 +14785,7 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
     }
   }
   for (const id of candidates.candidateTransactionIds) {
-    const value: unknown = await requestResult(transaction.objectStore("transactions").get(id));
-    const record = value === undefined ? undefined : asTransactionRecord(value);
+    const record = await readStoredTransactionRecord(transaction, id);
     if (
       record === undefined ||
       (record.status !== "aborted" &&
@@ -14196,12 +14809,9 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   }
   const blockHasProvenance = async (id: string): Promise<boolean> => {
     if (manifestProvenBlockIds.has(id)) return true;
-    const transactionProven = await visitObjectStoreSequentially(
-      transaction.objectStore("transactions"),
-      (value) => {
-        const record = asTransactionRecord(value);
-        return record.status === "aborted" && record.pendingBlockIds.includes(id);
-      },
+    const transactionProven = await visitTransactionRecords(
+      transaction,
+      (record) => record.status === "aborted" && record.pendingBlockIds.includes(id),
     );
     if (transactionProven) return true;
     return visitObjectStoreSequentially(transaction.objectStore("gc"), (value, key) => {
@@ -14243,17 +14853,12 @@ async function collectBoundedPhysicalRootsInTransaction(
       else if (!ownerBlockRoots.has(id)) ownerBlockRootsComplete = false;
     }
   };
-  await visitIndexPartitionSequentially(
-    transaction.objectStore("transactions").index(TRANSACTION_STATUS_INDEX),
-    "active",
-    (value) => {
-      const record = asTransactionRecord(value);
-      if (record.status !== "active") return;
-      rememberOwnerBlocks(record.pendingBlockIds);
-      for (const id of record.pendingSegmentIds)
-        if (candidateSegments.has(id)) directSegmentRoots.add(id);
-    },
-  );
+  await visitActiveTransactionRecords(transaction, (record) => {
+    if (record.status !== "active") return;
+    rememberOwnerBlocks(record.pendingBlockIds);
+    for (const id of record.pendingSegmentIds)
+      if (candidateSegments.has(id)) directSegmentRoots.add(id);
+  });
   await visitObjectStoreSequentially(transaction.objectStore("gc"), (value, key) => {
     const job = asCompactionJobAtMaintenanceKey(value, key);
     if (job === undefined) return;
@@ -14276,13 +14881,9 @@ async function collectBoundedPhysicalRootsInTransaction(
     if (cached !== undefined) return cached;
     let rooted = ownerBlockRoots.has(id);
     if (!rooted && !ownerBlockRootsComplete) {
-      rooted = await visitIndexPartitionSequentially(
-        transaction.objectStore("transactions").index(TRANSACTION_STATUS_INDEX),
-        "active",
-        (value) => {
-          const record = asTransactionRecord(value);
-          return record.status === "active" && record.pendingBlockIds.includes(id);
-        },
+      rooted = await visitActiveTransactionRecords(
+        transaction,
+        (record) => record.status === "active" && record.pendingBlockIds.includes(id),
       );
       if (!rooted) {
         rooted = await visitObjectStoreSequentially(transaction.objectStore("gc"), (value, key) => {
@@ -14311,14 +14912,12 @@ async function collectBoundedPhysicalRootsInTransaction(
   const rootedBlockIds = new Set<string>();
   const rootedSegmentIds = new Set<string>();
   const segmentStore = transaction.objectStore("segments");
-  const transactionStore = transaction.objectStore("transactions");
   for (const id of candidateSegmentIds) {
     const value: unknown = await requestResult(segmentStore.get(id));
     if (value === undefined) continue;
     const segment = asSegmentRecord(value);
     const ids = segmentBlockIds(segment);
-    const ownerValue: unknown = await requestResult(transactionStore.get(segment.transactionId));
-    const owner = ownerValue === undefined ? undefined : asTransactionRecord(ownerValue);
+    const owner = await readStoredTransactionRecord(transaction, segment.transactionId);
     let allBlocksRooted = ids.length > 0;
     for (const blockId of ids) {
       if (await isDirectBlockRoot(blockId)) continue;
@@ -15546,7 +16145,7 @@ async function pendingCatalogReservations(
   let retainedBytes = 0;
   await visitObjectStoreSequentially(store, (value, key) => {
     if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-    const transaction = asTransactionRecord(value, key);
+    const transaction = asStoredTransactionRecord(value, key);
     if (
       transaction.id === excludeTransactionId ||
       transaction.status !== "active" ||
@@ -15841,7 +16440,7 @@ async function assertPinnedHistoryAdmission(
     cutoff: string;
     currentVersion: number | null;
     replacementLease?: LeaseRecord;
-    replacementTransaction?: TransactionRecord;
+    replacementTransaction?: Pick<TransactionRecord, "status" | "snapshotVersion" | "expiresAt">;
     excludeLeaseId?: string;
     excludeTransactionId?: string;
     prospectiveRemovedBlockIds?: ReadonlySet<string>;
@@ -15878,7 +16477,7 @@ async function assertPinnedHistoryAdmission(
   }
   if (transaction.objectStoreNames.contains("transactions")) {
     const transactions = transaction.objectStore("transactions");
-    // Terminal journals can grow to the durable hard limit before collection. They cannot pin
+    // Terminal records accumulate up to the durable hard limit before collection. They cannot pin
     // history, so walk only the bounded active partition instead of rescanning every historical
     // transaction on each begin and commit.
     await visitIndexPartitionSequentially(
@@ -15887,7 +16486,7 @@ async function assertPinnedHistoryAdmission(
       (value, key) => {
         if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
         if (key === input.excludeTransactionId) return;
-        const record = asTransactionRecord(value, key);
+        const record = asStoredTransactionRecord(value, key);
         if (record.status !== "active") {
           throw corruption(`transactions/${key}`, "status index does not match its record");
         }

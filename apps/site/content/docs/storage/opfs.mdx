@@ -12,11 +12,12 @@ const store = await OpfsBlockStore.open({
 });
 ```
 
-| Option       | Default      | Effect                                                                            |
-| ------------ | ------------ | --------------------------------------------------------------------------------- |
-| `name`       | —            | The database directory name. Two stores with the same name are the same database. |
-| `durability` | `"strict"`   | `"relaxed"` allows deferred final flushes for more write throughput.              |
-| `root`       | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                          |
+| Option         | Default      | Effect                                                                             |
+| -------------- | ------------ | ---------------------------------------------------------------------------------- |
+| `name`         | —            | The database directory name. Two stores with the same name are the same database.  |
+| `durability`   | `"strict"`   | `"relaxed"` allows deferred final flushes for more write throughput.               |
+| `root`         | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                           |
+| `onDiagnostic` | —            | Hears background failures: a failed checkpoint or cleanup, an election that threw. |
 
 The store lives in the [Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
 and is built around one especially fast browser feature: a synchronous access handle that stays
@@ -31,12 +32,14 @@ Anything with OPFS synchronous access handles: current Chrome, Firefox, Safari 1
 Two gaps to know about: Safari's private browsing has no OPFS at all, and the store must live in
 a dedicated worker (`{ kind: "opfs", name }` through the worker client just works; the main thread cannot
 hold synchronous handles). Where OPFS is unavailable, [IndexedDB](/docs/storage/indexeddb) is the
-durable fallback:
+durable fallback, and the worker client can make that choice itself:
 
 ```ts
-const supported = "storage" in navigator && "getDirectory" in navigator.storage;
-const store = { kind: supported ? ("opfs" as const) : ("indexeddb" as const), name: "shop" };
+const store = { kind: "auto", name: "shop" }; // OPFS where the worker can hold it, else IndexedDB
 ```
+
+The choice is remembered per database name, so a database never silently reopens empty on the
+other store; see [choosing the store at runtime](/docs/engine/workers#choosing-the-store-at-runtime).
 
 ## One leader, held handles
 
@@ -77,17 +80,43 @@ through both follower and database worker RPC. Established live subscriptions re
 good result and retry these errors with backoff. Initial subscription and explicit reads can
 reject with the typed error; boot code can retry, including a failed `migrate()` catalog read.
 
-An in-flight mutation instead rejects with
-`OpfsUncertainOutcomeError`: the old leader may have durably committed it before its reply was
-lost, so automatically sending it to the new leader could execute it twice. Reconcile the
-operation's stable ids or revisions before deciding whether to retry. Correctness never rides on
-a message; the channel affects how fast multi-tab work moves, never whether it is right.
+A follower gives up on a leader only after a full second of silence, and a leader is never
+silent while it holds a request: it posts a keepalive every half-timeout for each admitted
+request, and announces a hold before a synchronous checkpoint sized from the previous one. A
+connection that is asked to run a request while it is not leading — after a handover, after
+closing, or when leadership moved while the request waited — answers with a decline, which
+proves the request never ran, so the follower simply finds the leader and sends it again. A
+leader that hands over or closes says goodbye first, and answers or declines everything it still
+holds. Even when a leader does fall silent, a mutation is not given up on at once: the follower
+pings, and a leader that answers the ping is alive and still holds the request. When the leader
+really is gone, the request goes to whoever leads next, with the same identity and the time it
+was first sent, and the log decides. Every frame a follower's mutation appended carries that
+request's identity, and each checkpoint carries a ledger of recently served requests with the
+values they returned, so a recovering leader answers a re-sent request from the log, or runs it
+fresh when the log proves it never ran. Three things are left to report as
+`OpfsUncertainOutcomeError`: a request first sent before the recovered ledger's coverage
+begins (its entries are kept for ten minutes, 65,536 requests, or 8 MiB of returned values), a
+request whose frame was durable but whose leader died in the instant before it recorded the
+value it returned, and a request whose returned value was larger than 64 KiB — a staging call
+answers with the whole transaction record, and the ledger records that such a request ran
+without keeping what it answered. The engine's transaction layer recovers a lost staging or
+commit acknowledgement by reading the record back, so that last case never reaches an
+application through `write()`. The mutation may have committed in any of these cases; reconcile the operation's stable ids or revisions
+before deciding whether to retry. Correctness never rides on a message; the channel affects how
+fast multi-tab work moves, never whether it is right.
 Temporary spill writes are reserved in the leader's durable ledger before a follower writes the
 file, so all tabs share the same page, run, and byte limits.
 
 The store also prefers to put leadership where the work is: the worker client reports page
-visibility, and a background leader yields to a foreground tab that asks. The tab the user is
-looking at is normally the tab holding the fast path.
+visibility, and a background leader yields to a foreground tab that asks. A leader that goes
+hidden while another tab stays visible announces so, and the visible tab asks. A leader yields
+at most once every three seconds; a bid that arrives sooner is honored when the cooldown ends,
+so tabs switched back and forth still settle on the visible one. After yielding, the old leader
+stays out of elections for one and a half seconds so the bidder can win the handles, then takes
+them back only if nobody did. A hidden leader with other connections around and nothing to do
+for fifteen seconds lets go of its handles on its own, because a browser may freeze a hidden
+tab, worker and all, and a frozen leader can neither serve nor yield; its own next operation
+simply elects again. The tab the user is looking at is normally the tab holding the fast path.
 
 The pieces used by the leader — the record engine, write-ahead log, packed data files, and
 checkpoint encoding — are published as
@@ -123,13 +152,15 @@ Collection keeps every retained segment’s block references intact, including r
 Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
 automatically repair a store already affected by missing referenced blocks.
 
-Layout 5 is the locked native OPFS contract. Its checkpoint includes the structural `schemaEpoch`
-used to reject a staged write after incompatible DDL. An unknown or pre-v1 layout marker is rejected
-without replaying or mutating its WAL, checkpoint, or extents; the adapter never guesses an old
-record shape forward. `StorageFormatVersionError` reports the found and supported versions; it is
-not storage corruption and never triggers automatic repair or deletion. A newer marker means to use
-the build that wrote it. For unsupported development data, use a matching older build to export a
-framed snapshot, or delete it only after deciding that its data is disposable.
+Layout 6 is the locked native OPFS contract. Its checkpoint includes the structural `schemaEpoch`
+used to reject a staged write after incompatible DDL, and the served-request ledger described
+below. An unknown or pre-v1 layout marker is rejected without replaying or mutating its WAL,
+checkpoint, or extents; the adapter never guesses an old record shape forward, and there is no
+in-place upgrade from layout 5. `StorageFormatVersionError` reports the found and supported
+versions; it is not storage corruption and never triggers automatic repair or deletion. A newer
+marker means to use the build that wrote it. For unsupported development data, use a matching
+older build to export a framed snapshot, or delete it only after deciding that its data is
+disposable.
 
 Every extent placement records its offset, length, and a CRC over all stored bytes. The checksum
 belongs to the placement layer rather than a block codec, so recovery verifies column blocks,
@@ -209,7 +240,8 @@ most 4,096 active transactions, 4,096 leases, 1,024 temporary owners, 1,024 acti
 one active garbage-collection job, 1,024 active UNIQUE builds, 128 active full-text builds,
 128 active secondary-index builds, and 4,096 catalog table/view records, including a table owned
 by an unpublished transaction. Active transaction journals are
-capped in aggregate at 65,536 staged blocks, 65,536 staged segments, and 512 MiB. Staged UNIQUE,
+capped in aggregate at 1,048,576 staged blocks, 1,048,576 staged segments, and 512 MiB; a single
+transaction's journal has no length limit of its own. Staged UNIQUE,
 full-text, and secondary-index generations share a 1 GiB and 16,777,216-entry ceiling. The catalog
 also has a 64 MiB aggregate ceiling measured as its exact UTF-8 record-wire bytes. Manifest
 history holds at most 65,536 summaries or 64 MiB of reservation bytes, and segment metadata holds
@@ -258,16 +290,22 @@ enforced.
 Several tabs may open the same database at once; every operation from every tab lands in one
 ordered log, so readers never see half of anything. Reads wait for recovery after a refused WAL
 append instead of observing its tentative state. Autocommit writers coordinate admission through
-Web Locks; explicit scopes and uncoordinated writers retain optimistic conflicts, as on IndexedDB. The moving parts differ from the IndexedDB adapter in one
-honest way: multi-tab _responsiveness_ uses `BroadcastChannel` (universal since 2022), while
-correctness rests entirely on the storage lock and the checksummed log. A browser with no
-channel at all would still be safe — one tab at a time would hold the database.
+Web Locks; explicit scopes and uncoordinated writers retain optimistic conflicts, as on IndexedDB.
+That admission lock is an optimization, never the correctness: a writer that has waited ten
+seconds for a holder that will not let go (a tab the browser paused with the lock in hand) goes
+ahead without it, reports the wait through `onBackgroundError`, and resolves any conflict
+through the same compare-and-swap retry as an uncoordinated writer. The moving parts differ from
+the IndexedDB adapter in one honest way: multi-tab _responsiveness_ uses `BroadcastChannel`
+(universal since 2022), while correctness rests entirely on the storage lock and the checksummed
+log. A browser with no channel at all would still be safe — one tab at a time would hold the
+database.
 
 Browsers can suspend a hidden leader while it still owns exclusive file handles. Foreground
 leadership preference is cooperative: the old leader must run and yield before another worker
-can take over. A frozen owner can therefore delay other tabs or cause a request timeout; durability
-does not guarantee uninterrupted availability. Resume or terminate that owner to release its
-handles, then reconcile any unknown write outcome before retrying. Background
+can take over, which is why an idle hidden leader releases its handles ahead of time. A leader
+frozen while busy can still delay other tabs or time out a request; durability does not
+guarantee uninterrupted availability. Resume or terminate that owner to release its handles,
+then reconcile any unknown write outcome before retrying. Background
 [maintenance](/docs/storage/maintenance) is stepped and resumable for the same reason.
 
 ## Choosing between OPFS and IndexedDB

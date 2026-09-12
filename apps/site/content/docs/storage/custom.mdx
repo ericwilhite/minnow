@@ -49,10 +49,16 @@ the new version, finishes its segments, updates keys and full-text data, and mar
 complete in one saved step. A crash cannot leave half of that change visible.
 
 OPFS follower RPC has one explicit transport-loss exception. `OpfsUncertainOutcomeError` means a
-leader changed after receiving the named mutation but before its reply arrived, so the whole
-operation may have committed. Preserve that class and its `method` field across any wrapper or
-worker boundary; inspect or reopen the database instead of blindly retrying. An ordinary `Error`
-still means no effect and must never be used to hide an uncertain outcome.
+leader vanished after receiving the named mutation, its reply was lost, and the log the next
+leader recovered can neither answer the re-sent request nor prove it never ran: the request was
+first sent before the recovered ledger's coverage begins, the leader died in the instant
+between the mutation's frame and the frame that records its return value, or the return value
+was too large for the ledger to keep (a staging call's answer is the whole transaction record). Every other loss is
+resolved from the log — a re-send is answered with the value the mutation already returned, or
+run once because the log proves it never ran — and a graceful handover never raises the error
+at all. Preserve the class and its `method` field across any wrapper or worker boundary;
+inspect or reopen the database instead of blindly retrying. An ordinary `Error` still means no
+effect and must never be used to hide an uncertain outcome.
 
 Artifact journaling has the same required boundary. `stageTransactionArtifacts` saves new blocks
 and segments and appends their IDs to the active transaction in one operation.
@@ -64,11 +70,14 @@ fallback: a crash between a record update and byte deletion would otherwise crea
 uncollectable orphan or a journal pointing at missing data.
 
 Keep each staging call within the exported `MAX_TRANSACTION_STAGE_BLOCKS`,
-`MAX_TRANSACTION_STAGE_SEGMENTS`, and `MAX_TRANSACTION_STAGE_BYTES` limits, and refuse a durable
-journal above `MAX_TRANSACTION_PENDING_BLOCKS` or `MAX_TRANSACTION_PENDING_SEGMENTS`. Check these
-bounds before opening a write transaction. The engine splits larger writes into resumable batches;
-the ceilings prevent one caller or abandoned transaction from creating an unbounded storage
-transaction or control record.
+`MAX_TRANSACTION_STAGE_SEGMENTS`, and `MAX_TRANSACTION_STAGE_BYTES` limits, checked before opening
+a write transaction. The engine splits larger writes into resumable batches; the per-call ceiling
+prevents one caller from creating an unbounded storage transaction. A transaction's journal itself
+has no fixed length: only the aggregate staged-artifact quotas bound it, so an adapter must not
+rewrite or re-verify the whole journal on every staging call — append to it, and validate what
+this call adds. A generic `updateTransaction` that carries pending ids must extend the journal
+in order; the IndexedDB adapter refuses one that reorders or drops journaled ids, and the
+engine never sends one.
 
 Transaction liveness is part of that boundary. Persist `ownerId` and `expiresAt` with the
 transaction itself. `renewTransaction` may extend only a matching, still-active owner whose old

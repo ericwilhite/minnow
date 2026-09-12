@@ -259,7 +259,7 @@ function exportedEngineErrorConstructors(): Array<readonly [string, StorageError
   const constructors: Array<readonly [string, StorageErrorConstructor]> = [];
   for (const [name, value] of Object.entries(engineErrors)) {
     if (typeof value === "function" && value.prototype instanceof Error) {
-      constructors.push([name, value]);
+      constructors.push([name, value as StorageErrorConstructor]);
     }
   }
   return constructors.sort(([left], [right]) => left.localeCompare(right));
@@ -585,7 +585,9 @@ async function createWorkerWriteTable(database: MinnowDatabase): Promise<void> {
     columns: [
       { name: "id", type: "number" },
       { name: "value", type: "string" },
-      // Two stages exceed the 64-block local batch and exercise durable staging/abort.
+      // Two stages exceed the 64-block local batch and exercise durable staging/abort. The
+      // trigger below keeps every stage per statement: without one, a scope holds its
+      // statements in a write set until something reads, checkpoints, or commits it.
       ...Array.from({ length: 31 }, (_, index) => ({
         name: `padding_${String(index)}`,
         type: "number" as const,
@@ -593,6 +595,13 @@ async function createWorkerWriteTable(database: MinnowDatabase): Promise<void> {
       })),
     ],
   });
+  await database.createTable({
+    name: "worker_log",
+    columns: [{ name: "value", type: "string" }],
+  });
+  await database.execute(
+    "CREATE TRIGGER worker_writes_log AFTER INSERT ON worker_writes BEGIN INSERT INTO worker_log (value) VALUES (NEW.value); END",
+  );
 }
 
 async function expectWorkerRpcPending(rpc: Promise<RpcResponse>): Promise<void> {
@@ -1011,7 +1020,7 @@ describe("MinnowDatabaseClient", () => {
       expect(
         (
           await raw.call(handleId, "stage", [
-            "insertBatch",
+            "upsertBatch",
             "worker_writes",
             { columns: { id: [1], value: ["one"] } },
           ])
@@ -1020,7 +1029,7 @@ describe("MinnowDatabaseClient", () => {
       expect(
         (
           await raw.call(handleId, "stage", [
-            "insertBatch",
+            "upsertBatch",
             "worker_writes",
             { columns: { id: [2], value: ["two"] } },
           ])
@@ -1099,7 +1108,7 @@ describe("MinnowDatabaseClient", () => {
       expect(
         (
           await raw.call(handleId, "stage", [
-            "insertBatch",
+            "upsertBatch",
             "worker_writes",
             { columns: { id: [1], value: ["one"] } },
           ])
@@ -1107,7 +1116,7 @@ describe("MinnowDatabaseClient", () => {
       ).toBe("rpc-result");
       store.pauseStages = true;
       const slowStage = raw.call(handleId, "stage", [
-        "insertBatch",
+        "upsertBatch",
         "worker_writes",
         { columns: { id: [2], value: ["two"] } },
       ]);
@@ -1164,12 +1173,12 @@ describe("MinnowDatabaseClient", () => {
         if (opened.kind !== "rpc-result") throw new Error("Expected write handle");
         const handleId = (opened.result as { handleId: string }).handleId;
         await raw.call(handleId, "stage", [
-          "insertBatch",
+          "upsertBatch",
           "worker_writes",
           { columns: { id: [1], value: ["one"] } },
         ]);
         await raw.call(handleId, "stage", [
-          "insertBatch",
+          "upsertBatch",
           "worker_writes",
           { columns: { id: [2], value: ["two"] } },
         ]);
@@ -1206,7 +1215,7 @@ describe("MinnowDatabaseClient", () => {
       expect(
         (
           await raw.call(handleId, "stage", [
-            "insertBatch",
+            "upsertBatch",
             "worker_writes",
             { columns: { id: [1], value: ["one"] } },
           ])
@@ -1242,12 +1251,12 @@ describe("MinnowDatabaseClient", () => {
     if (opened.kind !== "rpc-result") throw new Error("Expected write handle");
     const handleId = (opened.result as { handleId: string }).handleId;
     await raw.call(handleId, "stage", [
-      "insertBatch",
+      "upsertBatch",
       "worker_writes",
       { columns: { id: [1], value: ["one"] } },
     ]);
     await raw.call(handleId, "stage", [
-      "insertBatch",
+      "upsertBatch",
       "worker_writes",
       { columns: { id: [2], value: ["two"] } },
     ]);
@@ -1279,12 +1288,12 @@ describe("MinnowDatabaseClient", () => {
       if (opened.kind !== "rpc-result") throw new Error("Expected write handle");
       const handleId = (opened.result as { handleId: string }).handleId;
       await raw.call(handleId, "stage", [
-        "insertBatch",
+        "upsertBatch",
         "worker_writes",
         { columns: { id: [1], value: ["one"] } },
       ]);
       await raw.call(handleId, "stage", [
-        "insertBatch",
+        "upsertBatch",
         "worker_writes",
         { columns: { id: [2], value: ["two"] } },
       ]);
@@ -1312,13 +1321,13 @@ describe("MinnowDatabaseClient", () => {
     if (opened.kind !== "rpc-result") throw new Error("Expected write handle");
     const handleId = (opened.result as { handleId: string }).handleId;
     await raw.call(handleId, "stage", [
-      "insertBatch",
+      "upsertBatch",
       "worker_writes",
       { columns: { id: [1], value: ["one"] } },
     ]);
     store.pauseStages = true;
     const stage = raw.call(handleId, "stage", [
-      "insertBatch",
+      "upsertBatch",
       "worker_writes",
       { columns: { id: [2], value: ["two"] } },
     ]);
@@ -2955,6 +2964,7 @@ describe("MinnowDatabaseClient", () => {
     await live.refresh();
     expect(changes.length).toBe(3);
     const stats = await live.stats();
+    expect(Array.isArray(stats.groups)).toBe(true);
     expect(stats.sweeps).toBeGreaterThanOrEqual(1);
     await live.close();
   });

@@ -1,4 +1,4 @@
 {
   "title": "Engine",
-  "pages": ["index", "transactions", "workers", "memory"]
+  "pages": ["index", "transactions", "workers", "errors", "memory"]
 }

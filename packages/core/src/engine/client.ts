@@ -7,44 +7,52 @@ import {
   BlockReadBatchTooLargeError,
   CompactionBacklogError,
   CompactionJobConflictError,
+  type CompactionJobRecord,
+  ConnectionLostError,
   GarbageCollectionJobConflictError,
+  type GarbageCollectionJobRecord,
   IndexedDbSchemaUpgradeBlockedError,
+  type InterruptedSnapshotImport,
+  type InterruptedSnapshotImportAbortResult,
   LeaseConflictError,
   LeaseExpiredError,
   LeaseOwnerConflictError,
+  OpfsCoordinationError,
+  OpfsDatabaseInUseError,
+  OpfsUncertainOutcomeError,
   PostingBuildConflictError,
-  SnapshotManifestMissingError,
-  SnapshotImportConflictError,
   SchemaConflictError,
+  SnapshotImportConflictError,
+  SnapshotManifestMissingError,
+  StorageCorruptionError,
+  StorageFormatVersionError,
+  type StorageIntegrityMode,
+  type StorageIntegrityReport,
   StorageResourceLimitError,
+  type StorageStats,
   TableInUseError,
   TableRecordConflictError,
   TempOwnerConflictError,
   TransactionRecordConflictError,
+  UniqueIndexCoverageError,
   UniqueKeyBuildConflictError,
   UniqueKeyConflictError,
-  UniqueIndexCoverageError,
+  UnknownOutcomeError,
   WriteConflictError,
-  StorageCorruptionError,
-  StorageFormatVersionError,
-  OpfsCoordinationError,
-  OpfsDatabaseInUseError,
-  OpfsUncertainOutcomeError,
-  type CompactionJobRecord,
-  type GarbageCollectionJobRecord,
-  type StorageIntegrityMode,
-  type StorageIntegrityReport,
-  type StorageStats,
-  type InterruptedSnapshotImport,
-  type InterruptedSnapshotImportAbortResult,
 } from "../storage/types.js";
 import { MAX_SNAPSHOT_STREAM_CHUNK_BYTES, type SnapshotLoadProgress } from "../storage/snapshot.js";
 import {
-  parseRpcResponse,
   MAX_DATABASE_RPC_IN_FLIGHT,
+  WORKER_DIAGNOSTIC_HANDLE_ID,
+  isWorkerErrorReport,
+  parseRpcResponse,
+  MIN_WORKER_KEEPALIVE_INTERVAL_MS,
+  WORKER_KEEPALIVE_INTERVAL_MS,
   protocolVersion,
+  rehydrateError as rehydrateSerializedError,
   type RpcResponse,
   type SerializedError,
+  type WorkerErrorKind,
 } from "../worker-protocol/index.js";
 import {
   definedVectors,
@@ -103,6 +111,8 @@ import {
   DatabaseReadBacklogError,
   TransactionExpiredError,
   DatabaseWorkerTimeoutError,
+  DatabaseWorkerFailedError,
+  DatabaseStoreUnavailableError,
   DatabaseWorkerOutcomeUnknownError,
   LiveQueryLimitError,
   MissingKeyError,
@@ -146,7 +156,12 @@ import type {
   TableName,
 } from "./schema.js";
 import { serializeSchema, type WireMigrationStep } from "./schema-wire.js";
-import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "./worker-host.js";
+import type {
+  DatabaseInitPayload,
+  OpenedStoreKind,
+  StoreDescriptor,
+  WireDatabaseOptions,
+} from "./worker-host.js";
 
 /**
  * Main-thread async proxy of the full database API, talking to a worker that runs
@@ -166,9 +181,20 @@ import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "
 export interface ClientTransport {
   postMessage(message: unknown, options?: { transfer: ArrayBuffer[] }): void;
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
-  addEventListener(type: "error" | "messageerror", listener: () => void): void;
+  /**
+   * The client's listeners accept the Worker's own `ErrorEvent` and `MessageEvent`, and read
+   * the message, file, and line off an error event when they are there. A transport that has
+   * no such events to give may invoke them with no argument.
+   */
+  addEventListener(
+    type: "error" | "messageerror",
+    listener: (event?: ErrorEvent | MessageEvent<unknown>) => void,
+  ): void;
   removeEventListener?(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
-  removeEventListener?(type: "error" | "messageerror", listener: () => void): void;
+  removeEventListener?(
+    type: "error" | "messageerror",
+    listener: (event?: ErrorEvent | MessageEvent<unknown>) => void,
+  ): void;
   terminate?(): void;
 }
 
@@ -187,8 +213,36 @@ export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = Untyped
   store?: StoreDescriptor;
   /** Cloneable database options applied when the worker constructs the database. */
   databaseOptions?: WireDatabaseOptions;
-  /** Maximum response wait, including initialization; defaults to 60 seconds. */
+  /**
+   * How long a call may go without a word from the worker before the connection is declared
+   * dead; defaults to 60 seconds and also covers initialization. The worker reports every few
+   * seconds while it works on a call, so a large batch write is bounded by progress, not by wall
+   * time — up to ten times this value in all.
+   */
   requestTimeoutMs?: number;
+  /**
+   * Hears every failure inside the worker that belongs to no call: uncaught exceptions,
+   * unhandled rejections, failed background maintenance, and multi-tab coordination errors,
+   * plus the transport's own error events. Without a handler each one is written to
+   * `console.error`, so nothing that goes wrong in the worker stays in the worker.
+   */
+  onWorkerError?: (event: DatabaseWorkerErrorEvent) => void;
+  /**
+   * Called once when the connection is lost — the worker raised an unhandled error, sent an
+   * unreadable frame, or fell silent past `requestTimeoutMs`. Every later call on this client
+   * fails the same way until `reopen()`; use this hook to reopen and rebuild handles.
+   */
+  onConnectionLost?: (error: ConnectionLostError) => void;
+}
+
+/** A worker failure that belongs to no call, delivered to `onWorkerError`. */
+export interface DatabaseWorkerErrorEvent {
+  /** `"transport"` is the Worker object's own error or messageerror event. */
+  kind: WorkerErrorKind | "transport";
+  /** Where in the worker it happened: "opfs election", "auto collection", a file and line. */
+  context: string;
+  /** Rehydrated like a call failure: `instanceof` works, the stack is the worker's. */
+  error: Error;
 }
 
 export interface ClientLiveQueryOptions {
@@ -253,7 +307,16 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   cleanup?: () => void;
+  /** The worker reported it is still working on this call; the deadline counts silence. */
+  keepalive?: () => void;
 }
+
+/**
+ * How far a keepalive can stretch a call past its deadline, as a multiple of the deadline. The
+ * deadline measures silence, so a long batch write survives as long as the worker keeps
+ * reporting; this cap still ends a call whose worker is alive but wedged forever.
+ */
+const MAX_KEEPALIVE_EXTENSION = 10;
 
 interface RpcCallControls {
   timeoutMs?: number;
@@ -275,6 +338,8 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     TransactionExpiredError,
     DatabaseWorkerTimeoutError,
     DatabaseWorkerOutcomeUnknownError,
+    DatabaseWorkerFailedError,
+    DatabaseStoreUnavailableError,
     LiveQueryLimitError,
     SqlCompileError,
     QueryMemoryBudgetError,
@@ -304,34 +369,13 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     OpfsCoordinationError,
     OpfsDatabaseInUseError,
     OpfsUncertainOutcomeError,
+    UnknownOutcomeError,
+    ConnectionLostError,
   ].map((constructor) => [constructor.name, constructor]),
 );
 
 function rehydrateError(serialized: SerializedError): Error {
-  const constructor = errorRegistry.get(serialized.name);
-  const error: Error =
-    constructor === undefined
-      ? new Error(serialized.message)
-      : (Object.create(constructor.prototype as object) as Error);
-  Object.defineProperty(error, "message", {
-    value: serialized.message,
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(error, "name", {
-    value: serialized.name,
-    writable: true,
-    configurable: true,
-  });
-  if (serialized.stack !== undefined) {
-    Object.defineProperty(error, "stack", {
-      value: serialized.stack,
-      writable: true,
-      configurable: true,
-    });
-  }
-  if (serialized.props !== undefined) Object.assign(error, serialized.props);
-  return error;
+  return rehydrateSerializedError(serialized, errorRegistry);
 }
 
 /**
@@ -359,39 +403,77 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   get #erased(): MinnowDatabaseClient {
     return this;
   }
-  readonly #transport: ClientTransport;
+  #transport: ClientTransport;
+  readonly #transportFactory: (() => ClientTransport) | undefined;
+  readonly #initPayload: DatabaseInitPayload;
+  readonly #onConnectionLost: ((error: ConnectionLostError) => void) | undefined;
   readonly #requestTimeoutMs: number;
   #closePromise: Promise<void> | undefined;
   readonly #pending = new Map<string, PendingCall>();
   readonly #events = new Map<string, EventRoute>();
-  readonly #ready: Promise<void>;
+  #ready: Promise<void>;
+  #storeKind: OpenedStoreKind | undefined;
   #fatal: Error | undefined;
   #closed = false;
   #onVisibilityChange: (() => void) | undefined;
   readonly #onMessage = (event: MessageEvent<unknown>): void => {
     this.#receive(event.data);
   };
-  readonly #onError = (): void => {
-    this.#fail(new Error("The database worker failed; see the worker's own error output"));
+  readonly #onWorkerError: ((event: DatabaseWorkerErrorEvent) => void) | undefined;
+  readonly #onError = (event?: ErrorEvent | MessageEvent<unknown>): void => {
+    // Duck-typed: an ErrorEvent carries message/filename/lineno; Node test transports may pass
+    // nothing at all, and neither runtime is guaranteed an ErrorEvent global to check against.
+    const detail = event !== undefined && "filename" in event ? event : undefined;
+    const where =
+      detail?.filename === undefined || detail.filename === ""
+        ? ""
+        : ` at ${detail.filename}:${String(detail.lineno)}:${String(detail.colno)}`;
+    const message =
+      detail?.message === undefined || detail.message === "" ? "" : `: ${detail.message}`;
+    const error = new DatabaseWorkerFailedError(
+      "error",
+      `The database worker failed: it raised an error it did not handle${message}${where}`,
+      detail?.error === undefined ? undefined : { cause: detail.error },
+    );
+    this.#reportWorkerError({ kind: "transport", context: "worker error event", error });
+    this.#fail(error);
   };
   readonly #onMessageError = (): void => {
-    this.#fail(new Error("A database worker message could not be deserialized"));
+    const error = new DatabaseWorkerFailedError(
+      "messageerror",
+      "A database worker message could not be deserialized",
+    );
+    this.#reportWorkerError({ kind: "transport", context: "worker messageerror event", error });
+    this.#fail(error);
   };
 
-  constructor(transport: ClientTransport, options: MinnowDatabaseClientOptions<TSchema> = {}) {
+  #reportWorkerError(event: DatabaseWorkerErrorEvent): void {
+    if (this.#onWorkerError !== undefined) {
+      this.#onWorkerError(event);
+      return;
+    }
+    if (typeof console === "undefined") return;
+    console.error(`[minnowdb] worker ${event.kind} (${event.context}):`, event.error);
+  }
+
+  constructor(
+    transport: ClientTransport | (() => ClientTransport),
+    options: MinnowDatabaseClientOptions<TSchema> = {},
+  ) {
     this.#requestTimeoutMs = clientDeadline(options.requestTimeoutMs ?? 60_000);
     this.#schema = options.schema;
-    this.#transport = transport;
-    transport.addEventListener("message", this.#onMessage);
-    transport.addEventListener("error", this.#onError);
-    transport.addEventListener("messageerror", this.#onMessageError);
-    const payload: DatabaseInitPayload = {
+    this.#onWorkerError = options.onWorkerError;
+    this.#onConnectionLost = options.onConnectionLost;
+    this.#transportFactory = typeof transport === "function" ? transport : undefined;
+    this.#transport = typeof transport === "function" ? transport() : transport;
+    this.#initPayload = {
       store: options.store ?? { kind: "indexeddb", name: "minnow" },
       ...(options.databaseOptions === undefined ? {} : { options: options.databaseOptions }),
+      // The worker reports on a long call often enough that this deadline, which counts
+      // silence, hears from it well before it runs out.
+      keepaliveIntervalMs: keepalivePace(this.#requestTimeoutMs),
     };
-    this.#ready = this.#post("rpc-init", null, "init", [payload]).then(() => undefined);
-    // Callers may rely on call ordering instead of awaiting ready(); keep its rejection observed.
-    this.#ready.catch(() => undefined);
+    this.#ready = this.#attach(this.#transport);
 
     // Report page visibility so a store that cares (the OPFS store's leadership preference)
     // can follow the tab the user is looking at. Best-effort: a worker-side host that predates
@@ -409,9 +491,77 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  /** Listens on a transport and sends it the init frame; the returned promise is `ready()`. */
+  #attach(transport: ClientTransport): Promise<void> {
+    transport.addEventListener("message", this.#onMessage);
+    transport.addEventListener("error", this.#onError);
+    transport.addEventListener("messageerror", this.#onMessageError);
+    const ready = this.#post("rpc-init", null, "init", [this.#initPayload]).then((result) => {
+      const kind = (result as { store?: unknown } | undefined)?.store;
+      this.#storeKind =
+        kind === "indexeddb" || kind === "opfs" || kind === "memory" ? kind : undefined;
+    });
+    // Callers may rely on call ordering instead of awaiting ready(); keep its rejection observed.
+    ready.catch(() => undefined);
+    return ready;
+  }
+
+  #detach(transport: ClientTransport): void {
+    transport.removeEventListener?.("message", this.#onMessage);
+    transport.removeEventListener?.("error", this.#onError);
+    transport.removeEventListener?.("messageerror", this.#onMessageError);
+  }
+
+  /**
+   * Replaces the connection after it was lost: a fresh worker, the same store and options. Pass
+   * the new transport, or construct the client with a transport factory
+   * (`new MinnowDatabaseClient(() => new Worker(...))`) and call this with no argument. The old
+   * transport is terminated when it can be. Every handle from before — write scopes, live
+   * sets, cursors, writers — belongs to the old worker and must be recreated; a pending call
+   * still in flight fails as a connection loss. Resolves once the new worker is ready.
+   */
+  async reopen(transport?: ClientTransport): Promise<void> {
+    const next = transport ?? this.#transportFactory?.();
+    if (next === undefined) {
+      throw new TypeError(
+        "reopen() needs a transport: pass one, or construct the client with a transport factory",
+      );
+    }
+    const previous = this.#transport;
+    this.#detach(previous);
+    // The next transport is in place before the old calls are failed: a lost-connection hook
+    // that reopens the client must find nothing left to do, not start a second reopen.
+    this.#transport = next;
+    if (this.#fatal === undefined) {
+      this.#fail(new DatabaseWorkerFailedError("reopened", "The database client was reopened"));
+    }
+    try {
+      previous.terminate?.();
+    } catch {
+      // A transport that cannot be terminated is simply left behind.
+    }
+    this.#fatal = undefined;
+    this.#closed = false;
+    this.#closePromise = undefined;
+    this.#events.clear();
+    this.#transport = next;
+    this.#ready = this.#attach(next);
+    this.#onVisibilityChange?.();
+    await this.#ready;
+  }
+
   /** Resolves once the worker has opened the store and constructed the database. */
   async ready(): Promise<void> {
     return this.#ready;
+  }
+
+  /**
+   * The kind of store the worker opened: what `{ kind: "auto" }` resolved to, or the kind the
+   * descriptor named. Undefined only when a custom worker entry opened a store without saying.
+   */
+  async storeKind(): Promise<OpenedStoreKind | undefined> {
+    await this.#ready;
+    return this.#storeKind;
   }
 
   // --- Catalog and writes -----------------------------------------------------------------------
@@ -598,11 +748,29 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       ...(onError === undefined ? {} : { onError }),
     });
     const created = this.#call("bufferedWriter", [handleId, tableName, wireOptions]);
-    return new ClientBufferedWriter<BatchInsertRow<TSchema, TName>>(
+    const writer = new ClientBufferedWriter<BatchInsertRow<TSchema, TName>>(
       this.#erased,
       handleId,
       created,
     );
+    // Rows younger than the age limit live in the worker; a tab being hidden or unloaded is the
+    // last moment to ask for them to land. Best-effort, like any flush the writer schedules.
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      const onHidden = (): void => {
+        if (document.visibilityState === "hidden") writer.requestFlush();
+      };
+      const onPageHide = (): void => {
+        writer.requestFlush();
+      };
+      document.addEventListener("visibilitychange", onHidden);
+      const page = typeof window === "undefined" ? undefined : window;
+      page?.addEventListener("pagehide", onPageHide);
+      writer._onClose(() => {
+        document.removeEventListener("visibilitychange", onHidden);
+        page?.removeEventListener("pagehide", onPageHide);
+      });
+    }
+    return writer;
   }
 
   // --- Reads ------------------------------------------------------------------------------------
@@ -1164,11 +1332,18 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     const timeoutMs = controls.timeoutMs ?? this.#requestTimeoutMs;
     const mayPublish = rpcMayPublish(method, args);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => this.#fail(new DatabaseWorkerTimeoutError(method, timeoutMs)),
-        timeoutMs,
-      );
+      const startedAt = Date.now();
+      const expire = (): void => this.#fail(new DatabaseWorkerTimeoutError(method, timeoutMs));
+      let timer = setTimeout(expire, timeoutMs);
       (timer as { unref?: () => void }).unref?.();
+      const keepalive = (): void => {
+        const elapsed = Date.now() - startedAt;
+        const remaining = timeoutMs * MAX_KEEPALIVE_EXTENSION - elapsed;
+        if (remaining <= 0) return;
+        clearTimeout(timer);
+        timer = setTimeout(expire, Math.min(timeoutMs, remaining));
+        (timer as { unref?: () => void }).unref?.();
+      };
       const onAbort = (): void => {
         try {
           this.#transport.postMessage({ version: protocolVersion, requestId, kind: "rpc-cancel" });
@@ -1198,7 +1373,15 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       if (controls.onStats !== undefined) {
         this.#events.set(requestId, { onStats: controls.onStats });
       }
-      this.#pending.set(requestId, { resolve, reject, cleanup, method, requestId, mayPublish });
+      this.#pending.set(requestId, {
+        resolve,
+        reject,
+        cleanup,
+        method,
+        requestId,
+        mayPublish,
+        keepalive,
+      });
       try {
         this.#transport.postMessage(
           kind === "rpc-init"
@@ -1226,6 +1409,20 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     }
     if (response === null) return;
     if (response.kind === "rpc-event") {
+      if (response.handleId === WORKER_DIAGNOSTIC_HANDLE_ID) {
+        if (response.event === "keepalive" && typeof response.requestId === "string") {
+          this.#pending.get(response.requestId)?.keepalive?.();
+          return;
+        }
+        if (response.event === "error" && isWorkerErrorReport(response.payload)) {
+          this.#reportWorkerError({
+            kind: response.payload.kind,
+            context: response.payload.context,
+            error: rehydrateError(response.payload.error),
+          });
+        }
+        return;
+      }
       const route = this.#events.get(response.handleId);
       if (route === undefined) return;
       if (response.event === "change") {
@@ -1301,6 +1498,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   }
 
   #fail(error: Error): void {
+    const first = this.#fatal === undefined;
     this.#fatal = error;
     const pending = [...this.#pending.values()];
     this.#pending.clear();
@@ -1313,7 +1511,28 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
           : error,
       );
     }
+    // A reopen the caller initiated is not a loss to report; the hook exists to trigger one.
+    if (
+      first &&
+      error instanceof ConnectionLostError &&
+      !(error instanceof DatabaseWorkerFailedError && error.reason === "reopened") &&
+      this.#onConnectionLost !== undefined
+    ) {
+      try {
+        this.#onConnectionLost(error);
+      } catch {
+        // A hook that throws must not hide the loss from the calls already rejected.
+      }
+    }
   }
+}
+
+/** A third of the deadline, within the worker's own bounds: two reports fit before it expires. */
+function keepalivePace(deadlineMs: number): number {
+  return Math.min(
+    WORKER_KEEPALIVE_INTERVAL_MS,
+    Math.max(MIN_WORKER_KEEPALIVE_INTERVAL_MS, Math.floor(deadlineMs / 3)),
+  );
 }
 
 function clientDeadline(value: number): number {
@@ -1380,6 +1599,12 @@ export class ClientBufferedWriter<TRow extends BatchRow = BatchRow> {
   }
 
   readonly #created: Promise<unknown>;
+  #onClose: (() => void) | undefined;
+
+  /** @internal Runs once when the writer closes, however it closes. */
+  _onClose(cleanup: () => void): void {
+    this.#onClose = cleanup;
+  }
 
   async add(row: TRow): Promise<BufferedFlushResult | undefined> {
     await this.#created;
@@ -1420,6 +1645,8 @@ export class ClientBufferedWriter<TRow extends BatchRow = BatchRow> {
         BufferedFlushResult | undefined;
     } finally {
       this.client._unrouteEvents(this.handleId);
+      this.#onClose?.();
+      this.#onClose = undefined;
     }
   }
 }

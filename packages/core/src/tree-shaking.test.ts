@@ -36,17 +36,24 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // exact NUMERIC ROUND/TRUNC/ABS/FLOOR/CEIL/MOD/SIGN with PostgreSQL display-scale inference
 // intentionally expand the complete engine surface.
 // Lifecycle queues, RPC deadlines, snapshot renewal, and write admission add about 3 KiB gzip.
-// Measured after the resilience audit: 878.3 KiB raw / 254.1 KiB gzip; under 1% headroom.
-const COMPLETE_ENTRY_RAW_BUDGET = 880 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 255 * 1024;
-// Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1214 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 339 * 1024;
+// Measured after the resilience audit: 878.3 KiB raw / 254.1 KiB gzip; under 1% headroom. The
+// scope write set (per-key memtable, mirror lookups, keyed SQL path) adds about 7 KiB raw:
+// 898.9 KiB raw / 260.5 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 904 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 264 * 1024;
+// Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
+// served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
+// write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
+// ledger) adds about 10 KiB raw: 1241.7 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1252 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 350 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1241 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 345 * 1024;
+// With the scope write set: 1257.8 KiB raw. The chunked transaction journal (schema 2) adds
+// about 6 KiB gzip: 351.7 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1280 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 356 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

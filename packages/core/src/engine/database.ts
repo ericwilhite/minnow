@@ -15,6 +15,15 @@ import {
 } from "./batch.js";
 import { ArtifactCache } from "./artifact-cache.js";
 import { estimateBatchBytes, estimateRowBytes, estimateValuesBytes } from "./byte-estimates.js";
+import {
+  composeScopeEffect,
+  netScopeEffect,
+  scopeWriteSetTestHooks,
+  type ScopeRowEffect,
+  type ScopeRowEntry,
+  type ScopeWriteSet,
+  type ScopeWriteState,
+} from "./scope-write-set.js";
 import { throwIfAborted } from "./cancellation.js";
 import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writer.js";
 export {
@@ -286,6 +295,7 @@ import {
   type LiveQueryExecuteContext,
   type LiveQueryInput,
   type LiveQuerySetOptions,
+  type LiveMaintenanceDeclined,
 } from "./live.js";
 import {
   chooseJoinOrder,
@@ -930,6 +940,26 @@ export interface StagedWriteResult {
   generatedColumns?: Record<string, QueryValue[]>;
 }
 
+/** Answers the keyed lookups the engine makes for its own checks inside a write scope. */
+type ScopeKeyLookup = (
+  keys: ReadonlyArray<Exclude<BatchValue, null>>,
+  projection: "*" | readonly string[],
+) => Promise<QueryRow[]>;
+
+/**
+ * Keys per lookup window. The SQL fallback binds each key as a parameter, and each value also
+ * contributes a comma token, so the parser's token cap is reached before its parameter cap; a
+ * fixed 1,024-key window stays inside both limits, and the direct plan uses the same size.
+ */
+const SCOPE_KEY_LOOKUP_WINDOW = Math.min(MAX_SQL_PARAMETERS, 1_024);
+
+/**
+ * A statement of this many rows or more stages directly instead of joining the write set. The
+ * set exists to fold many small statements; a bulk batch gains nothing from it and would pay a
+ * per-row entry twice — once buffered, once mirrored — on a path that encoding already bounds.
+ */
+const SCOPE_DIRECT_STAGE_ROWS = 4_096;
+
 export interface StagedUpsertResult extends StagedWriteResult {
   /** Input rows rejected by `conflictWhere`; always 0 without it. */
   skippedRowCount: number;
@@ -1284,6 +1314,13 @@ export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema
   coordinateWrites?: boolean;
   now?: () => Date;
   createId?: () => string;
+  /**
+   * Hears failures in work no caller awaits: a background collection pass that failed, a live
+   * sweep that failed with nobody subscribed. `maintenanceStatus().lastError` still records the
+   * last one; this hook sees every one, as it happens. Inside the worker host it feeds the
+   * client's `onWorkerError`.
+   */
+  onBackgroundError?: (error: unknown, context: string) => void;
   /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
   spillOwnerLeaseMs?: number;
   /** Durable active-writer deadline; renewed every third while the writer is live. */
@@ -1774,6 +1811,17 @@ export interface RunStatementOptions {
  */
 export interface StatementWriter extends WriteSession {
   queryPlan(plan: CompiledQuery): Promise<QueryResult>;
+  /**
+   * Which of the given keys the scope sees as present — staged by it and not removed, or
+   * committed — as key tokens, answered from the scope's key ledger and a keyed probe so a plain
+   * INSERT or an `ON CONFLICT DO NOTHING` never has to stage its buffered predecessors just to
+   * find a duplicate. Undefined when the writer cannot answer without a read.
+   */
+  stagedKeyPresence?(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: ReadonlyArray<Exclude<BatchValue, null>>,
+  ): Promise<ReadonlySet<string> | undefined>;
 }
 
 /** The extra entry point held by BEGIN so already-compiled statements are not parsed twice. */
@@ -1781,7 +1829,7 @@ interface TransactionStatementWriter extends StatementWriter {
   /** Snapshot-only scalar projection; undefined keeps the ordinary row-shaped fallback. */
   queryFirstColumn(plan: CompiledQuery): Promise<QueryValue[] | undefined>;
   executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
-  checkpoint(): TransactionCheckpoint;
+  checkpoint(): Promise<TransactionCheckpoint>;
   checkpointRetainedBytes(): number;
   rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;
 }
@@ -2107,6 +2155,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #spillOwnerLeaseMs: number;
   readonly #transactionOwnerLeaseMs: number;
   readonly #createId: () => string;
+  readonly #onBackgroundError: ((error: unknown, context: string) => void) | undefined;
   readonly #internalLeaseOwnerId: string;
   readonly #liveSets = new Set<LiveQuerySet>();
   /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
@@ -2261,6 +2310,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? (() => crypto.randomUUID());
+    this.#onBackgroundError = options.onBackgroundError;
     this.#internalLeaseOwnerId = `minnow/${this.#createId()}`;
     this.#spillOwnerLeaseMs = options.spillOwnerLeaseMs ?? 60_000;
     if (
@@ -4008,7 +4058,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keyColumnId: keyColumn.id,
         level: 0,
         logicalOrder: 0,
-        commitOrdinal: transaction.pendingSegmentIds.length,
+        commitOrdinal: transaction.pendingSegmentCount,
         rowIdSpans: [],
         createdAt: dateIsoString(this.#now()),
       };
@@ -4080,11 +4130,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: TName,
     options: BufferedWriterOptions = {},
   ): BufferedTableWriter<BatchInsertRow<TSchema, TName>> {
-    return new BufferedTableWriter<BatchInsertRow<TSchema, TName>>(
-      this.#erased,
-      tableName,
-      options,
-    );
+    return new BufferedTableWriter<BatchInsertRow<TSchema, TName>>(this.#erased, tableName, {
+      ...options,
+      onBackgroundError: (error, context) => this.#reportBackgroundError(error, context),
+    });
   }
 
   async #writeUpdateBatch(
@@ -4246,7 +4295,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keyColumnId: keyColumn.id,
         level: 0,
         logicalOrder: 0,
-        commitOrdinal: transaction.pendingSegmentIds.length,
+        commitOrdinal: transaction.pendingSegmentCount,
         rowIdSpans: [],
         createdAt: dateIsoString(this.#now()),
       };
@@ -4597,7 +4646,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
         level: 0,
         logicalOrder: 0,
-        commitOrdinal: transaction.pendingSegmentIds.length,
+        commitOrdinal: transaction.pendingSegmentCount,
         rowIdSpans: [],
         createdAt: dateIsoString(this.#now()),
       };
@@ -6408,15 +6457,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Update and delete deltas are replayed for the one key instead of the whole table: a
       // scalar key identifies its row in every segment, so the row's history is a handful of
       // small blocks. A composite (hidden) key keeps the ordinary replay.
-      if (
-        keyColumn.hidden === true ||
-        segments.some((segment) => {
-          const kind = segment.kind;
-          return kind !== "insert" && kind !== "base" && kind !== "update" && kind !== "delete";
-        })
-      ) {
-        return undefined;
-      }
+      if (keyColumn.hidden === true) return undefined;
+      // Outside a scope, a history too long to replay cheaply is one compaction should have
+      // folded, and the scan is the honest answer. Inside one, the staged segments cannot fold
+      // before the commit and the scan would walk the same segments in full: replay them all.
       return this.#pointReadThroughDeltas(
         shape,
         keyColumn,
@@ -6425,6 +6469,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         projected,
         snapshot,
         options,
+        visibility.overlayTransactionId === undefined
+          ? MAX_POINT_READ_DELTA_BLOCKS
+          : Number.POSITIVE_INFINITY,
       );
     }
     // The most selective searchable component wins nothing provable without statistics, so
@@ -6600,6 +6647,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     projected: ReadonlyArray<{ column: TableColumnRecord; alias: string }>,
     snapshot: LeasedSnapshot,
     options: QueryOptions,
+    maxDecodedBlocks = MAX_POINT_READ_DELTA_BLOCKS,
   ): Promise<QueryResult | undefined> {
     const keyEquality = shape.equalities.find((equality) => equality.column === keyColumn.name);
     if (keyEquality === undefined) return undefined;
@@ -6625,7 +6673,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       if (blockIndexes.length === 0) continue;
       decodedBlocks += blockIndexes.length;
-      if (decodedBlocks > MAX_POINT_READ_DELTA_BLOCKS) return undefined;
+      if (decodedBlocks > maxDecodedBlocks) return undefined;
       const keyBlocks = await this.#pointReadVectors(
         blockIndexes.map((blockIndex) => keyBlockIds[blockIndex] ?? ""),
         snapshot,
@@ -6645,6 +6693,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           continue;
         }
         if (segment.kind === "update" && current === undefined) continue;
+        // An upsert carries the whole row and replaces whatever the key held before; an
+        // insert must find the key absent. Both read every needed column of this row.
         const carried =
           segment.kind === "update"
             ? neededColumns.filter(
@@ -6655,14 +6705,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const blockIds = carried.map((column) => segment.columnBlockIds[column.id]?.[blockIndex]);
         if (blockIds.some((id) => id === undefined)) return undefined;
         decodedBlocks += blockIds.length;
-        if (decodedBlocks > MAX_POINT_READ_DELTA_BLOCKS) return undefined;
+        if (decodedBlocks > maxDecodedBlocks) return undefined;
         const blocks = await this.#pointReadVectors(blockIds as string[], snapshot);
         const values =
           segment.kind === "update" && current !== undefined
             ? current
             : new Map<string, QueryValue>();
         if (segment.kind !== "update") {
-          if (current !== undefined) return undefined;
+          if (current !== undefined && segment.kind !== "upsert") return undefined;
           values.set(keyColumn.name, vectorValue(keyVector, slot));
         }
         for (const [index, column] of carried.entries()) {
@@ -6995,60 +7045,76 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #liveMaintenancePlan(
     compiled: CompiledQuery,
     probe: CatalogProbe,
+    reasons?: string[],
   ): Promise<LiveMaintenanceState | undefined> {
-    if (
-      compiled.usesStatementDatetime === true ||
-      compiled.usesVolatileFunctions === true ||
-      compiled.usesSequenceCalls === true
-    ) {
+    const decline = (reason: string): undefined => {
+      reasons?.push(reason);
       return undefined;
-    }
+    };
+    if (compiled.usesStatementDatetime === true) return decline("reads the statement clock");
+    if (compiled.usesVolatileFunctions === true) return decline("calls a volatile function");
+    if (compiled.usesSequenceCalls === true) return decline("calls a sequence");
     const plan = await this.#applyCatalogRewrites(compiled, probe);
-    if (blockCallsFunctions(plan, nonDeterministicFunctionNames)) return undefined;
-    const base = plan.base;
-    if (
-      base.table === DUAL_TABLE ||
-      base.derived !== undefined ||
-      base.union !== undefined ||
-      base.recursive !== undefined ||
-      base.windowed !== undefined ||
-      plan.pendingSelectShape !== undefined ||
-      plan.distinctWildcard === true ||
-      plan.limitParameter !== undefined ||
-      plan.offsetParameter !== undefined ||
-      planReadsBeyondSingleScan(plan) ||
-      planContainsFts(plan)
-    ) {
-      return undefined;
+    if (blockCallsFunctions(plan, nonDeterministicFunctionNames)) {
+      return decline("calls a non-deterministic function");
     }
+    const base = plan.base;
+    if (base.table === DUAL_TABLE) return decline("FROM has no base table");
+    if (base.derived !== undefined) return decline("FROM is a derived table or CTE");
+    if (base.union !== undefined) return decline("UNION, INTERSECT, or EXCEPT");
+    if (base.recursive !== undefined) return decline("recursive CTE");
+    if (base.windowed !== undefined) return decline("window function");
+    if (plan.pendingSelectShape !== undefined) return decline("unexpanded SELECT shape");
+    if (plan.distinctWildcard === true) return decline("SELECT DISTINCT *");
+    if (plan.limitParameter !== undefined || plan.offsetParameter !== undefined) {
+      return decline("LIMIT or OFFSET given as a parameter");
+    }
+    if (planReadsBeyondSingleScan(plan)) return decline("subquery or EXISTS");
+    if (planContainsFts(plan)) return decline("full-text MATCH or BM25");
     if (plan.joins.length > 0) {
       // A unique lookup contributes at most one row per base key. Changes on the lookup side
       // still execute in full; base-only changes can reuse the ordinary changed-key patch.
       const join = plan.joins[0];
+      if (plan.joins.length !== 1 || join === undefined) {
+        return decline(
+          `${String(plan.joins.length)} joins; incremental maintenance supports one inner or left join to a unique key`,
+        );
+      }
+      if (!["inner", "left"].includes(join.kind)) {
+        return decline(`${join.kind} join; only an inner or left join is maintained`);
+      }
+      if (join.on !== undefined) {
+        return decline("join ON is not a single equality on the lookup table's unique key");
+      }
       if (
-        plan.joins.length !== 1 ||
-        join === undefined ||
-        !["inner", "left"].includes(join.kind) ||
-        join.on !== undefined ||
         join.derived !== undefined ||
         join.union !== undefined ||
         join.windowed !== undefined ||
         join.recursive !== undefined
-      )
-        return undefined;
+      ) {
+        return decline("join side is a derived table, union, window, or recursive CTE");
+      }
       const lookup = await this.#findTable(join.table);
       const lookupKey = getUniqueKeyColumn(lookup);
-      if (lookupKey === undefined || lookupKey.sqlDomain !== undefined) return undefined;
+      if (lookupKey === undefined) return decline(`${lookup.name} has no unique key to join on`);
+      if (lookupKey.sqlDomain !== undefined) {
+        return decline(`the unique key of ${lookup.name} has a SQL domain`);
+      }
       const lookupReference = `${join.alias}.${lookupKey.name}`;
       const joinedKey = [join.left, join.right].find(
         (expression) => expression.kind === "column" && expression.reference === lookupReference,
       );
-      if (joinedKey === undefined) return undefined;
+      if (joinedKey === undefined) {
+        return decline(`join ON does not name the unique key of ${lookup.name}`);
+      }
     }
     const table = await this.#findTable(base.table);
     const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined || keyColumn.hidden === true || keyColumn.sqlDomain !== undefined)
-      return undefined;
+    if (keyColumn === undefined) return decline(`${table.name} has no unique key`);
+    if (keyColumn.hidden === true) return decline(`${table.name} has a composite unique key`);
+    if (keyColumn.sqlDomain !== undefined) {
+      return decline(`the unique key of ${table.name} has a SQL domain`);
+    }
     const aggregate = LiveAggregate.plan(plan, `${base.alias}.${keyColumn.name}`);
     if (aggregate !== undefined)
       return {
@@ -7070,7 +7136,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         order: [],
         aggregate,
       };
-    if (plan.groupBy.length > 0 || plan.having.length > 0) return undefined;
+    if (plan.groupBy.length > 0 || plan.having.length > 0) {
+      return decline(
+        "GROUP BY or HAVING without additive aggregates (COUNT, SUM, AVG of one row-local argument)",
+      );
+    }
     const rowLocal = (expression: Expression): boolean => {
       if (
         expression.kind === "subquery" ||
@@ -7084,13 +7154,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       return childExpressions(expression).every(rowLocal);
     };
-    if (!plan.select.every((item) => rowLocal(item.expression))) return undefined;
+    const notRowLocal =
+      "a SELECT, WHERE, or ORDER BY term is not row-local (an aggregate, subquery, window, wildcard, or parameter)";
+    if (!plan.select.every((item) => rowLocal(item.expression))) return decline(notRowLocal);
     if (!plan.predicates.every(({ left, right }) => rowLocal(left) && rowLocal(right))) {
-      return undefined;
+      return decline(notRowLocal);
     }
-    if (!plan.orderBy.every((term) => rowLocal(term.expression))) return undefined;
+    if (!plan.orderBy.every((term) => rowLocal(term.expression))) return decline(notRowLocal);
     const publicColumns = plan.select.map((item) => item.alias);
-    if (publicColumns.some((name) => name.startsWith(LIVE_HIDDEN_PREFIX))) return undefined;
+    if (publicColumns.some((name) => name.startsWith(LIVE_HIDDEN_PREFIX))) {
+      return decline("an output alias uses the reserved __minnow_live prefix");
+    }
     const fullPlan = clonePlanTree(plan);
     const qualifiedKey = `${base.alias}.${keyColumn.name}`;
     fullPlan.select.push({
@@ -7108,7 +7182,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       } else if (term.expression.kind === "literal" && typeof term.expression.value === "number") {
         const position = term.expression.value;
         if (!Number.isInteger(position) || position < 1 || position > publicColumns.length) {
-          return undefined;
+          return decline("ORDER BY ordinal is out of range");
         }
         alias = publicColumns[position - 1];
       }
@@ -7151,10 +7225,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #liveExecuteMaintainable(
     compiled: CompiledQuery,
     context: LiveQueryExecuteContext | undefined,
-  ): Promise<LiveMaintainedExecution | undefined> {
+  ): Promise<LiveMaintainedExecution | LiveMaintenanceDeclined | undefined> {
     const probe = context?.probe ?? (await this.store.getCatalogProbe());
-    const state = await this.#liveMaintenancePlan(compiled, probe);
-    if (state === undefined) return undefined;
+    const reasons: string[] = [];
+    const state = await this.#liveMaintenancePlan(compiled, probe, reasons);
+    if (state === undefined) return { declined: reasons };
     if (state.aggregate !== undefined) {
       try {
         const input = await this.#withReadReservation(() =>
@@ -8181,6 +8256,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * in-batch duplicate key fires as an UPDATE of the earlier occurrence. Returns undefined
    * when the table has no insert or update triggers.
    */
+  /**
+   * A parameterized read in stored form, for the engine's own use: the public `query` crosses
+   * the result boundary and externalizes domain values, and an old image read that way would
+   * no longer match the stored batch values a unique secondary index compares it against.
+   */
+  async #readStoredRows(sql: string, params: readonly QueryValue[]): Promise<QueryResult> {
+    const plan = await this.#applyCatalogRewrites(
+      bindPlanParameters(this.#compileCached(sql), [...params]),
+    );
+    return this.#queryCompiled(plan, { memoize: false });
+  }
+
   async #upsertTriggerFirings(
     table: TableRecord,
     keyColumn: TableColumnRecord,
@@ -8192,11 +8279,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       operator: ComparisonOperator;
       value: BatchValue;
     },
+    /** Inside a scope: the write set answers where it can, instead of the SQL read. */
+    lookup?: ScopeKeyLookup,
   ): Promise<UpsertFirings | undefined> {
     const fires = (table.triggers ?? []).some(
       (trigger) => trigger.event === "insert" || trigger.event === "update",
     );
-    if ((!fires && conflictWhere === undefined) || rowCount === 0) return undefined;
+    // A unique secondary index needs each replaced row's old image too, to retire the term the
+    // row held before; without one, a later row could never take that value again.
+    const retiresUniqueTerms = readyUniqueSecondaryIndexes(table).length > 0;
+    if ((!fires && conflictWhere === undefined && !retiresUniqueTerms) || rowCount === 0) {
+      return undefined;
+    }
     const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
     const keyValues = batch.columns[keyColumn.name] ?? [];
     const distinct = new Map<string, Exclude<BatchValue, null>>();
@@ -8205,18 +8299,29 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const params = [...distinct.values()];
     const rows: QueryRow[] = [];
-    // Each value also contributes a comma token, so the parser's token cap is reached before
-    // its parameter cap. A fixed 1,024-key window stays comfortably inside both limits.
-    const keyWindowSize = Math.min(MAX_SQL_PARAMETERS, 1_024);
-    for (let start = 0; start < params.length; start += keyWindowSize) {
-      const window = params.slice(start, start + keyWindowSize);
-      const placeholders = window.map(() => "?").join(", ");
-      const sql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
-      const result =
-        readRows === undefined
-          ? await this.query(sql, { params: window, memoize: false })
-          : await readRows(sql, window);
-      rows.push(...result.rows);
+    // A trigger sees the whole replaced row as OLD. Without one, the old image serves only the
+    // conflict guard and the unique secondary-index terms it must retire, so only those columns
+    // are read: decoding every column of every existing row makes a guarded upsert of a wide
+    // table cost many times the write itself.
+    const projectedColumns = new Set<string>([keyColumn.name]);
+    if (conflictWhere !== undefined) projectedColumns.add(conflictWhere.column.name);
+    for (const { columns } of readyUniqueSecondaryIndexes(table)) {
+      for (const column of columns) projectedColumns.add(column.name);
+    }
+    if (lookup !== undefined) {
+      rows.push(...(await lookup(params, fires ? "*" : [...projectedColumns])));
+    } else {
+      const projection = fires ? "*" : [...projectedColumns].map(quote).join(", ");
+      for (let start = 0; start < params.length; start += SCOPE_KEY_LOOKUP_WINDOW) {
+        const window = params.slice(start, start + SCOPE_KEY_LOOKUP_WINDOW);
+        const placeholders = window.map(() => "?").join(", ");
+        const sql = `SELECT ${projection} FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
+        const result =
+          readRows === undefined
+            ? await this.#readStoredRows(sql, window)
+            : await readRows(sql, window);
+        rows.push(...result.rows);
+      }
     }
     const byToken = new Map(
       rows.map((row) => {
@@ -8318,17 +8423,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     readRows?: (sql: string, params: QueryValue[]) => Promise<QueryResult>,
     /** Reads the rows even with no trigger to feed — CHECK constraints need the post-image. */
     force = false,
+    /** Inside a scope: the write set answers where it can, instead of the SQL read. */
+    lookup?: ScopeKeyLookup,
   ): Promise<Array<Record<string, BatchValue> | undefined>> {
     if (!force && !(table.triggers ?? []).some((trigger) => trigger.event === event)) return [];
-    const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
-    const placeholders = keys.map(() => "?").join(", ");
-    const preImageSql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
-    const result =
-      readRows === undefined
-        ? await this.query(preImageSql, { params: [...keys] as QueryValue[], memoize: false })
-        : await readRows(preImageSql, [...keys] as QueryValue[]);
+    let rows: QueryRow[];
+    if (lookup !== undefined) {
+      rows = await lookup(keys, "*");
+    } else {
+      const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+      const placeholders = keys.map(() => "?").join(", ");
+      const preImageSql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
+      const result =
+        readRows === undefined
+          ? await this.#readStoredRows(preImageSql, [...keys] as QueryValue[])
+          : await readRows(preImageSql, [...keys] as QueryValue[]);
+      rows = result.rows;
+    }
     const byToken = new Map(
-      result.rows.map((row) => {
+      rows.map((row) => {
         const key = row[keyColumn.name];
         return [
           key === null || key === undefined ? "" : keyToken(keyColumn.type, key),
@@ -8659,7 +8772,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
       level: 0,
       logicalOrder: 0,
-      commitOrdinal: transaction.pendingSegmentIds.length,
+      commitOrdinal: transaction.pendingSegmentCount,
       rowIdSpans: [],
       createdAt: dateIsoString(this.#now()),
     };
@@ -8689,7 +8802,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * paths a statement-level transaction routes through.
    */
   #coordinateWrite<T>(run: () => Promise<T>): Promise<T> {
-    return this.#coordinateWrites ? coordinateWrite(this.store, run, this.#shutdown.signal) : run();
+    if (!this.#coordinateWrites) return run();
+    return coordinateWrite(this.store, run, this.#shutdown.signal, {
+      onAdmissionWaitExceeded: (waitedMs) => {
+        this.#reportBackgroundError(
+          new Error(
+            `A write waited ${String(waitedMs)}ms for the cross-tab admission lock and went ` +
+              "ahead without it; another tab holds the lock and is not letting go",
+          ),
+          "write admission",
+        );
+      },
+    });
   }
 
   async #openWriteScope<T>(
@@ -8743,6 +8867,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       durableSnapshot: options.durableSnapshot ?? true,
       coalesceArtifacts: true,
     });
+    // Only a scope buffers: a standalone write's trigger bodies and cascades run through the
+    // same session paths, and nothing would encode a write set of theirs before they commit.
+    this.#scopeWrites.set(transaction, {
+      tables: new Map(),
+      mirrored: true,
+      generation: 0,
+      flushing: Promise.resolve(),
+    });
     let closed = false;
     let accepting = true;
     let tail: Promise<unknown> = Promise.resolve();
@@ -8761,18 +8893,27 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const open = (): void => {
       signal.throwIfAborted();
       if (closed) throw new Error("The write scope has ended");
+      poisoned ??= this.#scopeWrites.get(transaction)?.failure;
       if (poisoned !== undefined) {
         throw new Error("The write scope already failed and can only roll back", {
           cause: poisoned,
         });
       }
     };
+    // Work that was staged or buffered by a statement that then failed cannot be undone in
+    // place, so the scope closes to everything but a rollback.
     const guarded = async <T>(run: () => Promise<T>): Promise<T> => {
       const before = transaction.stagedWorkCount;
+      const generation = this.#scopeWriteGeneration(transaction);
       try {
         return await run();
       } catch (error) {
-        if (transaction.stagedWorkCount !== before) poisoned ??= error;
+        if (
+          transaction.stagedWorkCount !== before ||
+          this.#scopeWriteGeneration(transaction) !== generation
+        ) {
+          poisoned ??= error;
+        }
         throw error;
       }
     };
@@ -8803,6 +8944,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw new TypeError(
             `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a write scope`,
           );
+        }
+        // A keyed UPDATE with constant assignments, or a keyed DELETE, needs no read of the
+        // table: its rows join the write set directly instead of first encoding everything the
+        // scope holds for the table.
+        if (statement.kind === "update" || statement.kind === "delete") {
+          const keyed = await this.#scopeKeyedMutation(statement);
+          if (keyed !== undefined) {
+            return guarded(() =>
+              this.#runScopeKeyedMutation(transaction, keyed, () => {
+                staged += 1;
+              }),
+            );
+          }
         }
         // Guard the whole SQL statement as one stage. Some INSERT forms perform more than one
         // batch operation; if a later step fails after an earlier one staged work, the caller
@@ -8838,7 +8992,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // by beginDeferred. Reuse the ordinary current-version pipeline and its compact
           // catalog/lease caches; once work is staged, switch to the overlay pipeline below.
           const probe = transaction.initialCatalogProbe;
-          return transaction.stagedWorkCount === 0 && probe !== undefined
+          return transaction.stagedWorkCount === 0 &&
+            !this.#hasPendingScopeWrites(transaction) &&
+            probe !== undefined
             ? this.#queryCompiled(plan, {}, probe)
             : this.#sessionQueryPlan(transaction, await this.#applyCatalogRewrites(plan));
         }),
@@ -8848,7 +9004,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // manifest. Keep that case on the read-your-writes row executor; before the first
           // stage, the transaction's exact catalog probe makes the streamed snapshot safe.
           const probe = transaction.initialCatalogProbe;
-          return transaction.stagedWorkCount === 0 && probe !== undefined
+          return transaction.stagedWorkCount === 0 &&
+            !this.#hasPendingScopeWrites(transaction) &&
+            probe !== undefined
             ? this.#queryCompiledFirstColumn(plan, probe)
             : undefined;
         }),
@@ -8856,8 +9014,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         open();
         return guarded(() => this.runStatement(statement, { writer }));
       },
-      checkpoint: () => {
+      stagedKeyPresence: (table, keyColumn, keys) =>
+        this.#scopeKeyPresence(transaction, table, keyColumn, keys),
+      checkpoint: async () => {
         open();
+        // A savepoint captures staged state; what is only buffered would be lost to it.
+        await this.#flushScopeWriteSets(transaction);
         return transaction.checkpoint();
       },
       checkpointRetainedBytes: () => {
@@ -8866,7 +9028,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       },
       rollbackTo: async (checkpoint) => {
         if (closed) throw new Error("The write scope has ended");
-        await transaction.rollbackTo(checkpoint);
+        // Everything buffered was written after the savepoint (taking one encoded the sets), so
+        // it goes once the rollback has; a rollback that fails leaves the scope only able to
+        // try again or end.
+        try {
+          await transaction.rollbackTo(checkpoint);
+        } catch (error) {
+          const state = this.#scopeWrites.get(transaction);
+          if (state !== undefined) state.failure ??= error;
+          throw error;
+        }
+        this.#discardScopeWriteSets(transaction);
         poisoned = undefined;
         staged = transaction.stagedWorkCount === 0 ? 0 : 1;
       },
@@ -8922,6 +9094,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       queryPlan: (plan) => enqueue(() => writer.queryPlan(plan), "read"),
       queryFirstColumn: (plan) => enqueue(() => writer.queryFirstColumn(plan), "read"),
       executeStatement: (statement) => enqueue(() => writer.executeStatement(statement)),
+      checkpoint: () => enqueue(() => writer.checkpoint()),
+      stagedKeyPresence: (table, keyColumn, keys) =>
+        enqueue(async () => writer.stagedKeyPresence?.(table, keyColumn, keys), "read"),
       rollbackTo: (checkpoint) => enqueue(() => writer.rollbackTo(checkpoint), "rollback"),
     };
     try {
@@ -8930,6 +9105,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await tail;
       signal.throwIfAborted();
       closed = true;
+      poisoned ??= this.#scopeWrites.get(transaction)?.failure;
       if (poisoned !== undefined) {
         // The outer catch aborts the transaction.
         throw new Error(
@@ -8943,6 +9119,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         await transaction.abort();
         return { result, version: await this.store.getCurrentManifestVersion() };
       }
+      await this.#finishScopeWriteSets(transaction);
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         try {
           const manifest = await transaction.commit();
@@ -8983,9 +9160,53 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     sql: string,
     options: QueryOptions = {},
   ): Promise<QueryResult> {
+    // The caller's options decide eligibility, as they do outside a scope: the default memory
+    // budget the normalized options carry is not the explicit budget that changes semantics.
+    const requested = options;
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
-    const bound = bindPlanParameters(this.#compileCached(sql), options.params);
+    const compiled = this.#compileCached(sql);
+    // A keyed lookup takes the point-read path under the scope's overlay as it would outside
+    // one: the staged segments join the visible set, and the row's history is replayed for the
+    // one key. Without this, every keyed read inside a long scope scanned everything the scope
+    // had staged for the table.
+    if (
+      !pointReadTestHooks.disabled &&
+      requested.version === undefined &&
+      requested.spillToStorage === undefined &&
+      requested.spillPageRows === undefined &&
+      requested.executionMemoryBudgetBytes === undefined &&
+      (compiled.parameterCount ?? 0) === (requested.params?.length ?? 0)
+    ) {
+      const template = cachedPointReadTemplate(compiled);
+      if (template !== null) {
+        const shape = resolvePointReadShape(template, options.params ?? []);
+        if (shape !== undefined) {
+          let point: QueryResult | undefined;
+          try {
+            pointReadTestHooks.attempted += 1;
+            const table = await this.#findTable(shape.table);
+            point = await this.#withSessionVisibility(
+              transaction,
+              [table],
+              options,
+              (snapshot, visibility, realTables) =>
+                this.#pointReadAtSnapshot(shape, snapshot, realTables, visibility, options),
+            );
+          } catch (error) {
+            // A table name that only folds case-insensitively is unknown to the fast path;
+            // the general path below resolves it, so this is a miss, not a failure.
+            if (!(error instanceof UnknownTableError)) throw error;
+          }
+          throwIfAborted(options.signal);
+          if (point !== undefined) {
+            pointReadTestHooks.served += 1;
+            return point;
+          }
+        }
+      }
+    }
+    const bound = bindPlanParameters(compiled, options.params);
     // The same catalog rewrites a read outside a scope gets: a scope that could not see a view
     // would make the scope's reads a different language from everyone else's.
     const plan = await this.#applyCatalogRewrites(bound);
@@ -9004,11 +9225,68 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const names = collectRealTableNames(plan);
     const tables = await Promise.all(names.map((name) => this.#findTable(name)));
     throwIfAborted(options.signal);
+    return this.#withSessionVisibility(
+      transaction,
+      tables,
+      options,
+      (snapshot, visibility, realTables) =>
+        this.#queryAtVisibility(plan, snapshot, visibility, realTables, true, options),
+    );
+  }
+
+  /**
+   * A table's segments as the store holds them apart from the scope's own staging, with the
+   * records of the writers that own them, listed once per scope: the pinned snapshot cannot see
+   * anything that lands later, and reclamation respects the pin.
+   */
+  readonly #scopeCommittedListings = new WeakMap<
+    DatabaseTransaction,
+    Map<string, { segments: SegmentRecord[]; records: TransactionRecord[] }>
+  >();
+
+  async #scopeCommittedSegments(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+  ): Promise<{ segments: SegmentRecord[]; records: TransactionRecord[] }> {
+    let byTable = this.#scopeCommittedListings.get(transaction);
+    if (byTable === undefined) {
+      byTable = new Map();
+      this.#scopeCommittedListings.set(transaction, byTable);
+    }
+    const cached = byTable.get(table.id);
+    if (cached !== undefined) return cached;
+    const segments = (await listTableSegmentsPaged(this.store, table.id)).filter(
+      (segment) => segment.transactionId !== transaction.id,
+    );
+    const records = await this.#transactionRecordsForSegments(segments, transaction.id);
+    const entry = { segments, records };
+    byTable.set(table.id, entry);
+    return entry;
+  }
+
+  /**
+   * The scope's view of the named tables — the pre-scope snapshot plus everything the scope has
+   * staged, ordered after all committed data — handed to one read. Whatever the scope still
+   * holds for those tables in its write sets is encoded first, so the read sees it.
+   */
+  async #withSessionVisibility<T>(
+    transaction: DatabaseTransaction,
+    tables: readonly TableRecord[],
+    options: QueryOptions,
+    read: (
+      snapshot: LeasedSnapshot,
+      visibility: SegmentVisibilityCatalog,
+      realTables: Map<string, TableRecord>,
+    ) => Promise<T>,
+  ): Promise<T> {
+    await this.#flushScopeWriteSets(
+      transaction,
+      tables.map((table) => table.id),
+    );
     const realTables = new Map(tables.map((table) => [table.name, table] as const));
-    const pendingIds = new Set(transaction.pendingSegmentIds);
-    const pendingBlocks = new Set(transaction.pendingBlockIds);
-    const ourRecord = await this.store.getTransaction(transaction.id);
-    throwIfAborted(options.signal);
+    const pendingBlocks = {
+      has: (blockId: string): boolean => transaction.hasPendingBlock(blockId),
+    };
     // Pinned to the scope's own snapshot, not the current manifest: the documented contract
     // is "the pre-scope snapshot plus everything this scope staged", and #assertKeysExist
     // already validates against transaction.snapshotVersion — reading the current version
@@ -9076,41 +9354,40 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         release: () => snapshot.release(),
       } as unknown as LeasedSnapshot;
       const segmentsByTable = new Map<string, SegmentRecord[]>();
-      const transactionRecords = new Map<string, TransactionRecord>();
-      const deferredSegments = transaction.deferredSegments;
+      // Our own staged segments are visible as one synthetic commit after the snapshot; every
+      // other writer's record decides its segments' visibility. Our record itself is never read
+      // back for this: its journal is unbounded, and this runs on every read the scope makes.
+      const transactionRecords = new Map<string, { committedVersion: number | null }>([
+        [transaction.id, { committedVersion: STAGED_OVERLAY_ORDER_BASE }],
+      ]);
+      const staged = transaction.stagedSegments;
       for (const table of tables) {
         throwIfAborted(options.signal);
-        const segments = [
-          ...(await listTableSegmentsPaged(this.store, table.id)),
-          ...deferredSegments.filter((segment) => segment.tableId === table.id),
-        ];
+        // What the store holds for the table apart from our own staging cannot change under
+        // the pinned snapshot, so it is listed once per scope; our segments come from the
+        // transaction itself, which knows them without a store round trip.
+        const committed = await this.#scopeCommittedSegments(transaction, table);
         throwIfAborted(options.signal);
         // Staged segments sort after every committed one; commitOrdinal keeps their
         // staging order (the journal's id list is sorted, so it cannot).
-        const doctored = segments.map((segment) =>
-          pendingIds.has(segment.id)
-            ? { ...segment, logicalOrder: STAGED_OVERLAY_ORDER_BASE + segment.commitOrdinal }
-            : segment,
-        );
+        const doctored = [
+          ...committed.segments,
+          ...staged
+            .filter((segment) => segment.tableId === table.id)
+            .map((segment) => ({
+              ...segment,
+              logicalOrder: STAGED_OVERLAY_ORDER_BASE + segment.commitOrdinal,
+            })),
+        ];
         segmentsByTable.set(table.id, doctored);
-        for (const record of await this.#transactionRecordsForSegments(doctored)) {
-          transactionRecords.set(record.id, record);
-        }
-        throwIfAborted(options.signal);
-      }
-      if (ourRecord !== undefined) {
-        transactionRecords.set(transaction.id, {
-          ...ourRecord,
-          status: "committed",
-          committedVersion: STAGED_OVERLAY_ORDER_BASE,
-        });
+        for (const record of committed.records) transactionRecords.set(record.id, record);
       }
       const visibility: SegmentVisibilityCatalog = {
         transactions: transactionRecords,
         segmentsByTable,
         overlayTransactionId: transaction.id,
       };
-      return this.#queryAtVisibility(plan, overlaySnapshot, visibility, realTables, true, options);
+      return read(overlaySnapshot, visibility, realTables);
     });
   }
 
@@ -9213,26 +9490,645 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
-  /** Net staged key membership per table, replayed from the transaction's entries. */
+  /**
+   * Net staged key membership per table, replayed from the transaction's entries. The replay is
+   * incremental — a scope of many statements consults the overlay on every one of them, and
+   * replaying from the start each time made a long scope quadratic. A savepoint rollback
+   * rewrites the entries, so the scope discards the cache with its write sets.
+   */
+  readonly #stagedKeyOverlays = new WeakMap<
+    DatabaseTransaction,
+    { consumed: number; tables: Map<string, { added: Set<string>; removed: Set<string> }> }
+  >();
+
   #stagedKeyOverlay(
     transaction: DatabaseTransaction,
     tableId: string,
   ): { added: Set<string>; removed: Set<string> } {
-    const added = new Set<string>();
-    const removed = new Set<string>();
-    for (const entry of transaction.accumulatedUniqueKeyChanges) {
-      if (entry.tableId !== tableId) continue;
+    const entries = transaction.accumulatedUniqueKeyChanges;
+    let cache = this.#stagedKeyOverlays.get(transaction);
+    if (cache === undefined || cache.consumed > entries.length) {
+      cache = { consumed: 0, tables: new Map() };
+      this.#stagedKeyOverlays.set(transaction, cache);
+    }
+    for (; cache.consumed < entries.length; cache.consumed += 1) {
+      const entry = entries[cache.consumed];
+      if (entry === undefined) continue;
+      let overlay = cache.tables.get(entry.tableId);
+      if (overlay === undefined) {
+        overlay = { added: new Set(), removed: new Set() };
+        cache.tables.set(entry.tableId, overlay);
+      }
       for (const token of entry.keyTokens) {
         if (entry.remove === true) {
-          added.delete(token);
-          removed.add(token);
+          overlay.added.delete(token);
+          overlay.removed.add(token);
         } else {
-          removed.delete(token);
-          added.add(token);
+          overlay.removed.delete(token);
+          overlay.added.add(token);
         }
       }
     }
-    return { added, removed };
+    return cache.tables.get(tableId) ?? { added: new Set(), removed: new Set() };
+  }
+
+  /**
+   * Plain mutations inside a write scope are not encoded one statement at a time. Each
+   * statement still validates, fills defaults, reserves identity values, registers its unique
+   * keys, and proves its foreign keys — everything that must fail on the statement that caused
+   * it — but its effect joins the table's write set: a per-key memtable in which an insert, an
+   * update, a delete, and an upsert of the same key fold into one net effect. The set becomes
+   * at most one delete, one upsert, one insert, and one update segment per distinct column set
+   * when something needs the segments: a read of the table, a savepoint, the commit, or a
+   * block's worth of rows waiting. What was encoded stays mirrored per key, within a budget, so
+   * the keyed lookups the engine makes for its own checks — upsert classification, pre-images
+   * for CHECK constraints and indexes — answer from the write set plus the committed snapshot
+   * and never force the encoding themselves. Tables with triggers stage per statement, because
+   * a trigger sees each statement's rows.
+   */
+  readonly #scopeWrites = new WeakMap<DatabaseTransaction, ScopeWriteState>();
+
+  /** The scope's write state; a standalone write's transaction has none and stages directly. */
+  #scopeWriteState(transaction: DatabaseTransaction): ScopeWriteState | undefined {
+    return this.#scopeWrites.get(transaction);
+  }
+
+  #scopeWriteSet(state: ScopeWriteState, table: TableRecord): ScopeWriteSet {
+    let set = state.tables.get(table.id);
+    if (set === undefined) {
+      set = {
+        table,
+        keyColumn: getUniqueKeyColumn(table),
+        rows: new Map(),
+        pendingRows: 0,
+        pendingBytes: 0,
+        mirrorBytes: 0,
+        opaque: false,
+        unkeyedSequence: 0,
+      };
+      state.tables.set(table.id, set);
+    }
+    return set;
+  }
+
+  #hasPendingScopeWrites(transaction: DatabaseTransaction): boolean {
+    const state = this.#scopeWrites.get(transaction);
+    if (state === undefined) return false;
+    for (const set of state.tables.values()) if (set.pendingRows > 0) return true;
+    return false;
+  }
+
+  /** Unchanged by a statement that buffered nothing. */
+  #scopeWriteGeneration(transaction: DatabaseTransaction): number {
+    return this.#scopeWrites.get(transaction)?.generation ?? 0;
+  }
+
+  /**
+   * Before a segment is staged for the table outside its write set: what the set still holds
+   * for the table goes first, so statement order survives, and the set stops vouching for the
+   * table — keyed lookups read the overlay from here on.
+   */
+  async #stageScopeDirectly(transaction: DatabaseTransaction, table: TableRecord): Promise<void> {
+    const state = this.#scopeWriteState(transaction);
+    if (state === undefined) return;
+    await this.#flushScopeWriteSets(transaction, [table.id]);
+    this.#scopeWriteSet(state, table).opaque = true;
+  }
+
+  /** The commit's encoding: nothing reads the set afterwards, so no mirror is kept. */
+  async #finishScopeWriteSets(transaction: DatabaseTransaction): Promise<void> {
+    const state = this.#scopeWriteState(transaction);
+    if (state === undefined) return;
+    state.mirrored = false;
+    await this.#flushScopeWriteSets(transaction);
+  }
+
+  #applyScopeEffect(
+    set: ScopeWriteSet,
+    token: string,
+    key: Exclude<BatchValue, null> | undefined,
+    effect: ScopeRowEffect,
+  ): void {
+    let entry = set.rows.get(token);
+    if (entry === undefined) {
+      entry = { key };
+      set.rows.set(token, entry);
+    }
+    if (entry.pending === undefined) set.pendingRows += 1;
+    entry.pending = composeScopeEffect(entry.pending, effect);
+  }
+
+  async #bufferScopeRows(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    batch: ColumnarBatch,
+    rowCount: number,
+    kind: "insert" | "upsert",
+  ): Promise<void> {
+    const state = this.#scopeWriteState(transaction);
+    if (state === undefined) throw new Error("Only a write scope buffers its statements");
+    state.generation += 1;
+    const set = this.#scopeWriteSet(state, table);
+    const { keyColumn } = set;
+    const keyValues = keyColumn === undefined ? undefined : (batch.columns[keyColumn.name] ?? []);
+    for (let row = 0; row < rowCount; row += 1) {
+      const values: Array<BatchValue | undefined> = table.columns.map(
+        (column) => batch.columns[column.name]?.[row] ?? null,
+      );
+      let token: string;
+      let key: Exclude<BatchValue, null> | undefined;
+      if (keyColumn === undefined || keyValues === undefined) {
+        token = `\u0000${String(set.unkeyedSequence)}`;
+        set.unkeyedSequence += 1;
+      } else {
+        const value = keyValues[row] ?? null;
+        if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
+        token = keyToken(keyColumn.type, value);
+        key = value;
+      }
+      this.#applyScopeEffect(set, token, key, { kind, values });
+    }
+    set.pendingBytes += estimateBatchBytes(batch);
+    await this.#settleScopeWriteSet(transaction, set);
+  }
+
+  async #bufferScopeUpdate(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    input: UpdateBatchInput,
+  ): Promise<void> {
+    const state = this.#scopeWriteState(transaction);
+    if (state === undefined) throw new Error("Only a write scope buffers its statements");
+    state.generation += 1;
+    const set = this.#scopeWriteSet(state, table);
+    const keyPosition = table.columns.findIndex((column) => column.id === keyColumn.id);
+    const changes = Object.entries(input.changes).map(([name, values]) => ({
+      position: table.columns.findIndex((column) => column.name === name),
+      values,
+    }));
+    let bytes = estimateValuesBytes(input.keys);
+    for (const change of changes) bytes += estimateValuesBytes(change.values);
+    for (let row = 0; row < input.keys.length; row += 1) {
+      const key = input.keys[row] ?? null;
+      if (key === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
+      const values = new Array<BatchValue | undefined>(table.columns.length).fill(undefined);
+      values[keyPosition] = key;
+      for (const change of changes) values[change.position] = change.values[row] ?? null;
+      this.#applyScopeEffect(set, keyToken(keyColumn.type, key), key, { kind: "update", values });
+    }
+    set.pendingBytes += bytes;
+    await this.#settleScopeWriteSet(transaction, set);
+  }
+
+  async #bufferScopeDelete(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keys: ReadonlyMap<string, Exclude<BatchValue, null>>,
+  ): Promise<void> {
+    const state = this.#scopeWriteState(transaction);
+    if (state === undefined) throw new Error("Only a write scope buffers its statements");
+    state.generation += 1;
+    const set = this.#scopeWriteSet(state, table);
+    for (const [token, key] of keys) {
+      this.#applyScopeEffect(set, token, key, { kind: "delete", values: [] });
+    }
+    set.pendingBytes += estimateValuesBytes([...keys.values()]);
+    await this.#settleScopeWriteSet(transaction, set);
+  }
+
+  /** Encodes a table's set at a block's worth of rows, or every set at the scope's byte budget. */
+  async #settleScopeWriteSet(transaction: DatabaseTransaction, set: ScopeWriteSet): Promise<void> {
+    if (set.pendingRows >= this.#rowsPerBlock) {
+      await this.#flushScopeWriteSets(transaction, [set.table.id]);
+      return;
+    }
+    let pendingBytes = 0;
+    for (const pending of this.#scopeWriteState(transaction)?.tables.values() ?? []) {
+      pendingBytes += pending.pendingBytes;
+    }
+    // The bound is per scope, not per table: many tables each just under the ceiling would
+    // otherwise hold many ceilings' worth of rows in memory.
+    if (pendingBytes >= scopeWriteSetTestHooks.budgetBytes) {
+      await this.#flushScopeWriteSets(transaction);
+    }
+  }
+
+  /**
+   * Encodes what waits for the named tables — every table when omitted — into segments. Reads
+   * run concurrently inside a scope, and two of them asking for the same table must not both
+   * encode its pending rows, so flushes take turns: the second finds nothing left to do.
+   */
+  #flushScopeWriteSets(
+    transaction: DatabaseTransaction,
+    tableIds?: Iterable<string>,
+  ): Promise<void> {
+    const state = this.#scopeWrites.get(transaction);
+    if (state === undefined) return Promise.resolve();
+    const ids = tableIds === undefined ? undefined : [...tableIds];
+    const turn = state.flushing.then(() => this.#flushScopeWriteSetsNow(transaction, state, ids));
+    state.flushing = turn.catch(() => undefined);
+    return turn;
+  }
+
+  async #flushScopeWriteSetsNow(
+    transaction: DatabaseTransaction,
+    state: ScopeWriteState,
+    tableIds: readonly string[] | undefined,
+  ): Promise<void> {
+    const ids = tableIds ?? [...state.tables.keys()];
+    for (const tableId of ids) {
+      const set = state.tables.get(tableId);
+      if (set === undefined || set.pendingRows === 0) continue;
+      try {
+        await this.#stageScopeWriteSet(transaction, state, set);
+      } catch (error) {
+        // Part of the set may have staged: the scope can only roll back from here.
+        state.failure ??= error;
+        throw error;
+      }
+    }
+    if (!state.mirrored) return;
+    let retained = 0;
+    for (const set of state.tables.values()) retained += set.mirrorBytes + set.pendingBytes;
+    if (retained <= scopeWriteSetTestHooks.budgetBytes) return;
+    // Past the budget the mirrors go, and keyed lookups read through the overlay from here on.
+    state.mirrored = false;
+    for (const set of state.tables.values()) {
+      for (const [token, entry] of set.rows) {
+        if (entry.pending === undefined) set.rows.delete(token);
+        else delete entry.staged;
+      }
+      set.mirrorBytes = 0;
+    }
+  }
+
+  async #stageScopeWriteSet(
+    transaction: DatabaseTransaction,
+    state: ScopeWriteState,
+    set: ScopeWriteSet,
+  ): Promise<void> {
+    const { table, keyColumn } = set;
+    const keyPosition =
+      keyColumn === undefined
+        ? -1
+        : table.columns.findIndex((column) => column.id === keyColumn.id);
+    const deletes: Array<Exclude<BatchValue, null>> = [];
+    const updates = new Map<string, { positions: number[]; entries: ScopeRowEntry[] }>();
+    const upserts: ScopeRowEffect[] = [];
+    const inserts: ScopeRowEffect[] = [];
+    for (const entry of set.rows.values()) {
+      const pending = entry.pending;
+      if (pending === undefined) continue;
+      switch (pending.kind) {
+        case "delete":
+          if (entry.key !== undefined) deletes.push(entry.key);
+          break;
+        case "insert":
+          inserts.push(pending);
+          break;
+        case "upsert":
+          upserts.push(pending);
+          break;
+        case "update": {
+          const positions: number[] = [];
+          pending.values.forEach((value, position) => {
+            if (value !== undefined && position !== keyPosition) positions.push(position);
+          });
+          const signature = positions.join(",");
+          let group = updates.get(signature);
+          if (group === undefined) {
+            group = { positions, entries: [] };
+            updates.set(signature, group);
+          }
+          group.entries.push(entry);
+          break;
+        }
+      }
+    }
+    const batchOf = (effects: readonly ScopeRowEffect[]): ColumnarBatch => ({
+      columns: Object.fromEntries(
+        table.columns.map((column, position) => [
+          column.name,
+          effects.map((effect) => effect.values[position] ?? null),
+        ]),
+      ),
+      rowCount: effects.length,
+    });
+    if (keyColumn !== undefined) {
+      if (deletes.length > 0) {
+        await this.#stageDeleteSegment(transaction, table, keyColumn, deletes);
+      }
+      for (const group of updates.values()) {
+        const changes: Record<string, BatchValue[]> = {};
+        for (const position of group.positions) {
+          const column = table.columns[position];
+          if (column === undefined) continue;
+          changes[column.name] = group.entries.map(
+            (entry) => entry.pending?.values[position] ?? null,
+          );
+        }
+        await this.#stageUpdateSegment(transaction, table, keyColumn, {
+          keys: group.entries.map((entry) => entry.key ?? null),
+          changes,
+        });
+      }
+    }
+    if (upserts.length > 0) {
+      await this.#stageInsertSegment(
+        transaction,
+        table,
+        batchOf(upserts),
+        upserts.length,
+        "upsert",
+      );
+    }
+    if (inserts.length > 0) {
+      await this.#stageInsertSegment(
+        transaction,
+        table,
+        batchOf(inserts),
+        inserts.length,
+        "insert",
+      );
+    }
+    // An opaque table's mirror would never be consulted, so it is not kept either.
+    const mirror = keyColumn !== undefined && state.mirrored && !set.opaque;
+    for (const [token, entry] of set.rows) {
+      if (entry.pending === undefined) continue;
+      if (!mirror) {
+        set.rows.delete(token);
+        continue;
+      }
+      entry.staged = composeScopeEffect(entry.staged, entry.pending);
+      delete entry.pending;
+    }
+    if (mirror) set.mirrorBytes += set.pendingBytes;
+    set.pendingBytes = 0;
+    set.pendingRows = 0;
+  }
+
+  /** After a savepoint rollback: the segments changed under the mirrors, so nothing is trusted. */
+  #discardScopeWriteSets(transaction: DatabaseTransaction): void {
+    const generation = this.#scopeWriteGeneration(transaction) + 1;
+    this.#scopeWrites.set(transaction, {
+      tables: new Map(),
+      mirrored: false,
+      generation,
+      flushing: Promise.resolve(),
+    });
+    this.#stagedKeyOverlays.delete(transaction);
+  }
+
+  /**
+   * Keyed rows as the scope sees them, for the engine's own checks: the write set answers the
+   * keys it holds, the committed snapshot answers the rest, and an update patches its committed
+   * row. Undefined when the set cannot vouch for the table — segments staged outside it, or
+   * mirrors dropped — so the caller reads through the overlay instead.
+   */
+  async #scopeRowsByKey(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: ReadonlyArray<Exclude<BatchValue, null>>,
+    projection: "*" | readonly string[],
+  ): Promise<QueryRow[] | undefined> {
+    const state = this.#scopeWrites.get(transaction);
+    if (!state?.mirrored) return undefined;
+    const set = state.tables.get(table.id);
+    if (set?.opaque === true) return undefined;
+    const names =
+      projection === "*" ? visibleTableColumns(table).map(({ name }) => name) : [...projection];
+    if (!names.includes(keyColumn.name)) names.push(keyColumn.name);
+    const wanted = new Set(names);
+    const answered = new Map<string, QueryRow>();
+    const committed: Array<Exclude<BatchValue, null>> = [];
+    const patches = new Map<string, ScopeRowEffect>();
+    for (const key of keys) {
+      const token = keyToken(keyColumn.type, key);
+      const entry = set?.rows.get(token);
+      const effect = entry === undefined ? undefined : netScopeEffect(entry);
+      if (effect === undefined) {
+        committed.push(key);
+        continue;
+      }
+      if (effect.kind === "delete") continue;
+      if (effect.kind === "update") {
+        committed.push(key);
+        patches.set(token, effect);
+        continue;
+      }
+      const row: QueryRow = {};
+      table.columns.forEach((column, position) => {
+        if (wanted.has(column.name)) row[column.name] = effect.values[position] ?? null;
+      });
+      answered.set(token, row);
+    }
+    if (committed.length > 0 && transaction.snapshotVersion !== null) {
+      for (let start = 0; start < committed.length; start += SCOPE_KEY_LOOKUP_WINDOW) {
+        const window = committed.slice(start, start + SCOPE_KEY_LOOKUP_WINDOW);
+        const plan: CompiledQuery = {
+          sql: "(scope keyed lookup)",
+          base: { table: table.name, alias: table.name },
+          joins: [],
+          select: names.map((name) => ({
+            expression: { kind: "column", reference: name },
+            alias: name,
+          })),
+          predicates: [
+            {
+              left: { kind: "column", reference: keyColumn.name },
+              operator: "IN",
+              right: { kind: "list", items: window.map((value) => ({ kind: "literal", value })) },
+            },
+          ],
+          groupBy: [],
+          having: [],
+          orderBy: [],
+        };
+        // Pinned to the scope's snapshot, like every other read the scope makes.
+        const result = await this.#queryCompiled(plan, {
+          version: transaction.snapshotVersion,
+          memoize: false,
+        });
+        for (const row of result.rows) {
+          const key = row[keyColumn.name] ?? null;
+          if (key === null) continue;
+          const token = keyToken(keyColumn.type, key);
+          const patch = patches.get(token);
+          if (patch !== undefined) {
+            table.columns.forEach((column, position) => {
+              const value = patch.values[position];
+              if (value !== undefined && wanted.has(column.name)) row[column.name] = value;
+            });
+          }
+          answered.set(token, row);
+        }
+      }
+    }
+    // Stored form throughout, as the overlay read returns: the terms a unique secondary index
+    // retires are computed from these images and must match the ones staged from batch values.
+    return [...answered.values()];
+  }
+
+  /** The scope's keyed reader: the write set where it can vouch, the overlay read otherwise. */
+  #scopeKeyLookup(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+  ): ScopeKeyLookup {
+    return async (keys, projection) => {
+      const direct = await this.#scopeRowsByKey(transaction, table, keyColumn, keys, projection);
+      if (direct !== undefined) return direct;
+      const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+      const selected = projection === "*" ? "*" : projection.map(quote).join(", ");
+      const rows: QueryRow[] = [];
+      for (let start = 0; start < keys.length; start += SCOPE_KEY_LOOKUP_WINDOW) {
+        const window = keys.slice(start, start + SCOPE_KEY_LOOKUP_WINDOW);
+        const placeholders = window.map(() => "?").join(", ");
+        const sql = `SELECT ${selected} FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
+        rows.push(...(await this.#sessionQuery(transaction, sql, { params: [...window] })).rows);
+      }
+      return rows;
+    };
+  }
+
+  /**
+   * A keyed UPDATE with constant assignments, or a keyed DELETE, inside a scope: the keys come
+   * from the predicate and their presence from the scope's key overlay and the committed
+   * snapshot, so the statement needs no read of the table. Anything else — an expression over
+   * the row, RETURNING, extra sources, a constant the column would have to convert, a domain
+   * column — takes the general path, whose read decides the same rows.
+   */
+  async #scopeKeyedMutation(
+    statement: Extract<CompiledStatement, { kind: "update" | "delete" }>,
+  ): Promise<ScopeKeyedMutation | undefined> {
+    if (
+      statement.from !== undefined ||
+      statement.returning !== undefined ||
+      statement.returningItems !== undefined ||
+      statement.predicates.length !== 1
+    ) {
+      return undefined;
+    }
+    const table = await this.#findTable(statement.table);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined || keyColumn.hidden === true || keyColumn.sqlDomain !== undefined) {
+      return undefined;
+    }
+    const predicate = statement.predicates[0];
+    if (predicate === undefined) return undefined;
+    const keyNames = new Set([
+      keyColumn.name,
+      `${statement.alias ?? table.name}.${keyColumn.name}`,
+    ]);
+    const isKey = (expression: Expression): boolean =>
+      expression.kind === "column" && keyNames.has(expression.reference);
+    const keys: Array<Exclude<BatchValue, null>> = [];
+    const accept = (expression: Expression): boolean => {
+      const value = plainLiteralValue(expression);
+      if (value === undefined || value === null || !valueMatchesColumnType(keyColumn, value)) {
+        return false;
+      }
+      keys.push(value);
+      return true;
+    };
+    if (predicate.operator === "=") {
+      if (isKey(predicate.left)) {
+        if (!accept(predicate.right)) return undefined;
+      } else if (isKey(predicate.right)) {
+        if (!accept(predicate.left)) return undefined;
+      } else {
+        return undefined;
+      }
+    } else if (predicate.operator === "IN" && isKey(predicate.left)) {
+      if (predicate.right.kind !== "list") return undefined;
+      for (const item of predicate.right.items) if (!accept(item)) return undefined;
+    } else {
+      return undefined;
+    }
+    if (statement.kind === "delete") return { kind: "delete", table, keyColumn, keys, changes: {} };
+    const changes: Record<string, BatchValue> = {};
+    for (const assignment of statement.assignments) {
+      const column = table.columns.find((candidate) => candidate.name === assignment.column);
+      if (
+        column === undefined ||
+        column.sqlDomain !== undefined ||
+        column.generatedValue !== undefined ||
+        column.id === keyColumn.id ||
+        (table.primaryKeyColumnIds ?? []).includes(column.id) ||
+        Object.hasOwn(changes, column.name)
+      ) {
+        return undefined;
+      }
+      const value = plainLiteralValue(assignment.expression);
+      if (value === undefined || (value !== null && !valueMatchesColumnType(column, value))) {
+        return undefined;
+      }
+      changes[column.name] = value;
+    }
+    if (Object.keys(changes).length === 0) return undefined;
+    return { kind: "update", table, keyColumn, keys, changes };
+  }
+
+  /**
+   * Which keys the scope sees as present, as key tokens: added by the scope and not removed
+   * since, or committed and not removed. The scope's key overlay settles most keys; the rest are
+   * probed at the scope's snapshot with a keyed read that needs none of the write set encoded.
+   */
+  async #scopeKeyPresence(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: ReadonlyArray<Exclude<BatchValue, null>>,
+  ): Promise<Set<string>> {
+    const overlay = this.#stagedKeyOverlay(transaction, table.id);
+    const present = new Set<string>();
+    const unresolved: string[] = [];
+    for (const key of keys) {
+      const token = keyToken(keyColumn.type, key);
+      if (overlay.added.has(token)) present.add(token);
+      else if (!overlay.removed.has(token)) unresolved.push(token);
+    }
+    if (unresolved.length > 0) {
+      // The committed probe reads the store's current unique-key index, as #assertKeysExist
+      // does: a key another writer committed meanwhile counts as present here, and the scope's
+      // commit then fails on that writer's conflict rather than publishing over it.
+      const existing = await this.#existingKeyTokens(
+        table,
+        transaction.snapshotVersion,
+        unresolved,
+      );
+      for (const token of existing) present.add(token);
+    }
+    return present;
+  }
+
+  async #runScopeKeyedMutation(
+    transaction: DatabaseTransaction,
+    keyed: ScopeKeyedMutation,
+    /** Runs when rows exist to mutate — the point at which the general path counts a stage. */
+    beforeMutation: () => void,
+  ): Promise<ExecuteResult> {
+    const { table, keyColumn } = keyed;
+    const byToken = new Map<string, Exclude<BatchValue, null>>();
+    for (const key of keyed.keys) byToken.set(keyToken(keyColumn.type, key), key);
+    const presence = await this.#scopeKeyPresence(transaction, table, keyColumn, [
+      ...byToken.values(),
+    ]);
+    const present: Array<Exclude<BatchValue, null>> = [];
+    for (const [token, key] of byToken) if (presence.has(token)) present.push(key);
+    if (present.length === 0) return { kind: keyed.kind, table: table.name, rowCount: 0 };
+    beforeMutation();
+    if (keyed.kind === "delete") {
+      const deleted = await this.#sessionDelete(transaction, table.name, { keys: present });
+      return { kind: "delete", table: table.name, rowCount: deleted.rowCount };
+    }
+    const changes = Object.fromEntries(
+      Object.entries(keyed.changes).map(([name, value]) => [name, present.map(() => value)]),
+    );
+    const updated = await this.#sessionUpdate(transaction, table.name, { keys: present, changes });
+    return { kind: "update", table: table.name, rowCount: updated.rowCount };
   }
 
   async #sessionInsert(
@@ -9279,8 +10175,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             sessionUpsertKeyColumn,
             batch,
             rowCount,
-            (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+            undefined,
             normalizedConflictWhere,
+            this.#scopeKeyLookup(transaction, table, sessionUpsertKeyColumn),
           );
     let skippedRowCount = 0;
     if (normalizedConflictWhere !== undefined) {
@@ -9313,6 +10210,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     await this.#assertCompactionCapacity(table, transaction);
     const keys = batchKeys(table, batch);
     if (keys !== undefined) {
+      if (kind === "insert") {
+        // A key the scope already holds fails this statement, before it registers anything,
+        // so the scope stays usable; commit still re-validates against committed rows.
+        const keyColumn = getUniqueKeyColumn(table);
+        const overlay = this.#stagedKeyOverlay(transaction, table.id);
+        for (const [token, value] of keys) {
+          if (overlay.added.has(token) && keyColumn !== undefined) {
+            throw new UniqueConstraintError(table.name, keyColumn.name, value);
+          }
+        }
+      }
       transaction.setUniqueKeyChanges({
         tableId: table.id,
         keyTokens: [...keys.keys()],
@@ -9325,7 +10233,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (sql, params) => this.#sessionQuery(transaction, sql, { params }),
       transaction,
     );
-    const rowIds = await this.store.reserveRowIds(table.id, rowCount);
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
     stageSecondaryUniqueInsertChanges(
@@ -9334,6 +10241,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       batch,
       kind === "upsert" ? sessionUpsertFirings?.oldImages : undefined,
     );
+    const buffered =
+      this.#scopeWrites.has(transaction) &&
+      rowCount < SCOPE_DIRECT_STAGE_ROWS &&
+      !(table.triggers ?? []).some(
+        (trigger) => trigger.event === "insert" || trigger.event === "update",
+      );
+    if (buffered) {
+      await this.#bufferScopeRows(transaction, table, batch, rowCount, kind);
+      collectAutoIncrementGenerated(batch, generated, autoIncrement);
+      return {
+        tableName: table.name,
+        segmentId: null,
+        rowCount,
+        skippedRowCount,
+        ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
+      };
+    }
+    await this.#stageScopeDirectly(transaction, table);
+    const rowIds = await this.store.reserveRowIds(table.id, rowCount);
     if (kind === "insert") {
       await this.#stageTriggerDerivedInserts(
         transaction,
@@ -9430,7 +10356,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       keyColumn,
       input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
       "update",
-      (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
+      undefined,
       sessionChecks.length > 0 ||
         changedForeignKey ||
         tableGeneratedExpressions(table).length > 0 ||
@@ -9438,6 +10364,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         readyUniqueSecondaryIndexes(table).some(({ columns }) =>
           columns.some((column) => input.changes[column.name] !== undefined),
         ),
+      this.#scopeKeyLookup(transaction, table, keyColumn),
     );
     input = applyStoredGeneratedUpdateChanges(table, input, preImages);
     validateUpdateBatch(table, keyColumn, input);
@@ -9491,67 +10418,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       "before",
       cascadeBudget,
     );
-    const changedColumns = Object.keys(input.changes).sort();
-    const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
-    const segmentId = this.#createId();
-    const columnBlockIds: Record<string, string[]> = {};
-    const blockStager = new BoundedWriteBlockStager(transaction);
-    const plannedColumns = columns.map((column) =>
-      writeColumnValues(
-        column.type,
-        column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
-      ),
-    );
-    const ranges = writeBlockRanges(
-      plannedColumns,
-      input.keys.length,
-      this.#rowsPerBlock,
-      this.#targetBlockBytes,
-    );
-    for (const [columnIndex, column] of columns.entries()) {
-      const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
-      const plannedColumn = plannedColumns[columnIndex];
-      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
-      const blockIds: string[] = [];
-      for (const [part, { start, end }] of ranges.entries()) {
-        await blockStager.prepare(
-          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
-        );
-        const slice = values.slice(start, end);
-        const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
-        const blockId = [
-          "table",
-          table.id,
-          "segment",
-          segmentId,
-          "update-column",
-          column.id,
-          "part",
-          String(part).padStart(6, "0"),
-        ].join("/");
-        blockStager.add({ id: blockId, bytes });
-        blockIds.push(blockId);
-      }
-      columnBlockIds[column.id] = blockIds;
+    const buffered =
+      this.#scopeWrites.has(transaction) &&
+      input.keys.length < SCOPE_DIRECT_STAGE_ROWS &&
+      !(table.triggers ?? []).some((trigger) => trigger.event === "update");
+    let segmentId: string | null = null;
+    if (buffered) {
+      await this.#bufferScopeUpdate(transaction, table, keyColumn, input);
+    } else {
+      await this.#stageScopeDirectly(transaction, table);
+      segmentId = await this.#stageUpdateSegment(transaction, table, keyColumn, input);
     }
-    await blockStager.stageWithSegments([
-      {
-        id: segmentId,
-        tableId: table.id,
-        transactionId: transaction.id,
-        rowCount: input.keys.length,
-        rowIdStart: 0n,
-        rowIdEndExclusive: 0n,
-        columnBlockIds,
-        kind: "update",
-        keyColumnId: keyColumn.id,
-        level: 0,
-        logicalOrder: 0,
-        commitOrdinal: transaction.pendingSegmentIds.length,
-        rowIdSpans: [],
-        createdAt: dateIsoString(this.#now()),
-      },
-    ]);
     await this.#stageTriggerDerivedInserts(
       transaction,
       table,
@@ -9647,8 +10524,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keyColumn,
         [...keys.values()],
         "delete",
-        (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
+        undefined,
         readyUniqueSecondaryIndexes(table).length > 0,
+        this.#scopeKeyLookup(transaction, table, keyColumn),
       )
     ).filter((row) => row !== undefined);
     stageSecondaryUniqueMutationChanges(transaction, table, undefined, preImages);
@@ -9666,10 +10544,111 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       "before",
       cascadeBudget,
     );
-    const values = [...keys.values()];
-    if (keyStringByteLengths !== undefined) {
-      validatedStringByteLengths.set(values, keyStringByteLengths);
+    const buffered =
+      this.#scopeWrites.has(transaction) &&
+      keys.size < SCOPE_DIRECT_STAGE_ROWS &&
+      !(table.triggers ?? []).some((trigger) => trigger.event === "delete");
+    let segmentId: string | null = null;
+    if (buffered) {
+      await this.#bufferScopeDelete(transaction, table, keys);
+    } else {
+      await this.#stageScopeDirectly(transaction, table);
+      const values = [...keys.values()];
+      if (keyStringByteLengths !== undefined) {
+        validatedStringByteLengths.set(values, keyStringByteLengths);
+      }
+      segmentId = await this.#stageDeleteSegment(transaction, table, keyColumn, values);
     }
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "delete",
+      preImages.length,
+      sessionDeleteValueAt,
+      "after",
+      cascadeBudget,
+    );
+    return { tableName: table.name, segmentId, rowCount: keys.size };
+  }
+
+  /** One update segment: the key column plus every changed column, one block set each. */
+  async #stageUpdateSegment(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    input: UpdateBatchInput,
+  ): Promise<string> {
+    const changedColumns = Object.keys(input.changes).sort();
+    const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
+    const segmentId = this.#createId();
+    const columnBlockIds: Record<string, string[]> = {};
+    const blockStager = new BoundedWriteBlockStager(transaction);
+    const plannedColumns = columns.map((column) =>
+      writeColumnValues(
+        column.type,
+        column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
+      ),
+    );
+    const ranges = writeBlockRanges(
+      plannedColumns,
+      input.keys.length,
+      this.#rowsPerBlock,
+      this.#targetBlockBytes,
+    );
+    for (const [columnIndex, column] of columns.entries()) {
+      const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
+      const plannedColumn = plannedColumns[columnIndex];
+      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
+      const blockIds: string[] = [];
+      for (const [part, { start, end }] of ranges.entries()) {
+        await blockStager.prepare(
+          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
+        );
+        const slice = values.slice(start, end);
+        const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
+        const blockId = [
+          "table",
+          table.id,
+          "segment",
+          segmentId,
+          "update-column",
+          column.id,
+          "part",
+          String(part).padStart(6, "0"),
+        ].join("/");
+        blockStager.add({ id: blockId, bytes });
+        blockIds.push(blockId);
+      }
+      columnBlockIds[column.id] = blockIds;
+    }
+    await blockStager.stageWithSegments([
+      {
+        id: segmentId,
+        tableId: table.id,
+        transactionId: transaction.id,
+        rowCount: input.keys.length,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        columnBlockIds,
+        kind: "update",
+        keyColumnId: keyColumn.id,
+        level: 0,
+        logicalOrder: 0,
+        commitOrdinal: transaction.pendingSegmentCount,
+        rowIdSpans: [],
+        createdAt: dateIsoString(this.#now()),
+      },
+    ]);
+    return segmentId;
+  }
+
+  /** One delete segment: the keys, stored raw so a replay can match them without decoding. */
+  async #stageDeleteSegment(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    values: ReadonlyArray<Exclude<BatchValue, null>>,
+  ): Promise<string> {
     const segmentId = this.#createId();
     const blockIds: string[] = [];
     const blockStager = new BoundedWriteBlockStager(transaction);
@@ -9706,7 +10685,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         id: segmentId,
         tableId: table.id,
         transactionId: transaction.id,
-        rowCount: keys.size,
+        rowCount: values.length,
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
         columnBlockIds: { [keyColumn.id]: blockIds },
@@ -9714,21 +10693,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keyColumnId: keyColumn.id,
         level: 0,
         logicalOrder: 0,
-        commitOrdinal: transaction.pendingSegmentIds.length,
+        commitOrdinal: transaction.pendingSegmentCount,
         rowIdSpans: [],
         createdAt: dateIsoString(this.#now()),
       },
     ]);
-    await this.#stageTriggerDerivedInserts(
-      transaction,
-      table,
-      "delete",
-      preImages.length,
-      sessionDeleteValueAt,
-      "after",
-      cascadeBudget,
-    );
-    return { tableName: table.name, segmentId, rowCount: keys.size };
+    return segmentId;
   }
 
   #notifyLiveCommit(): void {
@@ -10357,6 +11327,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           );
         }
       }
+      const liveReasons: string[] = [];
+      const liveState = await this.#liveMaintenancePlan(
+        plan,
+        await this.store.getCatalogProbe(),
+        liveReasons,
+      );
+      notes.push(
+        liveState !== undefined
+          ? "live: maintained incrementally on change"
+          : `live: re-executes on change: ${liveReasons.join("; ") || "the shape is not maintainable"}`,
+      );
       return `${renderPlan(plan)}\n${notes.map((note) => `-- ${note}`).join("\n")}`;
     });
   }
@@ -10874,7 +11855,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             `Transaction savepoints cannot retain more than ${String(MAX_TRANSACTION_SAVEPOINT_BYTES)} bytes`,
           );
         }
-        open.savepoints.push({ name, checkpoint: open.session.checkpoint(), retainedBytes });
+        const checkpoint = await open.session.checkpoint();
+        open.savepoints.push({ name, checkpoint, retainedBytes });
       });
       return { kind: "transaction", action, name };
     }
@@ -11290,6 +12272,28 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
     );
     const keys = filled.batch.columns[keyColumn.name] ?? [];
+    const presence = await writer?.stagedKeyPresence?.(
+      table,
+      keyColumn,
+      keys.filter((value): value is Exclude<BatchValue, null> => value !== null),
+    );
+    if (presence !== undefined) {
+      const taken = new Set(presence);
+      return {
+        ...statement,
+        columns,
+        rows: materializedRows.filter((_, index) => {
+          const value = keys[index] ?? null;
+          if (value === null) return true;
+          const token = keyToken(keyColumn.type, value);
+          if (taken.has(token)) return false;
+          // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
+          // therefore conflicts with the first retained proposal and takes DO NOTHING too.
+          taken.add(token);
+          return true;
+        }),
+      };
+    }
     const plan: CompiledQuery = {
       sql: "(on conflict do nothing)",
       base: { table: table.name, alias: table.name },
@@ -11342,6 +12346,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (keyColumn.hidden === true) return;
     const keys = insertBatchKeyValues(input, keyColumn.name);
     if (keys.length === 0) return;
+    const present = await writer.stagedKeyPresence?.(
+      table,
+      keyColumn,
+      keys.filter((value): value is Exclude<BatchValue, null> => value !== null),
+    );
+    if (present !== undefined) {
+      for (const value of keys) {
+        if (value !== null && present.has(keyToken(keyColumn.type, value))) {
+          throw new UniqueConstraintError(table.name, keyColumn.name, value);
+        }
+      }
+      return;
+    }
     const plan: CompiledQuery = {
       sql: "(staged insert keys)",
       base: { table: table.name, alias: table.name },
@@ -11737,6 +12754,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               normalizeDomainBatch(pendingTable, batch);
               validateBatch(pendingTable, batch);
               const endExclusive = nextRowId + BigInt(rows.length);
+              await this.#stageScopeDirectly(transaction, pendingTable);
               await this.#stageInsertSegment(
                 transaction,
                 pendingTable,
@@ -13048,16 +14066,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }>;
       }
     | undefined {
+    // An upsert segment is appended rows whose keys may supersede earlier rows; it scans like
+    // an insert and replays like an update, so it takes the mutation table's overlay.
     const scanSegments = segments.filter((segment) => {
       const kind = segment.kind;
-      return kind === "insert" || kind === "base";
+      return kind === "insert" || kind === "base" || kind === "upsert";
     });
     const mutationSegments = segments.filter(
       (segment) => segment.kind === "update" || segment.kind === "delete",
     );
     if (scanSegments.length + mutationSegments.length !== segments.length) return undefined;
+    const replays =
+      mutationSegments.length > 0 || segments.some((segment) => segment.kind === "upsert");
     const keyColumn = getUniqueKeyColumn(table);
-    if (mutationSegments.length > 0) {
+    if (replays) {
       if (keyColumn === undefined) return undefined;
       // The key replay is block-driven over every segment, so the key column must have blocks
       // wherever rows exist; older histories without that shape keep the materialized path.
@@ -13076,7 +14098,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const scanRowCount = scanSegments.reduce((total, segment) => total + segment.rowCount, 0);
     return {
       create: async (memory: QueryMemoryContext) =>
-        mutationSegments.length > 0 && keyColumn !== undefined
+        replays && keyColumn !== undefined
           ? this.#createStreamedMutationTable(
               table,
               keyColumn,
@@ -13518,7 +14540,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }> {
     const scanSegments = baseSegments.filter((segment) => {
       const kind = segment.kind;
-      return kind === "insert" || kind === "base";
+      return kind === "insert" || kind === "base" || kind === "upsert";
     });
     const overlay = await this.#streamedOverlayState(
       table,
@@ -13529,8 +14551,72 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       memory,
       zonePruned,
     );
-    const { baseRows, dead, deadCount, patches, patchedSlots } = overlay;
+    const { baseRows, dead, deadCount, lazyPatches, patchedSlots } = overlay;
     const hasPatches = patchedSlots.length > 0;
+    /**
+     * The window's patches with every lazy one resolved: the blocks an upsert wrote come out
+     * of the buffer pool, as block vectors, for the projected columns of the slots in range.
+     */
+    const windowPatches = async (
+      from: number,
+      to: number,
+    ): Promise<ReadonlyMap<number, ReadonlyMap<string, OverlayPatch>>> => {
+      const needed = new Set<string>();
+      const inRange: Array<[number, readonly OverlayLazyPatch[]]> = [];
+      // Per slot and projected column, the newest layer that carries the column decides.
+      const winning = (
+        layers: readonly OverlayLazyPatch[],
+        columnId: string,
+      ): { blockId: string; row: number } | undefined => {
+        for (let index = layers.length - 1; index >= 0; index -= 1) {
+          const candidate = layers[index];
+          if (candidate === undefined) continue;
+          const blockId = candidate.segment.columnBlockIds[columnId]?.[candidate.blockIndex];
+          if (blockId !== undefined) return { blockId, row: candidate.row };
+        }
+        return undefined;
+      };
+      for (const [slot, layers] of lazyPatches) {
+        if (slot < from || slot >= to) continue;
+        inRange.push([slot, layers]);
+        for (const column of projectedColumns) {
+          const hit = winning(layers, column.id);
+          if (hit !== undefined) needed.add(hit.blockId);
+        }
+      }
+      const empty = new Map<number, ReadonlyMap<string, OverlayPatch>>();
+      if (inRange.length === 0) return empty;
+      const ids = [...needed];
+      const decoded = await this.#decodedBlocksThroughCache(ids, snapshot);
+      const vectors = new Map<string, ColumnVector>();
+      // The block vectors live in the buffer pool, which bounds them and shares them with the
+      // scan; the window pays for the cells it copies out, in overlayWindowCompacted.
+      ids.forEach((id, index) => {
+        const block = decoded[index];
+        if (block === undefined) throw new Error(`Visible block is missing: ${id}`);
+        vectors.set(id, this.#blockColumnVector(id, block));
+      });
+      memory.tally(inRange.length * 96, "Streamed mutation replay");
+      const resolved = new Map<number, Map<string, OverlayPatch>>();
+      const plain = new Map<string, ColumnVector>();
+      for (const [slot, layers] of inRange) {
+        const slotPatches = new Map<string, OverlayPatch>();
+        for (const column of projectedColumns) {
+          const hit = winning(layers, column.id);
+          if (hit === undefined) continue;
+          let vector = plain.get(hit.blockId);
+          if (vector === undefined) {
+            const raw = vectors.get(hit.blockId);
+            if (raw === undefined) throw new Error(`Visible block is missing: ${hit.blockId}`);
+            vector = plainTextExecutionVector(column, raw);
+            plain.set(hit.blockId, vector);
+          }
+          slotPatches.set(column.id, { vector, row: hit.row });
+        }
+        if (slotPatches.size > 0) resolved.set(slot, slotPatches);
+      }
+      return resolved;
+    };
     const outputRows = baseRows - deadCount;
     const inner = this.#createStreamedTable(
       table,
@@ -13588,15 +14674,35 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // The inner loader serves whole blocks; the outer window covers the suffix of the inner
       // window from baseStart, however long, and the caller clamps to what it asked for.
       const innerEnd = await inner.load(baseStart, baseRows - baseStart);
-      const baseEnd = typeof innerEnd === "number" ? Math.min(innerEnd, baseRows) : baseRows;
-      if (baseEnd <= baseStart) throw new Error(`Column row count mismatch: ${table.name}`);
-      const deadInWindow = bitmapCountRange(dead, baseStart, baseEnd);
-      const patchedInWindow = hasPatches ? sortedCountRange(patchedSlots, baseStart, baseEnd) : 0;
-      const liveRows = baseEnd - baseStart - deadInWindow;
+      const innerBaseEnd = typeof innerEnd === "number" ? Math.min(innerEnd, baseRows) : baseRows;
+      if (innerBaseEnd <= baseStart) throw new Error(`Column row count mismatch: ${table.name}`);
+      let baseEnd = innerBaseEnd;
+      let deadInWindow = bitmapCountRange(dead, baseStart, baseEnd);
+      let patchedInWindow = hasPatches ? sortedCountRange(patchedSlots, baseStart, baseEnd) : 0;
       const untouched = deadInWindow === 0 && patchedInWindow === 0;
+      if (!untouched) {
+        // A window that must be copied out is bounded to what the scan asked for: compacting
+        // the block's whole remaining suffix for every projected column, with the previous
+        // window still held while the next is built, is what let a wide table with wide
+        // deltas exhaust the query budget. An untouched window stays the zero-copy suffix.
+        let live = 0;
+        let row = baseStart;
+        while (row < innerBaseEnd && live < length) {
+          if (!bitmapHasValue(dead, row)) live += 1;
+          row += 1;
+        }
+        if (row < baseEnd) {
+          baseEnd = row;
+          deadInWindow = bitmapCountRange(dead, baseStart, baseEnd);
+          patchedInWindow = hasPatches ? sortedCountRange(patchedSlots, baseStart, baseEnd) : 0;
+        }
+      }
+      const liveRows = baseEnd - baseStart - deadInWindow;
       const runs = untouched
         ? undefined
         : overlayWindowRuns(dead, patchedSlots, baseStart, baseEnd, patchedInWindow);
+      const resolvedPatches =
+        runs === undefined || !hasPatches ? undefined : await windowPatches(baseStart, baseEnd);
       interface OuterTarget {
         state: OuterColumnState;
         fields: MutableStreamedVectorFields;
@@ -13623,7 +14729,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                   innerWindow.start,
                   runs,
                   liveRows,
-                  hasPatches ? patches : undefined,
+                  resolvedPatches,
                   state.column,
                   memory,
                   replacements,
@@ -13749,11 +14855,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // await per segment is what made a table with a few hundred deltas pay ten milliseconds
     // to rebuild this state after every commit.
     const deltaSegments = baseSegments.filter(mutationSegmentKind);
+    // An upsert segment's rows scan as base rows. A row whose key an earlier row holds patches
+    // that earlier slot in place with every column the segment carries and retires its own
+    // slot — the materialized replay's and the compaction fold's resolution, which keeps a
+    // row's identity stable across an upsert. The values are not held here: a patch names the
+    // block and row, and a window resolves it through the buffer pool when it needs it. Only
+    // the key vector loads now, and every one of its keys counts as touched.
+    const upsertSegments = baseSegments.filter((segment) => segment.kind === "upsert");
     const deltaBlockIds = new Set<string>();
-    for (const segment of deltaSegments) {
-      for (const column of table.columns) {
-        for (const blockId of segment.columnBlockIds[column.id] ?? []) deltaBlockIds.add(blockId);
-      }
+    // Only the key blocks load now; the values a patch needs come out of the pool per window.
+    for (const segment of [...deltaSegments, ...upsertSegments]) {
+      for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) deltaBlockIds.add(blockId);
     }
     const decodedDeltaBlocks = new Map<string, DecodedPhysicalBlock>();
     if (deltaBlockIds.size > 0) {
@@ -13786,14 +14898,37 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return vector;
     };
     const mutationKeyVectors = new Map<string, ColumnVector>();
-    const mutationChangedVectors = new Map<string, Map<string, ColumnVector>>();
+    // Where each delta segment's rows sit block by block, so a patch can name its block.
+    const blockStarts = new Map<string, number[]>();
+    const layoutOf = (segment: SegmentRecord): number[] => {
+      const starts: number[] = [];
+      let start = 0;
+      for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
+        starts.push(start);
+        const decoded = decodedDeltaBlocks.get(blockId);
+        if (decoded === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+        start += this.#blockColumnVector(blockId, decoded).length;
+      }
+      if (start !== segment.rowCount) {
+        throw new Error(`Column row count mismatch: ${keyColumn.name}`);
+      }
+      return starts;
+    };
+    const locate = (
+      segment: SegmentRecord,
+      row: number,
+    ): { blockIndex: number; rowInBlock: number } => {
+      const starts = blockStarts.get(segment.id) ?? [];
+      let blockIndex = starts.length - 1;
+      while (blockIndex > 0 && (starts[blockIndex] ?? 0) > row) blockIndex -= 1;
+      return { blockIndex, rowInBlock: row - (starts[blockIndex] ?? 0) };
+    };
     // Keys as the primitives the vectors already hold. The replay used to build one string
     // token per row on both sides, which made a single deleted row cost an allocation and a
     // hash of every key in the table.
     const touched = new Set<OverlayKey>();
-    let retainedBytes = 0;
+    const retainedBytes = 0;
     for (const segment of deltaSegments) {
-      const kind = segment.kind;
       const keyVector = await deltaVector(keyColumn, segment);
       memory.reserve(columnVectorRetainedBytes(keyVector), "Streamed mutation replay");
       mutationKeyVectors.set(segment.id, keyVector);
@@ -13801,24 +14936,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (let row = 0; row < segment.rowCount; row += 1) {
         touched.add(readMutationKey(row));
       }
-      if (kind === "update") {
-        const changed = new Map<string, ColumnVector>();
-        for (const column of table.columns) {
-          if (column.id === keyColumn.id) continue;
-          if ((segment.columnBlockIds[column.id]?.length ?? 0) === 0) continue;
-          const vector = await deltaVector(column, segment);
-          const bytes = columnVectorRetainedBytes(vector);
-          memory.reserve(bytes, "Streamed mutation replay");
-          retainedBytes += bytes;
-          changed.set(column.id, plainTextExecutionVector(column, vector));
-        }
-        mutationChangedVectors.set(segment.id, changed);
-      }
+      if (segment.kind === "update") blockStarts.set(segment.id, layoutOf(segment));
+    }
+    for (const segment of upsertSegments) {
+      const keyVector = await deltaVector(keyColumn, segment);
+      memory.reserve(columnVectorRetainedBytes(keyVector), "Streamed mutation replay");
+      mutationKeyVectors.set(segment.id, keyVector);
+      const readMutationKey = requiredColumnVectorKeyReader(keyVector);
+      for (let row = 0; row < segment.rowCount; row += 1) touched.add(readMutationKey(row));
     }
 
     // Phase B: one bounded pass over the scan segments' key blocks — a single block resident
     // at a time — recording, per scan segment, the touched keys and their absolute slots.
-    const touchedByScanSegment = new Map<string, Array<{ key: OverlayKey; slot: number }>>();
+    const touchedByScanSegment = new Map<string, TouchedScanRow[]>();
     // A mutation history is small, and a unique key is usually written in order, so most key
     // blocks cannot hold any touched key at all. Their zone maps say so from the header alone,
     // which is what keeps one deleted row from costing a decode of every key block in the table.
@@ -13832,10 +14962,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           );
     let baseRows = 0;
     for (const segment of scanSegments) {
-      const entries: Array<{ key: OverlayKey; slot: number }> = [];
+      const entries: TouchedScanRow[] = [];
       touchedByScanSegment.set(segment.id, entries);
       let segmentRows = 0;
-      for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
+      for (const [blockIndex, blockId] of (segment.columnBlockIds[keyColumn.id] ?? []).entries()) {
         const description = keyDescriptions.get(blockId);
         if (touchedPredicate !== undefined && description !== undefined) {
           if (description.type !== keyColumn.type) {
@@ -13858,7 +14988,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const readBlockKey = requiredColumnVectorKeyReader(blockVector);
         for (let row = 0; row < rows; row += 1) {
           const key = readBlockKey(row);
-          if (touched.has(key)) entries.push({ key, slot: baseRows + segmentRows + row });
+          if (touched.has(key)) {
+            entries.push({ key, slot: baseRows + segmentRows + row, blockIndex, row });
+          }
         }
         segmentRows += rows;
       }
@@ -13875,8 +15007,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const dead = new Uint8Array(Math.ceil(baseRows / 8));
     memory.reserve(dead.byteLength, "Streamed mutation replay");
     const slotByKey = new Map<OverlayKey, number>();
-    const patches = new Map<number, Map<string, OverlayPatch>>();
+    const lazyPatches = new Map<number, OverlayLazyPatch[]>();
     let deadCount = 0;
+    const layer = (slot: number, patch: OverlayLazyPatch): void => {
+      const layers = lazyPatches.get(slot);
+      if (layers === undefined) lazyPatches.set(slot, [patch]);
+      else layers.push(patch);
+    };
     for (const segment of baseSegments) {
       const kind = segment.kind;
       if (kind === "insert" || kind === "base") {
@@ -13885,6 +15022,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             throw new Error(`Stored table contains a duplicate unique key: ${table.name}`);
           }
           slotByKey.set(entry.key, entry.slot);
+        }
+        continue;
+      }
+      if (kind === "upsert") {
+        for (const entry of touchedByScanSegment.get(segment.id) ?? []) {
+          const existing = slotByKey.get(entry.key);
+          if (existing === undefined) {
+            slotByKey.set(entry.key, entry.slot);
+            continue;
+          }
+          // The earlier slot takes this row's values and this row retires. A later update or
+          // upsert of the key lands on the same earlier slot.
+          layer(existing, { segment, blockIndex: entry.blockIndex, row: entry.row });
+          if (!bitmapHasValue(dead, entry.slot)) {
+            setBitmapValue(dead, entry.slot);
+            deadCount += 1;
+          }
         }
         continue;
       }
@@ -13900,13 +15054,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (slot !== undefined && !bitmapHasValue(dead, slot)) {
             setBitmapValue(dead, slot);
             deadCount += 1;
-            patches.delete(slot);
+            lazyPatches.delete(slot);
           }
           slotByKey.delete(key);
         }
         continue;
       }
-      const changed = mutationChangedVectors.get(segment.id) ?? new Map<string, ColumnVector>();
       for (let row = 0; row < segment.rowCount; row += 1) {
         const slot = slotByKey.get(readKey(row));
         if (slot === undefined) {
@@ -13916,30 +15069,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (zonePruned) continue;
           throw new Error(`Update segment references a missing key: ${segment.id}`);
         }
-        let slotPatches = patches.get(slot);
-        if (slotPatches === undefined) {
-          slotPatches = new Map();
-          patches.set(slot, slotPatches);
-        }
-        for (const [columnId, vector] of changed) slotPatches.set(columnId, { vector, row });
+        const { blockIndex, rowInBlock } = locate(segment, row);
+        layer(slot, { segment, blockIndex, row: rowInBlock });
       }
     }
-    let patchCells = 0;
-    for (const slotPatches of patches.values()) patchCells += slotPatches.size;
-    memory.tally(patches.size * 96 + patchCells * 48, "Streamed mutation replay");
-    const patchedSlots = Uint32Array.from(patches.keys()).sort();
+    let layers = 0;
+    for (const slotLayers of lazyPatches.values()) layers += slotLayers.length;
+    memory.tally(lazyPatches.size * 96 + layers * 48, "Streamed mutation replay");
+    const patchedSlots = Uint32Array.from(lazyPatches.keys()).sort();
     return {
       baseRows,
       deadCount,
       dead,
-      patches,
+      lazyPatches,
       patchedSlots,
       bytes:
         dead.byteLength +
         retainedBytes +
         patchedSlots.byteLength +
-        patches.size * 96 +
-        patchCells * 48,
+        lazyPatches.size * 96 +
+        layers * 48,
     };
   }
 
@@ -14939,6 +16088,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           message: error instanceof Error ? error.message : String(error),
           at,
         };
+        this.#reportBackgroundError(error, "auto collection");
         this.#scheduleAutoCollectionRetry();
       })
       .finally(() => {
@@ -14963,6 +16113,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
     this.#autoCollectionTask = run;
     void run;
+  }
+
+  /** Hands a failure nobody awaits to the `onBackgroundError` hook; a throwing hook is contained. */
+  #reportBackgroundError(error: unknown, context: string): void {
+    try {
+      this.#onBackgroundError?.(error, context);
+    } catch {
+      // A diagnostic hook must never turn a background failure into a second one.
+    }
   }
 
   #scheduleAutoCollectionRetry(): void {
@@ -21456,8 +22615,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // owner's committed version as well as exact manifest membership. The sole exception is a
     // transaction-scoped overlay, whose pending owner is deliberately presented after the
     // pinned committed snapshot.
+    // The overlay's own segments exist by construction — the scope staged them and journals
+    // their blocks — so only committed segments take the block-presence check, which would
+    // otherwise probe every block of a long scope on each of its reads.
+    const overlay: SegmentRecord[] = [];
     const versionEligible = segments.filter((segment) => {
-      if (segment.transactionId === catalog?.overlayTransactionId) return true;
+      if (segment.transactionId === catalog?.overlayTransactionId) {
+        overlay.push(segment);
+        return false;
+      }
       const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
       return (
         snapshot.version !== null &&
@@ -21466,8 +22632,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         committedVersion <= snapshot.version
       );
     });
-    const visible = await filterSnapshotSegments(snapshot, versionEligible);
-    return [...visible].sort((left, right) => {
+    const visible = [...(await filterSnapshotSegments(snapshot, versionEligible)), ...overlay];
+    return visible.sort((left, right) => {
       const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
       const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
       const leftOrder = left.logicalOrder;
@@ -21483,8 +22649,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   async #transactionRecordsForSegments(
     segments: readonly SegmentRecord[],
+    /** A writer whose visibility the caller already decided, so its record is not read. */
+    excludeTransactionId?: string,
   ): Promise<TransactionRecord[]> {
-    const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
+    const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))].filter(
+      (id) => id !== excludeTransactionId,
+    );
     const records: TransactionRecord[] = [];
     for (let start = 0; start < transactionIds.length; start += 64) {
       const window = transactionIds.slice(start, start + 64);
@@ -24142,6 +25312,47 @@ function boundedExpiryMilliseconds(nowMs: number, ttlMs: number): number {
   return expiresAt;
 }
 
+/** A keyed statement inside a scope that needs no read of its table. */
+interface ScopeKeyedMutation {
+  kind: "update" | "delete";
+  table: TableRecord;
+  keyColumn: TableColumnRecord;
+  keys: Array<Exclude<BatchValue, null>>;
+  /** One constant per assigned column; empty for a delete. */
+  changes: Record<string, BatchValue>;
+}
+
+/** A constant the query pipeline would hand on unchanged; anything tagged or exact is not. */
+function plainLiteralValue(expression: Expression): BatchValue | undefined {
+  if (
+    expression.kind !== "literal" ||
+    expression.internalSqlValue === true ||
+    expression.sqlDomain !== undefined ||
+    expression.exactText !== undefined ||
+    expression.decimal === true
+  ) {
+    return undefined;
+  }
+  return expression.value;
+}
+
+/** True when the value is already in the column's physical type, so no read-time coercion applies. */
+function valueMatchesColumnType(
+  column: Pick<TableColumnRecord, "type">,
+  value: Exclude<BatchValue, null>,
+): boolean {
+  switch (column.type) {
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "string":
+      return typeof value === "string";
+    case "boolean":
+      return typeof value === "boolean";
+    case "datetime":
+      return value instanceof Date;
+  }
+}
+
 function keyToken(type: SimpleDataType, value: BatchValue): string {
   if (value === null) throw new TypeError("Unique key cannot be null");
   switch (type) {
@@ -24854,6 +26065,27 @@ interface OverlayPatch {
 }
 
 /**
+ * One delta row that patched a base row: the segment holding the values, and the block and row
+ * within it. A segment's columns share one block layout, so the pair locates the value in every
+ * column the segment carries; a later layer overrides an earlier one column by column. Nothing
+ * is retained: a window resolves the layers of its slots through the buffer pool as it is
+ * built, so an update or upsert history is bounded by its row count, not by the table's width.
+ */
+interface OverlayLazyPatch {
+  readonly segment: SegmentRecord;
+  readonly blockIndex: number;
+  readonly row: number;
+}
+
+/** A scan-segment row whose key some delta touches, with where its values live. */
+interface TouchedScanRow {
+  readonly key: OverlayKey;
+  readonly slot: number;
+  readonly blockIndex: number;
+  readonly row: number;
+}
+
+/**
  * The replayed mutation state of one visible segment set, shared by every query over it until
  * the next commit: see `#streamedOverlayState`.
  */
@@ -24863,9 +26095,9 @@ interface StreamedOverlayState {
   readonly deadCount: number;
   /** One bit per base row; set when a delete removed it. */
   readonly dead: Uint8Array;
-  /** Per patched base row, the column IDs an update replaced. */
-  readonly patches: ReadonlyMap<number, ReadonlyMap<string, OverlayPatch>>;
-  /** The patched base rows in ascending order, for range counts. */
+  /** Per patched base row, the delta rows that wrote it, oldest first. */
+  readonly lazyPatches: ReadonlyMap<number, readonly OverlayLazyPatch[]>;
+  /** The patched base rows (resident or lazy) in ascending order, for range counts. */
   readonly patchedSlots: Uint32Array;
   /** Modeled retained bytes, as charged to the buffer pool and tallied to each query. */
   readonly bytes: number;
@@ -25073,9 +26305,26 @@ function overlayWindowCompacted(
         : new Float64Array(rows);
   const codes = inner.kind === "string" ? new Uint32Array(rows) : undefined;
   codes?.fill(NULL_STRING_VECTOR_CODE);
-  let dictionary = inner.kind === "string" ? (inner.dictionary as string[]) : undefined;
-  let dictionaryIndex: Map<string, number> | undefined;
-  let dictionaryCopied = false;
+  // A string window that takes no patch for this column shares the inner dictionary, which
+  // belongs to the buffer pool. One that does is re-encoded into a dictionary of its own
+  // rows: the block's dictionary can hold tens of thousands of values the window never uses,
+  // and copying and indexing it per column per window is what made a wide patched scan cost
+  // memory and time proportional to the table, not to the window.
+  let patched = false;
+  if (inner.kind === "string" && patches !== undefined) {
+    for (let index = 0; index < steps.length; index += 2) {
+      if (
+        (steps[index + 1] ?? 0) === 0 &&
+        patches.get(steps[index] ?? 0)?.has(column.id) === true
+      ) {
+        patched = true;
+        break;
+      }
+    }
+  }
+  const dictionary: string[] | undefined =
+    inner.kind === "string" ? (patched ? [] : (inner.dictionary as string[])) : undefined;
+  const dictionaryIndex = patched ? new Map<string, number>() : undefined;
   const target = (
     codes !== undefined
       ? { kind: "string", length: rows, validity, codes, dictionary: dictionary ?? [] }
@@ -25088,23 +26337,27 @@ function overlayWindowCompacted(
     const patch = length === 0 ? patches?.get(start)?.get(column.id) : undefined;
     if (patch === undefined) {
       const count = Math.max(1, length);
-      copyVectorSpan(inner, start - innerWindowStart, count, target, out);
+      if (dictionaryIndex === undefined) {
+        copyVectorSpan(inner, start - innerWindowStart, count, target, out);
+      } else {
+        for (let row = 0; row < count; row += 1) {
+          copyColumnVectorValue(
+            inner,
+            start - innerWindowStart + row,
+            target,
+            out + row,
+            dictionaryIndex,
+          );
+        }
+      }
       out += count;
       continue;
-    }
-    if (target.kind === "string" && !dictionaryCopied) {
-      // A patch value may be new to this window's dictionary, and the inner's belongs to the
-      // buffer pool: copy before the first append, and index the copy for the lookups.
-      dictionary = [...(dictionary ?? [])];
-      (target as unknown as { dictionary: string[] }).dictionary = dictionary;
-      dictionaryIndex = new Map(dictionary.map((value, code) => [value, code]));
-      dictionaryCopied = true;
     }
     copyColumnVectorValue(patch.vector, patch.row, target, out, dictionaryIndex);
     out += 1;
   }
   if (out !== rows) throw new Error(`Column row count mismatch: ${column.name}`);
-  if (dictionaryCopied && dictionary !== undefined) {
+  if (patched && dictionary !== undefined) {
     let dictionaryBytes = 0;
     for (const value of dictionary) dictionaryBytes += 16 + value.length * 2;
     reservations.push(memory.reserve(dictionaryBytes, `Streamed window ${column.name}`));

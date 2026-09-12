@@ -114,7 +114,6 @@ import {
   UniqueIndexCoverageError,
   type WriteTransactionInput,
   assertTransactionArtifactBatchLimits,
-  assertTransactionArtifactJournalLimits,
   assertTempRunPageBatchLimits,
   assertStorageBulkReadItems,
   boundedMaintenanceBatchItems,
@@ -122,6 +121,7 @@ import {
   normalizeGarbageCollectionJobRecord,
   normalizeSegmentRecord,
   updateCompactionJobRecord,
+  appendTransactionJournal,
   updateTransactionRecord,
   updateGarbageCollectionPlanningRecord,
   validateTableColumns,
@@ -657,6 +657,22 @@ class RecordRootIndex {
     else index.delete(record.version);
   }
 
+  /**
+   * The record grew by exactly these artifacts and changed in no other way: only they gain a
+   * reference. A stage on a long journal would otherwise release and re-take every reference
+   * the journal holds, twice per call.
+   */
+  appendTransactionArtifacts(
+    record: TransactionRecord,
+    appended: { blockIds: readonly string[]; segmentIds: readonly string[] },
+  ): void {
+    this.#change(this.#transactionBlocks, appended.blockIds, 1);
+    this.#change(this.#transactionSegments, appended.segmentIds, 1);
+    if (record.status !== "active") return;
+    this.#change(this.#activeTransactionBlocks, appended.blockIds, 1);
+    this.#change(this.#activeTransactionSegments, appended.segmentIds, 1);
+  }
+
   changeTransaction(record: TransactionRecord, delta: 1 | -1): void {
     this.#change(this.#transactionBlocks, record.pendingBlockIds, delta);
     this.#change(this.#transactionSegments, record.pendingSegmentIds, delta);
@@ -898,7 +914,11 @@ interface CommitPlan {
 
 interface StageTransactionArtifactsPlan {
   updated: TransactionRecord;
+  /** The record as stored when the plan was made; the apply replaces exactly this one. */
+  current: TransactionRecord;
   segments: SegmentRecord[];
+  /** The journal's block set before this stage; the apply extends it in place once committed. */
+  journalBlocks: Set<string>;
 }
 
 interface WriteTransactionPlan {
@@ -953,6 +973,22 @@ export class RecordCore {
   #activeStagedArtifactBytes = 0;
   #terminalTransactionCount = 0;
   #transactionBlockLengthOverrides: ReadonlyMap<string, number> | undefined;
+  /**
+   * A journal has no length limit, and staging consults it on every call: which blocks it holds
+   * and how many bytes they retain. Both are memoized on the identity of the record's id list,
+   * which every update replaces, so an append costs what it appends and a rewrite (rollback,
+   * load) rebuilds once.
+   */
+  readonly #journalBlockSets = new WeakMap<readonly string[], Set<string>>();
+  readonly #journalBytes = new WeakMap<readonly string[], number>();
+  /**
+   * Set for the duration of one staging update: the record replacing the current one is that
+   * record plus exactly these artifacts, so the roots take the delta instead of re-walking the
+   * journal. Anything else about the transition is accounted for as before.
+   */
+  #transactionAppendHint:
+    | { previous: TransactionRecord; blockIds: readonly string[]; segmentIds: readonly string[] }
+    | undefined;
   readonly #activeTransactionExpiries = new OrderedKeyIndex<ExpiryKey>(compareExpiryKeys);
   readonly #activeTransactionExpiryKeys = new Map<string, ExpiryKey>();
   readonly #transactions = new OrderedRecordMap<string, TransactionRecord>((previous, next) => {
@@ -1049,6 +1085,21 @@ export class RecordCore {
     this.#activeStagedBlockCount += after.blocks - before.blocks;
     this.#activeStagedSegmentCount += after.segments - before.segments;
     this.#activeStagedArtifactBytes += after.bytes - before.bytes;
+    const hint = this.#transactionAppendHint;
+    if (
+      hint !== undefined &&
+      previous !== undefined &&
+      next !== undefined &&
+      hint.previous === previous &&
+      previous.status === "active" &&
+      next.status === "active" &&
+      next.snapshotVersion === previous.snapshotVersion &&
+      next.pendingBlockIds.length === previous.pendingBlockIds.length + hint.blockIds.length &&
+      next.pendingSegmentIds.length === previous.pendingSegmentIds.length + hint.segmentIds.length
+    ) {
+      this.#roots.appendTransactionArtifacts(next, hint);
+      return;
+    }
     if (previous !== undefined) {
       const linkedJobs = this.#roots.liveJobTransactionCount(previous.id);
       if (previous.status === "committed") {
@@ -1227,15 +1278,19 @@ export class RecordCore {
     overrides?: ReadonlyMap<string, number>,
   ): { transactions: number; blocks: number; segments: number; bytes: number } {
     if (record?.status !== "active") return { transactions: 0, blocks: 0, segments: 0, bytes: 0 };
-    let bytes = 0;
-    for (const id of record.pendingBlockIds) {
-      const length = overrides?.get(id) ?? this.#physical.blockByteLength(id);
-      if (length === undefined)
-        throw new Error(`Active transaction references missing block: ${id}`);
-      bytes += length;
-      if (!Number.isSafeInteger(bytes)) {
-        throw new RangeError("Active transaction staged bytes exceed the safe integer range");
+    let bytes = this.#journalBytes.get(record.pendingBlockIds);
+    if (bytes === undefined) {
+      bytes = 0;
+      for (const id of record.pendingBlockIds) {
+        const length = overrides?.get(id) ?? this.#physical.blockByteLength(id);
+        if (length === undefined)
+          throw new Error(`Active transaction references missing block: ${id}`);
+        bytes += length;
+        if (!Number.isSafeInteger(bytes)) {
+          throw new RangeError("Active transaction staged bytes exceed the safe integer range");
+        }
       }
+      this.#journalBytes.set(record.pendingBlockIds, bytes);
     }
     return {
       transactions: 1,
@@ -2828,10 +2883,6 @@ export class RecordCore {
     if (replacement.pendingSegmentIds.includes(desired.id)) {
       throw new Error(`Replacement transaction already journals segment: ${desired.id}`);
     }
-    assertTransactionArtifactJournalLimits(replacement.pendingBlockIds, [
-      ...replacement.pendingSegmentIds,
-      desired.id,
-    ]);
     for (const id of segmentBlockIds(stored)) {
       const provenance = this.#manifestBlocks.get(id);
       if (provenance !== undefined && this.#manifestBlockHasReadableVersion(provenance)) {
@@ -3701,8 +3752,30 @@ export class RecordCore {
     );
     this.#assertTransactionResourceTransition(plan.updated, blockByteLengths);
     this.#replaceSegments(plan.segments);
-    this.#setTransaction(plan.updated, blockByteLengths);
+    this.#transactionAppendHint = {
+      previous: plan.current,
+      blockIds: [...blockByteLengths.keys()],
+      segmentIds: plan.segments.map((segment) => segment.id),
+    };
+    try {
+      this.#setTransaction(plan.updated, blockByteLengths);
+    } finally {
+      this.#transactionAppendHint = undefined;
+    }
+    // The record is in place: the journal's block set grows by exactly this call's blocks.
+    for (const id of blockByteLengths.keys()) plan.journalBlocks.add(id);
+    this.#journalBlockSets.set(plan.updated.pendingBlockIds, plan.journalBlocks);
     return cloneRecord(plan.updated);
+  }
+
+  /** The block ids a transaction's journal holds, built once per journal list. */
+  #journalBlockSet(record: TransactionRecord): Set<string> {
+    let set = this.#journalBlockSets.get(record.pendingBlockIds);
+    if (set === undefined) {
+      set = new Set(record.pendingBlockIds);
+      this.#journalBlockSets.set(record.pendingBlockIds, set);
+    }
+    return set;
   }
 
   /**
@@ -3734,28 +3807,22 @@ export class RecordCore {
     assertGenericTransactionUpdateAllowed(current, { updatedAt: input.updatedAt });
     validateTimestampRuntime(input.updatedAt, "Transaction staging timestamp");
     assertTransactionArtifactBatchLimits(input.blocks, input.segments);
-    const pendingBlockIds = [...current.pendingBlockIds, ...input.blocks.map((block) => block.id)];
-    const pendingSegmentIds = [
-      ...current.pendingSegmentIds,
-      ...input.segments.map((segment) => segment.id),
-    ];
-    assertTransactionArtifactJournalLimits(pendingBlockIds, pendingSegmentIds);
+    const journalBlocks = this.#journalBlockSet(current);
     const inputBlockIds = new Set<string>();
+    let addedBytes = 0;
     for (const block of input.blocks) {
       validateId(block.id);
       validateBlockWriteBytes(block.bytes);
       if (
         inputBlockIds.has(block.id) ||
+        journalBlocks.has(block.id) ||
         (options.blocksPrevalidated !== true && this.#physical.hasBlock(block.id))
       ) {
         throw new Error(`Block already exists: ${block.id}`);
       }
       inputBlockIds.add(block.id);
+      addedBytes += options.blockByteLengths?.get(block.id) ?? block.bytes.byteLength;
     }
-    const stagedBlockIds = new Set([
-      ...current.pendingBlockIds,
-      ...input.blocks.map((block) => block.id),
-    ]);
     const segmentIds = new Set<string>();
     const normalizedSegments: SegmentRecord[] = [];
     for (const segment of input.segments) {
@@ -3773,18 +3840,21 @@ export class RecordCore {
           `Segment ${segment.id} commit ordinal must be ${String(expectedCommitOrdinal)}`,
         );
       }
-      const availableBlockIds = new Set(stagedBlockIds);
+      // Only this segment's own blocks matter, so the check costs the segment, not the journal.
+      const availableBlockIds = new Set<string>();
       for (const id of segmentBlockIds(normalized)) {
-        if (this.#isManifestBlockVisible(current.snapshotVersion, id)) availableBlockIds.add(id);
+        if (
+          inputBlockIds.has(id) ||
+          journalBlocks.has(id) ||
+          this.#isManifestBlockVisible(current.snapshotVersion, id)
+        ) {
+          availableBlockIds.add(id);
+        }
       }
       this.#validateStagedSegment(normalized, input.transactionId, availableBlockIds);
       normalizedSegments.push(normalized);
     }
-    const update: TransactionRecordUpdate = {
-      pendingBlockIds,
-      pendingSegmentIds,
-      updatedAt: input.updatedAt,
-    };
+    let pendingTableNextRowId: bigint | undefined;
     if (current.pendingTable !== undefined) {
       let nextRowId = current.pendingTableNextRowId;
       if (nextRowId === undefined) throw new Error("Pending table row-ID state is missing");
@@ -3799,15 +3869,24 @@ export class RecordCore {
         }
         nextRowId = segment.rowIdEndExclusive;
       }
-      update.pendingTableNextRowId = nextRowId;
+      pendingTableNextRowId = nextRowId;
     }
-    assertGenericTransactionUpdateAllowed(current, update);
-    const updated = updateTransactionRecord(current, update);
-    // Only previously journaled artifacts need existence checks; the new ones land with the
-    // journal update in this same atomic step.
-    this.#assertPendingArtifactsAvailable(current, true, true);
+    // What the journal already holds was proved when it was staged; commit, abort, and rollback
+    // re-verify the whole journal. Staging verifies only what it adds.
+    const updated = appendTransactionJournal(current, {
+      blockIds: input.blocks.map((block) => block.id),
+      segmentIds: normalizedSegments.map((segment) => segment.id),
+      updatedAt: input.updatedAt,
+      ...(pendingTableNextRowId === undefined ? {} : { pendingTableNextRowId }),
+    });
+    // Both the preflight and the apply measure this transition, and either would otherwise
+    // re-sum the journal: the staged bytes of the new journal list are known right here.
+    this.#journalBytes.set(
+      updated.pendingBlockIds,
+      this.#transactionResources(current, options.blockByteLengths).bytes + addedBytes,
+    );
     this.#segmentUsageAfter(normalizedSegments);
-    return { updated, segments: normalizedSegments };
+    return { updated, segments: normalizedSegments, journalBlocks, current };
   }
 
   /** Validates and applies the record/segment half of an atomic savepoint rewind. */
@@ -4075,7 +4154,6 @@ export class RecordCore {
     }
     const pendingBlockIds = [...base.pendingBlockIds, ...blockIds];
     const pendingSegmentIds = [...base.pendingSegmentIds, ...segments.keys()];
-    assertTransactionArtifactJournalLimits(pendingBlockIds, pendingSegmentIds);
     let segmentIndex = 0;
     for (const segment of segments.values()) {
       const expectedCommitOrdinal = base.pendingSegmentIds.length + segmentIndex;

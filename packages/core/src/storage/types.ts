@@ -1155,8 +1155,8 @@ export const MAX_ACCELERATOR_BUILD_STAGED_BYTES_TOTAL = 1024 * 1024 * 1024;
 export const MAX_ACCELERATOR_BUILD_STAGED_ENTRIES_TOTAL = 16_777_216;
 export const MAX_ACTIVE_TRANSACTIONS = 4_096;
 export const MAX_GLOBAL_STAGED_ARTIFACT_BYTES = 512 * 1024 * 1024;
-export const MAX_GLOBAL_STAGED_BLOCKS = 65_536;
-export const MAX_GLOBAL_STAGED_SEGMENTS = 65_536;
+export const MAX_GLOBAL_STAGED_BLOCKS = 1_048_576;
+export const MAX_GLOBAL_STAGED_SEGMENTS = 1_048_576;
 /** Catalog enumeration remains bounded even for cold public inspection APIs. */
 export const MAX_CATALOG_RECORDS = 4_096;
 /** Total canonical UTF-8 record-wire bytes retained by the durable catalog. */
@@ -2182,10 +2182,6 @@ export const MAX_TRANSACTION_STAGE_SEGMENTS = 64;
  * maximum-size physical block; callers split collections of smaller blocks into bounded calls.
  */
 export const MAX_TRANSACTION_STAGE_BYTES = MAX_STORED_BLOCK_BYTE_LENGTH;
-/** Durable journal ceilings prevent a forgotten or hostile transaction growing without bound. */
-export const MAX_TRANSACTION_PENDING_BLOCKS = 4_096;
-export const MAX_TRANSACTION_PENDING_SEGMENTS = 4_096;
-
 /** Storage-boundary preflight shared by staging and single-shot write implementations. */
 export function assertTransactionArtifactBatchLimits(
   blocks: readonly BlockWrite[],
@@ -2212,23 +2208,6 @@ export function assertTransactionArtifactBatchLimits(
         `Transaction artifact batch exceeds ${String(MAX_TRANSACTION_STAGE_BYTES)} block bytes`,
       );
     }
-  }
-}
-
-/** Preflight for the complete persisted journal after a bounded staging operation. */
-export function assertTransactionArtifactJournalLimits(
-  pendingBlockIds: readonly string[],
-  pendingSegmentIds: readonly string[],
-): void {
-  if (pendingBlockIds.length > MAX_TRANSACTION_PENDING_BLOCKS) {
-    throw new RangeError(
-      `Transaction journal exceeds ${String(MAX_TRANSACTION_PENDING_BLOCKS)} pending blocks`,
-    );
-  }
-  if (pendingSegmentIds.length > MAX_TRANSACTION_PENDING_SEGMENTS) {
-    throw new RangeError(
-      `Transaction journal exceeds ${String(MAX_TRANSACTION_PENDING_SEGMENTS)} pending segments`,
-    );
   }
 }
 
@@ -2647,10 +2626,27 @@ export class StorageCorruptionError extends Error {
 }
 
 /**
+ * The base of every error that means "the operation may have happened": the reply was lost,
+ * not the request. Nothing that extends it may be retried blindly — reconcile a stable id or
+ * revision first. `instanceof` survives the worker and follower hops.
+ */
+export class UnknownOutcomeError extends Error {
+  override readonly name: string = "UnknownOutcomeError";
+}
+
+/**
+ * The base of every error that means "this connection is finished": every later call on it
+ * fails the same way, and the remedy is a new connection (`client.reopen()`), not a retry.
+ */
+export class ConnectionLostError extends Error {
+  override readonly name: string = "ConnectionLostError";
+}
+
+/**
  * A remote OPFS leader may have committed a mutation whose acknowledgement was lost.
  * Reconcile stable identities or revisions before retrying the named operation.
  */
-export class OpfsUncertainOutcomeError extends Error {
+export class OpfsUncertainOutcomeError extends UnknownOutcomeError {
   override readonly name = "OpfsUncertainOutcomeError";
 
   constructor(readonly method: string) {
@@ -4549,6 +4545,41 @@ export function updateTransactionRecord(
     delete updated.schemaEpochGuard;
   }
   return updated;
+}
+
+/**
+ * Appends artifacts to a transaction's journal without re-validating the journal it already
+ * holds. The caller proves the additions are new; this checks only that they are well-formed and
+ * distinct among themselves, so one staging call costs what it stages, not what came before.
+ */
+export function appendTransactionJournal(
+  record: TransactionRecord,
+  additions: {
+    blockIds: readonly string[];
+    segmentIds: readonly string[];
+    updatedAt: string;
+    pendingTableNextRowId?: bigint;
+  },
+): TransactionRecord {
+  if (record.status !== "active") {
+    throw new TypeError(`Only active transactions can be updated; found ${record.status}`);
+  }
+  const blockIds = orderedUniqueIds(additions.blockIds, "Transaction pending block ID");
+  const segmentIds = orderedUniqueIds(additions.segmentIds, "Transaction pending segment ID");
+  return {
+    ...record,
+    pendingBlockIds:
+      blockIds.length === 0 ? record.pendingBlockIds : [...record.pendingBlockIds, ...blockIds],
+    pendingSegmentIds:
+      segmentIds.length === 0
+        ? record.pendingSegmentIds
+        : [...record.pendingSegmentIds, ...segmentIds],
+    ...(additions.pendingTableNextRowId === undefined
+      ? {}
+      : { pendingTableNextRowId: additions.pendingTableNextRowId }),
+    updatedAt: additions.updatedAt,
+    revision: safeSum([record.revision, 1], "Transaction revision"),
+  };
 }
 
 export function createGarbageCollectionJobRecord(

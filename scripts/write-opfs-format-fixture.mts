@@ -25,10 +25,19 @@ function table(id: string, name: string): TableRecord {
 const store = await OpfsBlockStore.open({
   name: databaseName,
   root: shim.root,
-  checkpointEntries: 5,
+  // Eight entries land the first follower request in the checkpoint; the follower's staging
+  // call, its withheld answer, and the last table stay in the write-ahead log's tail.
+  checkpointEntries: 8,
+  // A row-id reservation's answer is kept; a staging call's answer (a transaction record) is
+  // too large for this ceiling and is withheld, so the fixture holds both ledger shapes.
+  servedLedgerResultBytes: 160,
 });
 await store.addTable(table("fixture-data", "data"));
 await store.addTable(table("fixture-checkpoint-b", "checkpoint-b"));
+// A follower on the same tree: its mutations reach the log through the leader with their
+// request identity, and the served-request ledger records what they answered.
+const follower = await OpfsBlockStore.open({ name: databaseName, root: shim.root });
+await follower.reserveRowIds("fixture-data", 2);
 const transaction = await store.beginTransaction({
   record: {
     id: "fixture-transaction",
@@ -74,7 +83,29 @@ await store.commitTransaction({
   levelZeroSegmentLimits: [{ tableId: "fixture-data", limit: 4096 }],
   committedAt: "2026-08-24T12:00:02.000Z",
 });
+const followerTransaction = await follower.beginTransaction({
+  record: {
+    id: "fixture-follower-transaction",
+    ownerId: "fixture-follower",
+    expiresAt: "2026-08-24T13:00:00.000Z",
+    pendingBlockIds: [],
+    pendingSegmentIds: [],
+    status: "active",
+    revision: 0,
+    startedAt: "2026-08-24T12:00:03.000Z",
+    updatedAt: "2026-08-24T12:00:03.000Z",
+    committedVersion: null,
+  },
+});
+await follower.stageTransactionArtifacts({
+  transactionId: followerTransaction.record.id,
+  expectedRevision: followerTransaction.record.revision,
+  blocks: [{ id: "fixture-follower-block", bytes: block }],
+  segments: [],
+  updatedAt: "2026-08-24T12:00:04.000Z",
+});
 await store.addTable(table("fixture-wal-tail", "wal-tail"));
+follower.close();
 store._crashForTests();
 
 const paths = [

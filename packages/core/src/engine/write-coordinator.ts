@@ -3,11 +3,29 @@ import type { BlockStore } from "../storage/types.js";
 const anonymous = new WeakMap<BlockStore, { tail: Promise<unknown> }>();
 const named = new Map<string, { tail: Promise<unknown> }>();
 
+/**
+ * How long a write waits for the cross-tab admission lock before going ahead without it. The
+ * lock is an optimization — it spares concurrent writers the rebase retries they would
+ * otherwise spend on each other — never the correctness: every commit is still a
+ * compare-and-swap against the store, so an uncoordinated write conflicts and retries rather
+ * than corrupting anything. A holder that never lets go (a tab the browser paused with the lock
+ * in hand) must therefore not stall every other tab's writes until each of them times out.
+ */
+export const WRITE_ADMISSION_WAIT_MS = 10_000;
+
+export interface CoordinateWriteOptions {
+  /** Test seam: the cross-tab lock wait; default `WRITE_ADMISSION_WAIT_MS`. */
+  admissionWaitMs?: number;
+  /** Hears a wait that ran out, with the write then proceeding uncoordinated. */
+  onAdmissionWaitExceeded?: (waitedMs: number) => void;
+}
+
 /** Admit autocommit before it captures a snapshot. Explicit callbacks never hold this lock. */
 export async function coordinateWrite<T>(
   store: BlockStore,
   run: () => Promise<T>,
   signal: AbortSignal,
+  options: CoordinateWriteOptions = {},
 ): Promise<T> {
   signal.throwIfAborted();
   const name = store.liveQueryChannelName;
@@ -26,11 +44,34 @@ export async function coordinateWrite<T>(
     admitted = true;
     return run();
   };
+  const admissionWaitMs = options.admissionWaitMs ?? WRITE_ADMISSION_WAIT_MS;
   const operation = queue.tail.then(async () => {
     signal.throwIfAborted();
-    return name !== undefined && locks !== undefined
-      ? await locks.request(`minnowdb-write:${name}`, { signal: lockController.signal }, enter)
-      : await enter();
+    if (name === undefined || locks === undefined) return enter();
+    const startedAt = Date.now();
+    const wait = { ranOut: false };
+    const waitTimer = setTimeout(() => {
+      wait.ranOut = true;
+      lockController.abort(new Error("Write admission wait ran out"));
+    }, admissionWaitMs);
+    (waitTimer as { unref?: () => void }).unref?.();
+    try {
+      return await locks.request(
+        `minnowdb-write:${name}`,
+        { signal: lockController.signal },
+        enter,
+      );
+    } catch (error) {
+      // The lock may still have been granted in the same instant the wait ran out; then the
+      // callback ran and its outcome is what surfaces. Only a refusal to grant is retried
+      // without the lock.
+      if (!wait.ranOut || admitted) throw error;
+      signal.throwIfAborted();
+      options.onAdmissionWaitExceeded?.(Date.now() - startedAt);
+      return await enter();
+    } finally {
+      clearTimeout(waitTimer);
+    }
   });
   const settled = operation.then(
     () => undefined,

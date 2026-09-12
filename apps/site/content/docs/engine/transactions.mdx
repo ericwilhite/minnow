@@ -47,13 +47,51 @@ run together against the same staged state. Commit joins admitted calls before p
 each call to handle its error. One engine admits at most 256 write/snapshot scopes; within a
 write scope, at most 64 mutations and 256 reads may be pending.
 
-Large writes are encoded and persisted with backpressure instead of retaining every encoded block
-in memory. Small successive stages share one bounded local batch and publish in one atomic
-storage call. Exceeding the batch limit moves artifacts into the recovery journal. One adapter call carries at most 64 blocks, 64 segment records, and 64 MiB of payload;
-one unpublished transaction may journal at most 4,096 pending blocks and 4,096 pending segments.
-Exceeding the transaction-wide limit fails the write before publication. Split a larger ingestion
-into several commits. A database also admits at most 64 pending write calls, and a buffered writer
-at most 64 unawaited `add()` calls, so a producer must await writes when it reaches backpressure.
+Never split a write to suit the engine. Hand it the whole batch: a statement stages about one
+block per column per 65,536 rows, so a million-row insert of a 100-column table is a few
+thousand blocks, and the engine encodes and persists them with backpressure instead of holding
+every encoded block in memory. Chunking only multiplies commits, and each commit is a durable
+flush, a manifest version, a live-query invalidation, and one more small segment for every
+later read to consult until compaction folds it; on the OPFS store, fifty thousand guarded
+upserts land four to seven times slower as 141-row scopes than as one batch. Inside a scope,
+statements coalesce too. Each insert, update, delete, and upsert still validates, fills
+defaults, reserves identity values, registers its unique keys, and proves its foreign keys on
+the spot — a second insert of a key the scope holds, or an update of a key it deleted, fails that
+statement and leaves the scope usable — but its effect joins the table's write set, a per-key memtable in which the
+statements that touch one key fold into a single net effect: an insert then an update is one
+inserted row, an update then a delete is one delete, a delete then an insert replaces the
+committed row in place. The set becomes at most one insert, one upsert, one delete, and one
+update segment per distinct set of changed columns when something needs the segments: a read of
+the table, a savepoint, the commit, or a block's worth of rows waiting. So a loop of single-row
+statements stages what one batch would, and a statement of 4,096 rows or more is encoded on the
+spot, after whatever the set held for its table. A keyed `UPDATE … SET column = constant WHERE key = ?`
+or `DELETE … WHERE key = ?` (also `IN (…)`) joins the set without reading the table; an
+assignment that is an expression over the row, a `RETURNING` clause, or extra `FROM` sources
+reads first, which encodes what waits for that table. The checks the engine runs for itself —
+which keys a guarded upsert will update, the pre-image behind a `CHECK` constraint or a unique
+index — answer from the write set and the committed snapshot, within a 64 MiB budget per scope,
+so they never force the encoding either. Tables with triggers stage per statement, because a
+trigger sees each statement's rows.
+
+The bounds that remain are far away. Small successive stages share one bounded local batch and
+publish in one atomic storage call; exceeding it moves artifacts into the recovery journal. One
+adapter call carries at most 64 blocks, 64 segment records, and 64 MiB of payload, and the
+engine splits larger stages into as many calls as it takes. A transaction's journal itself has
+no length limit: staging costs what it stages, not what the journal already holds, in every
+adapter. What bounds an unpublished transaction is the store's aggregate quota — 512 MiB of
+staged artifact bytes across all active transactions, and 1,048,576 staged blocks or segments —
+and its lease, which a crashed tab's transaction loses. A database also admits at most 64 pending
+write calls, and a buffered writer at most 64 unawaited `add()` calls, so a producer must await
+writes when it reaches backpressure.
+
+Reads inside a scope see everything the scope has staged, and nothing folds those segments
+before the commit. A keyed read — `SELECT … WHERE key = ?` — replays that key through the
+staged segments and stays cheap however many there are: under 1 ms with a thousand of them on
+the memory store. A read that scans the table walks every staged segment, so a long scope that
+scans in every iteration pays a little more per scan as it goes; on the memory store, 1,500
+read-then-upsert cycles on a 60-column table average 7 ms each. Write loops without reads pay
+neither — their statements fold into the write set — and the checks the engine makes for itself
+answer from the write set too.
 
 The scope durably pins its pre-scope version from the start. While its first bounded write batch is
 still process-local, a renewable reader lease owns that pin. If an overflowing stage persists a recovery

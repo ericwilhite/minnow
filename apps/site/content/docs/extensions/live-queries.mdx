@@ -159,6 +159,15 @@ window's start moved, a commit changed more than 2,048 rows, or history no survi
 accounts for — and that execution refills the margin. `LiveQueryStats.maintained` counts patched
 re-runs beside `reruns`; `liveQueries({ incremental: false })` turns patching off for a set.
 
+Whether a statement is maintained is decided from its shape, and the engine says so. `explain()`
+ends with `-- live: maintained incrementally on change` or `-- live: re-executes on change:`
+followed by the reason in plain terms ("2 joins; incremental maintenance supports one inner or
+left join to a unique key", "subquery or EXISTS", "window function", "orders has no unique key").
+`stats.groups` carries the same per statement — `maintainable`, `reasons`, and its own `reruns`,
+`maintained`, and `fallbacks` counts — through the worker client, and the devtools Plan tab
+shows the `-- live:` line, so a statement that re-executes on every commit is visible rather
+than merely slow.
+
 `COUNT`, `SUM`, and `AVG` can maintain per-key contributions, including grouped results. Exact
 `NUMERIC` inputs retain decimal semantics. Plain numbers qualify for SUM/AVG only while their
 integer values and absolute sum remain safely representable; other floating-point aggregates

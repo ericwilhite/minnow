@@ -5,6 +5,7 @@
 export * from "./catalog.js";
 export * from "./database.js";
 export * from "./errors.js";
+export { forgetStoreChoice } from "./auto-store.js";
 export { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
 export {
   MAX_SQL_NESTING_DEPTH,

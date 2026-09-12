@@ -3570,13 +3570,9 @@ describe("OPFS leadership", () => {
     expect((await follower.checkIntegrity()).ok).toBe(true);
 
     leader._crashForTests();
-    // A mutation sent toward an apparently live leader cannot be proven absent after its
-    // timeout, so the adapter refuses to replay it automatically. Reconcile, then retry the
-    // stable table id after the follower has acquired and replayed the database.
-    await expect(follower.addTable(table("after"))).rejects.toMatchObject({
-      name: "OpfsUncertainOutcomeError",
-    });
-    expect(await follower.getTableByName("after")).toBeUndefined();
+    // The mutation went to a leader that was already dead. The follower acquires the handles,
+    // replays the log, finds no trace of its own request in a log that would hold one, and
+    // runs it itself — once.
     await follower.addTable(table("after"));
     expect((await follower.listTables()).map((record) => record.name)).toEqual(["after", "before"]);
     follower.close();
@@ -3686,6 +3682,7 @@ describe("OPFS leadership", () => {
       kind: "op" as const,
       requestId: "same-request-id",
       method: "reserveRowIds",
+      sentAt: Date.now(),
     };
     inbox.postMessage({ ...shared, from: "requester-a", args: ["table-identity", 10] });
     inbox.postMessage({ ...shared, from: "requester-b", args: ["table-identity", 20] });
@@ -3760,10 +3757,7 @@ describe("OPFS leadership", () => {
     await leader.addTable(table("counter"));
     const walBefore = shim.readFileBytes("minnowdb/uncertain-failover/wal")?.byteLength ?? 0;
     leader._dropNextRpcResultForTests();
-    const pending = follower.reserveRowIds("table-counter", 10).then(
-      () => undefined,
-      (error: unknown) => error,
-    );
+    const pending = follower.reserveRowIds("table-counter", 10).catch((error: unknown) => error);
     await waitFor(
       () => (shim.readFileBytes("minnowdb/uncertain-failover/wal")?.byteLength ?? 0) > walBefore,
       "the mutation WAL frame before dropping its acknowledgement",
@@ -3774,13 +3768,9 @@ describe("OPFS leadership", () => {
       root: shim.root,
       rpcTimeoutMs: 500,
     });
-    expect(await pending).toMatchObject({
-      name: "OpfsUncertainOutcomeError",
-      method: "reserveRowIds",
-    });
-
-    // The recovered range starts after the one committed by the dead leader. The follower did
-    // not resend its old request and burn a second ten-row range during takeover.
+    // The dead leader's log carried the request and the range it answered; the recovered
+    // leader answers the re-send with that same range instead of burning a second one.
+    expect(await pending).toEqual({ start: 1n, endExclusive: 11n });
     expect(await recovered.reserveRowIds("table-counter", 10)).toEqual({
       start: 11n,
       endExclusive: 21n,

@@ -131,6 +131,11 @@
           "description": "Side-effect-only dedicated-worker entry bundling the OPFS store alone."
         },
         {
+          "subpath": "./worker/auto",
+          "audience": "runtime",
+          "description": "Side-effect-only dedicated-worker entry bundling the OPFS and IndexedDB stores, for the auto descriptor."
+        },
+        {
           "subpath": "./worker-host",
           "audience": "extension",
           "description": "Manual worker exposure and stock database-worker attachment."

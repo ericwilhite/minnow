@@ -38,7 +38,7 @@ function loadFixtures(): Fixture[] {
 }
 
 const fixtures = loadFixtures();
-const FIRST_STABLE_OPFS_LAYOUT_VERSION = 5;
+const FIRST_STABLE_OPFS_LAYOUT_VERSION = 6;
 const currentPackageVersion = (
   JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
     version: string;

@@ -35,7 +35,6 @@ import {
   MAX_TEMP_RUN_BATCH_BYTES,
   MAX_TEMP_RUN_PAGE_BYTES,
   MAX_TEMP_RUN_PAGES_PER_BATCH,
-  MAX_TRANSACTION_PENDING_BLOCKS,
   MAX_TRANSACTION_STAGE_BLOCKS,
   MAX_TRANSACTION_STAGE_SEGMENTS,
   SchemaConflictError,
@@ -715,6 +714,38 @@ function activeTransaction(id: string, snapshotVersion: number | null): Transact
   };
 }
 
+/** The schema-2 `transactions` store value: the record minus its journal, plus the counts. */
+function storedTransaction(record: TransactionRecord): Record<string, unknown> {
+  const { pendingBlockIds, pendingSegmentIds, ...header } = record;
+  const entries = pendingBlockIds.length + pendingSegmentIds.length;
+  return {
+    ...header,
+    journalChunkCount: Math.ceil(entries / 1_024),
+    pendingBlockCount: pendingBlockIds.length,
+    pendingSegmentCount: pendingSegmentIds.length,
+  };
+}
+
+/** Writes a record the way the adapter stores it: header in `transactions`, ids in chunks. */
+function putRawTransaction(transaction: IDBTransaction, record: TransactionRecord): void {
+  transaction.objectStore("transactions").put(storedTransaction(record), record.id);
+  const journal = transaction.objectStore("transactionJournal");
+  const ids = [
+    ...record.pendingBlockIds.map((id) => ["block", id] as const),
+    ...record.pendingSegmentIds.map((id) => ["segment", id] as const),
+  ];
+  for (let index = 0; index * 1_024 < ids.length; index += 1) {
+    const chunk = ids.slice(index * 1_024, (index + 1) * 1_024);
+    journal.put(
+      {
+        blockIds: chunk.filter(([kind]) => kind === "block").map(([, id]) => id),
+        segmentIds: chunk.filter(([kind]) => kind === "segment").map(([, id]) => id),
+      },
+      [record.id, index],
+    );
+  }
+}
+
 function segment(id: string, transactionId: string, blockId: string): SegmentRecord {
   return {
     id,
@@ -1134,67 +1165,460 @@ describe("IndexedDB corruption hardening", () => {
     expect(await store.getTransaction("bounded-write-blocks")).toBeUndefined();
     expect(await store.getTransaction("bounded-write-segments")).toBeUndefined();
 
-    let revision = 0;
-    for (
-      let start = 0;
-      start < MAX_TRANSACTION_STAGE_BLOCKS * 2;
-      start += MAX_TRANSACTION_STAGE_BLOCKS
-    ) {
-      const updated = await store.stageTransactionArtifacts({
-        transactionId: "bounded-stage",
-        expectedRevision: revision,
-        blocks: Array.from({ length: MAX_TRANSACTION_STAGE_BLOCKS }, (_, offset) => ({
-          id: `journal-block-${String(start + offset)}`,
-          bytes: Uint8Array.of((start + offset) & 0xff),
-        })),
-        segments: [],
+    store.close();
+  });
+
+  it("journals artifacts past the old ceiling in packed chunks and rewinds and commits them", async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    const store = await openStore(indexedDB, name);
+    await store.addTable({
+      managed: false,
+      id: "events",
+      name: "events",
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      revision: 0,
+      createdAt: NOW,
+    });
+    let record = activeTransaction("long-journal", null);
+    await store.createTransaction(record);
+    const batchCount = 100;
+    const blockIds: string[] = [];
+    const segmentIds: string[] = [];
+    for (let batch = 0; batch < batchCount; batch += 1) {
+      const blocks = Array.from({ length: MAX_TRANSACTION_STAGE_BLOCKS }, (_, offset) => ({
+        id: `long-block-${String(batch * MAX_TRANSACTION_STAGE_BLOCKS + offset)}`,
+        bytes: Uint8Array.of(offset & 0xff),
+      }));
+      const segments = blocks.slice(0, 2).map((block, offset) => ({
+        ...segment(`long-segment-${String(batch * 2 + offset)}`, "long-journal", block.id),
+        rowIdStart: BigInt(batch * 2 + offset + 1),
+        rowIdEndExclusive: BigInt(batch * 2 + offset + 2),
+        commitOrdinal: batch * 2 + offset,
+      }));
+      record = await store.stageTransactionArtifacts({
+        transactionId: "long-journal",
+        expectedRevision: record.revision,
+        blocks,
+        segments,
         updatedAt: NOW,
       });
-      revision = updated.revision;
+      blockIds.push(...blocks.map((block) => block.id));
+      segmentIds.push(...segments.map((entry) => entry.id));
+      expect(record.pendingBlockIds).toHaveLength(blockIds.length);
+      expect(record.pendingSegmentIds).toHaveLength(segmentIds.length);
     }
-    const journalIds = Array.from(
-      { length: MAX_TRANSACTION_PENDING_BLOCKS },
-      (_, index) => `journal-block-${String(index)}`,
-    ).sort();
-    const alreadyStaged = new Set(
-      Array.from(
-        { length: MAX_TRANSACTION_STAGE_BLOCKS * 2 },
-        (_, index) => `journal-block-${String(index)}`,
-      ),
-    );
-    await injectBlocks(
-      indexedDB,
-      name,
-      journalIds
-        .filter((id) => !alreadyStaged.has(id))
-        .map((id) => ({
-          id,
-          bytes: Uint8Array.of(1),
-        })),
-    );
-    const bounded = await store.getTransaction("bounded-stage");
-    if (bounded === undefined) throw new Error("Missing bounded transaction fixture");
-    await mutate(indexedDB, name, "transactions", (transaction) => {
-      transaction
-        .objectStore("transactions")
-        .put({ ...bounded, pendingBlockIds: journalIds }, bounded.id);
+    expect(blockIds.length).toBeGreaterThan(4_096);
+    expect(record.pendingBlockIds).toEqual(blockIds);
+    expect(record.pendingSegmentIds).toEqual(segmentIds);
+    // A returned record is the caller's own copy: extending it must not leak into the next.
+    record.pendingBlockIds.push("not-journaled");
+    expect(await store.getTransaction("long-journal")).toMatchObject({
+      pendingBlockIds: blockIds,
+      pendingSegmentIds: segmentIds,
     });
+    expect(await store.getTransactions(["long-journal", "absent"])).toMatchObject([
+      { pendingBlockIds: blockIds, pendingSegmentIds: segmentIds },
+      undefined,
+    ]);
+    const page = await store.listTransactionPage(null, 10);
+    expect(page.records.map((entry) => entry.id)).toEqual(["long-journal"]);
+    expect(page.records[0]?.pendingBlockIds).toEqual(blockIds);
+
+    // Chunks are packed in order: every chunk but the last holds exactly 1,024 ids.
+    const chunkEntries = 1_024;
+    const chunkCount = Math.ceil((blockIds.length + segmentIds.length) / chunkEntries);
+    const seenBlocks: string[] = [];
+    const seenSegments: string[] = [];
+    for (let index = 0; index < chunkCount; index += 1) {
+      const chunk = (await readRawValue(indexedDB, name, "transactionJournal", [
+        "long-journal",
+        index,
+      ])) as { blockIds: string[]; segmentIds: string[] };
+      const entries = chunk.blockIds.length + chunk.segmentIds.length;
+      if (index < chunkCount - 1) expect(entries).toBe(chunkEntries);
+      else expect(entries).toBe(blockIds.length + segmentIds.length - index * chunkEntries);
+      seenBlocks.push(...chunk.blockIds);
+      seenSegments.push(...chunk.segmentIds);
+    }
+    expect(seenBlocks).toEqual(blockIds);
+    expect(seenSegments).toEqual(segmentIds);
+    await expect(
+      readRawValue(indexedDB, name, "transactionJournal", ["long-journal", chunkCount]),
+    ).resolves.toBeUndefined();
+    await expect(readRawValue(indexedDB, name, "transactions", "long-journal")).resolves.toEqual(
+      expect.objectContaining({
+        journalChunkCount: chunkCount,
+        pendingBlockCount: blockIds.length,
+        pendingSegmentCount: segmentIds.length,
+      }),
+    );
+    await expect(
+      readRawValue(indexedDB, name, "transactions", "long-journal"),
+    ).resolves.not.toHaveProperty("pendingBlockIds");
+
+    // A savepoint rewind truncates the journal to the retained prefix.
+    const keptBlocks = blockIds.slice(0, 3_000);
+    const keptSegments = segmentIds.slice(0, 50);
+    record = await store.rollbackTransactionArtifacts({
+      transactionId: "long-journal",
+      expectedRevision: record.revision,
+      pendingBlockIds: keptBlocks,
+      pendingSegmentIds: keptSegments,
+      removeBlockIds: blockIds.slice(3_000),
+      removeSegmentIds: segmentIds.slice(50),
+      updatedAt: NOW,
+    });
+    expect(record.pendingBlockIds).toEqual(keptBlocks);
+    expect(record.pendingSegmentIds).toEqual(keptSegments);
+    expect(await store.getTransaction("long-journal")).toMatchObject({
+      pendingBlockIds: keptBlocks,
+      pendingSegmentIds: keptSegments,
+    });
+    const keptChunkCount = Math.ceil((keptBlocks.length + keptSegments.length) / chunkEntries);
+    await expect(
+      readRawValue(indexedDB, name, "transactionJournal", ["long-journal", keptChunkCount]),
+    ).resolves.toBeUndefined();
+    expect(await store.getBlock(blockIds[3_000] ?? "")).toBeUndefined();
+
+    // Staging continues after the rewind, from the truncated tail.
+    record = await store.stageTransactionArtifacts({
+      transactionId: "long-journal",
+      expectedRevision: record.revision,
+      blocks: [{ id: "after-rewind", bytes: Uint8Array.of(7) }],
+      segments: [],
+      updatedAt: NOW,
+    });
+    expect(record.pendingBlockIds).toEqual([...keptBlocks, "after-rewind"]);
+    const manifest = await store.commitTransaction({
+      transactionId: "long-journal",
+      expectedTransactionRevision: record.revision,
+      expectedManifestVersion: null,
+      levelZeroSegmentLimits: [{ tableId: "events", limit: 4_096 }],
+      committedAt: NOW,
+    });
+    expect(manifest.version).toBe(0);
+    expect(await readManifestBlockIds(store, 0)).toEqual([...keptBlocks, "after-rewind"].sort());
+    expect(await store.getTransaction("long-journal")).toMatchObject({
+      status: "committed",
+      pendingBlockIds: [...keptBlocks, "after-rewind"],
+      pendingSegmentIds: keptSegments,
+    });
+    expect((await store.checkIntegrity()).issues).toEqual([]);
+
+    // Reclaiming a record removes its journal chunks with it.
+    const doomed = activeTransaction("doomed", 0);
+    await store.createTransaction(doomed);
+    const staged = await store.stageTransactionArtifacts({
+      transactionId: "doomed",
+      expectedRevision: doomed.revision,
+      blocks: [{ id: "doomed-block", bytes: Uint8Array.of(9) }],
+      segments: [],
+      updatedAt: NOW,
+    });
+    await store.updateTransaction("doomed", staged.revision, { status: "aborted", updatedAt: NOW });
+    await expect(
+      readRawValue(indexedDB, name, "transactionJournal", ["doomed", 0]),
+    ).resolves.toEqual({ blockIds: ["doomed-block"], segmentIds: [] });
+    for (const [jobId, candidates] of [
+      ["doomed-blocks", { candidateBlockIds: ["doomed-block"], candidateTransactionIds: [] }],
+      ["doomed-record", { candidateBlockIds: [], candidateTransactionIds: ["doomed"] }],
+    ] as const) {
+      const job = await store.createGarbageCollectionJob({
+        id: jobId,
+        candidateManifestVersions: [],
+        candidateSegmentIds: [],
+        ...candidates,
+        leaseCutoff: NOW,
+        createdAt: NOW,
+      });
+      await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: job.revision,
+        maxItems: 8,
+        updatedAt: NOW,
+      });
+    }
+    expect(await store.getTransaction("doomed")).toBeUndefined();
+    await expect(
+      readRawValue(indexedDB, name, "transactionJournal", ["doomed", 0]),
+    ).resolves.toBeUndefined();
+    expect((await store.checkIntegrity()).issues).toEqual([]);
+    store.close();
+  });
+
+  it("resolves segment block references against the journal across instances", async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    let store = await openStore(indexedDB, name);
+    await store.addTable({
+      managed: false,
+      id: "events",
+      name: "events",
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      revision: 0,
+      createdAt: NOW,
+    });
+    let record = activeTransaction("cross-instance", null);
+    await store.createTransaction(record);
+    record = await store.stageTransactionArtifacts({
+      transactionId: "cross-instance",
+      expectedRevision: record.revision,
+      blocks: [
+        { id: "earlier-block", bytes: Uint8Array.of(1) },
+        { id: "other-block", bytes: Uint8Array.of(2) },
+      ],
+      segments: [],
+      updatedAt: NOW,
+    });
+    // A second connection has no journal cache; another writer's stage moves the revision.
+    const other = await openStore(indexedDB, name);
+    const advanced = await other.stageTransactionArtifacts({
+      transactionId: "cross-instance",
+      expectedRevision: record.revision,
+      blocks: [{ id: "foreign-block", bytes: Uint8Array.of(3) }],
+      segments: [],
+      updatedAt: NOW,
+    });
+    other.close();
     await expect(
       store.stageTransactionArtifacts({
-        transactionId: "bounded-stage",
-        expectedRevision: revision,
-        blocks: [{ id: "journal-overflow", bytes: Uint8Array.of(1) }],
-        segments: [],
+        transactionId: "cross-instance",
+        expectedRevision: record.revision,
+        blocks: [],
+        segments: [segment("stale", "cross-instance", "earlier-block")],
         updatedAt: NOW,
       }),
-    ).rejects.toThrow(/journal exceeds 4096 pending blocks/);
-    const capped = await store.getTransaction("bounded-stage");
-    expect(capped).toMatchObject({ revision });
-    expect(capped?.pendingBlockIds).toContain("journal-block-0");
-    expect(capped?.pendingBlockIds).toContain("journal-block-4095");
-    expect(capped?.pendingBlockIds).toHaveLength(MAX_TRANSACTION_PENDING_BLOCKS);
-    expect(await store.getBlock("journal-overflow")).toBeUndefined();
+    ).rejects.toMatchObject({ name: "TransactionRecordConflictError" });
+    await expect(
+      store.stageTransactionArtifacts({
+        transactionId: "cross-instance",
+        expectedRevision: advanced.revision,
+        blocks: [],
+        segments: [segment("dangling", "cross-instance", "never-staged")],
+        updatedAt: NOW,
+      }),
+    ).rejects.toThrow(/absent from the transaction journal: never-staged/);
+    // The stale cache is rebuilt from the chunks, so the earlier block and the other
+    // writer's block both resolve and the returned journal carries every id.
+    record = await store.stageTransactionArtifacts({
+      transactionId: "cross-instance",
+      expectedRevision: advanced.revision,
+      blocks: [],
+      segments: [
+        segment("from-earlier", "cross-instance", "earlier-block"),
+        {
+          ...segment("from-foreign", "cross-instance", "foreign-block"),
+          rowIdStart: 2n,
+          rowIdEndExclusive: 3n,
+          commitOrdinal: 1,
+        },
+      ],
+      updatedAt: NOW,
+    });
+    expect(record.pendingBlockIds).toEqual(["earlier-block", "other-block", "foreign-block"]);
+    expect(record.pendingSegmentIds).toEqual(["from-earlier", "from-foreign"]);
     store.close();
+    store = await openStore(indexedDB, name);
+    expect(await store.getTransaction("cross-instance")).toMatchObject({
+      pendingBlockIds: ["earlier-block", "other-block", "foreign-block"],
+      pendingSegmentIds: ["from-earlier", "from-foreign"],
+    });
+    expect((await store.checkIntegrity()).issues).toEqual([]);
+    store.close();
+  });
+
+  it("refuses journal chunks that disagree with their record", async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    const store = await openStore(indexedDB, name);
+    const record = activeTransaction("chunked", null);
+    await store.createTransaction(record);
+    await store.stageTransactionArtifacts({
+      transactionId: "chunked",
+      expectedRevision: record.revision,
+      blocks: [{ id: "chunk-block", bytes: Uint8Array.of(1) }],
+      segments: [],
+      updatedAt: NOW,
+    });
+    const corruptions: Array<[string, (transaction: IDBTransaction) => void]> = [
+      ["chunk is missing", (tx) => tx.objectStore("transactionJournal").delete(["chunked", 0])],
+      [
+        "more chunks than its record declares",
+        (tx) =>
+          tx
+            .objectStore("transactionJournal")
+            .put({ blockIds: ["stray"], segmentIds: [] }, ["chunked", 1]),
+      ],
+      [
+        "journal counts disagree with its chunks",
+        (tx) =>
+          tx
+            .objectStore("transactionJournal")
+            .put({ blockIds: ["chunk-block", "extra"], segmentIds: [] }, ["chunked", 0]),
+      ],
+      [
+        "chunk count 3 disagrees",
+        (tx) => {
+          const store = tx.objectStore("transactions");
+          const request = store.get("chunked");
+          request.onsuccess = () => {
+            store.put({ ...(request.result as object), journalChunkCount: 3 }, "chunked");
+          };
+        },
+      ],
+      [
+        "identifier list is invalid",
+        (tx) =>
+          tx
+            .objectStore("transactionJournal")
+            .put({ blockIds: [""], segmentIds: [] }, ["chunked", 0]),
+      ],
+    ];
+    for (const [message, corrupt] of corruptions) {
+      const snapshot = await readRawValue(indexedDB, name, "transactions", "chunked");
+      const chunk = await readRawValue(indexedDB, name, "transactionJournal", ["chunked", 0]);
+      await mutate(indexedDB, name, ["transactions", "transactionJournal"], corrupt);
+      await expect(store.getTransaction("chunked")).rejects.toThrow(message);
+      await expect(store.getTransaction("chunked")).rejects.toBeInstanceOf(StorageCorruptionError);
+      await mutate(indexedDB, name, ["transactions", "transactionJournal"], (tx) => {
+        tx.objectStore("transactions").put(snapshot, "chunked");
+        tx.objectStore("transactionJournal").put(chunk, ["chunked", 0]);
+        tx.objectStore("transactionJournal").delete(["chunked", 1]);
+      });
+    }
+    expect(await store.getTransaction("chunked")).toMatchObject({
+      pendingBlockIds: ["chunk-block"],
+    });
+    // Orphan chunks are an integrity finding, never silently ignored.
+    await mutate(indexedDB, name, "transactionJournal", (tx) => {
+      tx.objectStore("transactionJournal").put({ blockIds: ["orphan"], segmentIds: [] }, [
+        "vanished",
+        0,
+      ]);
+    });
+    expect((await store.checkIntegrity()).issues).toEqual([
+      expect.objectContaining({ code: "orphan-transaction-journal", location: "[vanished,0]" }),
+    ]);
+    store.close();
+  });
+
+  it("migrates schema 1 transaction journals into chunks on open", async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    // Seed values come from a database the current build created, so the raw schema-1
+    // database below differs from it only in version and transaction layout.
+    const seedName = crypto.randomUUID();
+    (await openStore(indexedDB, seedName)).close();
+    const seeds = {
+      quota: await readRawValue(indexedDB, seedName, "gc", "maintenance/quota"),
+      global: await readRawValue(indexedDB, seedName, "statistics", "resource/global"),
+      catalog: await readRawValue(indexedDB, seedName, "statistics", "resource/catalog"),
+      records: await readRawValue(indexedDB, seedName, "statistics", "resource/records"),
+    };
+    const blockIds = Array.from({ length: 2_500 }, (_, index) => `v1-block-${String(index)}`);
+    const segmentIds = ["v1-segment-0", "v1-segment-1"];
+    const aborted: TransactionRecord = {
+      ...activeTransaction("v1-aborted", null),
+      status: "aborted",
+      revision: 3,
+      pendingBlockIds: blockIds,
+      pendingSegmentIds: segmentIds,
+    };
+    const committed: TransactionRecord = {
+      ...activeTransaction("v1-committed", null),
+      status: "committed",
+      revision: 2,
+      committedVersion: 0,
+    };
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(name, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        for (const storeName of [
+          "blocks",
+          "catalog",
+          "gc",
+          "leases",
+          "manifests",
+          "segments",
+          "statistics",
+          "temp",
+          "transactions",
+          "snapshotHeaders",
+        ]) {
+          db.createObjectStore(storeName);
+        }
+        const upgrade = request.transaction;
+        if (upgrade === null) throw new Error("missing upgrade transaction");
+        upgrade.objectStore("segments").createIndex("byTable", "tableId");
+        upgrade.objectStore("leases").createIndex("byExpiry", ["expiresAt", "id"]);
+        upgrade.objectStore("transactions").createIndex("byStatus", "status");
+        upgrade.objectStore("temp").createIndex("byOwnerExpiry", ["expiresAt", "ownerId"]);
+        const catalog = upgrade.objectStore("catalog");
+        catalog.createIndex("byFtsBuildUpdatedAt", "updatedAt");
+        catalog.createIndex("byFtsBuildExpiry", "ftsBuildExpiry");
+        catalog.createIndex("byFtsRetirementUpdatedAt", "retirementUpdatedAt");
+        catalog.createIndex("byUniqueKeyBuildActive", "activeBuildState");
+        catalog.createIndex("byUniqueKeyBuildExpiry", "activeExpiry");
+        catalog.createIndex("byManifestBlockId", "blockId", { unique: true });
+        upgrade.objectStore("gc").add(seeds.quota, "maintenance/quota");
+        const statistics = upgrade.objectStore("statistics");
+        statistics.add(seeds.global, "resource/global");
+        statistics.add(seeds.catalog, "resource/catalog");
+        statistics.add(seeds.records, "resource/records");
+        const blocks = upgrade.objectStore("blocks");
+        for (const id of blockIds) {
+          const bytes = Uint8Array.of(1);
+          blocks.add(bytes, id);
+          catalog.add({ byteLength: 1, checksum: crc32(bytes) }, `block-metadata/${id}`);
+        }
+        upgrade.objectStore("transactions").add(aborted, aborted.id);
+        upgrade.objectStore("transactions").add(committed, committed.id);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error ?? new Error("schema-1 open failed"));
+    });
+    database.close();
+
+    const store = await openStore(indexedDB, name);
+    expect(await store.getTransaction("v1-aborted")).toEqual(aborted);
+    expect(await store.getTransaction("v1-committed")).toEqual(committed);
+    await expect(readRawValue(indexedDB, name, "transactions", "v1-aborted")).resolves.toEqual({
+      ...aborted,
+      pendingBlockIds: undefined,
+      pendingSegmentIds: undefined,
+      journalChunkCount: 3,
+      pendingBlockCount: blockIds.length,
+      pendingSegmentCount: segmentIds.length,
+    });
+    await expect(
+      readRawValue(indexedDB, name, "transactionJournal", ["v1-aborted", 2]),
+    ).resolves.toEqual({ blockIds: blockIds.slice(2_048), segmentIds });
+    await expect(
+      readRawValue(indexedDB, name, "transactionJournal", ["v1-committed", 0]),
+    ).resolves.toBeUndefined();
+    store.close();
+
+    // A schema-1 record whose journal cannot be chunked aborts the upgrade and leaves the
+    // database at schema 1.
+    const brokenName = crypto.randomUUID();
+    const broken = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(brokenName, 1);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("transactions");
+        request.transaction
+          ?.objectStore("transactions")
+          .add({ ...committed, pendingBlockIds: "not-a-list" }, committed.id);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error ?? new Error("schema-1 open failed"));
+    });
+    broken.close();
+    await expect(openStore(indexedDB, brokenName)).rejects.toThrow(/pendingBlockIds/);
+    expect((await indexedDB.databases()).find((entry) => entry.name === brokenName)?.version).toBe(
+      1,
+    );
   });
 
   it("rejects oversized temp-page batches before any IndexedDB mutation", async () => {
@@ -2363,7 +2787,10 @@ describe("IndexedDB corruption hardening", () => {
       );
       tx.objectStore("catalog").put("broken-table", "table/name/broken");
       tx.objectStore("transactions").put(
-        { ...activeTransaction("broken-transaction", null), status: "committed" },
+        storedTransaction({
+          ...activeTransaction("broken-transaction", null),
+          status: "committed",
+        }),
         "broken-transaction",
       );
       tx.objectStore("leases").put(
@@ -2432,7 +2859,7 @@ describe("IndexedDB corruption hardening", () => {
           "strict-table",
         ]);
         tx.objectStore("transactions").put(
-          { ...activeTransaction("unknown-transaction", null), future: true },
+          { ...storedTransaction(activeTransaction("unknown-transaction", null)), future: true },
           "unknown-transaction",
         );
         tx.objectStore("leases").put(
@@ -3175,32 +3602,34 @@ describe("IndexedDB corruption hardening", () => {
       revision: 0,
       createdAt: NOW,
     });
-    await mutate(indexedDB, name, ["catalog", "manifests", "transactions"], (tx) => {
-      const catalog = tx.objectStore("catalog");
-      catalog.put(rowEnd, "row-id/overflow-row");
-      catalog.put(autoEnd, "auto-increment/overflow-auto/id");
-      catalog.put(Number.MAX_SAFE_INTEGER, "catalog/epoch");
-      catalog.put(Number.MAX_SAFE_INTEGER, "manifest/current");
-      tx.objectStore("manifests").put(
-        {
-          version: Number.MAX_SAFE_INTEGER,
-          previousVersion: Number.MAX_SAFE_INTEGER - 1,
-          liveBlockCount: 0,
-          liveBlockBytes: 0,
-          changedTableIds: [],
-          createdAt: NOW,
-        },
-        Number.MAX_SAFE_INTEGER,
-      );
-      tx.objectStore("transactions").put(
-        {
+    await mutate(
+      indexedDB,
+      name,
+      ["catalog", "manifests", "transactions", "transactionJournal"],
+      (tx) => {
+        const catalog = tx.objectStore("catalog");
+        catalog.put(rowEnd, "row-id/overflow-row");
+        catalog.put(autoEnd, "auto-increment/overflow-auto/id");
+        catalog.put(Number.MAX_SAFE_INTEGER, "catalog/epoch");
+        catalog.put(Number.MAX_SAFE_INTEGER, "manifest/current");
+        tx.objectStore("manifests").put(
+          {
+            version: Number.MAX_SAFE_INTEGER,
+            previousVersion: Number.MAX_SAFE_INTEGER - 1,
+            liveBlockCount: 0,
+            liveBlockBytes: 0,
+            changedTableIds: [],
+            createdAt: NOW,
+          },
+          Number.MAX_SAFE_INTEGER,
+        );
+        putRawTransaction(tx, {
           ...activeTransaction("overflow-transaction", null),
           revision: Number.MAX_SAFE_INTEGER,
           schemaEpochGuard: Number.MAX_SAFE_INTEGER,
-        },
-        "overflow-transaction",
-      );
-    });
+        });
+      },
+    );
 
     await expect(store.reserveRowIds("overflow-row", 1)).rejects.toBeInstanceOf(RangeError);
     await expect(store.reserveRowIds("overflow-row", 1)).rejects.toBeInstanceOf(RangeError);
@@ -3300,11 +3729,8 @@ describe("IndexedDB corruption hardening", () => {
     const corruptJournal = await store.getTransaction("corrupt-journal");
     expect(corruptJournal).toBeDefined();
     if (corruptJournal === undefined) throw new Error("Expected corrupt-journal transaction");
-    await mutate(indexedDB, name, "transactions", (tx) => {
-      tx.objectStore("transactions").put(
-        { ...corruptJournal, pendingBlockIds: ["historical-live"] },
-        "corrupt-journal",
-      );
+    await mutate(indexedDB, name, ["transactions", "transactionJournal"], (tx) => {
+      putRawTransaction(tx, { ...corruptJournal, pendingBlockIds: ["historical-live"] });
     });
     await expect(
       store.rollbackTransactionArtifacts({
@@ -3342,11 +3768,8 @@ describe("IndexedDB corruption hardening", () => {
     const victim = await store.getTransaction("victim");
     expect(victim).toBeDefined();
     if (victim === undefined) throw new Error("Expected victim transaction");
-    await mutate(indexedDB, foreignName, "transactions", (tx) => {
-      tx.objectStore("transactions").put(
-        { ...victim, pendingSegmentIds: ["foreign-segment"] },
-        "victim",
-      );
+    await mutate(indexedDB, foreignName, ["transactions", "transactionJournal"], (tx) => {
+      putRawTransaction(tx, { ...victim, pendingSegmentIds: ["foreign-segment"] });
     });
     await expect(
       store.rollbackTransactionArtifacts({
@@ -4098,12 +4521,12 @@ describe("IndexedDB corruption hardening", () => {
         const suffix = String(index).padStart(4, "0");
         const transactionId = `snapshot-owner-${suffix}`;
         transactions.add(
-          {
+          storedTransaction({
             ...activeTransaction(transactionId, 0),
             status: "committed",
             revision: 1,
             committedVersion: 0,
-          },
+          }),
           transactionId,
         );
         segments.add(

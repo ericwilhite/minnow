@@ -87,22 +87,23 @@ describe("OPFS RPC trust boundary", () => {
       {},
       { kind: "unknown" },
       { kind: "ping", extra: true },
-      { kind: "op", requestId: "r", from: "f", method: "unknown", args: [] },
+      { kind: "op", requestId: "r", from: "f", method: "unknown", args: [], sentAt: 1 },
       {
         kind: "op",
         requestId: "r".repeat(MAX_OPFS_RPC_IDENTIFIER_CHARACTERS + 1),
         from: "f",
         method: "getBlock",
         args: [],
+        sentAt: 1,
       },
-      { kind: "op", requestId: "r", from: "f", method: "getBlock", args: cyclic },
+      { kind: "op", requestId: "r", from: "f", method: "getBlock", args: cyclic, sentAt: 1 },
       { kind: "result", requestId: "r", ok: false, error: { name: "Error" } },
     ]) {
       expect(parseStoreRpcMessage(value, methods)).toBeUndefined();
     }
     expect(
       parseStoreRpcMessage(
-        { kind: "op", requestId: "r", from: "f", method: "getBlock", args: ["id"] },
+        { kind: "op", requestId: "r", from: "f", method: "getBlock", args: ["id"], sentAt: 1 },
         methods,
       ),
     ).toBeDefined();
@@ -128,7 +129,14 @@ describe("OPFS RPC trust boundary", () => {
 
   it("accepts every exact protocol shape and rejects each invalid discriminator field", () => {
     const valid = [
-      { kind: "op", requestId: "request", from: "follower", method: "getBlock", args: ["id"] },
+      {
+        kind: "op",
+        requestId: "request",
+        from: "follower",
+        method: "getBlock",
+        args: ["id"],
+        sentAt: 1,
+      },
       { kind: "result", requestId: "request", ok: true, value: { answer: 1 } },
       {
         kind: "result",
@@ -165,9 +173,9 @@ describe("OPFS RPC trust boundary", () => {
 
     const invalid = [
       [],
-      { kind: "op", requestId: "", from: "f", method: "getBlock", args: [] },
-      { kind: "op", requestId: "r", from: "", method: "getBlock", args: [] },
-      { kind: "op", requestId: "r", from: "f", method: "", args: [] },
+      { kind: "op", requestId: "", from: "f", method: "getBlock", args: [], sentAt: 1 },
+      { kind: "op", requestId: "r", from: "", method: "getBlock", args: [], sentAt: 1 },
+      { kind: "op", requestId: "r", from: "f", method: "", args: [], sentAt: 1 },
       { kind: "op", requestId: "r", from: "f", method: "getBlock", args: {} },
       { kind: "result", requestId: "", ok: true, value: null },
       { kind: "result", requestId: "r", ok: "yes", value: null },
@@ -269,22 +277,26 @@ describe("OPFS RPC trust boundary", () => {
 
   it("serializes platform, scalar, cloneable, and non-cloneable errors without poisoning RPC", () => {
     const dom = serializeStoreError(new DOMException("disk full", "QuotaExceededError"));
-    expect(dom).toEqual({
+    expect(dom).toMatchObject({
       name: "QuotaExceededError",
       message: "disk full",
       domException: true,
     });
+    expect(
+      Object.keys(dom)
+        .filter((key) => key !== "stack")
+        .sort(),
+    ).toEqual(["domException", "message", "name"]);
     expect(rehydrateStoreError(dom)).toBeInstanceOf(DOMException);
     expect(serializeStoreError(17)).toEqual({ name: "Error", message: "17" });
 
     const original = new Error("mixed") as Error & { code: number; callback: () => void };
     original.code = 42;
     original.callback = () => undefined;
-    expect(serializeStoreError(original)).toEqual({
-      name: "Error",
-      message: "mixed",
-      props: { code: 42 },
-    });
+    const serialized = serializeStoreError(original);
+    expect(serialized).toMatchObject({ name: "Error", message: "mixed", props: { code: 42 } });
+    expect(typeof serialized.stack).toBe("string");
+    expect(serialized).not.toHaveProperty("cause");
     const unknown = rehydrateStoreError({
       name: "FutureError",
       message: "future",

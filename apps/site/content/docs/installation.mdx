@@ -109,6 +109,7 @@ defines the tested browser line, OPFS qualification, and release-candidate check
 | `@minnowdb/core/worker-host`                    | Manual worker-host wiring for custom worker entry points.                           |
 | `@minnowdb/core/worker`                         | The ready-made worker entry.                                                        |
 | `@minnowdb/core/worker/{indexeddb,opfs,memory}` | A worker entry bundling one store only, for bundlers that cannot split worker code. |
+| `@minnowdb/core/worker/auto`                    | A worker entry bundling the two durable stores, for `{ kind: "auto" }`.             |
 | `@minnowdb/core/plan`                           | Low-level plan-building tools for custom query layers.                              |
 | `@minnowdb/core/storage/toolkit`                | Reusable parts for [custom storage adapters](/docs/storage/custom).                 |
 | `@minnowdb/core/testing`                        | Fault injection, deterministic simulation, SQLLogicTest, and the storage test kit.  |

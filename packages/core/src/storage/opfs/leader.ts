@@ -133,6 +133,7 @@ import {
   validateTempRunPageIdentity,
 } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, decodeSegment } from "./files.js";
+import { estimateRpcValueBytes } from "./rpc.js";
 import {
   SnapshotFrameLedger,
   snapshotLedgerPath,
@@ -305,6 +306,13 @@ interface CheckpointState {
   snapshotFrameImport?: SnapshotFrameImportState;
   completedSnapshotFrameImport?: CompletedSnapshotFrameImportState;
   extents: ExtentMeta;
+  /** Recently served follower mutations and what they returned, oldest first. */
+  servedRequests: ServedMutationOutcome[];
+  /**
+   * The ledger is complete for every request first sent at or after this time: a re-sent
+   * request it does not hold was never durably executed, and one sent earlier is uncertain.
+   */
+  servedCoverageSince: number;
 }
 
 type WalEntryBody =
@@ -452,9 +460,56 @@ type WalEntryBody =
       replay: boolean;
     }
   | { op: "finishSnapshotFrameImport"; input: FinishSnapshotFrameImportInput }
-  | { op: "cancelSnapshotFrameImport"; input: CancelSnapshotImportInput };
+  | { op: "cancelSnapshotFrameImport"; input: CancelSnapshotImportInput }
+  /**
+   * The value a served mutation returned, logged once the operation completed, so a recovering
+   * leader can answer a re-send of it. Never flushed: losing it costs one uncertain answer,
+   * never a wrong one.
+   */
+  | { op: "servedResult"; key: string; result?: unknown; withheld?: true };
 
-type WalEntry = WalEntryBody & { seq: number };
+type WalEntry = WalEntryBody & {
+  seq: number;
+  /** Present when a follower's request produced this frame: its identity, for the ledger. */
+  request?: ServedMutationRequest;
+};
+
+/** The identity of an RPC-served mutation, as the leader receives it. */
+export interface ServedMutationRequest {
+  /** The store's dedupe key: requester instance id plus request id. */
+  readonly key: string;
+  readonly method: string;
+  /** The canonical fingerprint of the arguments; a reused id with other arguments is refused. */
+  readonly signature: string;
+  readonly requestBytes: number;
+  /** When the requester first sent it (its clock; every tab of one device shares it). */
+  readonly sentAt: number;
+}
+
+/**
+ * A served mutation the log holds. `settled` means the value it returned is known; a frame
+ * replayed after a crash proves the mutation happened but not what it answered.
+ */
+export interface ServedMutationOutcome extends ServedMutationRequest {
+  readonly seq: number;
+  settled: boolean;
+  result?: unknown;
+  /** Settled, but the value was too large to keep: a re-send learns only that it happened. */
+  withheld?: true;
+}
+
+/** Served outcomes the ledger keeps beyond the write-ahead log, by count, by age, and by size. */
+const MAX_SERVED_LEDGER_ENTRIES = 65_536;
+const MAX_SERVED_LEDGER_AGE_MS = 10 * 60 * 1000;
+/**
+ * A result larger than this is not retained: a staging call answers with the whole transaction
+ * record, whose journal has no length limit, and keeping every such answer for every served
+ * request would grow the leader and its checkpoints with the square of a long scope. The
+ * requester's transaction layer recovers a lost staging or commit acknowledgement by reading
+ * the record back, so withholding costs it one uncertain answer, never a wrong one.
+ */
+const MAX_SERVED_LEDGER_RESULT_BYTES = 64 * 1024;
+const MAX_SERVED_LEDGER_BYTES = 8 * 1024 * 1024;
 
 const CORE_READ_METHODS = [
   "getTempOwner",
@@ -616,6 +671,33 @@ export class OpfsLeader {
   #lastCleanupError: unknown;
   #cleanupRetryScheduled = false;
   #cleanupDebtBytes = 0;
+  readonly #onDiagnostic: ((error: unknown, context: string) => void) | undefined;
+  /**
+   * Set by the store for the one follower mutation it is running: the first frame appended
+   * while it is set carries the request's identity and clears it, so the next leader can
+   * answer a re-send from the log. The store runs mutations one at a time, so no other served
+   * mutation can take it. A background step queued earlier (post-commit cleanup, collection)
+   * that appends first takes it instead; the ledger then names that frame as the request's,
+   * which costs an uncertain answer only if a crash keeps that frame and loses the mutation's
+   * own — never a wrong one, and never a second execution.
+   */
+  servingRequest: ServedMutationRequest | undefined;
+  /** Served follower mutations, oldest first, from the checkpoint plus every frame since. */
+  readonly #servedLedger = new Map<string, ServedMutationOutcome>();
+  /** Retained result bytes per settled entry; the sum is bounded by MAX_SERVED_LEDGER_BYTES. */
+  readonly #servedResultBytes = new Map<string, number>();
+  #servedLedgerBytes = 0;
+  readonly #servedLedgerResultBytes: number;
+  /** Zero until an entry is evicted: a fresh log holds every request it was ever handed. */
+  #servedCoverageSince = 0;
+  readonly #servedLedgerAgeMs: number;
+  /**
+   * Runs synchronously just before a checkpoint's writes. The store uses it to tell waiting
+   * followers how long the leader will be silent; nothing else may run in between.
+   */
+  onBeforeCheckpoint: ((expectedMs: number) => void) | undefined;
+  /** How long the previous checkpoint took, the estimate the next hold is based on. */
+  #lastCheckpointMs = 0;
 
   private constructor(
     tree: OpfsTree,
@@ -624,7 +706,13 @@ export class OpfsLeader {
     slots: [FileSystemSyncAccessHandle, FileSystemSyncAccessHandle],
     checkpointEntries?: number,
     cleanupLimitBytes?: number,
+    onDiagnostic?: (error: unknown, context: string) => void,
+    servedLedgerAgeMs?: number,
+    servedLedgerResultBytes?: number,
   ) {
+    this.#onDiagnostic = onDiagnostic;
+    this.#servedLedgerAgeMs = servedLedgerAgeMs ?? MAX_SERVED_LEDGER_AGE_MS;
+    this.#servedLedgerResultBytes = servedLedgerResultBytes ?? MAX_SERVED_LEDGER_RESULT_BYTES;
     this.#checkpointEntries = checkpointEntries ?? CHECKPOINT_ENTRIES;
     this.#cleanupLimitBytes = cleanupLimitBytes ?? MAX_OPFS_CLEANUP_DEBT_BYTES;
     if (!Number.isSafeInteger(this.#cleanupLimitBytes) || this.#cleanupLimitBytes < 1) {
@@ -655,6 +743,9 @@ export class OpfsLeader {
     },
     checkpointEntries?: number,
     cleanupLimitBytes?: number,
+    onDiagnostic?: (error: unknown, context: string) => void,
+    servedLedgerAgeMs?: number,
+    servedLedgerResultBytes?: number,
   ): Promise<OpfsLeader> {
     const leader = new OpfsLeader(
       tree,
@@ -663,6 +754,9 @@ export class OpfsLeader {
       [handles.slotA, handles.slotB],
       checkpointEntries,
       cleanupLimitBytes,
+      onDiagnostic,
+      servedLedgerAgeMs,
+      servedLedgerResultBytes,
     );
     try {
       await leader.#loadFromDisk();
@@ -829,6 +923,16 @@ export class OpfsLeader {
       this.#applyTempPageUpdates(checkpoint.tempPages);
       this.#seq = checkpoint.lastSeq;
       this.#checkpointGeneration = checkpoint.generation;
+      this.#servedLedger.clear();
+      this.#servedResultBytes.clear();
+      this.#servedLedgerBytes = 0;
+      this.#servedCoverageSince = checkpoint.servedCoverageSince;
+      for (const outcome of checkpoint.servedRequests) {
+        this.#servedLedger.set(outcome.key, { ...outcome });
+        if (outcome.settled && outcome.withheld !== true) {
+          this.#retainServedResult(outcome.key, estimateRpcValueBytes(outcome.result));
+        }
+      }
     }
 
     const newest = this.#slots[this.#newestSlot];
@@ -906,6 +1010,20 @@ export class OpfsLeader {
       }
       applied += 1;
       this.#applyReplayed(entry);
+      if (entry.request !== undefined) {
+        this.#recordServed({ ...entry.request, seq: entry.seq, settled: false });
+      }
+      if (entry.op === "servedResult") {
+        const served = this.#servedLedger.get(entry.key);
+        if (served !== undefined) {
+          served.settled = true;
+          if (entry.withheld === true) served.withheld = true;
+          else {
+            served.result = entry.result;
+            this.#retainServedResult(entry.key, estimateRpcValueBytes(entry.result));
+          }
+        }
+      }
       for (const placement of placementsOf(entry)) {
         this.#pool.restorePlacement(placement);
       }
@@ -1016,6 +1134,89 @@ export class OpfsLeader {
     await this.#run(() => undefined);
   }
 
+  #recordServed(outcome: ServedMutationOutcome): void {
+    this.#forgetServedResult(outcome.key);
+    this.#servedLedger.delete(outcome.key);
+    this.#servedLedger.set(outcome.key, outcome);
+    this.#trimServedLedger(outcome.sentAt - this.#servedLedgerAgeMs);
+  }
+
+  /** Evicts the oldest entries past the count, age, or byte bound, moving coverage past them. */
+  #trimServedLedger(horizon: number): void {
+    for (const [key, entry] of this.#servedLedger) {
+      if (
+        this.#servedLedger.size <= MAX_SERVED_LEDGER_ENTRIES &&
+        this.#servedLedgerBytes <= MAX_SERVED_LEDGER_BYTES &&
+        entry.sentAt >= horizon
+      ) {
+        break;
+      }
+      // Evicted: nothing sent at or before its time can be answered from the ledger any more.
+      this.#forgetServedResult(key);
+      this.#servedLedger.delete(key);
+      this.#servedCoverageSince = Math.max(this.#servedCoverageSince, entry.sentAt + 1);
+    }
+  }
+
+  #retainServedResult(key: string, bytes: number): void {
+    this.#forgetServedResult(key);
+    this.#servedResultBytes.set(key, bytes);
+    this.#servedLedgerBytes += bytes;
+  }
+
+  #forgetServedResult(key: string): void {
+    const bytes = this.#servedResultBytes.get(key);
+    if (bytes === undefined) return;
+    this.#servedResultBytes.delete(key);
+    this.#servedLedgerBytes -= bytes;
+  }
+
+  /** The outcome the log holds for a follower's request, when it holds one. */
+  servedOutcome(key: string): ServedMutationOutcome | undefined {
+    return this.#servedLedger.get(key);
+  }
+
+  /**
+   * The served mutation returned: log its value so the ledger, recovered or checkpointed, can
+   * answer a re-send with it. Not flushed — an acknowledgement carries the value to the
+   * requester anyway, and a lost result frame turns a re-send into an uncertain answer.
+   */
+  async completeServed(key: string, result: unknown): Promise<void> {
+    const entry = this.#servedLedger.get(key);
+    if (entry === undefined || entry.settled) return;
+    const bytes = estimateRpcValueBytes(result);
+    await this.#run(() => {
+      if (bytes > this.#servedLedgerResultBytes) {
+        this.#appendFrame({ op: "servedResult", key, withheld: true }, false);
+        entry.settled = true;
+        entry.withheld = true;
+        return;
+      }
+      this.#appendFrame({ op: "servedResult", key, result }, false);
+      entry.result = result;
+      entry.settled = true;
+      this.#retainServedResult(key, bytes);
+      this.#trimServedLedger(Number.NEGATIVE_INFINITY);
+    });
+  }
+
+  /**
+   * Every request first sent at or after this time is either in the ledger or was never
+   * durably executed here; a request sent before it may have been served and forgotten.
+   */
+  get servedCoverageSince(): number {
+    return this.#servedCoverageSince;
+  }
+
+  /** Background failures are recorded in the stats and also reported, as they happen. */
+  #diagnostic(error: unknown, context: string): void {
+    try {
+      this.#onDiagnostic?.(error, context);
+    } catch {
+      // A diagnostic hook must never turn a background failure into a second one.
+    }
+  }
+
   /**
    * The critical section: apply to the core and append the frame in one synchronous run.
    * A validation throw leaves the core untouched (validate-then-mutate bodies); a WAL write
@@ -1053,10 +1254,16 @@ export class OpfsLeader {
     return result;
   }
 
-  #appendFrame(body: WalEntryBody): void {
+  #appendFrame(body: WalEntryBody, flush = this.#strict): void {
+    const request = this.servingRequest;
+    this.servingRequest = undefined;
+    let nextSeq: number;
     try {
-      const nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
-      this.#wal.append({ seq: nextSeq, ...body }, this.#strict);
+      nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
+      this.#wal.append(
+        { seq: nextSeq, ...body, ...(request === undefined ? {} : { request }) },
+        flush,
+      );
       this.#seq = nextSeq;
       this.#entriesSinceCheckpoint = safeSuccessor(
         this.#entriesSinceCheckpoint,
@@ -1066,6 +1273,8 @@ export class OpfsLeader {
       this.#poisoned = true;
       throw error;
     }
+    // Durable now, so the ledger may promise it happened; the value follows on completion.
+    if (request !== undefined) this.#recordServed({ ...request, seq: nextSeq, settled: false });
     // The checkpoint runs as its own queued step: the operation that trips the threshold is
     // already durable and should not absorb the pause — or a checkpoint failure. A failed
     // checkpoint (quota, most plausibly) leaves the WAL covering everything and retries on a
@@ -1081,7 +1290,9 @@ export class OpfsLeader {
         if (this.#checkpointDue()) {
           this.checkpointNow();
         }
-      }).catch(() => undefined);
+      }).catch((error: unknown) => {
+        this.#diagnostic(error, "opfs checkpoint");
+      });
     }
   }
 
@@ -1666,6 +1877,9 @@ export class OpfsLeader {
         this.#snapshotFrameImport = undefined;
         return undefined;
       }
+      case "servedResult":
+        // Bookkeeping for the served-request ledger; the core does not change.
+        return undefined;
       case "cancelSnapshotFrameImport": {
         const session = this.#snapshotFrameImport;
         if (session?.identity !== body.input.identity) {
@@ -1947,8 +2161,9 @@ export class OpfsLeader {
   #applyReplayed(entry: WalEntry): void {
     this.#permissivePhysical = true;
     try {
-      const { seq: _seq, ...body } = entry;
+      const { seq: _seq, request: _request, ...body } = entry;
       void _seq;
+      void _request;
       this.#applyBody(body);
       this.#clearCompletedSnapshotImportIfAdvanced();
     } finally {
@@ -2386,7 +2601,10 @@ export class OpfsLeader {
    */
   checkpointNow(): void {
     try {
+      this.onBeforeCheckpoint?.(this.#lastCheckpointMs);
+      const started = Date.now();
       this.#checkpointNowUnchecked();
+      this.#lastCheckpointMs = Date.now() - started;
       this.#checkpointFailures = 0;
       this.#lastCheckpointError = undefined;
       this.#checkpointRetryAtEntries = 0;
@@ -2428,6 +2646,8 @@ export class OpfsLeader {
             completedSnapshotFrameImport: structuredClone(this.#completedSnapshotFrameImport),
           }),
       extents: this.#pool.meta(),
+      servedRequests: [...this.#servedLedger.values()],
+      servedCoverageSince: this.#servedCoverageSince,
     };
     const bytes = encodeSyncCheckpoint(state);
     if (bytes.byteLength > MAX_OPFS_CHECKPOINT_BYTES) {
@@ -2531,6 +2751,7 @@ export class OpfsLeader {
     } catch (error) {
       this.#cleanupFailures += 1;
       this.#lastCleanupError = error;
+      this.#diagnostic(error, "opfs cleanup");
       await this.#refreshCleanupDebtAfterFailure();
     }
     if (this.#cleanupRetryScheduled || this.#closed) return;
@@ -2545,11 +2766,14 @@ export class OpfsLeader {
       } catch (error) {
         this.#cleanupFailures += 1;
         this.#lastCleanupError = error;
+        this.#diagnostic(error, "opfs cleanup retry");
         await this.#refreshCleanupDebtAfterFailure();
         // A later mutation that creates cleanup work retries again. Do not spin forever on a
         // persistent platform refusal or on corruption that needs operator attention.
       }
-    }).catch(() => undefined);
+    }).catch((error: unknown) => {
+      this.#diagnostic(error, "opfs cleanup retry");
+    });
   }
 
   async #refreshCleanupDebtAfterFailure(): Promise<void> {
@@ -4741,13 +4965,19 @@ export class OpfsLeader {
     };
   }
 
+  /** True once shutdown or crash began; work queued after that never runs. */
+  isClosed(): boolean {
+    return this.#closed;
+  }
+
   /** Graceful: flush, checkpoint (so the next leader's takeover is instant), release. */
   async shutdown(): Promise<void> {
     await this.#run(() => {
       this.checkpointNow();
       this.#closed = true;
-    }).catch(() => {
+    }).catch((error: unknown) => {
       // Shutting down a poisoned leader still releases its handles below.
+      this.#diagnostic(error, "opfs shutdown checkpoint");
       this.#closed = true;
     });
     this.#walHandle.close();
@@ -4869,6 +5099,7 @@ const WAL_BODY_KEYS = {
   appendSnapshotImportFrames: ["input", "state", "blockPlacements", "replay"],
   finishSnapshotFrameImport: ["input"],
   cancelSnapshotFrameImport: ["input"],
+  servedResult: ["key", "result", "withheld"],
 } as const satisfies Record<WalEntryBody["op"], readonly string[]>;
 
 function validateWalEntry(value: unknown): WalEntry {
@@ -5077,6 +5308,17 @@ function validateWalEntry(value: unknown): WalEntry {
       requireTimestamp(entry.input.expiresAtCutoff, "finishSnapshotFrameImport cutoff");
       requireRecord(entry.input.footer, "finishSnapshotFrameImport footer");
       break;
+    case "servedResult":
+      if (typeof entry.key !== "string" || entry.key.length === 0 || entry.key.length > 4096) {
+        throw new Error("servedResult key is invalid");
+      }
+      if (
+        Object.hasOwn(entry, "withheld") &&
+        ((entry as { withheld: unknown }).withheld !== true || Object.hasOwn(entry, "result"))
+      ) {
+        throw new Error("servedResult withholding is invalid");
+      }
+      break;
     case "cancelSnapshotFrameImport":
       requireRecord(entry.input, "cancelSnapshotFrameImport input");
       assertExactRecordKeys(
@@ -5110,9 +5352,47 @@ function validateIdPlacements(value: unknown, label: string): asserts value is I
 }
 
 function assertWalKeys(value: Record<string, unknown>, bodyKeys: readonly string[]): void {
-  const allowed = new Set(["seq", "op", ...bodyKeys]);
+  const allowed = new Set(["seq", "op", ...bodyKeys, "request"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`Unexpected ${String(value.op)} WAL field: ${key}`);
+  }
+  if (value.request !== undefined) validateServedRequest(value.request);
+}
+
+function validateServedRequest(value: unknown): asserts value is ServedMutationRequest {
+  if (!isRecord(value)) throw new Error("OPFS WAL served request is not an object");
+  assertExactRecordKeys(
+    value,
+    ["key", "method", "signature", "requestBytes", "sentAt"],
+    "OPFS WAL served request",
+  );
+  if (typeof value.key !== "string" || value.key.length === 0 || value.key.length > 4096) {
+    throw new Error("OPFS WAL served request has an invalid key");
+  }
+  if (typeof value.method !== "string" || value.method.length === 0) {
+    throw new Error("OPFS WAL served request has an invalid method");
+  }
+  if (typeof value.signature !== "string" || value.signature.length === 0) {
+    throw new Error("OPFS WAL served request has an invalid signature");
+  }
+  if (!isNonNegativeSafeInteger(value.requestBytes) || !isNonNegativeSafeInteger(value.sentAt)) {
+    throw new Error("OPFS WAL served request has invalid numbers");
+  }
+}
+
+function validateServedOutcome(value: unknown): asserts value is ServedMutationOutcome {
+  if (!isRecord(value)) throw new Error("OPFS served outcome is not an object");
+  const { seq, settled, withheld, result: _result, ...request } = value;
+  void _result;
+  validateServedRequest(request);
+  if (!Number.isSafeInteger(seq) || (seq as number) < 1) {
+    throw new Error("OPFS served outcome has an invalid sequence");
+  }
+  if (typeof settled !== "boolean" || (!settled && Object.hasOwn(value, "result"))) {
+    throw new Error("OPFS served outcome has an invalid settlement");
+  }
+  if (withheld !== undefined && (withheld !== true || !settled || Object.hasOwn(value, "result"))) {
+    throw new Error("OPFS served outcome has an invalid withholding");
   }
 }
 
@@ -5346,6 +5626,20 @@ function validateCheckpointState(value: unknown): CheckpointState {
   if (!Array.isArray(value.tempPages)) {
     throw new Error("Invalid OPFS checkpoint temp-page ledger");
   }
+  if (!Array.isArray(value.servedRequests)) {
+    throw new Error("Invalid OPFS checkpoint served-request ledger");
+  }
+  if (!isNonNegativeSafeInteger(value.servedCoverageSince)) {
+    throw new Error("Invalid OPFS checkpoint served-request coverage");
+  }
+  const seenServed = new Set<string>();
+  for (const entry of value.servedRequests) {
+    validateServedOutcome(entry);
+    if (seenServed.has(entry.key)) {
+      throw new Error(`Duplicate OPFS checkpoint served request: ${entry.key}`);
+    }
+    seenServed.add(entry.key);
+  }
   assertExactRecordKeys(
     value,
     [
@@ -5361,6 +5655,8 @@ function validateCheckpointState(value: unknown): CheckpointState {
       ...(value.snapshotFrameImport === undefined ? [] : ["snapshotFrameImport"]),
       ...(value.completedSnapshotFrameImport === undefined ? [] : ["completedSnapshotFrameImport"]),
       "extents",
+      "servedRequests",
+      "servedCoverageSince",
     ],
     "OPFS checkpoint",
   );
@@ -6422,6 +6718,8 @@ function parseTempPageFilePath(
 
 function placementsOf(entry: WalEntry): Placement[] {
   switch (entry.op) {
+    case "servedResult":
+      return [];
     case "stageTransactionArtifacts":
     case "writeTransaction":
       return entry.blocks.map(({ placement }) => placement);

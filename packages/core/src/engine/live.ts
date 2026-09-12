@@ -151,6 +151,26 @@ export interface LiveQueryStats {
   /** Work avoided because equal statements shared one query group or in-flight execution. */
   sharedExecutions: number;
   lastSweepMs: number;
+  /** One entry per distinct statement, with why it re-executes when it does. */
+  groups: readonly LiveQueryGroupStats[];
+}
+
+/** What one distinct live statement costs, and why. */
+export interface LiveQueryGroupStats {
+  /** The statement's SQL; undefined for a compiled-plan envelope. */
+  readonly sql: string | undefined;
+  readonly subscribers: number;
+  /** Whether the engine maintains this statement incrementally; false before its first run too. */
+  readonly maintainable: boolean;
+  /** Why it re-executes on every relevant commit; empty when it is maintained. */
+  readonly reasons: readonly string[];
+  /** Full executions after the first. */
+  readonly reruns: number;
+  /** Deliveries answered by patching the retained result. */
+  readonly maintained: number;
+  /** Full executions of a maintainable statement that a particular commit could not be patched for. */
+  readonly fallbacks: number;
+  readonly retainedRows: number;
 }
 
 /** A live query: plain SQL, parameterized SQL, or a compiled-plan envelope. */
@@ -183,6 +203,11 @@ export interface LiveMaintainedExecution {
   readonly retainedBytes?: number;
 }
 
+/** The host will not maintain this statement, and says why, in the terms a developer fixes. */
+export interface LiveMaintenanceDeclined {
+  readonly declined: readonly string[];
+}
+
 export interface LiveMaintainedChange extends LiveMaintainedExecution {
   readonly changed: boolean;
   /** For each row of `result`, its index in the previous result, or -1; see `LiveQueryDelivery`. */
@@ -205,7 +230,7 @@ export interface LiveQueryHost {
   executeMaintainable?(
     query: LiveQueryInput,
     context?: LiveQueryExecuteContext,
-  ): Promise<LiveMaintainedExecution | undefined>;
+  ): Promise<LiveMaintainedExecution | LiveMaintenanceDeclined | undefined>;
   /**
    * Patches a retained result with the row changes the commits in (after, until] made to
    * `tableIds`, or returns undefined when only a full execution can answer.
@@ -270,6 +295,11 @@ interface QueryGroup {
   maintenance: unknown;
   /** Set once the host declined to maintain the statement; the group executes in full after. */
   unmaintainable: boolean;
+  /** The host's reasons for declining, in a developer's terms; empty while maintainable. */
+  reasons: readonly string[];
+  reruns: number;
+  maintained: number;
+  fallbacks: number;
 }
 
 /** Exact structural equality; stops at the first difference. */
@@ -407,6 +437,7 @@ export class LiveQuerySet {
     retainedBytes: 0,
     sharedExecutions: 0,
     lastSweepMs: 0,
+    groups: [],
   };
   /** The probe the last completed sweep brought every non-lagging group up to. */
   #lastProbe: CatalogProbe | undefined;
@@ -469,8 +500,27 @@ export class LiveQuerySet {
 
   get stats(): LiveQueryStats {
     let retainedRows = 0;
-    for (const group of this.#groups.values()) retainedRows += group.result?.rows.length ?? 0;
-    return { ...this.#stats, retainedRows, retainedBytes: this.#retainedBytes };
+    const groups: LiveQueryGroupStats[] = [];
+    for (const group of this.#groups.values()) {
+      const rows = group.result?.rows.length ?? 0;
+      retainedRows += rows;
+      groups.push({
+        sql:
+          typeof group.query === "string"
+            ? group.query
+            : group.query.kind === "sql-query"
+              ? group.query.sql
+              : undefined,
+        subscribers: group.subscribers.size,
+        maintainable: group.maintenance !== undefined,
+        reasons: group.reasons,
+        reruns: group.reruns,
+        maintained: group.maintained,
+        fallbacks: group.fallbacks,
+        retainedRows: rows,
+      });
+    }
+    return { ...this.#stats, retainedRows, retainedBytes: this.#retainedBytes, groups };
   }
 
   /**
@@ -680,6 +730,10 @@ export class LiveQuerySet {
       deliveries: 0,
       maintenance: undefined,
       unmaintainable: false,
+      reasons: [],
+      reruns: 0,
+      maintained: 0,
+      fallbacks: 0,
     };
     this.#groups.set(key, group);
     this.#indexGroup(group, dependencies);
@@ -757,8 +811,10 @@ export class LiveQuerySet {
           !group.unmaintainable
         ) {
           const maintained = await this.#host.executeMaintainable(group.query, context);
-          if (maintained === undefined) group.unmaintainable = true;
-          else {
+          if (maintained === undefined || "declined" in maintained) {
+            group.unmaintainable = true;
+            group.reasons = maintained?.declined ?? ["the host declined to maintain it"];
+          } else {
             candidate = maintained;
             executed = maintained.result;
             maintenance = maintained.state;
@@ -1102,6 +1158,7 @@ export class LiveQuerySet {
       // The plan the host maintains was made against the old catalog.
       group.maintenance = undefined;
       group.unmaintainable = false;
+      group.reasons = [];
       try {
         await this.#refreshDependencies(group);
       } catch (error) {
@@ -1174,9 +1231,13 @@ export class LiveQuerySet {
           );
           if (!this.#stillOpen() || this.#groups.get(group.key) !== group) return;
         }
-        if (execution !== undefined) this.#stats.maintained += 1;
-        else {
+        if (execution !== undefined) {
+          this.#stats.maintained += 1;
+          group.maintained += 1;
+        } else {
           this.#stats.reruns += 1;
+          group.reruns += 1;
+          if (group.maintenance !== undefined) group.fallbacks += 1;
           execution = await this.#executeGroup(group, {
             probe: current,
             memoize: groupMemoizes(group),

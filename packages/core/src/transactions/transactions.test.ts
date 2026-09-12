@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   IndexedDbBlockStore,
   MemoryBlockStore,
-  MAX_TRANSACTION_PENDING_BLOCKS,
   OpfsBlockStore,
   SnapshotManifestMissingError,
   WriteConflictError,
@@ -762,17 +761,18 @@ it("chunks large staging calls and refuses an oversized journal before mutation"
   expect(store.artifactBatchBlockCounts).toEqual([64, 64, 1]);
   expect((await store.getTransaction(transaction.id))?.pendingBlockIds).toHaveLength(129);
 
-  const tooMany = Array.from({ length: MAX_TRANSACTION_PENDING_BLOCKS + 1 }, (_, index) => ({
-    id: `too-many-${String(index)}`,
+  // The journal has no ceiling of its own: a batch well past the old 4,096 limit lands in
+  // bounded storage calls, and the record reads back every id in order.
+  const many = Array.from({ length: 4_500 }, (_, index) => ({
+    id: `many-${String(index)}`,
     bytes: Uint8Array.of(1),
   }));
-  const callsBeforeRefusal = store.artifactBatchBlockCounts.length;
-  const pendingBeforeRefusal = (await store.getTransaction(transaction.id))?.pendingBlockIds;
-  await expect(transaction.stageBlocks(tooMany)).rejects.toBeInstanceOf(RangeError);
-  expect(store.artifactBatchBlockCounts).toHaveLength(callsBeforeRefusal);
-  expect((await store.getTransaction(transaction.id))?.pendingBlockIds).toEqual(
-    pendingBeforeRefusal,
-  );
+  await transaction.stageBlocks(many);
+  expect(store.artifactBatchBlockCounts.slice(3).every((count) => count <= 64)).toBe(true);
+  const journaled = (await store.getTransaction(transaction.id))?.pendingBlockIds ?? [];
+  expect(journaled).toHaveLength(129 + 4_500);
+  expect(journaled.slice(129)).toEqual(many.map((block) => block.id));
+  expect(transaction.pendingBlockCount).toBe(129 + 4_500);
   store.close();
 });
 

@@ -15,7 +15,7 @@ export class TransactionExpiredError extends Error {
 }
 
 /** The worker stopped responding within the configured request deadline. */
-export class DatabaseWorkerTimeoutError extends Error {
+export class DatabaseWorkerTimeoutError extends ConnectionLostError {
   override readonly name = "DatabaseWorkerTimeoutError";
   constructor(
     readonly method: string,
@@ -25,8 +25,40 @@ export class DatabaseWorkerTimeoutError extends Error {
   }
 }
 
+/**
+ * The worker's channel failed underneath every pending call: the worker raised a script error it
+ * did not handle, or sent a frame that could not be read. `reason` says which; `cause` carries
+ * the worker's own error when the browser handed it over.
+ */
+export class DatabaseWorkerFailedError extends ConnectionLostError {
+  override readonly name = "DatabaseWorkerFailedError";
+  constructor(
+    readonly reason: "error" | "messageerror" | "reopened",
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
+/**
+ * The store an `auto` descriptor remembered for this database cannot be opened here — OPFS in a
+ * context without synchronous access handles, typically — and the database is not reopened,
+ * empty, on the other store.
+ */
+export class DatabaseStoreUnavailableError extends Error {
+  override readonly name = "DatabaseStoreUnavailableError";
+  constructor(
+    readonly store: "opfs" | "indexeddb",
+    readonly databaseName: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 /** A transport failure cannot prove whether this operation published before its reply was lost. */
-export class DatabaseWorkerOutcomeUnknownError extends Error {
+export class DatabaseWorkerOutcomeUnknownError extends UnknownOutcomeError {
   override readonly name = "DatabaseWorkerOutcomeUnknownError";
   constructor(
     readonly method: string,
@@ -200,3 +232,176 @@ export class SqlCompileError extends TypeError {
   }
 }
 import { dateIsoString } from "../date-value.js";
+import {
+  BlockReadBatchTooLargeError,
+  CompactionBacklogError,
+  CompactionJobConflictError,
+  ConnectionLostError,
+  GarbageCollectionJobConflictError,
+  IndexedDbSchemaUpgradeBlockedError,
+  LeaseConflictError,
+  LeaseExpiredError,
+  LeaseOwnerConflictError,
+  OpfsCoordinationError,
+  OpfsDatabaseInUseError,
+  PostingBuildConflictError,
+  SchemaConflictError,
+  SnapshotImportConflictError,
+  SnapshotManifestMissingError,
+  StorageCorruptionError,
+  StorageFormatVersionError,
+  StorageResourceLimitError,
+  TableInUseError,
+  TableRecordConflictError,
+  TempOwnerConflictError,
+  TransactionRecordConflictError,
+  UniqueIndexCoverageError,
+  UniqueKeyBuildConflictError,
+  UniqueKeyConflictError,
+  UnknownOutcomeError,
+  WriteConflictError,
+} from "../storage/types.js";
+
+/**
+ * What an error means for the caller, in the three terms that decide what to do next. Every
+ * error Minnow throws maps to exactly one kind; an unrecognized error is `"other"` with the
+ * cautious answers.
+ */
+export type ErrorKind =
+  /** The operation may have happened. Reconcile a stable id or revision before retrying. */
+  | "unknown-outcome"
+  /** This connection is finished; open a new one. Pending mutations were reported separately. */
+  | "connection-lost"
+  /** Lost a race with another writer or a schema change; nothing happened. Retry as is. */
+  | "conflict"
+  /** The request itself is wrong (a duplicate key, a bad table, a compile error). Fix it. */
+  | "rejected"
+  /** A momentary condition: backpressure, coordination, an expired scope. Retry with backoff. */
+  | "transient"
+  /** A limit was reached: quota, memory, a resource ceiling. Free something, then retry. */
+  | "resource"
+  /** The stored data is unreadable by this build. Do not retry, and do not delete. */
+  | "corruption"
+  /** The caller cancelled it; nothing happened. */
+  | "cancelled"
+  | "other";
+
+export interface ErrorClassification {
+  kind: ErrorKind;
+  /** True when the operation may have published despite the error. Never replay when true. */
+  mayHavePublished: boolean;
+  /** Whether repeating the same call is sound: as is, only after reconciling, or not at all. */
+  retry: "safe" | "after-reconcile" | "never";
+  /** False when every later call on the same connection will fail the same way. */
+  connectionUsable: boolean;
+}
+
+type ErrorClass = abstract new (...args: never[]) => Error;
+
+const CONFLICT_ERRORS: readonly ErrorClass[] = [
+  WriteConflictError,
+  SchemaConflictError,
+  TableRecordConflictError,
+  TransactionRecordConflictError,
+  LeaseConflictError,
+  LeaseOwnerConflictError,
+  CompactionJobConflictError,
+  GarbageCollectionJobConflictError,
+  TempOwnerConflictError,
+  UniqueKeyBuildConflictError,
+  PostingBuildConflictError,
+  SnapshotImportConflictError,
+  SnapshotManifestMissingError,
+  TableInUseError,
+  OpfsDatabaseInUseError,
+];
+
+const TRANSIENT_ERRORS: readonly ErrorClass[] = [
+  OpfsCoordinationError,
+  DatabaseReadBacklogError,
+  MaintenanceBacklogError,
+  CompactionBacklogError,
+  LiveQueryLimitError,
+  LeaseExpiredError,
+  TransactionExpiredError,
+  IndexedDbSchemaUpgradeBlockedError,
+  VisibleSegmentCursorStaleError,
+];
+
+const RESOURCE_ERRORS: readonly ErrorClass[] = [
+  StorageResourceLimitError,
+  BlockReadBatchTooLargeError,
+  CompactionMemoryBudgetError,
+  CompactionWriteAmplificationError,
+];
+
+const REJECTED_ERRORS: readonly ErrorClass[] = [
+  UniqueConstraintError,
+  UniqueKeyConflictError,
+  UniqueIndexCoverageError,
+  MissingKeyError,
+  UnknownTableError,
+  SqlCompileError,
+  CompactionJobCancelledError,
+];
+
+function isAnyOf(error: unknown, classes: readonly ErrorClass[]): boolean {
+  return classes.some((constructor) => error instanceof constructor);
+}
+
+function hasErrorName(error: unknown, name: string): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === name;
+}
+
+/**
+ * Classifies any error into what it means for the caller: may the operation have published, is
+ * a retry sound, and is the connection still usable. Works on errors rehydrated from the worker
+ * or a follower hop, and on the platform's own `QuotaExceededError` and `AbortError`.
+ */
+export function classifyError(error: unknown): ErrorClassification {
+  if (error instanceof UnknownOutcomeError) {
+    return {
+      kind: "unknown-outcome",
+      mayHavePublished: true,
+      retry: "after-reconcile",
+      connectionUsable: !(error.cause instanceof ConnectionLostError),
+    };
+  }
+  if (error instanceof ConnectionLostError) {
+    return {
+      kind: "connection-lost",
+      mayHavePublished: false,
+      retry: "never",
+      connectionUsable: false,
+    };
+  }
+  if (error instanceof StorageCorruptionError || error instanceof StorageFormatVersionError) {
+    return { kind: "corruption", mayHavePublished: false, retry: "never", connectionUsable: true };
+  }
+  if (isAnyOf(error, CONFLICT_ERRORS)) {
+    return { kind: "conflict", mayHavePublished: false, retry: "safe", connectionUsable: true };
+  }
+  if (isAnyOf(error, TRANSIENT_ERRORS)) {
+    return { kind: "transient", mayHavePublished: false, retry: "safe", connectionUsable: true };
+  }
+  if (isAnyOf(error, RESOURCE_ERRORS) || hasErrorName(error, "QuotaExceededError")) {
+    return {
+      kind: "resource",
+      mayHavePublished: false,
+      retry: "after-reconcile",
+      connectionUsable: true,
+    };
+  }
+  if (
+    isAnyOf(error, REJECTED_ERRORS) ||
+    error instanceof TypeError ||
+    error instanceof RangeError ||
+    error instanceof SyntaxError
+  ) {
+    return { kind: "rejected", mayHavePublished: false, retry: "never", connectionUsable: true };
+  }
+  if (hasErrorName(error, "AbortError")) {
+    return { kind: "cancelled", mayHavePublished: false, retry: "safe", connectionUsable: true };
+  }
+  return { kind: "other", mayHavePublished: false, retry: "never", connectionUsable: true };
+}

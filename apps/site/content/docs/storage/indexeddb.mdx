@@ -58,11 +58,22 @@ await store.getLogicalStorageBytes();
 
 ## What it creates
 
-One IndexedDB database with ten object stores: `blocks`, `manifests`, `segments`, `transactions`,
-`catalog`, `leases`, `temp`, `gc`, `statistics`, and `snapshotHeaders`. Block payloads are stored as
-`Uint8Array` values keyed by block id. Manifest membership is interval provenance beside each
-block, so snapshot export can cursor the captured version without constructing a descriptor array;
-integrity checks cross-check that provenance against the payload store.
+One IndexedDB database with eleven object stores: `blocks`, `manifests`, `segments`,
+`transactions`, `transactionJournal`, `catalog`, `leases`, `temp`, `gc`, `statistics`, and
+`snapshotHeaders`. Block payloads are stored as `Uint8Array` values keyed by block id. Manifest
+membership is interval provenance beside each block, so snapshot export can cursor the captured
+version without constructing a descriptor array; integrity checks cross-check that provenance
+against the payload store.
+
+A transaction record in `transactions` holds the record's fields plus three counts: journaled
+blocks, journaled segments, and journal chunks. The block and segment ids themselves live in
+`transactionJournal` as chunks keyed `[transactionId, chunkIndex]`, each holding at most 1,024 ids
+in journal order, and every chunk but the last is full. Staging reads only the last chunk and
+writes only the ids it adds, so a transaction can journal as many artifacts as the global staging
+ceilings allow without each step growing with the journal. Reads reassemble the contract's
+`pendingBlockIds` and `pendingSegmentIds` from the chunks and refuse a record whose counts, chunk
+count, or chunk contents disagree. Commit, abort, and savepoint rollback still validate the whole
+journal; a record's chunks are deleted with the record.
 
 A resumable snapshot import keeps one scalar identity/progress marker in `catalog` until the final
 transaction publishes the manifest pointer and deletes the live marker atomically. Its header
@@ -131,7 +142,7 @@ that is safe.
 | -------------------------------------------------------- | ---------------------: |
 | Live reader/backup leases                                |                  4,096 |
 | Active transactions                                      |                  4,096 |
-| Globally staged transaction blocks / segments            |        65,536 / 65,536 |
+| Globally staged transaction blocks / segments            |  1,048,576 / 1,048,576 |
 | Globally staged transaction payload bytes                |                512 MiB |
 | Catalog table/view records, including a pending table    |                  4,096 |
 | Catalog table/view metadata bytes                        |                 64 MiB |
@@ -198,13 +209,15 @@ even if quota or request-failure processing resumes after the abort event.
 
 ## Schema compatibility and recovery
 
-IndexedDB schema 1 is Minnow's only native layout so far; there are no pre-contract schemas or
-compatibility branches. Future schema changes must add one
-ordered migration for every integer version between the database and the current build. All of
-those migrations run inside the browser's single `versionchange` transaction: either the complete
-chain and its data changes commit, or the old database remains byte-for-byte logical state. A
-frozen schema-1 database is opened, written, and checked in CI, and the migration registry refuses
-to load if a schema bump omitted or reordered a step.
+The current IndexedDB schema is 2. Schema 1 kept each transaction's journal ids on the record
+itself; opening a schema-1 database moves them into `transactionJournal` chunks and rewrites the
+records with their counts. There are no pre-contract schemas or compatibility branches. Every
+schema change adds one ordered migration for every integer version between the database and the
+current build. All of those migrations run inside the browser's single `versionchange`
+transaction: either the complete chain and its data changes commit, or the old database remains
+byte-for-byte logical state. A frozen database of every stable schema is opened, migrated, written,
+and checked in CI, and the migration registry refuses to load if a schema bump omitted or
+reordered a step.
 
 A build older than the database throws `StorageFormatVersionError` and leaves every store, index,
 and record untouched; it never downgrades or recreates the database. Malformed current-schema
