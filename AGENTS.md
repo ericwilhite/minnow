@@ -102,7 +102,11 @@ reach for `MemoryBlockStore` in tests. Every one of them is then wrong, and no t
 What the suites do and do not cover:
 
 - **Covered.** The SELECT guide's SQL runs against the retail dataset (`docs-sql.test.ts`), and
-  so do the console's SQL chips (`queries.test.ts`). The console's TypeScript snippets are both
+  so do the console's SQL chips (`queries.test.ts`). The committed SQLLogicTest profile runs in
+  Node and in all three real browsers over IndexedDB and OPFS (`sqllogictest.spec.ts`), and the
+  interaction-plan simulator (`testing/interaction-simulator.ts`) checks the SQL surface against
+  a shadow model in Node and across real tabs (`interaction.spec.ts`); a seed that fails belongs
+  in `regression-seeds.json` and its reduction in `simulator-regressions.test.ts`. The console's TypeScript snippets are both
   typechecked against the published declarations and executed (`snippets.test.ts`) — that suite
   also proves the whole editor pipeline offline, so a broken `paths` map or a declaration the
   resolver cannot follow fails in Vitest rather than in a browser. The SQL feature matrix is a

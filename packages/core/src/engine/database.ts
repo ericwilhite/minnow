@@ -1,4 +1,5 @@
 import { coordinateWrite } from "./write-coordinator.js";
+import { quoteSqlIdentifier } from "./sql-quote.js";
 import { LiveAggregate } from "./live-aggregate.js";
 import { stageLiveExecution } from "./live-accept.js";
 import { QueryGenerations } from "./query-generations.js";
@@ -1783,11 +1784,6 @@ function resolveMutationStatementDatetimes(
     return { ...statement, query: plan(statement.query) };
   }
   return statement;
-}
-
-/** Quotes a catalog identifier for internally generated SQL. */
-function quoteSqlIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`;
 }
 
 export interface RunStatementOptions {
@@ -8291,7 +8287,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if ((!fires && conflictWhere === undefined && !retiresUniqueTerms) || rowCount === 0) {
       return undefined;
     }
-    const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+    const quote = quoteSqlIdentifier;
     const keyValues = batch.columns[keyColumn.name] ?? [];
     const distinct = new Map<string, Exclude<BatchValue, null>>();
     for (const value of keyValues) {
@@ -8431,7 +8427,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (lookup !== undefined) {
       rows = await lookup(keys, "*");
     } else {
-      const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+      const quote = quoteSqlIdentifier;
       const placeholders = keys.map(() => "?").join(", ");
       const preImageSql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
       const result =
@@ -10068,7 +10064,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return async (keys, projection) => {
       const direct = await this.#scopeRowsByKey(transaction, table, keyColumn, keys, projection);
       if (direct !== undefined) return direct;
-      const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+      const quote = quoteSqlIdentifier;
       const selected = projection === "*" ? "*" : projection.map(quote).join(", ");
       const rows: QueryRow[] = [];
       for (let start = 0; start < keys.length; start += SCOPE_KEY_LOOKUP_WINDOW) {
@@ -12787,7 +12783,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         return {
           kind: "rows",
-          result: await this.query(`SELECT $1 AS ${quoteIdentifier(name)}`, { params: [value] }),
+          result: await this.query(`SELECT $1 AS ${quoteSqlIdentifier(name)}`, { params: [value] }),
         };
       }
       if (statement.kind === "create-enum") {
@@ -13244,7 +13240,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (statement.kind === "transaction") {
         const action = statement.action === "rollback-to" ? "ROLLBACK TO" : statement.action;
         return this.execute(
-          `${action}${statement.name === undefined ? "" : ` ${quoteIdentifier(statement.name)}`}`,
+          `${action}${statement.name === undefined ? "" : ` ${quoteSqlIdentifier(statement.name)}`}`,
         );
       }
       if (options.writer === undefined) {
@@ -14198,9 +14194,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             if (description === undefined || description.type !== keyColumn?.type) return true;
             return keyPredicates.every((predicate) => zoneMapCanMatch(description, predicate));
           });
-        // Retained deltas keep their original place in the overlay. A delta ruled out by its
-        // immutable key cannot alter any row the predicate may return, including a delete.
-        if (canAffect) prunedSegments.push(segment);
+        // Retained deltas keep their original place in the overlay. An update ruled out by its
+        // immutable key cannot alter any row the predicate may return. A delete is different:
+        // the replay maps each key to the base slot holding it, and a delete is what unmaps a
+        // key before a later insert maps it again. Dropping a delete whose key the predicate
+        // rejects left that key mapped twice whenever the re-inserted row shared a kept block
+        // with a matching row, and the replay then refused the whole table as a duplicate key
+        // (found by the interaction simulator). Deletes are small; every one is replayed.
+        if (segment.kind === "delete" || canAffect) prunedSegments.push(segment);
         continue;
       }
       const firstIds = segment.columnBlockIds[predicateColumns[0]?.id ?? ""] ?? [];
@@ -15996,12 +15997,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         options.maxBlocksPerStep ?? 16,
         "Compaction blocks per step",
       );
-      let progress = await this.compactTableStep(tableName, { ...options, maxBlocks });
-      while (progress.result === null) {
-        if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
-        progress = await this.resumeCompactionJob(progress.jobId, { maxBlocks });
+      // A background index build finishing, or another connection's DDL, moves the schema
+      // epoch under a fold in flight; the fold's commit is refused and the next attempt plans
+      // against the new schema. Writes restart the same way (#runWrite).
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          let progress = await this.compactTableStep(tableName, { ...options, maxBlocks });
+          while (progress.result === null) {
+            if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
+            progress = await this.resumeCompactionJob(progress.jobId, { maxBlocks });
+          }
+          return progress.result;
+        } catch (error) {
+          if (!isTransientCompactionConflict(error) || attempt >= this.#maxCommitRetries) {
+            throw error;
+          }
+        }
       }
-      return progress.result;
     });
   }
 
@@ -16145,17 +16157,38 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         reconciliationCursor = (await this.#reconcileCompactionPage(reconciliationCursor))
           .nextCursor;
       } while (reconciliationCursor !== null);
-      let progress = await this.collectGarbageStep({
-        maxItems,
-        ...(options.maxPlanningItems === undefined
-          ? {}
-          : { maxPlanningItems: options.maxPlanningItems }),
-        ...(options.retainRecentVersions === undefined
-          ? {}
-          : { retainRecentVersions: options.retainRecentVersions }),
-      });
-      while (progress.result === null) {
-        progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
+      // Another connection may advance or finish the same job between two steps here; its
+      // revision then no longer matches and the step is refused. The next planning step picks
+      // the job up at its current revision, or plans a fresh one once it has completed.
+      let progress: GarbageCollectionProgress | undefined;
+      for (let attempt = 0; progress?.result == null; attempt += 1) {
+        try {
+          progress =
+            progress === undefined
+              ? await this.collectGarbageStep({
+                  maxItems,
+                  ...(options.maxPlanningItems === undefined
+                    ? {}
+                    : { maxPlanningItems: options.maxPlanningItems }),
+                  ...(options.retainRecentVersions === undefined
+                    ? {}
+                    : { retainRecentVersions: options.retainRecentVersions }),
+                })
+              : await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
+        } catch (error) {
+          if (
+            !(
+              error instanceof GarbageCollectionJobConflictError ||
+              error instanceof TransactionRecordConflictError ||
+              error instanceof CompactionJobConflictError
+            ) ||
+            attempt >= 64
+          ) {
+            throw error;
+          }
+          progress = undefined;
+          await this.#yieldMaintenance();
+        }
       }
       await this.#pruneFinishedJobRecords();
       // An explicit successful pass is the caller accepting responsibility for manual mode. It
@@ -16290,6 +16323,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (reclaimed || !moreWork) this.#autoCollectionDebtCommits = 0;
       })
       .catch((error: unknown) => {
+        // close() flips #closed before joining this run, so a store call the run makes after
+        // that point is refused with "Database is closed". That is the shutdown working, not
+        // a maintenance failure: nothing to report, retry, or count.
+        if (this.#closed) return;
+        // Another connection advanced or finished the job this run was driving. Nothing went
+        // wrong -- the work is being done -- so nothing is reported; a later trigger resumes
+        // whatever is left.
+        if (error instanceof GarbageCollectionJobConflictError) {
+          this.#autoCollectionRequested = true;
+          return;
+        }
         this.#autoCollectionConsecutiveFailures += 1;
         const at = dateMilliseconds(this.#now());
         this.#autoCollectionLastError = {
@@ -16655,14 +16699,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         artifactCursor: continuation?.discovery.artifactCursor ?? null,
       },
     } satisfies Parameters<BlockStore["createGarbageCollectionJob"]>[0];
-    let discovered: GarbageCollectionJobRecord;
-    try {
-      discovered = await this.store.createGarbageCollectionJob(input);
-    } catch (error) {
-      if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
-      const raced = await this.#findActiveGarbageCollectionJob();
-      if (raced === undefined) throw error;
-      return raced;
+    let discovered: GarbageCollectionJobRecord | undefined;
+    for (let attempt = 0; discovered === undefined; attempt += 1) {
+      try {
+        discovered = await this.store.createGarbageCollectionJob(input);
+      } catch (error) {
+        if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+        // Another connection's job is active: continue it. If that job finished between the
+        // refusal and this lookup, the store is free again and the plan is retried; a store
+        // that keeps refusing without an active job is reported as the conflict it raises.
+        const raced = await this.#findActiveGarbageCollectionJob();
+        if (raced !== undefined) return raced;
+        if (attempt >= 3) throw error;
+        await this.#yieldMaintenance();
+      }
     }
     // The successor job now durably owns the exact continuation cursor. Retaining the source
     // forever makes a same-timestamp reopen choose an arbitrary old cursor and can replay or
@@ -18138,7 +18188,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
     }
 
-    assertCanonicalMergeSourceOrder(describedSegments);
+    assertCanonicalMergeSourceOrder(
+      sourceSegments.map((segment) => sourceOrderTuple(segment, transactions, "Compaction source")),
+    );
     const resolved = await this.#resolveMergeOutput(
       table,
       describedSegments,
@@ -18880,6 +18932,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#afterCompactionCommit(manifest, table.id);
           return manifest;
         } catch (error) {
+          if (error instanceof SchemaConflictError) {
+            // The schema moved under the fold -- an index build finishing, a column dropped.
+            // The output was built against the old schema, so the job is abandoned rather than
+            // resumed; the caller plans a fresh one (compactTable retries, auto backs off).
+            if (transaction.status === "active") await transaction.abort();
+            job = await this.#abortCompactionJob(job, "Schema changed during compaction");
+            throw error;
+          }
           if (!(error instanceof WriteConflictError)) throw error;
           publicationConflict = error;
           return undefined;
@@ -19335,10 +19395,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // A keyed multi-range promotion falls through to the merge-source and ordering checks
       // below; the retained partitions are validated against the planned ordinal there.
     }
-    let latestSource: Pick<
-      MergeCompactionSourceSegment,
-      "logicalOrder" | "committedVersion" | "segmentId"
-    > | null = null;
+    let latestSource: MergeSourceOrderTuple | null = null;
     let outputLogicalOrder: number | null = null;
     if (plan.kind === "merge-v1") {
       const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
@@ -19449,10 +19506,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         : keyedLevelOneLayout(plannedVisible);
     if (plannedLayout === null) throw new Error("Compaction planned layout is no longer valid");
 
-    let latestSource: Pick<
-      MergeCompactionSourceSegment,
-      "logicalOrder" | "committedVersion" | "segmentId"
-    > | null = null;
+    let latestSource: MergeSourceOrderTuple | null = null;
     if (plan.kind === "merge-v1") {
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
@@ -20072,25 +20126,46 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const indexId = this.#createId();
       const storageColumnId = `secondary-index:${indexId}`;
       const buildId = this.#createId();
-      const marked = await this.store.updateTable(table.id, table.revision, {
-        secondaryIndexes: {
-          ...table.secondaryIndexes,
-          [indexId]: {
-            name: indexName,
-            columnId: columns[0]?.id ?? "",
-            columnIds: columns.map((column) => column.id),
-            directions: indexColumns.map((column) => column.direction),
-            ...(options.unique === true ? { unique: true as const } : {}),
-            termEncoding: "tuple-v1",
-            storage: "postings-v1",
-            storageColumnId,
-            locator: table.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
-            state: "building",
-            buildId,
-            buildFromVersion: -1,
-          },
-        },
-      });
+      // Another connection's fold or index build may move the table record between the read
+      // above and this update; the marking is re-based on the fresh record rather than failing
+      // the DDL for a race it did not lose anything to.
+      let current = table;
+      let marked: TableRecord | undefined;
+      for (let attempt = 0; marked === undefined; attempt += 1) {
+        try {
+          marked = await this.store.updateTable(current.id, current.revision, {
+            secondaryIndexes: {
+              ...current.secondaryIndexes,
+              [indexId]: {
+                name: indexName,
+                columnId: columns[0]?.id ?? "",
+                columnIds: columns.map((column) => column.id),
+                directions: indexColumns.map((column) => column.direction),
+                ...(options.unique === true ? { unique: true as const } : {}),
+                termEncoding: "tuple-v1",
+                storage: "postings-v1",
+                storageColumnId,
+                locator: current.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
+                state: "building",
+                buildId,
+                buildFromVersion: -1,
+              },
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+            throw error;
+          }
+          const fresh = await this.store.getTable(current.id);
+          if (fresh === undefined) throw new UnknownTableError(tableName);
+          if (
+            Object.values(fresh.secondaryIndexes ?? {}).some((index) => index.name === indexName)
+          ) {
+            throw new TypeError(`Index already exists: ${indexName}`, { cause: error });
+          }
+          current = fresh;
+        }
+      }
       try {
         await this.#buildSecondaryIndex(marked, indexId);
       } catch (error) {
@@ -21291,6 +21366,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let selectedRowStart = 0;
     const selected: SegmentRecord[] = [];
     for (const segment of segments) {
+      // A delete is never pruned, not even by block: the replay maps every touched key to the
+      // base row holding it, and the delete is what unmaps a key before a later insert maps it
+      // again. A delete block dropped for holding no candidate left a re-inserted key mapped
+      // twice and the table refused as a duplicate (found by the interaction simulator).
+      // Deletes carry only keys, so keeping them whole costs one key vector each.
+      if (segment.kind === "delete") {
+        selected.push(segment);
+        continue;
+      }
       const anchorColumn = keyColumn ?? table.columns[0];
       if (anchorColumn === undefined) return { segments, pruned: false };
       const anchorIds = segment.columnBlockIds[anchorColumn.id] ?? [];
@@ -21371,9 +21455,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
       });
     }
-    return rowPositions === undefined
-      ? { segments: selected, pruned: true }
-      : { segments: selected, pruned: true, rows: rowPositions };
+    if (rowPositions === undefined) {
+      return { segments: withEveryDelta(segments, selected), pruned: true };
+    }
+    return { segments: selected, pruned: true, rows: rowPositions };
   }
 
   #scheduleSecondaryIndexBuild(table: TableRecord, indexId: string): void {
@@ -21640,7 +21725,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         table,
         snapshot,
         projectedColumns,
-        segments,
+        // The overlay replays deltas over whole kept blocks, never over an exact row
+        // selection, so it needs every delta (see withEveryDelta).
+        indexed.rows === undefined ? segments : withEveryDelta(visibleSegments, segments),
         keyColumn,
         plan,
         indexed.pruned,
@@ -25094,10 +25181,6 @@ function foldAssignmentColumns<T extends { column: string }>(
     : assignments;
 }
 
-function quoteIdentifier(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
-
 /** Canonicalizes logical PostgreSQL domains before validation and primitive block encoding. */
 function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
@@ -27082,6 +27165,15 @@ function secondaryIndexPredicates(
       break;
     }
     if (matchedColumns === 0) continue;
+    // Postings exist only for rows whose every indexed value is non-null. A prefix lookup
+    // leaves the trailing columns unconstrained, so a row that is NULL in one of them would be
+    // a legitimate match the index cannot name; pruning through it would drop the row.
+    if (
+      matchedColumns < indexedColumns.length &&
+      indexedColumns.slice(matchedColumns).some((column) => column.nullable)
+    ) {
+      continue;
+    }
     if (queries === undefined) {
       const complete = matchedColumns === indexedColumns.length;
       queries = prefixes.map((term) => ({ term, prefix: !complete }));
@@ -27522,7 +27614,58 @@ function mergeSourceRowIdSpans(segment: SegmentRecord, kind: SegmentKind): RowId
   return spans;
 }
 
-function assertCanonicalMergeSourceOrder(segments: readonly MergeCompactionSourceSegment[]): void {
+/**
+ * A fold refused because other connections moved the database under it: the schema epoch
+ * changed, a concurrent fold replaced its sources or advanced the same job or transaction
+ * record, or its publication lost the manifest race too many times. Each abandons the job; a
+ * fresh plan over the current state is the answer.
+ */
+function isTransientCompactionConflict(error: unknown): boolean {
+  if (
+    error instanceof SchemaConflictError ||
+    error instanceof TransactionRecordConflictError ||
+    error instanceof CompactionJobConflictError
+  ) {
+    return true;
+  }
+  if (!(error instanceof Error)) return false;
+  if (error.cause instanceof WriteConflictError || error.cause instanceof SchemaConflictError) {
+    return true;
+  }
+  return /^Compaction (source|sources|publication|planned layout)/u.test(error.message);
+}
+
+/**
+ * Block-level index pruning keeps a whole block for one candidate row, so every row in that
+ * block is materialized and rechecked. Those rows' current values come from replaying the
+ * deltas that touch them -- all of them: keeping only the deltas whose keys are candidates
+ * leaves a non-candidate row patched by an earlier update but not by the later one that
+ * superseded it, and that stale intermediate value can satisfy the predicate. (Found by the
+ * interaction simulator: a UNION ALL member returned rows a later UPDATE had moved out of its
+ * range.) Only an exact row selection, which never surfaces non-candidate rows, may drop the
+ * deltas of keys outside it.
+ */
+function withEveryDelta(
+  visible: readonly SegmentRecord[],
+  pruned: readonly SegmentRecord[],
+): SegmentRecord[] {
+  const keptAppends = new Map(
+    pruned
+      .filter((segment) => segment.kind !== "update" && segment.kind !== "delete")
+      .map((segment) => [segment.id, segment]),
+  );
+  const result: SegmentRecord[] = [];
+  for (const segment of visible) {
+    if (segment.kind === "update" || segment.kind === "delete") result.push(segment);
+    else {
+      const kept = keptAppends.get(segment.id);
+      if (kept !== undefined) result.push(kept);
+    }
+  }
+  return result;
+}
+
+function assertCanonicalMergeSourceOrder(segments: readonly MergeSourceOrderTuple[]): void {
   for (let index = 1; index < segments.length; index += 1) {
     const previous = segments[index - 1];
     const current = segments[index];
@@ -27536,13 +27679,27 @@ function assertCanonicalMergeSourceOrder(segments: readonly MergeCompactionSourc
   }
 }
 
+/**
+ * The order sources merge in, which must be the order readers see them in
+ * (`#visibleSegmentRecords`): logical order, then commit, then position within the commit,
+ * then id. A persisted plan source carries no commit ordinal; it only ever compares against
+ * segments of other commits, where the first two components decide.
+ */
+interface MergeSourceOrderTuple extends Pick<
+  MergeCompactionSourceSegment,
+  "logicalOrder" | "committedVersion" | "segmentId"
+> {
+  readonly commitOrdinal?: number;
+}
+
 function compareMergeSourceOrder(
-  left: Pick<MergeCompactionSourceSegment, "logicalOrder" | "committedVersion" | "segmentId">,
-  right: Pick<MergeCompactionSourceSegment, "logicalOrder" | "committedVersion" | "segmentId">,
+  left: MergeSourceOrderTuple,
+  right: MergeSourceOrderTuple,
 ): number {
   return (
     left.logicalOrder - right.logicalOrder ||
     left.committedVersion - right.committedVersion ||
+    (left.commitOrdinal ?? 0) - (right.commitOrdinal ?? 0) ||
     left.segmentId.localeCompare(right.segmentId)
   );
 }
@@ -27551,7 +27708,7 @@ function sourceOrderTuple(
   segment: SegmentRecord | undefined,
   transactions: ReadonlyMap<string, { status: string; committedVersion: number | null }>,
   label: string,
-): Pick<MergeCompactionSourceSegment, "logicalOrder" | "committedVersion" | "segmentId"> {
+): MergeSourceOrderTuple {
   if (segment === undefined) throw new Error(`${label} is unavailable`);
   const owner = transactions.get(segment.transactionId);
   if (owner?.status !== "committed" || owner.committedVersion === null) {
@@ -27560,6 +27717,7 @@ function sourceOrderTuple(
   return {
     logicalOrder: segment.logicalOrder,
     committedVersion: owner.committedVersion,
+    commitOrdinal: segment.commitOrdinal,
     segmentId: segment.id,
   };
 }

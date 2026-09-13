@@ -2377,13 +2377,16 @@ async function executeBoundPlanAsync(
 }
 
 /** Selected rows closer than this run in one batch; the predicates discard the rows between. */
-const SELECTED_ROW_COALESCE_GAP = 32;
-
 /**
  * Visits only the rows of an index-provided selection. Rows are ascending, so each streamed
- * window is loaded once; neighbouring selected rows inside a window run as one contiguous
- * batch, so a clustered hit costs one batch and a scattered one costs a batch per row, never
- * a batch per unselected row in between.
+ * window is loaded once; adjacent selected rows inside a window run as one contiguous batch,
+ * so a clustered hit costs one batch and a scattered one costs a batch per run.
+ *
+ * Exactly the selected rows, never the unselected rows between them. Index pruning keeps only
+ * the update and delete segments whose keys are candidates, so a row outside the selection may
+ * carry a deletion or an older value the scan never replays: a batch that swept across it would
+ * return a deleted row, or a stale one, that happened to satisfy the predicate. (Found by the
+ * interaction simulator: an index built after a DELETE resurrected the deleted row.)
  */
 async function scanSelectedRows(
   plan: BoundPlan,
@@ -2413,13 +2416,7 @@ async function scanSelectedRows(
       index += 1;
       while (index < selection.length) {
         const next = selection[index] ?? 0;
-        if (
-          next >= windowEnd ||
-          next - end > SELECTED_ROW_COALESCE_GAP ||
-          next >= begin + DEFAULT_BATCH_ROWS
-        ) {
-          break;
-        }
+        if (next !== end || next >= windowEnd || next >= begin + DEFAULT_BATCH_ROWS) break;
         end = next + 1;
         index += 1;
       }

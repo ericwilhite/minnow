@@ -13,26 +13,27 @@ after generated declarations or asynchronous signatures change.
 
 ## Choose the smallest runner that proves the change
 
-| Command                        | What it runs                                                                     | Use it for                          |
-| ------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------- |
-| `npm test`                     | Vitest plus the committed fast SQLLogicTest profile                              | Normal implementation work          |
-| `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                 | A focused inner loop                |
-| `npm run test:sql:standard`    | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds | Every SQL or optimizer change       |
-| `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations     | Before a release                    |
-| `npm run test:coverage`        | Vitest with the coverage floors enforced                                         | Before pushing                      |
-| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures                | Hunting bugs rather than pinning    |
-| `npm run simulate`             | One replayable deterministic concurrency, fault, and storage simulation          | Storage and transaction changes     |
-| `npm run test:simulator:full`  | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints  | Before a release                    |
-| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture                  | Before changing a format version    |
-| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit     | Storage or browser-runtime changes  |
-| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                            | Docs, examples, and site changes    |
-| `npm run test:browser`         | Both browser runners, in sequence                                                | Cross-browser regression checks     |
-| `npm run test:consumer`        | Packed libraries installed, typed, bundled, and run outside the workspace        | Package and public-entry changes    |
-| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                   | Query-executor performance changes  |
-| `npm run benchmark:sizes`      | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages    | Dependency or public-entry changes  |
-| `npm run api:check`            | The public API surface against the committed contract snapshot                   | Public-entry or declaration changes |
-| `npm run check`                | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest        | The local merge gate                |
-| `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners             | Release candidates                  |
+| Command                         | What it runs                                                                                                                                                   | Use it for                                  |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `npm test`                      | Vitest plus the committed fast SQLLogicTest profile                                                                                                            | Normal implementation work                  |
+| `npm run test:unit`             | Vitest unit, generated, simulator, comparison, and harness tests                                                                                               | A focused inner loop                        |
+| `npm run test:sql:standard`     | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds                                                                               | Every SQL or optimizer change               |
+| `npm run test:sql:full`         | The full supported profile, including exhaustive multi-way join permutations                                                                                   | Before a release                            |
+| `npm run test:coverage`         | Vitest with the coverage floors enforced                                                                                                                       | Before pushing                              |
+| `npm run soak`                  | The generative suites on fresh random seeds, to find new failures                                                                                              | Hunting bugs rather than pinning            |
+| `npm run simulate`              | One replayable deterministic concurrency, fault, and storage simulation                                                                                        | Storage and transaction changes             |
+| `npm run test:simulator:full`   | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints, then three long interaction plans over the memory, IndexedDB, and OPFS stores | Before a release                            |
+| `npm run simulate:interactions` | One replayable interaction plan: DDL, DML, transactions, concurrent rounds, faults, reopens, and maintenance against a shadow model                            | Engine, index, and transaction changes      |
+| `npm run fixture:format`        | Freezes a database this build wrote, as a compatibility fixture                                                                                                | Before changing a format version            |
+| `npm run test:browser:library`  | Core IndexedDB, OPFS, transaction, SQLLogicTest, and multi-tab interaction-plan tests in Chromium, Firefox, and WebKit                                         | Storage, engine, or browser-runtime changes |
+| `npm run test:browser:site`     | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes            |
+| `npm run test:browser`          | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks             |
+| `npm run test:consumer`         | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes            |
+| `npm run benchmark:gate`        | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor performance changes          |
+| `npm run benchmark:sizes`       | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
+| `npm run api:check`             | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
+| `npm run check`                 | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest                                                                                      | The local merge gate                        |
+| `npm run check:release`         | The local gate, full SQL/simulator, performance, and browser runners                                                                                           | Release candidates                          |
 
 Install the browser binaries once before using a browser runner:
 
@@ -72,6 +73,10 @@ application it starts.
 - **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
   cannot prove, and drive a database through a real module worker: the package entry booting,
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.
+  They also run the SQL engine itself where it ships: the committed SQLLogicTest profile executes
+  through the published worker against real IndexedDB and OPFS in all three browsers, and a
+  seeded interaction plan runs with each plan connection being a real tab, so the same properties
+  the Node simulator checks are judged against real workers, real storage, and real crashes.
 - **The packed-consumer test** builds every public package, installs the resulting tarballs in an
   OS-temporary Vite application outside the npm workspace, and resolves every exported entry with
   both Bundler and NodeNext TypeScript resolution. Chromium then runs the emitted worker against
@@ -132,7 +137,12 @@ npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select
 ```
 
 It runs 1,822 statements and 6,345 queries, checking 385,389 scalar results across 8,169 source
-records. The fast set includes representative five-table and seventeen-table join-order families
+records. The same committed files also run inside Chromium, Firefox, and WebKit
+(`sqllogictest.spec.ts`), through the published module worker against real IndexedDB and OPFS with
+automatic maintenance left on, so a browser engine's Date, regular-expression, or number-formatting
+difference, a result that does not survive the worker boundary, or a durable store's commit path
+under thousands of statements is checked against the corpus's recorded answers rather than
+against Node's. Each run attaches its per-file timings to the report. The fast set includes representative five-table and seventeen-table join-order families
 that guard against pathological Cartesian work. On the development machine used to measure it,
 the whole profile took about fifteen seconds. That makes the broad suite part of
 `npm test`, `npm run check`, and every pull request, instead of a suite agents discover only after
@@ -298,6 +308,52 @@ npm run simulate -- --plan /tmp/minnow-plan.json
 The seed fixes both workload generation and storage completion choices. A failure prints its
 replay command. `npm run soak -- --suite deterministic-simulator` explores fresh seeds, and a
 failure joins `packages/core/regression-seeds.json` so every future unit run replays it.
+
+## Interaction plans
+
+The storage simulator above drives one table with keyed upserts and deletes. The interaction-plan
+simulator (`interaction-simulator.ts`, exported from `@minnowdb/core/testing`) drives the SQL
+surface an application uses, in the spirit of Turso's simulator: a seeded plan of interactions
+over several connections that share one database — `CREATE TABLE` with random column types and
+nullability, multi-row inserts by literal and by parameter, predicate `UPDATE` and `DELETE`,
+selects with three-valued predicates, `LIMIT` and `ORDER BY`, secondary indexes, `DROP TABLE`,
+SQL transactions that commit or roll back, rounds of concurrent keyed writes with readers in
+flight, storage faults and worker crashes, reopens, compaction and collection, and checkpoints.
+The plan is JSON, so a failing seed replays exactly and can be checked in.
+
+Every interaction is executed through the real SQL entry points and judged against a shadow model
+that evaluates the predicates with SQL's three-valued logic. Beyond "the rows match", the runner
+checks properties a database must honour whatever its internals do: a rejected insert leaves none
+of its rows behind; reported row counts equal the model's; nothing matching a delete survives it;
+`LIMIT` returns exactly the first rows in order; `COUNT(p) + COUNT(NOT p) + COUNT(p IS NULL)`
+equals `COUNT(*)`; a `UNION ALL` has the sum of its members' cardinalities; uncommitted rows are
+visible on their own connection and invisible to another; a read taken during a round of
+commuting writes shows every untouched key exactly and every touched key at its old or new
+value; a mutation interrupted by a fault lands entirely or not at all and a reported success is
+durable; and at every checkpoint every connection reads the same database as the model.
+
+The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`) each connection is a
+`MinnowDatabase` over one shared memory, IndexedDB, or OPFS store with the storage fault points
+armed. In Playwright (`interaction.spec.ts`) each connection is a real tab holding the published
+worker over a real IndexedDB or OPFS database, and the plan's faults terminate a worker with a
+statement in flight. The same seed produces the same plan in both.
+
+```bash
+npm run simulate:interactions -- --seed 24301 --length 300 --connections 4 --store indexeddb
+npm run simulate:interactions -- --seed 24301 --write-plan /tmp/minnow-interactions.json
+npm run simulate:interactions -- --plan /tmp/minnow-interactions.json --store opfs
+npm run soak -- --suite interaction-simulator
+```
+
+A failure names the interaction, the property, the model's rows, and the SQL leading up to it.
+The first soaks of this simulator found seven defects the existing suites had missed — an
+index-pruned scan that resurrected deleted rows, a composite index that skipped rows with a NULL
+trailing column, a stale intermediate value served by block-level pruning, a fold that refused
+any transaction writing two segments to one table, a zone-pruned delete that made a reinserted
+key fail every keyed range read, a compaction refused by a background index build, and an
+IndexedDB key cache that let two tabs write one primary key twice — each now pinned in
+`simulator-regressions.test.ts`. The last one only shows with a separate adapter instance per
+connection, which is why the Node driver opens one per connection for IndexedDB and OPFS.
 
 ## Background maintenance, size, and memory
 

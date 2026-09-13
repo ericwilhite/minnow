@@ -339,3 +339,52 @@ it("cancels write admission on close without waiting for another connection's st
   await first.close();
   store.close();
 });
+
+it("closing while automatic collection is in flight reports no background error", async () => {
+  // Seen first in a real browser: every SQLLogicTest file ended with "[minnowdb] worker
+  // maintenance (auto collection): Error: Database is closed" on the page console. close()
+  // flips the closed flag and then joins the collector, whose next public call was refused --
+  // and reported through onBackgroundError as if collection had failed.
+  const base = new MemoryBlockStore();
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let gated = false;
+  const store = new Proxy(base, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      const method = value as (...args: unknown[]) => unknown;
+      if (property !== "listCompactionJobPage") return method.bind(target);
+      // The collector's first store call. Hold it so the run is provably in flight at close().
+      return async (...args: unknown[]) => {
+        if (!gated) {
+          gated = true;
+          await gate;
+        }
+        return method.apply(target, args);
+      };
+    },
+  });
+  const background: Array<{ error: unknown; context: string }> = [];
+  const db = new MinnowDatabase(store, {
+    rowsPerBlock: 4,
+    onBackgroundError: (error, context) => background.push({ error, context }),
+  });
+  await db.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER)");
+  // Past the commit interval that triggers a collection pass, with enough superseded manifests
+  // that the pass needs more than one bounded step -- the resumption is the call that close()
+  // refuses.
+  for (let id = 0; id < 320; id += 1) {
+    await db.execute("INSERT INTO items VALUES (?, ?)", [id, id]);
+  }
+  await vi.waitFor(() => {
+    expect(gated).toBe(true);
+  });
+  const closing = db.close();
+  release?.();
+  await closing;
+  store.close();
+  expect(background).toEqual([]);
+});

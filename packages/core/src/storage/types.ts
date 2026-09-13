@@ -5996,7 +5996,7 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
     if (
       previous !== undefined &&
       current !== undefined &&
-      compareMergeSourceSegments(previous, current) >= 0
+      compareMergeSourceSegments(previous, current) > 0
     ) {
       throw new TypeError("Merge source segments must use canonical logical order");
     }
@@ -6438,15 +6438,17 @@ function normalizeRowIdSpans(
   return spans;
 }
 
+/**
+ * The commit-level part of the canonical merge order. Sources of one commit share a logical
+ * order and a committed version; their order within the commit is the segments' commit
+ * ordinal, which the planner applies and the record does not carry, so a plan is checked to be
+ * non-decreasing here rather than strictly increasing by segment id.
+ */
 function compareMergeSourceSegments(
   left: MergeCompactionSourceSegment,
   right: MergeCompactionSourceSegment,
 ): number {
-  return (
-    left.logicalOrder - right.logicalOrder ||
-    left.committedVersion - right.committedVersion ||
-    left.segmentId.localeCompare(right.segmentId)
-  );
+  return left.logicalOrder - right.logicalOrder || left.committedVersion - right.committedVersion;
 }
 
 function normalizeCompactionOutputCursor(

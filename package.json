@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -38,7 +38,8 @@
     "test:sql:full": "npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select1.test --file packages/core/testdata/sqllogictest/standard-select2.test --file packages/core/testdata/sqllogictest/standard-select3.test --file packages/core/testdata/sqllogictest/full-select4.test --file packages/core/testdata/sqllogictest/full-select5.test --progress-every 500",
     "test:sql:upstream": "vite-node scripts/run-sqllogictest-upstream.mts",
     "simulate": "vite-node scripts/simulate.mts",
-    "test:simulator:full": "npm run simulate -- --seed 24301 --rounds 500 --clients 8 --key-space 128 --trace-events 512",
+    "simulate:interactions": "vite-node scripts/simulate-interactions.mts",
+    "test:simulator:full": "npm run simulate -- --seed 24301 --rounds 500 --clients 8 --key-space 128 --trace-events 512 && npm run simulate:interactions -- --seed 24301 --length 1500 --connections 6 --tables 3 --key-space 48 --store memory && npm run simulate:interactions -- --seed 24302 --length 800 --connections 4 --tables 2 --key-space 32 --store indexeddb && npm run simulate:interactions -- --seed 24303 --length 800 --connections 4 --tables 2 --key-space 32 --store opfs",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",

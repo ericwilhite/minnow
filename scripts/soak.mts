@@ -34,6 +34,10 @@ const SUITES: Suite[] = [
   },
   { name: "differential", file: "packages/core/src/engine/differential.test.ts" },
   { name: "deterministic-simulator", file: "packages/core/src/testing/simulator.test.ts" },
+  {
+    name: "interaction-simulator",
+    file: "packages/core/src/testing/interaction-simulator.test.ts",
+  },
   { name: "compaction-soak", file: "packages/core/src/engine/compaction-soak.test.ts" },
   {
     name: "auto-compaction-soak",

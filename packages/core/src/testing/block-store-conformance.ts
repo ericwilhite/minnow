@@ -1,5 +1,6 @@
 import {
   CompactionJobConflictError,
+  GarbageCollectionJobConflictError,
   LeaseConflictError,
   LeaseOwnerConflictError,
   MAX_LEVEL_ZERO_SEGMENTS,
@@ -1161,6 +1162,44 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           [first.blockId],
           "retired provenance must remain independently pageable before collection",
         );
+        // A job whose discovery ends with nothing to reclaim completes through the planning
+        // update, never through a step. It must give up the single active-job admission all
+        // the same, or every later job is refused as conflicting with a finished one.
+        const discovering = await store.createGarbageCollectionJob({
+          id: "gc-discovering",
+          candidateManifestVersions: [],
+          candidateSegmentIds: [],
+          candidateBlockIds: [],
+          leaseCutoff: LATER,
+          createdAt: LATER,
+          discovery: {
+            phase: "manifests",
+            currentManifestVersion: null,
+            retainAboveVersion: 0,
+            retainAfter: 0,
+            maxPlanningItems: 16,
+            manifestCursor: null,
+            segmentCursor: null,
+            transactionCursor: null,
+            compactionCursor: null,
+            visitedRecords: 0,
+            resumePhase: null,
+            postManifestPhase: null,
+            artifactCursor: null,
+          },
+        });
+        const discovered = await store.updateGarbageCollectionPlanning({
+          jobId: discovering.id,
+          expectedRevision: discovering.revision,
+          discovery: { ...(discovering.discovery ?? {}), phase: "complete" } as NonNullable<
+            typeof discovering.discovery
+          >,
+          updatedAt: LATER,
+        });
+        check(
+          discovered.state === "completed",
+          "a discovery that found nothing must complete its job",
+        );
         const job = await store.createGarbageCollectionJob({
           id: "gc-1",
           candidateManifestVersions: [first.version],
@@ -1177,6 +1216,25 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         check(
           (await store.getGarbageCollectionJob(job.id))?.state === "planned",
           "a refused garbage-collection job removal mutated the record",
+        );
+        // Two engines over one store can both decide to collect; the second must learn the
+        // first is active as a conflict it can continue, not as a resource-limit breach.
+        await checkThrows(
+          () =>
+            store.createGarbageCollectionJob({
+              id: "gc-2",
+              candidateManifestVersions: [first.version],
+              candidateSegmentIds: [],
+              candidateBlockIds: [first.blockId],
+              leaseCutoff: LATER,
+              createdAt: LATER,
+            }),
+          GarbageCollectionJobConflictError,
+          "a second active garbage-collection job",
+        );
+        check(
+          (await store.getGarbageCollectionJob("gc-2")) === undefined,
+          "a refused second garbage-collection job left a record behind",
         );
         const step = await store.runGarbageCollectionStep({
           jobId: job.id,

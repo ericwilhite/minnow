@@ -23,7 +23,11 @@ cannot pass in the docs while failing in the engine.
 - Every SQL fence in the SELECT, DML, DDL, full-text, transaction, and schema guides executes
   exactly as published against its required schema.
 - SQLLogicTest adds thousands of database-neutral queries for joins, expressions, ordering, NULL
-  behavior, and result checking.
+  behavior, and result checking — in Node, and again inside Chromium, Firefox, and WebKit over
+  real IndexedDB and OPFS.
+- A seeded interaction-plan simulator drives DDL, DML, transactions, indexes, concurrent rounds,
+  faults, reopens, and maintenance across several connections against a shadow model, in Node
+  over every store and across real browser tabs.
 
 Each matrix entry describes one checked form. It does not promise every PostgreSQL variation.
 Differences such as exact decimals and JSON values returning strings are named in the
@@ -51,6 +55,7 @@ npm test
 npm run test:sql:standard
 npm run test:sql:full
 npm run test:simulator:full
+npm run simulate:interactions
 npm run benchmark:gate
 npm run soak:memory
 npm run test:browser

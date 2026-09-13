@@ -8,6 +8,105 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.10.2 — September 13, 2026
+
+Published packages: `@minnowdb/core@0.10.2`.
+
+**Stored formats are unchanged**: OPFS layout 6, IndexedDB schema 2, block format 2, snapshot
+format 1, worker protocol 7. No migration is needed; a 0.10.1 tab and a 0.10.2 tab can share an
+origin.
+
+A testing audit added an interaction-plan simulator (below) and ran the SQLLogicTest corpus
+inside real browsers. The simulator's first soaks found the engine and adapter defects fixed here,
+each reduced to a deterministic test in `simulator-regressions.test.ts`.
+
+### Fixed
+
+- **An index-pruned scan no longer returns deleted rows or stale values.** When a secondary
+  index narrowed a scan to an exact set of rows, the executor swept across the unselected rows
+  between them as one batch. A row deleted or updated before the index was built has no delete
+  or update segment among the pruned candidates, so it was read back from its original block:
+  a `DELETE` followed by `CREATE INDEX` resurrected the deleted row on every indexed range query,
+  and an `UPDATE` followed by `CREATE INDEX` served the pre-update value. The scan now visits
+  exactly the selected rows.
+- **Block-level index pruning keeps every delta.** A set-operation member, or any scan the index
+  narrows to whole blocks rather than exact rows, replays deltas over every row of a kept block.
+  Dropping the delta segments whose keys were not candidates left a row patched by an earlier
+  update but not by the later one that superseded it, and that stale intermediate value could
+  satisfy the predicate: a `UNION ALL` member returned rows a later `UPDATE` had moved out of its
+  range. Every update and delete segment now stays in a block-level pruned scan.
+- **A composite index no longer skips rows with a NULL trailing column.** Postings exist only for
+  rows whose every indexed value is non-null, so an index on `(a, b)` names no row with `b` NULL. A
+  lookup on `a` alone that pruned through it dropped those rows: a `SELECT` missed them and an
+  `UPDATE` reported one row too few. A prefix lookup no longer prunes through an index whose
+  unconstrained trailing columns are nullable.
+- **A transaction that writes two segments to one table can be compacted.** A SQL transaction
+  holding, say, a predicate `DELETE` and an `INSERT` on the same table commits two segments with
+  one logical order and one committed version. The merge planner ordered its sources by segment
+  id as the tie-break while readers order them by position within the commit; whenever the two
+  disagreed, every fold of that table failed with "Mutation compaction sources are not in
+  canonical logical order" and the table could never be compacted again. The planner now orders
+  sources exactly as readers see them, and the stored plan's validation checks the commit-level
+  order it can see.
+- **Two tabs no longer write one primary key twice through IndexedDB.** The adapter keeps a
+  per-instance cache of a table's unique keys and moved it to each new manifest version when a
+  commit touched another table, as if nothing else could have happened in between. Another tab's
+  commit to the cached table in that gap was invisible to it, and the next multi-row `INSERT`
+  was checked against a key set missing those rows: it was accepted, and the table then held
+  two rows with one primary key. The cache now follows a commit only when it was current at the
+  version the commit was built on, and is dropped otherwise.
+- **A deleted-and-reinserted key no longer makes reads and writes fail.** Zone-map pruning and
+  index pruning both dropped delete segments, or blocks of them, whose keys could not match the
+  query, but the streamed replay maps keys to base rows and relies on those deletes to unmap a
+  key before a later insert maps it again. Once the reinserted row shared a kept block with a
+  matching row, every keyed range `SELECT`, `UPDATE`, and `DELETE` on the table -- and every
+  indexed lookup after a range delete -- failed with "Stored table contains a duplicate unique
+  key" until the table was compacted. Deletes are now always replayed whole.
+- **`compactTable()` retries when the database moves under a fold.** A background index build
+  finishing, or another connection's DDL, moves the schema epoch while a fold is in flight, and
+  a concurrent fold can replace a job's sources or win its publication races; each refusal
+  surfaced to the caller, and a job refused for a schema change stayed active to be refused
+  again. Such a job is now abandoned and compaction plans a fresh one, retrying the way writes
+  already do.
+- **A collection job that finds nothing no longer blocks every later one on IndexedDB.** A
+  discovery pass that ends with nothing to reclaim completes its job through the planning
+  update rather than a reclamation step, and that path never released the adapter's single
+  active-job admission. Every later `collectGarbage()` on that origin, from any tab, was then
+  refused as conflicting with the finished job. Both completion paths now release it, and the
+  block-store conformance kit checks that a second job can follow a discovery-completed one.
+- **`CREATE INDEX` no longer fails because another connection moved the table record.** Marking
+  the index as building raced folds and index builds on other connections for the table's
+  revision and surfaced `TableRecordConflictError`; the marking is now re-based on the fresh
+  record.
+- **Two tabs collecting garbage at once is a conflict, not a corruption.** The IndexedDB adapter
+  refused a second active collection job with `StorageResourceLimitError`, which
+  `collectGarbage()` surfaced to the caller while another tab's background pass was running.
+  It now raises `GarbageCollectionJobConflictError` like the memory and OPFS adapters, which the
+  engine catches to continue the job already in flight -- or, when that job finished in the
+  meantime, to plan again. Two tabs stepping one job also no longer trip each other:
+  `collectGarbage()` picks the job up at its current revision instead of failing, and
+  background collection treats another tab's progress as work done rather than reporting a
+  failure through `onBackgroundError`. The block-store conformance kit pins the adapter
+  behaviour.
+- **Closing while automatic collection is in flight reports no error.** `close()` refused the
+  collector's next store call with "Database is closed" and handed that refusal to
+  `onBackgroundError` — on the page console of every worker-hosted database that closed with a
+  pass pending. The shutdown is now recognized as such.
+
+### Added
+
+- **`@minnowdb/core/testing` exports the interaction-plan simulator**: `generateInteractionPlan`,
+  `parseInteractionPlan`, `runInteractionPlan`, `createDatabaseDriver`, `InteractionFailure`, and
+  the plan and driver types. A plan is a seeded, JSON-replayable sequence of DDL, DML,
+  transactions, concurrent rounds, faults, reopens, and maintenance across several connections,
+  checked against a shadow model and a set of properties; the driver interface lets the same plan
+  run over any block store in Node or across real browser tabs.
+
+### Changed
+
+- The published tarball no longer carries three test-only modules that nothing exported reached
+  (`client-audit-harness`, `indexeddb-audit-helpers`, `power-loss-model`).
+
 ## 0.10.1 — September 12, 2026
 
 Published packages: `@minnowdb/core@0.10.1`.

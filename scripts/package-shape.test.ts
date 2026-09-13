@@ -84,6 +84,9 @@ describe("published package shape", () => {
     expect(manifest.files).toContain("!dist/engine/storage-test-helpers.*");
     expect(manifest.files).toContain("!dist/testing/seeds.*");
     expect(manifest.files).toContain("!dist/testing/oracle.*");
+    expect(manifest.files).toContain("!dist/engine/client-audit-harness.*");
+    expect(manifest.files).toContain("!dist/storage/indexeddb-audit-helpers.*");
+    expect(manifest.files).toContain("!dist/storage/opfs/power-loss-model.*");
   });
 
   it("boots browser tests through published package subpaths", async () => {
@@ -147,9 +150,11 @@ describe("published core tarball", () => {
     expect(report?.files.map(({ path }) => path)).not.toContain("dist/engine/query-cache.d.ts");
     expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
     // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
-    // 4,300,000 with 0.10.1's coordination and recovery fixes; ratchets, not targets.
-    expect(report?.size, "packed bytes").toBeLessThanOrEqual(880_000);
-    expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_350_000);
+    // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
+    // when the interaction-plan simulator joined the published testing entry; ratchets, not
+    // targets.
+    expect(report?.size, "packed bytes").toBeLessThanOrEqual(920_000);
+    expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
     const emitted = await readFile(join(coreRoot, "dist", "engine", "optimizer.js"), "utf8");
     expect(emitted).not.toContain("/**");
     expect(emitted).not.toMatch(/^\s*\/\//mu);

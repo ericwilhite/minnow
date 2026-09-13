@@ -14,6 +14,7 @@
     "compaction-soak": [],
     "compaction-soak-snapshots": [],
     "partitioned-compaction-soak": [],
-    "auto-compaction-soak": [26172526, 756656541, 1271068371]
+    "auto-compaction-soak": [26172526, 756656541, 1271068371],
+    "interaction-simulator": []
   }
 }

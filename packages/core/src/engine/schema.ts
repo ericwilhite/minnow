@@ -1,4 +1,5 @@
 import { copyDate, dateMilliseconds } from "../date-value.js";
+import { quoteSqlIdentifier } from "./sql-quote.js";
 import {
   validateColumnDefault,
   validateEnumValues,
@@ -1996,7 +1997,7 @@ export function typedTable<TTable extends AnyTable>(
   rows(): Promise<Array<InferRow<TTable>>>;
 } {
   const columnNames = Object.keys(definition.columns);
-  const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+  const quote = quoteSqlIdentifier;
   const scalarUniqueKey = Object.entries(definition.columns).find(
     ([, columnDefinition]) => columnDefinition.isUnique,
   )?.[0];

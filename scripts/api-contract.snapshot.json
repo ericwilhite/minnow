@@ -7914,6 +7914,13 @@
           "audience": "testing",
           "exports": [
             {
+              "name": "Assignment",
+              "kind": "type",
+              "declarations": [
+                "export type Assignment = {\n    readonly kind: \"set\";\n    readonly column: string;\n    readonly value: PlanValue;\n} | {\n    readonly kind: \"increment\";\n    readonly column: string;\n    readonly by: number;\n};"
+              ]
+            },
+            {
               "name": "BlockStoreConformanceCase",
               "kind": "type",
               "declarations": [
@@ -7942,10 +7949,52 @@
               ]
             },
             {
+              "name": "ColumnType",
+              "kind": "type",
+              "declarations": [
+                "export type ColumnType = \"integer\" | \"real\" | \"text\" | \"boolean\";"
+              ]
+            },
+            {
+              "name": "CompareOperator",
+              "kind": "type",
+              "declarations": [
+                "export type CompareOperator = \"=\" | \"<>\" | \"<\" | \"<=\" | \">\" | \">=\";"
+              ]
+            },
+            {
+              "name": "createDatabaseDriver",
+              "kind": "value",
+              "declarations": [
+                "export declare function createDatabaseDriver(source: DriverStoreSource, options?: DatabaseDriverOptions): SimulationDriver;"
+              ]
+            },
+            {
+              "name": "DatabaseDriverOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface DatabaseDriverOptions {\n    readonly databaseOptions?: MinnowDatabaseOptions;\n}"
+              ]
+            },
+            {
               "name": "DeterministicScheduler",
               "kind": "type-and-value",
               "declarations": [
                 "export declare class DeterministicScheduler {\n    #private;\n    constructor(seed: number, traceLimit?: number);\n    get highWater(): number;\n    get trace(): readonly SimulationTraceEvent[];\n    schedule<T>(label: string, run: () => Promise<T>): Promise<T>;\n    settle<T>(promises: ReadonlyArray<Promise<T>>): Promise<Array<PromiseSettledResult<T>>>;\n}"
+              ]
+            },
+            {
+              "name": "DriverStoreSource",
+              "kind": "type",
+              "declarations": [
+                "export type DriverStoreSource = BlockStore | (() => Promise<BlockStore>);"
+              ]
+            },
+            {
+              "name": "evaluatePlanPredicate",
+              "kind": "value",
+              "declarations": [
+                "export declare function evaluate(predicate: Predicate, row: PlanRow): Truth;"
               ]
             },
             {
@@ -7970,6 +8019,13 @@
               ]
             },
             {
+              "name": "FaultPointName",
+              "kind": "type",
+              "declarations": [
+                "export type FaultPointName = \"beforeBlockWrite\" | \"afterBlockWrite\" | \"beforeTransactionCommit\" | \"afterTransactionCommit\" | \"crash\";"
+              ]
+            },
+            {
               "name": "faultPoints",
               "kind": "value",
               "declarations": [
@@ -7977,10 +8033,66 @@
               ]
             },
             {
+              "name": "generateInteractionPlan",
+              "kind": "value",
+              "declarations": [
+                "export declare function generateInteractionPlan(seed: number, options?: InteractionPlanOptions): InteractionPlan;"
+              ]
+            },
+            {
               "name": "generateSimulationPlan",
               "kind": "value",
               "declarations": [
                 "export declare function generateSimulationPlan(seed: number, options?: {\n    readonly rounds?: number;\n    readonly clients?: number;\n    readonly keySpace?: number;\n}): SimulationPlan;"
+              ]
+            },
+            {
+              "name": "Interaction",
+              "kind": "type",
+              "declarations": [
+                "export type Interaction = {\n    readonly kind: \"createTable\";\n    readonly connection: number;\n    readonly table: PlanTable;\n    readonly expectExisting: boolean;\n} | {\n    readonly kind: \"insert\";\n    readonly connection: number;\n    readonly table: string;\n    readonly rows: readonly PlanRow[];\n    readonly viaParameters: boolean;\n} | {\n    readonly kind: \"update\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"delete\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"select\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly limit: number | null;\n    readonly descending: boolean;\n} | {\n    readonly kind: \"partition\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"unionAll\";\n    readonly connection: number;\n    readonly table: string;\n    readonly left: Predicate;\n    readonly right: Predicate;\n} | {\n    readonly kind: \"createIndex\";\n    readonly connection: number;\n    readonly table: string;\n    readonly name: string;\n    readonly columns: readonly string[];\n} | {\n    readonly kind: \"dropTable\";\n    readonly connection: number;\n    readonly table: string;\n    readonly expectMissing: boolean;\n} | {\n    readonly kind: \"transaction\";\n    readonly connection: number;\n    readonly observer: number;\n    readonly table: string;\n    readonly statements: readonly TransactionStatement[];\n    readonly outcome: \"commit\" | \"rollback\";\n} | {\n    readonly kind: \"concurrent\";\n    readonly table: string;\n    readonly operations: ReadonlyArray<{\n        readonly connection: number;\n        readonly mutation: KeyedMutation;\n    }>;\n    readonly readers: readonly number[];\n} | {\n    readonly kind: \"fault\";\n    readonly connection: number;\n    readonly table: string;\n    readonly mutation: KeyedMutation;\n    readonly point: FaultPointName;\n} | {\n    readonly kind: \"reopen\";\n    readonly connection: number;\n} | {\n    readonly kind: \"maintenance\";\n    readonly connection: number;\n    readonly table: string;\n} | {\n    readonly kind: \"checkpoint\";\n};"
+              ]
+            },
+            {
+              "name": "InteractionFailure",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class InteractionFailure extends Error {\n    readonly index: number;\n    readonly interaction: Interaction;\n    readonly trace: readonly string[];\n    constructor(message: string, index: number, interaction: Interaction, trace: readonly string[], options?: ErrorOptions);\n}"
+              ]
+            },
+            {
+              "name": "InteractionPlan",
+              "kind": "type",
+              "declarations": [
+                "export interface InteractionPlan {\n    readonly version: 1;\n    readonly seed: number;\n    readonly connections: number;\n    readonly interactions: readonly Interaction[];\n}"
+              ]
+            },
+            {
+              "name": "InteractionPlanOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface InteractionPlanOptions {\n    readonly length?: number;\n    readonly connections?: number;\n    readonly tables?: number;\n    readonly keySpace?: number;\n    readonly faultPoints?: readonly FaultPointName[];\n}"
+              ]
+            },
+            {
+              "name": "InteractionRunOptions",
+              "kind": "type",
+              "declarations": [
+                "export interface InteractionRunOptions {\n    readonly traceLength?: number;\n}"
+              ]
+            },
+            {
+              "name": "InteractionRunResult",
+              "kind": "type",
+              "declarations": [
+                "export interface InteractionRunResult {\n    readonly seed: number;\n    readonly interactions: number;\n    readonly statements: number;\n    readonly queries: number;\n    readonly acceptedWrites: number;\n    readonly rejectedConflicts: number;\n    readonly expectedFailures: number;\n    readonly faultsInjected: number;\n    readonly faultsSkipped: number;\n    readonly reopens: number;\n    readonly checkpoints: number;\n    readonly tablesAtEnd: number;\n    readonly rowsAtEnd: number;\n}"
+              ]
+            },
+            {
+              "name": "KeyedMutation",
+              "kind": "type",
+              "declarations": [
+                "export type KeyedMutation = {\n    readonly kind: \"insert\";\n    readonly row: PlanRow;\n} | {\n    readonly kind: \"upsert\";\n    readonly row: PlanRow;\n} | {\n    readonly kind: \"updateKey\";\n    readonly id: number;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"deleteKey\";\n    readonly id: number;\n};"
               ]
             },
             {
@@ -7995,6 +8107,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare class MemoryOpfs {\n    #private;\n    get root(): FileSystemDirectoryHandle;\n    setWriteFault(fault: WriteFault | null): void;\n    setDeleteFault(fault: DeleteFault | null): void;\n    setTransferLimit(limit: TransferLimit | null): void;\n    maybeFault(path: string, phase: \"create\" | \"write\" | \"flush\"): void;\n    maybeDeleteFault(path: string): void;\n    limitTransfer(path: string, operation: \"read\" | \"write\", requestedBytes: number, at: number): number;\n    readFileBytes(path: string): Uint8Array | undefined;\n    writeFileBytes(path: string, bytes: Uint8Array): void;\n    corruptFileByte(path: string, offset: number): void;\n}"
+              ]
+            },
+            {
+              "name": "parseInteractionPlan",
+              "kind": "value",
+              "declarations": [
+                "export declare function parseInteractionPlan(source: string): InteractionPlan;"
               ]
             },
             {
@@ -8019,6 +8138,55 @@
               ]
             },
             {
+              "name": "PlanColumn",
+              "kind": "type",
+              "declarations": [
+                "export interface PlanColumn {\n    readonly name: string;\n    readonly type: ColumnType;\n    readonly nullable: boolean;\n}"
+              ]
+            },
+            {
+              "name": "PlanRow",
+              "kind": "type",
+              "declarations": [
+                "export type PlanRow = Readonly<Record<string, PlanValue>>;"
+              ]
+            },
+            {
+              "name": "PlanTable",
+              "kind": "type",
+              "declarations": [
+                "export interface PlanTable {\n    readonly name: string;\n    readonly columns: readonly PlanColumn[];\n}"
+              ]
+            },
+            {
+              "name": "PlanValue",
+              "kind": "type",
+              "declarations": [
+                "export type PlanValue = number | string | boolean | null;"
+              ]
+            },
+            {
+              "name": "Predicate",
+              "kind": "type",
+              "declarations": [
+                "export type Predicate = {\n    readonly kind: \"compare\";\n    readonly column: string;\n    readonly op: CompareOperator;\n    readonly value: PlanValue;\n} | {\n    readonly kind: \"isNull\";\n    readonly column: string;\n    readonly negated: boolean;\n} | {\n    readonly kind: \"and\";\n    readonly left: Predicate;\n    readonly right: Predicate;\n} | {\n    readonly kind: \"or\";\n    readonly left: Predicate;\n    readonly right: Predicate;\n} | {\n    readonly kind: \"not\";\n    readonly inner: Predicate;\n} | {\n    readonly kind: \"literal\";\n    readonly value: boolean;\n};"
+              ]
+            },
+            {
+              "name": "renderPlanLiteral",
+              "kind": "value",
+              "declarations": [
+                "export declare function renderLiteral(value: PlanValue): string;"
+              ]
+            },
+            {
+              "name": "renderPlanPredicate",
+              "kind": "value",
+              "declarations": [
+                "export declare function renderPredicate(predicate: Predicate): string;"
+              ]
+            },
+            {
               "name": "renderSqlLogicValue",
               "kind": "value",
               "declarations": [
@@ -8030,6 +8198,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function runBlockStoreConformance(target: BlockStoreConformanceTarget): Promise<void>;"
+              ]
+            },
+            {
+              "name": "runInteractionPlan",
+              "kind": "value",
+              "declarations": [
+                "export declare function runInteractionPlan(plan: InteractionPlan, driver: SimulationDriver, options?: InteractionRunOptions): Promise<InteractionRunResult>;"
               ]
             },
             {
@@ -8054,10 +8229,45 @@
               ]
             },
             {
+              "name": "SimulatedConnection",
+              "kind": "type",
+              "declarations": [
+                "export interface SimulatedConnection {\n    execute(sql: string, params?: readonly PlanValue[]): Promise<SimulatedExecuteResult>;\n    query(sql: string, params?: readonly PlanValue[]): Promise<SimulatedQueryResult>;\n    reopen(): Promise<void>;\n    maintain?(table: string): Promise<void>;\n    crash?(): Promise<void>;\n}"
+              ]
+            },
+            {
+              "name": "SimulatedExecuteResult",
+              "kind": "type",
+              "declarations": [
+                "export interface SimulatedExecuteResult {\n    readonly kind: string;\n    readonly rowCount?: number;\n}"
+              ]
+            },
+            {
+              "name": "SimulatedFaults",
+              "kind": "type",
+              "declarations": [
+                "export interface SimulatedFaults {\n    arm(point: Exclude<FaultPointName, \"crash\">, occurrence: number): void;\n    disarm(): void;\n    fired(): boolean;\n}"
+              ]
+            },
+            {
+              "name": "SimulatedQueryResult",
+              "kind": "type",
+              "declarations": [
+                "export interface SimulatedQueryResult {\n    readonly columns: readonly string[];\n    readonly rows: ReadonlyArray<Readonly<Record<string, unknown>>>;\n}"
+              ]
+            },
+            {
               "name": "SimulationDelete",
               "kind": "type",
               "declarations": [
                 "export interface SimulationDelete {\n    readonly kind: \"delete\";\n    readonly client: number;\n    readonly key: number;\n}"
+              ]
+            },
+            {
+              "name": "SimulationDriver",
+              "kind": "type",
+              "declarations": [
+                "export interface SimulationDriver {\n    open(connection: number): Promise<SimulatedConnection>;\n    readonly faults?: SimulatedFaults;\n    close?(): Promise<void>;\n}"
               ]
             },
             {
@@ -8219,6 +8429,13 @@
               "kind": "type",
               "declarations": [
                 "export type SqlLogicType = \"I\" | \"R\" | \"T\";"
+              ]
+            },
+            {
+              "name": "TransactionStatement",
+              "kind": "type",
+              "declarations": [
+                "export type TransactionStatement = {\n    readonly kind: \"insert\";\n    readonly rows: readonly PlanRow[];\n} | {\n    readonly kind: \"update\";\n    readonly predicate: Predicate;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"delete\";\n    readonly predicate: Predicate;\n};"
               ]
             },
             {

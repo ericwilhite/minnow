@@ -1546,3 +1546,77 @@ describe("unique secondary indexes under upserts", () => {
     await database.close();
   });
 });
+
+describe("index pruning never widens the scan past the selected rows", () => {
+  // Found by the interaction simulator (packages/core/src/testing/interaction-simulator.ts):
+  // an index built after a DELETE returned the deleted row. The postings correctly omitted it,
+  // so its delete segment was pruned away as irrelevant -- and the selected-row scan then
+  // coalesced the two live rows on either side of it into one batch that swept the dead row
+  // back in. The same path served an UPDATE's stale pre-image.
+  const rows = `INSERT INTO t (id, c0, c1) VALUES (30, 'zulu', -10), (4, 'gap', -12), (35, 'echo', -24), (9, 'end', 40)`;
+
+  for (const { name, create } of implementations()) {
+    it(`${name}: a row deleted before the index was built stays deleted`, async () => {
+      const store = await create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 8, autoCompact: false });
+      await database.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c0 TEXT NOT NULL, c1 INTEGER)",
+      );
+      await database.execute(rows);
+      await database.execute("DELETE FROM t WHERE id = 4");
+      await database.execute("CREATE INDEX t_c1 ON t (c1)");
+      expect(await database.explain("SELECT id FROM t WHERE c1 < 26 ORDER BY id")).toContain(
+        "secondary index prunes",
+      );
+      const indexed = await database.query("SELECT id FROM t WHERE c1 < 26 ORDER BY id", {
+        memoize: false,
+      });
+      expect(indexed.rows.map((row) => row.id)).toEqual([30, 35]);
+      const count = await database.query("SELECT COUNT(*) AS n FROM t WHERE c1 < 26", {
+        memoize: false,
+      });
+      expect(count.rows[0]?.n).toBe(2);
+      await database.close();
+      store.close();
+    });
+
+    it(`${name}: a row updated before the index was built reads its current value`, async () => {
+      const store = await create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 8, autoCompact: false });
+      await database.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c0 TEXT NOT NULL, c1 INTEGER)",
+      );
+      await database.execute(rows);
+      await database.execute("UPDATE t SET c1 = 100 WHERE id = 4");
+      await database.execute("CREATE INDEX t_c1 ON t (c1)");
+      const indexed = await database.query("SELECT id, c1 FROM t WHERE c1 < 26 ORDER BY id", {
+        memoize: false,
+      });
+      expect(indexed.rows).toEqual([
+        { id: 30, c1: -10 },
+        { id: 35, c1: -24 },
+      ]);
+      await database.close();
+      store.close();
+    });
+  }
+
+  it("serves a selection with gaps from two connections over one store", async () => {
+    const store = new MemoryBlockStore();
+    const writer = new MinnowDatabase(store, { rowsPerBlock: 8, autoCompact: false });
+    const reader = new MinnowDatabase(store, { rowsPerBlock: 8, autoCompact: false });
+    await writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c0 TEXT NOT NULL, c1 INTEGER)");
+    await writer.execute(rows);
+    await reader.execute("DELETE FROM t WHERE NOT (id >= 21)");
+    await writer.execute("CREATE INDEX t_c1 ON t (c1)");
+    for (const database of [writer, reader]) {
+      const result = await database.query("SELECT id FROM t WHERE c1 < 26 ORDER BY id", {
+        memoize: false,
+      });
+      expect(result.rows.map((row) => row.id)).toEqual([30, 35]);
+    }
+    await writer.close();
+    await reader.close();
+    store.close();
+  });
+});

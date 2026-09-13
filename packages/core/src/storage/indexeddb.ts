@@ -2024,8 +2024,8 @@ export class IndexedDbBlockStore implements BlockStore {
           true
       ) {
         this.#uniqueKeyCache = undefined;
-      } else if (this.#uniqueKeyCache !== undefined) {
-        this.#uniqueKeyCache.version = manifest.version;
+      } else {
+        this.#carryUniqueKeyCache(input.expectedManifestVersion, manifest.version);
       }
       return manifest;
     } catch (error) {
@@ -2189,7 +2189,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await transactionDone(transaction);
       this.#manifestCache = undefined;
       this.#journalCache = undefined;
-      if (this.#uniqueKeyCache !== undefined) this.#uniqueKeyCache.version = manifest.version;
+      this.#carryUniqueKeyCache(input.expectedManifestVersion, manifest.version);
       return manifest;
     } catch (error) {
       abortIfActive(transaction);
@@ -3336,6 +3336,23 @@ export class IndexedDbBlockStore implements BlockStore {
     } catch (error) {
       abortIfActive(transaction);
       throw await refusalBehindAbort(transaction, error);
+    }
+  }
+
+  /**
+   * Moves the unique-key cache to the version a commit just published, when that commit
+   * changed nothing about the cached table. That is only sound if the cache was current at the
+   * version the commit was built on: another instance may have committed to the cached table
+   * in between, and a cache carried past such a commit answered the next insert from a key set
+   * missing those rows -- two tabs then wrote one primary key twice.
+   */
+  #carryUniqueKeyCache(basedOn: number | null | undefined, version: number): void {
+    const cache = this.#uniqueKeyCache;
+    if (cache === undefined || cache.version === version) return;
+    if (basedOn !== null && basedOn !== undefined && cache.version === basedOn) {
+      cache.version = version;
+    } else {
+      this.#uniqueKeyCache = undefined;
     }
   }
 
@@ -5298,18 +5315,14 @@ export class IndexedDbBlockStore implements BlockStore {
               : undefined;
         } else if (this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId) {
           this.#uniqueKeyCache = undefined;
-        } else if (this.#uniqueKeyCache !== undefined) {
-          this.#uniqueKeyCache.version = manifest.version;
+        } else {
+          this.#carryUniqueKeyCache(input.expectedManifestVersion, manifest.version);
         }
-      } else if (
-        uniqueKeyChanges !== undefined &&
-        this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId
-      ) {
-        // A no-op key write against the cached table: nothing changed on disk, so the cache
-        // just moves to the new version.
-        this.#uniqueKeyCache.version = manifest.version;
-      } else if (this.#uniqueKeyCache !== undefined) {
-        this.#uniqueKeyCache.version = manifest.version;
+      } else {
+        // A no-op key write against the cached table, or a commit to another table: nothing
+        // this commit wrote changes the cached key set, so the cache moves to the new version
+        // -- provided it was current at the version this commit was built on.
+        this.#carryUniqueKeyCache(input.expectedManifestVersion, manifest.version);
       }
       this.#manifestCache = undefined;
       this.#journalCache = undefined;
@@ -5886,6 +5899,17 @@ export class IndexedDbBlockStore implements BlockStore {
       const quota = await readMaintenanceQuota(gcStore);
       let activeGarbageCollectionJobs: number | undefined;
       if (record.state !== "completed") {
+        // Another job already active is a conflict, the same class the toolkit adapters raise:
+        // the engine catches it and continues that job instead of surfacing a refusal. Two
+        // tabs planning collection at once is ordinary, not a resource-limit breach, so the
+        // marker is checked before the fixed active-job ceiling.
+        const markerValue: unknown = await requestResult(
+          gcStore.get(ACTIVE_GARBAGE_COLLECTION_KEY),
+        );
+        if (markerValue !== undefined) {
+          const marker = asActiveGarbageCollectionMarker(markerValue);
+          throw new GarbageCollectionJobConflictError(marker.jobId, record.revision, null);
+        }
         activeGarbageCollectionJobs = checkedQuotaIncrement(
           quota.activeGarbageCollectionJobs,
           "Active garbage collection job count",
@@ -5895,13 +5919,6 @@ export class IndexedDbBlockStore implements BlockStore {
           activeGarbageCollectionJobs,
           MAX_ACTIVE_GARBAGE_COLLECTION_JOBS,
         );
-        const markerValue: unknown = await requestResult(
-          gcStore.get(ACTIVE_GARBAGE_COLLECTION_KEY),
-        );
-        if (markerValue !== undefined) {
-          const marker = asActiveGarbageCollectionMarker(markerValue);
-          throw new Error(`Garbage collection job ${marker.jobId} is already active`);
-        }
       }
       await assertGarbageCollectionCandidateProvenanceInTransaction(transaction, record);
       if (record.state !== "completed") {
@@ -5964,6 +5981,12 @@ export class IndexedDbBlockStore implements BlockStore {
         candidateTransactionIds: input.candidateTransactionIds ?? [],
       });
       gcStore.put(garbageCollectionJobEnvelope(updated), key);
+      // Discovery that ends with nothing to reclaim completes the job here, never through a
+      // step -- so the admission it holds is released here too. Leaving the active marker in
+      // place made every later job creation a conflict against a job that had finished.
+      if (updated.state === "completed" && current.state !== "completed") {
+        await releaseGarbageCollectionAdmission(gcStore);
+      }
       await transactionDone(transaction);
       return structuredClone(updated);
     } catch (error) {
@@ -6281,30 +6304,7 @@ export class IndexedDbBlockStore implements BlockStore {
         updatedAt: input.updatedAt,
       });
       gcStore.put(garbageCollectionJobEnvelope(updated), key);
-      if (updated.state === "completed") {
-        const quota = await readMaintenanceQuota(gcStore);
-        const completedGarbageCollectionJobs = checkedQuotaIncrement(
-          quota.completedGarbageCollectionJobs,
-          "Completed garbage collection job count",
-        );
-        assertMaintenanceLimit(
-          "completed garbage collection job",
-          completedGarbageCollectionJobs,
-          MAX_COMPLETED_GARBAGE_COLLECTION_JOB_RECORDS,
-        );
-        gcStore.put(
-          {
-            ...quota,
-            activeGarbageCollectionJobs: checkedQuotaDecrement(
-              quota.activeGarbageCollectionJobs,
-              "active garbage collection job count",
-            ),
-            completedGarbageCollectionJobs,
-          },
-          MAINTENANCE_QUOTA_KEY,
-        );
-        await requestResult(gcStore.delete(ACTIVE_GARBAGE_COLLECTION_KEY));
-      }
+      if (updated.state === "completed") await releaseGarbageCollectionAdmission(gcStore);
       await transactionDone(transaction);
       return {
         job: structuredClone(updated),
@@ -14326,6 +14326,37 @@ async function assertActiveCompactionMarker(
       `marker names job ${marker.jobId} instead of ${record.id}`,
     );
   }
+}
+
+/**
+ * A job that reached `completed` gives up the single active-job admission: the completed count
+ * takes it (within its ceiling), the active count drops, and the marker that refuses a second
+ * active job goes away. Both completion paths -- a reclamation step, and a discovery that ends
+ * with nothing to reclaim -- must do exactly this.
+ */
+async function releaseGarbageCollectionAdmission(gcStore: IDBObjectStore): Promise<void> {
+  const quota = await readMaintenanceQuota(gcStore);
+  const completedGarbageCollectionJobs = checkedQuotaIncrement(
+    quota.completedGarbageCollectionJobs,
+    "Completed garbage collection job count",
+  );
+  assertMaintenanceLimit(
+    "completed garbage collection job",
+    completedGarbageCollectionJobs,
+    MAX_COMPLETED_GARBAGE_COLLECTION_JOB_RECORDS,
+  );
+  gcStore.put(
+    {
+      ...quota,
+      activeGarbageCollectionJobs: checkedQuotaDecrement(
+        quota.activeGarbageCollectionJobs,
+        "active garbage collection job count",
+      ),
+      completedGarbageCollectionJobs,
+    },
+    MAINTENANCE_QUOTA_KEY,
+  );
+  await requestResult(gcStore.delete(ACTIVE_GARBAGE_COLLECTION_KEY));
 }
 
 async function assertActiveGarbageCollectionMarker(

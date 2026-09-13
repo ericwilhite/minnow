@@ -5,6 +5,7 @@
  * inference, constant folding, and both executors read one definition. Anything with its own
  * syntax (EXTRACT, CAST, TRIM ... FROM, JSON constructors) stays in the parser's own tables.
  */
+import { quoteSqlIdentifier } from "./sql-quote.js";
 import {
   dateIsoString,
   dateMilliseconds,
@@ -572,7 +573,7 @@ function formatText(template: string, values: readonly unknown[]): string {
         if (value === null || value === undefined)
           throw new TypeError("FORMAT %I does not accept NULL");
         const name = rendered(value);
-        return /^[a-z_][a-z0-9_]*$/.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
+        return /^[a-z_][a-z0-9_]*$/.test(name) ? name : quoteSqlIdentifier(name);
       }
       if (value === null || value === undefined) return "NULL";
       return `'${rendered(value).replace(/'/g, "''")}'`;
@@ -1102,7 +1103,7 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
         const name = text("QUOTE_IDENT", values[0]);
         return /^[a-z_][a-z0-9_]*$/.test(name)
           ? name
-          : bounded(`"${name.replace(/"/g, '""')}"`, "QUOTE_IDENT");
+          : bounded(quoteSqlIdentifier(name), "QUOTE_IDENT");
       },
     },
   ],
