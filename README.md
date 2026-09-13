@@ -76,7 +76,9 @@ npm install
 npm test               # unit tests and the standard SQLLogicTest profile
 npm run check          # format, types, lint, build, coverage, and SQL tests
 npm run test:sql:full  # full supported SQLLogicTest profile
-npm run test:browser   # library and site tests in real browsers
+npm run test:browser   # library and site tests in real browsers, including the SQLLogicTest corpus and multi-tab interaction plans
+npm run simulate:interactions # one replayable interaction plan against the shadow model
+npm run soak           # generative suites on fresh seeds, the simulators included
 npm run test:browser:pos # isolated sustained POS correctness and latency checks
 npm run test:consumer  # install packed libraries in a clean Vite app and run it
 npm run site:dev       # docs, live console, and browser benchmarks

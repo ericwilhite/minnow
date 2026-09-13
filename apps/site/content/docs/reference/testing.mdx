@@ -370,7 +370,11 @@ any transaction writing two segments to one table, a zone-pruned delete that mad
 key fail every keyed range read, a compaction refused by a background index build, and an
 IndexedDB key cache that let two tabs write one primary key twice — each now pinned in
 `simulator-regressions.test.ts`. The last one only shows with a separate adapter instance per
-connection, which is why the Node driver opens one per connection for IndexedDB and OPFS.
+connection, which is why the Node driver opens one per connection for IndexedDB and OPFS. Its
+first real-browser runs then added two more: WebKit keeping a terminated worker's IndexedDB
+connection and open transaction alive until its document goes away, which wedged every tab
+(now bounded by `StorageUnresponsiveError`), and a crashed tab's pending call waiting out the
+client's silence deadline long enough for another tab's idle transaction rollback to fire.
 
 ## Background maintenance, size, and memory
 
