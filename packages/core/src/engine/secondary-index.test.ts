@@ -1620,3 +1620,282 @@ describe("index pruning never widens the scan past the selected rows", () => {
     store.close();
   });
 });
+
+describe("NULL-aware composite index terms", () => {
+  const PRUNES = "a ready secondary index prunes";
+
+  /** Enough rows, in enough blocks, that the postings can eliminate a real row group. */
+  const stockRows = Array.from({ length: 24 }, (_, offset) => ({
+    id: offset + 1,
+    shop: offset % 3 === 2 ? "south" : "north",
+    // Every third northern row leaves the trailing indexed column NULL.
+    bin: offset % 3 === 1 ? null : (offset % 7) + 1,
+  }));
+
+  const stockValues = stockRows
+    .map(
+      (row) => `(${String(row.id)}, '${row.shop}', ${row.bin === null ? "NULL" : String(row.bin)})`,
+    )
+    .join(", ");
+
+  const northIds = stockRows.filter((row) => row.shop === "north").map((row) => ({ id: row.id }));
+  const northNullBinIds = stockRows
+    .filter((row) => row.shop === "north" && row.bin === null)
+    .map((row) => ({ id: row.id }));
+  const northRealBinIds = stockRows
+    .filter((row) => row.shop === "north" && row.bin !== null)
+    .map((row) => ({ id: row.id }));
+  const northBinOneIds = stockRows
+    .filter((row) => row.shop === "north" && row.bin === 1)
+    .map((row) => ({ id: row.id }));
+
+  for (const trailing of ["ASC", "DESC"] as const) {
+    for (const implementation of implementations()) {
+      it(`${implementation.name} prefix-prunes past a NULL trailing ${trailing} column`, async () => {
+        // The regression this pins: a composite index on (shop, bin) named no row whose bin was
+        // NULL, so `WHERE shop = ?` pruned the scan to the postings and silently dropped them.
+        const store = await implementation.create();
+        const database = new MinnowDatabase(store, { rowsPerBlock: 2, autoCompact: false });
+        try {
+          await database.execute(
+            "CREATE TABLE stock (id INTEGER PRIMARY KEY, shop VARCHAR NOT NULL, bin INTEGER)",
+          );
+          await database.execute(`INSERT INTO stock VALUES ${stockValues}`);
+          await database.execute(`CREATE INDEX stock_shop_bin ON stock(shop ASC, bin ${trailing})`);
+
+          // The prefix lookup is used, and it returns the NULL-bin rows it used to drop.
+          expect(
+            await database.explain("SELECT id FROM stock WHERE shop = 'north' ORDER BY id"),
+          ).toContain(PRUNES);
+          expect(
+            (await database.query("SELECT id FROM stock WHERE shop = 'north' ORDER BY id")).rows,
+          ).toEqual(northIds);
+          expect(
+            (
+              await database.query(
+                "SELECT id FROM stock WHERE shop = 'north' AND bin IS NULL ORDER BY id",
+              )
+            ).rows,
+          ).toEqual(northNullBinIds);
+
+          // The marker never matches a predicate on the column it stands in for.
+          for (const predicate of [
+            "(bin = 1 OR bin <> 1)",
+            "bin >= 1",
+            "bin <= 7",
+            "bin > 0 AND bin < 8",
+            "bin BETWEEN 1 AND 7",
+            "bin IN (1, 2, 3, 4, 5, 6, 7)",
+          ]) {
+            const sql = `SELECT id FROM stock WHERE shop = 'north' AND ${predicate} ORDER BY id`;
+            expect((await database.query(sql, { memoize: false })).rows, sql).toEqual(
+              northRealBinIds,
+            );
+          }
+          expect(
+            (
+              await database.query("SELECT id FROM stock WHERE shop = 'north' AND bin = 1", {
+                memoize: false,
+              })
+            ).rows,
+          ).toEqual(northBinOneIds);
+          // An open-ended range over the whole domain must not reach the marker either.
+          expect(
+            (await database.query("SELECT COUNT(*) AS n FROM stock WHERE bin >= 1")).rows,
+          ).toEqual([{ n: stockRows.filter((row) => row.bin !== null).length }]);
+
+          const table = await store.getTableByName("stock");
+          expect(Object.values(table?.secondaryIndexes ?? {})).toMatchObject([
+            { termEncoding: "tuple-v2", state: "ready" },
+          ]);
+        } finally {
+          await database.close();
+          store.close();
+        }
+      });
+    }
+  }
+
+  for (const implementation of implementations()) {
+    it(`${implementation.name} tracks a trailing column moved to NULL and back in the delta tail`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, autoCompact: false });
+      try {
+        await database.execute(
+          "CREATE TABLE stock (id INTEGER PRIMARY KEY, shop VARCHAR NOT NULL, bin INTEGER)",
+        );
+        await database.execute(`INSERT INTO stock VALUES ${stockValues}`);
+        await database.execute("CREATE INDEX stock_shop_bin ON stock(shop ASC, bin ASC)");
+
+        const prefix = "SELECT id FROM stock WHERE shop = 'north' ORDER BY id";
+        const equality = "SELECT id FROM stock WHERE shop = 'north' AND bin = 1 ORDER BY id";
+        expect((await database.query(equality, { memoize: false })).rows).toEqual(northBinOneIds);
+
+        // Every hop lands in the postings delta tail, not a rebuilt base.
+        await database.execute("UPDATE stock SET bin = NULL WHERE id = 1");
+        expect((await database.query(prefix, { memoize: false })).rows).toEqual(northIds);
+        expect((await database.query(equality, { memoize: false })).rows).toEqual(
+          northBinOneIds.filter((row) => row.id !== 1),
+        );
+
+        await database.execute("UPDATE stock SET bin = 1 WHERE id = 1");
+        expect((await database.query(prefix, { memoize: false })).rows).toEqual(northIds);
+        expect((await database.query(equality, { memoize: false })).rows).toEqual(northBinOneIds);
+
+        // A NULL-bin row deleted out of the delta tail leaves the prefix answer exact.
+        await database.execute("DELETE FROM stock WHERE id = 2");
+        expect((await database.query(prefix, { memoize: false })).rows).toEqual(
+          northIds.filter((row) => row.id !== 2),
+        );
+      } finally {
+        await database.close();
+        store.close();
+      }
+    });
+  }
+
+  for (const implementation of implementations()) {
+    it(`${implementation.name} keeps PostgreSQL UNIQUE semantics for NULL components`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, autoCompact: false });
+      try {
+        await database.execute(
+          "CREATE TABLE badges (id INTEGER PRIMARY KEY, owner VARCHAR NOT NULL, slot INTEGER)",
+        );
+        await database.execute("INSERT INTO badges VALUES (1, 'ana', 1), (2, 'ana', NULL)");
+        await database.execute("CREATE UNIQUE INDEX badges_owner_slot ON badges(owner, slot)");
+
+        // A row with a NULL indexed component does not participate in uniqueness, so any number
+        // of them may coexist — including within one statement and one write scope.
+        await database.execute("INSERT INTO badges VALUES (3, 'ana', NULL), (4, 'ana', NULL)");
+        await database.write(async (tx) => {
+          await tx.insertBatch("badges", [
+            { id: 5, owner: "ana", slot: null },
+            { id: 6, owner: "ana", slot: null },
+          ]);
+        });
+        // Non-null duplicates are still refused, in a statement and in a batch.
+        await expect(
+          database.execute("INSERT INTO badges VALUES (7, 'ana', 1)"),
+        ).rejects.toBeInstanceOf(UniqueConstraintError);
+        await expect(
+          database.insertBatch("badges", [
+            { id: 7, owner: "bo", slot: 2 },
+            { id: 8, owner: "bo", slot: 2 },
+          ]),
+        ).rejects.toThrow(/UNIQUE index badges_owner_slot has a duplicate key/);
+        // Two NULL-component rows in one batch are not a duplicate at all.
+        await database.insertBatch("badges", [
+          { id: 8, owner: "bo", slot: null },
+          { id: 9, owner: "bo", slot: null },
+        ]);
+        // Freeing a term by moving the row to NULL lets another row claim it.
+        await database.execute("UPDATE badges SET slot = NULL WHERE id = 1");
+        await database.execute("INSERT INTO badges VALUES (7, 'ana', 1)");
+
+        expect(
+          (await database.query("SELECT id FROM badges WHERE owner = 'ana' ORDER BY id")).rows,
+        ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }, { id: 6 }, { id: 7 }]);
+        expect(
+          (await database.query("SELECT id FROM badges WHERE owner = 'ana' AND slot = 1")).rows,
+        ).toEqual([{ id: 7 }]);
+        expect(
+          (await database.query("SELECT COUNT(*) AS n FROM badges WHERE slot IS NULL")).rows,
+        ).toEqual([{ n: 8 }]);
+      } finally {
+        await database.close();
+        store.close();
+      }
+    });
+  }
+
+  it("refuses prefix pruning through a tuple-v1 index, and still prunes its equalities", async () => {
+    // An index built before the NULL marker existed names no NULL-component row, so a prefix
+    // lookup over it would drop those rows. It keeps serving equality lookups, which no NULL can
+    // match, and becomes eligible for prefix pruning again once it is rebuilt.
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 2, autoCompact: false });
+    try {
+      await database.execute(
+        "CREATE TABLE stock (id INTEGER PRIMARY KEY, shop VARCHAR NOT NULL, bin INTEGER)",
+      );
+      await database.execute(`INSERT INTO stock VALUES ${stockValues}`);
+      const created = await store.getTableByName("stock");
+      if (created === undefined) throw new Error("Expected the stock table");
+      const columnId = (name: string): string =>
+        created.columns.find((column) => column.name === name)?.id ?? "";
+      await store.updateTable(created.id, created.revision, {
+        secondaryIndexes: {
+          legacy: {
+            name: "stock_shop_bin_v1",
+            columnId: columnId("shop"),
+            columnIds: [columnId("shop"), columnId("bin")],
+            directions: ["asc", "asc"],
+            termEncoding: "tuple-v1",
+            storage: "postings-v1",
+            storageColumnId: "legacy-storage",
+            locator: "key-hash-v1",
+            state: "building",
+            buildId: "abandoned-v1-build",
+            buildFromVersion: -1,
+          },
+        },
+      });
+
+      // A query over an indexed column takes the abandoned build over; the base it writes uses
+      // the record's own tuple-v1 encoding, so it genuinely omits every NULL-bin row.
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        await database.query("SELECT id FROM stock WHERE shop = 'north'", { memoize: false });
+        const state = (await store.getTableByName("stock"))?.secondaryIndexes?.legacy?.state;
+        if (state === "ready") break;
+      }
+      expect((await store.getTableByName("stock"))?.secondaryIndexes?.legacy).toMatchObject({
+        state: "ready",
+        termEncoding: "tuple-v1",
+      });
+
+      // Prefix pruning is refused, so the answer comes from a full scan and stays complete.
+      expect(await database.explain("SELECT id FROM stock WHERE shop = 'north'")).not.toContain(
+        PRUNES,
+      );
+      expect(
+        (
+          await database.query("SELECT id FROM stock WHERE shop = 'north' ORDER BY id", {
+            memoize: false,
+          })
+        ).rows,
+      ).toEqual(northIds);
+
+      // A full-key equality names every column, so no NULL row can belong to the answer and the
+      // old base is still safe to prune with.
+      expect(
+        await database.explain("SELECT id FROM stock WHERE shop = 'north' AND bin = 1"),
+      ).toContain(PRUNES);
+      expect(
+        (
+          await database.query(
+            "SELECT id FROM stock WHERE shop = 'north' AND bin = 1 ORDER BY id",
+            {
+              memoize: false,
+            },
+          )
+        ).rows,
+      ).toEqual(northBinOneIds);
+
+      // Rebuilding under the current encoding restores prefix pruning.
+      await database.execute("DROP INDEX stock_shop_bin_v1");
+      await database.execute("CREATE INDEX stock_shop_bin ON stock(shop, bin)");
+      expect(await database.explain("SELECT id FROM stock WHERE shop = 'north'")).toContain(PRUNES);
+      expect(
+        (
+          await database.query("SELECT id FROM stock WHERE shop = 'north' ORDER BY id", {
+            memoize: false,
+          })
+        ).rows,
+      ).toEqual(northIds);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+});

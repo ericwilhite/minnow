@@ -114,6 +114,7 @@ import {
   type FtsColumnIndexRecord,
   type FtsPostingQuery,
   type FtsPosting,
+  type SecondaryIndexDirection,
   type SecondaryIndexRecord,
   secondaryIndexColumnIds,
   secondaryIndexDirections,
@@ -2780,7 +2781,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           directions: indexedColumns.map(() => "asc" as const),
           unique: true,
           uniqueEnforced: true,
-          termEncoding: "tuple-v1",
+          termEncoding: "tuple-v2",
           storage: "postings-v1",
           storageColumnId: this.#createId(),
           locator: uniqueKeyColumn === undefined ? "row-id" : "key-hash-v1",
@@ -20142,7 +20143,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 columnIds: columns.map((column) => column.id),
                 directions: indexColumns.map((column) => column.direction),
                 ...(options.unique === true ? { unique: true as const } : {}),
-                termEncoding: "tuple-v1",
+                termEncoding: "tuple-v2",
                 storage: "postings-v1",
                 storageColumnId,
                 locator: current.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
@@ -20532,7 +20533,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               ? null
               : storedSqlValueFromExecution(columns[position], vectorValue(vector, row)),
           );
-          if (values.some((value) => value === null)) continue;
           const locator = secondaryKeyLocator(
             keyColumn.type,
             storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
@@ -20606,7 +20606,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               ? null
               : storedSqlValueFromExecution(columns[position], vectorValue(vector, row)),
           );
-          if (values.some((value) => value === null)) continue;
           const locator =
             keyColumn === undefined
               ? (rowIdAt?.(row) ?? 0n)
@@ -20736,7 +20735,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               const vector = vectors[position];
               return vector === undefined ? (column.backfill ?? null) : vectorValue(vector, row);
             });
-            if (values.some((value) => value === null)) continue;
             const locator =
               keyColumn === undefined
                 ? (rowIdAt?.(segmentRow + row) ?? 0n)
@@ -24227,7 +24225,31 @@ function secondaryIndexTerm(type: SimpleDataType, value: BatchValue): string {
   return sortable.toString(16).padStart(16, "0");
 }
 
-/** Prefix-free hexadecimal scalar component used by tuple-v1 composite keys. */
+/**
+ * The NULL component marker of a `tuple-v2` term, per key direction.
+ *
+ * Every non-null component is hexadecimal, so one non-hexadecimal character is both unambiguous
+ * to the decoder and strictly outside the byte span of every real value at that position. An
+ * ascending component puts NULL above every value — the engine's own ASC ordering, NULLs last —
+ * and a descending one mirrors it, which is what reversing a component means. Neither can ever
+ * be produced by an equality or range bound, so no such lookup matches a NULL component.
+ */
+const ASCENDING_NULL_COMPONENT = "g";
+const DESCENDING_NULL_COMPONENT = "/";
+
+/** The lowest byte any non-null component can start with, either direction: hexadecimal zero. */
+const LOWEST_SECONDARY_COMPONENT = "0";
+
+function secondaryNullComponent(direction: SecondaryIndexDirection): string {
+  return direction === "desc" ? DESCENDING_NULL_COMPONENT : ASCENDING_NULL_COMPONENT;
+}
+
+/** Whether this index's terms name rows that hold a NULL in a trailing indexed column. */
+function secondaryIndexTermsCoverNulls(index: SecondaryIndexRecord): boolean {
+  return index.termEncoding === "tuple-v2";
+}
+
+/** Prefix-free hexadecimal scalar component, byte-identical in tuple-v1 and tuple-v2 keys. */
 function secondaryTupleComponent(type: SimpleDataType, value: BatchValue): string {
   if (value === null) throw new TypeError("A NULL has no secondary-index comparison term");
   if (type === "string") {
@@ -24268,20 +24290,41 @@ function reverseSecondaryHex(input: string): string {
   return output;
 }
 
+/**
+ * The posting term one indexed row is named under, or `undefined` when the row has no term.
+ *
+ * A leading NULL is deliberately left unindexed: no equality or range predicate can match it, and
+ * a lookup only ever prefix-seeks from a non-null leading component, so the posting could never
+ * be read. A NULL in a later component is indexed under the marker, which keeps the row inside
+ * the prefix range of its non-null leading components — the whole point of `tuple-v2`.
+ */
 function secondaryTupleIndexTerm(
   index: SecondaryIndexRecord,
   columns: readonly TableColumnRecord[],
   values: readonly BatchValue[],
-): string {
+): string | undefined {
   if (columns.length !== values.length) throw new TypeError("Index key has the wrong arity");
+  if (values[0] === null) return undefined;
+  // tuple-v1 has no marker for a NULL component, so such a row stays out of the postings and the
+  // planner refuses to prefix-prune through the index's nullable trailing columns.
+  if (!secondaryIndexTermsCoverNulls(index) && values.some((value) => value === null)) {
+    return undefined;
+  }
   const directions = secondaryIndexDirections(index);
   let term = "";
   for (const [position, column] of columns.entries()) {
-    const component = secondaryTupleComponent(column.type, values[position] ?? null);
+    const direction = directions[position] ?? "asc";
+    const value = values[position] ?? null;
+    const encoded =
+      value === null
+        ? secondaryNullComponent(direction)
+        : secondaryTupleComponent(column.type, value);
+    const component =
+      value !== null && direction === "desc" ? reverseSecondaryHex(encoded) : encoded;
     if (term.length + component.length > MAX_FTS_POSTING_TERM_CHARACTERS) {
       throw new RangeError("Composite index term exceeds the persisted term limit");
     }
-    term += directions[position] === "desc" ? reverseSecondaryHex(component) : component;
+    term += component;
   }
   return term;
 }
@@ -24305,9 +24348,16 @@ function decodeSecondaryTupleTerm(
   const directions = secondaryIndexDirections(index);
   let offset = 0;
   const values = columns.map((column, position) => {
-    const descending = directions[position] === "desc";
+    const direction = directions[position] ?? "asc";
+    const descending = direction === "desc";
     const restore = (encoded: string): string =>
       descending ? reverseSecondaryHex(encoded) : encoded;
+    // The marker is the one non-hexadecimal character a component can start with, so a tuple-v1
+    // term — which never holds one — decodes exactly as before.
+    if (term.startsWith(secondaryNullComponent(direction), offset)) {
+      offset += 1;
+      return null;
+    }
     if (column.type === "string") {
       let value = "";
       for (;;) {
@@ -24366,14 +24416,18 @@ function addSecondaryPosting(
   locator: bigint,
   uniqueTerms?: Set<string>,
 ): void {
-  if (values.some((value) => value === null)) return;
   const first = columns[0];
   if (first === undefined) return;
   const term = secondaryTupleIndexTerm(index, columns, values);
-  if (uniqueTerms?.has(term) === true) {
-    throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
+  if (term === undefined) return;
+  // PostgreSQL UNIQUE ignores a row with a NULL in any indexed column: such rows now carry a
+  // posting so a prefix lookup can find them, but they never join the uniqueness set.
+  if (!values.some((value) => value === null)) {
+    if (uniqueTerms?.has(term) === true) {
+      throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
+    }
+    uniqueTerms?.add(term);
   }
-  uniqueTerms?.add(term);
   const posting = byTerm.get(term) ?? { rowIds: [], tf: [] };
   posting.rowIds.push(locator);
   posting.tf.push(1);
@@ -24533,7 +24587,6 @@ function buildSecondaryInsertDeltas(
     try {
       for (let row = 0; row < rowCount; row += 1) {
         const values = indexedColumns.map((column) => input.columns[column.name]?.[row] ?? null);
-        if (values.some((value) => value === null)) continue;
         const locator =
           keyColumn === undefined
             ? rowIdStart + BigInt(row)
@@ -24582,7 +24635,6 @@ function buildSecondaryUpdateDeltas(
               ? (preImages[row]?.[column.name] ?? null)
               : (input.changes[column.name]?.[row] ?? null),
           );
-          if (values.some((value) => value === null)) continue;
           addSecondaryPosting(
             byTerm,
             index,
@@ -24653,6 +24705,9 @@ function secondaryUniqueTerm(
   columns: readonly TableColumnRecord[],
   values: readonly BatchValue[],
 ): string | undefined {
+  // PostgreSQL UNIQUE semantics: a row with a NULL in any indexed column does not participate in
+  // uniqueness, so any number of them may coexist. The postings name those rows under a tuple-v2
+  // marker for pruning, but the membership set never holds their terms.
   if (values.some((value) => value === null)) return undefined;
   return secondaryTupleIndexTerm(index, columns, values);
 }
@@ -27136,13 +27191,16 @@ function secondaryIndexPredicates(
       // unsound, so preserve equality acceleration and let range predicates scan/recheck.
       if (column.sqlDomain !== undefined) break;
       if (constraint.lower === undefined && constraint.upper === undefined) break;
-      const descending = secondaryIndexDirections(index)[position] === "desc";
+      const direction = secondaryIndexDirections(index)[position] ?? "asc";
+      const descending = direction === "desc";
       queries = prefixes.map((prefix) => {
         const query: FtsPostingQuery = {};
         const logicalLower = descending ? constraint.upper : constraint.lower;
         const logicalUpper = descending ? constraint.lower : constraint.upper;
         if (logicalLower === undefined) {
-          query.lower = prefix;
+          // An open side must still stop at the non-null span: a tuple-v2 NULL marker sits
+          // outside every hexadecimal component, and no range matches NULL in SQL.
+          query.lower = descending ? prefix + LOWEST_SECONDARY_COMPONENT : prefix;
           query.lowerInclusive = true;
         } else {
           const term =
@@ -27151,7 +27209,7 @@ function secondaryIndexPredicates(
           query.lowerInclusive = logicalLower.inclusive;
         }
         if (logicalUpper === undefined) {
-          query.upper = `${prefix}\uffff`;
+          query.upper = descending ? `${prefix}\uffff` : prefix + ASCENDING_NULL_COMPONENT;
           query.upperInclusive = false;
         } else {
           const term =
@@ -27165,11 +27223,15 @@ function secondaryIndexPredicates(
       break;
     }
     if (matchedColumns === 0) continue;
-    // Postings exist only for rows whose every indexed value is non-null. A prefix lookup
-    // leaves the trailing columns unconstrained, so a row that is NULL in one of them would be
-    // a legitimate match the index cannot name; pruning through it would drop the row.
+    // A lookup that leaves trailing key columns unconstrained reads every term under its prefix.
+    // tuple-v1 postings exist only for rows whose every indexed value is non-null, so a row that
+    // is NULL in one of those trailing columns is a legitimate match the index cannot name and
+    // pruning through it would drop the row. tuple-v2 names it under the NULL marker instead. An
+    // index built before the marker existed keeps serving equality and range lookups — neither can
+    // match a NULL — and becomes eligible for prefix pruning again once it is rebuilt.
     if (
       matchedColumns < indexedColumns.length &&
+      !secondaryIndexTermsCoverNulls(index) &&
       indexedColumns.slice(matchedColumns).some((column) => column.nullable)
     ) {
       continue;

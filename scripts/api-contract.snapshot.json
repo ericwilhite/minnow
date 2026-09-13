@@ -4501,7 +4501,7 @@
               "name": "SecondaryIndexRecord",
               "kind": "type",
               "declarations": [
-                "export interface SecondaryIndexRecord {\n    name: string;\n    columnId: string;\n    columnIds: string[];\n    directions: SecondaryIndexDirection[];\n    unique?: true;\n    uniqueEnforced?: true;\n    termEncoding: \"tuple-v1\";\n    storage: \"postings-v1\";\n    storageColumnId: string;\n    locator: \"row-id\" | \"key-hash-v1\";\n    state: SecondaryIndexState;\n    buildId?: string;\n    buildFromVersion: number;\n}"
+                "export interface SecondaryIndexRecord {\n    name: string;\n    columnId: string;\n    columnIds: string[];\n    directions: SecondaryIndexDirection[];\n    unique?: true;\n    uniqueEnforced?: true;\n    termEncoding: \"tuple-v1\" | \"tuple-v2\";\n    storage: \"postings-v1\";\n    storageColumnId: string;\n    locator: \"row-id\" | \"key-hash-v1\";\n    state: SecondaryIndexState;\n    buildId?: string;\n    buildFromVersion: number;\n}"
               ]
             },
             {
@@ -6789,7 +6789,7 @@
               "name": "SecondaryIndexRecord",
               "kind": "type",
               "declarations": [
-                "export interface SecondaryIndexRecord {\n    name: string;\n    columnId: string;\n    columnIds: string[];\n    directions: SecondaryIndexDirection[];\n    unique?: true;\n    uniqueEnforced?: true;\n    termEncoding: \"tuple-v1\";\n    storage: \"postings-v1\";\n    storageColumnId: string;\n    locator: \"row-id\" | \"key-hash-v1\";\n    state: SecondaryIndexState;\n    buildId?: string;\n    buildFromVersion: number;\n}"
+                "export interface SecondaryIndexRecord {\n    name: string;\n    columnId: string;\n    columnIds: string[];\n    directions: SecondaryIndexDirection[];\n    unique?: true;\n    uniqueEnforced?: true;\n    termEncoding: \"tuple-v1\" | \"tuple-v2\";\n    storage: \"postings-v1\";\n    storageColumnId: string;\n    locator: \"row-id\" | \"key-hash-v1\";\n    state: SecondaryIndexState;\n    buildId?: string;\n    buildFromVersion: number;\n}"
               ]
             },
             {

@@ -32,6 +32,7 @@ import {
   validateEnumValues,
   validateFtsOrderedReadLimits,
   validateFtsPostingQueries,
+  secondaryIndexWriteContractChanged,
   validateSecondaryIndexes,
   validateSqlDomain,
   validateTableColumns,
@@ -134,6 +135,33 @@ describe("bounded catalog validation", () => {
     record.checks = [{ name: "t_v_idx", sql: "v <> ''" }];
 
     expect(() => validateTableRecordBounds(record)).toThrow("Constraint already exists: t_v_idx");
+  });
+
+  it("admits both composite term encodings and nothing else", () => {
+    // tuple-v1 bases stay readable after tuple-v2 adds the NULL component marker, so a database
+    // written before the marker existed still opens.
+    const withEncoding = (termEncoding: unknown): TableRecord => {
+      const record = indexedTable();
+      const index = record.secondaryIndexes?.index;
+      if (index === undefined) expect.unreachable("index fixture missing");
+      record.secondaryIndexes = { index: { ...index, termEncoding } as typeof index };
+      return record;
+    };
+    expect(() => validateSecondaryIndexes(withEncoding("tuple-v1"))).not.toThrow();
+    expect(() => validateSecondaryIndexes(withEncoding("tuple-v2"))).not.toThrow();
+    expect(() => validateSecondaryIndexes(withEncoding("tuple-v3"))).toThrow(
+      "invalid key metadata",
+    );
+    expect(() => validateSecondaryIndexes(withEncoding(undefined))).toThrow("invalid key metadata");
+  });
+
+  it("treats the term encoding as part of the staged write contract", () => {
+    // A writer that still encodes tuple-v1 terms would leave every NULL-component row out of the
+    // postings a tuple-v2 index lets the planner prefix-prune with.
+    const previous = indexedTable().secondaryIndexes;
+    const next = { index: { ...previous?.index, termEncoding: "tuple-v2" as const } };
+    expect(secondaryIndexWriteContractChanged(previous, next as typeof previous)).toBe(true);
+    expect(secondaryIndexWriteContractChanged(previous, previous)).toBe(false);
   });
 });
 

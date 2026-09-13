@@ -71,9 +71,11 @@ describe.each(stores)("simulator regressions over $name", ({ open }) => {
 
 describe.each(stores)("composite index over nullable columns on $name", ({ open }) => {
   it("does not prune rows whose unconstrained trailing column is NULL", async () => {
-    // A composite index only holds rows whose every indexed value is non-null, so an index on
-    // (c1, c0) has no entry for a row with c0 NULL. A prefix lookup on c1 alone that pruned
-    // through it dropped that row: a SELECT missed it and an UPDATE reported one row too few.
+    // A tuple-v1 composite index only held rows whose every indexed value was non-null, so an
+    // index on (c1, c0) had no entry for a row with c0 NULL. A prefix lookup on c1 alone that
+    // pruned through it dropped that row: a SELECT missed it and an UPDATE reported one row too
+    // few. tuple-v2 names such a row under a NULL component marker, so the lookup both prunes and
+    // returns it; row 5 is the one with c0 NULL.
     const store = await open();
     const database = new MinnowDatabase(store, { rowsPerBlock: 4, autoCompact: false });
     await database.execute(
@@ -83,6 +85,9 @@ describe.each(stores)("composite index over nullable columns on $name", ({ open 
       "INSERT INTO t VALUES (1, -9.75, -4), (5, NULL, 50), (6, 13.5, 1), (9, -4, -13), (11, 2.25, 47), (14, 9.5, -1), (17, 15.75, -32), (22, 2.25, -40), (32, 2.25, -31), (39, 2.25, 36)",
     );
     await database.execute("CREATE INDEX t_c1_c0 ON t (c1, c0)");
+    expect(await database.explain("SELECT id FROM t WHERE c1 > 18 ORDER BY id")).toContain(
+      "a ready secondary index prunes",
+    );
     const selected = await database.query("SELECT id FROM t WHERE c1 > 18 ORDER BY id", {
       memoize: false,
     });

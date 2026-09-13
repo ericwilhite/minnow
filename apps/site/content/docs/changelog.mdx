@@ -13,8 +13,12 @@ compatibility policy and release process.
 Published packages: `@minnowdb/core@0.10.2`.
 
 **Stored formats are unchanged**: OPFS layout 6, IndexedDB schema 2, block format 2, snapshot
-format 1, worker protocol 7. No migration is needed; a 0.10.1 tab and a 0.10.2 tab can share an
-origin.
+format 1, worker protocol 7. One catalog field gains a value: a secondary index's `termEncoding`
+is now `tuple-v2` instead of `tuple-v1`. Both are readable, so **upgrading needs no migration** and
+every existing index keeps working untouched. **Downgrading does not work** once an index has been
+created or rebuilt on 0.10.2: 0.10.1 and earlier accept only `tuple-v1` and report a `tuple-v2`
+index as catalog corruption, so drop such indexes before pinning an older version. Two 0.10.2 tabs,
+and a 0.10.1 tab reading a database whose indexes all predate this release, still share an origin.
 
 A testing audit added an interaction-plan simulator (below) and ran the SQLLogicTest corpus
 inside real browsers. The simulator's first soaks found the engine and adapter defects fixed here,
@@ -35,11 +39,28 @@ each reduced to a deterministic test in `simulator-regressions.test.ts`.
   update but not by the later one that superseded it, and that stale intermediate value could
   satisfy the predicate: a `UNION ALL` member returned rows a later `UPDATE` had moved out of its
   range. Every update and delete segment now stays in a block-level pruned scan.
-- **A composite index no longer skips rows with a NULL trailing column.** Postings exist only for
-  rows whose every indexed value is non-null, so an index on `(a, b)` names no row with `b` NULL. A
-  lookup on `a` alone that pruned through it dropped those rows: a `SELECT` missed them and an
-  `UPDATE` reported one row too few. A prefix lookup no longer prunes through an index whose
-  unconstrained trailing columns are nullable.
+- **A composite index no longer skips rows with a NULL trailing column, and now indexes them.**
+  `tuple-v1` postings exist only for rows whose every indexed value is non-null, so an index on
+  `(a, b)` named no row with `b` NULL. A lookup on `a` alone that pruned through it dropped those
+  rows: a `SELECT` missed them and an `UPDATE` reported one row too few, with no error and an
+  `EXPLAIN` that said the index was pruning. The new `tuple-v2` encoding gives a NULL component a
+  one-character marker, so the row is named under its non-null prefix and a prefix lookup finds it.
+  Every non-null component is byte-identical to `tuple-v1`. The marker sorts outside every real
+  value of that column, so an equality, `IN`, or range on it never matches a NULL, as SQL requires.
+  A NULL in the _leading_ indexed column stays unindexed: no such predicate can match it.
+
+  `UNIQUE` semantics are unchanged and still PostgreSQL's: a row with a NULL in any indexed column
+  does not participate in uniqueness, so any number of them coexist. Those rows now carry a posting
+  for pruning, but never join the membership set.
+
+  An index written by an earlier version genuinely omits its NULL-component rows, so a prefix
+  lookup that leaves nullable trailing key columns unconstrained is refused over it and answers
+  from the ordinary scan — correct, just not accelerated. Its equality and range lookups, which no
+  NULL can match, still prune. `DROP INDEX` then `CREATE INDEX` rebuilds one under the new
+  encoding and restores prefix pruning; an index created on 0.10.2 has it from the start. A staged
+  writer that still encodes `tuple-v1` terms into a `tuple-v2` index is now rejected at commit
+  rather than leaving NULL rows out of the postings the planner prunes with.
+
 - **A transaction that writes two segments to one table can be compacted.** A SQL transaction
   holding, say, a predicate `DELETE` and an `INSERT` on the same table commits two segments with
   one logical order and one committed version. The merge planner ordered its sources by segment

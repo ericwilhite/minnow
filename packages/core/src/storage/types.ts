@@ -547,8 +547,16 @@ export interface SecondaryIndexRecord {
   unique?: true;
   /** The membership set has been seeded and must be enforced, independent of postings state. */
   uniqueEnforced?: true;
-  /** Prefix-free composite encoding used by every v1 secondary index. */
-  termEncoding: "tuple-v1";
+  /**
+   * Prefix-free composite term encoding.
+   *
+   * `tuple-v1` encodes non-null components only: a row with a NULL in any indexed column has no
+   * posting at all, so a prefix lookup through the index cannot see it. `tuple-v2` keeps every
+   * non-null component byte-identical and adds a one-character marker for a NULL component, so a
+   * row with a NULL trailing component is named under its non-null prefix. Both stay readable;
+   * only `tuple-v2` may serve a prefix lookup whose unconstrained trailing columns are nullable.
+   */
+  termEncoding: "tuple-v1" | "tuple-v2";
   storage: "postings-v1";
   storageColumnId: string;
   locator: "row-id" | "key-hash-v1";
@@ -586,6 +594,9 @@ export function secondaryIndexWriteContractChanged(
       left.columnIds.some((columnId, index) => columnId !== right.columnIds[index]) ||
       left.directions.length !== right.directions.length ||
       left.directions.some((direction, index) => direction !== right.directions[index]) ||
+      // A writer that still encodes tuple-v1 terms into a tuple-v2 index would leave every
+      // NULL-component row out of the postings the planner is now allowed to prefix-prune with.
+      left.termEncoding !== right.termEncoding ||
       left.unique !== right.unique ||
       left.uniqueEnforced !== right.uniqueEnforced ||
       left.storageColumnId !== right.storageColumnId ||
@@ -964,7 +975,7 @@ export function validateSecondaryIndexes(record: TableRecord): void {
     if (
       directions.length !== indexedColumnIds.length ||
       directions.some((direction) => direction !== "asc" && direction !== "desc") ||
-      termEncoding !== "tuple-v1"
+      (termEncoding !== "tuple-v1" && termEncoding !== "tuple-v2")
     ) {
       throw new TypeError(`Secondary index ${index.name} has invalid key metadata`);
     }
