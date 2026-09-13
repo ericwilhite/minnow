@@ -1059,6 +1059,13 @@
               ]
             },
             {
+              "name": "StorageUnresponsiveError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class StorageUnresponsiveError extends UnknownOutcomeError {\n    readonly backend: string;\n    readonly databaseName: string;\n    readonly waitedMs: number;\n    readonly name = \"StorageUnresponsiveError\";\n    constructor(backend: string, databaseName: string, waitedMs: number);\n}"
+              ]
+            },
+            {
               "name": "table",
               "kind": "type-and-value",
               "declarations": [
@@ -3391,6 +3398,13 @@
               ]
             },
             {
+              "name": "INDEXEDDB_UNRESPONSIVE_AFTER_MS",
+              "kind": "value",
+              "declarations": [
+                "INDEXEDDB_UNRESPONSIVE_AFTER_MS = 30000"
+              ]
+            },
+            {
               "name": "IndexedDbBlockStore",
               "kind": "type-and-value",
               "declarations": [
@@ -3401,7 +3415,7 @@
               "name": "IndexedDbBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n}"
+                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n    unresponsiveAfterMs?: number;\n}"
               ]
             },
             {
@@ -4824,6 +4838,13 @@
               "kind": "type",
               "declarations": [
                 "export interface StorageStats {\n    readonly backend: string;\n    readonly logicalBytes: number;\n    readonly physicalBytes: number | null;\n    readonly liveBlockCount: number;\n    readonly obsoleteBlockCount: number;\n    readonly liveBlockBytes: number;\n    readonly obsoleteBlockBytes: number;\n    readonly temporaryBytes: number;\n    readonly walBytes: number | null;\n    readonly checkpointBytes: number | null;\n    readonly orphanBytes: number | null;\n    readonly manifestCount: number;\n    readonly transactionCount: number;\n    readonly segmentCount: number;\n    readonly maintenance?: {\n        readonly degraded: boolean;\n        readonly consecutiveFailures: number;\n        readonly lastError: string | null;\n        readonly walLimitBytes: number | null;\n        readonly cleanupDebtBytes: number | null;\n        readonly cleanupLimitBytes: number | null;\n    };\n}"
+              ]
+            },
+            {
+              "name": "StorageUnresponsiveError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class StorageUnresponsiveError extends UnknownOutcomeError {\n    readonly backend: string;\n    readonly databaseName: string;\n    readonly waitedMs: number;\n    readonly name = \"StorageUnresponsiveError\";\n    constructor(backend: string, databaseName: string, waitedMs: number);\n}"
               ]
             },
             {
@@ -7066,6 +7087,13 @@
               ]
             },
             {
+              "name": "StorageUnresponsiveError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class StorageUnresponsiveError extends UnknownOutcomeError {\n    readonly backend: string;\n    readonly databaseName: string;\n    readonly waitedMs: number;\n    readonly name = \"StorageUnresponsiveError\";\n    constructor(backend: string, databaseName: string, waitedMs: number);\n}"
+              ]
+            },
+            {
               "name": "StoredManifestRecord",
               "kind": "type",
               "declarations": [
@@ -7415,6 +7443,13 @@
           "audience": "application",
           "exports": [
             {
+              "name": "INDEXEDDB_UNRESPONSIVE_AFTER_MS",
+              "kind": "value",
+              "declarations": [
+                "INDEXEDDB_UNRESPONSIVE_AFTER_MS = 30000"
+              ]
+            },
+            {
               "name": "IndexedDbBlockStore",
               "kind": "type-and-value",
               "declarations": [
@@ -7425,7 +7460,7 @@
               "name": "IndexedDbBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n}"
+                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n    unresponsiveAfterMs?: number;\n}"
               ]
             }
           ]
@@ -8085,7 +8120,7 @@
               "name": "InteractionRunResult",
               "kind": "type",
               "declarations": [
-                "export interface InteractionRunResult {\n    readonly seed: number;\n    readonly interactions: number;\n    readonly statements: number;\n    readonly queries: number;\n    readonly acceptedWrites: number;\n    readonly rejectedConflicts: number;\n    readonly expectedFailures: number;\n    readonly faultsInjected: number;\n    readonly faultsSkipped: number;\n    readonly reopens: number;\n    readonly checkpoints: number;\n    readonly tablesAtEnd: number;\n    readonly rowsAtEnd: number;\n}"
+                "export interface InteractionRunResult {\n    readonly seed: number;\n    readonly interactions: number;\n    readonly statements: number;\n    readonly queries: number;\n    readonly acceptedWrites: number;\n    readonly rejectedConflicts: number;\n    readonly expectedFailures: number;\n    readonly faultsInjected: number;\n    readonly faultsSkipped: number;\n    readonly reopens: number;\n    readonly checkpoints: number;\n    readonly tablesAtEnd: number;\n    readonly rowsAtEnd: number;\n    readonly transientsAccepted: number;\n    readonly stoppedBy: string | undefined;\n}"
               ]
             },
             {

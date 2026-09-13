@@ -259,6 +259,12 @@ machines: https://minnowdb.com/llms.txt
   they go to `console.error`. They are not fatal. `DatabaseWorkerFailedError` is: it means the
   Worker itself raised an unhandled error or an unreadable frame, and the client must be
   replaced.
+- Never call `worker.terminate()` yourself; `client.close({ terminateWorker: true })` disposes the
+  store first. A worker killed with a write in flight leaves WebKit holding its IndexedDB
+  connection until that document is gone, and every connection to the database — new ones in other
+  tabs included — blocks meanwhile. The engine bounds that wait and throws
+  `StorageUnresponsiveError` after thirty seconds of total storage silence; the remedy is to reload
+  the page, not `reopen()`, which opens the same wedged database.
 - OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
   deletion while a current client is open; a client just closed is waited for, not refused. Close
   pre-0.9.0 clients too: they do not participate in the deletion lock protocol.

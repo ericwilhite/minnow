@@ -109,6 +109,16 @@ each reduced to a deterministic test in `simulator-regressions.test.ts`.
   background collection treats another tab's progress as work done rather than reporting a
   failure through `onBackgroundError`. The block-store conformance kit pins the adapter
   behaviour.
+- **A wedged IndexedDB connection fails instead of hanging forever.** A worker killed with a write
+  in flight leaves WebKit holding its IndexedDB connection, and its unfinished transaction, until
+  the document that created the worker goes away; until then every connection to that database
+  blocks, including connections opened afterwards in other tabs, and no event ever arrives. A read
+  through a replacement worker therefore never returned. The adapter now keeps one deadline for
+  the whole connection — thirty seconds of no storage event at all while work is outstanding, reset
+  by any event, so a transaction queued behind a long one is never mistaken for a wedge — and fails
+  every waiting call with `StorageUnresponsiveError`, then refuses new work rather than queueing
+  behind it. The error says what the remedy is: reload the page, because a new worker in the same
+  document opens the same wedged database.
 - **Closing while automatic collection is in flight reports no error.** `close()` refused the
   collector's next store call with "Database is closed" and handed that refusal to
   `onBackgroundError` — on the page console of every worker-hosted database that closed with a
@@ -122,6 +132,11 @@ each reduced to a deterministic test in `simulator-regressions.test.ts`.
   transactions, concurrent rounds, faults, reopens, and maintenance across several connections,
   checked against a shadow model and a set of properties; the driver interface lets the same plan
   run over any block store in Node or across real browser tabs.
+- **`StorageUnresponsiveError`** on the main entry and `@minnowdb/core/storage/contracts`: a store
+  that answered nothing for its whole deadline. It extends `UnknownOutcomeError` and classifies as
+  `unknown-outcome` with the connection unusable. `IndexedDbBlockStore.open` takes
+  `unresponsiveAfterMs` to change that deadline from the exported
+  `INDEXEDDB_UNRESPONSIVE_AFTER_MS` default of thirty seconds.
 
 ### Changed
 
@@ -140,7 +155,10 @@ each reduced to a deterministic test in `simulator-regressions.test.ts`.
   commit race and acknowledges an idle rollback instead of reporting an engine defect, and the
   browser tab harness reports a crashed worker to its client at once, so an in-flight call fails as
   an unknown outcome rather than waiting out the 60-second silence deadline — a minute long enough
-  to expire another tab's open transaction.
+  to expire another tab's open transaction. The browser driver also recovers a crash by reloading
+  the document, the remedy `StorageUnresponsiveError` names, so all three browsers run the plan's
+  crash faults; a store that stops answering anyway is recorded in `transientsAccepted` and ends
+  the run instead of failing it.
 
 ## 0.10.1 — September 12, 2026
 

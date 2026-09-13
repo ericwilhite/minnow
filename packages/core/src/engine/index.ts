@@ -56,4 +56,5 @@ export {
   OpfsCoordinationError,
   OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
+  StorageUnresponsiveError,
 } from "../storage/types.js";

@@ -346,6 +346,15 @@ statement in flight — the tab then reports the loss to its client at once, so 
 fails as an unknown outcome instead of waiting out the client's silence deadline. The same seed
 produces the same plan in both.
 
+The browser driver recovers a crash the way an application must: by reloading the document. A new
+worker in the same document is enough on Chromium and Firefox, but WebKit keeps the dead worker's
+IndexedDB connection registered until its document goes away and blocks every connection to that
+database meanwhile — so a reload is the remedy the engine's `StorageUnresponsiveError` names, and
+the driver uses it. A run that meets an unresponsive store anyway records it in
+`transientsAccepted` and stops there, with `interactions` counting the steps it judged; the engine
+bounding the wait and saying so is the accepted outcome, since nothing further can be driven
+through a store the browser has wedged.
+
 ```bash
 npm run simulate:interactions -- --seed 24301 --length 300 --connections 4 --store indexeddb
 npm run simulate:interactions -- --seed 24301 --write-plan /tmp/minnow-interactions.json

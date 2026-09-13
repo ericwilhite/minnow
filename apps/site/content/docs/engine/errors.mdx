@@ -26,7 +26,7 @@ try {
 
 | Kind              | Errors                                                                                                                                                                                                                                                  | May have published | Retry                                            | Connection usable |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------------ | ----------------- |
-| `unknown-outcome` | `DatabaseWorkerOutcomeUnknownError`, `OpfsUncertainOutcomeError` — both extend `UnknownOutcomeError`                                                                                                                                                    | **yes**            | after reconciling                                | see below         |
+| `unknown-outcome` | `DatabaseWorkerOutcomeUnknownError`, `OpfsUncertainOutcomeError`, `StorageUnresponsiveError` — all extend `UnknownOutcomeError`                                                                                                                         | **yes**            | after reconciling                                | see below         |
 | `connection-lost` | `DatabaseWorkerTimeoutError`, `DatabaseWorkerFailedError` — both extend `ConnectionLostError`                                                                                                                                                           | no                 | never on this client                             | **no**            |
 | `conflict`        | `WriteConflictError`, `SchemaConflictError`, `TableRecordConflictError`, `TransactionRecordConflictError`, lease, compaction, collection, temp-owner, index-build, and snapshot-import conflicts, `TableInUseError`, `OpfsDatabaseInUseError`           | no                 | as is                                            | yes               |
 | `rejected`        | `UniqueConstraintError`, `UniqueKeyConflictError`, `UniqueIndexCoverageError`, `MissingKeyError`, `UnknownTableError`, `SqlCompileError`, `CompactionJobCancelledError`, any `TypeError`, `RangeError`, `SyntaxError`                                   | no                 | never as written                                 | yes               |
@@ -58,6 +58,24 @@ const client = new MinnowDatabaseClient(() => new Worker(workerUrl, { type: "mod
 Handles from before the loss — write scopes, live sets, cursors, buffered writers — belonged to
 the old worker and must be recreated. A mutation that was in flight was already reported as an
 unknown outcome.
+
+## A store that stops answering
+
+`StorageUnresponsiveError` means the database answered nothing at all for thirty seconds while
+the engine had work outstanding. Nothing in IndexedDB can be cancelled or timed out, so this
+deadline is what stands between a wedged browser and a call that never returns; any storage event
+resets it, so work queued behind a genuinely long transaction is never mistaken for a wedge.
+
+The known cause is a worker killed with a write in flight — `worker.terminate()` from your own
+code, or the browser killing it. Safari and other WebKit browsers keep the dead worker's
+IndexedDB connection, and its unfinished transaction, registered until the document that created
+the worker goes away. While it is registered, every connection to that database blocks, including
+connections opened afterwards in other tabs.
+
+**Reload the page.** `reopen()` is not enough: a new worker in the same document opens the same
+wedged database. Reloading, or closing the tab, releases the dead connection immediately. Let the
+engine terminate workers for you — `close({ terminateWorker: true })` disposes the store first —
+and treat a write that was in flight as an unknown outcome.
 
 Background failures that belong to no call — an uncaught exception in the worker, a failed
 checkpoint, an election that threw — are not errors on any promise. They arrive through

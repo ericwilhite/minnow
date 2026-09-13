@@ -256,11 +256,22 @@ export interface InteractionRunOptions {
 
 export interface InteractionRunResult {
   readonly seed: number;
+  /** Interactions judged. Short of the plan's length only when `transientsAccepted` is not zero. */
   readonly interactions: number;
   readonly statements: number;
   readonly queries: number;
   readonly acceptedWrites: number;
+  /**
+   * Refusals the engine documents and the runner models rather than reports: a write that lost a
+   * conflict, and a transaction whose COMMIT lost the race to another connection's data commit.
+   * The run continues from the state they leave behind.
+   */
   readonly rejectedConflicts: number;
+  /**
+   * Refusals the plan expected: a duplicate insert, a double create, and a transaction the engine
+   * rolled back on its own idle deadline, which the runner acknowledges with a `ROLLBACK`. These
+   * do not stop the run either.
+   */
   readonly expectedFailures: number;
   readonly faultsInjected: number;
   readonly faultsSkipped: number;
@@ -268,6 +279,17 @@ export interface InteractionRunResult {
   readonly checkpoints: number;
   readonly tablesAtEnd: number;
   readonly rowsAtEnd: number;
+  /**
+   * The one transient that ends a run instead of being modelled: a store that stopped answering.
+   * A browser can wedge a whole database beyond any engine's reach (a worker terminated with a
+   * write in flight leaves WebKit's IndexedDB connection registered until its document goes away),
+   * and the engine then bounds the wait and reports `StorageUnresponsiveError` rather than hanging.
+   * Nothing further can be driven through that store, so the run stops at that interaction and
+   * `interactions` counts only the steps it judged.
+   */
+  readonly transientsAccepted: number;
+  /** What ended the run early, when `transientsAccepted` is not zero. */
+  readonly stoppedBy: string | undefined;
 }
 
 export class InteractionFailure extends Error {
@@ -1326,15 +1348,24 @@ class PlanRunner {
     for (let index = 0; index < this.#plan.connections; index++) {
       this.#connections.push(await this.#driver.open(index));
     }
+    let judged = 0;
+    let stoppedBy: string | undefined;
     for (const [index, interaction] of this.#plan.interactions.entries()) {
       this.#index = index;
-      await this.#step(interaction);
+      try {
+        await this.#step(interaction);
+      } catch (error) {
+        if (!isStoreUnresponsive(error)) throw error;
+        stoppedBy = describeError(error);
+        break;
+      }
+      judged += 1;
     }
     let rows = 0;
     for (const table of this.#model.tables.values()) rows += table.rows.size;
     return {
       seed: this.#plan.seed,
-      interactions: this.#plan.interactions.length,
+      interactions: judged,
       statements: this.#statements,
       queries: this.#queries,
       acceptedWrites: this.#acceptedWrites,
@@ -1346,6 +1377,8 @@ class PlanRunner {
       checkpoints: this.#checkpoints,
       tablesAtEnd: this.#model.tables.size,
       rowsAtEnd: rows,
+      transientsAccepted: stoppedBy === undefined ? 0 : 1,
+      stoppedBy,
     };
   }
 
@@ -2148,6 +2181,19 @@ function isUnknownOutcome(error: unknown): boolean {
 
 function isInjectedFault(error: unknown): boolean {
   return /injected/iu.test(errorText(error));
+}
+
+/**
+ * A store that stopped answering, reported by name so it is recognized across a driver that
+ * carries errors as text. The failure may be wrapped -- an `InteractionFailure` keeps it as its
+ * cause -- so the whole chain is searched.
+ */
+function isStoreUnresponsive(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current !== undefined && depth < 8; depth += 1) {
+    if (errorText(current).includes("StorageUnresponsive")) return true;
+    current = isRecord(current) ? current.cause : undefined;
+  }
+  return false;
 }
 
 // Stream-identical copy of `mulberry32` in ./seeds.ts; see simulator.ts for why the published

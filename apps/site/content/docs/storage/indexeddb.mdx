@@ -207,6 +207,21 @@ silently upgrade or rebuild the database after its caller has moved on.
 Transaction completion is observed before requests are submitted. An abort remains observable
 even if quota or request-failure processing resumes after the abort event.
 
+## A connection that stops answering
+
+IndexedDB requests cannot be cancelled and report no progress, so the adapter keeps one deadline
+for the whole connection: if thirty seconds pass with no storage event at all while it has work
+outstanding, every waiting call fails with `StorageUnresponsiveError` and the store refuses new
+work rather than queueing behind something that never moves. Any event resets the deadline, so a
+transaction waiting behind a genuinely long one is never mistaken for a wedge.
+`unresponsiveAfterMs` on `IndexedDbBlockStore.open` changes the deadline.
+
+A wedge like that has one known cause: a worker killed with a write in flight. WebKit keeps the
+dead worker's connection, and its unfinished transaction, registered until the document that
+created the worker goes away, and until then every connection to that database blocks — new ones
+in other tabs included. No adapter can undo that, so it bounds the wait and names the remedy:
+reload the page. See [Errors](/docs/engine/errors) for what a caller should do with it.
+
 ## Schema compatibility and recovery
 
 The current IndexedDB schema is 2. Schema 1 kept each transaction's journal ids on the record

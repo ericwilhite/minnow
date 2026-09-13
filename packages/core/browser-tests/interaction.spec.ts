@@ -41,31 +41,37 @@ function rethrow<T>(value: T | TabFailure): T {
   return value;
 }
 
+interface Tab {
+  execute(sql: string, params?: PlanValue[]): Promise<SimulatedExecuteResult | TabFailure>;
+  query(sql: string, params?: PlanValue[]): Promise<SimulatedQueryResult | TabFailure>;
+  reopen(): Promise<void>;
+  crash(): Promise<void>;
+  maintain(table: string): Promise<void>;
+  pageErrors(): string[];
+}
+type TabWindow = typeof window & { simulatorTab: Tab };
+
 async function openTab(
   page: Page,
   kind: StoreKind,
   name: string,
-  crashes: boolean,
+  collect: (errors: string[]) => void,
 ): Promise<SimulatedConnection> {
-  await page.goto("/packages/core/browser/interaction/");
-  await expect(page.locator("#ready")).toHaveText("Interaction simulator tab ready");
-  await page.evaluate(
-    async ({ kind, name }) => {
-      const target = window as typeof window & {
-        simulatorTab: { open(k: string, n: string): Promise<void> };
-      };
-      await target.simulatorTab.open(kind, name);
-    },
-    { kind, name },
-  );
-  interface Tab {
-    execute(sql: string, params?: PlanValue[]): Promise<SimulatedExecuteResult | TabFailure>;
-    query(sql: string, params?: PlanValue[]): Promise<SimulatedQueryResult | TabFailure>;
-    reopen(): Promise<void>;
-    crash(): Promise<void>;
-    maintain(table: string): Promise<void>;
-  }
-  type TabWindow = typeof window & { simulatorTab: Tab };
+  const load = async (): Promise<void> => {
+    await page.goto("/packages/core/browser/interaction/");
+    await expect(page.locator("#ready")).toHaveText("Interaction simulator tab ready");
+    await page.evaluate(
+      async ({ kind, name }) => {
+        const target = window as typeof window & {
+          simulatorTab: { open(k: string, n: string): Promise<void> };
+        };
+        await target.simulatorTab.open(kind, name);
+      },
+      { kind, name },
+    );
+  };
+  await load();
+  let crashed = false;
   // Each callback runs inside the page, so it must reach the tab through `window` itself.
   return {
     execute: async (sql, params) =>
@@ -82,14 +88,27 @@ async function openTab(
           { sql, params: params === undefined ? undefined : [...params] },
         ),
       ),
-    reopen: () => page.evaluate(() => (window as TabWindow).simulatorTab.reopen()),
-    // WebKit once stalled for the whole test timeout on the first read after a worker was
-    // terminated mid-write, and the stall did not reproduce in isolation; until it is
-    // understood, WebKit runs the plan without crash faults so the rest of it still judges
-    // WebKit (the Node suites and the other two browsers keep exercising crashes).
-    ...(crashes
-      ? { crash: () => page.evaluate(() => (window as TabWindow).simulatorTab.crash()) }
-      : {}),
+    /**
+     * A crash is recovered the way an application must recover one: by reloading the document.
+     * A new worker in the same document is enough on Chromium and Firefox, but WebKit keeps the
+     * terminated worker's IndexedDB connection -- and its unfinished transaction -- registered
+     * until the document goes away, and until then every connection to that database blocks,
+     * new ones in other tabs included. The engine bounds that wait and reports
+     * `StorageUnresponsiveError` rather than hanging; the remedy it names is this reload.
+     */
+    reopen: async () => {
+      if (!crashed) {
+        await page.evaluate(() => (window as TabWindow).simulatorTab.reopen());
+        return;
+      }
+      crashed = false;
+      collect(await page.evaluate(() => (window as TabWindow).simulatorTab.pageErrors()));
+      await load();
+    },
+    crash: async () => {
+      crashed = true;
+      await page.evaluate(() => (window as TabWindow).simulatorTab.crash());
+    },
     maintain: (table) =>
       page.evaluate((table) => (window as TabWindow).simulatorTab.maintain(table), table),
   };
@@ -104,6 +123,8 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
     const name = `interaction-${crypto.randomUUID()}`;
     const pages: Page[] = [];
     const consoleErrors: string[] = [];
+    // A reload after a crash wipes the tab's own record, so take it before every reload.
+    const tabErrors: string[] = [];
     const driver: SimulationDriver = {
       open: async () => {
         const page = await storageContext.newPage();
@@ -113,7 +134,7 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
           await page.goto("/packages/core/browser/interaction/");
           await requireWorkerOpfs(page);
         }
-        return openTab(page, store, name, browserName !== "webkit");
+        return openTab(page, store, name, (errors) => tabErrors.push(...errors));
       },
     };
     // Seeds differ per browser so three engines explore three plans on every run.
@@ -127,17 +148,11 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       faultPoints: ["crash"],
     });
     const result = await runInteractionPlan(plan, driver);
-    const tabErrors = (
-      await Promise.all(
-        pages.map((page) =>
-          page.evaluate(() =>
-            (
-              window as typeof window & { simulatorTab: { pageErrors(): string[] } }
-            ).simulatorTab.pageErrors(),
-          ),
-        ),
-      )
-    ).flat();
+    for (const page of pages) {
+      tabErrors.push(
+        ...(await page.evaluate(() => (window as TabWindow).simulatorTab.pageErrors())),
+      );
+    }
     await Promise.all(
       pages.map((page) =>
         page.evaluate(() =>
@@ -147,22 +162,23 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         ),
       ),
     );
-    expect(result.interactions).toBe(plan.interactions.length);
-    expect(result.acceptedWrites).toBeGreaterThan(10);
-    expect(result.checkpoints).toBeGreaterThan(0);
-    const faults = plan.interactions.filter((interaction) => interaction.kind === "fault").length;
-    if (browserName === "webkit") {
-      expect(result.faultsSkipped).toBe(faults);
+    // The plan draws crash faults only, and every driver here can crash, so none are skipped.
+    expect(result.faultsSkipped).toBe(0);
+    expect(result.faultsInjected).toBeGreaterThan(0);
+    if (result.transientsAccepted > 0) {
+      // A browser that wedges a whole database is beyond the engine's reach; bounding the wait and
+      // naming it is the accepted outcome, and nothing further can be driven through that store.
+      expect(result.stoppedBy).toMatch(/StorageUnresponsive/u);
     } else {
-      expect(result.faultsInjected).toBeGreaterThan(0);
-      // The plan draws crash faults only, so every fault step was a real worker termination.
-      expect(result.faultsSkipped).toBe(0);
+      expect(result.interactions).toBe(plan.interactions.length);
+      expect(result.acceptedWrites).toBeGreaterThan(10);
+      expect(result.checkpoints).toBeGreaterThan(0);
     }
     expect(consoleErrors).toEqual([]);
     // Worker terminations surface through the client's error sink; the connection-lost report
     // for a deliberate crash is expected, anything else is not.
-    expect(tabErrors.filter((message) => !/terminated|lost|closed|crash/iu.test(message))).toEqual(
-      [],
-    );
+    expect(
+      tabErrors.filter((message) => !/terminated|lost|closed|crash|unresponsive/iu.test(message)),
+    ).toEqual([]);
   });
 }

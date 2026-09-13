@@ -147,6 +147,7 @@ import {
   type StorageStats,
   StorageCorruptionError,
   StorageFormatVersionError,
+  StorageUnresponsiveError,
   IndexedDbSchemaUpgradeBlockedError,
   StorageResourceLimitError,
   type RunGarbageCollectionStepInput,
@@ -558,6 +559,12 @@ export interface IndexedDbBlockStoreOptions {
    * 8 MiB so a table's row count cannot silently become an unbounded resident-memory cost.
    */
   uniqueKeyCacheBytes?: number;
+  /**
+   * How long the connection may answer nothing at all, while it has work outstanding, before
+   * every waiting call fails with `StorageUnresponsiveError` and the store refuses new work.
+   * Defaults to `INDEXEDDB_UNRESPONSIVE_AFTER_MS`.
+   */
+  unresponsiveAfterMs?: number;
 }
 
 const DEFAULT_UNIQUE_KEY_CACHE_BYTES = 8 * 1024 * 1024;
@@ -604,16 +611,27 @@ export class IndexedDbBlockStore implements BlockStore {
   #snapshotPeakRetainedItems = 0;
   #snapshotPeakRetainedBytes = 0;
   #closed = false;
+  /** Set once the connection's deadline ran out; every later call fails with it. */
+  #unresponsive: StorageUnresponsiveError | undefined;
+  readonly #stallGuard: ConnectionStallGuard;
 
   private constructor(
     db: IDBDatabase,
     durability: IDBTransactionDurability,
     uniqueKeyCacheBytes: number,
+    unresponsiveAfterMs: number,
   ) {
     this.#db = db;
     this.liveQueryChannelName = `minnowdb-live:indexeddb:${db.name}`;
     this.#durability = durability;
     this.#uniqueKeyCacheBytes = uniqueKeyCacheBytes;
+    this.#stallGuard = new ConnectionStallGuard(db.name, unresponsiveAfterMs, (error) => {
+      this.#unresponsive = error;
+      // A wedged connection cannot be drained, so stop using it: later calls fail with the typed
+      // error from #transaction instead of joining the queue that never moves.
+      this.close();
+    });
+    stallGuards.set(db, this.#stallGuard);
     db.addEventListener("versionchange", () => {
       // Never leave a newer deployment blocked behind a forgotten connection in another tab.
       // Closing also makes every later method fail deterministically through #transaction.
@@ -626,6 +644,10 @@ export class IndexedDbBlockStore implements BlockStore {
     const uniqueKeyCacheBytes = options.uniqueKeyCacheBytes ?? DEFAULT_UNIQUE_KEY_CACHE_BYTES;
     if (!Number.isSafeInteger(uniqueKeyCacheBytes) || uniqueKeyCacheBytes < 0) {
       throw new RangeError("Unique-key cache bytes must be a non-negative whole number");
+    }
+    const unresponsiveAfterMs = options.unresponsiveAfterMs ?? INDEXEDDB_UNRESPONSIVE_AFTER_MS;
+    if (!Number.isSafeInteger(unresponsiveAfterMs) || unresponsiveAfterMs <= 0) {
+      throw new RangeError("The unresponsive deadline must be a positive whole number of ms");
     }
     const factory = options.indexedDB ?? getGlobalIndexedDb();
     if (factory === undefined) throw new Error("IndexedDB is unavailable");
@@ -655,14 +677,19 @@ export class IndexedDbBlockStore implements BlockStore {
     });
     let db: IDBDatabase;
     try {
-      db = await openDatabaseRequest(request, (event) => {
-        abandoned = true;
-        return new IndexedDbSchemaUpgradeBlockedError(
-          options.name,
-          event.oldVersion,
-          event.newVersion ?? SCHEMA_VERSION,
-        );
-      });
+      db = await openDatabaseRequest(
+        request,
+        (event) => {
+          abandoned = true;
+          return new IndexedDbSchemaUpgradeBlockedError(
+            options.name,
+            event.oldVersion,
+            event.newVersion ?? SCHEMA_VERSION,
+          );
+        },
+        options.name,
+        unresponsiveAfterMs,
+      );
     } catch (error) {
       if (upgradeError !== undefined) throw upgradeError;
       if (isErrorNamed(error, "VersionError")) {
@@ -677,7 +704,12 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       throw error;
     }
-    const store = new IndexedDbBlockStore(db, options.durability ?? "strict", uniqueKeyCacheBytes);
+    const store = new IndexedDbBlockStore(
+      db,
+      options.durability ?? "strict",
+      uniqueKeyCacheBytes,
+      unresponsiveAfterMs,
+    );
     try {
       await validateCurrentIndexedDbSchema(db);
       await store.#validateCatalogResourceLedger();
@@ -8865,6 +8897,7 @@ export class IndexedDbBlockStore implements BlockStore {
     this.#uniqueKeyCache = undefined;
     this.#manifestCache = undefined;
     this.#journalCache = undefined;
+    this.#stallGuard.dispose();
     this.#db.close();
   }
 
@@ -9230,6 +9263,7 @@ export class IndexedDbBlockStore implements BlockStore {
     mode: IDBTransactionMode,
     options: { allowSnapshotImport?: boolean } = {},
   ): IDBTransaction {
+    if (this.#unresponsive !== undefined) throw this.#unresponsive;
     if (this.#closed) throw new Error("This IndexedDB store connection is closed");
     // A transaction record is only meaningful with its journal chunks, so the journal store
     // travels with the transactions store in every scope rather than at every call site.
@@ -9408,20 +9442,144 @@ async function readIndexedDbVersion(factory: IDBFactory, name: string): Promise<
   }
 }
 
+/**
+ * How long a connection may go without a single IndexedDB event, while it has work outstanding,
+ * before the adapter calls it unresponsive. Nothing in IndexedDB can be cancelled and nothing
+ * reports progress, so this is the only way for a store to tell a wedged browser from a busy
+ * one: any event anywhere on the connection resets the deadline, which means a transaction
+ * queued behind a genuinely long one is never mistaken for a wedge — only total silence is.
+ *
+ * See `StorageUnresponsiveError` for the wedge this bounds. Thirty seconds is far longer than
+ * any single request takes and comfortably inside the worker client's own request deadline, so
+ * the typed error is what a caller sees rather than a lost worker.
+ */
+export const INDEXEDDB_UNRESPONSIVE_AFTER_MS = 30_000;
+
+/**
+ * One deadline for a whole IndexedDB connection. Callers register while they wait; releasing a
+ * registration counts as progress and restarts the deadline for whoever is still waiting. When
+ * it runs out every waiter is rejected with the same `StorageUnresponsiveError` and the store
+ * that owns the guard stops accepting work.
+ */
+class ConnectionStallGuard {
+  readonly #databaseName: string;
+  readonly #afterMs: number;
+  readonly #onTrip: (error: StorageUnresponsiveError) => void;
+  readonly #waiting = new Set<(error: Error) => void>();
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #tripped: StorageUnresponsiveError | undefined;
+  #disposed = false;
+
+  constructor(
+    databaseName: string,
+    afterMs: number,
+    onTrip: (error: StorageUnresponsiveError) => void,
+  ) {
+    this.#databaseName = databaseName;
+    this.#afterMs = afterMs;
+    this.#onTrip = onTrip;
+  }
+
+  /**
+   * Registers a waiting caller and returns its release, which must run on every settlement.
+   * A guard that has already tripped rejects at once instead of letting the caller wait again.
+   */
+  wait(reject: (error: Error) => void): () => void {
+    if (this.#tripped !== undefined) {
+      const tripped = this.#tripped;
+      queueMicrotask(() => reject(tripped));
+      return () => undefined;
+    }
+    if (this.#disposed) return () => undefined;
+    this.#waiting.add(reject);
+    this.#arm();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#waiting.delete(reject);
+      this.#progress();
+    };
+  }
+
+  dispose(): void {
+    this.#disposed = true;
+    this.#waiting.clear();
+    this.#disarm();
+  }
+
+  #arm(): void {
+    if (this.#timer !== undefined || this.#waiting.size === 0) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      this.#trip();
+    }, this.#afterMs);
+    (this.#timer as { unref?: () => void }).unref?.();
+  }
+
+  #disarm(): void {
+    if (this.#timer === undefined) return;
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+
+  /** An event arrived, so the connection is alive: start the deadline over. */
+  #progress(): void {
+    if (this.#tripped !== undefined) return;
+    this.#disarm();
+    this.#arm();
+  }
+
+  #trip(): void {
+    if (this.#tripped !== undefined) return;
+    const error = new StorageUnresponsiveError("indexeddb", this.#databaseName, this.#afterMs);
+    this.#tripped = error;
+    const waiting = [...this.#waiting];
+    this.#waiting.clear();
+    this.#onTrip(error);
+    for (const reject of waiting) reject(error);
+  }
+}
+
+/**
+ * Connections are shared by the adapter's free functions, which receive a request, transaction
+ * or object store rather than the store instance, so the guard hangs off the connection itself.
+ */
+const stallGuards = new WeakMap<IDBDatabase, ConnectionStallGuard>();
+
+function stallGuardFor(db: IDBDatabase | null | undefined): ConnectionStallGuard | undefined {
+  return db === null || db === undefined ? undefined : stallGuards.get(db);
+}
+
 function openDatabaseRequest(
   request: IDBOpenDBRequest,
   blockedError: (event: IDBVersionChangeEvent) => Error,
+  databaseName: string,
+  unresponsiveAfterMs: number,
 ): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    // There is no connection to hang a guard off yet, and an open request that answers nothing
+    // is the first symptom of a wedged database: a dead worker's connection blocks every open.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new StorageUnresponsiveError("indexeddb", databaseName, unresponsiveAfterMs));
+    }, unresponsiveAfterMs);
+    (timer as { unref?: () => void }).unref?.();
+    const settle = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timer);
+      return true;
+    };
     request.addEventListener(
       "success",
       () => {
-        if (settled) {
+        if (!settle()) {
           request.result.close();
           return;
         }
-        settled = true;
         resolve(request.result);
       },
       { once: true },
@@ -9429,8 +9587,7 @@ function openDatabaseRequest(
     request.addEventListener(
       "error",
       () => {
-        if (settled) return;
-        settled = true;
+        if (!settle()) return;
         reject(request.error ?? new Error("IndexedDB open failed"));
       },
       { once: true },
@@ -9438,8 +9595,7 @@ function openDatabaseRequest(
     request.addEventListener(
       "blocked",
       (event) => {
-        if (settled) return;
-        settled = true;
+        if (!settle()) return;
         reject(blockedError(event));
       },
       { once: true },
@@ -9448,11 +9604,23 @@ function openDatabaseRequest(
 }
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+  const guard = stallGuardFor(request.transaction?.db);
   return new Promise((resolve, reject) => {
-    request.addEventListener("success", () => resolve(request.result), { once: true });
+    const release = guard?.wait(reject);
+    request.addEventListener(
+      "success",
+      () => {
+        release?.();
+        resolve(request.result);
+      },
+      { once: true },
+    );
     request.addEventListener(
       "error",
-      () => reject(request.error ?? new Error("IndexedDB request failed")),
+      () => {
+        release?.();
+        reject(request.error ?? new Error("IndexedDB request failed"));
+      },
       {
         once: true,
       },
@@ -9467,15 +9635,30 @@ function readCursorPage<T>(
   acceptKey: (key: IDBValidKey) => boolean,
   seekKey?: string | number,
 ): Promise<T[]> {
+  const guard = stallGuardFor(store.transaction.db);
   return new Promise((resolve, reject) => {
     const records: T[] = [];
     const request = store.openCursor();
     let seekPending = seekKey !== undefined;
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
+    let release = guard?.wait(reject);
+    const settle = (value: T[]): void => {
+      release?.();
+      release = undefined;
+      resolve(value);
+    };
+    request.onerror = () => {
+      release?.();
+      release = undefined;
+      reject(request.error ?? new Error("IndexedDB cursor failed"));
+    };
     request.onsuccess = () => {
+      // Each cursor step is progress on the connection, so re-register rather than hold one
+      // registration across a whole scan: a long page still resets the unresponsive deadline.
+      release?.();
+      release = guard?.wait(reject);
       const cursor = request.result;
       if (cursor === null || records.length === limit) {
-        resolve(records);
+        settle(records);
         return;
       }
       try {
@@ -9487,9 +9670,11 @@ function readCursorPage<T>(
           }
         }
         if (acceptKey(cursor.key)) records.push(decode(cursor.value, cursor.key));
-        if (records.length === limit) resolve(records);
+        if (records.length === limit) settle(records);
         else cursor.continue();
       } catch (error) {
+        release?.();
+        release = undefined;
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     };
@@ -10101,11 +10286,23 @@ const transactionCompletions = new WeakMap<IDBTransaction, Promise<void>>();
 function transactionDone(transaction: IDBTransaction): Promise<void> {
   const existing = transactionCompletions.get(transaction);
   if (existing !== undefined) return existing;
+  const guard = stallGuardFor(transaction.db);
   const done = new Promise<void>((resolve, reject) => {
-    transaction.addEventListener("complete", () => resolve(), { once: true });
+    const release = guard?.wait(reject);
+    transaction.addEventListener(
+      "complete",
+      () => {
+        release?.();
+        resolve();
+      },
+      { once: true },
+    );
     transaction.addEventListener(
       "abort",
-      () => reject(transaction.error ?? new Error("Transaction aborted")),
+      () => {
+        release?.();
+        reject(transaction.error ?? new Error("Transaction aborted"));
+      },
       {
         once: true,
       },

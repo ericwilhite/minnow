@@ -2655,6 +2655,38 @@ export class ConnectionLostError extends Error {
 }
 
 /**
+ * The store stopped answering: the whole connection went the adapter's unresponsive deadline
+ * without a single storage event while it had work outstanding. The remedy is to reload the
+ * page, not to retry — the connection cannot recover, and a fresh one in the same page may be
+ * wedged by the same cause.
+ *
+ * The known cause is a worker terminated with a write in flight. WebKit keeps the dead worker's
+ * IndexedDB connection, and its unfinished transaction, registered until the owning document
+ * goes away, and while it is registered every connection to that database blocks — including
+ * connections opened afterwards in other tabs. A store cannot unwedge the browser, so it bounds
+ * the wait and says so instead of hanging.
+ *
+ * It extends `UnknownOutcomeError` because a write that stalled may still be committed by the
+ * browser once the wedge clears, and carries a `ConnectionLostError` cause so `classifyError`
+ * reports the connection as unusable.
+ */
+export class StorageUnresponsiveError extends UnknownOutcomeError {
+  override readonly name = "StorageUnresponsiveError";
+
+  constructor(
+    readonly backend: string,
+    readonly databaseName: string,
+    readonly waitedMs: number,
+  ) {
+    super(
+      `The ${backend} database ${databaseName} answered nothing for ${String(waitedMs)}ms and is ` +
+        "treated as unresponsive; reload the page to open it again",
+      { cause: new ConnectionLostError(`The ${backend} connection stopped answering`) },
+    );
+  }
+}
+
+/**
  * A remote OPFS leader may have committed a mutation whose acknowledgement was lost.
  * Reconcile stable identities or revisions before retrying the named operation.
  */
