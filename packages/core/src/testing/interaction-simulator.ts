@@ -1639,11 +1639,74 @@ class PlanRunner {
       this.#fail("drop-select: a dropped table still answers queries");
   }
 
+  /**
+   * A transaction the engine refuses for a reason it documents ends this step instead of
+   * reporting a defect: nothing of it published, so the committed state is what remains.
+   */
   async #transaction(interaction: Extract<Interaction, { kind: "transaction" }>): Promise<void> {
     const committed = this.#model.clone();
+    try {
+      await this.#runTransaction(interaction, committed);
+      return;
+    } catch (error) {
+      if (!(error instanceof RefusedTransaction)) throw error;
+      this.#model = committed;
+      if (error.expired) {
+        this.#expectedFailures++;
+        // An expired transaction stays failed until an explicit ROLLBACK acknowledges it; a lost
+        // commit race already ended the transaction, so there is nothing left to roll back.
+        await this.#execute(interaction.connection, "ROLLBACK").catch((rollback: unknown) =>
+          this.#fail(
+            `ROLLBACK after an expired transaction failed: ${describeError(rollback)}`,
+            rollback,
+          ),
+        );
+      } else {
+        this.#rejectedConflicts++;
+      }
+      await this.#expectRows(
+        interaction.connection,
+        interaction.table,
+        this.#model.sorted(interaction.table),
+        `after a refused transaction (${error.reason})`,
+      );
+    }
+  }
+
+  /**
+   * Inside a SQL transaction two refusals are documented engine behaviour rather than a defect:
+   * another connection publishing a data commit while this transaction has writes staged, which
+   * loses the commit race, and a transaction left idle past `transactionIdleTimeoutMs`, which
+   * rolls itself back. Both discard the whole transaction. Anything else is a defect.
+   */
+  #refuseTransaction(step: string, error: unknown): never {
+    if (isExpiredTransaction(error)) throw new RefusedTransaction("idle rollback", error);
+    if (isConflict(error)) throw new RefusedTransaction("lost commit race", error);
+    this.#fail(`${step} failed: ${describeError(error)}`, error);
+  }
+
+  /** A read inside a transaction meets the same two refusals its writes do. */
+  async #expectRowsInTransaction(
+    connection: number,
+    table: string,
+    expected: readonly PlanRow[],
+    context: string,
+  ): Promise<void> {
+    try {
+      await this.#expectRows(connection, table, expected, context);
+    } catch (error) {
+      if (isExpiredTransaction(error) || isConflict(error)) this.#refuseTransaction(context, error);
+      throw error;
+    }
+  }
+
+  async #runTransaction(
+    interaction: Extract<Interaction, { kind: "transaction" }>,
+    committed: ShadowModel,
+  ): Promise<void> {
     const columns = this.#model.columns(interaction.table);
     await this.#execute(interaction.connection, "BEGIN").catch((error: unknown) =>
-      this.#fail(`BEGIN failed: ${describeError(error)}`, error),
+      this.#refuseTransaction("BEGIN", error),
     );
     let poisoned = false;
     for (const statement of interaction.statements) {
@@ -1652,10 +1715,7 @@ class PlanRunner {
         const rendered = renderInsert(interaction.table, columns, statement.rows, true);
         const outcome = await this.#attempt(interaction.connection, rendered.sql, rendered.params);
         if (accepted && outcome.error !== undefined)
-          this.#fail(
-            `INSERT inside a transaction failed: ${describeError(outcome.error)}`,
-            outcome.error,
-          );
+          this.#refuseTransaction("INSERT inside a transaction", outcome.error);
         if (!accepted) {
           if (outcome.error === undefined)
             this.#fail("a duplicate primary key was accepted inside a transaction");
@@ -1669,21 +1729,19 @@ class PlanRunner {
         this.#model.update(interaction.table, statement.predicate, statement.assignments);
         const sql = `UPDATE ${quote(interaction.table)} SET ${renderAssignments(statement.assignments)} WHERE ${renderPredicate(statement.predicate)}`;
         await this.#execute(interaction.connection, sql).catch((error: unknown) =>
-          this.#fail(`UPDATE inside a transaction failed: ${describeError(error)}`, error),
+          this.#refuseTransaction("UPDATE inside a transaction", error),
         );
       } else {
         this.#model.delete(interaction.table, statement.predicate);
         await this.#execute(
           interaction.connection,
           `DELETE FROM ${quote(interaction.table)} WHERE ${renderPredicate(statement.predicate)}`,
-        ).catch((error: unknown) =>
-          this.#fail(`DELETE inside a transaction failed: ${describeError(error)}`, error),
-        );
+        ).catch((error: unknown) => this.#refuseTransaction("DELETE inside a transaction", error));
       }
     }
     if (!poisoned) {
       // transaction-isolation: the owner sees its own pending rows; an observer sees none.
-      await this.#expectRows(
+      await this.#expectRowsInTransaction(
         interaction.connection,
         interaction.table,
         this.#model.sorted(interaction.table),
@@ -1700,7 +1758,7 @@ class PlanRunner {
     }
     const end = poisoned ? "ROLLBACK" : interaction.outcome === "commit" ? "COMMIT" : "ROLLBACK";
     await this.#execute(interaction.connection, end).catch((error: unknown) =>
-      this.#fail(`${end} failed: ${describeError(error)}`, error),
+      this.#refuseTransaction(end, error),
     );
     if (end === "ROLLBACK") this.#model = committed;
     else this.#acceptedWrites++;
@@ -2061,6 +2119,25 @@ function isUniqueViolation(error: unknown): boolean {
 
 function isConflict(error: unknown): boolean {
   return /WriteConflict|Manifest changed|conflict/iu.test(errorText(error));
+}
+
+function isExpiredTransaction(error: unknown): boolean {
+  return /TransactionExpired|transaction expired/iu.test(errorText(error));
+}
+
+/** A SQL transaction the engine refused for a documented reason; the plan step ends with it. */
+class RefusedTransaction extends Error {
+  constructor(
+    readonly reason: "lost commit race" | "idle rollback",
+    cause: unknown,
+  ) {
+    super(`SQL transaction refused: ${reason}`, { cause });
+    this.name = "RefusedTransaction";
+  }
+
+  get expired(): boolean {
+    return this.reason === "idle rollback";
+  }
 }
 
 function isUnknownOutcome(error: unknown): boolean {

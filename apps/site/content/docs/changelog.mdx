@@ -106,6 +106,20 @@ each reduced to a deterministic test in `simulator-regressions.test.ts`.
 
 - The published tarball no longer carries three test-only modules that nothing exported reached
   (`client-audit-harness`, `indexeddb-audit-helpers`, `power-loss-model`).
+- **The [transactions guide](/docs/engine/transactions) now states exactly what ends an open SQL
+  transaction.** The idle deadline counts from the connection's last statement rather than from
+  `BEGIN`, a statement still running keeps the transaction open, and no other connection's crash,
+  reopen, recovery, compaction, or collection rolls it back. What another connection can do is win
+  the commit race: one data commit published while a transaction has writes staged — even to a
+  table it never touched — fails its `COMMIT` with `WriteConflictError`, publishes nothing, and
+  leaves nothing to acknowledge, unlike the failed state an idle rollback leaves. Behaviour is
+  unchanged; the rules were only partly written down, and two tabs made the difference look like a
+  defect.
+- **The interaction simulator models both refusals.** A plan's transaction step now counts a lost
+  commit race and acknowledges an idle rollback instead of reporting an engine defect, and the
+  browser tab harness reports a crashed worker to its client at once, so an in-flight call fails as
+  an unknown outcome rather than waiting out the 60-second silence deadline — a minute long enough
+  to expire another tab's open transaction.
 
 ## 0.10.1 — September 12, 2026
 

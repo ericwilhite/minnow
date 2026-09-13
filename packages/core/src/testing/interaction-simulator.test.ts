@@ -18,6 +18,8 @@ import {
   runInteractionPlan,
   type DriverStoreSource,
   type Interaction,
+  type InteractionPlan,
+  type SimulatedConnection,
 } from "./interaction-simulator.js";
 import { MemoryOpfs } from "./opfs-shim.js";
 import { seedsFor } from "./seeds.js";
@@ -140,6 +142,110 @@ describe("interaction plans", () => {
         right: { kind: "compare", column: "c", op: "<>", value: "it's" },
       }),
     ).toBe(`("b" > 2 AND "c" <> 'it''s')`);
+  });
+});
+
+/**
+ * The two refusals a SQL transaction may legitimately meet. Both discard the whole transaction,
+ * so the plan step ends with the committed state rather than reporting an engine defect: the
+ * runner would otherwise call a lost commit race or an idle rollback a bug, which is what a
+ * crash fault in another tab (a minute of silence on its in-flight call) once looked like.
+ */
+describe("a refused SQL transaction", () => {
+  const plan: InteractionPlan = {
+    version: 1,
+    seed: 1,
+    connections: 2,
+    interactions: [
+      {
+        kind: "createTable",
+        connection: 0,
+        table: { name: "t0", columns: [{ name: "c0", type: "integer", nullable: true }] },
+        expectExisting: false,
+      },
+      {
+        kind: "insert",
+        connection: 0,
+        table: "t0",
+        rows: [{ id: 1, c0: 10 }],
+        viaParameters: false,
+      },
+      {
+        kind: "transaction",
+        connection: 1,
+        observer: 0,
+        table: "t0",
+        statements: [{ kind: "insert", rows: [{ id: 2, c0: 20 }] }],
+        outcome: "commit",
+      },
+      {
+        kind: "select",
+        connection: 0,
+        table: "t0",
+        predicate: { kind: "literal", value: true },
+        limit: null,
+        descending: false,
+      },
+    ],
+  };
+
+  it("counts a lost commit race and keeps going", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      const driver = createDatabaseDriver(store);
+      const connections: SimulatedConnection[] = [];
+      const result = await runInteractionPlan(plan, {
+        ...driver,
+        open: async (index) => {
+          const connection = await driver.open(index);
+          connections[index] = connection;
+          return {
+            ...connection,
+            execute: async (sql, params) => {
+              // Another connection publishes a data commit while this transaction has writes
+              // staged. The values do not change, so the shadow model still describes the table.
+              if (sql === "COMMIT") {
+                await connections[0]?.execute(`UPDATE "t0" SET "c0" = "c0" WHERE "id" = 1`);
+              }
+              return connection.execute(sql, params);
+            },
+          };
+        },
+      });
+      expect(result.rejectedConflicts).toBe(1);
+      expect(result.acceptedWrites).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("acknowledges an idle rollback and keeps going", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      // One millisecond of idleness is all this transaction is allowed, and the connection waits
+      // twenty after BEGIN, so its first staged statement meets a transaction already rolled back.
+      const driver = createDatabaseDriver(store, {
+        databaseOptions: { transactionIdleTimeoutMs: 1 },
+      });
+      const result = await runInteractionPlan(plan, {
+        ...driver,
+        open: async (index) => {
+          const connection = await driver.open(index);
+          return {
+            ...connection,
+            execute: async (sql, params) => {
+              const executed = await connection.execute(sql, params);
+              if (sql === "BEGIN") await new Promise((resolve) => setTimeout(resolve, 20));
+              return executed;
+            },
+          };
+        },
+      });
+      expect(result.expectedFailures).toBe(1);
+      expect(result.rejectedConflicts).toBe(0);
+    } finally {
+      store.close();
+    }
   });
 });
 

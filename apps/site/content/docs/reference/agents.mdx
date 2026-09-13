@@ -130,7 +130,11 @@ machines: https://minnowdb.com/llms.txt
   `timeoutMs`. An unknown mutation outcome requires reconciliation by durable application ID,
   never blind replay. Deploy matching client/worker builds (wire protocol 7 in core 0.9.0).
 - An idle SQL transaction rolls back and rejects subsequent statements with
-  `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. Keep transaction callbacks
+  `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. The 30-second default counts from
+  the connection's last statement, and no other connection's crash, reopen, or maintenance ends
+  your transaction. A `COMMIT` that loses the race to another connection's data commit fails with
+  `WriteConflictError`, publishes nothing, and leaves nothing to acknowledge: rerun the whole
+  transaction. Keep transaction callbacks
   short; readers use renewable leases, and a scope suspended past an expired lease fails explicitly.
 - For anything interactive, run the engine in a worker. Put
   `import "@minnowdb/core/worker"` in a local `db-worker.ts`, then pass

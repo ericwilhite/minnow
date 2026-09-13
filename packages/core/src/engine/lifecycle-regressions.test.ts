@@ -4,6 +4,7 @@ import {
   IndexedDbBlockStore,
   MemoryBlockStore,
   OpfsBlockStore,
+  WriteConflictError,
   type BlockStore,
 } from "../storage/index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
@@ -64,6 +65,114 @@ for (const adapter of stores)
       await db.execute("INSERT INTO items VALUES (3, 30)");
       await db.execute("COMMIT");
       expect((await db.query("SELECT * FROM items")).rows).toEqual([{ id: 3, value: 30 }]);
+    });
+
+    it("counts transaction idleness from the last statement, not from BEGIN", async () => {
+      let now = Date.parse("2026-09-06T12:00:00.000Z");
+      const { db } = await open(adapter.open, {
+        now: () => new Date(now),
+        transactionIdleTimeoutMs: 1000,
+      });
+      await db.execute("BEGIN");
+      now += 900;
+      await db.execute("INSERT INTO items VALUES (1, 10)");
+      now += 900;
+      await db.execute("INSERT INTO items VALUES (2, 20)");
+      now += 900;
+      // Three quarters of the deadline have passed since BEGIN twice over; each statement is
+      // what the deadline measures from, so the transaction is still the caller's to commit.
+      await db.execute("COMMIT");
+      expect((await db.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+        { id: 1, value: 10 },
+        { id: 2, value: 20 },
+      ]);
+    });
+
+    it("leaves another connection's open transaction alone through a crash and reopen", async () => {
+      const { db, store } = await open(adapter.open);
+      const other = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      cleanup.push(async () => {
+        await other.close().catch(() => undefined);
+      });
+      await db.execute("INSERT INTO items VALUES (1, 10)");
+      await other.execute("BEGIN");
+      await other.execute("UPDATE items SET value = 99 WHERE id = 1");
+      await other.execute("INSERT INTO items VALUES (2, 20)");
+      // The first connection crashes with a write staged and never published: its scope is
+      // abandoned mid-flight rather than closed, exactly what a terminated worker leaves.
+      let staged!: () => void;
+      const stagedWrite = new Promise<void>((resolve) => {
+        staged = resolve;
+      });
+      const abandoned = db.write(async (tx) => {
+        await tx.insertBatch("items", [{ id: 3, value: 30 }]);
+        staged();
+        await new Promise(() => undefined);
+      });
+      abandoned.catch(() => undefined);
+      await stagedWrite;
+      // The tab comes back as a fresh engine over the same store, reads, and sweeps.
+      const reopened = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      cleanup.push(async () => {
+        await reopened.close().catch(() => undefined);
+      });
+      expect((await reopened.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+        { id: 1, value: 10 },
+      ]);
+      await reopened.collectGarbage();
+      // Nothing about that touched a live transaction on another connection.
+      await other.execute("COMMIT");
+      expect((await reopened.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+        { id: 1, value: 99 },
+        { id: 2, value: 20 },
+      ]);
+    });
+
+    it("refuses a transaction's commit when another connection published data first", async () => {
+      const { db, store } = await open(adapter.open);
+      const other = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      cleanup.push(async () => {
+        await other.close().catch(() => undefined);
+      });
+      await db.execute("CREATE TABLE unrelated(id INTEGER PRIMARY KEY, value INTEGER)");
+      await db.execute("INSERT INTO items VALUES (1, 10)");
+      await other.execute("BEGIN");
+      await other.execute("INSERT INTO items VALUES (2, 20)");
+      // Any data commit from another connection loses the race for this one, even a commit to a
+      // table the transaction never touched.
+      await db.execute("INSERT INTO unrelated VALUES (1, 1)");
+      await expect(other.execute("COMMIT")).rejects.toBeInstanceOf(WriteConflictError);
+      expect((await db.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+        { id: 1, value: 10 },
+      ]);
+      // The transaction is over rather than failed: the next statement is an ordinary autocommit.
+      await other.execute("INSERT INTO items VALUES (3, 30)");
+      expect((await db.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+        { id: 1, value: 10 },
+        { id: 3, value: 30 },
+      ]);
+    });
+
+    it("keeps a transaction through another connection's compaction and collection", async () => {
+      const { db, store } = await open(adapter.open);
+      const other = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      cleanup.push(async () => {
+        await other.close().catch(() => undefined);
+      });
+      await db.execute("INSERT INTO items VALUES (1, 10)");
+      await db.execute("INSERT INTO items VALUES (2, 20)");
+      await other.execute("BEGIN");
+      await other.execute("INSERT INTO items VALUES (3, 30)");
+      // Maintenance publishes manifest versions of its own; they rewrite no rows, so they are
+      // not a commit race and the transaction holding staged writes still commits.
+      await db.compactTable("items");
+      await db.collectGarbage();
+      await other.execute("COMMIT");
+      expect((await db.query("SELECT * FROM items ORDER BY id")).rows).toEqual([
+        { id: 1, value: 10 },
+        { id: 2, value: 20 },
+        { id: 3, value: 30 },
+      ]);
     });
 
     it("orders parallel stages and drains admitted writes before publishing", async () => {

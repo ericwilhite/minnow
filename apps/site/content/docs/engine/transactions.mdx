@@ -120,6 +120,14 @@ An idle rollback leaves the connection in a failed state: later statements rejec
 transaction. A delayed statement cannot silently become an autocommit. Calls to `execute()` on
 one connection run in invocation order, including `BEGIN`, mutations, and `COMMIT`.
 
+The deadline is `transactionIdleTimeoutMs`, and it measures the time since the connection's last
+statement, not the age of the transaction. A statement still running keeps the transaction open
+however long it takes, and each statement restarts the clock, so a transaction a caller keeps
+using stays open. Three things end one: its own `COMMIT` or `ROLLBACK`, that deadline, and closing
+the database. Another connection is not one of them — its crash, reopen, recovery, compaction, or
+garbage collection never rolls your transaction back, because a sweep reclaims only work whose own
+lease has expired. What another connection can do is win the commit race below.
+
 Reads inside the transaction see its earlier writes, including scalar subqueries in INSERT VALUES
 and trigger INSERT bodies. A statement that violates a unique key or a UNIQUE index fails
 on that statement, as it does in PostgreSQL, whether the conflicting row was committed before the
@@ -237,6 +245,13 @@ try {
 An explicit `db.write()` scope or SQL transaction does not replay application code. A concurrent
 data commit surfaces `WriteConflictError`, nothing from the losing scope publishes, and the caller
 may rerun the complete operation after deciding that its side effects are safe to repeat.
+
+One data commit from another connection is enough, even a commit to a table the scope never
+touched. A SQL transaction that loses the race fails at `COMMIT`, and the connection is then out of
+its transaction with nothing to acknowledge: the next statement is an ordinary autocommit, unlike
+the failed state an idle rollback leaves. A transaction that only reads publishes nothing and so
+never loses a race, and compaction and garbage collection — which publish versions of their own
+but rewrite no rows — are not a race either.
 
 Structural catalog changes have a separate monotonic schema epoch. A transaction captures it when
 it begins and verifies it in the same atomic step that publishes data. This prevents work staged

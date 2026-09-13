@@ -32,6 +32,7 @@ interface TabFailure {
 
 let client: MinnowDatabaseClient | undefined;
 let worker: Worker | undefined;
+let crashed = false;
 let descriptor: { kind: StoreKind; name: string } | undefined;
 const pageErrors: string[] = [];
 
@@ -46,6 +47,7 @@ function spawn(): Worker {
 
 async function connect(): Promise<MinnowDatabaseClient> {
   if (descriptor === undefined) throw new Error("open() first");
+  crashed = false;
   worker = spawn();
   client = new MinnowDatabaseClient(worker, {
     store: descriptor,
@@ -90,7 +92,8 @@ const tab = {
     }
   },
   async reopen(): Promise<void> {
-    if (client !== undefined) {
+    // A crashed connection is already gone; only a live one has a worker worth disposing.
+    if (client !== undefined && !crashed) {
       await client.close({ terminateWorker: true }).catch(() => undefined);
     }
     await connect();
@@ -100,6 +103,14 @@ const tab = {
     // Let a call issued just before reach the worker's queue before the process dies.
     await new Promise((resolve) => setTimeout(resolve, 2));
     worker?.terminate();
+    crashed = true;
+    // A page cannot observe its own `terminate()`, and the client's deadline measures silence,
+    // so a call the dead worker was carrying would otherwise sit for the whole request timeout
+    // before reporting an unknown outcome -- a minute of it, long enough to expire another tab's
+    // open SQL transaction, which is not what a crash means. Report the loss here instead: the
+    // in-flight call fails at once as `DatabaseWorkerOutcomeUnknownError`, exactly what a
+    // crashed connection leaves behind.
+    await client?.close({ terminateWorker: true, timeoutMs: 1 }).catch(() => undefined);
   },
   async maintain(table: string): Promise<void> {
     if (client === undefined) throw new Error("open() first");

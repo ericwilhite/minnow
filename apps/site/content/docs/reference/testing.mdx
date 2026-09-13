@@ -332,11 +332,19 @@ commuting writes shows every untouched key exactly and every touched key at its 
 value; a mutation interrupted by a fault lands entirely or not at all and a reported success is
 durable; and at every checkpoint every connection reads the same database as the model.
 
+Two refusals inside a transaction are engine behaviour rather than defects, so the runner counts
+them and continues: a `COMMIT` that lost the race to another connection's data commit, and a
+transaction the engine rolled back after `transactionIdleTimeoutMs` of idleness. Both discard the
+whole transaction, and an expired one is acknowledged with a `ROLLBACK` before the plan goes on.
+See [transactions](/docs/engine/transactions) for the rules themselves.
+
 The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`) each connection is a
 `MinnowDatabase` over one shared memory, IndexedDB, or OPFS store with the storage fault points
 armed. In Playwright (`interaction.spec.ts`) each connection is a real tab holding the published
 worker over a real IndexedDB or OPFS database, and the plan's faults terminate a worker with a
-statement in flight. The same seed produces the same plan in both.
+statement in flight — the tab then reports the loss to its client at once, so the in-flight call
+fails as an unknown outcome instead of waiting out the client's silence deadline. The same seed
+produces the same plan in both.
 
 ```bash
 npm run simulate:interactions -- --seed 24301 --length 300 --connections 4 --store indexeddb
