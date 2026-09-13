@@ -193,7 +193,9 @@ machines: https://minnowdb.com/llms.txt
   compile-time promise only: reads and writes stay JSON text unless `json: "parse"` decoding is
   set, and `->>` leaves are always text at runtime.
 - `CREATE INDEX name ON table(a, b DESC)` creates a durable scalar or composite accelerator.
-  Leftmost equality/`IN` prefixes and the next range prune candidates. `CREATE UNIQUE INDEX`
+  Leftmost equality/`IN` prefixes and the next range prune candidates. A nullable trailing column
+  still prunes: its NULL rows are indexed under the non-null prefix, and no comparison matches
+  them. `CREATE UNIQUE INDEX`
   enforces additional candidate keys atomically; any NULL component does not conflict.
   `DROP INDEX name` removes the catalog, postings, and unique membership. A matching non-null index
   can satisfy `ORDER BY` (and cover the query) on a keyless append-only table; other shapes sort.

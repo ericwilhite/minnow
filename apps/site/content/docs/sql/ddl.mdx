@@ -138,6 +138,15 @@ other side of a join, only those rows are read before the join. Minnow still eva
 predicate on every candidate row, so a stale posting or an internal locator collision can cost
 an extra read but cannot change an answer.
 
+A nullable indexed column does not cost you the index. A row with a `NULL` in a trailing indexed
+column is named under its non-null leading columns, so `WHERE customer_id = ?` still prunes
+through `orders (customer_id, status)` when `status` is nullable, and the `NULL` rows come back
+with the rest. The `NULL` marker sorts outside every real value, so an equality, `IN`, or range
+on that column never matches it — which is what SQL means by a comparison with `NULL`. A `NULL`
+in the _leading_ column is deliberately not indexed: no such predicate could match it. Indexes
+created before 0.10.2 keep serving equality and range lookups; rebuild one (`DROP INDEX`, then
+`CREATE INDEX`) to get prefix pruning past its nullable trailing columns.
+
 Exact equality remains indexable for SQL-domain columns such as `NUMERIC` and enum. Their lossless
 physical strings are not bytewise SQL order, so range pruning and index-supplied `ORDER BY` fall
 back to the ordinary scan/sort path for correctness.
