@@ -69,6 +69,26 @@ it("finds a database by its OPFS directory again after the remembered choice is 
   await expect(resolveAutoStoreKind("db")).rejects.toBeInstanceOf(DatabaseStoreUnavailableError);
 });
 
+it("does not call a failed IndexedDB open probe an absent database", async () => {
+  const failingFactory = {
+    open: () => {
+      const request = new EventTarget() as IDBOpenDBRequest;
+      Object.defineProperty(request, "error", {
+        get: () => new DOMException("storage backend unavailable", "UnknownError"),
+      });
+      queueMicrotask(() => request.dispatchEvent(new Event("error")));
+      return request;
+    },
+  } as unknown as IDBFactory;
+  autoStoreTestHooks.indexedDB = failingFactory;
+  autoStoreTestHooks.opfsAvailable = async () => true;
+  autoStoreTestHooks.opfsDatabaseExists = async () => false;
+
+  await expect(resolveAutoStoreKind("existing-ledger")).rejects.toMatchObject({
+    name: "UnknownError",
+  });
+});
+
 it("keeps a reservation another connection opened when this connection's open fails", async () => {
   autoStoreTestHooks.indexedDB = new IDBFactory();
   autoStoreTestHooks.opfsAvailable = async () => true;

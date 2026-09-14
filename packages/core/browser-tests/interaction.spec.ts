@@ -3,6 +3,7 @@ import type { Page } from "@playwright/test";
 import {
   generateInteractionPlan,
   runInteractionPlan,
+  type InteractionPlan,
   type PlanValue,
   type SimulatedConnection,
   type SimulatedExecuteResult,
@@ -26,10 +27,65 @@ import { requireWorkerOpfs, test } from "./fixtures.js";
  */
 type StoreKind = "indexeddb" | "opfs";
 
+const conformance = process.env.MINNOW_BROWSER_CONFORMANCE === "1";
+const configuredSeedBase = process.env.MINNOW_BROWSER_INTERACTION_SEED_BASE;
+
+function parseSeedBase(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const seed = Number(value);
+  if (!Number.isSafeInteger(seed) || seed < 0 || seed > 0xffff_ffff) {
+    throw new RangeError(
+      "MINNOW_BROWSER_INTERACTION_SEED_BASE must be an integer from 0 through 4294967295",
+    );
+  }
+  return seed;
+}
+
+const seedBase = parseSeedBase(configuredSeedBase);
+const browserSeeds: Record<string, number> = {
+  chromium: 0x5eed,
+  firefox: 0xf1ef,
+  webkit: 0x3eb5,
+};
+const browserSeedOffsets: Record<string, number> = {
+  chromium: 0x9e37_79b9,
+  firefox: 0x243f_6a88,
+  webkit: 0xb7e1_5163,
+};
+
+function campaignSeed(browserName: string, campaign: "complete" | "crash"): number {
+  const base =
+    seedBase === undefined
+      ? (browserSeeds[browserName] ?? browserSeeds.chromium ?? 0x5eed)
+      : (seedBase + (browserSeedOffsets[browserName] ?? 0)) >>> 0;
+  return campaign === "complete" ? (base ^ 0xa5a5_a5a5) >>> 0 : base;
+}
+
+function withoutFaults(plan: InteractionPlan): InteractionPlan {
+  return {
+    ...plan,
+    interactions: plan.interactions.filter((interaction) => interaction.kind !== "fault"),
+  };
+}
+
 interface TabFailure {
   failed: true;
   name: string;
   message: string;
+}
+
+interface TabError {
+  source: "window-error" | "unhandled-rejection" | "worker";
+  name: string;
+  message: string;
+  kind?:
+    | "uncaught"
+    | "unhandled-rejection"
+    | "messageerror"
+    | "maintenance"
+    | "coordination"
+    | "transport";
+  context?: string;
 }
 
 function rethrow<T>(value: T | TabFailure): T {
@@ -47,7 +103,7 @@ interface Tab {
   reopen(): Promise<void>;
   crash(): Promise<void>;
   maintain(table: string): Promise<void>;
-  pageErrors(): string[];
+  pageErrors(): TabError[];
 }
 type TabWindow = typeof window & { simulatorTab: Tab };
 
@@ -55,7 +111,7 @@ async function openTab(
   page: Page,
   kind: StoreKind,
   name: string,
-  collect: (errors: string[]) => void,
+  collect: (errors: TabError[]) => void,
 ): Promise<SimulatedConnection> {
   const load = async (): Promise<void> => {
     await page.goto("/packages/core/browser/interaction/");
@@ -115,70 +171,100 @@ async function openTab(
 }
 
 for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[]) {
-  test(`${store}: a seeded interaction plan holds across real tabs`, async ({
-    storageContext,
-    browserName,
-  }) => {
-    test.setTimeout(600_000);
-    const name = `interaction-${crypto.randomUUID()}`;
-    const pages: Page[] = [];
-    const consoleErrors: string[] = [];
-    // A reload after a crash wipes the tab's own record, so take it before every reload.
-    const tabErrors: string[] = [];
-    const driver: SimulationDriver = {
-      open: async () => {
-        const page = await storageContext.newPage();
-        page.on("pageerror", (error) => consoleErrors.push(error.message));
-        pages.push(page);
-        if (store === "opfs" && pages.length === 1) {
-          await page.goto("/packages/core/browser/interaction/");
-          await requireWorkerOpfs(page);
-        }
-        return openTab(page, store, name, (errors) => tabErrors.push(...errors));
-      },
-    };
-    // Seeds differ per browser so three engines explore three plans on every run.
-    const seeds: Record<string, number> = { chromium: 0x5eed, firefox: 0xf1ef, webkit: 0x3eb5 };
-    const seed = seeds[browserName] ?? 0x5eed;
-    const plan = generateInteractionPlan(seed, {
-      length: 220,
-      connections: 3,
-      tables: 2,
-      keySpace: 16,
-      faultPoints: ["crash"],
-    });
-    const result = await runInteractionPlan(plan, driver);
-    for (const page of pages) {
-      tabErrors.push(
-        ...(await page.evaluate(() => (window as TabWindow).simulatorTab.pageErrors())),
-      );
-    }
-    await Promise.all(
-      pages.map((page) =>
-        page.evaluate(() =>
-          (
-            window as typeof window & { simulatorTab: { close(): Promise<void> } }
-          ).simulatorTab.close(),
+  for (const campaign of ["complete", "crash"] as const) {
+    test(`${store}: the ${campaign} seeded interaction plan holds across real tabs`, async ({
+      storageContext,
+      browserName,
+    }, info) => {
+      test.setTimeout(600_000);
+      const name = `interaction-${crypto.randomUUID()}`;
+      const pages: Page[] = [];
+      const consoleErrors: string[] = [];
+      // A reload after a crash wipes the tab's own record, so take it before every reload.
+      const tabErrors: TabError[] = [];
+      const driver: SimulationDriver = {
+        open: async () => {
+          const page = await storageContext.newPage();
+          page.on("console", (message) => {
+            if (message.type() === "error") consoleErrors.push(message.text());
+          });
+          page.on("pageerror", (error) => consoleErrors.push(error.message));
+          pages.push(page);
+          if (store === "opfs" && pages.length === 1) {
+            await page.goto("/packages/core/browser/interaction/");
+            await requireWorkerOpfs(page);
+          }
+          return openTab(page, store, name, (errors) => tabErrors.push(...errors));
+        },
+      };
+      // The complete campaign removes fault steps so every browser and store must judge the whole
+      // plan. Crash recovery remains a separate campaign, where a browser-level storage wedge can
+      // be classified without letting it substitute for ordinary SQL and concurrency coverage.
+      const seed = campaignSeed(browserName, campaign);
+      const generated = generateInteractionPlan(seed, {
+        length: conformance ? 800 : 220,
+        connections: conformance ? 4 : 3,
+        tables: 2,
+        keySpace: conformance ? 32 : 16,
+        faultPoints: ["crash"],
+      });
+      const plan = campaign === "complete" ? withoutFaults(generated) : generated;
+      await info.attach(`${store}-${campaign}-plan.json`, {
+        contentType: "application/json",
+        body: JSON.stringify(
+          {
+            browser: browserName,
+            store,
+            campaign,
+            conformance,
+            seed,
+            seedBase,
+            plan,
+          },
+          undefined,
+          2,
         ),
-      ),
-    );
-    // The plan draws crash faults only, and every driver here can crash, so none are skipped.
-    expect(result.faultsSkipped).toBe(0);
-    expect(result.faultsInjected).toBeGreaterThan(0);
-    if (result.transientsAccepted > 0) {
-      // A browser that wedges a whole database is beyond the engine's reach; bounding the wait and
-      // naming it is the accepted outcome, and nothing further can be driven through that store.
-      expect(result.stoppedBy).toMatch(/StorageUnresponsive/u);
-    } else {
-      expect(result.interactions).toBe(plan.interactions.length);
-      expect(result.acceptedWrites).toBeGreaterThan(10);
-      expect(result.checkpoints).toBeGreaterThan(0);
-    }
-    expect(consoleErrors).toEqual([]);
-    // Worker terminations surface through the client's error sink; the connection-lost report
-    // for a deliberate crash is expected, anything else is not.
-    expect(
-      tabErrors.filter((message) => !/terminated|lost|closed|crash|unresponsive/iu.test(message)),
-    ).toEqual([]);
-  });
+      });
+      const result = await runInteractionPlan(plan, driver);
+      for (const page of pages) {
+        tabErrors.push(
+          ...(await page.evaluate(() => (window as TabWindow).simulatorTab.pageErrors())),
+        );
+      }
+      await Promise.all(
+        pages.map((page) =>
+          page.evaluate(() =>
+            (
+              window as typeof window & { simulatorTab: { close(): Promise<void> } }
+            ).simulatorTab.close(),
+          ),
+        ),
+      );
+      // A complete campaign has no fault steps. The crash campaign draws only faults this real-tab
+      // driver can inject, so it must not skip any either.
+      expect(result.faultsSkipped).toBe(0);
+      if (campaign === "complete") {
+        expect(result.faultsInjected).toBe(0);
+      } else {
+        expect(result.faultsInjected).toBeGreaterThan(0);
+      }
+      if (result.transientsAccepted > 0) {
+        // A browser that wedges a whole database is beyond the engine's reach; bounding the wait and
+        // naming it is the accepted outcome for WebKit's IndexedDB worker-crash behavior. It is not
+        // an accepted substitute for a complete plan or for any other browser/store combination.
+        expect(campaign).toBe("crash");
+        expect(browserName).toBe("webkit");
+        expect(store).toBe("indexeddb");
+        expect(result.stoppedBy).toMatch(/StorageUnresponsive/u);
+      } else {
+        expect(result.interactions).toBe(plan.interactions.length);
+        expect(result.acceptedWrites).toBeGreaterThan(10);
+        expect(result.checkpoints).toBeGreaterThan(0);
+      }
+      expect(consoleErrors).toEqual([]);
+      // A deliberate crash is classified on the mutation's typed failure. The error sink is for
+      // unsolicited window and worker diagnostics, none of which may be hidden by message text.
+      expect(tabErrors).toEqual([]);
+    });
+  }
 }

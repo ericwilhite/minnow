@@ -1,10 +1,18 @@
-import { test as base, webkit, type Page, type BrowserContext } from "@playwright/test";
+import {
+  chromium,
+  firefox,
+  test as base,
+  webkit,
+  type BrowserContext,
+  type Page,
+} from "@playwright/test";
 
-// Safari needs a persistent (non-private) context for OPFS worker storage.
+// Storage coverage needs a persistent profile so every engine exercises its disk-backed path.
+// Overriding `context` also makes Playwright's built-in `page` fixture use this profile.
 export const test = base.extend<{ storageContext: BrowserContext }>({
-  storageContext: async ({ browserName, context }, use, info) => {
-    if (browserName !== "webkit") return use(context);
-    const persistent = await webkit.launchPersistentContext(info.outputPath("storage-profile"), {
+  context: async ({ browserName }, use, info) => {
+    const launcher = { chromium, firefox, webkit }[browserName];
+    const persistent = await launcher.launchPersistentContext(info.outputPath("storage-profile"), {
       baseURL: info.project.use.baseURL ?? "",
     });
     try {
@@ -13,6 +21,7 @@ export const test = base.extend<{ storageContext: BrowserContext }>({
       await persistent.close();
     }
   },
+  storageContext: async ({ context }, use) => use(context),
 });
 
 /** Probe the worker realm: Linux WebKit may expose OPFS in a page but not in its workers. */
@@ -53,5 +62,8 @@ export async function requireWorkerOpfs(page: Page): Promise<void> {
         );
       }),
   );
+  if (!supported && process.env.MINNOW_BROWSER_CONFORMANCE === "1") {
+    throw new Error("Browser conformance requires OPFS inside dedicated workers");
+  }
   test.skip(!supported, "This browser build exposes no OPFS in dedicated workers");
 }

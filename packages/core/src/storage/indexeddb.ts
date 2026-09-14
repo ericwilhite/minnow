@@ -13304,6 +13304,16 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
   }
   const columnIds = new Set(record.columns.map((column) => column.id));
   const columnNames = new Set(record.columns.map((column) => column.name));
+  // Sequence records written before their hidden counter column was declared as the table's
+  // unique key still have one unambiguous key identity in `sequence.columnId`. Accept that exact
+  // legacy shape and normalize it below; arbitrary auto-increment columns remain corruption.
+  const legacySequenceColumnId =
+    record.uniqueKeyColumnId === undefined &&
+    isRecord(record.sequence) &&
+    typeof record.sequence.columnId === "string" &&
+    columnIds.has(record.sequence.columnId)
+      ? record.sequence.columnId
+      : undefined;
   for (const column of record.columns) {
     const context = {
       name: column.name,
@@ -13311,7 +13321,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
       ...(column.integer === undefined ? {} : { integer: column.integer }),
       ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
       nullable: column.nullable,
-      isUniqueKey: record.uniqueKeyColumnId === column.id,
+      isUniqueKey: record.uniqueKeyColumnId === column.id || legacySequenceColumnId === column.id,
       ...(column.enumValues === undefined ? {} : { enumValues: column.enumValues }),
     };
     try {
@@ -13592,6 +13602,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
     ) {
       throw corruption(location, "sequence metadata is invalid");
     }
+    record.uniqueKeyColumnId ??= record.sequence.columnId;
   }
   if (record.id !== id) throw corruption(location, "table id is invalid");
   return record;
@@ -15019,7 +15030,7 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   for (const id of candidates.candidateSegmentIds) {
     const segmentValue: unknown = await requestResult(transaction.objectStore("segments").get(id));
     if (segmentValue !== undefined) continue;
-    throw new Error(`Garbage collection segment candidate has no persisted provenance: ${id}`);
+    throw new Error(`GC segment has no provenance: ${id}`);
   }
 }
 

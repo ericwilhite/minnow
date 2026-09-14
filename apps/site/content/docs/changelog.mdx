@@ -8,6 +8,60 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.10.3 — September 13, 2026
+
+Published packages: `@minnowdb/core@0.10.3`.
+
+**Migration:** no application or data migration is needed. Automatic storage selection now
+rejects an unexpected error while checking for an existing database. Handle that error as a
+failed open; retry once the storage problem is resolved.
+
+**Stored formats are unchanged:** OPFS layout 6, IndexedDB schema 2, block format 2, snapshot
+format 1, worker protocol 7, and secondary-index term encoding `tuple-v2`. Databases remain
+compatible with 0.10.2.
+
+### Fixed
+
+- **A failed existence probe cannot select an empty replacement database.** OPFS permission,
+  I/O, and layout errors now propagate instead of being treated as a missing database. The
+  IndexedDB fallback probe also propagates unexpected open failures. This prevents `{ kind:
+"auto" }` from opening the other adapter when it cannot establish whether existing data is
+  present. Native-browser regressions verify that existing storage survives the failed probe.
+- **Worker keepalives respect their timeout cap when the system clock moves backward.** The
+  client measures elapsed RPC time with a monotonic clock, so progress messages cannot extend
+  a stalled request indefinitely after a wall-clock adjustment.
+- **Garbage collection tolerates a concurrent table drop during planning.** If a segment disappears
+  between discovery and nomination, the planner verifies that exact segment is absent and retries.
+  It still rejects candidates without valid provenance instead of hiding unrelated storage errors.
+- **`CREATE SEQUENCE` works on IndexedDB.** Sequence creation now records its generated-value
+  column as the unique key, satisfying the adapter's durable catalog validation. Native-browser
+  regressions also verify that sequence values continue after closing and reopening the database.
+- **SQLLogicTest rejects malformed result rows.** A missing or undefined result field can no
+  longer pass as SQL NULL, and unexpected result fields fail the harness.
+
+### Testing
+
+- Every SQL feature-matrix entry now executes in all three real browsers over IndexedDB and
+  OPFS, with explicit result-comparison and acceptance categories. Additional fixed and seeded
+  reads and mutations compare against browser-native SQLite Wasm and PGlite with maintenance on.
+- The fault sweep now checks exact whole-statement states and preserves every acknowledged
+  write. Partial batches and lost committed rows fail. The same sweep runs in dedicated workers
+  over IndexedDB and OPFS in Chromium, Firefox, and WebKit.
+- In-engine SQL comparisons use exact values; only external database comparisons retain their
+  documented numeric normalization. Non-finite numbers stay distinct from NULL, text that looks
+  like JSON stays text, and output column arrays are compared without ambiguous separators.
+- Simulator oracles reject malformed result rows and unrelated errors. Expected schema,
+  uniqueness, transaction, injected-fault, and worker-crash refusals are checked by specific
+  identities; an unresponsive store can end a campaign only during deliberate crash recovery.
+- Block-format properties run in real browser workers with the same seeded generators and
+  assertions as Node, covering both codecs, exact round trips, pruning metadata, and corrupt
+  bytes. The seed registry and soak runner now include this campaign.
+- Release and nightly gates run the full pinned SQLLogicTest corpus and longer interaction
+  campaigns against real browser storage. Ordinary interaction plans must complete; deliberate
+  worker-crash campaigns are separate. Plans are attached for replay, and nightly runs explore
+  new recorded seed inputs. WebKit conformance runs on macOS, and unavailable worker OPFS fails
+  the release profile. Publishing requires the exact commit's successful CI and conformance runs.
+
 ## 0.10.2 — September 13, 2026
 
 Published packages: `@minnowdb/core@0.10.2`.

@@ -56,6 +56,7 @@ machines: https://minnowdb.com/llms.txt
   `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
   exist in Safari private browsing. Through the worker client, `{ kind: "auto", name }` picks
   OPFS where the worker can hold it and IndexedDB elsewhere, remembering the choice per name.
+  A failed probe for an existing database rejects; it must never select an empty replacement store.
 - Durable adapters default to `durability: "strict"`. Use `strict` whenever losing an acknowledged
   write is unacceptable. Use `"relaxed"` only when every acknowledged write can be reconstructed,
   replayed, or recovered from another durable source. For browser-local data that must be preserved,

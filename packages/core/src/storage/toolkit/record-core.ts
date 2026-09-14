@@ -7911,9 +7911,7 @@ function assertGarbageCollectionCandidateProvenance(
     return !segments.has(id);
   });
   if (unprovenSegmentId !== undefined) {
-    throw new Error(
-      `Garbage collection segment candidate has no persisted provenance: ${unprovenSegmentId}`,
-    );
+    throw new Error(`GC segment has no provenance: ${unprovenSegmentId}`);
   }
 }
 

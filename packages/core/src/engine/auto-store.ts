@@ -149,7 +149,7 @@ async function indexedDbDatabaseExists(name: string): Promise<boolean> {
       // Fall through to the open probe.
     }
   }
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const request = factory.open(name);
     let created = false;
     request.addEventListener("upgradeneeded", () => {
@@ -161,7 +161,13 @@ async function indexedDbDatabaseExists(name: string): Promise<boolean> {
       request.result.close();
       resolve(!created);
     });
-    request.addEventListener("error", () => resolve(false));
+    request.addEventListener("error", () => {
+      // The one expected failure is the abort above, which proves this name was absent. An
+      // existing database can also fail to open because storage is unavailable or unhealthy;
+      // calling that "absent" would let `auto` create an empty same-named database in OPFS.
+      if (created) resolve(false);
+      else reject(request.error ?? new Error("IndexedDB existence probe failed"));
+    });
     request.addEventListener("blocked", () => resolve(true));
   });
 }

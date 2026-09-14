@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { availableParallelism } from "node:os";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -8,6 +9,10 @@ export default defineConfig({
     alias: { "@/": `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
   },
   test: {
+    // Each file may start whole engines and durable-store simulations. Unbounded file-level
+    // parallelism turns CPU/heap contention into unrelated timeouts on large developer hosts.
+    // Keep the existing deadlines and bound simultaneous heavy suites instead.
+    maxWorkers: Math.min(4, availableParallelism()),
     include: [
       "packages/**/*.test.ts",
       "scripts/**/*.test.ts",

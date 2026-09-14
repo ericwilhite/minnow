@@ -8,7 +8,7 @@
  * crash that terminates the worker with a call in flight -- so the same seeded plan that runs
  * in-process over the Node stores runs across real tabs, real workers, and real storage.
  */
-import { MinnowDatabaseClient } from "@minnowdb/core/client";
+import { MinnowDatabaseClient, type DatabaseWorkerErrorEvent } from "@minnowdb/core/client";
 import type { QueryValue } from "@minnowdb/core";
 
 type StoreKind = "indexeddb" | "opfs";
@@ -30,16 +30,35 @@ interface TabFailure {
   message: string;
 }
 
+interface TabError {
+  source: "window-error" | "unhandled-rejection" | "worker";
+  name: string;
+  message: string;
+  kind?: DatabaseWorkerErrorEvent["kind"];
+  context?: string;
+}
+
 let client: MinnowDatabaseClient | undefined;
 let worker: Worker | undefined;
 let crashed = false;
 let descriptor: { kind: StoreKind; name: string } | undefined;
-const pageErrors: string[] = [];
+const pageErrors: TabError[] = [];
 
-window.addEventListener("error", (event) => pageErrors.push(event.message));
-window.addEventListener("unhandledrejection", (event) =>
-  pageErrors.push(event.reason instanceof Error ? event.reason.message : String(event.reason)),
+window.addEventListener("error", (event) =>
+  pageErrors.push({
+    source: "window-error",
+    name: event.error instanceof Error ? event.error.name : "Error",
+    message: event.message,
+  }),
 );
+window.addEventListener("unhandledrejection", (event) => {
+  const reason: unknown = event.reason;
+  pageErrors.push({
+    source: "unhandled-rejection",
+    name: reason instanceof Error ? reason.name : "Error",
+    message: reason instanceof Error ? reason.message : String(reason),
+  });
+});
 
 function spawn(): Worker {
   return new Worker(new URL("./published-worker.ts", import.meta.url), { type: "module" });
@@ -51,7 +70,14 @@ async function connect(): Promise<MinnowDatabaseClient> {
   worker = spawn();
   client = new MinnowDatabaseClient(worker, {
     store: descriptor,
-    onWorkerError: (event) => pageErrors.push(`${event.kind}: ${event.error.message}`),
+    onWorkerError: (event) =>
+      pageErrors.push({
+        source: "worker",
+        kind: event.kind,
+        context: event.context,
+        name: event.error.name,
+        message: event.error.message,
+      }),
   });
   await client.ready();
   return client;
@@ -121,7 +147,7 @@ const tab = {
     await client?.close({ terminateWorker: true }).catch(() => undefined);
     client = undefined;
   },
-  pageErrors(): string[] {
+  pageErrors(): TabError[] {
     return [...pageErrors];
   },
 };

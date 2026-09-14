@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./fixtures.js";
 
 /**
  * The worker boundary, with a real worker on the other side of it.

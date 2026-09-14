@@ -7,11 +7,11 @@ export default defineConfig({
   ...runnerDefaults,
   testDir: "./packages/core/browser-tests",
   webServer: {
-    command: `npx vite --host 127.0.0.1 --port ${String(port)} --strictPort`,
+    command: `node apps/site/scripts/vendor-engines.mjs && npx vite --config vite.library.config.ts --host 127.0.0.1 --port ${String(port)} --strictPort`,
     url: `${localUrl(port)}/packages/core/browser/`,
     reuseExistingServer: false,
   },
-  use: { baseURL: localUrl(port) },
+  use: { baseURL: localUrl(port), trace: "retain-on-failure" },
   // All three, including WebKit: this runner is the only place real IndexedDB is exercised, and
   // Safari's is the implementation most likely to differ. It was excluded until the harness
   // stopped treating a transient `blocked` on deleteDatabase as a failure -- see run.ts.

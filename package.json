@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -44,7 +44,7 @@
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "check": "npm run version:check && npm run format && npm run typecheck && npm run lint && npm run build && npm run api:check && npm run test:coverage && npm run test:sql:standard",
-    "check:release": "npm run check && npm run test:sql:full && npm run test:simulator:full && npm run benchmark:gate && npm run test:browser && npm run test:consumer",
+    "check:release": "npm run check && npm run test:sql:full && npm run test:simulator:full && npm run benchmark:gate && npm run test:browser:conformance && npm run test:browser:site && npm run test:consumer",
     "version:check": "vite-node scripts/version.mts check",
     "version:set": "vite-node scripts/version.mts set",
     "release:publish": "vite-node scripts/publish-packages.mts",
@@ -55,7 +55,8 @@
     "fixture:format": "vite-node scripts/write-format-fixture.mts",
     "fixture:opfs-format": "vite-node scripts/write-opfs-format-fixture.mts",
     "devtools:matrix": "vite-node scripts/devtools-unsupported-features.mts",
-    "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts"
+    "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts",
+    "test:browser:conformance": "tsc -b packages/core --force && MINNOW_BROWSER_CONFORMANCE=1 playwright test --config playwright.library.config.ts"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.5",

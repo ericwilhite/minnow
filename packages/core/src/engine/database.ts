@@ -12873,6 +12873,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               defaultValue: { kind: "autoincrement" },
             },
           ],
+          uniqueKeyColumnId: columnId,
           managed: false,
           revision: 0,
           sequence: { name: statement.name, start: 1, columnId },
@@ -16804,6 +16805,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     initialJob: GarbageCollectionJobRecord,
   ): Promise<GarbageCollectionJobRecord> {
     let job = initialJob;
+    const disappearedSegmentCandidates: string[] = [];
     for (;;) {
       const discovery = job.discovery;
       if (discovery === undefined || discovery.phase === "complete") return job;
@@ -16819,7 +16821,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const appendSegmentIds: string[] = [];
       const appendTransactionIds: string[] = [];
       const knownBlocks = new Set(job.candidateBlockIds);
-      const knownSegments = new Set(job.candidateSegmentIds);
+      const knownSegments = new Set([...job.candidateSegmentIds, ...disappearedSegmentCandidates]);
       const knownTransactions = new Set(job.candidateTransactionIds);
       let next: NonNullable<GarbageCollectionJobRecord["discovery"]> = {
         ...discovery,
@@ -17204,7 +17206,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         });
         return job;
       } catch (error) {
-        if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+        if (!(error instanceof GarbageCollectionJobConflictError)) {
+          if (!(error instanceof Error) || error.name !== "Error") throw error;
+          const disappearedSegmentId = appendSegmentIds.find(
+            (id) => error.message === `GC segment has no provenance: ${id}`,
+          );
+          if (
+            disappearedSegmentId === undefined ||
+            (await this.store.getSegment(disappearedSegmentId)) !== undefined
+          ) {
+            throw error;
+          }
+          // Segment discovery and nomination are separate bounded store calls. A foreground
+          // DROP TABLE may delete a segment in between, so retry the same discovery page while
+          // remembering that exact vanished ID. The adapter still rejects arbitrary unproven
+          // candidates; only an ID this planner just listed and then proved absent is skipped.
+          disappearedSegmentCandidates.push(disappearedSegmentId);
+        }
         const latest = await this.store.getGarbageCollectionJob(job.id);
         if (latest === undefined) throw error;
         job = latest;

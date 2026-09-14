@@ -402,10 +402,33 @@ async function runQuery(record: SqlLogicQuery, database: SqlLogicDatabase): Prom
       record.sql,
     );
   }
+  const resultColumnSet = new Set(result.columns);
+  if (resultColumnSet.size !== result.columns.length) {
+    throw new SqlLogicFailure("duplicate result column name", record.location, record.sql);
+  }
+
+  for (const [index, row] of result.rows.entries()) {
+    const rowColumns = Object.keys(row);
+    const missing = result.columns.filter(
+      (column) => !Object.hasOwn(row, column) || row[column] === undefined,
+    );
+    const unexpected = rowColumns.filter((column) => !resultColumnSet.has(column));
+    if (missing.length > 0 || unexpected.length > 0) {
+      const details = [
+        missing.length === 0 ? undefined : `missing ${missing.join(", ")}`,
+        unexpected.length === 0 ? undefined : `unexpected ${unexpected.join(", ")}`,
+      ].filter((detail) => detail !== undefined);
+      throw new SqlLogicFailure(
+        `malformed result row ${String(index + 1)}: ${details.join("; ")}`,
+        record.location,
+        record.sql,
+      );
+    }
+  }
 
   const rows = result.rows.map((row) =>
     result.columns.map((column, index) =>
-      renderSqlLogicValue(row[column] ?? null, record.types[index]),
+      renderSqlLogicValue(row[column] as QueryValue, record.types[index]),
     ),
   );
   if (record.sortMode === "rowsort") rows.sort(compareRows);

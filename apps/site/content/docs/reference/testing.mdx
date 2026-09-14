@@ -13,27 +13,28 @@ after generated declarations or asynchronous signatures change.
 
 ## Choose the smallest runner that proves the change
 
-| Command                         | What it runs                                                                                                                                                   | Use it for                                  |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| `npm test`                      | Vitest plus the committed fast SQLLogicTest profile                                                                                                            | Normal implementation work                  |
-| `npm run test:unit`             | Vitest unit, generated, simulator, comparison, and harness tests                                                                                               | A focused inner loop                        |
-| `npm run test:sql:standard`     | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds                                                                               | Every SQL or optimizer change               |
-| `npm run test:sql:full`         | The full supported profile, including exhaustive multi-way join permutations                                                                                   | Before a release                            |
-| `npm run test:coverage`         | Vitest with the coverage floors enforced                                                                                                                       | Before pushing                              |
-| `npm run soak`                  | The generative suites on fresh random seeds, to find new failures                                                                                              | Hunting bugs rather than pinning            |
-| `npm run simulate`              | One replayable deterministic concurrency, fault, and storage simulation                                                                                        | Storage and transaction changes             |
-| `npm run test:simulator:full`   | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints, then three long interaction plans over the memory, IndexedDB, and OPFS stores | Before a release                            |
-| `npm run simulate:interactions` | One replayable interaction plan: DDL, DML, transactions, concurrent rounds, faults, reopens, and maintenance against a shadow model                            | Engine, index, and transaction changes      |
-| `npm run fixture:format`        | Freezes a database this build wrote, as a compatibility fixture                                                                                                | Before changing a format version            |
-| `npm run test:browser:library`  | Core IndexedDB, OPFS, transaction, SQLLogicTest, and multi-tab interaction-plan tests in Chromium, Firefox, and WebKit                                         | Storage, engine, or browser-runtime changes |
-| `npm run test:browser:site`     | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes            |
-| `npm run test:browser`          | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks             |
-| `npm run test:consumer`         | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes            |
-| `npm run benchmark:gate`        | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor performance changes          |
-| `npm run benchmark:sizes`       | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
-| `npm run api:check`             | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
-| `npm run check`                 | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest                                                                                      | The local merge gate                        |
-| `npm run check:release`         | The local gate, full SQL/simulator, performance, and browser runners                                                                                           | Release candidates                          |
+| Command                            | What it runs                                                                                                                                                   | Use it for                                  |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `npm test`                         | Vitest plus the committed fast SQLLogicTest profile                                                                                                            | Normal implementation work                  |
+| `npm run test:unit`                | Vitest unit, generated, simulator, comparison, and harness tests                                                                                               | A focused inner loop                        |
+| `npm run test:sql:standard`        | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds                                                                               | Every SQL or optimizer change               |
+| `npm run test:sql:full`            | The full supported profile, including exhaustive multi-way join permutations                                                                                   | Before a release                            |
+| `npm run test:coverage`            | Vitest with the coverage floors enforced                                                                                                                       | Before pushing                              |
+| `npm run soak`                     | The generative suites on fresh random seeds, to find new failures                                                                                              | Hunting bugs rather than pinning            |
+| `npm run simulate`                 | One replayable deterministic concurrency, fault, and storage simulation                                                                                        | Storage and transaction changes             |
+| `npm run test:simulator:full`      | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints, then three long interaction plans over the memory, IndexedDB, and OPFS stores | Before a release                            |
+| `npm run simulate:interactions`    | One replayable interaction plan: DDL, DML, transactions, concurrent rounds, faults, reopens, and maintenance against a shadow model                            | Engine, index, and transaction changes      |
+| `npm run fixture:format`           | Freezes a database this build wrote, as a compatibility fixture                                                                                                | Before changing a format version            |
+| `npm run test:browser:library`     | Core IndexedDB, OPFS, transaction, SQLLogicTest, and multi-tab interaction-plan tests in Chromium, Firefox, and WebKit                                         | Storage, engine, or browser-runtime changes |
+| `npm run test:browser:conformance` | Full core browser suite, full SQLLogicTest, and 800-step interactions over native IndexedDB and OPFS in all three browsers                                     | Release and nightly storage correctness     |
+| `npm run test:browser:site`        | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes            |
+| `npm run test:browser`             | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks             |
+| `npm run test:consumer`            | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes            |
+| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor performance changes          |
+| `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
+| `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
+| `npm run check`                    | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest                                                                                      | The local merge gate                        |
+| `npm run check:release`            | The local gate, full SQL/simulator, performance, and browser runners                                                                                           | Release candidates                          |
 
 Install the browser binaries once before using a browser runner:
 
@@ -43,8 +44,12 @@ npx playwright install chromium firefox webkit
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request. `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
-nightly and on demand. The release workflow repeats both against the exact CI-tested commit and
-will not publish until they pass. `.github/workflows/performance.yml` runs the performance gate
+nightly and on demand. Both it and the release workflow also run
+`test:browser:conformance`: the entire core browser suite, including the full pinned SQL corpus
+and longer multi-tab plans over native IndexedDB and OPFS. WebKit runs on macOS so worker OPFS is available; a missing worker OPFS API
+fails this profile instead of skipping its tests. Publishing requires the exact commit's successful
+CI, SQL, simulator, and browser conformance gates. Retry a failed release through GitHub's rerun
+control; there is no manual trigger that can bypass CI. `.github/workflows/performance.yml` runs the performance gate
 nightly. The performance gate is deliberately kept off the merge path — it measures a machine as
 much as it measures the code, and a merge gate that fails on a noisy runner is one people learn to
 re-run rather than read. When a completed run crosses a ratio threshold, the gate starts a fresh
@@ -54,7 +59,21 @@ missing profiles, and incomplete runs still fail immediately.
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
 `playwright.*.config.ts` file. This keeps every runner independently callable without hiding which
-application it starts.
+application it starts. The library server disables file watching and hot reload, so editing a
+shared checkout cannot navigate a page in the middle of a conformance test. Finish edits before
+starting a release run so its workers and pages all load the same build.
+The tarball-shape test packs an isolated copy: its prepack hook cannot rewrite the compiler
+output while concurrent bundle and declaration tests read it.
+
+Browser runs save an HTML report in `playwright-report/`, including attached seed plans and
+result summaries. Failure traces are retained, and CI uploads the report and `test-results/`
+when a browser gate fails. A console log alone is not a replay artifact.
+
+Unit files are capped at four concurrent workers (or the available CPU count, if lower). Each
+file can start complete databases and comparison engines, so unrestricted file concurrency can
+produce heap pressure and scheduling timeouts unrelated to the engine. Test deadlines and
+coverage floors remain unchanged. Browser runners likewise cap independent scenarios at two
+workers (one on a two-CPU runner); each concurrency scenario still creates its full set of tabs.
 
 ## What each layer proves
 
@@ -73,7 +92,8 @@ application it starts.
 - **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
   cannot prove, and drive a database through a real module worker: the package entry booting,
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.
-  They also run the SQL engine itself where it ships: the committed SQLLogicTest profile executes
+  Storage fixtures use persistent browser profiles in every engine so durable adapters reach their
+  disk-backed browser implementations. They also run the SQL engine itself where it ships: the committed SQLLogicTest profile executes
   through the published worker against real IndexedDB and OPFS in all three browsers, and a
   seeded interaction plan runs with each plan connection being a real tab, so the same properties
   the Node simulator checks are judged against real workers, real storage, and real crashes.
@@ -106,6 +126,31 @@ application it starts.
   composite-key lookup, and the Kysely compilation/driver path as well as direct SQL. It is a
   guardrail, not a published cross-engine benchmark: the comparison engines run without indexes,
   which is fine for noticing that Minnow got slower and useless as a fair cross-engine claim.
+
+## Native-browser SQL comparisons
+
+The library runner executes every SQL feature-matrix entry through Minnow's built module worker
+over both native IndexedDB and OPFS in Chromium, Firefox, and WebKit. SQLite Wasm and PGlite run
+in those same real browsers as independent comparison engines. Background maintenance stays
+enabled, and unexpected worker or page errors fail the campaign even when query answers match.
+
+The 366 matrix entries are accounted for explicitly: 305 supported entries execute, and 61
+unsupported entries must reject with their recorded error while leaving the fixture unchanged.
+Portable reads compare columns and values with PostgreSQL. Compatible mutations compare affected
+counts, `RETURNING`, and the resulting keyed table state. Nondeterministic `ANY_VALUE`,
+nonportable features, and remaining DDL have explicit acceptance categories; the report does not
+count acceptance alone as a result comparison. The category totals must cover the entire matrix.
+
+Each seed also runs fixed edge cases, 42 generated queries, and four mutations with immediate
+post-state checks against SQLite and PostgreSQL: 117 independent comparisons per storage adapter
+and browser. Cases include NULL logic, joins, aggregates, windows, correlated subqueries, Unicode,
+JSON, numeric boundaries, and a literal question mark alongside a bound parameter. Numeric values
+compare exactly unless a particular aggregate or cross-runtime math expression declares a
+floating-point precision. JSON and numeric normalization follows result-domain metadata; ordinary
+text is never parsed as JSON.
+
+The campaign replays the committed `sql-conformance` seeds and accepts `MINNOW_SEED` for new or
+reproduced inputs. Its report records the seed and each coverage category.
 
 ## SQLLogicTest: broad, strict SQL correctness
 
@@ -267,7 +312,12 @@ against generated inputs rather than chosen ones: a value written and read back 
 both codecs agree, a zone map contains everything it summarizes, and a flipped byte is detected
 rather than decoded into plausible rows. The generators reach for what breaks encoders — negative
 zero, the extremes of the double range, subnormals, empty and astral-plane strings, all-null and
-empty columns. A failure shrinks to a minimal case and prints the seed.
+empty columns. A failure shrinks to a minimal case and prints the seed and shrinking path. The same property
+campaign runs in dedicated workers in Chromium, Firefox, and WebKit, using each engine's native
+`CompressionStream`, `DecompressionStream`, UTF-8 conversion, dates, and typed arrays. Every
+browser replays the same committed seeds; set `MINNOW_SEED` to reproduce a reported failure.
+The `block-format-properties` entry in `regression-seeds.json` and the soak runner keep discovered
+failures in the permanent regression set.
 
 ## Soaks and deterministic simulation
 
@@ -338,6 +388,13 @@ transaction the engine rolled back after `transactionIdleTimeoutMs` of idleness.
 whole transaction, and an expired one is acknowledged with a `ROLLBACK` before the plan goes on.
 See [transactions](/docs/engine/transactions) for the rules themselves.
 
+The runner also validates result shape: projected columns must match in order, each row must
+have exactly its declared fields, and a missing field cannot stand in for NULL. Its expected-error
+paths check the engine's specific error identity or exact documented refusal. An unrelated error
+does not become acceptable just because a statement was meant to fail or a crash was injected.
+Custom drivers must preserve error names and causes across their transport, including
+`DatabaseWorkerOutcomeUnknownError` for a mutation interrupted by a worker crash.
+
 The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`) each connection is a
 `MinnowDatabase` over one shared memory, IndexedDB, or OPFS store with the storage fault points
 armed. In Playwright (`interaction.spec.ts`) each connection is a real tab holding the published
@@ -350,10 +407,22 @@ The browser driver recovers a crash the way an application must: by reloading th
 worker in the same document is enough on Chromium and Firefox, but WebKit keeps the dead worker's
 IndexedDB connection registered until its document goes away and blocks every connection to that
 database meanwhile — so a reload is the remedy the engine's `StorageUnresponsiveError` names, and
-the driver uses it. A run that meets an unresponsive store anyway records it in
-`transientsAccepted` and stops there, with `interactions` counting the steps it judged; the engine
-bounding the wait and saying so is the accepted outcome, since nothing further can be driven
-through a store the browser has wedged.
+the driver uses it. A deliberate WebKit/IndexedDB crash campaign that meets an
+unresponsive store records it in `transientsAccepted` and stops, with `interactions` counting the
+steps it judged. This exception is limited to that browser, store, and deliberate crash campaign.
+Every browser/store pair also runs a separate campaign without fault steps that must complete
+the entire plan; a crash exception cannot replace that coverage. Other early stops fail.
+
+The standard browser campaigns generate 220 steps with three connections. The conformance profile
+generates 800 with four connections. Each run attaches its exact generated plan before executing
+it. The nightly workflow varies a logged `MINNOW_BROWSER_INTERACTION_SEED_BASE` input; reproduce that frontier with:
+
+```bash
+MINNOW_SEED=123456 MINNOW_BROWSER_INTERACTION_SEED_BASE=123456 npm run test:browser:conformance
+```
+
+This fixes the generated plan, while actual browser scheduling remains uncontrolled. Node's
+IndexedDB and OPFS simulations are additional diagnostic checks, not proof of native durability.
 
 ```bash
 npm run simulate:interactions -- --seed 24301 --length 300 --connections 4 --store indexeddb
@@ -413,18 +482,22 @@ from several tabs should funnel them through one, or retry the rejections.
 
 ## The fault sweep
 
-`packages/core/src/testing/fault-sweep.test.ts` runs one fixed write workload many times, failing
-a different storage operation each time — the first block write, then the second, then the first
-block read, and so on through every operation a clean run performs. After each interruption it
-reopens the store and asks whether what survived is coherent.
+`packages/core/src/testing/fault-sweep.ts` runs a fixed workload once without faults, then
+interrupts every reached block-read, block-write, and transaction-commit boundary in turn.
+`fault-sweep.test.ts` runs it in Node; `fault-sweep.spec.ts` runs the same campaign in dedicated
+workers over native IndexedDB and OPFS in Chromium, Firefox, and WebKit.
 
-The test cares about all-or-nothing writes, not whether an interrupted write survives. A write
-stopped halfway may be present or absent; both are correct. What is never correct is a torn state — a row nobody wrote, a duplicated
-key, a database that will not reopen. Every assertion is phrased as "the surviving state is one a
-caller could have observed", never "the write committed".
+Recovery must match an exact complete table state. Every acknowledged statement must survive;
+only the interrupted statement may be wholly present or wholly absent. Partial batches, lost
+acknowledged rows, duplicate keys, changed values, and an unreadable database all fail. A failed
+read cannot change the allowed durable state. The uninterrupted baseline must also survive a
+cold adapter reopen with every expected row.
 
-The set of fault points the workload reaches is pinned in the test. If a change starts or stops
-routing writes through one, the sweep fails and someone decides whether it should follow.
+The campaign records each injected error and rejects unrelated engine errors instead of
+swallowing them. Every fault point must be reached, and every scheduled injection must fire.
+Automatic maintenance is disabled here so the operation counts are deterministic; separate
+maintenance and crash suites test background work and abrupt worker termination. Each trial
+closes the engine and adapter, reopens the database, and removes its browser storage afterwards.
 
 ## Benchmark workload model
 
@@ -518,6 +591,7 @@ prove that every possible behavior is regression-free.
 
 OPFS browser cases check for the storage API inside a dedicated worker before running. Some
 Linux WebKit builds expose it only in the page; those cases are skipped for that missing
-capability, while IndexedDB cases still run. Worker startup errors and probe timeouts remain
-failures. Contention correctness tests allow queued durable writes a 30-second RPC deadline;
+capability in the ordinary browser runner, while IndexedDB cases still run. The conformance
+profile requires worker OPFS and fails if it is absent. Worker startup errors and probe timeouts
+remain failures. Contention correctness tests allow queued durable writes a 30-second RPC deadline;
 the separate timeout and sustained-latency tests retain their own limits.

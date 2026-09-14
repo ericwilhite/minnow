@@ -15,6 +15,7 @@
     "**/*.mts",
     "**/*.ts",
     "../vitest.config.ts",
+    "../vite.library.config.ts",
     "../playwright.library.config.ts",
     "../playwright.site.config.ts",
     "../playwright-flaky-reporter.mjs",

@@ -476,10 +476,18 @@ function buildScript(seed: number): Step[] {
 function normalize(value: unknown): unknown {
   if (value === true) return 1;
   if (value === false) return 0;
-  if (typeof value === "bigint") return Number(value);
+  if (value === undefined) return { missingValue: true };
+  if (typeof value === "bigint") {
+    const numeric = Number(value);
+    if (!Number.isSafeInteger(numeric))
+      throw new Error("Oracle integer exceeds exact numeric range");
+    return numeric;
+  }
   if (typeof value === "number") {
     if (Object.is(value, -0)) return 0;
-    return Number(value.toFixed(9));
+    if (!Number.isFinite(value)) return { nonFiniteNumber: String(value) };
+    // This corpus uses exact quarter-valued arithmetic; rounding would hide wrong answers.
+    return value;
   }
   return value;
 }
@@ -500,6 +508,10 @@ function rowKey(row: Record<string, unknown>): string {
 function keys(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): string[] {
   const mapped = rows.map(rowKey);
   return ordered ? mapped : [...mapped].sort();
+}
+
+function sameColumns(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((column, index) => column === right[index]);
 }
 
 function diffSummary(label: string, oracle: string, left: string[], right: string[]): string {
@@ -526,6 +538,19 @@ function sqliteParams(params: QueryValue[] | undefined): Array<string | number |
 // --- The harness --------------------------------------------------------------------------------
 
 describe("DML conformance against SQLite and PGlite", () => {
+  it("rejects lossy comparisons and ambiguous RETURNING column names", () => {
+    for (const value of [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      undefined,
+    ]) {
+      expect(rowKey({ amount: value })).not.toBe(rowKey({ amount: null }));
+    }
+    expect(rowKey({ amount: 1.0000000001 })).not.toBe(rowKey({ amount: 1.0000000002 }));
+    expect(() => rowKey({ amount: 9007199254740993n })).toThrow("exact numeric range");
+    expect(sameColumns(["a,b", "c"], ["a", "b,c"])).toBe(false);
+  });
   it.each(seedsFor("sql-mutation-conformance", [0xd1ffe4]))(
     "agrees on state, triggers, outcomes, and row counts across a seeded mutation script (seed %s)",
     async (seed) => {
@@ -656,7 +681,7 @@ describe("DML conformance against SQLite and PGlite", () => {
           if (
             minnowReturnedColumns !== undefined &&
             oracleReturnedColumns !== undefined &&
-            minnowReturnedColumns.join(",") !== oracleReturnedColumns.join(",")
+            !sameColumns(minnowReturnedColumns, oracleReturnedColumns)
           ) {
             failures.push(
               `${label}\n  RETURNING column order/names diverged:\n` +

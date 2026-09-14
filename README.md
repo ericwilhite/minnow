@@ -33,7 +33,7 @@ and benchmarks that run in your browser.
   OPFS performs it. Every query reads one stable snapshot, even when another tab commits at the
   same time, and origin-persistence policy is explicit for applications that cannot accept
   automatic quota eviction.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 338 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 350 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so
@@ -79,6 +79,7 @@ npm run test:sql:full  # full supported SQLLogicTest profile
 npm run test:browser   # library and site tests in real browsers, including the SQLLogicTest corpus and multi-tab interaction plans
 npm run simulate:interactions # one replayable interaction plan against the shadow model
 npm run soak           # generative suites on fresh seeds, the simulators included
+npm run test:browser:conformance # full SQL corpus and long interaction plans in all three browsers
 npm run test:browser:pos # isolated sustained POS correctness and latency checks
 npm run test:consumer  # install packed libraries in a clean Vite app and run it
 npm run site:dev       # docs, live console, and browser benchmarks

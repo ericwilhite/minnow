@@ -1,4 +1,4 @@
-import { chromium, firefox, webkit, test as base, type BrowserContext } from "@playwright/test";
+import { requireWorkerOpfs, test } from "./fixtures.js";
 
 /**
  * The live-query benchmark on real storage. Opt in with `MINNOW_LIVE_BENCH=1`; it prints one
@@ -42,18 +42,6 @@ interface LiveBenchReport {
   typedRowIdentityPreserved: boolean;
 }
 
-const test = base.extend<{ context: BrowserContext }>({
-  context: async ({ browserName }, use, testInfo) => {
-    const launcher =
-      browserName === "webkit" ? webkit : browserName === "firefox" ? firefox : chromium;
-    const context = await launcher.launchPersistentContext(testInfo.outputPath("profile"), {
-      baseURL: testInfo.project.use.baseURL ?? "",
-    });
-    await use(context);
-    await context.close();
-  },
-});
-
 function row(label: string, value: string): string {
   return `${label.padEnd(28)} ${value}`;
 }
@@ -90,25 +78,7 @@ for (const store of ["indexeddb", "opfs"] as const) {
       });
       await page.goto("/packages/core/browser/live/");
       await page.locator("#ready").waitFor();
-      if (store === "opfs") {
-        const opfsInWorkers = await page.evaluate(
-          () =>
-            new Promise<boolean>((resolve) => {
-              const code =
-                "self.postMessage(typeof navigator?.storage?.getDirectory === 'function');";
-              const worker = new Worker(
-                URL.createObjectURL(new Blob([code], { type: "text/javascript" })),
-              );
-              worker.addEventListener("message", (event) => {
-                resolve(event.data === true);
-              });
-              worker.addEventListener("error", () => {
-                resolve(false);
-              });
-            }),
-        );
-        test.skip(!opfsInWorkers, "this browser exposes no OPFS in workers");
-      }
+      if (store === "opfs") await requireWorkerOpfs(page);
       let report: LiveBenchReport;
       try {
         report = await page.evaluate(

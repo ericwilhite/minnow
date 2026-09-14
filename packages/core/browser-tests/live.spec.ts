@@ -1,17 +1,4 @@
-import { requireWorkerOpfs } from "./fixtures.js";
-import { chromium, firefox, webkit, test as base, type BrowserContext } from "@playwright/test";
-
-const test = base.extend<{ context: BrowserContext }>({
-  context: async ({ browserName }, use, info) => {
-    const launcher =
-      browserName === "webkit" ? webkit : browserName === "firefox" ? firefox : chromium;
-    const context = await launcher.launchPersistentContext(info.outputPath("profile"), {
-      baseURL: info.project.use.baseURL ?? "",
-    });
-    await use(context);
-    await context.close();
-  },
-});
+import { requireWorkerOpfs, test } from "./fixtures.js";
 
 for (const store of ["indexeddb", "opfs"] as const) {
   test(`maintains exact live patches through a real ${store} worker`, async ({ page }) => {

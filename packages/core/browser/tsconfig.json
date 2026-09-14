@@ -16,6 +16,12 @@
     "pos.ts",
     "quota.ts",
     "sqllogictest-run.ts",
-    "interaction-run.ts"
+    "interaction-run.ts",
+    "fault-sweep-worker.ts",
+    "storage-probe.ts",
+    "block-properties-worker.ts",
+    "sql-differential-run.ts",
+    "clock-run.ts",
+    "clock-worker.ts"
   ]
 }

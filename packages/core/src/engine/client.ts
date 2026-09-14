@@ -1339,12 +1339,15 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     const timeoutMs = controls.timeoutMs ?? this.#requestTimeoutMs;
     const mayPublish = rpcMayPublish(method, args);
     return new Promise((resolve, reject) => {
-      const startedAt = Date.now();
+      // Keepalive bounds measure elapsed time, so they must use a monotonic clock. Date.now()
+      // can move backward after a system clock correction or laptop resume; with a reporting
+      // worker that made the overall extension cap recede forever.
+      const startedAt = performance.now();
       const expire = (): void => this.#fail(new DatabaseWorkerTimeoutError(method, timeoutMs));
       let timer = setTimeout(expire, timeoutMs);
       (timer as { unref?: () => void }).unref?.();
       const keepalive = (): void => {
-        const elapsed = Date.now() - startedAt;
+        const elapsed = performance.now() - startedAt;
         const remaining = timeoutMs * MAX_KEEPALIVE_EXTENSION - elapsed;
         if (remaining <= 0) return;
         clearTimeout(timer);

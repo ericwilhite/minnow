@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./fixtures.js";
 
 test("coordinates and recovers transactions in real IndexedDB", async ({ page }) => {
   await page.goto("/packages/core/browser/");

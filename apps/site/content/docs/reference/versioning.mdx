@@ -137,8 +137,10 @@ git commit -m "Release core 0.5.0 and adapters" && git push
 ```
 
 Publishing is driven by the versions in the manifests, not by a tag or a command. When that
-commit's CI run goes green, `.github/workflows/release.yml` publishes every package whose version
-npm does not already have and tags each one, such as `@minnowdb/core@0.5.0`. A push that changes no version
+commit's CI run goes green, `.github/workflows/release.yml` checks the same commit with the full
+SQL and simulator campaigns, including native IndexedDB and OPFS in Chromium, Firefox, and
+macOS WebKit. Only after those pass does it publish every package whose version npm does not
+already have and tag each one, such as `@minnowdb/core@0.5.0`. A push that changes no version
 publishes nothing, and a rerun after a failure is safe, because the registry decides what has
 already shipped.
 

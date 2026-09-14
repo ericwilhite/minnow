@@ -1,5 +1,5 @@
-import { requireWorkerOpfs } from "./fixtures.js";
-import { expect, test as base, webkit, type Page } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { requireWorkerOpfs, test } from "./fixtures.js";
 
 /**
  * The OPFS block store on real browser storage. The Node suites prove the store's behaviour
@@ -7,26 +7,10 @@ import { expect, test as base, webkit, type Page } from "@playwright/test";
  * and WebKit each implement the exclusive sync-access-handle lock the command log builds on,
  * and each is the only place that implementation is exercised.
  *
- * WebKit gets a persistent browser context: Playwright's default ephemeral context is
- * private-browsing storage, and Safari's private browsing has no OPFS at all —
- * `navigator.storage.getDirectory()` fails outright. (The same fact is why the docs keep
- * IndexedDB as the fallback story for private windows.)
+ * Every engine gets the shared persistent storage fixture. Playwright's default ephemeral
+ * context can put storage on an in-memory or private-browsing path, which does not prove the
+ * durable implementation applications use.
  */
-const test = base.extend<{ page: Page }>({
-  page: async ({ browserName, page }, use, testInfo) => {
-    if (browserName !== "webkit") {
-      await use(page);
-      return;
-    }
-    const context = await webkit.launchPersistentContext(testInfo.outputPath("webkit-profile"), {
-      baseURL: testInfo.project.use.baseURL ?? "",
-    });
-    const persistentPage = await context.newPage();
-    await use(persistentPage);
-    await context.close();
-  },
-});
-
 test("runs the OPFS store through real workers on real storage", async ({ page }) => {
   // Firefox occasionally needs well over the default 30s for the full sequence of real
   // flushed writes; the assertions below are about correctness, not latency.
@@ -34,10 +18,6 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
   const consoleErrors: string[] = [];
   page.on("console", (message) => {
     if (message.type() !== "error") return;
-    // Terminating a worker mid-session makes WebKit log a failed blob resource load for the
-    // dying worker's module graph. That is the browser narrating the termination, not an
-    // application error.
-    if (message.text().includes("Failed to load resource")) return;
     const where = message.location();
     consoleErrors.push(`${message.text()} @ ${where.url}:${String(where.lineNumber)}`);
   });

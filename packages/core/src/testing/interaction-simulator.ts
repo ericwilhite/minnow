@@ -1355,8 +1355,8 @@ class PlanRunner {
       try {
         await this.#step(interaction);
       } catch (error) {
-        if (!isStoreUnresponsive(error)) throw error;
-        stoppedBy = describeError(error);
+        if (!(error instanceof AcceptedStoreUnresponsive)) throw error;
+        stoppedBy = describeError(error.storageError);
         break;
       }
       judged += 1;
@@ -1415,7 +1415,33 @@ class PlanRunner {
   async #query(connection: number, sql: string): Promise<SimulatedQueryResult> {
     this.#record(`[${String(connection)}] ${sql}`);
     this.#queries++;
-    return this.#connection(connection).query(sql);
+    const result = await this.#connection(connection).query(sql);
+    if (new Set(result.columns).size !== result.columns.length) {
+      this.#fail("query result has duplicate columns");
+    }
+    for (const row of result.rows) {
+      const missing = result.columns.filter(
+        (column) => !Object.hasOwn(row, column) || row[column] === undefined,
+      );
+      const unexpected = Object.keys(row).filter((column) => !result.columns.includes(column));
+      if (missing.length > 0 || unexpected.length > 0) {
+        this.#fail(
+          `malformed query row: missing ${missing.join(", ")}; unexpected ${unexpected.join(", ")}`,
+        );
+      }
+    }
+    return result;
+  }
+
+  #expectColumns(actual: readonly string[], expected: readonly string[]): void {
+    if (
+      actual.length !== expected.length ||
+      actual.some((column, index) => column !== expected[index])
+    ) {
+      this.#fail(
+        `query result columns differ: observed ${JSON.stringify(actual)}; expected ${JSON.stringify(expected)}`,
+      );
+    }
   }
 
   async #step(interaction: Interaction): Promise<void> {
@@ -1463,6 +1489,12 @@ class PlanRunner {
     if (exists) {
       if (outcome.error === undefined)
         this.#fail("double-create-failure: creating an existing table succeeded");
+      if (!isTableAlreadyExists(outcome.error, interaction.table.name)) {
+        this.#fail(
+          `creating an existing table failed with the wrong error: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      }
       this.#expectedFailures++;
       return;
     }
@@ -1658,6 +1690,12 @@ class PlanRunner {
     );
     if (!exists) {
       if (outcome.error === undefined) this.#fail("dropping a missing table succeeded");
+      if (!isUnknownTable(outcome.error, interaction.table)) {
+        this.#fail(
+          `dropping a missing table failed with the wrong error: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      }
       this.#expectedFailures++;
       return;
     }
@@ -1670,6 +1708,12 @@ class PlanRunner {
     );
     if (select.error === undefined)
       this.#fail("drop-select: a dropped table still answers queries");
+    if (!isUnknownTable(select.error, interaction.table)) {
+      this.#fail(
+        `querying a dropped table failed with the wrong error: ${describeError(select.error)}`,
+        select.error,
+      );
+    }
   }
 
   /**
@@ -1752,6 +1796,12 @@ class PlanRunner {
         if (!accepted) {
           if (outcome.error === undefined)
             this.#fail("a duplicate primary key was accepted inside a transaction");
+          if (!isUniqueViolation(outcome.error)) {
+            this.#fail(
+              `duplicate insert inside a transaction failed with the wrong error: ${describeError(outcome.error)}`,
+              outcome.error,
+            );
+          }
           this.#expectedFailures++;
           // A failed statement inside a SQL transaction leaves the transaction unusable; the
           // engine must refuse further statements and COMMIT must roll back, like PostgreSQL.
@@ -1912,6 +1962,12 @@ class PlanRunner {
       const outcome = await this.#attempt(interaction.connection, sql);
       if (outcome.error === undefined)
         this.#fail("a duplicate insert was accepted during a fault step");
+      if (!isUniqueViolation(outcome.error)) {
+        this.#fail(
+          `duplicate insert during a fault step failed with the wrong error: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      }
       this.#expectedFailures++;
       return;
     }
@@ -1957,19 +2013,33 @@ class PlanRunner {
     // A fault after the commit point, or a crash after the reply, legitimately reports success:
     // the only requirement is then durability, checked below. A reported failure must have
     // left the table exactly as it was or exactly as the mutation would have made it.
-    if (
-      outcome.error !== undefined &&
-      !isUnknownOutcome(outcome.error) &&
-      !isInjectedFault(outcome.error) &&
-      !isConflict(outcome.error)
-    ) {
+    const expectedError =
+      outcome.error === undefined
+        ? true
+        : interaction.point === "crash"
+          ? isExpectedCrashOutcome(outcome.error)
+          : isInjectedFault(outcome.error, interaction.point);
+    if (!expectedError) {
       this.#fail(
         `fault ${interaction.point} surfaced an unexpected error: ${describeError(outcome.error)}`,
       );
     }
     // Reopen before judging: the model is settled only once the durable state has been read.
-    await this.#reopenConnection(interaction.connection);
-    const actual = await this.#read(interaction.connection, interaction.table);
+    let actual: Array<Readonly<Record<string, unknown>>>;
+    try {
+      await this.#reopenConnection(interaction.connection);
+      actual = await this.#read(interaction.connection, interaction.table);
+    } catch (error) {
+      // Only crash recovery may meet the browser wedge documented by `StorageUnresponsiveError`.
+      // Ordinary steps and the crashed mutation's own outcome still have to report their exact
+      // contract; accepting this name globally would let an unrelated engine failure stop a run
+      // successfully before the remaining interactions were judged.
+      const storageError = errorInChainWithName(error, "StorageUnresponsiveError");
+      if (interaction.point === "crash" && storageError !== undefined) {
+        throw new AcceptedStoreUnresponsive(storageError);
+      }
+      throw error;
+    }
     const beforeRows = canonicalRows(before.sorted(interaction.table), columns);
     const afterRows = canonicalRows(after.sorted(interaction.table), columns);
     const observed = canonicalRows(actual, columns);
@@ -2044,6 +2114,7 @@ class PlanRunner {
       connection,
       `SELECT * FROM ${quote(table)} WHERE ${where} ORDER BY id`,
     ).catch((error: unknown) => this.#fail(`SELECT failed: ${describeError(error)}`, error));
+    this.#expectColumns(result.columns, this.#model.columns(table));
     return [...result.rows];
   }
 
@@ -2071,8 +2142,7 @@ class PlanRunner {
     columns: readonly string[],
     property: string,
   ): void {
-    const missing = columns.filter((column) => !result.columns.includes(column));
-    if (missing.length > 0) this.#fail(`${property}: result lacks columns ${missing.join(", ")}`);
+    this.#expectColumns(result.columns, columns);
     const observed = result.rows.map((row) => canonical(row, columns)).join("\n");
     const wanted = expected.map((row) => canonical(row, columns)).join("\n");
     if (observed !== wanted) {
@@ -2142,20 +2212,32 @@ export function describeError(error: unknown): string {
   return String(error);
 }
 
-function errorText(error: unknown): string {
-  return describeError(error);
+function isTableAlreadyExists(error: unknown, table: string): boolean {
+  return errorChainSome(
+    error,
+    (name, message) =>
+      (name === "Error" && message === `Table name already exists: ${table}`) ||
+      (name === "TypeError" && message === `Table already exists: ${table}`),
+  );
+}
+
+function isUnknownTable(error: unknown, table: string): boolean {
+  return errorChainSome(
+    error,
+    (name, message) => name === "UnknownTableError" && message === `Unknown table: ${table}`,
+  );
 }
 
 function isUniqueViolation(error: unknown): boolean {
-  return /UniqueConstraint|duplicate value|unique/iu.test(errorText(error));
+  return errorChainSome(error, (name) => name === "UniqueConstraintError");
 }
 
 function isConflict(error: unknown): boolean {
-  return /WriteConflict|Manifest changed|conflict/iu.test(errorText(error));
+  return errorChainSome(error, (name) => name === "WriteConflictError");
 }
 
 function isExpiredTransaction(error: unknown): boolean {
-  return /TransactionExpired|transaction expired/iu.test(errorText(error));
+  return errorChainSome(error, (name) => name === "TransactionExpiredError");
 }
 
 /** A SQL transaction the engine refused for a documented reason; the plan step ends with it. */
@@ -2173,27 +2255,53 @@ class RefusedTransaction extends Error {
   }
 }
 
-function isUnknownOutcome(error: unknown): boolean {
-  return /OutcomeUnknown|UnknownOutcome|ConnectionLost|Worker.*(terminated|failed|closed)|is closed/iu.test(
-    errorText(error),
-  );
+function errorChainSome(
+  error: unknown,
+  predicate: (name: string | undefined, message: string | undefined) => boolean,
+): boolean {
+  return findErrorInChain(error, predicate) !== undefined;
 }
 
-function isInjectedFault(error: unknown): boolean {
-  return /injected/iu.test(errorText(error));
-}
-
-/**
- * A store that stopped answering, reported by name so it is recognized across a driver that
- * carries errors as text. The failure may be wrapped -- an `InteractionFailure` keeps it as its
- * cause -- so the whole chain is searched.
- */
-function isStoreUnresponsive(error: unknown): boolean {
-  for (let current: unknown = error, depth = 0; current !== undefined && depth < 8; depth += 1) {
-    if (errorText(current).includes("StorageUnresponsive")) return true;
-    current = isRecord(current) ? current.cause : undefined;
+function findErrorInChain(
+  error: unknown,
+  predicate: (name: string | undefined, message: string | undefined) => boolean,
+): Record<string, unknown> | undefined {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (isRecord(current) && !seen.has(current)) {
+    seen.add(current);
+    const name = typeof current.name === "string" ? current.name : undefined;
+    const message = typeof current.message === "string" ? current.message : undefined;
+    if (predicate(name, message)) return current;
+    current = current.cause;
   }
-  return false;
+  return undefined;
+}
+
+function isExpectedCrashOutcome(error: unknown): boolean {
+  return errorChainSome(error, (name) => name === "DatabaseWorkerOutcomeUnknownError");
+}
+
+function isInjectedFault(error: unknown, point: Exclude<FaultPointName, "crash">): boolean {
+  const expected = `injected ${point} #1`;
+  return errorChainSome(error, (name, message) => name === "Error" && message === expected);
+}
+
+function errorInChainWithName(
+  error: unknown,
+  expectedName: string,
+): Record<string, unknown> | undefined {
+  return findErrorInChain(error, (name) => name === expectedName);
+}
+
+/** A deliberate crash reached recovery, where a browser-level storage wedge prevents judging it. */
+class AcceptedStoreUnresponsive extends Error {
+  constructor(readonly storageError: unknown) {
+    super("The store stopped answering during deliberate crash recovery", {
+      cause: storageError,
+    });
+    this.name = "AcceptedStoreUnresponsive";
+  }
 }
 
 // Stream-identical copy of `mulberry32` in ./seeds.ts; see simulator.ts for why the published

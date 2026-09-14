@@ -1967,12 +1967,22 @@ export async function opfsDatabaseExists(options: {
 }): Promise<boolean> {
   const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
   try {
-    const root = options.root ?? (await navigator.storage.getDirectory());
-    const namespace = await root.getDirectoryHandle("minnowdb");
-    await namespace.getDirectoryHandle(encodedName);
+    const root =
+      options.root ??
+      (await (
+        globalThis as {
+          navigator?: { storage?: { getDirectory?: () => Promise<FileSystemDirectoryHandle> } };
+        }
+      ).navigator?.storage?.getDirectory?.());
+    if (root === undefined) return false;
+    await (await root.getDirectoryHandle("minnowdb")).getDirectoryHandle(encodedName);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // Absence is the only safe negative answer. `auto` uses this probe to decide whether it may
+    // create a same-named database in IndexedDB, so treating a permission, I/O, or transient
+    // backend failure as "missing" could silently open an empty database on the other adapter.
+    if (isDomError(error, "NotFoundError")) return false;
+    throw error;
   }
 }
 

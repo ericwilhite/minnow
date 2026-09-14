@@ -302,6 +302,34 @@ describe("SQLLogicTest runner", () => {
     expect(statistics).toMatchObject({ queries: 2, values: 1 });
   });
 
+  it.each([
+    [{ columns: ["n"], rows: [{}] }, "query I\nSELECT n\n----\nNULL\n", "missing n"],
+    [{ columns: ["n"], rows: [{ n: undefined }] }, "query I\nSELECT n\n----\nNULL\n", "missing n"],
+    [
+      { columns: ["n"], rows: [{ n: null, hidden: 1 }] },
+      "query I\nSELECT n\n----\nNULL\n",
+      "unexpected hidden",
+    ],
+    [
+      { columns: ["n", "n"], rows: [{ n: null }] },
+      "query II\nSELECT n\n----\nNULL\nNULL\n",
+      "duplicate result column name",
+    ],
+  ])(
+    "rejects malformed result rows instead of canonicalizing them",
+    async (result, source, message) => {
+      const records = parseSqlLogicTest(source, "shape.test");
+      await expect(
+        runSqlLogicTest(
+          records,
+          fakeDatabase({
+            "SELECT n": result as never,
+          }),
+        ),
+      ).rejects.toThrow(message);
+    },
+  );
+
   it("runs the format through Minnow's public SQL and storage APIs", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore(), {
       compression: "raw",

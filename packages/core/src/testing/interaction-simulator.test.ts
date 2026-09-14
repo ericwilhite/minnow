@@ -249,6 +249,475 @@ describe("a refused SQL transaction", () => {
   });
 });
 
+describe("expected failure identities", () => {
+  type ExecuteArgs = Parameters<SimulatedConnection["execute"]>;
+  type QueryArgs = Parameters<SimulatedConnection["query"]>;
+  interface Overrides {
+    execute?: (
+      connection: SimulatedConnection,
+      ...args: ExecuteArgs
+    ) => ReturnType<SimulatedConnection["execute"]>;
+    query?: (
+      connection: SimulatedConnection,
+      ...args: QueryArgs
+    ) => ReturnType<SimulatedConnection["query"]>;
+  }
+
+  const table = {
+    name: "t0",
+    columns: [{ name: "c0", type: "integer", nullable: false }],
+  } as const;
+  const create = (expectExisting: boolean): Interaction => ({
+    kind: "createTable",
+    connection: 0,
+    table,
+    expectExisting,
+  });
+  const insert = (): Interaction => ({
+    kind: "insert",
+    connection: 0,
+    table: "t0",
+    rows: [{ id: 1, c0: 10 }],
+    viaParameters: false,
+  });
+  const plan = (...interactions: Interaction[]): InteractionPlan => ({
+    version: 1,
+    seed: 3,
+    connections: 1,
+    interactions,
+  });
+
+  const expectRejected = async (
+    interactionPlan: InteractionPlan,
+    overrides: Overrides,
+    expected: RegExp,
+  ): Promise<void> => {
+    const store = new MemoryBlockStore();
+    try {
+      const driver = createDatabaseDriver(store);
+      await expect(
+        runInteractionPlan(interactionPlan, {
+          ...driver,
+          open: async (index) => {
+            const connection = await driver.open(index);
+            const execute = overrides.execute;
+            const query = overrides.query;
+            return {
+              ...connection,
+              execute: (...args) =>
+                execute === undefined ? connection.execute(...args) : execute(connection, ...args),
+              query: (...args) =>
+                query === undefined ? connection.query(...args) : query(connection, ...args),
+            };
+          },
+        }),
+      ).rejects.toThrow(expected);
+    } finally {
+      store.close();
+    }
+  };
+
+  it("rejects an unrelated error on double CREATE", async () => {
+    let creates = 0;
+    await expectRejected(
+      plan(create(false), create(true)),
+      {
+        execute: (connection, sql, params) => {
+          if (sql.startsWith("CREATE TABLE") && ++creates === 2) {
+            return Promise.reject(new Error("catalog storage unavailable"));
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /creating an existing table failed with the wrong error.*catalog storage unavailable/s,
+    );
+  });
+
+  it("rejects an unrelated error on a missing DROP", async () => {
+    let drops = 0;
+    await expectRejected(
+      plan(
+        create(false),
+        { kind: "dropTable", connection: 0, table: "t0", expectMissing: false },
+        { kind: "dropTable", connection: 0, table: "t0", expectMissing: true },
+      ),
+      {
+        execute: (connection, sql, params) => {
+          if (sql.startsWith("DROP TABLE") && ++drops === 2) {
+            return Promise.reject(new Error("catalog storage unavailable"));
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /dropping a missing table failed with the wrong error.*catalog storage unavailable/s,
+    );
+  });
+
+  it("requires an UnknownTableError after DROP", async () => {
+    await expectRejected(
+      plan(create(false), { kind: "dropTable", connection: 0, table: "t0", expectMissing: false }),
+      {
+        query: (connection, sql, params) =>
+          sql.startsWith('SELECT * FROM "t0"')
+            ? Promise.reject(new Error("catalog read unavailable"))
+            : connection.query(sql, params),
+      },
+      /querying a dropped table failed with the wrong error.*catalog read unavailable/s,
+    );
+  });
+
+  it("rejects an unrelated error containing unique on a duplicate INSERT", async () => {
+    let inserts = 0;
+    await expectRejected(
+      plan(create(false), insert(), insert()),
+      {
+        execute: (connection, sql, params) => {
+          if (sql.startsWith("INSERT INTO") && ++inserts === 2) {
+            return Promise.reject(new Error("unique storage service unavailable"));
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /duplicate insert failed with the wrong error.*unique storage service unavailable/s,
+    );
+  });
+
+  it("requires UniqueConstraintError for a duplicate inside a transaction", async () => {
+    let inserts = 0;
+    await expectRejected(
+      plan(create(false), insert(), {
+        kind: "transaction",
+        connection: 0,
+        observer: 0,
+        table: "t0",
+        statements: [{ kind: "insert", rows: [{ id: 1, c0: 10 }] }],
+        outcome: "rollback",
+      }),
+      {
+        execute: (connection, sql, params) => {
+          if (sql.startsWith("INSERT INTO") && ++inserts === 2) {
+            return Promise.reject(new Error("transaction storage unavailable"));
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /duplicate insert inside a transaction failed with the wrong error.*storage unavailable/s,
+    );
+  });
+
+  it("requires UniqueConstraintError for a duplicate fault step", async () => {
+    let inserts = 0;
+    await expectRejected(
+      plan(create(false), insert(), {
+        kind: "fault",
+        connection: 0,
+        table: "t0",
+        mutation: { kind: "insert", row: { id: 1, c0: 10 } },
+        point: "beforeBlockWrite",
+      }),
+      {
+        execute: (connection, sql, params) => {
+          if (sql.startsWith("INSERT INTO") && ++inserts === 2) {
+            return Promise.reject(new Error("fault driver unavailable"));
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /duplicate insert during a fault step failed with the wrong error.*driver unavailable/s,
+    );
+  });
+
+  it("rejects unrelated conflict text as a lost transaction race", async () => {
+    await expectRejected(
+      plan(create(false), {
+        kind: "transaction",
+        connection: 0,
+        observer: 0,
+        table: "t0",
+        statements: [{ kind: "insert", rows: [{ id: 2, c0: 20 }] }],
+        outcome: "commit",
+      }),
+      {
+        execute: async (connection, sql, params) => {
+          if (sql === "COMMIT") {
+            await connection.execute("ROLLBACK");
+            throw new Error("conflict observer unavailable");
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /COMMIT failed.*conflict observer unavailable/s,
+    );
+  });
+
+  it("rejects unrelated transaction-expired text as an idle rollback", async () => {
+    let transactionOpen = false;
+    await expectRejected(
+      plan(create(false), {
+        kind: "transaction",
+        connection: 0,
+        observer: 0,
+        table: "t0",
+        statements: [{ kind: "insert", rows: [{ id: 2, c0: 20 }] }],
+        outcome: "rollback",
+      }),
+      {
+        execute: async (connection, sql, params) => {
+          if (sql === "BEGIN") {
+            const result = await connection.execute(sql, params);
+            transactionOpen = true;
+            return result;
+          }
+          if (transactionOpen && sql.startsWith("INSERT INTO")) {
+            throw new Error("transaction expired metrics unavailable");
+          }
+          return connection.execute(sql, params);
+        },
+      },
+      /INSERT inside a transaction failed.*transaction expired metrics unavailable/s,
+    );
+  });
+});
+
+describe("fault outcome oracle", () => {
+  const faultPlan = (point: "beforeBlockWrite" | "crash"): InteractionPlan => ({
+    version: 1,
+    seed: 2,
+    connections: 1,
+    interactions: [
+      {
+        kind: "createTable",
+        connection: 0,
+        table: { name: "t0", columns: [{ name: "c0", type: "integer", nullable: false }] },
+        expectExisting: false,
+      },
+      {
+        kind: "fault",
+        connection: 0,
+        table: "t0",
+        mutation: { kind: "insert", row: { id: 1, c0: 10 } },
+        point,
+      },
+    ],
+  });
+
+  const rejectingDriver = (
+    store: MemoryBlockStore,
+    error: Error,
+    point: "beforeBlockWrite" | "crash",
+    recoveryError?: Error,
+  ) => {
+    const driver = createDatabaseDriver(store);
+    let crashed = false;
+    return {
+      ...driver,
+      ...(point === "beforeBlockWrite"
+        ? {
+            faults: {
+              arm: () => undefined,
+              disarm: () => undefined,
+              fired: () => true,
+            },
+          }
+        : {}),
+      open: async (index: number) => {
+        const connection = await driver.open(index);
+        return {
+          ...connection,
+          execute: (sql: string, params?: ReadonlyArray<number | string | boolean | null>) =>
+            sql.startsWith("INSERT INTO") ? Promise.reject(error) : connection.execute(sql, params),
+          query: (sql: string, params?: ReadonlyArray<number | string | boolean | null>) =>
+            crashed && recoveryError !== undefined
+              ? Promise.reject(recoveryError)
+              : connection.query(sql, params),
+          ...(point === "crash"
+            ? {
+                crash: async () => {
+                  crashed = true;
+                },
+              }
+            : {}),
+        };
+      },
+    };
+  };
+
+  it("rejects a generic closed error from a crash driver", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      await expect(
+        runInteractionPlan(
+          faultPlan("crash"),
+          rejectingDriver(store, new Error("Table is closed for maintenance"), "crash"),
+        ),
+      ).rejects.toThrow(/crash surfaced an unexpected error.*Table is closed/s);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a conflict from a sequential injected-fault step", async () => {
+    const store = new MemoryBlockStore();
+    const error = new Error("Manifest changed without a competing writer");
+    error.name = "WriteConflictError";
+    try {
+      await expect(
+        runInteractionPlan(
+          faultPlan("beforeBlockWrite"),
+          rejectingDriver(store, error, "beforeBlockWrite"),
+        ),
+      ).rejects.toThrow(/beforeBlockWrite surfaced an unexpected error.*WriteConflictError/s);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects an unrelated error merely containing the word injected", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      await expect(
+        runInteractionPlan(
+          faultPlan("beforeBlockWrite"),
+          rejectingDriver(
+            store,
+            new Error("the storage provider injected latency into this request"),
+            "beforeBlockWrite",
+          ),
+        ),
+      ).rejects.toThrow(/beforeBlockWrite surfaced an unexpected error.*injected latency/s);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("accepts the explicit unknown-outcome identity for a crashed publishing call", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      const error = new Error("The worker ended before the commit reply");
+      error.name = "DatabaseWorkerOutcomeUnknownError";
+      const result = await runInteractionPlan(
+        faultPlan("crash"),
+        rejectingDriver(store, error, "crash"),
+      );
+      expect(result.faultsInjected).toBe(1);
+      expect(result.interactions).toBe(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("does not call unrelated StorageUnresponsive text an accepted browser wedge", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      const outcome = new Error("The worker ended before the commit reply");
+      outcome.name = "DatabaseWorkerOutcomeUnknownError";
+      await expect(
+        runInteractionPlan(
+          faultPlan("crash"),
+          rejectingDriver(
+            store,
+            outcome,
+            "crash",
+            new Error("StorageUnresponsive is only a diagnostic label here"),
+          ),
+        ),
+      ).rejects.toThrow(/SELECT failed.*StorageUnresponsive is only a diagnostic label/s);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("accepts an exact StorageUnresponsiveError only during deliberate crash recovery", async () => {
+    const store = new MemoryBlockStore();
+    try {
+      const outcome = new Error("The worker ended before the commit reply");
+      outcome.name = "DatabaseWorkerOutcomeUnknownError";
+      const recovery = new Error("The IndexedDB connection answered nothing");
+      recovery.name = "StorageUnresponsiveError";
+      const result = await runInteractionPlan(
+        faultPlan("crash"),
+        rejectingDriver(store, outcome, "crash", recovery),
+      );
+      expect(result.transientsAccepted).toBe(1);
+      expect(result.stoppedBy).toBe(
+        "StorageUnresponsiveError: The IndexedDB connection answered nothing",
+      );
+      expect(result.interactions).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("simulator result-shape oracle", () => {
+  it.each([
+    "missing nullable field",
+    "undefined nullable field",
+    "extra field",
+    "reordered columns",
+    "missing columns",
+    "duplicate columns",
+  ])("rejects %s instead of accepting a plausible row set", async (defect) => {
+    const store = new MemoryBlockStore();
+    const driver = createDatabaseDriver(store, {
+      databaseOptions: { autoCompact: false, autoCollect: false },
+    });
+    const plan: InteractionPlan = {
+      version: 1,
+      seed: 1,
+      connections: 1,
+      interactions: [
+        {
+          kind: "createTable",
+          connection: 0,
+          expectExisting: false,
+          table: { name: "t0", columns: [{ name: "c0", type: "integer", nullable: true }] },
+        },
+        {
+          kind: "insert",
+          connection: 0,
+          table: "t0",
+          rows: [{ id: 1, c0: null }],
+          viaParameters: false,
+        },
+        { kind: "checkpoint" },
+      ],
+    };
+    try {
+      await expect(
+        runInteractionPlan(plan, {
+          open: async (index) => {
+            const connection = await driver.open(index);
+            return {
+              ...connection,
+              query: async (sql) => {
+                const result = await connection.query(sql);
+                if (defect === "reordered columns")
+                  return { ...result, columns: [...result.columns].reverse() };
+                if (defect === "missing columns") return { ...result, columns: [] };
+                if (defect === "duplicate columns")
+                  return { ...result, columns: [...result.columns, ...result.columns] };
+                return {
+                  ...result,
+                  rows: result.rows.map((original) => {
+                    const row = { ...original };
+                    if (defect === "missing nullable field") delete row.c0;
+                    if (defect === "undefined nullable field") row.c0 = undefined;
+                    if (defect === "extra field") row.unrequested = 1;
+                    return row;
+                  }),
+                };
+              },
+            };
+          },
+        }),
+      ).rejects.toThrow(/malformed query row|query result.*columns/);
+    } finally {
+      store.close();
+    }
+  });
+});
+
 describe.each(stores)("interaction simulator over $name", ({ source }) => {
   it.each(seedsFor("interaction-simulator", [0x5eed, 0xc0ffee]))("seed %i", async (seed) => {
     const store = source();

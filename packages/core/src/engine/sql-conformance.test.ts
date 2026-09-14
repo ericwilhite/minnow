@@ -1625,19 +1625,12 @@ function normalize(value: unknown): unknown {
   if (typeof value === "bigint") return normalize(Number(value));
   if (typeof value === "number") {
     if (Object.is(value, -0)) return 0;
+    if (!Number.isFinite(value)) return { nonFiniteNumber: String(value) };
     return Number(value.toFixed(9));
   }
-  // JSON documents: Minnow returns text, PGlite parses json/jsonb into values, jsonb reorders
-  // object keys (shorter first), and json keeps the producer's whitespace. All of those are one
-  // document, so an object, an array, or text that parses as one compares in canonical form.
+  // JSON documents are decoded according to Minnow's result domain before reaching this helper.
+  // Native documents from PGlite still need stable key ordering here.
   if (typeof value === "object" && value !== null) return canonicalJson(value);
-  if (typeof value === "string" && (value.startsWith("{") || value.startsWith("["))) {
-    try {
-      return canonicalJson(JSON.parse(value) as unknown);
-    } catch {
-      return value;
-    }
-  }
   return value;
 }
 
@@ -1661,6 +1654,44 @@ function rowKey(row: Record<string, unknown>): string {
     Object.keys(row)
       .sort()
       .map((key) => [key, normalize(row[key])]),
+  );
+}
+
+function exactValue(value: unknown): unknown {
+  if (value === null) return ["null"];
+  if (value instanceof Date) return ["date", value.getTime()];
+  if (typeof value === "number") {
+    return [
+      "number",
+      Number.isNaN(value)
+        ? "NaN"
+        : value === Number.POSITIVE_INFINITY
+          ? "Infinity"
+          : value === Number.NEGATIVE_INFINITY
+            ? "-Infinity"
+            : Object.is(value, -0)
+              ? "-0"
+              : String(value),
+    ];
+  }
+  if (typeof value === "bigint") return ["bigint", String(value)];
+  if (Array.isArray(value)) return ["array", value.map(exactValue)];
+  if (typeof value === "object") {
+    return [
+      "object",
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, exactValue((value as Record<string, unknown>)[key])]),
+    ];
+  }
+  return [typeof value, value];
+}
+
+function exactRowKey(row: Record<string, unknown>): string {
+  return JSON.stringify(
+    Object.keys(row)
+      .sort()
+      .map((key) => [key, exactValue(row[key])]),
   );
 }
 
@@ -1694,9 +1725,42 @@ function numericDecodedRows(result: QueryResult): Array<Record<string, unknown>>
   });
 }
 
+function oracleDecodedRows(
+  rows: Array<Record<string, unknown>>,
+  minnowResult: QueryResult,
+): Array<Record<string, unknown>> {
+  const jsonColumns = minnowResult.columns.filter(
+    (_, index) => minnowResult.columnDomains[index]?.kind === "json",
+  );
+  if (jsonColumns.length === 0) return rows;
+  return rows.map((row) => {
+    const decoded = { ...row };
+    for (const name of jsonColumns) {
+      const value = decoded[name];
+      if (typeof value === "string") {
+        try {
+          decoded[name] = JSON.parse(value) as unknown;
+        } catch {
+          // PGlite already decodes a JSON string scalar to its unquoted JavaScript string.
+        }
+      }
+    }
+    return decoded;
+  });
+}
+
 function resultKeys(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): string[] {
   const keys = rows.map(rowKey);
   return ordered ? keys : [...keys].sort();
+}
+
+function exactResultKeys(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): string[] {
+  const keys = rows.map(exactRowKey);
+  return ordered ? keys : [...keys].sort();
+}
+
+function sameColumns(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((column, index) => column === right[index]);
 }
 
 /** Result ordering may live under the projection that hides an ORDER BY-only expression. */
@@ -2305,6 +2369,25 @@ const REQUIRES_LOWERING = "Unknown table alias";
 // --- The harness --------------------------------------------------------------------------------
 
 describe("SQL conformance against SQLite and PGlite", () => {
+  it("keeps malformed numeric values and ambiguous column-name lists distinct", () => {
+    expect(resultKeys([{ value: Number.NaN }], false)).not.toEqual(
+      resultKeys([{ value: null }], false),
+    );
+    expect(resultKeys([{ value: Number.POSITIVE_INFINITY }], false)).not.toEqual(
+      resultKeys([{ value: null }], false),
+    );
+    expect(resultKeys([{ value: '{"a":1}' }], false)).not.toEqual(
+      resultKeys([{ value: '{ "a": 1 }' }], false),
+    );
+    expect(resultKeys([{ value: { b: 2, a: 1 } }], false)).toEqual(
+      resultKeys([{ value: { a: 1, b: 2 } }], false),
+    );
+    expect(exactResultKeys([{ value: 1.0000000001 }], false)).not.toEqual(
+      exactResultKeys([{ value: 1.0000000002 }], false),
+    );
+    expect(sameColumns(["a,b", "c"], ["a", "b,c"])).toBe(false);
+  });
+
   it.each(conformanceRuns())(
     "agrees on the generated corpus across all execution paths and oracles (fixture seed $fixtureSeed, corpus seed $corpusSeed)",
     async ({ fixtureSeed, corpusSeed }) => {
@@ -2341,14 +2424,14 @@ describe("SQL conformance against SQLite and PGlite", () => {
             failures.push(`${caseLabel}\n  minnow threw: ${String(error)}`);
             continue;
           }
-          const vectorKeys = resultKeys(vectorized.rows, testCase.ordered);
-          const rowKeys = resultKeys(rowExecutor.rows, testCase.ordered);
+          const vectorKeys = exactResultKeys(vectorized.rows, testCase.ordered);
+          const rowKeys = exactResultKeys(rowExecutor.rows, testCase.ordered);
           if (vectorKeys.join("\n") !== rowKeys.join("\n")) {
             failures.push(
               `${caseLabel}\n${diffSummary("vectorized vs row executor", vectorKeys, rowKeys)}`,
             );
           }
-          if (vectorized.columns.join(",") !== rowExecutor.columns.join(",")) {
+          if (!sameColumns(vectorized.columns, rowExecutor.columns)) {
             failures.push(
               `${caseLabel}\n  column order/names, vectorized vs row executor:\n` +
                 `    vectorized: ${vectorized.columns.join(", ")}\n` +
@@ -2371,13 +2454,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
               rowTables,
             );
             unoptimizedCompared += 1;
-            const unoptimizedKeys = resultKeys(unoptimized.rows, testCase.ordered);
+            const unoptimizedKeys = exactResultKeys(unoptimized.rows, testCase.ordered);
             if (rowKeys.join("\n") !== unoptimizedKeys.join("\n")) {
               failures.push(
                 `${caseLabel}\n${diffSummary("optimized vs unoptimized plan", rowKeys, unoptimizedKeys)}`,
               );
             }
-            if (rowExecutor.columns.join(",") !== unoptimized.columns.join(",")) {
+            if (!sameColumns(rowExecutor.columns, unoptimized.columns)) {
               failures.push(
                 `${caseLabel}\n  column order/names, optimized vs unoptimized plan:\n` +
                   `    optimized: ${rowExecutor.columns.join(", ")}\n` +
@@ -2399,7 +2482,10 @@ describe("SQL conformance against SQLite and PGlite", () => {
               failures.push(`${caseLabel}\n  ${oracle.name} threw: ${String(error)}`);
               continue;
             }
-            const oracleKeys = resultKeys(oracleResult.rows, testCase.ordered);
+            const oracleKeys = resultKeys(
+              oracleDecodedRows(oracleResult.rows, vectorized),
+              testCase.ordered,
+            );
             const minnowKeys = resultKeys(numericDecodedRows(vectorized), testCase.ordered);
             if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
               failures.push(
@@ -2409,7 +2495,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
             // Row comparison sorts keys, so it cannot see output column order. Compare the
             // projected column lists directly: a regression that reorders or renames output
             // columns would otherwise pass silently.
-            if (vectorized.columns.join(",") !== oracleResult.columns.join(",")) {
+            if (!sameColumns(vectorized.columns, oracleResult.columns)) {
               failures.push(
                 `${caseLabel}\n  column order/names vs ${oracle.name}:\n` +
                   `    minnow: ${vectorized.columns.join(", ")}\n` +
@@ -2495,13 +2581,16 @@ describe("SQL conformance against SQLite and PGlite", () => {
               if (typeof row.amounts === "string") row.amounts = JSON.parse(row.amounts) as unknown;
           }
           const minnowKeys = resultKeys(minnowRows, compareOrder);
-          const oracleKeys = resultKeys(oracleResult.rows, compareOrder);
+          const oracleKeys = resultKeys(
+            oracleDecodedRows(oracleResult.rows, minnowResult),
+            compareOrder,
+          );
           if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
             failures.push(
               `${feature.id} :: ${feature.example}\n${diffSummary(`minnow vs ${oracle.name}`, minnowKeys, oracleKeys)}`,
             );
           }
-          if (minnowResult.columns.join(",") !== oracleResult.columns.join(",")) {
+          if (!sameColumns(minnowResult.columns, oracleResult.columns)) {
             failures.push(
               `${feature.id} :: ${feature.example}\n  column order/names vs ${oracle.name}:\n` +
                 `    minnow: ${minnowResult.columns.join(", ")}\n` +

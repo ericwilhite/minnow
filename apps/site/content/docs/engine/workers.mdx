@@ -129,7 +129,8 @@ when a large batch must not share the UI thread.
 Each RPC has a deadline: `requestTimeoutMs` on the client defaults to 60,000 ms and also covers
 startup. The deadline measures silence, not wall time: the worker reports every five seconds on
 each call it is still working on, so a large batch write or a slow query is bounded by progress
-rather than by size, up to ten times the deadline in all. Expiry closes the connection to
+rather than by size, up to ten times the deadline in all. The cap uses monotonic elapsed time,
+so changing the system clock cannot extend it. Expiry closes the connection to
 further work and rejects pending calls with `DatabaseWorkerTimeoutError`, or
 `DatabaseWorkerOutcomeUnknownError` when an operation could have published before its reply was
 lost. Transport failures and cancellation of a dispatched mutation use the same unknown-outcome
@@ -297,7 +298,9 @@ rejects with `DatabaseStoreUnavailableError` rather than starting over. A name w
 that already holds a database on one store — created through an explicit `{ kind: "indexeddb" }`
 or `{ kind: "opfs" }` descriptor before the application switched to `auto`, or whose record was
 cleared — opens that database and records the store then, so the switch never starts an empty
-one beside it. When you delete the database, call `forgetStoreChoice(name)` from
+one beside it. If a storage existence probe fails with a permission, I/O, or other unexpected
+error, resolution rejects with that error; uncertainty is never treated as an absent database.
+When you delete the database, call `forgetStoreChoice(name)` from
 `@minnowdb/core` as well, so the name can decide afresh.
 
 `auto` is served by the generic entry and by `@minnowdb/core/worker/auto`, which bundles the two

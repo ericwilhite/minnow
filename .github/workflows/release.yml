@@ -2,12 +2,12 @@
 #
 # There is no release ritual beyond a version bump: `npm run version:set` writes a new version,
 # and once that commit's CI run is green this publishes every package whose version npm does not
-# already have, then tags each one. A push that changes no version publishes nothing, and a rerun
-# after a failure is safe, because the registry is what decides — not this workflow's history.
+# already have, then tags each one. A push that changes no version publishes nothing, and rerunning
+# a failed job is safe, because the registry is what decides — not this workflow's history.
 #
-# It waits for CI rather than repeating the merge gate, then adds the exhaustive SQL and long
-# deterministic-simulator profiles. `workflow_run` fires when CI finishes, and no red or skipped
-# gate can reach the registry.
+# It waits for CI rather than repeating the merge gate, then adds the exhaustive SQL, long
+# deterministic-simulator, and full real-browser profiles. `workflow_run` fires when CI finishes,
+# and no red or skipped gate can reach the registry.
 name: Release
 
 on:
@@ -15,8 +15,6 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  # For a release that needs a nudge — a publish that failed on an expired token, say.
-  workflow_dispatch:
 
 # There is no npm token here, and there is no secret to rotate: npm is configured to trust this
 # workflow, and `id-token: write` is what lets it prove it is this workflow. The same token signs
@@ -31,13 +29,13 @@ concurrency: release
 jobs:
   conformance:
     name: Release SQL and simulator gate
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -46,17 +44,69 @@ jobs:
       - run: npm run test:sql:full
       - run: npm run test:simulator:full
 
+  browser-conformance:
+    name: Release browser conformance (${{ matrix.browser }})
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - browser: chromium
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: firefox
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: webkit
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Resolve Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        id: browser
+        with:
+          path: ${{ matrix.cache_path }}
+          key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ steps.playwright.outputs.version }}
+      - name: Install browser
+        run: npx playwright install ${{ matrix.browser }}
+        if: steps.browser.outputs.cache-hit != 'true'
+      - name: Install browser system dependencies
+        run: npx playwright install-deps ${{ matrix.browser }}
+        if: runner.os == 'Linux'
+      - run: npm run test:browser:conformance -- --project ${{ matrix.browser }}
+      - name: Upload failure traces and plans
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-browser-conformance-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
   publish:
     name: Publish new versions to npm
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    needs: conformance
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
+    needs: [conformance, browser-conformance]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
           # The commit CI actually tested, which is not necessarily the tip of main by now.
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/setup-node@v5
         with:
           node-version: 24

@@ -35,7 +35,7 @@ hold synchronous handles). Where OPFS is unavailable, [IndexedDB](/docs/storage/
 durable fallback, and the worker client can make that choice itself:
 
 ```ts
-const store = { kind: "auto", name: "shop" }; // OPFS where the worker can hold it, else IndexedDB
+const store = { kind: "auto", name: "shop" }; // Reuses existing data; prefers OPFS for a new name
 ```
 
 The choice is remembered per database name, so a database never silently reopens empty on the

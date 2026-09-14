@@ -27,6 +27,7 @@ interface Suite {
 
 /** Every suite whose corpus is generated from a seed. A suite with a fixed corpus gains nothing here. */
 const SUITES: Suite[] = [
+  { name: "block-format-properties", file: "packages/core/src/block-format/properties.test.ts" },
   { name: "sql-conformance", file: "packages/core/src/engine/sql-conformance.test.ts" },
   {
     name: "sql-mutation-conformance",

@@ -1,6 +1,6 @@
-# The slow, exhaustive multi-way join permutations are useful precisely because they are too
-# expensive for every edit. They remain locally runnable and are required by check:release; this
-# schedule catches drift even between releases.
+# The slow, exhaustive multi-way join permutations and long real-browser interaction plans are
+# useful precisely because they are too expensive for every edit. They remain locally runnable
+# and are required by check:release; this schedule catches drift even between releases.
 name: Full SQL conformance
 
 on:
@@ -37,6 +37,60 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:simulator:full
+
+  browser-conformance:
+    name: Full browser conformance (${{ matrix.browser }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - browser: chromium
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: firefox
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: webkit
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Resolve Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        id: browser
+        with:
+          path: ${{ matrix.cache_path }}
+          key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ steps.playwright.outputs.version }}
+      - name: Install browser
+        run: npx playwright install ${{ matrix.browser }}
+        if: steps.browser.outputs.cache-hit != 'true'
+      - name: Install browser system dependencies
+        run: npx playwright install-deps ${{ matrix.browser }}
+        if: runner.os == 'Linux'
+      # The run number advances the scheduled frontier and is printed in each plan attachment, so
+      # every failure can be replayed exactly. Each engine runs that frontier over both real stores.
+      - run: npm run test:browser:conformance -- --project ${{ matrix.browser }}
+        env:
+          MINNOW_BROWSER_INTERACTION_SEED_BASE: ${{ github.run_number }}
+          MINNOW_SEED: ${{ github.run_number }}
+      - name: Upload failure traces and plans
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-conformance-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
 
   randomized-soak:
     name: Randomized engine and storage soak

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -137,26 +138,47 @@ describe("published core tarball", () => {
     expect(manifest.scripts?.prepack).toBe(
       "node ../../scripts/prepare-package.mjs --strip-comments",
     );
-    const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
-      cwd: coreRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const [report] = JSON.parse(output.slice(output.indexOf("["))) as Array<{
-      size: number;
-      unpackedSize: number;
-      files: Array<{ path: string }>;
-    }>;
-    expect(report?.files.map(({ path }) => path)).not.toContain("dist/engine/query-cache.d.ts");
-    expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
-    // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
-    // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
-    // when the interaction-plan simulator joined the published testing entry; ratchets, not
-    // targets.
-    expect(report?.size, "packed bytes").toBeLessThanOrEqual(920_000);
-    expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
-    const emitted = await readFile(join(coreRoot, "dist", "engine", "optimizer.js"), "utf8");
-    expect(emitted).not.toContain("/**");
-    expect(emitted).not.toMatch(/^\s*\/\//mu);
+    // npm's prepack hook rewrites JavaScript. Pack an isolated copy so concurrent bundle and
+    // declaration tests always read the original build, never partially rewritten files.
+    const originalOptimizer = await readFile(
+      join(coreRoot, "dist", "engine", "optimizer.js"),
+      "utf8",
+    );
+    const isolatedRoot = await mkdtemp(join(tmpdir(), "minnow-package-shape-"));
+    const isolatedCore = join(isolatedRoot, "packages", "core");
+    try {
+      await cp(coreRoot, isolatedCore, { recursive: true });
+      await mkdir(join(isolatedRoot, "scripts"));
+      for (const script of ["prepare-package.mjs", "strip-dist-comments.mjs"]) {
+        await cp(join(repoRoot, "scripts", script), join(isolatedRoot, "scripts", script));
+      }
+      await symlink(join(repoRoot, "node_modules"), join(isolatedRoot, "node_modules"), "dir");
+      const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
+        cwd: isolatedCore,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const [report] = JSON.parse(output.slice(output.indexOf("["))) as Array<{
+        size: number;
+        unpackedSize: number;
+        files: Array<{ path: string }>;
+      }>;
+      expect(report?.files.map(({ path }) => path)).not.toContain("dist/engine/query-cache.d.ts");
+      expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
+      // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
+      // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
+      // when the interaction-plan simulator joined the published testing entry; ratchets, not
+      // targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(920_000);
+      expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
+      const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
+      expect(emitted).not.toContain("/**");
+      expect(emitted).not.toMatch(/^\s*\/\//mu);
+      expect(await readFile(join(coreRoot, "dist", "engine", "optimizer.js"), "utf8")).toBe(
+        originalOptimizer,
+      );
+    } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
   }, 60_000);
 });
