@@ -6,9 +6,9 @@ import type { MinnowDatabase, VisibleSegment, VisibleSegmentPageCursor } from ".
  * with `vi.setConfig({ testTimeout })` rather than as a third `it()` argument — prettier keeps
  * a test call's layout only when that argument is a numeric literal. Locally it is exactly the
  * number given, so a hang still fails fast; on CI it is never below the 300 seconds the config
- * grants every other test there, because a hosted runner's two shared cores plus coverage
- * instrumentation run this suite five to ten times slower — a literal tuned on a developer
- * machine is a flake generator on CI.
+ * grants every other test there. Hosted CPU contention and coverage instrumentation make the
+ * same work substantially slower than a developer run. The maintenance stress suite runs in a
+ * separate execution group so unrelated files cannot consume its deadline.
  */
 export function heavyTestTimeout(localMs: number): number {
   return process.env.CI === undefined ? localMs : Math.max(localMs, 300_000);

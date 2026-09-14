@@ -53,6 +53,7 @@ interface Engine {
 export interface BrowserSqlDifferentialResult {
   readonly seeds: readonly number[];
   readonly versions: Record<EngineName, string>;
+  readonly startupStages: readonly string[];
   readonly generatedQueries: number;
   readonly fixedQueries: number;
   readonly mutations: number;
@@ -1016,14 +1017,25 @@ export async function runBrowserSqlDifferential(request: {
   const started = performance.now();
   const failures: string[] = [];
   const workerErrors: string[] = [];
-  const engines = await Promise.all([
-    openMinnow(request.store, workerErrors),
-    openSqlite(),
-    openPglite(),
-  ]);
-  const minnow = engines[0];
-  const sqlite = engines[1];
-  const pglite = engines[2];
+  const startupStages: string[] = [];
+  const reportStartupStage = (stage: string): void => {
+    startupStages.push(stage);
+    console.info(`[minnow-sql-differential] ${stage}`);
+  };
+
+  // PGlite briefly creates a second Wasm-backed database while initdb runs. Finish that peak
+  // before starting SQLite or Minnow so WebKit does not compile and allocate all three engines at
+  // once. The stage messages remain in a retained trace if the page process exits during startup.
+  reportStartupStage("pglite:start");
+  const pglite = await openPglite();
+  reportStartupStage("pglite:ready");
+  reportStartupStage("sqlite:start");
+  const sqlite = await openSqlite();
+  reportStartupStage("sqlite:ready");
+  reportStartupStage("minnow:start");
+  const minnow = await openMinnow(request.store, workerErrors);
+  reportStartupStage("minnow:ready");
+  const engines = [minnow, sqlite, pglite];
   const oracles = new Map<OracleName, Engine>([
     ["sqlite", sqlite],
     ["pglite", pglite],
@@ -1093,6 +1105,7 @@ export async function runBrowserSqlDifferential(request: {
       sqlite: sqlite.version,
       pglite: pglite.version,
     },
+    startupStages,
     generatedQueries: generatedCount,
     fixedQueries: fixedCount,
     mutations: mutationCount,

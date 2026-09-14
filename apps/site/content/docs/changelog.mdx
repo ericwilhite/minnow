@@ -72,6 +72,13 @@ compatible with 0.10.2.
 
 ### Testing
 
+- The maintenance stress suite runs in a separate execution group after the other unit files.
+  This prevents the expanding simulator corpus from consuming its CPU time under coverage.
+  A single run still covers every test and combines their coverage, with the same workloads,
+  assertions, and deadlines.
+- Native SQL comparisons initialize their Wasm oracles sequentially to reduce startup memory
+  pressure. Traces record each initialization phase to locate any future page-process failure;
+  the query corpus and required comparisons are unchanged.
 - Native checkpoint regressions reproduce both recovery defects in Chromium, Firefox, and
   WebKit. Failed interaction plans retain their original error chain, failing step, SQL history,
   and browser database files. Library traces omit continuous captures of blank runner pages;

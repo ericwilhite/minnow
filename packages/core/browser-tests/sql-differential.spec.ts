@@ -7,6 +7,7 @@ type StoreKind = "indexeddb" | "opfs";
 interface BrowserSqlDifferentialResult {
   readonly seeds: readonly number[];
   readonly versions: Record<"minnow" | "sqlite" | "pglite", string>;
+  readonly startupStages: readonly string[];
   readonly generatedQueries: number;
   readonly fixedQueries: number;
   readonly mutations: number;
@@ -93,6 +94,14 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       expect(result.versions.minnow).not.toBe("");
       expect(result.versions.sqlite).toMatch(/^3\./);
       expect(result.versions.pglite).not.toBe("");
+      expect(result.startupStages).toEqual([
+        "pglite:start",
+        "pglite:ready",
+        "sqlite:start",
+        "sqlite:ready",
+        "minnow:start",
+        "minnow:ready",
+      ]);
       expect(result.fixedQueries).toBe(10);
       expect(result.generatedQueries).toBe(42);
       expect(result.mutations).toBe(4);

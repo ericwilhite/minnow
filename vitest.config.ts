@@ -1,6 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { availableParallelism } from "node:os";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
+
+const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
 
 export default defineConfig({
   // The site's own modules import each other through the `@/` alias its tsconfig declares, so a
@@ -13,19 +15,39 @@ export default defineConfig({
     // parallelism turns CPU/heap contention into unrelated timeouts on large developer hosts.
     // Keep the existing deadlines and bound simultaneous heavy suites instead.
     maxWorkers: Math.min(4, availableParallelism()),
-    include: [
-      "packages/**/*.test.ts",
-      "scripts/**/*.test.ts",
-      "apps/site/{lib,bench,components}/**/*.test.ts",
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "unit",
+          include: [
+            "packages/**/*.test.ts",
+            "scripts/**/*.test.ts",
+            "apps/site/{lib,bench,components}/**/*.test.ts",
+          ],
+          exclude: [...configDefaults.exclude, maintenanceWorkload],
+          // Nonzero groups also preserve this order with Vitest's single-worker shortcut.
+          sequence: { groupOrder: 1 },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "maintenance",
+          include: [maintenanceWorkload],
+          // The 20,000-row update loop drives its own writer/maintenance concurrency. Running
+          // unrelated database simulators beside it under coverage exhausted its existing CI
+          // deadline. Run the unchanged workload alone, then merge coverage from both projects.
+          fileParallelism: false,
+          sequence: { groupOrder: 2 },
+        },
+      },
     ],
     /**
-     * The heavy tests here drive whole databases over a simulated IndexedDB, and the slowest
-     * takes about nine seconds on a developer machine. A hosted runner has two cores, so several
-     * test files share them and every one of those tests stretches -- the same work has measured
-     * five to ten times slower there, with V8 coverage adding the high end. A limit tuned on the
-     * machine that wrote the test is therefore a flake generator on CI, which is what these
-     * numbers answer: enough room that only a genuine hang reaches the ceiling, while a local
-     * run still fails fast.
+     * Heavy tests drive whole databases and simulated durable stores. Hosted CPU contention and
+     * V8 coverage make the same work substantially slower than an uninstrumented local run. Keep
+     * these existing deadlines while isolating the maintenance workload from unrelated files;
+     * a stalled engine still fails, and growing the regression corpus cannot starve that test.
      *
      * This is not the performance guard. A test that gets slower still passes here; the
      * benchmark gate is what reports that, and it runs on its own schedule for the same reason

@@ -99,10 +99,18 @@ cleanup marker, concurrent pruning, and deliberately unrelated gaps. Worker life
 check slow disposal, its absolute timeout cap, and cleanup after an already-reported fatal error.
 These reductions run in all three engines alongside the longer seeded plans.
 
+The native SQL comparison runner initializes PGlite, SQLite Wasm, and Minnow sequentially to
+reduce overlapping startup allocations. Its trace records each engine's start and readiness,
+so a page-process failure can be distinguished from a SQL comparison failure. Every oracle,
+query, and result check still runs, and a test that passes only on retry still fails CI.
+
 Unit files are capped at four concurrent workers (or the available CPU count, if lower). Each
 file can start complete databases and comparison engines, so unrestricted file concurrency can
-produce heap pressure and scheduling timeouts unrelated to the engine. Test deadlines and
-coverage floors remain unchanged. Browser runners likewise cap independent scenarios at two
+produce heap pressure and scheduling timeouts unrelated to the engine. The maintenance stress
+file runs alone after the other unit files, so the growing simulator seed corpus cannot consume
+its CPU time. Its own writer and background-maintenance concurrency remains intact, and coverage
+from both execution groups is combined. Test workloads, deadlines, assertions, and coverage
+floors remain unchanged. Browser runners likewise cap independent scenarios at two
 workers (one on a two-CPU runner); each concurrency scenario still creates its full set of tabs.
 
 ## What each layer proves
