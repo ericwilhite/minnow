@@ -5122,12 +5122,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         `A query cannot reference more than ${String(MAX_STORAGE_BULK_READ_ITEMS)} tables`,
       );
     }
+    // Catalog state is a set of physical tables. SQL source order still belongs to the plan,
+    // but must not give equivalent join permutations different cache identities. Keep the
+    // positional table records aligned with this canonical order when reading and unpacking it.
+    const catalogNames = names.length > 1 ? [...names].sort() : names;
     for (;;) {
-      const state = await this.#cachedCatalogState(names, probe);
+      const state = await this.#cachedCatalogState(catalogNames, probe);
       let prepared = this.#preparedCatalogStates.get(state);
       if (prepared === undefined) {
         const realTables = new Map<string, TableRecord>();
-        names.forEach((name, index) => {
+        catalogNames.forEach((name, index) => {
           const table = state.tables[index];
           if (table === undefined) throw new UnknownTableError(name);
           realTables.set(table.name, table);

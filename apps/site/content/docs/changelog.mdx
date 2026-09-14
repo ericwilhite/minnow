@@ -22,6 +22,10 @@ compatible with 0.10.2.
 
 ### Fixed
 
+- **Equivalent join orders reuse the same catalog snapshot.** Metadata cache entries now use
+  a canonical table-name order. This avoids repeated IndexedDB catalog and segment scans when
+  queries join the same tables in different orders. SQL column order, snapshot freshness,
+  durability, and query results are unchanged.
 - **A failed existence probe cannot select an empty replacement database.** OPFS permission,
   I/O, and layout errors now propagate instead of being treated as a missing database. The
   IndexedDB fallback probe also propagates unexpected open failures. This prevents `{ kind:
@@ -72,6 +76,10 @@ compatible with 0.10.2.
 
 ### Testing
 
+- Native SQLLogicTest runs report progress every thirty seconds, including the active SQL,
+  completed operation counts, and statement and query timings. Progress is retained in CI logs
+  and report attachments, so a timeout identifies where the corpus stopped. The full corpus,
+  recorded answers, and ten-minute per-file deadline are unchanged.
 - The maintenance stress suite runs in a separate execution group after the other unit files.
   This prevents the expanding simulator corpus from consuming its CPU time under coverage.
   A single run still covers every test and combines their coverage, with the same workloads,

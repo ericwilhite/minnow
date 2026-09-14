@@ -1,6 +1,8 @@
 import { expect } from "@playwright/test";
 import { requireWorkerOpfs, test as storageTest } from "./fixtures.js";
 
+const PROGRESS_PREFIX = "[minnow-sqllogictest-progress] ";
+
 /**
  * The recorded SQLLogicTest corpus in real browsers, over real storage.
  *
@@ -57,6 +59,27 @@ interface BrowserRunResult {
   statementMs: number;
   queryMs: number;
   pageErrors: string[];
+  progress: {
+    phase: "fetching" | "opening" | "running" | "closing" | "complete";
+    totalRecords: number;
+    totalStatements: number;
+    totalQueries: number;
+    operationsStarted: number;
+    operationsSettled: number;
+    statementsSettled: number;
+    queriesSettled: number;
+    current:
+      | {
+          kind: "statement" | "query";
+          ordinal: number;
+          sql: string;
+          sqlLength: number;
+        }
+      | undefined;
+    elapsedMs: number;
+    statementMs: number;
+    queryMs: number;
+  };
 }
 
 for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[]) {
@@ -66,27 +89,52 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       async ({ storageContext }, info) => {
         storageTest.setTimeout(600_000);
         const page = await storageContext.newPage();
+        let progressSequence = 0;
+        let progressWrites = Promise.resolve();
         // Errors the worker reports through the client's sink land on the page console. They are
         // part of the verdict: a corpus that passes while maintenance fails in the background is
         // not a pass.
         const consoleErrors: string[] = [];
         page.on("console", (message) => {
-          if (message.type() === "error") consoleErrors.push(message.text());
+          const text = message.text();
+          if (message.type() === "error") consoleErrors.push(text);
+          if (!text.startsWith(PROGRESS_PREFIX)) return;
+          const progress = text.slice(PROGRESS_PREFIX.length);
+          console.info(`[${info.project.name}] ${store} ${file} ${progress}`);
+          const sequence = ++progressSequence;
+          progressWrites = progressWrites
+            .then(() =>
+              info.attach(`sqllogictest-progress-${String(sequence).padStart(3, "0")}`, {
+                contentType: "application/json",
+                body: progress,
+              }),
+            )
+            .catch((error: unknown) => {
+              consoleErrors.push(`Could not attach SQLLogicTest progress: ${String(error)}`);
+            });
         });
         page.on("pageerror", (error) => consoleErrors.push(error.message));
         await page.goto("/packages/core/browser/sqllogictest/");
         await expect(page.locator("#ready")).toHaveText("SQLLogicTest runner ready");
         if (store === "opfs") await requireWorkerOpfs(page);
 
-        const result = await page.evaluate(
-          async (request) => {
-            const target = window as typeof window & {
-              runSqlLogicTestInBrowser(input: typeof request): Promise<BrowserRunResult>;
-            };
-            return target.runSqlLogicTestInBrowser(request);
-          },
-          { file, store },
-        );
+        let result: BrowserRunResult;
+        try {
+          result = await page.evaluate(
+            async (request) => {
+              const target = window as typeof window & {
+                runSqlLogicTestInBrowser(input: typeof request): Promise<BrowserRunResult>;
+              };
+              return target.runSqlLogicTestInBrowser(request);
+            },
+            { file, store },
+          );
+        } finally {
+          // Earlier progress attachments must finish even when the main evaluate is interrupted by
+          // the unchanged test deadline. Attachment failures are collected above and do not mask
+          // the corpus error or timeout.
+          await progressWrites;
+        }
 
         await info.attach(`${store}-${file}-timing.json`, {
           contentType: "application/json",
@@ -99,6 +147,7 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
               elapsedMs: Math.round(result.elapsedMs),
               statementMs: Math.round(result.statementMs),
               queryMs: Math.round(result.queryMs),
+              progress: result.progress,
             },
             undefined,
             2,
@@ -110,6 +159,16 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         expect(result.failures).toEqual([]);
         expect(recordCounts[file]).toBeDefined();
         expect(result.statistics).toMatchObject({ ...recordCounts[file], skipped: 0 });
+        expect(result.progress).toMatchObject({
+          phase: "complete",
+          totalStatements: result.statistics.statements,
+          totalQueries: result.statistics.queries,
+          operationsStarted: result.statistics.statements + result.statistics.queries,
+          operationsSettled: result.statistics.statements + result.statistics.queries,
+          statementsSettled: result.statistics.statements,
+          queriesSettled: result.statistics.queries,
+          current: undefined,
+        });
         await page.close();
       },
     );

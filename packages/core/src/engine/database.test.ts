@@ -9963,6 +9963,83 @@ describe("prepared-input cache and shared read lease", () => {
     await external.close();
   });
 
+  it("shares catalog state across reversed join order without changing SELECT star order", async () => {
+    const store = new CountingMemoryBlockStore();
+    const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+    await database.createTable({
+      name: "catalog_left",
+      columns: [
+        { name: "left_id", type: "number" },
+        { name: "left_value", type: "string" },
+      ],
+    });
+    await database.createTable({
+      name: "catalog_right",
+      columns: [
+        { name: "right_id", type: "number" },
+        { name: "right_value", type: "string" },
+      ],
+    });
+    await database.insertBatch("catalog_left", {
+      columns: { left_id: [1, 2], left_value: ["left-one", "left-two"] },
+    });
+    await database.insertBatch("catalog_right", {
+      columns: { right_id: [2, 1], right_value: ["right-two", "right-one"] },
+    });
+    store.queryCatalogStateCalls = 0;
+
+    expect(
+      await database.query(
+        "SELECT * FROM catalog_left JOIN catalog_right ON left_id = right_id ORDER BY left_id",
+        { memoize: false },
+      ),
+    ).toEqual({
+      columns: ["left_id", "left_value", "right_id", "right_value"],
+      columnDomains: [null, null, null, null],
+      rows: [
+        { left_id: 1, left_value: "left-one", right_id: 1, right_value: "right-one" },
+        { left_id: 2, left_value: "left-two", right_id: 2, right_value: "right-two" },
+      ],
+    });
+    expect(
+      await database.query(
+        "SELECT * FROM catalog_right JOIN catalog_left ON left_id = right_id ORDER BY right_id",
+        { memoize: false },
+      ),
+    ).toEqual({
+      columns: ["right_id", "right_value", "left_id", "left_value"],
+      columnDomains: [null, null, null, null],
+      rows: [
+        { right_id: 1, right_value: "right-one", left_id: 1, left_value: "left-one" },
+        { right_id: 2, right_value: "right-two", left_id: 2, left_value: "left-two" },
+      ],
+    });
+    expect(store.queryCatalogStateCalls).toBe(1);
+
+    await database.insertBatch("catalog_left", {
+      columns: { left_id: [3], left_value: ["left-three"] },
+    });
+    await database.insertBatch("catalog_right", {
+      columns: { right_id: [3], right_value: ["right-three"] },
+    });
+    expect(
+      (
+        await database.query(
+          "SELECT right_value, left_value FROM catalog_right JOIN catalog_left " +
+            "ON left_id = right_id ORDER BY right_id",
+          { memoize: false },
+        )
+      ).rows,
+    ).toEqual([
+      { right_value: "right-one", left_value: "left-one" },
+      { right_value: "right-two", left_value: "left-two" },
+      { right_value: "right-three", left_value: "left-three" },
+    ]);
+    expect(store.queryCatalogStateCalls).toBe(2);
+    await database.close();
+    store.close();
+  });
+
   it("keeps warm result-cache identity work independent of visible segment count", async () => {
     const store = new SegmentIdReadCountingStore();
     const database = new MinnowDatabase(store, {

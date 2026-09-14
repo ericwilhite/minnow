@@ -240,7 +240,10 @@ records. The same committed files also run inside Chromium, Firefox, and WebKit
 automatic maintenance left on, so a browser engine's Date, regular-expression, or number-formatting
 difference, a result that does not survive the worker boundary, or a durable store's commit path
 under thousands of statements is checked against the corpus's recorded answers rather than
-against Node's. Each run attaches its per-file timings to the report. The fast set includes representative five-table and seventeen-table join-order families
+against Node's. Each run attaches its per-file timings to the report. Every thirty seconds,
+native runs also log and attach their phase, completed statement and query counts, accumulated
+timings, and a bounded prefix of the active SQL. This preserves progress when the unchanged
+ten-minute per-file deadline expires. The fast set includes representative five-table and seventeen-table join-order families
 that guard against pathological Cartesian work. On the development machine used to measure it,
 the whole profile took about fifteen seconds. That makes the broad suite part of
 `npm test`, `npm run check`, and every pull request, instead of a suite agents discover only after
