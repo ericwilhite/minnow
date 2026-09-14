@@ -22,6 +22,8 @@ compatible with 0.10.2.
 
 ### Fixed
 
+- **The TypeScript console preserves nested compiler diagnostics.** Errors now include the
+  underlying invalid column or argument instead of stopping at a generic overload message.
 - **Equivalent join orders reuse the same catalog snapshot.** Metadata cache entries now use
   a canonical table-name order. This avoids repeated IndexedDB catalog and segment scans when
   queries join the same tables in different orders. SQL column order, snapshot freshness,
@@ -76,6 +78,9 @@ compatible with 0.10.2.
 
 ### Testing
 
+- TypeScript console checks now target the compiler's diagnostic output and verify the logged
+  mutation result exactly. Matching text in the editor can no longer satisfy an output assertion
+  or make it ambiguous. The result panel has an accessible name, and compiler errors use an alert.
 - Interaction plans finish with a fresh-row insert for each configured fault point, followed by
   a full checkpoint. Random fault steps can target missing rows and perform no write; these
   additional probes ensure that supported write hooks are actually reached. The randomized

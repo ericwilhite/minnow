@@ -279,7 +279,13 @@ export async function compile(
     : { javascript };
 }
 
-function flatten(message: string | { messageText: string; next?: unknown[] } | undefined): string {
+interface DiagnosticMessageChain {
+  readonly messageText: string;
+  readonly next?: readonly DiagnosticMessageChain[];
+}
+
+function flatten(message: string | DiagnosticMessageChain | undefined): string {
   if (message === undefined) return "";
-  return typeof message === "string" ? message : message.messageText;
+  if (typeof message === "string") return message;
+  return [message.messageText, ...(message.next ?? []).map(flatten)].join(" ");
 }

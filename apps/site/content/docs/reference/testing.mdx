@@ -104,6 +104,11 @@ reduce overlapping startup allocations. Its trace records each engine's start an
 so a page-process failure can be distinguished from a SQL comparison failure. Every oracle,
 query, and result check still runs, and a test that passes only on retry still fails CI.
 
+Site tests distinguish editor text from executed output. TypeScript errors must appear in the
+compiler diagnostics alert, and the guarded-upsert example must log exactly zero updated rows
+and one skipped row in the results panel. A matching word in the source editor cannot satisfy
+either check.
+
 Unit files are capped at four concurrent workers (or the available CPU count, if lower). Each
 file can start complete databases and comparison engines, so unrestricted file concurrency can
 produce heap pressure and scheduling timeouts unrelated to the engine. The maintenance stress

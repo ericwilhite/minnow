@@ -171,11 +171,13 @@ test("the TypeScript tab checks a snippet against the schema and runs it", async
   await page.getByRole("tab", { name: "TypeScript" }).click();
   const console_ = page.locator('[data-minnow-console="typescript"]');
   await expect(console_.locator(".monaco-editor").first()).toBeVisible({ timeout: 120_000 });
+  const results = console_.getByRole("region", { name: "TypeScript results" });
+  const compilerDiagnostics = results.getByRole("alert", { name: "Compiler diagnostics" });
 
   // The seeded snippet is a grouped aggregate through the builder. Rows come back as a table.
   await console_.getByRole("button", { name: "Run", exact: true }).click();
-  await expect(console_.locator("table")).toBeVisible({ timeout: 60_000 });
-  await expect(console_.getByRole("columnheader", { name: "revenue" })).toBeVisible();
+  await expect(results.locator("table")).toBeVisible({ timeout: 60_000 });
+  await expect(results.getByRole("columnheader", { name: "revenue" })).toBeVisible();
 
   // And the type checking is real: a column the schema does not have never reaches the database.
   // Clicking the rendered lines rather than the editor's own hidden textarea, and inserting the
@@ -186,8 +188,10 @@ test("the TypeScript tab checks a snippet against the schema and runs it", async
     'const rows = await db.selectFrom("orders").select(["nmae"]).execute();',
   );
   await console_.getByRole("button", { name: "Run", exact: true }).click();
-  await expect(console_.getByText("the compiler refused it")).toBeVisible({ timeout: 60_000 });
-  await expect(console_.getByText(/nmae/)).toBeVisible();
+  await expect(compilerDiagnostics).toContainText("the compiler refused it", {
+    timeout: 60_000,
+  });
+  await expect(compilerDiagnostics).toContainText("nmae");
 
   // The engine under the builder is declared against the same schema, so a table it does not
   // have is refused by name — and the message lists the ones it does.
@@ -195,15 +199,19 @@ test("the TypeScript tab checks a snippet against the schema and runs it", async
   await page.keyboard.press("ControlOrMeta+a");
   await page.keyboard.insertText('await database.insertBatch("stroes", []);');
   await console_.getByRole("button", { name: "Run", exact: true }).click();
-  await expect(console_.getByText(/"stroes"/)).toBeVisible({ timeout: 60_000 });
-  await expect(console_.getByText(/"stores" \| "employees"/)).toBeVisible();
+  await expect(compilerDiagnostics).toContainText(
+    /Argument of type '"stroes"'[\s\S]*"stores" \| "employees"/u,
+    { timeout: 60_000 },
+  );
 
   // And the chip that shows it off typechecks and runs: its guarded upsert is skipped, not written.
   await console_.getByRole("button", { name: "The engine, typed too" }).click();
   await console_.getByRole("button", { name: "Run", exact: true }).click();
-  // The logged object is drawn more than once (as a table and as text), so any match will do.
-  await expect(console_.getByText(/skipped/).first()).toBeVisible({ timeout: 60_000 });
-  await expect(console_.getByText("the compiler refused it")).toHaveCount(0);
+  await expect(results.locator("pre").nth(1)).toHaveText(
+    /^\{\s*"updated": 0,\s*"skipped": 1\s*\}$/u,
+    { timeout: 60_000 },
+  );
+  await expect(compilerDiagnostics).toHaveCount(0);
 });
 
 /**

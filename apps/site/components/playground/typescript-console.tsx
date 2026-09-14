@@ -272,9 +272,13 @@ export function TypeScriptConsole({
           <div ref={mount} className="h-full" />
         </div>
 
-        <div className="min-h-0 flex-[2] overflow-auto border-t border-fd-border">
+        <div
+          role="region"
+          aria-label="TypeScript results"
+          className="min-h-0 flex-[2] overflow-auto border-t border-fd-border"
+        >
           {status.kind === "rejected" ? (
-            <div className="flex flex-col gap-1 p-3">
+            <div role="alert" aria-label="Compiler diagnostics" className="flex flex-col gap-1 p-3">
               <p className="text-xs text-fd-muted-foreground">
                 Nothing ran — the compiler refused it:
               </p>
