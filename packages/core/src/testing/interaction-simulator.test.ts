@@ -80,6 +80,38 @@ describe("interaction plans", () => {
     }
   });
 
+  it("appends an effective fresh insert for every configured fault point", () => {
+    const points = [
+      "beforeBlockWrite",
+      "afterBlockWrite",
+      "beforeTransactionCommit",
+      "afterTransactionCommit",
+      "crash",
+    ] as const;
+    const keySpace = 20;
+    const plan = generateInteractionPlan(1_349_451_771, {
+      length: 160,
+      connections: 3,
+      tables: 2,
+      keySpace,
+      faultPoints: points,
+    });
+    const probes = plan.interactions.slice(-(points.length + 1), -1);
+
+    expect(probes.map((interaction) => interaction.kind)).toEqual(points.map(() => "fault"));
+    expect(
+      probes.map((interaction) => (interaction.kind === "fault" ? interaction.point : undefined)),
+    ).toEqual(points);
+    expect(
+      probes.map((interaction) =>
+        interaction.kind === "fault" && interaction.mutation.kind === "insert"
+          ? interaction.mutation.row.id
+          : undefined,
+      ),
+    ).toEqual([21, 22, 23, 24, 25]);
+    expect(plan.interactions.at(-1)).toEqual({ kind: "checkpoint" });
+  });
+
   it.each([
     "null",
     JSON.stringify({ version: 2, seed: 1, connections: 1, interactions: [] }),
@@ -777,7 +809,9 @@ describe.each(stores)("interaction simulator over $name", ({ source }) => {
       expect(result.checkpoints).toBeGreaterThan(0);
       expect(result.acceptedWrites).toBeGreaterThan(20);
       expect(result.expectedFailures).toBeGreaterThan(0);
-      expect(result.faultsInjected).toBeGreaterThan(0);
+      // The default plan ends with an effective insert for each of the four storage fault points;
+      // the in-process driver intentionally skips only the separate browser crash point.
+      expect(result.faultsInjected).toBeGreaterThanOrEqual(4);
     } finally {
       if (typeof store !== "function") store.close();
     }

@@ -76,6 +76,10 @@ compatible with 0.10.2.
 
 ### Testing
 
+- Interaction plans finish with a fresh-row insert for each configured fault point, followed by
+  a full checkpoint. Random fault steps can target missing rows and perform no write; these
+  additional probes ensure that supported write hooks are actually reached. The randomized
+  plan remains intact, and seed `1349451771` permanently covers the gap found by the soak.
 - Native SQLLogicTest runs report progress every thirty seconds, including the active SQL,
   completed operation counts, and statement and query timings. Progress is retained in CI logs
   and report attachments, so a timeout identifies where the corpus stopped. The full corpus,

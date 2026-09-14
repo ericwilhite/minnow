@@ -10,7 +10,8 @@
     "Seed 2654435792 exposed a compaction transaction ownership race in native Chromium IndexedDB.",
     "Seeds from base 23 are retained above; base 24 Firefox seed 608135840 exposed non-durable manifest cleanup cursors and disposal heartbeat timing.",
     "Its reductions are manifest-prefix.spec.ts, record-core-hardening.test.ts, and dispose-keepalive.spec.ts.",
-    "Base 24 WebKit seed 3084996987 independently exposed invalid manifest checkpoints and closing an already-failed worker client."
+    "Base 24 WebKit seed 3084996987 independently exposed invalid manifest checkpoints and closing an already-failed worker client.",
+    "Seed 1349451771 exposed a fault-coverage gap: every randomized fault targeted a missing row, so no storage write hook fired."
   ],
   "suites": {
     "sql-conformance": [12648430],
@@ -23,7 +24,7 @@
     "partitioned-compaction-soak": [],
     "auto-compaction-soak": [26172526, 756656541, 1271068371],
     "interaction-simulator": [
-      24301, 61935, 608135839, 3084996986, 2654435792, 608135840, 3084996987
+      24301, 61935, 608135839, 3084996986, 2654435792, 608135840, 3084996987, 1349451771
     ],
     "block-format-properties": []
   }

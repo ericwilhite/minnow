@@ -579,6 +579,24 @@ export function generateInteractionPlan(
     }
     if (step % 25 === 24) interactions.push({ kind: "checkpoint" });
   }
+  // Random fault steps deliberately retain mutation diversity, including duplicates and
+  // missing-key updates/deletes that never reach storage. End with one known-effective insert
+  // per configured point so every supported fault mechanism gets an effective write to interrupt.
+  // These suffix steps consume no RNG, preserving the random prefix for every recorded seed.
+  const faultTable = live.values().next().value;
+  if (faultTable === undefined) throw new Error("Plan generation ended without a live table");
+  for (const [index, point] of [...new Set(faultPoints)].entries()) {
+    interactions.push({
+      kind: "fault",
+      connection: index % connections,
+      table: faultTable.name,
+      mutation: {
+        kind: "insert",
+        row: faultProbeRow(faultTable, keySpace + index + 1),
+      },
+      point,
+    });
+  }
   interactions.push({ kind: "checkpoint" });
   return { version: 1, seed, connections, interactions };
 }
@@ -619,6 +637,25 @@ function generateValue(random: Random, column: PlanColumn): PlanValue {
 function generateRow(random: Random, table: PlanTable, keySpace: number): PlanRow {
   const row: Record<string, PlanValue> = { id: 1 + random.int(keySpace) };
   for (const column of table.columns) row[column.name] = generateValue(random, column);
+  return row;
+}
+
+function faultProbeRow(table: PlanTable, id: number): PlanRow {
+  const row: Record<string, PlanValue> = { id };
+  for (const column of table.columns) {
+    switch (column.type) {
+      case "integer":
+      case "real":
+        row[column.name] = 0;
+        break;
+      case "text":
+        row[column.name] = "fault-probe";
+        break;
+      case "boolean":
+        row[column.name] = false;
+        break;
+    }
+  }
   return row;
 }
 

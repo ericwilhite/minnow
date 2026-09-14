@@ -427,6 +427,12 @@ SQL transactions that commit or roll back, rounds of concurrent keyed writes wit
 flight, storage faults and worker crashes, reopens, compaction and collection, and checkpoints.
 The plan is JSON, so a failing seed replays exactly and can be checked in.
 
+Generated plans preserve the randomized sequence and add a fresh-row insert for each configured
+fault point before the final checkpoint. These keys lie outside the random key range, so each
+probe can change the database and reach its write hook. An update or delete of a missing row can
+otherwise make a random fault step do no work. The fresh probes supplement those random cases;
+unsupported fault points are still reported as skipped by drivers that cannot inject them.
+
 Every interaction is executed through the real SQL entry points and judged against a shadow model
 that evaluates the predicates with SQL's three-valued logic. Beyond "the rows match", the runner
 checks properties a database must honour whatever its internals do: a rejected insert leaves none
