@@ -300,6 +300,8 @@ or `{ kind: "opfs" }` descriptor before the application switched to `auto`, or w
 cleared — opens that database and records the store then, so the switch never starts an empty
 one beside it. If a storage existence probe fails with a permission, I/O, or other unexpected
 error, resolution rejects with that error; uncertainty is never treated as an absent database.
+The choice must commit before its adapter opens. A successful IndexedDB request followed by a
+transaction abort rejects the open; deleting a remembered choice also waits for commit.
 When you delete the database, call `forgetStoreChoice(name)` from
 `@minnowdb/core` as well, so the name can decide afresh.
 

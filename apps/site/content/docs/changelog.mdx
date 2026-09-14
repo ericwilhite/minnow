@@ -8,7 +8,7 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## 0.10.3 — September 13, 2026
+## 0.10.3 — September 14, 2026
 
 Published packages: `@minnowdb/core@0.10.3`.
 
@@ -27,6 +27,9 @@ compatible with 0.10.2.
   IndexedDB fallback probe also propagates unexpected open failures. This prevents `{ kind:
 "auto" }` from opening the other adapter when it cannot establish whether existing data is
   present. Native-browser regressions verify that existing storage survives the failed probe.
+- **Automatic store choices wait for their IndexedDB transaction to commit.** A request that
+  succeeds inside a transaction that later aborts can no longer authorize opening the chosen
+  adapter. Removing a remembered choice also waits for its durable transaction outcome.
 - **Worker keepalives respect their timeout cap when the system clock moves backward.** The
   client measures elapsed RPC time with a monotonic clock, so progress messages cannot extend
   a stalled request indefinitely after a wall-clock adjustment.
@@ -36,6 +39,10 @@ compatible with 0.10.2.
 - **`CREATE SEQUENCE` works on IndexedDB.** Sequence creation now records its generated-value
   column as the unique key, satisfying the adapter's durable catalog validation. Native-browser
   regressions also verify that sequence values continue after closing and reopening the database.
+- **A busy queue of tabs keeps its write coordination.** Admission now observes changes of lock
+  holder before treating a long wait as a frozen tab. Previously, a healthy queue could trigger
+  the fallback and make concurrent writers exhaust their commit retries. Native Web Locks tests
+  cover a queue that advances beyond one admission interval; frozen-holder and RPC bounds remain.
 - **SQLLogicTest rejects malformed result rows.** A missing or undefined result field can no
   longer pass as SQL NULL, and unexpected result fields fail the harness.
 
@@ -44,6 +51,9 @@ compatible with 0.10.2.
 - Every SQL feature-matrix entry now executes in all three real browsers over IndexedDB and
   OPFS, with explicit result-comparison and acceptance categories. Additional fixed and seeded
   reads and mutations compare against browser-native SQLite Wasm and PGlite with maintenance on.
+- Fixed behavior probes check mutation post-images, trigger effects, constraints, defaults,
+  generated columns, sequences, identities, and transactions. An accepted statement or an affected
+  row count alone can no longer satisfy these probes.
 - The fault sweep now checks exact whole-statement states and preserves every acknowledged
   write. Partial batches and lost committed rows fail. The same sweep runs in dedicated workers
   over IndexedDB and OPFS in Chromium, Firefox, and WebKit.

@@ -300,10 +300,12 @@ Several tabs may open the same database at once; every operation from every tab 
 ordered log, so readers never see half of anything. Reads wait for recovery after a refused WAL
 append instead of observing its tentative state. Autocommit writers coordinate admission through
 Web Locks; explicit scopes and uncoordinated writers retain optimistic conflicts, as on IndexedDB.
-That admission lock is an optimization, never the correctness: a writer that has waited ten
-seconds for a holder that will not let go (a tab the browser paused with the lock in hand) goes
+That admission lock is an optimization, never the correctness: a writer that has observed no
+change of holder for ten seconds (a tab the browser paused with the lock in hand, for example) goes
 ahead without it, reports the wait through `onBackgroundError`, and resolves any conflict
-through the same compare-and-swap retry as an uncoordinated writer. The moving parts differ from
+through the same compare-and-swap retry as an uncoordinated writer. A change of holder restarts
+the admission wait, allowing a healthy queue to drain; worker RPC deadlines still cap the total
+request time. The moving parts differ from
 the IndexedDB adapter in one honest way: multi-tab _responsiveness_ uses `BroadcastChannel`
 (universal since 2022), while correctness rests entirely on the storage lock and the checksummed
 log. A browser with no channel at all would still be safe — one tab at a time would hold the

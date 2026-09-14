@@ -86,14 +86,17 @@ jobs:
         run: npx playwright install-deps ${{ matrix.browser }}
         if: runner.os == 'Linux'
       - run: npm run test:browser:conformance -- --project ${{ matrix.browser }}
-      - name: Upload failure traces and plans
-        if: failure()
+      - name: Upload browser reports, traces, and plans
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: release-browser-conformance-${{ matrix.browser }}
           path: |
             playwright-report/
             test-results/
+            !test-results/**/storage-profile/**
+            !test-results/**/crash-profile/**
+            !test-results/**/quota-profile/**
           retention-days: 14
 
   publish:

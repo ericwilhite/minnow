@@ -82,6 +82,102 @@ function frozenHolder(): {
   };
 }
 
+/** A request queued behind several healthy holders whose identities keep advancing. */
+function progressingQueue(): { locks: LockManager; occupied: () => boolean } {
+  let occupied = true;
+  let observations = 0;
+  const request: LockManager["request"] = async (
+    _name: string,
+    optionsOrCallback: LockOptions | LockGrantedCallback<unknown>,
+    maybeCallback?: LockGrantedCallback<unknown>,
+  ) => {
+    const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
+    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        occupied = false;
+        Promise.resolve(callback?.({ name: "lock", mode: "exclusive" })).then(resolve, reject);
+      }, 75);
+      options.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        const reason: unknown = options.signal?.reason;
+        reject(reason instanceof Error ? reason : new Error("aborted", { cause: reason }));
+      });
+    });
+  };
+  return {
+    locks: {
+      request,
+      query: async () => ({
+        held: [{ name: "minnowdb-write:minnowdb-live:progress", clientId: String(observations++) }],
+        pending: [],
+      }),
+    },
+    occupied: () => occupied,
+  };
+}
+
+it("does not bypass a healthy queue whose holders keep advancing", async () => {
+  const queue = progressingQueue();
+  installLocks(queue.locks);
+  const store = new MemoryBlockStore();
+  Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:progress" });
+  const exceeded = vi.fn();
+  await expect(
+    coordinateWrite(store, async () => queue.occupied(), new AbortController().signal, {
+      admissionWaitMs: 30,
+      onAdmissionWaitExceeded: exceeded,
+    }),
+  ).resolves.toBe(false);
+  expect(exceeded).not.toHaveBeenCalled();
+});
+
+it("does not rearm admission after an unexpected lock rejection settles", async () => {
+  vi.useFakeTimers();
+  try {
+    let rejectRequest!: (error: Error) => void;
+    let queryCount = 0;
+    let resolveLateQuery!: (snapshot: LockManagerSnapshot) => void;
+    const request: LockManager["request"] = () =>
+      new Promise<unknown>((_resolve, reject) => {
+        rejectRequest = reject;
+      });
+    const locks: LockManager = {
+      request,
+      query: () => {
+        queryCount += 1;
+        if (queryCount === 1) {
+          return Promise.resolve({
+            held: [{ name: "minnowdb-write:minnowdb-live:late", clientId: "first" }],
+            pending: [],
+          });
+        }
+        return new Promise((resolve) => {
+          resolveLateQuery = resolve;
+        });
+      },
+    };
+    installLocks(locks);
+    const store = new MemoryBlockStore();
+    Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:late" });
+    const writing = coordinateWrite(store, async () => "never", new AbortController().signal, {
+      admissionWaitMs: 40,
+    });
+    await vi.advanceTimersByTimeAsync(11);
+    expect(queryCount).toBe(2);
+    rejectRequest(new Error("native lock failure"));
+    await expect(writing).rejects.toThrow("native lock failure");
+    resolveLateQuery({
+      held: [{ name: "minnowdb-write:minnowdb-live:late", clientId: "second" }],
+      pending: [],
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("waits out a frozen holder once, then lets later writes go ahead at once until it lets go", async () => {
   const holder = frozenHolder();
   installLocks(holder.locks);

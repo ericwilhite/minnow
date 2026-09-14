@@ -1,6 +1,29 @@
 import { expect } from "@playwright/test";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
+test("a progressing native Web Locks queue is not mistaken for a frozen holder", async ({
+  storageContext,
+}) => {
+  const page = await storageContext.newPage();
+  await page.goto("/packages/core/browser/");
+  const result = await page.evaluate(async () => {
+    const url = "/packages/core/browser/storage-probe.ts";
+    return (
+      (await import(url)) as typeof import("../browser/storage-probe.js")
+    ).runNativeWriteAdmissionProgress();
+  });
+
+  expect(result).toEqual({
+    progressingQueueOverlapped: false,
+    progressingQueueExceeded: 0,
+    progressingQueueWaitedPastOneInterval: true,
+    frozenQueueEnteredWhileHeld: true,
+    frozenQueueExceeded: 1,
+    frozenQueueChurnProven: true,
+    frozenQueueStayedBounded: true,
+  });
+});
+
 test("an uncertain native storage probe cannot shadow an existing database", async ({
   storageContext,
 }) => {

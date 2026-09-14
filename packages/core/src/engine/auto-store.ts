@@ -71,19 +71,10 @@ export async function resolveAutoStoreKind(
 ): Promise<{ kind: AutoStoreKind; reserved: boolean }> {
   const remembered = await readChoice(name);
   if (remembered === "indexeddb") return { kind: "indexeddb", reserved: false };
-  if (remembered === "opfs") {
-    if (await opfsAvailable()) return { kind: "opfs", reserved: false };
-    throw new DatabaseStoreUnavailableError(
-      "opfs",
-      name,
-      `Database "${name}" lives on the OPFS store, which this context cannot open; it is not ` +
-        "reopened on IndexedDB, where it would be empty",
-    );
-  }
-  // Nothing remembered: a database that already exists under this name — created by an
+  // If nothing is remembered, a database that already exists under this name — created by an
   // explicit `{ kind: "indexeddb" }` or `{ kind: "opfs" }` descriptor, or whose memory was
   // lost — decides, so switching a descriptor to `auto` never reopens it, empty, elsewhere.
-  const existing = await existingDatabaseStore(name, probes);
+  const existing = remembered ?? (await existingDatabaseStore(name, probes));
   let kind: AutoStoreKind;
   if (existing === "opfs" && !(await opfsAvailable())) {
     throw new DatabaseStoreUnavailableError(
@@ -94,6 +85,7 @@ export async function resolveAutoStoreKind(
     );
   } else if (existing !== undefined) kind = existing;
   else kind = (await opfsAvailable()) ? "opfs" : "indexeddb";
+  if (remembered !== undefined) return { kind, reserved: false };
   const reserved = await reserveChoice(name, kind);
   if (reserved) return { kind, reserved: true };
   // Another connection reserved the name first; its choice stands.
@@ -244,7 +236,15 @@ async function reserveChoice(name: string, kind: AutoStoreKind): Promise<boolean
 
 function complete<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
-    request.addEventListener("success", () => resolve(request.result));
+    const transaction = request.transaction;
+    // A successful request is still tentative. Reservations and deletions must not be
+    // acknowledged until the containing transaction commits; an open request has none yet.
+    (transaction ?? request).addEventListener(transaction === null ? "success" : "complete", () =>
+      resolve(request.result),
+    );
+    transaction?.addEventListener("abort", () =>
+      reject(transaction.error ?? new DOMException("IndexedDB transaction aborted", "AbortError")),
+    );
     request.addEventListener("error", () =>
       reject(request.error ?? new Error("IndexedDB request failed")),
     );

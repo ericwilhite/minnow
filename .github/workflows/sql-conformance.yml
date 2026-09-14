@@ -82,14 +82,17 @@ jobs:
         env:
           MINNOW_BROWSER_INTERACTION_SEED_BASE: ${{ github.run_number }}
           MINNOW_SEED: ${{ github.run_number }}
-      - name: Upload failure traces and plans
-        if: failure()
+      - name: Upload browser reports, traces, and plans
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: browser-conformance-${{ matrix.browser }}
           path: |
             playwright-report/
             test-results/
+            !test-results/**/storage-profile/**
+            !test-results/**/crash-profile/**
+            !test-results/**/quota-profile/**
           retention-days: 14
 
   randomized-soak:

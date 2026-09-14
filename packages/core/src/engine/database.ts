@@ -2916,11 +2916,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         try {
           return await run();
         } catch (error) {
-          if (error instanceof SchemaConflictError) {
-            if (attempt >= this.#maxCommitRetries) throw error;
-            continue;
-          }
-          if (error instanceof UniqueIndexCoverageError) {
+          if (error instanceof SchemaConflictError || error instanceof UniqueIndexCoverageError) {
             if (attempt >= this.#maxCommitRetries) throw error;
             continue;
           }

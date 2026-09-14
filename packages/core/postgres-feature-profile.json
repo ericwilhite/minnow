@@ -122,7 +122,7 @@
       "id": "aggregate.any-value",
       "classification": "compatible",
       "verification": "acceptance",
-      "reason": "Both engines accept ANY_VALUE, but which group member it returns is intentionally nondeterministic, so the oracle checks acceptance rather than row equality."
+      "reason": "PostgreSQL may choose any non-null group member; Minnow documents the minimum. This cross-engine profile checks acceptance rather than row equality, while the native browser behavior probe asserts Minnow's minimum."
     },
     {
       "id": "aggregate.json",

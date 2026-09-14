@@ -2,7 +2,9 @@ import { autoStoreTestHooks, forgetStoreChoice, openAutoStore } from "../dist/en
 import { MinnowDatabase } from "@minnowdb/core";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
+import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { deleteOpfsDatabase, opfsDatabaseExists } from "@minnowdb/core/storage/opfs";
+import { coordinateWrite } from "../dist/engine/write-coordinator.js";
 
 interface StorageProbeResult {
   errorName: string;
@@ -29,6 +31,247 @@ interface IndexedDbSequenceResult {
   first: unknown[];
   second: unknown[];
   durableKeyMetadata: boolean;
+}
+
+interface WriteAdmissionProgressResult {
+  progressingQueueOverlapped: boolean;
+  progressingQueueExceeded: number;
+  progressingQueueWaitedPastOneInterval: boolean;
+  frozenQueueEnteredWhileHeld: boolean;
+  frozenQueueExceeded: number;
+  frozenQueueChurnProven: boolean;
+  frozenQueueStayedBounded: boolean;
+}
+
+function nativeLockHolder(lockName: string): {
+  worker: Worker;
+  ready: Promise<void>;
+  acquired: Promise<void>;
+  released: Promise<void>;
+  acquire: () => void;
+  release: () => void;
+} {
+  const worker = new Worker(new URL("./lock-holder-worker.ts", import.meta.url), {
+    type: "module",
+  });
+  let markReady!: () => void;
+  let acquire!: () => void;
+  let release!: () => void;
+  const failures: Array<(error: Error) => void> = [];
+  const ready = new Promise<void>((resolve, reject) => {
+    markReady = resolve;
+    failures.push(reject);
+  });
+  const acquired = new Promise<void>((resolve, reject) => {
+    acquire = resolve;
+    failures.push(reject);
+  });
+  const released = new Promise<void>((resolve, reject) => {
+    release = resolve;
+    failures.push(reject);
+  });
+  worker.addEventListener(
+    "message",
+    (event: MessageEvent<"ready" | "acquired" | "released" | { error: string }>) => {
+      if (event.data === "ready") {
+        markReady();
+      } else if (event.data === "acquired") {
+        acquire();
+      } else if (event.data === "released") {
+        release();
+      } else {
+        const error = new Error(event.data.error);
+        for (const fail of failures) fail(error);
+      }
+    },
+  );
+  worker.addEventListener("error", (event) => {
+    const error = new Error(event.message);
+    for (const fail of failures) fail(error);
+  });
+  return {
+    worker,
+    ready,
+    acquired,
+    released,
+    acquire: () => worker.postMessage({ type: "acquire", lockName }),
+    release: () => worker.postMessage({ type: "release" }),
+  };
+}
+
+function heldClientId(snapshot: LockManagerSnapshot, lockName: string): string | null {
+  return snapshot.held?.find(({ name }) => name === lockName)?.clientId ?? null;
+}
+
+async function waitForNativeLock(
+  predicate: (snapshot: LockManagerSnapshot) => boolean,
+  message: string,
+): Promise<void> {
+  const deadline = performance.now() + 10_000;
+  for (;;) {
+    if (predicate(await navigator.locks.query())) return;
+    if (performance.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+export async function runNativeWriteAdmissionProgress(): Promise<WriteAdmissionProgressResult> {
+  const channelName = `minnowdb-live:lock-progress:${crypto.randomUUID()}`;
+  const lockName = `minnowdb-write:${channelName}`;
+  const store = new MemoryBlockStore();
+  Object.defineProperty(store, "liveQueryChannelName", { value: channelName });
+  const workers: Worker[] = [];
+  try {
+    const identityLockName = `${lockName}:identity`;
+    let pageClientId: string | undefined;
+    await navigator.locks.request(identityLockName, async () => {
+      pageClientId = heldClientId(await navigator.locks.query(), identityLockName) ?? undefined;
+    });
+    if (pageClientId === undefined) throw new Error("Native lock client identity is unavailable");
+
+    const first = nativeLockHolder(lockName);
+    const second = nativeLockHolder(lockName);
+    const third = nativeLockHolder(lockName);
+    const progressing = [first, second, third];
+    workers.push(...progressing.map(({ worker }) => worker));
+    await Promise.all(progressing.map(({ ready }) => ready));
+    first.acquire();
+    await first.acquired;
+    const holderIds = [heldClientId(await navigator.locks.query(), lockName)];
+    second.acquire();
+    await waitForNativeLock(
+      (snapshot) => (snapshot.pending ?? []).filter(({ name }) => name === lockName).length === 1,
+      "Second native lock holder did not enter the queue",
+    );
+    third.acquire();
+    await waitForNativeLock(
+      (snapshot) => (snapshot.pending ?? []).filter(({ name }) => name === lockName).length === 2,
+      "Third native lock holder did not enter the queue",
+    );
+    let progressingQueueExceeded = 0;
+    const progressingStartedAt = performance.now();
+    const progressingAdmission = coordinateWrite(
+      store,
+      async () => heldClientId(await navigator.locks.query(), lockName),
+      new AbortController().signal,
+      {
+        admissionWaitMs: 5_000,
+        onAdmissionWaitExceeded: () => {
+          progressingQueueExceeded += 1;
+        },
+      },
+    );
+    await waitForNativeLock(
+      (snapshot) =>
+        (snapshot.pending ?? []).some(
+          ({ name, clientId }) => name === lockName && clientId === pageClientId,
+        ),
+      "Native write admission did not enter the queue",
+    );
+    const advanceHolders = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      first.release();
+      await first.released;
+      await second.acquired;
+      holderIds.push(heldClientId(await navigator.locks.query(), lockName));
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      second.release();
+      await second.released;
+      await third.acquired;
+      holderIds.push(heldClientId(await navigator.locks.query(), lockName));
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      third.release();
+      await third.released;
+    })();
+    const progressingEntryClientId = await progressingAdmission;
+    const progressingElapsedMs = performance.now() - progressingStartedAt;
+    await advanceHolders;
+    if (
+      holderIds.some((id) => id === null || id === pageClientId) ||
+      new Set(holderIds).size !== progressing.length
+    ) {
+      throw new Error("Native lock holders did not advance through distinct clients");
+    }
+
+    const frozen = nativeLockHolder(lockName);
+    workers.push(frozen.worker);
+    await frozen.ready;
+    frozen.acquire();
+    await frozen.acquired;
+    const frozenClientId = heldClientId(await navigator.locks.query(), lockName);
+    if (frozenClientId === null || frozenClientId === pageClientId) {
+      throw new Error("Native frozen holder identity is invalid");
+    }
+    let frozenQueueExceeded = 0;
+    const frozenStartedAt = performance.now();
+    const frozenAdmission = coordinateWrite(
+      store,
+      async () => heldClientId(await navigator.locks.query(), lockName),
+      new AbortController().signal,
+      {
+        admissionWaitMs: 5_000,
+        onAdmissionWaitExceeded: () => {
+          frozenQueueExceeded += 1;
+        },
+      },
+    );
+    await waitForNativeLock(
+      (snapshot) =>
+        (snapshot.pending ?? []).some(
+          ({ name, clientId }) => name === lockName && clientId === pageClientId,
+        ),
+      "Frozen write admission did not enter the queue",
+    );
+    let frozenQueueChurn = 0;
+    const churnState = { stop: false };
+    const churnTask = (async () => {
+      const deadline = performance.now() + 7_000;
+      while (!churnState.stop && performance.now() < deadline) {
+        const controller = new AbortController();
+        const churn = navigator.locks
+          .request(lockName, { mode: "shared", signal: controller.signal }, () => undefined)
+          .catch(() => undefined);
+        await waitForNativeLock(
+          (snapshot) =>
+            (snapshot.pending ?? []).some(
+              ({ name, mode }) => name === lockName && mode === "shared",
+            ),
+          "Native pending lock churn was not observable",
+        );
+        frozenQueueChurn += 1;
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+        controller.abort();
+        await churn;
+        await waitForNativeLock(
+          (snapshot) =>
+            !(snapshot.pending ?? []).some(
+              ({ name, mode }) => name === lockName && mode === "shared",
+            ),
+          "Native pending lock churn did not leave the queue",
+        );
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+      }
+    })();
+    const frozenEntryClientId = await frozenAdmission;
+    const frozenElapsedMs = performance.now() - frozenStartedAt;
+    churnState.stop = true;
+    await churnTask;
+    frozen.release();
+    await frozen.released;
+
+    return {
+      progressingQueueOverlapped: progressingEntryClientId !== pageClientId,
+      progressingQueueExceeded,
+      progressingQueueWaitedPastOneInterval: progressingElapsedMs >= 5_000,
+      frozenQueueEnteredWhileHeld: frozenEntryClientId === frozenClientId,
+      frozenQueueExceeded,
+      frozenQueueChurnProven: frozenQueueChurn >= 3,
+      frozenQueueStayedBounded: frozenElapsedMs < 8_000,
+    };
+  } finally {
+    for (const worker of workers) worker.terminate();
+    store.close();
+  }
 }
 
 function databaseNames(): Promise<string[]> {

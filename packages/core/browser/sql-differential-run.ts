@@ -18,6 +18,12 @@ import {
   type DifferentialQuery,
   type SqlParameter,
 } from "./sql-differential-corpus.js";
+import {
+  featureBehaviorProbes,
+  type ExpectedFeaturePatternResult,
+  type ExpectedFeatureValue,
+  type FeatureBehaviorProbe,
+} from "./sql-feature-probes.js";
 
 type EngineName = "minnow" | "sqlite" | "pglite";
 type OracleName = Exclude<EngineName, "minnow">;
@@ -38,6 +44,7 @@ interface Engine {
   readonly name: EngineName;
   readonly version: string;
   execute(sql: string, params?: readonly SqlParameter[]): Promise<void>;
+  executeQuery(sql: string, params?: readonly SqlParameter[]): Promise<ResultSet>;
   query(sql: string, params?: readonly SqlParameter[]): Promise<ResultSet>;
   mutate(sql: string, params?: readonly SqlParameter[]): Promise<MutationResult>;
   close(): Promise<void>;
@@ -59,6 +66,9 @@ export interface BrowserSqlDifferentialResult {
     readonly compatibleMutationsCompared: number;
     readonly compatibleWritesAccepted: number;
     readonly nonportableWritesAccepted: number;
+    readonly behaviorProbedFeatures: number;
+    readonly behaviorProbeSteps: number;
+    readonly behaviorProbeOracleComparisons: number;
     readonly unsupportedRejected: number;
   };
   readonly failures: readonly string[];
@@ -92,6 +102,9 @@ const postgresProfile = rawPostgresProfile as {
   overrides: ProfileOverride[];
 };
 const postgresOverrides = new Map(postgresProfile.overrides.map((entry) => [entry.id, entry]));
+const behaviorProbeByFeature = new Map(
+  featureBehaviorProbes.map((probe) => [probe.featureId, probe]),
+);
 const nonportableMutationCounts = new Map([
   ["mutation.truncate", 3],
   ["mutation.upsert-replace", 1],
@@ -139,6 +152,13 @@ async function openMinnow(
     version: "published worker",
     execute: async (sql, params) => {
       await client.execute(sql, params);
+    },
+    executeQuery: async (sql, params) => {
+      const result = await client.execute(sql, params);
+      if (result.kind !== "rows") {
+        throw new Error(`Minnow returned ${result.kind} for a row-returning statement`);
+      }
+      return rows(result.result.columns, result.result.rows, result.result.columnDomains);
     },
     query: async (sql, params) => {
       const result = await client.query(sql, {
@@ -220,6 +240,7 @@ async function openSqlite(): Promise<Engine> {
     execute: async (sql, params) => {
       run(sql, params);
     },
+    executeQuery: async (sql, params) => run(sql, params),
     query: async (sql, params) => run(sql, params),
     mutate: async (sql, params) => ({
       ...run(sql, params),
@@ -263,6 +284,7 @@ async function openPglite(): Promise<Engine> {
     execute: async (sql, params) => {
       await run(sql, params);
     },
+    executeQuery: run,
     query: run,
     mutate: run,
     close: () => database.close(),
@@ -450,6 +472,7 @@ async function compareCase(
   minnow: Engine,
   oracles: ReadonlyMap<OracleName, Engine>,
   mutation: boolean,
+  afterMinnow?: () => void,
 ): Promise<{ failures: string[]; comparisons: number }> {
   const failures: string[] = [];
   const selected = testCase.oracles ?? (["sqlite", "pglite"] as const);
@@ -458,6 +481,7 @@ async function compareCase(
     actual = await (mutation
       ? minnow.mutate(testCase.sql, testCase.params)
       : minnow.query(testCase.sql, testCase.params));
+    afterMinnow?.();
   } catch (error) {
     return {
       failures: [`${testCase.label}: Minnow threw: ${String(error)}\n${testCase.sql}`],
@@ -503,11 +527,193 @@ async function compareCase(
   return { failures, comparisons };
 }
 
+interface BehaviorProbeResult {
+  readonly failures: readonly string[];
+  readonly steps: number;
+  readonly oracleComparisons: number;
+}
+
+interface TimestampWindow {
+  readonly firstMs: number;
+  readonly secondMs: number;
+}
+
+function patternValueFailure(
+  actual: unknown,
+  expected: ExpectedFeatureValue,
+  timestampWindow: TimestampWindow | undefined,
+): string | undefined {
+  if (typeof expected !== "object" || expected === null) {
+    return Object.is(actual, expected)
+      ? undefined
+      : `expected ${JSON.stringify(expected)}, received ${JSON.stringify(actual)}`;
+  }
+  if (expected.matcher === "timestamp") {
+    if (!(actual instanceof Date) || !Number.isFinite(actual.getTime())) {
+      return `expected a valid Date, received ${JSON.stringify(actual)}`;
+    }
+    if (timestampWindow !== undefined) {
+      const minimum = Math.min(timestampWindow.firstMs, timestampWindow.secondMs);
+      const maximum = Math.max(timestampWindow.firstMs, timestampWindow.secondMs);
+      if (actual.getTime() < minimum || actual.getTime() > maximum) {
+        return `expected a statement-time Date between ${new Date(minimum).toISOString()} and ${new Date(maximum).toISOString()}, received ${actual.toISOString()}`;
+      }
+    }
+    return undefined;
+  }
+  if (expected.matcher === "uuid") {
+    return typeof actual === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(actual)
+      ? undefined
+      : `expected an RFC 4122 version-4 UUID, received ${JSON.stringify(actual)}`;
+  }
+  if (typeof actual !== "number" || !Number.isFinite(actual)) {
+    return `expected a finite number, received ${JSON.stringify(actual)}`;
+  }
+  if (expected.minimumInclusive !== undefined && actual < expected.minimumInclusive) {
+    return `expected at least ${String(expected.minimumInclusive)}, received ${String(actual)}`;
+  }
+  if (expected.minimumExclusive !== undefined && actual <= expected.minimumExclusive) {
+    return `expected greater than ${String(expected.minimumExclusive)}, received ${String(actual)}`;
+  }
+  if (expected.maximumExclusive !== undefined && actual >= expected.maximumExclusive) {
+    return `expected less than ${String(expected.maximumExclusive)}, received ${String(actual)}`;
+  }
+  return undefined;
+}
+
+function patternResultFailure(
+  actual: ResultSet,
+  expected: ExpectedFeaturePatternResult,
+  timestampWindow: TimestampWindow | undefined,
+): string | undefined {
+  if (
+    actual.columns.length !== expected.columns.length ||
+    actual.columns.some((column, index) => column !== expected.columns[index])
+  ) {
+    return `columns differ\n  minnow: ${JSON.stringify(actual.columns)}\n  fixed expectation: ${JSON.stringify(expected.columns)}`;
+  }
+  if (actual.rows.length !== expected.rows.length) {
+    return `row count differs\n  minnow: ${String(actual.rows.length)}\n  fixed expectation: ${String(expected.rows.length)}`;
+  }
+  for (const [rowIndex, expectedRow] of expected.rows.entries()) {
+    const actualRow = actual.rows[rowIndex];
+    if (actualRow?.length !== expectedRow.length) {
+      return `row ${String(rowIndex)} width differs\n  minnow: ${JSON.stringify(actualRow)}\n  fixed expectation: ${String(expectedRow.length)} columns`;
+    }
+    for (const [columnIndex, expectedValue] of expectedRow.entries()) {
+      const failure = patternValueFailure(actualRow[columnIndex], expectedValue, timestampWindow);
+      if (failure !== undefined) {
+        return `row ${String(rowIndex)} column ${String(columnIndex)} differs: ${failure}`;
+      }
+    }
+  }
+  return undefined;
+}
+
+async function runBehaviorProbe(
+  probe: FeatureBehaviorProbe,
+  minnow: Engine,
+  pglite: Engine | undefined,
+  timestampWindow: TimestampWindow | undefined,
+): Promise<BehaviorProbeResult> {
+  const failures: string[] = [];
+  let steps = 0;
+  let oracleComparisons = 0;
+  for (const [index, step] of probe.steps.entries()) {
+    const label = `${probe.featureId} behavior ${String(index + 1)}`;
+    steps++;
+    try {
+      if (step.kind === "query") {
+        const testCase: DifferentialQuery = {
+          label,
+          sql: step.sql,
+          ...(step.expected.ordered === true ? { ordered: true } : {}),
+        };
+        const actual = await (step.throughExecute === true
+          ? minnow.executeQuery(step.sql, step.params)
+          : minnow.query(step.sql, step.params));
+        const fixedFailure = compare(
+          `${label} vs fixed expectation`,
+          testCase,
+          actual,
+          step.expected,
+        );
+        if (fixedFailure !== undefined) failures.push(`${fixedFailure}\n${step.sql}`);
+        if (step.compareWithPglite === true) {
+          if (pglite === undefined) {
+            failures.push(`${label}: PGlite was not available\n${step.sql}`);
+          } else {
+            const oracle = await pglite.query(step.sql, step.params);
+            oracleComparisons++;
+            const oracleFailure = compare(`${label} vs pglite`, testCase, actual, oracle);
+            if (oracleFailure !== undefined) failures.push(`${oracleFailure}\n${step.sql}`);
+          }
+        }
+      } else if (step.kind === "query-pattern") {
+        const actual = await minnow.query(step.sql, step.params);
+        const patternFailure = patternResultFailure(actual, step.expected, timestampWindow);
+        if (patternFailure !== undefined) {
+          failures.push(`${label} vs fixed pattern: ${patternFailure}\n${step.sql}`);
+        }
+      } else if (step.kind === "mutation") {
+        const actual = await minnow.mutate(step.sql, step.params);
+        if (actual.affectedRows !== step.affectedRows) {
+          failures.push(
+            `${label}: affected rows differ\n  minnow: ${String(actual.affectedRows)}\n  fixed expectation: ${String(step.affectedRows)}\n${step.sql}`,
+          );
+        }
+        if (step.expected !== undefined) {
+          const resultFailure = compare(
+            `${label} vs fixed expectation`,
+            { label, sql: step.sql, ...(step.expected.ordered === true ? { ordered: true } : {}) },
+            actual,
+            step.expected,
+          );
+          if (resultFailure !== undefined) failures.push(`${resultFailure}\n${step.sql}`);
+        }
+      } else if (step.kind === "execute") {
+        await minnow.execute(step.sql, step.params);
+      } else {
+        let thrown: unknown;
+        try {
+          await minnow.execute(step.sql, step.params);
+        } catch (error) {
+          thrown = error;
+        }
+        if (thrown === undefined) {
+          failures.push(
+            `${label}: expected ${step.errorName} containing ${JSON.stringify(step.includes)}\n${step.sql}`,
+          );
+        } else if (!(thrown instanceof Error)) {
+          failures.push(
+            `${label}: expected ${step.errorName}, received a non-Error rejection\n${step.sql}`,
+          );
+        } else {
+          if (thrown.name !== step.errorName) {
+            failures.push(
+              `${label}: error name differed\n  expected: ${step.errorName}\n  actual: ${thrown.name}\n${step.sql}`,
+            );
+          } else if (!thrown.message.includes(step.includes)) {
+            failures.push(
+              `${label}: error message differed\n  expected to include: ${JSON.stringify(step.includes)}\n  actual: ${thrown.message}\n${step.sql}`,
+            );
+          }
+        }
+      }
+    } catch (error) {
+      failures.push(`${label}: probe threw: ${String(error)}\n${step.sql}`);
+    }
+    if (failures.length > 0) break;
+  }
+  return { failures, steps, oracleComparisons };
+}
+
 function createdNames(pattern: RegExp): string[] {
-  const statements = matrixFeatures.flatMap((feature) => [
-    ...(feature.setup ?? []),
-    feature.example,
-  ]);
+  const statements = [
+    ...matrixFeatures.flatMap((feature) => [...(feature.setup ?? []), feature.example]),
+    ...featureBehaviorProbes.flatMap(({ steps }) => steps.map(({ sql }) => sql)),
+  ];
   return [
     ...new Set(
       statements.flatMap((statement) => {
@@ -605,6 +811,28 @@ async function runMatrix(
   pglite: Engine,
   failures: string[],
 ): Promise<BrowserSqlDifferentialResult["matrix"]> {
+  let behaviorProbedFeatures = 0;
+  let behaviorProbeSteps = 0;
+  let behaviorProbeOracleComparisons = 0;
+  const verifyBehavior = async (
+    feature: MatrixFeature,
+    oracle: Engine | undefined,
+    timestampWindow?: TimestampWindow,
+  ): Promise<readonly string[]> => {
+    const probe = behaviorProbeByFeature.get(feature.id);
+    if (probe === undefined) {
+      const failure = `${feature.id}: matrix category requires an independently authored behavior probe`;
+      failures.push(failure);
+      return [failure];
+    }
+    behaviorProbedFeatures++;
+    const result = await runBehaviorProbe(probe, minnow, oracle, timestampWindow);
+    behaviorProbeSteps += result.steps;
+    behaviorProbeOracleComparisons += result.oracleComparisons;
+    failures.push(...result.failures);
+    return result.failures;
+  };
+
   await resetMatrixFixture([minnow, pglite]);
   const supported = matrixFeatures.filter(({ status }) => status === "supported");
   const reads = supported.filter(({ id }) => !writesData(id));
@@ -627,7 +855,8 @@ async function runMatrix(
     }
     const override = postgresOverrides.get(feature.id);
     if (classification(feature) !== "compatible") {
-      nonportableReadsAccepted++;
+      const probeFailures = await verifyBehavior(feature, undefined);
+      if (probeFailures.length === 0) nonportableReadsAccepted++;
       continue;
     }
     let expected: ResultSet;
@@ -638,7 +867,8 @@ async function runMatrix(
       continue;
     }
     if (override?.verification === "acceptance") {
-      compatibleReadAcceptance++;
+      const probeFailures = await verifyBehavior(feature, pglite);
+      if (probeFailures.length === 0) compatibleReadAcceptance++;
       continue;
     }
     compatibleReadsCompared++;
@@ -658,9 +888,11 @@ async function runMatrix(
       await preparePgliteWriteFixture(pglite, index);
       for (const statement of feature.setup ?? []) await pglite.execute(statement);
     }
+    const featureStartedAt = Date.now();
     try {
       if (feature.id.startsWith("mutation.")) {
         if (compatible) {
+          let featureEndedAt = featureStartedAt;
           const result = await compareCase(
             {
               label: `feature matrix ${feature.id}`,
@@ -670,30 +902,44 @@ async function runMatrix(
             minnow,
             new Map([["pglite", pglite]]),
             true,
+            () => {
+              featureEndedAt = Date.now();
+            },
           );
           failures.push(...result.failures);
-          const state = await compareCase(
-            {
-              label: `feature matrix ${feature.id} resulting keyed table`,
-              sql: "SELECT name, score, bonus FROM keyed ORDER BY name NULLS LAST",
-              ordered: true,
-            },
-            minnow,
-            new Map([["pglite", pglite]]),
-            false,
-          );
-          failures.push(...state.failures);
-          if (result.failures.length === 0 && state.failures.length === 0) {
+          const probe = behaviorProbeByFeature.get(feature.id);
+          const timestampWindow =
+            feature.id === "mutation.insert-runtime-values"
+              ? { firstMs: featureStartedAt, secondMs: featureEndedAt }
+              : undefined;
+          const stateFailures =
+            probe?.replacesCompatibleMutationState === true
+              ? await verifyBehavior(feature, pglite, timestampWindow)
+              : (
+                  await compareCase(
+                    {
+                      label: `feature matrix ${feature.id} resulting keyed table`,
+                      sql: "SELECT name, score, bonus FROM keyed ORDER BY name NULLS LAST",
+                      ordered: true,
+                    },
+                    minnow,
+                    new Map([["pglite", pglite]]),
+                    false,
+                  )
+                ).failures;
+          if (probe?.replacesCompatibleMutationState !== true) failures.push(...stateFailures);
+          if (result.failures.length === 0 && stateFailures.length === 0) {
             compatibleMutationsCompared++;
           }
         } else {
           const result = await minnow.mutate(feature.example, feature.params);
           const expectedCount = nonportableMutationCounts.get(feature.id);
+          const probeFailures = await verifyBehavior(feature, undefined);
           if (expectedCount === undefined || result.affectedRows !== expectedCount) {
             failures.push(
               `${feature.id} :: ${feature.example}\n  affected rows: ${String(result.affectedRows)}, expected ${String(expectedCount)}`,
             );
-          } else {
+          } else if (probeFailures.length === 0) {
             nonportableWritesAccepted++;
           }
         }
@@ -701,9 +947,11 @@ async function runMatrix(
         await minnow.execute(feature.example, feature.params);
         if (compatible) {
           await pglite.execute(feature.example, feature.params);
-          compatibleWritesAccepted++;
+          const probeFailures = await verifyBehavior(feature, pglite);
+          if (probeFailures.length === 0) compatibleWritesAccepted++;
         } else {
-          nonportableWritesAccepted++;
+          const probeFailures = await verifyBehavior(feature, undefined);
+          if (probeFailures.length === 0) nonportableWritesAccepted++;
         }
       }
     } catch (error) {
@@ -754,6 +1002,9 @@ async function runMatrix(
     compatibleMutationsCompared,
     compatibleWritesAccepted,
     nonportableWritesAccepted,
+    behaviorProbedFeatures,
+    behaviorProbeSteps,
+    behaviorProbeOracleComparisons,
     unsupportedRejected,
   };
 }
@@ -790,6 +1041,9 @@ export async function runBrowserSqlDifferential(request: {
     compatibleMutationsCompared: 0,
     compatibleWritesAccepted: 0,
     nonportableWritesAccepted: 0,
+    behaviorProbedFeatures: 0,
+    behaviorProbeSteps: 0,
+    behaviorProbeOracleComparisons: 0,
     unsupportedRejected: 0,
   };
   try {

@@ -20,6 +20,9 @@ interface BrowserSqlDifferentialResult {
     readonly compatibleMutationsCompared: number;
     readonly compatibleWritesAccepted: number;
     readonly nonportableWritesAccepted: number;
+    readonly behaviorProbedFeatures: number;
+    readonly behaviorProbeSteps: number;
+    readonly behaviorProbeOracleComparisons: number;
     readonly unsupportedRejected: number;
   };
   readonly failures: readonly string[];
@@ -33,10 +36,11 @@ interface BrowserSqlDifferentialResult {
  * The custom corpus sends the same seeded fixtures, parameters, ordered reads, and stateful
  * RETURNING mutations to all three engines. The feature-matrix pass then executes every supported
  * read in a published Minnow worker; PostgreSQL-compatible deterministic examples are compared
- * with PGlite, while documented differences and extensions are acceptance checked. Every
- * supported write runs against a fresh durable fixture; compatible mutations also compare their
- * affected count, RETURNING rows, and resulting state with PGlite. Every documented unsupported
- * example must produce its recorded error without changing the fixture.
+ * with PGlite, while fixed behavior probes check every documented difference and extension. Every
+ * supported write runs against a fresh durable fixture with a semantic postcondition: fixed probes
+ * cover DDL, triggers, transactions, and Minnow-specific mutations, while compatible mutations
+ * compare their affected count, RETURNING rows, and resulting state with PGlite. Every documented
+ * unsupported example must produce its recorded error without changing the fixture.
  */
 for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[]) {
   for (const seed of seedsFor("sql-conformance", [0xc0ffee])) {
@@ -106,6 +110,11 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         compatibleMutationsCompared: 24,
         compatibleWritesAccepted: 36,
         nonportableWritesAccepted: 7,
+        // Fixed, independently authored postconditions overlay the acceptance categories above.
+        // They cover mutation targets, triggers, transactions, and the highest-risk catalog DDL.
+        behaviorProbedFeatures: 74,
+        behaviorProbeSteps: 137,
+        behaviorProbeOracleComparisons: 2,
         unsupportedRejected: 61,
       });
       expect(result.matrix.supported + result.matrix.unsupportedRejected).toBe(

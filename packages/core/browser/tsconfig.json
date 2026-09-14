@@ -19,9 +19,12 @@
     "interaction-run.ts",
     "fault-sweep-worker.ts",
     "storage-probe.ts",
+    "auto-choice.ts",
     "block-properties-worker.ts",
     "sql-differential-run.ts",
+    "sql-feature-probes.test.ts",
     "clock-run.ts",
-    "clock-worker.ts"
+    "clock-worker.ts",
+    "lock-holder-worker.ts"
   ]
 }

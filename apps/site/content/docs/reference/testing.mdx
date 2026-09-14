@@ -7,6 +7,14 @@ One set of focused runners covers fast correctness checks, real-browser behavior
 regressions, and the benchmark harness behind the live benchmarks page. This page is the source
 of truth for running and maintaining them.
 
+Treat a failure as a defect to explain. Expected answers come from SQL semantics, independent
+engines, or an independently authored model; never record Minnow's failing output as its new
+expected answer. An oracle correction needs evidence from that independent contract. Preserve
+failing inputs and reduce them into regressions. Do not loosen assertions, deadlines, coverage
+floors, or resource budgets to hide a failure, and do not treat a successful retry as a clean run.
+Storage and browser-runtime regressions must run against real browser APIs and durable stores;
+Node models and injected faults are useful additional checks, not substitutes for that gate.
+
 The typecheck, build, and browser prerequisites force a fresh TypeScript project-reference build.
 They do not trust an existing `.tsbuildinfo`, so a release gate proves the current sources even
 after generated declarations or asynchronous signatures change.
@@ -43,7 +51,11 @@ npx playwright install chromium firefox webkit
 ```
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request. `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
+request. Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on macOS.
+Each runs the library and site suites; Chromium also runs the packed consumer. The `Real browsers`
+check requires every engine to pass. Splitting the jobs preserves their 45-minute deadlines and
+leaves time to save failure artifacts. A test that passes only on retry still fails the gate.
+`.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
 nightly and on demand. Both it and the release workflow also run
 `test:browser:conformance`: the entire core browser suite, including the full pinned SQL corpus
 and longer multi-tab plans over native IndexedDB and OPFS. WebKit runs on macOS so worker OPFS is available; a missing worker OPFS API
@@ -66,8 +78,10 @@ The tarball-shape test packs an isolated copy: its prepack hook cannot rewrite t
 output while concurrent bundle and declaration tests read it.
 
 Browser runs save an HTML report in `playwright-report/`, including attached seed plans and
-result summaries. Failure traces are retained, and CI uploads the report and `test-results/`
-when a browser gate fails. A console log alone is not a replay artifact.
+result summaries. CI, release, and nightly jobs retain reports for passing and failing browser
+runs for 14 days; failed tests also retain traces. Each engine's library report is saved before
+the site runner can replace it. Persistent browser profile directories are excluded because they
+contain browser caches rather than replay evidence. A console log alone is not a replay artifact.
 
 Unit files are capped at four concurrent workers (or the available CPU count, if lower). Each
 file can start complete databases and comparison engines, so unrestricted file concurrency can
@@ -137,9 +151,24 @@ enabled, and unexpected worker or page errors fail the campaign even when query 
 The 366 matrix entries are accounted for explicitly: 305 supported entries execute, and 61
 unsupported entries must reject with their recorded error while leaving the fixture unchanged.
 Portable reads compare columns and values with PostgreSQL. Compatible mutations compare affected
-counts, `RETURNING`, and the resulting keyed table state. Nondeterministic `ANY_VALUE`,
-nonportable features, and remaining DDL have explicit acceptance categories; the report does not
-count acceptance alone as a result comparison. The category totals must cover the entire matrix.
+counts, `RETURNING`, and their actual target table's state, with domain checks for volatile values.
+The report separately counts cross-engine comparisons and features with fixed behavior probes.
+Every supported entry must have one of those semantic checks; acceptance alone cannot pass the
+matrix. The category totals must cover the entire matrix.
+
+An additional 137 independently authored behavior steps cover 74 matrix features, with two more
+PostgreSQL state comparisons. They check TRUNCATE and UPSERT post-images, stored defaults and runtime
+values, trigger effects and removal, constraint enforcement, generated columns, views, sequences,
+identities, ALTER backfill, and transactions. Minnow's documented minimum-value `ANY_VALUE` result
+has a fixed assertion even though PostgreSQL may choose another value. Runtime defaults must be a
+valid timestamp, a finite random value in range, and a version-4 UUID. Negative probes require the
+specific error type and message. The remaining DDL forms have observable schema checks, and all
+28 nonportable reads have fixed answers or documented value-domain assertions. A new entry in a
+category without cross-engine result comparison must provide a behavior probe, or the suite fails.
+Single-argument `AGE` must agree with its documented two-argument form using the same statement's
+`CURRENT_DATE`, including NULL propagation. BM25 checks matching rows and finite positive scores;
+it does not invent an exact public scoring formula. Index probes check catalog behavior and query
+results, while the separate performance suites cover execution cost.
 
 Each seed also runs fixed edge cases, 42 generated queries, and four mutations with immediate
 post-state checks against SQLite and PostgreSQL: 117 independent comparisons per storage adapter
