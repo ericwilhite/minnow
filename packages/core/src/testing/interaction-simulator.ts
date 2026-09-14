@@ -1355,9 +1355,12 @@ class PlanRunner {
       try {
         await this.#step(interaction);
       } catch (error) {
-        if (!(error instanceof AcceptedStoreUnresponsive)) throw error;
-        stoppedBy = describeError(error.storageError);
-        break;
+        if (error instanceof AcceptedStoreUnresponsive) {
+          stoppedBy = describeError(error.storageError);
+          break;
+        }
+        if (error instanceof InteractionFailure) throw error;
+        this.#fail(`${interaction.kind} failed: ${describeError(error)}`, error);
       }
       judged += 1;
     }

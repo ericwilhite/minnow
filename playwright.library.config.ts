@@ -11,7 +11,19 @@ export default defineConfig({
     url: `${localUrl(port)}/packages/core/browser/`,
     reuseExistingServer: false,
   },
-  use: { baseURL: localUrl(port), trace: "retain-on-failure" },
+  use: {
+    baseURL: localUrl(port),
+    // These runners expose database drivers on otherwise static pages. Keep the action timeline,
+    // errors, sources, and attachments without continuously encoding blank-page screenshots or
+    // serializing DOM snapshots around thousands of storage calls.
+    trace: {
+      mode: "retain-on-failure",
+      screenshots: false,
+      snapshots: false,
+      sources: true,
+      attachments: true,
+    },
+  },
   // All three, including WebKit: this runner is the only place real IndexedDB is exercised, and
   // Safari's is the implementation most likely to differ. It was excluded until the harness
   // stopped treating a transient `blocked` on deleteDatabase as a failure -- see run.ts.

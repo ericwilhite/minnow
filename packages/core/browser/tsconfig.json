@@ -25,6 +25,10 @@
     "sql-feature-probes.test.ts",
     "clock-run.ts",
     "clock-worker.ts",
-    "lock-holder-worker.ts"
+    "lock-holder-worker.ts",
+    "opfs-checkpoint-run.ts",
+    "opfs-checkpoint-worker.ts",
+    "compaction-resume-run.ts",
+    "compaction-resume-worker.ts"
   ]
 }

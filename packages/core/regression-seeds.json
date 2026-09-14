@@ -3,7 +3,12 @@
     "Seeds that once produced a failure. The soak runner (npm run soak) varies the seed to find",
     "new ground; when it finds a break, the seed goes here and the deterministic suite replays it",
     "forever after. Never remove one: a seed listed here is a bug that used to exist, and the",
-    "entry is what stops it coming back. Keys match the suite names passed to seedsFor()."
+    "entry is what stops it coming back. Keys match the suite names passed to seedsFor().",
+    "Interaction seeds 24301, 61935, and 608135839 exposed native OPFS checkpoint recovery failures;",
+    "their storage reductions are in checkpoint-interruption.test.ts and opfs-checkpoint.spec.ts.",
+    "Seed 3084996986 preserves the long WebKit plan that exposed excessive trace capture cost.",
+    "Seed 2654435792 exposed a compaction transaction ownership race in native Chromium IndexedDB.",
+    "The nightly browser seeds came from MINNOW_BROWSER_INTERACTION_SEED_BASE=23."
   ],
   "suites": {
     "sql-conformance": [12648430],
@@ -15,7 +20,7 @@
     "compaction-soak-snapshots": [],
     "partitioned-compaction-soak": [],
     "auto-compaction-soak": [26172526, 756656541, 1271068371],
-    "interaction-simulator": [],
+    "interaction-simulator": [24301, 61935, 608135839, 3084996986, 2654435792],
     "block-format-properties": []
   }
 }

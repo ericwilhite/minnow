@@ -80,8 +80,11 @@ output while concurrent bundle and declaration tests read it.
 Browser runs save an HTML report in `playwright-report/`, including attached seed plans and
 result summaries. CI, release, and nightly jobs retain reports for passing and failing browser
 runs for 14 days; failed tests also retain traces. Each engine's library report is saved before
-the site runner can replace it. Persistent browser profile directories are excluded because they
-contain browser caches rather than replay evidence. A console log alone is not a replay artifact.
+the site runner can replace it. Successful attempts delete their persistent browser profiles;
+failed attempts retain and upload the complete profile with the trace, including a failed first
+attempt whose retry passes. Library traces retain action timing, errors, sources, and attachments;
+the static runner pages omit continuous screenshots and DOM snapshots. A console log alone is not
+a replay artifact.
 
 Unit files are capped at four concurrent workers (or the available CPU count, if lower). Each
 file can start complete databases and comparison engines, so unrestricted file concurrency can

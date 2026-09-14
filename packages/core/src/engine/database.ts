@@ -184,6 +184,7 @@ import {
 } from "../storage/snapshot.js";
 import {
   Snapshot,
+  TransactionClosedError,
   TransactionManager,
   type DatabaseTransaction,
   type LeasedSnapshot,
@@ -18796,33 +18797,38 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
     let transaction: DatabaseTransaction;
     try {
-      if (job.transactionId === null) {
+      if (job.transactionId === null || linkedTransaction?.status !== "active") {
         const linked = await this.#beginCompactionTransaction(job);
         if (linked.transaction === null) {
           return await this.#runCompactionJob(table, linked.job, maxBlocks);
         }
         ({ job, transaction } = linked);
       } else {
-        if (linkedTransaction?.status !== "active") {
-          const linked = await this.#beginCompactionTransaction(job);
-          if (linked.transaction === null) {
-            return await this.#runCompactionJob(table, linked.job, maxBlocks);
-          }
-          ({ job, transaction } = linked);
-        } else {
-          transaction = await this.#transactions.resume(job.transactionId);
-          if (job.state !== "running") {
-            job = await this.store.updateCompactionJob(job.id, job.revision, {
-              state: "running",
-              updatedAt: dateIsoString(this.#now()),
-              error: null,
-            });
-          }
+        transaction = await this.#transactions.resume(job.transactionId);
+        if (job.state !== "running") {
+          job = await this.store.updateCompactionJob(job.id, job.revision, {
+            state: "running",
+            updatedAt: dateIsoString(this.#now()),
+            error: null,
+          });
         }
       }
     } catch (error) {
-      if ((await this.store.getCompactionJob(job.id))?.state === "cancelled") {
+      const latestJob = await this.store.getCompactionJob(job.id);
+      if (latestJob?.state === "cancelled") {
         throw new CompactionJobCancelledError(job.id);
+      }
+      // Another coordinator may publish the same transaction after our active-owner read but
+      // before resume renews it. Reconcile only after the durable job or owner demonstrably moved.
+      if (error instanceof TransactionClosedError && latestJob !== undefined) {
+        const latestOwner = await this.store.getTransaction(error.transactionId);
+        if (
+          latestJob.revision !== job.revision ||
+          latestOwner?.status !== "active" ||
+          Date.parse(latestOwner.expiresAt) <= dateMilliseconds(this.#now())
+        ) {
+          return await this.#runCompactionJob(table, latestJob, maxBlocks);
+        }
       }
       throw error;
     }

@@ -43,11 +43,27 @@ compatible with 0.10.2.
   holder before treating a long wait as a frozen tab. Previously, a healthy queue could trigger
   the fallback and make concurrent writers exhaust their commit retries. Native Web Locks tests
   cover a queue that advances beyond one admission interval; frozen-holder and RPC bounds remain.
+- **OPFS reopens valid checkpoints after an index-build lease renewal.** Recovery validates the
+  current lease instead of measuring it from the build's original creation time. Renewals also
+  keep their timestamps consistent when the wall clock moves backward. Previously, a valid
+  checkpoint could be rejected and recovery could report a WAL gap or broken manifest chain.
+- **An interrupted no-op shutdown checkpoint remains recoverable.** Adjacent mirror generations
+  with the same WAL sequence preserve acknowledged state. Different sequences without a WAL
+  bridge, invalid generations, and corrupt payloads still fail closed.
+- **Concurrent compaction reconciles publication during transaction resume.** If another
+  connection commits the same compaction while a coordinator renews its owner, the coordinator
+  reloads the durable result. An ownership error without a durable state change still fails.
 - **SQLLogicTest rejects malformed result rows.** A missing or undefined result field can no
   longer pass as SQL NULL, and unexpected result fields fail the harness.
 
 ### Testing
 
+- Native checkpoint regressions reproduce both recovery defects in Chromium, Firefox, and
+  WebKit. Failed interaction plans retain their original error chain, failing step, SQL history,
+  and browser database files. Library traces omit continuous captures of blank runner pages;
+  query counts, interaction lengths, assertions, and deadlines are unchanged.
+- A controlled compaction interleaving runs against real IndexedDB and OPFS in all three
+  browsers, alongside the recorded long interaction seed that exposed the race.
 - Every SQL feature-matrix entry now executes in all three real browsers over IndexedDB and
   OPFS, with explicit result-comparison and acceptance categories. Additional fixed and seeded
   reads and mutations compare against browser-native SQLite Wasm and PGlite with maintenance on.

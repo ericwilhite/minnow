@@ -877,18 +877,19 @@ export class OpfsLeader {
       ) {
         throw new Error("OPFS checkpoint copies disagree within the same generation");
       }
+      // A no-op checkpoint interrupted between mirrors advances only the generation.
+      // Equal sequences preserve acknowledged state; a missing WAL sequence does not.
+      if (
+        walSize === 0 &&
+        (firstCopy.generation - secondCopy.generation > 1 ||
+          firstCopy.lastSeq !== secondCopy.lastSeq)
+      ) {
+        throw new Error(
+          "OPFS checkpoint copies disagree without a WAL bridge; refusing a silent rollback",
+        );
+      }
     }
     this.#newestSlot = selected?.index ?? 0;
-    if (
-      walSize === 0 &&
-      validSlots.length === 2 &&
-      (validSlots[0]?.state.generation !== validSlots[1]?.state.generation ||
-        validSlots[0]?.state.lastSeq !== validSlots[1]?.state.lastSeq)
-    ) {
-      throw new Error(
-        "OPFS checkpoint copies disagree without a WAL bridge; refusing a silent rollback",
-      );
-    }
     if (checkpoint !== undefined) await validateCheckpointPhysical(checkpoint, this.#tree);
 
     this.#blockIndex.clear();
@@ -1741,7 +1742,7 @@ export class OpfsLeader {
       case "renewFtsBaseBuild": {
         const build = this.#requireLivePostingBuild(body.input);
         build.expiresAt = laterTimestamp(build.expiresAt, body.input.expiresAt);
-        build.updatedAt = body.input.updatedAt;
+        build.updatedAt = laterTimestamp(build.updatedAt, body.input.updatedAt);
         return undefined;
       }
       case "writeFtsBaseBuildChunk": {
@@ -1769,7 +1770,7 @@ export class OpfsLeader {
             "Accelerator build staged entries",
           ),
           expiresAt: laterTimestamp(build.expiresAt, body.input.expiresAt),
-          updatedAt: body.input.updatedAt,
+          updatedAt: laterTimestamp(build.updatedAt, body.input.updatedAt),
         };
         this.#setFtsBuildPointer(postingStorageKey(body.input.tableId, body.input.columnId), next);
         return undefined;
@@ -5565,9 +5566,13 @@ function validatePostingBuildBegin(value: unknown): asserts value is BeginPostin
   validatePostingBuildIdentity(value, "posting build begin");
   requireTimestamp(value.createdAt, "posting build creation time");
   requireTimestamp(value.expiresAt, "posting build expiration");
-  const lifetime = Date.parse(value.expiresAt) - Date.parse(value.createdAt);
+  validatePostingBuildInterval(value.createdAt, value.expiresAt, "Posting build expiration");
+}
+
+function validatePostingBuildInterval(start: string, end: string, label: string): void {
+  const lifetime = Date.parse(end) - Date.parse(start);
   if (lifetime <= 0 || lifetime > MAX_POSTING_BUILD_TTL_MS) {
-    throw new RangeError("Posting build expiration interval is invalid");
+    throw new RangeError(`${label} interval is invalid`);
   }
 }
 
@@ -5582,9 +5587,8 @@ function validatePostingBuildRenewal(value: unknown): asserts value is RenewPost
   requireTimestamp(value.expiresAtCutoff, "posting build expiration cutoff");
   requireTimestamp(value.expiresAt, "posting build expiration");
   requireTimestamp(value.updatedAt, "posting build update time");
-  const lifetime = Date.parse(value.expiresAt) - Date.parse(value.expiresAtCutoff);
-  if (lifetime <= 0 || lifetime > MAX_POSTING_BUILD_TTL_MS) {
-    throw new RangeError("Posting build renewal interval is invalid");
+  for (const start of [value.expiresAtCutoff, value.updatedAt]) {
+    validatePostingBuildInterval(start, value.expiresAt, "Posting build renewal");
   }
 }
 
@@ -5851,10 +5855,8 @@ function validatePointerEntries(entries: unknown[], label: string): void {
       requireTimestamp(pointer.createdAt, `${label} createdAt`);
       requireTimestamp(pointer.expiresAt, `${label} expiresAt`);
       requireTimestamp(pointer.updatedAt, `${label} updatedAt`);
-      const lifetime = Date.parse(pointer.expiresAt) - Date.parse(pointer.createdAt);
-      if (lifetime <= 0 || lifetime > MAX_POSTING_BUILD_TTL_MS) {
-        throw new RangeError(`${label} expiration interval is invalid`);
-      }
+      // Renewals extend the current lease, not the immutable creation time of the build.
+      validatePostingBuildInterval(pointer.updatedAt, pointer.expiresAt, `${label} expiration`);
       requireNonNegativeInteger(pointer.totalTokens, `${label} totalTokens`);
       requireNonNegativeInteger(pointer.retainedBytes, `${label} retainedBytes`);
       requireNonNegativeInteger(pointer.retainedEntries, `${label} retainedEntries`);

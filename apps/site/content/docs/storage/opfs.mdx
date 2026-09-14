@@ -192,6 +192,14 @@ another format version. Opening the database is the recovery; there is no separa
 from the fully validated current layout. A recognized but unsupported envelope or checkpoint
 version stops before redundant-slot fallback and before any truncation or deletion.
 
+A shutdown checkpoint can advance its generation without adding a WAL entry. If shutdown ends
+between mirror writes, recovery accepts adjacent generations only when their WAL sequences agree.
+It still rejects a sequence gap without the log that bridges it. Staged index builds can renew
+their leases across checkpoints; recovery validates the current lease interval, not the total
+age of the build. Low-level renewal and chunk-append calls must place the expiration after both
+`expiresAtCutoff` and `updatedAt`, within the one-hour lease limit of each. Invalid intervals are
+rejected before writing durable state.
+
 ## Durability
 
 `strict`, the default, flushes each payload before flushing the WAL frame that publishes it, and

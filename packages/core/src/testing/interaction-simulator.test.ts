@@ -13,6 +13,7 @@ import {
   createDatabaseDriver,
   evaluate,
   generateInteractionPlan,
+  InteractionFailure,
   parseInteractionPlan,
   renderPredicate,
   runInteractionPlan,
@@ -143,6 +144,46 @@ describe("interaction plans", () => {
       }),
     ).toBe(`("b" > 2 AND "c" <> 'it''s')`);
   });
+});
+
+it("wraps a raw reopen failure with its interaction and SQL trace", async () => {
+  const storageError = Object.assign(new Error("Segment header checksum differs"), {
+    name: "StorageCorruptionError",
+    backend: "opfs",
+    location: "segments/0007",
+  });
+  const reopen = { kind: "reopen", connection: 0 } as const;
+  const plan: InteractionPlan = {
+    version: 1,
+    seed: 24_301,
+    connections: 1,
+    interactions: [reopen],
+  };
+
+  let failure: unknown;
+  try {
+    await runInteractionPlan(plan, {
+      open: () =>
+        Promise.resolve({
+          execute: () => Promise.resolve({ kind: "noop" }),
+          query: () => Promise.resolve({ columns: [], rows: [] }),
+          reopen: () => Promise.reject(storageError),
+        }),
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  expect(failure).toBeInstanceOf(InteractionFailure);
+  const interactionFailure = failure as InteractionFailure;
+  expect(interactionFailure.index).toBe(0);
+  expect(interactionFailure.interaction).toEqual(reopen);
+  expect(interactionFailure.trace).toEqual(["[0] -- reopen"]);
+  expect(interactionFailure.cause).toBe(storageError);
+  expect(interactionFailure.message).toContain(
+    "reopen failed: StorageCorruptionError: Segment header checksum differs",
+  );
+  expect(interactionFailure.message).toContain("at interaction 0 (reopen)");
 });
 
 /**

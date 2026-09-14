@@ -15,6 +15,7 @@ export const browserProjects = [
 /**
  * @type {{
  *   forbidOnly: boolean;
+ *   preserveOutput: "failures-only";
  *   retries: number;
  *   workers: number;
  *   reporter: import("@playwright/test").ReporterDescription[];
@@ -25,6 +26,10 @@ export const runnerDefaults = {
   // persistent storage stress tests cannot turn host-wide contention into unrelated timeouts.
   workers: Math.max(1, Math.min(2, Math.floor(availableParallelism() / 2))),
   forbidOnly: Boolean(process.env.CI),
+  // Profiles and other per-test files are useful only when that attempt fails. Playwright gives
+  // retries distinct output directories, so a failed first attempt remains available even when
+  // its retry passes, while successful persistent browser profiles do not fill CI artifacts.
+  preserveOutput: "failures-only",
   // One retry absorbs a single noisy sample; the flaky reporter then fails the run anyway, so a
   // test that needed the retry is reported rather than hidden behind a green result.
   retries: process.env.CI ? 1 : 0,

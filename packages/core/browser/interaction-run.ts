@@ -10,6 +10,7 @@
  */
 import { MinnowDatabaseClient, type DatabaseWorkerErrorEvent } from "@minnowdb/core/client";
 import type { QueryValue } from "@minnowdb/core";
+import { serializeError, type SerializedError } from "@minnowdb/core/worker-protocol";
 
 type StoreKind = "indexeddb" | "opfs";
 
@@ -23,17 +24,14 @@ interface TabQueryResult {
   rows: Array<Record<string, unknown>>;
 }
 
-/** Errors cross `page.evaluate` as plain text, so the name travels inside the message. */
-interface TabFailure {
+/** Explicit transport keeps rehydrated worker errors intact across Playwright's page boundary. */
+interface TabFailure extends SerializedError {
   failed: true;
-  name: string;
-  message: string;
 }
 
 interface TabError {
   source: "window-error" | "unhandled-rejection" | "worker";
-  name: string;
-  message: string;
+  error: SerializedError;
   kind?: DatabaseWorkerErrorEvent["kind"];
   context?: string;
 }
@@ -47,16 +45,13 @@ const pageErrors: TabError[] = [];
 window.addEventListener("error", (event) =>
   pageErrors.push({
     source: "window-error",
-    name: event.error instanceof Error ? event.error.name : "Error",
-    message: event.message,
+    error: serializeError(event.error ?? new Error(event.message)),
   }),
 );
 window.addEventListener("unhandledrejection", (event) => {
-  const reason: unknown = event.reason;
   pageErrors.push({
     source: "unhandled-rejection",
-    name: reason instanceof Error ? reason.name : "Error",
-    message: reason instanceof Error ? reason.message : String(reason),
+    error: serializeError(event.reason),
   });
 });
 
@@ -75,8 +70,7 @@ async function connect(): Promise<MinnowDatabaseClient> {
         source: "worker",
         kind: event.kind,
         context: event.context,
-        name: event.error.name,
-        message: event.error.message,
+        error: serializeError(event.error),
       }),
   });
   await client.ready();
@@ -84,15 +78,24 @@ async function connect(): Promise<MinnowDatabaseClient> {
 }
 
 function failure(error: unknown): TabFailure {
-  const name = error instanceof Error ? error.name : "Error";
-  const message = error instanceof Error ? error.message : String(error);
-  return { failed: true, name, message };
+  return { failed: true, ...serializeError(error) };
+}
+
+async function lifecycle(action: () => Promise<void>): Promise<TabFailure | undefined> {
+  try {
+    await action();
+    return undefined;
+  } catch (error) {
+    return failure(error);
+  }
 }
 
 const tab = {
-  async open(kind: StoreKind, name: string): Promise<void> {
-    descriptor = { kind, name };
-    await connect();
+  open(kind: StoreKind, name: string): Promise<TabFailure | undefined> {
+    return lifecycle(async () => {
+      descriptor = { kind, name };
+      await connect();
+    });
   },
   async execute(sql: string, params?: QueryValue[]): Promise<TabExecuteResult | TabFailure> {
     if (client === undefined) throw new Error("open() first");
@@ -117,12 +120,14 @@ const tab = {
       return failure(error);
     }
   },
-  async reopen(): Promise<void> {
-    // A crashed connection is already gone; only a live one has a worker worth disposing.
-    if (client !== undefined && !crashed) {
-      await client.close({ terminateWorker: true }).catch(() => undefined);
-    }
-    await connect();
+  reopen(): Promise<TabFailure | undefined> {
+    return lifecycle(async () => {
+      // A crashed connection is already gone; only a live one has a worker worth disposing.
+      if (client !== undefined && !crashed) {
+        await client.close({ terminateWorker: true });
+      }
+      await connect();
+    });
   },
   /** Terminates the worker outright, mid-call if one is pending -- a tab crash. */
   async crash(): Promise<void> {
@@ -138,14 +143,22 @@ const tab = {
     // crashed connection leaves behind.
     await client?.close({ terminateWorker: true, timeoutMs: 1 }).catch(() => undefined);
   },
-  async maintain(table: string): Promise<void> {
-    if (client === undefined) throw new Error("open() first");
-    await client.compactTable(table);
-    await client.collectGarbage();
+  maintain(table: string): Promise<TabFailure | undefined> {
+    return lifecycle(async () => {
+      if (client === undefined) throw new Error("open() first");
+      await client.compactTable(table);
+      await client.collectGarbage();
+    });
   },
-  async close(): Promise<void> {
-    await client?.close({ terminateWorker: true }).catch(() => undefined);
-    client = undefined;
+  close(): Promise<TabFailure | undefined> {
+    if (crashed) {
+      client = undefined;
+      return Promise.resolve(undefined);
+    }
+    return lifecycle(async () => {
+      await client?.close({ terminateWorker: true });
+      client = undefined;
+    });
   },
   pageErrors(): TabError[] {
     return [...pageErrors];

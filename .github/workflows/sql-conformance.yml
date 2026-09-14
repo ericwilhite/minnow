@@ -90,9 +90,6 @@ jobs:
           path: |
             playwright-report/
             test-results/
-            !test-results/**/storage-profile/**
-            !test-results/**/crash-profile/**
-            !test-results/**/quota-profile/**
           retention-days: 14
 
   randomized-soak:

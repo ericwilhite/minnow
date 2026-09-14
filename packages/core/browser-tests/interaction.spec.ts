@@ -10,6 +10,11 @@ import {
   type SimulatedQueryResult,
   type SimulationDriver,
 } from "@minnowdb/core/testing";
+import {
+  rehydrateError,
+  serializeError,
+  type SerializedError,
+} from "@minnowdb/core/worker-protocol";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 /**
@@ -68,16 +73,13 @@ function withoutFaults(plan: InteractionPlan): InteractionPlan {
   };
 }
 
-interface TabFailure {
+interface TabFailure extends SerializedError {
   failed: true;
-  name: string;
-  message: string;
 }
 
 interface TabError {
   source: "window-error" | "unhandled-rejection" | "worker";
-  name: string;
-  message: string;
+  error: SerializedError;
   kind?:
     | "uncaught"
     | "unhandled-rejection"
@@ -88,11 +90,19 @@ interface TabError {
   context?: string;
 }
 
+type PageDiagnostic =
+  | { readonly source: "console"; readonly message: string }
+  | { readonly source: "pageerror"; readonly error: SerializedError };
+
+interface DiagnosticCollectionFailure {
+  readonly phase: "read-tab-errors" | "close-tab";
+  readonly page: number;
+  readonly error: SerializedError;
+}
+
 function rethrow<T>(value: T | TabFailure): T {
   if (typeof value === "object" && value !== null && "failed" in value) {
-    const error = new Error(value.message);
-    error.name = value.name;
-    throw error;
+    throw rehydrateError(value, new Map());
   }
   return value;
 }
@@ -100,9 +110,10 @@ function rethrow<T>(value: T | TabFailure): T {
 interface Tab {
   execute(sql: string, params?: PlanValue[]): Promise<SimulatedExecuteResult | TabFailure>;
   query(sql: string, params?: PlanValue[]): Promise<SimulatedQueryResult | TabFailure>;
-  reopen(): Promise<void>;
+  reopen(): Promise<TabFailure | undefined>;
   crash(): Promise<void>;
-  maintain(table: string): Promise<void>;
+  maintain(table: string): Promise<TabFailure | undefined>;
+  close(): Promise<TabFailure | undefined>;
   pageErrors(): TabError[];
 }
 type TabWindow = typeof window & { simulatorTab: Tab };
@@ -116,15 +127,17 @@ async function openTab(
   const load = async (): Promise<void> => {
     await page.goto("/packages/core/browser/interaction/");
     await expect(page.locator("#ready")).toHaveText("Interaction simulator tab ready");
-    await page.evaluate(
-      async ({ kind, name }) => {
-        const target = window as typeof window & {
-          simulatorTab: { open(k: string, n: string): Promise<void> };
-        };
-        await target.simulatorTab.open(kind, name);
-      },
-      { kind, name },
-    );
+    await page
+      .evaluate(
+        async ({ kind, name }) => {
+          const target = window as typeof window & {
+            simulatorTab: { open(k: string, n: string): Promise<TabFailure | undefined> };
+          };
+          return target.simulatorTab.open(kind, name);
+        },
+        { kind, name },
+      )
+      .then(rethrow);
   };
   await load();
   let crashed = false;
@@ -154,7 +167,7 @@ async function openTab(
      */
     reopen: async () => {
       if (!crashed) {
-        await page.evaluate(() => (window as TabWindow).simulatorTab.reopen());
+        rethrow(await page.evaluate(() => (window as TabWindow).simulatorTab.reopen()));
         return;
       }
       crashed = false;
@@ -165,8 +178,10 @@ async function openTab(
       crashed = true;
       await page.evaluate(() => (window as TabWindow).simulatorTab.crash());
     },
-    maintain: (table) =>
-      page.evaluate((table) => (window as TabWindow).simulatorTab.maintain(table), table),
+    maintain: async (table) =>
+      rethrow(
+        await page.evaluate((table) => (window as TabWindow).simulatorTab.maintain(table), table),
+      ),
   };
 }
 
@@ -179,16 +194,20 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       test.setTimeout(600_000);
       const name = `interaction-${crypto.randomUUID()}`;
       const pages: Page[] = [];
-      const consoleErrors: string[] = [];
+      const pageDiagnostics: PageDiagnostic[] = [];
       // A reload after a crash wipes the tab's own record, so take it before every reload.
       const tabErrors: TabError[] = [];
       const driver: SimulationDriver = {
         open: async () => {
           const page = await storageContext.newPage();
           page.on("console", (message) => {
-            if (message.type() === "error") consoleErrors.push(message.text());
+            if (message.type() === "error") {
+              pageDiagnostics.push({ source: "console", message: message.text() });
+            }
           });
-          page.on("pageerror", (error) => consoleErrors.push(error.message));
+          page.on("pageerror", (error) =>
+            pageDiagnostics.push({ source: "pageerror", error: serializeError(error) }),
+          );
           pages.push(page);
           if (store === "opfs" && pages.length === 1) {
             await page.goto("/packages/core/browser/interaction/");
@@ -225,21 +244,72 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
           2,
         ),
       });
-      const result = await runInteractionPlan(plan, driver);
-      for (const page of pages) {
-        tabErrors.push(
-          ...(await page.evaluate(() => (window as TabWindow).simulatorTab.pageErrors())),
-        );
+      let result: Awaited<ReturnType<typeof runInteractionPlan>> | undefined;
+      let runFailure: { readonly error: unknown } | undefined;
+      try {
+        result = await runInteractionPlan(plan, driver);
+      } catch (error) {
+        runFailure = { error };
       }
-      await Promise.all(
-        pages.map((page) =>
-          page.evaluate(() =>
-            (
-              window as typeof window & { simulatorTab: { close(): Promise<void> } }
-            ).simulatorTab.close(),
+      const collectionFailures: DiagnosticCollectionFailure[] = [];
+      const collectTabErrors = async (): Promise<void> => {
+        for (const [pageIndex, page] of pages.entries()) {
+          try {
+            tabErrors.push(
+              ...(await page.evaluate(() => (window as TabWindow).simulatorTab.pageErrors())),
+            );
+          } catch (error) {
+            collectionFailures.push({
+              phase: "read-tab-errors",
+              page: pageIndex,
+              error: serializeError(error),
+            });
+          }
+        }
+      };
+      const attachDiagnostics = (explicitCloseAttempted: boolean): Promise<void> =>
+        info.attach(`${store}-${campaign}-diagnostics.json`, {
+          contentType: "application/json",
+          body: JSON.stringify(
+            {
+              browser: browserName,
+              store,
+              campaign,
+              conformance,
+              seed,
+              runFailure: runFailure === undefined ? undefined : serializeError(runFailure.error),
+              explicitCloseAttempted,
+              pageDiagnostics,
+              tabErrors,
+              collectionFailures,
+            },
+            undefined,
+            2,
           ),
+        });
+      if (runFailure !== undefined) {
+        await collectTabErrors();
+        await attachDiagnostics(false);
+        throw runFailure.error;
+      }
+      const closeOutcomes = await Promise.allSettled(
+        pages.map(async (page) =>
+          rethrow(await page.evaluate(() => (window as TabWindow).simulatorTab.close())),
         ),
       );
+      for (const [pageIndex, outcome] of closeOutcomes.entries()) {
+        if (outcome.status === "rejected") {
+          collectionFailures.push({
+            phase: "close-tab",
+            page: pageIndex,
+            error: serializeError(outcome.reason),
+          });
+        }
+      }
+      await collectTabErrors();
+      await attachDiagnostics(true);
+      expect(collectionFailures).toEqual([]);
+      if (result === undefined) throw new Error("Interaction plan returned no result");
       // A complete campaign has no fault steps. The crash campaign draws only faults this real-tab
       // driver can inject, so it must not skip any either.
       expect(result.faultsSkipped).toBe(0);
@@ -261,7 +331,7 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         expect(result.acceptedWrites).toBeGreaterThan(10);
         expect(result.checkpoints).toBeGreaterThan(0);
       }
-      expect(consoleErrors).toEqual([]);
+      expect(pageDiagnostics).toEqual([]);
       // A deliberate crash is classified on the mutation's typed failure. The error sink is for
       // unsolicited window and worker diagnostics, none of which may be hidden by message text.
       expect(tabErrors).toEqual([]);
