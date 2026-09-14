@@ -8,7 +8,9 @@
     "their storage reductions are in checkpoint-interruption.test.ts and opfs-checkpoint.spec.ts.",
     "Seed 3084996986 preserves the long WebKit plan that exposed excessive trace capture cost.",
     "Seed 2654435792 exposed a compaction transaction ownership race in native Chromium IndexedDB.",
-    "The nightly browser seeds came from MINNOW_BROWSER_INTERACTION_SEED_BASE=23."
+    "Seeds from base 23 are retained above; base 24 Firefox seed 608135840 exposed non-durable manifest cleanup cursors and disposal heartbeat timing.",
+    "Its reductions are manifest-prefix.spec.ts, record-core-hardening.test.ts, and dispose-keepalive.spec.ts.",
+    "Base 24 WebKit seed 3084996987 independently exposed invalid manifest checkpoints and closing an already-failed worker client."
   ],
   "suites": {
     "sql-conformance": [12648430],
@@ -20,7 +22,9 @@
     "compaction-soak-snapshots": [],
     "partitioned-compaction-soak": [],
     "auto-compaction-soak": [26172526, 756656541, 1271068371],
-    "interaction-simulator": [24301, 61935, 608135839, 3084996986, 2654435792],
+    "interaction-simulator": [
+      24301, 61935, 608135839, 3084996986, 2654435792, 608135840, 3084996987
+    ],
     "block-format-properties": []
   }
 }

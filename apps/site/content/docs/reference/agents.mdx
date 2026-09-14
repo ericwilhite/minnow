@@ -127,9 +127,10 @@ machines: https://minnowdb.com/llms.txt
   Never chunk a write to suit the engine: hand `insertBatch`/`upsertBatch` the whole batch, and
   inside `write()` single-row inserts, updates, deletes, upserts, and keyed constant `UPDATE`/
   `DELETE` statements coalesce into a few segments per table. Chunking only multiplies commits. Worker calls have a 60-second default `requestTimeoutMs` that counts
-  silence, not wall time; close has a five-second default
-  `timeoutMs`. An unknown mutation outcome requires reconciliation by durable application ID,
-  never blind replay. Deploy matching client/worker builds (wire protocol 7 in core 0.9.0).
+  silence, not wall time; close has a five-second default silence `timeoutMs` and the same
+  ten-timeout absolute cap. An unknown mutation outcome requires reconciliation by durable
+  application ID, never blind replay. Deploy matching client/worker builds (wire protocol 7 in
+  core 0.9.0).
 - An idle SQL transaction rolls back and rejects subsequent statements with
   `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. The 30-second default counts from
   the connection's last statement, and no other connection's crash, reopen, or maintenance ends
@@ -261,11 +262,14 @@ machines: https://minnowdb.com/llms.txt
   Worker itself raised an unhandled error or an unreadable frame, and the client must be
   replaced.
 - Never call `worker.terminate()` yourself; `client.close({ terminateWorker: true })` disposes the
-  store first. A worker killed with a write in flight leaves WebKit holding its IndexedDB
-  connection until that document is gone, and every connection to the database — new ones in other
-  tabs included — blocks meanwhile. The engine bounds that wait and throws
-  `StorageUnresponsiveError` after thirty seconds of total storage silence; the remedy is to reload
-  the page, not `reopen()`, which opens the same wedged database.
+  store first on a healthy connection. After initialization or the transport already failed, the
+  original `ready()` or operation reports that error; close removes local listeners and requests
+  termination because the unusable channel cannot confirm store disposal. Without a terminable
+  transport, server-side release cannot be confirmed. A worker killed with a write in flight leaves
+  WebKit holding its IndexedDB connection until that document is gone, and every connection to the
+  database — new ones in other tabs included — blocks meanwhile. The engine bounds that wait and
+  throws `StorageUnresponsiveError` after thirty seconds of total storage silence; the remedy is to
+  reload the page, not `reopen()`, which opens the same wedged database.
 - OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
   deletion while a current client is open; a client just closed is waited for, not refused. Close
   pre-0.9.0 clients too: they do not participate in the deletion lock protocol.

@@ -253,9 +253,12 @@ export interface ClientLiveQueryOptions {
 }
 
 export interface CloseClientOptions {
-  /** Also terminate the worker after disposing; only meaningful when the transport can. */
+  /** Terminate the worker after cleanup; only meaningful when the transport can. */
   terminateWorker?: boolean;
-  /** Grace allowed for disposal before closing the transport; defaults to 5 seconds. */
+  /**
+   * How long disposal may go silent before closing the transport; defaults to 5 seconds. Worker
+   * progress can extend wall time up to the same ten-deadline cap as any other request.
+   */
   timeoutMs?: number;
 }
 
@@ -414,6 +417,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   readonly #pending = new Map<string, PendingCall>();
   readonly #events = new Map<string, EventRoute>();
   #ready: Promise<void>;
+  #readyFailed = false;
   #storeKind: OpenedStoreKind | undefined;
   #fatal: Error | undefined;
   #closed = false;
@@ -495,14 +499,22 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
 
   /** Listens on a transport and sends it the init frame; the returned promise is `ready()`. */
   #attach(transport: ClientTransport): Promise<void> {
+    this.#readyFailed = false;
     transport.addEventListener("message", this.#onMessage);
     transport.addEventListener("error", this.#onError);
     transport.addEventListener("messageerror", this.#onMessageError);
-    const ready = this.#post("rpc-init", null, "init", [this.#initPayload]).then((result) => {
-      const kind = (result as { store?: unknown } | undefined)?.store;
-      this.#storeKind =
-        kind === "indexeddb" || kind === "opfs" || kind === "memory" ? kind : undefined;
-    });
+    const ready = this.#post("rpc-init", null, "init", [this.#initPayload]).then(
+      (result) => {
+        if (this.#transport !== transport) return;
+        const kind = (result as { store?: unknown } | undefined)?.store;
+        this.#storeKind =
+          kind === "indexeddb" || kind === "opfs" || kind === "memory" ? kind : undefined;
+      },
+      (error: unknown) => {
+        if (this.#transport === transport) this.#readyFailed = true;
+        throw error;
+      },
+    );
     // Callers may rely on call ordering instead of awaiting ready(); keep its rejection observed.
     ready.catch(() => undefined);
     return ready;
@@ -1261,7 +1273,12 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
 
   // --- Lifecycle --------------------------------------------------------------------------------
 
-  /** Disposes every worker-side handle, closes the store, and optionally terminates the worker. */
+  /**
+   * Disposes every worker-side handle, closes the store, and optionally terminates the worker.
+   * If initialization or the transport already failed, the original ready/call promise keeps
+   * that error and close performs only local cleanup plus requested termination: the unusable
+   * channel cannot acknowledge worker-side disposal.
+   */
   close(options: CloseClientOptions = {}): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
     const timeoutMs = clientDeadline(options.timeoutMs ?? 5_000);
@@ -1275,7 +1292,15 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       document.removeEventListener("visibilitychange", this.#onVisibilityChange);
     }
     try {
-      await this.#post("rpc-call", null, "dispose", [], undefined, true, { timeoutMs });
+      // A worker that never initialized has no database to dispose, and a transport already
+      // known to be lost cannot receive the call. The original ready/call rejection reported
+      // that failure; close still owns local listener cleanup and requested termination.
+      if (!this.#readyFailed && this.#fatal === undefined) {
+        // The worker uses this silence deadline to report disposal progress before it expires.
+        // Disposal has its own shorter default than ordinary calls, so the connection-wide pace
+        // negotiated at initialization is not necessarily fast enough here.
+        await this.#post("rpc-call", null, "dispose", [timeoutMs], undefined, true, { timeoutMs });
+      }
     } finally {
       this.#fail(new Error("Database client is closed"), true);
       this.#transport.removeEventListener?.("message", this.#onMessage);

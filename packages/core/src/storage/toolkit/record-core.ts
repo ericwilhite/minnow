@@ -1046,7 +1046,6 @@ export class RecordCore {
   #catalogEpoch = 0;
   /** Advances only when a structural catalog change invalidates prepared write artifacts. */
   #schemaEpoch = 0;
-  #prunedManifestRemovalCursor: number | null = null;
 
   constructor(physical: PhysicalBlocks) {
     this.#physical = physical;
@@ -3464,19 +3463,14 @@ export class RecordCore {
     const earliestReadable = this.#roots.readableManifestVersions.after(null).next();
     const safeBelow = earliestReadable.done ? Number.POSITIVE_INFINITY : earliestReadable.value;
     const selected: Manifest[] = [];
-    let visited = 0;
-    for (const version of this.#roots.prunedManifestVersions.after(
-      this.#prunedManifestRemovalCursor,
-    )) {
-      this.#prunedManifestRemovalCursor = version;
-      visited += 1;
-      const manifest = this.#manifests.get(version);
-      if (manifest !== undefined && version < safeBelow) {
-        selected.push(manifest);
-      }
-      if (visited === maxItems) break;
+    // Manifest descriptors form one predecessor chain. Removing an interior tombstone would
+    // leave its readable successor pointing at a missing version, so every bounded step must
+    // peel only the oldest prefix. This is also state-deterministic: log replay cannot depend
+    // on a scan cursor that is absent from the checkpoint and WAL.
+    for (const manifest of this.#manifests.orderedValues(null)) {
+      if (selected.length === maxItems || manifest.version >= safeBelow) break;
+      selected.push(manifest);
     }
-    if (visited < maxItems) this.#prunedManifestRemovalCursor = null;
     this.#replaceManifests(
       [],
       selected.map((manifest) => manifest.version),
@@ -6092,7 +6086,6 @@ export class RecordCore {
     this.#currentVersion = cloned.currentVersion;
     this.#catalogEpoch = cloned.catalogEpoch;
     this.#schemaEpoch = cloned.schemaEpoch;
-    this.#prunedManifestRemovalCursor = null;
     this.#manifestRetainedBytes = 0;
     this.#segmentRetainedBytes = 0;
     for (const manifest of cloned.manifests) this.#setManifest(manifest);

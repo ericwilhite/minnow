@@ -53,6 +53,20 @@ compatible with 0.10.2.
 - **Concurrent compaction reconciles publication during transaction resume.** If another
   connection commits the same compaction while a coordinator renews its owner, the coordinator
   reloads the durable result. An ownership error without a durable state change still fails.
+- **Manifest cleanup preserves the stored predecessor chain.** Each bounded cleanup removes
+  the oldest pruned prefix. OPFS replay chooses the same records as the live operation without
+  relying on an in-memory cursor. Previously, an interrupted cleanup could make a valid database
+  fail recovery. IndexedDB cleanup also preserves valid intermediate states and recognizes the
+  exact unfinished cleanup range recorded by earlier releases during integrity checks.
+  Already-invalid OPFS checkpoints still fail closed and require a known-good snapshot; the fix
+  does not infer missing manifest history.
+- **Graceful worker disposal reports progress before its deadline.** Disposal uses its own
+  heartbeat pace, so a responsive worker can finish closing after the five-second silence
+  deadline. The existing ten-deadline absolute cap still terminates a stalled close.
+- **Closing an already-failed worker client finishes local cleanup.** The original fatal error
+  remains the outcome of the failed call. Closing releases listeners and terminates the worker
+  when requested instead of attempting an impossible disposal call and repeating that error.
+  A new failure during graceful disposal still rejects the close.
 - **SQLLogicTest rejects malformed result rows.** A missing or undefined result field can no
   longer pass as SQL NULL, and unexpected result fields fail the harness.
 
@@ -64,6 +78,13 @@ compatible with 0.10.2.
   query counts, interaction lengths, assertions, and deadlines are unchanged.
 - A controlled compaction interleaving runs against real IndexedDB and OPFS in all three
   browsers, alongside the recorded long interaction seed that exposed the race.
+- Native regressions compare manifest lists before termination and after WAL replay, reopen
+  intermediate cleanup checkpoints, and exercise slow worker disposal in all three browsers.
+  Each reproduces a failure against the previous engine. The campaigns retain their original
+  deadlines and reject unrelated errors.
+- Failed native tests preserve OPFS evidence before browser teardown. WebKit's storage is
+  isolated under the test profile, and a bounded browser-API copy records raw files, byte counts,
+  hashes, and any capture errors. Native tests verify that saved bytes survive context closure.
 - Every SQL feature-matrix entry now executes in all three real browsers over IndexedDB and
   OPFS, with explicit result-comparison and acceptance categories. Additional fixed and seeded
   reads and mutations compare against browser-native SQLite Wasm and PGlite with maintenance on.

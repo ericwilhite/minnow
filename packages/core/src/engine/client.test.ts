@@ -24,7 +24,6 @@ import { MinnowDatabase } from "./database.js";
 import * as engineErrors from "./errors.js";
 import {
   MaintenanceBacklogError,
-  DatabaseWorkerTimeoutError,
   DatabaseWorkerOutcomeUnknownError,
   SqlCompileError,
   UnknownTableError,
@@ -140,6 +139,133 @@ it("settles cancelled reads and forcibly terminates an unresponsive worker on cl
   }
 });
 
+it("cleans up a client whose worker initialization already failed", async () => {
+  let messageListener: ((event: MessageEvent<unknown>) => void) | undefined;
+  const calls: Array<{ kind: string; method: string | undefined }> = [];
+  const removed: string[] = [];
+  const terminate = vi.fn();
+  const client = new MinnowDatabaseClient({
+    postMessage: (message) => {
+      const request = message as { kind: string; method?: string; requestId: string };
+      calls.push({ kind: request.kind, method: request.method });
+      const error = new Error(
+        "Database initialization failed: StorageUnresponsiveError: storage stopped answering",
+      );
+      queueMicrotask(() => {
+        messageListener?.({ data: rpcFailure(request.requestId, error) } as MessageEvent<unknown>);
+      });
+    },
+    addEventListener: (type, listener) => {
+      if (type === "message") messageListener = listener;
+    },
+    removeEventListener: (type) => {
+      removed.push(type);
+    },
+    terminate,
+  });
+
+  await expect(client.ready()).rejects.toThrow(
+    "Database initialization failed: StorageUnresponsiveError: storage stopped answering",
+  );
+  const closing = client.close({ terminateWorker: true });
+  expect(client.close()).toBe(closing);
+  await expect(closing).resolves.toBeUndefined();
+  expect(calls).toEqual([{ kind: "rpc-init", method: undefined }]);
+  expect(removed.sort()).toEqual(["error", "message", "messageerror"]);
+  expect(terminate).toHaveBeenCalledTimes(1);
+  await expect(client.listTables()).rejects.toThrow("closed");
+});
+
+it("cleans up a fatally failed transport without replacing a pending mutation outcome", async () => {
+  const listeners = new Map<string, (event?: MessageEvent<unknown>) => void>();
+  const calls: Array<{ kind: string; method: string | undefined }> = [];
+  const removed: string[] = [];
+  const terminate = vi.fn();
+  const client = new MinnowDatabaseClient({
+    postMessage: (message) => {
+      const request = message as { kind: string; method?: string; requestId: string };
+      calls.push({ kind: request.kind, method: request.method });
+      if (request.kind === "rpc-init") {
+        queueMicrotask(() => {
+          listeners.get("message")?.({
+            data: {
+              version: protocolVersion,
+              requestId: request.requestId,
+              kind: "rpc-result",
+              result: {},
+            },
+          } as MessageEvent<unknown>);
+        });
+      }
+    },
+    addEventListener: (type, listener) => {
+      listeners.set(type, listener as (event?: MessageEvent<unknown>) => void);
+    },
+    removeEventListener: (type) => {
+      removed.push(type);
+    },
+    terminate,
+  });
+  await client.ready();
+
+  const mutation = client.execute("INSERT INTO lost VALUES (1)");
+  listeners.get("error")?.();
+  await expect(mutation).rejects.toBeInstanceOf(DatabaseWorkerOutcomeUnknownError);
+  await expect(client.close({ terminateWorker: true })).resolves.toBeUndefined();
+  expect(calls).toEqual([
+    { kind: "rpc-init", method: undefined },
+    { kind: "rpc-call", method: "execute" },
+  ]);
+  expect(removed.sort()).toEqual(["error", "message", "messageerror"]);
+  expect(terminate).toHaveBeenCalledTimes(1);
+});
+
+it("does not let the previous initialization failure poison a reopened transport", async () => {
+  let oldListener: ((event: MessageEvent<unknown>) => void) | undefined;
+  const oldTransport: ClientTransport = {
+    postMessage: () => undefined,
+    addEventListener: (type, listener) => {
+      if (type === "message") oldListener = listener;
+    },
+  };
+  let nextListener: ((event: MessageEvent<unknown>) => void) | undefined;
+  const nextCalls: Array<{ requestId: string; method?: string }> = [];
+  const nextTransport: ClientTransport = {
+    postMessage: (message) => {
+      const request = message as { requestId: string; method?: string };
+      nextCalls.push(request);
+      queueMicrotask(() => {
+        nextListener?.({
+          data: {
+            version: protocolVersion,
+            requestId: request.requestId,
+            kind: "rpc-result",
+            result: request.method === undefined ? { store: "memory" } : {},
+          },
+        } as MessageEvent<unknown>);
+      });
+    },
+    addEventListener: (type, listener) => {
+      if (type === "message") nextListener = listener;
+    },
+  };
+  const client = new MinnowDatabaseClient(oldTransport, { store: { kind: "memory" } });
+  const reopened = client.reopen(nextTransport);
+  oldListener?.({
+    data: {
+      version: protocolVersion,
+      requestId: "stale-initialization",
+      kind: "rpc-result",
+      result: { store: "indexeddb" },
+    },
+  } as MessageEvent<unknown>);
+
+  await reopened;
+  await expect(client.storeKind()).resolves.toBe("memory");
+  await expect(client.close()).resolves.toBeUndefined();
+  expect(nextCalls.map((call) => call.method)).toEqual([undefined, "dispose"]);
+});
+
 it("reports a lost mutation reply as unknown and never replays its committed write", async () => {
   const boundary = createBoundary();
   let drop = false;
@@ -160,7 +286,7 @@ it("reports a lost mutation reply as unknown and never replays its committed wri
     DatabaseWorkerOutcomeUnknownError,
   );
   expect((await database.query("SELECT * FROM sales")).rows).toEqual([{ id: 7 }]);
-  await expect(client.close()).rejects.toBeInstanceOf(DatabaseWorkerTimeoutError);
+  await expect(client.close()).resolves.toBeUndefined();
   await database.close();
 });
 
@@ -3087,6 +3213,87 @@ describe("MinnowDatabaseClient", () => {
     expect(closeCalls).toBe(1);
     expect(disposed).toBe(true);
     await expect(client.listTables()).rejects.toThrow(/closed/);
+  });
+
+  it("keeps graceful worker disposal alive while database resources drain", async () => {
+    vi.useFakeTimers();
+    try {
+      class SlowClosingDatabase extends MinnowDatabase {
+        override async close(): Promise<void> {
+          await new Promise<void>((resolve) => setTimeout(resolve, 6_000));
+          await super.close();
+        }
+      }
+
+      const { clientSide, workerSide } = createBoundary();
+      exposeDatabase(new SlowClosingDatabase(new MemoryBlockStore()), workerSide, {
+        keepaliveIntervalMs: 5_000,
+      });
+      const client = new MinnowDatabaseClient(clientSide);
+      await client.ready();
+      let settled = false;
+      const closing = client.close();
+      const outcome = closing.then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await outcome).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still bounds a worker disposal that reports progress forever", async () => {
+    vi.useFakeTimers();
+    let releaseClose: (() => void) | undefined;
+    try {
+      const closeGate = new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      });
+      class StuckClosingDatabase extends MinnowDatabase {
+        override async close(): Promise<void> {
+          await closeGate;
+          await super.close();
+        }
+      }
+
+      const { clientSide, workerSide } = createBoundary();
+      exposeDatabase(new StuckClosingDatabase(new MemoryBlockStore()), workerSide, {
+        keepaliveIntervalMs: 5_000,
+      });
+      const client = new MinnowDatabaseClient(clientSide);
+      await client.ready();
+      let settled = false;
+      const outcome = client.close({ timeoutMs: 300 }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      void outcome.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(2_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(outcome).resolves.toMatchObject({
+        name: "DatabaseWorkerOutcomeUnknownError",
+        cause: { name: "DatabaseWorkerTimeoutError", timeoutMs: 300 },
+      });
+    } finally {
+      releaseClose?.();
+      vi.runAllTicks();
+      vi.useRealTimers();
+    }
   });
 
   it("fails closed when a whitelisted database implementation is unavailable", async () => {

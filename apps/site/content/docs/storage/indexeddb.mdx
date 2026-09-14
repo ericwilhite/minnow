@@ -114,6 +114,11 @@ live block ids. Version membership checks are point reads, snapshot and maintena
 cursor-paged, and deleting an old manifest summary does not erase the provenance GC needs to finish
 reclaiming its retired blocks.
 
+Cleanup removes the oldest pruned summaries in bounded transactions, so closing between pages
+leaves a valid predecessor chain. Earlier releases could leave an unfinished deletion range;
+its durable cleanup marker identifies that exact range for integrity checks and resumption.
+An unrelated gap remains a corruption finding.
+
 UNIQUE membership uses immutable lexical generations plus at most 16 ordered commit tails. Every
 base or tail part is capped at 2,048 tokens and a conservative 2 MiB retained-size model. The
 seventeenth tail is folded by a bounded k-way merge into a new generation; the old generation and

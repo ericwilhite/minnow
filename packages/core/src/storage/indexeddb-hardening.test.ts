@@ -3082,6 +3082,167 @@ describe("IndexedDB corruption hardening", () => {
     store.close();
   });
 
+  it("keeps bounded prefix cleanup contiguous when its scan boundary is pruned", async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    const store = await openStore(indexedDB, name);
+    const manifestRecords = Array.from({ length: 10 }, (_, version) => ({
+      version,
+      previousVersion: version === 0 ? null : version - 1,
+      liveBlockCount: 0,
+      liveBlockBytes: 0,
+      changedTableIds: [],
+      createdAt: NOW,
+      ...(version < 8 ? { prunedAt: NOW } : {}),
+    }));
+    await mutate(indexedDB, name, ["catalog", "manifests", "statistics"], (tx) => {
+      const manifests = tx.objectStore("manifests");
+      for (const record of manifestRecords) manifests.put(record, record.version);
+      tx.objectStore("catalog").put(9, "manifest/current");
+      adjustRawRecordLedger(tx, {
+        manifestCount: manifestRecords.length,
+        manifestBytes: manifestRecords.reduce(
+          (total, record) => total + manifestRecordRetainedReservationBytes(record),
+          0,
+        ),
+      });
+    });
+
+    // The first two pages only discover the safe boundary. The first delete page must remove
+    // the oldest versions even if later collection prunes the formerly readable boundary.
+    await expect(store.removePrunedManifestRecords(5)).resolves.toBe(0);
+    await expect(store.removePrunedManifestRecords(5)).resolves.toBe(0);
+    const concurrentCollection = await store.createGarbageCollectionJob({
+      id: "prune-scanned-boundary",
+      candidateManifestVersions: [8],
+      candidateSegmentIds: [],
+      candidateBlockIds: [],
+      candidateTransactionIds: [],
+      leaseCutoff: NOW,
+      createdAt: NOW,
+    });
+    const concurrentStep = await store.runGarbageCollectionStep({
+      jobId: concurrentCollection.id,
+      expectedRevision: concurrentCollection.revision,
+      maxItems: 1,
+      updatedAt: NOW,
+    });
+    expect(concurrentStep.prunedManifestVersions).toEqual([8]);
+    await expect(store.checkIntegrity()).resolves.toMatchObject({ ok: true, issues: [] });
+    await expect(store.removePrunedManifestRecords(5)).resolves.toBe(5);
+    await expect(store.getManifest(0)).resolves.toBeUndefined();
+    await expect(store.getManifest(7)).resolves.toMatchObject({ version: 7, prunedAt: NOW });
+    await expect(store.checkIntegrity()).resolves.toMatchObject({ ok: true, issues: [] });
+
+    await expect(store.removePrunedManifestRecords(5)).resolves.toBe(3);
+    await expect(store.checkIntegrity()).resolves.toMatchObject({ ok: true, issues: [] });
+    expect((await store.listManifestPage(null, 20)).records.map(({ version }) => version)).toEqual([
+      8, 9,
+    ]);
+    store.close();
+  });
+
+  it("resumes a legacy descending manifest cleanup and authenticates only its declared gap", async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    let store = await openStore(indexedDB, name);
+    const manifestRecords = [0, 1, 2, 3, 4, 5, 8, 9].map((version) => ({
+      version,
+      previousVersion: version === 0 ? null : version - 1,
+      liveBlockCount: 0,
+      liveBlockBytes: 0,
+      changedTableIds: [],
+      createdAt: NOW,
+      ...(version < 8 ? { prunedAt: NOW } : {}),
+    }));
+    const legacyCleanup = { phase: "delete", safeBelow: 8, beforeVersion: 6 };
+    await mutate(indexedDB, name, ["catalog", "manifests", "statistics"], (tx) => {
+      const manifests = tx.objectStore("manifests");
+      for (const record of manifestRecords) manifests.put(record, record.version);
+      const catalog = tx.objectStore("catalog");
+      catalog.put(9, "manifest/current");
+      catalog.put(legacyCleanup, "manifest/prune-cleanup");
+      adjustRawRecordLedger(tx, {
+        manifestCount: manifestRecords.length,
+        manifestBytes: manifestRecords.reduce(
+          (total, record) => total + manifestRecordRetainedReservationBytes(record),
+          0,
+        ),
+      });
+    });
+    await expect(store.checkIntegrity()).resolves.toMatchObject({ ok: true, issues: [] });
+
+    const version4 = manifestRecords.find(({ version }) => version === 4);
+    if (version4 === undefined) throw new Error("Missing legacy manifest fixture");
+    await mutate(indexedDB, name, "manifests", (tx) => {
+      tx.objectStore("manifests").delete(4);
+    });
+    expect(
+      (await store.checkIntegrity()).issues.some(
+        ({ code, message }) => code === "invalid-manifest" && message.includes("predecessor"),
+      ),
+    ).toBe(true);
+    await mutate(indexedDB, name, "manifests", (tx) => {
+      tx.objectStore("manifests").put(version4, 4);
+    });
+
+    await mutate(indexedDB, name, "catalog", (tx) => {
+      tx.objectStore("catalog").put(
+        { phase: "delete", safeBelow: 8, beforeVersion: 9 },
+        "manifest/prune-cleanup",
+      );
+    });
+    expect((await store.checkIntegrity()).issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "invalid-catalog-record",
+          location: "manifest/prune-cleanup",
+        }),
+      ]),
+    );
+    await mutate(indexedDB, name, "catalog", (tx) => {
+      tx.objectStore("catalog").put(legacyCleanup, "manifest/prune-cleanup");
+    });
+
+    const version8 = manifestRecords.find(({ version }) => version === 8);
+    if (version8 === undefined) throw new Error("Missing cleanup-boundary manifest fixture");
+    await mutate(indexedDB, name, "manifests", (tx) => {
+      tx.objectStore("manifests").delete(8);
+    });
+    expect(
+      (await store.checkIntegrity()).issues.some(
+        ({ code, message }) =>
+          code === "invalid-manifest-prune-cleanup" && message.includes("boundary is missing"),
+      ),
+    ).toBe(true);
+    try {
+      await store.removePrunedManifestRecords(8);
+      expect.unreachable("Missing cleanup boundary must fail closed");
+    } catch (error) {
+      expect(error).toBeInstanceOf(StorageCorruptionError);
+      if (!(error instanceof Error)) throw error;
+      expect(error.name).toBe("StorageCorruptionError");
+      expect(error.message).toContain("boundary is missing");
+    }
+    await mutate(indexedDB, name, "manifests", (tx) => {
+      tx.objectStore("manifests").put(version8, 8);
+    });
+
+    await expect(store.removePrunedManifestRecords(2)).resolves.toBe(2);
+    await expect(store.getManifest(0)).resolves.toBeUndefined();
+    await expect(store.getManifest(5)).resolves.toMatchObject({ version: 5, prunedAt: NOW });
+    store.close();
+    store = await openStore(indexedDB, name);
+    await expect(store.removePrunedManifestRecords(2)).resolves.toBe(2);
+    await expect(store.removePrunedManifestRecords(2)).resolves.toBe(2);
+    await expect(store.removePrunedManifestRecords(2)).resolves.toBe(0);
+    expect((await store.listManifestPage(null, 20)).records.map(({ version }) => version)).toEqual([
+      8, 9,
+    ]);
+    await expect(store.checkIntegrity()).resolves.toMatchObject({ ok: true, issues: [] });
+    store.close();
+  });
+
   it("prunes a manifest while its reservation ledger is at the exact byte ceiling", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();

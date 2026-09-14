@@ -167,11 +167,17 @@ opened OPFS store as `OpfsBlockStoreOptions.onDiagnostic`; the worker host wires
 event above.
 
 `client.close({ terminateWorker: true, timeoutMs: 5000 })` attempts graceful disposal, then
-terminates the worker even if disposal times out. The timeout defaults to five seconds. A rejected
-close is not a successful flush; pending buffered writes may have an unknown outcome. Repeated
-close calls share one promise. Explicit `client.write()` callbacks are not replayed, and their
-parallel session calls run in order before commit. Snapshot queries use the live worker scope, so
-an expired or closed scope cannot silently read through a replacement lease.
+terminates the worker even if disposal times out. The timeout defaults to five seconds of silence. The
+worker reports while it drains resources, so a healthy shutdown may take longer, while the same
+ten-timeout absolute cap still ends a worker that reports forever. A rejected close is not a
+successful flush; pending buffered writes may have an unknown outcome. Repeated close calls share
+one promise. If initialization or the transport already failed, its original `ready()` or operation
+keeps that error. `close()` skips the impossible disposal call, removes the client's listeners, and
+terminates a terminable transport when requested. With `terminateWorker: false` or a transport such
+as `MessagePort` that cannot terminate, worker-side store and handle release cannot be confirmed
+after that prior failure. Explicit `client.write()` callbacks are not replayed, and their parallel
+session calls run in order before commit. Snapshot queries use the live worker scope, so an expired
+or closed scope cannot silently read through a replacement lease.
 
 Client adapters can wrap the same worker client because it implements `MinnowSqlDriver`. The
 [Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker

@@ -200,6 +200,13 @@ age of the build. Low-level renewal and chunk-append calls must place the expira
 `expiresAtCutoff` and `updatedAt`, within the one-hour lease limit of each. Invalid intervals are
 rejected before writing durable state.
 
+Removing pruned manifest summaries advances from the oldest stored version in bounded steps.
+Every intermediate checkpoint retains a contiguous predecessor chain, and replay selects the
+same prefix from durable state. Cleanup never depends on a cursor held only in worker memory.
+This prevents new gaps from cleanup. It does not repair a checkpoint that already contains an
+invalid manifest chain: recovery still rejects it rather than guessing which missing records
+were safe to delete. Such a database needs a known-good [snapshot](/docs/storage/snapshots).
+
 ## Durability
 
 `strict`, the default, flushes each payload before flushing the WAL frame that publishes it, and

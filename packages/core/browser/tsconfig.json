@@ -29,6 +29,11 @@
     "opfs-checkpoint-run.ts",
     "opfs-checkpoint-worker.ts",
     "compaction-resume-run.ts",
-    "compaction-resume-worker.ts"
+    "compaction-resume-worker.ts",
+    "dispose-keepalive-run.ts",
+    "dispose-keepalive-worker.ts",
+    "manifest-prefix-run.ts",
+    "manifest-prefix-worker.ts",
+    "manifest-prefix-idb-run.ts"
   ]
 }

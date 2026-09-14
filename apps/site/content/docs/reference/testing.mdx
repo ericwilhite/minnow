@@ -81,10 +81,23 @@ Browser runs save an HTML report in `playwright-report/`, including attached see
 result summaries. CI, release, and nightly jobs retain reports for passing and failing browser
 runs for 14 days; failed tests also retain traces. Each engine's library report is saved before
 the site runner can replace it. Successful attempts delete their persistent browser profiles;
-failed attempts retain and upload the complete profile with the trace, including a failed first
-attempt whose retry passes. Library traces retain action timing, errors, sources, and attachments;
+failed attempts retain and upload the profile with the trace, including a failed first attempt
+whose retry passes. Because macOS WebKit otherwise stores OPFS outside Playwright's profile
+directory, its storage fixture redirects that browser-owned data into the per-test profile. The
+failure fixture also copies every file from the isolated test origin through the browser File
+System API. Its manifest records each original path, size, captured byte count, hash, and capture
+error, so incomplete evidence is explicit. Evidence collection has a separate 20-second,
+20,000-file, and 512 MiB cap and marks the manifest incomplete if any limit is reached. Library
+traces retain action timing, errors, sources, and attachments;
 the static runner pages omit continuous screenshots and DOM snapshots. A console log alone is not
 a replay artifact.
+
+Focused native recovery tests force real checkpoint and WAL boundaries, terminate the worker,
+and compare the reopened manifest list with the list acknowledged before termination. IndexedDB
+cleanup tests check integrity between bounded pages and after reopening, including a legacy
+cleanup marker, concurrent pruning, and deliberately unrelated gaps. Worker lifecycle tests
+check slow disposal, its absolute timeout cap, and cleanup after an already-reported fatal error.
+These reductions run in all three engines alongside the longer seeded plans.
 
 Unit files are capped at four concurrent workers (or the available CPU count, if lower). Each
 file can start complete databases and comparison engines, so unrestricted file concurrency can

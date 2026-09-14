@@ -522,13 +522,16 @@ class DatabaseRpcServer {
     if (!bypassLimit) this.#inFlightRpcCount += 1;
     // A long call — a large batch write, a slow query — must not look like a dead worker to the
     // client's deadline. Marked unref so an idle Node scope can still exit.
-    const keepalive = setInterval(() => {
-      try {
-        this.scope.postMessage(workerKeepaliveEvent(request.requestId));
-      } catch {
-        // The scope is gone; the call's own outcome can no longer be delivered either.
-      }
-    }, this.#keepaliveIntervalMs);
+    const keepalive = setInterval(
+      () => {
+        try {
+          this.scope.postMessage(workerKeepaliveEvent(request.requestId));
+        } catch {
+          // The scope is gone; the call's own outcome can no longer be delivered either.
+        }
+      },
+      requestKeepaliveInterval(request, this.#keepaliveIntervalMs),
+    );
     unrefTimer(keepalive);
     const abort =
       request.method === "query" || request.method === "execute"
@@ -1577,6 +1580,15 @@ async function createServer(
 function keepaliveInterval(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return WORKER_KEEPALIVE_INTERVAL_MS;
   return Math.min(WORKER_KEEPALIVE_INTERVAL_MS, Math.max(MIN_WORKER_KEEPALIVE_INTERVAL_MS, value));
+}
+
+/** Disposal carries its shorter silence deadline so two progress reports fit before it expires. */
+function requestKeepaliveInterval(request: RpcRequest, fallback: number): number {
+  if (request.kind !== "rpc-call" || request.method !== "dispose") return fallback;
+  const deadlineMs = request.args[0];
+  if (typeof deadlineMs !== "number" || !Number.isSafeInteger(deadlineMs) || deadlineMs < 1)
+    return fallback;
+  return Math.min(fallback, Math.max(MIN_WORKER_KEEPALIVE_INTERVAL_MS, Math.floor(deadlineMs / 3)));
 }
 
 function isOpenedStore(value: BlockStore | OpenedStore): value is OpenedStore {

@@ -277,6 +277,7 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
               campaign,
               conformance,
               seed,
+              result,
               runFailure: runFailure === undefined ? undefined : serializeError(runFailure.error),
               explicitCloseAttempted,
               pageDiagnostics,

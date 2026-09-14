@@ -1275,7 +1275,61 @@ describe("RecordCore hardening", () => {
     expect(core.dump().manifests.map(({ version }) => version)).toEqual([3]);
   });
 
-  it("advances pruned-manifest cleanup without rescanning an ineligible prefix", () => {
+  it("replays bounded manifest cleanup identically without breaking the predecessor chain", () => {
+    const physical = { hasBlock: () => false, blockByteLength: () => undefined };
+    const live = new RecordCore(physical);
+    live.load({
+      ...live.dump(),
+      currentVersion: 7,
+      manifests: Array.from({ length: 8 }, (_, version) => ({
+        version,
+        previousVersion: version === 0 ? null : version - 1,
+        liveBlockCount: 0,
+        liveBlockBytes: 0,
+        changedTableIds: [],
+        createdAt: "2026-08-24T00:00:00.000Z",
+        ...([1, 2, 3, 4, 6].includes(version) ? { prunedAt: "2026-08-24T00:01:00.000Z" } : {}),
+      })),
+    });
+
+    // With version 0 still readable, cleanup has no safe prefix to remove. Its result must not
+    // leave hidden progress that changes the same operation after a checkpoint reload.
+    expect(live.removePrunedManifestRecords(2)).toBe(0);
+    const checkpoint = live.dump();
+    const replayed = new RecordCore(physical);
+    replayed.load(checkpoint);
+
+    const pruneOldest = (core: RecordCore): void => {
+      const job = core.createGarbageCollectionJob({
+        id: "oldest-manifest",
+        candidateManifestVersions: [0],
+        candidateSegmentIds: [],
+        candidateBlockIds: [],
+        candidateTransactionIds: [],
+        leaseCutoff: "2026-08-24T00:10:00.000Z",
+        createdAt: "2026-08-24T00:10:00.000Z",
+      });
+      const step = core.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: job.revision,
+        maxItems: 1,
+        updatedAt: "2026-08-24T00:10:01.000Z",
+      });
+      expect(step.prunedManifestVersions).toEqual([0]);
+    };
+    pruneOldest(live);
+    pruneOldest(replayed);
+
+    expect(live.removePrunedManifestRecords(2)).toBe(2);
+    expect(replayed.removePrunedManifestRecords(2)).toBe(2);
+    expect(live.dump()).toEqual(replayed.dump());
+    expect(live.dump().manifests.map(({ version }) => version)).toEqual([2, 3, 4, 5, 6, 7]);
+
+    // Every bounded intermediate is itself a valid checkpoint candidate.
+    expect(() => new RecordCore(physical).load(live.dump())).not.toThrow();
+  });
+
+  it("removes a bounded prefix without consulting physical blocks", () => {
     const retained = new Set(
       Array.from({ length: 2_048 }, (_, version) => version)
         .filter((version) => version % 2 === 0)

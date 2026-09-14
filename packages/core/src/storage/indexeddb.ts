@@ -6402,7 +6402,7 @@ export class IndexedDbBlockStore implements BlockStore {
           catalog.put(state, MANIFEST_PRUNE_CLEANUP_KEY);
           break;
         }
-        const deletion = await deletePrunedManifestPage(
+        const deletion = await deletePrunedManifestPrefixPage(
           store,
           state.safeBelow,
           state.beforeVersion,
@@ -6707,6 +6707,7 @@ export class IndexedDbBlockStore implements BlockStore {
     let snapshotImportMarker: SnapshotFrameImportMarker | undefined;
     let completedSnapshotImport: CompletedSnapshotFrameImportRecord | undefined;
     let snapshotExportMarker: SnapshotFrameExportMarker | undefined;
+    let manifestPruneCleanup: ManifestPruneCleanupState | undefined;
     await visitObjectStoreSequentially(catalog, async (value, key) => {
       checkedRecords += 1;
       try {
@@ -6750,6 +6751,8 @@ export class IndexedDbBlockStore implements BlockStore {
             completedSnapshotImport = asOptionalCompletedSnapshotFrameImportRecord(value);
           } else if (key === SNAPSHOT_EXPORT_KEY) {
             snapshotExportMarker = asSnapshotFrameExportMarker(value);
+          } else if (key === MANIFEST_PRUNE_CLEANUP_KEY) {
+            manifestPruneCleanup = asManifestPruneCleanupState(value);
           } else if (key.startsWith(BLOCK_METADATA_PREFIX)) {
             const blockId = key.slice(BLOCK_METADATA_PREFIX.length);
             if (blockId.length === 0) throw corruption(key, "block ID is missing");
@@ -7190,6 +7193,9 @@ export class IndexedDbBlockStore implements BlockStore {
     let currentManifestRecord: StoredManifestRecord | undefined;
     let observedManifestCount = 0;
     let observedManifestBytes = 0;
+    const manifestDeleteState =
+      manifestPruneCleanup?.phase === "delete" ? manifestPruneCleanup : undefined;
+    let manifestDeleteBoundarySeen = manifestDeleteState === undefined;
     await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value, key) => {
       checkedRecords += 1;
       observedManifestCount = incrementSafeInteger(
@@ -7206,11 +7212,39 @@ export class IndexedDbBlockStore implements BlockStore {
           manifestRecordRetainedReservationBytes(record),
           "Integrity manifest bytes",
         );
-        if (
-          record.previousVersion !== null &&
-          record.previousVersion !== previousManifest?.version
-        ) {
-          throw corruption(`manifests/${String(key)}`, "manifest predecessor is unavailable");
+        if (manifestDeleteState !== undefined) {
+          if (record.version < manifestDeleteState.beforeVersion && record.prunedAt === undefined) {
+            throw corruption(
+              `manifests/${String(key)}`,
+              "prune cleanup prefix contains a readable manifest",
+            );
+          }
+          if (
+            record.version >= manifestDeleteState.beforeVersion &&
+            record.version < manifestDeleteState.safeBelow
+          ) {
+            throw corruption(
+              `manifests/${String(key)}`,
+              "prune cleanup contains a record inside its deleted range",
+            );
+          }
+          if (record.version === manifestDeleteState.safeBelow) {
+            manifestDeleteBoundarySeen = true;
+          }
+        }
+        const predecessorUnavailable =
+          previousManifest !== undefined && record.previousVersion !== previousManifest.version;
+        if (predecessorUnavailable) {
+          const resumesLegacyDelete =
+            previousManifest !== undefined &&
+            manifestDeleteState !== undefined &&
+            manifestDeleteState.beforeVersion < manifestDeleteState.safeBelow &&
+            previousManifest.version === manifestDeleteState.beforeVersion - 1 &&
+            record.version === manifestDeleteState.safeBelow &&
+            record.previousVersion === manifestDeleteState.safeBelow - 1;
+          if (!resumesLegacyDelete) {
+            throw corruption(`manifests/${String(key)}`, "manifest predecessor is unavailable");
+          }
         }
         previousManifest = record;
         if (key === currentVersion) {
@@ -7224,6 +7258,13 @@ export class IndexedDbBlockStore implements BlockStore {
         issue("invalid-manifest", storageKeyLocation(key), error);
       }
     });
+    if (!manifestDeleteBoundarySeen) {
+      issue(
+        "invalid-manifest-prune-cleanup",
+        MANIFEST_PRUNE_CLEANUP_KEY,
+        "prune cleanup boundary is missing",
+      );
+    }
     if (!currentManifestFound) {
       issue("missing-current-manifest", CURRENT_MANIFEST_KEY, "current manifest is missing");
     }
@@ -10680,6 +10721,11 @@ function manifestBlockRecordOverlapsVersions(
 
 type ManifestPruneCleanupState =
   | { phase: "scan"; afterVersion: number | null }
+  /**
+   * Versions below `beforeVersion` are the remaining prefix. Older releases deleted the band
+   * from `beforeVersion` through `safeBelow - 1` in descending order; current releases retain
+   * the same shape and finish the lower prefix in ascending order.
+   */
   | { phase: "delete"; safeBelow: number; beforeVersion: number };
 
 function asManifestPruneCleanupState(value: unknown): ManifestPruneCleanupState {
@@ -10778,7 +10824,7 @@ function scanManifestPruneBoundary(
   });
 }
 
-function deletePrunedManifestPage(
+function deletePrunedManifestPrefixPage(
   store: IDBObjectStore,
   safeBelow: number,
   beforeVersion: number,
@@ -10794,36 +10840,40 @@ function deletePrunedManifestPage(
     let visited = 0;
     let removed = 0;
     const removedRecords: StoredManifestRecord[] = [];
-    let before = beforeVersion;
-    let seekPending = true;
-    const request = store.openCursor(null, "prev");
+    const request = store.openCursor();
     request.onerror = () => reject(request.error ?? new Error("IndexedDB manifest cursor failed"));
     request.onsuccess = () => {
       const cursor = request.result;
       if (cursor === null) {
-        resolve({ visited, removed, removedRecords, beforeVersion: before, reachedEnd: true });
+        reject(corruption(MANIFEST_PRUNE_CLEANUP_KEY, "cleanup boundary is missing"));
         return;
       }
       try {
         if (typeof cursor.key !== "number" || !Number.isSafeInteger(cursor.key) || cursor.key < 0) {
           throw corruption("manifests", "record key is invalid");
         }
-        if (seekPending) {
-          seekPending = false;
-          if (cursor.key >= beforeVersion) {
-            if (beforeVersion === 0) {
-              resolve({
-                visited,
-                removed,
-                removedRecords,
-                beforeVersion: 0,
-                reachedEnd: true,
-              });
-            } else {
-              cursor.continue(beforeVersion - 1);
-            }
-            return;
+        if (cursor.key >= beforeVersion) {
+          // Old releases deleted from the readable boundary downward and persisted the first
+          // version not yet visited. Continue below that ceiling, but verify the supposedly
+          // deleted band before accepting the legacy cursor as complete.
+          if (cursor.key < safeBelow) {
+            throw corruption(
+              MANIFEST_PRUNE_CLEANUP_KEY,
+              "delete cursor skipped a retained manifest",
+            );
           }
+          if (cursor.key !== safeBelow) {
+            throw corruption(MANIFEST_PRUNE_CLEANUP_KEY, "cleanup boundary is missing");
+          }
+          asStoredManifestRecord(cursor.value, cursor.key);
+          resolve({
+            visited,
+            removed,
+            removedRecords,
+            beforeVersion,
+            reachedEnd: true,
+          });
+          return;
         }
         const record = asStoredManifestRecord(cursor.value, cursor.key);
         if (record.version >= safeBelow || record.prunedAt === undefined) {
@@ -10833,12 +10883,11 @@ function deletePrunedManifestPage(
           );
         }
         visited += 1;
-        before = record.version;
         cursor.delete();
         removed += 1;
         removedRecords.push(record);
         if (visited === maxItems) {
-          resolve({ visited, removed, removedRecords, beforeVersion: before, reachedEnd: false });
+          resolve({ visited, removed, removedRecords, beforeVersion, reachedEnd: false });
         } else {
           cursor.continue();
         }
