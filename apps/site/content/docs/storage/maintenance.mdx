@@ -51,6 +51,18 @@ from the same scan every other table gets, plus the cost of the deltas themselve
 compaction adds is returning the table to a plain append — the deltas stop being re-read on every
 query, and the storage they occupy is freed.
 
+Upserts replay through the same streamed scan. Repeated writes to one key keep only the
+patches needed for its latest column values. Replay reads historical key blocks in bounded
+groups and tracks distinct touched keys, surviving patches, and a bitmap with one bit per
+historical insert, base, or upsert row. Temporary patch data is released after each scan window.
+Compaction still reduces the history that must be read and the bitmap's size.
+
+`QueryMemoryBudgetError` with the label `Streamed mutation replay` means this replay state
+exceeded the query's execution budget; it does not mean the browser ran out of memory. This
+state does not spill. Run `await db.compactTable("orders")` to fold accumulated history and
+inspect its result, or raise `executionMemoryBudgetBytes` for the query. Compaction has its own
+memory budget, described below. A reload alone preserves the stored mutation history.
+
 ### Partitioned folds
 
 A folded table is a run of level-one partitions of at most `partitionRows` rows (16,384 by
