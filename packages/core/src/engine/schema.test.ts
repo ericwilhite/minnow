@@ -1625,13 +1625,10 @@ describe("views in the schema", () => {
   it("creates the view and reads through it", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store);
-    const runStatement = vi.spyOn(database, "runStatement");
     const result = await database.migrate(withView(ACTIVE_SQL));
+    expect(result.createdTables).toEqual(["customers"]);
     expect(result.replacedViews).toEqual(["active_customers"]);
-    expect(runStatement.mock.calls.map(([statement]) => statement.kind)).toEqual([
-      "create-table",
-      "create-view",
-    ]);
+    expect(result.steps.map((step) => step.kind)).toEqual(["create-table", "replace-view"]);
     await database.insertBatch("customers", [
       { id: 1, status: "active" },
       { id: 2, status: "churned" },

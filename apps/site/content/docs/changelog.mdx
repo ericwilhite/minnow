@@ -8,6 +8,59 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.11.0 — September 17, 2026
+
+Published packages: `@minnowdb/core@0.11.0`.
+
+**Migration:** a database now has one writer at a time across engines, workers, and tabs. Every
+`write()` scope, batch write, SQL mutation, `BEGIN` transaction, migration, DDL statement,
+compaction publication, and snapshot import takes its turn — a queue per store in each context,
+plus the Web Lock `minnowdb-write:<store>` across contexts — before reading the state it depends
+on, and holds it until its outcome is known. Remove any application-side write serializer or
+contention-retry loop: writers issued at once from any number of tabs land in a serial order with
+no `WriteConflictError` or `SchemaConflictError` between them. Those errors now only come from a
+writer that does not take turns (an older build in another tab, or a custom store with no
+`liveQueryChannelName` opened in another context), where storage compare-and-swap still refuses
+it. Inside a callback, use the supplied `tx`: a write on the same database awaited from inside
+the callback waits on the callback itself, which the engine reports through `onBackgroundError`
+(`WriteAdmissionStalledError`, context `write admission`) after ten seconds and otherwise waits
+out. Callbacks are never replayed.
+
+- `coordinateWrites` is deprecated and ignored; it is removed in 0.12.0. There is no optimistic
+  mode to select, and the ten-second lock bypass it governed is gone: a holder that stops is
+  reported, never overtaken, and the wait ends when the holder finishes, the browser releases
+  its lock, or the waiter is cancelled. The provisional `serializeWriteScopes` option from the
+  unreleased tree is removed.
+- `write(callback, { signal })` cancels a scope still waiting for its turn (its callback never
+  runs) or aborts one already inside. Closing an engine or a worker client rejects every write it
+  still has waiting without waiting for the tab that holds the turn.
+- `db.writeCoordination` and `client.writeCoordination()` report how far the turn reaches:
+  `cross-context`, `context` (no Web Locks), or `instance` (no store identity).
+- SQL `BEGIN` takes the turn before its snapshot and keeps it through `COMMIT`, `ROLLBACK`, the
+  idle rollback, or close, so a transaction is no longer optimistic against other connections.
+  Other writers on the same database wait for it; the idle timeout still bounds an abandoned one.
+- `migrate()` and each DDL statement take one turn for their whole validation and publication.
+  `CREATE INDEX` marks the index in one turn, builds outside any, and publishes readiness in
+  another, so a long build never holds every other writer. A cooperating writer is no longer
+  invalidated by a concurrent schema change.
+- Compaction, garbage-collection reconciliation, and background index builds publish as
+  writers; a fold's publication takes a turn of its own or rides inside the next writer's. A
+  write at the level-zero ceiling lends its turn to the fold it steps instead of waiting behind
+  it. Closing grants background maintenance two seconds of turns before cancelling what is still
+  waiting; the work stays resumable in its job record.
+- Collection assistance and debt backpressure run before a writer takes its turn, so a writer
+  never holds the turn while waiting for maintenance that needs it.
+
+**Stored formats and the wire protocol are unchanged.** No data migration or rebuild is required.
+
+**Regression coverage:** 45-table bursts at concurrency 1, 6, and 12 over memory, IndexedDB,
+and the OPFS shim through direct engines and worker clients with zero commit retries; three real
+tabs bursting scopes, batch writes, SQL statements, and `BEGIN` transactions over one IndexedDB
+or OPFS database while one tab adds a column and an index, with zero conflicts; a scope held
+open in one tab while another tab's write waits and a closing tab lets go at once; the writer
+queue against real Web Lock holders that progress, freeze, or are cancelled; and the interaction
+simulator asserting zero lost commit races in Node and across real tabs.
+
 ## 0.10.4 — September 17, 2026
 
 Published packages: `@minnowdb/core@0.10.4`.

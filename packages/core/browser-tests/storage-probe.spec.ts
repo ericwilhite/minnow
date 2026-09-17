@@ -1,9 +1,10 @@
 import { expect } from "@playwright/test";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
-test("a progressing native Web Locks queue is not mistaken for a frozen holder", async ({
+test("native Web Locks admission waits out a frozen holder without bypassing it", async ({
   storageContext,
 }) => {
+  test.setTimeout(60_000);
   const page = await storageContext.newPage();
   await page.goto("/packages/core/browser/");
   const result = await page.evaluate(async () => {
@@ -15,12 +16,14 @@ test("a progressing native Web Locks queue is not mistaken for a frozen holder",
 
   expect(result).toEqual({
     progressingQueueOverlapped: false,
-    progressingQueueExceeded: 0,
+    progressingQueueStalls: 0,
     progressingQueueWaitedPastOneInterval: true,
-    frozenQueueEnteredWhileHeld: true,
-    frozenQueueExceeded: 1,
+    frozenQueueBypassed: false,
+    frozenQueueStalls: 1,
+    frozenQueueStallHolder: "other-context",
     frozenQueueChurnProven: true,
-    frozenQueueStayedBounded: true,
+    frozenQueueEnteredAfterRelease: true,
+    frozenQueueCancelledPromptly: true,
   });
 });
 

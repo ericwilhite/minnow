@@ -12,7 +12,8 @@ npm install @minnowdb/core
   mutations, upserts, `RETURNING`, triggers, exact decimals, nested JSON/JSONB, stored generated
   columns, zoneless DATE, arrays, enums, sequences, and savepoints.
 - Compressed column storage, secondary indexes, full-text search, and snapshot reads.
-- Atomic writes across tabs through IndexedDB or OPFS, strict durability by default, and explicit
+- Atomic writes across tabs through IndexedDB or OPFS, one writer at a time through Web Locks
+  with no application-side queue or retry loop, strict durability by default, and explicit
   origin-eviction persistence policy.
 - A ready-made worker client with the same everyday database API.
 - TypeScript schema declarations and metadata-only migrations, including SQL domains,

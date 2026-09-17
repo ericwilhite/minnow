@@ -24,6 +24,21 @@ The callback can mix batch calls with parameterized SQL through `tx.execute(...)
 transaction callback to Minnow's SQL transaction statements; see the
 [Kysely adapter](/docs/adapters/kysely).
 
+A database has one writer at a time. A scope takes its turn before its callback runs — in order
+with every other write on this engine, on other engines in this context, and in other tabs and
+workers over the same database — and keeps it until its commit or rollback has a known outcome.
+Concurrent `write()` calls therefore run one after another, never against each other: no scope
+spends a retry on a sibling, no callback runs twice, and a failed scope rolls back and hands the
+turn to the next writer. Reads through `query()` do not take turns and never wait behind a
+callback; they keep snapshot isolation and see their own scope's staged rows.
+
+Inside the callback, use `tx` for every write. Another `db.write()`, a standalone batch write, or
+an autocommit SQL mutation awaited from inside the callback waits for the callback to return, so
+it waits on itself; the engine reports such a wait through `onBackgroundError` after ten seconds
+and keeps waiting rather than guessing. Keep network requests outside the callback: fetch first,
+then open the scope with the data in hand. `write(callback, { signal })` cancels a scope still
+waiting for its turn, which then never runs its callback, or aborts one already inside it.
+
 `tx.upsertBatch` accepts the same `conflictWhere` guard as the autocommit form (see
 [Bulk writes](/docs/engine#bulk-writes)), so a guarded upsert composes atomically with the rest of
 the scope — for example, replacing an offline-created row with its server-confirmed twin only when
@@ -216,17 +231,28 @@ transaction it reads through.
 Readers retain a stable version while writers publish a new one. Storage operations can still
 queue behind each other: snapshot isolation is not a promise of zero read/write latency.
 
-Autocommit writes share admission before reading their starting version. Engines over the same
-adapter or named store coordinate locally; Web Locks extend this coordination across tabs and
-workers where available. This avoids spending a retry for every competing autocommit. An engine
-closing while it waits for admission cancels that wait. Set `coordinateWrites: false` only when
-providing your own scheduler or deliberately using optimistic contention.
+Every path that publishes takes one turn as the database's writer before it reads the state it
+depends on: `write()` scopes, `insertBatch` and its siblings, SQL mutations, `BEGIN … COMMIT`,
+`migrate()` and every DDL statement, compaction and index publications, and snapshot imports. The
+turn is a local queue per store, shared by every engine in the same context that opened the same
+store name, and — where the browser offers Web Locks — the lock `minnowdb-write:<store>` across
+tabs and workers. Turns are taken in arrival order; a `BEGIN` holds its turn until `COMMIT`,
+`ROLLBACK`, the idle rollback, or close; a migration holds one for all of its catalog steps. There
+is nothing to configure and no application-side queue or retry loop to write: writers issued from
+several tabs at once land in some serial order with no conflict between them.
 
-Custom stores identify shared storage with `liveQueryChannelName`. Without a common identifier or
-cross-context Web Locks, writers still use storage compare-and-swap and bounded retries. A plain
-one-statement write restarts from a fresh snapshot — up to `maxCommitRetries`, eight by default —
-so predicates, constraints, foreign-key proofs, and trigger bodies are recomputed. Exhaustion
-returns `WriteConflictError`; it never acknowledges a rejected write.
+`db.writeCoordination` (`client.writeCoordination()` through a worker) reports how far the
+turn reaches: `cross-context` with a store identity and Web Locks, `context` with only the
+identity (Node, or a browser without Web Locks — every engine in the context over that name
+still takes turns), and `instance` for a custom store with no `liveQueryChannelName`, where only
+engines sharing the same store object do.
+
+Storage compare-and-swap stays underneath as the defensive check. Writers that do not take turns
+— an older Minnow build in another tab, a custom store without an identity in another context,
+a crashed tab's commit landing as the lock passes on — still cannot interleave with a turn: a
+plain one-statement write restarts from a fresh snapshot, up to `maxCommitRetries` (eight by
+default), so predicates, constraints, foreign-key proofs, and trigger bodies are recomputed, and
+exhaustion returns `WriteConflictError` without acknowledging anything.
 
 ```ts
 import { WriteConflictError } from "@minnowdb/core/storage/contracts";
@@ -242,16 +268,33 @@ try {
 }
 ```
 
-An explicit `db.write()` scope or SQL transaction does not replay application code. A concurrent
-data commit surfaces `WriteConflictError`, nothing from the losing scope publishes, and the caller
-may rerun the complete operation after deciding that its side effects are safe to repeat.
+An explicit `db.write()` scope or SQL transaction never replays application code. Among
+writers that take turns it never needs to: nothing commits between a scope's snapshot and its
+commit. Only a writer that did not take a turn can still land in that window, and then the
+scope surfaces `WriteConflictError`, nothing from it publishes, and the caller may rerun the
+complete operation after deciding that its side effects are safe to repeat. One such data commit
+is enough, even to a table the scope never touched. A SQL transaction that loses that way fails
+at `COMMIT`, and the connection is then out of its transaction with nothing to acknowledge: the
+next statement is an ordinary autocommit, unlike the failed state an idle rollback leaves. A
+transaction that only reads publishes nothing and cannot lose. Compaction and garbage collection
+publish versions of their own but rewrite no rows; a fold that lands without a turn is rebased
+over automatically, within `maxCommitRetries`.
 
-One data commit from another connection is enough, even a commit to a table the scope never
-touched. A SQL transaction that loses the race fails at `COMMIT`, and the connection is then out of
-its transaction with nothing to acknowledge: the next statement is an ordinary autocommit, unlike
-the failed state an idle rollback leaves. A transaction that only reads publishes nothing and so
-never loses a race, and compaction and garbage collection — which publish versions of their own
-but rewrite no rows — are not a race either.
+A holder that stops — a tab paused by the browser inside a callback, or a callback awaiting a
+network call — holds every other writer to the database. The wait is reported through
+`onBackgroundError` (a `WriteAdmissionStalledError` with the context `write admission`) after ten
+seconds without a change of holder and continues until the holder finishes, the browser releases
+the holder's lock when its tab is unloaded or discarded, or the waiter is cancelled: closing an
+engine or a client rejects everything it still has waiting without waiting for the holder. The
+engine never takes a turn away from a live holder, because neither storage adapter can fence a
+resumed writer at the commit boundary, and a lock a timeout can defeat is not a lock. An idle SQL
+transaction is bounded separately by `transactionIdleTimeoutMs`.
+
+Schema changes take turns too. A migration or DDL statement waits for the writers ahead of it and
+publishes while none is mid-transaction, so a cooperating writer never has its scope invalidated
+by a schema change; the schema epoch check below remains for writers that do not take turns. A
+write queued behind a migration that removes the table it needs fails against the new schema,
+as it should — that is an application error, not contention.
 
 Structural catalog changes have a separate monotonic schema epoch. A transaction captures it when
 it begins and verifies it in the same atomic step that publishes data. This prevents work staged

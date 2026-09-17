@@ -332,6 +332,9 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         expect(result.acceptedWrites).toBeGreaterThan(10);
         expect(result.checkpoints).toBeGreaterThan(0);
       }
+      // Real tabs take turns as the database's writer through Web Locks, so a complete campaign
+      // never loses a commit race; only a crash can leave a defensive conflict behind.
+      if (campaign === "complete") expect(result.rejectedConflicts).toBe(0);
       expect(pageDiagnostics).toEqual([]);
       // A deliberate crash is classified on the mutation's typed failure. The error sink is for
       // unsolicited window and worker diagnostics, none of which may be hidden by message text.

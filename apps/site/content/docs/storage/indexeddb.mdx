@@ -198,12 +198,14 @@ also use bounded read batches, so each retained block does not require a separat
 
 Several tabs may open the same database at once. Engine snapshots keep reads consistent while
 other connections publish. Physical IndexedDB operations can queue behind overlapping read/write
-transactions, including collection. Autocommit admission uses Web Locks when available to reduce
-conflicts; storage compare-and-swap remains the correctness boundary when coordination is absent
-or a message is lost. Explicit write scopes report conflicts for the application to handle.
-The admission wait restarts when the observed lock holder changes, so a healthy queue can drain
-without sending its waiting writers into optimistic contention. A holder that stops advancing
-still triggers the bounded fallback; worker RPC deadlines continue to cap a request's total wait.
+transactions, including collection. Every writer — scopes, batch and SQL writes, `BEGIN`
+transactions, DDL, and maintenance publications — takes its turn through the Web Lock
+`minnowdb-write:minnowdb-live:indexeddb:<name>` before reading the state it depends on, so tabs
+never conflict with each other; see [writer turns](/docs/engine/transactions#conflicts). Storage
+compare-and-swap remains the correctness boundary for a writer that does not take a turn. A tab
+that stops inside its turn holds the others until it finishes or the browser releases its lock;
+the wait is reported after ten seconds and never bypassed, and closing a waiting engine or
+client cancels its wait at once.
 
 When a newer build requests an IndexedDB schema version, every Minnow connection closes itself on
 the browser's `versionchange` event so it cannot strand the open. If a non-cooperating connection

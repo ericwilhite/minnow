@@ -145,7 +145,10 @@ checkpoint or collection step that failed, a multi-tab election that threw — i
 worker host and delivered to the client's `onWorkerError` option as a
 `DatabaseWorkerErrorEvent`: a `kind` (`uncaught`, `unhandled-rejection`, `messageerror`,
 `maintenance`, `coordination`, or `transport`), a `context` naming where it happened, and the
-rehydrated `error`. Without a handler each one is written to `console.error` on the main thread.
+rehydrated `error`. A `WriteAdmissionStalledError` with the context `write admission` means a
+write has waited ten seconds for the database's writer turn without the holder changing — a
+callback on this connection awaiting another write, or another tab that stopped inside one; the
+wait continues. Without a handler each one is written to `console.error` on the main thread.
 These reports are not fatal: the connection keeps working, and the calls it was serving settle on
 their own. The Worker object's own `error` and `messageerror` events are different — they mean
 the channel's state is unknown, so every pending call rejects with `DatabaseWorkerFailedError`
@@ -176,8 +179,13 @@ keeps that error. `close()` skips the impossible disposal call, removes the clie
 terminates a terminable transport when requested. With `terminateWorker: false` or a transport such
 as `MessagePort` that cannot terminate, worker-side store and handle release cannot be confirmed
 after that prior failure. Explicit `client.write()` callbacks are not replayed, and their parallel
-session calls run in order before commit. Snapshot queries use the live worker scope, so an expired
-or closed scope cannot silently read through a replacement lease.
+session calls run in order before commit. A scope takes its turn as the database's one writer
+before its callback runs, in order with every other write in every tab; use the callback's
+session for writes and keep network requests outside it (see
+[write scopes](/docs/engine/transactions#atomic-writes)). Closing a client rejects every call it
+still has waiting for a turn without waiting for the tab that holds it. Snapshot queries use the
+live worker scope, so an expired or closed scope cannot silently read through a replacement
+lease.
 
 Client adapters can wrap the same worker client because it implements `MinnowSqlDriver`. The
 [Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker
@@ -318,7 +326,7 @@ A per-store entry refuses it, since it could only ever open one of the two.
 ## Custom worker entries
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
-`opfs`, `auto`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`, `coordinateWrites`,
+`opfs`, `auto`, or `memory` — omitted, it defaults to `{ kind: "indexeddb", name: "minnow" }`) plus `compression`, `rowsPerBlock`, `targetBlockBytes`, `maxCommitRetries`,
 `spillOwnerLeaseMs`, `transactionOwnerLeaseMs`, `transactionIdleTimeoutMs`, `bufferPoolBytes`,
 `executionMemoryBudgetBytes`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
 It loads each storage adapter only when its descriptor asks for it; whether that becomes a

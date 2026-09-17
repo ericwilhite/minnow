@@ -4,7 +4,7 @@ import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { deleteOpfsDatabase, opfsDatabaseExists } from "@minnowdb/core/storage/opfs";
-import { coordinateWrite } from "../dist/engine/write-coordinator.js";
+import { admitWriter } from "../dist/engine/write-coordinator.js";
 
 interface StorageProbeResult {
   errorName: string;
@@ -35,12 +35,18 @@ interface IndexedDbSequenceResult {
 
 interface WriteAdmissionProgressResult {
   progressingQueueOverlapped: boolean;
-  progressingQueueExceeded: number;
+  progressingQueueStalls: number;
   progressingQueueWaitedPastOneInterval: boolean;
-  frozenQueueEnteredWhileHeld: boolean;
-  frozenQueueExceeded: number;
+  /** The writer never ran while the frozen holder still held the lock. */
+  frozenQueueBypassed: boolean;
+  /** Exactly one stall report for the whole frozen episode, naming another context. */
+  frozenQueueStalls: number;
+  frozenQueueStallHolder: string | undefined;
   frozenQueueChurnProven: boolean;
-  frozenQueueStayedBounded: boolean;
+  /** The writer ran once the holder let go, under the lock. */
+  frozenQueueEnteredAfterRelease: boolean;
+  /** A second waiter cancelled while the holder was frozen rejected without waiting for it. */
+  frozenQueueCancelledPromptly: boolean;
 }
 
 function nativeLockHolder(lockName: string): {
@@ -148,18 +154,19 @@ export async function runNativeWriteAdmissionProgress(): Promise<WriteAdmissionP
       (snapshot) => (snapshot.pending ?? []).filter(({ name }) => name === lockName).length === 2,
       "Third native lock holder did not enter the queue",
     );
-    let progressingQueueExceeded = 0;
+    let progressingQueueStalls = 0;
     const progressingStartedAt = performance.now();
-    const progressingAdmission = coordinateWrite(
+    const progressingAdmission = admitWriter(
       store,
-      async () => heldClientId(await navigator.locks.query(), lockName),
-      new AbortController().signal,
       {
-        admissionWaitMs: 5_000,
-        onAdmissionWaitExceeded: () => {
-          progressingQueueExceeded += 1;
+        kind: "autocommit",
+        signal: new AbortController().signal,
+        stallReportMs: 5_000,
+        onStalled: () => {
+          progressingQueueStalls += 1;
         },
       },
+      async () => heldClientId(await navigator.locks.query(), lockName),
     );
     await waitForNativeLock(
       (snapshot) =>
@@ -193,6 +200,8 @@ export async function runNativeWriteAdmissionProgress(): Promise<WriteAdmissionP
       throw new Error("Native lock holders did not advance through distinct clients");
     }
 
+    // A holder that never lets go: the writer reports the stall once and keeps waiting. It is
+    // never let through while the lock is held, and a waiter that gives up leaves at once.
     const frozen = nativeLockHolder(lockName);
     workers.push(frozen.worker);
     await frozen.ready;
@@ -202,17 +211,25 @@ export async function runNativeWriteAdmissionProgress(): Promise<WriteAdmissionP
     if (frozenClientId === null || frozenClientId === pageClientId) {
       throw new Error("Native frozen holder identity is invalid");
     }
-    let frozenQueueExceeded = 0;
-    const frozenStartedAt = performance.now();
-    const frozenAdmission = coordinateWrite(
+    let frozenQueueStalls = 0;
+    let frozenQueueStallHolder: string | undefined;
+    let frozenEntryClientId: string | null | undefined;
+    let enteredWhileFrozen = false;
+    let frozenHeld = true;
+    const frozenAdmission = admitWriter(
       store,
-      async () => heldClientId(await navigator.locks.query(), lockName),
-      new AbortController().signal,
       {
-        admissionWaitMs: 5_000,
-        onAdmissionWaitExceeded: () => {
-          frozenQueueExceeded += 1;
+        kind: "autocommit",
+        signal: new AbortController().signal,
+        stallReportMs: 5_000,
+        onStalled: (stall) => {
+          frozenQueueStalls += 1;
+          frozenQueueStallHolder = stall.holder;
         },
+      },
+      async () => {
+        if (frozenHeld) enteredWhileFrozen = true;
+        frozenEntryClientId = heldClientId(await navigator.locks.query(), lockName);
       },
     );
     await waitForNativeLock(
@@ -252,21 +269,37 @@ export async function runNativeWriteAdmissionProgress(): Promise<WriteAdmissionP
         await new Promise((resolve) => setTimeout(resolve, 1_200));
       }
     })();
-    const frozenEntryClientId = await frozenAdmission;
-    const frozenElapsedMs = performance.now() - frozenStartedAt;
-    churnState.stop = true;
     await churnTask;
+    // Seven seconds of churn behind a frozen holder: still waiting, reported exactly once.
+    const cancel = new AbortController();
+    const cancelledStartedAt = performance.now();
+    const cancelled = admitWriter(
+      store,
+      { kind: "autocommit", signal: cancel.signal },
+      async () => "should not run",
+    ).then(
+      () => "ran",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    setTimeout(() => cancel.abort(new Error("waiter gave up")), 100);
+    const cancelledOutcome = await cancelled;
+    const cancelledElapsedMs = performance.now() - cancelledStartedAt;
+    frozenHeld = false;
     frozen.release();
     await frozen.released;
+    await frozenAdmission;
 
     return {
       progressingQueueOverlapped: progressingEntryClientId !== pageClientId,
-      progressingQueueExceeded,
+      progressingQueueStalls,
       progressingQueueWaitedPastOneInterval: progressingElapsedMs >= 5_000,
-      frozenQueueEnteredWhileHeld: frozenEntryClientId === frozenClientId,
-      frozenQueueExceeded,
+      frozenQueueBypassed: enteredWhileFrozen,
+      frozenQueueStalls,
+      frozenQueueStallHolder,
       frozenQueueChurnProven: frozenQueueChurn >= 3,
-      frozenQueueStayedBounded: frozenElapsedMs < 8_000,
+      frozenQueueEnteredAfterRelease: frozenEntryClientId === pageClientId,
+      frozenQueueCancelledPromptly:
+        cancelledOutcome === "waiter gave up" && cancelledElapsedMs < 2_000,
     };
   } finally {
     for (const worker of workers) worker.terminate();

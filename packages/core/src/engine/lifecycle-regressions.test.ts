@@ -9,6 +9,7 @@ import {
 } from "../storage/index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
+import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 import { TransactionExpiredError } from "./errors.js";
 
 const stores = [
@@ -90,6 +91,9 @@ for (const adapter of stores)
 
     it("leaves another connection's open transaction alone through a crash and reopen", async () => {
       const { db, store } = await open(adapter.open);
+      // The other connection does not take turns, as an older build would not: coordinated
+      // engines would wait for its transaction rather than publish under it.
+      markStoreUncoordinatedForTests(store);
       const other = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
       cleanup.push(async () => {
         await other.close().catch(() => undefined);
@@ -130,6 +134,9 @@ for (const adapter of stores)
 
     it("refuses a transaction's commit when another connection published data first", async () => {
       const { db, store } = await open(adapter.open);
+      // The other connection does not take turns, as an older build would not: coordinated
+      // engines would wait for its transaction rather than publish under it.
+      markStoreUncoordinatedForTests(store);
       const other = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
       cleanup.push(async () => {
         await other.close().catch(() => undefined);
@@ -155,6 +162,9 @@ for (const adapter of stores)
 
     it("keeps a transaction through another connection's compaction and collection", async () => {
       const { db, store } = await open(adapter.open);
+      // The other connection does not take turns, as an older build would not: coordinated
+      // engines would wait for its transaction rather than publish under it.
+      markStoreUncoordinatedForTests(store);
       const other = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
       cleanup.push(async () => {
         await other.close().catch(() => undefined);

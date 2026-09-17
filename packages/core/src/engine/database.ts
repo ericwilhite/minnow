@@ -1,4 +1,11 @@
-import { coordinateWrite } from "./write-coordinator.js";
+import { databaseInternals } from "./internals.js";
+import {
+  admitWriter,
+  writeCoordinationScope,
+  type WriteCoordinationScope,
+  type WriterAdmission,
+  type WriterKind,
+} from "./write-coordinator.js";
 import { quoteSqlIdentifier } from "./sql-quote.js";
 import { LiveAggregate } from "./live-aggregate.js";
 import { stageLiveExecution } from "./live-accept.js";
@@ -50,6 +57,7 @@ import {
   UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
+  WriteAdmissionStalledError,
 } from "./errors.js";
 export { DatabaseReadBacklogError } from "./errors.js";
 import {
@@ -512,6 +520,8 @@ const AUTO_COMPACT_STEP_BLOCKS = 4;
  * cost several; the stored-bytes ceiling still bounds the pass.
  */
 const AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS = 256;
+/** How long close() keeps granting turns to background maintenance it is joining. */
+const CLOSE_MAINTENANCE_GRACE_MS = 2_000;
 /**
  * Level-zero segments past which a write drives one fold step before its own commit. The
  * background fold takes one bounded step per commit under a writer that never pauses, so a
@@ -1353,7 +1363,11 @@ export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema
   targetBlockBytes?: number;
   rowsPerBlock?: number;
   maxCommitRetries?: number;
-  /** Coordinate autocommit writers across instances and, with Web Locks, tabs. Default true. */
+  /**
+   * @deprecated Ignored since 0.11.0 and removed in 0.12.0. Every writer takes a turn through
+   * the database's admission queue (see `writeCoordination`); there is no optimistic mode to
+   * select. Delete the option.
+   */
   coordinateWrites?: boolean;
   now?: () => Date;
   createId?: () => string;
@@ -1484,6 +1498,37 @@ type TransactionalStatement = Extract<
   CompiledStatement,
   { kind: "insert" | "update" | "delete" | "select" }
 >;
+
+/**
+ * Statements that publish a catalog change and take one writer turn for the whole statement.
+ * CREATE INDEX is deliberately absent: it marks, builds outside any turn, and publishes in a
+ * second one, so a large build never holds every other writer.
+ */
+function isCatalogStatement(statement: CompiledStatement): boolean {
+  switch (statement.kind) {
+    case "create-enum":
+    case "create-sequence":
+    case "create-table":
+    case "create-table-as":
+    case "drop-index":
+    case "add-column":
+    case "drop-column":
+    case "create-view":
+    case "drop-view":
+    case "drop-table":
+    case "create-trigger":
+    case "drop-trigger":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** A catalog statement reached its branch without the turn `runStatement` takes for it. */
+function catalogAdmission(admission: WriterAdmission | undefined): WriterAdmission {
+  if (admission === undefined) throw new Error("A catalog statement ran outside a writer turn");
+  return admission;
+}
 
 function isTransactionalStatement(
   statement: CompiledStatement,
@@ -1826,6 +1871,15 @@ function resolveMutationStatementDatetimes(
     return { ...statement, query: plan(statement.query) };
   }
   return statement;
+}
+
+export interface WriteOptions {
+  /**
+   * Cancels the scope while it waits for its turn as the database's writer, or aborts its
+   * callback once inside. A scope cancelled before its turn never ran its callback and
+   * published nothing; one cancelled inside rolls back with nothing published.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface RunStatementOptions {
@@ -2186,7 +2240,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #rowsPerBlock: number;
   readonly #targetBlockBytes: number;
   readonly #maxCommitRetries: number;
-  readonly #coordinateWrites: boolean;
   readonly #shutdown = new AbortController();
   readonly #exports = new Set<AsyncGenerator<Uint8Array, void, void>>();
   readonly #now: () => Date;
@@ -2251,10 +2304,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #commitsSinceCompactionCheck = new Map<string, number>();
   /** The compaction step in flight per table, so steps on one table run one at a time. */
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
-  /** The simple writes in flight, chained so they commit one after another: see #runWrite. */
-  #writeChain: Promise<unknown> = Promise.resolve();
-  /** Fold publications waiting for a turn on the write chain: see #withCompactionPublicationSlot. */
+  /** Every writer turn this engine has taken or is waiting for: see #admit. */
+  readonly #writers = new Set<Promise<unknown>>();
+  /** Cancels foreground writers waiting on another context's lock: a disposing connection. */
+  readonly #crossContextWaits = new AbortController();
+  /** Cancels background maintenance still waiting for a turn once close has given it a grace. */
+  readonly #maintenanceQueue = new AbortController();
+  /** The turn a scope's transaction runs under, so a lent fold step never re-enters the queue. */
+  readonly #transactionAdmissions = new WeakMap<DatabaseTransaction, WriterAdmission>();
+  /** Fold publications waiting for a turn: see #withCompactionPublicationSlot. */
   readonly #pendingCompactionPublications = new Set<() => Promise<void>>();
+  /** Settled when the next fold publication registers; a lender parked on a step wakes on it. */
+  #pendingPublicationSignal: { promise: Promise<void>; resolve: () => void } | undefined;
   /** Settled by the next local commit; maintenance parked on a yield wakes on it. */
   #commitSignal: { promise: Promise<void>; resolve: () => void } | undefined;
   /** One shared pending event-loop turn, so parked maintenance holds one channel, not one each. */
@@ -2341,7 +2402,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         `Target block bytes must be a positive whole number no larger than ${String(MAX_PHYSICAL_COLUMN_BYTE_LENGTH)}`,
       );
     }
-    this.#coordinateWrites = options.coordinateWrites ?? true;
     this.#maxCommitRetries = options.maxCommitRetries ?? 8;
     if (!Number.isSafeInteger(this.#maxCommitRetries) || this.#maxCommitRetries < 0) {
       throw new RangeError("Commit retries must be a non-negative whole number");
@@ -2402,6 +2462,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       transactionTtlMs: this.#transactionOwnerLeaseMs,
     });
     this.#armIdleCollection();
+    databaseInternals.set(this, {
+      cancelCrossContextWaits: (reason) => {
+        this.#crossContextWaits.abort(reason);
+      },
+    });
   }
 
   /**
@@ -2422,6 +2487,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (const controller of this.#scopeControllers) {
       controller.abort(new Error("Database is closed"));
     }
+    // Background maintenance close is about to join — a fold publishing, an index build
+    // stamping its result — may still need a turn, and gets one while the store is idle. A turn
+    // held elsewhere for longer than the grace is not waited for: the work stays resumable in
+    // its durable job record, and closing must not depend on another tab's callback.
+    const maintenanceGrace = setTimeout(() => {
+      this.#maintenanceQueue.abort(new Error("Database is closed"));
+    }, CLOSE_MAINTENANCE_GRACE_MS);
+    (maintenanceGrace as { unref?: () => void }).unref?.();
     if (this.#idleCompactionTimer !== undefined) {
       clearTimeout(this.#idleCompactionTimer);
       this.#idleCompactionTimer = undefined;
@@ -2448,7 +2521,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // store work before releasing leases or allowing the caller to close the injected store.
     await Promise.allSettled([
       ...[...this.#exports].map((iterator) => iterator.return(undefined)),
-      this.#writeChain,
+      ...this.#writers,
       this.#executeChain,
       ...this.#scopeTasks,
       ...this.#foregroundTasks,
@@ -2481,6 +2554,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await Promise.allSettled([...this.#sharedLeaseReleases]);
     }
     if (open !== undefined) await open.finished.catch(() => undefined);
+    clearTimeout(maintenanceGrace);
+    this.#maintenanceQueue.abort(new Error("Database is closed"));
 
     this.#planCache.clear();
     this.#statementCache.clear();
@@ -2525,6 +2600,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async createTable(input: CreateTableInput): Promise<void> {
+    return this.#admit("catalog", (admission) => this.#createTableAdmitted(admission, input));
+  }
+
+  async #createTableAdmitted(_admission: WriterAdmission, input: CreateTableInput): Promise<void> {
     return this.#foreground(async () => {
       const name = validateName(input.name, "Table");
       if (input.columns.length === 0) throw new TypeError("A table needs at least one column");
@@ -2891,31 +2970,89 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
-   * Runs one simple write — insert, upsert, update, or delete — after every simple write this
-   * database already has in flight. A stale trigger derivation restarts the whole statement so
-   * it re-reads pre-images and re-runs trigger bodies at the fresh state.
-   *
-   * Commits are optimistic: a writer reads the manifest version, stages, and publishes only if
-   * the version has not moved, rebasing and retrying otherwise up to `maxCommitRetries`.
-   * Writers issued concurrently from one database used to all read the same version and spend
-   * a retry per rival that landed first, so past `maxCommitRetries + 1` of them the rest failed
-   * for nothing — contention this database need not create, and the queue does not. Writers in
-   * other instances share admission where available; uncoordinated writers still resolve
-   * conflicts through the retry loop. Write scopes are not queued: a scope's callback may issue a plain write of its own,
-   * which must not wait on the scope that contains it.
-   *
-   * A complete background fold whose publication lost the manifest race takes its turn here
-   * first, before the write's own statement, so the queue itself is what lands it (see
-   * #withCompactionPublicationSlot). That runs before collection assistance: assistance can
-   * wait on the collector, and the collector on that fold.
+   * How far this database's writer coordination reaches: across tabs and workers through Web
+   * Locks, across engines in this context that opened the same store name, or only across
+   * engines sharing this store object (a custom adapter with no `liveQueryChannelName`).
+   * Whatever the reach, storage compare-and-swap still refuses a writer that did not take a
+   * turn; what changes is whether such writers exist.
    */
-  async #runWrite<T>(run: () => Promise<T>): Promise<T> {
-    const restarting = async (): Promise<T> => {
+  get writeCoordination(): WriteCoordinationScope {
+    return writeCoordinationScope(this.store);
+  }
+
+  /**
+   * Takes this database's turn as the one logical writer, then runs the callback with the
+   * admission that proves it. Every path that publishes goes through here exactly once; paths
+   * that already hold a turn receive its admission and must not take another (see
+   * `WriterAdmission`). Waiting is cancelled by the scope's signal, which closing aborts, and a
+   * holder that stops advancing is reported after `WRITE_ADMISSION_STALL_REPORT_MS` without
+   * being bypassed.
+   */
+  #admit<T>(
+    kind: WriterKind,
+    run: (admission: WriterAdmission) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const maintenance = signal === this.#maintenanceQueue.signal;
+    if (this.#closed && !maintenance) return Promise.reject(new Error("Database is closed"));
+    const admit = (waitSignal: AbortSignal): Promise<T> =>
+      admitWriter(
+        this.store,
+        {
+          kind,
+          signal: waitSignal,
+          ...(maintenance ? {} : { crossContextSignal: this.#crossContextWaits.signal }),
+          onStalled: (stall) => {
+            this.#reportBackgroundError(
+              new WriteAdmissionStalledError(stall.waitedMs, stall.holder, stall.holderKind),
+              "write admission",
+            );
+          },
+        },
+        run,
+      );
+    const task =
+      signal === undefined
+        ? admit(this.#shutdown.signal)
+        : maintenance
+          ? admit(signal)
+          : this.#withLinkedSignal(signal, admit);
+    this.#writers.add(task);
+    void task.then(
+      () => this.#writers.delete(task),
+      () => this.#writers.delete(task),
+    );
+    return task;
+  }
+
+  /** The admission signal for background maintenance: see #closeResources for its grace. */
+  get #maintenanceSignal(): AbortSignal {
+    return this.#maintenanceQueue.signal;
+  }
+
+  /**
+   * Runs one simple write — insert, upsert, update, or delete — as this database's writer. A
+   * stale trigger derivation restarts the whole statement so it re-reads pre-images and
+   * re-runs trigger bodies at the fresh state.
+   *
+   * Commits are optimistic underneath: a writer reads the manifest version, stages, and
+   * publishes only if the version has not moved, rebasing and retrying otherwise up to
+   * `maxCommitRetries`. Admission is what keeps that from ever being exercised by writers that
+   * take part — every cooperating writer, in every tab, takes its snapshot only once it holds
+   * the turn — so the retry loop is left for writers that do not.
+   *
+   * Collection assistance runs before the turn is taken: assistance can wait on the collector,
+   * and the collector on a fold publication that needs a turn of its own. A complete background
+   * fold whose publication is waiting takes its turn inside this one, before the write's own
+   * statement, so the queue itself is what lands it (see #withCompactionPublicationSlot).
+   */
+  async #runWrite<T>(run: (admission: WriterAdmission) => Promise<T>): Promise<T> {
+    await this.#assistAutomaticCollection();
+    return this.#admit("autocommit", async (admission) => {
       await this.#publishPendingCompactions();
-      await this.#assistAutomaticCollection();
       for (let attempt = 0; ; attempt += 1) {
         try {
-          return await run();
+          return await run(admission);
         } catch (error) {
           if (error instanceof SchemaConflictError || error instanceof UniqueIndexCoverageError) {
             if (attempt >= this.#maxCommitRetries) throw error;
@@ -2925,38 +3062,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (attempt >= this.#maxCommitRetries) throw error.conflict;
         }
       }
-    };
-    const previous = this.#writeChain;
-    const coordinated = () => this.#coordinateWrite(restarting);
-    const current = previous.then(coordinated, coordinated);
-    this.#writeChain = current;
-    try {
-      return await current;
-    } finally {
-      if (this.#writeChain === current) this.#writeChain = Promise.resolve();
-    }
+    });
   }
 
   /**
-   * Runs one publication attempt for a compaction as a writer of this database: the next
-   * write — a queued simple write or a SQL statement's scope — runs it before its own work, and
-   * an idle database runs it on the next event-loop turn, whichever comes first. Writers that
-   * arrive while it runs wait for it, so only writers already in flight can commit between its
-   * rebase and its commit, and the attempt retries against those without yielding.
+   * Runs one publication attempt for a compaction as a writer of this database. The attempt
+   * takes a turn of its own through admission, and any writer that gets its turn first runs
+   * the attempt inside that turn, before its own statement, whichever comes first. Writers
+   * that arrive while it runs wait for it, so only an uncoordinated writer can commit between
+   * its rebase and its commit, and the attempt retries against those without yielding.
    *
-   * A retry on the fold's own event-loop turn is not enough. A caller that awaits one statement
-   * after another keeps this database's write queue moving, so a rebase followed by a yield lost
-   * the manifest race to the next write every time; on an in-memory store such a caller never
-   * even reaches the macrotask queue, and the fold sat parked on its yield — its lease expiring
-   * unrenewed — while every write scanned one more level-zero segment.
+   * Lending the turn is what keeps a fold moving under a caller that awaits one statement
+   * after another: on an in-memory store such a caller never reaches the macrotask queue, and
+   * a fold parked on a yield of its own sat with its lease expiring while every write scanned
+   * one more level-zero segment.
    */
   async #withCompactionPublicationSlot<T>(attempt: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       // The claim stays pending until the attempt has finished, not until it has started: a
-      // writer that arrives while it is in flight waits for it. Otherwise, on a store where a
-      // write is in flight for several event-loop turns, the turn claims the slot mid-write,
-      // that write lands between the fold's rebase and its commit, the next write starts
-      // unhindered, and the fold loses every retry to a writer it can never get ahead of.
+      // writer that arrives while it is in flight waits for it.
       let settled: Promise<void> | undefined;
       const claim = (): Promise<void> => {
         settled ??= (async () => {
@@ -2971,20 +3095,72 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return settled;
       };
       this.#pendingCompactionPublications.add(claim);
-      void this.#eventLoopTurn().then(claim);
+      const registered = this.#pendingPublicationSignal;
+      this.#pendingPublicationSignal = undefined;
+      registered?.resolve();
+      void this.#admit("maintenance", () => claim(), this.#maintenanceSignal).catch(
+        (error: unknown) => {
+          // Closing refuses the turn. A claim nobody lent a turn to never publishes; one a writer
+          // already started runs to its known outcome inside that writer's turn.
+          if (settled !== undefined) return;
+          this.#pendingCompactionPublications.delete(claim);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        },
+      );
     });
   }
 
   /**
-   * Runs, or waits for, every fold publication pending a turn; a claim never throws to its
-   * runner. A writer calls this before it starts, so at most the writers already in flight
-   * can commit under a publication attempt.
+   * Runs, or waits for, every fold publication pending a turn, inside the caller's own turn; a
+   * claim never throws to its runner. A writer calls this once admitted and before its
+   * snapshot, so nothing of its own can conflict with the neutral manifest the fold publishes.
    */
   async #publishPendingCompactions(): Promise<void> {
     while (this.#pendingCompactionPublications.size > 0) {
       const [claim] = this.#pendingCompactionPublications;
       if (claim === undefined) return;
       await claim();
+    }
+  }
+
+  /** Settles when the next fold publication registers for a turn. */
+  #nextPendingPublication(): Promise<void> {
+    if (this.#pendingPublicationSignal === undefined) {
+      let resolve = (): void => undefined;
+      const promise = new Promise<void>((settle) => {
+        resolve = settle;
+      });
+      this.#pendingPublicationSignal = { promise, resolve };
+    }
+    return this.#pendingPublicationSignal.promise;
+  }
+
+  /**
+   * Waits for a compaction step that may need this writer's turn to publish, lending the turn
+   * to every publication that registers meanwhile. Waiting for the step outright would
+   * deadlock: the step waits for a turn, and the turn is held by the waiter.
+   */
+  async #lendUntilSettled(step: Promise<unknown>): Promise<void> {
+    const state = { done: false };
+    const settled = step.then(
+      () => {
+        state.done = true;
+      },
+      () => {
+        state.done = true;
+      },
+    );
+    // Read through a function: the flag flips inside the settlement callbacks, which narrowing
+    // across the awaits below would otherwise read as never changing.
+    const pending = (): boolean => !state.done;
+    while (pending()) {
+      // Arm the wake-up before draining: a publication that registers after the drain and
+      // before the wait would otherwise be missed, and the step could never settle, since its
+      // turn is the one this writer holds.
+      const registered = this.#nextPendingPublication();
+      await this.#publishPendingCompactions();
+      if (!pending()) break;
+      await Promise.race([settled, registered]);
     }
   }
 
@@ -3187,6 +3363,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     sql: string,
     options: { orReplace?: boolean; managed?: boolean } = {},
   ): Promise<void> {
+    return this.#admit("catalog", (admission) =>
+      this.#createViewAdmitted(admission, name, sql, options),
+    );
+  }
+
+  async #createViewAdmitted(
+    _admission: WriterAdmission,
+    name: string,
+    sql: string,
+    options: { orReplace?: boolean; managed?: boolean },
+  ): Promise<void> {
     return this.#foreground(async () => {
       const viewName = validateName(name, "View");
       const plan = compileQuery(sql);
@@ -3269,6 +3456,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Removes a view. Returns whether one was dropped; `ifExists` makes a missing one no error. */
   async dropView(name: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    return this.#admit("catalog", (admission) => this.#dropViewAdmitted(admission, name, options));
+  }
+
+  async #dropViewAdmitted(
+    _admission: WriterAdmission,
+    name: string,
+    options: { ifExists?: boolean },
+  ): Promise<boolean> {
     return this.#foreground(async () => {
       let pinnedId: string | undefined;
       for (let attempt = 0; ; attempt += 1) {
@@ -3345,6 +3540,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     columnName: string,
     options: { ifExists?: boolean } = {},
+  ): Promise<boolean> {
+    return this.#admit("catalog", (admission) =>
+      this.#dropColumnAdmitted(admission, tableName, columnName, options),
+    );
+  }
+
+  async #dropColumnAdmitted(
+    _admission: WriterAdmission,
+    tableName: string,
+    columnName: string,
+    options: { ifExists?: boolean },
   ): Promise<boolean> {
     return this.#foreground(async () => {
       let pinnedTableId: string | undefined;
@@ -3497,6 +3703,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * Returns whether a table was dropped; with `ifExists`, a missing table is not an error.
    */
   async dropTable(tableName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    return this.#admit("catalog", (admission) =>
+      this.#dropTableAdmitted(admission, tableName, options),
+    );
+  }
+
+  async #dropTableAdmitted(
+    _admission: WriterAdmission,
+    tableName: string,
+    options: { ifExists?: boolean },
+  ): Promise<boolean> {
     return this.#foreground(async () => {
       let pinnedTableId: string | undefined;
       for (let attempt = 0; ; attempt += 1) {
@@ -3602,7 +3818,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     input: InsertBatchInputLike,
   ): Promise<InsertBatchResult> {
-    const completed = await this.#runWrite(async () => {
+    const completed = await this.#runWrite(async (admission) => {
       const table = await this.#findTable(tableName);
       const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
       const keys =
@@ -3611,7 +3827,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           : undefined;
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new UnknownTableError(tableName);
-      const result = await this.#writeBatch(current, batch, "insert", keys, autoIncrement);
+      const result = await this.#writeBatch(
+        admission,
+        current,
+        batch,
+        "insert",
+        keys,
+        autoIncrement,
+      );
       return { result, batch, generated, autoIncrement, rowCount };
     });
     const { result, batch, generated, autoIncrement, rowCount } = completed;
@@ -3751,7 +3974,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: InsertBatchInputLike,
     options: UpsertOptions,
   ): Promise<UpsertBatchResult> {
-    const completed = await this.#runWrite(async () => {
+    const completed = await this.#runWrite(async (admission) => {
       const table = await this.#findTable(tableName);
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
@@ -3763,6 +3986,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new UnknownTableError(tableName);
       const result = await this.#writeBatch(
+        admission,
         current,
         batch,
         "upsert",
@@ -3822,7 +4046,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     input: UpdateBatchInput,
   ): Promise<UpdateBatchResult> {
-    return this.#runWrite(async () => {
+    return this.#runWrite(async (admission) => {
       const table = await this.#findTable(tableName);
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
@@ -3837,7 +4061,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (currentKey?.id !== keyColumn.id) {
         throw new TypeError(`Table unique key changed during update: ${tableName}`);
       }
-      return this.#writeUpdateBatch(current, currentKey, normalizedInput, keys);
+      return this.#writeUpdateBatch(admission, current, currentKey, normalizedInput, keys);
     });
   }
 
@@ -3890,7 +4114,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     input: DeleteBatchInput,
   ): Promise<DeleteBatchResult> {
-    return this.#runWrite(async () => {
+    return this.#runWrite(async (admission) => {
       const table = await this.#findTable(tableName);
       const keyColumn = getUniqueKeyColumn(table);
       const keyDomain = keyColumn?.sqlDomain;
@@ -3899,10 +4123,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ? input
           : { keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)) };
       const dependents = await this.#childForeignKeys(tableName);
-      if (dependents.length === 0) return this.#deleteBatchOnce(tableName, normalizedInput);
+      if (dependents.length === 0) {
+        return this.#deleteBatchOnce(admission, tableName, normalizedInput);
+      }
       // E141-04: the referential actions and the delete itself publish as one commit.
       const started = performance.now();
-      const { result, version } = await this.#erased.write(async (session) => {
+      const { result, version } = await this.#openWriteScope(admission, async (session) => {
         await this.#applyReferentialActions(
           table,
           [...normalizedInput.keys],
@@ -3934,10 +4160,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
   }
 
-  async #deleteBatchOnce(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
+  async #deleteBatchOnce(
+    admission: WriterAdmission,
+    tableName: string,
+    input: DeleteBatchInput,
+  ): Promise<DeleteBatchResult> {
     const started = performance.now();
     const table = await this.#findTable(tableName);
-    await this.#assertCompactionCapacity(table);
+    await this.#assertCompactionCapacity(table, admission);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
@@ -3970,6 +4200,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // Deferred: the record is written only if something stages in two steps (trigger rows),
     // and otherwise rides the single-shot commit below — or never exists, for a no-op delete.
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
+    this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
     const blockStager = new BoundedWriteBlockStager(transaction);
     const segmentId = this.#createId();
@@ -4171,16 +4402,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #writeUpdateBatch(
+    admission: WriterAdmission,
     table: TableRecord,
     keyColumn: TableColumnRecord,
     input: UpdateBatchInput,
     keys: Map<string, Exclude<BatchValue, null>>,
   ): Promise<UpdateBatchResult> {
-    await this.#assertCompactionCapacity(table);
+    await this.#assertCompactionCapacity(table, admission);
     const started = performance.now();
     let logicalBytes: number;
     // Deferred: the record rides the single-shot commit below unless trigger rows stage first.
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
+    this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
     const blockStager = new BoundedWriteBlockStager(transaction);
     const segmentId = this.#createId();
@@ -4424,6 +4657,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #writeBatch(
+    admission: WriterAdmission,
     table: TableRecord,
     input: ColumnarBatch,
     kind: "insert" | "upsert",
@@ -4431,7 +4665,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     autoIncrement?: AutoIncrementFill,
     conflictWhere?: UpsertConflictWhere,
   ): Promise<UpsertBatchResult & { acceptedRowIndexes: number[] }> {
-    await this.#assertCompactionCapacity(table);
+    await this.#assertCompactionCapacity(table, admission);
     const started = performance.now();
     const requestedRowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     let rowCount = requestedRowCount;
@@ -4451,6 +4685,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             atLeast: autoIncrement.atLeast,
           },
     );
+    this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
     const blockStager = new BoundedWriteBlockStager(transaction);
     let resolvedKeys = keys;
@@ -7830,6 +8065,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   async #assertCompactionCapacity(
     table: TableRecord,
+    admission: WriterAdmission,
     transaction?: DatabaseTransaction,
   ): Promise<void> {
     transaction?.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
@@ -7853,13 +8089,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const atCeiling = levelZero >= MAX_LEVEL_ZERO_SEGMENTS;
     if (!atCeiling && this.#autoCompactionBackoff.get(table.id)?.retryTimer !== undefined) return;
     // A fold waiting to publish is the step that helps most, and stepping the table would wait
-    // behind it while it waits for this write: run it here rather than deadlock on it.
+    // behind it while it waits for this write: run it here rather than deadlock on it. The same
+    // goes for a background step already in flight on this table, which may be about to ask for
+    // the turn this write holds: lend the turn until it settles instead of waiting behind it.
     await this.#publishPendingCompactions();
     try {
-      const progress = await this.compactTableStep(table.name, {
-        maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
-        maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
-      });
+      const progress = await this.#compactTableStep(
+        table.name,
+        {
+          maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
+          maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+        },
+        admission,
+      );
       if (!atCeiling && progress.result !== null && !progress.result.compacted) {
         this.#backOffAutoCompaction(table.id, visible);
       }
@@ -8160,6 +8402,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * table, and carry no triggers of their own: cascades are rejected, not silently skipped.
    */
   async #createTrigger(
+    _admission: WriterAdmission,
     tableName: string,
     trigger: {
       name: string;
@@ -8246,7 +8489,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
-  async #dropTrigger(name: string): Promise<void> {
+  async #dropTrigger(_admission: WriterAdmission, name: string): Promise<void> {
     let pinnedOwnerId: string | undefined;
     let pinnedTriggerId: string | undefined;
     for (let attempt = 0; ; attempt += 1) {
@@ -8821,40 +9064,55 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /**
    * Runs the callback against one shared write transaction: every staged mutation — across
    * any number of keyed or keyless tables, with their AFTER triggers — publishes as one
-   * atomic commit. A concurrent *write* surfaces as a WriteConflictError from the scope
-   * (nothing published); retry the whole scope. Background self-maintenance is not a
-   * concurrent write: the scope rebases over data-neutral manifests and commits anyway, so
-   * compaction landing mid-scope never fails it. An error thrown by the callback aborts the
-   * scope with nothing published. A scope that stages nothing publishes nothing.
+   * atomic commit. Scopes queue with this engine's autocommit writes by default, before taking
+   * their snapshot. Use the supplied session for writes inside the callback. With
+   * serializeWriteScopes: false, scopes overlap instead. A concurrent external write surfaces
+   * as a WriteConflictError from the scope (nothing published); retry the whole scope.
+   * The scope can rebase over data-neutral maintenance manifests within maxCommitRetries.
+   * An error thrown by the callback aborts the scope with nothing published. A scope that
+   * stages nothing publishes nothing.
    */
   async write<T>(
     action: (session: WriteSession<TSchema>) => Promise<T>,
+    options: WriteOptions = {},
   ): Promise<{ result: T; version: number | null }> {
+    // Collection assistance waits on the collector, and the collector may need a turn of its
+    // own to publish, so it runs before this scope asks for one.
+    await this.#assistAutomaticCollection();
     // The scope stages by runtime table name; the declaration only types the caller's view.
-    return this.#openWriteScope((session) => action(session as WriteSession<TSchema>));
+    return this.#ownScope(
+      (signal) =>
+        this.#admit(
+          "scope",
+          (admission) =>
+            this.#runWriteScope(
+              admission,
+              (session) => action(session as WriteSession<TSchema>),
+              {},
+              signal,
+            ),
+          signal,
+        ),
+      options.signal,
+    );
   }
 
   /**
-   * `write()` with the scope's transaction handed to the callback as well, for the internal
-   * callers that need to read through it by plan rather than by SQL text — the keyed mutation
-   * paths a statement-level transaction routes through.
+   * A statement's turn: collection assistance, then admission as the one writer, then any fold
+   * publication waiting for a turn, then the statement itself.
    */
-  #coordinateWrite<T>(run: () => Promise<T>): Promise<T> {
-    if (!this.#coordinateWrites) return run();
-    return coordinateWrite(this.store, run, this.#shutdown.signal, {
-      onAdmissionWaitExceeded: (waitedMs) => {
-        this.#reportBackgroundError(
-          new Error(
-            `A write waited ${String(waitedMs)}ms for the cross-tab admission lock and went ` +
-              "ahead without it; another tab holds the lock and is not letting go",
-          ),
-          "write admission",
-        );
-      },
-    });
+  #coordinateWrite<T>(run: (admission: WriterAdmission) => Promise<T>): Promise<T> {
+    return this.#assistAutomaticCollection().then(() =>
+      this.#admit("statement", async (admission) => {
+        await this.#publishPendingCompactions();
+        return run(admission);
+      }),
+    );
   }
 
+  /** A scope for a caller that already holds the turn: a statement, a cascade, a transaction. */
   async #openWriteScope<T>(
+    admission: WriterAdmission,
     action: (
       session: WriteSession,
       transaction: DatabaseTransaction,
@@ -8862,27 +9120,45 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) => Promise<T>,
     options: { durableSnapshot?: boolean } = {},
   ): Promise<{ result: T; version: number | null }> {
-    return this.#ownScope((signal) => this.#runWriteScope(action, options, signal));
+    return this.#ownScope((signal) => this.#runWriteScope(admission, action, options, signal));
   }
 
-  async #ownScope<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  /** The turn a scope's transaction runs under; a session path without one is an engine bug. */
+  #admissionOf(transaction: DatabaseTransaction): WriterAdmission {
+    const admission = this.#transactionAdmissions.get(transaction);
+    if (admission === undefined) {
+      throw new Error("A session write ran outside its transaction's writer turn");
+    }
+    return admission;
+  }
+
+  /**
+   * Tracks one scope for shutdown: closing aborts its signal, whether it is still waiting for
+   * its turn or already inside its callback. A caller's own signal cancels the same way.
+   */
+  async #ownScope<T>(run: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
     if (this.#closed) throw new Error("Database is closed");
+    external?.throwIfAborted();
     if (this.#scopeTasks.size >= MAX_DATABASE_ACTIVE_SCOPES) {
       throw new RangeError("Too many active database scopes; await a scope before opening another");
     }
     const controller = new AbortController();
+    const forward = (): void => controller.abort(external?.reason);
+    external?.addEventListener("abort", forward, { once: true });
     this.#scopeControllers.add(controller);
     const task = run(controller.signal);
     this.#scopeTasks.add(task);
     try {
       return await task;
     } finally {
+      external?.removeEventListener("abort", forward);
       this.#scopeControllers.delete(controller);
       this.#scopeTasks.delete(task);
     }
   }
 
   async #runWriteScope<T>(
+    admission: WriterAdmission,
     action: (
       session: WriteSession,
       transaction: DatabaseTransaction,
@@ -8892,12 +9168,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     signal: AbortSignal,
   ): Promise<{ result: T; version: number | null }> {
     signal.throwIfAborted();
-    // A scope is not queued behind other writes, but it is a writer all the same, and SQL
-    // statements are scopes: a fold waiting to publish takes its turn before the scope opens
-    // its transaction (see #withCompactionPublicationSlot), where nothing of this scope's can
-    // yet conflict with it. A scope inside a scope simply rebases over the neutral manifest.
+    // A fold waiting to publish takes its turn inside this one, before the scope opens its
+    // transaction (see #withCompactionPublicationSlot), where nothing of this scope's can yet
+    // conflict with it.
     await this.#publishPendingCompactions();
-    await this.#assistAutomaticCollection();
     // Keep one storage-sized statement batch process-local. The common single-statement write
     // then publishes through writeTransaction atomically. Stages share that bounded batch;
     // exceeding its limit spills to the durable journal before accepting more.
@@ -8905,6 +9179,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       durableSnapshot: options.durableSnapshot ?? true,
       coalesceArtifacts: true,
     });
+    this.#transactionAdmissions.set(transaction, admission);
     // Only a scope buffers: a standalone write's trigger bodies and cascades run through the
     // same session paths, and nothing would encode a write set of theirs before they commit.
     this.#scopeWrites.set(transaction, {
@@ -10455,7 +10730,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         };
       }
     }
-    await this.#assertCompactionCapacity(table, transaction);
+    await this.#assertCompactionCapacity(table, this.#admissionOf(transaction), transaction);
     // Proven before anything registers: a missing parent fails this statement alone, and the
     // scope stays usable. Registering the keys first would turn the refusal into a poisoned scope.
     await this.#assertForeignKeysPresent(
@@ -10571,7 +10846,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     keysVerified = false,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName, transaction);
-    await this.#assertCompactionCapacity(table, transaction);
+    await this.#assertCompactionCapacity(table, this.#admissionOf(transaction), transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
@@ -10718,7 +10993,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     referentialBudget = REFERENTIAL_CASCADES,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName, transaction);
-    await this.#assertCompactionCapacity(table, transaction);
+    await this.#assertCompactionCapacity(table, this.#admissionOf(transaction), transaction);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
@@ -11011,22 +11286,27 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
       // a genuinely concurrent migrator still fails explicitly once the retries are exhausted.
       let originalSteps: MigrationStep[] | undefined;
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          const result = await this.#migrateOnce(definition, options, (steps) => {
-            originalSteps ??= [...steps];
-          });
-          return originalSteps === undefined ? result : migrationResult(originalSteps);
-        } catch (error) {
-          if (
-            (!(error instanceof TableRecordConflictError) &&
-              !(error instanceof WriteConflictError)) ||
-            attempt >= this.#maxCommitRetries
-          ) {
-            throw error;
+      // One turn as the database's writer covers planning and every catalog step, so two tabs
+      // migrating to the same declaration at start-up run one after the other: the second
+      // plans against the first's result and finds nothing left to do.
+      return this.#admit("catalog", async (admission) => {
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            const result = await this.#migrateOnce(admission, definition, options, (steps) => {
+              originalSteps ??= [...steps];
+            });
+            return originalSteps === undefined ? result : migrationResult(originalSteps);
+          } catch (error) {
+            if (
+              (!(error instanceof TableRecordConflictError) &&
+                !(error instanceof WriteConflictError)) ||
+              attempt >= this.#maxCommitRetries
+            ) {
+              throw error;
+            }
           }
         }
-      }
+      });
     });
   }
 
@@ -11164,8 +11444,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #migrateOnce(
+    admission: WriterAdmission,
     definition: SchemaDefinition<readonly AnyTable[]>,
-    options: MigrateOptions = {},
+    options: MigrateOptions,
     onPlan?: (steps: readonly MigrationStep[]) => void,
   ): Promise<MigrateResult> {
     // One listTables pass drives planning and execution: a create step exists only because the
@@ -11223,7 +11504,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           return { ...key, column, parentColumn };
         });
-        await this.runStatement({
+        await this.#runStatementAdmitted(admission, {
           kind: "create-table",
           table: step.table.name,
           ...(uniqueEntry === undefined && primaryKey.length !== 1
@@ -11288,7 +11569,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           },
           step,
         );
-        await this.runStatement({
+        await this.#runStatementAdmitted(admission, {
           kind: "create-view",
           view: step.view.name,
           sql: step.view.sql,
@@ -11301,13 +11582,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         continue;
       }
       if (step.kind === "drop-table") {
-        await this.runStatement({ kind: "drop-table", table: step.tableName, ifExists: true });
+        await this.#runStatementAdmitted(admission, {
+          kind: "drop-table",
+          table: step.tableName,
+          ifExists: true,
+        });
         droppedTables.push(step.tableName);
         catalogChangedBeforeAlterations = true;
         continue;
       }
       if (step.kind === "drop-view") {
-        await this.runStatement({ kind: "drop-view", view: step.viewName, ifExists: true });
+        await this.#runStatementAdmitted(admission, {
+          kind: "drop-view",
+          view: step.viewName,
+          ifExists: true,
+        });
         droppedViews.push(step.viewName);
         catalogChangedBeforeAlterations = true;
         continue;
@@ -11330,7 +11619,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // blocks; an idle table therefore cannot retain dead column payloads forever.
       for (const step of plannedSteps) {
         if (step.kind !== "drop-column") continue;
-        await this.dropColumn(tableName, step.columnName);
+        await this.#dropColumnAdmitted(admission, tableName, step.columnName, {});
         changed = true;
         alterationProof = await this.#stableCatalogProof();
       }
@@ -12039,11 +12328,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const decided = new Promise<"commit" | "rollback">((resolve) => {
         settle = resolve;
       });
-      const finished = this.#openWriteScope<null>(async (_session, _transaction, writer) => {
-        start(writer);
-        if ((await decided) === "rollback") throw new TransactionRollback();
-        return null;
-      });
+      // The transaction is this database's writer from BEGIN until COMMIT, ROLLBACK, the idle
+      // sweep, or close: its turn is taken before its snapshot and kept across statements.
+      await this.#assistAutomaticCollection();
+      const finished = this.#admit("transaction", (admission) =>
+        this.#openWriteScope<null>(admission, async (_session, _transaction, writer) => {
+          start(writer);
+          if ((await decided) === "rollback") throw new TransactionRollback();
+          return null;
+        }),
+      );
       // Scope startup performs maintenance admission, the catalog probe, and the durable lease
       // admission before invoking its callback. Reflect any refusal into the startup rendezvous;
       // otherwise BEGIN waits forever on a resolve-only promise while `finished` rejects with no
@@ -12786,6 +13080,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     statement: CompiledStatement,
     options: RunStatementOptions = {},
   ): Promise<ExecuteResult> {
+    // A catalog statement takes one turn as the database's writer for the whole of its
+    // validation and publication, so no coordinated writer in any tab can be mid-transaction
+    // against the schema it replaces. CREATE INDEX manages its own turns: it marks the index
+    // in one, builds outside any, and publishes readiness in another. Data mutations take
+    // theirs inside (see #coordinateWrite), and a statement inside a scope already holds one.
+    if (isCatalogStatement(statement) && options.writer === undefined) {
+      return this.#admit("catalog", (admission) =>
+        this.#runStatementAdmitted(admission, statement, options),
+      );
+    }
+    return this.#runStatementAdmitted(undefined, statement, options);
+  }
+
+  async #runStatementAdmitted(
+    admission: WriterAdmission | undefined,
+    statement: CompiledStatement,
+    options: RunStatementOptions = {},
+  ): Promise<ExecuteResult> {
     return this.#foreground(async () => {
       if (this.#closed) throw new Error("Database is closed");
       if (this.#statementTransactionExpired && statement.kind !== "transaction")
@@ -12888,7 +13200,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (existing !== undefined) return { kind: "create-table", table: statement.table };
         }
         try {
-          await this.createTable({
+          await this.#createTableAdmitted(catalogAdmission(admission), {
             name: statement.table,
             columns: statement.columns,
             ...(statement.checks === undefined ? {} : { checks: statement.checks }),
@@ -13121,9 +13433,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         };
       }
       if (statement.kind === "drop-index") {
-        const dropped = await this.dropIndex(statement.index, {
-          ...(statement.ifExists === true ? { ifExists: true } : {}),
-        });
+        const dropped = await this.#dropIndexAdmitted(
+          catalogAdmission(admission),
+          statement.index,
+          {
+            ...(statement.ifExists === true ? { ifExists: true } : {}),
+          },
+        );
         return { kind: "drop-index", index: statement.index, dropped };
       }
       if (statement.kind === "add-column") {
@@ -13242,9 +13558,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       if (statement.kind === "drop-column") {
-        const dropped = await this.dropColumn(statement.table, statement.column, {
-          ...(statement.ifExists === true ? { ifExists: true } : {}),
-        });
+        const dropped = await this.#dropColumnAdmitted(
+          catalogAdmission(admission),
+          statement.table,
+          statement.column,
+          {
+            ...(statement.ifExists === true ? { ifExists: true } : {}),
+          },
+        );
         return {
           kind: "drop-column",
           table: statement.table,
@@ -13254,30 +13575,34 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       if (statement.kind === "merge") return this.#runMerge(statement);
       if (statement.kind === "create-view") {
-        await this.createView(statement.view, statement.sql, {
+        await this.#createViewAdmitted(catalogAdmission(admission), statement.view, statement.sql, {
           ...(statement.orReplace === true ? { orReplace: true } : {}),
           ...(statement.managed === true ? { managed: true } : {}),
         });
         return { kind: "create-view", view: statement.view };
       }
       if (statement.kind === "drop-view") {
-        const dropped = await this.dropView(statement.view, {
+        const dropped = await this.#dropViewAdmitted(catalogAdmission(admission), statement.view, {
           ...(statement.ifExists === true ? { ifExists: true } : {}),
         });
         return { kind: "drop-view", view: statement.view, dropped };
       }
       if (statement.kind === "drop-table") {
-        const dropped = await this.dropTable(statement.table, {
-          ...(statement.ifExists === true ? { ifExists: true } : {}),
-        });
+        const dropped = await this.#dropTableAdmitted(
+          catalogAdmission(admission),
+          statement.table,
+          {
+            ...(statement.ifExists === true ? { ifExists: true } : {}),
+          },
+        );
         return { kind: "drop-table", table: statement.table, dropped };
       }
       if (statement.kind === "create-trigger") {
-        await this.#createTrigger(statement.table, statement.trigger);
+        await this.#createTrigger(catalogAdmission(admission), statement.table, statement.trigger);
         return { kind: "create-trigger", table: statement.table, name: statement.trigger.name };
       }
       if (statement.kind === "drop-trigger") {
-        await this.#dropTrigger(statement.name);
+        await this.#dropTrigger(catalogAdmission(admission), statement.name);
         return { kind: "drop-trigger", name: statement.name };
       }
       if (statement.kind === "transaction") {
@@ -13291,10 +13616,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // itself are one statement transaction. A genuine concurrent data commit does not rebase
         // stale derived values: it aborts this scope, then the loop restarts the whole statement
         // against a fresh snapshot. Maintenance-only commits are handled inside #openWriteScope.
-        return this.#coordinateWrite(async () => {
+        return this.#coordinateWrite(async (statementAdmission) => {
           for (let attempt = 0; ; attempt += 1) {
             try {
               const completed = await this.#openWriteScope(
+                statementAdmission,
                 (_session, _transaction, writer) =>
                   this.runStatement(statement, { ...options, writer }),
                 // A standalone statement has no user-controlled idle gap. Its selection reads hold
@@ -15818,7 +16144,46 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     source: AsyncIterable<Uint8Array>,
     options: SnapshotImportOptions = {},
   ): Promise<void> {
-    return this.#foreground(async () => {
+    // Replacing the database is exclusive by nature: the import holds the writer turn from its
+    // first staged frame to the catalog swap, so no cooperating writer commits into a store
+    // that is about to be replaced, and every writer queued behind it runs on the result.
+    return this.#foreground(() =>
+      this.#admit(
+        "import",
+        () => this.#importSnapshotStreamAdmitted(source, options),
+        options.signal,
+      ),
+    );
+  }
+
+  /** A signal aborted by close or by the caller's own, for a wait that both must cancel. */
+  async #withLinkedSignal<T>(
+    external: AbortSignal | undefined,
+    run: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const queue = this.#shutdown.signal;
+    if (external === undefined) return run(queue);
+    const controller = new AbortController();
+    const forward = (source: AbortSignal) => (): void => controller.abort(source.reason);
+    const fromExternal = forward(external);
+    const fromQueue = forward(queue);
+    if (external.aborted) fromExternal();
+    else if (queue.aborted) fromQueue();
+    external.addEventListener("abort", fromExternal, { once: true });
+    queue.addEventListener("abort", fromQueue, { once: true });
+    try {
+      return await run(controller.signal);
+    } finally {
+      external.removeEventListener("abort", fromExternal);
+      queue.removeEventListener("abort", fromQueue);
+    }
+  }
+
+  async #importSnapshotStreamAdmitted(
+    source: AsyncIterable<Uint8Array>,
+    options: SnapshotImportOptions,
+  ): Promise<void> {
+    {
       const store = streamingSnapshotImportStore(this.store);
       const ownerId = `snapshot-import/${crypto.randomUUID()}`;
       let identity: string | undefined;
@@ -15924,7 +16289,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       this.#catalogStateCache.clear();
       this.#catalogStateEpoch = undefined;
       options.onProgress?.({ phase: "done", writtenBytes, totalBytes });
-    });
+    }
   }
 
   /** Verifies adapter metadata, or metadata plus every live payload, without changing storage. */
@@ -16004,22 +16369,38 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     options: CompactTableStepOptions = {},
   ): Promise<CompactionJobProgress> {
+    return this.#compactTableStep(tableName, options);
+  }
+
+  /**
+   * One compaction step. A writer lending its turn passes its admission, so the step's
+   * publication runs inside that turn instead of asking for one the writer holds.
+   */
+  async #compactTableStep(
+    tableName: string,
+    options: CompactTableStepOptions,
+    admission?: WriterAdmission,
+  ): Promise<CompactionJobProgress> {
     return this.#foreground(async () => {
       const maxBlocks = boundedMaintenanceBatchItems(
         options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
         "Compaction step block limit",
       );
       const table = await this.#findTable(tableName);
-      return this.#serializedCompactionStep(table.id, async () => {
-        const active = await this.#findActiveCompactionJob(table.id);
-        let job = active;
-        if (job === undefined) {
-          const planned = await this.#planCompaction(table, options);
-          if ("compacted" in planned) return compactionSkippedProgress(planned);
-          job = planned;
-        }
-        return this.#runCompactionJob(table, job, maxBlocks);
-      });
+      return this.#serializedCompactionStep(
+        table.id,
+        async () => {
+          const active = await this.#findActiveCompactionJob(table.id);
+          let job = active;
+          if (job === undefined) {
+            const planned = await this.#planCompaction(table, options);
+            if ("compacted" in planned) return compactionSkippedProgress(planned);
+            job = planned;
+          }
+          return this.#runCompactionJob(table, job, maxBlocks, admission);
+        },
+        admission !== undefined,
+      );
     });
   }
 
@@ -16050,9 +16431,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * twice. Each step loads the job record fresh, so alternating drivers simply continue where
    * the other left off. Between instances and tabs the job's revision is the guard.
    */
-  async #serializedCompactionStep<T>(tableId: string, step: () => Promise<T>): Promise<T> {
+  async #serializedCompactionStep<T>(
+    tableId: string,
+    step: () => Promise<T>,
+    lending = false,
+  ): Promise<T> {
     const previous = this.#compactionSteps.get(tableId) ?? Promise.resolve();
-    const run = previous.then(step, step);
+    // A writer stepping the table while it holds the turn lends that turn to the background
+    // step ahead of it in the chain, which may need it to publish; waiting outright would wait
+    // for a step that waits for this writer.
+    const before = lending ? this.#lendUntilSettled(previous) : previous;
+    const run = before.then(step, step);
     this.#compactionSteps.set(tableId, run);
     try {
       return await run;
@@ -18695,6 +19084,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     table: TableRecord,
     initialJob: CompactionJobRecord,
     maxBlocks: number,
+    admission?: WriterAdmission,
   ): Promise<CompactionJobProgress> {
     let job = (await this.store.getCompactionJob(initialJob.id)) ?? initialJob;
     if (job.state === "cancelled") throw new CompactionJobCancelledError(job.id);
@@ -18743,7 +19133,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (job.transactionId === null || linkedTransaction?.status !== "active") {
         const linked = await this.#beginCompactionTransaction(job);
         if (linked.transaction === null) {
-          return await this.#runCompactionJob(table, linked.job, maxBlocks);
+          return await this.#runCompactionJob(table, linked.job, maxBlocks, admission);
         }
         ({ job, transaction } = linked);
       } else {
@@ -18985,28 +19375,30 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         transaction.setCompactionIntent(job.id, job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
       };
-      let manifest = await publish();
-      if (manifest === undefined) {
-        // A retry on this fold's own turn is not sufficient: this database's writers win the
-        // manifest CAS again between rebase and commit, every time, leaving a complete job in
-        // `ready` while the table grows. So the rebase and the commit take a turn as a writer
-        // (#withCompactionPublicationSlot), and inside that turn they retry without yielding:
-        // what can still commit in between is a writer already in flight — a pipelined scope,
-        // another tab — and those are finite, where a fold that yielded between attempts met
-        // a fresh one each time. Past the limit the job is abandoned and the next check plans
-        // a fresh one.
-        manifest = await this.#withCompactionPublicationSlot(async () => {
-          for (
-            let conflicts = 1;
-            conflicts <= MAX_COMPACTION_PUBLICATION_CONFLICTS;
-            conflicts += 1
+      // Publication is a writer's turn like any other (#withCompactionPublicationSlot): the
+      // rebase and the commit run with no coordinated writer in flight anywhere, so the
+      // manifest race can only be lost to a writer that did not take a turn, and inside the
+      // turn the attempt retries against those without yielding. Past the limit the job is
+      // abandoned and the next check plans a fresh one. A writer lending its turn (a write at
+      // the level-zero ceiling stepping the fold itself) runs the same attempt inside it.
+      const publishInTurn = async (): Promise<ManifestSummary | undefined> => {
+        for (let conflicts = 0; conflicts <= MAX_COMPACTION_PUBLICATION_CONFLICTS; conflicts += 1) {
+          if (
+            conflicts > 0 ||
+            (await this.store.getCurrentManifestVersion()) !== transaction.snapshotVersion
           ) {
             await rebaseOverConcurrentCommits();
-            const published = await publish();
-            if (published !== undefined) return published;
           }
-          return undefined;
-        });
+          const published = await publish();
+          if (published !== undefined) return published;
+        }
+        return undefined;
+      };
+      const manifest =
+        admission === undefined
+          ? await this.#withCompactionPublicationSlot(publishInTurn)
+          : await publishInTurn();
+      {
         if (manifest === undefined) {
           if (transaction.status === "active") await transaction.abort();
           job = await this.#abortCompactionJob(
@@ -20134,42 +20526,43 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // above and this update; the marking is re-based on the fresh record rather than failing
       // the DDL for a race it did not lose anything to.
       let current = table;
-      let marked: TableRecord | undefined;
-      for (let attempt = 0; marked === undefined; attempt += 1) {
-        try {
-          marked = await this.store.updateTable(current.id, current.revision, {
-            secondaryIndexes: {
-              ...current.secondaryIndexes,
-              [indexId]: {
-                name: indexName,
-                columnId: columns[0]?.id ?? "",
-                columnIds: columns.map((column) => column.id),
-                directions: indexColumns.map((column) => column.direction),
-                ...(options.unique === true ? { unique: true as const } : {}),
-                termEncoding: "tuple-v2",
-                storage: "postings-v1",
-                storageColumnId,
-                locator: current.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
-                state: "building",
-                buildId,
-                buildFromVersion: -1,
+      const marked = await this.#admit("catalog", async (): Promise<TableRecord> => {
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            return await this.store.updateTable(current.id, current.revision, {
+              secondaryIndexes: {
+                ...current.secondaryIndexes,
+                [indexId]: {
+                  name: indexName,
+                  columnId: columns[0]?.id ?? "",
+                  columnIds: columns.map((column) => column.id),
+                  directions: indexColumns.map((column) => column.direction),
+                  ...(options.unique === true ? { unique: true as const } : {}),
+                  termEncoding: "tuple-v2",
+                  storage: "postings-v1",
+                  storageColumnId,
+                  locator: current.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
+                  state: "building",
+                  buildId,
+                  buildFromVersion: -1,
+                },
               },
-            },
-          });
-        } catch (error) {
-          if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
-            throw error;
+            });
+          } catch (error) {
+            if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+              throw error;
+            }
+            const fresh = await this.store.getTable(current.id);
+            if (fresh === undefined) throw new UnknownTableError(tableName);
+            if (
+              Object.values(fresh.secondaryIndexes ?? {}).some((index) => index.name === indexName)
+            ) {
+              throw new TypeError(`Index already exists: ${indexName}`, { cause: error });
+            }
+            current = fresh;
           }
-          const fresh = await this.store.getTable(current.id);
-          if (fresh === undefined) throw new UnknownTableError(tableName);
-          if (
-            Object.values(fresh.secondaryIndexes ?? {}).some((index) => index.name === indexName)
-          ) {
-            throw new TypeError(`Index already exists: ${indexName}`, { cause: error });
-          }
-          current = fresh;
         }
-      }
+      });
       try {
         await this.#buildSecondaryIndex(marked, indexId);
       } catch (error) {
@@ -20199,31 +20592,53 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     indexName: string,
     storageColumnId: string,
   ): Promise<void> {
-    for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
-      const fresh = await this.store.getTable(tableId);
-      if (fresh === undefined) return;
-      const owned = fresh.secondaryIndexes?.[indexId];
-      if (owned?.name !== indexName || owned.storageColumnId !== storageColumnId) {
-        return;
-      }
-      const secondaryIndexes = Object.fromEntries(
-        Object.entries(fresh.secondaryIndexes ?? {}).filter(([candidate]) => candidate !== indexId),
-      );
-      try {
-        await this.store.updateTable(fresh.id, fresh.revision, {
-          secondaryIndexes: Object.keys(secondaryIndexes).length === 0 ? null : secondaryIndexes,
-        });
-        return;
-      } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt === this.#maxCommitRetries) {
-          throw error;
+    await this.#admit(
+      "catalog",
+      async () => {
+        for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
+          const fresh = await this.store.getTable(tableId);
+          if (fresh === undefined) return;
+          const owned = fresh.secondaryIndexes?.[indexId];
+          if (owned?.name !== indexName || owned.storageColumnId !== storageColumnId) {
+            return;
+          }
+          const secondaryIndexes = Object.fromEntries(
+            Object.entries(fresh.secondaryIndexes ?? {}).filter(
+              ([candidate]) => candidate !== indexId,
+            ),
+          );
+          try {
+            await this.store.updateTable(fresh.id, fresh.revision, {
+              secondaryIndexes:
+                Object.keys(secondaryIndexes).length === 0 ? null : secondaryIndexes,
+            });
+            return;
+          } catch (error) {
+            if (
+              !(error instanceof TableRecordConflictError) ||
+              attempt === this.#maxCommitRetries
+            ) {
+              throw error;
+            }
+          }
         }
-      }
-    }
+      },
+      this.#maintenanceSignal,
+    );
   }
 
   /** Drops one globally named secondary index. */
   async dropIndex(indexName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    return this.#admit("catalog", (admission) =>
+      this.#dropIndexAdmitted(admission, indexName, options),
+    );
+  }
+
+  async #dropIndexAdmitted(
+    _admission: WriterAdmission,
+    indexName: string,
+    options: { ifExists?: boolean },
+  ): Promise<boolean> {
     return this.#foreground(async () => {
       for (const table of await this.store.listTables()) {
         const entry = Object.entries(table.secondaryIndexes ?? {}).find(
@@ -20287,21 +20702,34 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     index: SecondaryIndexRecord,
     ownedBuildId?: string,
   ): Promise<void> {
-    const current = await this.store.getTable(table.id);
-    if (current === undefined) return;
-    const held = current.secondaryIndexes?.[indexId];
-    if (held === undefined) return;
-    const ownsMarkedBuild =
-      ownedBuildId !== undefined && held.state === "building" && held.buildId === ownedBuildId;
-    const buildId = ownsMarkedBuild ? ownedBuildId : this.#createId();
-    const marked = ownsMarkedBuild
-      ? current
-      : await this.store.updateTable(current.id, current.revision, {
-          secondaryIndexes: {
-            ...current.secondaryIndexes,
-            [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
-          },
-        });
+    // Marking and publishing are catalog steps, each taken as one writer turn; the build in
+    // between reads a leased snapshot outside any turn, so a large table never holds every
+    // other writer for the whole scan.
+    const entered = await this.#admit(
+      "catalog",
+      async (): Promise<{ marked: TableRecord; buildId: string } | undefined> => {
+        // (background: the maintenance signal below keeps this turn available during close)
+        const current = await this.store.getTable(table.id);
+        if (current === undefined) return undefined;
+        const held = current.secondaryIndexes?.[indexId];
+        if (held === undefined) return undefined;
+        const ownsMarkedBuild =
+          ownedBuildId !== undefined && held.state === "building" && held.buildId === ownedBuildId;
+        const buildId = ownsMarkedBuild ? ownedBuildId : this.#createId();
+        const marked = ownsMarkedBuild
+          ? current
+          : await this.store.updateTable(current.id, current.revision, {
+              secondaryIndexes: {
+                ...current.secondaryIndexes,
+                [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
+              },
+            });
+        return { marked, buildId };
+      },
+      this.#maintenanceSignal,
+    );
+    if (entered === undefined) return;
+    const { marked, buildId } = entered;
     try {
       await this.#withLeasedSnapshot(undefined, async (snapshot) => {
         const columns = secondaryIndexColumnIds(index).map((columnId) =>
@@ -20350,44 +20778,51 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             );
           }
         }
-        const fresh = await this.store.getTable(marked.id);
-        const freshIndex = fresh?.secondaryIndexes?.[indexId];
-        if (freshIndex === undefined) {
-          // DROP INDEX / DROP TABLE can win while a whole-base build is writing.
-          // Its storage identity is never reused, so reclaiming it here cannot touch a new index.
-          await this.store.removeFtsColumn(marked.id, index.storageColumnId);
-          return;
-        }
-        if (
-          fresh !== undefined &&
-          freshIndex.state === "building" &&
-          freshIndex.buildId === buildId
-        ) {
-          const { buildId: _completedBuild, ...readyIndex } = freshIndex;
-          void _completedBuild;
-          await this.store.updateTable(fresh.id, fresh.revision, {
-            secondaryIndexes: {
-              ...fresh.secondaryIndexes,
-              [indexId]: {
-                ...readyIndex,
-                state: "ready",
-                buildFromVersion: coversVersion,
-                ...(index.unique === true ? { uniqueEnforced: true as const } : {}),
-              },
-            },
-            ...(index.unique === true
-              ? {
-                  expectedManifestVersion: {
-                    value: coversVersion < 0 ? null : coversVersion,
+        await this.#admit(
+          "catalog",
+          async () => {
+            const fresh = await this.store.getTable(marked.id);
+            const freshIndex = fresh?.secondaryIndexes?.[indexId];
+            if (freshIndex === undefined) {
+              // DROP INDEX / DROP TABLE can win while a whole-base build is writing.
+              // Its storage identity is never reused, so reclaiming it here cannot touch a new
+              // index.
+              await this.store.removeFtsColumn(marked.id, index.storageColumnId);
+              return;
+            }
+            if (
+              fresh !== undefined &&
+              freshIndex.state === "building" &&
+              freshIndex.buildId === buildId
+            ) {
+              const { buildId: _completedBuild, ...readyIndex } = freshIndex;
+              void _completedBuild;
+              await this.store.updateTable(fresh.id, fresh.revision, {
+                secondaryIndexes: {
+                  ...fresh.secondaryIndexes,
+                  [indexId]: {
+                    ...readyIndex,
+                    state: "ready",
+                    buildFromVersion: coversVersion,
+                    ...(index.unique === true ? { uniqueEnforced: true as const } : {}),
                   },
-                  uniqueKeySeed: {
-                    namespaceId: secondaryUniqueKeyNamespace(fresh.id, indexId),
-                    keyTokens: [...(uniqueTerms ?? [])],
-                  },
-                }
-              : {}),
-          });
-        }
+                },
+                ...(index.unique === true
+                  ? {
+                      expectedManifestVersion: {
+                        value: coversVersion < 0 ? null : coversVersion,
+                      },
+                      uniqueKeySeed: {
+                        namespaceId: secondaryUniqueKeyNamespace(fresh.id, indexId),
+                        keyTokens: [...(uniqueTerms ?? [])],
+                      },
+                    }
+                  : {}),
+              });
+            }
+          },
+          this.#maintenanceSignal,
+        );
       });
     } catch (error) {
       const fresh = await this.store.getTable(table.id);
@@ -20399,13 +20834,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ) {
         const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
         void _failedBuild;
-        const invalidated = await this.store
-          .updateTable(fresh.id, fresh.revision, {
-            secondaryIndexes: {
-              ...fresh.secondaryIndexes,
-              [indexId]: { ...invalidIndex, state: "invalid" },
-            },
-          })
+        const invalidated = await this.#admit(
+          "catalog",
+          () =>
+            this.store.updateTable(fresh.id, fresh.revision, {
+              secondaryIndexes: {
+                ...fresh.secondaryIndexes,
+                [indexId]: { ...invalidIndex, state: "invalid" },
+              },
+            }),
+          this.#maintenanceSignal,
+        )
           .then(() => true)
           .catch(() => false);
         // Catalog first: every intermediate reader scans. Once invalid, postings are neither
@@ -20810,22 +21249,28 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (column.type === "boolean") {
       throw new TypeError(`Full-text indexes cannot cover boolean columns: ${columnName}`);
     }
+    // Each stamp is a catalog step and takes one writer turn; the scan between them does not.
     const stamp = (
       record: TableRecord,
       state: FtsColumnIndexRecord["state"],
       buildFromVersion: number,
     ): Promise<TableRecord> =>
-      this.store.updateTable(record.id, record.revision, {
-        ftsColumns: {
-          ...record.ftsColumns,
-          [column.id]: {
-            storage: "fts-chunks-v1",
-            tokenizerVersion: FTS_TOKENIZER_VERSION,
-            state,
-            buildFromVersion,
-          },
-        },
-      });
+      this.#admit(
+        "catalog",
+        () =>
+          this.store.updateTable(record.id, record.revision, {
+            ftsColumns: {
+              ...record.ftsColumns,
+              [column.id]: {
+                storage: "fts-chunks-v1",
+                tokenizerVersion: FTS_TOKENIZER_VERSION,
+                state,
+                buildFromVersion,
+              },
+            },
+          }),
+        this.#maintenanceSignal,
+      );
     // From this flip on, every writer that reads the record emits commit deltas; writers that
     // committed against the older record flip the column to "invalid" in the store, which the
     // ready-CAS below observes as a revision conflict and abandons the build.
@@ -20918,22 +21363,29 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw error;
         }
         const coversVersion = snapshot.version ?? -1;
-        const fresh = await this.store.getTable(table.id);
-        const current = fresh?.ftsColumns?.[column.id];
-        if (fresh?.columns.some((candidate) => candidate.id === column.id) !== true) {
-          // A concurrent DROP COLUMN won after this build took its snapshot. The catalog update
-          // already removed any older index; remove the base this stale builder just wrote too.
-          await this.store.removeFtsColumn(table.id, column.id);
-          return;
-        }
-        if (current?.state === "building") {
-          await this.store.updateTable(fresh.id, fresh.revision, {
-            ftsColumns: {
-              ...fresh.ftsColumns,
-              [column.id]: { ...current, state: "ready", buildFromVersion: coversVersion },
-            },
-          });
-        }
+        await this.#admit(
+          "catalog",
+          async () => {
+            const fresh = await this.store.getTable(table.id);
+            const current = fresh?.ftsColumns?.[column.id];
+            if (fresh?.columns.some((candidate) => candidate.id === column.id) !== true) {
+              // A concurrent DROP COLUMN won after this build took its snapshot. The catalog
+              // update already removed any older index; remove the base this stale builder just
+              // wrote too.
+              await this.store.removeFtsColumn(table.id, column.id);
+              return;
+            }
+            if (current?.state === "building") {
+              await this.store.updateTable(fresh.id, fresh.revision, {
+                ftsColumns: {
+                  ...fresh.ftsColumns,
+                  [column.id]: { ...current, state: "ready", buildFromVersion: coversVersion },
+                },
+              });
+            }
+          },
+          this.#maintenanceSignal,
+        );
       });
     } catch (error) {
       // A failed build must never leave a catalog entry perpetually "building" or a partial
@@ -20942,13 +21394,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const fresh = await this.store.getTable(table.id);
       const current = fresh?.ftsColumns?.[column.id];
       if (fresh !== undefined && current?.state === "building") {
-        const invalidated = await this.store
-          .updateTable(fresh.id, fresh.revision, {
-            ftsColumns: {
-              ...fresh.ftsColumns,
-              [column.id]: { ...current, state: "invalid" },
-            },
-          })
+        const invalidated = await this.#admit(
+          "catalog",
+          () =>
+            this.store.updateTable(fresh.id, fresh.revision, {
+              ftsColumns: {
+                ...fresh.ftsColumns,
+                [column.id]: { ...current, state: "invalid" },
+              },
+            }),
+          this.#maintenanceSignal,
+        )
           .then(() => true)
           .catch(() => false);
         if (invalidated)
@@ -21574,41 +22030,52 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * deliberately untouched. A later relevant query can rebuild the invalid accelerator.
    */
   async #invalidateOversizedPostingTail(tableId: string, columnId: string): Promise<void> {
-    for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
-      const table = await this.store.getTable(tableId);
-      if (table === undefined) return;
-      const fts = table.ftsColumns?.[columnId];
-      const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
-        ([, index]) => index.storageColumnId === columnId,
-      );
-      if (fts === undefined && secondary === undefined) return;
-      if (fts?.state === "invalid" || secondary?.[1].state === "invalid") break;
-      try {
-        if (fts !== undefined) {
-          await this.store.updateTable(table.id, table.revision, {
-            ftsColumns: {
-              ...table.ftsColumns,
-              [columnId]: { ...fts, state: "invalid", buildFromVersion: -1 },
-            },
-          });
-        } else if (secondary !== undefined) {
-          const [indexId, index] = secondary;
-          const { buildId: _buildId, ...stable } = index;
-          void _buildId;
-          await this.store.updateTable(table.id, table.revision, {
-            secondaryIndexes: {
-              ...table.secondaryIndexes,
-              [indexId]: { ...stable, state: "invalid", buildFromVersion: -1 },
-            },
-          });
+    const present = await this.#admit(
+      "catalog",
+      async (): Promise<boolean> => {
+        for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
+          const table = await this.store.getTable(tableId);
+          if (table === undefined) return false;
+          const fts = table.ftsColumns?.[columnId];
+          const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
+            ([, index]) => index.storageColumnId === columnId,
+          );
+          if (fts === undefined && secondary === undefined) return false;
+          if (fts?.state === "invalid" || secondary?.[1].state === "invalid") return true;
+          try {
+            if (fts !== undefined) {
+              await this.store.updateTable(table.id, table.revision, {
+                ftsColumns: {
+                  ...table.ftsColumns,
+                  [columnId]: { ...fts, state: "invalid", buildFromVersion: -1 },
+                },
+              });
+            } else if (secondary !== undefined) {
+              const [indexId, index] = secondary;
+              const { buildId: _buildId, ...stable } = index;
+              void _buildId;
+              await this.store.updateTable(table.id, table.revision, {
+                secondaryIndexes: {
+                  ...table.secondaryIndexes,
+                  [indexId]: { ...stable, state: "invalid", buildFromVersion: -1 },
+                },
+              });
+            }
+            return true;
+          } catch (error) {
+            if (
+              !(error instanceof TableRecordConflictError) ||
+              attempt === this.#maxCommitRetries
+            ) {
+              throw error;
+            }
+          }
         }
-        break;
-      } catch (error) {
-        if (!(error instanceof TableRecordConflictError) || attempt === this.#maxCommitRetries) {
-          throw error;
-        }
-      }
-    }
+        return true;
+      },
+      this.#maintenanceSignal,
+    );
+    if (!present) return;
     await this.store.removeFtsColumn(tableId, columnId);
   }
 

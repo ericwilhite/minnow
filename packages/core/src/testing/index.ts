@@ -1,3 +1,7 @@
+import {
+  isStoreUncoordinatedForTests,
+  markStoreUncoordinatedForTests,
+} from "../engine/write-coordinator.js";
 import type {
   BlockStore,
   AdoptAbortedSegmentInput,
@@ -42,7 +46,19 @@ export class FaultInjectingBlockStore implements BlockStore {
   constructor(
     private readonly inner: BlockStore,
     private readonly inject: FaultInjector,
-  ) {}
+  ) {
+    // A store marked as a writer that takes no turns keeps that role behind this wrapper.
+    if (isStoreUncoordinatedForTests(inner)) markStoreUncoordinatedForTests(this);
+    // The wrapped store's identity, so engines over separate wrappers still take turns.
+    if (inner.liveQueryChannelName !== undefined) {
+      Object.defineProperty(this, "liveQueryChannelName", {
+        value: inner.liveQueryChannelName,
+        enumerable: true,
+      });
+    }
+  }
+
+  declare readonly liveQueryChannelName?: string;
 
   getCatalogProbe(): Promise<CatalogProbe> {
     return this.inner.getCatalogProbe();

@@ -50,6 +50,7 @@ import {
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./database.js";
+import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 
 async function manifestBlockIdsAt(store: BlockStore, version: number): Promise<string[]> {
   const ids: string[] = [];
@@ -6162,7 +6163,9 @@ it("recovers a mutation-merge block whose durable cursor checkpoint was lost", a
 
 it("preserves logical row order when row-ID reservation order differs from commit order", async () => {
   const store = new FirstCommitBarrierMemoryBlockStore();
-  const database = new MinnowDatabase(store, { coordinateWrites: false });
+  // The overtaking writer stands in for a tab that does not take turns: an older build, say.
+  markStoreUncoordinatedForTests(store);
+  const database = new MinnowDatabase(store);
   await database.createTable({
     name: "reverse_ids",
     uniqueKey: "email",
@@ -6176,7 +6179,7 @@ it("preserves logical row order when row-ID reservation order differs from commi
   await store.firstCommitReached;
   // One database runs its writes in turn, so the overtaking insert comes from a second
   // instance over the same store — another tab, whose commit lands while the first is held.
-  const overtaking = new MinnowDatabase(store, { coordinateWrites: false });
+  const overtaking = new MinnowDatabase(store);
   let second;
   try {
     second = await overtaking.insert("reverse_ids", { email: "second@example.com", score: 2 });

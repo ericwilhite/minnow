@@ -145,8 +145,11 @@ block-ID set. A commit publishes version N + 1, in strict order:
 Data first, version last. The version change is all or nothing. A crash anywhere in between leaves
 unused blocks for the garbage collector — never a version pointing at half-written data.
 
-Step 4 handles competing writers. If another tab published first, the commit fails cleanly and
-retries against the new version. Conflicts surface as typed errors, never as silent interleaving.
+Step 4 is the defensive check. Writers take turns before step 1 — a queue per store in each
+context, and the Web Lock `minnowdb-write:<store>` across tabs — so among cooperating
+connections nothing publishes between a writer's snapshot and its commit. If a writer that did
+not take a turn published first, the commit fails cleanly and a plain write retries against the
+new version. Conflicts surface as typed errors, never as silent interleaving.
 
 A simple write — an insert, a point update, a delete, with no triggers staging rows of their own
 — folds steps 2 to 5 into one storage transaction where the store offers it (every shipped store
@@ -164,9 +167,12 @@ without making the committed layout depend on completion timing.
 
 Minnow assumes several tabs, unaware of each other, some frozen or already gone.
 
-- **One writer wins.** The store serializes the manifest flip — IndexedDB in a transaction, the
-  OPFS store through the browser's own exclusive lock on its log. Two tabs can prepare writes at
-  the same time; only one publishes, the other retries.
+- **One writer at a time.** Tabs take turns through a Web Lock before a write reads anything, so
+  two tabs never prepare conflicting writes. Underneath, the store still serializes the manifest
+  flip — IndexedDB in a transaction, the OPFS store through the browser's own exclusive lock on
+  its log — so a writer that did not take a turn cannot interleave either: only one publishes,
+  the other retries. A tab that stops inside its turn holds the others until the browser
+  releases its lock; the engine reports the wait and never bypasses it.
 - **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
   reconciles against the durable store. A missed message costs a little latency, never a stale
   result. [Live queries](/docs/extensions/live-queries) are built on this.

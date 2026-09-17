@@ -23,6 +23,9 @@
  *     to another; ROLLBACK discards them and COMMIT keeps them
  *   - concurrent-explicability: a read taken while a round of commuting writes is in flight
  *     shows every untouched key exactly and every touched key at either its old or new value
+ *   - writer-turns: a keyed write issued on another connection while a transaction is open
+ *     waits for it rather than landing under it or losing a commit race, then lands exactly
+ *     once with its own outcome; concurrent rounds among cooperating connections lose no race
  *   - fault-atomicity: a mutation interrupted by a storage fault or a crash lands entirely or
  *     not at all, and a reported success is durable
  *   - agreement: at every checkpoint every connection reads the same database as the model
@@ -174,6 +177,20 @@ export type Interaction =
       readonly table: string;
       readonly mutation: KeyedMutation;
       readonly point: FaultPointName;
+    }
+  | {
+      /**
+       * A transaction on one connection holds the database's writer turn while another
+       * connection issues a keyed write: that write must wait, not conflict, and land right after
+       * the transaction ends, whichever way it ends.
+       */
+      readonly kind: "queuedWrite";
+      readonly connection: number;
+      readonly waiter: number;
+      readonly table: string;
+      readonly rows: readonly PlanRow[];
+      readonly mutation: KeyedMutation;
+      readonly outcome: "commit" | "rollback";
     }
   | { readonly kind: "reopen"; readonly connection: number }
   | { readonly kind: "maintenance"; readonly connection: number; readonly table: string }
@@ -585,6 +602,28 @@ export function generateInteractionPlan(
   // These suffix steps consume no RNG, preserving the random prefix for every recorded seed.
   const faultTable = live.values().next().value;
   if (faultTable === undefined) throw new Error("Plan generation ended without a live table");
+  // With two or more connections, one transaction holds the writer turn while another
+  // connection's write queues behind it; the keys sit past every fault probe's.
+  if (connections >= 2) {
+    interactions.push({
+      kind: "queuedWrite",
+      connection: 0,
+      waiter: 1,
+      table: faultTable.name,
+      rows: [faultProbeRow(faultTable, keySpace + 64 + 1)],
+      mutation: { kind: "insert", row: faultProbeRow(faultTable, keySpace + 64 + 2) },
+      outcome: "commit",
+    });
+    interactions.push({
+      kind: "queuedWrite",
+      connection: 1,
+      waiter: 0,
+      table: faultTable.name,
+      rows: [faultProbeRow(faultTable, keySpace + 64 + 3)],
+      mutation: { kind: "upsert", row: faultProbeRow(faultTable, keySpace + 64 + 2) },
+      outcome: "rollback",
+    });
+  }
   for (const [index, point] of [...new Set(faultPoints)].entries()) {
     interactions.push({
       kind: "fault",
@@ -842,6 +881,23 @@ function validateInteraction(value: unknown, connections: number, index: number)
       checkTableName();
       if (typeof value.expectMissing !== "boolean")
         throw new TypeError(`${where} expectMissing must be boolean`);
+      return;
+    }
+    case "queuedWrite": {
+      checkConnection("connection");
+      checkConnection("waiter");
+      checkTableName();
+      if (value.connection === value.waiter) throw new TypeError(`${where} waiter is the owner`);
+      if (!Array.isArray(value.rows) || value.rows.length === 0 || value.rows.length > 100) {
+        throw new TypeError(`${where} rows are invalid`);
+      }
+      value.rows.forEach((row: unknown) => {
+        validateRow(row, where);
+      });
+      validateKeyedMutation(value.mutation, where);
+      if (value.outcome !== "commit" && value.outcome !== "rollback") {
+        throw new TypeError(`${where} outcome is invalid`);
+      }
       return;
     }
     case "transaction": {
@@ -1506,6 +1562,8 @@ class PlanRunner {
         return this.#dropTable(interaction);
       case "transaction":
         return this.#transaction(interaction);
+      case "queuedWrite":
+        return this.#queuedWrite(interaction);
       case "concurrent":
         return this.#concurrent(interaction);
       case "fault":
@@ -1788,6 +1846,87 @@ class PlanRunner {
         `after a refused transaction (${error.reason})`,
       );
     }
+  }
+
+  /**
+   * writer-turns: a transaction holds the database's one writer turn, so a keyed write issued
+   * on another connection meanwhile stays pending — it neither lands under the transaction nor
+   * loses a commit race — and completes right after COMMIT or ROLLBACK. Reads on the waiting
+   * connection do not wait. Either end leaves the queued write's own outcome exact.
+   */
+  async #queuedWrite(interaction: Extract<Interaction, { kind: "queuedWrite" }>): Promise<void> {
+    const columns = this.#model.columns(interaction.table);
+    const committed = this.#model.clone();
+    try {
+      await this.#execute(interaction.connection, "BEGIN");
+    } catch (error) {
+      this.#refuseTransaction("BEGIN", error);
+    }
+    let poisoned = false;
+    const accepted = this.#model.insert(interaction.table, interaction.rows);
+    const rendered = renderInsert(interaction.table, columns, interaction.rows, true);
+    const staged = await this.#attempt(interaction.connection, rendered.sql, rendered.params);
+    if (accepted && staged.error !== undefined) {
+      this.#refuseTransaction("INSERT inside a transaction", staged.error);
+    }
+    if (!accepted) {
+      if (staged.error === undefined) this.#fail("a duplicate primary key was accepted");
+      this.#expectedFailures++;
+      poisoned = true;
+    }
+    const sql = renderKeyed(interaction.table, columns, interaction.mutation);
+    const queued = this.#attempt(interaction.waiter, sql);
+    // The waiter's write must still be pending while the transaction holds the turn: give it
+    // real time to land wrongly before checking, then read through the waiter (reads never
+    // wait) to prove the transaction's rows are invisible there.
+    const settledEarly = await Promise.race([
+      queued.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+    if (settledEarly) {
+      this.#fail(
+        "writer-turns: a write on another connection landed while a transaction held the turn",
+      );
+    }
+    await this.#expectRows(
+      interaction.waiter,
+      interaction.table,
+      committed.sorted(interaction.table),
+      "on the waiting connection while a transaction holds the turn",
+    );
+    const end = poisoned ? "ROLLBACK" : interaction.outcome === "commit" ? "COMMIT" : "ROLLBACK";
+    try {
+      await this.#execute(interaction.connection, end);
+    } catch (error) {
+      this.#refuseTransaction(end, error);
+    }
+    if (end === "ROLLBACK") this.#model = committed;
+    else this.#acceptedWrites++;
+    const outcome = await queued;
+    const wouldAccept = this.#model.clone().applyKeyed(interaction.table, interaction.mutation);
+    if (outcome.error === undefined) {
+      if (!wouldAccept) this.#fail("writer-turns: a queued write of an existing key was accepted");
+      this.#model.applyKeyed(interaction.table, interaction.mutation);
+      this.#acceptedWrites++;
+    } else if (isUniqueViolation(outcome.error)) {
+      if (wouldAccept) {
+        this.#fail(
+          `writer-turns: a queued write was refused as a duplicate: ${describeError(outcome.error)}`,
+        );
+      }
+      this.#expectedFailures++;
+    } else {
+      this.#fail(
+        `writer-turns: a queued write failed after the transaction ended: ${describeError(outcome.error)}`,
+        outcome.error,
+      );
+    }
+    await this.#expectRows(
+      interaction.connection,
+      interaction.table,
+      this.#model.sorted(interaction.table),
+      `after ${end} and the queued write`,
+    );
   }
 
   /**

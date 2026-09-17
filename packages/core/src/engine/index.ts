@@ -5,6 +5,11 @@
 export * from "./catalog.js";
 export * from "./database.js";
 export * from "./errors.js";
+export type {
+  WriteAdmissionStall,
+  WriteCoordinationScope,
+  WriterKind,
+} from "./write-coordinator.js";
 export { forgetStoreChoice } from "./auto-store.js";
 export { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
 export {

@@ -152,6 +152,15 @@ their exact canonical wire bytes; charge an unpruned manifest for the exact byte
 24-byte UTC tombstone too, so pruning cannot deadlock at the byte ceiling. Treat a negative,
 overflowing, over-limit, or checksum-invalid durable ledger as corruption, not as an empty ledger.
 
+**A stable identity is what lets writers take turns.** `liveQueryChannelName` names the storage
+underneath the adapter object — the shipped adapters use `minnowdb-live:<kind>:<database>` — and
+the engine keys its writer queue and the cross-tab Web Lock on it. Give a durable adapter one,
+and two engines over the same storage take turns whether they share the object, the context, or
+only the browser profile. Without it, only engines sharing the same store object take turns:
+`db.writeCoordination` reports `instance`, and a second connection in another context is an
+uncoordinated writer that storage compare-and-swap alone keeps out. See
+[writer turns](/docs/engine/transactions#conflicts).
+
 **Control records have fixed structural bounds too.** Validate them before I/O with the exported
 helpers and constants: database names stop at 256 characters; storage IDs and catalog names at
 1,024; and posting terms at 65,536. Tables stop at 1,024 columns, indexes, or

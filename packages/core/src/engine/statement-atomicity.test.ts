@@ -9,6 +9,7 @@ import {
   type WriteTransactionInput,
 } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 import { compileStatement } from "./query.js";
 
 class CommitRaceStore extends MemoryBlockStore {
@@ -50,11 +51,16 @@ class CtasObservingStore extends MemoryBlockStore {
   }
 }
 
+/**
+ * Two engines over one store stand in for two tabs, one of which commits in the middle of the
+ * other's statement. Coordinated engines never overlap, so the store is marked uncoordinated:
+ * what these tests prove is the restart path a writer that does not take turns still needs.
+ */
 function database(store: MemoryBlockStore): MinnowDatabase {
+  markStoreUncoordinatedForTests(store);
   return new MinnowDatabase(store, {
     autoCollect: false,
     autoCompact: false,
-    coordinateWrites: false,
   });
 }
 

@@ -29,6 +29,7 @@ import {
   type ReadTableOptions,
   type UpsertOptions,
 } from "./database.js";
+import { internalsOf } from "./internals.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
 import type { CompiledQuery, QueryRow, QueryValue } from "./query.js";
 import { encodeQueryResult, encodeQueryRows, type EncodedQueryResult } from "./result-wire.js";
@@ -462,6 +463,8 @@ class DatabaseRpcServer {
   readonly #settlingWritePromises = new Set<Promise<unknown>>();
   readonly #requestAborts = new Map<string, AbortController>();
   #disposed = false;
+  /** Aborted by disposal, so scopes still waiting for their writer turn stop waiting. */
+  readonly #connectionAbort = new AbortController();
   #inFlightRpcCount = 0;
   #inFlightRpcDrain: Promise<void> | undefined;
   #resolveInFlightRpcDrain: (() => void) | undefined;
@@ -534,7 +537,7 @@ class DatabaseRpcServer {
     );
     unrefTimer(keepalive);
     const abort =
-      request.method === "query" || request.method === "execute"
+      request.method === "query" || request.method === "execute" || request.method === "writeOpen"
         ? new AbortController()
         : undefined;
     if (abort !== undefined) this.#requestAborts.set(request.requestId, abort);
@@ -692,7 +695,9 @@ class DatabaseRpcServer {
         };
       }
       case "writeOpen":
-        return this.#trackOpeningHandle(this.#openWriteHandle());
+        return this.#trackOpeningHandle(this.#openWriteHandle(context));
+      case "writeCoordination":
+        return this.database.writeCoordination;
       case "snapshotOpen":
         return this.#trackOpeningHandle(this.#openSnapshotHandle());
       case "exportSnapshotOpen": {
@@ -793,10 +798,21 @@ class DatabaseRpcServer {
     }
   }
 
-  async #openWriteHandle(): Promise<{ handleId: string }> {
+  async #openWriteHandle(context: RpcCallContext): Promise<{ handleId: string }> {
     // Same deferred-callback shape as snapshotOpen: the scoped write() stays pending until the
     // client commits or aborts, so its staged transaction spans the RPC session.
     const handleId = this.#claimGeneratedHandleId();
+    // A scope waiting for its turn as the writer — behind another tab's callback, say — must
+    // not hold up disposal or a client that cancelled the open: either aborts the wait
+    // without touching the turn it never got.
+    const cancel = new AbortController();
+    const forward = (signal: AbortSignal) => (): void => cancel.abort(signal.reason);
+    const fromRequest = forward(context.signal);
+    const fromConnection = forward(this.#connectionAbort.signal);
+    if (this.#connectionAbort.signal.aborted) fromConnection();
+    else if (context.signal.aborted) fromRequest();
+    context.signal.addEventListener("abort", fromRequest, { once: true });
+    this.#connectionAbort.signal.addEventListener("abort", fromConnection, { once: true });
     let sessionResolve!: (session: WriteSession) => void;
     let sessionReject!: (error: unknown) => void;
     const sessionReady = new Promise<WriteSession>((resolveSession, rejectSession) => {
@@ -805,16 +821,26 @@ class DatabaseRpcServer {
     });
     let finish: ((commit: boolean) => void) | undefined;
     const done = this.database
-      .write(async (session) => {
-        sessionResolve(session);
-        await new Promise<void>((resolveCommit, rejectAbort) => {
-          finish = (commit) => {
-            if (commit) resolveCommit();
-            else rejectAbort(new WriteScopeAbortedError());
-          };
-        });
-      })
-      .then((outcome) => ({ version: outcome.version }));
+      .write(
+        async (session) => {
+          // Admitted: from here the scope owns its cancellation through commit and abort.
+          context.signal.removeEventListener("abort", fromRequest);
+          this.#connectionAbort.signal.removeEventListener("abort", fromConnection);
+          sessionResolve(session);
+          await new Promise<void>((resolveCommit, rejectAbort) => {
+            finish = (commit) => {
+              if (commit) resolveCommit();
+              else rejectAbort(new WriteScopeAbortedError());
+            };
+          });
+        },
+        { signal: cancel.signal },
+      )
+      .then((outcome) => ({ version: outcome.version }))
+      .finally(() => {
+        context.signal.removeEventListener("abort", fromRequest);
+        this.#connectionAbort.signal.removeEventListener("abort", fromConnection);
+      });
     // beginDeferred can fail before the callback starts (for example at the durable reader-lease
     // ceiling). Reject the open rendezvous too and observe `done` immediately.
     void done.catch((error: unknown) => sessionReject(error));
@@ -1350,6 +1376,13 @@ class DatabaseRpcServer {
 
   async #dispose(): Promise<void> {
     this.#disposed = true;
+    this.#connectionAbort.abort(new Error("Database connection was disposed"));
+    // A root call — a batch write, a statement, a migration — queued behind this engine's own
+    // writers is still answered before the database closes; one that would have to wait for
+    // another tab's lock is refused instead, without ever having taken the turn.
+    internalsOf(this.database).cancelCrossContextWaits(
+      new Error("Database connection was disposed"),
+    );
     this.#reservedHandleIds.clear();
     const handles = [...this.#handles.entries()];
     this.#handles.clear();

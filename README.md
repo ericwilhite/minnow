@@ -33,6 +33,11 @@ and benchmarks that run in your browser.
   OPFS performs it. Every query reads one stable snapshot, even when another tab commits at the
   same time, and origin-persistence policy is explicit for applications that cannot accept
   automatic quota eviction.
+- **One writer at a time, across tabs.** Write scopes, batch writes, SQL transactions, and
+  schema changes from any number of tabs and workers take turns through Web Locks before they
+  read anything, so concurrent writes land in a serial order without an application-side queue
+  or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
+  bypassed.
 - **Plain JavaScript.** The engine with its larger durable adapter is about 350 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through

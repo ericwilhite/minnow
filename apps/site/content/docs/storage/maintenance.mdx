@@ -23,8 +23,9 @@ keeps going while the table is still due. A step yields to the event loop or to 
 next commit, whichever comes first, so a loop that awaits one statement after another without
 pausing still lets the fold advance. A fold reads and decodes its source blocks in groups sized
 by its memory budget, so a step costs the loop a turn per group rather than a turn per block. A
-finished fold publishes on the write path: the next statement lands it before its own work,
-rather than the fold racing every write for the manifest.
+finished fold publishes as a writer: it takes a turn of its own in the database's writer
+queue, and a statement that gets its turn first lands the fold inside that turn before its own
+work, so the fold never races a write for the manifest.
 
 Setting `autoCompact: false` transfers that responsibility to the caller. Small-write segments
 then accumulate, so scans become progressively slower and writes eventually meet the fixed

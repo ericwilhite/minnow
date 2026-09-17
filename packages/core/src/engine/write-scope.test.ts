@@ -3,6 +3,7 @@ import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../stora
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
+import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 
 /**
  * write(): every mutation in the scope publishes as one atomic commit — all of it or none
@@ -477,7 +478,10 @@ describe("atomic write scopes", () => {
   });
 
   it("surfaces concurrent commits as explicit conflicts; a retry succeeds", async () => {
+    // The interloper stands in for a writer that does not take turns (an older build): with
+    // coordinated engines it would wait for the scope instead of landing under it.
     const store = new MemoryBlockStore();
+    markStoreUncoordinatedForTests(store);
     const database = await bank(store);
     const other = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
     await expect(
@@ -510,7 +514,10 @@ describe("atomic write scopes", () => {
    */
   for (const implementation of implementations) {
     it(`${implementation.name} commits a scope that a compaction lands under`, async () => {
+      // Maintenance that publishes without a turn (another tab on an older build) lands under
+      // the scope; the scope rebases over the neutral manifest and commits.
       const store = await implementation.create();
+      markStoreUncoordinatedForTests(store);
       const database = await bank(store);
       // Enough separate segments that compaction has real work to publish.
       for (let id = 100; id < 112; id += 1) {
@@ -543,6 +550,7 @@ describe("atomic write scopes", () => {
 
     it(`${implementation.name} pins an idle one-stage scope through compaction and collection`, async () => {
       const store = await implementation.create();
+      markStoreUncoordinatedForTests(store);
       const database = await bank(store);
       for (let id = 100; id < 112; id += 1) {
         await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
@@ -595,6 +603,7 @@ describe("atomic write scopes", () => {
 
     it(`${implementation.name} pins an idle one-stage SQL transaction through compaction and collection`, async () => {
       const store = await implementation.create();
+      markStoreUncoordinatedForTests(store);
       const database = await bank(store);
       for (let id = 100; id < 112; id += 1) {
         await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
@@ -643,6 +652,7 @@ describe("atomic write scopes", () => {
    */
   it("still loses to a concurrent write that a compaction is mixed in with", async () => {
     const store = new MemoryBlockStore();
+    markStoreUncoordinatedForTests(store);
     const database = await bank(store);
     for (let id = 100; id < 112; id += 1) {
       await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
@@ -747,6 +757,7 @@ describe("atomic write scopes", () => {
 
   it("pins scope reads to the pre-scope snapshot", async () => {
     const store = new MemoryBlockStore();
+    markStoreUncoordinatedForTests(store);
     const database = await bank(store);
     const other = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
     let sawInterloper: number | undefined;

@@ -8,6 +8,7 @@
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore, MemoryBlockStore, OpfsBlockStore } from "../storage/index.js";
+import { markStoreUncoordinatedForTests } from "../engine/write-coordinator.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
 import {
   createDatabaseDriver,
@@ -70,6 +71,7 @@ describe("interaction plans", () => {
       "createIndex",
       "dropTable",
       "transaction",
+      "queuedWrite",
       "concurrent",
       "fault",
       "reopen",
@@ -264,6 +266,8 @@ describe("a refused SQL transaction", () => {
 
   it("counts a lost commit race and keeps going", async () => {
     const store = new MemoryBlockStore();
+    // The interloper on connection 0 must land under the transaction: an uncoordinated writer.
+    markStoreUncoordinatedForTests(store);
     try {
       const driver = createDatabaseDriver(store);
       const connections: SimulatedConnection[] = [];
@@ -809,6 +813,9 @@ describe.each(stores)("interaction simulator over $name", ({ source }) => {
       expect(result.checkpoints).toBeGreaterThan(0);
       expect(result.acceptedWrites).toBeGreaterThan(20);
       expect(result.expectedFailures).toBeGreaterThan(0);
+      // Every connection takes its turn as the database's writer, so concurrent rounds and
+      // transactions across connections never lose a commit race.
+      expect(result.rejectedConflicts).toBe(0);
       // The default plan ends with an effective insert for each of the four storage fault points;
       // the in-process driver intentionally skips only the separate browser crash point.
       expect(result.faultsInjected).toBeGreaterThanOrEqual(4);

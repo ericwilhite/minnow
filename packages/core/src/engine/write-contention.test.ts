@@ -1,4 +1,7 @@
-/** Coordinated autocommit admits all writers; the opt-out still exercises bounded CAS retries. */
+/**
+ * Coordinated writers all land; writers that do not take turns (the rogue-writer seam standing
+ * in for an older build) still exercise the bounded compare-and-swap retries underneath.
+ */
 import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import {
@@ -9,6 +12,7 @@ import {
 } from "../storage/index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
+import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 
 const RETRIES = 8;
 
@@ -20,12 +24,10 @@ const RETRIES = 8;
 async function contend(
   store: BlockStore,
   writers: number,
-  options: { separateInstances?: boolean; coordinateWrites?: boolean } = {},
+  options: { separateInstances?: boolean; coordinated?: boolean } = {},
 ): Promise<{ accepted: number; persisted: number; reasons: Set<string> }> {
-  const database = new MinnowDatabase(store, {
-    maxCommitRetries: RETRIES,
-    coordinateWrites: options.coordinateWrites ?? true,
-  });
+  if (options.coordinated === false) markStoreUncoordinatedForTests(store);
+  const database = new MinnowDatabase(store, { maxCommitRetries: RETRIES });
   await database.createTable({
     name: "items",
     uniqueKey: "id",
@@ -40,10 +42,7 @@ async function contend(
     Array.from({ length: writers }, (_, index) => {
       const writer =
         options.separateInstances === true
-          ? new MinnowDatabase(store, {
-              maxCommitRetries: RETRIES,
-              coordinateWrites: options.coordinateWrites ?? true,
-            })
+          ? new MinnowDatabase(store, { maxCommitRetries: RETRIES })
           : database;
       return writer.insertBatch("items", [{ id: 1_000 + index, value: index }]).then(
         () => 1,
@@ -89,7 +88,7 @@ describe("concurrent writes to one table", () => {
 
   it.each([true, false])(
     "handles separate IndexedDB instances with coordination=%s",
-    async (coordinateWrites) => {
+    async (coordinated) => {
       // The fallback remains an explicit conflict, never partial or duplicated data.
       for (const writers of [16, 32, 64]) {
         const store = await IndexedDbBlockStore.open({
@@ -98,17 +97,13 @@ describe("concurrent writes to one table", () => {
         });
         const { accepted, persisted, reasons } = await contend(store, writers, {
           separateInstances: true,
-          coordinateWrites,
+          coordinated,
         });
-        expect(accepted, `${String(writers)} writers`).toBe(
-          coordinateWrites ? writers : RETRIES + 1,
-        );
-        expect(persisted, `${String(writers)} writers`).toBe(
-          coordinateWrites ? writers : RETRIES + 1,
-        );
+        expect(accepted, `${String(writers)} writers`).toBe(coordinated ? writers : RETRIES + 1);
+        expect(persisted, `${String(writers)} writers`).toBe(coordinated ? writers : RETRIES + 1);
         // A conflict, not a corruption or a quota failure -- the losers must be losing for the
         // reason this test claims they are.
-        if (coordinateWrites) expect(reasons.size).toBe(0);
+        if (coordinated) expect(reasons.size).toBe(0);
         else expect([...reasons].join(" | ")).toMatch(/Manifest changed/);
       }
     },

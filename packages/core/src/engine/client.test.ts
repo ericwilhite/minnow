@@ -979,35 +979,50 @@ describe("MinnowDatabaseClient", () => {
     });
   }
 
-  it("counts opening, active, and settling write handles against one connection cap", async () => {
+  it("keeps a settling write handle's turn until its outcome is known", async () => {
+    // A scope's abort holds the database's writer turn until its lease removal has settled, so
+    // the next open queues behind it rather than overlapping a rollback still in storage.
     const store = new PausedWorkerRemoveLeaseStore();
     const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
     const raw = exposeRaw(database);
-    const handleIds: string[] = [];
-    for (let index = 0; index < MAX_WORKER_HANDLES_PER_CONNECTION; index += 1) {
-      const opened = await raw.call(null, "writeOpen");
-      if (opened.kind !== "rpc-result") throw new Error("Expected write handle");
-      handleIds.push((opened.result as { handleId: string }).handleId);
-    }
+    const opened = await raw.call(null, "writeOpen");
+    if (opened.kind !== "rpc-result") throw new Error("Expected write handle");
+    const settlingId = (opened.result as { handleId: string }).handleId;
     store.pauseRemovals = true;
-    const aborts = handleIds.slice(0, -1).map((handleId) => raw.call(handleId, "abort"));
-    await waitForLeaseRemovals(store, MAX_WORKER_HANDLES_PER_CONNECTION - 1);
+    const settling = raw.call(settlingId, "abort");
+    await waitForLeaseRemovals(store, 1);
+    const queued = raw.call(null, "writeOpen");
+    await expectWorkerRpcPending(queued);
+    store.resumeRemovals();
+    expect((await settling).kind).toBe("rpc-result");
+    const admitted = await queued;
+    expect(admitted.kind).toBe("rpc-result");
+    if (admitted.kind !== "rpc-result") throw new Error("Expected queued write handle");
+    const handleId = (admitted.result as { handleId: string }).handleId;
+    expect((await raw.call(handleId, "abort")).kind).toBe("rpc-result");
+    expect((await raw.call(null, "dispose")).kind).toBe("rpc-result");
+    await expectNoActiveWorkerOwners(store);
+  });
+
+  it("counts queued write opens against the handle cap and drains them on disposal", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+    const raw = exposeRaw(database);
+    const first = await raw.call(null, "writeOpen");
+    expect(first.kind).toBe("rpc-result");
+    const queued = Array.from({ length: MAX_WORKER_HANDLES_PER_CONNECTION - 1 }, () =>
+      raw.call(null, "writeOpen"),
+    );
     const refused = await raw.call(null, "writeOpen");
     expect(refused.kind).toBe("rpc-failure");
     if (refused.kind === "rpc-failure") {
       expect(refused.error.message).toContain("open handles (active or settling)");
     }
-
-    store.resumeRemovals();
-    expect((await Promise.all(aborts)).every((result) => result.kind === "rpc-result")).toBe(true);
-    const recovered = await raw.call(null, "writeOpen");
-    expect(recovered.kind).toBe("rpc-result");
-    if (recovered.kind !== "rpc-result") throw new Error("Expected recovered capacity");
-    const recoveredId = (recovered.result as { handleId: string }).handleId;
-    expect((await raw.call(recoveredId, "abort")).kind).toBe("rpc-result");
-    expect((await raw.call(handleIds.at(-1) ?? "", "abort")).kind).toBe("rpc-result");
+    expect(await store.listLeases()).toHaveLength(1);
     expect((await raw.call(null, "dispose")).kind).toBe("rpc-result");
+    expect((await Promise.all(queued)).every((result) => result.kind === "rpc-failure")).toBe(true);
     await expectNoActiveWorkerOwners(store);
+    expect(await store.listLeases()).toEqual([]);
   });
 
   for (const pause of ["before-apply", "after-apply"] as const) {

@@ -9,6 +9,7 @@ import {
   type WriteTransactionInput,
 } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 import { UniqueConstraintError } from "./errors.js";
 import { compileStatement } from "./query.js";
 import {
@@ -562,7 +563,10 @@ describe("secondary-index SQL", () => {
   }
 
   it("restarts a writer that began before a UNIQUE index became ready", async () => {
+    // The builder publishes readiness without a turn, as another tab on an older build would;
+    // a coordinated builder waits for the writer instead. The writer's restart is what is tested.
     const store = new MemoryBlockStore();
+    markStoreUncoordinatedForTests(store);
     const first = new MinnowDatabase(store);
     const second = new MinnowDatabase(store);
     await first.execute("CREATE TABLE stale_unique (id INTEGER PRIMARY KEY, code VARCHAR)");

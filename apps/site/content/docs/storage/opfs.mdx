@@ -313,14 +313,15 @@ enforced.
 
 Several tabs may open the same database at once; every operation from every tab lands in one
 ordered log, so readers never see half of anything. Reads wait for recovery after a refused WAL
-append instead of observing its tentative state. Autocommit writers coordinate admission through
-Web Locks; explicit scopes and uncoordinated writers retain optimistic conflicts, as on IndexedDB.
-That admission lock is an optimization, never the correctness: a writer that has observed no
-change of holder for ten seconds (a tab the browser paused with the lock in hand, for example) goes
-ahead without it, reports the wait through `onBackgroundError`, and resolves any conflict
-through the same compare-and-swap retry as an uncoordinated writer. A change of holder restarts
-the admission wait, allowing a healthy queue to drain; worker RPC deadlines still cap the total
-request time. The moving parts differ from
+append instead of observing its tentative state. The leader orders individual operations; a
+transaction's whole read, stage, and commit sequence is ordered one level up, where every writer
+in every tab takes its turn through the Web Lock `minnowdb-write:minnowdb-live:opfs:<name>`
+before reading the state it depends on (see
+[writer turns](/docs/engine/transactions#conflicts)), so tabs never conflict with each other and
+compare-and-swap in the log stays a defensive check. A tab paused by the browser inside its turn
+holds the others until it resumes or is discarded; the wait is reported through
+`onBackgroundError` after ten seconds and never bypassed, and closing a waiting engine or client
+cancels its wait at once. The moving parts differ from
 the IndexedDB adapter in one honest way: multi-tab _responsiveness_ uses `BroadcastChannel`
 (universal since 2022), while correctness rests entirely on the storage lock and the checksummed
 log. A browser with no channel at all would still be safe — one tab at a time would hold the

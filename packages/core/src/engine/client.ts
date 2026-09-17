@@ -103,12 +103,15 @@ import type {
   UpsertOptions,
   VisibleSegmentPage,
   VisibleSegmentPageOptions,
+  WriteOptions,
 } from "./database.js";
+import type { WriteCoordinationScope } from "./write-coordinator.js";
 import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   MaintenanceBacklogError,
+  WriteAdmissionStalledError,
   DatabaseReadBacklogError,
   TransactionExpiredError,
   DatabaseWorkerTimeoutError,
@@ -338,6 +341,7 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     CompactionWriteAmplificationError,
     CompactionJobCancelledError,
     MaintenanceBacklogError,
+    WriteAdmissionStalledError,
     DatabaseReadBacklogError,
     TransactionExpiredError,
     DatabaseWorkerTimeoutError,
@@ -946,11 +950,20 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
    * `MinnowDatabase.write()`: every staged mutation crosses the channel into the shared
    * transaction and publishes as one atomic commit when the callback returns; an error
    * aborts the scope with nothing published.
+   *
+   * The scope takes its turn as the database's one writer before its callback runs, in order
+   * with every other write in every tab. Use the supplied session for writes inside the
+   * callback: another write on this client, or on any other connection to the same database,
+   * waits for this scope to finish, so awaiting one from inside the callback waits on itself.
+   * `signal` cancels the wait for a turn, or aborts the callback once inside.
    */
   async write<T>(
     action: (session: ClientWriteSession<TSchema>) => Promise<T>,
+    options: WriteOptions = {},
   ): Promise<{ result: T; version: number | null }> {
-    const opened = (await this.#call("writeOpen", [])) as { handleId: string };
+    const opened = (await this.#call("writeOpen", [], { signal: options.signal })) as {
+      handleId: string;
+    };
     let tail: Promise<unknown> = Promise.resolve();
     let accepting = true;
     let pending = 0;
@@ -1150,6 +1163,11 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
 
   async maintenanceStatus(): Promise<MaintenanceStatus> {
     return (await this.#call("maintenanceStatus", [])) as MaintenanceStatus;
+  }
+
+  /** How far the worker database's writer coordination reaches; see `MinnowDatabase`. */
+  async writeCoordination(): Promise<WriteCoordinationScope> {
+    return (await this.#call("writeCoordination", [])) as WriteCoordinationScope;
   }
 
   async checkIntegrity(

@@ -120,6 +120,14 @@ machines: https://minnowdb.com/llms.txt
   `skippedRowCount` for rejected conflicts. The same `conflictWhere` option works on
   `tx.upsertBatch` inside a `db.write()` scope, so a guarded upsert can compose atomically with
   other staged mutations in one commit.
+- A database has one writer at a time, across engines, workers, and tabs: every `write()`,
+  batch write, SQL mutation, `BEGIN` transaction, migration, and DDL statement takes its turn
+  before reading anything and holds it until its outcome is known. Issue concurrent writes
+  freely from any number of tabs; do not add an application queue, a serializer, or a
+  contention-retry loop, and do not pass `coordinateWrites` (deprecated, ignored). Use the
+  supplied `tx` for writes inside a callback; another write on the same database awaited from
+  inside the callback waits on the callback itself and is reported through `onBackgroundError`
+  after ten seconds. Keep network requests outside scopes. Callbacks are never replayed.
 - On teardown, `await db.close()` before `store.close()` for a direct engine. For a worker,
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
   This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
@@ -134,9 +142,9 @@ machines: https://minnowdb.com/llms.txt
 - An idle SQL transaction rolls back and rejects subsequent statements with
   `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. The 30-second default counts from
   the connection's last statement, and no other connection's crash, reopen, or maintenance ends
-  your transaction. A `COMMIT` that loses the race to another connection's data commit fails with
-  `WriteConflictError`, publishes nothing, and leaves nothing to acknowledge: rerun the whole
-  transaction. Keep transaction callbacks
+  your transaction. `WriteConflictError` only comes from a writer that did not take a turn (an
+  older build in another tab); a `COMMIT` that loses that way publishes nothing and leaves
+  nothing to acknowledge: rerun the whole transaction. Keep transaction callbacks
   short; readers use renewable leases, and a scope suspended past an expired lease fails explicitly.
 - For anything interactive, run the engine in a worker. Put
   `import "@minnowdb/core/worker"` in a local `db-worker.ts`, then pass

@@ -405,3 +405,29 @@ export function classifyError(error: unknown): ErrorClassification {
   }
   return { kind: "other", mayHavePublished: false, retry: "never", connectionUsable: true };
 }
+
+/**
+ * A writer has waited for its turn without the holder changing. Reported through
+ * `onBackgroundError` with the context "write admission"; the waiter keeps waiting. The usual
+ * cause in one context is a `write()` callback awaiting another write on the same database,
+ * which can only proceed once the callback returns. Across tabs it is a tab holding a turn
+ * inside a long callback, or one the browser paused mid-write.
+ */
+export class WriteAdmissionStalledError extends Error {
+  override readonly name = "WriteAdmissionStalledError";
+
+  constructor(
+    readonly waitedMs: number,
+    readonly holder: "this-context" | "other-context",
+    readonly holderKind?: string,
+  ) {
+    super(
+      holder === "this-context"
+        ? `A write has waited ${String(waitedMs)}ms for a ${holderKind ?? "writer"} on this ` +
+            "database to finish; a write() callback that awaits another write on the same " +
+            "database waits on itself"
+        : `A write has waited ${String(waitedMs)}ms for another tab to finish its write; it ` +
+            "proceeds when that tab lets go or the browser releases its lock",
+    );
+  }
+}

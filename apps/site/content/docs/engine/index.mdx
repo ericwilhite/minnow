@@ -142,8 +142,8 @@ strict committed write before acknowledging a sale.
 | `targetBlockBytes`            | 2 MiB    | Target uncompressed bytes in each ordinary write block. Every column uses the same row boundaries. One value may exceed the target, up to the format's 64 MiB hard limit.                                         |
 | `bufferPoolBytes`             | 64 MiB   | Space kept for decoded blocks and reusable query work. `0` disables the cache. Cached data is tied to the exact block or table version, so an old entry is never used for new data.                               |
 | `ftsAutoIndexRows`            | `4096`   | Row count above which `MATCH` can schedule a background index build for a column that does not have one yet.                                                                                                      |
-| `coordinateWrites`            | `true`   | Coordinate autocommit writers locally and across tabs with Web Locks when available. Disable only for custom scheduling or optimistic contention.                                                                 |
-| `maxCommitRetries`            | `8`      | How many times a write retries after another tab publishes first.                                                                                                                                                 |
+| `coordinateWrites`            | —        | Deprecated and ignored since 0.11.0; removed in 0.12.0. Every writer takes a turn (see [writer turns](/docs/engine/transactions#conflicts)); there is no optimistic mode to select. Delete the option.            |
+| `maxCommitRetries`            | `8`      | How many times a plain write restarts after a writer that did not take a turn publishes first. Writers that take turns never need one.                                                                            |
 | `spillOwnerLeaseMs`           | `60000`  | How long temporary query files stay claimed between renewals while a query is running.                                                                                                                            |
 | `transactionOwnerLeaseMs`     | `30000`  | Durable active-writer deadline, renewed while a live write scope waits or works. Expired crashed writers are atomically aborted and reclaimed by collection.                                                      |
 | `transactionIdleTimeoutMs`    | `30000`  | How long an untouched `BEGIN` transaction may remain open before Minnow rolls it back. Later statements fail with `TransactionExpiredError` until `ROLLBACK` or a new `BEGIN`.                                    |
@@ -154,7 +154,7 @@ strict committed write before acknowledging a sale.
 | `compaction`                  | `{}`     | Defaults for every compaction job, including background work. `partitionRows` defaults to 16,384. See [partitioned folds](/docs/storage/maintenance#partitioned-folds).                                           |
 
 The stock worker accepts the cloneable options in its startup message, including `compression`,
-block sizing, `coordinateWrites`, retry and buffer limits, `executionMemoryBudgetBytes`, `transactionOwnerLeaseMs`,
+block sizing, retry and buffer limits, `executionMemoryBudgetBytes`, `transactionOwnerLeaseMs`,
 `transactionIdleTimeoutMs`, `autoCompact`, `autoCollect`, and `autoCollectDebtLimitCommits`.
 Function-valued seams remain worker-side. A
 [custom worker entry](/docs/engine/workers#custom-worker-entries) can construct
@@ -170,8 +170,10 @@ import { WriteConflictError } from "@minnowdb/core/storage/contracts";
 ```
 
 `SqlCompileError` carries the `offset` and `length` of the offending span, which is what the
-devtools editor underlines. `WriteConflictError` means a writer in another tab, or a write scope,
-committed first; the engine retries these itself up to `maxCommitRetries` before surfacing one.
+devtools editor underlines. `WriteConflictError` means a writer that did not take a turn — an
+older build in another tab, say — committed first; writers that take turns never see it. Plain
+writes restart up to `maxCommitRetries`; an explicit scope fails without replaying its callback.
+See [writer turns](/docs/engine/transactions#conflicts).
 `UnknownTableError` carries `tableName`, including across the worker boundary, so schema self-heal
 can use `instanceof` instead of matching error text.
 

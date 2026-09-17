@@ -1,36 +1,106 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/memory.js";
-import { _resetWriteAdmissionForTests, coordinateWrite } from "./write-coordinator.js";
+import {
+  admitWriter,
+  markStoreUncoordinatedForTests,
+  writeAdmissionState,
+  writeCoordinationScope,
+  type WriteAdmissionStall,
+} from "./write-coordinator.js";
 
-/** A LockManager whose grants the test controls; `never` refuses forever, like a paused holder. */
-function fakeLocks(mode: "grant" | "never"): { locks: LockManager; requests: number } {
-  const state = { requests: 0 };
+interface Grant {
+  name: string;
+  mode: "exclusive" | "shared";
+}
+
+/**
+ * A lock manager the test controls. `held` names the client currently holding the lock (the
+ * engine's own grants are recorded as "self"); requests wait until the holder lets go.
+ */
+function fakeLocks(): {
+  locks: LockManager;
+  requests: () => number;
+  hold: (clientId: string) => () => void;
+} {
+  let holder: string | undefined;
+  let requests = 0;
+  const waiters: Array<() => void> = [];
+  const wake = (): void => {
+    const next = waiters.shift();
+    next?.();
+  };
   const request: LockManager["request"] = async (
-    _name: string,
+    name: string,
     optionsOrCallback: LockOptions | LockGrantedCallback<unknown>,
     maybeCallback?: LockGrantedCallback<unknown>,
   ) => {
-    state.requests += 1;
+    requests += 1;
     const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
     const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
-    if (mode === "grant") return callback?.({ name: "lock", mode: "exclusive" });
-    return new Promise((_resolve, reject) => {
-      options.signal?.addEventListener("abort", () => {
-        const reason: unknown = options.signal?.reason;
-        reject(reason instanceof Error ? reason : new Error("aborted", { cause: reason }));
+    if (options.ifAvailable === true && holder !== undefined) return callback?.(null);
+    while (holder !== undefined) {
+      if (options.signal?.aborted === true) {
+        const reason: unknown = options.signal.reason;
+        throw reason instanceof Error ? reason : new Error("aborted", { cause: reason });
+      }
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          const index = waiters.indexOf(resolve);
+          if (index !== -1) waiters.splice(index, 1);
+          resolve();
+        };
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        waiters.push(() => {
+          options.signal?.removeEventListener("abort", onAbort);
+          resolve();
+        });
       });
-    });
+    }
+    holder = "self";
+    try {
+      return await callback?.({ name, mode: "exclusive" } satisfies Grant);
+    } finally {
+      holder = undefined;
+      wake();
+    }
   };
+  const query: LockManager["query"] = async () => ({
+    held:
+      holder === undefined ? [] : [{ name: "minnowdb-write:minnowdb-live:test", clientId: holder }],
+    pending: [],
+  });
   return {
-    locks: { request, query: async () => ({ held: [], pending: [] }) },
-    requests: state.requests,
+    locks: { request, query },
+    requests: () => requests,
+    hold: (clientId) => {
+      if (holder !== undefined) throw new Error("already held");
+      holder = clientId;
+      return () => {
+        holder = undefined;
+        wake();
+      };
+    },
   };
 }
 
 const originalNavigator = globalThis.navigator;
 
+function installLocks(locks: LockManager | undefined): void {
+  Object.defineProperty(globalThis, "navigator", {
+    value: locks === undefined ? undefined : { locks },
+    configurable: true,
+    writable: true,
+  });
+}
+
+function namedStore(name = "minnowdb-live:test"): MemoryBlockStore {
+  const store = new MemoryBlockStore();
+  Object.defineProperty(store, "liveQueryChannelName", { value: name });
+  return store;
+}
+
 afterEach(() => {
-  _resetWriteAdmissionForTests();
+  vi.useRealTimers();
   Object.defineProperty(globalThis, "navigator", {
     value: originalNavigator,
     configurable: true,
@@ -38,224 +108,285 @@ afterEach(() => {
   });
 });
 
-/**
- * A holder that never lets go, modelled faithfully: a plain request waits until its signal
- * aborts, and an `ifAvailable` request is answered at once with `null`. `release` frees the
- * lock, after which every request is granted.
- */
-function frozenHolder(): {
-  locks: LockManager;
-  waits: () => number;
-  probes: () => number;
-  release: () => void;
-} {
-  let held = true;
-  let waits = 0;
-  let probes = 0;
-  const request: LockManager["request"] = async (
-    _name: string,
-    optionsOrCallback: LockOptions | LockGrantedCallback<unknown>,
-    maybeCallback?: LockGrantedCallback<unknown>,
-  ) => {
-    const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
-    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
-    if (!held) return callback?.({ name: "lock", mode: "exclusive" });
-    if (options.ifAvailable === true) {
-      probes += 1;
-      return callback?.(null);
-    }
-    waits += 1;
-    return new Promise((_resolve, reject) => {
-      options.signal?.addEventListener("abort", () => {
-        const reason: unknown = options.signal?.reason;
-        reject(reason instanceof Error ? reason : new Error("aborted", { cause: reason }));
-      });
-    });
-  };
-  return {
-    locks: { request, query: async () => ({ held: [], pending: [] }) },
-    waits: () => waits,
-    probes: () => probes,
-    release: () => {
-      held = false;
-    },
-  };
-}
-
-/** A request queued behind several healthy holders whose identities keep advancing. */
-function progressingQueue(): { locks: LockManager; occupied: () => boolean } {
-  let occupied = true;
-  let observations = 0;
-  const request: LockManager["request"] = async (
-    _name: string,
-    optionsOrCallback: LockOptions | LockGrantedCallback<unknown>,
-    maybeCallback?: LockGrantedCallback<unknown>,
-  ) => {
-    const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
-    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
-    return new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        occupied = false;
-        Promise.resolve(callback?.({ name: "lock", mode: "exclusive" })).then(resolve, reject);
-      }, 75);
-      options.signal?.addEventListener("abort", () => {
-        clearTimeout(timer);
-        const reason: unknown = options.signal?.reason;
-        reject(reason instanceof Error ? reason : new Error("aborted", { cause: reason }));
-      });
-    });
-  };
-  return {
-    locks: {
-      request,
-      query: async () => ({
-        held: [{ name: "minnowdb-write:minnowdb-live:progress", clientId: String(observations++) }],
-        pending: [],
-      }),
-    },
-    occupied: () => occupied,
-  };
-}
-
-it("does not bypass a healthy queue whose holders keep advancing", async () => {
-  const queue = progressingQueue();
-  installLocks(queue.locks);
-  const store = new MemoryBlockStore();
-  Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:progress" });
-  const exceeded = vi.fn();
-  await expect(
-    coordinateWrite(store, async () => queue.occupied(), new AbortController().signal, {
-      admissionWaitMs: 30,
-      onAdmissionWaitExceeded: exceeded,
-    }),
-  ).resolves.toBe(false);
-  expect(exceeded).not.toHaveBeenCalled();
+it("runs writers one at a time in arrival order, whichever engine asked", async () => {
+  installLocks(undefined);
+  const store = namedStore();
+  const order: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const signal = new AbortController().signal;
+  const first = admitWriter(store, { kind: "scope", signal }, async () => {
+    order.push("first:start");
+    await gate;
+    order.push("first:end");
+  });
+  const second = admitWriter(store, { kind: "autocommit", signal }, async () => {
+    order.push("second");
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(order).toEqual(["first:start"]);
+  expect(writeAdmissionState(store)).toMatchObject({ waiting: 1, holder: { kind: "scope" } });
+  release();
+  await Promise.all([first, second]);
+  expect(order).toEqual(["first:start", "first:end", "second"]);
+  expect(writeAdmissionState(store)).toEqual({ holder: undefined, waiting: 0 });
 });
 
-it("does not rearm admission after an unexpected lock rejection settles", async () => {
+it("keeps different databases on different queues", async () => {
+  installLocks(undefined);
+  const blocked = namedStore("minnowdb-live:a");
+  const other = namedStore("minnowdb-live:b");
+  const signal = new AbortController().signal;
+  const held = admitWriter(blocked, { kind: "scope", signal }, () => new Promise(() => undefined));
+  void held;
+  await expect(admitWriter(other, { kind: "scope", signal }, async () => "ran")).resolves.toBe(
+    "ran",
+  );
+});
+
+it("asks the lock manager only from the head of the local queue", async () => {
+  const fake = fakeLocks();
+  installLocks(fake.locks);
+  const store = namedStore();
+  const signal = new AbortController().signal;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const first = admitWriter(store, { kind: "scope", signal }, () => gate);
+  const rest = Array.from({ length: 4 }, () =>
+    admitWriter(store, { kind: "autocommit", signal }, async () => undefined),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(fake.requests()).toBe(1);
+  release();
+  await Promise.all([first, ...rest]);
+  expect(fake.requests()).toBe(5);
+});
+
+it("cancels a queued writer at once without running it, and the queue moves on", async () => {
+  installLocks(undefined);
+  const store = namedStore();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const holder = admitWriter(
+    store,
+    { kind: "scope", signal: new AbortController().signal },
+    () => gate,
+  );
+  const controller = new AbortController();
+  const callback = vi.fn(async () => undefined);
+  const queued = admitWriter(store, { kind: "scope", signal: controller.signal }, callback);
+  const after = admitWriter(
+    store,
+    { kind: "scope", signal: new AbortController().signal },
+    async () => "after",
+  );
+  controller.abort(new Error("caller gave up"));
+  await expect(queued).rejects.toThrow("caller gave up");
+  release();
+  await holder;
+  await expect(after).resolves.toBe("after");
+  expect(callback).not.toHaveBeenCalled();
+});
+
+it("cancels a writer waiting on another context's lock without taking the lock", async () => {
+  const fake = fakeLocks();
+  installLocks(fake.locks);
+  const store = namedStore();
+  const letGo = fake.hold("other-tab");
+  const controller = new AbortController();
+  const callback = vi.fn(async () => undefined);
+  const waiting = admitWriter(store, { kind: "scope", signal: controller.signal }, callback);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort(new Error("closed"));
+  await expect(waiting).rejects.toThrow("closed");
+  expect(callback).not.toHaveBeenCalled();
+  letGo();
+  // The lock is free and the local queue empty: the next writer runs under the lock.
+  await expect(
+    admitWriter(store, { kind: "scope", signal: new AbortController().signal }, async () => 1),
+  ).resolves.toBe(1);
+  expect(writeAdmissionState(store)).toEqual({ holder: undefined, waiting: 0 });
+});
+
+it("reports a holder that does not change once, keeps waiting, and never bypasses it", async () => {
   vi.useFakeTimers();
-  try {
-    let rejectRequest!: (error: Error) => void;
-    let queryCount = 0;
-    let resolveLateQuery!: (snapshot: LockManagerSnapshot) => void;
-    const request: LockManager["request"] = () =>
-      new Promise<unknown>((_resolve, reject) => {
-        rejectRequest = reject;
-      });
-    const locks: LockManager = {
-      request,
-      query: () => {
-        queryCount += 1;
-        if (queryCount === 1) {
-          return Promise.resolve({
-            held: [{ name: "minnowdb-write:minnowdb-live:late", clientId: "first" }],
-            pending: [],
-          });
-        }
-        return new Promise((resolve) => {
-          resolveLateQuery = resolve;
-        });
-      },
-    };
-    installLocks(locks);
-    const store = new MemoryBlockStore();
-    Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:late" });
-    const writing = coordinateWrite(store, async () => "never", new AbortController().signal, {
-      admissionWaitMs: 40,
-    });
-    await vi.advanceTimersByTimeAsync(11);
-    expect(queryCount).toBe(2);
-    rejectRequest(new Error("native lock failure"));
-    await expect(writing).rejects.toThrow("native lock failure");
-    resolveLateQuery({
-      held: [{ name: "minnowdb-write:minnowdb-live:late", clientId: "second" }],
-      pending: [],
-    });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(vi.getTimerCount()).toBe(0);
-  } finally {
-    vi.useRealTimers();
+  const fake = fakeLocks();
+  installLocks(fake.locks);
+  const store = namedStore();
+  const letGo = fake.hold("frozen-tab");
+  const stalls: WriteAdmissionStall[] = [];
+  let ran = false;
+  const waiting = admitWriter(
+    store,
+    {
+      kind: "autocommit",
+      signal: new AbortController().signal,
+      stallReportMs: 100,
+      onStalled: (stall) => stalls.push(stall),
+    },
+    async () => {
+      ran = true;
+    },
+  );
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(ran).toBe(false);
+  expect(stalls).toHaveLength(1);
+  expect(stalls[0]).toMatchObject({ holder: "other-context" });
+  expect(stalls[0]?.waitedMs).toBeGreaterThanOrEqual(100);
+  letGo();
+  await vi.advanceTimersByTimeAsync(10);
+  await waiting;
+  expect(ran).toBe(true);
+  expect(fake.requests()).toBe(1);
+});
+
+it("does not report a queue whose holders keep changing", async () => {
+  vi.useFakeTimers();
+  const fake = fakeLocks();
+  installLocks(fake.locks);
+  const store = namedStore();
+  const stalls: WriteAdmissionStall[] = [];
+  let letGo = fake.hold("tab-1");
+  const waiting = admitWriter(
+    store,
+    {
+      kind: "autocommit",
+      signal: new AbortController().signal,
+      stallReportMs: 100,
+      onStalled: (stall) => stalls.push(stall),
+    },
+    async () => "ran",
+  );
+  for (let holder = 2; holder <= 5; holder += 1) {
+    await vi.advanceTimersByTimeAsync(70);
+    letGo();
+    letGo = fake.hold(`tab-${String(holder)}`);
   }
+  expect(stalls).toEqual([]);
+  letGo();
+  await vi.advanceTimersByTimeAsync(10);
+  await expect(waiting).resolves.toBe("ran");
 });
 
-it("waits out a frozen holder once, then lets later writes go ahead at once until it lets go", async () => {
-  const holder = frozenHolder();
-  installLocks(holder.locks);
-  const store = new MemoryBlockStore();
-  Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:frozen" });
-  const exceeded = vi.fn();
-  const write = (): Promise<number> =>
-    coordinateWrite(store, async () => Date.now(), new AbortController().signal, {
-      admissionWaitMs: 40,
-      onAdmissionWaitExceeded: exceeded,
-    });
-  const started = Date.now();
-  await write();
-  const firstDone = Date.now() - started;
-  expect(firstDone).toBeGreaterThanOrEqual(35);
-  // Six more writes, queued together as a burst would be: none waits the admission wait
-  // again — a serial 6 × 40 ms here stood for 6 × 10 s in a real tab.
-  const burstStarted = Date.now();
-  await Promise.all(Array.from({ length: 6 }, write));
-  expect(Date.now() - burstStarted).toBeLessThan(35);
-  expect(holder.waits()).toBe(1);
-  expect(holder.probes()).toBe(6);
-  expect(exceeded).toHaveBeenCalledTimes(1);
-  // The holder lets go: the next probe is granted, coordination resumes, and a later write
-  // takes the lock the ordinary way again.
-  holder.release();
-  await write();
-  await write();
-  expect(holder.probes()).toBe(6);
-  expect(exceeded).toHaveBeenCalledTimes(1);
-});
-
-function installLocks(locks: LockManager): void {
-  Object.defineProperty(globalThis, "navigator", {
-    value: { locks },
-    configurable: true,
-    writable: true,
+it("names a local holder in its stall report", async () => {
+  vi.useFakeTimers();
+  installLocks(undefined);
+  const store = namedStore();
+  const stalls: WriteAdmissionStall[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
   });
-}
-
-it("goes ahead without the cross-tab lock once the wait runs out, and says so", async () => {
-  installLocks(fakeLocks("never").locks);
-  const store = new MemoryBlockStore();
-  Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:test" });
-  const exceeded = vi.fn();
-  const started = Date.now();
-  const result = await coordinateWrite(store, async () => "wrote", new AbortController().signal, {
-    admissionWaitMs: 30,
-    onAdmissionWaitExceeded: exceeded,
-  });
-  expect(result).toBe("wrote");
-  expect(Date.now() - started).toBeGreaterThanOrEqual(25);
-  expect(exceeded).toHaveBeenCalledTimes(1);
-  expect(exceeded.mock.calls[0]?.[0]).toBeGreaterThanOrEqual(25);
+  const holder = admitWriter(
+    store,
+    { kind: "transaction", signal: new AbortController().signal },
+    () => gate,
+  );
+  const waiting = admitWriter(
+    store,
+    {
+      kind: "scope",
+      signal: new AbortController().signal,
+      stallReportMs: 100,
+      onStalled: (stall) => stalls.push(stall),
+    },
+    async () => "ran",
+  );
+  await vi.advanceTimersByTimeAsync(500);
+  expect(stalls).toHaveLength(1);
+  expect(stalls[0]).toMatchObject({ holder: "this-context", holderKind: "transaction" });
+  release();
+  await holder;
+  await expect(waiting).resolves.toBe("ran");
 });
 
-it("runs under the lock when it is granted, without reporting a wait", async () => {
-  installLocks(fakeLocks("grant").locks);
-  const store = new MemoryBlockStore();
-  Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:granted" });
-  const exceeded = vi.fn();
+it("surfaces the callback's own failure and releases the turn", async () => {
+  installLocks(undefined);
+  const store = namedStore();
+  const signal = new AbortController().signal;
   await expect(
-    coordinateWrite(store, async () => 7, new AbortController().signal, {
-      admissionWaitMs: 30,
-      onAdmissionWaitExceeded: exceeded,
+    admitWriter(store, { kind: "scope", signal }, async () => {
+      throw new Error("callback failed");
     }),
-  ).resolves.toBe(7);
-  expect(exceeded).not.toHaveBeenCalled();
+  ).rejects.toThrow("callback failed");
+  await expect(admitWriter(store, { kind: "scope", signal }, async () => "next")).resolves.toBe(
+    "next",
+  );
 });
 
-it("still honors a close that arrives while the lock wait is running", async () => {
-  installLocks(fakeLocks("never").locks);
-  const store = new MemoryBlockStore();
-  Object.defineProperty(store, "liveQueryChannelName", { value: "minnowdb-live:closing" });
-  const shutdown = new AbortController();
-  const pending = coordinateWrite(store, async () => "never", shutdown.signal, {
-    admissionWaitMs: 10_000,
+it("lets a store marked uncoordinated publish without a turn", async () => {
+  const fake = fakeLocks();
+  installLocks(fake.locks);
+  const store = namedStore();
+  markStoreUncoordinatedForTests(store);
+  const letGo = fake.hold("other-tab");
+  await expect(
+    admitWriter(
+      store,
+      { kind: "scope", signal: new AbortController().signal },
+      async () => "rogue",
+    ),
+  ).resolves.toBe("rogue");
+  expect(fake.requests()).toBe(0);
+  letGo();
+});
+
+it("describes how far coordination reaches", () => {
+  installLocks(fakeLocks().locks);
+  expect(writeCoordinationScope(namedStore())).toBe("cross-context");
+  expect(writeCoordinationScope(new MemoryBlockStore())).toBe("instance");
+  installLocks(undefined);
+  expect(writeCoordinationScope(namedStore())).toBe("context");
+});
+
+it("cancels only the wait on another context's lock, never the local queue", async () => {
+  const fake = fakeLocks();
+  installLocks(fake.locks);
+  const store = namedStore();
+  const crossContext = new AbortController();
+  const signal = new AbortController().signal;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
   });
-  shutdown.abort(new Error("closing"));
-  await expect(pending).rejects.toThrow("closing");
+  // A local holder, then a local writer queued behind it: both are served after cancellation.
+  const holder = admitWriter(
+    store,
+    { kind: "scope", signal, crossContextSignal: crossContext.signal },
+    () => gate,
+  );
+  const queued = admitWriter(
+    store,
+    { kind: "autocommit", signal, crossContextSignal: crossContext.signal },
+    async () => "served locally",
+  );
+  crossContext.abort(new Error("connection disposed"));
+  release();
+  await holder;
+  await expect(queued).resolves.toBe("served locally");
+  // A writer that must wait for another tab is refused, before and after it asks for the lock.
+  const letGo = fake.hold("other-tab");
+  await expect(
+    admitWriter(
+      store,
+      { kind: "autocommit", signal, crossContextSignal: crossContext.signal },
+      async () => "never",
+    ),
+  ).rejects.toThrow("connection disposed");
+  const live = new AbortController();
+  const waiting = admitWriter(
+    store,
+    { kind: "autocommit", signal, crossContextSignal: live.signal },
+    async () => "never",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  live.abort(new Error("disposed while waiting"));
+  await expect(waiting).rejects.toThrow("disposed while waiting");
+  letGo();
 });
