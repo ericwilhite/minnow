@@ -8,11 +8,16 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## Unreleased
+## 0.11.1 — September 27, 2026
 
-Changes on `main` that ship in the next `@minnowdb/core` release.
+Published packages: `@minnowdb/core@0.11.1`.
 
-**Migration:** none. Stored formats and the wire protocol are unchanged.
+**Migration:** no application or data migration is needed. Code that drives collection itself
+with `collectGarbageStep()` and `resumeGarbageCollectionJob()` can now also receive
+`GarbageCollectionJobConflictError` when another tab finishes the job during a step. Handle it
+like `Garbage collection job not found`: call `collectGarbageStep()` again.
+
+**Stored formats and the wire protocol are unchanged.** Databases remain compatible with 0.11.0.
 
 ### Fixed
 
@@ -32,6 +37,9 @@ Changes on `main` that ship in the next `@minnowdb/core` release.
 - `garbage-collection-step-race.test.ts` removes the job record just before and just after the
   collector's step, for both `collectGarbage()` and background collection. Each case fails
   without the fix.
+- The nightly performance gate's Linux threshold for `delta-count-star` now covers GitHub's
+  slower runner class, where it was flagged before and after 0.11.0 alike. The query's cost is
+  unchanged: 37.6 µs before 0.11.0 and 37.4 µs after, measured side by side.
 
 ## 0.11.0 — September 17, 2026
 
