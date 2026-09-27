@@ -16626,15 +16626,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options: CollectGarbageStepOptions = {},
   ): Promise<GarbageCollectionProgress> {
     return this.#foreground(async () => {
-      const job = await this.store.getGarbageCollectionJob(jobId);
-      if (job === undefined) throw new Error(`Garbage collection job not found: ${jobId}`);
-      return this.#serializedCollectionStep(() =>
-        this.#runGarbageCollectionJob(
-          job,
-          boundedMaintenanceBatchItems(options.maxItems ?? 1, "Garbage collection item limit"),
-        ),
-      );
+      const progress = await this.#resumeGarbageCollectionJob(jobId, options);
+      if (progress === undefined) throw new Error(`Garbage collection job not found: ${jobId}`);
+      return progress;
     });
+  }
+
+  /** `resumeGarbageCollectionJob`, or undefined when no record of the job remains. */
+  async #resumeGarbageCollectionJob(
+    jobId: string,
+    options: CollectGarbageStepOptions,
+  ): Promise<GarbageCollectionProgress | undefined> {
+    const job = await this.store.getGarbageCollectionJob(jobId);
+    if (job === undefined) return undefined;
+    return this.#serializedCollectionStep(() =>
+      this.#runGarbageCollectionJob(
+        job,
+        boundedMaintenanceBatchItems(options.maxItems ?? 1, "Garbage collection item limit"),
+      ),
+    );
   }
 
   /**
@@ -16790,7 +16800,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
       if (this.#closed) break;
       this.#releaseIdleSharedLease();
-      let progress = await this.#collectGarbageStep(
+      let progress: GarbageCollectionProgress | undefined = await this.#collectGarbageStep(
         {
           maxItems: AUTO_COLLECT_STEP_ITEMS,
           maxPlanningItems: AUTO_COLLECT_STEP_ITEMS,
@@ -16798,11 +16808,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         },
         AUTO_COLLECT_RETAINED_VERSION_MS,
       );
-      while (progress.result === null) {
+      while (progress?.result === null) {
         await this.#yieldMaintenance();
-        progress = await this.resumeGarbageCollectionJob(progress.jobId, {
-          maxItems: AUTO_COLLECT_STEP_ITEMS,
-        });
+        const jobId: string = progress.jobId;
+        progress = await this.#foreground(() =>
+          this.#resumeGarbageCollectionJob(jobId, { maxItems: AUTO_COLLECT_STEP_ITEMS }),
+        );
+      }
+      // Another connection finished the job and dropped its record between two steps. As when
+      // a step loses the job's revision race, the work is done elsewhere; another run picks up
+      // whatever is left.
+      if (progress === undefined) {
+        moreWork = true;
+        break;
       }
       const result = progress.result;
       const madeProgress = !(
@@ -17652,9 +17670,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return garbageCollectionProgress(step.job);
       } catch (error) {
         if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+        // Another connection advanced the job. When it also finished it and dropped the record
+        // (its prune, or the handoff to a successor job), the conflict is the answer: background
+        // collection counts it as work done elsewhere and collectGarbage() plans again.
         const latest = await this.store.getGarbageCollectionJob(job.id);
-        if (latest === undefined)
-          throw new Error(`Garbage collection job not found: ${job.id}`, { cause: error });
+        if (latest === undefined) throw error;
         job = latest;
       }
     }

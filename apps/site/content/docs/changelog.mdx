@@ -8,6 +8,31 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased
+
+Changes on `main` that ship in the next `@minnowdb/core` release.
+
+**Migration:** none. Stored formats and the wire protocol are unchanged.
+
+### Fixed
+
+- **Garbage collection no longer fails when another tab finishes the same job first.** Two tabs
+  can step one collection job. When the other tab completed the job and removed its record
+  before this tab's step landed, the step failed with
+  `Garbage collection job not found`. Background collection reported it through
+  `onBackgroundError`, and `collectGarbage()` threw it. Background collection now treats the
+  job as done elsewhere, whether the record disappears during a step or between two steps.
+  `collectGarbage()` plans again. `collectGarbageStep()` and `resumeGarbageCollectionJob()`
+  raise `GarbageCollectionJobConflictError` in that case instead of a plain `Error`. Calling
+  `resumeGarbageCollectionJob()` with an unknown job ID still raises
+  `Garbage collection job not found`.
+
+### Testing
+
+- `garbage-collection-step-race.test.ts` removes the job record just before and just after the
+  collector's step, for both `collectGarbage()` and background collection. Each case fails
+  without the fix.
+
 ## 0.11.0 — September 17, 2026
 
 Published packages: `@minnowdb/core@0.11.0`.
