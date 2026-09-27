@@ -213,8 +213,8 @@
           "pglite": 0.0116
         },
         "delta-count-star": {
-          "sqlite": 1.07,
-          "pglite": 0.00466
+          "sqlite": 1.59,
+          "pglite": 0.00739
         },
         "delta-filter-scan": {
           "sqlite": 0.475,
