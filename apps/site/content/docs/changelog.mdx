@@ -25,6 +25,9 @@ Published packages: `@minnowdb/core@0.12.0`, `@minnowdb/devtools@0.3.4`.
 - Lazy index and maintenance failures reach their diagnostic hook or `console.error`.
   Throwing hooks cannot prevent worker failure cleanup. Malformed worker result frames are
   rejected before allocation; use cursors for results above 1,000,000 rows or 4,000,000 cells per frame.
+- Writer stall reports require an observed holder. An empty or unavailable Web Locks snapshot
+  cannot invent a stalled writer, and only the local queue head inspects remote locks.
+  Observed holders still trigger the ten-second diagnostic without being bypassed.
 - Benchmarks remove sample tables, await database cleanup, use SQLite's public OPFS constructor,
   and cannot count execution failures or missing read/write engines as passing. `npm run benchmark:compare`
   gives every engine the same primary-key indexes; historical regression thresholds remain separate.

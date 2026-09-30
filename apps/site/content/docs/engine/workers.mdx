@@ -152,6 +152,8 @@ wait continues. Without a handler each one is written to `console.error` on the 
 handler is logged alongside the original error. Exceptions in loss listeners (`onError`,
 `onComplete`, and `onConnectionLost`) are logged too, and every pending call and other listener
 still receives the connection loss.
+Stall detection requires an observed holder; an empty or unavailable lock snapshot does not
+produce a stall report. The ten-second threshold and writer ordering are unchanged.
 These reports are not fatal: the connection keeps working, and the calls it was serving settle on
 their own. The Worker object's own `error` and `messageerror` events are different — they mean
 the channel's state is unknown, so every pending call rejects with `DatabaseWorkerFailedError`

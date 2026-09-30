@@ -95,9 +95,47 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         // part of the verdict: a corpus that passes while maintenance fails in the background is
         // not a pass.
         const consoleErrors: string[] = [];
+        let consoleDetails = Promise.resolve();
+        let consoleSequence = 0;
         page.on("console", (message) => {
           const text = message.text();
-          if (message.type() === "error") consoleErrors.push(text);
+          if (message.type() === "error") {
+            consoleErrors.push(text);
+            const sequence = ++consoleSequence;
+            consoleDetails = consoleDetails
+              .then(async () => {
+                const arguments_ = await Promise.all(
+                  message.args().map((argument) =>
+                    argument.evaluate((value: unknown) => {
+                      if (value instanceof Error) {
+                        const properties: Record<string, unknown> = Object.fromEntries(
+                          Object.entries(value),
+                        );
+                        return {
+                          ...properties,
+                          name: value.name,
+                          message: value.message,
+                          stack: value.stack,
+                        };
+                      }
+                      return value;
+                    }),
+                  ),
+                );
+                console.error(
+                  JSON.stringify({ browser: info.project.name, store, file, text, arguments_ }),
+                );
+                await info.attach(`sqllogictest-console-error-${String(sequence)}`, {
+                  contentType: "application/json",
+                  body: JSON.stringify({ text, arguments_ }),
+                });
+              })
+              .catch((error: unknown) => {
+                consoleErrors.push(
+                  `Could not capture SQLLogicTest console details: ${String(error)}`,
+                );
+              });
+          }
           if (!text.startsWith(PROGRESS_PREFIX)) return;
           const progress = text.slice(PROGRESS_PREFIX.length);
           console.info(`[${info.project.name}] ${store} ${file} ${progress}`);
@@ -134,6 +172,7 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
           // the unchanged test deadline. Attachment failures are collected above and do not mask
           // the corpus error or timeout.
           await progressWrites;
+          await consoleDetails;
         }
 
         await info.attach(`${store}-${file}-timing.json`, {

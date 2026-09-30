@@ -581,6 +581,9 @@ the warm-up rounds, which are excluded; a climb that continues past a full pool 
 arrival order, one pending lock request per context, prompt cancellation of a queued or
 lock-waiting writer, one stall report per unchanging holder with no bypass, silence while
 holders keep changing, and separate queues for separate databases.
+It also refuses to invent a stalled holder from an empty or unavailable lock snapshot and
+proves that writers behind the local queue do not inspect remote locks. The browser corpus
+retains every console error's structured arguments in its report while still failing on errors.
 
 `write-contention.test.ts` covers writers that do and do not take turns. Coordinated writers all
 land; a store marked uncoordinated through the test seam (`markStoreUncoordinatedForTests`, the
