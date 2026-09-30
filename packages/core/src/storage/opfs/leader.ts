@@ -1743,7 +1743,11 @@ export class OpfsLeader {
         validatePostingBuildBegin(input);
         const table = this.#core.getTable(input.tableId);
         if (table === undefined || !activePostingStorageColumnIds(table).has(input.columnId)) {
-          throw new Error(`Postings index is no longer active: ${input.tableId}/${input.columnId}`);
+          throw new PostingBuildConflictError(
+            input.buildId,
+            input.ownerId,
+            "index is no longer active",
+          );
         }
         const key = postingStorageKey(input.tableId, input.columnId);
         const ownerKind = this.#postingBuildOwnerKind(table, input.columnId);

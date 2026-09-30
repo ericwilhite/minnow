@@ -40,6 +40,13 @@ IndexedDB schema 2 are unchanged. Regex patterns using the refused forms must be
 - Maintenance scheduling now has separate owners for collection and compaction timers, retries,
   debt and task draining. A bounded background failure history supplements diagnostic hooks.
   Native adapters share transaction refusal rules while retaining their atomic storage mechanics.
+- Concurrent compaction registers jobs under a short writer turn, reconciles superseded sources
+  only after verifying durable job progress, and keeps ready jobs ready during resume. Automatic
+  folds replan after a schema conflict and stop cleanly when another tab drops the table or
+  cancels the job. Unrelated I/O failures still propagate even if another tab publishes or cancels
+  concurrently, or a job transition persisted before failing. Failure-recording I/O reaches the
+  diagnostic hook without replacing the original failure. A posting build racing an index drop
+  returns the same typed ownership conflict on every adapter.
 - Generated semantic equivalence checks also fix typed NULL result-domain loss and negative zero
   in INTEGER casts. These are query-result fixes; stored formats are unchanged by this refactor.
 - Comparison reports enforce declared workload coverage and expose attempted/verified/failed counts.

@@ -1489,6 +1489,25 @@ class TransactionRollback extends Error {
   }
 }
 
+/** A validated plan's source disappeared from a newer snapshot, rather than failing I/O. */
+class CompactionSourceChangedError extends Error {
+  constructor(
+    sourceId: string,
+    readonly snapshotChanged: boolean,
+  ) {
+    super(`Compaction source is no longer visible: ${sourceId}`);
+  }
+}
+
+function isCompactionCoordinationRefusal(error: unknown): boolean {
+  return (
+    error instanceof CompactionSourceChangedError ||
+    error instanceof CompactionJobConflictError ||
+    error instanceof TransactionRecordConflictError ||
+    error instanceof TransactionClosedError
+  );
+}
+
 /**
  * Whether a statement may run inside a statement-level transaction. Reads and row writes stage
  * into the scope; schema changes do not, because the catalog commits outside it and a rollback
@@ -8025,15 +8044,39 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
     };
     let folded = false;
+    let planningConflicts = 0;
     for (;;) {
       if (this.#closed) return folded;
       if (this.#droppingTables.has(table.id)) return folded;
-      let progress = await this.compactTableStep(table.name, options);
-      while (progress.result === null) {
-        if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
-        await this.#yieldMaintenance();
-        progress = await this.resumeCompactionJob(progress.jobId, options);
+      let progress: CompactionJobProgress;
+      try {
+        progress = await this.compactTableStep(table.name, options);
+        while (progress.result === null) {
+          if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
+          await this.#yieldMaintenance();
+          progress = await this.resumeCompactionJob(progress.jobId, options);
+        }
+      } catch (error) {
+        // A table removed by another writer cancels its scheduled fold. Unexpected I/O and
+        // validation failures still propagate even if a drop happened at the same time.
+        if (
+          error instanceof UnknownTableError &&
+          (await this.store.getTable(table.id)) === undefined
+        )
+          return folded;
+        if (error instanceof CompactionJobCancelledError) return folded;
+        if (
+          (error instanceof SchemaConflictError ||
+            (error instanceof CompactionSourceChangedError && error.snapshotChanged)) &&
+          planningConflicts < this.#maxCommitRetries
+        ) {
+          planningConflicts += 1;
+          await this.#yieldMaintenance();
+          continue;
+        }
+        throw error;
       }
+      planningConflicts = 0;
       if (!progress.result.compacted) return folded;
       folded = true;
       // The fold's sources are garbage now; collect before planning the next fold.
@@ -16394,7 +16437,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           const active = await this.#findActiveCompactionJob(table.id);
           let job = active;
           if (job === undefined) {
-            const planned = await this.#planCompaction(table, options);
+            const planned = await this.#planCompaction(table, options, admission);
             if ("compacted" in planned) return compactionSkippedProgress(planned);
             job = planned;
           }
@@ -16417,8 +16460,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
       const job = await this.store.getCompactionJob(jobId);
       if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
+      if (job.state === "cancelled") throw new CompactionJobCancelledError(job.id);
       const table = await this.store.getTable(job.tableId);
-      if (table === undefined) throw new Error(`Compaction table not found: ${job.tableId}`);
+      if (table === undefined) throw new UnknownTableError(job.tableId);
       return this.#serializedCompactionStep(table.id, () =>
         this.#runCompactionJob(table, job, maxBlocks),
       );
@@ -17550,12 +17594,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #planCompaction(
     table: TableRecord,
     options: CompactTableOptions,
+    admission?: WriterAdmission,
   ): Promise<CompactionJobRecord | CompactTableResult> {
     for (;;) {
       const version = await this.store.getCurrentManifestVersion();
       try {
         return await this.#withLeasedSnapshot(version, (snapshot) =>
-          this.#planCompactionAtSnapshot(table, options, version, snapshot),
+          this.#planCompactionAtSnapshot(table, options, version, snapshot, admission),
         );
       } catch (error) {
         if (error instanceof SnapshotManifestMissingError) continue;
@@ -17569,6 +17614,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options: CompactTableOptions,
     version: number | null,
     snapshot: LeasedSnapshot,
+    admission?: WriterAdmission,
   ): Promise<CompactionJobRecord | CompactTableResult> {
     const minimumLevel0Segments = positiveWholeNumber(
       options.minimumLevel0Segments ?? DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS,
@@ -17995,18 +18041,30 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       updatedAt: timestamp,
     };
     await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
-    try {
-      await this.store.createCompactionJob(job);
-      return job;
-    } catch (error) {
-      const raced = await this.store.getCompactionJob(id);
-      if (raced !== undefined) return raced;
-      if (error instanceof CompactionJobConflictError) {
+    // Planning stays outside the writer turn. Registration shares the short publication turn
+    // with DDL and other planners, so a dropped table or competing job is observed before create.
+    const register = async (): Promise<CompactionJobRecord> => {
+      if ((await this.store.getTable(table.id)) === undefined)
+        throw new UnknownTableError(table.name);
+      const active = await this.#findActiveCompactionJob(table.id);
+      if (active !== undefined) return active;
+      const currentVersion = await this.store.getCurrentManifestVersion();
+      if (currentVersion !== version) {
+        await this.#assertCompactionSnapshotOrder(job, new Snapshot(this.store, currentVersion));
+      }
+      try {
+        await this.store.createCompactionJob(job);
+        return job;
+      } catch (error) {
+        if (!(error instanceof CompactionJobConflictError)) throw error;
+        const raced = await this.store.getCompactionJob(id);
+        if (raced !== undefined) return raced;
         const active = await this.#findActiveCompactionJob(table.id);
         if (active !== undefined) return active;
+        throw error;
       }
-      throw error;
-    }
+    };
+    return admission === undefined ? this.#withCompactionPublicationSlot(register) : register();
   }
 
   async #priorCompactionAttemptOutputStoredBytes(
@@ -18072,6 +18130,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * minimum, and past it no more than the segment and stored-byte ceilings allow. Also reports
    * the order of the first segment left behind, which bounds the orders a fold may publish.
    */
+  async #compactionOwnerError(segment: SegmentRecord): Promise<Error> {
+    return (await this.store.getTable(segment.tableId)) === undefined
+      ? new UnknownTableError(segment.tableId)
+      : new Error(`Compaction source segment has no committed owner: ${segment.id}`);
+  }
+
   async #selectLevelZeroSources(
     level0Segments: readonly SegmentRecord[],
     minimumLevel0Segments: number,
@@ -18090,13 +18154,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         record,
       ]),
     );
-    const logicalOrder = (segment: SegmentRecord): number => {
+    const missingOwner = level0Segments.find((segment) => {
       const owner = transactions.get(segment.transactionId);
-      if (owner?.status !== "committed" || owner.committedVersion === null) {
-        throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
-      }
-      return segment.logicalOrder;
-    };
+      return owner?.status !== "committed" || owner.committedVersion === null;
+    });
+    if (missingOwner !== undefined) throw await this.#compactionOwnerError(missingOwner);
     const seenBlockIds = new Set<string>();
     const selected: SegmentRecord[] = [];
     let storedBytes = 0;
@@ -18104,11 +18166,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     while (start < level0Segments.length) {
       const first = level0Segments[start];
       if (first === undefined) throw new Error("Compaction L0 source selection is unavailable");
-      const order = logicalOrder(first);
+      const order = first.logicalOrder;
       let end = start + 1;
       for (;;) {
         const next = level0Segments[end];
-        if (next === undefined || logicalOrder(next) !== order) break;
+        if (next?.logicalOrder !== order) break;
         end += 1;
       }
       const group = level0Segments.slice(start, end);
@@ -18141,7 +18203,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       segments: selected,
       storedBytes,
       blockIds: seenBlockIds,
-      nextLogicalOrder: next === undefined ? null : logicalOrder(next),
+      nextLogicalOrder: next?.logicalOrder ?? null,
     };
   }
 
@@ -18394,7 +18456,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (const segment of sourceSegments) {
       const transaction = transactions.get(segment.transactionId);
       if (transaction?.status !== "committed" || transaction.committedVersion === null) {
-        throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
+        throw await this.#compactionOwnerError(segment);
       }
       const kind = segment.kind;
       const keyColumnId = segment.keyColumnId ?? table.uniqueKeyColumnId ?? null;
@@ -19025,7 +19087,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ({ job, transaction } = linked);
       } else {
         transaction = await this.#transactions.resume(job.transactionId);
-        if (job.state !== "running") {
+        if (job.state === "planned") {
           job = await this.store.updateCompactionJob(job.id, job.revision, {
             state: "running",
             updatedAt: dateIsoString(this.#now()),
@@ -19035,7 +19097,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     } catch (error) {
       const latestJob = await this.store.getCompactionJob(job.id);
-      if (latestJob?.state === "cancelled") {
+      if (latestJob?.state === "cancelled" && isCompactionCoordinationRefusal(error)) {
         throw new CompactionJobCancelledError(job.id);
       }
       // Another coordinator may publish the same transaction after our active-owner read but
@@ -19303,12 +19365,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     } catch (error) {
       const latest = await this.store.getCompactionJob(job.id);
-      if (latest?.state === "cancelled") {
+      if (latest?.state === "cancelled" && isCompactionCoordinationRefusal(error)) {
         throw new CompactionJobCancelledError(job.id);
       }
       if (error instanceof CompactionWriteAmplificationError) {
         if (transaction.status === "active") await transaction.abort();
-        if (latest !== undefined && latest.state !== "published" && latest.state !== "aborted") {
+        if (latest !== undefined && isActiveCompactionState(latest.state)) {
           try {
             await this.#abortCompactionJob(latest, error.message);
           } catch (updateError) {
@@ -19329,8 +19391,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             updatedAt: dateIsoString(this.#now()),
             error: errorMessage(error),
           });
-        } catch {
-          // Another coordinator advanced the same persisted job.
+        } catch (updateError) {
+          if (!(updateError instanceof CompactionJobConflictError)) {
+            this.#reportBackgroundError(updateError, `compaction failure recording for ${job.id}`);
+          }
         }
       }
       throw error;
@@ -19664,6 +19728,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         table,
         visibleSegments,
         transactions,
+        snapshot.version !== job.sourceManifestVersion,
       );
       return;
     }
@@ -19685,7 +19750,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
         if (actual === undefined) {
-          throw new Error(`Compaction source is no longer visible: ${planned.segmentId}`);
+          throw new CompactionSourceChangedError(
+            planned.segmentId,
+            snapshot.version !== job.sourceManifestVersion,
+          );
         }
         const owner = transactions.get(actual.transactionId);
         if (!sameMergeSourceSegment(actual, owner, planned)) {
@@ -19699,7 +19767,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (const segment of sourceSegments) {
         const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
         if (committedVersion === null || committedVersion === undefined) {
-          throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
+          throw await this.#compactionOwnerError(segment);
         }
         const tuple = {
           logicalOrder: segment.logicalOrder,
@@ -19769,6 +19837,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     table: TableRecord,
     visibleSegments: readonly SegmentRecord[],
     transactions: ReadonlyMap<string, { status: string; committedVersion: number | null }>,
+    snapshotChanged: boolean,
   ): Promise<void> {
     const sourceIds = new Set(job.sourceSegmentIds);
     const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
@@ -19794,7 +19863,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
         if (actual === undefined) {
-          throw new Error(`Compaction source is no longer visible: ${planned.segmentId}`);
+          throw new CompactionSourceChangedError(planned.segmentId, snapshotChanged);
         }
         const owner = transactions.get(actual.transactionId);
         if (!sameMergeSourceSegment(actual, owner, planned)) {
@@ -19806,7 +19875,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (const id of job.sourceSegmentIds) {
         const actual = visibleById.get(id);
         const planned = plannedById.get(id);
-        if (actual === undefined) throw new Error(`Compaction source is no longer visible: ${id}`);
+        if (actual === undefined) throw new CompactionSourceChangedError(id, snapshotChanged);
         if (
           actual.transactionId !== planned?.transactionId ||
           !sameCompactionSegment(actual, planned)
@@ -19972,36 +20041,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const snapshot = await candidate.snapshot();
     try {
       await this.#assertCompactionSnapshotOrder(job, snapshot);
+      const missing = await firstMissingSnapshotBlock(snapshot, job.sourceBlockIds);
+      if (missing !== undefined)
+        throw new CompactionSourceChangedError(
+          missing,
+          snapshot.version !== job.sourceManifestVersion,
+        );
     } catch (error) {
       if (candidate.status === "active") await candidate.abort();
       const latest = await this.store.getCompactionJob(job.id);
-      if (
-        latest?.revision === job.revision &&
-        latest.state !== "published" &&
-        latest.state !== "cancelled" &&
-        latest.state !== "aborted"
-      ) {
+      if (error instanceof CompactionSourceChangedError) {
+        if (latest === undefined) throw new CompactionJobConflictError(job.id, job.revision, null);
+        if (latest.revision !== job.revision) return { job: latest, transaction: null };
+      }
+      if (latest?.revision === job.revision && isActiveCompactionState(latest.state)) {
         await this.#abortCompactionJob(latest, errorMessage(error));
       }
       throw error;
-    }
-    const missingSourceId = await firstMissingSnapshotBlock(snapshot, job.sourceBlockIds);
-    if (missingSourceId !== undefined) {
-      if (candidate.status === "active") await candidate.abort();
-      const latest = await this.store.getCompactionJob(job.id);
-      if (latest !== undefined && latest.revision !== job.revision) {
-        return { job: latest, transaction: null };
-      }
-      const reason = `Compaction source is no longer visible: ${missingSourceId}`;
-      if (
-        latest !== undefined &&
-        latest.state !== "published" &&
-        latest.state !== "aborted" &&
-        latest.state !== "cancelled"
-      ) {
-        await this.#abortCompactionJob(latest, reason);
-      }
-      throw new Error(reason);
     }
     try {
       const linked = await this.store.updateCompactionJob(job.id, job.revision, {
@@ -20013,7 +20069,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return { job: linked, transaction: candidate };
     } catch (error) {
       const latest = await this.store.getCompactionJob(job.id);
-      if (latest?.transactionId === candidate.id) {
+      if (error instanceof CompactionJobConflictError && latest?.transactionId === candidate.id) {
         return { job: latest, transaction: candidate };
       }
       if (candidate.status === "active") await candidate.abort();
@@ -20029,23 +20085,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     version: number,
   ): Promise<CompactionJobRecord> {
     if (job.state === "published") return job;
-    try {
-      return await this.store.updateCompactionJob(job.id, job.revision, {
-        state: "published",
+    const publish = (current: CompactionJobRecord): Promise<CompactionJobRecord> =>
+      this.store.updateCompactionJob(current.id, current.revision, {
+        state: "published" as const,
         publishedVersion: version,
         updatedAt: dateIsoString(this.#now()),
         error: null,
       });
+    try {
+      return await publish(job);
     } catch (error) {
+      if (!(error instanceof CompactionJobConflictError)) throw error;
       const latest = await this.store.getCompactionJob(job.id);
       if (latest?.state === "published") return latest;
       if (latest?.transactionId === job.transactionId) {
-        return this.store.updateCompactionJob(latest.id, latest.revision, {
-          state: "published",
-          publishedVersion: version,
-          updatedAt: dateIsoString(this.#now()),
-          error: null,
-        });
+        return publish(latest);
       }
       throw error;
     }

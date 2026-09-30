@@ -5638,10 +5638,12 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     const store = transaction.objectStore("gc");
     const key = compactionJobKey(normalized.id);
-    if ((await requestResult(store.getKey(key))) !== undefined) {
+    const duplicateValue: unknown = await requestResult(store.get(key));
+    if (duplicateValue !== undefined) {
+      const duplicate = asCompactionJobEnvelope(duplicateValue);
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Compaction job already exists: ${normalized.id}`);
+      throw new CompactionJobConflictError(normalized.id, normalized.revision, duplicate.revision);
     }
     await assertCompactionJobReferences(transaction, normalized);
     const quota = await readMaintenanceQuota(store);
@@ -5655,8 +5657,15 @@ export class IndexedDbBlockStore implements BlockStore {
       const markerValue: unknown = await requestResult(store.get(markerKey));
       if (markerValue !== undefined) {
         const marker = asActiveCompactionMarker(markerValue, normalized.tableId);
-        throw new Error(
-          `Compaction job ${marker.jobId} is already active for table ${normalized.tableId}`,
+        const competing = asCompactionJobEnvelope(
+          await requestResult(store.get(compactionJobKey(marker.jobId))),
+        );
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new CompactionJobConflictError(
+          normalized.id,
+          normalized.revision,
+          competing.revision,
         );
       }
       store.add(

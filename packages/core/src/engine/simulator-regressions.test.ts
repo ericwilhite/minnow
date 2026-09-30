@@ -5,7 +5,12 @@
  */
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
-import { GarbageCollectionJobConflictError } from "../storage/types.js";
+import {
+  CompactionJobConflictError,
+  PostingBuildConflictError,
+  type CompactionJobRecord,
+  GarbageCollectionJobConflictError,
+} from "../storage/types.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import {
   IndexedDbBlockStore,
@@ -14,6 +19,8 @@ import {
   type BlockStore,
 } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { CompactionJobCancelledError, UnknownTableError } from "./errors.js";
+import { allTransactionRecords } from "./storage-test-helpers.js";
 
 const stores: ReadonlyArray<{ name: string; open: () => Promise<BlockStore> }> = [
   { name: "memory", open: async () => new MemoryBlockStore() },
@@ -330,3 +337,515 @@ describe.each(stores)("index pruning keeps every delete on $name", ({ open }) =>
     store.close();
   });
 });
+
+describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
+  "compaction planning races on $name",
+  ({ create }) => {
+    it.each([
+      ["published", false],
+      ["published", true],
+      ["cancelled", true],
+    ] as const)(
+      "reconciles a %s job without hiding unrelated I/O (fault=%s)",
+      async (outcome, fault) => {
+        const store = await create();
+        const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        const originalCreate = store.createCompactionJob.bind(store);
+        const originalGet = store.getCompactionJob.bind(store);
+        let armed: string | undefined;
+        let published: number | null | undefined;
+        const failure = new Error("unrelated source metadata I/O failure");
+        let restoreFailedRead: (() => void) | undefined;
+        const creating = vi
+          .spyOn(store, "createCompactionJob")
+          .mockImplementation(async (record) => {
+            await originalCreate(record);
+            armed = record.id;
+          });
+        const reading = vi.spyOn(store, "getCompactionJob").mockImplementation(async (id) => {
+          const stale = await originalGet(id);
+          if (id === armed) {
+            armed = undefined;
+            if (outcome === "published") {
+              const winner = await owner.resumeCompactionJob(id, { maxBlocks: 64 });
+              expect(winner.state).toBe("published");
+              published = winner.result?.version;
+            } else await owner.cancelCompactionJob(id);
+            if (fault) {
+              const failedRead = vi.spyOn(store, "getSegment").mockRejectedValueOnce(failure);
+              restoreFailedRead = () => failedRead.mockRestore();
+            }
+          }
+          return stale;
+        });
+        try {
+          await owner.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, value INTEGER)");
+          for (let id = 1; id <= 4; id += 1) await owner.insert("events", { id, value: id });
+          const running = contender.compactTableStep("events", { maxBlocks: 1 });
+          if (fault) await expect(running).rejects.toBe(failure);
+          else {
+            const result = await running;
+            expect(result).toMatchObject({
+              state: "published",
+              result: { version: published, rowCount: 4 },
+            });
+          }
+          expect((await contender.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+            { n: 10 },
+          ]);
+          expect((await store.listCompactionJobs()).every((job) => job.state === outcome)).toBe(
+            true,
+          );
+          expect(
+            (await allTransactionRecords(store)).some(
+              (transaction) => transaction.status === "active",
+            ),
+          ).toBe(false);
+        } finally {
+          restoreFailedRead?.();
+          reading.mockRestore();
+          creating.mockRestore();
+          await Promise.all([owner.close(), contender.close()]);
+          store.close();
+        }
+      },
+    );
+
+    it("reports registration I/O even when the durable job was created and can be resumed", async () => {
+      const store = await create();
+      const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const original = store.createCompactionJob.bind(store);
+      const failure = new Error("registration I/O failed after persistence");
+      const creating = vi.spyOn(store, "createCompactionJob").mockImplementation(async (record) => {
+        await original(record);
+        throw failure;
+      });
+      try {
+        await database.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await database.insert("events", { value });
+        await expect(database.compactTableStep("events")).rejects.toBe(failure);
+        const [job] = await store.listCompactionJobs();
+        expect(job?.state).toBe("planned");
+        if (job === undefined) throw new Error("Expected a persisted job");
+        expect((await database.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+          { n: 10 },
+        ]);
+        creating.mockRestore();
+        expect(await database.resumeCompactionJob(job.id, { maxBlocks: 64 })).toMatchObject({
+          state: "published",
+          result: { rowCount: 4 },
+        });
+      } finally {
+        creating.mockRestore();
+        await database.close();
+        store.close();
+      }
+    });
+
+    it("reports failure-recording I/O while preserving the original publication failure", async () => {
+      const store = await create();
+      const reports: Array<{ error: unknown; context: string }> = [];
+      const database = new MinnowDatabase(store, {
+        autoCompact: false,
+        autoCollect: false,
+        onBackgroundError: (error, context) => reports.push({ error, context }),
+      });
+      const primary = new Error("publication failed");
+      const secondary = new Error("recording failed");
+      const committing = vi.spyOn(store, "commitTransaction");
+      const update = store.updateCompactionJob.bind(store);
+      const updating = vi
+        .spyOn(store, "updateCompactionJob")
+        .mockImplementation(async (...args) => {
+          if (args[2].error === primary.message) throw secondary;
+          return update(...args);
+        });
+      try {
+        await database.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await database.insert("events", { value });
+        committing.mockRejectedValueOnce(primary);
+        await expect(database.compactTableStep("events", { maxBlocks: 64 })).rejects.toBe(primary);
+        const [job] = await store.listCompactionJobs();
+        if (job === undefined) throw new Error("Expected the durable job");
+        expect(reports).toEqual([
+          { error: secondary, context: `compaction failure recording for ${job.id}` },
+        ]);
+        expect((await database.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+          { n: 10 },
+        ]);
+      } finally {
+        committing.mockRestore();
+        updating.mockRestore();
+        await database.close();
+        store.close();
+      }
+    });
+
+    it.each(["running", "published"] as const)(
+      "reports I/O after persisting the %s transition and resumes safely",
+      async (phase) => {
+        const store = await create();
+        const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        const original = store.updateCompactionJob.bind(store);
+        const failure = new Error(`I/O after ${phase} persisted`);
+        let armed = true;
+        const updating = vi
+          .spyOn(store, "updateCompactionJob")
+          .mockImplementation(async (...args) => {
+            const job = await original(...args);
+            if (armed && args[2].state === phase) {
+              armed = false;
+              throw failure;
+            }
+            return job;
+          });
+        try {
+          await database.execute("CREATE TABLE events(value INTEGER)");
+          for (let value = 1; value <= 4; value += 1) await database.insert("events", { value });
+          await expect(database.compactTableStep("events", { maxBlocks: 64 })).rejects.toBe(
+            failure,
+          );
+          expect(armed).toBe(false);
+          const [job] = await store.listCompactionJobs();
+          if (job === undefined) throw new Error("Expected a durable job");
+          expect(
+            (await allTransactionRecords(store)).some((record) => record.status === "active"),
+          ).toBe(false);
+          expect((await database.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+            { n: 10 },
+          ]);
+          expect(await database.resumeCompactionJob(job.id, { maxBlocks: 64 })).toMatchObject({
+            state: "published",
+            result: { rowCount: 4 },
+          });
+        } finally {
+          updating.mockRestore();
+          await database.close();
+          store.close();
+        }
+      },
+    );
+
+    it("refuses a competing active job with the shared typed conflict and unchanged records", async () => {
+      const store = await create();
+      const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const original = store.createCompactionJob.bind(store);
+      let planned: CompactionJobRecord | undefined;
+      const creating = vi.spyOn(store, "createCompactionJob").mockImplementation(async (record) => {
+        planned = structuredClone(record);
+        await original(record);
+      });
+      try {
+        await database.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await database.insert("events", { value });
+        const partial = await database.compactTableStep("events", {
+          maxBlocks: 1,
+          targetBlockBytes: 9,
+        });
+        expect(partial.result).toBeNull();
+        if (planned === undefined) throw new Error("Expected a planned job");
+        const before = await store.listCompactionJobs();
+        await expect(
+          original({
+            ...planned,
+            id: `${planned.id}/other`,
+            outputSegmentId: `${planned.id}/other/output`,
+          }),
+        ).rejects.toBeInstanceOf(CompactionJobConflictError);
+        expect(await store.listCompactionJobs()).toEqual(before);
+        expect((await database.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+          { n: 10 },
+        ]);
+      } finally {
+        creating.mockRestore();
+        await database.close();
+        store.close();
+      }
+    });
+
+    it("refuses posting ownership after a concurrent index drop with a typed conflict", async () => {
+      const store = await create();
+      const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      try {
+        await database.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, value INTEGER)");
+        await database.insert("events", { id: 1, value: 10 });
+        await database.execute("CREATE INDEX by_value ON events(value)");
+        const table = await store.getTableByName("events");
+        const index = Object.values(table?.secondaryIndexes ?? {})[0];
+        if (table === undefined || index === undefined) throw new Error("Expected the index");
+        await database.execute("DROP INDEX by_value");
+        const createdAt = new Date().toISOString();
+        const input = {
+          tableId: table.id,
+          columnId: index.storageColumnId,
+          buildId: "stale-build",
+          ownerId: "stale-owner",
+          createdAt,
+          expiresAt: new Date(Date.now() + 60000).toISOString(),
+        };
+        await expect(store.beginFtsBaseBuild(input)).rejects.toMatchObject({
+          name: "PostingBuildConflictError",
+          buildId: input.buildId,
+          ownerId: input.ownerId,
+          reason: "index is no longer active",
+        });
+        await expect(store.beginFtsBaseBuild(input)).rejects.toBeInstanceOf(
+          PostingBuildConflictError,
+        );
+        expect((await database.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+          { n: 10 },
+        ]);
+      } finally {
+        await database.close();
+        store.close();
+      }
+    });
+
+    it.each(["drop", "missing", "I/O"] as const)(
+      "rechecks a missing compaction owner without hiding %s failures",
+      async (mode) => {
+        const store = await create();
+        const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        const get = store.getTransactions.bind(store);
+        let reads = 0;
+        const failure = new Error("source owner I/O failure");
+        const reading = vi.spyOn(store, "getTransactions").mockImplementation(async (...args) => {
+          reads += 1;
+          if (reads === 3 && mode === "I/O") throw failure;
+          if (reads === 3 && mode === "missing") return args[0].map(() => undefined);
+          const records = await get(...args);
+          if (reads === 2 && mode === "drop") {
+            await owner.execute("DROP TABLE events");
+            await owner.collectGarbage({ retainRecentVersions: 0 });
+          }
+          return records;
+        });
+        try {
+          await owner.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, value INTEGER)");
+          for (let id = 1; id <= 4; id += 1) await owner.insert("events", { id, value: id });
+          const run = contender.compactTableStep("events", { maxBlocks: 64 });
+          if (mode === "drop") await expect(run).rejects.toBeInstanceOf(UnknownTableError);
+          else if (mode === "I/O") await expect(run).rejects.toBe(failure);
+          else
+            await expect(run).rejects.toThrow("Compaction source segment has no committed owner");
+          expect(reads).toBeGreaterThanOrEqual(3);
+          expect(await store.listCompactionJobs()).toEqual([]);
+          if (mode !== "drop")
+            expect((await contender.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+              { n: 10 },
+            ]);
+        } finally {
+          reading.mockRestore();
+          await Promise.all([owner.close(), contender.close()]);
+          store.close();
+        }
+      },
+    );
+
+    it("preserves cancellation when another tab drops the table before a suspended fold resumes", async () => {
+      const store = await create();
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      try {
+        await owner.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await owner.insert("events", { value });
+        const partial = await contender.compactTableStep("events", {
+          maxBlocks: 1,
+          targetBlockBytes: 9,
+        });
+        if (partial.jobId === null) throw new Error("Expected a suspended fold");
+        await owner.cancelCompactionJob(partial.jobId);
+        await owner.execute("DROP TABLE events");
+        await expect(contender.resumeCompactionJob(partial.jobId)).rejects.toBeInstanceOf(
+          CompactionJobCancelledError,
+        );
+        expect(
+          (await allTransactionRecords(store)).some((record) => record.status === "active"),
+        ).toBe(false);
+      } finally {
+        await Promise.all([owner.close(), contender.close()]);
+        store.close();
+      }
+    });
+
+    it("refuses planning for a table dropped during source measurement", async () => {
+      const store = await create();
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      try {
+        await owner.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await owner.insert("events", { value });
+        const original = store.getBlock.bind(store);
+        let dropped = false;
+        const reading = vi.spyOn(store, "getBlock").mockImplementation(async (id) => {
+          const bytes = await original(id);
+          if (!dropped) {
+            dropped = true;
+            await owner.execute("DROP TABLE events");
+          }
+          return bytes;
+        });
+        try {
+          await expect(contender.compactTableStep("events")).rejects.toBeInstanceOf(
+            UnknownTableError,
+          );
+          expect(dropped).toBe(true);
+          expect(await store.listCompactionJobs()).toEqual([]);
+        } finally {
+          reading.mockRestore();
+        }
+      } finally {
+        await Promise.all([owner.close(), contender.close()]);
+        store.close();
+      }
+    });
+
+    it("does not register a stale plan after another job replaces its sources", async () => {
+      const store = await create();
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const get = store.getCompactionJob.bind(store);
+      let armed: string | undefined;
+      let prior: string | undefined;
+      const reading = vi.spyOn(store, "getCompactionJob").mockImplementation(async (id) => {
+        const job = await get(id);
+        if (id === armed && job === undefined) {
+          armed = undefined;
+          if (prior === undefined) throw new Error("Expected the prior fold");
+          expect(await owner.resumeCompactionJob(prior, { maxBlocks: 64 })).toMatchObject({
+            state: "published",
+          });
+        }
+        return job;
+      });
+      try {
+        await owner.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await owner.insert("events", { value });
+        const partial = await owner.compactTableStep("events", {
+          maxBlocks: 1,
+          targetBlockBytes: 9,
+        });
+        if (partial.jobId === null) throw new Error("Expected the prior fold");
+        prior = partial.jobId;
+        await owner.insert("events", { value: 5 });
+        const table = await store.getTableByName("events");
+        if (table === undefined) throw new Error("Expected the table");
+        armed = `compaction/${table.id}/manifest/${String(await store.getCurrentManifestVersion())}`;
+        // Suppress the existing active job once so this models a planner whose job scan ran
+        // before that job was registered, but whose snapshot includes the subsequent append.
+        const page = store.listCompactionJobPage.bind(store);
+        let scanned = false;
+        const scanning = vi
+          .spyOn(store, "listCompactionJobPage")
+          .mockImplementation(async (...args) => {
+            const result = await page(...args);
+            if (!scanned) {
+              scanned = true;
+              return { ...result, records: [] };
+            }
+            return result;
+          });
+        try {
+          expect(await contender.compactTable("events", { maxBlocksPerStep: 64 })).toMatchObject({
+            rowCount: 5,
+          });
+          expect(armed).toBeUndefined();
+          expect((await store.listCompactionJobs()).every((job) => job.state === "published")).toBe(
+            true,
+          );
+          expect((await contender.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+            { n: 15 },
+          ]);
+        } finally {
+          scanning.mockRestore();
+        }
+      } finally {
+        reading.mockRestore();
+        await Promise.all([owner.close(), contender.close()]);
+        store.close();
+      }
+    });
+
+    it("resumes a ready job without making it unready for another publisher", async () => {
+      const store = await create();
+      const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const commit = store.commitTransaction.bind(store);
+      const failure = new Error("publication I/O failure");
+      const committing = vi.spyOn(store, "commitTransaction");
+      const update = store.updateCompactionJob.bind(store);
+      const updating = vi.spyOn(store, "updateCompactionJob");
+      try {
+        await database.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await database.insert("events", { value });
+        committing.mockRejectedValueOnce(failure);
+        await expect(database.compactTableStep("events", { maxBlocks: 64 })).rejects.toBe(failure);
+        const [job] = await store.listCompactionJobs();
+        if (job === undefined) throw new Error("Expected a durable job");
+        expect(job.state).toBe("ready");
+        committing.mockImplementation(commit);
+        updating.mockImplementation(async (id, revision, patch) => {
+          if (patch.state === "running") throw new Error("A ready job must not be downgraded");
+          return update(id, revision, patch);
+        });
+        expect(await database.resumeCompactionJob(job.id, { maxBlocks: 64 })).toMatchObject({
+          state: "published",
+          result: { rowCount: 4 },
+        });
+        expect((await database.query("SELECT SUM(value) AS n FROM events")).rows).toEqual([
+          { n: 10 },
+        ]);
+      } finally {
+        committing.mockRestore();
+        updating.mockRestore();
+        await database.close();
+        store.close();
+      }
+    });
+
+    it("replans an automatic fold when a concurrent schema commit invalidates publication", async () => {
+      const store = await create();
+      const reports: unknown[] = [];
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const contender = new MinnowDatabase(store, {
+        autoCollect: false,
+        onBackgroundError: (error) => reports.push(error),
+      });
+      const update = store.updateCompactionJob.bind(store);
+      let changed = false;
+      const updating = vi
+        .spyOn(store, "updateCompactionJob")
+        .mockImplementation(async (...args) => {
+          const job = await update(...args);
+          if (args[2].state === "ready" && !changed) {
+            changed = true;
+            await owner.execute("CREATE TABLE unrelated (n INTEGER)");
+          }
+          return job;
+        });
+      try {
+        await owner.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 0; value < 47; value += 1) await owner.insert("events", { value });
+        await contender.insert("events", { value: 47 });
+        await vi.waitFor(
+          async () => {
+            expect(changed).toBe(true);
+            expect(
+              (await store.listCompactionJobs()).some((job) => job.state === "published"),
+            ).toBe(true);
+          },
+          { timeout: 5000 },
+        );
+        expect(reports).toEqual([]);
+        expect(
+          (await contender.query("SELECT COUNT(*) AS n, SUM(value) AS s FROM events")).rows,
+        ).toEqual([{ n: 48, s: 1128 }]);
+      } finally {
+        updating.mockRestore();
+        await Promise.all([owner.close(), contender.close()]);
+        store.close();
+      }
+    });
+  },
+);

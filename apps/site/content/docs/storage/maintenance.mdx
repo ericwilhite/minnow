@@ -113,6 +113,13 @@ owner is aborted and the job continues under a fresh one. `cancelCompactionJob(j
 compaction is visible-data-neutral by construction, so cancelling it can never lose data.
 The store atomically admits only one non-terminal compaction for a table, so two tabs racing the
 plan step converge on the same durable job instead of creating parallel roots.
+Planning reads stay outside the writer turn; job registration takes a short turn alongside DDL.
+A resumer reconciles replaced sources only after confirming that the durable job advanced.
+Resuming a ready job preserves its publication readiness. Automatic folds retry schema conflicts
+within the write retry limit and stop cleanly when another tab drops the table or cancels the job.
+Unexpected I/O failures still reach the caller or background diagnostic hook, including failures
+that coincide with another tab publishing or cancelling the job, or arrive after a job transition
+was persisted. A failure while recording the original error is reported separately.
 
 Level-zero growth is guarded on the write path in two tiers. Past 512 level-zero segments — twice
 the prefix one background fold absorbs — a write drives one fold step before its own commit and
