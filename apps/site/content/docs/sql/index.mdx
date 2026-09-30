@@ -63,23 +63,25 @@ SQL compilation happens before a query has an execution-memory account, and scal
 allocate before a sort or join gets a chance to spill. Minnow therefore refuses these inputs at a
 fixed boundary:
 
-| Input                                         |                                                                 Limit |
-| --------------------------------------------- | --------------------------------------------------------------------: |
-| SQL text                                      |                                                  1,048,576 characters |
-| Tokens in one statement                       |                                                                16,384 |
-| Nested SQL syntax                             |                                                            128 levels |
-| Parameter positions                           |                                                                 4,096 |
-| `LIKE` / `SIMILAR TO` / full-text search text |                                                     16,384 characters |
-| Work in one `LIKE` / `SIMILAR TO` match       |                                         8,388,608 deterministic steps |
-| A NUMERIC input significand or precision      |                                                        100,000 digits |
-| A string created by a scalar function         |                                                  1,048,576 characters |
-| A JSON, JSONB, or ARRAY value                 | 65,536 values and names, 128 levels, and 1,048,576 encoded characters |
-| A value tokenized for full-text search        |                                                     16,384 characters |
+| Input                                                 |                                                                 Limit |
+| ----------------------------------------------------- | --------------------------------------------------------------------: |
+| SQL text                                              |                                                  1,048,576 characters |
+| Tokens in one statement                               |                                                                16,384 |
+| Nested SQL syntax                                     |                                                            128 levels |
+| Parameter positions                                   |                                                                 4,096 |
+| `LIKE` / `SIMILAR TO` / regex / full-text search text |                                                     16,384 characters |
+| Work in one `LIKE` / `SIMILAR TO` / regex match       |                                         8,388,608 deterministic steps |
+| A NUMERIC input significand or precision              |                                                        100,000 digits |
+| A string created by a scalar function                 |                                                  1,048,576 characters |
+| A JSON, JSONB, or ARRAY value                         | 65,536 values and names, 128 levels, and 1,048,576 encoded characters |
+| A value tokenized for full-text search                |                                                     16,384 characters |
 
 These are safety limits, not cache tuning. Inputs are checked before tokenization, structural pattern
 compilation, JSON parsing, padding, or other expanding work. Pattern matching uses a glob walker or
-Thompson NFA instead of an attacker-controlled host regular expression and charges every transition
-against the fixed work ceiling. Plain selection and cursor streaming do not apply the scalar-result
+Thompson NFA for LIKE/SIMILAR TO. Regex uses a bounded interpreter with leftmost-longest match
+selection and charges every transition against the same fixed work ceiling. Regex also limits
+compiled and visited states to 65,536, capture groups to 32, and repetition bounds to 1,000.
+Exceeding any bound throws instead of hanging or returning an approximate answer. Plain selection and cursor streaming do not apply the scalar-result
 limit to an existing stored string. All accepted SQL, pattern, JSON, and full-text strings must also
 be well-formed Unicode; an unpaired UTF-16 surrogate is rejected instead of being silently replaced
 during UTF-8 persistence.

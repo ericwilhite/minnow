@@ -545,7 +545,11 @@ export class MemoryBlockStore implements BlockStore {
       }
       const table = this.#core.getTable(input.tableId);
       if (table === undefined || !activePostingStorageColumnIds(table).has(input.columnId)) {
-        throw new Error(`Postings index is no longer active: ${key}`);
+        throw new PostingBuildConflictError(
+          input.buildId,
+          input.ownerId,
+          "index is no longer active",
+        );
       }
       this.#ftsBaseBuilds.set(key, {
         buildId: input.buildId,

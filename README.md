@@ -12,7 +12,7 @@ and benchmarks that run in your browser.
 
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
 > changes. Stored data is stable: block format 2, snapshot format 1, IndexedDB schema 2, and OPFS
-> layout 6 are versioned separately and locked — an incompatible future writer must use a new
+> layout 7 are versioned separately and locked — an incompatible future writer must use a new
 > format number.
 > Pin exact package versions. See
 > [Versioning](https://minnowdb.com/docs/reference/versioning/), the
@@ -38,7 +38,7 @@ and benchmarks that run in your browser.
   read anything, so concurrent writes land in a serial order without an application-side queue
   or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
   bypassed.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 350 KB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 362 KB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so

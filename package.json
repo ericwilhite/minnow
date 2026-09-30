@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -56,14 +56,16 @@
     "fixture:opfs-format": "vite-node scripts/write-opfs-format-fixture.mts",
     "devtools:matrix": "vite-node scripts/devtools-unsupported-features.mts",
     "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts",
-    "test:browser:conformance": "tsc -b packages/core --force && MINNOW_BROWSER_CONFORMANCE=1 playwright test --config playwright.library.config.ts"
+    "test:browser:conformance": "tsc -b packages/core --force && MINNOW_BROWSER_CONFORMANCE=1 playwright test --config playwright.library.config.ts",
+    "benchmark:compare": "vite-node scripts/perf-gate.mts --compare"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.5",
     "@eslint/js": "^10.0.1",
+    "@minnowdb/core-layout6": "npm:@minnowdb/core@0.10.0",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^4.1.11",
     "esbuild": "^0.28.1",
     "eslint": "^10.8.1",
     "fake-indexeddb": "^6.2.5",
@@ -76,11 +78,11 @@
     "typescript-eslint": "^8.67.0",
     "vite": "^8.2.1",
     "vite-node": "^6.0.0",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "overrides": {
     "monaco-editor": {
-      "dompurify": "3.4.14"
+      "dompurify": "3.4.16"
     }
   },
   "engines": {

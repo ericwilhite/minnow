@@ -3331,7 +3331,11 @@ function foldExpression(expression: Expression): Expression {
       literalValues.length === foldedArguments.length
     ) {
       try {
-        const folded = scalarFunctionValue(expression.name, literalValues);
+        const folded = scalarFunctionValue(
+          expression.name,
+          literalValues,
+          expression.argumentDisplayScales,
+        );
         if (
           folded === null ||
           typeof folded === "string" ||
@@ -3360,7 +3364,7 @@ function foldExpression(expression: Expression): Expression {
                           ? "TIMESTAMP"
                           : "TEXT",
                 }
-              : targetWord?.startsWith("numeric:") === true
+              : targetWord === "numeric" || targetWord?.startsWith("numeric:") === true
                 ? (() => {
                     const [, precisionWord = "", scaleWord = ""] = targetWord.split(":");
                     return {

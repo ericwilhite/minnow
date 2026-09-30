@@ -45,7 +45,10 @@ export async function fillColumnDefaults(
     }
   }
   if (rowCount === 0) return { batch: input, generated: new Map() };
-  const columns: Record<string, readonly BatchValue[]> = { ...input.columns };
+  const columns = Object.assign(
+    Object.create(null) as Record<string, readonly BatchValue[]>,
+    input.columns,
+  );
   const generated = new Map<string, BatchValue[]>();
   let autoIncrement: AutoIncrementFill | undefined;
   for (const [name, mask] of Object.entries(input.omitted ?? {})) {
@@ -63,8 +66,13 @@ export async function fillColumnDefaults(
   }
   for (const column of table.columns) {
     const defaultValue = column.defaultValue;
-    const provided = input.columns[column.name];
-    const omitted = input.omitted?.[column.name];
+    const provided = Object.hasOwn(input.columns, column.name)
+      ? input.columns[column.name]
+      : undefined;
+    const omitted =
+      input.omitted !== undefined && Object.hasOwn(input.omitted, column.name)
+        ? input.omitted[column.name]
+        : undefined;
     const isOmitted = (index: number): boolean =>
       provided === undefined || omitted?.[index] === true;
     if (column.generatedValue !== undefined) {

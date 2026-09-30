@@ -44,7 +44,7 @@ let contextPromise: Promise<SqliteContext> | undefined;
 function sqliteContext(): Promise<SqliteContext> {
   contextPromise ??= (async () => {
     const sqlite3 = await (await loadSqlite())();
-    if ("opfs" in sqlite3 && typeof sqlite3.oo1.OpfsDb === "function") {
+    if (typeof sqlite3.oo1.OpfsDb === "function") {
       return { sqlite3, vfs: "opfs" as const };
     }
     const pool = await sqlite3.installOpfsSAHPoolVfs({
@@ -286,16 +286,23 @@ export const sqliteDriver: EngineDriver = {
     const sqlite = await sqliteContext();
     const path = materialization.storageName;
     if (materialization.vfs === "sah-pool") {
-      sqlite.pool?.unlink(path);
+      const pool =
+        sqlite.pool ??
+        (await sqlite.sqlite3.installOpfsSAHPoolVfs({
+          name: SAH_POOL_NAME,
+          directory: `/${SAH_POOL_NAME}`,
+          initialCapacity: 6,
+        }));
+      pool.unlink(path);
       return;
     }
-    const opfs = (
-      sqlite.sqlite3 as Sqlite3Static & {
-        opfs?: { unlink?: (path: string) => Promise<unknown> };
+    const root = await navigator.storage.getDirectory();
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      try {
+        await root.removeEntry(file.replace(/^\//, ""));
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "NotFoundError")) throw error;
       }
-    ).opfs;
-    await opfs?.unlink?.(path);
-    await opfs?.unlink?.(`${path}-wal`);
-    await opfs?.unlink?.(`${path}-shm`);
+    }
   },
 };

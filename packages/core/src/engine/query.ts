@@ -1,3 +1,5 @@
+import { castSqlValue, datetimeText } from "./sql-casts.js";
+export { datetimeText } from "./sql-casts.js";
 import { encodeQueryIdentity } from "./query-identity.js";
 import { alreadyExternalResults, copyQueryResultExternalization } from "./result-state.js";
 export { copyQueryResultExternalization, markQueryResultExternal } from "./result-state.js";
@@ -94,6 +96,7 @@ import {
   readUntypedText,
 } from "./sql-semantics.js";
 import { simpleScalarFunctions } from "./sql-functions.js";
+import { JsonNumber, parseJsonValue } from "./json-values.js";
 import {
   jsonArrowStep,
   jsonAtPath,
@@ -130,12 +133,10 @@ import {
   isDateDomainValue,
   isExactNumeric,
   isSqlDomainValue,
-  jsonDomainValue,
   normalizeSqlDomainValue,
   preservedJsonDomainValue,
   protectedSqlTextValue,
   timeDomainValue,
-  uuidDomainValue,
 } from "./sql-domains.js";
 import {
   columnarTableFromRows,
@@ -338,109 +339,6 @@ function trimEnds(
 }
 
 /**
- * CAST conversions between the four logical types, matching the strict common ground of
- * SQLite and PostgreSQL: numeric strings parse or fail (never silently 0), integer targets
- * truncate toward zero, booleans render as 'true'/'false', datetimes as ISO strings, and a
- * number cast to datetime reads as milliseconds since the epoch.
- */
-function castValue(value: unknown, target: string): unknown {
-  if (target.startsWith("numeric")) {
-    const [, precision, scale] = target.split(":");
-    return exactNumericValue(
-      value,
-      precision === undefined || precision === "" ? undefined : Number(precision),
-      scale === undefined || scale === "" ? undefined : Number(scale),
-    );
-  }
-  if (target === "json") return jsonDomainValue(value, false);
-  if (target === "jsonb") return jsonDomainValue(value, true);
-  if (target === "uuid") return uuidDomainValue(value);
-  if (target === "date") return dateDomainValue(value);
-  if (target === "time") return timeDomainValue(value);
-  if (target === "interval") return intervalDomainValue(value);
-  if (target === "string") {
-    const external = externalSqlDomainValue(value);
-    if (typeof external === "string") return protectedSqlTextValue(external);
-    if (typeof value === "number") return protectedSqlTextValue(String(value));
-    if (typeof value === "boolean") return protectedSqlTextValue(value ? "true" : "false");
-    if (value instanceof Date) return protectedSqlTextValue(dateIsoString(value));
-  }
-  if (target === "number-integer" && isExactNumeric(value)) {
-    const integer = Number(externalSqlDomainValue(exactNumericRounded(value, 0, "round")));
-    if (!Number.isSafeInteger(integer))
-      throw new RangeError("Integer cast is outside the exact safe range");
-    return integer;
-  }
-  if (target === "number" || target === "number-integer") {
-    // Externalize first, exactly as the string and datetime targets do: a NUMERIC (or other
-    // domain) value is an internally tagged string, and CAST(numeric_column AS DOUBLE
-    // PRECISION) must read its decimal text, not fail on the tag (T703).
-    const external = externalSqlDomainValue(value);
-    let parsed: number | undefined;
-    if (typeof external === "number") parsed = external;
-    else if (typeof external === "boolean") parsed = external ? 1 : 0;
-    else if (typeof external === "string") {
-      const text = external.trim();
-      if (target === "number-integer" && !/^[+-]?\d+$/.test(text)) {
-        throw new TypeError(`Cannot cast this string to a number: ${text} (expected integer text)`);
-      }
-      const candidate = text === "" ? Number.NaN : Number(text);
-      if (!Number.isFinite(candidate)) {
-        throw new TypeError(`Cannot cast this string to a number: ${text}`);
-      }
-      parsed = candidate;
-    }
-    if (parsed !== undefined) {
-      if (target !== "number-integer") return parsed;
-      // PostgreSQL rounds a double precision value cast to an integer type to the nearest
-      // integer, ties to even (2.5 -> 2, 3.5 -> 4, -2.5 -> -2); SQLite truncates. A stored
-      // number is double precision, so the engine follows PostgreSQL's float8 cast.
-      const integer = roundHalfToEven(parsed);
-      if (!Number.isSafeInteger(integer)) {
-        throw new RangeError(`Integer cast is outside the exact safe range: ${String(value)}`);
-      }
-      return integer;
-    }
-  }
-  if (target === "boolean") {
-    if (typeof value === "boolean") return value;
-    if (typeof value === "number") {
-      if (value === 0) return false;
-      if (value === 1) return true;
-      throw new TypeError(`Only 0 and 1 cast to boolean, got ${String(value)}`);
-    }
-    if (typeof value === "string") {
-      const external = externalSqlDomainValue(value);
-      const text = typeof external === "string" ? external.trim().toLowerCase() : "";
-      const parsed = readUntypedText("boolean", text);
-      if (typeof parsed === "boolean") return parsed;
-      throw new TypeError(
-        `Cannot cast this string to a boolean: ${typeof external === "string" ? external : value}`,
-      );
-    }
-  }
-  if (target === "datetime") {
-    if (value instanceof Date) return value;
-    const external = externalSqlDomainValue(value);
-    if (typeof external === "string" || typeof external === "number") {
-      const parsed = typeof external === "string" ? datetimeText(external) : new Date(external);
-      if (Number.isFinite(dateMilliseconds(parsed))) return parsed;
-      throw new TypeError(`Cannot cast this value to a datetime: ${String(value)}`);
-    }
-  }
-  throw new TypeError(`Unsupported CAST: ${typeof value} to ${target}`);
-}
-
-/** Nearest integer with ties to even, the rounding PostgreSQL applies to float8 -> integer. */
-function roundHalfToEven(value: number): number {
-  const floor = Math.floor(value);
-  const fraction = value - floor;
-  if (fraction < 0.5) return floor;
-  if (fraction > 0.5) return floor + 1;
-  return floor % 2 === 0 ? floor : floor + 1;
-}
-
-/**
  * Evaluates one scalar function over already-evaluated argument values. Every executor calls
  * through here, so a function behaves identically in the row executor, the vectorized executor,
  * and constant folding. COALESCE is not handled here — it short-circuits, so each call site
@@ -450,8 +348,17 @@ function roundHalfToEven(value: number): number {
 export function scalarFunctionValue(
   name: Exclude<ScalarFunctionName, "COALESCE">,
   values: readonly unknown[],
+  displayScales?: ReadonlyArray<number | null>,
 ): unknown {
-  return scalarFunctionEvaluator(name)(values);
+  return scalarFunctionEvaluator(name)(
+    displayScales === undefined
+      ? values
+      : values.map((value, index) =>
+          displayScales[index] === null || displayScales[index] === undefined
+            ? value
+            : externalSqlDomainColumnValue(value, { kind: "numeric", scale: displayScales[index] }),
+        ),
+  );
 }
 
 export type ScalarFunctionEvaluator = (values: readonly unknown[]) => unknown;
@@ -737,14 +644,16 @@ function scalarFunctionValueGeneric(
       const value = found.value;
       // A scalar comes back as itself; an object or array has no scalar value to give.
       if (value === null) return null;
-      if (typeof value === "object") return null;
-      return protectedSqlTextValue(typeof value === "string" ? value : JSON.stringify(value));
+      if (typeof value === "object" && !(value instanceof JsonNumber)) return null;
+      return protectedSqlTextValue(
+        typeof value === "string" ? value : boundedJsonText(value, false),
+      );
     }
     case "JSON_QUERY": {
       const found = jsonAtPath(first, values[1], "JSON_QUERY");
       if (!found.found || found.value === undefined) return null;
       // JSON_QUERY returns JSON text, so a selected string keeps its quotes.
-      return preservedJsonDomainValue(JSON.stringify(found.value));
+      return preservedJsonDomainValue(boundedJsonText(found.value, false));
     }
     case "TO_JSON":
       // A SQL NULL is a JSON null document, as PostgreSQL's to_json(NULL) is.
@@ -755,7 +664,7 @@ function scalarFunctionValueGeneric(
       if (!found.found) return null;
       // -> returns a JSON value: a selected string keeps its quotes, a JSON null is the
       // one-character document "null" rather than SQL NULL, exactly as PostgreSQL has it.
-      return preservedJsonDomainValue(JSON.stringify(found.value));
+      return preservedJsonDomainValue(boundedJsonText(found.value, false));
     }
     case "MINNOW_JSON_GET_TEXT": {
       if (values[1] === null || values[1] === undefined) return null;
@@ -764,7 +673,9 @@ function scalarFunctionValueGeneric(
       // and arrays serialized, and a JSON null as SQL NULL.
       if (!found.found || found.value === null || found.value === undefined) return null;
       const value = found.value;
-      return protectedSqlTextValue(typeof value === "string" ? value : JSON.stringify(value));
+      return protectedSqlTextValue(
+        typeof value === "string" ? value : boundedJsonText(value, false),
+      );
     }
 
     case "LPAD":
@@ -827,7 +738,7 @@ function scalarFunctionValueGeneric(
       );
     }
     case "CAST":
-      return castValue(first, typeof values[1] === "string" ? values[1] : "");
+      return castSqlValue(first, typeof values[1] === "string" ? values[1] : "");
     case "SUBSTR": {
       // PostgreSQL SUBSTRING returns the characters whose positions fall in both the requested
       // window and the string, so a start before 1 shortens the result instead of shifting it,
@@ -3061,6 +2972,11 @@ export function inferBlockSchema(
       const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
       return input?.kind === "numeric" ? input : undefined;
     }
+    if (expression.name === "DIV") {
+      return expression.arguments.some((argument) => inferDomain(argument)?.kind === "numeric")
+        ? { kind: "numeric" }
+        : undefined;
+    }
     if (expression.name === "FLOOR" || expression.name === "CEIL" || expression.name === "SIGN") {
       const input = inferDomain(expression.arguments[0] ?? { kind: "literal", value: null });
       return input?.kind === "numeric" ? { kind: "numeric" } : undefined;
@@ -3193,7 +3109,8 @@ export function inferBlockSchema(
       expression.name === "ABS" ||
       expression.name === "FLOOR" ||
       expression.name === "CEIL" ||
-      expression.name === "MOD"
+      expression.name === "MOD" ||
+      expression.name === "DIV"
     ) {
       // Exact NUMERIC in, exact NUMERIC out: the value stays a tagged string.
       return inferDomain(expression)?.kind === "numeric" ? "string" : "number";
@@ -3337,10 +3254,19 @@ export function inferBlockSchema(
       return wildcardSchema(source);
     }
     const type = infer(item.expression);
-    if (type === "null")
-      return [{ name: item.alias, type: "string" as const, unknown: true as const }];
-    const integer = integerTypedExpression(item.expression, resolveColumnInteger);
     const sqlDomain = inferDomain(item.expression);
+    if (type === "null") {
+      // Folding a typed NULL keeps its domain. Only an untyped NULL awaits common-type
+      // resolution; dropping the domain here changes casts and worker results after a rewrite.
+      return [
+        {
+          name: item.alias,
+          type: "string" as const,
+          ...(sqlDomain === undefined ? { unknown: true as const } : { sqlDomain }),
+        },
+      ];
+    }
+    const integer = integerTypedExpression(item.expression, resolveColumnInteger);
     return [
       {
         name: item.alias,
@@ -4882,25 +4808,28 @@ export function expandFtsColumns(
 }
 
 /**
- * Annotates every `AVG(column)` in this block's expression positions with the argument column's
+ * Annotates `AVG(column)` and `QUOTE_LITERAL(column)` in this block with the argument column's
  * declared NUMERIC scale, resolved against the given schemas. PostgreSQL floors an AVG's
  * internal division scale at the summed values' display scale; the canonical NUMERIC encoding
  * strips trailing fractional zeros, so without the annotation the divide cannot know the digits
  * a declared scale above its own selection would render, and the display padding would fabricate
  * zeros where PostgreSQL computes real digits. Runs where the catalog is known, per block —
  * nested blocks execute through their own schema-aware entry. Copy-on-write: plans without an
- * AVG pass through untouched, and the input is often the compile cache's own object.
+ * scale-sensitive call pass through untouched, and the input is often the compile cache's own object.
  */
 export function annotateAvgArgumentScales(
   plan: CompiledQuery,
   schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
 ): CompiledQuery {
-  const containsAvg = (expression: Expression): boolean =>
-    (expression.kind === "call" && expression.name === "AVG") ||
-    childExpressions(expression).some(containsAvg);
+  const needsScale = (expression: Expression): boolean =>
+    (expression.kind === "call" &&
+      (expression.name === "AVG" ||
+        expression.name === "QUOTE_LITERAL" ||
+        expression.name === "FORMAT")) ||
+    childExpressions(expression).some(needsScale);
   const roots: Expression[] = [];
   forEachBlockExpression(plan, (expression) => roots.push(expression));
-  if (!roots.some(containsAvg)) return plan;
+  if (!roots.some(needsScale)) return plan;
   plan = clonePlanTree(plan);
   const sources = [plan.base, ...plan.joins];
   const declaredScale = (reference: string): number | undefined => {
@@ -4919,6 +4848,10 @@ export function annotateAvgArgumentScales(
     return domain?.kind === "numeric" ? domain.scale : undefined;
   };
   const annotate = (expression: Expression): void => {
+    if (expression.kind === "call") {
+      const scales = scalarArgumentDisplayScales(expression, declaredScale);
+      if (scales !== undefined) expression.argumentDisplayScales = scales;
+    }
     if (expression.kind === "call" && expression.name === "AVG") {
       const argument = expression.arguments[0];
       if (argument?.kind === "column") {
@@ -4930,6 +4863,31 @@ export function annotateAvgArgumentScales(
   };
   forEachBlockExpression(plan, annotate);
   return plan;
+}
+
+/** Preserve the display scale consumed by SQL's textual numeric rendering functions. */
+function scalarArgumentDisplayScales(
+  expression: Expression,
+  declaredScale?: (reference: string) => number | undefined,
+): Array<number | null> | undefined {
+  if (expression.kind !== "call" || !["QUOTE_LITERAL", "FORMAT"].includes(expression.name))
+    return undefined;
+  const scales = expression.arguments.map((argument) => {
+    if (argument.kind === "column") return declaredScale?.(argument.reference) ?? null;
+    if (argument.kind === "call" && argument.name === "CAST") {
+      const target = argument.arguments[1];
+      if (
+        target?.kind === "literal" &&
+        typeof target.value === "string" &&
+        target.value.startsWith("numeric:")
+      ) {
+        const text = target.value.split(":")[2];
+        if (text !== undefined && text !== "") return Number(text);
+      }
+    }
+    return null;
+  });
+  return scales.some((scale) => scale !== null) ? scales : undefined;
 }
 
 /**
@@ -5036,7 +4994,12 @@ function resolveExactNumericConstants(expression: Expression): Expression {
         : { argument: resolveExactNumericConstants(expression.argument) }),
     };
   }
-  return mapChildExpressions(expression, resolveExactNumericConstants);
+  const resolved = mapChildExpressions(expression, resolveExactNumericConstants);
+  if (resolved.kind === "call") {
+    const scales = scalarArgumentDisplayScales(resolved);
+    if (scales !== undefined) return { ...resolved, argumentDisplayScales: scales };
+  }
+  return resolved;
 }
 
 /** Applies `resolveExactNumericConstants` to every expression of a plan, nested blocks included. */
@@ -5772,6 +5735,7 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         return scalarFunctionValue(
           expression.name,
           expression.arguments.map((argument) => evaluate(argument, context, group)),
+          expression.argumentDisplayScales,
         );
       }
       throw new TypeError(`${expression.name} requires grouped execution`);
@@ -5808,6 +5772,7 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
   }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
+    if (predicate.right.items.length === 0) return predicate.operator === "NOT IN";
     const membership = cachedListMembership(predicate.right, predicate.right.items);
     if (membership !== null) {
       const value = evaluate(predicate.left, context);
@@ -5862,6 +5827,7 @@ function inListHolds(
   value: unknown,
   items: readonly unknown[],
 ): boolean {
+  if (items.length === 0) return operator === "NOT IN";
   if (value === null || value === undefined) return false;
   let hasNull = false;
   for (const item of items) {
@@ -6116,6 +6082,7 @@ export function evaluateBooleanExpression(
     }
     if (operator === "IN" || operator === "NOT IN") {
       if (expression.right.kind !== "list") throw new TypeError("IN requires a value list");
+      if (expression.right.items.length === 0) return operator === "NOT IN";
       const probe = evaluateValue(expression.left);
       if (probe === null || probe === undefined) return null;
       let sawNull = false;
@@ -9035,9 +9002,10 @@ class Parser {
         if (typeof raw !== "string") throw new TypeError("JSON_TABLE document must be JSON text");
         let parsed: unknown;
         try {
-          parsed = JSON.parse(raw);
-        } catch {
-          throw new TypeError("JSON_TABLE document is invalid JSON");
+          parsed = parseJsonValue(raw);
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+          throw new TypeError("JSON_TABLE document is invalid JSON", { cause: error });
         }
         const members =
           rowPath === "$"
@@ -9052,7 +9020,7 @@ class Parser {
           base: { table: DUAL_TABLE, alias: DUAL_TABLE },
           joins: [],
           select: columns.map((column) => {
-            const selected = jsonAtPath(JSON.stringify(member), column.path, "JSON_TABLE");
+            const selected = jsonAtPath(boundedJsonText(member, false), column.path, "JSON_TABLE");
             const value = empty
               ? column.sqlDomain?.kind === "numeric"
                 ? jsonTableColumnValue(column, 0)
@@ -12401,15 +12369,16 @@ function jsonTableColumnValue(
   value: unknown,
 ): QueryValue {
   if (value === null || value === undefined) return null;
+  if (value instanceof JsonNumber) value = value.text;
   if (column.sqlDomain !== undefined) {
     const input =
       column.sqlDomain.kind === "array" && typeof value !== "string"
-        ? JSON.stringify(value)
+        ? boundedJsonText(value, false)
         : value;
     return normalizeSqlDomainValue(column.sqlDomain, input);
   }
   if (column.type === "string") {
-    return typeof value === "string" ? value : JSON.stringify(value);
+    return typeof value === "string" ? value : boundedJsonText(value, false);
   }
   if (column.type === "boolean") {
     if (typeof value !== "boolean")
@@ -12438,16 +12407,6 @@ function timestampLiteral(text: string): Date {
   const date = parseSqlTimestampText(text);
   if (date === undefined) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
   return date;
-}
-
-/**
- * Reads datetime text the way the TIMESTAMP literal does — a zoneless `2026-01-02 03:04:05` is
- * UTC, never the host's zone — and falls back to the JavaScript parser for other spellings.
- * `new Date("2026-01-02 03:04:05")` alone would read the same text in local time, so a CAST
- * would answer differently on two machines.
- */
-export function datetimeText(text: string): Date {
-  return parseSqlTimestampText(text) ?? new Date(text);
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */

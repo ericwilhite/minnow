@@ -1,5 +1,11 @@
 import { stringArgument } from "./sql-semantics.js";
-import { externalSqlDomainValue, jsonDomainDocument } from "./sql-domains.js";
+import {
+  boundedJsonText,
+  externalSqlDomainValue,
+  isExactNumeric,
+  jsonDomainDocument,
+} from "./sql-domains.js";
+import { JsonNumber, parseJsonValue } from "./json-values.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
 
 /**
@@ -64,8 +70,9 @@ export function jsonAtPath(
   let current: unknown;
   const source = boundedJsonDocument(document, caller);
   try {
-    current = JSON.parse(source);
-  } catch {
+    current = parseJsonValue(source);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
     // A document that is not JSON selects nothing rather than failing the whole statement,
     // matching the standard's default ON ERROR behaviour for these functions.
     return { found: false };
@@ -78,7 +85,8 @@ export function jsonAtPath(
       current = current[step.index];
       continue;
     }
-    if (typeof current !== "object" || Array.isArray(current)) return { found: false };
+    if (typeof current !== "object" || Array.isArray(current) || current instanceof JsonNumber)
+      return { found: false };
     const members = current as Record<string, unknown>;
     if (!Object.hasOwn(members, step.name)) return { found: false };
     current = members[step.name];
@@ -102,9 +110,10 @@ export function jsonArrowStep(
   const source = boundedJsonDocument(document, caller);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(source);
-  } catch {
-    throw new TypeError(`${caller} requires a JSON document`);
+    parsed = parseJsonValue(source);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new TypeError(`${caller} requires a JSON document`, { cause: error });
   }
   const step = externalSqlDomainValue(key);
   if (typeof step === "number") {
@@ -117,7 +126,12 @@ export function jsonArrowStep(
     return { found: true, value: parsed[index] };
   }
   if (typeof step === "string") {
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      parsed instanceof JsonNumber
+    ) {
       return { found: false };
     }
     const members = parsed as Record<string, unknown>;
@@ -138,11 +152,16 @@ export function jsonIsValid(document: unknown, kind: string): boolean {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(document);
-  } catch {
+    parsed = parseJsonValue(document);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
     return false;
   }
-  const isObject = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+  const isObject =
+    typeof parsed === "object" &&
+    parsed !== null &&
+    !Array.isArray(parsed) &&
+    !(parsed instanceof JsonNumber);
   switch (kind) {
     case "object":
       return isObject;
@@ -225,6 +244,9 @@ export function jsonDocumentOf(value: unknown): string {
 }
 
 function boundedJsonValue(value: unknown, label: string): string {
+  if (isExactNumeric(value)) {
+    return new JsonNumber(String(externalSqlDomainValue(value))).text;
+  }
   const domainDocument = jsonDomainDocument(value);
   if (domainDocument !== undefined) {
     if (domainDocument.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
@@ -238,8 +260,7 @@ function boundedJsonValue(value: unknown, label: string): string {
   if (typeof normalized === "string" && normalized.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
     throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
   }
-  const encoded: unknown = JSON.stringify(normalized);
-  if (typeof encoded !== "string") throw new TypeError(`${label} is not JSON serializable`);
+  const encoded = boundedJsonText(normalized, false, label);
   if (encoded.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
     throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
   }

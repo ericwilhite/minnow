@@ -146,6 +146,8 @@ import {
   encodeSyncCheckpoint,
 } from "../toolkit/wire.js";
 import { WalWriter, iterateWalFrames } from "../toolkit/wal.js";
+import { WalAcknowledgements } from "../toolkit/wal-acknowledgement.js";
+import { OpfsUncertainOutcomeError } from "../types.js";
 import {
   ExtentPool,
   assertValidExtentMeta,
@@ -681,6 +683,8 @@ export class OpfsLeader {
   >();
   #extents: ExtentPool | undefined;
   #wal: WalWriter;
+  #acknowledgements: WalAcknowledgements | undefined;
+  readonly #acknowledgementHandle: FileSystemSyncAccessHandle;
   /** The pool exists from the moment recovery succeeds; before that, nothing may touch it. */
   get #pool(): ExtentPool {
     const pool = this.#extents;
@@ -742,6 +746,7 @@ export class OpfsLeader {
     strict: boolean,
     walHandle: FileSystemSyncAccessHandle,
     slots: [FileSystemSyncAccessHandle, FileSystemSyncAccessHandle],
+    acknowledgementHandle: FileSystemSyncAccessHandle,
     checkpointEntries?: number,
     cleanupLimitBytes?: number,
     onDiagnostic?: (error: unknown, context: string) => void,
@@ -760,6 +765,7 @@ export class OpfsLeader {
     this.#strict = strict;
     this.#walHandle = walHandle;
     this.#slots = slots;
+    this.#acknowledgementHandle = acknowledgementHandle;
     this.#wal = new WalWriter(walHandle, 0);
     this.#core = new RecordCore({
       hasBlock: (id) => this.#permissivePhysical || this.#blockIndex.has(id),
@@ -778,6 +784,7 @@ export class OpfsLeader {
       wal: FileSystemSyncAccessHandle;
       slotA: FileSystemSyncAccessHandle;
       slotB: FileSystemSyncAccessHandle;
+      acknowledgements: FileSystemSyncAccessHandle;
     },
     checkpointEntries?: number,
     cleanupLimitBytes?: number,
@@ -790,6 +797,7 @@ export class OpfsLeader {
       strict,
       handles.wal,
       [handles.slotA, handles.slotB],
+      handles.acknowledgements,
       checkpointEntries,
       cleanupLimitBytes,
       onDiagnostic,
@@ -982,8 +990,22 @@ export class OpfsLeader {
     let tailExtent = checkpoint?.extents.tailExtentId ?? 0;
     let tailEnd = checkpoint?.extents.tailOffset ?? 0;
     let nextExtent = checkpoint?.extents.nextExtentId ?? 1;
-    for (const { payload, frameEnd } of iterateWalFrames(this.#walHandle)) {
+    const checkpointSequence = this.#seq;
+    this.#acknowledgements = new WalAcknowledgements(
+      this.#acknowledgementHandle,
+      walSize === 0 && decodedSlots.every(({ size }) => size === 0),
+    );
+    const acknowledged = this.#acknowledgements.latest;
+    const acknowledgedEnd = acknowledged.sequence > checkpointSequence ? acknowledged.endOffset : 0;
+    for (const { payload, frameEnd } of iterateWalFrames(this.#walHandle, acknowledgedEnd)) {
       const entry = validateWalEntry(payload);
+      if (
+        entry.seq === acknowledged.sequence &&
+        acknowledgedEnd > 0 &&
+        frameEnd !== acknowledgedEnd
+      ) {
+        throw new Error("WAL frame disagrees with its acknowledged boundary");
+      }
       if (previousWalSeq === undefined) {
         if (checkpoint === undefined && entry.seq !== 1) {
           throw new Error(`OPFS WAL starts at sequence ${String(entry.seq)} instead of 1`);
@@ -1068,6 +1090,11 @@ export class OpfsLeader {
       }
       this.#seq = entry.seq;
       recoveryEndOffset = frameEnd;
+    }
+    if (this.#seq < acknowledged.sequence) {
+      throw new Error(
+        "WAL recovery stops before an acknowledged sequence; refusing silent rollback",
+      );
     }
     this.#snapshotFrameExportLedger?.truncate(this.#snapshotFrameExportLedger.byteLength);
     this.#snapshotFrameImportLedger?.truncate(this.#snapshotFrameImportLedger.byteLength);
@@ -1253,11 +1280,15 @@ export class OpfsLeader {
 
   /** Background failures are recorded in the stats and also reported, as they happen. */
   #diagnostic(error: unknown, context: string): void {
-    try {
-      this.#onDiagnostic?.(error, context);
-    } catch {
-      // A diagnostic hook must never turn a background failure into a second one.
+    if (this.#onDiagnostic !== undefined) {
+      try {
+        this.#onDiagnostic(error, context);
+        return;
+      } catch (hookError) {
+        console.error("Minnow OPFS diagnostic callback failed", hookError);
+      }
     }
+    console.error(`Minnow ${context}`, error);
   }
 
   /**
@@ -1320,6 +1351,16 @@ export class OpfsLeader {
         { seq: nextSeq, ...body, ...(request === undefined ? {} : { request }) },
         flush,
       );
+      if (flush) {
+        try {
+          this.#acknowledgements?.publish(nextSeq, this.#wal.byteLength);
+        } catch (error) {
+          // WAL and extent bytes are already durable. Do not roll them back as unpublished:
+          // the caller must reconcile this mutation and recovery must verify the boundary.
+          this.#diagnostic(error, "opfs WAL acknowledgement");
+          throw new OpfsUncertainOutcomeError(body.op, { cause: error });
+        }
+      }
       this.#seq = nextSeq;
       this.#entriesSinceCheckpoint = safeSuccessor(
         this.#entriesSinceCheckpoint,
@@ -1702,7 +1743,11 @@ export class OpfsLeader {
         validatePostingBuildBegin(input);
         const table = this.#core.getTable(input.tableId);
         if (table === undefined || !activePostingStorageColumnIds(table).has(input.columnId)) {
-          throw new Error(`Postings index is no longer active: ${input.tableId}/${input.columnId}`);
+          throw new PostingBuildConflictError(
+            input.buildId,
+            input.ownerId,
+            "index is no longer active",
+          );
         }
         const key = postingStorageKey(input.tableId, input.columnId);
         const ownerKind = this.#postingBuildOwnerKind(table, input.columnId);
@@ -2729,6 +2774,7 @@ export class OpfsLeader {
     this.#checkpointGeneration = state.generation;
     // WAL remains intact until the redundant copy is equally durable.
     writeSlot(mirrorIndex);
+    this.#acknowledgements?.publish(this.#seq, this.#wal.byteLength);
     this.#wal.reset();
     this.#entriesSinceCheckpoint = 0;
     this.#lastCheckpointBytes = bytes.byteLength;
@@ -2968,6 +3014,10 @@ export class OpfsLeader {
   }
 
   async #rollbackUnpublishedBatch(mark: ExtentBatchMark, originalError: unknown): Promise<never> {
+    if (originalError instanceof OpfsUncertainOutcomeError) {
+      this.#pool.commitBatch(mark);
+      throw originalError;
+    }
     try {
       await this.#pool.rollbackBatch(mark);
     } catch (rollbackError) {
@@ -4352,6 +4402,10 @@ export class OpfsLeader {
         this.#pool.commitBatch(mark);
         return result;
       } catch (error) {
+        if (error instanceof OpfsUncertainOutcomeError) {
+          this.#pool.commitBatch(mark);
+          throw error;
+        }
         ledger.truncate(before);
         await this.#pool.rollbackBatch(mark);
         throw error;
@@ -5040,6 +5094,7 @@ export class OpfsLeader {
       this.#closed = true;
     });
     this.#walHandle.close();
+    this.#acknowledgementHandle.close();
     for (const slot of this.#slots) slot.close();
     this.#snapshotFrameExportLedger?.close();
     this.#snapshotFrameImportLedger?.close();
@@ -5052,6 +5107,7 @@ export class OpfsLeader {
   crash(): void {
     this.#closed = true;
     this.#walHandle.close();
+    this.#acknowledgementHandle.close();
     for (const slot of this.#slots) slot.close();
     this.#snapshotFrameExportLedger?.close();
     this.#snapshotFrameImportLedger?.close();

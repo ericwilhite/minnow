@@ -113,6 +113,23 @@ owner is aborted and the job continues under a fresh one. `cancelCompactionJob(j
 compaction is visible-data-neutral by construction, so cancelling it can never lose data.
 The store atomically admits only one non-terminal compaction for a table, so two tabs racing the
 plan step converge on the same durable job instead of creating parallel roots.
+Planning reads stay outside the writer turn; job registration takes a short turn alongside DDL.
+A resumer reconciles replaced sources only after confirming that the durable job advanced.
+Resuming a ready job preserves its publication readiness. Automatic folds retry schema conflicts
+within the write retry limit and stop cleanly when another tab drops the table or cancels the job.
+Unexpected I/O failures still reach the caller or background diagnostic hook, including failures
+that coincide with another tab publishing or cancelling the job, or arrive after a job transition
+was persisted. A failure while recording the original error is reported separately.
+Before opening a write snapshot, the writer assists one pending compaction claim at each entry
+point. Newly arriving jobs cannot keep that entry point draining indefinitely. A claim that uses
+the writer's turn cancels its redundant queue wait; its actual storage work keeps the turn until
+completion. Backpressure can still drive the steps needed to keep the table below its hard limit.
+IndexedDB validates visible segment owners in groups of at most 128 reads within the publishing
+transaction. Every owner is still checked, and multiple segments owned by one transaction count
+separately toward the level-zero ceiling. A corrupt or missing owner aborts publication atomically.
+Segment discovery reads at most 1,024 records from the selected table's index. A complete smaller
+partition avoids one cursor turn per segment; a full batch falls back to the exact cursor path.
+Block visibility is still checked through fresh point reads in the same publishing transaction.
 
 Level-zero growth is guarded on the write path in two tiers. Past 512 level-zero segments — twice
 the prefix one background fold absorbs — a write drives one fold step before its own commit and
@@ -160,6 +177,10 @@ removes the segment before its blocks, or removes both in the same atomic step. 
 before its segment is retained for a later pass, keeping recovery valid between cleanup steps.
 New discovery cycles visit segments before retired blocks to avoid spending an extra cycle on
 blocks still protected by segment metadata. Existing durable discovery cursors remain resumable.
+Concurrent background collectors retry a job conflict even if another collector has already
+finished and removed that job. This normal race does not report a worker error or mark
+maintenance as failed; other storage failures still do.
+
 Only one planned/running collection job may exist. Its durable cursor advances across the
 ID-ordered retired-provenance and segment pages, so a large obsolete history is read once across
 bounded steps and reopen—not rescanned from its first ID on every step.
@@ -181,6 +202,16 @@ so an explicit call also repairs a fold a dead owner left behind.
 
 Collection failures are visible and bounded. `db.maintenanceStatus()` reports pending commit
 debt, whether a pass is running or queued, retry time, consecutive failures, and the last error.
+Automatic compaction checks and jobs, lazy full-text and secondary index builds, and posting
+tail folds also report failures through `onBackgroundError`. Without a handler, the direct
+engine writes the error and operation context to `console.error`; in a worker these reports
+reach `onWorkerError`. A throwing diagnostic callback is logged and contained. Scan fallbacks
+remain available when an optional index build fails. `maintenanceStatus().backgroundFailureCount`
+counts all reported background failures; `backgroundErrors` keeps the last 32 in reporting order,
+with sequence, context, name, message and time. Each text field is capped at 1,024 characters.
+The snapshot is defensive and stays available after close. Observers still receive the original
+error. Collection-specific counters and `lastError` describe collection only. Foreground failures
+reject their owning call; a successful fallback still reports the unexpected accelerator failure.
 Failures retry on a capped timer even when no more writes arrive. Debt resets after any pass
 that reclaims something. If repeated failures let it reach the safety ceiling, the next write
 first assists collection and, if that pass still reclaims nothing, throws
@@ -238,3 +269,8 @@ folded 20,000-row table, 6,000 such statements hold between about 1.4 and 3.6 ms
 level-zero count never past 512, where before 0.7.6 latency climbed to 18 ms and the loop was
 refused at the ceiling by its 4,200th statement. A bulk update through `updateBatch()` or
 `UPDATE … FROM` a VALUES source is still cheaper: it lands as one segment.
+
+Background work can lose its build ownership or job revision to maintenance in another tab.
+Those typed refusals also reach the diagnostic hook; they do not imply that an acknowledged
+application write was lost. Index readers use the correct scan fallback while the accelerator
+is rebuilt. An I/O or corruption failure remains a failure and is reported through the same hook.

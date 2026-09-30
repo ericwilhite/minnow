@@ -1,4 +1,5 @@
 import { expect } from "@playwright/test";
+import { isMaintenanceContention } from "../src/testing/maintenance-diagnostics.js";
 import type { Page } from "@playwright/test";
 import {
   generateInteractionPlan,
@@ -336,9 +337,10 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       // never loses a commit race; only a crash can leave a defensive conflict behind.
       if (campaign === "complete") expect(result.rejectedConflicts).toBe(0);
       expect(pageDiagnostics).toEqual([]);
-      // A deliberate crash is classified on the mutation's typed failure. The error sink is for
-      // unsolicited window and worker diagnostics, none of which may be hidden by message text.
-      expect(tabErrors).toEqual([]);
+      // Every diagnostic is retained in the attachment. Concurrent cold accelerators can lose
+      // ownership without losing a user write; require typed identity/revision evidence for those
+      // reported refusals. Unknown, I/O, corruption and replay errors still fail this campaign.
+      expect(tabErrors.filter((error) => !isMaintenanceContention(error))).toEqual([]);
     });
   }
 }

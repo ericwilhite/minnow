@@ -24,6 +24,50 @@ const transportError = {
   error: new Error("boom"),
 };
 
+it.each(["error", "messageerror"] as const)(
+  "settles pending calls and live routes when a diagnostic hook throws on %s",
+  async (kind) => {
+    const boundary = createBoundary();
+    attachDatabaseWorker(boundary.workerSide);
+    const lost = vi.fn();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const hookError = new Error("broken diagnostic hook");
+    const client = new MinnowDatabaseClient(boundary.clientSide, {
+      store: { kind: "memory" },
+      onWorkerError: () => {
+        throw hookError;
+      },
+      onConnectionLost: lost,
+    });
+    try {
+      await seeded(client);
+      const events: string[] = [];
+      const live = client.liveQueries();
+      await live.subscribe("SELECT id FROM t", {
+        onChange: () => undefined,
+        onError: () => events.push("error"),
+        onComplete: () => events.push("complete"),
+      });
+      boundary.sever();
+      const pending = client.listTables();
+      const mutation = client.insert("t", { id: 2, v: "y" });
+      const results = Promise.allSettled([pending, mutation]);
+      expect(() => boundary.emitTransport(kind, transportError)).not.toThrow();
+      expect(await results).toMatchObject([
+        { status: "rejected", reason: { name: "DatabaseWorkerFailedError" } },
+        { status: "rejected", reason: { name: "DatabaseWorkerOutcomeUnknownError" } },
+      ]);
+      expect(events).toEqual(["error", "complete"]);
+      expect(lost).toHaveBeenCalledTimes(1);
+      await expect(client.listTables()).rejects.toBeInstanceOf(DatabaseWorkerFailedError);
+      expect(logged).toHaveBeenCalledWith("[minnowdb] onWorkerError callback failed:", hookError);
+    } finally {
+      await client.close();
+      logged.mockRestore();
+    }
+  },
+);
+
 async function seeded(client: MinnowDatabaseClient): Promise<void> {
   await client.createTable({
     name: "t",
@@ -240,4 +284,53 @@ it("commits a scope that cancelled a read and returned while the read was still 
   expect(result).toBe("done");
   expect((await client.readTable("t")).length).toBe(2);
   await client.close();
+});
+
+it("reports throwing loss listeners and still ends every route and pending call", async () => {
+  const boundary = createBoundary();
+  attachDatabaseWorker(boundary.workerSide);
+  const hookError = new Error("loss hook failed");
+  const routeError = new Error("error listener failed");
+  const completionError = new Error("completion listener failed");
+  const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const client = new MinnowDatabaseClient(boundary.clientSide, {
+    store: { kind: "memory" },
+    onWorkerError: () => undefined,
+    onConnectionLost: () => {
+      throw hookError;
+    },
+  });
+  try {
+    await seeded(client);
+    const live = client.liveQueries();
+    await live.subscribe("SELECT id FROM t", {
+      onChange: () => undefined,
+      onError: () => {
+        throw routeError;
+      },
+      onComplete: () => {
+        throw completionError;
+      },
+    });
+    const events: string[] = [];
+    await live.subscribe("SELECT v FROM t", {
+      onChange: () => undefined,
+      onError: () => events.push("error"),
+      onComplete: () => events.push("complete"),
+    });
+    boundary.sever();
+    const pending = client.listTables().catch((error: unknown) => error);
+    expect(() => boundary.emitTransport("messageerror", transportError)).not.toThrow();
+    expect(await pending).toBeInstanceOf(DatabaseWorkerFailedError);
+    expect(events).toEqual(["error", "complete"]);
+    expect(logged.mock.calls.map((call): unknown => call[1])).toEqual([
+      routeError,
+      completionError,
+      hookError,
+    ]);
+    await expect(client.listTables()).rejects.toBeInstanceOf(DatabaseWorkerFailedError);
+  } finally {
+    await client.close();
+    logged.mockRestore();
+  }
 });

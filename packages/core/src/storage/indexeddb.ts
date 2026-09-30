@@ -1,4 +1,9 @@
 import {
+  validateAutoIncrementReservation,
+  validateBeginTransactionInput,
+  assertGenericTransactionUpdateAllowed,
+} from "./toolkit/transaction-rules.js";
+import {
   type AbortTransactionIfExpiredInput,
   type AdoptAbortedSegmentInput,
   type BeginTransactionInput,
@@ -126,6 +131,7 @@ import {
   MAX_SNAPSHOT_METADATA_FRAME_BYTES,
   SNAPSHOT_FRAME_KINDS,
   MAX_LEVEL_ZERO_SEGMENTS,
+  MAX_STORAGE_BULK_READ_ITEMS,
   MAX_AUTO_INCREMENT_EXCLUSIVE_END,
   MAX_ROW_ID,
   MAX_ROW_ID_EXCLUSIVE_END,
@@ -2337,7 +2343,7 @@ export class IndexedDbBlockStore implements BlockStore {
           Date.parse(existing.updatedAt),
         )))
     ) {
-      throw new Error(`Postings base build is owned by another caller: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "owned by another caller");
     }
     const transaction = this.#transaction("catalog", "readwrite");
     const store = transaction.objectStore("catalog");
@@ -2347,7 +2353,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "index is no longer active");
     }
     const ownerKind = Object.values(table.secondaryIndexes ?? {}).some(
       (index) => index.storageColumnId === columnId,
@@ -2371,7 +2377,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if ((await requestResult(store.getKey(markerKey))) !== undefined) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Full-text base build changed: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "another live build exists");
     }
     store.put(
       {
@@ -2446,7 +2452,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if (marker.cleanupIndex !== 0) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Full-text base build changed: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "another live build exists");
     }
     const chunkKey = `${ftsBaseChunkPrefix(tableId, columnId, buildId)}${String(ordinal).padStart(6, "0")}`;
     if (ordinal < marker.boundaries.length) {
@@ -2586,10 +2592,15 @@ export class IndexedDbBlockStore implements BlockStore {
     if (
       marker?.buildId !== buildId ||
       marker.ownerId !== input.ownerId ||
-      Date.parse(marker.expiresAt) <= Date.parse(input.expiresAtCutoff) ||
-      marker.cleanupIndex !== 0 ||
-      marker.boundaries.length !== input.chunkCount
+      Date.parse(marker.expiresAt) <= Date.parse(input.expiresAtCutoff)
     ) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "ownership is absent or expired");
+    }
+    // Ownership loss is a stale builder; incomplete chunks under the same live owner are a
+    // genuine failure and must not be classified as harmless contention.
+    if (marker.cleanupIndex !== 0 || marker.boundaries.length !== input.chunkCount) {
       transaction.abort();
       await ignoreAbort(transaction);
       throw new Error(`Full-text base build is incomplete: ${buildId}`);
@@ -2654,9 +2665,10 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     await transactionDone(probe);
     if (marker === undefined) return;
-    if (marker.buildId !== buildId) throw new Error(`Postings base build changed: ${buildId}`);
+    if (marker.buildId !== buildId)
+      throw new PostingBuildConflictError(buildId, input.ownerId, "Postings base build changed");
     if (marker.ownerId !== input.ownerId && Date.parse(marker.expiresAt) > Date.parse(cutoff)) {
-      throw new Error(`Postings base build is owned by another caller: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "owned by another caller");
     }
     await this.#deleteFtsBaseBuildFully(tableId, columnId, buildId, Date.parse(marker.updatedAt));
   }
@@ -3572,17 +3584,7 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   async beginTransaction(input: BeginTransactionInput): Promise<BeginTransactionResult> {
-    if (input.record.pendingBlockIds.length > 0 || input.record.pendingSegmentIds.length > 0) {
-      throw new TypeError("A fresh transaction cannot begin with pending artifacts");
-    }
-    if (
-      input.record.pendingTable !== undefined ||
-      input.record.pendingTableNextRowId !== undefined ||
-      input.record.catalogEpochGuard !== undefined ||
-      (input.record as TransactionRecord).schemaEpochGuard !== undefined
-    ) {
-      throw new TypeError("Storage-owned transaction state cannot be supplied at begin");
-    }
+    validateBeginTransactionInput(input);
     const pending =
       input.pendingTable === undefined
         ? undefined
@@ -5637,10 +5639,12 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     const store = transaction.objectStore("gc");
     const key = compactionJobKey(normalized.id);
-    if ((await requestResult(store.getKey(key))) !== undefined) {
+    const duplicateValue: unknown = await requestResult(store.get(key));
+    if (duplicateValue !== undefined) {
+      const duplicate = asCompactionJobEnvelope(duplicateValue);
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Compaction job already exists: ${normalized.id}`);
+      throw new CompactionJobConflictError(normalized.id, normalized.revision, duplicate.revision);
     }
     await assertCompactionJobReferences(transaction, normalized);
     const quota = await readMaintenanceQuota(store);
@@ -5654,8 +5658,15 @@ export class IndexedDbBlockStore implements BlockStore {
       const markerValue: unknown = await requestResult(store.get(markerKey));
       if (markerValue !== undefined) {
         const marker = asActiveCompactionMarker(markerValue, normalized.tableId);
-        throw new Error(
-          `Compaction job ${marker.jobId} is already active for table ${normalized.tableId}`,
+        const competing = asCompactionJobEnvelope(
+          await requestResult(store.get(compactionJobKey(marker.jobId))),
+        );
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new CompactionJobConflictError(
+          normalized.id,
+          normalized.revision,
+          competing.revision,
         );
       }
       store.add(
@@ -9509,6 +9520,7 @@ class ConnectionStallGuard {
   readonly #waiting = new Set<(error: Error) => void>();
   #timer: ReturnType<typeof setTimeout> | undefined;
   #tripped: StorageUnresponsiveError | undefined;
+  #deadline = 0;
   #disposed = false;
 
   constructor(
@@ -9532,6 +9544,7 @@ class ConnectionStallGuard {
       return () => undefined;
     }
     if (this.#disposed) return () => undefined;
+    if (this.#waiting.size === 0) this.#deadline = performance.now() + this.#afterMs;
     this.#waiting.add(reject);
     this.#arm();
     let released = false;
@@ -9551,10 +9564,14 @@ class ConnectionStallGuard {
 
   #arm(): void {
     if (this.#timer !== undefined || this.#waiting.size === 0) return;
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      this.#trip();
-    }, this.#afterMs);
+    this.#timer = setTimeout(
+      () => {
+        this.#timer = undefined;
+        if (performance.now() < this.#deadline) this.#arm();
+        else this.#trip();
+      },
+      Math.max(0, this.#deadline - performance.now()),
+    );
     (this.#timer as { unref?: () => void }).unref?.();
   }
 
@@ -9567,8 +9584,9 @@ class ConnectionStallGuard {
   /** An event arrived, so the connection is alive: start the deadline over. */
   #progress(): void {
     if (this.#tripped !== undefined) return;
-    this.#disarm();
-    this.#arm();
+    this.#deadline = performance.now() + this.#afterMs;
+    if (this.#waiting.size === 0) this.#disarm();
+    else this.#arm();
   }
 
   #trip(): void {
@@ -14174,9 +14192,8 @@ async function assertLevelZeroSegmentLimits(
 
 /**
  * How many committed level-zero segments of a table are live at `version`. Visibility is
- * decided per segment from point reads of its block records — the level-zero limit times the
- * column count — never from the manifest's whole block set, so an insert's commit costs what
- * the table holds unfolded, not what the database holds.
+ * decided per segment from fresh point reads of its block records, never from the whole
+ * manifest. Small table partitions batch segment discovery; larger partitions retain cursors.
  */
 async function countVisibleLevelZeroSegments(
   index: IDBIndex,
@@ -14185,35 +14202,47 @@ async function countVisibleLevelZeroSegments(
   version: number | null,
   tableId: string,
 ): Promise<number> {
-  const candidates = await new Promise<SegmentRecord[]>((resolve, reject) => {
-    const found: SegmentRecord[] = [];
-    const request = index.openCursor(tableId);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB segment cursor failed"));
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor === null) {
-        resolve(found);
-        return;
-      }
-      try {
-        const segment = asSegmentRecord(cursor.value);
-        if (segment.id !== cursor.primaryKey || segment.tableId !== tableId) {
-          throw corruption(`segments/${segment.id}`, "table index does not match its record");
+  const candidates: SegmentRecord[] = [];
+  const append = (value: unknown, key: IDBValidKey): void => {
+    const segment = asSegmentRecord(value);
+    if (segment.id !== key || segment.tableId !== tableId)
+      throw corruption(`segments/${segment.id}`, "table index does not match its record");
+    if (segment.level === 0) candidates.push(segment);
+  };
+  const [keys, values] = await Promise.all([
+    requestResult<IDBValidKey[]>(index.getAllKeys(tableId, MAX_STORAGE_BULK_READ_ITEMS)),
+    requestResult<unknown[]>(index.getAll(tableId, MAX_STORAGE_BULK_READ_ITEMS)),
+  ]);
+  if (keys.length !== values.length) throw corruption("segments", "batch keys do not match values");
+  if (keys.length < MAX_STORAGE_BULK_READ_ITEMS) {
+    for (const [position, key] of keys.entries()) append(values[position], key);
+  } else {
+    // A full bounded read cannot establish completeness. Keep the exact cursor path for
+    // larger partitions; its data remains in the same atomic publishing transaction.
+    await new Promise<void>((resolve, reject) => {
+      const request = index.openCursor(tableId);
+      request.onerror = () => reject(request.error ?? new Error("IndexedDB segment cursor failed"));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          resolve();
+          return;
         }
-        if (segment.level === 0) found.push(segment);
-        cursor.continue();
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    };
-  });
+        try {
+          append(cursor.value, cursor.primaryKey);
+          cursor.continue();
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      };
+    });
+  }
   const memberships = await Promise.all(
     candidates.map((segment) =>
       manifestBlockMembershipInTransaction(catalog, version, segmentBlockIds(segment)),
     ),
   );
-  const statuses = new Map<string, TransactionRecord["status"]>();
-  let count = 0;
+  const owners = new Map<string, { segmentId: string; count: number }>();
   for (const [position, segment] of candidates.entries()) {
     const membership = memberships[position] ?? [];
     const visibleBlockCount = membership.filter((present) => present).length;
@@ -14221,19 +14250,26 @@ async function countVisibleLevelZeroSegments(
       throw corruption(`segments/${segment.id}`, "only part of the segment is manifest-live");
     }
     if (membership.length > 0 && visibleBlockCount === 0) continue;
-    let status = statuses.get(segment.transactionId);
-    if (status === undefined) {
-      const owner = await requestResult<unknown>(transactions.get(segment.transactionId));
-      if (owner === undefined) {
-        throw corruption(
-          `segments/${segment.id}`,
-          `owning transaction ${segment.transactionId} is missing`,
-        );
+    const owner = owners.get(segment.transactionId);
+    if (owner === undefined) owners.set(segment.transactionId, { segmentId: segment.id, count: 1 });
+    else owner.count += 1;
+  }
+  // Ownership cannot change inside this native transaction. Queue bounded groups of reads
+  // instead of one browser IPC round trip per visible segment owner; validate every record.
+  const entries = [...owners];
+  let count = 0;
+  for (let start = 0; start < entries.length; start += 128) {
+    const page = entries.slice(start, start + 128);
+    const records = await Promise.all(
+      page.map(([id]) => requestResult<unknown>(transactions.get(id))),
+    );
+    for (const [position, [id, owner]] of page.entries()) {
+      const record = records[position];
+      if (record === undefined) {
+        throw corruption(`segments/${owner.segmentId}`, `owning transaction ${id} is missing`);
       }
-      status = asStoredTransactionRecord(owner, segment.transactionId).status;
-      statuses.set(segment.transactionId, status);
+      if (asStoredTransactionRecord(record, id).status === "committed") count += owner.count;
     }
-    if (status === "committed") count += 1;
   }
   return count;
 }
@@ -14999,21 +15035,6 @@ function isTerminalCompactionJob(record: CompactionJobRecord): boolean {
   return record.state === "published" || record.state === "cancelled" || record.state === "aborted";
 }
 
-function assertGenericTransactionUpdateAllowed(
-  record: Pick<TransactionRecord, "status">,
-  update: TransactionRecordUpdate,
-): void {
-  if (record.status !== "active") {
-    throw new TypeError(`Only active transactions can be updated; found ${record.status}`);
-  }
-  if (update.status === "committed") {
-    throw new TypeError("Use commitTransaction to commit a transaction");
-  }
-  if (Reflect.has(update, "committedVersion")) {
-    throw new TypeError("Only commitTransaction can set a committed transaction version");
-  }
-}
-
 /**
  * Validates only the given candidate set, not a job's full accumulated history. A resumed,
  * multi-page planning job re-adds nothing for candidates already appended on earlier pages, so
@@ -15667,7 +15688,11 @@ function assertLivePostingBuildOwner(
     marker.ownerId !== input.ownerId ||
     Date.parse(marker.expiresAt) <= Date.parse(input.expiresAtCutoff)
   ) {
-    throw new Error(`Postings base build ownership is absent or expired: ${input.buildId}`);
+    throw new PostingBuildConflictError(
+      input.buildId,
+      input.ownerId,
+      "ownership is absent or expired",
+    );
   }
 }
 
@@ -16133,21 +16158,6 @@ async function deleteFtsColumnRecords(
   store.delete(tocKey);
   store.delete(deltaIndexKey);
   store.delete(markerKey);
-}
-
-function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new RangeError("Auto-increment reservation count must be a non-negative whole number");
-  }
-  if (atLeast !== undefined && typeof atLeast !== "bigint") {
-    throw new TypeError("Auto-increment bump target must be a bigint");
-  }
-  if (atLeast !== undefined && atLeast < 1n) {
-    throw new RangeError("Auto-increment bump target must be at least 1");
-  }
-  if (atLeast !== undefined && atLeast > MAX_AUTO_INCREMENT_EXCLUSIVE_END) {
-    throw new RangeError("Auto-increment bump target is outside the safe integer range");
-  }
 }
 
 function assertCounterEndInRange(endExclusive: bigint, maximum: bigint, label: string): void {
@@ -18752,7 +18762,11 @@ function applyUniqueMembershipSourceToRequested(
 ): Promise<void> {
   if (requestedDescending.length === 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const request = store.openCursor(null, "prev");
+    const range =
+      typeof IDBKeyRange === "undefined"
+        ? undefined
+        : IDBKeyRange.bound([...prefix], [...prefix, requestedDescending[0] ?? ""]);
+    const request = store.openCursor(range, "prev");
     let position = 0;
     let positioned = false;
     request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
@@ -18830,7 +18844,11 @@ function assertUniqueMembershipSourceExists(
   kind: "base" | "tail",
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const request = store.openCursor();
+    const range =
+      typeof IDBKeyRange === "undefined"
+        ? undefined
+        : IDBKeyRange.bound([...prefix], [...prefix, []], false, true);
+    const request = store.openCursor(range);
     let positioned = false;
     request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
     request.onsuccess = () => {

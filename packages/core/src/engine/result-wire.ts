@@ -1,5 +1,5 @@
 import { dateMilliseconds } from "../date-value.js";
-import type { SqlDomain } from "../storage/types.js";
+import { validateSqlDomain, type SqlDomain } from "../storage/types.js";
 import type { QueryResult, QueryRow, QueryValue } from "./query.js";
 import { unknownColumnDomains } from "./query.js";
 
@@ -65,10 +65,29 @@ export function decodeQueryResult(payload: unknown): QueryResult {
   if (!isWireQueryResult(payload)) {
     throw new TypeError("Expected a columnar query result frame");
   }
+  validateResultShape(payload.rowCount, payload.columns.length);
   const columns = [...payload.columns];
   if (payload.values.length !== columns.length || payload.columnDomains.length !== columns.length) {
     throw new TypeError("Columnar result frame metadata is not aligned");
   }
+  for (const name of columns) {
+    if (typeof name !== "string")
+      throw new TypeError("Columnar result column names must be strings");
+  }
+  for (const domain of payload.columnDomains as readonly unknown[]) {
+    if (domain === null) continue;
+    if (
+      typeof domain !== "object" ||
+      !["numeric", "json", "jsonb", "uuid", "date", "time", "interval", "array", "enum"].includes(
+        String((domain as { kind?: unknown }).kind),
+      )
+    ) {
+      throw new TypeError("Invalid columnar result domain metadata");
+    }
+    validateSqlDomain(domain as SqlDomain, "worker result");
+  }
+  // Validate lengths before allocating rows: a missing vector must never fabricate SQL values.
+  for (const column of payload.values) validateColumn(column, payload.rowCount);
   const columnDomains = structuredClone(payload.columnDomains);
   const rows: QueryRow[] = [];
   for (let index = 0; index < payload.rowCount; index += 1) rows.push({});
@@ -80,6 +99,92 @@ export function decodeQueryResult(payload: unknown): QueryResult {
     fillColumn(rows, name, column);
   }
   return { columns, columnDomains, rows };
+}
+
+function validateResultShape(rowCount: number, columnCount: number): void {
+  if (!Number.isSafeInteger(rowCount) || rowCount < 0 || rowCount > 1_000_000) {
+    throw new TypeError("Columnar result frame row count must be between 0 and 1,000,000");
+  }
+  if (columnCount > 16_384 || rowCount * columnCount > 4_000_000) {
+    throw new RangeError(
+      "Worker result exceeds its column/cell limit; narrow the projection or use a query cursor",
+    );
+  }
+}
+
+function validateColumn(input: unknown, rowCount: number): void {
+  const fail = (): never => {
+    throw new TypeError("Invalid columnar result column encoding");
+  };
+  if (typeof input !== "object" || input === null) return fail();
+  const column = input as {
+    kind?: unknown;
+    nulls?: unknown;
+    values?: unknown;
+    text?: unknown;
+    offsets?: unknown;
+  };
+  if ("nulls" in column && column.nulls !== undefined) {
+    if (!(column.nulls instanceof Uint8Array) || column.nulls.length !== rowCount) return fail();
+    for (const value of column.nulls) if (value !== 0 && value !== 1) return fail();
+  }
+  switch (column.kind) {
+    case "null":
+      return;
+    case "number":
+    case "datetime":
+      if (!(column.values instanceof Float64Array) || column.values.length !== rowCount)
+        return fail();
+      if (column.kind === "datetime")
+        for (let row = 0; row < rowCount; row += 1) {
+          if (column.nulls instanceof Uint8Array && column.nulls[row] === 1) continue;
+          const value = column.values[row];
+          if (typeof value === "number" && Number.isNaN(value)) continue; // Explicit Invalid Date sentinel.
+          if (
+            value === undefined ||
+            !Number.isSafeInteger(value) ||
+            Math.abs(value) > 8_640_000_000_000_000
+          )
+            return fail();
+        }
+      return;
+    case "boolean":
+      if (!(column.values instanceof Uint8Array) || column.values.length !== rowCount)
+        return fail();
+      for (const value of column.values) if (value !== 0 && value !== 1) return fail();
+      return;
+    case "string": {
+      if (
+        typeof column.text !== "string" ||
+        !(column.offsets instanceof Uint32Array) ||
+        column.offsets.length !== rowCount + 1 ||
+        column.offsets[0] !== 0 ||
+        column.offsets[rowCount] !== column.text.length
+      )
+        return fail();
+      let previous = 0;
+      for (const offset of column.offsets) {
+        if (offset < previous || offset > column.text.length) return fail();
+        previous = offset;
+      }
+      return;
+    }
+    case "mixed":
+      if (!Array.isArray(column.values) || column.values.length !== rowCount) return fail();
+      for (const value of column.values as readonly unknown[]) {
+        if (
+          value !== null &&
+          typeof value !== "number" &&
+          typeof value !== "string" &&
+          typeof value !== "boolean" &&
+          !(value instanceof Date)
+        )
+          return fail();
+      }
+      return;
+    default:
+      return fail();
+  }
 }
 
 export function isWireQueryResult(value: unknown): value is WireQueryResult {
@@ -102,6 +207,7 @@ function encodeRows(
   if (columnDomains.length !== columns.length) {
     throw new TypeError("Query result column domains must align with the result columns");
   }
+  validateResultShape(rows.length, columns.length);
   const transfer: ArrayBuffer[] = [];
   const values = columns.map((name) => {
     const column = encodeColumn(name, rows);

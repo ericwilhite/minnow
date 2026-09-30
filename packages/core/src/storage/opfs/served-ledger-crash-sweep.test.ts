@@ -1,5 +1,5 @@
 /**
- * The layout-6 served-request ledger across crash points.
+ * The served-request ledger across crash points.
  *
  * Drives a bare `OpfsLeader` (as log-crash.test.ts does) so each crash point can be
  * manufactured exactly: frame durable but no result frame, torn result frame, torn checkpoint
@@ -49,6 +49,11 @@ function reserveRowIds(leader: OpfsLeader, tableId: string, count: number): Prom
   return leader._loggedGenerated("reserveRowIds", [tableId, count]);
 }
 
+function present<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("Required fixture bytes are missing");
+  return value;
+}
+
 interface Handles {
   tree: OpfsTree;
   recover: (options?: {
@@ -74,10 +79,11 @@ async function handles(shim: MemoryOpfs, name: string): Promise<Handles> {
       const wal = await tree.openHandle(["wal"], { create: true });
       const slotA = await tree.openHandle(["checkpoint-a"], { create: true });
       const slotB = await tree.openHandle(["checkpoint-b"], { create: true });
+      const acknowledgements = await tree.openHandle(["wal-acknowledgements"], { create: true });
       return OpfsLeader.recover(
         tree,
         options.strict ?? true,
-        { wal, slotA, slotB },
+        { wal, slotA, slotB, acknowledgements },
         options.checkpointEntries ?? 1_000_000,
         undefined,
         options.onDiagnostic,
@@ -203,13 +209,17 @@ describe("served-request ledger crash sweep", () => {
     const walBeforeCheckpoint = shim.readFileBytes(h.walPath);
     if (walBeforeCheckpoint === undefined) throw new Error("wal");
     leader.checkpointNow(); // generation 2
+    const acknowledgementPath = "minnowdb/ledger-checkpoint/wal-acknowledgements";
+    const acknowledgementsBeforeD = present(shim.readFileBytes(acknowledgementPath));
     await add("d", 4_000, false);
     // Crash point 1: pretend the WAL reset of generation 2 never happened (restore the old WAL
     // in front of d's frame is impossible — the sequence continues — so restore exactly the
     // pre-checkpoint WAL, i.e. crash after both slots flushed, before reset).
     leader.crash();
     const walWithD = shim.readFileBytes(h.walPath);
+    const acknowledgementsWithD = present(shim.readFileBytes(acknowledgementPath));
     shim.writeFileBytes(h.walPath, walBeforeCheckpoint);
+    shim.writeFileBytes(acknowledgementPath, acknowledgementsBeforeD);
     leader = await h.recover();
     expect(
       await checkLedger(
@@ -224,6 +234,7 @@ describe("served-request ledger crash sweep", () => {
     // (bit rot). The other slot is the same generation, so nothing rolls back.
     if (walWithD === undefined) throw new Error("wal");
     shim.writeFileBytes(h.walPath, walWithD);
+    shim.writeFileBytes(acknowledgementPath, acknowledgementsWithD);
     const slotBytes = h.slotPaths.map((p) => shim.readFileBytes(p));
     const newest = slotBytes[0] !== undefined && slotBytes[1] !== undefined ? 0 : 1;
     const bytes = slotBytes[newest];

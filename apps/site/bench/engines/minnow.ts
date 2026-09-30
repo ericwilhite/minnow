@@ -6,6 +6,7 @@ import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 import { commerceEntities, generateEntityBatch } from "../benchmark";
 import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol";
 import { canonicalizeRow, createSecondaryIndexes, normalizeRows } from "./shared";
+import { deleteDatabase } from "../worker/support";
 import type {
   EngineDriver,
   EngineSession,
@@ -36,9 +37,12 @@ function connectClient(database: MinnowDatabase): {
   return {
     client,
     async close() {
-      await client.close();
-      channel.port1.close();
-      channel.port2.close();
+      try {
+        await client.close();
+      } finally {
+        channel.port1.close();
+        channel.port2.close();
+      }
     },
   };
 }
@@ -83,8 +87,8 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
       const { record } = context;
       const name = datasetStorageName(record);
       const started = performance.now();
-      const store = await backend.openStore(record);
-      const database = new MinnowDatabase(store, databaseOptions(record));
+      let store = await backend.openStore(record);
+      let database = new MinnowDatabase(store, databaseOptions(record));
       let insertMs = 0;
       let indexMs: number;
       let dataStoredBytes: number;
@@ -118,6 +122,10 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             ? await createSecondaryIndexes(entities, (sql) => database.execute(sql))
             : 0;
         indexStoredBytes = Math.max(0, (await store.getLogicalStorageBytes()) - dataStoredBytes);
+        await database.close();
+        store.close();
+        store = await backend.openStore(record);
+        database = new MinnowDatabase(store, databaseOptions(record));
         const orderRows =
           entities.find((entity) => entity.name === "orders")?.rows(record.scale) ?? 0;
         const counted = await database.query("SELECT COUNT(*) AS row_count FROM orders");
@@ -141,7 +149,11 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
           indexMs,
         };
       } finally {
-        store.close();
+        try {
+          await database.close();
+        } finally {
+          store.close();
+        }
       }
     },
 
@@ -184,8 +196,11 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
           return statement;
         },
         async close() {
-          await database.close();
-          store.close();
+          try {
+            await database.close();
+          } finally {
+            store.close();
+          }
         },
       };
     },
@@ -207,6 +222,9 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             columns: schema.columns.map((column) => ({ name: column.name, type: column.type })),
           });
         },
+        async dropTable(table) {
+          await database.dropTable(table, { ifExists: true });
+        },
         async insert(table, batch) {
           await connection.client.insertBatch(table, {
             columns: batch.columns,
@@ -222,9 +240,15 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
           return { close: () => subscription.close() };
         },
         async close() {
-          await live.close();
-          await connection.close();
-          store.close();
+          try {
+            await live.close();
+          } finally {
+            try {
+              await connection.close();
+            } finally {
+              store.close();
+            }
+          }
         },
       };
     },
@@ -270,13 +294,17 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
                   )
                 ).rows,
               ).map(canonicalizeRow),
-            // MinnowDatabase has no DROP TABLE; these tables leave with the dataset's database.
-            drop: () => Promise.resolve(),
+            drop: async () => {
+              await database.dropTable(schema.name, { ifExists: true });
+            },
           };
         },
-        close() {
-          store.close();
-          return Promise.resolve();
+        async close() {
+          try {
+            await database.close();
+          } finally {
+            store.close();
+          }
         },
       };
     },
@@ -292,17 +320,5 @@ export const minnowDriver: EngineDriver = createMinnowDriver({
   persistence: "IndexedDB · immutable compressed column blocks",
   openStore: (record) =>
     IndexedDbBlockStore.open({ name: datasetStorageName(record), durability: record.durability }),
-  deleteDataset: (materialization) =>
-    new Promise<void>((resolve) => {
-      const request = indexedDB.deleteDatabase(materialization.storageName);
-      request.onsuccess = () => {
-        resolve();
-      };
-      request.onerror = () => {
-        resolve();
-      };
-      request.onblocked = () => {
-        resolve();
-      };
-    }),
+  deleteDataset: (materialization) => deleteDatabase(materialization.storageName),
 });

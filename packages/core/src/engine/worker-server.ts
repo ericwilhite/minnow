@@ -86,7 +86,6 @@ export type WireDatabaseOptions = Pick<
   | "targetBlockBytes"
   | "rowsPerBlock"
   | "maxCommitRetries"
-  | "coordinateWrites"
   | "spillOwnerLeaseMs"
   | "transactionOwnerLeaseMs"
   | "transactionIdleTimeoutMs"

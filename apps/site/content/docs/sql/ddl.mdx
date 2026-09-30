@@ -242,7 +242,17 @@ scale: a bare `NUMERIC` column with no declared scale, and derived arithmetic su
 `price * 2`, whose result type carries no scale.
 
 `JSON` validates a document and preserves object key order; `JSONB` canonicalizes object keys.
-UUID values validate and normalize. Arrays use canonical JSON at the JavaScript boundary. Minnow
+Numbers read from JSON text retain every decimal digit in storage, extraction, constructors,
+and JSONB comparisons. They never pass through JavaScript's floating-point parser. JSON
+numbers share the exact numeric digit limit; documents also have the scalar size, nesting,
+and item limits described in the SQL reference. Pass JSON text when precision matters:
+digits already rounded in a JavaScript number cannot be recovered. Native `JSON.parse` on
+a returned document can round its numbers again. This fix cannot restore digits already rounded
+in documents stored by an older build.
+UUID values validate and normalize. Arrays use canonical JSON at the JavaScript boundary.
+An unquoted number in ARRAY input must retain its decimal value when converted to a JavaScript
+number; otherwise insertion is refused. Encode exact values as JSON strings to retain their
+digits, as the `ARRAY` constructor does for exact NUMERIC members. Minnow
 supports one-based scalar array subscripts, `ARRAY_AGG` with ordering and `DISTINCT`, and typed
 `UNNEST(ARRAY[...])` constructor sources with optional `WITH ORDINALITY`. Array slices,
 multidimensional access, correlated UNNEST inputs, and PostgreSQL array operators such as `||`
@@ -345,8 +355,8 @@ CREATE TABLE offline_rows (
 )
 ```
 
-Callers omit `offline_key`; assigning it in an `INSERT`, `UPDATE`, trigger body, or conflict update
-is rejected. The expression may use immutable scalar operators and functions over ordinary
+Callers omit `offline_key`, or use `DEFAULT` for it in an `INSERT`. Assigning an explicit value
+in an `INSERT`, `UPDATE`, trigger body, or conflict update is rejected. The expression may use immutable scalar operators and functions over ordinary
 sibling columns. It cannot use parameters, aggregates, windows, subqueries, volatile functions,
 another generated column, or a column from another table. Generated columns may be indexed and
 returned normally, but cannot be a primary key or the single unique row-addressing key.

@@ -161,7 +161,7 @@ export async function admitWriter<T>(
     writeAdmissionTestHooks.stallReportMs ??
     WRITE_ADMISSION_STALL_REPORT_MS;
   const startedAt = Date.now();
-  const state = { admitted: false, finished: false };
+  const state = { admitted: false, finished: false, crossContext: false };
 
   const hold = async (): Promise<T> => {
     state.admitted = true;
@@ -198,7 +198,7 @@ export async function admitWriter<T>(
       if (owned.holder !== undefined) {
         nextMark = owned.holder;
         holderKind = owned.holder.kind;
-      } else if (locks !== undefined) {
+      } else if (locks !== undefined && state.crossContext) {
         try {
           const snapshot = await locks.query();
           if (!waiting()) return;
@@ -212,7 +212,13 @@ export async function admitWriter<T>(
         nextMark = null;
       }
       const now = Date.now();
-      if (nextMark !== mark) {
+      // An empty/unavailable lock snapshot establishes no holder. A delayed lock grant or
+      // watchdog timer must not turn that absence into a stalled writer.
+      if (nextMark === null) {
+        mark = undefined;
+        markedAt = now;
+        reported = false;
+      } else if (nextMark !== mark) {
         mark = nextMark;
         markedAt = now;
         reported = false;
@@ -236,6 +242,7 @@ export async function admitWriter<T>(
     owned.waiting -= 1;
     if (signal.aborted) throw abortError(signal);
     if (locks === undefined) return hold();
+    state.crossContext = true;
     // The cross-context stage. Only the head of the local queue reaches here, so this context
     // never holds more than one pending request on the lock.
     if (crossContext !== undefined && isAborted(crossContext)) {

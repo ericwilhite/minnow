@@ -1,5 +1,6 @@
 import type { PGlite } from "@electric-sql/pglite";
 import { loadPglite } from "./vendored";
+import { withBenchmarkCleanup } from "../cleanup";
 import { commerceEntities, generateEntityBatch } from "../benchmark";
 import type { DatasetRecord, EngineMaterialization } from "../protocol";
 import {
@@ -79,20 +80,15 @@ async function openPglite(
 const RELAXED_CLOSE_SETTLE_MS = 2_000;
 
 /**
- * Closes a handle, settling first when it was opened relaxed. A close that fails anyway is
- * logged and stepped over: the dataset is about to be dropped, so a stuck handle is not worth
- * losing a capture that has already produced its numbers.
+ * Closes a handle, settling first when it was opened relaxed. Unexpected close failures
+ * invalidate the run, just like failed execution or verification.
  */
 async function closePglite(database: PGlite, relaxed = false): Promise<void> {
   if (database.closed) return;
   if (relaxed) {
     await new Promise((resolve) => setTimeout(resolve, RELAXED_CLOSE_SETTLE_MS));
   }
-  try {
-    await database.close();
-  } catch (error) {
-    console.warn(`PGlite close failed, continuing: ${String(error)}`);
-  }
+  await database.close();
 }
 
 /**
@@ -125,101 +121,102 @@ export const pgliteDriver: EngineDriver = {
     let indexMs: number;
     let dataStoredBytes: number | null;
     let indexStoredBytes: number | null;
-    try {
-      const entities = commerceEntities;
-      for (const entity of entities) await database.exec(createTableSql(entity));
-      let completedRows = 0;
-      for (const entity of entities) {
-        const entityRows = entity.rows(record.scale);
-        for (let start = 0; start < entityRows; start += BATCH_ROWS) {
-          context.checkCancelled();
-          const rowCount = Math.min(BATCH_ROWS, entityRows - start);
-          const columns = generateEntityBatch(entity, start, rowCount, entityRows, record.scale);
-          const rows = rowsFromColumns(entity, columns);
-          const maxRowsPerStatement = Math.max(1, Math.floor(10_000 / entity.columns.length));
-          const insertStarted = performance.now();
-          await database.transaction(async (transaction) => {
-            for (let offset = 0; offset < rows.length; offset += maxRowsPerStatement) {
-              const statementRows = rows.slice(offset, offset + maxRowsPerStatement);
-              const values: unknown[] = [];
-              const tuples = statementRows.map((row) => {
-                const placeholders = row.map((value) => {
-                  values.push(value);
-                  return `$${String(values.length)}`;
+    return withBenchmarkCleanup<EngineMaterialization>(
+      async () => {
+        const entities = commerceEntities;
+        for (const entity of entities) await database.exec(createTableSql(entity));
+        let completedRows = 0;
+        for (const entity of entities) {
+          const entityRows = entity.rows(record.scale);
+          for (let start = 0; start < entityRows; start += BATCH_ROWS) {
+            context.checkCancelled();
+            const rowCount = Math.min(BATCH_ROWS, entityRows - start);
+            const columns = generateEntityBatch(entity, start, rowCount, entityRows, record.scale);
+            const rows = rowsFromColumns(entity, columns);
+            const maxRowsPerStatement = Math.max(1, Math.floor(10_000 / entity.columns.length));
+            const insertStarted = performance.now();
+            await database.transaction(async (transaction) => {
+              for (let offset = 0; offset < rows.length; offset += maxRowsPerStatement) {
+                const statementRows = rows.slice(offset, offset + maxRowsPerStatement);
+                const values: unknown[] = [];
+                const tuples = statementRows.map((row) => {
+                  const placeholders = row.map((value) => {
+                    values.push(value);
+                    return `$${String(values.length)}`;
+                  });
+                  return `(${placeholders.join(", ")})`;
                 });
-                return `(${placeholders.join(", ")})`;
-              });
-              await transaction.query(
-                `INSERT INTO ${quoteIdentifier(entity.name)} (${entity.columns.map((column) => quoteIdentifier(column.name)).join(", ")}) VALUES ${tuples.join(", ")}`,
-                values,
-              );
-            }
-          });
-          insertMs += performance.now() - insertStarted;
-          completedRows += rowCount;
-          context.report(`PGlite · ${entity.name}`, completedRows);
+                await transaction.query(
+                  `INSERT INTO ${quoteIdentifier(entity.name)} (${entity.columns.map((column) => quoteIdentifier(column.name)).join(", ")}) VALUES ${tuples.join(", ")}`,
+                  values,
+                );
+              }
+            });
+            insertMs += performance.now() - insertStarted;
+            completedRows += rowCount;
+            context.report(`PGlite · ${entity.name}`, completedRows);
+          }
         }
-      }
-      const dataSizeResult = await database.query<{ bytes: number | bigint }>(
-        "SELECT pg_database_size(current_database()) AS bytes",
-      );
-      dataStoredBytes =
-        dataSizeResult.rows[0]?.bytes === undefined ? null : Number(dataSizeResult.rows[0].bytes);
-      indexMs =
-        record.secondaryIndexes === "foreign-keys"
-          ? await createSecondaryIndexes(entities, (sql) => database.exec(sql))
-          : 0;
-      const indexedSizeResult = await database.query<{ bytes: number | bigint }>(
-        "SELECT pg_database_size(current_database()) AS bytes",
-      );
-      const indexedStoredBytes =
-        indexedSizeResult.rows[0]?.bytes === undefined
-          ? null
-          : Number(indexedSizeResult.rows[0].bytes);
-      indexStoredBytes =
-        dataStoredBytes === null || indexedStoredBytes === null
-          ? null
-          : Math.max(0, indexedStoredBytes - dataStoredBytes);
-      await database.exec("ANALYZE");
-      await database.syncToFs();
-      // Close and reopen so what the record marks "ready" is what actually persisted.
-      await database.close();
-      database = await openPglite(name, record.durability, "write");
-      const orderRows =
-        entities.find((entity) => entity.name === "orders")?.rows(record.scale) ?? 0;
-      const counted = await database.query<{ row_count: number | bigint }>(
-        "SELECT COUNT(*) AS row_count FROM orders",
-      );
-      const countedRows = Number(counted.rows[0]?.row_count ?? -1);
-      if (countedRows !== orderRows) {
-        throw new Error(
-          `PGlite verification failed after reopen: expected ${String(orderRows)} orders, found ${String(countedRows)}`,
+        const dataSizeResult = await database.query<{ bytes: number | bigint }>(
+          "SELECT pg_database_size(current_database()) AS bytes",
         );
-      }
-      const sizeResult = await database.query<{ bytes: number | bigint }>(
-        "SELECT pg_database_size(current_database()) AS bytes",
-      );
-      const storedBytes =
-        sizeResult.rows[0]?.bytes === undefined ? null : Number(sizeResult.rows[0].bytes);
-      return {
-        engine: "pglite",
-        status: "ready",
-        storageName: await observedIndexedDbName(name),
-        version: "0.5.x",
-        persistence:
-          record.durability === "relaxed"
-            ? "IndexedDB VFS · persistent PostgreSQL data directory · relaxed flush on reads, strict on writes"
-            : "IndexedDB VFS · persistent PostgreSQL data directory · strict flush",
-        dataStoredBytes,
-        indexStoredBytes,
-        storedBytes,
-        buildMs: performance.now() - started,
-        insertMs,
-        indexMs,
-      };
-    } finally {
-      await closePglite(database);
-    }
+        dataStoredBytes =
+          dataSizeResult.rows[0]?.bytes === undefined ? null : Number(dataSizeResult.rows[0].bytes);
+        indexMs =
+          record.secondaryIndexes === "foreign-keys"
+            ? await createSecondaryIndexes(entities, (sql) => database.exec(sql))
+            : 0;
+        const indexedSizeResult = await database.query<{ bytes: number | bigint }>(
+          "SELECT pg_database_size(current_database()) AS bytes",
+        );
+        const indexedStoredBytes =
+          indexedSizeResult.rows[0]?.bytes === undefined
+            ? null
+            : Number(indexedSizeResult.rows[0].bytes);
+        indexStoredBytes =
+          dataStoredBytes === null || indexedStoredBytes === null
+            ? null
+            : Math.max(0, indexedStoredBytes - dataStoredBytes);
+        await database.exec("ANALYZE");
+        await database.syncToFs();
+        // Close and reopen so what the record marks "ready" is what actually persisted.
+        await database.close();
+        database = await openPglite(name, record.durability, "write");
+        const orderRows =
+          entities.find((entity) => entity.name === "orders")?.rows(record.scale) ?? 0;
+        const counted = await database.query<{ row_count: number | bigint }>(
+          "SELECT COUNT(*) AS row_count FROM orders",
+        );
+        const countedRows = Number(counted.rows[0]?.row_count ?? -1);
+        if (countedRows !== orderRows) {
+          throw new Error(
+            `PGlite verification failed after reopen: expected ${String(orderRows)} orders, found ${String(countedRows)}`,
+          );
+        }
+        const sizeResult = await database.query<{ bytes: number | bigint }>(
+          "SELECT pg_database_size(current_database()) AS bytes",
+        );
+        const storedBytes =
+          sizeResult.rows[0]?.bytes === undefined ? null : Number(sizeResult.rows[0].bytes);
+        return {
+          engine: "pglite",
+          status: "ready",
+          storageName: await observedIndexedDbName(name),
+          version: "0.5.x",
+          persistence:
+            record.durability === "relaxed"
+              ? "IndexedDB VFS · persistent PostgreSQL data directory · relaxed flush on reads, strict on writes"
+              : "IndexedDB VFS · persistent PostgreSQL data directory · strict flush",
+          dataStoredBytes,
+          indexStoredBytes,
+          storedBytes,
+          buildMs: performance.now() - started,
+          insertMs,
+          indexMs,
+        };
+      },
+      () => closePglite(database),
+    );
   },
 
   async openSession(record: DatasetRecord): Promise<EngineSession> {
@@ -238,8 +235,8 @@ export const pgliteDriver: EngineDriver = {
             normalizeRows(
               (await database.query<Record<string, unknown>>(`EXECUTE ${name}`)).rows,
             ).map(canonicalizeRow),
-          close: () => {
-            void database.exec(`DEALLOCATE ${name}`).catch(() => undefined);
+          close: async () => {
+            await database.exec(`DEALLOCATE ${name}`);
           },
         };
       },

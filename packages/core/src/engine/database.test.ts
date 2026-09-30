@@ -10311,7 +10311,11 @@ describe("prepared-input cache and shared read lease", () => {
       name: "special_names",
       columns: [{ name: "__proto__", type: "string" }],
     });
-    await database.insertBatch("special_names", { columns: { __proto__: ["kept"] } });
+    // An uncomputed __proto__ literal changes the object's prototype, not its own columns.
+    await expect(
+      database.insertBatch("special_names", { columns: { __proto__: ["inherited"] } }),
+    ).rejects.toThrow("Missing column: __proto__");
+    await database.insertBatch("special_names", { columns: { ["__proto__"]: ["kept"] } });
 
     const result = await database.query('SELECT "__proto__" FROM special_names');
     expect(result.columns).toEqual(["__proto__"]);

@@ -111,9 +111,9 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       // These are the committed matrix/profile populations. Exact counts make removing examples
       // or routing one around execution a visible review change instead of silently weakening CI.
       expect(result.matrix).toEqual({
-        entries: 366,
-        supported: 305,
-        compatibleReadsCompared: 209,
+        entries: 370,
+        supported: 306,
+        compatibleReadsCompared: 210,
         compatibleReadAcceptance: 1,
         nonportableReadsAccepted: 28,
         compatibleMutationsCompared: 24,
@@ -124,7 +124,7 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         behaviorProbedFeatures: 74,
         behaviorProbeSteps: 137,
         behaviorProbeOracleComparisons: 2,
-        unsupportedRejected: 61,
+        unsupportedRejected: 64,
       });
       expect(result.matrix.supported + result.matrix.unsupportedRejected).toBe(
         result.matrix.entries,

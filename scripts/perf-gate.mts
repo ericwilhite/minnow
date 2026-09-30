@@ -10,6 +10,8 @@
  * the gate catches regressions rather than host differences. Run with --update to add or rewrite
  * the current runtime's thresholds after an intentional change.
  */
+import { performanceMode, performanceIdDeclaration } from "./lib/performance-schema.mts";
+import { QuietWindow } from "./lib/quiet-window.mts";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
@@ -54,12 +56,14 @@ async function allVisibleSegments(
 const BASELINE_PATH = new URL("../packages/core/perf-baseline.json", import.meta.url);
 const ROWS = 200_000;
 const update = process.argv.includes("--update");
+const mode = performanceMode(process.argv.slice(2));
+const idDeclaration = performanceIdDeclaration(mode);
 const profile = runtimePerformanceProfile();
 const baselineFile = existsSync(BASELINE_PATH)
   ? parsePerformanceBaseline(JSON.parse(readFileSync(BASELINE_PATH, "utf8")), ROWS)
   : undefined;
 // Reject an unknown runtime before spending minutes building and loading the benchmark corpus.
-selectPerformanceThresholds(baselineFile, profile, [], update);
+if (mode === "regression") selectPerformanceThresholds(baselineFile, profile, [], update);
 // Give V8 enough executions to tier allocation-heavy grouped/DISTINCT kernels before sampling.
 // Two left that shape bimodal between fresh processes (about 17ms or 27ms) even though its
 // steady-state cost was unchanged, turning the release gate into a coin flip.
@@ -738,12 +742,12 @@ const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
       stats.manifestCount,
     ]);
   };
-  let previous: string | undefined;
-  let quiet = 0;
+  const quietWindow = new QuietWindow();
+  let confirmed = false;
   const deadline = performance.now() + 60_000;
-  while (quiet < 10) {
+  while (!confirmed) {
     if (performance.now() > deadline) {
-      throw new Error(`data_settled did not settle within a minute: ${previous ?? "active"}`);
+      throw new Error("data_settled did not settle within a minute");
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
     const activeCompaction = (await settled.listCompactionJobs()).some(
@@ -753,19 +757,22 @@ const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
       (job) => job.state === "planned" || job.state === "running",
     );
     if (activeCompaction || activeCollection) {
-      quiet = 0;
+      quietWindow.observe(undefined, performance.now());
       continue;
     }
     const visibleSegments = (await allVisibleSegments(settled, "data_settled")).length;
     if (visibleSegments >= 32) {
-      quiet = 0;
+      quietWindow.observe(undefined, performance.now());
       continue;
     }
     const current = await footprint(visibleSegments);
-    quiet = current === previous ? quiet + 1 : 0;
-    previous = current;
+    confirmed = quietWindow.observe(current, performance.now());
   }
-  settleMs.minnow = performance.now() - started;
+  const timings = quietWindow.timings(started, performance.now());
+  settleMs.minnow = timings.totalMs;
+  console.log(
+    `Minnow settle: ${timings.observedWorkMs.toFixed(2)} ms to first confirmed-stable observation + ${timings.confirmationMs.toFixed(2)} ms confirmation. Observation resolution is 50 ms; the gate and comparison row retain the full ${timings.totalMs.toFixed(2)} ms. Other engines time updates without this confirmation window.`,
+  );
 }
 const SETTLED_QUERIES: readonly PerfQuery[] = [
   {
@@ -793,7 +800,7 @@ for (let index = 0; index < CATALOG_TABLES; index += 1) {
   sqlite.exec(`CREATE TABLE spare_${String(index)} ("id" INTEGER)`);
 }
 sqlite.exec(
-  `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+  `CREATE TABLE data (${idDeclaration}, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
 );
 sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
 sqlite.exec(`CREATE TABLE exact_data ("id" INTEGER PRIMARY KEY, "amount" NUMERIC NOT NULL)`);
@@ -820,7 +827,7 @@ sqlite.exec(
   }
   sqlite.exec("COMMIT");
   sqlite.exec(
-    `CREATE TABLE data_mut ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+    `CREATE TABLE data_mut (${idDeclaration}, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
   );
   const mut = sqlite.prepare("INSERT INTO data_mut VALUES (?, ?, ?, ?, ?, ?)");
   sqlite.exec("BEGIN");
@@ -838,7 +845,7 @@ sqlite.exec(
   sqlite.exec("COMMIT");
   sqlite.exec(`CREATE INDEX orders_customer_id ON orders ("customer_id")`);
   sqlite.exec(
-    `CREATE TABLE data_settled ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+    `CREATE TABLE data_settled (${idDeclaration}, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
   );
   const settledInsert = sqlite.prepare("INSERT INTO data_settled VALUES (?, ?, ?, ?, ?, ?)");
   sqlite.exec("BEGIN");
@@ -870,7 +877,7 @@ console.log("loading pglite...");
 const { PGlite } = await import("@electric-sql/pglite");
 const pglite = await PGlite.create();
 await pglite.exec(
-  `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+  `CREATE TABLE data (${idDeclaration}, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
 await pglite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
 await pglite.exec(
@@ -915,7 +922,7 @@ for (let start = 0; start < domainRows.length; start += 2_000) {
   );
 }
 await pglite.exec(
-  `CREATE TABLE data_mut ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+  `CREATE TABLE data_mut (${idDeclaration}, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
 for (let start = 0; start < rows.length; start += 2000) {
   const batch = rows
@@ -942,7 +949,7 @@ for (let start = 0; start < orderRows.length; start += 2000) {
 }
 await pglite.exec(`CREATE INDEX orders_customer_id ON orders ("customer_id")`);
 await pglite.exec(
-  `CREATE TABLE data_settled ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+  `CREATE TABLE data_settled (${idDeclaration}, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
 for (let start = 0; start < rows.length; start += 2000) {
   const batch = rows
@@ -983,7 +990,10 @@ const workloadNames = [
   ...SETTLED_QUERIES.map(({ name }) => name),
   "bulk-delete",
 ];
-const baseline = selectPerformanceThresholds(baselineFile, profile, workloadNames, update);
+const baseline =
+  mode === "comparison"
+    ? undefined
+    : selectPerformanceThresholds(baselineFile, profile, workloadNames, update);
 
 interface Result {
   name: string;
@@ -1190,4 +1200,8 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`  ${failure}`);
   process.exit(1);
 }
-console.log("\nNo performance regressions.");
+console.log(
+  mode === "comparison"
+    ? "\nMatched-index comparison verified. Historical regression thresholds use a different schema and do not apply."
+    : "\nNo performance regressions. Historical ordinary-key comparator tables are unindexed; use npm run benchmark:compare for competitive results.",
+);

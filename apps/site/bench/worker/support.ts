@@ -158,3 +158,78 @@ export async function measureRepeated(
   }
   return { ...summarizeSamples(windows), batchSize };
 }
+
+export { withBenchmarkCleanup } from "../cleanup";
+
+/** Suite coverage is checked against declared capabilities, never inferred from a failed
+ * driver. A missing or duplicate result cannot turn a partial comparison into a passing run. */
+export function suiteCoverage(
+  engines: readonly EngineId[],
+  expectedIds: readonly string[],
+  reports: ReadonlyArray<{
+    id: string;
+    engines: ReadonlyArray<{ engine: EngineId; supported: boolean; verified: boolean }>;
+  }>,
+  expectsSupport: (engine: EngineId) => boolean = () => true,
+) {
+  const coverageByEngine: Partial<
+    Record<
+      EngineId,
+      {
+        expected: number;
+        attempted: number;
+        supported: number;
+        verified: number;
+        failed: number;
+      }
+    >
+  > = {};
+  let passed =
+    engines.length > 0 &&
+    expectedIds.length > 0 &&
+    reports.length === expectedIds.length &&
+    new Set(engines).size === engines.length &&
+    new Set(expectedIds).size === expectedIds.length &&
+    reports.every(
+      (report) =>
+        report.engines.length === engines.length &&
+        report.engines.every((value) => engines.includes(value.engine)),
+    );
+  for (const engine of engines) {
+    let attempted = 0;
+    let supported = 0;
+    let verified = 0;
+    let failed = 0;
+    const expected = expectsSupport(engine) ? expectedIds.length : 0;
+    for (const id of expectedIds) {
+      const matches = reports
+        .filter((report) => report.id === id)
+        .flatMap((report) => report.engines.filter((measurement) => measurement.engine === engine));
+      if (matches.length !== 1) {
+        passed = false;
+        failed += 1;
+        continue;
+      }
+      const measurement = matches[0];
+      if (measurement === undefined) throw new Error("Suite coverage result disappeared");
+      attempted += 1;
+      if (measurement.supported) supported += 1;
+      if (measurement.supported && measurement.verified) verified += 1;
+      if (
+        expectsSupport(engine)
+          ? !(measurement.supported && measurement.verified)
+          : measurement.supported
+      ) {
+        passed = false;
+        failed += 1;
+      }
+    }
+    coverageByEngine[engine] = { expected, attempted, supported, verified, failed };
+  }
+  return { coverageByEngine, passed };
+}
+
+/** The current comparison drivers expose subscriptions only for Minnow's two stores. */
+export function supportsLiveQueries(engine: EngineId): boolean {
+  return engine === "minnow" || engine === "minnow-opfs";
+}

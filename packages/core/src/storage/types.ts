@@ -2693,9 +2693,13 @@ export class StorageUnresponsiveError extends UnknownOutcomeError {
 export class OpfsUncertainOutcomeError extends UnknownOutcomeError {
   override readonly name = "OpfsUncertainOutcomeError";
 
-  constructor(readonly method: string) {
+  constructor(
+    readonly method: string,
+    options?: ErrorOptions,
+  ) {
     super(
-      `The OPFS leader changed before ${method} was acknowledged; the mutation may have committed`,
+      `The OPFS operation ${method} could not be acknowledged; the mutation may have committed`,
+      options,
     );
   }
 }
@@ -5296,11 +5300,23 @@ export function advanceGarbageCollectionJobRecord(
 }
 
 export function normalizeCompactionJobRecord(record: CompactionJobRecord): CompactionJobRecord {
+  return normalizeCompactionJob(record);
+}
+
+/** The optional plan is an already validated, privately copied plan from this synchronous
+ * transition. No caller-provided identity or retained cross-call cache can bypass validation. */
+function normalizeCompactionJob(
+  record: CompactionJobRecord,
+  validatedPlan?: CompactionRewritePlan,
+): CompactionJobRecord {
   const error: unknown = record.error;
   if (error !== undefined && typeof error !== "string") {
     throw new TypeError("Compaction job error must be a string");
   }
-  const rewritePlan = normalizeCompactionRewritePlan(record.rewritePlan);
+  const rewritePlan =
+    validatedPlan !== undefined && record.rewritePlan === validatedPlan
+      ? validatedPlan
+      : normalizeCompactionRewritePlan(record.rewritePlan);
   const logicalBytes = nonNegativeWholeNumber(record.logicalBytes, "Compaction logical bytes");
   const sourceStoredBytes = nonNegativeWholeNumber(
     record.sourceStoredBytes,
@@ -5487,6 +5503,13 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
   }
   validateCompactionRewrite(normalized);
   validateCompactionJobState(normalized);
+  if (rewritePlan === validatedPlan) {
+    // The previous normalization made a complete defensive plan copy. The transition cannot
+    // change it; copy the new metadata without walking that private graph a second time.
+    const { rewritePlan: _plan, ...metadata } = normalized;
+    void _plan;
+    return { ...clonePlainRecord(metadata), rewritePlan };
+  }
   return clonePlainRecord(normalized);
 }
 
@@ -5550,7 +5573,7 @@ export function updateCompactionJobRecord(
   };
   if (update.error === null) delete updated.error;
   else if (update.error !== undefined) updated.error = update.error;
-  const normalized = normalizeCompactionJobRecord(updated);
+  const normalized = normalizeCompactionJob(updated, current.rewritePlan);
   validateCompactionJobTransition(current.state, normalized.state);
   validateCompactionJobProgress(current, normalized);
   return normalized;

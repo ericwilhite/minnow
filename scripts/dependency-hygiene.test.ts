@@ -26,7 +26,7 @@ describe("dependency hygiene", () => {
     // longer pins a vulnerable DOMPurify release.
     expect(root.devDependencies["monaco-editor"]).toBe(site.dependencies["monaco-editor"]);
     const patchedVersion = root.overrides["monaco-editor"]?.dompurify;
-    expect(patchedVersion).toBe("3.4.14");
+    expect(patchedVersion).toBe("3.4.16");
     expect(lock.packages["node_modules/dompurify"]?.version).toBe(patchedVersion);
   });
 });

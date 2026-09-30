@@ -13,7 +13,7 @@ import { MAX_ROW_ID_EXCLUSIVE_END, StorageFormatVersionError } from "../types.js
  * and the reviver only converts an object whose sole key is `$n`.
  */
 
-export const LOG_FORMAT_VERSION = 6;
+export const LOG_FORMAT_VERSION = 7;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -82,7 +82,11 @@ function encodeEnvelope(magic: string, payload: Uint8Array): Uint8Array {
  * the write (zeros where the header should be) is torn, not a version-0 database, and a torn
  * slot must leave its mirror and the un-reset log to answer instead.
  */
-function decodeEnvelope(magic: string, bytes: Uint8Array): Uint8Array | undefined {
+function decodeEnvelope(
+  magic: string,
+  bytes: Uint8Array,
+  retainLayout6 = false,
+): Uint8Array | undefined {
   if (bytes.byteLength < ENVELOPE_HEADER_BYTES) return undefined;
   for (let index = 0; index < 8; index += 1) {
     if (bytes[index] !== magic.charCodeAt(index)) return undefined;
@@ -93,7 +97,7 @@ function decodeEnvelope(magic: string, bytes: Uint8Array): Uint8Array | undefine
   if (bytes.byteLength !== ENVELOPE_HEADER_BYTES + payloadLength) return undefined;
   const payload = bytes.subarray(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + payloadLength);
   if (crc32(payload) !== view.getUint32(16, true)) return undefined;
-  if (version !== LOG_FORMAT_VERSION) {
+  if (version !== LOG_FORMAT_VERSION && !(retainLayout6 && version === 6)) {
     throw new StorageFormatVersionError(
       "opfs",
       `envelope/${magic}`,
@@ -115,7 +119,7 @@ export function encodeChunk(value: unknown): Uint8Array {
 }
 
 export function decodeChunk(bytes: Uint8Array): unknown {
-  const payload = decodeEnvelope(CHUNK_MAGIC, bytes);
+  const payload = decodeEnvelope(CHUNK_MAGIC, bytes, true);
   return payload === undefined ? undefined : decodeRecordJson(payload);
 }
 
@@ -164,7 +168,9 @@ export function encodePostingChunk(entries: readonly PostingChunkEntry[]): Uint8
 
 /** `undefined` means the bytes are torn or are not a canonical postings envelope. */
 export function decodePostingChunk(bytes: Uint8Array): PostingChunkEntry[] | undefined {
-  const payload = decodeEnvelope(POSTING_CHUNK_MAGIC, bytes);
+  // Layout 7 changes acknowledgement/control files, not immutable posting encodings. Keep
+  // the frozen layout-6 reader after automatic conversion; never rewrite live extent bytes.
+  const payload = decodeEnvelope(POSTING_CHUNK_MAGIC, bytes, true);
   if (payload === undefined) return undefined;
   const reader = new BinaryReader(payload);
   const count = reader.safeInteger("posting count");

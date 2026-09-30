@@ -4,6 +4,8 @@ import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CompactionJobConflictError,
+  normalizeCompactionJobRecord,
+  updateCompactionJobRecord,
   GarbageCollectionJobConflictError,
   IndexedDbBlockStore,
   LeaseConflictError,
@@ -6178,4 +6180,106 @@ it("re-resolves a table name when the remembered record no longer carries it", a
   expect(await store.getTableByName("events")).toBeUndefined();
   expect((await store.getTableByName("renamed"))?.id).toBe("events-id");
   store.close();
+});
+
+for (const implementation of stores()) {
+  it(`${implementation.name}: generated transaction refusals preserve the same atomic state`, async () => {
+    const store = await implementation.create();
+    try {
+      await store.addTable({
+        id: "rule-table",
+        name: "rule_table",
+        managed: false,
+        columns: [
+          {
+            id: "id",
+            name: "id",
+            type: "number",
+            nullable: false,
+            integer: true,
+            defaultValue: { kind: "autoincrement" as const },
+          },
+        ],
+        uniqueKeyColumnId: "id",
+        primaryKeyColumnIds: ["id"],
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      for (const count of [-1, 0.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        await expect(store.reserveAutoIncrement("rule-table", "id", count)).rejects.toBeInstanceOf(
+          RangeError,
+        );
+      }
+      for (const atLeast of [0n, -1n, 9007199254740993n, 1 as unknown as bigint]) {
+        await expect(
+          store.reserveAutoIncrement("rule-table", "id", 1, atLeast),
+        ).rejects.toBeInstanceOf(RangeError);
+      }
+      expect(await store.reserveAutoIncrement("rule-table", "id", 1)).toEqual({
+        start: 1n,
+        endExclusive: 2n,
+      });
+      for (const forbidden of [
+        { pendingBlockIds: ["missing"] },
+        { pendingSegmentIds: ["missing"] },
+        { catalogEpochGuard: 0 },
+        { schemaEpochGuard: 0 },
+      ]) {
+        const input = { record: { ...activeTransaction("refused-begin"), ...forbidden } };
+        await expect(store.beginTransaction(input)).rejects.toBeInstanceOf(TypeError);
+        expect(await store.getTransaction("refused-begin")).toBeUndefined();
+        expect(await store.getCurrentManifestVersion()).toBeNull();
+      }
+      const begun = await store.beginTransaction({ record: activeTransaction("rules") });
+      const before = await store.getTransaction("rules");
+      for (const forbidden of [
+        { status: "committed" as const },
+        { committedVersion: 0 },
+        { committedVersion: null },
+      ]) {
+        await expect(
+          store.updateTransaction("rules", begun.record.revision, {
+            ...forbidden,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          }),
+        ).rejects.toBeInstanceOf(TypeError);
+        expect(await store.getTransaction("rules")).toEqual(before);
+      }
+      await store.updateTransaction("rules", begun.record.revision, {
+        status: "aborted",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+      expect((await store.getTransaction("rules"))?.status).toBe("aborted");
+      if (store.checkIntegrity !== undefined) expect((await store.checkIntegrity()).ok).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+}
+
+it("compaction transitions validate every external plan and preserve defensive copies", () => {
+  const source = rechunkCompactionJob();
+  const original = structuredClone(source);
+  const next = updateCompactionJobRecord(source, {
+    updatedAt: "2026-01-01T00:00:01.000Z",
+  });
+  expect(source).toEqual(original);
+  if (source.rewritePlan.kind !== "rechunk-v1" || next.rewritePlan.kind !== "rechunk-v1")
+    throw new Error("Missing rechunk plan");
+  Reflect.set(source.rewritePlan.outputs[0] ?? {}, "rowCount", 0);
+  expect(next.rewritePlan.outputs[0]?.rowCount).toBeGreaterThan(0);
+  expect(() =>
+    updateCompactionJobRecord(source, { updatedAt: "2026-01-01T00:00:02.000Z" }),
+  ).toThrow();
+  expect(() => normalizeCompactionJobRecord(source)).toThrow();
+  expect(() =>
+    updateCompactionJobRecord(next, {
+      rewritePlan: original.rewritePlan,
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    } as unknown as CompactionJobRecordUpdate),
+  ).toThrow("immutable");
+  expect(() =>
+    updateCompactionJobRecord(next, { processedRows: -1, updatedAt: "2026-01-01T00:00:02.000Z" }),
+  ).toThrow();
+  expect(next.processedRows).toBe(0);
 });

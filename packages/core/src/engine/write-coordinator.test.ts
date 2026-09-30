@@ -306,6 +306,91 @@ it("names a local holder in its stall report", async () => {
   await expect(waiting).resolves.toBe("ran");
 });
 
+it.each(["empty", "unavailable"] as const)(
+  "does not invent a stalled holder when the lock snapshot is %s",
+  async (snapshot) => {
+    vi.useFakeTimers();
+    const fake = fakeLocks();
+    const letGo = fake.hold("remote-writer");
+    const query = fake.locks.query.bind(fake.locks);
+    fake.locks.query = async () => {
+      if (snapshot === "unavailable") throw new Error("lock inspection unavailable");
+      return { held: [], pending: [] };
+    };
+    installLocks(fake.locks);
+    const store = namedStore();
+    const stalls: WriteAdmissionStall[] = [];
+    const callback = vi.fn(async () => "ran");
+    const waiting = admitWriter(
+      store,
+      {
+        kind: "autocommit",
+        signal: new AbortController().signal,
+        stallReportMs: 100,
+        onStalled: (stall) => stalls.push(stall),
+      },
+      callback,
+    );
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      expect(stalls).toEqual([]);
+      expect(callback).not.toHaveBeenCalled();
+      // An observable holder is still reported and never bypassed.
+      fake.locks.query = query;
+      await vi.advanceTimersByTimeAsync(200);
+      expect(stalls).toHaveLength(1);
+      expect(stalls[0]).toMatchObject({ holder: "other-context" });
+    } finally {
+      letGo();
+      await vi.advanceTimersByTimeAsync(10);
+      await waiting;
+    }
+    await expect(waiting).resolves.toBe("ran");
+    expect(callback).toHaveBeenCalledOnce();
+  },
+);
+
+it("does not inspect remote holders for a writer still behind the local queue", async () => {
+  vi.useFakeTimers();
+  let grant!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    grant = resolve;
+  });
+  const query = vi.fn(async () => ({
+    held: [{ name: "minnowdb-write:minnowdb-live:test", clientId: "same-context" }],
+    pending: [],
+  }));
+  const request: LockManager["request"] = async (
+    name: string,
+    optionsOrCallback: LockOptions | LockGrantedCallback<unknown>,
+    maybeCallback?: LockGrantedCallback<unknown>,
+  ) => {
+    await gate;
+    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    return callback?.({ name, mode: "exclusive" });
+  };
+  installLocks({ query, request });
+  const store = namedStore();
+  const signal = new AbortController().signal;
+  const first = admitWriter(store, { kind: "scope", signal }, async () => "first");
+  const onStalled = vi.fn();
+  const second = admitWriter(
+    store,
+    { kind: "autocommit", signal, stallReportMs: 100, onStalled },
+    async () => "second",
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(500);
+    expect(query).not.toHaveBeenCalled();
+    expect(onStalled).not.toHaveBeenCalled();
+  } finally {
+    grant();
+    await vi.advanceTimersByTimeAsync(10);
+    await Promise.all([first, second]);
+  }
+  expect(writeAdmissionState(store)).toEqual({ holder: undefined, waiting: 0 });
+});
+
 it("surfaces the callback's own failure and releases the turn", async () => {
   installLocks(undefined);
   const store = namedStore();

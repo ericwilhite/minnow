@@ -40,7 +40,7 @@ A change is breaking when it is one of these:
   differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
 - **Stored data.** A database written by the old version that the new one cannot open. The locked
   byte contracts below narrow this category: a release cannot reinterpret or drop an existing
-  block-format-2, snapshot-format-1, IndexedDB-schema-2, or OPFS-layout-6 reader.
+  block-format-2, snapshot-format-1, IndexedDB-schema-1/2, or OPFS-layout-6/7 reader or automatic converter.
 
 From 1.0 onwards these move the major version — every package's, together — and minor releases
 stay additive.
@@ -84,22 +84,35 @@ version it supersedes. The browser runs the complete chain
 inside one `versionchange` transaction, so either every schema and data step commits or the old
 database remains intact. An older application build refuses a newer database without mutation.
 
-OPFS native layout 6 is locked separately. Its fixture freezes the format marker, checkpoint,
-WAL tail, and extent payloads, including the structural `schemaEpoch` required to reject a staged
-write after incompatible DDL and the served-request ledger. It then proves the current adapter
-can reopen and continue writing the tree. From 1.0, a future incompatible OPFS layout uses a new
-marker and keeps the previous layout's reader or an explicit conversion path; it never guesses
-old control bytes into the current record shape. Before 1.0 a layout bump may instead refuse the
-previous layout outright, as 0.10.0 refused layout 5 — no layout-5 store had shipped to
-production — and an older build refuses the newer layout the same way.
+OPFS native layout 7 is the current contract. Its fixture freezes the format marker, checkpoint,
+WAL tail, extent payloads, and a separate checksummed acknowledgement file. That file records
+which WAL boundary completed a strict flush, so recovery can distinguish an unwritten suffix
+from damage to an acknowledged write. Missing or corrupt acknowledgement bytes stop recovery.
 
-An OPFS conversion is version-preserving until its new marker is durable: an old reader must see an
-unsupported marker before any new-format checkpoint, WAL, extent, or recovery-cleanup rule can
-appear. The new reader must either keep writing the previous layout while it has such a tree open, or run an
-explicit crash-resumable conversion and validate the complete result before publishing it. It never
-rewrites, repairs, downgrades, or deletes a tree merely because its version differs. A portable
-snapshot imported into a separate database is the simplest conversion when an atomic directory
-swap is unavailable.
+**Supported upgrades are automatic, including during 0.x.** Opening a layout-6 database with
+the current build validates its native data and converts it to layout 7 under exclusive ownership.
+No export/import or separate migration call is needed. Block format 2, snapshot format 1, and
+IndexedDB schema 2 are unchanged. Frozen older immutable posting envelopes remain readable.
+Older application builds refuse the upgraded database.
+
+Conversion prepares and validates a temporary copy before replacing native control files. It
+needs temporary quota for that copy. The new format marker is flushed before current-format
+checkpoints replace the old ones; both checkpoint mirrors and the acknowledgement file are
+durable before the old WAL is reset. A checksummed ready record resumes interrupted publication,
+and a durable completion receipt prevents a stale conversion record from rolling back later
+writes. Cleanup follows current-layout recovery and full integrity validation.
+
+A missing payload, corrupt legacy checkpoint, or ambiguous incomplete legacy WAL stops the
+upgrade with an error. Layout 6 never recorded strict acknowledgement boundaries, so conversion
+cannot reconstruct lost historical acknowledgement evidence or silently excuse damaged bytes.
+If an older connection still owns the database, close it and retry opening. Quota or I/O failures
+also report an error; opening again retries or resumes the conversion.
+
+Every future supported format change must retain a reader or an automatic, crash-resumable
+conversion through the ordinary open/load API. Manual export/import is not its upgrade path.
+Tests must open every supported frozen older fixture, preserve its data, continue writing and
+reopen, and exercise interruption, power loss, concurrent openers and older-writer refusal.
+Unknown versions are refused without guessing their shape or deleting their data.
 
 There is deliberately no data migration for unsupported pre-v1 prototypes. They were removed
 before the schema-1 IndexedDB contract was frozen. OPFS always rejects an unknown layout marker;
@@ -128,16 +141,23 @@ npm run version:set -- major                  # every package to the next major,
 Add the release and its migration/storage notes to `apps/site/content/docs/changelog.mdx`. The
 version check fails until every current published package version appears there.
 
-Then commit and push. That is the whole release:
+Run the full local gate and open a pull request on a release branch:
 
 ```bash
 npm run check:release   # fullest local gate; CI splits release checks across workflows
 # Stage the reviewed changes, then:
-git commit -m "Release core 0.5.0 and adapters" && git push
+git commit -m "Release core 0.12.0 and devtools 0.3.4"
+git push -u origin HEAD
 ```
 
-Publishing is driven by the versions in the manifests, not by a tag or a command. When that
-commit's CI run goes green, `.github/workflows/release.yml` checks the same commit with the full
+The pull request runs CI and `.github/workflows/release-readiness.yml`, which adds the full SQL,
+simulator and three-browser conformance campaigns with read-only repository permissions. It
+does not publish. Check both workflows before merging. `npm run release:publish -- --dry-run`
+checks the registry and packed package contents without publishing or writing tags.
+
+Publishing is driven by the versions in the manifests, not by a tag or a command. **Merging or
+pushing a version bump to `main` starts the release automatically.** When that commit's CI run
+goes green, `.github/workflows/release.yml` checks the same commit with the full
 SQL and simulator campaigns, including native IndexedDB and OPFS in Chromium, Firefox, and
 macOS WebKit. Only after those pass does it publish every package whose version npm does not
 already have and tag each one, such as `@minnowdb/core@0.5.0`. A push that changes no version
@@ -159,7 +179,8 @@ code, and `files` has to exclude them.
 
 The `prepack` hooks trace public type exports and exclude unreachable
 internal declarations through a generated `dist/.npmignore`. It keeps the local declarations
-intact for incremental builds and the docs editor. Core strips JavaScript comments, and devtools
+intact for incremental builds and the docs editor. Core strips JavaScript comments and compacts
+whitespace without renaming identifiers, and devtools
 compacts its embedded CSS, while public type documentation remains available. Run the
 packed-consumer test after changing this preparation so both TypeScript module resolvers and
 the browser exercise the files users actually install.

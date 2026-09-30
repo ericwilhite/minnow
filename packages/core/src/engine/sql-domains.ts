@@ -1,6 +1,7 @@
 import type { SqlDomain } from "../storage/types.js";
 import { assertWellFormedString } from "../block-format/unicode.js";
 import { dateIsoString } from "../date-value.js";
+import { JsonNumber, parseJsonValue } from "./json-values.js";
 import {
   MAX_SQL_SCALAR_RESULT_CHARACTERS,
   MAX_SQL_NUMERIC_DIGITS,
@@ -36,6 +37,11 @@ export function externalSqlTextValue(value: unknown): unknown {
   return typeof value === "string" && value.startsWith(TEXT_VALUE)
     ? value.slice(TEXT_VALUE.length)
     : value;
+}
+
+/** Explicit TEXT retains its type and must not be read as an unknown SQL string literal. */
+export function typedSqlTextValue(value: string): string {
+  return TEXT_VALUE + value;
 }
 
 interface DecimalParts {
@@ -361,11 +367,27 @@ export function exactNumericCompare(left: unknown, right: unknown): number | und
   return ac === bc ? 0 : ac < bc ? -1 : 1;
 }
 
+/** Integer quotient, toward zero, without rounding the dividend through a binary float. */
+export function exactNumericIntegerDivision(left: unknown, right: unknown): string | undefined {
+  const a = taggedDecimalParts(left);
+  const b = taggedDecimalParts(right);
+  if (a === undefined && b === undefined) return undefined;
+  const dividend = a ?? decimalParts(String(externalSqlDomainValue(left)));
+  const divisor = b ?? decimalParts(String(externalSqlDomainValue(right)));
+  if (divisor.coefficient === 0n) throw new TypeError("DIV by zero");
+  const scale = Math.max(dividend.scale, divisor.scale);
+  const quotient =
+    (dividend.coefficient * pow10(scale - dividend.scale)) /
+    (divisor.coefficient * pow10(scale - divisor.scale));
+  return boundedTaggedDomainValue(NUMERIC, quotient.toString(), "DIV result");
+}
+
 interface JsonEncodingState {
   readonly active: Set<object>;
   readonly pieces: string[];
   items: number;
   length: number;
+  readonly exactNumbers: boolean;
 }
 
 /**
@@ -373,8 +395,19 @@ interface JsonEncodingState {
  * Canonical mode sorts object names directly in the wire text (including integer-looking names,
  * which JavaScript object enumeration would otherwise silently reorder).
  */
-export function boundedJsonText(value: unknown, canonical: boolean, label = "JSON value"): string {
-  const state: JsonEncodingState = { active: new Set(), pieces: [], items: 0, length: 0 };
+export function boundedJsonText(
+  value: unknown,
+  canonical: boolean,
+  label = "JSON value",
+  exactNumbers = false,
+): string {
+  const state: JsonEncodingState = {
+    active: new Set(),
+    pieces: [],
+    items: 0,
+    length: 0,
+    exactNumbers,
+  };
   encodeBoundedJson(value, canonical, label, 0, state);
   return state.pieces.join("");
 }
@@ -399,13 +432,21 @@ function encodeBoundedJson(
     appendJsonPiece(state, "null", label);
     return;
   }
+  if (value instanceof JsonNumber) {
+    appendJsonPiece(state, value.text, label);
+    return;
+  }
   if (typeof value === "boolean") {
     appendJsonPiece(state, value ? "true" : "false", label);
     return;
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new TypeError("JSON numbers must be finite");
-    appendJsonPiece(state, JSON.stringify(value), label);
+    appendJsonPiece(
+      state,
+      state.exactNumbers ? new JsonNumber(String(value)).text : JSON.stringify(value),
+      label,
+    );
     return;
   }
   if (typeof value === "string") {
@@ -499,12 +540,13 @@ export function jsonDomainValue(value: unknown, binary: boolean): string | null 
     const source = prefix === undefined ? value : value.slice(prefix.length);
     assertBoundedDomainString(source, "JSON value");
     try {
-      parsed = JSON.parse(source);
-    } catch {
-      throw new TypeError("Invalid JSON value");
+      parsed = parseJsonValue(source);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      throw new TypeError("Invalid JSON value", { cause: error });
     }
   }
-  const text = boundedJsonText(parsed, binary, binary ? "JSONB value" : "JSON value");
+  const text = boundedJsonText(parsed, binary, binary ? "JSONB value" : "JSON value", true);
   return boundedTaggedDomainValue(
     binary ? JSONB_VALUE : JSON_VALUE,
     text,
@@ -528,9 +570,10 @@ export function jsonDomainDocument(value: unknown): string | undefined {
 export function preservedJsonDomainValue(document: string, binary = false): string {
   assertBoundedDomainString(document, binary ? "JSONB value" : "JSON value");
   try {
-    JSON.parse(document);
-  } catch {
-    throw new TypeError("Invalid JSON value");
+    parseJsonValue(document);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new TypeError("Invalid JSON value", { cause: error });
   }
   return boundedTaggedDomainValue(
     binary ? JSONB_VALUE : JSON_VALUE,
@@ -751,12 +794,31 @@ export function normalizeSqlDomainValue(domain: SqlDomain, value: unknown): stri
   if (typeof value !== "string") throw new TypeError("ARRAY columns accept JSON array text");
   const source = value.startsWith(ARRAY_VALUE) ? value.slice(ARRAY_VALUE.length) : value;
   assertBoundedDomainString(source, "ARRAY value");
-  let parsed: unknown;
+  let exact: unknown;
   try {
-    parsed = JSON.parse(source);
-  } catch {
-    throw new TypeError("Invalid ARRAY value");
+    exact = parseJsonValue(source);
+  } catch (error) {
+    throw new TypeError("Invalid ARRAY value", { cause: error });
   }
+  // ARRAY's existing scalar representation uses ordinary JS numbers. Refuse a textual number
+  // that would change its decimal value on that boundary instead of persisting rounded digits.
+  const materialize = (value: unknown): unknown => {
+    if (value instanceof JsonNumber) {
+      const number = Number(value.text);
+      if (!Number.isFinite(number) || new JsonNumber(String(number)).text !== value.text)
+        throw new RangeError(
+          "ARRAY numeric input would lose precision; encode exact values as JSON strings",
+        );
+      return number;
+    }
+    if (Array.isArray(value)) return value.map(materialize);
+    if (typeof value === "object" && value !== null)
+      return Object.fromEntries(
+        Object.entries(value).map(([key, member]: [string, unknown]) => [key, materialize(member)]),
+      );
+    return value;
+  };
+  const parsed = materialize(exact);
   if (!Array.isArray(parsed)) throw new TypeError("ARRAY value must be an array");
   // JSON array text contains ordinary JSON strings. Do not interpret a string that happens to
   // begin with Minnow's internal domain prefix as an already-tagged SQL scalar.
@@ -1047,8 +1109,12 @@ export function structuredDomainCompare(left: unknown, right: unknown): number |
   if (!array && !jsonb) return undefined;
   if (left === right) return 0;
   const prefix = array ? ARRAY_VALUE : JSONB_VALUE;
-  const a: unknown = JSON.parse(left.slice(prefix.length));
-  const b: unknown = JSON.parse(right.slice(prefix.length));
+  const a: unknown = array
+    ? JSON.parse(left.slice(prefix.length))
+    : parseJsonValue(left.slice(prefix.length));
+  const b: unknown = array
+    ? JSON.parse(right.slice(prefix.length))
+    : parseJsonValue(right.slice(prefix.length));
   if (array && Array.isArray(a) && Array.isArray(b)) {
     for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
       const x: unknown = a[index];
@@ -1073,7 +1139,7 @@ function compareJsonStructure(left: unknown, right: unknown): number {
       ? 0
       : typeof value === "string"
         ? 1
-        : typeof value === "number"
+        : typeof value === "number" || value instanceof JsonNumber
           ? 2
           : typeof value === "boolean"
             ? 3
@@ -1082,6 +1148,9 @@ function compareJsonStructure(left: unknown, right: unknown): number {
               : 5;
   const difference = rank(left) - rank(right);
   if (difference !== 0) return difference;
+  if (left instanceof JsonNumber && right instanceof JsonNumber) {
+    return exactNumericCompare(exactNumericValue(left.text), exactNumericValue(right.text)) ?? 0;
+  }
   if (typeof left === "number" && typeof right === "number") return left - right;
   if (typeof left === "string" && typeof right === "string") return left < right ? -1 : 1;
   if (typeof left === "boolean" && typeof right === "boolean") return Number(left) - Number(right);

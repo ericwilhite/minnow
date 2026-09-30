@@ -7,6 +7,7 @@ import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { decodeSyncCheckpoint, LOG_FORMAT_VERSION } from "../toolkit/wire.js";
 import type { TableRecord } from "../types.js";
 import { OpfsBlockStore } from "./index.js";
+import { FIRST_SUPPORTED_OPFS_LAYOUT, OPFS_UPGRADES } from "./upgrades.js";
 
 interface NativeFixture {
   layoutFormatVersion: number;
@@ -38,7 +39,7 @@ function loadFixtures(): Fixture[] {
 }
 
 const fixtures = loadFixtures();
-const FIRST_STABLE_OPFS_LAYOUT_VERSION = 6;
+const FIRST_STABLE_OPFS_LAYOUT_VERSION = FIRST_SUPPORTED_OPFS_LAYOUT;
 const currentPackageVersion = (
   JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
     version: string;
@@ -83,6 +84,14 @@ function table(name: string): TableRecord {
 }
 
 describe("frozen native OPFS layout", () => {
+  it("requires an ordered automatic upgrade for every retained native layout", () => {
+    expect(OPFS_UPGRADES.map(({ from, to }) => [from, to])).toEqual(
+      Array.from({ length: LOG_FORMAT_VERSION - FIRST_SUPPORTED_OPFS_LAYOUT }, (_, index) => [
+        FIRST_SUPPORTED_OPFS_LAYOUT + index,
+        FIRST_SUPPORTED_OPFS_LAYOUT + index + 1,
+      ]),
+    );
+  });
   it("retains exactly one fixture for every locked layout", () => {
     const expectedVersions = Array.from(
       { length: LOG_FORMAT_VERSION - FIRST_STABLE_OPFS_LAYOUT_VERSION + 1 },
@@ -117,6 +126,7 @@ describe("frozen native OPFS layout", () => {
       expect.arrayContaining([
         "minnowdb/native-fixture/format.json",
         "minnowdb/native-fixture/wal",
+        "minnowdb/native-fixture/wal-acknowledgements",
         "minnowdb/native-fixture/checkpoint-b",
         "minnowdb/native-fixture/extents/000000",
       ]),
@@ -129,10 +139,14 @@ describe("frozen native OPFS layout", () => {
 
   for (const { stem, fixture } of fixtures) {
     it(`reopens ${stem} from @minnowdb/core@${fixture.writerPackageVersion}`, async () => {
+      const shim = hydrate(fixture);
       const store = await OpfsBlockStore.open({
         name: "native-fixture",
-        root: hydrate(fixture).root,
+        root: shim.root,
       });
+      expect(
+        new TextDecoder().decode(shim.readFileBytes("minnowdb/native-fixture/format.json")),
+      ).toBe(JSON.stringify({ formatVersion: LOG_FORMAT_VERSION }));
       expect((await store.listTables()).map(({ name }) => name)).toEqual(
         fixture.expectations.tables,
       );
@@ -141,6 +155,10 @@ describe("frozen native OPFS layout", () => {
       expect((await decodeBlock(block ?? new Uint8Array())).column.values).toEqual(
         fixture.expectations.blockValues,
       );
+      expect(await store.checkIntegrity({ mode: "full" })).toMatchObject({
+        ok: true,
+        issueCount: 0,
+      });
       store.close();
     });
 

@@ -1,6 +1,7 @@
 dist
 coverage
 node_modules
+.tasks
 playwright-report
 test-results
 scripts/api-contract.snapshot.json

@@ -1,3 +1,4 @@
+import { SqlRegex } from "./sql-regex.js";
 import { dateMilliseconds } from "../date-value.js";
 import { assertWellFormedString } from "../block-format/unicode.js";
 import {
@@ -7,6 +8,7 @@ import {
 } from "./cache-limits.js";
 import {
   structuredDomainCompare,
+  dateDomainValue,
   collatedDomainCompare,
   enumDomainCompare,
   exactNumericCompare,
@@ -36,9 +38,23 @@ export function parseSqlTimestampText(text: string): Date | undefined {
   const match = SQL_TIMESTAMP_TEXT.exec(text.trim());
   if (match === null) return undefined;
   const [, day, time = "00:00:00", zone = "Z"] = match;
+  dateDomainValue(day);
+  const [hour, minute, second = "0"] = time.split(":");
+  const zoneParts =
+    zone === "Z" ? [0, 0] : [Number(zone.slice(1, 3)), Number(zone.replace(":", "").slice(3, 5))];
+  if (
+    Number(hour) > 23 ||
+    Number(minute) > 59 ||
+    Number(second) >= 60 ||
+    (zoneParts[0] ?? 0) > 15 ||
+    (zoneParts[1] ?? 0) > 59
+  ) {
+    throw new TypeError(`Invalid TIMESTAMP fields: ${text}`);
+  }
   const seconds = time.length === 5 ? `${time}:00` : time;
   const date = new Date(`${String(day)}T${seconds}${zone === "Z" ? "Z" : zone}`);
-  return Number.isFinite(dateMilliseconds(date)) ? date : undefined;
+  if (!Number.isFinite(dateMilliseconds(date))) throw new TypeError(`Invalid TIMESTAMP: ${text}`);
+  return date;
 }
 
 /**
@@ -662,43 +678,35 @@ function nfaMatcher(pattern: string, escape: string): WeightedPatternMatcher {
   return { test, retainedSize: states.length * 32 };
 }
 
-const regexCache = new Map<string, RegExp>();
+const regexCache = new Map<string, SqlRegex>();
+let regexCacheBytes = 0;
 
-/**
- * PostgreSQL's ~ / ~* / !~ / !~* operators and REGEXP_REPLACE, compiled as JavaScript regular
- * expressions. Advanced regular expressions and JavaScript agree on the everyday syntax; the
- * `n` flag makes `.` and anchors newline-sensitive, `i` is case-insensitive, and `g` replaces
- * every match. Patterns are bounded like every other SQL pattern.
- */
-export function compileRegexPattern(pattern: string, flags = ""): RegExp {
+/** Bounded SQL regular expressions with deterministic refusal of unsupported syntax. */
+export function compileRegexPattern(pattern: string, flags = ""): SqlRegex {
   assertBoundedPattern(pattern, "regular expression");
-  const normalized = [...new Set(flags)].sort().join("");
-  const key = `${normalized}\u0000${pattern}`;
+  const key = `${flags}\u0000${pattern}`;
   const cached = regexCache.get(key);
   if (cached !== undefined) {
-    cached.lastIndex = 0;
+    regexCache.delete(key);
+    regexCache.set(key, cached);
     return cached;
   }
-  let jsFlags = "u";
-  if (normalized.includes("i")) jsFlags += "i";
-  if (normalized.includes("g")) jsFlags += "g";
-  if (normalized.includes("n")) jsFlags += "m";
-  else jsFlags += "s";
-  let expression: RegExp;
-  try {
-    expression = new RegExp(pattern, jsFlags);
-  } catch {
-    try {
-      expression = new RegExp(pattern, jsFlags.replace("u", ""));
-    } catch (error) {
-      throw new TypeError(
-        `Invalid regular expression: ${error instanceof Error ? error.message : pattern}`,
-        { cause: error },
-      );
+  const expression = new SqlRegex(pattern, flags);
+  const size = expression.retainedSize + key.length * 2;
+  if (size <= MAX_PATTERN_CACHE_RETAINED_SIZE) {
+    while (
+      regexCache.size >= MAX_PATTERN_CACHE_ENTRIES ||
+      regexCacheBytes + size > MAX_PATTERN_CACHE_RETAINED_SIZE
+    ) {
+      const oldest = regexCache.keys().next().value;
+      if (oldest === undefined) break;
+      const removed = regexCache.get(oldest);
+      regexCacheBytes -= (removed?.retainedSize ?? 0) + oldest.length * 2;
+      regexCache.delete(oldest);
     }
+    regexCache.set(key, expression);
+    regexCacheBytes += size;
   }
-  if (regexCache.size >= 256) regexCache.clear();
-  regexCache.set(key, expression);
   return expression;
 }
 

@@ -14,6 +14,8 @@ export default tseslint.config(
       "**/.source/**",
       // Gitignored caches other tooling writes (SQLLogicTest corpora, storage comparisons).
       ".cache/**",
+      // Local audit evidence and diagnostic probes are not package or tooling source.
+      ".tasks/**",
       // Agent worktrees the Claude Code harness checks out inside the repository.
       ".claude/worktrees/**",
       // Third-party engine builds, copied in verbatim by scripts/vendor-engines.mjs.

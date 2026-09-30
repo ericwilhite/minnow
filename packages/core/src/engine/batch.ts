@@ -55,7 +55,16 @@ export function definedVectors<T>(
 ): Record<string, T> {
   const defined: Record<string, T> = {};
   for (const [name, vector] of Object.entries(vectors)) {
-    if (vector !== undefined) defined[name] = vector;
+    if (vector !== undefined) {
+      if (name === "__proto__") {
+        Object.defineProperty(defined, name, {
+          value: vector,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      } else defined[name] = vector;
+    }
   }
   return defined;
 }

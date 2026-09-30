@@ -183,11 +183,15 @@ async function updateLoop(
   values: Map<number, number>,
   count: number,
   sampleEvery: number,
+  checkpointTurns?: () => number,
+  observeTurns?: (turns: number) => void,
 ): Promise<number> {
   let mostLevelZero = 0;
   for (let index = 0; index < count; index += 1) {
     const id = (index * 7_919) % values.size;
+    const before = checkpointTurns?.() ?? 0;
     await database.execute("UPDATE t SET a = ? WHERE id = ?", [index, id]);
+    observeTurns?.((checkpointTurns?.() ?? 0) - before);
     values.set(id, index);
     if (index % sampleEvery !== sampleEvery - 1) continue;
     mostLevelZero = Math.max(mostLevelZero, await levelZeroSegments(database, store));
@@ -231,11 +235,13 @@ describe("a single-row update loop over a folded table", () => {
    * that gives it one turn per statement outruns it however cheap its reads are.
    */
   class SlowCheckpointStore extends MemoryBlockStore {
+    checkpointTurns = 0;
     override async updateCompactionJob(
       ...args: Parameters<MemoryBlockStore["updateCompactionJob"]>
     ): ReturnType<MemoryBlockStore["updateCompactionJob"]> {
       for (let turn = 0; turn < 40; turn += 1) {
         await new Promise((resolve) => setImmediate(resolve));
+        this.checkpointTurns += 1;
       }
       return super.updateCompactionJob(...args);
     }
@@ -245,12 +251,26 @@ describe("a single-row update loop over a folded table", () => {
     const store = new SlowCheckpointStore();
     const database = new MinnowDatabase(store);
     const values = await foldedTable(database, 2_000);
-    const mostLevelZero = await updateLoop(database, store, values, 1_500, 25);
+    let mostTurnsPerWrite = 0;
+    const mostLevelZero = await updateLoop(
+      database,
+      store,
+      values,
+      1_500,
+      25,
+      () => store.checkpointTurns,
+      (turns) => {
+        mostTurnsPerWrite = Math.max(mostTurnsPerWrite, turns);
+      },
+    );
     // The background fold alone could not hold the table under twice the 256-segment prefix
     // one fold absorbs; from there each statement drove a fold step before its own commit, so
     // the backlog stayed within one fold's steps of the threshold instead of climbing to the
     // ceiling one segment per statement.
-    expect(mostLevelZero).toBeGreaterThanOrEqual(512);
+    // Samples can miss the threshold when a fold publishes between them. Instead, prove a
+    // statement waited through a whole slow checkpoint, lending its turn to maintenance.
+    expect(mostTurnsPerWrite).toBeGreaterThanOrEqual(40);
+    expect(await publishedFolds(database, "t")).toBeGreaterThan(1);
     expect(mostLevelZero).toBeLessThan(512 + 64);
     expect(database.maintenanceStatus()).toMatchObject({ lastError: null });
     expect((await database.query("SELECT SUM(a) AS total FROM t")).rows).toEqual([

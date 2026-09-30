@@ -289,6 +289,9 @@ engine or a client rejects everything it still has waiting without waiting for t
 engine never takes a turn away from a live holder, because neither storage adapter can fence a
 resumed writer at the commit boundary, and a lock a timeout can defeat is not a lock. An idle SQL
 transaction is bounded separately by `transactionIdleTimeoutMs`.
+The watchdog reports only an observed holder. An empty or unavailable Web Locks snapshot does
+not establish a stalled writer; writers behind the local queue inspect its holder instead of
+requesting a remote lock snapshot.
 
 Schema changes take turns too. A migration or DDL statement waits for the writers ahead of it and
 publishes while none is mid-transaction, so a cooperating writer never has its scope invalidated

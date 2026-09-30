@@ -2306,6 +2306,10 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ],
   ["function.md5-format", { oracles: ["sqlite"], reason: "SQLite has no MD5 or FORMAT %I/%L" }],
   ["predicate.regex", { oracles: ["sqlite"], reason: "SQLite has no ~ operators" }],
+  [
+    "predicate.regex-longest-classes",
+    { oracles: ["sqlite"], reason: "SQLite has no POSIX SUBSTRING or ~ operators" },
+  ],
   ["function.regexp-replace", { oracles: ["sqlite"], reason: "SQLite has no REGEXP_REPLACE" }],
   ["expression.power-operator", { oracles: ["sqlite"], reason: "SQLite has no ^ operator" }],
   [

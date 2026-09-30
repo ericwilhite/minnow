@@ -160,6 +160,19 @@ workers (one on a two-CPU runner); each concurrency scenario still creates its f
   case runs a suite end to end in each browser and asserts it verified against the oracles,
   another asserts the `/benchmarks` route is cross-origin isolated. Documentation cannot drift
   into non-running sample code, and the harness cannot drift from the page that runs it.
+  Comparison suites require one result per declared engine/workload and report expected,
+  attempted, supported, verified and failed counts. A missing live driver on an engine that
+  declares subscriptions fails; the SQLite and PGlite comparison drivers' absent subscription
+  support is declared explicitly rather than inferred from a missing driver method.
+  Timings show medians. The exported `p95Ms` is an empirical percentile of five or seven timed
+  windows, which is their maximum, rather than an estimate of production tail latency.
+- **Semantic path equivalence** generates NULLs, signed zero, exact decimals, invalid text,
+  casts and empty/nonempty membership. It compares optimized and unoptimized row execution,
+  vector execution, literal and parameter input, memoized results and worker RPC. Values and
+  result domains agree exactly; refusals retain their error class. PostgreSQL independently
+  checks acceptance and values without converting NUMERIC text through Float64. The same corpus
+  runs over native IndexedDB and OPFS workers. Interaction runs also check that the bounded
+  background history agrees with observer evidence.
 - **The performance gate** detects regressions on stable seeded query shapes, reads and writes
   alike. Read-only engines calibrate their repeat counts independently so every fast path gets a
   measurable sample. A regression is reported only when the full ratio range observed across
@@ -170,6 +183,10 @@ workers (one on a two-CPU runner); each concurrency scenario still creates its f
   guardrail, not a published cross-engine benchmark: the comparison engines run without indexes,
   which is fine for noticing that Minnow got slower and useless as a fair cross-engine claim.
 
+Plain `COUNT(*)` reads use the snapshot's surviving row count without preparing column schemas
+or index scans. The regression suite checks this path after deletes, updates, upserts, and
+compaction, including old snapshots, concurrent connections, memory budgets, and cancellation.
+
 ## Native-browser SQL comparisons
 
 The library runner executes every SQL feature-matrix entry through Minnow's built module worker
@@ -177,7 +194,7 @@ over both native IndexedDB and OPFS in Chromium, Firefox, and WebKit. SQLite Was
 in those same real browsers as independent comparison engines. Background maintenance stays
 enabled, and unexpected worker or page errors fail the campaign even when query answers match.
 
-The 366 matrix entries are accounted for explicitly: 305 supported entries execute, and 61
+The 370 matrix entries are accounted for explicitly: 306 supported entries execute, and 64
 unsupported entries must reject with their recorded error while leaving the fixture unchanged.
 Portable reads compare columns and values with PostgreSQL. Compatible mutations compare affected
 counts, `RETURNING`, and their actual target table's state, with domain checks for volatile values.
@@ -335,9 +352,22 @@ block-format-2 physical type.
 
 The directory also holds one native fixture for every locked OPFS layout. The test requires a
 fixture for the current writer and checks its recorded package version, then reopens each fixture's
-format marker, checkpoint, WAL tail, and packed extent through the current adapter before
-committing and recovering another write. That catches both a control-layout break and an
-accidentally dropped old reader that a portable snapshot alone cannot see.
+format marker, checkpoint, WAL tail, acknowledgement file, and packed extent through the current
+adapter before committing and recovering another write. Every supported older fixture must
+upgrade automatically through ordinary open; an older-layout refusal cannot pass this test.
+The ordered OPFS upgrade registry must cover every version between the first locked layout and
+the current one. `upgrades.test.ts` injects failure at every preparation/publication I/O boundary,
+models both tab death and power loss, exercises partial transfers and concurrent openers, and
+keeps concurrent openers waiting through a slow live conversion. A resurrected ready record
+cannot roll back later acknowledged writes, even with a missing/torn marker and missing/corrupt
+completion receipt. Damaged native proof after resetting a nonempty old WAL is refused rather
+than repaired from stale staging. The native browser
+worker suite discovers the same frozen fixtures and checks automatic upgrade and new writes
+across restart. A pinned test-only alias of the released core 0.10.0 package proves that the actual
+layout-6 reader opens the old fixture and refuses the upgraded tree before mutation, in Node
+and native workers. Unsupported pre-contract prototypes are refused without changing their bytes.
+The layout-7 tests also zero or truncate acknowledged WAL bytes and
+damage either acknowledgement slot; recovery must report corruption rather than roll back.
 
 It also fails when the current `BLOCK_FORMAT_VERSION` or `SNAPSHOT_FORMAT_VERSION` has no fixture
 behind it. That failure is the useful one, because it fires _before_ the damage:
@@ -357,6 +387,18 @@ only then change the version. A fixture can only be produced by the build that w
 that code is gone, the format it wrote cannot be regenerated. For the same reason, never delete a
 released, locked fixture. Block format 2 is the first such lock; the unsupported experimental
 block-1 fixture was replaced before v1.
+
+## Matched-index performance comparisons
+
+`npm run benchmark:compare` runs the Node suite with primary-key indexes on every engine's
+ordinary, mutation, and settled tables. It verifies query and final-state results before timing.
+Use this command and the live browser comparison for competitive speed claims.
+
+The existing `benchmark:gate` preserves its historical schema and runtime-specific thresholds,
+including unindexed ordinary-key comparator tables. Its purpose is detecting changes against
+that same workload. Its ordinary key ratios cannot support competitive speed claims. A comparison
+run cannot update those thresholds; changing that gate's schema requires fresh calibration on
+every recorded runtime, including Linux.
 
 ## Running out of quota
 
@@ -539,6 +581,9 @@ the warm-up rounds, which are excluded; a climb that continues past a full pool 
 arrival order, one pending lock request per context, prompt cancellation of a queued or
 lock-waiting writer, one stall report per unchanging holder with no bypass, silence while
 holders keep changing, and separate queues for separate databases.
+It also refuses to invent a stalled holder from an empty or unavailable lock snapshot and
+proves that writers behind the local queue do not inspect remote locks. The browser corpus
+retains every console error's structured arguments in its report while still failing on errors.
 
 `write-contention.test.ts` covers writers that do and do not take turns. Coordinated writers all
 land; a store marked uncoordinated through the test seam (`markStoreUncoordinatedForTests`, the
@@ -598,6 +643,9 @@ median of the timed windows for that query, after one untimed warm-up. Writes ke
 and batch size visible the same way. Nothing is reported unless it was verified — every read must
 match an independent JavaScript oracle and every write is read back and compared row for row, and
 a query an engine got wrong or could not run prints a dash instead of a timing.
+Statement deallocation and session cleanup are awaited outside the timing windows. An
+unexpected cleanup failure invalidates the measurement or suite; a paired execution and
+cleanup failure retains both original errors.
 
 Two further measurements cover what an application pays above the engine, so a regression in the
 worker client or the live-query layer shows on the page instead of hiding behind engine numbers:
@@ -637,6 +685,9 @@ pass that grows expensive shows up too. Its waiter checks active jobs first, rea
 visibility only between jobs, and measures the full storage footprint only after the table is no
 longer due for a fold. This keeps the observer from competing with the maintenance it times; the
 sample ends only after ten consecutive 50ms observations see no job and the same footprint.
+The report separates the time to the first confirmed-stable observation from the following
+confirmation delay. Observation resolution is 50ms. The gate and comparison row keep the full
+elapsed time, including confirmation; SQLite and PGlite time their updates without this window.
 
 ## Update the performance-gate baseline
 
@@ -668,10 +719,12 @@ The figure each measured engine shows on the page is the `download` field in
 `apps/site/components/bench/config.ts`, updated by hand from that run.
 
 The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
-Wasm file. Both the engine with OPFS and the generic worker with all stores plus its separately
-bundled client must stay smaller after gzip. The report and test share the same measurement
-code. Existing per-entry byte budgets still catch smaller increases before SQLite parity is at
-risk. This guards compressed download size; it does not claim a smaller uncompressed bundle or
+Wasm file. The engine with OPFS must stay smaller after gzip. The generic worker with all
+stores plus its separately bundled client has a tight 465 KiB combined budget; those two
+downloads repeat some code and currently slightly exceed SQLite's single loader-plus-Wasm
+measurement. The report and test share the same measurement code. Per-entry budgets separately
+bound the main engine and IndexedDB worker. Exact JSON parsing and bounded regex matching add
+code, and those intentional additions are recorded alongside the budgets. This guards compressed download size; it does not claim a smaller uncompressed bundle or
 prove that every possible behavior is regression-free.
 
 OPFS browser cases check for the storage API inside a dedicated worker before running. Some
@@ -680,3 +733,10 @@ capability in the ordinary browser runner, while IndexedDB cases still run. The 
 profile requires worker OPFS and fails if it is absent. Worker startup errors and probe timeouts
 remain failures. Contention correctness tests allow queued durable writes a 30-second RPC deadline;
 the separate timeout and sustained-latency tests retain their own limits.
+
+Browser interaction campaigns retain every worker diagnostic in their attached evidence.
+A typed ownership or revision refusal from an unpublished index build or compaction job can
+occur when another tab wins the same maintenance work. Those specific maintenance events are
+classified by their operation, error type, and identity/revision fields. Generic errors,
+I/O failures, corruption, changed posting chunks, and window or unhandled errors still fail
+the campaign; message text never suppresses a failure.

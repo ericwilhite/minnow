@@ -28,6 +28,44 @@ function engineLabel(engine: EngineId): string {
   return ENGINES.find((choice) => choice.id === engine)?.label ?? engine;
 }
 
+function hasCoverage(result: {
+  coverageByEngine?: ReferenceSuiteResult["coverageByEngine"];
+}): boolean {
+  return result.coverageByEngine !== undefined;
+}
+
+function Coverage({
+  result,
+}: {
+  result: {
+    engines: readonly EngineId[];
+    coverageByEngine?: ReferenceSuiteResult["coverageByEngine"];
+  };
+}) {
+  const coverage = result.coverageByEngine;
+  if (coverage === undefined)
+    return (
+      <p className="mt-2 text-sm text-fd-muted-foreground">
+        This saved run predates workload coverage counts.
+      </p>
+    );
+  return (
+    <ul className="mt-2 text-sm text-fd-muted-foreground">
+      {result.engines.map((engine) => {
+        const counts = coverage[engine];
+        return (
+          <li key={engine}>
+            {engineLabel(engine)}:{" "}
+            {counts === undefined
+              ? "coverage unavailable"
+              : `${String(counts.expected)} expected, ${String(counts.attempted)} attempted, ${String(counts.supported)} supported, ${String(counts.verified)} verified, ${String(counts.failed)} failed.`}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 /** Fastest verified column in a row, so the winner can be marked rather than eyeballed. */
 function fastest(entries: ReadonlyArray<{ id: string; ms: number | null }>): string | null {
   let best: { id: string; ms: number } | undefined;
@@ -142,15 +180,16 @@ export function ReadResults({
         {batched > 1
           ? `A query quicker than the clock is executed up to ${batched.toLocaleString("en-US")} times per window and divided back down, so a microsecond lookup reads as microseconds rather than as a clock tick. `
           : ""}
-        {result.passed
-          ? "Every query every engine could run agreed with the independent oracle."
-          : "Some results disagreed with the oracle — treat these timings as suspect."}
+        {result.passed && hasCoverage(result)
+          ? "Every expected query on every selected engine agreed with the independent oracle."
+          : "Expected coverage is incomplete, unavailable in this saved run, or includes failed queries."}
         {result.secondaryIndexes === "foreign-keys"
           ? " This run includes the same 81 foreign-key secondary indexes in every engine."
           : result.secondaryIndexes === "none"
             ? " This run has primary keys only and no secondary indexes."
             : " This saved run predates index-mode labels, so its secondary-index configuration is unknown."}
       </p>
+      <Coverage result={result} />
       {WORKLOADS.map((workload) => (
         <Table
           key={workload.kind}
@@ -214,6 +253,7 @@ export function WriteResults({
         Only the engine&rsquo;s own call is timed — reshaping rows into the form each API wants is
         the harness&rsquo;s cost, not the engine&rsquo;s.
       </p>
+      <Coverage result={result} />
       {WORKLOADS.map((workload) => (
         <Table
           key={workload.kind}
@@ -273,13 +313,14 @@ export function LiveResults({
         Median of {result.sampleCount} commits per case, after one untimed warm-up: from issuing the
         write through the worker client until the last affected subscription&rsquo;s{" "}
         <code>onChange</code> has fired with its rows rebuilt on this side of the channel.{" "}
-        {result.passed
+        {result.passed && hasCoverage(result)
           ? "Every affected subscription fired exactly once per commit and none of the others did."
-          : "Some subscriptions fired the wrong number of times or on the wrong result — treat these timings as suspect."}
+          : "Expected coverage is incomplete, unavailable in this saved run, or includes failed subscription cases."}
         {missing.length > 0
-          ? ` ${missing.join(" and ")} ${missing.length === 1 ? "has" : "have"} no live-query layer, so there is nothing to time.`
+          ? ` ${missing.join(" and ")} ${missing.length === 1 ? "has" : "have"} no verified live measurement; coverage counts distinguish unsupported drivers from failures.`
           : ""}
       </p>
+      <Coverage result={result} />
       {shown.length === 0 ? (
         <p className="mt-3 text-sm text-fd-muted-foreground">
           No selected engine could run the live-query suite.

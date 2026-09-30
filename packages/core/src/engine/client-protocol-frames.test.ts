@@ -79,3 +79,36 @@ it("refuses an old-version request in the worker per request id", async () => {
   expect(reply?.error?.message).toMatch(/Unsupported protocol version/);
   await client.close();
 });
+
+it.each([
+  { kind: "number", values: new Float64Array([42]) },
+  { kind: "string", text: "ab", offsets: new Uint32Array([0, 3, 2]) },
+])(
+  "rejects malformed query vectors without fabricating rows or losing the connection",
+  async (column) => {
+    const boundary = createBoundary();
+    attachDatabaseWorker(boundary.workerSide);
+    const client = new MinnowDatabaseClient(boundary.clientSide, { store: { kind: "memory" } });
+    await client.ready();
+    try {
+      const pending = client.query("SELECT 1 AS v");
+      const requestId = (boundary.sentByClient.at(-1) as { requestId: string }).requestId;
+      boundary.injectToClient({
+        version: protocolVersion,
+        requestId,
+        kind: "rpc-result",
+        result: {
+          kind: "columnar-result",
+          columns: ["v"],
+          columnDomains: [null],
+          rowCount: 2,
+          values: [column],
+        },
+      });
+      await expect(pending).rejects.toThrow(/column|vector|Malformed/i);
+      expect((await client.query("SELECT 7 AS v")).rows).toEqual([{ v: 7 }]);
+    } finally {
+      await client.close();
+    }
+  },
+);

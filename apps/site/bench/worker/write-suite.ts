@@ -1,3 +1,4 @@
+import { suiteCoverage } from "./support";
 /**
  * The write suite: insert, update, and upsert at several batch sizes, on every engine, each
  * through that engine's own bulk path — minnow's batch write API, one sqlite prepared
@@ -16,8 +17,7 @@
  *  - The table is dedicated to this suite and lives beside the dataset's own tables, which
  *    are never read or written here. Writing into a database that already holds data is the
  *    case worth measuring, and it keeps each engine's persistence settings identical to the
- *    read comparison. minnow has no DROP TABLE, so its per-sample tables stay until the
- *    dataset is deleted; the others drop theirs.
+ *    read comparison. Every engine drops its per-sample tables and reports cleanup failures.
  *  - The final table is read back — with minnow's result memo off — and compared row for row
  *    against an oracle built in JavaScript from the same deterministic inputs. A timing an
  *    engine cannot back with the right table state is reported unverified, never as a win.
@@ -46,6 +46,7 @@ import {
   progress,
   summarizeSamples,
   validateDatasetSuitePayload,
+  withBenchmarkCleanup,
 } from "./support";
 
 const SAMPLE_COUNT = 5;
@@ -53,8 +54,7 @@ const SAMPLE_COUNT = 5;
  * Same target window as the read suite, and the same reason: the browser's clock steps in 5µs or
  * 100µs, so a write it cannot resolve has to be repeated inside one window and divided back down.
  * The cap is far lower than the read suite's because every repeat here costs a table — created,
- * seeded, and thrown away — rather than another call against one that already exists, and minnow
- * has no DROP TABLE, so the ones it makes stay with the dataset. Sixteen repeats already put the
+ * seeded, and thrown away — rather than another call against one that already exists. Sixteen repeats already put the
  * clock's step three orders of magnitude below the window.
  */
 const TARGET_WINDOW_MS = 5;
@@ -158,55 +158,66 @@ export async function runWriteSuite(
       sessions.set(engine, error instanceof Error ? error : new Error(String(error)));
     }
   }
-  // Every run gets its own table names: minnow has no DROP TABLE, so a fixed name would
-  // collide with a previous run on the same dataset.
+  // Unique names isolate concurrent runs on the same dataset.
   const runToken = Math.random().toString(36).slice(2, 8);
   const totalSteps = definitions.length * payload.engines.length;
   let completed = 0;
   const cases: WriteCaseReport[] = [];
-  try {
-    for (const definition of definitions) {
-      assertNotCancelled(requestId);
-      const oracleTuples = canonicalTuples(oracleRows(definition), projectRow);
-      const oracleChecksum = referenceChecksum(oracleTuples);
-      const measurements: WriteEngineMeasurement[] = [];
-      for (const engine of payload.engines) {
+  await withBenchmarkCleanup(
+    async () => {
+      for (const definition of definitions) {
         assertNotCancelled(requestId);
-        progress(requestId, {
-          phase: "writes",
-          completed,
-          total: totalSteps,
-          message: `${definition.name} · ${engine}`,
+        const oracleTuples = canonicalTuples(oracleRows(definition), projectRow);
+        const oracleChecksum = referenceChecksum(oracleTuples);
+        const measurements: WriteEngineMeasurement[] = [];
+        for (const engine of payload.engines) {
+          assertNotCancelled(requestId);
+          progress(requestId, {
+            phase: "writes",
+            completed,
+            total: totalSteps,
+            message: `${definition.name} · ${engine}`,
+          });
+          const session = sessions.get(engine);
+          measurements.push(
+            session === undefined || session instanceof Error
+              ? unsupported(
+                  engine,
+                  session instanceof Error ? session.message : "session unavailable",
+                )
+              : await measureCase(requestId, session, engine, definition, runToken, oracleTuples),
+          );
+          completed += 1;
+        }
+        cases.push({
+          id: definition.id,
+          name: definition.name,
+          operation: definition.operation,
+          workload: definition.workload,
+          rows: definition.rows,
+          seedRows: definition.seedRows,
+          expectedTableRows: definition.expectedTableRows,
+          oracleChecksum,
+          engines: measurements,
+          checksumAgreement: agreement(measurements),
         });
-        const session = sessions.get(engine);
-        measurements.push(
-          session === undefined || session instanceof Error
-            ? unsupported(
-                engine,
-                session instanceof Error ? session.message : "session unavailable",
-              )
-            : await measureCase(requestId, session, engine, definition, runToken, oracleTuples),
-        );
-        completed += 1;
       }
-      cases.push({
-        id: definition.id,
-        name: definition.name,
-        operation: definition.operation,
-        workload: definition.workload,
-        rows: definition.rows,
-        seedRows: definition.seedRows,
-        expectedTableRows: definition.expectedTableRows,
-        oracleChecksum,
-        engines: measurements,
-        checksumAgreement: agreement(measurements),
-      });
-    }
-  } finally {
-    for (const session of sessions.values()) {
-      if (!(session instanceof Error)) await session.close().catch(() => undefined);
-    }
-  }
+    },
+    async () => {
+      const failures: unknown[] = [];
+      for (const session of sessions.values()) {
+        if (!(session instanceof Error)) {
+          try {
+            await session.close();
+          } catch (error) {
+            failures.push(error);
+          }
+        }
+      }
+      if (failures.length > 0)
+        throw new AggregateError(failures, "Benchmark write session cleanup failed");
+    },
+  );
   const totalMsByEngine: Partial<Record<EngineId, number>> = {};
   const supportedByEngine: Partial<Record<EngineId, number>> = {};
   for (const engine of payload.engines) {
@@ -236,8 +247,10 @@ export async function runWriteSuite(
     cases,
     totalMsByEngine,
     supportedByEngine,
-    passed: cases.every((report) =>
-      report.engines.every((measurement) => !measurement.supported || measurement.verified),
+    ...suiteCoverage(
+      payload.engines,
+      definitions.map((definition) => definition.id),
+      cases,
     ),
   };
 }
@@ -303,60 +316,86 @@ async function measureCase(
   };
 
   const dropAll = async (targets: readonly WriteTarget[]): Promise<void> => {
-    for (const target of targets) await target.drop().catch(() => undefined);
+    const failures: unknown[] = [];
+    for (const target of targets) {
+      try {
+        await target.drop();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0)
+      throw new AggregateError(failures, "Benchmark write table cleanup failed");
   };
 
-  try {
-    // A calibration write, thrown away, sizes the window the way the read suite sizes its own:
-    // a write that costs milliseconds is timed one at a time, and one the clock cannot resolve
-    // is repeated until the window is long enough to divide.
-    const probeApplies = await prepareBatch(1);
-    const probeStarted = performance.now();
-    for (const apply of probeApplies) await apply();
-    const probeMs = performance.now() - probeStarted;
-    await dropAll(batch);
-    const batchSize =
-      probeMs >= TARGET_WINDOW_MS
-        ? 1
-        : Math.min(
-            MAX_WRITE_BATCH,
-            Math.max(1, Math.ceil(TARGET_WINDOW_MS / Math.max(probeMs, 0.005))),
-          );
+  let executionFailure: { error: unknown } | undefined;
+  return withBenchmarkCleanup(
+    async () => {
+      try {
+        // A calibration write, thrown away, sizes the window the way the read suite sizes its own:
+        // a write that costs milliseconds is timed one at a time, and one the clock cannot resolve
+        // is repeated until the window is long enough to divide.
+        const probeApplies = await prepareBatch(1);
+        const probeStarted = performance.now();
+        for (const apply of probeApplies) await apply();
+        const probeMs = performance.now() - probeStarted;
+        await dropAll(batch);
+        const batchSize =
+          probeMs >= TARGET_WINDOW_MS
+            ? 1
+            : Math.min(
+                MAX_WRITE_BATCH,
+                Math.max(1, Math.ceil(TARGET_WINDOW_MS / Math.max(probeMs, 0.005))),
+              );
 
-    for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
-      assertNotCancelled(requestId);
-      const applies = await prepareBatch(batchSize);
-      const started = performance.now();
-      for (const apply of applies) await apply();
-      samples.push((performance.now() - started) / applies.length);
-      // The previous sample's tables are dropped where the engine can, and always abandoned:
-      // every write in every window ran against a table prepared for it alone.
-      await dropAll(previous);
-      previous = batch;
-    }
-    // Every table in the batch took the identical write, so any of them is every sample's
-    // state; verifying one keeps a 100k read-back out of the measured loop.
-    const last = previous[previous.length - 1];
-    const rows = await (last?.readAll() ?? Promise.resolve([]));
-    const tuples = canonicalTuples(rows, projectRow);
-    const { medianMs, p95Ms } = summarizeSamples(samples);
-    return {
-      engine,
-      supported: true,
-      medianMs,
-      p95Ms,
-      batchSize,
-      rowsPerSecond: medianMs > 0 ? (definition.rows / medianMs) * 1_000 : 0,
-      tableRows: rows.length,
-      checksum: referenceChecksum(tuples),
-      verified: rows.length === definition.expectedTableRows && tuplesMatch(tuples, oracleTuples),
-    };
-  } catch (error) {
-    return unsupported(engine, error instanceof Error ? error.message : String(error));
-  } finally {
-    await dropAll(previous);
-    await dropAll(batch.filter((target) => !previous.includes(target)));
-  }
+        for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
+          assertNotCancelled(requestId);
+          const applies = await prepareBatch(batchSize);
+          const started = performance.now();
+          for (const apply of applies) await apply();
+          samples.push((performance.now() - started) / applies.length);
+          // The previous sample's tables are dropped where the engine can, and always abandoned:
+          // every write in every window ran against a table prepared for it alone.
+          await dropAll(previous);
+          previous = batch;
+        }
+        // Every table in the batch took the identical write, so any of them is every sample's
+        // state; verifying one keeps a 100k read-back out of the measured loop.
+        const last = previous[previous.length - 1];
+        const rows = await (last?.readAll() ?? Promise.resolve([]));
+        const tuples = canonicalTuples(rows, projectRow);
+        const { medianMs, p95Ms } = summarizeSamples(samples);
+        return {
+          engine,
+          supported: true,
+          medianMs,
+          p95Ms,
+          batchSize,
+          rowsPerSecond: medianMs > 0 ? (definition.rows / medianMs) * 1_000 : 0,
+          tableRows: rows.length,
+          checksum: referenceChecksum(tuples),
+          verified:
+            rows.length === definition.expectedTableRows && tuplesMatch(tuples, oracleTuples),
+        };
+      } catch (error) {
+        executionFailure = { error };
+        return unsupported(engine, error instanceof Error ? error.message : String(error));
+      }
+    },
+    async () => {
+      try {
+        await dropAll([...new Set([...previous, ...batch])]);
+      } catch (error) {
+        if (executionFailure !== undefined)
+          throw new AggregateError(
+            [executionFailure.error, error],
+            "Benchmark write execution and table cleanup failed",
+            { cause: error },
+          );
+        throw error;
+      }
+    },
+  );
 }
 
 /**

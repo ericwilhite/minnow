@@ -339,6 +339,7 @@ type BoundExpression =
       kind: "call";
       name: AggregateName | ScalarFunctionName;
       arguments: BoundExpression[];
+      argumentDisplayScales?: Array<number | null>;
       aggregateIndex?: number;
       signature: string;
     }
@@ -628,6 +629,8 @@ interface BoundPlan {
   /** Single bare number or datetime key: rows group through a Map on the raw Float64 value. */
   readonly numberGrouping?: { source: number; vector: NumberVector | DateTimeVector };
   readonly wildcard: boolean;
+  /** Bound columns/literals already return QueryValue; no generic expression/value gate per cell. */
+  readonly directProjection: boolean;
   readonly limit?: number;
   readonly offset?: number;
 }
@@ -1332,6 +1335,9 @@ function bindPlan(
     ...(codeGrouping === undefined ? {} : { codeGrouping }),
     ...(numberGrouping === undefined ? {} : { numberGrouping }),
     wildcard: plan.select[0]?.expression.kind === "wildcard",
+    directProjection: select.every(
+      ({ expression }) => expression.kind === "column" || expression.kind === "literal",
+    ),
     ...(plan.limit === undefined ? {} : { limit: plan.limit }),
     ...(plan.offset === undefined ? {} : { offset: plan.offset }),
   };
@@ -1526,6 +1532,10 @@ function dictionaryTruthTable(
   }
   if (operator === "IN" || operator === "NOT IN") {
     if (!isColumn(expression.left) || expression.right.kind !== "list") return undefined;
+    if (expression.right.items.length === 0) {
+      table.fill(operator === "IN" ? TRUTH_FALSE : TRUTH_TRUE);
+      return table;
+    }
     const members = new Set<string>();
     let hasNull = false;
     for (const item of expression.right.items) {
@@ -1861,7 +1871,15 @@ function bindExpression(
     ),
   );
   if (isScalarFunctionName(expression.name)) {
-    return { kind: "call", name: expression.name, arguments: arguments_, signature };
+    return {
+      kind: "call",
+      name: expression.name,
+      arguments: arguments_,
+      signature,
+      ...(expression.argumentDisplayScales === undefined
+        ? {}
+        : { argumentDisplayScales: expression.argumentDisplayScales }),
+    };
   }
   let aggregateIndex = aggregateIndexes.get(signature);
   if (aggregateIndex === undefined) {
@@ -4564,6 +4582,9 @@ class ResultSink {
     const window = vector.window;
     const windowStart = window?.start ?? 0;
     const windowLength = window?.length ?? vector.length;
+    // Intersect source and resident-window bounds once, rather than testing both per row.
+    const firstSlot = Math.max(0, -windowStart);
+    const lastSlot = Math.min(windowLength, vector.length - windowStart);
     const desc = fast.desc;
     // A key that arrives sorted against the requested direction — `ORDER BY id DESC` over a
     // table stored in key order, the newest-first page — would otherwise improve on the cut
@@ -4573,29 +4594,38 @@ class ResultSink {
     // earlier `seq`, and seq numbers are assigned in scan order below either way.
     const reversed = desc && this.#batchKeyIsAscending(rows, vector, selection, count);
     const firstSeq = this.#seq;
+    // Candidate insertion is the only operation that changes the cut line. Keep the cut line
+    // and arrival counter local while rejecting rows; synchronize before each insertion.
+    let threshold = this.#thresholdFirst;
+    let seq = firstSeq;
     for (let step = 0; step < count; step += 1) {
       const position = reversed ? count - 1 - step : step;
       const row = selection === undefined ? position : (selection[position] ?? 0);
-      if (reversed) this.#seq = firstSeq + position;
-      const threshold = this.#thresholdFirst;
+      if (reversed) seq = firstSeq + position;
       if (threshold === undefined || threshold === null) {
+        this.#seq = seq;
         this.#addCandidate(batch, row);
+        seq = this.#seq;
+        threshold = this.#thresholdFirst;
         continue;
       }
       const sourceRow = rows?.[row] ?? -1;
       const slot = sourceRow - windowStart;
-      if (sourceRow >= 0 && sourceRow < vector.length && slot >= 0 && slot < windowLength) {
+      if (slot >= firstSlot && slot < lastSlot) {
         if (isValid(validity, slot)) {
           const value = values[slot] ?? 0;
-          if ((desc ? threshold - value : value - threshold) > 0) {
-            this.#seq += 1;
+          if (desc ? value < threshold : value > threshold) {
+            seq += 1;
             continue;
           }
         }
       }
+      this.#seq = seq;
       this.#addCandidate(batch, row);
+      seq = this.#seq;
+      threshold = this.#thresholdFirst;
     }
-    if (reversed) this.#seq = firstSeq + count;
+    this.#seq = reversed ? firstSeq + count : seq;
     return true;
   }
 
@@ -5994,6 +6024,7 @@ function evaluateFinalExpression(
     return scalarFunctionValue(
       expression.name,
       expression.arguments.map((argument) => evaluateFinalExpression(plan, argument, group)),
+      expression.argumentDisplayScales,
     );
   }
   const aggregateIndex = expression.aggregateIndex ?? -1;
@@ -6100,6 +6131,20 @@ function evaluateFinalExpression(
 function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryRow {
   const result: QueryRow = {};
   if (!plan.wildcard) {
+    if (plan.directProjection) {
+      for (const item of plan.select) {
+        const expression = item.expression;
+        const value =
+          expression.kind === "column"
+            ? vectorValue(expression.vector, batch.rowsBySource[expression.source]?.[row] ?? -1)
+            : expression.kind === "literal"
+              ? expression.value
+              : asQueryValue(evaluateBatchExpression(plan, expression, batch, row));
+        if (item.alias === "__proto__") defineSqlResultProperty(result, item.alias, value);
+        else result[item.alias] = value;
+      }
+      return result;
+    }
     for (const item of plan.select) {
       const value = asQueryValue(evaluateBatchExpression(plan, item.expression, batch, row));
       if (item.alias === "__proto__") defineSqlResultProperty(result, item.alias, value);
@@ -6554,6 +6599,7 @@ function booleanTruth(
     }
     if (operator === "IN" || operator === "NOT IN") {
       if (expression.right.kind !== "list") throw new TypeError("IN requires a value list");
+      if (expression.right.items.length === 0) return operator === "NOT IN";
       const probe = evaluateValue(expression.left);
       if (probe === null || probe === undefined) return null;
       const membership = cachedListMembership(expression.right, expression.right.items);
@@ -6752,6 +6798,7 @@ function evaluateBatchPredicate(
   }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
+    if (predicate.right.items.length === 0) return predicate.operator === "NOT IN";
     const membership = cachedListMembership(predicate.right, predicate.right.items);
     if (membership !== null) {
       const value = evaluateBatchExpression(plan, predicate.left, batch, row);
@@ -6781,6 +6828,7 @@ function inListHolds(
   value: unknown,
   items: readonly unknown[],
 ): boolean {
+  if (items.length === 0) return operator === "NOT IN";
   if (value === null || value === undefined) return false;
   let hasNull = false;
   for (const item of items) {
@@ -6901,7 +6949,9 @@ function compiledBatchExpression(
           values[index] = part(batch, row);
           index += 1;
         }
-        return evaluate(values);
+        return expression.argumentDisplayScales === undefined
+          ? evaluate(values)
+          : scalarFunctionValue(name, values, expression.argumentDisplayScales);
       };
     }
   }
@@ -6991,6 +7041,7 @@ function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Arra
   return scalarFunctionValue(
     expression.name,
     expression.arguments.map((argument) => evaluateExpression(argument, rowsBySource)),
+    expression.argumentDisplayScales,
   );
 }
 
