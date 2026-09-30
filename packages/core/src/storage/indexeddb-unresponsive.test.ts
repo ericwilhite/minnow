@@ -1,5 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { classifyError } from "../engine/errors.js";
 import { IndexedDbBlockStore, INDEXEDDB_UNRESPONSIVE_AFTER_MS } from "./indexeddb.js";
 import { StorageUnresponsiveError, UnknownOutcomeError } from "./types.js";
@@ -147,6 +147,75 @@ describe("an IndexedDB connection that stops answering", () => {
     }
     expect(reads).toBeGreaterThan(5);
     store.close();
+  });
+
+  it("coalesces progress timers without postponing the silence deadline for new waiters", async () => {
+    const { store, connections } = await openStore(1000);
+    const db = firstConnection(connections);
+    const completions: Array<() => Promise<void>> = [];
+    const controlled = (): IDBTransaction => {
+      const events = new EventTarget();
+      const requestEvents = new EventTarget();
+      const transaction = Object.assign(events, {
+        db,
+        error: null,
+        mode: "readonly",
+        durability: "strict",
+        objectStoreNames: [],
+        objectStore: () => ({ get: () => request }),
+        abort: () => undefined,
+        commit: () => undefined,
+      }) as unknown as IDBTransaction;
+      const request = Object.assign(requestEvents, {
+        transaction,
+        result: undefined,
+        error: null,
+        source: null,
+        readyState: "pending",
+      }) as unknown as IDBRequest;
+      completions.push(async () => {
+        requestEvents.dispatchEvent(new Event("success"));
+        await Promise.resolve();
+        events.dispatchEvent(new Event("complete"));
+      });
+      return transaction;
+    };
+    Object.defineProperty(db, "transaction", { value: controlled, configurable: true });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const stalled = store.getBlock("silent").catch((error: unknown) => error);
+      let settled = false;
+      void stalled.then(() => {
+        settled = true;
+      });
+      for (let n = 0; n < 90; n++) {
+        await vi.advanceTimersByTimeAsync(10);
+        const traffic = store.getBlock(`traffic-${String(n)}`);
+        const complete = completions.at(-1);
+        if (complete === undefined) throw new Error("Missing controlled request");
+        await complete();
+        expect(await traffic).toBeUndefined();
+      }
+      // Progress extends the deadline but does not replace one native timer per request.
+      expect(timers).toHaveBeenCalledTimes(1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(950);
+      expect(settled).toBe(false);
+      const later = store.getBlock("later").catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(49);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const failure = await stalled;
+      expect(failure).toBeInstanceOf(StorageUnresponsiveError);
+      expect(await later).toBe(failure);
+      expect(timers).toHaveBeenCalledTimes(2);
+      await expect(store.getBlock("after-stall")).rejects.toBe(failure);
+    } finally {
+      store.close();
+      timers.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("bounds opening a database that never answers", async () => {

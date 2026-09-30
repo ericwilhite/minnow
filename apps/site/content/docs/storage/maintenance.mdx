@@ -120,6 +120,16 @@ within the write retry limit and stop cleanly when another tab drops the table o
 Unexpected I/O failures still reach the caller or background diagnostic hook, including failures
 that coincide with another tab publishing or cancelling the job, or arrive after a job transition
 was persisted. A failure while recording the original error is reported separately.
+Before opening a write snapshot, the writer assists one pending compaction claim at each entry
+point. Newly arriving jobs cannot keep that entry point draining indefinitely. A claim that uses
+the writer's turn cancels its redundant queue wait; its actual storage work keeps the turn until
+completion. Backpressure can still drive the steps needed to keep the table below its hard limit.
+IndexedDB validates visible segment owners in groups of at most 128 reads within the publishing
+transaction. Every owner is still checked, and multiple segments owned by one transaction count
+separately toward the level-zero ceiling. A corrupt or missing owner aborts publication atomically.
+Segment discovery reads at most 1,024 records from the selected table's index. A complete smaller
+partition avoids one cursor turn per segment; a full batch falls back to the exact cursor path.
+Block visibility is still checked through fresh point reads in the same publishing transaction.
 
 Level-zero growth is guarded on the write path in two tiers. Past 512 level-zero segments — twice
 the prefix one background fold absorbs — a write drives one fold step before its own commit and

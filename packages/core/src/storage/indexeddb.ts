@@ -131,6 +131,7 @@ import {
   MAX_SNAPSHOT_METADATA_FRAME_BYTES,
   SNAPSHOT_FRAME_KINDS,
   MAX_LEVEL_ZERO_SEGMENTS,
+  MAX_STORAGE_BULK_READ_ITEMS,
   MAX_AUTO_INCREMENT_EXCLUSIVE_END,
   MAX_ROW_ID,
   MAX_ROW_ID_EXCLUSIVE_END,
@@ -9519,6 +9520,7 @@ class ConnectionStallGuard {
   readonly #waiting = new Set<(error: Error) => void>();
   #timer: ReturnType<typeof setTimeout> | undefined;
   #tripped: StorageUnresponsiveError | undefined;
+  #deadline = 0;
   #disposed = false;
 
   constructor(
@@ -9542,6 +9544,7 @@ class ConnectionStallGuard {
       return () => undefined;
     }
     if (this.#disposed) return () => undefined;
+    if (this.#waiting.size === 0) this.#deadline = performance.now() + this.#afterMs;
     this.#waiting.add(reject);
     this.#arm();
     let released = false;
@@ -9561,10 +9564,14 @@ class ConnectionStallGuard {
 
   #arm(): void {
     if (this.#timer !== undefined || this.#waiting.size === 0) return;
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      this.#trip();
-    }, this.#afterMs);
+    this.#timer = setTimeout(
+      () => {
+        this.#timer = undefined;
+        if (performance.now() < this.#deadline) this.#arm();
+        else this.#trip();
+      },
+      Math.max(0, this.#deadline - performance.now()),
+    );
     (this.#timer as { unref?: () => void }).unref?.();
   }
 
@@ -9577,8 +9584,9 @@ class ConnectionStallGuard {
   /** An event arrived, so the connection is alive: start the deadline over. */
   #progress(): void {
     if (this.#tripped !== undefined) return;
-    this.#disarm();
-    this.#arm();
+    this.#deadline = performance.now() + this.#afterMs;
+    if (this.#waiting.size === 0) this.#disarm();
+    else this.#arm();
   }
 
   #trip(): void {
@@ -14184,9 +14192,8 @@ async function assertLevelZeroSegmentLimits(
 
 /**
  * How many committed level-zero segments of a table are live at `version`. Visibility is
- * decided per segment from point reads of its block records — the level-zero limit times the
- * column count — never from the manifest's whole block set, so an insert's commit costs what
- * the table holds unfolded, not what the database holds.
+ * decided per segment from fresh point reads of its block records, never from the whole
+ * manifest. Small table partitions batch segment discovery; larger partitions retain cursors.
  */
 async function countVisibleLevelZeroSegments(
   index: IDBIndex,
@@ -14195,35 +14202,47 @@ async function countVisibleLevelZeroSegments(
   version: number | null,
   tableId: string,
 ): Promise<number> {
-  const candidates = await new Promise<SegmentRecord[]>((resolve, reject) => {
-    const found: SegmentRecord[] = [];
-    const request = index.openCursor(tableId);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB segment cursor failed"));
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor === null) {
-        resolve(found);
-        return;
-      }
-      try {
-        const segment = asSegmentRecord(cursor.value);
-        if (segment.id !== cursor.primaryKey || segment.tableId !== tableId) {
-          throw corruption(`segments/${segment.id}`, "table index does not match its record");
+  const candidates: SegmentRecord[] = [];
+  const append = (value: unknown, key: IDBValidKey): void => {
+    const segment = asSegmentRecord(value);
+    if (segment.id !== key || segment.tableId !== tableId)
+      throw corruption(`segments/${segment.id}`, "table index does not match its record");
+    if (segment.level === 0) candidates.push(segment);
+  };
+  const [keys, values] = await Promise.all([
+    requestResult<IDBValidKey[]>(index.getAllKeys(tableId, MAX_STORAGE_BULK_READ_ITEMS)),
+    requestResult<unknown[]>(index.getAll(tableId, MAX_STORAGE_BULK_READ_ITEMS)),
+  ]);
+  if (keys.length !== values.length) throw corruption("segments", "batch keys do not match values");
+  if (keys.length < MAX_STORAGE_BULK_READ_ITEMS) {
+    for (const [position, key] of keys.entries()) append(values[position], key);
+  } else {
+    // A full bounded read cannot establish completeness. Keep the exact cursor path for
+    // larger partitions; its data remains in the same atomic publishing transaction.
+    await new Promise<void>((resolve, reject) => {
+      const request = index.openCursor(tableId);
+      request.onerror = () => reject(request.error ?? new Error("IndexedDB segment cursor failed"));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          resolve();
+          return;
         }
-        if (segment.level === 0) found.push(segment);
-        cursor.continue();
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    };
-  });
+        try {
+          append(cursor.value, cursor.primaryKey);
+          cursor.continue();
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      };
+    });
+  }
   const memberships = await Promise.all(
     candidates.map((segment) =>
       manifestBlockMembershipInTransaction(catalog, version, segmentBlockIds(segment)),
     ),
   );
-  const statuses = new Map<string, TransactionRecord["status"]>();
-  let count = 0;
+  const owners = new Map<string, { segmentId: string; count: number }>();
   for (const [position, segment] of candidates.entries()) {
     const membership = memberships[position] ?? [];
     const visibleBlockCount = membership.filter((present) => present).length;
@@ -14231,19 +14250,26 @@ async function countVisibleLevelZeroSegments(
       throw corruption(`segments/${segment.id}`, "only part of the segment is manifest-live");
     }
     if (membership.length > 0 && visibleBlockCount === 0) continue;
-    let status = statuses.get(segment.transactionId);
-    if (status === undefined) {
-      const owner = await requestResult<unknown>(transactions.get(segment.transactionId));
-      if (owner === undefined) {
-        throw corruption(
-          `segments/${segment.id}`,
-          `owning transaction ${segment.transactionId} is missing`,
-        );
+    const owner = owners.get(segment.transactionId);
+    if (owner === undefined) owners.set(segment.transactionId, { segmentId: segment.id, count: 1 });
+    else owner.count += 1;
+  }
+  // Ownership cannot change inside this native transaction. Queue bounded groups of reads
+  // instead of one browser IPC round trip per visible segment owner; validate every record.
+  const entries = [...owners];
+  let count = 0;
+  for (let start = 0; start < entries.length; start += 128) {
+    const page = entries.slice(start, start + 128);
+    const records = await Promise.all(
+      page.map(([id]) => requestResult<unknown>(transactions.get(id))),
+    );
+    for (const [position, [id, owner]] of page.entries()) {
+      const record = records[position];
+      if (record === undefined) {
+        throw corruption(`segments/${owner.segmentId}`, `owning transaction ${id} is missing`);
       }
-      status = asStoredTransactionRecord(owner, segment.transactionId).status;
-      statuses.set(segment.transactionId, status);
+      if (asStoredTransactionRecord(record, id).status === "committed") count += owner.count;
     }
-    if (status === "committed") count += 1;
   }
   return count;
 }
@@ -18736,7 +18762,11 @@ function applyUniqueMembershipSourceToRequested(
 ): Promise<void> {
   if (requestedDescending.length === 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const request = store.openCursor(null, "prev");
+    const range =
+      typeof IDBKeyRange === "undefined"
+        ? undefined
+        : IDBKeyRange.bound([...prefix], [...prefix, requestedDescending[0] ?? ""]);
+    const request = store.openCursor(range, "prev");
     let position = 0;
     let positioned = false;
     request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
@@ -18814,7 +18844,11 @@ function assertUniqueMembershipSourceExists(
   kind: "base" | "tail",
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const request = store.openCursor();
+    const range =
+      typeof IDBKeyRange === "undefined"
+        ? undefined
+        : IDBKeyRange.bound([...prefix], [...prefix, []], false, true);
+    const request = store.openCursor(range);
     let positioned = false;
     request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
     request.onsuccess = () => {

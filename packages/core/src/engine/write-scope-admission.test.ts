@@ -1,11 +1,16 @@
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
-import { IndexedDbBlockStore, MemoryBlockStore, OpfsBlockStore } from "../storage/index.js";
+import {
+  IndexedDbBlockStore,
+  MemoryBlockStore,
+  OpfsBlockStore,
+  type BlockStore,
+} from "../storage/index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabaseClient } from "./client.js";
 import { createBoundary } from "./client-audit-harness.js";
 import { MinnowDatabase } from "./database.js";
-import { writeAdmissionTestHooks } from "./write-coordinator.js";
+import { writeAdmissionState, writeAdmissionTestHooks } from "./write-coordinator.js";
 import { exposeDatabase } from "./worker-host.js";
 
 const stores = [
@@ -20,6 +25,176 @@ const stores = [
     open: () => OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
   },
 ];
+
+for (const storage of stores) {
+  it.each([1, 3])(
+    `${storage.name}: lends bounded maintenance without retaining completed waiters (%i jobs)`,
+    async (count) => {
+      const nativeStore = await storage.open();
+      let registrations = 0;
+      const create = nativeStore.createCompactionJob.bind(nativeStore);
+      // OPFS exposes immutable bound methods. Instrument a facade, keeping native method
+      // receivers and atomic storage operations intact.
+      const store = new Proxy({} as BlockStore, {
+        get(_target, property) {
+          if (property === "createCompactionJob")
+            return async (input: Parameters<BlockStore["createCompactionJob"]>[0]) => {
+              registrations++;
+              return create(input);
+            };
+          const value: unknown = Reflect.get(nativeStore, property, nativeStore);
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(nativeStore)
+            : value;
+        },
+      });
+      const reports: Array<{ error: unknown; context: string }> = [];
+      const database = new MinnowDatabase(store, {
+        autoCollect: false,
+        autoCompact: false,
+        targetBlockBytes: 1024,
+        compression: "raw",
+        onBackgroundError: (error, context) => reports.push({ error, context }),
+      });
+      const rows = Array.from({ length: 32 }, (_, id) => ({
+        id,
+        value: String(id).padEnd(2000, "x"),
+      }));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let registeredBeforeCallback = 0;
+      let callbackReportStart = 0;
+      const compactions: Array<ReturnType<MinnowDatabase["compactTableStep"]>> = [];
+      let blocker: ReturnType<MinnowDatabase["write"]> | undefined;
+      let foreground: ReturnType<MinnowDatabase["write"]> | undefined;
+      try {
+        await database.execute("CREATE TABLE marker(id INTEGER PRIMARY KEY)");
+        for (let i = 0; i < count; i++) {
+          await database.execute(
+            `CREATE TABLE fold_${String(i)}(id INTEGER PRIMARY KEY, value TEXT)`,
+          );
+          await database.insertBatch(`fold_${String(i)}`, rows.slice(0, 16));
+          await database.insertBatch(`fold_${String(i)}`, rows.slice(16));
+        }
+        writeAdmissionTestHooks.stallReportMs = 50;
+        blocker = database.write(async (tx) => {
+          await tx.insertBatch("marker", [{ id: 0 }]);
+          entered();
+          await gate;
+        });
+        await started;
+        foreground = database.write(async (tx) => {
+          registeredBeforeCallback = registrations;
+          callbackReportStart = reports.length;
+          if (count === 1) {
+            const step = await compactions[0];
+            expect(step?.result).toBeNull();
+            // The fold has used this turn and completed its bounded step. Its redundant
+            // admission must not report a wait while the callback continues doing work.
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          }
+          await tx.insertBatch("marker", [{ id: 1 }]);
+        });
+        await vi.waitFor(() => expect(writeAdmissionState(store).waiting).toBe(1), { interval: 1 });
+        for (let i = 0; i < count; i++)
+          compactions.push(
+            database.compactTableStep(`fold_${String(i)}`, { maxBlocks: 1, maxLevel0Segments: 2 }),
+          );
+        await vi.waitFor(() => expect(writeAdmissionState(store).waiting).toBe(count + 1), {
+          interval: 1,
+          timeout: 5000,
+        });
+        release();
+        await Promise.all([blocker, foreground, ...compactions]);
+        expect(registeredBeforeCallback).toBe(1);
+        if (count === 1)
+          expect(
+            reports
+              .slice(callbackReportStart)
+              .filter(({ context }) => context === "write admission"),
+          ).toEqual([]);
+        expect((await database.query("SELECT id FROM marker ORDER BY id")).rows).toEqual([
+          { id: 0 },
+          { id: 1 },
+        ]);
+        for (let i = 0; i < count; i++)
+          expect(
+            (await database.query(`SELECT id, value FROM fold_${String(i)} ORDER BY id`)).rows,
+          ).toEqual(rows);
+        for (const step of await Promise.all(compactions))
+          if (step.jobId !== null) await database.cancelCompactionJob(step.jobId);
+      } finally {
+        release();
+        await Promise.allSettled(
+          [blocker, foreground, ...compactions].filter((task) => task !== undefined),
+        );
+        writeAdmissionTestHooks.stallReportMs = undefined;
+        await database.close();
+        store.close();
+      }
+    },
+  );
+}
+
+it("reports a real admission failure after a compaction used its turn", async () => {
+  const originalNavigator = globalThis.navigator;
+  const failure = new Error("lock service failed after grant");
+  const request: LockManager["request"] = async (
+    name: string,
+    optionsOrCallback: LockOptions | LockGrantedCallback<unknown>,
+    maybeCallback?: LockGrantedCallback<unknown>,
+  ) => {
+    const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
+    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    const result = await callback?.({ name, mode: "exclusive" });
+    if (options.signal?.aborted === true) throw failure;
+    return result;
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    value: { locks: { request, query: async () => ({ held: [], pending: [] }) } },
+    configurable: true,
+    writable: true,
+  });
+  const store = new MemoryBlockStore();
+  Object.defineProperty(store, "liveQueryChannelName", {
+    value: `minnowdb-live:${crypto.randomUUID()}`,
+  });
+  const reports: Array<{ error: unknown; context: string }> = [];
+  const database = new MinnowDatabase(store, {
+    autoCollect: false,
+    autoCompact: false,
+    targetBlockBytes: 1024,
+    compression: "raw",
+    onBackgroundError: (error, context) => reports.push({ error, context }),
+  });
+  const rows = Array.from({ length: 32 }, (_, id) => ({ id, value: String(id).padEnd(2000, "x") }));
+  try {
+    await database.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)");
+    await database.insertBatch("items", rows.slice(0, 16));
+    await database.insertBatch("items", rows.slice(16));
+    const step = await database.compactTableStep("items", { maxBlocks: 1, maxLevel0Segments: 2 });
+    expect(step.result).toBeNull();
+    await vi.waitFor(() => expect(reports).toHaveLength(1));
+    expect(reports[0]?.context).toBe("compaction admission");
+    expect(reports[0]?.error).toBe(failure);
+    expect((await database.query("SELECT id, value FROM items ORDER BY id")).rows).toEqual(rows);
+    if (step.jobId !== null) await database.cancelCompactionJob(step.jobId);
+  } finally {
+    await database.close();
+    store.close();
+    Object.defineProperty(globalThis, "navigator", {
+      value: originalNavigator,
+      configurable: true,
+      writable: true,
+    });
+  }
+});
 
 for (const storage of stores) {
   describe(storage.name, () => {

@@ -126,7 +126,8 @@ tails disappear in the same commit. Builds require globally strict lexical input
 bounded parts under an expiring owner, and publish by switching the namespace generation pointer
 in the same catalog transaction.
 
-Point and bulk probes seek only the predecessor parts for their requested tokens and retain one
+Point and bulk probes bound each cursor to its selected base or tail source, seek only the
+predecessor parts for their requested tokens, and retain one
 decoded part at a time. Small and bulk-loaded tables can still use the optional complete
 membership cache; it drops itself at `uniqueKeyCacheBytes`, after which persistent probes remain
 authoritative. The limit also works in a worker store descriptor:
@@ -224,6 +225,8 @@ for the whole connection: if thirty seconds pass with no storage event at all wh
 outstanding, every waiting call fails with `StorageUnresponsiveError` and the store refuses new
 work rather than queueing behind something that never moves. Any event resets the deadline, so a
 transaction waiting behind a genuinely long one is never mistaken for a wedge.
+Progress advances the deadline without replacing a native timer for every request. The timer
+checks the latest deadline when it wakes; a newly queued request does not count as progress.
 `unresponsiveAfterMs` on `IndexedDbBlockStore.open` changes the deadline.
 
 A wedge like that has one known cause: a worker killed with a write in flight. WebKit keeps the

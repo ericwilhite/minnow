@@ -1,4 +1,4 @@
-import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange, IDBObjectStore, IDBIndex } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { crc32, encodeBlock } from "../block-format/index.js";
 import {
@@ -2462,6 +2462,238 @@ describe("IndexedDB corruption hardening", () => {
     store.close();
   });
 
+  it.each([
+    "valid",
+    "missing",
+    "invalid",
+    "partial",
+    "invalid provenance",
+    "index mismatch",
+    "overflow partition",
+  ] as const)(
+    "batches level-zero owner reads without weakening the ceiling or atomic refusal (%s)",
+    async (mode) => {
+      const indexedDB = new IDBFactory();
+      const name = crypto.randomUUID();
+      const store = await openStore(indexedDB, name);
+      let restoreGet = (): void => undefined;
+      try {
+        await store.addTable({
+          managed: false,
+          id: "events",
+          name: "events",
+          columns: [{ id: "value", name: "value", type: "string", nullable: false }],
+          revision: 0,
+          createdAt: NOW,
+        });
+        for (let n = 0; n < 130; n++) {
+          const suffix = String(n).padStart(3, "0");
+          const id = `owner-${suffix}`;
+          await store.createTransaction(activeTransaction(id, n === 0 ? null : n - 1));
+          // One owner has two visible segments: counting owners alone would undercount the
+          // ceiling. Owner 128 lies beyond the first read batch in the table index's order.
+          const parts = n === 129 ? ["a", "b"] : n === 128 ? ["", "extra"] : [""];
+          const blocks = parts.map((part) => ({
+            id: `zz-block-${suffix}${part}`,
+            bytes: Uint8Array.of(1),
+          }));
+          const segments =
+            n === 128
+              ? [
+                  {
+                    ...segment(`segment-${suffix}`, id, `zz-block-${suffix}`),
+                    rowCount: 2,
+                    rowIdEndExclusive: 3n,
+                    columnBlockIds: { value: blocks.map((block) => block.id) },
+                  },
+                ]
+              : parts.map((part, ordinal) => ({
+                  ...segment(`segment-${suffix}${part}`, id, `zz-block-${suffix}${part}`),
+                  commitOrdinal: ordinal,
+                }));
+          const staged = await store.stageTransactionArtifacts({
+            transactionId: id,
+            expectedRevision: 0,
+            blocks,
+            segments,
+            updatedAt: NOW,
+          });
+          await store.commitTransaction({
+            transactionId: id,
+            expectedTransactionRevision: staged.revision,
+            expectedManifestVersion: n === 0 ? null : n - 1,
+            removedBlockIds: [],
+            levelZeroSegmentLimits: [{ tableId: "events", limit: 4096 }],
+            committedAt: NOW,
+          });
+        }
+        await store.createTransaction(activeTransaction("new-owner", 129));
+        const staged = await store.stageTransactionArtifacts({
+          transactionId: "new-owner",
+          expectedRevision: 0,
+          blocks: [{ id: "new-block", bytes: Uint8Array.of(2) }],
+          segments: [segment("zz-new-segment", "new-owner", "new-block")],
+          updatedAt: NOW,
+        });
+        if (mode === "missing" || mode === "invalid") {
+          const owner = await readRawValue(indexedDB, name, "transactions", "owner-128");
+          await mutate(indexedDB, name, "transactions", (transaction) => {
+            const transactions = transaction.objectStore("transactions");
+            if (mode === "missing") transactions.delete("owner-128");
+            else {
+              transactions.put(
+                { ...(owner as Record<string, unknown>), status: "invalid" },
+                "owner-128",
+              );
+            }
+          });
+        }
+        if (mode === "partial") {
+          await mutate(indexedDB, name, "catalog", (transaction) => {
+            transaction.objectStore("catalog").delete(["manifest-block", "zz-block-128extra"]);
+          });
+        }
+        if (mode === "invalid provenance") {
+          const key = ["manifest-block", "zz-block-129b"];
+          const value = await readRawValue(indexedDB, name, "catalog", key);
+          await mutate(indexedDB, name, "catalog", (transaction) => {
+            transaction
+              .objectStore("catalog")
+              .put({ ...(value as Record<string, unknown>), addedVersion: -1 }, key);
+          });
+        }
+        if (mode === "index mismatch") {
+          const key = "segment-128";
+          const value = await readRawValue(indexedDB, name, "segments", key);
+          await mutate(indexedDB, name, "segments", (transaction) => {
+            transaction
+              .objectStore("segments")
+              .put({ ...(value as Record<string, unknown>), id: "wrong-id" }, key);
+          });
+        }
+        if (mode === "overflow partition") {
+          // A full bulk read is not a complete partition. Invisible history sorts before
+          // the selected live segments, so trusting the prefix would undercount the ceiling.
+          await mutate(indexedDB, name, "segments", (transaction) => {
+            const segments = transaction.objectStore("segments");
+            for (let n = 0; n < MAX_STORAGE_BULK_READ_ITEMS; n++) {
+              const id = `aaa-history-${String(n).padStart(4, "0")}`;
+              segments.put(segment(id, "absent-owner", `absent-block-${String(n)}`), id);
+            }
+          });
+        }
+        const before = await Promise.all([
+          readRawValue(indexedDB, name, "statistics", "resource/global"),
+          readRawValue(indexedDB, name, "statistics", "resource/records"),
+        ]);
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with its native receiver below.
+        const original = IDBObjectStore.prototype.get;
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with its native receiver below.
+        const originalGetAll = IDBIndex.prototype.getAll;
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with its native receiver below.
+        const originalCursor = IDBIndex.prototype.openCursor;
+        let segmentBatchReads = 0;
+        let segmentCursorReads = 0;
+        const getAll = vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (
+          this: IDBIndex,
+          query,
+          count,
+        ) {
+          if (
+            this.objectStore.name === "segments" &&
+            this.objectStore.transaction.mode === "readwrite"
+          ) {
+            segmentBatchReads++;
+            expect(count).toBe(MAX_STORAGE_BULK_READ_ITEMS);
+          }
+          return originalGetAll.call(this, query, count);
+        });
+        const cursor = vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (
+          this: IDBIndex,
+          query,
+          direction,
+        ) {
+          if (
+            this.objectStore.name === "segments" &&
+            this.objectStore.transaction.mode === "readwrite"
+          )
+            segmentCursorReads++;
+          return originalCursor.call(this, query, direction);
+        });
+        let pending = 0;
+        let maximum = 0;
+        const get = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (
+          this: IDBObjectStore,
+          key,
+        ) {
+          const request = original.call(this, key);
+          if (this.name === "transactions" && this.transaction.mode === "readwrite") {
+            pending++;
+            maximum = Math.max(maximum, pending);
+            const complete = (): void => {
+              pending--;
+            };
+            request.addEventListener("success", complete, { once: true });
+            request.addEventListener("error", complete, { once: true });
+          }
+          return request;
+        });
+        restoreGet = () => {
+          get.mockRestore();
+          getAll.mockRestore();
+          cursor.mockRestore();
+        };
+        const commit = {
+          transactionId: "new-owner",
+          expectedTransactionRevision: staged.revision,
+          expectedManifestVersion: 129,
+          removedBlockIds: [],
+          levelZeroSegmentLimits: [{ tableId: "events", limit: 131 }],
+          committedAt: NOW,
+        };
+        if (mode === "valid" || mode === "overflow partition")
+          await expect(store.commitTransaction(commit)).rejects.toMatchObject({
+            name: "CompactionBacklogError",
+            levelZeroSegments: 132,
+          });
+        else
+          await expect(store.commitTransaction(commit)).rejects.toBeInstanceOf(
+            StorageCorruptionError,
+          );
+        if (mode !== "partial" && mode !== "invalid provenance" && mode !== "index mismatch")
+          expect(maximum).toBeGreaterThan(1);
+        expect(maximum).toBeLessThanOrEqual(128);
+        expect(segmentBatchReads).toBe(1);
+        expect(segmentCursorReads).toBe(mode === "overflow partition" ? 1 : 0);
+        expect(await store.getCurrentManifestVersion()).toBe(129);
+        expect(await store.getTransaction("new-owner")).toMatchObject({
+          status: "active",
+          revision: staged.revision,
+        });
+        expect(
+          await Promise.all([
+            readRawValue(indexedDB, name, "statistics", "resource/global"),
+            readRawValue(indexedDB, name, "statistics", "resource/records"),
+          ]),
+        ).toEqual(before);
+        expect(await store.hasManifestBlocks(129, ["new-block"])).toEqual([false]);
+        if (mode === "valid") {
+          await store.commitTransaction({
+            ...commit,
+            levelZeroSegmentLimits: [{ tableId: "events", limit: 132 }],
+          });
+          expect(await store.getCurrentManifestVersion()).toBe(130);
+          expect(await readManifestBlockIds(store, 130)).toHaveLength(133);
+          expect(await store.getTransaction("new-owner")).toMatchObject({ status: "committed" });
+          expect(await store.checkIntegrity()).toMatchObject({ ok: true });
+        }
+      } finally {
+        restoreGet();
+        store.close();
+      }
+    },
+  );
+
   it("bounds durable owner lifetimes and pages only expired owners in expiry order", async () => {
     const store = await openStore(new IDBFactory());
     const cutoff = "2026-08-24T12:10:00.000Z";
@@ -3536,6 +3768,89 @@ describe("IndexedDB corruption hardening", () => {
     restored.close();
     source.close();
   });
+  it.each([true, false])(
+    "seeks only the selected UNIQUE source and replays its ordered tail (ranges=%s)",
+    async (ranges) => {
+      if (!ranges) vi.stubGlobal("IDBKeyRange", undefined);
+      const indexedDB = new IDBFactory();
+      const name = crypto.randomUUID();
+      const store = await openStore(indexedDB, name);
+      const indexKey = ["unique-key-chunk-index", "users"];
+      const index = {
+        hasBase: true,
+        baseGenerationId: "generation",
+        tokenCount: 3,
+        versions: [1, 2, 3],
+      };
+      try {
+        await mutate(indexedDB, name, "catalog", (transaction) => {
+          const catalog = transaction.objectStore("catalog");
+          catalog.put(index, indexKey);
+          catalog.put(["a", "b", "d"], ["unique-key-base-part", "generation", "a"]);
+          catalog.put({ addedTokens: ["c"], removedTokens: ["b"] }, [
+            "unique-key-chunk",
+            "users",
+            1,
+            "b",
+          ]);
+          catalog.put({ addedTokens: ["b", "e"], removedTokens: ["a", "c"] }, [
+            "unique-key-chunk",
+            "users",
+            2,
+            "a",
+          ]);
+          catalog.put({ addedTokens: ["a"], removedTokens: ["e"] }, [
+            "unique-key-chunk",
+            "users",
+            3,
+            "a",
+          ]);
+          // Malformed records in another namespace are outside this point lookup's scope.
+          catalog.put({}, ["unique-key-chunk", "zz-other", 0, "z"]);
+        });
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with its native receiver below.
+        const original = IDBObjectStore.prototype.openCursor;
+        const queries: unknown[] = [];
+        const cursor = vi
+          .spyOn(IDBObjectStore.prototype, "openCursor")
+          .mockImplementation(function (this: IDBObjectStore, query, direction) {
+            if (this.name === "catalog" && this.transaction.mode === "readonly")
+              queries.push(query);
+            return original.call(this, query, direction);
+          });
+        try {
+          expect(
+            await store.getExistingUniqueKeys("users", ["0", "a", "b", "c", "d", "e", "z"]),
+          ).toEqual(["a", "b", "d"]);
+          expect(queries).toHaveLength(8);
+          if (ranges) expect(queries.every((query) => query instanceof IDBKeyRange)).toBe(true);
+          else expect(queries.every((query) => query == null)).toBe(true);
+        } finally {
+          cursor.mockRestore();
+        }
+        for (const damage of ["missing", "wrong boundary", "invalid needed part"] as const) {
+          await mutate(indexedDB, name, "catalog", (transaction) => {
+            const catalog = transaction.objectStore("catalog");
+            const key = ["unique-key-chunk", "users", 3, "a"];
+            if (damage === "missing") catalog.delete(key);
+            else if (damage === "wrong boundary")
+              catalog.put({ addedTokens: ["b"], removedTokens: ["e"] }, key);
+            else {
+              catalog.put({ addedTokens: ["a"], removedTokens: ["e"] }, key);
+              catalog.put({}, ["unique-key-chunk", "users", 3, "y"]);
+            }
+          });
+          await expect(store.getExistingUniqueKeys("users", ["a", "z"])).rejects.toBeInstanceOf(
+            StorageCorruptionError,
+          );
+          expect(await readRawValue(indexedDB, name, "catalog", indexKey)).toEqual(index);
+        }
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("never treats missing, legacy, partition, or tail UNIQUE membership as empty", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();

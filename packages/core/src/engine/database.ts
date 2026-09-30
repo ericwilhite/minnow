@@ -2976,6 +2976,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     kind: WriterKind,
     run: (admission: WriterAdmission) => Promise<T>,
     signal?: AbortSignal,
+    cancelWait?: AbortSignal,
   ): Promise<T> {
     const maintenance = signal === this.#maintenanceQueue.signal;
     if (this.#closed && !maintenance) return Promise.reject(new DatabaseClosedError());
@@ -2996,16 +2997,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         run,
       );
     const task =
-      signal === undefined
-        ? admit(this.#shutdown.signal)
-        : maintenance
-          ? admit(signal)
-          : this.#withLinkedSignal(signal, admit);
+      cancelWait !== undefined
+        ? this.#withLinkedSignal(cancelWait, admit, signal ?? this.#shutdown.signal)
+        : signal === undefined
+          ? admit(this.#shutdown.signal)
+          : maintenance
+            ? admit(signal)
+            : this.#withLinkedSignal(signal, admit);
     this.#writers.add(task);
-    void task.then(
-      () => this.#writers.delete(task),
-      () => this.#writers.delete(task),
-    );
+    const forget = (): boolean => this.#writers.delete(task);
+    void task.then(forget, forget);
     return task;
   }
 
@@ -3061,13 +3062,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * a fold parked on a yield of its own sat with its lease expiring while every write scanned
    * one more level-zero segment.
    */
-  async #withCompactionPublicationSlot<T>(attempt: () => Promise<T>): Promise<T> {
+  #withCompactionPublicationSlot<T>(attempt: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
+      const unusedWait = new AbortController();
       // The claim stays pending until the attempt has finished, not until it has started: a
       // writer that arrives while it is in flight waits for it.
       let settled: Promise<void> | undefined;
       const claim = (): Promise<void> => {
         settled ??= (async () => {
+          // This attempt owns a writer turn now, either its own or the caller's loan.
+          // Cancel only its redundant wait; already-admitted work keeps its turn.
+          unusedWait.abort(new Error("Compaction admitted"));
           try {
             resolve(await attempt());
           } catch (error) {
@@ -3082,29 +3087,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const registered = this.#pendingPublicationSignal;
       this.#pendingPublicationSignal = undefined;
       registered?.resolve();
-      void this.#admit("maintenance", () => claim(), this.#maintenanceSignal).catch(
-        (error: unknown) => {
-          // Closing refuses the turn. A claim nobody lent a turn to never publishes; one a writer
-          // already started runs to its known outcome inside that writer's turn.
-          if (settled !== undefined) return;
-          this.#pendingCompactionPublications.delete(claim);
-          reject(error instanceof Error ? error : new Error(String(error)));
-        },
-      );
+      void this.#admit(
+        "maintenance",
+        () => claim(),
+        this.#maintenanceSignal,
+        unusedWait.signal,
+      ).catch((error: unknown) => {
+        // Closing refuses the turn. A claim nobody lent a turn to never publishes; one a writer
+        // already started runs to its known outcome inside that writer's turn.
+        if (settled !== undefined) {
+          if (error !== unusedWait.signal.reason)
+            this.#reportBackgroundError(error, "compaction admission");
+          return;
+        }
+        this.#pendingCompactionPublications.delete(claim);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
   }
 
   /**
-   * Runs, or waits for, every fold publication pending a turn, inside the caller's own turn; a
+   * Runs, or waits for, one pending fold publication inside the caller's own turn; a
    * claim never throws to its runner. A writer calls this once admitted and before its
    * snapshot, so nothing of its own can conflict with the neutral manifest the fold publishes.
    */
-  async #publishPendingCompactions(): Promise<void> {
-    while (this.#pendingCompactionPublications.size > 0) {
-      const [claim] = this.#pendingCompactionPublications;
-      if (claim === undefined) return;
-      await claim();
-    }
+  #publishPendingCompactions(): Promise<void> {
+    const [claim] = this.#pendingCompactionPublications;
+    return claim?.() ?? Promise.resolve();
   }
 
   /** Settles when the next fold publication registers for a turn. */
@@ -3144,6 +3153,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const registered = this.#nextPendingPublication();
       await this.#publishPendingCompactions();
       if (!pending()) break;
+      if (this.#pendingCompactionPublications.size > 0) continue;
       await Promise.race([settled, registered]);
     }
   }
@@ -16204,8 +16214,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #withLinkedSignal<T>(
     external: AbortSignal | undefined,
     run: (signal: AbortSignal) => Promise<T>,
+    queue: AbortSignal = this.#shutdown.signal,
   ): Promise<T> {
-    const queue = this.#shutdown.signal;
     if (external === undefined) return run(queue);
     const controller = new AbortController();
     const forward = (source: AbortSignal) => (): void => controller.abort(source.reason);

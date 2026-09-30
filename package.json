@@ -82,7 +82,7 @@
   },
   "overrides": {
     "monaco-editor": {
-      "dompurify": "3.4.14"
+      "dompurify": "3.4.16"
     }
   },
   "engines": {
