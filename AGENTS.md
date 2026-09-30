@@ -19,6 +19,13 @@
 - Test all changes before committing.
 - Check for regressions.
 - Do not commit broken or unverified work.
+- Every change to a supported stored format must preserve automatic upgrades on open/load.
+  Require frozen fixtures from every supported older writer and tests that open them through
+  the ordinary API, preserve their data, continue writing, and reopen with the current build.
+  Test interruption/power loss and retry at every conversion publication step, corruption
+  refusal, concurrent openers, and older-writer refusal after upgrade. Manual export/import
+  is not an acceptable upgrade path for a supported version. A format bump without this
+  regression coverage is unfinished, including during 0.x.
 
 ## Traps
 

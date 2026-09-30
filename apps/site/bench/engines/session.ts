@@ -26,7 +26,7 @@ export interface PreparedStatement {
   peakMemoryBytes?: number;
   /** minnow only: the optimized plan. */
   plan?: string;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 export interface EngineSession {
@@ -78,7 +78,7 @@ export interface WriteTarget {
   ): () => Promise<void>;
   /** The whole table, canonicalized, with every result cache bypassed. */
   readAll(): Promise<Array<Record<string, unknown>>>;
-  /** Best effort: an engine with no DROP TABLE leaves the table behind with the dataset. */
+  /** Removes this sample's table; cleanup failures must be reported. */
   drop(): Promise<void>;
 }
 
@@ -103,6 +103,8 @@ export interface LiveSession {
   engine: EngineId;
   /** Creates one empty table; the suite writes into it and watches it. */
   createTable(schema: WriteTableSchema): Promise<void>;
+  /** Removes the case table after its subscriptions are closed. */
+  dropTable(table: string): Promise<void>;
   /** Inserts through the same client the subscriptions were registered on. */
   insert(table: string, batch: WriteBatch): Promise<void>;
   /** Registers a query; `onChange` receives its initial rows and then every changed result. */
@@ -131,7 +133,7 @@ export interface EngineDriver {
    * engine's persistence settings identical to the read comparison.
    */
   openWriteSession(record: DatasetRecord): Promise<WriteSession>;
-  /** Engines with a live-query layer; absent means the live suite reports "unsupported". */
+  /** Optional live driver; an absent method fails when the engine declares live support. */
   openLiveSession?(record: DatasetRecord): Promise<LiveSession>;
   deleteDataset(materialization: EngineMaterialization): Promise<void>;
 }

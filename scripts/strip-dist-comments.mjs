@@ -2,7 +2,7 @@
 /**
  * Strips comments from a package's shipped JavaScript before it is packed. The sources keep
  * their doc comments, and so do the declaration files (an editor reads those); only `dist/**.js`
- * is rewritten, which is a fifth of the tarball and zero bytes of any application bundle. Runs
+ * is rewritten and whitespace is compacted, with zero effect on application bundles. Runs
  * as the package's `prepack` hook, so `npm pack` and `npm publish` ship the trimmed files
  * whichever command built them.
  *
@@ -26,8 +26,8 @@ function javascriptFiles(directory) {
 }
 
 /**
- * Comments are the only thing removed: no syntax lowering, no renaming, so the module keeps its
- * shape and its stack traces keep their names. TypeScript's emitter drops every comment
+ * Comments and whitespace are removed: no syntax lowering or identifier renaming, so the
+ * module keeps its shape and stack traces keep their names. TypeScript drops every comment
  * (esbuild keeps the ones inside object literals and argument lists); esbuild then reprints the
  * result compactly, since TypeScript's output is wider than the original.
  * @param {string} source @returns {string}
@@ -40,8 +40,12 @@ export function stripComments(source) {
       removeComments: true,
     },
   }).outputText;
-  return transformSync(uncommented, { format: "esm", target: "esnext", legalComments: "none" })
-    .code;
+  return transformSync(uncommented, {
+    format: "esm",
+    target: "esnext",
+    legalComments: "none",
+    minifyWhitespace: true,
+  }).code;
 }
 
 const directory = process.argv[2];

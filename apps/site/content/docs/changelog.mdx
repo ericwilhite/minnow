@@ -8,6 +8,70 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.12.0 — September 30, 2026
+
+Published packages: `@minnowdb/core@0.12.0`, `@minnowdb/devtools@0.3.4`.
+
+- `coordinateWrites` is removed, as announced in 0.11.0. Delete this ignored option from
+  engine and worker-client initialization. Writers still take turns automatically.
+
+- JSON/JSONB preserves every numeric digit from JSON text through persistence, extraction,
+  constructors, and comparison. ARRAY text refuses numeric input that would lose precision. Exact NUMERIC `DIV` and `TO_CHAR` avoid Float64 conversion.
+- Empty-subquery `IN`/`NOT IN`, timestamp validation and years below 100, TEXT comparisons,
+  SQL quoting, and positional `FORMAT` now return correct results or explicit errors.
+- Regex matching uses a bounded interpreter with leftmost-longest selection and ASCII POSIX
+  classes. Unsupported pattern backreferences, lookaround, inline flags, and non-greedy
+  quantifiers are refused instead of running in the host regex engine.
+- Lazy index and maintenance failures reach their diagnostic hook or `console.error`.
+  Throwing hooks cannot prevent worker failure cleanup. Malformed worker result frames are
+  rejected before allocation; use cursors for results above 1,000,000 rows or 4,000,000 cells per frame.
+- Benchmarks remove sample tables, await database cleanup, use SQLite's public OPFS constructor,
+  and cannot count execution failures or missing read/write engines as passing. `npm run benchmark:compare`
+  gives every engine the same primary-key indexes; historical regression thresholds remain separate.
+
+**Migration:** OPFS now writes layout 7, with an independent checksummed WAL acknowledgement
+boundary. Layout 6 upgrades automatically on open using a validated temporary copy and
+crash-resumable publication. No export/import is required; allow temporary quota for the copy
+and close older connections if they block ownership. Conversion refuses damaged or ambiguous
+old state. Keep snapshots: a torn acknowledgement
+slot is reported as corruption and stops recovery. Block format 2, snapshot format 1, and
+IndexedDB schema 2 are unchanged. Regex patterns using the refused forms must be rewritten.
+
+- Maintenance scheduling now has separate owners for collection and compaction timers, retries,
+  debt and task draining. A bounded background failure history supplements diagnostic hooks.
+  Native adapters share transaction refusal rules while retaining their atomic storage mechanics.
+- Generated semantic equivalence checks also fix typed NULL result-domain loss and negative zero
+  in INTEGER casts. These are query-result fixes; stored formats are unchanged by this refactor.
+- Comparison reports enforce declared workload coverage and expose attempted/verified/failed counts.
+  Small-sample percentiles are documented as sample maxima, not production tail estimates.
+  Prepared-statement cleanup is awaited; unexpected PGlite deallocation and database-close
+  failures invalidate the run, and paired execution/cleanup failures retain both errors.
+- Compaction transitions validate external plans once and retain a private validated copy within
+  the transition. Bound column/literal projections avoid repeated general expression dispatch.
+  Result and corruption checks remain in place. The settle report separates observed work from
+  its confirmation window while preserving the gate's full elapsed-time measurement.
+
+- Bounded numeric and timestamp ordering keeps its cut line and arrival counter local to
+  each batch, and combines source/window bounds before scanning. NULL ordering and tie
+  handling retain the ordinary sort semantics.
+- Keyed UPDATEs can reuse bounded point reads before evaluating assignments through the ordinary
+  query kernel. Constraints, triggers and commit checks retain their usual behavior. These
+  query changes add no cache or stored-format change.
+- Correlated lookups with a proven base-table key predicate materialize only those keys, then
+  evaluate joins and remaining predicates normally. Ambiguous aliases and full-text queries
+  retain ordinary preparation.
+- Numeric and timestamp point reads skip unrelated mutation blocks using their durable key
+  bounds, including single-block segments. Header inspection and decoded history remain bounded;
+  long or relevant histories fall back to ordinary replay. Deletes and reinserts retain their
+  usual snapshot semantics.
+- Point reads preserve result aliases named `__proto__` as ordinary own properties through
+  append, mutation and compacted histories. SQL writes, defaults and columnar batches also
+  preserve columns with that name instead of invoking JavaScript's inherited setter.
+- INSERT accepts `DEFAULT` for stored generated columns. Explicit values, including mixed
+  batches containing an explicit generated value, are still refused before any row is staged.
+- Published core JavaScript compacts whitespace without renaming identifiers. Declaration
+  documentation stays available; stored formats and application bundles are unchanged.
+
 ## 0.11.1 — September 27, 2026
 
 Published packages: `@minnowdb/core@0.11.1`.

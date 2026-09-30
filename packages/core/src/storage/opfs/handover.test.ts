@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { OpfsUncertainOutcomeError, type TableRecord } from "../types.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { OpfsBlockStore, type OpfsBlockStoreOptions } from "./store.js";
@@ -261,35 +261,60 @@ it("declines a write that reaches a closing leader so it runs once on the next o
   }
 });
 
-it("reports a failed background checkpoint through onDiagnostic", async () => {
-  const shim = new MemoryOpfs();
-  const reports: Array<{ error: unknown; context: string }> = [];
-  const store = await OpfsBlockStore.open({
-    name: "checkpoint",
-    root: shim.root,
-    checkpointEntries: 2,
-    onDiagnostic: (error, context) => reports.push({ error, context }),
-  });
-  try {
-    await store.addTable(table("one"));
-    shim.setWriteFault((path) => {
-      if (path.includes("checkpoint-")) throw new DOMException("no room", "QuotaExceededError");
+it.each(["hook", "console", "throwing hook"] as const)(
+  "reports a failed background checkpoint through %s",
+  async (mode) => {
+    const shim = new MemoryOpfs();
+    const reports: Array<{ error: unknown; context: string }> = [];
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const hookError = new Error("broken OPFS diagnostic observer");
+    const store = await OpfsBlockStore.open({
+      name: "checkpoint",
+      root: shim.root,
+      checkpointEntries: 2,
+      ...(mode === "console"
+        ? {}
+        : {
+            onDiagnostic(error: unknown, context: string) {
+              reports.push({ error, context });
+              if (mode === "throwing hook") throw hookError;
+            },
+          }),
     });
-    await store.addTable(table("two"));
-    await store.addTable(table("three"));
-    await waitFor(() => reports.length > 0, "the checkpoint failure to be reported");
-    expect(reports[0]?.context).toBe("opfs checkpoint");
-    expect(reports[0]?.error).toBeInstanceOf(DOMException);
-    shim.setWriteFault(null);
-    expect((await store.listTables()).map((record) => record.name)).toEqual([
-      "one",
-      "three",
-      "two",
-    ]);
-  } finally {
-    store.close();
-  }
-});
+    try {
+      await store.addTable(table("one"));
+      shim.setWriteFault((path) => {
+        if (path.includes("checkpoint-")) throw new DOMException("no room", "QuotaExceededError");
+      });
+      await store.addTable(table("two"));
+      await store.addTable(table("three"));
+      await waitFor(
+        () =>
+          mode === "console"
+            ? logged.mock.calls.some((call) => call[0] === "Minnow opfs checkpoint")
+            : reports.length > 0,
+        "the checkpoint failure to be reported",
+      );
+      if (mode !== "console") {
+        expect(reports[0]?.context).toBe("opfs checkpoint");
+        expect(reports[0]?.error).toBeInstanceOf(DOMException);
+      }
+      if (mode === "hook") expect(logged).not.toHaveBeenCalled();
+      else expect(logged).toHaveBeenCalledWith("Minnow opfs checkpoint", expect.any(DOMException));
+      if (mode === "throwing hook")
+        expect(logged).toHaveBeenCalledWith("Minnow OPFS diagnostic callback failed", hookError);
+      shim.setWriteFault(null);
+      expect((await store.listTables()).map((record) => record.name)).toEqual([
+        "one",
+        "three",
+        "two",
+      ]);
+    } finally {
+      store.close();
+      logged.mockRestore();
+    }
+  },
+);
 
 it("carries a served request through a checkpoint and answers its re-send after a crash", async () => {
   const shim = new MemoryOpfs();

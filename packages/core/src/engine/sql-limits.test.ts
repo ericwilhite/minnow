@@ -13,6 +13,7 @@ import { compileQuery, compileStatement, scalarFunctionValue } from "./query.js"
 import { jsonAtPath, jsonIsValid } from "./sql-json.js";
 import {
   boundedJsonText,
+  externalSqlDomainValue,
   exactNumericValue,
   jsonDomainValue,
   normalizeSqlDomainValue,
@@ -147,7 +148,7 @@ describe("SQL scalar allocation limits", () => {
     expect(() => scalarFunctionValue("SUBSTR", ["abcdef", 1.5])).toThrow("integer");
     expect(() => scalarFunctionValue("SUBSTR", ["abcdef", 2, -1])).toThrow("non-negative");
 
-    expect(scalarFunctionValue("CAST", [false, "string"])).toBe("false");
+    expect(externalSqlDomainValue(scalarFunctionValue("CAST", [false, "string"]))).toBe("false");
     expect(scalarFunctionValue("CAST", [true, "number"])).toBe(1);
     expect(scalarFunctionValue("CAST", [0, "boolean"])).toBe(false);
     expect(scalarFunctionValue("CAST", [1, "boolean"])).toBe(true);

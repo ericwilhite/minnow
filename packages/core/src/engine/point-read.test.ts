@@ -855,3 +855,33 @@ describe("point-read fast path", () => {
     await database.close();
   });
 });
+
+describe("point-read result properties", () => {
+  it("preserves __proto__ aliases through appends, updates and compaction", async () => {
+    const database = await scalarDatabase();
+    try {
+      for (const stage of ["append", "delta", "compacted"]) {
+        if (stage === "delta") {
+          await database.execute(
+            "UPDATE users SET score=score+1 WHERE email='user-42@example.com'",
+          );
+        }
+        if (stage === "compacted") await database.compactTable("users");
+        const result = await differential(
+          database,
+          'SELECT score AS "__proto__", email AS "constructor" FROM users WHERE email=?',
+          ["user-42@example.com"],
+        );
+        expect(result.served, stage).toBe(true);
+        const row = result.rows[0];
+        if (row === undefined) throw new Error(`Missing ${stage} row`);
+        expect(Object.hasOwn(row, "__proto__"), stage).toBe(true);
+        expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+        expect(row.__proto__).toBe(stage === "append" ? 54 : 55);
+        expect(row.constructor).toBe("user-42@example.com");
+      }
+    } finally {
+      await database.close();
+    }
+  });
+});

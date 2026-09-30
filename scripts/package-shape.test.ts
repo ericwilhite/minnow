@@ -85,6 +85,8 @@ describe("published package shape", () => {
     expect(manifest.files).toContain("!dist/engine/storage-test-helpers.*");
     expect(manifest.files).toContain("!dist/testing/seeds.*");
     expect(manifest.files).toContain("!dist/testing/oracle.*");
+    expect(manifest.files).toContain("!dist/testing/semantic-corpus.*");
+    expect(manifest.files).toContain("!dist/testing/maintenance-diagnostics.*");
     expect(manifest.files).toContain("!dist/engine/client-audit-harness.*");
     expect(manifest.files).toContain("!dist/storage/indexeddb-audit-helpers.*");
     expect(manifest.files).toContain("!dist/storage/opfs/power-loss-model.*");
@@ -119,8 +121,8 @@ describe("published package shape", () => {
 
 describe("published core tarball", () => {
   it("ships its JavaScript without comments and stays under the packed-size budget", async () => {
-    // The prepack hook strips comments from dist/**.js (never from the declarations), which is
-    // a fifth of the tarball. A dry-run pack runs the hook the way a publish does, so this
+    // The prepack hook strips comments and compacts whitespace in dist/**.js, retaining names
+    // and declaration documentation. A dry-run pack runs the hook the way a publish does, so this
     // proves the wiring rather than the script alone.
     const { stripComments } = (await import("./strip-dist-comments.mjs")) as {
       stripComments: (source: string) => string;
@@ -130,7 +132,13 @@ describe("published core tarball", () => {
     );
     expect(stripped).not.toMatch(/\/\*|\/\//u);
     expect(stripped).toMatch(/export/u);
-    expect(stripped).toContain("return a + 1;");
+    expect(stripped).toContain("return a+1");
+    expect(stripped).toContain("function f(a)");
+    expect(stripped).not.toContain("\n  ");
+    const module = (await import(`data:text/javascript,${encodeURIComponent(stripped)}`)) as {
+      f: (value: number) => number;
+    };
+    expect(module.f(41)).toBe(42);
     const coreRoot = join(repoRoot, "packages", "core");
     const manifest = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8")) as {
       scripts?: Record<string, string>;
@@ -164,6 +172,12 @@ describe("published core tarball", () => {
         files: Array<{ path: string }>;
       }>;
       expect(report?.files.map(({ path }) => path)).not.toContain("dist/engine/query-cache.d.ts");
+      expect(report?.files.map(({ path }) => path)).not.toContain(
+        "dist/testing/semantic-corpus.js",
+      );
+      expect(report?.files.map(({ path }) => path)).not.toContain(
+        "dist/testing/maintenance-diagnostics.js",
+      );
       expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
       // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
       // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000

@@ -111,6 +111,7 @@ store._crashForTests();
 const paths = [
   `${prefix}/format.json`,
   `${prefix}/wal`,
+  `${prefix}/wal-acknowledgements`,
   `${prefix}/checkpoint-a`,
   `${prefix}/checkpoint-b`,
   `${prefix}/extents/000000`,

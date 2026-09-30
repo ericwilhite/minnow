@@ -65,6 +65,55 @@ class TestSpillStore implements QuerySpillStore {
 }
 
 describe("vector query execution", () => {
+  it("preserves direct column and literal projections across batches, null joins and hostile aliases", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 4097 }, (_, id) => ({
+      id,
+      amount: id % 17 === 0 ? null : id === 1 ? -0 : id / 4,
+      happened: new Date(Date.UTC(2025, 0, (id % 28) + 1)),
+      label: id % 13 === 0 ? null : `row-${String(id)}`,
+      active: id % 2 === 0,
+    }));
+    const tables = new Map<string, DatabaseRow[]>([
+      ["rows", rows],
+      ["right_rows", [{ id: 1, label: "matched" }]],
+    ]);
+    const plan = compileQuery(
+      'SELECT l.id, l.amount, l.happened, l.active, l.label AS "__proto__", r.label AS matched, NULL AS absent, 7 AS literal FROM rows l LEFT JOIN right_rows r ON r.id = l.id',
+    );
+    const expected = executeRowQuery(plan, tables);
+    const prepared = createPreparedQuery(plan, tables);
+    try {
+      const result = prepared.execute();
+      expect(result).toEqual(expected);
+      expect(Object.is(result.rows[1]?.amount, -0)).toBe(true);
+      expect(Object.prototype.hasOwnProperty.call(result.rows[1], "__proto__")).toBe(true);
+      expect(Object.getPrototypeOf(result.rows[1])).toBe(Object.prototype);
+      expect(result.rows[0]?.matched).toBeNull();
+      expect(result.rows[1]?.matched).toBe("matched");
+      const batchPlan = compileQuery(
+        'SELECT id, amount, happened, active, label AS "__proto__", NULL AS absent, 7 AS literal FROM rows',
+      );
+      const batchPrepared = createPreparedQuery(batchPlan, tables);
+      try {
+        const batchExpected = executeRowQuery(batchPlan, tables);
+        const batched: typeof result.rows = [];
+        await batchPrepared.executeBatches({ batchRows: 257 }, (batch) => {
+          expect(batch.columnDomains).toEqual(batchExpected.columnDomains);
+          batched.push(...batch.rows);
+        });
+        expect(batched).toEqual(batchExpected.rows);
+      } finally {
+        batchPrepared.close();
+      }
+      const happened = result.rows[0]?.happened;
+      if (!(happened instanceof Date)) throw new Error("missing projected date");
+      happened.setUTCFullYear(2040);
+      expect(prepared.execute()).toEqual(expected);
+    } finally {
+      prepared.close();
+    }
+  });
+
   it("recomputes BM25 corpus statistics per execution instead of freezing them into the plan", () => {
     const plan = compileQuery("SELECT id, BM25(text) AGAINST 'quick' AS score FROM rows");
     const small = new Map<string, DatabaseRow[]>([["rows", [{ id: 1, text: "quick" }]]]);

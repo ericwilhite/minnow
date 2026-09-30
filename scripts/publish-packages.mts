@@ -116,7 +116,7 @@ if (pending.length === 0) {
 }
 
 console.log(
-  `Publishing ${pending.map((entry) => `${entry.name}@${entry.version}`).join(", ")}` +
+  `${dryRun ? "Would publish" : "Publishing"} ${pending.map((entry) => `${entry.name}@${entry.version}`).join(", ")}` +
     `${provenance ? " with provenance" : ""}.`,
 );
 
@@ -161,4 +161,8 @@ for (const entry of pending) {
   }
 }
 
-console.log(`Published ${String(pending.length)} package${pending.length === 1 ? "" : "s"}.`);
+console.log(
+  dryRun
+    ? `Dry run complete: ${String(pending.length)} package${pending.length === 1 ? "" : "s"}; nothing published or tagged.`
+    : `Published ${String(pending.length)} package${pending.length === 1 ? "" : "s"}.`,
+);

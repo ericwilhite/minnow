@@ -99,6 +99,9 @@ Derived results, including window output, build their column vectors directly fr
 without retaining an intermediate value array for every column. Window execution also omits
 peer buffers when all functions sharing an ordering can operate by row position alone.
 Keyed reads use the pool's block vectors directly; they add no separate row cache or index.
+Eligible keyed UPDATEs load the selected row through the bounded point reader, then
+evaluate assignments through the ordinary query kernel. This path retains the usual predicate,
+visibility and type checks.
 
 `0` disables it, which is the right setting for a one-shot import that will never re-read what it
 writes.

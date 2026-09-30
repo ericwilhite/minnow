@@ -5,7 +5,7 @@
  * inference, constant folding, and both executors read one definition. Anything with its own
  * syntax (EXTRACT, CAST, TRIM ... FROM, JSON constructors) stays in the parser's own tables.
  */
-import { quoteSqlIdentifier } from "./sql-quote.js";
+import { minimallyQuoteSqlIdentifier } from "./sql-quote.js";
 import {
   dateIsoString,
   dateMilliseconds,
@@ -21,6 +21,7 @@ import { MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
 import {
   dateDomainValue,
   exactNumericRounded,
+  exactNumericIntegerDivision,
   exactNumericUnary,
   externalSqlDomainValue,
   intervalDomainValue,
@@ -219,17 +220,20 @@ function cased(name: string, token: string): string {
 }
 
 function isoWeek(date: Date): number {
-  const probe = new Date(Date.UTC(dateUtcFullYear(date), dateUtcMonth(date), dateUtcDate(date)));
+  const probe = new Date(
+    utcMilliseconds(dateUtcFullYear(date), dateUtcMonth(date), dateUtcDate(date)),
+  );
   probe.setUTCDate(probe.getUTCDate() + 4 - (probe.getUTCDay() || 7));
-  const yearStart = Date.UTC(probe.getUTCFullYear(), 0, 1);
+  const yearStart = utcMilliseconds(probe.getUTCFullYear(), 0, 1);
   return Math.ceil(((probe.getTime() - yearStart) / 86_400_000 + 1) / 7);
 }
 
 function dayOfYear(date: Date): number {
-  const start = Date.UTC(dateUtcFullYear(date), 0, 1);
+  const start = utcMilliseconds(dateUtcFullYear(date), 0, 1);
   return (
     Math.floor(
-      (Date.UTC(dateUtcFullYear(date), dateUtcMonth(date), dateUtcDate(date)) - start) / 86_400_000,
+      (utcMilliseconds(dateUtcFullYear(date), dateUtcMonth(date), dateUtcDate(date)) - start) /
+        86_400_000,
     ) + 1
   );
 }
@@ -335,6 +339,22 @@ function formatDatetime(date: Date, template: string): string {
   return parts.join("");
 }
 
+/** UTC construction without Date.UTC's special interpretation of years 0..99. */
+function utcMilliseconds(
+  year: number,
+  month: number,
+  day = 1,
+  hours = 0,
+  minutes = 0,
+  seconds = 0,
+  milliseconds = 0,
+): number {
+  const date = new Date(0);
+  date.setUTCFullYear(year, month, day);
+  date.setUTCHours(hours, minutes, seconds, milliseconds);
+  return date.getTime();
+}
+
 /** Reads datetime text against a TO_DATE / TO_TIMESTAMP template; fields not named default. */
 function parseDatetime(name: string, input: string, template: string): Date {
   let year = 1970;
@@ -396,7 +416,7 @@ function parseDatetime(name: string, input: string, template: string): Date {
         break;
       case "DDD": {
         const ordinal = digits(3, "the day of year");
-        const date = new Date(Date.UTC(year, 0, ordinal));
+        const date = new Date(utcMilliseconds(year, 0, ordinal));
         month = date.getUTCMonth() + 1;
         day = date.getUTCDate();
         break;
@@ -449,9 +469,14 @@ function parseDatetime(name: string, input: string, template: string): Date {
     }
   }
   if (pm !== undefined) hours = pm ? (hours % 12) + 12 : hours % 12;
-  const date = new Date(Date.UTC(year, month - 1, day, hours, minutes, seconds, milliseconds));
+  const date = new Date(
+    utcMilliseconds(year, month - 1, day, hours, minutes, seconds, milliseconds),
+  );
   if (
     !Number.isFinite(date.getTime()) ||
+    year < 1 ||
+    year > 9999 ||
+    date.getUTCFullYear() !== year ||
     date.getUTCMonth() !== month - 1 ||
     date.getUTCDate() !== day ||
     hours > 23 ||
@@ -470,7 +495,7 @@ function parseDatetime(name: string, input: string, template: string): Date {
  * separators, FM to drop padding, and S / MI for an explicit sign. Other pattern letters
  * (EEEE, RN, V, PL, L, TH) are refused rather than rendered wrongly.
  */
-function formatNumber(value: number, template: string): string {
+function formatNumber(value: number | string, template: string): string {
   const fill = template.includes("FM");
   const body = template.replace(/FM/g, "");
   const unsupported = /[^90.,SMI\s]/.exec(body);
@@ -486,18 +511,27 @@ function formatNumber(value: number, template: string): string {
   // is a hair below the tie and renders as .07 under '9.99', while 77.25 is exact and renders
   // as 77.2 under '9999.9'. toFixed rounds by the exact value but breaks ties upward, so ties
   // are detected on a long exact expansion and settled here.
-  const magnitude = Math.abs(value);
-  const expansion = magnitude.toFixed(Math.min(fractionDigits + 30, 100));
-  const cut = expansion.indexOf(".") + 1 + fractionDigits;
-  const tie = /^50*$/.test(expansion.slice(cut));
-  let rounded = magnitude.toFixed(fractionDigits);
-  if (tie) {
-    const kept = expansion.slice(0, cut).replace(/\.$/, "");
-    const lastDigit = Number(kept.at(-1) ?? "0");
-    rounded =
-      lastDigit % 2 === 0
-        ? Number(kept).toFixed(fractionDigits)
-        : (Number(kept) + 10 ** -fractionDigits).toFixed(fractionDigits);
+  let rounded: string;
+  if (typeof value === "string") {
+    const exact = String(
+      externalSqlDomainValue(exactNumericRounded(value, fractionDigits, "round")),
+    );
+    const [whole = "0", fraction = ""] = exact.replace(/^-/, "").split(".");
+    rounded = fractionDigits === 0 ? whole : `${whole}.${fraction.padEnd(fractionDigits, "0")}`;
+  } else {
+    const magnitude = Math.abs(value);
+    const expansion = magnitude.toFixed(Math.min(fractionDigits + 30, 100));
+    const cut = expansion.indexOf(".") + 1 + fractionDigits;
+    const tie = /^50*$/.test(expansion.slice(cut));
+    rounded = magnitude.toFixed(fractionDigits);
+    if (tie) {
+      const kept = expansion.slice(0, cut).replace(/\.$/, "");
+      const lastDigit = Number(kept.at(-1) ?? "0");
+      rounded =
+        lastDigit % 2 === 0
+          ? Number(kept).toFixed(fractionDigits)
+          : (Number(kept) + 10 ** -fractionDigits).toFixed(fractionDigits);
+    }
   }
   const [wholeText = "0", fractionText = ""] = rounded.split(".");
   if (wholeText.length > integerSlots && !(wholeText === "0" && integerSlots === 0)) {
@@ -544,7 +578,10 @@ function formatNumber(value: number, template: string): string {
   }
   if (fractionDigits > 0) text += `.${fractionText}`;
   // The sign is the value's, even when the digits round to zero: -0.001 and -0 render with '-'.
-  const negative = value < 0 || Object.is(value, -0);
+  const negative =
+    typeof value === "string"
+      ? String(externalSqlDomainValue(value)).startsWith("-")
+      : value < 0 || Object.is(value, -0);
   if (signStyle === "MI") {
     const result = text + (negative ? "-" : fill ? "" : " ");
     return fill ? result.trim() : result;
@@ -560,25 +597,44 @@ function formatNumber(value: number, template: string): string {
 
 function formatText(template: string, values: readonly unknown[]): string {
   let next = 0;
-  return template.replace(
-    /%(?:(\d+)\$)?([sIL%])/g,
-    (_, position: string | undefined, kind: string) => {
-      if (kind === "%") return "%";
-      const index = position === undefined ? next++ : Number(position) - 1;
-      if (index >= values.length)
-        throw new TypeError("FORMAT has too few arguments for its template");
-      const value = values[index];
-      if (kind === "s") return value === null || value === undefined ? "" : rendered(value);
-      if (kind === "I") {
-        if (value === null || value === undefined)
-          throw new TypeError("FORMAT %I does not accept NULL");
-        const name = rendered(value);
-        return /^[a-z_][a-z0-9_]*$/.test(name) ? name : quoteSqlIdentifier(name);
-      }
-      if (value === null || value === undefined) return "NULL";
-      return `'${rendered(value).replace(/'/g, "''")}'`;
-    },
-  );
+  const parts: string[] = [];
+  for (let cursor = 0; cursor < template.length;) {
+    const percent = template.indexOf("%", cursor);
+    if (percent < 0) {
+      parts.push(template.slice(cursor));
+      break;
+    }
+    parts.push(template.slice(cursor, percent));
+    if (template[percent + 1] === "%") {
+      parts.push("%");
+      cursor = percent + 2;
+      continue;
+    }
+    const directive = /^%(?:(\d+)\$)?([sIL])/.exec(template.slice(percent));
+    if (directive === null)
+      throw new TypeError("FORMAT has an unsupported or incomplete directive");
+    const position = directive[1];
+    const kind = directive[2];
+    const index = position === undefined ? next : Number(position) - 1;
+    if (!Number.isSafeInteger(index) || index < 0)
+      throw new TypeError("FORMAT argument positions start at 1");
+    if (index >= values.length)
+      throw new TypeError("FORMAT has too few arguments for its template");
+    next = index + 1;
+    const value = values[index];
+    if (kind === "s") parts.push(nullish(value) ? "" : rendered(value));
+    else if (kind === "I") {
+      if (nullish(value)) throw new TypeError("FORMAT %I does not accept NULL");
+      parts.push(minimallyQuoteSqlIdentifier(rendered(value)));
+    } else parts.push(nullish(value) ? "NULL" : quoteLiteral(value));
+    cursor = percent + directive[0].length;
+  }
+  return parts.join("");
+}
+
+function quoteLiteral(value: unknown): string {
+  const escaped = rendered(value).replace(/'/g, "''");
+  return escaped.includes("\\") ? `E'${escaped.replace(/\\/g, "\\\\")}'` : `'${escaped}'`;
 }
 
 // --- MD5 ---------------------------------------------------------------------------------------
@@ -680,8 +736,8 @@ function ageInterval(later: Date, earlier: Date): string | null {
   let days = dateUtcDate(a) - dateUtcDate(b);
   let milliseconds =
     dateMilliseconds(a) -
-    Date.UTC(dateUtcFullYear(a), dateUtcMonth(a), dateUtcDate(a)) -
-    (dateMilliseconds(b) - Date.UTC(dateUtcFullYear(b), dateUtcMonth(b), dateUtcDate(b)));
+    utcMilliseconds(dateUtcFullYear(a), dateUtcMonth(a), dateUtcDate(a)) -
+    (dateMilliseconds(b) - utcMilliseconds(dateUtcFullYear(b), dateUtcMonth(b), dateUtcDate(b)));
   if (milliseconds < 0) {
     milliseconds += 86_400_000;
     days -= 1;
@@ -689,7 +745,7 @@ function ageInterval(later: Date, earlier: Date): string | null {
   if (days < 0) {
     // Borrow the length of the earlier date's month, as PostgreSQL's timestamp_age does.
     const earlierMonthDays = new Date(
-      Date.UTC(dateUtcFullYear(b), dateUtcMonth(b) + 1, 0),
+      utcMilliseconds(dateUtcFullYear(b), dateUtcMonth(b) + 1, 0),
     ).getUTCDate();
     days += earlierMonthDays;
     months -= 1;
@@ -1078,16 +1134,8 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
       maxArgs: 1,
       returns: "string",
       evaluate: (values) => {
-        const value = values[0];
-        const rendered =
-          typeof value === "string"
-            ? value
-            : typeof value === "number"
-              ? String(value)
-              : String(value);
-        const escaped = rendered.replace(/'/g, "''");
         return bounded(
-          escaped.includes("\\") ? `E'${escaped.replace(/\\/g, "\\\\")}'` : `'${escaped}'`,
+          quoteLiteral(typeof values[0] === "boolean" ? String(values[0]) : values[0]),
           "QUOTE_LITERAL",
         );
       },
@@ -1101,9 +1149,7 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
       returns: "string",
       evaluate: (values) => {
         const name = text("QUOTE_IDENT", values[0]);
-        return /^[a-z_][a-z0-9_]*$/.test(name)
-          ? name
-          : bounded(quoteSqlIdentifier(name), "QUOTE_IDENT");
+        return bounded(minimallyQuoteSqlIdentifier(name), "QUOTE_IDENT");
       },
     },
   ],
@@ -1215,8 +1261,10 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
     {
       minArgs: 2,
       maxArgs: 2,
-      returns: "number",
+      returns: "argument",
       evaluate: (values) => {
+        const exact = exactNumericIntegerDivision(values[0], values[1]);
+        if (exact !== undefined) return exact;
         const divisor = number("DIV", values[1]);
         if (divisor === 0) throw new TypeError("DIV by zero");
         return Math.trunc(number("DIV", values[0]) / divisor);
@@ -1338,6 +1386,7 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
       evaluate: (values) => {
         const template = text("TO_CHAR", values[1]);
         const external = externalSqlDomainValue(values[0]);
+        if (isExactNumeric(values[0])) return bounded(formatNumber(values[0], template), "TO_CHAR");
         if (typeof external === "number")
           return bounded(formatNumber(external, template), "TO_CHAR");
         if (
@@ -1412,21 +1461,35 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
           .slice(0, 5)
           .map((value) => integer("MAKE_TIMESTAMP", value));
         const seconds = number("MAKE_TIMESTAMP", values[5]);
-        const date = new Date(
-          Date.UTC(
-            year ?? 0,
-            (month ?? 1) - 1,
-            day ?? 1,
-            hour ?? 0,
-            minute ?? 0,
-            0,
-            Math.round(seconds * 1000),
-          ),
+        if (
+          year === undefined ||
+          month === undefined ||
+          day === undefined ||
+          hour === undefined ||
+          minute === undefined ||
+          year < 1 ||
+          year > 9999 ||
+          hour < 0 ||
+          hour > 23 ||
+          minute < 0 ||
+          minute > 59 ||
+          !Number.isFinite(seconds) ||
+          seconds < 0 ||
+          seconds >= 60
+        ) {
+          throw new TypeError("MAKE_TIMESTAMP fields do not form a valid timestamp");
+        }
+        dateDomainValue(
+          `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
         );
+        const date = new Date(0);
+        // Date.UTC maps years 0..99 to 1900..1999. Explicit setters preserve the requested year.
+        date.setUTCFullYear(year, month - 1, day);
+        date.setUTCHours(hour, minute, 0, Math.round(seconds * 1000));
         if (
           !Number.isFinite(date.getTime()) ||
-          date.getUTCMonth() !== (month ?? 1) - 1 ||
-          date.getUTCDate() !== (day ?? 1)
+          date.getUTCMonth() !== month - 1 ||
+          date.getUTCDate() !== day
         ) {
           throw new TypeError("MAKE_TIMESTAMP fields do not form a valid timestamp");
         }

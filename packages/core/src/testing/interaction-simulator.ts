@@ -2539,11 +2539,34 @@ export function createDatabaseDriver(
     store.close();
   };
   const databases = new Set<MinnowDatabase>();
+  const reports = new WeakMap<MinnowDatabase, { count: number }>();
+  const assertDiagnostics = (database: MinnowDatabase): void => {
+    const status = database.maintenanceStatus();
+    if (
+      status.backgroundFailureCount !== reports.get(database)?.count ||
+      status.backgroundErrors.length !== Math.min(32, status.backgroundFailureCount) ||
+      status.backgroundErrors.some(
+        (entry, index) =>
+          entry.sequence !==
+          status.backgroundFailureCount - status.backgroundErrors.length + index + 1,
+      )
+    ) {
+      throw new Error("Background diagnostic history and observer evidence diverged");
+    }
+  };
   const open = async (): Promise<{ database: MinnowDatabase; store: BlockStore | undefined }> => {
     const store = await acquire();
+    const evidence = { count: 0 };
+    const observer = options.databaseOptions?.onBackgroundError;
     const database = new MinnowDatabase(shared === undefined ? wrap(store) : store, {
       ...options.databaseOptions,
+      onBackgroundError: (error, context) => {
+        evidence.count += 1;
+        if (observer !== undefined) observer(error, context);
+        else console.error(`[minnowdb] background failure (${context}):`, error);
+      },
     });
+    reports.set(database, evidence);
     databases.add(database);
     return { database, store: shared === undefined ? store : undefined };
   };
@@ -2553,20 +2576,25 @@ export function createDatabaseDriver(
       let { database, store } = await open();
       return {
         execute: async (sql, params) => {
-          const result = await database.execute(sql, params);
+          const result = await database
+            .execute(sql, params)
+            .finally(() => assertDiagnostics(database));
           return "rowCount" in result
             ? { kind: result.kind, rowCount: result.rowCount }
             : { kind: result.kind };
         },
         query: async (sql, params) => {
-          const result = await database.query(
-            sql,
-            params === undefined ? { memoize: false } : { memoize: false, params: [...params] },
-          );
+          const result = await database
+            .query(
+              sql,
+              params === undefined ? { memoize: false } : { memoize: false, params: [...params] },
+            )
+            .finally(() => assertDiagnostics(database));
           return { columns: result.columns, rows: result.rows };
         },
         reopen: async () => {
           await database.close();
+          assertDiagnostics(database);
           databases.delete(database);
           release(store);
           ({ database, store } = await open());

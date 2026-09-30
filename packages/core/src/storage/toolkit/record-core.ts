@@ -1,4 +1,13 @@
 import {
+  validateAutoIncrementReservation,
+  validateBeginTransactionInput,
+  assertGenericTransactionUpdateAllowed,
+} from "./transaction-rules.js";
+export {
+  validateAutoIncrementReservation,
+  validateBeginTransactionInput,
+} from "./transaction-rules.js";
+import {
   type BeginTransactionInput,
   type BeginTransactionResult,
   type AbortTransactionIfExpiredInput,
@@ -7728,20 +7737,6 @@ function validateTableRuntimeRecord(record: TableRecord, label: string): void {
   validateTableView(record.view);
 }
 
-export function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new RangeError("Auto-increment reservation count must be a non-negative whole number");
-  }
-  if (
-    atLeast !== undefined &&
-    (typeof atLeast !== "bigint" || atLeast < 1n || atLeast > MAX_AUTO_INCREMENT_EXCLUSIVE_END)
-  ) {
-    throw new RangeError(
-      `Auto-increment bump target must be between 1 and ${String(MAX_AUTO_INCREMENT_EXCLUSIVE_END)}`,
-    );
-  }
-}
-
 function assertCounterEndInRange(endExclusive: bigint, limit: bigint, label: string): void {
   if (endExclusive < 1n || endExclusive > limit) {
     throw new RangeError(`${label} exceeds its persisted numeric range`);
@@ -7776,37 +7771,8 @@ function nextManifestVersion(expectedVersion: number | null): number {
   return expectedVersion === null ? 0 : safeWholeIncrement(expectedVersion, "Manifest version");
 }
 
-export function validateBeginTransactionInput(input: BeginTransactionInput): void {
-  if (input.record.pendingBlockIds.length > 0 || input.record.pendingSegmentIds.length > 0) {
-    throw new TypeError("A fresh transaction cannot begin with pending artifacts");
-  }
-  if (
-    input.record.pendingTable !== undefined ||
-    input.record.pendingTableNextRowId !== undefined ||
-    input.record.catalogEpochGuard !== undefined ||
-    (input.record as TransactionRecord).schemaEpochGuard !== undefined
-  ) {
-    throw new TypeError("Storage-owned transaction state cannot be supplied at begin");
-  }
-}
-
 function isTerminalCompactionJob(record: CompactionJobRecord): boolean {
   return record.state === "published" || record.state === "cancelled" || record.state === "aborted";
-}
-
-function assertGenericTransactionUpdateAllowed(
-  record: TransactionRecord,
-  update: TransactionRecordUpdate,
-): void {
-  if (record.status !== "active") {
-    throw new TypeError(`Only active transactions can be updated; found ${record.status}`);
-  }
-  if (update.status === "committed") {
-    throw new TypeError("Use commitTransaction to commit a transaction");
-  }
-  if (Reflect.has(update, "committedVersion")) {
-    throw new TypeError("Only commitTransaction can set a committed transaction version");
-  }
 }
 
 function assertSnapshotAvailable(

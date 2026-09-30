@@ -201,6 +201,8 @@ export type Expression =
        * this the internal division cannot know the digits the declared scale will render.
        */
       avgArgumentScale?: number;
+      /** Declared NUMERIC scales retained by text-rendering scalar arguments. */
+      argumentDisplayScales?: Array<number | null>;
     }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }

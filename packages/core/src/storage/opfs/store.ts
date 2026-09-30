@@ -13,6 +13,12 @@ import {
 import { validateTempRunPage, validateTempRunPageIdentity } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, isDomError } from "./files.js";
 import { LOG_FORMAT_VERSION } from "../toolkit/wire.js";
+import {
+  canUpgradeOpfsLayout,
+  finishOpfsUpgrade,
+  hasPreparedOpfsUpgrade,
+  upgradeOpfsLayout,
+} from "./upgrades.js";
 import { OpfsLeader, OpfsLeaderClosedError, type ServedMutationRequest } from "./leader.js";
 import {
   rehydrateStoreError,
@@ -363,6 +369,7 @@ export class OpfsBlockStore {
   #electing: Promise<boolean> | undefined;
   /** Holding the handles and recovering the log: the moment between winning and leading. */
   #recovering = false;
+  #upgradePending = false;
   /** When a connection holding the handles last said it was still recovering or leaving. */
   #waitHeardAt = 0;
   readonly #pending = new Map<string, PendingRpc>();
@@ -445,6 +452,20 @@ export class OpfsBlockStore {
         store.#inbox = inbox;
       }
       await store.#tryBecomeLeader();
+      const upgradeStarted = Date.now();
+      while (store.#upgradePending) {
+        if (Date.now() - Math.max(upgradeStarted, store.#waitHeardAt) > store.#dispatchBudgetMs) {
+          throw new Error(
+            "Automatic OPFS upgrade is waiting for exclusive access; close older connections and reopen",
+          );
+        }
+        // Recovery answers pings with a wait announcement. Refresh that evidence while a
+        // large conversion is alive, including when this opener missed its first broadcast.
+        store.#post({ kind: "ping" });
+        await sleep(20);
+        await store.#ensureFormatMarker();
+        await store.#tryBecomeLeader();
+      }
       return store;
     } catch (error) {
       store.close();
@@ -458,11 +479,15 @@ export class OpfsBlockStore {
 
   /** Reports a failure no caller awaits; a throwing hook is contained. */
   #diagnostic(error: unknown, context: string): void {
-    try {
-      this.#onDiagnostic?.(error, context);
-    } catch {
-      // A diagnostic hook must never turn a background failure into a second one.
+    if (this.#onDiagnostic !== undefined) {
+      try {
+        this.#onDiagnostic(error, context);
+        return;
+      } catch (hookError) {
+        console.error("Minnow OPFS diagnostic callback failed", hookError);
+      }
     }
+    console.error(`Minnow ${context}`, error);
   }
 
   /** Fire-and-forget election: a failure is reported, never left as an unhandled rejection. */
@@ -502,6 +527,7 @@ export class OpfsBlockStore {
     }
     let slotA: FileSystemSyncAccessHandle | undefined;
     let slotB: FileSystemSyncAccessHandle | undefined;
+    let acknowledgements: FileSystemSyncAccessHandle | undefined;
     // The handles are held from here on: nobody else can lead until recovery ends, so every
     // connection looking for a leader is told to wait rather than run out its patience.
     this.#recovering = true;
@@ -511,20 +537,36 @@ export class OpfsBlockStore {
       // them in sequence; the brief retry covers the gap.
       slotA = await this.#openWithRetry(["checkpoint-a"]);
       slotB = await this.#openWithRetry(["checkpoint-b"]);
+      const upgraded = await upgradeOpfsLayout(this.#tree, { wal, slotA, slotB });
+      this.#upgradePending = false;
+      acknowledgements = await this.#openWithRetry(["wal-acknowledgements"]);
       this.#leader = await OpfsLeader.recover(
         this.#tree,
         this.#durability === "strict",
-        { wal, slotA, slotB },
+        { wal, slotA, slotB, acknowledgements },
         this.#checkpointEntries,
         this.#cleanupLimitBytes,
         this.#onDiagnostic,
         this.#servedLedgerAgeMs,
         this.#servedLedgerResultBytes,
       );
+      if (upgraded) {
+        const report = await this.#leader.checkIntegrity({ mode: "full" });
+        if (!report.ok)
+          throw new StorageCorruptionError(
+            "opfs",
+            "automatic-upgrade",
+            report.issues[0]?.message ?? "Upgraded database integrity failed",
+          );
+        await finishOpfsUpgrade(this.#tree);
+      }
     } catch (error) {
+      this.#leader?.crash();
+      this.#leader = undefined;
       wal.close();
       slotA?.close();
       slotB?.close();
+      acknowledgements?.close();
       if (isLockContention(error)) return false;
       throw error;
     } finally {
@@ -1772,12 +1814,17 @@ export class OpfsBlockStore {
     if (existing !== undefined) {
       try {
         this.#validateFormatMarker(existing);
+        this.#upgradePending ||= await hasPreparedOpfsUpgrade(this.#tree);
         return;
       } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
         // A torn marker from a crashed first open is repairable only while no database
         // artifacts exist. Never stamp the current version over an unversioned WAL.
       }
+    }
+    if (await hasPreparedOpfsUpgrade(this.#tree)) {
+      this.#upgradePending = true;
+      return;
     }
     let artifact: string | undefined;
     for await (const name of this.#tree.iterateNames([])) {
@@ -1834,7 +1881,7 @@ export class OpfsBlockStore {
       );
     }
     const formatVersion = (parsed as { formatVersion: number }).formatVersion;
-    if (formatVersion !== LOG_FORMAT_VERSION) {
+    if (formatVersion !== LOG_FORMAT_VERSION && !canUpgradeOpfsLayout(formatVersion)) {
       throw new StorageFormatVersionError(
         "opfs",
         "format.json",
@@ -1854,6 +1901,7 @@ export class OpfsBlockStore {
         "The OPFS format marker is not the canonical layout marker",
       );
     }
+    this.#upgradePending = canUpgradeOpfsLayout(formatVersion);
   }
 }
 

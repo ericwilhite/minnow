@@ -182,6 +182,8 @@ export interface EngineQueryRun {
   error?: string;
   prepareMs: number;
   medianMs: number;
+  /** Empirical percentile of timed windows; with 5–7 samples this is the maximum,
+   * not an estimate of production tail latency. */
   p95Ms: number;
   iterations: number;
   rowCount: number;
@@ -212,6 +214,8 @@ export interface ReferenceEngineMeasurement {
   error?: string;
   prepareMs: number;
   medianMs: number;
+  /** Empirical percentile of timed windows; with 5–7 samples this is the maximum,
+   * not an estimate of production tail latency. */
   p95Ms: number;
   /**
    * Executions per timed window. A statement quicker than the clock's resolution is run many
@@ -255,6 +259,19 @@ export interface ReferenceQueryReport {
 }
 
 export interface ReferenceSuiteResult {
+  /** Counts checked against declared engine/workload support. */
+  coverageByEngine: Partial<
+    Record<
+      EngineId,
+      {
+        expected: number;
+        attempted: number;
+        supported: number;
+        verified: number;
+        failed: number;
+      }
+    >
+  >;
   datasetId: string;
   scale: number;
   secondaryIndexes: RecordedSecondaryIndexMode;
@@ -264,7 +281,7 @@ export interface ReferenceSuiteResult {
   /** Summed median execution per engine over its supported queries. */
   totalMsByEngine: Partial<Record<EngineId, number>>;
   supportedByEngine: Partial<Record<EngineId, number>>;
-  /** Every query an engine could run agreed with the oracle. */
+  /** Every expected query was attempted and agreed with the oracle. */
   passed: boolean;
 }
 
@@ -281,6 +298,8 @@ export interface WriteEngineMeasurement {
   supported: boolean;
   error?: string;
   medianMs: number;
+  /** Empirical percentile of timed windows; with 5–7 samples this is the maximum,
+   * not an estimate of production tail latency. */
   p95Ms: number;
   /**
    * Writes per timed window. A write quicker than the clock's resolution is repeated across that
@@ -317,6 +336,19 @@ export interface WriteCaseReport {
 }
 
 export interface WriteSuiteResult {
+  /** Counts checked against declared engine/workload support. */
+  coverageByEngine: Partial<
+    Record<
+      EngineId,
+      {
+        expected: number;
+        attempted: number;
+        supported: number;
+        verified: number;
+        failed: number;
+      }
+    >
+  >;
   datasetId: string;
   scale: number;
   sampleCount: number;
@@ -327,7 +359,7 @@ export interface WriteSuiteResult {
   /** Summed median write time per engine over its supported cases. */
   totalMsByEngine: Partial<Record<EngineId, number>>;
   supportedByEngine: Partial<Record<EngineId, number>>;
-  /** Every case an engine could run left the table exactly as the oracle predicts. */
+  /** Every expected case was attempted and left the exact oracle state. */
   passed: boolean;
 }
 
@@ -349,6 +381,8 @@ export interface LiveEngineMeasurement {
    * the live-query sweep, and the change event crossing the channel.
    */
   medianMs: number;
+  /** Empirical percentile of timed windows; with 5–7 samples this is the maximum,
+   * not an estimate of production tail latency. */
   p95Ms: number;
   /** Change notifications received per commit, which must equal the affected subscriptions. */
   notifications: number;
@@ -367,13 +401,26 @@ export interface LiveCaseReport {
 }
 
 export interface LiveSuiteResult {
+  /** Counts checked against declared engine/workload support. */
+  coverageByEngine: Partial<
+    Record<
+      EngineId,
+      {
+        expected: number;
+        attempted: number;
+        supported: number;
+        verified: number;
+        failed: number;
+      }
+    >
+  >;
   datasetId: string;
   scale: number;
   sampleCount: number;
   engines: EngineId[];
   cases: LiveCaseReport[];
   supportedByEngine: Partial<Record<EngineId, number>>;
-  /** Every case an engine could run delivered exactly the expected notifications. */
+  /** Every expected live case delivered exactly the expected notifications. */
   passed: boolean;
 }
 

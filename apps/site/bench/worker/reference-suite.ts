@@ -1,3 +1,5 @@
+import { suiteCoverage } from "./support";
+import { benchmarkErrorMessage } from "../cleanup";
 /**
  * The relational read suite: definitions, hand-written JavaScript
  * baselines, independent oracles, and the cross-engine runner. The dataset is
@@ -22,6 +24,7 @@ import {
   progress,
   measureRepeated,
   validateDatasetSuitePayload,
+  withBenchmarkCleanup,
 } from "./support";
 
 export interface ReferenceQueryDefinition {
@@ -108,71 +111,83 @@ export async function runReferenceSuite(
   const totalSteps = definitions.length * (1 + payload.engines.length);
   let completed = 0;
   const queries: ReferenceQueryReport[] = [];
-  try {
-    for (const definition of definitions) {
-      assertNotCancelled(requestId);
-      progress(requestId, {
-        phase: "oracle",
-        completed,
-        total: totalSteps,
-        message: `Computing oracle · ${definition.name}`,
-      });
-      const tables = new Map(
-        definition.tables.map((name) => {
-          const entity = entityByName.get(name);
-          if (entity === undefined) throw new Error(`Unknown table: ${name}`);
-          return [name, generateTableRows(entity, record.scale)] as const;
-        }),
-      );
-      const oracleResult = definition.oracle(tables);
-      const oracleTuples = canonicalTuples(oracleResult, definition.project);
-      tables.clear();
-      completed += 1;
-      const engineMeasurements: ReferenceEngineMeasurement[] = [];
-      for (const engine of payload.engines) {
+  await withBenchmarkCleanup(
+    async () => {
+      for (const definition of definitions) {
         assertNotCancelled(requestId);
         progress(requestId, {
-          phase: "queries",
+          phase: "oracle",
           completed,
           total: totalSteps,
-          message: `${definition.id.toUpperCase()} · ${engine}`,
+          message: `Computing oracle · ${definition.name}`,
         });
-        const session = sessions.get(engine);
-        engineMeasurements.push(
-          session === undefined || session instanceof Error
-            ? {
-                engine,
-                supported: false,
-                error: session instanceof Error ? session.message : "session unavailable",
-                prepareMs: 0,
-                medianMs: 0,
-                p95Ms: 0,
-                resultRows: 0,
-                checksum: 0,
-                verified: false,
-              }
-            : await measureOnSession(session, definition, engine, oracleTuples),
+        const tables = new Map(
+          definition.tables.map((name) => {
+            const entity = entityByName.get(name);
+            if (entity === undefined) throw new Error(`Unknown table: ${name}`);
+            return [name, generateTableRows(entity, record.scale)] as const;
+          }),
         );
+        const oracleResult = definition.oracle(tables);
+        const oracleTuples = canonicalTuples(oracleResult, definition.project);
+        tables.clear();
         completed += 1;
+        const engineMeasurements: ReferenceEngineMeasurement[] = [];
+        for (const engine of payload.engines) {
+          assertNotCancelled(requestId);
+          progress(requestId, {
+            phase: "queries",
+            completed,
+            total: totalSteps,
+            message: `${definition.id.toUpperCase()} · ${engine}`,
+          });
+          const session = sessions.get(engine);
+          engineMeasurements.push(
+            session === undefined || session instanceof Error
+              ? {
+                  engine,
+                  supported: false,
+                  error: session instanceof Error ? session.message : "session unavailable",
+                  prepareMs: 0,
+                  medianMs: 0,
+                  p95Ms: 0,
+                  resultRows: 0,
+                  checksum: 0,
+                  verified: false,
+                }
+              : await measureOnSession(session, definition, engine, oracleTuples),
+          );
+          completed += 1;
+        }
+        queries.push({
+          id: definition.id,
+          name: definition.name,
+          complexity: definition.complexity,
+          workload: definition.workload,
+          sql: definition.sql,
+          tables: definition.tables,
+          expectedRows: definition.expectedRows,
+          oracleRows: oracleResult.length,
+          ...(definition.surfaceGap === undefined ? {} : { surfaceGap: definition.surfaceGap }),
+          engines: engineMeasurements,
+        });
       }
-      queries.push({
-        id: definition.id,
-        name: definition.name,
-        complexity: definition.complexity,
-        workload: definition.workload,
-        sql: definition.sql,
-        tables: definition.tables,
-        expectedRows: definition.expectedRows,
-        oracleRows: oracleResult.length,
-        ...(definition.surfaceGap === undefined ? {} : { surfaceGap: definition.surfaceGap }),
-        engines: engineMeasurements,
-      });
-    }
-  } finally {
-    for (const session of sessions.values()) {
-      if (!(session instanceof Error)) await session.close().catch(() => undefined);
-    }
-  }
+    },
+    async () => {
+      const failures: unknown[] = [];
+      for (const session of sessions.values()) {
+        if (!(session instanceof Error)) {
+          try {
+            await session.close();
+          } catch (error) {
+            failures.push(error);
+          }
+        }
+      }
+      if (failures.length > 0)
+        throw new AggregateError(failures, "Benchmark read session cleanup failed");
+    },
+  );
   const totalMsByEngine: Partial<Record<EngineId, number>> = {};
   const supportedByEngine: Partial<Record<EngineId, number>> = {};
   for (const engine of payload.engines) {
@@ -200,13 +215,15 @@ export async function runReferenceSuite(
     queries,
     totalMsByEngine,
     supportedByEngine,
-    passed: queries.every((query) =>
-      query.engines.every((measurement) => !measurement.supported || measurement.verified),
+    ...suiteCoverage(
+      payload.engines,
+      definitions.map((definition) => definition.id),
+      queries,
     ),
   };
 }
 
-async function measureOnSession(
+export async function measureOnSession(
   session: EngineSession,
   definition: ReferenceQueryDefinition,
   engine: EngineId,
@@ -217,51 +234,55 @@ async function measureOnSession(
     const prepareStarted = performance.now();
     const prepared = await session.prepare(sql);
     const prepareMs = performance.now() - prepareStarted;
-    try {
-      let rows = await prepared.execute();
-      const { medianMs, p95Ms, batchSize } = await measureRepeated(async () => {
-        rows = await prepared.execute();
-      }, SAMPLE_COUNT);
-      // Engines with a result cache also report what a repeat costs an application that keeps
-      // the default on. It is a different quantity from medianMs, so it gets its own field
-      // instead of replacing it — and it is microseconds, so it needs the batching most.
-      let cachedMedianMs: number | undefined;
-      let cachedBatchSize: number | undefined;
-      if (prepared.executeCached !== undefined) {
-        // Bound to the statement: the harness only ever calls it back through the object.
-        const runCached = (): Promise<unknown> => prepared.executeCached?.() ?? Promise.resolve([]);
-        await runCached();
-        const cached = await measureRepeated(runCached, SAMPLE_COUNT);
-        cachedMedianMs = cached.medianMs;
-        cachedBatchSize = cached.batchSize;
-      }
-      const tuples = canonicalTuples(rows, (row) =>
-        definition.columns.map((column) => row[column]),
-      );
-      return {
-        engine,
-        supported: true,
-        prepareMs,
-        medianMs,
-        p95Ms,
-        batchSize,
-        ...(cachedMedianMs === undefined ? {} : { cachedMedianMs }),
-        ...(cachedBatchSize === undefined ? {} : { cachedBatchSize }),
-        ...(prepared.peakMemoryBytes === undefined
-          ? {}
-          : { peakMemoryBytes: prepared.peakMemoryBytes }),
-        resultRows: rows.length,
-        checksum: referenceChecksum(tuples),
-        verified: tuplesMatch(tuples, oracleTuples),
-      };
-    } finally {
-      prepared.close();
-    }
+    return await withBenchmarkCleanup(
+      async () => {
+        let rows = await prepared.execute();
+        const { medianMs, p95Ms, batchSize } = await measureRepeated(async () => {
+          rows = await prepared.execute();
+        }, SAMPLE_COUNT);
+        // Engines with a result cache also report what a repeat costs an application that keeps
+        // the default on. It is a different quantity from medianMs, so it gets its own field
+        // instead of replacing it — and it is microseconds, so it needs the batching most.
+        let cachedMedianMs: number | undefined;
+        let cachedBatchSize: number | undefined;
+        if (prepared.executeCached !== undefined) {
+          // Bound to the statement: the harness only ever calls it back through the object.
+          const runCached = (): Promise<unknown> =>
+            prepared.executeCached?.() ?? Promise.resolve([]);
+          await runCached();
+          const cached = await measureRepeated(runCached, SAMPLE_COUNT);
+          cachedMedianMs = cached.medianMs;
+          cachedBatchSize = cached.batchSize;
+        }
+        const tuples = canonicalTuples(rows, (row) =>
+          definition.columns.map((column) => row[column]),
+        );
+        return {
+          engine,
+          supported: true,
+          prepareMs,
+          medianMs,
+          p95Ms,
+          batchSize,
+          ...(cachedMedianMs === undefined ? {} : { cachedMedianMs }),
+          ...(cachedBatchSize === undefined ? {} : { cachedBatchSize }),
+          ...(prepared.peakMemoryBytes === undefined
+            ? {}
+            : { peakMemoryBytes: prepared.peakMemoryBytes }),
+          resultRows: rows.length,
+          checksum: referenceChecksum(tuples),
+          verified: tuplesMatch(tuples, oracleTuples),
+        };
+      },
+      async () => {
+        await prepared.close();
+      },
+    );
   } catch (error) {
     return {
       engine,
       supported: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: benchmarkErrorMessage(error),
       prepareMs: 0,
       medianMs: 0,
       p95Ms: 0,

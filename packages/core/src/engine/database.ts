@@ -1,3 +1,6 @@
+import { CompactionController } from "./compaction-controller.js";
+import { BackgroundDiagnostics } from "./background-diagnostics.js";
+import { CollectionController } from "./collection-controller.js";
 import { databaseInternals } from "./internals.js";
 import {
   admitWriter,
@@ -220,6 +223,7 @@ import {
   markQueryResultExternal,
   expressionColumnNames,
   inferBlockSchema,
+  expressionColumns,
   inferResultColumnDomains,
   isDeferredInsertExpression,
   isDefaultInsertValue,
@@ -302,7 +306,11 @@ import {
   qualifyCorrelatedReferences,
   renderPlan,
 } from "./optimizer.js";
-import { encodeSqlEqualityValue, readUntypedText } from "./sql-semantics.js";
+import {
+  defineSqlResultProperty,
+  encodeSqlEqualityValue,
+  readUntypedText,
+} from "./sql-semantics.js";
 import {
   exactNumericAsNumber,
   exactNumericValue,
@@ -429,6 +437,7 @@ const SEQUENCE_PREFIX = "\u0000minnow_sequence:";
 const MAX_POINT_READ_CANDIDATES = 1_024;
 /** A keyed replay decoding more blocks than this leaves the read to the ordinary path. */
 const MAX_POINT_READ_DELTA_BLOCKS = 256;
+const MAX_POINT_READ_DELTA_HEADER_BLOCKS = 1_024;
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
 /** Candidate lists wider than this scan their blocks instead of probing for exact rows. */
@@ -469,12 +478,6 @@ const STREAMED_SCAN_LOOKAHEAD_BLOCKS = 8;
 const AUTO_COMPACT_SCAN_SEGMENTS = 48;
 /** Visible delete/update segments at which a scan or a commit schedules a compaction step. */
 const AUTO_COMPACT_DELTA_SEGMENTS = 32;
-/** Commits to one table between auto-compaction checks on the write path. */
-const AUTO_COMPACT_COMMIT_CHECK_INTERVAL = 8;
-/** Quiet time after a write burst before checking its final, sub-interval tail. */
-const AUTO_COMPACT_IDLE_CHECK_MS = 25;
-/** Commits between background collection passes; each prunes the manifests they wrote. */
-const AUTO_COLLECT_COMMIT_INTERVAL = 64;
 /**
  * Manifest versions background collection leaves readable behind the current one, and how
  * old one may be before it is collected regardless. A version is kept only while both hold: the
@@ -484,8 +487,6 @@ const AUTO_COLLECT_COMMIT_INTERVAL = 64;
  */
 const AUTO_COLLECT_RETAINED_VERSIONS = 64;
 const AUTO_COLLECT_RETAINED_VERSION_MS = 60_000;
-/** A commit this long after the last collection pass starts one, whatever the commit count. */
-const AUTO_COLLECT_QUIET_MS = 60_000;
 /** Candidates one background collection step examines before yielding to the event loop. */
 const AUTO_COLLECT_STEP_ITEMS = 64;
 /** Passes one background collection run makes before handing the rest to the next trigger. */
@@ -508,9 +509,6 @@ const MAX_DATABASE_ACTIVE_SCOPES = 256;
 export const MAX_DATABASE_ACTIVE_READS = 256;
 /** Commits tolerated while collection fails before foreground writes assist and backpressure. */
 const AUTO_COLLECT_MAX_DEBT_COMMITS = 4_096;
-/** Failed background passes retry without another write, with bounded exponential backoff. */
-const AUTO_COLLECT_RETRY_MIN_MS = 1_000;
-const AUTO_COLLECT_RETRY_MAX_MS = 60_000;
 /** Output blocks one background compaction step writes before yielding to the event loop. */
 const AUTO_COMPACT_STEP_BLOCKS = 4;
 /**
@@ -530,24 +528,22 @@ const CLOSE_MAINTENANCE_GRACE_MS = 2_000;
  * a statement is delayed by one step, where the absolute ceiling would refuse it.
  */
 const AUTO_COMPACT_BACKPRESSURE_LEVEL_ZERO_SEGMENTS = 2 * AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS;
-/** A failed background fold waits this long before the next attempt, doubling per failure. */
-const AUTO_COMPACT_RETRY_MIN_MS = 250;
-const AUTO_COMPACT_RETRY_MAX_MS = 60_000;
 /** Manifest races a complete fold may lose to writers already in flight before it is abandoned. */
 const MAX_COMPACTION_PUBLICATION_CONFLICTS = 64;
 
-/** Why a table's next background fold waits: a segment count it must reach, and a timer. */
-interface AutoCompactionBackoff {
-  readonly minimumSegments: number;
-  readonly failures: number;
-  /** Set while the time part of the backoff is still running; its firing re-checks the table. */
-  readonly retryTimer: ReturnType<typeof setTimeout> | undefined;
-}
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
 const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 
 /** Overlay logical order for a write scope's staged segments: after all committed data. */
 const STAGED_OVERLAY_ORDER_BASE = 2 ** 52;
+
+/** Internal identity distinguishes an expected close refusal from an I/O failure during close.
+ * The public error remains named Error, with the existing message. */
+class DatabaseClosedError extends Error {
+  constructor() {
+    super("Database is closed");
+  }
+}
 
 /**
  * Internal restart signal: a commit conflict invalidated staged trigger derivations — their
@@ -1068,6 +1064,16 @@ export interface QueryExecutionStats {
 }
 
 export interface MaintenanceStatus {
+  /** Total reported failures, including entries aged out of the bounded history. */
+  readonly backgroundFailureCount: number;
+  /** Last 32 background failures, in reporting order; text is capped at 1024 characters each. */
+  readonly backgroundErrors: ReadonlyArray<{
+    readonly sequence: number;
+    readonly context: string;
+    readonly name: string;
+    readonly message: string;
+    readonly at: Date;
+  }>;
   readonly autoCollectionEnabled: boolean;
   readonly collectionRunning: boolean;
   readonly collectionRequested: boolean;
@@ -1363,18 +1369,12 @@ export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema
   targetBlockBytes?: number;
   rowsPerBlock?: number;
   maxCommitRetries?: number;
-  /**
-   * @deprecated Ignored since 0.11.0 and removed in 0.12.0. Every writer takes a turn through
-   * the database's admission queue (see `writeCoordination`); there is no optimistic mode to
-   * select. Delete the option.
-   */
-  coordinateWrites?: boolean;
   now?: () => Date;
   createId?: () => string;
   /**
    * Hears failures in work no caller awaits: a background collection pass that failed, a live
-   * sweep that failed with nobody subscribed. `maintenanceStatus().lastError` still records the
-   * last one; this hook sees every one, as it happens. Inside the worker host it feeds the
+   * sweep that failed with nobody subscribed. `maintenanceStatus().lastError` records collection
+   * failures; the bounded `backgroundErrors` history also records index, compaction, and cleanup failures. Inside the worker host it feeds the
    * client's `onWorkerError`.
    */
   onBackgroundError?: (error: unknown, context: string) => void;
@@ -1724,8 +1724,8 @@ function insertBatchKeyValues(input: InsertBatchInput, keyColumn: string): Query
 function insertStatementBatch(
   statement: Extract<CompiledStatement, { kind: "insert" }>,
 ): ColumnarBatch {
-  const columns: Record<string, BatchValue[]> = {};
-  const omitted: Record<string, boolean[]> = {};
+  const columns = Object.create(null) as Record<string, BatchValue[]>;
+  const omitted = Object.create(null) as Record<string, boolean[]>;
   statement.columns.forEach((name, columnIndex) => {
     const values = new Array<BatchValue>(statement.rows.length).fill(null);
     const mask = new Array<boolean>(statement.rows.length).fill(false);
@@ -2246,7 +2246,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #spillOwnerLeaseMs: number;
   readonly #transactionOwnerLeaseMs: number;
   readonly #createId: () => string;
-  readonly #onBackgroundError: ((error: unknown, context: string) => void) | undefined;
+  readonly #diagnostics: BackgroundDiagnostics;
   readonly #internalLeaseOwnerId: string;
   readonly #liveSets = new Set<LiveQuerySet>();
   /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
@@ -2259,49 +2259,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #autoCompact: boolean;
   readonly #compactionPartitionRows: number;
   readonly #autoCollect: boolean;
-  readonly #autoCollectionDebtLimitCommits: number;
-  /** Data commits since the last background collection pass. */
-  #commitsSinceCollection = 0;
+  /** Scheduling owns its timers, pending runs, debt and serialized step queue. */
+  readonly #collection: CollectionController;
   /** Rotating durable-job scan cursor; keeps one quiet reconciliation pass bounded. */
   #compactionReconciliationCursor: string | null = null;
-  #autoCollectionInFlight = false;
-  /** A trigger that arrived while a run was in flight; honoured when the run ends. */
-  #autoCollectionRequested = false;
-  /** Conservative debt: reset only after a pass finds no more immediately reclaimable work. */
-  #autoCollectionDebtCommits = 0;
-  #manualCollectionDebtInitialized = false;
-  #autoCollectionConsecutiveFailures = 0;
-  #autoCollectionLastError: { name: string; message: string; at: number } | undefined;
-  #lastCollectionCompletedAt: number | undefined;
-  #autoCollectionRetryAt: number | undefined;
-  #autoCollectionRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  /** When the last background collection pass started, by the database clock. */
-  #lastCollectionAt: number | undefined;
-  /** The idle pass scheduled after the last commit; reset by the next commit. */
-  #idleCollectionTimer: ReturnType<typeof setTimeout> | undefined;
-  /** The garbage-collection step in flight, so steps run one at a time: see #serializedCollectionStep. */
-  #collectionSteps: Promise<unknown> = Promise.resolve();
   /** One background build attempt per (table, column) per session; misses just stay scans. */
   readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
   /** Highest authoritative commit hint observed while a postings fold is in flight. */
   readonly #postingDeltaTailCounts = new Map<string, number>();
   readonly #droppingFtsColumns = new Set<string>();
-  /** Tables with a fire-and-forget compaction step already running. */
-  readonly #autoCompactionsInFlight = new Map<string, Promise<void>>();
-  /** Tables whose maintenance threshold was observed again while their fold was still running. */
-  readonly #autoCompactionsRequested = new Set<string>();
+  readonly #compaction: CompactionController;
   readonly #accountedCompactionVersions = new Set<number>();
-  /** Changed tables awaiting the debounced check that closes a write burst. */
-  readonly #idleCompactionTableIds = new Set<string>();
-  #idleCompactionTimer: ReturnType<typeof setTimeout> | undefined;
   /** Tables whose drop is retiring data; prevents a new background fold from starting. */
   readonly #droppingTables = new Set<string>();
-  /** Per table: the visible segment count a failed auto-compaction must see before retrying. */
-  readonly #autoCompactionBackoff = new Map<string, AutoCompactionBackoff>();
   /** Exact current-layout counters; local commits advance them without rescanning history. */
   readonly #autoCompactionHints = new Map<string, AutoCompactionHint>();
-  /** Data commits per table since its last write-path auto-compaction check. */
-  readonly #commitsSinceCompactionCheck = new Map<string, number>();
   /** The compaction step in flight per table, so steps on one table run one at a time. */
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
   /** Every writer turn this engine has taken or is waiting for: see #admit. */
@@ -2323,7 +2295,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   #pendingWriteReservations = 0;
   #activeReadReservations = 0;
   /** The complete automatic collection loop, retained so close() can join it before the store. */
-  #autoCollectionTask: Promise<void> | undefined;
   /**
    * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
    * optimization — subquery resolution and CTE expansion clone before rewriting and join
@@ -2408,7 +2379,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? (() => crypto.randomUUID());
-    this.#onBackgroundError = options.onBackgroundError;
+    this.#diagnostics = new BackgroundDiagnostics(
+      () => dateMilliseconds(this.#now()),
+      options.onBackgroundError,
+    );
     this.#internalLeaseOwnerId = `minnow/${this.#createId()}`;
     this.#spillOwnerLeaseMs = options.spillOwnerLeaseMs ?? 60_000;
     if (
@@ -2442,7 +2416,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
     this.#autoCompact = options.autoCompact ?? true;
     this.#autoCollect = options.autoCollect ?? true;
-    this.#autoCollectionDebtLimitCommits = positiveWholeNumber(
+    const collectionDebtLimit = positiveWholeNumber(
       options.autoCollectDebtLimitCommits ?? AUTO_COLLECT_MAX_DEBT_COMMITS,
       "Automatic collection debt limit",
     );
@@ -2461,7 +2435,30 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       createId: this.#createId,
       transactionTtlMs: this.#transactionOwnerLeaseMs,
     });
-    this.#armIdleCollection();
+    this.#collection = new CollectionController({
+      enabled: this.#autoCollect,
+      debtLimit: collectionDebtLimit,
+      now: () => dateMilliseconds(this.#now()),
+      run: () => this.#runAutoCollection(),
+      yield: () => this.#yieldMaintenance(),
+      isShutdownRefusal: (error) => this.#isShutdownRefusal(error),
+      report: (error, context) => this.#reportBackgroundError(error, context),
+      durableDebt: async () => {
+        const current = await this.store.getCurrentManifestVersion();
+        const first = (await this.store.listManifestPage(null, 1)).records[0];
+        return current === null || first === undefined ? 0 : current - first.version + 1;
+      },
+    });
+    this.#compaction = new CompactionController({
+      enabled: this.#autoCompact,
+      maximumLevelZeroSegments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+      dropping: (id) => this.#droppingTables.has(id),
+      run: (table) => this.#runAutoCompaction(table),
+      check: (id) => this.#checkAutoCompaction(id),
+      yield: () => this.#yieldMaintenance(),
+      report: (error, context) => this.#reportBackgroundError(error, context),
+    });
+    this.#collection.start();
     databaseInternals.set(this, {
       cancelCrossContextWaits: (reason) => {
         this.#crossContextWaits.abort(reason);
@@ -2477,7 +2474,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   close(): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closed = true;
-    this.#shutdown.abort(new Error("Database is closed"));
+    this.#shutdown.abort(new DatabaseClosedError());
     const closing = this.#closeResources();
     this.#closePromise = closing;
     return closing;
@@ -2485,28 +2482,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   async #closeResources(): Promise<void> {
     for (const controller of this.#scopeControllers) {
-      controller.abort(new Error("Database is closed"));
+      controller.abort(new DatabaseClosedError());
     }
     // Background maintenance close is about to join — a fold publishing, an index build
     // stamping its result — may still need a turn, and gets one while the store is idle. A turn
     // held elsewhere for longer than the grace is not waited for: the work stays resumable in
     // its durable job record, and closing must not depend on another tab's callback.
     const maintenanceGrace = setTimeout(() => {
-      this.#maintenanceQueue.abort(new Error("Database is closed"));
+      this.#maintenanceQueue.abort(new DatabaseClosedError());
     }, CLOSE_MAINTENANCE_GRACE_MS);
     (maintenanceGrace as { unref?: () => void }).unref?.();
-    if (this.#idleCompactionTimer !== undefined) {
-      clearTimeout(this.#idleCompactionTimer);
-      this.#idleCompactionTimer = undefined;
-    }
-    if (this.#idleCollectionTimer !== undefined) {
-      clearTimeout(this.#idleCollectionTimer);
-      this.#idleCollectionTimer = undefined;
-    }
-    if (this.#autoCollectionRetryTimer !== undefined) {
-      clearTimeout(this.#autoCollectionRetryTimer);
-      this.#autoCollectionRetryTimer = undefined;
-    }
+    this.#compaction.stop();
+    this.#collection.stop();
 
     const open = this.#openTransaction;
     const statementCleanup =
@@ -2525,9 +2512,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       this.#executeChain,
       ...this.#scopeTasks,
       ...this.#foregroundTasks,
-      ...this.#autoCompactionsInFlight.values(),
+      this.#compaction.drain(),
       ...this.#ftsBuildsInFlight.values(),
-      ...(this.#autoCollectionTask === undefined ? [] : [this.#autoCollectionTask]),
+      this.#collection.drain(),
       ...(statementCleanup === undefined ? [] : [statementCleanup]),
     ]);
 
@@ -2555,47 +2542,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     if (open !== undefined) await open.finished.catch(() => undefined);
     clearTimeout(maintenanceGrace);
-    this.#maintenanceQueue.abort(new Error("Database is closed"));
+    this.#maintenanceQueue.abort(new DatabaseClosedError());
 
     this.#planCache.clear();
     this.#statementCache.clear();
     this.#catalogStateCache.clear();
     this.#liveProofContexts.clear();
     this.#gzipVerdicts.clear();
-    this.#autoCompactionsRequested.clear();
-    this.#idleCompactionTableIds.clear();
-    for (const backoff of this.#autoCompactionBackoff.values()) {
-      if (backoff.retryTimer !== undefined) clearTimeout(backoff.retryTimer);
-    }
-    this.#autoCompactionBackoff.clear();
     this.#autoCompactionHints.clear();
-    this.#commitsSinceCompactionCheck.clear();
     this.#artifactCache.clear();
   }
 
   /** Current background-collection health, returned as a defensive snapshot. */
   maintenanceStatus(): MaintenanceStatus {
-    const error = this.#autoCollectionLastError;
     return {
-      autoCollectionEnabled: this.#autoCollect,
-      collectionRunning: this.#autoCollectionInFlight,
-      collectionRequested: this.#autoCollectionRequested,
-      pendingCommitDebt: this.#autoCollectionDebtCommits,
-      consecutiveFailures: this.#autoCollectionConsecutiveFailures,
+      ...this.#collection.status(),
+      ...this.#diagnostics.snapshot(),
       postingDeltaTailMarkers: this.#postingDeltaTailCounts.size,
       retainedPlanEntries: this.#planCache.size,
       retainedStatementEntries: this.#statementCache.size,
-      lastStartedAt: this.#lastCollectionAt === undefined ? null : new Date(this.#lastCollectionAt),
-      lastCompletedAt:
-        this.#lastCollectionCompletedAt === undefined
-          ? null
-          : new Date(this.#lastCollectionCompletedAt),
-      nextRetryAt:
-        this.#autoCollectionRetryAt === undefined ? null : new Date(this.#autoCollectionRetryAt),
-      lastError:
-        error === undefined
-          ? null
-          : { name: error.name, message: error.message, at: new Date(error.at) },
     };
   }
 
@@ -2994,7 +2959,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     signal?: AbortSignal,
   ): Promise<T> {
     const maintenance = signal === this.#maintenanceQueue.signal;
-    if (this.#closed && !maintenance) return Promise.reject(new Error("Database is closed"));
+    if (this.#closed && !maintenance) return Promise.reject(new DatabaseClosedError());
     const admit = (waitSignal: AbortSignal): Promise<T> =>
       admitWriter(
         this.store,
@@ -3047,7 +3012,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * statement, so the queue itself is what lands it (see #withCompactionPublicationSlot).
    */
   async #runWrite<T>(run: (admission: WriterAdmission) => Promise<T>): Promise<T> {
-    await this.#assistAutomaticCollection();
+    await this.#collection.assist();
     return this.#admit("autocommit", async (admission) => {
       await this.#publishPendingCompactions();
       for (let attempt = 0; ; attempt += 1) {
@@ -3202,7 +3167,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #withWriteReservation<T>(run: () => Promise<T>): Promise<T> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     if (this.#statementTransactionExpired) throw new TransactionExpiredError();
     if (this.#pendingWriteReservations >= MAX_DATABASE_PENDING_WRITES) {
       throw new RangeError(
@@ -3220,7 +3185,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #foregroundTasks = new Set<Promise<unknown>>();
 
   async #foreground<T>(run: () => Promise<T>): Promise<T> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     const task = run();
     this.#foregroundTasks.add(task);
     try {
@@ -3231,7 +3196,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #withReadReservation<T>(run: () => Promise<T>): Promise<T> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     if (this.#activeReadReservations >= MAX_DATABASE_ACTIVE_READS) {
       throw new DatabaseReadBacklogError(MAX_DATABASE_ACTIVE_READS);
     }
@@ -3249,7 +3214,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     probe?: CatalogProbe,
     storeMemo = true,
   ): Promise<QueryResult> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
     if (this.#statementTransactionExpired) throw new TransactionExpiredError();
@@ -3266,41 +3231,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * intentionally far above the normal 64-commit cadence: only a genuinely unhealthy store pays
    * foreground latency, and a write is refused only after an assisted pass still fails.
    */
-  async #assistAutomaticCollection(): Promise<void> {
-    if (!this.#autoCollect && !this.#manualCollectionDebtInitialized) {
-      const current = await this.store.getCurrentManifestVersion();
-      const first = (await this.store.listManifestPage(null, 1)).records[0];
-      if (current !== null && first !== undefined) {
-        const distance = current - first.version;
-        const durableDebt =
-          distance >= this.#autoCollectionDebtLimitCommits
-            ? this.#autoCollectionDebtLimitCommits
-            : distance + 1;
-        this.#autoCollectionDebtCommits = Math.max(this.#autoCollectionDebtCommits, durableDebt);
-      }
-      this.#manualCollectionDebtInitialized = true;
-    }
-    if (this.#autoCollectionDebtCommits < this.#autoCollectionDebtLimitCommits) return;
-    if (!this.#autoCollect) {
-      throw new MaintenanceBacklogError(
-        this.#autoCollectionDebtCommits,
-        "automatic collection is disabled; call collectGarbage() before writing again",
-      );
-    }
-    // Foreground work is capped at one already-bounded collector run. If a very old database
-    // needs more, the run requeues itself in the background and this write refuses before it
-    // starts; foreground latency must not scale with the total retained history.
-    this.#maybeScheduleAutoCollection(true);
-    const task = this.#autoCollectionTask;
-    if (task !== undefined) await task;
-    if (this.#autoCollectionDebtCommits >= this.#autoCollectionDebtLimitCommits) {
-      throw new MaintenanceBacklogError(
-        this.#autoCollectionDebtCommits,
-        this.#autoCollectionLastError?.message ?? "bounded collection assistance left a backlog",
-      );
-    }
-  }
-
   /** Turns a storage namespace/token UNIQUE conflict into the public table/constraint error. */
   async #translateUniqueConflict(error: unknown): Promise<unknown> {
     if (!(error instanceof UniqueKeyConflictError)) return error;
@@ -3780,10 +3710,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           });
           this.#afterCommit(manifest);
           for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
-          this.#autoCompactionBackoff.delete(table.id);
+          this.#compaction.forget(table.id);
           this.#autoCompactionHints.delete(table.id);
-          this.#commitsSinceCompactionCheck.delete(table.id);
-          this.#idleCompactionTableIds.delete(table.id);
           const postingPrefix = `${table.id}/`;
           for (const key of this.#postingDeltaTailCounts.keys()) {
             if (key.startsWith(postingPrefix)) this.#postingDeltaTailCounts.delete(key);
@@ -4535,7 +4463,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (checks.length > 0) {
         for (let rowIndex = 0; rowIndex < input.keys.length; rowIndex += 1) {
           if (preImages[rowIndex] === undefined) continue;
-          const row: Record<string, BatchValue> = {};
+          const row = Object.create(null) as Record<string, BatchValue>;
           for (const column of table.columns) {
             row[column.name] = updateValueAt("new", column.name, rowIndex);
           }
@@ -5479,7 +5407,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * manifest disappeared between the catalog read and the lease, so the caller can re-read.
    */
   async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     this.#sharedLeaseAcquisitions += 1;
     try {
       for (;;) {
@@ -5914,6 +5842,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const table = realTables.get(source.table);
       if (table === undefined) throw new UnknownTableError(source.table);
       const requestedColumns = columns.get(table.name) ?? [];
+      let readPlan = onlyRealSource;
+      if (source === block.base && sources.length > 1 && !planContainsFts(block)) {
+        const key = getUniqueKeyColumn(table);
+        // A conjunctive WHERE key restriction remains necessary after any join. Select that
+        // base superset only; the ordinary kernel still checks every predicate and join.
+        // Self-joins and ambiguous/unbound keys fail uniqueKeyMembers' alias/type proof.
+        if (key !== undefined && uniqueKeyMembers(block, table, key) !== undefined) {
+          readPlan = block;
+        }
+      }
       inputs.set(
         table.name,
         await this.#materializeColumnarTableAtSnapshot(
@@ -5921,7 +5859,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           snapshot,
           requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
           visibility,
-          onlyRealSource,
+          readPlan,
         ),
       );
       throwIfAborted(signal);
@@ -6036,7 +5974,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     sql: string,
     options: QueryCursorOptions = {},
   ): AsyncIterableIterator<QueryResult, undefined> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     const batchRows = positiveWholeNumber(options.batchRows ?? 2_048, "Query batch rows");
     const controller = new AbortController();
     const channel = new QueryBatchChannel();
@@ -6850,7 +6788,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 return undefined;
               }
             }
-            row[item.alias] = value;
+            if (item.alias === "__proto__") defineSqlResultProperty(row, item.alias, value);
+            else row[item.alias] = value;
           }
           rows.push(row);
         }
@@ -6931,14 +6870,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ];
     let current: Map<string, QueryValue> | undefined;
     let decodedBlocks = 0;
+    // Read bounded batches of headers once, including single-block deltas. Unrelated keys
+    // cannot affect this row and must not exhaust its unchanged decoded-block replay cap.
+    let descriptions: Map<string, ReturnType<typeof inspectBlock>> | undefined;
+    if (typeof target === "number") {
+      const ids: string[] = [];
+      for (const segment of segments) {
+        for (const id of segment.columnBlockIds[keyColumn.id] ?? []) {
+          if (ids.length === MAX_POINT_READ_DELTA_HEADER_BLOCKS) return undefined;
+          ids.push(id);
+        }
+      }
+      descriptions = await this.#zoneDescriptions(ids, snapshot);
+    }
     for (const segment of segments) {
       throwIfAborted(options.signal);
       if (segment.rowCount === 0) continue;
       const keyBlockIds = segment.columnBlockIds[keyColumn.id] ?? [];
       if (keyBlockIds.length === 0) return undefined;
       let blockIndexes = keyBlockIds.map((_, index) => index);
-      if (typeof target === "number" && keyBlockIds.length > 1) {
-        const descriptions = await this.#zoneDescriptions(keyBlockIds, snapshot);
+      if (typeof target === "number" && descriptions !== undefined) {
         blockIndexes = blockIndexes.filter((blockIndex) => {
           const zone = descriptions.get(keyBlockIds[blockIndex] ?? "")?.metadata.zoneMap;
           return zone === undefined || (zone.min <= target && target <= zone.max);
@@ -7020,7 +6971,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (typeof value === "string" && value.charCodeAt(0) === 0) {
             if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return undefined;
           }
-          row[item.alias] = value;
+          if (item.alias === "__proto__") defineSqlResultProperty(row, item.alias, value);
+          else row[item.alias] = value;
         }
         rows.push(row);
       }
@@ -7212,7 +7164,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * snapshot, compared exactly before delivery.
    */
   liveQueries(options: LiveQuerySetOptions = {}): LiveQuerySet {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     if (this.#liveSets.size >= MAX_LIVE_QUERY_SETS_PER_DATABASE) {
       throw new LiveQueryLimitError("set", MAX_LIVE_QUERY_SETS_PER_DATABASE);
     }
@@ -7982,68 +7934,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (!this.#autoCompact) return;
     if (this.#droppingTables.has(table.id)) return;
     if (!autoCompactionDueHint(hint)) return;
-    const backoff = this.#autoCompactionBackoff.get(table.id);
-    if (backoff !== undefined) {
-      if (backoff.retryTimer !== undefined || hint.visible < backoff.minimumSegments) return;
-    }
-    if (this.#autoCompactionsInFlight.has(table.id)) {
-      // A final burst can cross the threshold while the prior fold is still planning or
-      // running. Remember it: otherwise no later commit or scan may arrive to trigger the fold
-      // that the final state still needs.
-      this.#autoCompactionsRequested.add(table.id);
-      return;
-    }
-    const run = this.#runAutoCompaction(table)
-      .then((folded) => {
-        if (folded) this.#autoCompactionBackoff.delete(table.id);
-        else this.#backOffAutoCompaction(table.id, hint.visible);
-      })
-      .catch(() => {
-        this.#backOffAutoCompaction(table.id, hint.visible);
-      })
-      .finally(() => {
-        if (this.#autoCompactionsInFlight.get(table.id) === run) {
-          this.#autoCompactionsInFlight.delete(table.id);
-        }
-        if (this.#autoCompactionsRequested.delete(table.id)) {
-          void this.#yieldMaintenance().then(() => this.#checkAutoCompaction(table.id));
-        }
-      });
-    this.#autoCompactionsInFlight.set(table.id, run);
-    void run;
-  }
-
-  /**
-   * Backs off a table whose fold failed or could not help: in segments, never beyond the
-   * largest level-zero prefix one fold consumes, so a transient conflict near the end of a
-   * burst cannot strand hundreds of segments behind a count the idle database never reaches;
-   * and in time, doubling per consecutive failure, so a table at that prefix is not re-planned
-   * on every eighth commit while the failure persists. The timer, like the collector's retry
-   * timer, is the clock for the time part — it re-checks the table itself when it fires, in
-   * case no later commit or scan arrives — and is unreferenced, so it never keeps a process up.
-   */
-  #backOffAutoCompaction(tableId: string, visible: number): void {
-    if (this.#closed) return;
-    const previous = this.#autoCompactionBackoff.get(tableId);
-    if (previous?.retryTimer !== undefined) clearTimeout(previous.retryTimer);
-    const failures = (previous?.failures ?? 0) + 1;
-    const delay = Math.min(
-      AUTO_COMPACT_RETRY_MAX_MS,
-      AUTO_COMPACT_RETRY_MIN_MS * 2 ** Math.min(16, failures - 1),
-    );
-    const timer = setTimeout(() => {
-      const current = this.#autoCompactionBackoff.get(tableId);
-      if (current?.retryTimer === timer) {
-        this.#autoCompactionBackoff.set(tableId, { ...current, retryTimer: undefined });
-      }
-      void this.#checkAutoCompaction(tableId);
-    }, delay);
-    (timer as { unref?: () => void }).unref?.();
-    this.#autoCompactionBackoff.set(tableId, {
-      minimumSegments: Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, visible * 2)),
-      failures,
-      retryTimer: timer,
-    });
+    this.#compaction.schedule(table, hint.visible);
   }
 
   /**
@@ -8087,7 +7978,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     if (levelZero < AUTO_COMPACT_BACKPRESSURE_LEVEL_ZERO_SEGMENTS) return;
     const atCeiling = levelZero >= MAX_LEVEL_ZERO_SEGMENTS;
-    if (!atCeiling && this.#autoCompactionBackoff.get(table.id)?.retryTimer !== undefined) return;
+    if (!atCeiling && this.#compaction.retryPending(table.id)) return;
     // A fold waiting to publish is the step that helps most, and stepping the table would wait
     // behind it while it waits for this write: run it here rather than deadlock on it. The same
     // goes for a background step already in flight on this table, which may be about to ask for
@@ -8103,11 +7994,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         admission,
       );
       if (!atCeiling && progress.result !== null && !progress.result.compacted) {
-        this.#backOffAutoCompaction(table.id, visible);
+        this.#compaction.backOff(table.id, visible);
       }
     } catch (error) {
       if (atCeiling) throw error;
-      this.#backOffAutoCompaction(table.id, visible);
+      this.#reportBackgroundError(error, `compaction assistance for ${table.name}`);
+      this.#compaction.backOff(table.id, visible);
       return;
     }
     if (!atCeiling) return;
@@ -8145,7 +8037,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (!progress.result.compacted) return folded;
       folded = true;
       // The fold's sources are garbage now; collect before planning the next fold.
-      this.#maybeScheduleAutoCollection();
+      this.#collection.schedule();
       await this.#yieldMaintenance();
       const current = await this.store.getTable(table.id);
       if (
@@ -8269,29 +8161,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         this.#scheduleFtsDeltaFold(hint.tableId, hint.columnId);
       }
     }
-    this.#commitsSinceCollection += 1;
-    this.#autoCollectionDebtCommits += 1;
-    const now = dateMilliseconds(this.#now());
-    if (
-      this.#commitsSinceCollection >= AUTO_COLLECT_COMMIT_INTERVAL ||
-      (this.#lastCollectionAt !== undefined &&
-        now - this.#lastCollectionAt >= AUTO_COLLECT_QUIET_MS)
-    ) {
-      this.#maybeScheduleAutoCollection();
-    }
-    this.#armIdleCollection();
-    if (!this.#autoCompact) return;
-    for (const tableId of manifest.changedTableIds) {
-      this.#idleCompactionTableIds.add(tableId);
-      const commits = (this.#commitsSinceCompactionCheck.get(tableId) ?? 0) + 1;
-      if (commits < AUTO_COMPACT_COMMIT_CHECK_INTERVAL) {
-        this.#commitsSinceCompactionCheck.set(tableId, commits);
-        continue;
-      }
-      this.#commitsSinceCompactionCheck.delete(tableId);
-      void this.#checkAutoCompaction(tableId);
-    }
-    this.#armIdleCompactionCheck();
+    this.#collection.committed();
+    this.#compaction.committed(manifest.changedTableIds);
   }
 
   /** Counts one physical rewrite version once in this engine, including lost-ack recovery. */
@@ -8348,29 +8219,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
-   * Debounces the final write-path check for a burst. Sampling every few commits keeps the hot
-   * path cheap, but the last one through seven commits can be the ones that cross a fold
-   * threshold. Without this check an idle table can remain due forever because no later write or
-   * scan arrives to notice it.
-   */
-  #armIdleCompactionCheck(): void {
-    if (this.#closed) return;
-    if (this.#idleCompactionTableIds.size === 0) return;
-    if (this.#idleCompactionTimer !== undefined) clearTimeout(this.#idleCompactionTimer);
-    const timer = setTimeout(() => {
-      this.#idleCompactionTimer = undefined;
-      const tableIds = [...this.#idleCompactionTableIds];
-      this.#idleCompactionTableIds.clear();
-      for (const tableId of tableIds) {
-        this.#commitsSinceCompactionCheck.delete(tableId);
-        void this.#checkAutoCompaction(tableId);
-      }
-    }, AUTO_COMPACT_IDLE_CHECK_MS);
-    (timer as { unref?: () => void }).unref?.();
-    this.#idleCompactionTimer = timer;
-  }
-
-  /**
    * The write-path auto-compaction check: the table's visible segments at the current manifest,
    * judged by the same thresholds a streamed scan applies. Without it a write-heavy phase with
    * no reads in between piles deltas up unfolded, and the next query pays for all of them at
@@ -8388,8 +8236,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return;
       }
       this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
-    } catch {
-      // Deliberately silent: the next commit or scan checks again.
+    } catch (error) {
+      this.#reportBackgroundError(error, `automatic compaction check for ${tableId}`);
     }
   }
 
@@ -8895,7 +8743,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const mergedKeys: BatchValue[] = [];
     const seenKeys = new Set<string>();
-    const mergedChanges: Record<string, BatchValue[]> = {};
+    const mergedChanges = Object.create(null) as Record<string, BatchValue[]>;
     for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
       const params = bindings.map((binding) => valueAt(binding.source, binding.column, rowIndex));
       const bound = bindStatementParameters(compiled, params);
@@ -9064,10 +8912,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /**
    * Runs the callback against one shared write transaction: every staged mutation — across
    * any number of keyed or keyless tables, with their AFTER triggers — publishes as one
-   * atomic commit. Scopes queue with this engine's autocommit writes by default, before taking
-   * their snapshot. Use the supplied session for writes inside the callback. With
-   * serializeWriteScopes: false, scopes overlap instead. A concurrent external write surfaces
-   * as a WriteConflictError from the scope (nothing published); retry the whole scope.
+   * atomic commit. Scopes queue with this engine's autocommit writes before taking their
+   * snapshot. Use the supplied session for writes inside the callback. An older or
+   * uncoordinated external writer can still cause WriteConflictError; callbacks are never replayed.
    * The scope can rebase over data-neutral maintenance manifests within maxCommitRetries.
    * An error thrown by the callback aborts the scope with nothing published. A scope that
    * stages nothing publishes nothing.
@@ -9078,7 +8925,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<{ result: T; version: number | null }> {
     // Collection assistance waits on the collector, and the collector may need a turn of its
     // own to publish, so it runs before this scope asks for one.
-    await this.#assistAutomaticCollection();
+    await this.#collection.assist();
     // The scope stages by runtime table name; the declaration only types the caller's view.
     return this.#ownScope(
       (signal) =>
@@ -9102,7 +8949,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * publication waiting for a turn, then the statement itself.
    */
   #coordinateWrite<T>(run: (admission: WriterAdmission) => Promise<T>): Promise<T> {
-    return this.#assistAutomaticCollection().then(() =>
+    return this.#collection.assist().then(() =>
       this.#admit("statement", async (admission) => {
         await this.#publishPendingCompactions();
         return run(admission);
@@ -9137,7 +8984,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * its turn or already inside its callback. A caller's own signal cancels the same way.
    */
   async #ownScope<T>(run: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     external?.throwIfAborted();
     if (this.#scopeTasks.size >= MAX_DATABASE_ACTIVE_SCOPES) {
       throw new RangeError("Too many active database scopes; await a scope before opening another");
@@ -10152,7 +9999,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         await this.#stageDeleteSegment(transaction, table, keyColumn, deletes);
       }
       for (const group of updates.values()) {
-        const changes: Record<string, BatchValue[]> = {};
+        const changes = Object.create(null) as Record<string, BatchValue[]>;
         for (const position of group.positions) {
           const column = table.columns[position];
           if (column === undefined) continue;
@@ -10253,7 +10100,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       const row: QueryRow = {};
       table.columns.forEach((column, position) => {
-        if (wanted.has(column.name)) row[column.name] = effect.values[position] ?? null;
+        if (wanted.has(column.name)) {
+          const value = effect.values[position] ?? null;
+          if (column.name === "__proto__") defineSqlResultProperty(row, column.name, value);
+          else row[column.name] = value;
+        }
       });
       answered.set(token, row);
     }
@@ -10280,7 +10131,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (patch !== undefined) {
             table.columns.forEach((column, position) => {
               const value = patch.values[position];
-              if (value !== undefined && wanted.has(column.name)) row[column.name] = value;
+              if (value !== undefined && wanted.has(column.name)) {
+                if (column.name === "__proto__") defineSqlResultProperty(row, column.name, value);
+                else row[column.name] = value;
+              }
             });
           }
           answered.set(token, row);
@@ -10450,7 +10304,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return undefined;
     }
     if (statement.kind === "delete") return { kind: "delete", table, keyColumn, keys, changes: {} };
-    const changes: Record<string, BatchValue> = {};
+    const changes = Object.create(null) as Record<string, BatchValue>;
     for (const assignment of statement.assignments) {
       const column = table.columns.find((candidate) => candidate.name === assignment.column);
       if (
@@ -10930,7 +10784,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (sessionChecks.length > 0) {
       for (let rowIndex = 0; rowIndex < input.keys.length; rowIndex += 1) {
         if (preImages[rowIndex] === undefined) continue;
-        const row: Record<string, BatchValue> = {};
+        const row = Object.create(null) as Record<string, BatchValue>;
         for (const column of table.columns) {
           row[column.name] = sessionUpdateValueAt("new", column.name, rowIndex);
         }
@@ -11899,7 +11753,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     params?: readonly QueryValue[],
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     if (this.#pendingExecutes >= MAX_DATABASE_PENDING_WRITES) {
       throw new RangeError("Too many pending SQL statements; await a statement");
     }
@@ -11922,7 +11776,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     params: readonly QueryValue[] | undefined,
     options: ExecuteOptions,
   ): Promise<ExecuteResult> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
     const statement = this.#compileStatementCached(sql);
@@ -12330,7 +12184,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
       // The transaction is this database's writer from BEGIN until COMMIT, ROLLBACK, the idle
       // sweep, or close: its turn is taken before its snapshot and kept across statements.
-      await this.#assistAutomaticCollection();
+      await this.#collection.assist();
       const finished = this.#admit("transaction", (admission) =>
         this.#openWriteScope<null>(admission, async (_session, _transaction, writer) => {
           start(writer);
@@ -12712,7 +12566,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       if (freshRows.length > 0) {
-        const columns: Record<string, BatchValue[]> = {};
+        const columns = Object.create(null) as Record<string, BatchValue[]>;
         for (const column of table.columns) {
           if (column.generatedValue !== undefined) continue;
           columns[column.name] = freshRows.map(
@@ -12992,7 +12846,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ];
       if (updates.size > 0) {
         const entries = [...updates.values()];
-        const changes: Record<string, BatchValue[]> = {};
+        const changes = Object.create(null) as Record<string, BatchValue[]>;
         for (const column of assignedColumns) {
           changes[column] = entries.map((entry) => entry.changes[column] ?? null);
         }
@@ -13099,7 +12953,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options: RunStatementOptions = {},
   ): Promise<ExecuteResult> {
     return this.#foreground(async () => {
-      if (this.#closed) throw new Error("Database is closed");
+      if (this.#closed) throw new DatabaseClosedError();
       if (this.#statementTransactionExpired && statement.kind !== "transaction")
         throw new TransactionExpiredError();
       const statementNow = this.#now();
@@ -13758,7 +13612,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // Statement validity first, so an invalid projection reports as itself, not as a
           // duplicate the invalid statement would also have hit.
           const assignedGenerated = table.columns.find(
-            (column) => column.generatedValue !== undefined && spelledColumns.includes(column.name),
+            (column) =>
+              column.generatedValue !== undefined &&
+              spelledColumns.includes(column.name) &&
+              !(
+                input.omitted !== undefined &&
+                Object.hasOwn(input.omitted, column.name) &&
+                input.omitted[column.name]?.every(Boolean) === true
+              ),
           );
           if (assignedGenerated !== undefined) {
             throw new TypeError(`Generated column cannot be assigned: ${assignedGenerated.name}`);
@@ -13991,9 +13852,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             : returningExecuteFields(table, returningColumns, [])),
         };
       }
-      const changes: Record<string, Array<BatchValue | null>> = {};
+      const changes = Object.create(null) as Record<string, Array<BatchValue | null>>;
       const returnedChanges: Record<string, Array<BatchValue | null>> | undefined =
-        returningColumns === undefined ? undefined : {};
+        returningColumns === undefined
+          ? undefined
+          : (Object.create(null) as Record<string, Array<BatchValue | null>>);
       for (const assignment of updateAssignments) {
         const column = table.columns.find((candidate) => candidate.name === assignment.column);
         if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
@@ -14146,6 +14009,82 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
   }
 
+  async #queryKeyedUpdateAtSnapshot(
+    plan: CompiledQuery,
+    options: QueryOptions,
+    snapshot: LeasedSnapshot,
+    baseTable: TableRecord,
+    visibility: SegmentVisibilityCatalog,
+    projectedBaseColumns: readonly TableColumnRecord[],
+    typedSchemas: ReadonlyMap<string, SqlColumnSchema[]>,
+  ): Promise<QueryResult | undefined> {
+    // A keyed UPDATE's read computes its assignments over at most one row. Reuse the point
+    // reader's exact predicate/type/history proofs, then evaluate the original assignment
+    // plan through the ordinary vector kernel. This changes input preparation only: triggers,
+    // constraints, staging, conflict checks and publication still take their usual paths.
+    if (
+      plan.joins.length === 0 &&
+      plan.predicates.every((predicate) => predicate.operator === "=") &&
+      !planContainsFts(plan) &&
+      projectedBaseColumns.every((column) => column.sqlDomain === undefined)
+    ) {
+      const template = cachedPointReadTemplate({
+        ...plan,
+        select: projectedBaseColumns.map((column) => ({
+          expression: { kind: "column", reference: `${plan.base.alias}.${column.name}` },
+          alias: column.name,
+        })),
+      });
+      const shape = template === null ? undefined : resolvePointReadShape(template, []);
+      if (shape !== undefined) {
+        pointReadTestHooks.attempted += 1;
+        const point = await this.#pointReadAtSnapshot(
+          shape,
+          snapshot,
+          new Map([[baseTable.name, baseTable]]),
+          visibility,
+          options,
+        );
+        if (point !== undefined) {
+          throwIfAborted(options.signal);
+          const input = createColumnarTable(
+            baseTable.name,
+            new Map(
+              projectedBaseColumns.map((column) => [
+                column.name,
+                {
+                  type: column.type,
+                  values: point.rows.map((row) => row[column.name] ?? null),
+                },
+              ]),
+            ),
+          );
+          const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
+          let prepared: PreparedQuery | undefined;
+          try {
+            prepared = createPreparedColumnarQuery(
+              plan,
+              new Map([[baseTable.name, input]]),
+              memory,
+              {
+                outputNeedsExternalization: queryResultNeedsExternalization(plan, typedSchemas),
+                outputColumnDomains: inferResultColumnDomains(plan, typedSchemas),
+              },
+            );
+            const result = prepared.execute();
+            pointReadTestHooks.served += 1;
+            options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
+            return result;
+          } finally {
+            if (prepared === undefined) memory.close();
+            else prepared.close();
+          }
+        }
+      }
+    }
+    return undefined;
+  }
+
   async #queryStreamedAtSnapshot(
     plan: CompiledQuery,
     options: QueryOptions,
@@ -14156,6 +14095,56 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     cursor?: QueryBatchCursorExecution,
   ): Promise<QueryResult | undefined> {
     throwIfAborted(options.signal);
+    // A plain count needs the snapshot's surviving row count, but no column schemas, index
+    // predicates, join ordering, or scan windows. Keep the ordinary replay and vector result
+    // builder so mutation histories, memory budgets, LIMIT/OFFSET, and result ownership retain
+    // their usual semantics. In particular this is not a memoized query result.
+    const selection = plan.select[0]?.expression;
+    if (
+      cursor === undefined &&
+      plan.select.length === 1 &&
+      selection?.kind === "call" &&
+      selection.name === "COUNT" &&
+      selection.distinct !== true &&
+      selection.arguments.length === 1 &&
+      selection.arguments[0]?.kind === "wildcard" &&
+      selection.arguments[0].table === undefined &&
+      (selection.aggregateOrderBy?.length ?? 0) === 0 &&
+      plan.joins.length === 0 &&
+      plan.predicates.length === 0 &&
+      plan.groupBy.length === 0 &&
+      plan.having.length === 0 &&
+      plan.orderBy.length === 0 &&
+      plan.base.columnAliases === undefined &&
+      plan.pendingSelectShape === undefined &&
+      plan.pendingOutputAliases === undefined
+    ) {
+      const table = tables.find((table) => table.name === plan.base.table);
+      if (table === undefined) throw new UnknownTableError(plan.base.table);
+      const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+      throwIfAborted(options.signal);
+      this.#maybeScheduleAutoCompaction(table, segments);
+      const view = this.#streamedViewFactory(table, [], segments, snapshot);
+      if (view !== undefined) {
+        const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
+        let prepared: PreparedQuery | undefined;
+        try {
+          const streamed = await view.create(memory);
+          throwIfAborted(options.signal);
+          prepared = createPreparedColumnarQuery(
+            plan,
+            new Map([[table.name, streamed.table]]),
+            memory,
+          );
+          const result = prepared.execute();
+          options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
+          return result;
+        } finally {
+          if (prepared === undefined) memory.close();
+          else prepared.close();
+        }
+      }
+    }
     // Copy-on-write: expansion clones only full-text plans, leaving the compile cache's copy
     // untouched.
     plan = expandFtsColumns(plan, (tableName) =>
@@ -14205,6 +14194,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
     const projectedBaseColumns =
       requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
+    if (cursor === undefined && plan.sql === "(update)" && !pointReadTestHooks.disabled) {
+      const point = await this.#queryKeyedUpdateAtSnapshot(
+        plan,
+        options,
+        snapshot,
+        baseTable,
+        visibility,
+        projectedBaseColumns,
+        typedSchemas,
+      );
+      if (point !== undefined) return point;
+    }
     if (secondaryIndexOrderForPlan(plan, baseTable, projectedBaseColumns, false) !== undefined) {
       return undefined;
     }
@@ -15969,7 +15970,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   exportSnapshotStream(
     options: SnapshotExportOptions = {},
   ): AsyncGenerator<Uint8Array, void, void> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     if (this.#exports.size >= MAX_DATABASE_ACTIVE_SCOPES)
       throw new RangeError("Too many open snapshot exports");
     const iterator = this.#exportSnapshotChunks(options);
@@ -16002,7 +16003,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async *#exportSnapshotChunks(
     options: SnapshotExportOptions,
   ): AsyncGenerator<Uint8Array, void, void> {
-    if (this.#closed) throw new Error("Database is closed");
+    if (this.#closed) throw new DatabaseClosedError();
     const store = streamingSnapshotExportStore(this.store);
     throwIfSnapshotAborted(options.signal);
     options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
@@ -16565,10 +16566,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // An explicit successful pass is the caller accepting responsibility for manual mode. It
       // reopens the generous write window; if the store cannot complete, the exception leaves the
       // ceiling in place.
-      this.#autoCollectionDebtCommits = 0;
-      this.#manualCollectionDebtInitialized = true;
-      this.#commitsSinceCollection = 0;
-      this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
+      this.#collection.collectedManually();
       return progress.result;
     });
   }
@@ -16595,7 +16593,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       options.maxItems ?? 1,
       "Garbage collection item limit",
     );
-    return this.#serializedCollectionStep(async () => {
+    return this.#collection.step(async () => {
       const active = await this.#findActiveGarbageCollectionJob();
       const job =
         active ??
@@ -16632,14 +16630,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
   }
 
-  /** `resumeGarbageCollectionJob`, or undefined when no record of the job remains. */
+  /** Internal resumption permits a job another connection already finished and removed. */
   async #resumeGarbageCollectionJob(
     jobId: string,
     options: CollectGarbageStepOptions,
   ): Promise<GarbageCollectionProgress | undefined> {
     const job = await this.store.getGarbageCollectionJob(jobId);
     if (job === undefined) return undefined;
-    return this.#serializedCollectionStep(() =>
+    return this.#collection.step(() =>
       this.#runGarbageCollectionJob(
         job,
         boundedMaintenanceBatchItems(options.maxItems ?? 1, "Garbage collection item limit"),
@@ -16647,147 +16645,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
   }
 
-  /**
-   * One garbage-collection step at a time within this database, for the same reason
-   * compaction steps take turns (`#serializedCompactionStep`): background collection drives
-   * a job in steps, and a caller stepping collection explicitly continues the same job rather
-   * than racing it.
-   */
-  async #serializedCollectionStep<T>(step: () => Promise<T>): Promise<T> {
-    const previous = this.#collectionSteps;
-    const run = previous.then(step, step);
-    this.#collectionSteps = run;
-    try {
-      return await run;
-    } finally {
-      if (this.#collectionSteps === run) this.#collectionSteps = Promise.resolve();
-    }
-  }
-
-  /**
-   * Background collection: plans one pass and drives it to completion in yielding steps.
-   * Runs after a background fold, whose superseded blocks are what a pass reclaims, and every
-   * AUTO_COLLECT_COMMIT_INTERVAL commits, since every commit writes a manifest that stays on
-   * disk until pruned. Keeps the most recent versions readable. Never surfaces through a
-   * write or a scan; a failed pass backs off for an interval of commits.
-   */
-  #maybeScheduleAutoCollection(force = false): void {
-    if (this.#closed) return;
-    if (!this.#autoCollect) return;
-    if (this.#autoCollectionInFlight) {
-      // A fold finishing or a quiet minute passing while a run is under way is a reason for
-      // one more run once this one ends — a dropped trigger after the last commit of a burst
-      // would otherwise leave the burst's leftovers until the next one.
-      this.#autoCollectionRequested = true;
-      return;
-    }
-    if (this.#autoCollectionRetryTimer !== undefined && !force) return;
-    if (force && this.#autoCollectionRetryTimer !== undefined) {
-      clearTimeout(this.#autoCollectionRetryTimer);
-      this.#autoCollectionRetryTimer = undefined;
-      this.#autoCollectionRetryAt = undefined;
-    }
-    this.#autoCollectionInFlight = true;
-    this.#autoCollectionRequested = false;
-    this.#commitsSinceCollection = 0;
-    this.#lastCollectionAt = dateMilliseconds(this.#now());
-    const run = this.#runAutoCollection()
-      .then(({ moreWork, reclaimed }) => {
-        this.#autoCollectionConsecutiveFailures = 0;
-        this.#autoCollectionLastError = undefined;
-        this.#lastCollectionCompletedAt = dateMilliseconds(this.#now());
-        this.#autoCollectionRetryAt = undefined;
-        if (moreWork) this.#autoCollectionRequested = true;
-        // Debt counts commits the collector has not kept up with. A pass that reclaimed
-        // something kept up; only a run that found nothing to reclaim while compaction work
-        // is still outstanding leaves the count for the next one to settle.
-        if (reclaimed || !moreWork) this.#autoCollectionDebtCommits = 0;
-      })
-      .catch((error: unknown) => {
-        // close() flips #closed before joining this run, so a store call the run makes after
-        // that point is refused with "Database is closed". That is the shutdown working, not
-        // a maintenance failure: nothing to report, retry, or count.
-        if (this.#closed) return;
-        // Another connection advanced or finished the job this run was driving. Nothing went
-        // wrong -- the work is being done -- so nothing is reported; a later trigger resumes
-        // whatever is left.
-        if (error instanceof GarbageCollectionJobConflictError) {
-          this.#autoCollectionRequested = true;
-          return;
-        }
-        this.#autoCollectionConsecutiveFailures += 1;
-        const at = dateMilliseconds(this.#now());
-        this.#autoCollectionLastError = {
-          name: error instanceof Error ? error.name : "Error",
-          message: error instanceof Error ? error.message : String(error),
-          at,
-        };
-        this.#reportBackgroundError(error, "auto collection");
-        this.#scheduleAutoCollectionRetry();
-      })
-      .finally(() => {
-        if (this.#autoCollectionTask === run) this.#autoCollectionTask = undefined;
-        this.#autoCollectionInFlight = false;
-        if (this.#autoCollectionRequested) {
-          void this.#yieldMaintenance().then(() => {
-            // Keep `collectionRequested` true until the continuation takes ownership. Otherwise
-            // maintenanceStatus briefly reports a false idle state between bounded runs, and a
-            // caller waiting for quiescence can leave a real backlog behind.
-            if (this.#closed) {
-              this.#autoCollectionRequested = false;
-              return;
-            }
-            // A commit may already have started the requested run during the yield. Its start
-            // clears the flag, and any newer request made while it runs remains set for that
-            // run's own continuation.
-            if (this.#autoCollectionInFlight) return;
-            this.#maybeScheduleAutoCollection();
-          });
-        }
-      });
-    this.#autoCollectionTask = run;
-    void run;
-  }
-
   /** Hands a failure nobody awaits to the `onBackgroundError` hook; a throwing hook is contained. */
+  #isShutdownRefusal(error: unknown): boolean {
+    return (
+      this.#closed &&
+      (error instanceof DatabaseClosedError ||
+        (this.#maintenanceSignal.aborted && error === this.#maintenanceSignal.reason) ||
+        (this.#shutdown.signal.aborted && error === this.#shutdown.signal.reason))
+    );
+  }
+
   #reportBackgroundError(error: unknown, context: string): void {
-    try {
-      this.#onBackgroundError?.(error, context);
-    } catch {
-      // A diagnostic hook must never turn a background failure into a second one.
-    }
-  }
-
-  #scheduleAutoCollectionRetry(): void {
-    if (this.#closed || !this.#autoCollect || this.#autoCollectionRetryTimer !== undefined) return;
-    const exponent = Math.min(16, Math.max(0, this.#autoCollectionConsecutiveFailures - 1));
-    const delay = Math.min(AUTO_COLLECT_RETRY_MAX_MS, AUTO_COLLECT_RETRY_MIN_MS * 2 ** exponent);
-    this.#autoCollectionRetryAt = dateMilliseconds(this.#now()) + delay;
-    const timer = setTimeout(() => {
-      this.#autoCollectionRetryTimer = undefined;
-      this.#autoCollectionRetryAt = undefined;
-      this.#maybeScheduleAutoCollection(true);
-    }, delay);
-    (timer as { unref?: () => void }).unref?.();
-    this.#autoCollectionRetryTimer = timer;
-  }
-
-  /**
-   * A pass a quiet period after the last commit, for a tab that stops writing: the retained
-   * window's age bound lets that pass reclaim what the last burst superseded, which no commit
-   * would otherwise arrive to trigger. Re-armed by every commit; unreferenced, so it never
-   * keeps a process alive.
-   */
-  #armIdleCollection(): void {
-    if (this.#closed) return;
-    if (!this.#autoCollect) return;
-    if (this.#idleCollectionTimer !== undefined) clearTimeout(this.#idleCollectionTimer);
-    const timer = setTimeout(() => {
-      this.#idleCollectionTimer = undefined;
-      this.#maybeScheduleAutoCollection();
-    }, AUTO_COLLECT_QUIET_MS);
-    (timer as { unref?: () => void }).unref?.();
-    this.#idleCollectionTimer = timer;
+    if (this.#isShutdownRefusal(error)) return;
+    this.#diagnostics.report(error, context);
   }
 
   async #runAutoCollection(): Promise<{ moreWork: boolean; reclaimed: boolean }> {
@@ -16815,9 +16685,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#resumeGarbageCollectionJob(jobId, { maxItems: AUTO_COLLECT_STEP_ITEMS }),
         );
       }
-      // Another connection finished the job and dropped its record between two steps. As when
-      // a step loses the job's revision race, the work is done elsewhere; another run picks up
-      // whatever is left.
       if (progress === undefined) {
         moreWork = true;
         break;
@@ -17670,10 +17537,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return garbageCollectionProgress(step.job);
       } catch (error) {
         if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
-        // Another connection advanced the job. When it also finished it and dropped the record
-        // (its prune, or the handoff to a successor job), the conflict is the answer: background
-        // collection counts it as work done elsewhere and collectGarbage() plans again.
         const latest = await this.store.getGarbageCollectionJob(job.id);
+        // Another collector may finish and prune the job between the conflict and this read.
+        // Keep the typed conflict so background collection can retry without reporting a
+        // spurious storage failure, just as it does during concurrent discovery.
         if (latest === undefined) throw error;
         job = latest;
       }
@@ -20845,7 +20712,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
       });
     } catch (error) {
-      const fresh = await this.store.getTable(table.id);
+      const fresh = await this.store
+        .getTable(table.id)
+        .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
       const freshIndex = fresh?.secondaryIndexes?.[indexId];
       if (
         fresh !== undefined &&
@@ -20866,18 +20735,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#maintenanceSignal,
         )
           .then(() => true)
-          .catch(() => false);
+          .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
         // Catalog first: every intermediate reader scans. Once invalid, postings are neither
         // truth nor maintained; removing their base and deltas bounds a persistently failing
         // rebuild without touching a UNIQUE index's separate membership namespace.
         if (invalidated) {
           await this.store
             .removeFtsColumn(fresh.id, freshIndex.storageColumnId)
-            .catch(() => undefined);
+            .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
         }
       }
       throw error;
     }
+  }
+
+  /** Cleanup must not replace the original failure or silently discard a second I/O error. */
+  #postingCleanupFailure(tableId: string, columnId: string): (error: unknown) => undefined {
+    return (error) => {
+      this.#reportBackgroundError(error, `posting build cleanup for ${tableId}/${columnId}`);
+      return undefined;
+    };
   }
 
   #postingBuildExpiry(now: Date): string {
@@ -21017,7 +20894,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         totalTokens,
       });
     } catch (error) {
-      await abort(table.id, index.storageColumnId, buildId).catch(() => undefined);
+      await abort(table.id, index.storageColumnId, buildId).catch(
+        this.#postingCleanupFailure(table.id, index.storageColumnId),
+      );
       throw error;
     }
   }
@@ -21097,7 +20976,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
       return true;
     } catch (error) {
-      await abort(table.id, index.storageColumnId, buildId).catch(() => undefined);
+      await abort(table.id, index.storageColumnId, buildId).catch(
+        this.#postingCleanupFailure(table.id, index.storageColumnId),
+      );
       throw error;
     } finally {
       memory.close();
@@ -21227,7 +21108,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         totalTokens,
       });
     } catch (error) {
-      await abort(table.id, index.storageColumnId, buildId).catch(() => undefined);
+      await abort(table.id, index.storageColumnId, buildId).catch(
+        this.#postingCleanupFailure(table.id, index.storageColumnId),
+      );
       throw error;
     }
   }
@@ -21299,7 +21182,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await this.#withLeasedSnapshot(undefined, async (snapshot) => {
         const segments = await this.#visibleSegmentRecords(marked, snapshot);
         if (segments.some((segment) => segment.kind !== "insert")) {
-          await stamp(marked, "invalid", -1).catch(() => undefined);
+          await stamp(marked, "invalid", -1).catch(
+            this.#postingCleanupFailure(table.id, column.id),
+          );
           throw new TypeError(
             `Full-text indexes support append-only tables; ${tableName} has keyed mutations`,
           );
@@ -21379,7 +21264,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             totalTokens,
           });
         } catch (error) {
-          await abort(table.id, column.id, buildId).catch(() => undefined);
+          await abort(table.id, column.id, buildId).catch(
+            this.#postingCleanupFailure(table.id, column.id),
+          );
           throw error;
         }
         const coversVersion = snapshot.version ?? -1;
@@ -21411,7 +21298,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // A failed build must never leave a catalog entry perpetually "building" or a partial
       // generation pinning chunks. Make scan-correctness durable first, then discard the cold
       // accelerator. A concurrent successful replacement is left untouched.
-      const fresh = await this.store.getTable(table.id);
+      const fresh = await this.store
+        .getTable(table.id)
+        .catch(this.#postingCleanupFailure(table.id, column.id));
       const current = fresh?.ftsColumns?.[column.id];
       if (fresh !== undefined && current?.state === "building") {
         const invalidated = await this.#admit(
@@ -21426,11 +21315,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#maintenanceSignal,
         )
           .then(() => true)
-          .catch(() => false);
+          .catch(this.#postingCleanupFailure(table.id, column.id));
         if (invalidated)
-          await this.store.removeFtsColumn(table.id, column.id).catch(() => undefined);
+          await this.store
+            .removeFtsColumn(table.id, column.id)
+            .catch(this.#postingCleanupFailure(table.id, column.id));
       } else if (current?.state === "invalid") {
-        await this.store.removeFtsColumn(table.id, column.id).catch(() => undefined);
+        await this.store
+          .removeFtsColumn(table.id, column.id)
+          .catch(this.#postingCleanupFailure(table.id, column.id));
       }
       throw error;
     }
@@ -21945,7 +21838,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const key = `${table.id}/${index.storageColumnId}`;
     if (this.#ftsBuildsInFlight.has(key)) return;
     const build = this.#buildSecondaryIndexBase(table, indexId, index)
-      .catch(() => undefined)
+      .catch((error: unknown) =>
+        this.#reportBackgroundError(error, `secondary index build for ${table.name}/${indexId}`),
+      )
       .finally(() => {
         if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
       });
@@ -21971,7 +21866,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const key = `${table.id}/${column.id}`;
       if (this.#ftsBuildsInFlight.has(key)) continue;
       const build = this.#buildFtsIndex(table, column)
-        .catch(() => undefined)
+        .catch((error: unknown) =>
+          this.#reportBackgroundError(
+            error,
+            `full-text index build for ${table.name}/${column.name}`,
+          ),
+        )
         .finally(() => {
           if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
         });
@@ -22022,13 +21922,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         observedCount = (await this.store.readFtsCandidates(tableId, columnId, [], version))
           .deltaChunkCount;
         this.#postingDeltaTailCounts.set(key, observedCount);
-      } catch {
+      } catch (error) {
+        this.#reportBackgroundError(error, `posting delta fold for ${key}`);
         if ((this.#postingDeltaTailCounts.get(key) ?? 0) >= FTS_HARD_DELTA_CHUNKS) {
           try {
             await this.#invalidateOversizedPostingTail(tableId, columnId);
             invalidated = true;
             this.#postingDeltaTailCounts.delete(key);
-          } catch {
+          } catch (error) {
+            this.#reportBackgroundError(error, `posting tail invalidation for ${key}`);
             // Keep the hard-threshold marker. A later commit or relevant read will retry; losing
             // it here would turn a transient catalog/cleanup refusal into silent unbounded growth.
           }
@@ -23721,7 +23623,7 @@ function classifyMergeRows(input: {
       }
       if (branch.action.kind === "update") {
         if (key === null || token === undefined) return;
-        const changes: Record<string, BatchValue> = {};
+        const changes = Object.create(null) as Record<string, BatchValue>;
         for (const assignment of branch.action.assignments) {
           if (assignment.column === keyColumn.name) {
             throw new TypeError(`MERGE cannot update the unique key: ${keyColumn.name}`);
@@ -23744,7 +23646,7 @@ function classifyMergeRows(input: {
       if (columns.length !== values.length) {
         throw new TypeError("MERGE INSERT values must match the table's columns");
       }
-      const row: Record<string, BatchValue> = {};
+      const row = Object.create(null) as Record<string, BatchValue>;
       columns.forEach((column, position) => {
         const value = values[position];
         if (value === undefined) return;
@@ -24237,7 +24139,11 @@ function fillStoredGeneratedColumns(
 
 function rejectGeneratedUpdateAssignments(table: TableRecord, input: UpdateBatchInput): void {
   for (const column of table.columns) {
-    if (column.generatedValue !== undefined && input.changes[column.name] !== undefined) {
+    if (
+      column.generatedValue !== undefined &&
+      Object.hasOwn(input.changes, column.name) &&
+      input.changes[column.name] !== undefined
+    ) {
       throw new TypeError(`Generated column cannot be assigned: ${column.name}`);
     }
   }
@@ -24247,7 +24153,7 @@ function generatedEvaluationRow(
   table: TableRecord,
   source: Record<string, BatchValue>,
 ): Record<string, BatchValue> {
-  const row: Record<string, BatchValue> = {};
+  const row = Object.create(null) as Record<string, BatchValue>;
   for (const column of table.columns) {
     const value = source[column.name] ?? null;
     row[column.name] =
@@ -24265,7 +24171,10 @@ function applyStoredGeneratedUpdateChanges(
 ): UpdateBatchInput {
   const generated = tableGeneratedExpressions(table);
   if (generated.length === 0) return input;
-  const changes: Record<string, readonly BatchValue[]> = { ...input.changes };
+  const changes = Object.assign(
+    Object.create(null) as Record<string, readonly BatchValue[]>,
+    input.changes,
+  );
   for (const { column, expression } of generated) {
     changes[column.name] = input.keys.map((_, rowIndex) => {
       const old = preImages[rowIndex];
@@ -24317,7 +24226,7 @@ function batchRowAt(
   input: ColumnarBatch,
   index: number,
 ): Record<string, BatchValue> {
-  const row: Record<string, BatchValue> = {};
+  const row = Object.create(null) as Record<string, BatchValue>;
   for (const column of table.columns)
     row[column.name] = input.columns[column.name]?.[index] ?? null;
   return row;
@@ -24336,7 +24245,8 @@ function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?:
     if (!expected.has(name)) throw new TypeError(`Unknown column: ${name}`);
   }
   for (const column of table.columns) {
-    if (!(column.name in input.columns)) throw new TypeError(`Missing column: ${column.name}`);
+    if (!Object.hasOwn(input.columns, column.name))
+      throw new TypeError(`Missing column: ${column.name}`);
   }
   const first = table.columns[0];
   if (first === undefined) throw new Error("Table has no columns");
@@ -24752,7 +24662,9 @@ function foldAssignmentColumns<T extends { column: string }>(
 /** Canonicalizes logical PostgreSQL domains before validation and primitive block encoding. */
 function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
-    const values = input.columns[column.name];
+    const values = Object.hasOwn(input.columns, column.name)
+      ? input.columns[column.name]
+      : undefined;
     if (values === undefined) continue;
     if (
       column.sqlDomain !== undefined ||
@@ -24921,7 +24833,10 @@ function normalizeDomainUpdate(table: TableRecord, input: UpdateBatchInput): Upd
     return input;
   }
   let changed = false;
-  const changes: Record<string, readonly BatchValue[]> = { ...input.changes };
+  const changes = Object.assign(
+    Object.create(null) as Record<string, readonly BatchValue[]>,
+    input.changes,
+  );
   for (const [name, values] of Object.entries(input.changes)) {
     const column = table.columns.find((candidate) => candidate.name === name);
     if (
@@ -25010,7 +24925,66 @@ function normalizePlanDomainLiterals(
         else literal.value = coerced;
       }
     };
+    const expressionSchema = (expression: Expression): SqlColumnSchema | undefined => {
+      // Derived and correlated sources acquire their schemas later in the execution pipeline.
+      // Validate only known types here; the completed block is checked when those sources bind.
+      if (
+        expression.kind === "subquery" ||
+        expression.kind === "exists" ||
+        expressionColumns(expression).some((reference) => lookup(reference, types) === undefined)
+      )
+        return undefined;
+      const schemas = new Map<string, SqlColumnSchema[]>();
+      for (const source of sources) {
+        schemas.set(
+          source.table,
+          [...(types.get(source.table) ?? [])].map(([name, type]) => {
+            const sqlDomain = domains.get(source.table)?.get(name);
+            return { name, type, ...(sqlDomain === undefined ? {} : { sqlDomain }) };
+          }),
+        );
+      }
+      return inferBlockSchema(
+        { ...block, select: [{ alias: "comparison", expression }] },
+        schemas,
+      )[0];
+    };
+    const plainTextExpression = (expression: Expression): boolean => {
+      if (expression.kind === "column")
+        return (
+          lookup(expression.reference, types) === "string" &&
+          domainFor(expression.reference) === undefined
+        );
+      if (expression.kind !== "call" && expression.kind !== "case") return false;
+      if (expression.kind === "call" && expression.name === "COALESCE") {
+        const known = expressionColumns(expression)
+          .map((reference) => lookup(reference, types))
+          .filter((type) => type !== undefined);
+        if (known.length > 0 && known.every((type) => type !== "string")) return false;
+      }
+      const schema = expressionSchema(expression);
+      return schema?.type === "string" && schema.sqlDomain === undefined && schema.unknown !== true;
+    };
+    const checkTextComparison = (text: Expression, value: Expression): void => {
+      if (!plainTextExpression(text)) return;
+      if (value.kind === "list") {
+        for (const item of value.items) checkTextComparison(text, item);
+        return;
+      }
+      // Unknown string literals take the surrounding SQL type; typed TEXT never takes a numeric type.
+      if (
+        value.kind === "literal" &&
+        (value.value === null ||
+          (typeof value.value === "string" && value.internalSqlValue !== true))
+      )
+        return;
+      const schema = expressionSchema(value);
+      if (schema === undefined || schema.unknown === true) return;
+      if (schema.type !== "string" || schema.sqlDomain !== undefined)
+        throw new TypeError("Values must have comparable SQL types: TEXT comparison");
+    };
     const coercePair = (column: Expression, value: Expression): void => {
+      checkTextComparison(column, value);
       if (column.kind !== "column") return;
       const domain = domainFor(column.reference);
       if (domain === undefined) {

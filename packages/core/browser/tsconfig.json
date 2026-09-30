@@ -35,6 +35,10 @@
     "dispose-keepalive-worker.ts",
     "manifest-prefix-run.ts",
     "manifest-prefix-worker.ts",
-    "manifest-prefix-idb-run.ts"
+    "manifest-prefix-idb-run.ts",
+    "audit-run.ts",
+    "semantic-run.ts",
+    "upgrade-run.ts",
+    "upgrade-worker.ts"
   ]
 }

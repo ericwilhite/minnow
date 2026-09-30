@@ -148,7 +148,10 @@ worker host and delivered to the client's `onWorkerError` option as a
 rehydrated `error`. A `WriteAdmissionStalledError` with the context `write admission` means a
 write has waited ten seconds for the database's writer turn without the holder changing — a
 callback on this connection awaiting another write, or another tab that stopped inside one; the
-wait continues. Without a handler each one is written to `console.error` on the main thread.
+wait continues. Without a handler each one is written to `console.error` on the main thread. A throwing diagnostic
+handler is logged alongside the original error. Exceptions in loss listeners (`onError`,
+`onComplete`, and `onConnectionLost`) are logged too, and every pending call and other listener
+still receives the connection loss.
 These reports are not fatal: the connection keeps working, and the calls it was serving settle on
 their own. The Worker object's own `error` and `messageerror` events are different — they mean
 the channel's state is unknown, so every pending call rejects with `DatabaseWorkerFailedError`
@@ -168,6 +171,12 @@ const client = new MinnowDatabaseClient(worker, {
 A direct engine has the same seam as `MinnowDatabaseOptions.onBackgroundError`, and a directly
 opened OPFS store as `OpfsBlockStoreOptions.onDiagnostic`; the worker host wires both into the
 event above.
+
+A throwing `onWorkerError` callback is logged and contained. It cannot prevent pending calls
+from settling or a failed connection from closing. Worker query results are validated before
+rows are allocated; malformed vectors, null masks, offsets, or domain metadata reject the
+call instead of inventing values. A result frame carries at most 1,000,000 rows, 16,384 columns,
+and 4,000,000 cells. Use a streamed query for larger results or narrow an overly wide projection.
 
 `client.close({ terminateWorker: true, timeoutMs: 5000 })` attempts graceful disposal, then
 terminates the worker even if disposal times out. The timeout defaults to five seconds of silence. The

@@ -459,8 +459,13 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
 
   #reportWorkerError(event: DatabaseWorkerErrorEvent): void {
     if (this.#onWorkerError !== undefined) {
-      this.#onWorkerError(event);
-      return;
+      try {
+        this.#onWorkerError(event);
+        return;
+      } catch (error) {
+        // Diagnostics are observers. A throwing observer cannot interrupt connection cleanup.
+        console.error("[minnowdb] onWorkerError callback failed:", error);
+      }
     }
     if (typeof console === "undefined") return;
     console.error(`[minnowdb] worker ${event.kind} (${event.context}):`, event.error);
@@ -1568,14 +1573,14 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       if (!closing) {
         try {
           route.onError?.(error);
-        } catch {
-          // A listener that throws must not keep the others from hearing the loss.
+        } catch (callbackError) {
+          console.error("[minnowdb] live onError callback failed:", callbackError);
         }
       }
       try {
         route.onComplete?.();
-      } catch {
-        // Same: every route hears the end.
+      } catch (callbackError) {
+        console.error("[minnowdb] live onComplete callback failed:", callbackError);
       }
     }
     for (const call of pending) {
@@ -1595,8 +1600,8 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     ) {
       try {
         this.#onConnectionLost(error);
-      } catch {
-        // A hook that throws must not hide the loss from the calls already rejected.
+      } catch (callbackError) {
+        console.error("[minnowdb] onConnectionLost callback failed:", callbackError);
       }
     }
   }

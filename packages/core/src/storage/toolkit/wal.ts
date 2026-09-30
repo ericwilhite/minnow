@@ -128,10 +128,20 @@ export function replayWalFrames(handle: SyncFileHandle): {
  * Streams checksum-valid frames with O(max-frame) memory. A truncated final frame is ignored;
  * complete foreign or checksum-invalid bytes are corruption and fail closed.
  */
-export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWalFrame> {
+export function* iterateWalFrames(
+  handle: SyncFileHandle,
+  acknowledgedEndOffset = 0,
+): Generator<ReplayedWalFrame> {
   const size = handle.getSize();
   if (!Number.isSafeInteger(size) || size < 0) {
     throw new Error(`Invalid WAL byte length: ${String(size)}`);
+  }
+  if (
+    !Number.isSafeInteger(acknowledgedEndOffset) ||
+    acknowledgedEndOffset < 0 ||
+    size < acknowledgedEndOffset
+  ) {
+    throw new Error("WAL is truncated before its acknowledged boundary");
   }
   const header = new Uint8Array(FRAME_HEADER_BYTES);
   const headerView = new DataView(header.buffer);
@@ -143,7 +153,7 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
       // zero-filled tail where the in-flight frame was to go. That frame was never
       // acknowledged, so an all-zero remainder is the end of the log, exactly like a short
       // tail; anything else in its place is foreign bytes, and fails closed.
-      if (isZeroFilled(handle, offset, size)) break;
+      if (offset >= acknowledgedEndOffset && isZeroFilled(handle, offset, size)) break;
       throw new Error(`WAL frame marker mismatch at offset ${String(offset)}`);
     }
     const length = headerView.getUint32(4, true);
@@ -155,7 +165,11 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
       );
     }
     const end = offset + FRAME_HEADER_BYTES + length;
-    if (!Number.isSafeInteger(end) || end > size) break;
+    if (!Number.isSafeInteger(end) || end > size) {
+      if (offset < acknowledgedEndOffset)
+        throw new Error("WAL frame is truncated before its acknowledged boundary");
+      break;
+    }
     const payloadBytes = new Uint8Array(length);
     readFully(
       handle,
@@ -165,7 +179,12 @@ export function* iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWal
     );
     if (crc32(payloadBytes) !== checksum) {
       // The header landed but the payload page did not: the same unacknowledged tail.
-      if (payloadBytes.every((byte) => byte === 0) && isZeroFilled(handle, end, size)) break;
+      if (
+        offset >= acknowledgedEndOffset &&
+        payloadBytes.every((byte) => byte === 0) &&
+        isZeroFilled(handle, end, size)
+      )
+        break;
       throw new Error(`WAL frame checksum mismatch at offset ${String(offset)}`);
     }
     yield { payload: decodeRecordJson(payloadBytes), frameEnd: end };

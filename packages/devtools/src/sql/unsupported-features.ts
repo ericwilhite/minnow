@@ -282,6 +282,24 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
       "ON CONFLICT targets the table's primary or row-addressing unique key; a secondary UNIQUE column, a constraint name (ON CONSTRAINT), or a partial-index predicate cannot be the target.",
   },
   {
+    id: "predicate.regex-backreferences",
+    error: "pattern backreferences are unsupported",
+    notes:
+      "Pattern backreferences are refused explicitly; numbered backreferences remain supported in REGEXP_REPLACE replacement text.",
+  },
+  {
+    id: "predicate.regex-lookaround",
+    error: "lookaround and inline flags are unsupported",
+    notes:
+      "Lookaround and inline regex flags are refused. Use the supported function flags or rewrite the predicate.",
+  },
+  {
+    id: "predicate.regex-nongreedy",
+    error: "repeated or non-greedy quantifiers are unsupported",
+    notes:
+      "Non-greedy regex quantifiers are refused. Supported matching chooses the leftmost, longest result.",
+  },
+  {
     id: "privileges.grant",
     error: "Expected SELECT, found GRANT",
     notes: "An embedded, single-user database in the page has no principals to grant to.",

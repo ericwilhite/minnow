@@ -73,6 +73,22 @@ integers as integers, truncating toward zero as PostgreSQL does — see
 interval arithmetic. The [compatibility page](/docs/sql/feature-matrix) lists each with its
 example and any difference from PostgreSQL.
 
+`DIV` and numeric `TO_CHAR` keep exact NUMERIC digits, including values beyond JavaScript's
+safe integer range. `QUOTE_LITERAL` renders public domain values and declared numeric scales;
+`QUOTE_IDENT` quotes PostgreSQL keywords. `FORMAT` supports `%s`, `%I`, `%L`, `%%`, and positional
+`%n$` conversions. An explicit position sets the cursor for the next unnumbered conversion.
+Malformed directives and missing arguments throw; width and alignment directives are unsupported.
+
+Regex matching selects the leftmost, longest match. It supports grouping, alternation, character
+classes and ASCII POSIX classes, anchors, and greedy repetition. Pattern backreferences,
+lookaround, inline flags, and non-greedy quantifiers throw; replacement backreferences still work.
+The [SQL limits](/docs/sql) bound pattern size, compilation, matching, and replacement output.
+
+Timestamp inputs and `MAKE_TIMESTAMP` validate calendar dates, clock fields, and timezone offsets.
+Invalid dates such as February 30 throw. Supported calendar years are 1–9999; years below 100
+keep their requested year. Explicit TEXT casts retain text comparison semantics: comparing
+`'1'::TEXT` to the number `1` throws rather than interpreting the text as a number.
+
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
 `COLLATE` on string expressions. A sort key may name a selected column through its source alias
 (`SELECT id FROM orders AS o ORDER BY o.id`), the way PostgreSQL resolves it.
@@ -267,6 +283,9 @@ distinct outer probe tuple. The inner predicates, projection, and aggregate argu
 number of qualified outer columns; every referenced value becomes part of that probe tuple. An
 ordinary scalar returns NULL for no row and raises a cardinality error for more than one row. The
 inner scalar block cannot itself use `GROUP BY` or `HAVING`.
+
+Membership in an empty subquery is always false (`IN`) or true (`NOT IN`), including a NULL
+probe. A nonempty list containing NULL still follows SQL's three-valued logic.
 
 Correlated `IN`, `NOT IN`, `ANY`, and `ALL` preserve their empty-set and NULL behavior at top level
 and inside larger expressions. `NOT IN` carries per-probe counts rather than treating NULL as an

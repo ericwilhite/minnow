@@ -9,6 +9,7 @@ import type { EngineId, EngineQueryRun, RunQueryPayload, RunQueryResult } from "
 import { engineIds } from "../protocol";
 import { getDataset } from "./registry";
 import { measureRepeated } from "./support";
+import { benchmarkErrorMessage, withBenchmarkCleanup } from "../cleanup";
 
 const ITERATIONS = 7;
 const PREVIEW_ROWS = 50;
@@ -58,7 +59,7 @@ async function runOnEngine(
   const failed = (error: unknown): EngineQueryRun => ({
     engine,
     ok: false,
-    error: error instanceof Error ? error.message : String(error),
+    error: benchmarkErrorMessage(error),
     prepareMs: 0,
     medianMs: 0,
     p95Ms: 0,
@@ -73,36 +74,40 @@ async function runOnEngine(
     requireMaterialization(record, engine);
     const driver = await loadDriver(engine);
     const session = await driver.openSession(record);
-    try {
-      const prepareStarted = performance.now();
-      const prepared = await session.prepare(sql);
-      const prepareMs = performance.now() - prepareStarted;
-      try {
-        let rows = await prepared.execute();
-        const { medianMs, p95Ms } = await measureRepeated(async () => {
-          rows = await prepared.execute();
-        }, ITERATIONS);
-        const columns = rows.length > 0 ? Object.keys(rows[0] ?? {}) : [];
-        return {
-          engine,
-          ok: true,
-          prepareMs,
-          medianMs,
-          p95Ms,
-          iterations: ITERATIONS,
-          rowCount: rows.length,
-          columns,
-          previewRows: rows.slice(0, PREVIEW_ROWS),
-          truncated: rows.length > PREVIEW_ROWS,
-          checksum: resultChecksum(rows),
-          ...(prepared.plan === undefined ? {} : { plan: prepared.plan }),
-        };
-      } finally {
-        prepared.close();
-      }
-    } finally {
-      await session.close();
-    }
+    return await withBenchmarkCleanup(
+      async () => {
+        const prepareStarted = performance.now();
+        const prepared = await session.prepare(sql);
+        const prepareMs = performance.now() - prepareStarted;
+        return withBenchmarkCleanup(
+          async () => {
+            let rows = await prepared.execute();
+            const { medianMs, p95Ms } = await measureRepeated(async () => {
+              rows = await prepared.execute();
+            }, ITERATIONS);
+            const columns = rows.length > 0 ? Object.keys(rows[0] ?? {}) : [];
+            return {
+              engine,
+              ok: true,
+              prepareMs,
+              medianMs,
+              p95Ms,
+              iterations: ITERATIONS,
+              rowCount: rows.length,
+              columns,
+              previewRows: rows.slice(0, PREVIEW_ROWS),
+              truncated: rows.length > PREVIEW_ROWS,
+              checksum: resultChecksum(rows),
+              ...(prepared.plan === undefined ? {} : { plan: prepared.plan }),
+            };
+          },
+          async () => {
+            await prepared.close();
+          },
+        );
+      },
+      () => session.close(),
+    );
   } catch (error) {
     return failed(error);
   }

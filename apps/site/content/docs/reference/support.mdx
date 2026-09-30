@@ -54,14 +54,18 @@ detection must fail clearly; it must not silently select a less durable store.
 
 ## Stored-data compatibility
 
-Package versions and stored formats move independently. A 1.x reader keeps every format that a
-released 1.x writer could create, or ships an explicit conversion that preserves acknowledged
-data. Unknown future native formats are rejected without mutation.
+Package versions and stored formats move independently. Every supported stored format remains
+readable through the ordinary open/load API, including during 0.x. A newer reader keeps the old
+reader or performs an automatic conversion that preserves data. OPFS layout 6 upgrades to 7 on
+open; manual export/import is not a required upgrade step. Unknown future native formats are
+rejected without mutation.
 
 Frozen block/snapshot, IndexedDB, and OPFS fixtures carry the exact Minnow package version that
 wrote them. Current tests open every released fixture, check its expected answers, continue
 writing, close, and reopen it. A fixture that claims a future writer version fails the suite. The
-format version cannot advance until its old-writer fixture is committed.
+format version cannot advance until its old-writer fixture and automatic-upgrade regression
+coverage are committed. Conversion tests include interruption, power loss and retry, corruption
+refusal, concurrent openers, and the barrier against older writers.
 
 See [Versioning](/docs/reference/versioning) for the byte contracts and
 [Testing](/docs/reference/testing#format-compatibility) for the fixture workflow.

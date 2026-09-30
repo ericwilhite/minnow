@@ -31,6 +31,7 @@ import { WalWriter } from "../toolkit/wal.js";
 import { decodeSyncCheckpoint, encodeSyncCheckpoint, LOG_FORMAT_VERSION } from "../toolkit/wire.js";
 import type { SyncFileHandle } from "../toolkit/sync-file.js";
 import { OpfsTree } from "./files.js";
+import { FIRST_SUPPORTED_OPFS_LAYOUT } from "./upgrades.js";
 import { MinnowDatabase } from "../../engine/database.js";
 import {
   assertBlockReadBatchByteLimit,
@@ -423,7 +424,8 @@ describe("OPFS write-ahead log crash shapes", () => {
     const wal = await tree.openHandle(["wal"], { create: false });
     const slotA = await tree.openHandle(["checkpoint-a"], { create: false });
     const slotB = await tree.openHandle(["checkpoint-b"], { create: false });
-    const leader = await OpfsLeader.recover(tree, true, { wal, slotA, slotB });
+    const acknowledgements = await tree.openHandle(["wal-acknowledgements"], { create: false });
+    const leader = await OpfsLeader.recover(tree, true, { wal, slotA, slotB, acknowledgements });
     expect(() => leader.checkpointNow()).toThrow(
       /checkpoint generation cannot exceed the safe integer range/,
     );
@@ -1742,6 +1744,7 @@ describe("OPFS write-ahead log crash shapes", () => {
         wal: sparseWal,
         slotA,
         slotB,
+        acknowledgements: await tree.openHandle(["wal-acknowledgements"], { create: true }),
       }),
     ).rejects.toThrow(/WAL exceeds its .* byte recovery limit/);
     expect(reads).toBe(0);
@@ -1763,9 +1766,10 @@ describe("OPFS write-ahead log crash shapes", () => {
       flush: () => undefined,
       close: () => undefined,
     };
-    await expect(OpfsLeader.recover(tree, true, { wal, slotA: sparseSlot, slotB })).rejects.toThrow(
-      /Every OPFS checkpoint copy is corrupt/,
-    );
+    const acknowledgements = await tree.openHandle(["wal-acknowledgements"], { create: true });
+    await expect(
+      OpfsLeader.recover(tree, true, { wal, slotA: sparseSlot, slotB, acknowledgements }),
+    ).rejects.toThrow(/Every OPFS checkpoint copy is corrupt/);
     expect(reads).toBe(0);
   });
 
@@ -3443,7 +3447,7 @@ describe("OPFS write-ahead log crash shapes", () => {
   });
 
   it.each([
-    [LOG_FORMAT_VERSION - 1, "older"],
+    [FIRST_SUPPORTED_OPFS_LAYOUT - 1, "older"],
     [LOG_FORMAT_VERSION + 1, "newer"],
   ] as const)(
     "refuses layout version %s without modifying its artifacts",

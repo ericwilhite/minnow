@@ -1,4 +1,9 @@
 import {
+  validateAutoIncrementReservation,
+  validateBeginTransactionInput,
+  assertGenericTransactionUpdateAllowed,
+} from "./toolkit/transaction-rules.js";
+import {
   type AbortTransactionIfExpiredInput,
   type AdoptAbortedSegmentInput,
   type BeginTransactionInput,
@@ -2337,7 +2342,7 @@ export class IndexedDbBlockStore implements BlockStore {
           Date.parse(existing.updatedAt),
         )))
     ) {
-      throw new Error(`Postings base build is owned by another caller: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "owned by another caller");
     }
     const transaction = this.#transaction("catalog", "readwrite");
     const store = transaction.objectStore("catalog");
@@ -2347,7 +2352,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "index is no longer active");
     }
     const ownerKind = Object.values(table.secondaryIndexes ?? {}).some(
       (index) => index.storageColumnId === columnId,
@@ -2371,7 +2376,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if ((await requestResult(store.getKey(markerKey))) !== undefined) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Full-text base build changed: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "another live build exists");
     }
     store.put(
       {
@@ -2446,7 +2451,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if (marker.cleanupIndex !== 0) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new Error(`Full-text base build changed: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "another live build exists");
     }
     const chunkKey = `${ftsBaseChunkPrefix(tableId, columnId, buildId)}${String(ordinal).padStart(6, "0")}`;
     if (ordinal < marker.boundaries.length) {
@@ -2586,10 +2591,15 @@ export class IndexedDbBlockStore implements BlockStore {
     if (
       marker?.buildId !== buildId ||
       marker.ownerId !== input.ownerId ||
-      Date.parse(marker.expiresAt) <= Date.parse(input.expiresAtCutoff) ||
-      marker.cleanupIndex !== 0 ||
-      marker.boundaries.length !== input.chunkCount
+      Date.parse(marker.expiresAt) <= Date.parse(input.expiresAtCutoff)
     ) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "ownership is absent or expired");
+    }
+    // Ownership loss is a stale builder; incomplete chunks under the same live owner are a
+    // genuine failure and must not be classified as harmless contention.
+    if (marker.cleanupIndex !== 0 || marker.boundaries.length !== input.chunkCount) {
       transaction.abort();
       await ignoreAbort(transaction);
       throw new Error(`Full-text base build is incomplete: ${buildId}`);
@@ -2654,9 +2664,10 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     await transactionDone(probe);
     if (marker === undefined) return;
-    if (marker.buildId !== buildId) throw new Error(`Postings base build changed: ${buildId}`);
+    if (marker.buildId !== buildId)
+      throw new PostingBuildConflictError(buildId, input.ownerId, "Postings base build changed");
     if (marker.ownerId !== input.ownerId && Date.parse(marker.expiresAt) > Date.parse(cutoff)) {
-      throw new Error(`Postings base build is owned by another caller: ${buildId}`);
+      throw new PostingBuildConflictError(buildId, input.ownerId, "owned by another caller");
     }
     await this.#deleteFtsBaseBuildFully(tableId, columnId, buildId, Date.parse(marker.updatedAt));
   }
@@ -3572,17 +3583,7 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   async beginTransaction(input: BeginTransactionInput): Promise<BeginTransactionResult> {
-    if (input.record.pendingBlockIds.length > 0 || input.record.pendingSegmentIds.length > 0) {
-      throw new TypeError("A fresh transaction cannot begin with pending artifacts");
-    }
-    if (
-      input.record.pendingTable !== undefined ||
-      input.record.pendingTableNextRowId !== undefined ||
-      input.record.catalogEpochGuard !== undefined ||
-      (input.record as TransactionRecord).schemaEpochGuard !== undefined
-    ) {
-      throw new TypeError("Storage-owned transaction state cannot be supplied at begin");
-    }
+    validateBeginTransactionInput(input);
     const pending =
       input.pendingTable === undefined
         ? undefined
@@ -14999,21 +15000,6 @@ function isTerminalCompactionJob(record: CompactionJobRecord): boolean {
   return record.state === "published" || record.state === "cancelled" || record.state === "aborted";
 }
 
-function assertGenericTransactionUpdateAllowed(
-  record: Pick<TransactionRecord, "status">,
-  update: TransactionRecordUpdate,
-): void {
-  if (record.status !== "active") {
-    throw new TypeError(`Only active transactions can be updated; found ${record.status}`);
-  }
-  if (update.status === "committed") {
-    throw new TypeError("Use commitTransaction to commit a transaction");
-  }
-  if (Reflect.has(update, "committedVersion")) {
-    throw new TypeError("Only commitTransaction can set a committed transaction version");
-  }
-}
-
 /**
  * Validates only the given candidate set, not a job's full accumulated history. A resumed,
  * multi-page planning job re-adds nothing for candidates already appended on earlier pages, so
@@ -15667,7 +15653,11 @@ function assertLivePostingBuildOwner(
     marker.ownerId !== input.ownerId ||
     Date.parse(marker.expiresAt) <= Date.parse(input.expiresAtCutoff)
   ) {
-    throw new Error(`Postings base build ownership is absent or expired: ${input.buildId}`);
+    throw new PostingBuildConflictError(
+      input.buildId,
+      input.ownerId,
+      "ownership is absent or expired",
+    );
   }
 }
 
@@ -16133,21 +16123,6 @@ async function deleteFtsColumnRecords(
   store.delete(tocKey);
   store.delete(deltaIndexKey);
   store.delete(markerKey);
-}
-
-function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new RangeError("Auto-increment reservation count must be a non-negative whole number");
-  }
-  if (atLeast !== undefined && typeof atLeast !== "bigint") {
-    throw new TypeError("Auto-increment bump target must be a bigint");
-  }
-  if (atLeast !== undefined && atLeast < 1n) {
-    throw new RangeError("Auto-increment bump target must be at least 1");
-  }
-  if (atLeast !== undefined && atLeast > MAX_AUTO_INCREMENT_EXCLUSIVE_END) {
-    throw new RangeError("Auto-increment bump target is outside the safe integer range");
-  }
 }
 
 function assertCounterEndInRange(endExclusive: bigint, maximum: bigint, label: string): void {

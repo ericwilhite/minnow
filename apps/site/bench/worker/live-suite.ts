@@ -1,3 +1,4 @@
+import { suiteCoverage, supportsLiveQueries } from "./support";
 /**
  * The live-query suite: N subscriptions registered through the engine's main-thread client, one
  * commit, and the time until every affected subscription has been told — through the client,
@@ -38,6 +39,7 @@ import {
   progress,
   summarizeSamples,
   validateDatasetSuitePayload,
+  withBenchmarkCleanup,
 } from "./support";
 
 /** Commits per case; each is one inserted row and one timed notification round. */
@@ -88,59 +90,73 @@ export async function runLiveSuite(
   const record = await getDataset(payload.datasetId);
   const definitions = liveCaseDefinitions();
   const sessions = new Map<EngineId, LiveSession | Error>();
+
   for (const engine of payload.engines) {
+    if (!supportsLiveQueries(engine)) {
+      sessions.set(engine, new Error("This engine has no live-query layer"));
+      continue;
+    }
     try {
       requireMaterialization(record, engine);
       const driver = await loadDriver(engine);
-      if (driver.openLiveSession === undefined) {
-        throw new Error("This engine has no live-query layer");
-      }
+      if (driver.openLiveSession === undefined)
+        throw new Error("Expected live-query driver is missing");
       sessions.set(engine, await driver.openLiveSession(record));
     } catch (error) {
       sessions.set(engine, error instanceof Error ? error : new Error(String(error)));
     }
   }
-  // Fresh table names per run: minnow has no DROP TABLE, so a fixed name would collide with a
-  // previous run on the same dataset.
+  // Unique names isolate concurrent runs on the same dataset.
   const runToken = Math.random().toString(36).slice(2, 8);
   const totalSteps = definitions.length * payload.engines.length;
   let completed = 0;
   const cases: LiveCaseReport[] = [];
-  try {
-    for (const definition of definitions) {
-      const measurements: LiveEngineMeasurement[] = [];
-      for (const engine of payload.engines) {
-        assertNotCancelled(requestId);
-        progress(requestId, {
-          phase: "live",
-          completed,
-          total: totalSteps,
-          message: `${definition.name} · ${engine}`,
+  await withBenchmarkCleanup(
+    async () => {
+      for (const definition of definitions) {
+        const measurements: LiveEngineMeasurement[] = [];
+        for (const engine of payload.engines) {
+          assertNotCancelled(requestId);
+          progress(requestId, {
+            phase: "live",
+            completed,
+            total: totalSteps,
+            message: `${definition.name} · ${engine}`,
+          });
+          const session = sessions.get(engine);
+          measurements.push(
+            session === undefined || session instanceof Error
+              ? unsupported(
+                  engine,
+                  session instanceof Error ? session.message : "session unavailable",
+                )
+              : await measureLiveCase(session, definition, `${runToken}_${definition.id}`),
+          );
+          completed += 1;
+        }
+        cases.push({
+          id: definition.id,
+          name: definition.name,
+          subscriptions: definition.subscriptions,
+          affected: definition.affected,
+          engines: measurements,
         });
-        const session = sessions.get(engine);
-        measurements.push(
-          session === undefined || session instanceof Error
-            ? unsupported(
-                engine,
-                session instanceof Error ? session.message : "session unavailable",
-              )
-            : await measureLiveCase(session, definition, `${runToken}_${definition.id}`),
-        );
-        completed += 1;
       }
-      cases.push({
-        id: definition.id,
-        name: definition.name,
-        subscriptions: definition.subscriptions,
-        affected: definition.affected,
-        engines: measurements,
-      });
-    }
-  } finally {
-    for (const session of sessions.values()) {
-      if (!(session instanceof Error)) await session.close().catch(() => undefined);
-    }
-  }
+    },
+    async () => {
+      const failures: unknown[] = [];
+      for (const session of sessions.values()) {
+        if (session instanceof Error) continue;
+        try {
+          await session.close();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length > 0)
+        throw new AggregateError(failures, "Benchmark live session cleanup failed");
+    },
+  );
   const supportedByEngine: Partial<Record<EngineId, number>> = {};
   for (const engine of payload.engines) {
     supportedByEngine[engine] = cases
@@ -160,8 +176,11 @@ export async function runLiveSuite(
     engines: payload.engines,
     cases,
     supportedByEngine,
-    passed: cases.every((report) =>
-      report.engines.every((measurement) => !measurement.supported || measurement.verified),
+    ...suiteCoverage(
+      payload.engines,
+      definitions.map((definition) => definition.id),
+      cases,
+      supportsLiveQueries,
     ),
   };
 }
@@ -196,97 +215,126 @@ export async function measureLiveCase(
   const watched = `bl_${token}_w`;
   const quiet = `bl_${token}_q`;
   const handles: LiveSubscriptionHandle[] = [];
-  try {
-    await session.createTable(tableSchema(watched));
-    await session.createTable(tableSchema(quiet));
-    await session.insert(watched, batchFor(1, SEED_ROWS));
-    await session.insert(quiet, batchFor(1, 16));
-
-    // Each affected subscription counts the rows above its own threshold, so every commit of a
-    // new highest key changes every one of them and the row count each ends on is predictable.
-    // Unaffected ones ask the quiet table the same question and must never fire.
-    let armed = false;
-    let fired = 0;
-    let strayFired = 0;
-    const latest = new Array<number | null>(definition.affected).fill(null);
-    let settle: (() => void) | undefined;
-    const subscribeStarted = performance.now();
-    for (let index = 0; index < definition.subscriptions; index += 1) {
-      const affected = index < definition.affected;
-      const table = affected ? watched : quiet;
-      const sql = `SELECT COUNT(*) AS n FROM ${table} WHERE key_id > ${String(index)}`;
-      handles.push(
-        await session.subscribe(sql, (rows) => {
-          if (!armed) return;
-          if (!affected) {
-            strayFired += 1;
-            return;
-          }
-          latest[index] = numberOf(rows[0]?.n);
-          fired += 1;
-          if (fired === definition.affected) settle?.();
-        }),
-      );
-    }
-    const subscribeMs = performance.now() - subscribeStarted;
-    armed = true;
-
-    const samples: number[] = [];
-    let verified = true;
-    let notifications = 0;
-    for (let sample = 0; sample <= SAMPLE_COUNT; sample += 1) {
-      fired = 0;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const settled = new Promise<void>((resolve, reject) => {
-        settle = resolve;
-        timer = setTimeout(() => {
-          reject(
-            new Error(
-              `${String(definition.affected - fired)} of ${String(definition.affected)} subscriptions were not notified within ${String(timeoutMs)} ms`,
-            ),
-          );
-        }, timeoutMs);
-      });
-      const key = SEED_ROWS + sample + 1;
-      const started = performance.now();
-      await session.insert(watched, batchFor(key, 1));
+  const tables: string[] = [];
+  let executionFailure: { error: unknown } | undefined;
+  return withBenchmarkCleanup(
+    async () => {
       try {
-        await settled;
-      } finally {
-        clearTimeout(timer);
+        await session.createTable(tableSchema(watched));
+        tables.push(watched);
+        await session.createTable(tableSchema(quiet));
+        tables.push(quiet);
+        await session.insert(watched, batchFor(1, SEED_ROWS));
+        await session.insert(quiet, batchFor(1, 16));
+
+        // Each affected subscription counts the rows above its own threshold, so every commit of a
+        // new highest key changes every one of them and the row count each ends on is predictable.
+        // Unaffected ones ask the quiet table the same question and must never fire.
+        let armed = false;
+        let fired = 0;
+        let strayFired = 0;
+        const latest = new Array<number | null>(definition.affected).fill(null);
+        let settle: (() => void) | undefined;
+        const subscribeStarted = performance.now();
+        for (let index = 0; index < definition.subscriptions; index += 1) {
+          const affected = index < definition.affected;
+          const table = affected ? watched : quiet;
+          const sql = `SELECT COUNT(*) AS n FROM ${table} WHERE key_id > ${String(index)}`;
+          handles.push(
+            await session.subscribe(sql, (rows) => {
+              if (!armed) return;
+              if (!affected) {
+                strayFired += 1;
+                return;
+              }
+              latest[index] = numberOf(rows[0]?.n);
+              fired += 1;
+              if (fired === definition.affected) settle?.();
+            }),
+          );
+        }
+        const subscribeMs = performance.now() - subscribeStarted;
+        armed = true;
+
+        const samples: number[] = [];
+        let verified = true;
+        let notifications = 0;
+        for (let sample = 0; sample <= SAMPLE_COUNT; sample += 1) {
+          fired = 0;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const settled = new Promise<void>((resolve, reject) => {
+            settle = resolve;
+            timer = setTimeout(() => {
+              reject(
+                new Error(
+                  `${String(definition.affected - fired)} of ${String(definition.affected)} subscriptions were not notified within ${String(timeoutMs)} ms`,
+                ),
+              );
+            }, timeoutMs);
+          });
+          const key = SEED_ROWS + sample + 1;
+          const started = performance.now();
+          await session.insert(watched, batchFor(key, 1));
+          try {
+            await settled;
+          } finally {
+            clearTimeout(timer);
+          }
+          const elapsed = performance.now() - started;
+          // Every affected subscription must now count the rows above its threshold.
+          const rowsNow = key;
+          for (let index = 0; index < definition.affected; index += 1) {
+            if (latest[index] !== rowsNow - index) verified = false;
+          }
+          notifications = fired;
+          // The first commit warms the sweep and the channel; it is not a sample.
+          if (sample > 0) samples.push(elapsed);
+        }
+        // A notification for a subscription the commit could not affect is a defect too — the
+        // selective sweep is the thing being measured, and it is not allowed to be selective
+        // by accident. Give late events a tick to land before judging.
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+        if (strayFired > 0) verified = false;
+        const { medianMs, p95Ms } = summarizeSamples(samples);
+        return {
+          engine: session.engine,
+          supported: true,
+          subscribeMs,
+          medianMs,
+          p95Ms,
+          notifications,
+          verified: verified && notifications === definition.affected,
+        };
+      } catch (error) {
+        executionFailure = { error };
+        return unsupported(session.engine, error instanceof Error ? error.message : String(error));
       }
-      const elapsed = performance.now() - started;
-      // Every affected subscription must now count the rows above its threshold.
-      const rowsNow = key;
-      for (let index = 0; index < definition.affected; index += 1) {
-        if (latest[index] !== rowsNow - index) verified = false;
+    },
+    async () => {
+      const failures: unknown[] = [];
+      for (const handle of handles) {
+        try {
+          await handle.close();
+        } catch (error) {
+          failures.push(error);
+        }
       }
-      notifications = fired;
-      // The first commit warms the sweep and the channel; it is not a sample.
-      if (sample > 0) samples.push(elapsed);
-    }
-    // A notification for a subscription the commit could not affect is a defect too — the
-    // selective sweep is the thing being measured, and it is not allowed to be selective
-    // by accident. Give late events a tick to land before judging.
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
-    if (strayFired > 0) verified = false;
-    const { medianMs, p95Ms } = summarizeSamples(samples);
-    return {
-      engine: session.engine,
-      supported: true,
-      subscribeMs,
-      medianMs,
-      p95Ms,
-      notifications,
-      verified: verified && notifications === definition.affected,
-    };
-  } catch (error) {
-    return unsupported(session.engine, error instanceof Error ? error.message : String(error));
-  } finally {
-    for (const handle of handles) await handle.close().catch(() => undefined);
-  }
+      for (const table of tables) {
+        try {
+          await session.dropTable(table);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length > 0)
+        throw new AggregateError(
+          [...(executionFailure === undefined ? [] : [executionFailure.error]), ...failures],
+          "Benchmark live case cleanup failed",
+        );
+    },
+  );
 }
 
 function tableSchema(name: string): WriteTableSchema {

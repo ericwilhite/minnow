@@ -11,16 +11,17 @@
  * `close()` is deliberately not treated as a flush: a closed descriptor's dirty pages are still
  * only in the OS cache.
  */
-import type { MemoryOpfs } from "../../testing/opfs-shim.js";
+import type { MemoryOpfs, WriteFault } from "../../testing/opfs-shim.js";
 
 export class PowerLossModel {
   readonly #durable = new Map<string, Uint8Array>();
   readonly #touched = new Set<string>();
   readonly #shim: MemoryOpfs;
 
-  constructor(shim: MemoryOpfs) {
+  constructor(shim: MemoryOpfs, beforeOperation?: WriteFault) {
     this.#shim = shim;
     shim.setWriteFault((path, phase) => {
+      beforeOperation?.(path, phase);
       if (phase === "flush") {
         this.#durable.set(path, shim.readFileBytes(path) ?? new Uint8Array());
       } else {

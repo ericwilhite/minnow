@@ -4,7 +4,8 @@
  * suites keep exploring; these pin what they already caught.
  */
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { GarbageCollectionJobConflictError } from "../storage/types.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import {
   IndexedDbBlockStore,
@@ -34,6 +35,74 @@ function descendingIds(): () => string {
 }
 
 describe.each(stores)("simulator regressions over $name", ({ open }) => {
+  it("retries background collection when another collector finishes and removes its job", async () => {
+    // Chromium crash campaign seed 2654435807: a conflict was raised while the job still
+    // existed, but the winning collector removed it before the losing collector reread it.
+    const store = await open();
+    const errors: unknown[] = [];
+    let now = Date.parse("2026-09-24T00:00:00Z");
+    const runStep = store.runGarbageCollectionStep.bind(store);
+    const getJob = store.getGarbageCollectionJob.bind(store);
+    let raced = false;
+    let retired: string | undefined;
+    const step = vi.spyOn(store, "runGarbageCollectionStep").mockImplementation(async (input) => {
+      if (raced) return runStep(input);
+      raced = true;
+      // Complete the real persisted job on behalf of the other collector. Only completed
+      // records may be removed, so the test exercises the adapter's actual lifecycle.
+      let result = await runStep(input);
+      while (result.job.state !== "completed") {
+        result = await runStep({ ...input, expectedRevision: result.job.revision, maxItems: 1024 });
+      }
+      retired = input.jobId;
+      throw new GarbageCollectionJobConflictError(
+        input.jobId,
+        input.expectedRevision,
+        result.job.revision,
+      );
+    });
+    const read = vi.spyOn(store, "getGarbageCollectionJob").mockImplementation(async (id) => {
+      if (id === retired) {
+        retired = undefined;
+        await store.removeGarbageCollectionJob(id);
+      }
+      return getJob(id);
+    });
+    const database = new MinnowDatabase(store, {
+      autoCompact: false,
+      now: () => new Date(now),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+      await database.execute("INSERT INTO t VALUES (1)");
+      now += 120_000;
+      for (let id = 2; id <= 65; id += 1) await database.insert("t", { id });
+      await vi.waitFor(
+        () => {
+          expect(raced).toBe(true);
+          expect(database.maintenanceStatus()).toMatchObject({
+            collectionRunning: false,
+            collectionRequested: false,
+            consecutiveFailures: 0,
+            lastError: null,
+          });
+        },
+        { timeout: 10_000 },
+      );
+      expect(errors).toEqual([]);
+      await database.execute("INSERT INTO t VALUES (66)");
+      expect((await database.query("SELECT * FROM t ORDER BY id")).rows).toEqual(
+        Array.from({ length: 66 }, (_, index) => ({ id: index + 1 })),
+      );
+    } finally {
+      await database.close();
+      step.mockRestore();
+      read.mockRestore();
+      store.close();
+    }
+  });
+
   it("folds a transaction that wrote two segments to one table", async () => {
     // A SQL transaction holding a predicate DELETE and an INSERT on the same table commits two
     // segments with one logical order and one committed version. The merge planner ordered

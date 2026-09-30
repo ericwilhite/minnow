@@ -12,12 +12,12 @@ const store = await OpfsBlockStore.open({
 });
 ```
 
-| Option         | Default      | Effect                                                                             |
-| -------------- | ------------ | ---------------------------------------------------------------------------------- |
-| `name`         | —            | The database directory name. Two stores with the same name are the same database.  |
-| `durability`   | `"strict"`   | `"relaxed"` allows deferred final flushes for more write throughput.               |
-| `root`         | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                           |
-| `onDiagnostic` | —            | Hears background failures: a failed checkpoint or cleanup, an election that threw. |
+| Option         | Default      | Effect                                                                                                      |
+| -------------- | ------------ | ----------------------------------------------------------------------------------------------------------- |
+| `name`         | —            | The database directory name. Two stores with the same name are the same database.                           |
+| `durability`   | `"strict"`   | `"relaxed"` allows deferred final flushes for more write throughput.                                        |
+| `root`         | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                                                    |
+| `onDiagnostic` | —            | Hears background failures and acknowledgement flush failures. Without a hook, errors go to `console.error`. |
 
 The store lives in the [Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
 and is built around one especially fast browser feature: a synchronous access handle that stays
@@ -44,18 +44,19 @@ other store; see [choosing the store at runtime](/docs/engine/workers#choosing-t
 ## One leader, held handles
 
 At any moment, exactly one connection — the **leader** — holds the database's file handles: the
-write-ahead log, two checkpoint slots, and the packed data files. Leadership _is_ the log file's
+write-ahead log, its acknowledgement file, two checkpoint slots, and the packed data files. Leadership _is_ the log file's
 own exclusive handle, a lock the browser enforces against the actual resource and releases the
 instant its holder dies. There is no lease to time out and no election protocol to trust:
 becoming leader is opening the file, and failover is the next connection's open succeeding.
 
 The leader does every operation at held-handle speed. A commit validates in memory and appends
-one checksummed frame to the log — a synchronous write, microseconds. Reads answer from memory
+one checksummed frame to the log. In strict mode it also flushes a separate checksummed
+acknowledgement boundary before replying. Reads answer from memory
 and from synchronous reads of the data files. And because the leader is provably the only
 writer, it never checks anything for freshness — the per-operation probes and version checks
 other designs pay simply do not exist. That is why the store is fast: on the
 [benchmarks page](/benchmarks) both Minnow columns run the identical engine and workload, and
-OPFS's small operations run several times faster than IndexedDB's.
+the results show the cost of each store in the browser running them.
 
 Other tabs are **followers**: their operations travel a `BroadcastChannel` to the leader and are
 acknowledged only after the leader's log holds them. Requests and answers are addressed — an
@@ -156,15 +157,29 @@ Collection keeps every retained segment’s block references intact, including r
 Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
 automatically repair a store already affected by missing referenced blocks.
 
-Layout 6 is the locked native OPFS contract. Its checkpoint includes the structural `schemaEpoch`
-used to reject a staged write after incompatible DDL, and the served-request ledger described
-below. An unknown or pre-v1 layout marker is rejected without replaying or mutating its WAL,
-checkpoint, or extents; the adapter never guesses an old record shape forward, and there is no
-in-place upgrade from layout 5. `StorageFormatVersionError` reports the found and supported
-versions; it is not storage corruption and never triggers automatic repair or deletion. A newer
-marker means to use the build that wrote it. For unsupported development data, use a matching
-older build to export a framed snapshot, or delete it only after deciding that its data is
-disposable.
+Layout 7 is the current native OPFS contract. It adds a 48-byte acknowledgement file with two
+checksummed slots, alongside the structural `schemaEpoch` and served-request ledger. Recovery
+requires both slots to be intact and refuses a missing file, damaged slot, or WAL ending before
+its acknowledged boundary. A zero-filled acknowledged tail is corruption, never an empty store.
+An interrupted acknowledgement update can therefore prevent reopening; this trades availability
+for refusing an uncertain rollback. Keep snapshots for recovery from damaged storage.
+
+**Layout 6 upgrades automatically on open.** Minnow holds exclusive storage ownership, validates
+a temporary copy, flushes the existing payloads, and publishes current-format checkpoints and
+the acknowledgement file before resetting the old WAL. Interrupted publication resumes on the
+next open. A completion receipt prevents an old conversion record from overwriting later writes.
+Recovery also checks native history when the marker is missing or torn. Stale conversion records
+cannot override newer checkpoints or repair a damaged installation proof after resetting a
+nonempty old WAL.
+The temporary `upgrade-6-7/` tree is removed only after current recovery and full integrity
+validation; the small `upgrade-6-7-complete` receipt remains. Allow temporary quota for a native
+copy. No export/import or separate migration call is needed.
+
+Close older connections if they block exclusive ownership, then retry opening. Quota and I/O
+failures report errors and leave the upgrade retryable. Missing payloads, corrupt old checkpoints
+and ambiguous incomplete legacy WALs are refused; conversion cannot recreate acknowledgement
+evidence that layout 6 never stored. Unknown layouts still raise `StorageFormatVersionError`
+without replay, automatic repair or deletion. See [versioning](/docs/reference/versioning).
 
 Every extent placement records its offset, length, and a CRC over all stored bytes. The checksum
 belongs to the placement layer rather than a block codec, so recovery verifies column blocks,
@@ -187,8 +202,9 @@ checkpoint is written and flushed, and only then is the log reset. A crash at an
 leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
 slot and the un-reset log still holding everything. A power loss that persists a file's new length
 ahead of its bytes leaves a zero-filled tail where the unacknowledged frame was to go, or a slot
-whose magic landed ahead of its header; both are read as unwritten, never as corruption or as
-another format version. Opening the database is the recovery; there is no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
+whose magic landed ahead of its header. A zero-filled WAL suffix is accepted as unwritten only
+when it is beyond the independently recorded acknowledged boundary; missing acknowledged bytes
+stop recovery. An incomplete checkpoint can fall back to its intact mirror and WAL. Opening the database is the recovery; there is no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
 from the fully validated current layout. A recognized but unsupported envelope or checkpoint
 version stops before redundant-slot fallback and before any truncation or deletion.
 
@@ -209,10 +225,15 @@ were safe to delete. Such a database needs a known-good [snapshot](/docs/storage
 
 ## Durability
 
-`strict`, the default, flushes each payload before flushing the WAL frame that publishes it, and
-does both before the operation resolves. A missing or corrupt durable payload is reported as
+`strict`, the default, flushes each payload, the WAL frame that publishes it, and the separate
+acknowledgement boundary before the operation resolves. A missing or corrupt durable payload is reported as
 storage corruption rather than silently rolled back. Use this mode whenever losing an acknowledged
 write is unacceptable.
+
+An acknowledgement flush failure is reported through `onDiagnostic` (or `console.error`) and
+returns `OpfsUncertainOutcomeError` to low-level callers. The WAL may already contain the mutation;
+the engine reconciles its transaction before deciding whether it can return success. Never retry
+an uncertain mutation blindly. A throwing diagnostic hook is contained and its error is logged.
 
 `relaxed` completes the payload and WAL writes before acknowledging, but lets the operating
 system schedule their final flush. A tab, worker, or browser-process failure normally recovers

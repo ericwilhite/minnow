@@ -124,7 +124,7 @@ machines: https://minnowdb.com/llms.txt
   batch write, SQL mutation, `BEGIN` transaction, migration, and DDL statement takes its turn
   before reading anything and holds it until its outcome is known. Issue concurrent writes
   freely from any number of tabs; do not add an application queue, a serializer, or a
-  contention-retry loop, and do not pass `coordinateWrites` (deprecated, ignored). Use the
+  contention-retry loop, and do not pass `coordinateWrites` (removed in 0.12.0). Use the
   supplied `tx` for writes inside a callback; another write on the same database awaited from
   inside the callback waits on the callback itself and is reported through `onBackgroundError`
   after ten seconds. Keep network requests outside scopes. Callbacks are never replayed.
@@ -256,6 +256,11 @@ machines: https://minnowdb.com/llms.txt
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
+- Supported stored-format upgrades run automatically through ordinary open/load, including
+  OPFS layout 6 to 7. Do not add a required export/import step. Every format change needs frozen
+  older-writer fixtures and data-preservation, continued-write/reopen, interruption/power-loss,
+  corruption-refusal, concurrent-open and older-writer-barrier tests. Close older connections
+  if they block an upgrade; quota/I/O failures must report an error and remain retryable.
 - OPFS coordination exhaustion and queue overload throw `OpfsCoordinationError` from
   `@minnowdb/core`; `instanceof` survives worker RPC. Retry boot/migrate with bounded backoff;
   never delete a database merely because migration rejected. Established live queries retain

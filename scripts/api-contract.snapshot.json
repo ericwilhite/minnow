@@ -628,7 +628,7 @@
               "name": "MaintenanceStatus",
               "kind": "type",
               "declarations": [
-                "export interface MaintenanceStatus {\n    readonly autoCollectionEnabled: boolean;\n    readonly collectionRunning: boolean;\n    readonly collectionRequested: boolean;\n    readonly pendingCommitDebt: number;\n    readonly consecutiveFailures: number;\n    readonly postingDeltaTailMarkers: number;\n    readonly retainedPlanEntries: number;\n    readonly retainedStatementEntries: number;\n    readonly lastStartedAt: Date | null;\n    readonly lastCompletedAt: Date | null;\n    readonly nextRetryAt: Date | null;\n    readonly lastError: {\n        readonly name: string;\n        readonly message: string;\n        readonly at: Date;\n    } | null;\n}"
+                "export interface MaintenanceStatus {\n    readonly backgroundFailureCount: number;\n    readonly backgroundErrors: ReadonlyArray<{\n        readonly sequence: number;\n        readonly context: string;\n        readonly name: string;\n        readonly message: string;\n        readonly at: Date;\n    }>;\n    readonly autoCollectionEnabled: boolean;\n    readonly collectionRunning: boolean;\n    readonly collectionRequested: boolean;\n    readonly pendingCommitDebt: number;\n    readonly consecutiveFailures: number;\n    readonly postingDeltaTailMarkers: number;\n    readonly retainedPlanEntries: number;\n    readonly retainedStatementEntries: number;\n    readonly lastStartedAt: Date | null;\n    readonly lastCompletedAt: Date | null;\n    readonly nextRetryAt: Date | null;\n    readonly lastError: {\n        readonly name: string;\n        readonly message: string;\n        readonly at: Date;\n    } | null;\n}"
               ]
             },
             {
@@ -789,7 +789,7 @@
               "name": "MinnowDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    coordinateWrites?: boolean;\n    now?: () => Date;\n    createId?: () => string;\n    onBackgroundError?: (error: unknown, context: string) => void;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
+                "export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    compression?: Compression;\n    targetBlockBytes?: number;\n    rowsPerBlock?: number;\n    maxCommitRetries?: number;\n    now?: () => Date;\n    createId?: () => string;\n    onBackgroundError?: (error: unknown, context: string) => void;\n    spillOwnerLeaseMs?: number;\n    transactionOwnerLeaseMs?: number;\n    transactionIdleTimeoutMs?: number;\n    bufferPoolBytes?: number;\n    executionMemoryBudgetBytes?: number | null;\n    ftsAutoIndexRows?: number;\n    autoCompact?: boolean;\n    autoCollect?: boolean;\n    autoCollectDebtLimitCommits?: number;\n    compaction?: {\n        partitionRows?: number;\n    };\n}"
               ]
             },
             {
@@ -831,7 +831,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string, options?: ErrorOptions);\n}"
               ]
             },
             {
@@ -2088,7 +2088,7 @@
               "name": "Expression",
               "kind": "type",
               "declarations": [
-                "export type Expression = {\n    kind: \"literal\";\n    value: QueryValue;\n    internalSqlValue?: true;\n    sqlDomain?: SqlDomain;\n    exactText?: string;\n    decimal?: true;\n} | {\n    kind: \"parameter\";\n    index: number;\n} | {\n    kind: \"column\";\n    reference: string;\n} | {\n    kind: \"wildcard\";\n    table?: string;\n} | {\n    kind: \"binary\";\n    operator: BinaryOperator;\n    left: Expression;\n    right: Expression;\n    integer?: true;\n} | {\n    kind: \"call\";\n    name: AggregateName | ScalarFunctionName;\n    arguments: Expression[];\n    distinct?: boolean;\n    aggregateOrderBy?: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    avgArgumentScale?: number;\n} | {\n    kind: \"list\";\n    items: Expression[];\n} | {\n    kind: \"subquery\";\n    block: CompiledQuery;\n} | {\n    kind: \"condition\";\n    operator: PredicateOperator;\n    left: Expression;\n    right: Expression;\n    escape?: string;\n} | {\n    kind: \"logical\";\n    operator: \"and\" | \"or\";\n    left: Expression;\n    right: Expression;\n} | {\n    kind: \"not\";\n    operand: Expression;\n} | {\n    kind: \"exists\";\n    block: CompiledQuery;\n    negated: boolean;\n} | {\n    kind: \"case\";\n    branches: Array<{\n        when: Expression;\n        then: Expression;\n    }>;\n    otherwise?: Expression;\n} | {\n    kind: \"window\";\n    name: WindowFunctionName;\n    partitionBy: Expression[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    argument?: Expression;\n    offset?: number;\n    fallback?: QueryValue;\n    frame?: WindowFrame;\n} | {\n    kind: \"fts\";\n    op: \"match\" | \"bm25\";\n    columns: Expression[] | \"*\";\n    query: string;\n    queryParameter?: number;\n    stats?: FtsStats;\n};"
+                "export type Expression = {\n    kind: \"literal\";\n    value: QueryValue;\n    internalSqlValue?: true;\n    sqlDomain?: SqlDomain;\n    exactText?: string;\n    decimal?: true;\n} | {\n    kind: \"parameter\";\n    index: number;\n} | {\n    kind: \"column\";\n    reference: string;\n} | {\n    kind: \"wildcard\";\n    table?: string;\n} | {\n    kind: \"binary\";\n    operator: BinaryOperator;\n    left: Expression;\n    right: Expression;\n    integer?: true;\n} | {\n    kind: \"call\";\n    name: AggregateName | ScalarFunctionName;\n    arguments: Expression[];\n    distinct?: boolean;\n    aggregateOrderBy?: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    avgArgumentScale?: number;\n    argumentDisplayScales?: Array<number | null>;\n} | {\n    kind: \"list\";\n    items: Expression[];\n} | {\n    kind: \"subquery\";\n    block: CompiledQuery;\n} | {\n    kind: \"condition\";\n    operator: PredicateOperator;\n    left: Expression;\n    right: Expression;\n    escape?: string;\n} | {\n    kind: \"logical\";\n    operator: \"and\" | \"or\";\n    left: Expression;\n    right: Expression;\n} | {\n    kind: \"not\";\n    operand: Expression;\n} | {\n    kind: \"exists\";\n    block: CompiledQuery;\n    negated: boolean;\n} | {\n    kind: \"case\";\n    branches: Array<{\n        when: Expression;\n        then: Expression;\n    }>;\n    otherwise?: Expression;\n} | {\n    kind: \"window\";\n    name: WindowFunctionName;\n    partitionBy: Expression[];\n    orderBy: Array<{\n        expression: Expression;\n        direction: \"asc\" | \"desc\";\n        nulls?: \"first\" | \"last\";\n    }>;\n    argument?: Expression;\n    offset?: number;\n    fallback?: QueryValue;\n    frame?: WindowFrame;\n} | {\n    kind: \"fts\";\n    op: \"match\" | \"bm25\";\n    columns: Expression[] | \"*\";\n    query: string;\n    queryParameter?: number;\n    stats?: FtsStats;\n};"
               ]
             },
             {
@@ -4340,7 +4340,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string, options?: ErrorOptions);\n}"
               ]
             },
             {
@@ -6684,7 +6684,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string, options?: ErrorOptions);\n}"
               ]
             },
             {
@@ -7571,7 +7571,7 @@
               "name": "OpfsUncertainOutcomeError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string);\n}"
+                "export declare class OpfsUncertainOutcomeError extends UnknownOutcomeError {\n    readonly method: string;\n    readonly name = \"OpfsUncertainOutcomeError\";\n    constructor(method: string, options?: ErrorOptions);\n}"
               ]
             },
             {
@@ -7876,14 +7876,14 @@
               "name": "iterateWalFrames",
               "kind": "value",
               "declarations": [
-                "export declare function iterateWalFrames(handle: SyncFileHandle): Generator<ReplayedWalFrame>;"
+                "export declare function iterateWalFrames(handle: SyncFileHandle, acknowledgedEndOffset?: number): Generator<ReplayedWalFrame>;"
               ]
             },
             {
               "name": "LOG_FORMAT_VERSION",
               "kind": "value",
               "declarations": [
-                "LOG_FORMAT_VERSION = 6"
+                "LOG_FORMAT_VERSION = 7"
               ]
             },
             {
@@ -8739,7 +8739,7 @@
               "name": "WireDatabaseOptions",
               "kind": "type",
               "declarations": [
-                "export type WireDatabaseOptions = Pick<MinnowDatabaseOptions, \"compression\" | \"targetBlockBytes\" | \"rowsPerBlock\" | \"maxCommitRetries\" | \"coordinateWrites\" | \"spillOwnerLeaseMs\" | \"transactionOwnerLeaseMs\" | \"transactionIdleTimeoutMs\" | \"bufferPoolBytes\" | \"executionMemoryBudgetBytes\" | \"autoCollectDebtLimitCommits\" | \"autoCollect\" | \"autoCompact\">;"
+                "export type WireDatabaseOptions = Pick<MinnowDatabaseOptions, \"compression\" | \"targetBlockBytes\" | \"rowsPerBlock\" | \"maxCommitRetries\" | \"spillOwnerLeaseMs\" | \"transactionOwnerLeaseMs\" | \"transactionIdleTimeoutMs\" | \"bufferPoolBytes\" | \"executionMemoryBudgetBytes\" | \"autoCollectDebtLimitCommits\" | \"autoCollect\" | \"autoCompact\">;"
               ]
             },
             {

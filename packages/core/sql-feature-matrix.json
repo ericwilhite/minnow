@@ -22,7 +22,7 @@
       "id": "select.distinct-on",
       "status": "supported",
       "example": "SELECT DISTINCT ON (region) region, amount FROM rows ORDER BY region, amount DESC",
-      "notes": "PostgreSQL's DISTINCT ON (expressions) keeps the first row of each group in ORDER BY order. It lowers to ROW_NUMBER() OVER (PARTITION BY expressions ORDER BY …) = 1 over the block, so ORDER BY may name output aliases and columns the select list omits, and LIMIT and OFFSET apply to the kept rows."
+      "notes": "PostgreSQL's DISTINCT ON (expressions) keeps the first row of each group in ORDER BY order. It lowers to ROW_NUMBER() OVER (PARTITION BY expressions ORDER BY \u2026) = 1 over the block, so ORDER BY may name output aliases and columns the select list omits, and LIMIT and OFFSET apply to the kept rows."
     },
     {
       "id": "select.locking-clause",
@@ -40,7 +40,7 @@
       "id": "literal.string-spellings",
       "status": "supported",
       "example": "SELECT E'tab\\\\there' AS escaped, $$dollar 'quoted'$$ AS plain, 5. AS five, .5 AS half FROM rows",
-      "notes": "E'…' strings take C-style backslash escapes (\\\\n, \\\\t, \\\\xHH, \\\\uHHHH, octal), $tag$…$tag$ strings are taken verbatim, and 5. and .5 spell 5.0 and 0.5, as in PostgreSQL."
+      "notes": "E'\u2026' strings take C-style backslash escapes (\\\\n, \\\\t, \\\\xHH, \\\\uHHHH, octal), $tag$\u2026$tag$ strings are taken verbatim, and 5. and .5 spell 5.0 and 0.5, as in PostgreSQL."
     },
     {
       "id": "predicate.like-operators",
@@ -321,13 +321,13 @@
       "id": "mutation.update-from",
       "status": "supported",
       "example": "UPDATE keyed SET score = r.amount FROM (SELECT 'x' AS name, 5 AS amount) r WHERE r.name = keyed.name",
-      "notes": "UPDATE … FROM joins extra sources — tables, views, or derived tables — to the target as PostgreSQL does; the assignments and predicates may read them. A target row matched by several source rows is updated once, from its first match."
+      "notes": "UPDATE \u2026 FROM joins extra sources \u2014 tables, views, or derived tables \u2014 to the target as PostgreSQL does; the assignments and predicates may read them. A target row matched by several source rows is updated once, from its first match."
     },
     {
       "id": "mutation.delete-using",
       "status": "supported",
       "example": "DELETE FROM keyed USING (SELECT 'y' AS name) gone WHERE gone.name = keyed.name",
-      "notes": "DELETE … USING joins extra sources to the target as PostgreSQL does; a target row matched by several source rows is deleted once."
+      "notes": "DELETE \u2026 USING joins extra sources to the target as PostgreSQL does; a target row matched by several source rows is deleted once."
     },
     {
       "id": "mutation.truncate",
@@ -439,7 +439,7 @@
       "id": "function.regexp-substring",
       "status": "supported",
       "example": "SELECT SUBSTRING(region FROM '(e.)') AS part, SUBSTRING(region FROM 2 FOR 2) AS middle, TO_HEX(255) AS hex, QUOTE_LITERAL(region) AS quoted, QUOTE_IDENT('Mixed Name') AS ident FROM rows",
-      "notes": "SUBSTRING(text FROM 'pattern') is PostgreSQL's POSIX-regex form: the first match, or its first parenthesized group; a number after FROM is the ordinary start position. TO_HEX renders an integer in hexadecimal; QUOTE_LITERAL and QUOTE_IDENT quote a value or a name for use in SQL text."
+      "notes": "SUBSTRING(text FROM 'pattern') is PostgreSQL's POSIX-regex form: the first match, or its first parenthesized group; a number after FROM is the ordinary start position. TO_HEX renders an integer in hexadecimal; QUOTE_LITERAL and QUOTE_IDENT quote a value or a name for use in SQL text. Matching is leftmost-longest and bounded; the regex operator profile lists unsupported syntax."
     },
     {
       "id": "order-by.expression",
@@ -823,7 +823,7 @@
       "id": "expression.integer-division",
       "status": "supported",
       "example": "SELECT 7 / 2 AS quotient, -7 / 2 AS negative, 7.0 / 2 AS exact, CAST(amount AS INTEGER) / 2 AS half FROM rows",
-      "notes": "Division follows PostgreSQL's typing. Two integer operands — INTEGER, BIGINT, or SMALLINT columns, integer constants, COUNT, integer CASTs, and integer arithmetic or aggregates over them — divide as integers, truncating toward zero: 7 / 2 is 3 and -7 / 2 is -3. A double, NUMERIC, or decimal constant operand makes the quotient fractional: 7.0 / 2 is 3.5. A bound parameter takes the type of its integer partner, so id / $1 truncates when $1 is bound to an integer."
+      "notes": "Division follows PostgreSQL's typing. Two integer operands \u2014 INTEGER, BIGINT, or SMALLINT columns, integer constants, COUNT, integer CASTs, and integer arithmetic or aggregates over them \u2014 divide as integers, truncating toward zero: 7 / 2 is 3 and -7 / 2 is -3. A double, NUMERIC, or decimal constant operand makes the quotient fractional: 7.0 / 2 is 3.5. A bound parameter takes the type of its integer partner, so id / $1 truncates when $1 is bound to an integer."
     },
     {
       "id": "expression.untyped-arithmetic",
@@ -899,7 +899,7 @@
       "id": "function.extract",
       "status": "supported",
       "example": "SELECT EXTRACT(year FROM joined) AS y, EXTRACT(dow FROM joined) AS d FROM rows WHERE joined IS NOT NULL",
-      "notes": "Fields: year, quarter, month, week (ISO), day, hour, minute, second, epoch, dow — all in UTC. SQLite spells this strftime."
+      "notes": "Fields: year, quarter, month, week (ISO), day, hour, minute, second, epoch, dow \u2014 all in UTC. SQLite spells this strftime."
     },
     {
       "id": "aggregate.distinct-argument",
@@ -953,7 +953,7 @@
       "status": "supported",
       "setup": ["INSERT INTO keyed (name, score, bonus) VALUES ('z', 5, NULL)"],
       "example": "MERGE INTO keyed k USING (SELECT 'z' AS name, 9 AS score) s ON k.name = s.name WHEN MATCHED THEN UPDATE SET score = s.score WHEN NOT MATCHED THEN INSERT (name, score) VALUES (s.name, s.score)",
-      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope — atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed. Matching PostgreSQL, two source rows cannot act on one target row. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
+      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope \u2014 atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed. Matching PostgreSQL, two source rows cannot act on one target row. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
     },
     {
       "id": "transaction.begin",
@@ -979,13 +979,13 @@
       "id": "transaction.session-settings",
       "status": "supported",
       "example": "SET search_path TO public",
-      "notes": "SET [SESSION | LOCAL] name TO value, SET TRANSACTION …, and RESET name are accepted and ignored: an embedded single-session engine has no search path, timeouts, encodings, or isolation levels to configure, and drivers and migration tools issue these on every connection. SET TIME ZONE accepts only UTC, because every datetime is an instant in UTC; another zone is refused rather than silently ignored."
+      "notes": "SET [SESSION | LOCAL] name TO value, SET TRANSACTION \u2026, and RESET name are accepted and ignored: an embedded single-session engine has no search path, timeouts, encodings, or isolation levels to configure, and drivers and migration tools issue these on every connection. SET TIME ZONE accepts only UTC, because every datetime is an instant in UTC; another zone is refused rather than silently ignored."
     },
     {
       "id": "transaction.show-setting",
       "status": "supported",
       "example": "SHOW server_version",
-      "notes": "SHOW returns the engine's fixed answer for the settings drivers and tools read on connection — search_path, server_version, timezone, transaction_isolation, client_encoding, and the like — as one row. An unknown setting is an error, as in PostgreSQL."
+      "notes": "SHOW returns the engine's fixed answer for the settings drivers and tools read on connection \u2014 search_path, server_version, timezone, transaction_isolation, client_encoding, and the like \u2014 as one row. An unknown setting is an error, as in PostgreSQL."
     },
     {
       "id": "transaction.commit",
@@ -1107,7 +1107,7 @@
       "id": "join.natural",
       "status": "supported",
       "example": "SELECT rows.amount AS amount FROM rows NATURAL JOIN dims",
-      "notes": "The shared columns are compared but not merged, so an unqualified reference to one is ambiguous — qualify it. NATURAL RIGHT JOIN is rejected, because the right-join mirror rewrites the sources the shared-column search reads."
+      "notes": "The shared columns are compared but not merged, so an unqualified reference to one is ambiguous \u2014 qualify it. NATURAL RIGHT JOIN is rejected, because the right-join mirror rewrites the sources the shared-column search reads."
     },
     {
       "id": "join.full-compound-on",
@@ -1130,7 +1130,7 @@
       "id": "datetime.localtime",
       "status": "supported",
       "example": "SELECT LOCALTIME IS NOT NULL AS ticking",
-      "notes": "LOCALTIME reads as an 'HH:MM:SS' string of the current UTC time, like SQLite's CURRENT_TIME — Minnow has no session time zone, where PostgreSQL renders the session-local wall clock."
+      "notes": "LOCALTIME reads as an 'HH:MM:SS' string of the current UTC time, like SQLite's CURRENT_TIME \u2014 Minnow has no session time zone, where PostgreSQL renders the session-local wall clock."
     },
     {
       "id": "predicate.row-comparison",
@@ -1161,7 +1161,7 @@
       "id": "literal.exact-decimal",
       "status": "supported",
       "example": "SELECT 1.000000000000000000000000 / 3 = CAST('0.333333333333333333333333' AS NUMERIC) AS exact_thirds",
-      "notes": "Decimal constants keep their exact digits, as PostgreSQL's NUMERIC typing does. Arithmetic among constants is exact — 0.1 + 0.2 is 0.3 — and a quotient's scale follows the operands' written scales. A result that reads back identically from a JavaScript number is returned as a number; one the number boundary would visibly round is returned as an exact decimal string."
+      "notes": "Decimal constants keep their exact digits, as PostgreSQL's NUMERIC typing does. Arithmetic among constants is exact \u2014 0.1 + 0.2 is 0.3 \u2014 and a quotient's scale follows the operands' written scales. A result that reads back identically from a JavaScript number is returned as a number; one the number boundary would visibly round is returned as an exact decimal string."
     },
     {
       "id": "literal.big-integer",
@@ -1263,7 +1263,7 @@
       "id": "json.row-reference",
       "status": "supported",
       "example": "SELECT r.region, JSON_AGG(r ORDER BY r.amount) AS rows_doc, JSON_AGG(ROW_TO_JSON(r) ORDER BY r.amount) AS row_docs FROM (SELECT region, amount FROM rows) r GROUP BY r.region",
-      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it — the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as ISO 8601 with a Z suffix."
+      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it \u2014 the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as ISO 8601 with a Z suffix."
     },
     {
       "id": "json.value",
@@ -1468,7 +1468,7 @@
       "setup": ["BEGIN"],
       "example": "CREATE TABLE inside (id INTEGER PRIMARY KEY)",
       "error": "CREATE TABLE is not allowed inside a transaction",
-      "notes": "Schema statements are refused inside BEGIN … COMMIT: the catalog commits outside the scope, so a rollback could not take them back. Run DDL outside a transaction; migration tools that wrap migrations in one need that step split out."
+      "notes": "Schema statements are refused inside BEGIN \u2026 COMMIT: the catalog commits outside the scope, so a rollback could not take them back. Run DDL outside a transaction; migration tools that wrap migrations in one need that step split out."
     },
     {
       "id": "transaction.lock-table",
@@ -1644,7 +1644,7 @@
       "status": "unsupported",
       "example": "SELECT region FROM rows WHERE amount = ANY(ARRAY[1, 2])",
       "error": "ANY/ALL take a subquery",
-      "notes": "= ANY(array) is not supported; use IN (…) with a list or a subquery."
+      "notes": "= ANY(array) is not supported; use IN (\u2026) with a list or a subquery."
     },
     {
       "id": "ddl.sequence",
@@ -1657,7 +1657,7 @@
       "status": "supported",
       "setup": ["CREATE TABLE doomed (a INTEGER)"],
       "example": "DROP TABLE doomed",
-      "notes": "Takes the table's rows, catalog record, full-text index, and triggers. The blocks are retired through the commit rather than deleted, so a reader pinned to an older version keeps resolving them and the lease-aware collector reclaims them later. Refused while a view reads the table or another table's trigger writes to it — both would be left pointing at something that is not there. DROP TABLE CASCADE is refused too: nothing cascades, because there are no dependent objects to reach."
+      "notes": "Takes the table's rows, catalog record, full-text index, and triggers. The blocks are retired through the commit rather than deleted, so a reader pinned to an older version keeps resolving them and the lease-aware collector reclaims them later. Refused while a view reads the table or another table's trigger writes to it \u2014 both would be left pointing at something that is not there. DROP TABLE CASCADE is refused too: nothing cascades, because there are no dependent objects to reach."
     },
     {
       "id": "ddl.create-view",
@@ -1675,7 +1675,7 @@
       "id": "ddl.check-constraint",
       "status": "supported",
       "example": "CREATE TABLE checked (a INTEGER NOT NULL CHECK (a > 0), CONSTRAINT small CHECK (a < 100))",
-      "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row — insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
+      "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row \u2014 insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
     },
     {
       "id": "expression.cast-postfix",
@@ -1717,19 +1717,19 @@
       "id": "function.md5-format",
       "status": "supported",
       "example": "SELECT MD5(region) AS digest, FORMAT('%s has %s items (%I, %L)', region, amount, 'a b', 'it''s') AS message FROM rows WHERE region IS NOT NULL",
-      "notes": "MD5 hashes the UTF-8 bytes to 32 lowercase hex digits. FORMAT supports %s, %I (quoted identifier), %L (quoted literal), %% and positional %n$s; other conversion letters are rejected."
+      "notes": "MD5 hashes the UTF-8 bytes to 32 lowercase hex digits. FORMAT supports %s, %I (quoted identifier), %L (quoted literal), %% and positional %n$s; other conversion letters are rejected. Positional arguments advance the next implicit argument position. Missing arguments, malformed directives, and width/alignment directives throw."
     },
     {
       "id": "predicate.regex",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region ~ '^w' AND region !~* 'EAST$' AND region ~* 'W.ST'",
-      "notes": "PostgreSQL's ~, ~*, !~, and !~* run as JavaScript regular expressions, which agree with advanced regular expressions on everyday syntax. They sit at PostgreSQL's operator level, so `label ~ 'a' || 'b'` matches against the concatenation."
+      "notes": "PostgreSQL's ~, ~*, !~, and !~* use a bounded interpreter with leftmost-longest matching. Grouping, alternation, greedy repetition, anchors, and ASCII POSIX character classes are supported; locale-dependent non-ASCII class membership differs. Pattern backreferences, lookaround, inline flags, and non-greedy quantifiers are refused. Pattern matching is subject to the SQL work and state limits. Operator precedence matches PostgreSQL."
     },
     {
       "id": "function.regexp-replace",
       "status": "supported",
       "example": "SELECT REGEXP_REPLACE(region, 'e+', 'E') AS first, REGEXP_REPLACE(region, '[aeiou]', '_', 'g') AS all_vowels, REGEXP_REPLACE('abc', '(a)(b)', '\\2\\1') AS swapped FROM rows WHERE region IS NOT NULL",
-      "notes": "Flags g (every match), i (case-insensitive), and n (newline-sensitive); \\1 back-references and \\& in the replacement follow PostgreSQL."
+      "notes": "Flags g (every match), i (case-insensitive), and n (newline-sensitive); \\1 back-references and \\& in the replacement follow PostgreSQL. Pattern syntax and work limits follow the regex operator profile; c overrides case-insensitive matching when it appears after i."
     },
     {
       "id": "expression.power-operator",
@@ -1742,7 +1742,7 @@
       "status": "unsupported",
       "example": "SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total FROM rows",
       "error": "Date arithmetic requires a date or datetime value",
-      "notes": "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds."
+      "notes": "Interval-valued arithmetic \u2014 interval + interval, timestamp - timestamp, date - date, date + integer, justify_days \u2014 is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH \u2026) readings for a duration in seconds."
     },
     {
       "id": "expression.date-minus-date",
@@ -1770,7 +1770,7 @@
       "status": "unsupported",
       "example": "SELECT ROW(1, 2) AS pair FROM rows",
       "error": "Unsupported function: ROW",
-      "notes": "A row constructor as a value is not supported; row comparisons ((a, b) = (1, 2), (a, b) IN (…)) are."
+      "notes": "A row constructor as a value is not supported; row comparisons ((a, b) = (1, 2), (a, b) IN (\u2026)) are."
     },
     {
       "id": "function.math-extended",
@@ -1980,14 +1980,14 @@
       "status": "unsupported",
       "example": "UPDATE keyed SET bonus = DEFAULT WHERE name = 'x'",
       "error": "Ambiguous or missing column: DEFAULT",
-      "notes": "SET column = DEFAULT and the row-value form SET (a, b) = (…) are not supported; assign the value explicitly."
+      "notes": "SET column = DEFAULT and the row-value form SET (a, b) = (\u2026) are not supported; assign the value explicitly."
     },
     {
       "id": "mutation.update-row-value",
       "status": "unsupported",
       "example": "UPDATE keyed SET (score, bonus) = (1, 2) WHERE name = 'x'",
       "error": "Expected identifier, found (",
-      "notes": "The row-value assignment SET (a, b) = (…) is not supported; assign each column."
+      "notes": "The row-value assignment SET (a, b) = (\u2026) is not supported; assign each column."
     },
     {
       "id": "mutation.data-modifying-cte",
@@ -2066,14 +2066,14 @@
       "status": "unsupported",
       "example": "CREATE TABLE copied (LIKE keyed)",
       "error": "Unsupported column type: keyed",
-      "notes": "CREATE TABLE … (LIKE other) is not supported; spell the columns out, or CREATE TABLE AS SELECT for a data copy."
+      "notes": "CREATE TABLE \u2026 (LIKE other) is not supported; spell the columns out, or CREATE TABLE AS SELECT for a data copy."
     },
     {
       "id": "ddl.serial-non-key",
       "status": "unsupported",
       "example": "CREATE TABLE ticketed (id INTEGER PRIMARY KEY, seq SERIAL)",
       "error": "Auto-increment requires the unique key column: seq",
-      "notes": "SERIAL and GENERATED … AS IDENTITY are supported on the primary key only; a sequence-fed non-key column is refused."
+      "notes": "SERIAL and GENERATED \u2026 AS IDENTITY are supported on the primary key only; a sequence-fed non-key column is refused."
     },
     {
       "id": "ddl.bytea",
@@ -2143,7 +2143,7 @@
       "status": "unsupported",
       "example": "ALTER TYPE mood ADD VALUE 'meh'",
       "error": "Expected TABLE, found TYPE",
-      "notes": "ALTER TYPE and DROP TYPE are not supported; CREATE TYPE … AS ENUM is, and the schema DSL widens enum values through migrate()."
+      "notes": "ALTER TYPE and DROP TYPE are not supported; CREATE TYPE \u2026 AS ENUM is, and the schema DSL widens enum values through migrate()."
     },
     {
       "id": "ddl.domain",
@@ -2171,7 +2171,7 @@
       "status": "unsupported",
       "example": "CREATE FUNCTION one() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
       "error": "Expected TABLE, found FUNCTION",
-      "notes": "CREATE FUNCTION and CREATE TRIGGER … EXECUTE FUNCTION are not supported; triggers take an inline BEGIN … END body of INSERT, UPDATE, and DELETE statements."
+      "notes": "CREATE FUNCTION and CREATE TRIGGER \u2026 EXECUTE FUNCTION are not supported; triggers take an inline BEGIN \u2026 END body of INSERT, UPDATE, and DELETE statements."
     },
     {
       "id": "ddl.exclude-constraint",
@@ -2207,6 +2207,33 @@
       "example": "SELECT column_name FROM information_schema.columns WHERE table_name = 'rows'",
       "error": "Expected eof, found .",
       "notes": "information_schema, pg_catalog, and sqlite_master are not supported; the catalog is read through the API (listTables, describe)."
+    },
+    {
+      "id": "predicate.regex-longest-classes",
+      "status": "supported",
+      "example": "SELECT SUBSTRING('abc' FROM 'a|ab') AS longest, 'A19!' ~ '^[[:alpha:]][[:digit:]]+[[:punct:]]$' AS classes",
+      "notes": "Leftmost-longest alternation and ASCII POSIX character classes follow the bounded regex profile."
+    },
+    {
+      "id": "predicate.regex-backreferences",
+      "status": "unsupported",
+      "example": "SELECT 'aa' ~ '(a)\\1'",
+      "error": "pattern backreferences are unsupported",
+      "notes": "Pattern backreferences are refused explicitly; numbered backreferences remain supported in REGEXP_REPLACE replacement text."
+    },
+    {
+      "id": "predicate.regex-lookaround",
+      "status": "unsupported",
+      "example": "SELECT 'ab' ~ '(?=a)a'",
+      "error": "lookaround and inline flags are unsupported",
+      "notes": "Lookaround and inline regex flags are refused. Use the supported function flags or rewrite the predicate."
+    },
+    {
+      "id": "predicate.regex-nongreedy",
+      "status": "unsupported",
+      "example": "SELECT 'aaa' ~ 'a+?'",
+      "error": "repeated or non-greedy quantifiers are unsupported",
+      "notes": "Non-greedy regex quantifiers are refused. Supported matching chooses the leftmost, longest result."
     }
   ]
 }

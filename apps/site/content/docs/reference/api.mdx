@@ -112,7 +112,8 @@ new MinnowDatabase(store: BlockStore, options?: MinnowDatabaseOptions)
 
 `MinnowDatabaseOptions` covers the schema the database is typed against, compression, block size,
 write retries, query spilling, idle SQL transactions, caching, automatic full-text indexing,
-background maintenance, and `onBackgroundError`, which hears failures of work no call owns. The full option
+background maintenance, and `onBackgroundError`, which hears failures of work no call owns.
+`maintenanceStatus()` also exposes a bounded background failure history and total count. The full option
 table is on [The database API](/docs/engine#options). `bufferPoolBytes` defaults to 64 MiB and
 limits one shared cache of decoded blocks and reusable query work; `0` disables it. Compiled SQL
 plans are cached separately by statement text.
@@ -317,7 +318,7 @@ adapter isolation explicit even to conservative bundlers.
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
 tooling but are storage internals. Their TypeScript API may still change during 0.x; the bytes
-written by the locked block-format 2, snapshot-format 1, IndexedDB-schema 2, and OPFS-layout 6
+written by the locked block-format 2, snapshot-format 1, IndexedDB-schema 2, and OPFS-layout 7
 writers are separate format contracts and cannot be reinterpreted in place.
 
 ## `@minnowdb/core/storage/toolkit`
@@ -327,17 +328,17 @@ and OPFS adapters are assembled from, published for writing new adapters. Delibe
 from the required storage interface. The engine never imports it, and a custom adapter does not
 have to use it.
 
-| Export                                                                                              | Description                                                                                                                                                                                                                         |
-| --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class RecordCore`                                                                                  | The in-memory record engine used by the memory and OPFS adapters. It has one method per operation, `dump()`/`load()` for checkpoints, and a `PhysicalBlocks` interface for checking stored bytes.                                   |
-| `class WalWriter` / `replayWalFrames(handle)`                                                       | Checksummed write-ahead-log frames over a held `SyncFileHandle`; replay ignores a truncated final frame and rejects complete corrupt frames.                                                                                        |
-| `class ExtentPool`                                                                                  | Packed append-only extent files for bulk bytes, addressed by checksummed `Placement`s; verified recovery reads, sealing, live-byte accounting, fragmentation detection, and a read-handle cache. Opens files through `ExtentFiles`. |
-| `encodeRecordJson` / `decodeRecordJson`                                                             | JSON with bigints (`{"$n":"…"}`) — the codec frames and checkpoints use.                                                                                                                                                            |
-| `appendTransactionJournal(record, additions)`                                                       | Extends a transaction record's journal by the staged ids without re-validating what it already holds; the caller proves the additions are new, so a staging call costs what it stages.                                              |
-| `encodeSyncCheckpoint` / `decodeSyncCheckpoint`, `encodeChunk` / `decodeChunk`                      | Checksummed, versioned envelopes for checkpoint payloads and immutable artifact chunks; torn bytes decode as "not written".                                                                                                         |
-| `SyncFileHandle`                                                                                    | The small file interface used by the toolkit: positioned read, write, truncate, flush, and close. A browser `FileSystemSyncAccessHandle` already has this shape.                                                                    |
-| `readFully` / `writeFully`                                                                          | Complete positioned transfers across short I/O without copying; reject invalid or overflowing ranges before I/O, plus EOF, zero progress, and invalid byte counts.                                                                  |
-| `RecordCoreState`, `PhysicalBlocks`, `ExtentFiles`, `ExtentMeta`, `Placement`, `LOG_FORMAT_VERSION` | Supporting types and the on-disk envelope version.                                                                                                                                                                                  |
+| Export                                                                                              | Description                                                                                                                                                                                                                             |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class RecordCore`                                                                                  | The in-memory record engine used by the memory and OPFS adapters. It has one method per operation, `dump()`/`load()` for checkpoints, and a `PhysicalBlocks` interface for checking stored bytes.                                       |
+| `class WalWriter` / `replayWalFrames(handle)` / `iterateWalFrames(handle, acknowledgedEndOffset?)`  | Checksummed WAL frames over a held `SyncFileHandle`. The optional independently verified acknowledgement boundary refuses missing or corrupt bytes before that offset; only an unacknowledged incomplete or zero suffix can be ignored. |
+| `class ExtentPool`                                                                                  | Packed append-only extent files for bulk bytes, addressed by checksummed `Placement`s; verified recovery reads, sealing, live-byte accounting, fragmentation detection, and a read-handle cache. Opens files through `ExtentFiles`.     |
+| `encodeRecordJson` / `decodeRecordJson`                                                             | JSON with bigints (`{"$n":"…"}`) — the codec frames and checkpoints use.                                                                                                                                                                |
+| `appendTransactionJournal(record, additions)`                                                       | Extends a transaction record's journal by the staged ids without re-validating what it already holds; the caller proves the additions are new, so a staging call costs what it stages.                                                  |
+| `encodeSyncCheckpoint` / `decodeSyncCheckpoint`, `encodeChunk` / `decodeChunk`                      | Checksummed, versioned envelopes for checkpoint payloads and immutable artifact chunks; torn bytes decode as "not written".                                                                                                             |
+| `SyncFileHandle`                                                                                    | The small file interface used by the toolkit: positioned read, write, truncate, flush, and close. A browser `FileSystemSyncAccessHandle` already has this shape.                                                                        |
+| `readFully` / `writeFully`                                                                          | Complete positioned transfers across short I/O without copying; reject invalid or overflowing ranges before I/O, plus EOF, zero progress, and invalid byte counts.                                                                      |
+| `RecordCoreState`, `PhysicalBlocks`, `ExtentFiles`, `ExtentMeta`, `Placement`, `LOG_FORMAT_VERSION` | Supporting types and the on-disk envelope version.                                                                                                                                                                                      |
 
 ## `@minnowdb/core/transactions`
 

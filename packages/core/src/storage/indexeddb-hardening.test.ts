@@ -5908,13 +5908,39 @@ describe("IndexedDB postings build recovery hardening", () => {
     } as const;
     await expect(store.beginFtsBaseBuild(begin)).resolves.toBeUndefined();
     await expect(store.beginFtsBaseBuild(begin)).resolves.toBeUndefined();
+    const completion = {
+      ...begin,
+      expiresAtCutoff: "2026-08-24T12:01:00.000Z",
+      completedAt: "2026-08-24T12:01:00.000Z",
+      coversVersion: -1,
+      chunkCount: 1,
+      totalTokens: 0,
+    };
+    await expect(
+      store.finishFtsBaseBuild({ ...completion, buildId: "stale-build" }),
+    ).rejects.toMatchObject({
+      name: "PostingBuildConflictError",
+      buildId: "stale-build",
+      ownerId: "search-owner",
+      reason: "ownership is absent or expired",
+    });
+    // The current owner missing a promised chunk remains an actual build failure.
+    const incomplete = await store.finishFtsBaseBuild(completion).catch((error: unknown) => error);
+    expect(incomplete).toBeInstanceOf(Error);
+    expect((incomplete as Error).name).toBe("Error");
+    expect((incomplete as Error).message).toContain("incomplete");
+
     await expect(
       store.beginFtsBaseBuild({
         ...begin,
         buildId: "competing-build",
         ownerId: "competing-owner",
       }),
-    ).rejects.toThrow("owned by another caller");
+    ).rejects.toMatchObject({
+      name: "PostingBuildConflictError",
+      ownerId: "competing-owner",
+      reason: "owned by another caller",
+    });
     await expect(
       store.renewFtsBaseBuild({
         ...begin,
@@ -5923,7 +5949,12 @@ describe("IndexedDB postings build recovery hardening", () => {
         expiresAt: "2026-08-24T12:40:00.000Z",
         updatedAt: "2026-08-24T12:01:00.000Z",
       }),
-    ).rejects.toThrow("ownership is absent or expired");
+    ).rejects.toMatchObject({
+      name: "PostingBuildConflictError",
+      buildId: "search-build",
+      ownerId: "competing-owner",
+      reason: "ownership is absent or expired",
+    });
     await expect(
       store.renewFtsBaseBuild({
         ...begin,
