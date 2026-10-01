@@ -360,7 +360,7 @@ then reconcile any unknown write outcome before retrying. Background
 
 Both are durable, both are safe across tabs, and both hold the same block format — a
 [snapshot](/docs/storage/snapshots) moves a database between them. The
-[benchmarks page](/benchmarks) measures both live in your browser; on current engines the OPFS
-store's small reads and writes are several times faster, and bulk loads are comparable. Prefer
-IndexedDB where OPFS does not exist (older browsers, Safari private windows); otherwise OPFS is
-the faster floor.
+[benchmarks page](/benchmarks) measures both live in your browser. Synchronous file access can
+reduce storage overhead, but relative latency depends on the workload, browser, durability, and
+competing tabs. Measure the queries and writes your application uses. Choose IndexedDB where
+OPFS is unavailable (older browsers, Safari private windows).

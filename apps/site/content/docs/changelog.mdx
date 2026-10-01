@@ -8,6 +8,32 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.12.1 — October 1, 2026
+
+Release packages: `@minnowdb/core@0.12.1`.
+
+- Catalog table/view creation and destructive changes now have a dedicated internal owner for
+  dependency checks, bounded conflict retries, and atomic publication. Writer admission owns
+  its waits, compaction turn lending, and maintenance shutdown. Query preparation and execution
+  own their compilation caches, streaming fallback, spill handling, and memory cleanup.
+- IndexedDB and the memory/OPFS record engine share commit freshness checks and level-zero
+  admission and table accelerator planning. Adapter transactions, block visibility checks, and durability stay native.
+
+- Bulk unique-key removals update membership immediately and rebuild snapshot order only when
+  needed, with a direct append path for the sorted rebuild. Batched writes index their block
+  metadata once rather than searching the batch for
+  each referenced block. IndexedDB queues independent commit reads together instead of
+  waiting for each request group separately. Validation, checksums, and atomic publication
+  remain in place.
+
+- Documentation and benchmark labels now distinguish measured downloads from worker bundles,
+  identify comparison-driver coverage, and describe competitors’ live queries, multi-tab access,
+  and persistence accurately. Broad performance claims are replaced with workload-specific guidance.
+
+**Migration and stored formats:** no application or data migration is needed. Public APIs,
+block format 2, snapshot format 1, IndexedDB schema 2, and OPFS layout 7 are unchanged.
+Automatic upgrades from the supported older formats remain in place.
+
 ## 0.12.0 — September 30, 2026
 
 Published packages: `@minnowdb/core@0.12.0`, `@minnowdb/devtools@0.3.4`.

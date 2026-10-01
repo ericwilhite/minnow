@@ -37,7 +37,7 @@ export const ENGINES: readonly EngineChoice[] = [
     engine: "minnow",
     label: "Minnow",
     note: "This engine. Columnar blocks on IndexedDB, plain JavaScript.",
-    download: "362 KB",
+    download: "363 KiB",
   },
   {
     id: "minnow-cached",
@@ -64,14 +64,14 @@ export const ENGINES: readonly EngineChoice[] = [
     engine: "sqlite",
     label: "SQLite Wasm",
     note: "The official build, persisting through an OPFS VFS.",
-    download: "457 KB",
+    download: "457 KiB",
   },
   {
     id: "pglite",
     engine: "pglite",
     label: "PGlite",
     note: "Postgres compiled to WebAssembly, persisting through IndexedDB.",
-    download: "5.6 MB",
+    download: "5.5 MiB",
   },
 ];
 
@@ -138,7 +138,7 @@ export const SUITES: readonly SuiteChoice[] = [
   {
     id: "live",
     label: "Live queries",
-    note: "1 to 100 subscriptions registered through the worker client, then one commit: the time until every affected subscription has been notified, with its rows in hand. Minnow only — the other engines have no live-query layer.",
+    note: "1 to 100 subscriptions registered through the worker client, then one commit: the time until every affected subscription has been notified, with its rows in hand. Minnow only in this harness; PGlite’s live-query extension is not measured.",
     needsDataset: true,
   },
   {
@@ -156,10 +156,8 @@ export interface ScaleChoice {
 }
 
 /**
- * The ceiling is deliberate. At scale 10 the dataset costs about 18 MB of IndexedDB for Minnow,
- * 77 MB for SQLite and 143 MB for PGlite, and PGlite alone takes a minute or more to load it —
- * large enough to expose the engines' storage and execution trade-offs while remaining practical
- * for a deliberate browser run.
+ * The ceiling keeps a deliberate browser run practical. Storage and load time vary with the
+ * browser, adapter, durability, and index selection; the page reports the observed costs.
  */
 export const SCALES: readonly ScaleChoice[] = [1, 2, 5, 10].map((scale) => ({
   scale,

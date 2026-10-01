@@ -51,8 +51,9 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 273 * 1024;
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
 // ledger) adds about 10 KiB raw: 1241.7 KiB raw. Writer turns: 1254.8 KiB raw / 351.6 KiB gzip.
 // Bounded delta-header preparation and the released cross-tab collection fix measure
-// 1285.3 KiB raw. Round this raw-text allowance by 1 KiB.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1286 * 1024;
+// 1285.3 KiB raw. The catalog, writer-admission and query controllers plus the storage
+// fast paths add about 4 KiB. Allow 1290 KiB raw while retaining the compressed download budget.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1290 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.

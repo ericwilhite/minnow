@@ -63,8 +63,11 @@ oversized compressed result.
 
 Keeping published blocks unchanged pays for everything else:
 
-- A crash can strand unused data — it can never corrupt visible data.
-- Retrying a write is always safe.
+- A crash before publication can strand unused blocks; incomplete blocks cannot become visible.
+  Acknowledged durability depends on the adapter and durability mode, and detected corruption
+  stops recovery rather than guessing.
+- Retrying an unpublished block write preserves its immutable bytes. Retrying an application
+  mutation with an unknown outcome requires reconciliation by durable application ID first.
 - Another tab can keep reading its leased old version; if it falls far enough behind, fixed
   retained-history ceilings backpressure writers rather than reclaiming data under the reader.
 - A snapshot reuses the published block bytes verbatim, so export never rewrites or recompresses
@@ -243,6 +246,13 @@ Storage                IndexedDB or OPFS, block codecs, manifests, leases, GC
   methods, nothing else.
 - Inside `@minnowdb/core`, the layers are separate modules — `block-format`, `storage`,
   `transactions`, and the engine — each importable on its own.
+- Within the engine, internal controllers own catalog mutations, writer admission, query
+  preparation/execution, and maintenance scheduling. They share the database’s existing
+  state and inject storage and lifecycle operations; physical execution kernels remain in
+  the database. These are internal boundaries, with no new public entry points.
+- IndexedDB and the memory/OPFS record engine share commit freshness checks, level-zero
+  admission planning, and accelerator retention rules. Each adapter still owns its native
+  transaction, block visibility checks, and durability boundary.
 
 ## Crash testing
 
@@ -253,7 +263,8 @@ after every block write and manifest commit, and these must hold no matter where
 2. A stale manifest check cannot publish anything.
 3. Retrying a block write cannot change published bytes.
 4. Unpublished data never affects a read and is always safe to collect.
-5. The UI stays responsive regardless of operation size.
+5. Worker execution keeps engine work off the UI thread; bounded pages and cancellation limit
+   transfer and retained work. Running the engine directly on the page can still block rendering.
 
 The same hook is public: `FaultInjectingBlockStore` in `@minnowdb/core/testing` wraps any store,
 so your own tests can crash the engine on purpose too.

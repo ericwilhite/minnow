@@ -3,8 +3,7 @@
  * Rendering a completed run.
  *
  * Two rules the tables follow throughout. OLTP and OLAP stay split, because a blended score
- * hides the trade-off that actually distinguishes these engines — Minnow leads on scans and
- * SQLite leads on single-key lookups, and one number would bury both facts. And nothing is
+ * hides differences between selective access, scans, and bulk operations. Nothing is
  * reported unless it was verified: a timing for a wrong answer is not a timing.
  */
 import type {
@@ -289,8 +288,8 @@ export function LiveResults({
   columns: readonly EngineChoice[];
 }) {
   // Every live number already goes through the worker client — that is the path a notification
-  // takes — so the variant columns have nothing separate to show. Engines without a live-query
-  // layer (the Wasm engines) report no number at all, and the table says so rather than
+  // takes — so the variant columns have nothing separate to show. Engines without a harness
+  // subscription driver report no number at all, and the table says so rather than
   // printing a stripe of dashes against them.
   const shown = columns.filter(
     (column) =>

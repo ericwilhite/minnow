@@ -370,7 +370,7 @@ export interface LiveSuitePayload {
 
 export interface LiveEngineMeasurement {
   engine: EngineId;
-  /** The engine has a live-query layer and ran the case. False carries the reason in `error`. */
+  /** The harness has a subscription driver for this engine and ran the case. False carries the reason in `error`. */
   supported: boolean;
   error?: string;
   /** Time to register every subscription and receive each one's initial result. */

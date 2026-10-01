@@ -15,8 +15,8 @@ import { suiteCoverage, supportsLiveQueries } from "./support";
  *  - Nothing counts until it is verified: every affected subscription must fire exactly once per
  *    commit and end on the row count the commits imply, and no unaffected one may fire at all.
  *
- * Only engines with a live-query layer take part; the others are reported as unsupported with
- * that reason, not as a slow number.
+ * Only engines with a subscription driver in this harness take part. Other engines are
+ * reported as unmeasured, regardless of their own live-query capabilities.
  */
 import type {
   EngineId,
@@ -93,7 +93,7 @@ export async function runLiveSuite(
 
   for (const engine of payload.engines) {
     if (!supportsLiveQueries(engine)) {
-      sessions.set(engine, new Error("This engine has no live-query layer"));
+      sessions.set(engine, new Error("This harness has no live-query driver for this engine"));
       continue;
     }
     try {

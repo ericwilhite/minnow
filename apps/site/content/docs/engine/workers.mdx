@@ -272,9 +272,10 @@ The generic entry loads each storage adapter with a dynamic `import()` when the 
 frame asks for it. That downloads only the store the worker opens when the bundler splits worker
 code into chunks — esbuild `--splitting`, Vite with `worker: { format: "es" }`, webpack 5. A
 bundler that cannot split a worker inlines all three adapters: with Vite's default `iife` worker
-format the generic worker is about 1.6 MB minified (438 KB gzipped), against about 1.3 MB
-(353 KB gzipped) for the IndexedDB store alone and 1.5 MB (430 KB gzipped) for the two durable
-stores the `auto` entry bundles.
+format the core 0.12.1 generic worker is about 1.60 MiB minified (453 KiB gzipped), against
+1.27 MiB (366 KiB gzipped) for the IndexedDB store alone and 1.57 MiB (445 KiB gzipped) for the
+two durable stores the `auto` entry bundles. These are minified ES2022 bundles without splitting;
+the separately bundled client adds its own download cost.
 
 When the worker always opens the same kind of store, import the entry that bundles only that
 store:

@@ -32,7 +32,7 @@ const bundle = {
 // Two-space indent so the generated file is already in Prettier style.
 writeFileSync(OUTPUT, JSON.stringify(bundle, null, 2) + "\n");
 
-const kb = (bytes: number): string => `${(bytes / 1024).toFixed(1)} KB`;
+const kb = (bytes: number): string => `${(bytes / 1024).toFixed(1)} KiB`;
 for (const engine of engines) {
   console.log(
     `${engine.name.padEnd(14)} ${kb(engine.totalGzipBytes).padStart(12)} gzip   ${kb(engine.totalBytes).padStart(12)} raw`,

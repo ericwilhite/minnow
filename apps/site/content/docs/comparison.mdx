@@ -12,7 +12,7 @@ complete server dialect, or direct file analysis matters more.
 | Local application tables with filters, joins, aggregates, search, and updates   | **Minnow**             |
 | Small record collections fetched mainly by key or declared index                | **Dexie** or IndexedDB |
 | The SQLite dialect, file format, extensions, or shared mobile/server migrations | **SQLite Wasm**        |
-| The PostgreSQL server and extension surface, or ElectricSQL sync                | **PGlite**             |
+| PostgreSQL query behavior, supported extensions, or ElectricSQL sync            | **PGlite**             |
 | In-browser analysis of Parquet, Arrow, or CSV files                             | **DuckDB-Wasm**        |
 | Multi-device or multi-user synchronization                                      | A sync engine          |
 
@@ -41,12 +41,12 @@ database's file format.
 
 Download size affects cold starts, and Wasm engines also compile a module before the first query.
 
-| Engine           | Download (gzip) | Raw     | Wasm compile step |
-| ---------------- | --------------- | ------- | ----------------- |
-| IndexedDB        | 0               | 0       | No                |
-| **Minnow**       | **362 KB**      | 1.3 MB  | No                |
-| SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes               |
-| PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes               |
+| Engine                    | Download (gzip) | Raw       | Wasm compile step |
+| ------------------------- | --------------- | --------- | ----------------- |
+| IndexedDB                 | 0               | 0         | No                |
+| **Minnow 0.12.1**         | **363 KiB**     | 1.26 MiB  | No                |
+| SQLite Wasm 3.53.0-build1 | 457 KiB         | 1.03 MiB  | Yes               |
+| PGlite 0.5.5              | 5.46 MiB        | 16.20 MiB | Yes               |
 
 The Minnow, SQLite Wasm, and PGlite values come from the repository's reproducible size script.
 It uses identical esbuild settings and includes the Wasm modules and packed runtime data each
@@ -54,7 +54,10 @@ package downloads. IndexedDB is built into the browser. Minnow's number includes
 its larger durable adapter, OPFS; an IndexedDB build is slightly smaller, and unused adapters stay
 out of the application bundle.
 The size advantage over this SQLite Wasm build is for compressed downloads; Minnow is larger
-uncompressed. Sizes use binary units (1 KB = 1,024 bytes).
+uncompressed. Sizes use binary units (1 KiB = 1,024 bytes, 1 MiB = 1,048,576 bytes). These are the
+installed comparison versions, not a claim about every build or the latest upstream release.
+Worker/client entries and optional extensions have separate download costs; see the
+[worker guide](/docs/engine/workers#per-store-worker-entries).
 
 ## IndexedDB
 
@@ -89,22 +92,29 @@ the browser.
 
 **Choose SQLite Wasm when** the application needs SQLite compatibility, existing SQLite
 migrations, broad index support, extensions, or the ability to move the same database file among
-browser, mobile, and server environments.
+browser, mobile, and server environments. Extensions must be included in, or supported by, the
+chosen Wasm build.
 
 **Choose Minnow when** browser-local analytical reads, compressed column storage, a smaller plain
 JavaScript download, and simple multi-tab persistence matter more. Minnow uses IndexedDB or OPFS
-without requiring cross-origin isolation headers.
+without requiring cross-origin isolation headers. SQLite’s
+[SAH-pool VFS](https://sqlite.org/wasm/doc/trunk/persistence.md) also avoids those
+headers; its standard OPFS VFS requires them. Concurrency differs between these VFS choices.
 
-SQLite's B-tree design is especially strong for the smallest point reads and writes. Minnow's
-columnar design favors scans, aggregates, and bulk loads. Run the [live benchmarks](/benchmarks)
+SQLite’s B-tree design suits point reads and writes; Minnow’s columnar design suits scans and
+aggregates. That does not establish a universal performance ranking or competitor parity. Run the [live benchmarks](/benchmarks)
 for the workload and browser you care about.
 
 ## PGlite
 
-PGlite runs PostgreSQL in WebAssembly. It provides PostgreSQL's types, behavior, migrations, and
-extensions such as `pgvector`, and it is part of ElectricSQL's sync architecture.
+PGlite runs PostgreSQL in WebAssembly with PostgreSQL query behavior and a
+[supported extension set](https://pglite.dev/extensions/), including `pgvector`. It is an embedded
+engine with one exclusive database connection, rather than a PostgreSQL server. Its
+[multi-tab worker](https://pglite.dev/docs/multi-tab-worker) shares that instance across tabs, and
+its [live-query extension](https://pglite.dev/docs/live-queries) provides reactive results.
+ElectricSQL provides a separate sync integration.
 
-**Choose PGlite when** exact PostgreSQL compatibility, extensions, shared server SQL, or
+**Choose PGlite when** PostgreSQL query behavior, supported extensions, shared server SQL, or
 ElectricSQL sync is the requirement.
 
 **Choose Minnow when** the application needs a much smaller download, no Wasm startup, columnar
@@ -113,10 +123,12 @@ dialect rather than the complete server.
 
 ## DuckDB-Wasm
 
-DuckDB-Wasm is a mature columnar analytics engine that reads Parquet, Arrow, and CSV directly.
+DuckDB-Wasm is a columnar analytics engine that reads Parquet, Arrow, and CSV directly. It also
+supports SQL mutations and [OPFS persistence](https://duckdb.org/docs/current/clients/wasm/instantiation#persistence-with-opfs);
+call `CHECKPOINT` to flush writes and observe its exclusive file-handle constraints.
 
-**Choose DuckDB-Wasm when** the task is analysis over files, very large in-memory datasets, or a
-SQL surface built for analytical tooling.
+**Choose DuckDB-Wasm when** the task is analysis over files or a SQL surface built for analytical
+tooling. Browser memory and the chosen Wasm build still bound the dataset size.
 
 **Choose Minnow when** the data is an application's own durable state and users also insert,
 update, and delete individual rows. Minnow provides IndexedDB and OPFS persistence, atomic

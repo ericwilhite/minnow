@@ -50,7 +50,7 @@ const store = await IndexedDbBlockStore.open({ name: "shop" });
 const db = new MinnowDatabase(store);
 ```
 
-Use OPFS in a worker when you want its faster file-based storage path:
+Use OPFS in a worker for synchronous file access and log-based persistence:
 
 ```ts
 import { OpfsBlockStore } from "@minnowdb/core/storage/opfs";

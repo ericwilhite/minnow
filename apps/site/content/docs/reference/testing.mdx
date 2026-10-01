@@ -388,6 +388,30 @@ that code is gone, the format it wrote cannot be regenerated. For the same reaso
 released, locked fixture. Block format 2 is the first such lock; the unsupported experimental
 block-1 fixture was replaced before v1.
 
+## Internal orchestration and adapter transitions
+
+Catalog mutations, per-connection writer admission, and query preparation/execution have separate
+internal owners. The public database API delegates to them; SQL kernels and adapter atomic
+publication remain shared with the ordinary paths. Refactoring these owners must preserve
+cancellation, reader leases, compaction turn lending, shutdown draining, and original failure
+reporting. The lifecycle, admission, semantic equivalence, and native interaction suites exercise
+those boundaries. Caller-provided clock and ID callbacks retain their original database
+receiver through the extracted catalog and query paths, with a lifecycle regression on all
+three adapters.
+
+`storage/commit-admission.test.ts` runs the same multi-table commit refusals on memory, IndexedDB,
+and OPFS. Invalid coverage, duplicate limits, invalid limits, and segment backpressure must leave
+the manifest, transaction journal, and staged bytes unchanged. A corrected retry on that same
+transaction must publish every changed table.
+
+Record-core hardening tests verify bulk unique-key removal without per-key ordered-index work,
+canonical snapshot export and restore after mixed mutations, and exact batched block lengths
+and checksums after refusal, retry, and placement-only adapter replay. Snapshot ordering is lazy;
+constraint membership stays immediate. IndexedDB hardening also verifies that independent
+commit reads are queued together and a refused commit leaves the journal and staged bytes
+unchanged for a corrected retry. The controller extraction and storage changes add about 4 KiB to the raw OPFS
+bundle allowance while keeping the compressed download budgets unchanged.
+
 ## Matched-index performance comparisons
 
 `npm run benchmark:compare` runs the Node suite with primary-key indexes on every engine's
@@ -650,18 +674,18 @@ cleanup failure retains both original errors.
 Two further measurements cover what an application pays above the engine, so a regression in the
 worker client or the live-query layer shows on the page instead of hiding behind engine numbers:
 
-- **The client columns** (`Minnow (client)`, `Minnow (OPFS, client)`) issue each read through
-  `MinnowDatabaseClient` over a message channel inside the bench worker: the RPC frame out, the
-  result back in its columnar wire form, and the rows rebuilt on the receiving side. The gap to the
-  plain Minnow column is the cost of the worker boundary. The client's rows are checked against
-  the oracle too, so a wire format that dropped a value could not pass as a faster number.
+- **The cached columns** (`Minnow (cached)`, `Minnow (OPFS, cached)`) repeat each statement with
+  the default result memo enabled. They measure repeat-query caching separately from execution.
+  The read table times engine calls directly inside the benchmark worker; it does not show
+  separate client RPC columns.
 - **The live-query suite** registers 1 to 100 subscriptions through that client, commits one row,
   and times the commit until the last affected subscription's `onChange` has fired with its rows
   in hand. One case keeps 99 of 100 subscriptions on a table the commit never touches, which
   measures the cost of ruling them out. Every affected subscription must fire exactly once per
   commit and end on the row count the commits imply, and no other may fire at all. The suite owns
   its tables and never writes the dataset's, so the read oracles stay true after it. Only Minnow
-  takes part; the Wasm engines have no live-query layer and are reported as such.
+  takes part in this harness. PGlite has a live-query extension, but this harness has no driver
+  for it; an unmeasured driver is reported as unsupported here, not as a missing engine capability.
 
 There is nothing to publish or regenerate. The [benchmarks page](/benchmarks) has no checked-in
 numbers: it builds every engine and runs the suites in the visitor's browser, on the engines,

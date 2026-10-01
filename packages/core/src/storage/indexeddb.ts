@@ -1,4 +1,8 @@
 import {
+  assertCommitSchema,
+  assertCommitSnapshot,
+  planLevelZeroAdmissions,
+  planTableAccelerators,
   validateAutoIncrementReservation,
   validateBeginTransactionInput,
   assertGenericTransactionUpdateAllowed,
@@ -130,7 +134,6 @@ import {
   MAX_SNAPSHOT_METADATA_BATCH_BYTES,
   MAX_SNAPSHOT_METADATA_FRAME_BYTES,
   SNAPSHOT_FRAME_KINDS,
-  MAX_LEVEL_ZERO_SEGMENTS,
   MAX_STORAGE_BULK_READ_ITEMS,
   MAX_AUTO_INCREMENT_EXCLUSIVE_END,
   MAX_ROW_ID,
@@ -1275,37 +1278,14 @@ export class IndexedDbBlockStore implements BlockStore {
         }
       }
       const {
-        ftsColumns: previousFts,
+        ftsColumns: _previousFts,
         secondaryIndexes: previousSecondary,
         triggers: previousTriggers,
         view: previousView,
         ...base
       } = record;
-      let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
-      let nextSecondary =
-        update.secondaryIndexes === undefined ? previousSecondary : update.secondaryIndexes;
-      const retainedColumnIds =
-        update.columns === undefined
-          ? undefined
-          : new Set(update.columns.map(({ id: columnId }) => columnId));
-      if (nextFts !== null && nextFts !== undefined && retainedColumnIds !== undefined) {
-        nextFts = Object.fromEntries(
-          Object.entries(nextFts).filter(([columnId]) => retainedColumnIds.has(columnId)),
-        );
-        if (Object.keys(nextFts).length === 0) nextFts = null;
-      }
-      if (
-        nextSecondary !== null &&
-        nextSecondary !== undefined &&
-        retainedColumnIds !== undefined
-      ) {
-        nextSecondary = Object.fromEntries(
-          Object.entries(nextSecondary).filter(([, index]) =>
-            secondaryIndexColumnIds(index).every((columnId) => retainedColumnIds.has(columnId)),
-          ),
-        );
-        if (Object.keys(nextSecondary).length === 0) nextSecondary = null;
-      }
+      void _previousFts;
+      const { nextFts, nextSecondary, retainedColumnIds } = planTableAccelerators(record, update);
       const indexNames = new Set<string>();
       for (const [indexId, index] of Object.entries(nextSecondary ?? {})) {
         const markerKey = `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`;
@@ -4619,22 +4599,16 @@ export class IndexedDbBlockStore implements BlockStore {
     incrementSafeInteger(record.revision, "Transaction revision");
     const transactionStore = transaction.objectStore("transactions");
     const catalog = transaction.objectStore("catalog");
-    const schemaEpoch = asSchemaEpoch(await requestResult<unknown>(catalog.get(SCHEMA_EPOCH_KEY)));
-    if (record.schemaEpochGuard !== schemaEpoch) {
-      throw new SchemaConflictError(record.schemaEpochGuard ?? -1, schemaEpoch);
-    }
-    const current = asOptionalManifestVersion(
-      await requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
-      CURRENT_MANIFEST_KEY,
-    );
+    // Independent reads share one native request round trip; freshness checks keep their
+    // original precedence and still run inside this atomic publication transaction.
+    const [schemaValue, currentValue] = await Promise.all([
+      requestResult<unknown>(catalog.get(SCHEMA_EPOCH_KEY)),
+      requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
+    ]);
+    assertCommitSchema(record, asSchemaEpoch(schemaValue));
+    const current = asOptionalManifestVersion(currentValue, CURRENT_MANIFEST_KEY);
     const actualVersion = current ?? null;
-    if (actualVersion !== input.expectedManifestVersion) {
-      throw new WriteConflictError(input.expectedManifestVersion, actualVersion);
-    }
-
-    if (record.snapshotVersion !== input.expectedManifestVersion) {
-      throw new Error("Transaction snapshot does not match the expected manifest");
-    }
+    assertCommitSnapshot(record, input.expectedManifestVersion, actualVersion);
     const pendingTable = record.pendingTable;
     if (pendingTable !== undefined) {
       const epoch = asCatalogEpoch(await requestResult<unknown>(catalog.get(CATALOG_EPOCH_KEY)));
@@ -4705,9 +4679,13 @@ export class IndexedDbBlockStore implements BlockStore {
     }
 
     const blockStore = transaction.objectStore("blocks");
-    const storedBlockKeys = await Promise.all(
-      record.pendingBlockIds.map((id) => requestResult(blockStore.getKey(id))),
-    );
+    const segmentStore = transaction.objectStore("segments");
+    const [storedBlockKeys, pendingSegmentValues] = await Promise.all([
+      Promise.all(record.pendingBlockIds.map((id) => requestResult(blockStore.getKey(id)))),
+      Promise.all(
+        record.pendingSegmentIds.map((id) => requestResult<unknown>(segmentStore.get(id))),
+      ),
+    ]);
     const missingBlockIndex = storedBlockKeys.findIndex((key) => key === undefined);
     if (missingBlockIndex >= 0) {
       throw new Error(
@@ -4715,10 +4693,6 @@ export class IndexedDbBlockStore implements BlockStore {
       );
     }
 
-    const segmentStore = transaction.objectStore("segments");
-    const pendingSegmentValues: unknown[] = await Promise.all(
-      record.pendingSegmentIds.map((id) => requestResult(segmentStore.get(id))),
-    );
     const missingSegmentIndex = pendingSegmentValues.findIndex((value) => value === undefined);
     if (missingSegmentIndex >= 0) {
       throw new Error(
@@ -14138,52 +14112,24 @@ async function assertLevelZeroSegmentLimits(
   version: number | null,
   pendingTable?: TableRecord,
 ): Promise<void> {
-  const pendingTables = new Set(
-    pendingSegments.filter((segment) => segment.level === 0).map((segment) => segment.tableId),
-  );
-  if (limits.length !== pendingTables.size) {
-    throw new TypeError("Level-zero segment limits must exactly cover pending level-zero tables");
-  }
-  const seenTables = new Set<string>();
+  const admissions = planLevelZeroAdmissions(limits, pendingSegments);
   const catalog = transaction.objectStore("catalog");
   const segmentIndex = transaction.objectStore("segments").index(SEGMENT_TABLE_INDEX);
-  for (const entry of limits) {
-    if (entry.tableId.length === 0) throw new TypeError("Level-zero table ID cannot be empty");
-    if (
-      !Number.isSafeInteger(entry.limit) ||
-      entry.limit <= 0 ||
-      entry.limit > MAX_LEVEL_ZERO_SEGMENTS
-    ) {
-      throw new RangeError(
-        `Level-zero segment limit must be between 1 and ${String(MAX_LEVEL_ZERO_SEGMENTS)}`,
-      );
-    }
-    if (seenTables.has(entry.tableId)) {
-      throw new TypeError(`Level-zero segment limit is duplicated: ${entry.tableId}`);
-    }
-    seenTables.add(entry.tableId);
-    if (!pendingTables.has(entry.tableId)) {
-      throw new TypeError(`Level-zero segment limit has no pending table: ${entry.tableId}`);
-    }
+  for (const [tableId, entry] of admissions) {
     const table =
-      (await readDeclaredTable(catalog, entry.tableId)) ??
-      (pendingTable?.id === entry.tableId ? pendingTable : undefined);
+      (await readDeclaredTable(catalog, tableId)) ??
+      (pendingTable?.id === tableId ? pendingTable : undefined);
     if (table === undefined) {
-      throw new Error(`Level-zero segment limit references missing table: ${entry.tableId}`);
+      throw new Error(`Level-zero segment limit references missing table: ${tableId}`);
     }
     const existing = await countVisibleLevelZeroSegments(
       segmentIndex,
       transaction.objectStore("transactions"),
       catalog,
       version,
-      entry.tableId,
+      tableId,
     );
-    const added = pendingSegments.reduce(
-      (count, segment) =>
-        count + (segment.tableId === entry.tableId && segment.level === 0 ? 1 : 0),
-      0,
-    );
-    const count = existing + added;
+    const count = existing + entry.added;
     if (count > entry.limit) {
       throw new CompactionBacklogError(table.name, count, entry.limit);
     }
