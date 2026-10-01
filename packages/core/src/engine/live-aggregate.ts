@@ -23,6 +23,7 @@ import {
   isExactNumeric,
 } from "./sql-domains.js";
 import { encodeSqlEqualityValue } from "./sql-semantics.js";
+import { maybeYieldToEventLoop } from "../work-slicer.js";
 
 interface Aggregate {
   name: "COUNT" | "SUM" | "AVG";
@@ -37,7 +38,12 @@ interface Group {
   keys: QueryValue[];
   members: number;
   counts: number[];
-  sums: string[];
+  /**
+   * Running sums. A plain number while every contribution has been a safe integer: `absolute`
+   * proves no partial sum can round, so integer addition is exact and reversible on its own. An
+   * exact decimal string once any exact numeric value has contributed.
+   */
+  sums: Array<number | string>;
   absolute: number[];
 }
 
@@ -59,7 +65,14 @@ function contributionBytes(key: string, row: Contribution): number {
 }
 
 function groupBytes(key: string, group: Group): number {
-  return 96 + key.length * 2 + group.sums.reduce((sum, value) => sum + value.length * 2 + 24, 0);
+  return (
+    96 +
+    key.length * 2 +
+    group.sums.reduce<number>(
+      (sum, value) => sum + (typeof value === "string" ? value.length * 2 + 24 : 16),
+      0,
+    )
+  );
 }
 
 /** Single-table COUNT/SUM/AVG contributions; SQL still evaluates filters and arguments. */
@@ -202,11 +215,17 @@ export class LiveAggregate {
     }
   }
 
-  patch(
+  /**
+   * Applies one commit's changed rows. Long inputs hand the event loop a turn between slices:
+   * a refresh of a hundred thousand rows patches without holding other queries for its length.
+   * Nothing shared changes until `accept`, so a query running between slices sees the previous
+   * result.
+   */
+  async patch(
     result: QueryResult,
     changed: ReadonlySet<string>,
     token: (value: QueryValue) => string,
-  ): LiveAggregate {
+  ): Promise<LiveAggregate> {
     if (this.#pending !== undefined || this.#revision !== this.#contributions.revision)
       throw new Error("Unaccepted or stale aggregate");
     const rows = this.#contributions.rows;
@@ -222,7 +241,7 @@ export class LiveAggregate {
           keys,
           members: 0,
           counts: this.#aggregates.map(() => 0),
-          sums: this.#aggregates.map(() => exactNumericValue(0) ?? ""),
+          sums: this.#aggregates.map(() => 0),
           absolute: this.#aggregates.map(() => 0),
         };
         groups.set(key, group);
@@ -257,10 +276,15 @@ export class LiveAggregate {
           }
           // Exact contributions support reversible removal; plain numeric inputs are maintained
           // only while every summation order is provably exact in the full float executor.
+          const current = group.sums[index] ?? 0;
+          if (typeof value === "number" && typeof current === "number") {
+            group.sums[index] = current + sign * value;
+            continue;
+          }
           const sum = exactNumericBinary(
             sign === 1 ? "+" : "-",
-            group.sums[index] ?? exactNumericValue(0),
-            exactNumericValue(value),
+            typeof current === "number" ? exactNumericValue(current) : current,
+            typeof value === "number" ? exactNumericValue(value) : value,
           );
           if (sum === null || sum === undefined)
             throw new TypeError("Invalid numeric aggregate contribution");
@@ -268,7 +292,9 @@ export class LiveAggregate {
         }
       }
     };
+    let step = 0;
     for (const key of changed) {
+      if ((++step & 1023) === 0) await maybeYieldToEventLoop();
       const old = rows.get(key);
       if (old === undefined) continue;
       apply(groupFor(old.group), old.values, -1);
@@ -276,6 +302,7 @@ export class LiveAggregate {
       bytes -= contributionBytes(key, old);
     }
     for (const row of result.rows) {
+      if ((++step & 1023) === 0) await maybeYieldToEventLoop();
       const key = token(row[this.keyAlias] ?? null);
       if (pending.get(key) !== undefined || (rows.has(key) && !changed.has(key)))
         throw new TypeError("Duplicate live input key");
@@ -359,8 +386,15 @@ export class LiveAggregate {
       for (const [index, aggregate] of this.#aggregates.entries()) {
         const count = group.counts[index] ?? 0;
         const domain = this.#domains[index];
+        const sum = group.sums[index] ?? null;
         let value: QueryValue =
-          aggregate.name === "COUNT" ? count : count === 0 ? null : (group.sums[index] ?? null);
+          aggregate.name === "COUNT"
+            ? count
+            : count === 0
+              ? null
+              : typeof sum === "number" && domain?.kind === "numeric"
+                ? (exactNumericValue(sum) ?? null)
+                : sum;
         if (value !== null && aggregate.name !== "COUNT") {
           if (domain?.kind !== "numeric") {
             value = Number(externalSqlDomainValue(value));

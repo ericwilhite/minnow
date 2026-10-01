@@ -225,31 +225,32 @@ describe("automatic compaction fits its folds to memory", () => {
     await database.close();
   });
 
-  it("refuses an automatic fold too fragmented to step through, and says why", async () => {
-    const { database, errors } = openDatabase();
+  it("folds refreshes written in an unrelated order as cheaply as ordered ones", async () => {
+    const { store, database, errors } = openDatabase();
     await wideTable(database);
-    await database.insertBatch("t", wideRows(1_200));
-    // Each refresh replaces every row, in an order unrelated to the table's: folding needs a
-    // plan of one range per cell, which automatic compaction will not persist.
-    for (let refresh = 1; refresh <= 5; refresh += 1) {
-      await database.upsertBatch("t", shuffled(wideRows(1_200, refresh), refresh));
+    await database.insertBatch("t", wideRows(7_000));
+    // Each refresh replaces every row in an order unrelated to the table's, so every output
+    // cell reads a different source row than its neighbour.
+    for (let refresh = 1; refresh <= 4; refresh += 1) {
+      await database.upsertBatch("t", shuffled(wideRows(7_000, refresh), refresh));
     }
-    await vi.waitFor(
-      () => {
-        expect(errors.length).toBeGreaterThan(0);
-      },
-      { timeout: heavyTestTimeout(60_000), interval: 50 },
-    );
-    expect(String(errors[0])).toMatch(
-      /^CompactionPlanTooFragmentedError: Compaction plan needs \d+ output ranges/,
-    );
-    expect((await database.listCompactionJobs("t")).filter(isActive)).toEqual([]);
-    const expected = await totals(await reference(wideRows(1_200, 5)));
-    expect(await totals(database)).toEqual(expected);
-    // An explicit fold is the caller's decision and is not held to that limit.
-    const result = await database.compactTable("t");
-    expect(result.compacted).toBe(true);
-    expect(await totals(database)).toEqual(expected);
+    const segments = await settled(database, store);
+    expect(errors).toEqual([]);
+    expect(segments.length).toBeLessThanOrEqual(2);
+    expect(await totals(database)).toEqual(await totals(await reference(wideRows(7_000, 4))));
+    const jobs = await publishedJobs(database);
+    expect(jobs.length).toBeGreaterThan(0);
+    for (const job of jobs) {
+      const plan = job.rewritePlan;
+      if (plan.kind !== "merge-v2") throw new Error("Expected a replayed merge");
+      // The record every step rewrites holds the sources and windows, not a range per cell:
+      // 7,000 reordered forty-column rows would be 280,000 ranges and tens of megabytes.
+      const recordBytes = JSON.stringify(job, (_key, value: unknown) =>
+        typeof value === "bigint" ? String(value) : value,
+      ).length;
+      expect(recordBytes).toBeLessThan(128 * 1024);
+      expect(plan.outputs.length).toBeLessThanOrEqual(4);
+    }
     await database.close();
   });
 
@@ -349,26 +350,76 @@ describe("merge planning keeps per-row replay semantics", () => {
     await database.close();
   });
 
-  it("reports what a fragmented plan needs and plans it at exactly that budget", async () => {
+  it("resumes a replayed merge elsewhere by recomputing its replay", async () => {
     const store = new MemoryBlockStore();
-    const database = new MinnowDatabase(store, { autoCompact: false });
-    await wideTable(database);
-    await database.insertBatch("t", wideRows(1_500));
-    await database.upsertBatch("t", shuffled(wideRows(1_500, 1), 7));
-    let refusal: unknown;
-    try {
-      await database.compactTableStep("t", { memoryBudgetBytes: 4 * 1024 * 1024 });
-    } catch (error) {
-      refusal = error;
+    const planner = new MinnowDatabase(store, { autoCompact: false });
+    await wideTable(planner);
+    await planner.insertBatch("t", wideRows(2_000));
+    await planner.upsertBatch("t", shuffled(wideRows(2_000, 1), 3));
+    await planner.execute(`UPDATE "t" SET "s3" = 'patched' WHERE "n0" % 7 = 0`);
+    const expected = await planner.readTable("t");
+    const first = await planner.compactTableStep("t", { maxBlocks: 2 });
+    if (first.jobId === null) throw new Error("Expected a running fold");
+    expect(first.result).toBeNull();
+    await planner.close();
+
+    // A second engine has never seen the replay: it recomputes it from the sources, checks it
+    // against the plan, and finishes the fold from the first engine's checkpoint.
+    const resumer = new MinnowDatabase(store, { autoCompact: false });
+    let progress = first;
+    while (progress.result === null) {
+      progress = await resumer.resumeCompactionJob(first.jobId, { maxBlocks: 4 });
     }
-    expect(refusal).toBeInstanceOf(CompactionMemoryBudgetError);
-    if (!(refusal instanceof CompactionMemoryBudgetError)) throw new Error("Expected a refusal");
-    expect(await database.listCompactionJobs("t")).toEqual([]);
-    const progress = await database.compactTableStep("t", {
-      memoryBudgetBytes: refusal.minimumBytes,
+    expect(progress.result.compacted).toBe(true);
+    expect(await resumer.readTable("t")).toEqual(expected);
+    await resumer.close();
+  });
+
+  it("abandons a fold whose recomputed replay does not match its plan", async () => {
+    const store = new MemoryBlockStore();
+    const planner = new MinnowDatabase(store, { autoCompact: false });
+    await wideTable(planner);
+    await planner.insertBatch("t", wideRows(500));
+    await planner.upsertBatch("t", shuffled(wideRows(500, 1), 5));
+    const expected = await planner.readTable("t");
+    const planned = await planner.compactTableStep("t", { maxBlocks: 1 });
+    if (planned.jobId === null) throw new Error("Expected a running fold");
+    const job = await store.getCompactionJob(planned.jobId);
+    if (job?.rewritePlan.kind !== "merge-v2") throw new Error("Expected a replayed merge");
+    await planner.cancelCompactionJob(job.id);
+    await planner.close();
+    // The same plan with a checksum no replay of these sources produces.
+    await store.createCompactionJob({
+      ...job,
+      id: `${job.id}/tampered`,
+      outputBlockIds: [],
+      outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+      processedRows: 0,
+      outputStoredBytes: 0,
+      outputLogicalBytes: 0,
+      peakWorkingBytes: 0,
+      state: "planned",
+      transactionId: null,
+      revision: 0,
+      rewritePlan: {
+        ...job.rewritePlan,
+        resolution: {
+          ...job.rewritePlan.resolution,
+          checksum: (job.rewritePlan.resolution.checksum + 1) >>> 0,
+        },
+      },
     });
-    expect(progress.jobId).not.toBeNull();
-    await database.close();
+    const resumer = new MinnowDatabase(store, { autoCompact: false });
+    await expect(resumer.resumeCompactionJob(`${job.id}/tampered`)).rejects.toThrow(
+      "Compaction replay differs from its plan",
+    );
+    expect(await store.getCompactionJob(`${job.id}/tampered`)).toMatchObject({
+      state: "aborted",
+    });
+    // Nothing was written; the table folds normally afterwards.
+    expect((await resumer.compactTable("t")).compacted).toBe(true);
+    expect(await resumer.readTable("t")).toEqual(expected);
+    await resumer.close();
   });
 });
 

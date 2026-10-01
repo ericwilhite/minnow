@@ -14,12 +14,27 @@ import { OpfsTree, isDomError } from "./files.js";
 import { MAX_OPFS_CHECKPOINT_BYTES, MAX_OPFS_WAL_BYTES, OpfsLeader } from "./leader.js";
 
 export const FIRST_SUPPORTED_OPFS_LAYOUT = 6;
-export const OPFS_UPGRADES = [{ from: 6, to: 7 }] as const;
+/**
+ * The layout this build writes. Layout 8 stores exactly layout 7's bytes — its checkpoints,
+ * WAL, and extents still carry encoding version 7 — and differs only in admitting replayed
+ * merge plans in compaction job records, which a layout-7 reader cannot parse. The marker is
+ * the barrier: an older reader refuses the database before it reads a record.
+ */
+export const OPFS_LAYOUT_VERSION = 8;
+export const OPFS_UPGRADES = [
+  { from: 6, to: 7 },
+  { from: 7, to: 8 },
+] as const;
 const DIRECTORY = "upgrade-6-7";
 const READY = "ready";
 const COMPLETE = "upgrade-6-7-complete";
 const CONTROL_NAMES = ["wal", "checkpoint-a", "checkpoint-b"] as const;
-const MARKER = new TextEncoder().encode(JSON.stringify({ formatVersion: 7 }));
+const MARKER = new TextEncoder().encode(JSON.stringify({ formatVersion: OPFS_LAYOUT_VERSION }));
+const MARKER_TEXT = new TextDecoder().decode(MARKER);
+const LAYOUT7_MARKER_TEXT = '{"formatVersion":7}';
+/** Present only while a layout-7 marker is being rewritten as layout 8. */
+const LAYOUT8_WITNESS = "upgrade-7-8";
+const LAYOUT8_WITNESS_BYTES = new TextEncoder().encode('{"from":7,"to":8}');
 
 interface Fingerprint {
   size: number;
@@ -287,16 +302,64 @@ function readReady(bytes: Uint8Array): ReadyRecord {
   return decoded as ReadyRecord;
 }
 
-/** May return false without mutation for an ordinary current-layout open. */
+/**
+ * Brings the database to the current layout under the held locks: layout 6 through the
+ * validated conversion, layout 7 through the marker. Returns whether stored bytes were
+ * converted, which the caller follows with a full integrity check; an ordinary current-layout
+ * open returns false without mutation.
+ */
 export async function upgradeOpfsLayout(tree: OpfsTree, handles: UpgradeHandles): Promise<boolean> {
+  const converted = await upgradeLayout6(tree, handles);
+  await upgradeLayout7Marker(tree);
+  return converted;
+}
+
+async function layout8Witness(tree: OpfsTree): Promise<boolean> {
+  const witness = await tree.readFile([LAYOUT8_WITNESS], { maxBytes: 64 });
+  if (witness === undefined) return false;
+  if (!same(bytesFingerprint(witness), bytesFingerprint(LAYOUT8_WITNESS_BYTES))) {
+    throw corrupt("Layout-8 upgrade witness is corrupt");
+  }
+  return true;
+}
+
+/**
+ * Layout 7 to 8 changes no stored byte, so the upgrade is the marker. The witness goes first and
+ * is flushed before the marker is touched: a crash that tears the marker while it is rewritten
+ * leaves a durable witness behind, and the next open finishes the rewrite instead of refusing a
+ * marker it cannot read. Only a torn marker needs the witness to be intact; beside a whole
+ * layout-7 marker a half-written witness is simply written again. It is removed last, once the
+ * layout-8 marker is durable, and a witness that outlives its removal is cleaned up later.
+ */
+async function upgradeLayout7Marker(tree: OpfsTree): Promise<void> {
+  const text = new TextDecoder().decode(await tree.readFile(["format.json"], { maxBytes: 1024 }));
+  if (text === MARKER_TEXT) {
+    if ((await tree.readFile([LAYOUT8_WITNESS], { maxBytes: 4096 })) !== undefined) {
+      await tree.deleteFile([LAYOUT8_WITNESS]);
+    }
+    return;
+  }
+  if (text !== LAYOUT7_MARKER_TEXT && !(await layout8Witness(tree))) return;
+  await tree.writeFile([LAYOUT8_WITNESS], LAYOUT8_WITNESS_BYTES, { flush: true });
+  await tree.writeFile(["format.json"], MARKER, { flush: true });
+  await tree.deleteFile([LAYOUT8_WITNESS]);
+}
+
+/** The layout-6 conversion; returns false without mutation once it has nothing to do. */
+async function upgradeLayout6(tree: OpfsTree, handles: UpgradeHandles): Promise<boolean> {
   const marker = await tree.readFile(["format.json"], { maxBytes: 1024 });
   const text = new TextDecoder().decode(marker);
-  const current = text === new TextDecoder().decode(MARKER);
+  // A layout-7 marker is as published as the current one: an older build may have finished
+  // this conversion's publication and stopped before its cleanup.
+  const current = text === MARKER_TEXT || text === LAYOUT7_MARKER_TEXT;
   const legacy = text === '{"formatVersion":6}';
   const readyBytes = await tree.readFile([DIRECTORY, READY], { maxBytes: 4096 });
   if (current && readyBytes === undefined) return false;
-  if (!current && !legacy && readyBytes === undefined)
+  if (!current && !legacy && readyBytes === undefined) {
+    // A marker torn while it was rewritten as layout 8 is the marker step's to finish.
+    if (await layout8Witness(tree)) return false;
     throw corrupt("Missing upgrade witness for a torn marker");
+  }
   let ready: ReadyRecord;
   if (legacy) {
     // Until publication changes the marker, an older writer may have advanced the source.
@@ -446,7 +509,13 @@ export async function hasPreparedOpfsUpgrade(tree: OpfsTree): Promise<boolean> {
     maxBytes: 4096,
     lockedMeansAbsent: true,
   });
-  if (bytes === undefined) return false;
+  if (bytes === undefined) {
+    const witness = await tree.readFile([LAYOUT8_WITNESS], {
+      maxBytes: 64,
+      lockedMeansAbsent: true,
+    });
+    return witness !== undefined;
+  }
   readReady(bytes);
   return true;
 }

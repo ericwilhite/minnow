@@ -56,8 +56,9 @@ detection must fail clearly; it must not silently select a less durable store.
 
 Package versions and stored formats move independently. Every supported stored format remains
 readable through the ordinary open/load API, including during 0.x. A newer reader keeps the old
-reader or performs an automatic conversion that preserves data. OPFS layout 6 upgrades to 7 on
-open; manual export/import is not a required upgrade step. Unknown future native formats are
+reader or performs an automatic conversion that preserves data. IndexedDB schema 2 upgrades to 3,
+and OPFS layouts 6 and 7 upgrade to 8, on open; manual export/import is not a required upgrade
+step. Unknown future native formats are
 rejected without mutation.
 
 Frozen block/snapshot, IndexedDB, and OPFS fixtures carry the exact Minnow package version that

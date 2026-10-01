@@ -334,8 +334,8 @@ describe("partitioned folds of a keyed table", () => {
       partitions[9]?.id,
       ...deltas.map((segment) => segment.id),
     ]);
-    expect(job.rewritePlan.kind).toBe("merge-v1");
-    if (job.rewritePlan.kind !== "merge-v1") throw new Error("Expected a merge plan");
+    expect(job.rewritePlan.kind).toBe("merge-v2");
+    if (job.rewritePlan.kind !== "merge-v2") throw new Error("Expected a merge plan");
     expect(job.rewritePlan.partitions).toEqual([
       { rowStart: 0, rowCount: PARTITION_ROWS, logicalOrder: partitions[2]?.logicalOrder },
       {
@@ -551,7 +551,7 @@ describe("partitioned folds of a keyed table", () => {
     });
     if (result.jobId === undefined) throw new Error("Expected a fold job");
     const job = await requiredJob(store, result.jobId);
-    if (job.rewritePlan.kind !== "merge-v1" || job.rewritePlan.partitions === undefined) {
+    if (job.rewritePlan.kind !== "merge-v2" || job.rewritePlan.partitions === undefined) {
       throw new Error("Expected a partitioned merge plan");
     }
     expect(partitions.length).toBeGreaterThan(1);

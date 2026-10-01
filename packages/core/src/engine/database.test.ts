@@ -2058,7 +2058,7 @@ async function assertPublishedMutationMerge(
 ): Promise<SegmentRecord> {
   const job = await store.getCompactionJob(jobId);
   if (job === undefined) throw new Error(`Expected compaction job ${jobId}`);
-  if (job.rewritePlan.kind !== "merge-v1") throw new Error("Expected a merge-v1 plan");
+  if (job.rewritePlan.kind !== "merge-v2") throw new Error("Expected a merge-v2 plan");
   expect(job).toMatchObject({ state: "published", processedRows: expectedRows.length });
   expect(new Set(job.outputBlockIds).size).toBe(job.outputBlockIds.length);
   expect(job.rewritePlan).toMatchObject({
@@ -2131,7 +2131,7 @@ async function createMutationRebaseGuardFixture(
   if (progress.jobId === null) throw new Error("Expected a guarded mutation compaction job");
   expect(progress).toMatchObject({ state: "running", outputBlockCount: 1, result: null });
   const job = await store.getCompactionJob(progress.jobId);
-  if (job?.rewritePlan.kind !== "merge-v1") throw new Error("Expected a merge-v1 guard plan");
+  if (job?.rewritePlan.kind !== "merge-v2") throw new Error("Expected a merge-v2 guard plan");
   const table = await store.getTableByName(tableName);
   if (table === undefined) throw new Error(`Expected guard table ${tableName}`);
   return { database, table, job, expectedRows };
@@ -6061,7 +6061,7 @@ for (const implementation of implementations()) {
       outputBlockIds: [],
       outputSegmentId: null,
       processedRows: 0,
-      rewritePlan: { kind: "merge-v1", totalRows: 0, rowIdSpans: [], outputs: [] },
+      rewritePlan: { kind: "merge-v2", totalRows: 0, rowIdSpans: [], outputs: [] },
     });
     expect(await currentManifestBlockIds(store)).toEqual([]);
     expect(await database.readTable(tableName)).toEqual([]);
@@ -6095,7 +6095,7 @@ for (const implementation of recoveryImplementations()) {
     expect(progress).toMatchObject({ state: "running", outputBlockCount: 1, result: null });
     expect(await store.getCompactionJob(jobId)).toMatchObject({
       rewritePlan: {
-        kind: "merge-v1",
+        kind: "merge-v2",
         rowIdSpans: canonicalRowIdSpans(fixture.expectedRowIds),
       },
       outputBlockIds: [expect.any(String)],
@@ -6142,7 +6142,7 @@ it("recovers a mutation-merge block whose durable cursor checkpoint was lost", a
   expect(interrupted).toMatchObject({
     state: "running",
     outputBlockIds: [],
-    rewritePlan: { kind: "merge-v1" },
+    rewritePlan: { kind: "merge-v2" },
   });
   if (interrupted.transactionId === null) throw new Error("Expected a merge transaction");
   expect((await store.getTransaction(interrupted.transactionId))?.pendingBlockIds).toHaveLength(1);
@@ -6298,7 +6298,7 @@ it("canonicalizes a hostile concurrent logical order and safely rebases a mutati
   const store = new MemoryBlockStore();
   const fixture = await createMutationRebaseGuardFixture(store, "interleaved_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan.kind !== "merge-v1") throw new Error("Expected an interleaved merge plan");
+  if (plan.kind !== "merge-v2") throw new Error("Expected an interleaved merge plan");
   const earliest = requiredItem(plan.sourceSegments, 0, "earliest guarded source");
   const latest = requiredItem(
     plan.sourceSegments,
@@ -6339,7 +6339,7 @@ it("canonicalizes a hostile equal logical order before rebasing a mutation merge
   const store = new MemoryBlockStore();
   const fixture = await createMutationRebaseGuardFixture(store, "equal_order_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan.kind !== "merge-v1") throw new Error("Expected an equal-order merge plan");
+  if (plan.kind !== "merge-v2") throw new Error("Expected an equal-order merge plan");
   const latestPlannedCommit = Math.max(
     ...plan.sourceSegments.map((segment) => segment.committedVersion),
   );
@@ -6375,7 +6375,7 @@ it("aborts a mutation merge before supersession when a concurrent segment aliase
   const store = new MemoryBlockStore();
   const fixture = await createMutationRebaseGuardFixture(store, "shared_block_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan.kind !== "merge-v1") throw new Error("Expected a shared-block merge plan");
+  if (plan.kind !== "merge-v2") throw new Error("Expected a shared-block merge plan");
   const keyBlockId = plan.sourceSegments
     .flatMap((segment) => segment.columns)
     .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
@@ -6429,7 +6429,7 @@ it("aborts a mutation merge when a segment from another table aliases a global s
   });
   const fixture = await createMutationRebaseGuardFixture(store, "cross_table_block_merge_guard");
   const plan = fixture.job.rewritePlan;
-  if (plan.kind !== "merge-v1") throw new Error("Expected a cross-table merge plan");
+  if (plan.kind !== "merge-v2") throw new Error("Expected a cross-table merge plan");
   const keyBlockId = plan.sourceSegments
     .flatMap((segment) => segment.columns)
     .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
@@ -6630,7 +6630,7 @@ for (const implementation of implementations()) {
       });
       const job = await store.getCompactionJob(result.jobId);
       expect(job?.rewritePlan).toMatchObject({
-        kind: "merge-v1",
+        kind: "merge-v2",
         totalRows: rowIds.length,
         rowIdSpans: canonicalRowIdSpans(rowIds),
       });
@@ -7429,7 +7429,7 @@ it("retries a cancelled keyed L2 promotion under the shared lifetime ceiling", a
   if (first.jobId === null) throw new Error("Expected a keyed promotion job");
   const interrupted = await store.getCompactionJob(first.jobId);
   const attemptBytes = interrupted?.outputStoredBytes ?? 0;
-  expect(interrupted?.rewritePlan.kind).toBe("merge-v1");
+  expect(interrupted?.rewritePlan.kind).toBe("merge-v2");
   expect(interrupted?.outputPartitionOrdinal).toBe(0);
   expect(attemptBytes).toBeGreaterThan(0);
   await database.cancelCompactionJob(first.jobId);

@@ -110,13 +110,34 @@ the size that fit. When even the smallest fold the table allows does not fit, au
 compaction gives that one fold the memory it needs — about what the writes that produced it
 already held — rather than leaving the table to slow every read.
 
-One kind of fold is too costly to run in the background: upserts that replace many rows in an
-order unrelated to the table's own. Each replaced row then needs its own source range for every
-column, and the job record holding those ranges is read and rewritten on every step. Past a
-fixed allowance, automatic compaction refuses the fold with `CompactionPlanTooFragmentedError`,
-reports it to `onBackgroundError` (`onWorkerError` on a worker client), and tries again after
-its backoff. Upserting rows in the order the table already has them — the order a plain
-`SELECT *` returns — keeps these folds cheap. `compactTable` folds the table either way.
+The order rows arrive in does not matter. A fold's job record holds its sources, output windows,
+and partitions — not which source row feeds each output cell. That mapping, the replay, is a pure
+function of the immutable sources: the engine that plans a fold keeps it in memory as compact
+runs, and any engine that resumes the fold — another tab, the same tab after a reload — recomputes
+it and checks it against a checksum the record carries before writing a block. A refresh written
+in an unrelated order therefore folds as quickly as one in the table's own order, and the record
+every step rewrites stays small. Jobs written by Minnow 0.12 and earlier keep their stored ranges
+and resume as planned.
+
+### Responsiveness
+
+Background work never holds the thread for long. Folds, garbage collection, index and full-text
+builds, OPFS checkpoints, and live-query updates run in slices of a few milliseconds and hand the
+event loop a turn between them, so a query or write that arrives in the middle waits for one
+slice, not for the job. Long statements are sliced the same way: a scan yields between batches,
+a large write yields between its passes over the rows, and the first lookup through a new index
+yields while it hashes each block's keys. One clock paces all of it, so a statement made of many
+short steps, or a run of statements awaited back to back, yields as often as one long loop.
+
+On a laptop, the longest single block measured during background work is about 40 ms, on the
+memory and OPFS stores alike, for every shape in `scripts/stall-survey.mts`: wide tables
+refreshed in any order, hundreds of thousands of rows of point updates or deletes, index and
+full-text builds, and live aggregates under heavy writes. Foreground statements hold it longer
+only in proportion to their own size: a 50,000-row write holds it for about 50–80 ms, a
+single write of half a million rows for up to about 160 ms, and creating a `UNIQUE` index on
+an existing table installs its whole key set in one step — about 30 ms per 200,000 rows on the
+memory store and 70 ms on OPFS. On an OPFS database of a million keyed rows, the longest block
+while loading it 50,000 rows at a time is under 80 ms.
 
 Automatic compaction backs off a table whose attempt does not help, rather than retrying it on
 every query. A fold that fails waits a delay that doubles from a quarter of a second per

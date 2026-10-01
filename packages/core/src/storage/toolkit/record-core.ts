@@ -1867,13 +1867,18 @@ export class RecordCore {
         this.getCurrentManifestVersion(),
       );
     }
-    let uniqueSeed: Set<string> | undefined;
+    // One pass builds the membership the update installs; only a seed that collapsed while
+    // building is walked again, to name its first duplicate.
+    let uniqueSeed: OrderedStringSet | undefined;
     if (update.uniqueKeySeed !== undefined) {
-      uniqueSeed = new Set<string>();
-      for (const token of update.uniqueKeySeed.keyTokens) {
-        if (uniqueSeed.has(token))
-          throw new UniqueKeyConflictError(update.uniqueKeySeed.namespaceId, token);
-        uniqueSeed.add(token);
+      const { namespaceId, keyTokens } = update.uniqueKeySeed;
+      uniqueSeed = new OrderedStringSet(keyTokens);
+      if (uniqueSeed.size !== keyTokens.length) {
+        const seen = new Set<string>();
+        for (const token of keyTokens) {
+          if (seen.has(token)) throw new UniqueKeyConflictError(namespaceId, token);
+          seen.add(token);
+        }
       }
     }
     if (update.autoIncrementSeed !== undefined) {
@@ -1982,10 +1987,7 @@ export class RecordCore {
       }
     }
     if (update.uniqueKeySeed !== undefined) {
-      this.#uniqueKeys.set(
-        update.uniqueKeySeed.namespaceId,
-        new OrderedStringSet(uniqueSeed ?? []),
-      );
+      this.#uniqueKeys.set(update.uniqueKeySeed.namespaceId, uniqueSeed ?? new OrderedStringSet());
     }
     if (autoIncrementCounter !== undefined) {
       this.#nextAutoIncrement.set(autoIncrementCounter.key, autoIncrementCounter.next);
@@ -2309,8 +2311,36 @@ export class RecordCore {
       throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
     }
     validateFtsBaseInput(input, "Full-text base");
+    this.#setFtsBase(tableId, columnId, cloneRecord(input));
+  }
+
+  /**
+   * Installs a postings base whose chunks the caller already validated one by one and owns
+   * outright — the chunks of a bounded build, each checked and copied as it was staged. Skips
+   * `writeFtsBase`'s whole-base validation and copy, which cost a pass over every posting.
+   */
+  installValidatedFtsBase(
+    tableId: string,
+    columnId: string,
+    input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
+  ): void {
+    const table = this.#tables.get(tableId);
+    if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
+      throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
+    }
+    if (input.chunks.length > MAX_FTS_BASE_CHUNKS) {
+      throw new RangeError("Full-text base exceeds the chunk-count limit");
+    }
+    this.#setFtsBase(tableId, columnId, input);
+  }
+
+  #setFtsBase(
+    tableId: string,
+    columnId: string,
+    input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
+  ): void {
     const key = `${tableId}/${columnId}`;
-    this.#ftsBases.set(key, cloneRecord(input));
+    this.#ftsBases.set(key, input);
     const deltas = this.#ftsDeltas.get(key);
     if (deltas !== undefined) {
       for (const version of [...deltas.keys()]) {

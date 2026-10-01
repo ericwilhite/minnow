@@ -15,6 +15,13 @@ export const MAX_PHYSICAL_COLUMN_BYTE_LENGTH = 64 * 1024 * 1024;
 export const MAX_BLOCK_ROW_COUNT = 1_048_576;
 const MAX_DATETIME_MILLISECONDS = 8_640_000_000_000_000;
 
+/**
+ * Columns this module has validated or built. A physical column is plain data, so validation
+ * is remembered by identity: appending row ranges of an already validated column (a decoded
+ * block feeding many output ranges) checks its payload once, not once per range.
+ */
+const validatedColumns = new WeakSet<PhysicalColumnPayload>();
+
 interface PreparedPhysicalRange<T extends LogicalType> {
   column: ValidatedPhysicalColumn<T>;
   start: number;
@@ -194,13 +201,15 @@ export function validatePhysicalColumn<T extends LogicalType>(
     }
   }
 
-  return {
+  const validated: ValidatedPhysicalColumn<T> = {
     type: input.type,
     rowCount: input.rowCount,
     nullCount,
     bytes: input.bytes,
     metadata,
   };
+  validatedColumns.add(validated);
+  return validated;
 }
 
 /**
@@ -304,13 +313,15 @@ export function buildPhysicalColumnFromRanges<T extends LogicalType>(
     }
   }
 
-  return {
+  const built: ValidatedPhysicalColumn<T> = {
     type,
     rowCount: measurement.rowCount,
     nullCount: measurement.nullCount,
     bytes: output,
     metadata: measurement.metadata,
   };
+  validatedColumns.add(built);
+  return built;
 }
 
 export function slicePhysicalColumn<T extends LogicalType>(
@@ -346,7 +357,9 @@ function preparePhysicalColumn<T extends LogicalType>(
     if (range.column.type !== type) {
       throw new TypeError(`Cannot append ${range.column.type} physical rows to a ${type} column`);
     }
-    const column = validatePhysicalColumn(range.column);
+    const column = validatedColumns.has(range.column)
+      ? (range.column as ValidatedPhysicalColumn<T>)
+      : validatePhysicalColumn(range.column);
     assertRangeBoundary(range.start, "range start");
     assertRangeBoundary(range.end, "range end");
     if (range.start > range.end || range.end > column.rowCount) {

@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
   decodeChunk,
@@ -8,6 +9,7 @@ import {
   encodePostingChunk,
   encodeRecordJson,
   encodeSyncCheckpoint,
+  encodeSyncCheckpointSliced,
   LOG_FORMAT_VERSION,
 } from "./wire.js";
 import { RecordCore, type RecordCoreState } from "./record-core.js";
@@ -470,5 +472,93 @@ describe("synchronous checkpoint slots", () => {
     bytes[bytes.byteLength - 1] = (bytes[bytes.byteLength - 1] ?? 0) ^ 0xff;
     expect(decodeSyncCheckpoint(bytes)).toBeUndefined();
     expect(decodeSyncCheckpoint(new Uint8Array(0))).toBeUndefined();
+  });
+});
+
+describe("sliced checkpoint encoding", () => {
+  let pauses = 0;
+  const pause = (): Promise<void> => {
+    pauses += 1;
+    return Promise.resolve();
+  };
+
+  async function expectSameBytes(state: unknown): Promise<void> {
+    const sliced = await encodeSyncCheckpointSliced(state, pause);
+    expect(Buffer.from(sliced).equals(Buffer.from(encodeSyncCheckpoint(state)))).toBe(true);
+  }
+
+  it("matches the synchronous encoding byte for byte where containers outgrow one slice", async () => {
+    const tokens = Array.from({ length: 30_000 }, (_, index) => `key-${String(index)}-é😀`);
+    const rowIds = Array.from({ length: 12_000 }, (_, index) => BigInt(index) * 7n);
+    const records = Array.from({ length: 5_000 }, (_, index) => ({
+      id: `segment-${String(index)}`,
+      rowIdStart: BigInt(index) * 1_000n,
+      columnBlockIds: { c1: [`b${String(index)}`], c2: [] },
+      skipped: undefined,
+      dropped: () => index,
+      createdAt: new Date(Date.UTC(2026, 9, 1, 0, 0, index)),
+      nested: { deeper: [index, null, Number.NaN, -0, Infinity] },
+    }));
+    const wide = Object.fromEntries(
+      Array.from({ length: 6_000 }, (_, index) => [
+        `k${String(index)}`,
+        index % 3 === 0 ? undefined : index,
+      ]),
+    );
+    // A hole, like undefined, a function, or a symbol, stringifies as null inside an array.
+    const sparse: unknown[] = [1, undefined, () => 1, Symbol("s"), ...tokens.slice(0, 5_000)];
+    sparse[sparse.length + 1] = 3;
+    pauses = 0;
+    await expectSameBytes({
+      formatVersion: 1,
+      core: {
+        uniqueKeys: [["table", tokens]],
+        segments: records,
+        ftsBases: [["t/c", { chunks: [[{ term: "fox", rowIds, tf: rowIds.map(() => 1) }]] }]],
+      },
+      sparse,
+      wide,
+      "10": "numeric-like keys sort first",
+      empty: { array: [], object: {} },
+    });
+    expect(pauses).toBeGreaterThan(1);
+  });
+
+  it("matches the synchronous encoding for arbitrary JSON-shaped states", async () => {
+    const leaf = fc.oneof(
+      fc.string({ unit: "grapheme", maxLength: 12 }),
+      fc.double(),
+      fc.integer(),
+      fc.boolean(),
+      fc.constant(null),
+      fc.constant(undefined),
+      fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
+    );
+    const { tree } = fc.letrec((node) => ({
+      tree: fc.oneof(
+        { depthSize: "small", withCrossShrink: true },
+        leaf,
+        fc.array(node("tree"), { maxLength: 6 }),
+        fc.dictionary(fc.string({ maxLength: 6 }), node("tree"), { maxKeys: 6 }),
+        // Wide enough to cross the slice boundary, so walked and native pieces interleave.
+        fc.array(leaf, { minLength: 4_000, maxLength: 9_000 }),
+      ),
+    }));
+    await fc.assert(
+      fc.asyncProperty(tree, async (state) => {
+        if (state === undefined) return;
+        await expectSameBytes(state);
+      }),
+      { numRuns: 60 },
+    );
+  });
+
+  it("refuses what the synchronous encoding refuses", async () => {
+    await expect(encodeSyncCheckpointSliced(undefined, pause)).rejects.toThrow(
+      /not JSON-serializable/,
+    );
+    const outOfRange = { rows: Array.from({ length: 9_000 }, () => MAX_ROW_ID_EXCLUSIVE_END + 1n) };
+    expect(() => encodeSyncCheckpoint(outOfRange)).toThrow(RangeError);
+    await expect(encodeSyncCheckpointSliced(outOfRange, pause)).rejects.toThrow(RangeError);
   });
 });

@@ -44,7 +44,7 @@ Download size affects cold starts, and Wasm engines also compile a module before
 | Engine                    | Download (gzip) | Raw       | Wasm compile step |
 | ------------------------- | --------------- | --------- | ----------------- |
 | IndexedDB                 | 0               | 0         | No                |
-| **Minnow 0.12.2**         | **364 KiB**     | 1.26 MiB  | No                |
+| **Minnow 0.13.0**         | **367 KiB**     | 1.27 MiB  | No                |
 | SQLite Wasm 3.53.0-build1 | 457 KiB         | 1.03 MiB  | Yes               |
 | PGlite 0.5.5              | 5.46 MiB        | 16.20 MiB | Yes               |
 
@@ -146,9 +146,9 @@ adapter ships with the project.
 ## Minnow's limits
 
 - Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Block format 2,
-  snapshot format 1, IndexedDB schema 2, and native OPFS layout 7 are separately versioned and
-  locked. Supported storage upgrades run automatically on open, including layout 6 to 7; see the
-  [OPFS guide](/docs/storage/opfs#what-it-creates).
+  snapshot format 1, IndexedDB schema 3, and native OPFS layout 8 are separately versioned and
+  locked. Supported storage upgrades run automatically on open, including IndexedDB schema 2 to 3
+  and OPFS layouts 6 and 7 to 8; see the [OPFS guide](/docs/storage/opfs#what-it-creates).
 - Its SQL dialect is an embedded PostgreSQL subset, not the PostgreSQL server.
 - `UPDATE` and `DELETE` require row identity: a primary key or one inline unique column.
 - Secondary indexes support scalar and composite left-prefix equality, `IN`, range filtering, and

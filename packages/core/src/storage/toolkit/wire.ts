@@ -1,4 +1,4 @@
-import { crc32 } from "../../block-format/index.js";
+import { crc32, crc32Continue } from "../../block-format/index.js";
 import { MAX_ROW_ID_EXCLUSIVE_END, StorageFormatVersionError } from "../types.js";
 
 /**
@@ -19,22 +19,159 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 export function encodeRecordJson(value: unknown): Uint8Array {
+  const json = stringifyRecordJson(value);
+  if (json === undefined) throw new TypeError("Record value is not JSON-serializable");
+  return textEncoder.encode(json);
+}
+
+/** The record JSON for `value`, or undefined where `JSON.stringify` would give no text. */
+function stringifyRecordJson(value: unknown): string | undefined {
   // The replacer costs ~3x on big payloads because it runs per node; most frames carry no
   // bigints at all, and stringify announces one by throwing.
-  let json: string;
+  // Typed `string`, but undefined at runtime for an undefined, function, or symbol value.
   try {
-    json = JSON.stringify(value);
+    return JSON.stringify(value);
   } catch {
-    json = JSON.stringify(value, (_key, entry: unknown) => {
-      if (typeof entry !== "bigint") return entry;
-      if (entry < 0n || entry > MAX_ROW_ID_EXCLUSIVE_END) {
-        throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
-      }
-      return { $n: entry.toString() };
-    });
+    return JSON.stringify(value, recordBigintReplacer);
   }
-  if (typeof json !== "string") throw new TypeError("Record value is not JSON-serializable");
-  return textEncoder.encode(json);
+}
+
+function recordBigintReplacer(_key: string, entry: unknown): unknown {
+  if (typeof entry !== "bigint") return entry;
+  if (entry < 0n || entry > MAX_ROW_ID_EXCLUSIVE_END) {
+    throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
+  }
+  return { $n: entry.toString() };
+}
+
+/** JSON values one native stringify call may cover in a sliced encoding. */
+const SLICED_JSON_NODES = 4_096;
+/** Characters a sliced encoding gathers before it encodes them and offers a pause. */
+const SLICED_JSON_FLUSH_CHARS = 64 * 1024;
+
+/**
+ * The record JSON of `value`, built a bounded piece at a time: containers too large for one
+ * slice are walked, everything else is stringified natively, and `pause` is awaited between
+ * pieces. The bytes are exactly `encodeRecordJson(value)`'s; `value` must not change while the
+ * encoding is in flight. Returns the UTF-8 pieces, their total length, and their CRC-32.
+ */
+async function encodeRecordJsonSliced(
+  value: unknown,
+  pause: () => Promise<void>,
+): Promise<{ chunks: Uint8Array[]; byteLength: number; checksum: number }> {
+  const chunks: Uint8Array[] = [];
+  let pending: string[] = [];
+  let pendingChars = 0;
+  let byteLength = 0;
+  let checksum = 0;
+  const flush = async (): Promise<void> => {
+    if (pending.length > 0) {
+      const bytes = textEncoder.encode(pending.join(""));
+      pending = [];
+      pendingChars = 0;
+      chunks.push(bytes);
+      byteLength += bytes.byteLength;
+      checksum = crc32Continue(checksum, bytes);
+    }
+    await pause();
+  };
+  const push = async (text: string): Promise<void> => {
+    pending.push(text);
+    pendingChars += text.length;
+    if (pendingChars >= SLICED_JSON_FLUSH_CHARS) await flush();
+  };
+  /** Writes `entry`'s JSON; false when `JSON.stringify` would omit it (an object property). */
+  const write = async (entry: unknown): Promise<boolean> => {
+    if (jsonNodes(entry, SLICED_JSON_NODES) <= SLICED_JSON_NODES) {
+      const text = stringifyRecordJson(entry);
+      if (text === undefined) return false;
+      await push(text);
+      return true;
+    }
+    if (Array.isArray(entry)) {
+      await push("[");
+      // Runs of small elements share one native call: `[a,b]` minus its brackets is exactly
+      // the text `a,b` contributes, holes and unserializable entries included (as `null`).
+      let run: unknown[] = [];
+      let runNodes = 0;
+      let first = true;
+      const writeRun = async (): Promise<void> => {
+        if (run.length === 0) return;
+        const text = stringifyRecordJson(run) ?? "[]";
+        await push(`${first ? "" : ","}${text.slice(1, -1)}`);
+        first = false;
+        run = [];
+        runNodes = 0;
+      };
+      for (const element of entry as unknown[]) {
+        const nodes = jsonNodes(element, SLICED_JSON_NODES);
+        if (nodes > SLICED_JSON_NODES) {
+          await writeRun();
+          if (!first) await push(",");
+          first = false;
+          if (!(await write(element))) await push("null");
+          continue;
+        }
+        if (runNodes + nodes > SLICED_JSON_NODES) await writeRun();
+        run.push(element);
+        runNodes += nodes;
+      }
+      await writeRun();
+      await push("]");
+      return true;
+    }
+    // A plain object (jsonNodes walks nothing else): keys in `JSON.stringify`'s order, each
+    // value written whole or walked, and omitted exactly when stringify omits it.
+    await push("{");
+    let first = true;
+    for (const key of Object.keys(entry as object)) {
+      const property: unknown = (entry as Record<string, unknown>)[key];
+      const label = `${first ? "" : ","}${JSON.stringify(key)}:`;
+      if (jsonNodes(property, SLICED_JSON_NODES) > SLICED_JSON_NODES) {
+        await push(label);
+        await write(property);
+        first = false;
+        continue;
+      }
+      const text = stringifyRecordJson(property);
+      if (text === undefined) continue;
+      await push(`${label}${text}`);
+      first = false;
+    }
+    await push("}");
+    return true;
+  };
+  if (!(await write(value))) throw new TypeError("Record value is not JSON-serializable");
+  await flush();
+  return { chunks, byteLength, checksum };
+}
+
+/**
+ * JSON values in `entry`, counted until `limit` is passed. Only arrays and plain objects are
+ * walked: anything else, a Date or a typed array included, stringifies natively as one piece.
+ */
+function jsonNodes(entry: unknown, limit: number): number {
+  if (typeof entry !== "object" || entry === null) return 1;
+  if (Array.isArray(entry)) {
+    if (entry.length >= limit) return limit + 1;
+    let count = 1;
+    for (const element of entry as unknown[]) {
+      count += jsonNodes(element, limit - count);
+      if (count > limit) return limit + 1;
+    }
+    return count;
+  }
+  const prototype: unknown = Object.getPrototypeOf(entry);
+  if (prototype !== Object.prototype && prototype !== null) return 1;
+  if (typeof (entry as { toJSON?: unknown }).toJSON === "function") return 1;
+  const keys = Object.keys(entry);
+  if (keys.length >= limit) return limit + 1;
+  let count = 1;
+  for (const key of keys) {
+    count += jsonNodes((entry as Record<string, unknown>)[key], limit - count);
+    if (count > limit) return limit + 1;
+  }
+  return count;
 }
 
 export function decodeRecordJson(bytes: Uint8Array): unknown {
@@ -312,6 +449,30 @@ class BinaryReader {
  */
 export function encodeSyncCheckpoint(state: unknown): Uint8Array {
   return encodeEnvelope(SYNC_CHECKPOINT_MAGIC, encodeRecordJson(state));
+}
+
+/**
+ * `encodeSyncCheckpoint`'s exact bytes, encoded a bounded piece at a time with `pause` awaited
+ * between pieces, so checkpointing a large database does not hold the thread for its whole
+ * size. `state` must not change until the returned promise settles.
+ */
+export async function encodeSyncCheckpointSliced(
+  state: unknown,
+  pause: () => Promise<void>,
+): Promise<Uint8Array> {
+  const payload = await encodeRecordJsonSliced(state, pause);
+  const bytes = new Uint8Array(ENVELOPE_HEADER_BYTES + payload.byteLength);
+  const view = new DataView(bytes.buffer);
+  textEncoder.encodeInto(SYNC_CHECKPOINT_MAGIC, bytes);
+  view.setUint32(8, LOG_FORMAT_VERSION, true);
+  view.setUint32(12, payload.byteLength, true);
+  view.setUint32(16, payload.checksum, true);
+  let offset = ENVELOPE_HEADER_BYTES;
+  for (const chunk of payload.chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 export function decodeSyncCheckpoint(bytes: Uint8Array): unknown {

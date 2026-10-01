@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { encodeBlock } from "../packages/core/src/block-format/index.ts";
 import { MemoryOpfs } from "../packages/core/src/testing/opfs-shim.ts";
 import { OpfsBlockStore } from "../packages/core/src/storage/opfs/index.ts";
-import { LOG_FORMAT_VERSION } from "../packages/core/src/storage/toolkit/wire.ts";
+import { OPFS_LAYOUT_VERSION } from "../packages/core/src/storage/opfs/upgrades.ts";
 import type { TableRecord } from "../packages/core/src/storage/types.ts";
 
 const databaseName = "native-fixture";
@@ -126,7 +126,7 @@ const { version: writerPackageVersion } = JSON.parse(
   await readFile(new URL("../packages/core/package.json", import.meta.url), "utf8"),
 ) as { version: string };
 const fixture = {
-  layoutFormatVersion: LOG_FORMAT_VERSION,
+  layoutFormatVersion: OPFS_LAYOUT_VERSION,
   writerPackageVersion,
   files,
   expectations: {
@@ -137,7 +137,7 @@ const fixture = {
 };
 const target = fileURLToPath(
   new URL(
-    `../packages/core/format-fixtures/opfs-layout${String(LOG_FORMAT_VERSION)}.json`,
+    `../packages/core/format-fixtures/opfs-layout${String(OPFS_LAYOUT_VERSION)}.json`,
     import.meta.url,
   ),
 );

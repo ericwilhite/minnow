@@ -230,7 +230,7 @@ import {
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -496,6 +496,13 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     // Schema 2 moves each transaction's id arrays out of its record into journal chunks.
     targetVersion: 2,
     migrate: migrateTransactionJournalsToChunks,
+  },
+  {
+    // Schema 3 admits replayed merge plans in compaction job records. No stored record changes:
+    // the version is the barrier that keeps a schema-2 reader, which cannot parse those plans,
+    // from opening a database that may hold one.
+    targetVersion: 3,
+    migrate: () => undefined,
   },
 ];
 
@@ -14711,7 +14718,7 @@ function assertKnownCompactionJobNestedFields(
     assertKnownRecordArrayFields(plan.partitions, partitionFields, `${planLocation}/partitions`);
     return;
   }
-  if (plan.kind !== "merge-v1") return;
+  if (plan.kind !== "merge-v1" && plan.kind !== "merge-v2") return;
   assertKnownFields(
     plan,
     [
@@ -14728,9 +14735,17 @@ function assertKnownCompactionJobNestedFields(
       "columns",
       "outputs",
       "partitions",
+      ...(plan.kind === "merge-v2" ? ["resolution"] : []),
     ],
     planLocation,
   );
+  if (plan.kind === "merge-v2" && isRecord(plan.resolution)) {
+    assertKnownFields(
+      plan.resolution,
+      ["runs", "patches", "checksum"],
+      `${planLocation}/resolution`,
+    );
+  }
   assertKnownRecordArrayFields(
     plan.rowIdSpans,
     ["rowStart", "rowCount", "rowIdStart"],
@@ -14772,17 +14787,21 @@ function assertKnownCompactionJobNestedFields(
       );
     },
   );
-  assertKnownRecordArrayFields(
-    plan.columns,
-    ["columnId", "type", "sourceRanges"],
-    `${planLocation}/columns`,
-    (column, columnLocation) =>
-      assertKnownRecordArrayFields(
-        column.sourceRanges,
-        ["outputRowStart", "sourceBlockId", "sourceRowStart", "rowCount"],
-        `${columnLocation}/sourceRanges`,
-      ),
-  );
+  if (plan.kind === "merge-v2") {
+    assertKnownRecordArrayFields(plan.columns, ["columnId", "type"], `${planLocation}/columns`);
+  } else {
+    assertKnownRecordArrayFields(
+      plan.columns,
+      ["columnId", "type", "sourceRanges"],
+      `${planLocation}/columns`,
+      (column, columnLocation) =>
+        assertKnownRecordArrayFields(
+          column.sourceRanges,
+          ["outputRowStart", "sourceBlockId", "sourceRowStart", "rowCount"],
+          `${columnLocation}/sourceRanges`,
+        ),
+    );
+  }
   assertKnownRecordArrayFields(plan.outputs, outputFields, `${planLocation}/outputs`);
   assertKnownRecordArrayFields(plan.partitions, partitionFields, `${planLocation}/partitions`);
 }

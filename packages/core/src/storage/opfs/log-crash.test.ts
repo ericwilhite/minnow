@@ -31,7 +31,7 @@ import { WalWriter } from "../toolkit/wal.js";
 import { decodeSyncCheckpoint, encodeSyncCheckpoint, LOG_FORMAT_VERSION } from "../toolkit/wire.js";
 import type { SyncFileHandle } from "../toolkit/sync-file.js";
 import { OpfsTree } from "./files.js";
-import { FIRST_SUPPORTED_OPFS_LAYOUT } from "./upgrades.js";
+import { FIRST_SUPPORTED_OPFS_LAYOUT, OPFS_LAYOUT_VERSION } from "./upgrades.js";
 import { MinnowDatabase } from "../../engine/database.js";
 import {
   assertBlockReadBatchByteLimit,
@@ -3334,8 +3334,13 @@ describe("OPFS write-ahead log crash shapes", () => {
     for (let index = 0; index < 7; index += 1) await store.addTable(table(`t${String(index)}`));
     const walBeforeCheckpoint = shim.readFileBytes("minnowdb/db/wal") ?? new Uint8Array(0);
     expect(walBeforeCheckpoint.byteLength).toBeGreaterThan(0);
-    // The eighth entry appends and then checkpoints (slot write, flush, WAL reset).
+    // The eighth entry appends and then checkpoints (slot write, flush, WAL reset) as its own
+    // queued step, which may span event-loop turns.
     await store.addTable(table("t7"));
+    await waitFor(
+      () => (shim.readFileBytes("minnowdb/db/wal")?.byteLength ?? -1) === 0,
+      "eighth-entry checkpoint",
+    );
     store._crashForTests();
 
     // Manufacture the crash-mid-checkpoint state: the slot is torn, and the WAL still holds
@@ -3448,7 +3453,7 @@ describe("OPFS write-ahead log crash shapes", () => {
 
   it.each([
     [FIRST_SUPPORTED_OPFS_LAYOUT - 1, "older"],
-    [LOG_FORMAT_VERSION + 1, "newer"],
+    [OPFS_LAYOUT_VERSION + 1, "newer"],
   ] as const)(
     "refuses layout version %s without modifying its artifacts",
     async (formatVersion, relation) => {
@@ -3465,7 +3470,7 @@ describe("OPFS write-ahead log crash shapes", () => {
         backend: "opfs",
         location: "format.json",
         actualVersion: formatVersion,
-        supportedVersion: LOG_FORMAT_VERSION,
+        supportedVersion: OPFS_LAYOUT_VERSION,
         relation,
       });
       expect(shim.readFileBytes("minnowdb/db/format.json")).toEqual(marker);
@@ -3490,13 +3495,13 @@ describe("OPFS write-ahead log crash shapes", () => {
   it.each([
     [
       "an extra field",
-      `{"formatVersion":${String(LOG_FORMAT_VERSION)},"migration":{"target":${String(LOG_FORMAT_VERSION + 1)}}}`,
+      `{"formatVersion":${String(OPFS_LAYOUT_VERSION)},"migration":{"target":${String(OPFS_LAYOUT_VERSION + 1)}}}`,
     ],
     [
       "a duplicate version",
-      `{"formatVersion":${String(LOG_FORMAT_VERSION + 1)},"formatVersion":${String(LOG_FORMAT_VERSION)}}`,
+      `{"formatVersion":${String(OPFS_LAYOUT_VERSION + 1)},"formatVersion":${String(OPFS_LAYOUT_VERSION)}}`,
     ],
-    ["noncanonical whitespace", `{ "formatVersion": ${String(LOG_FORMAT_VERSION)} }`],
+    ["noncanonical whitespace", `{ "formatVersion": ${String(OPFS_LAYOUT_VERSION)} }`],
   ])("refuses %s in the locked marker without modifying artifacts", async (_, marker) => {
     const shim = new MemoryOpfs();
     const markerBytes = new TextEncoder().encode(marker);
@@ -3544,7 +3549,7 @@ describe("OPFS write-ahead log crash shapes", () => {
     const store = await OpfsBlockStore.open({ name: "db", root: shim.root });
     expect(
       JSON.parse(new TextDecoder().decode(shim.readFileBytes("minnowdb/db/format.json"))),
-    ).toEqual({ formatVersion: LOG_FORMAT_VERSION });
+    ).toEqual({ formatVersion: OPFS_LAYOUT_VERSION });
     store.close();
   });
 

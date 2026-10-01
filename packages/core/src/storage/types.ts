@@ -1377,9 +1377,8 @@ export interface MergeOutputPartition {
   readonly logicalOrder: number;
 }
 
-/** An immutable logical replay result followed by a physical, output-driven rewrite. */
-export interface MergeCompactionRewritePlan {
-  readonly kind: "merge-v1";
+/** What every merge plan records, whichever way it describes its per-cell sources. */
+export interface MergeCompactionPlanLayout {
   readonly targetBlockBytes: number;
   readonly outputCompression: CompactionOutputCompression;
   readonly keyColumnId: string;
@@ -1390,7 +1389,6 @@ export interface MergeCompactionRewritePlan {
   readonly rowIdSpans: readonly RowIdSpan[];
   readonly logicalOrder: number;
   readonly sourceSegments: readonly MergeCompactionSourceSegment[];
-  readonly columns: readonly MergeCompactionOutputColumn[];
   readonly outputs: readonly RechunkCompactionOutputWindow[];
   /**
    * How the output is split into published segments. Missing on plans that publish the whole
@@ -1401,8 +1399,58 @@ export interface MergeCompactionRewritePlan {
   readonly partitions?: readonly MergeOutputPartition[];
 }
 
+/**
+ * An immutable logical replay result followed by a physical, output-driven rewrite, with the
+ * replay stored as a source range per output cell run. Written by Minnow 0.12.x and earlier;
+ * still resumed, never planned.
+ */
+export interface MergeCompactionRewritePlan extends MergeCompactionPlanLayout {
+  readonly kind: "merge-v1";
+  readonly columns: readonly MergeCompactionOutputColumn[];
+}
+
+/** An output column of a replayed merge plan: its identity, without stored source ranges. */
+export interface MergeCompactionPlannedColumn {
+  readonly columnId: string;
+  readonly type: SimpleDataType;
+}
+
+/**
+ * What a replayed merge plan's sources resolve to: how many row runs and per-column patches the
+ * replay produces, and a CRC-32 over them. The engine recomputes the replay from the immutable
+ * sources and must arrive at exactly this before it writes a block.
+ */
+export interface MergeCompactionResolution {
+  readonly runs: number;
+  readonly patches: number;
+  readonly checksum: number;
+}
+
+/**
+ * A merge plan that records its sources, output windows, and partitions, but not which source
+ * row feeds each output cell. That mapping is a pure function of the immutable sources, so the
+ * engine recomputes it in memory and checks it against `resolution`. The record's size follows
+ * the sources rather than the rows replayed, so a fold of upserts written in any order
+ * checkpoints as cheaply as one written in the table's own order.
+ */
+export interface ReplayedMergeCompactionRewritePlan extends MergeCompactionPlanLayout {
+  readonly kind: "merge-v2";
+  readonly columns: readonly MergeCompactionPlannedColumn[];
+  readonly resolution: MergeCompactionResolution;
+}
+
 export type CompactionRewritePlan =
-  CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan;
+  | CopyCompactionRewritePlan
+  | RechunkCompactionRewritePlan
+  | MergeCompactionRewritePlan
+  | ReplayedMergeCompactionRewritePlan;
+
+/** Whether a plan merges keyed sources by replay, whichever way it records the replay. */
+export function isMergeCompactionPlan(
+  plan: CompactionRewritePlan,
+): plan is MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan {
+  return plan.kind === "merge-v1" || plan.kind === "merge-v2";
+}
 
 /**
  * The next rechunk output to emit, ordered by output window and then column. A completed cursor
@@ -1489,8 +1537,7 @@ export function compactionOutputSegmentIds(
   const outputSegmentId = job.outputSegmentId;
   if (outputSegmentId === null) return [];
   const partitionCount =
-    (job.rewritePlan.kind === "merge-v1" || job.rewritePlan.kind === "rechunk-v1") &&
-    job.rewritePlan.partitions !== undefined
+    job.rewritePlan.kind !== "copy-v1" && job.rewritePlan.partitions !== undefined
       ? job.rewritePlan.partitions.length
       : 1;
   return Array.from({ length: partitionCount }, (_, index) =>
@@ -1559,7 +1606,7 @@ export function assertCompactionOutputProvenance(
     ) {
       throw new Error(`Compaction job ${job.id} table schema differs from its rewrite plan`);
     }
-    if (plan.kind === "merge-v1" && plan.keyColumnId !== table.uniqueKeyColumnId) {
+    if (isMergeCompactionPlan(plan) && plan.keyColumnId !== table.uniqueKeyColumnId) {
       throw new Error(`Compaction job ${job.id} table key differs from its rewrite plan`);
     }
     const expectedOutputBlockIds = plan.outputs.flatMap((_output, outputIndex) =>
@@ -1646,17 +1693,15 @@ function expectedCompactionOutputSegments(
     { rowStart: 0, rowCount: plan.totalRows, logicalOrder: plan.logicalOrder },
   ];
   return partitions.map((partition, index) => {
-    const rowIdSpans =
-      plan.kind === "merge-v1"
-        ? sliceCompactionRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount)
-        : [];
-    const envelope =
-      plan.kind === "merge-v1"
-        ? compactionRowIdSpanEnvelope(rowIdSpans)
-        : {
-            start: plan.rowIdStart + BigInt(partition.rowStart),
-            endExclusive: plan.rowIdStart + BigInt(partition.rowStart + partition.rowCount),
-          };
+    const rowIdSpans = isMergeCompactionPlan(plan)
+      ? sliceCompactionRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount)
+      : [];
+    const envelope = isMergeCompactionPlan(plan)
+      ? compactionRowIdSpanEnvelope(rowIdSpans)
+      : {
+          start: plan.rowIdStart + BigInt(partition.rowStart),
+          endExclusive: plan.rowIdStart + BigInt(partition.rowStart + partition.rowCount),
+        };
     return {
       id: index === 0 ? outputSegmentId : `${outputSegmentId}/${String(index)}`,
       ...common,
@@ -1674,7 +1719,7 @@ function expectedCompactionOutputSegments(
           ),
         ]),
       ),
-      kind: plan.kind === "merge-v1" ? "base" : "insert",
+      kind: isMergeCompactionPlan(plan) ? "base" : "insert",
       logicalOrder: partition.logicalOrder,
       commitOrdinal: index,
       rowIdSpans,
@@ -5373,7 +5418,7 @@ function normalizeCompactionJob(
       >
     | undefined;
   if (level2PolicyFieldCount !== 0) {
-    if (rewritePlan.kind !== "rechunk-v1" && rewritePlan.kind !== "merge-v1") {
+    if (rewritePlan.kind === "copy-v1") {
       throw new TypeError("L2 compaction requires a rechunk or merge plan");
     }
     if (record.targetLevel !== 2) {
@@ -5581,7 +5626,7 @@ export function updateCompactionJobRecord(
 
 function validateCompactionJobState(record: CompactionJobRecord): void {
   const plan = record.rewritePlan;
-  if (plan.kind === "merge-v1") {
+  if (isMergeCompactionPlan(plan)) {
     if (plan.totalRows === 0 && record.outputSegmentId !== null) {
       throw new TypeError("An empty merge compaction cannot have an output segment");
     }
@@ -5614,7 +5659,7 @@ function validateCompactionJobState(record: CompactionJobRecord): void {
   if (record.state === "ready" || record.state === "published") {
     if (
       record.transactionId === null ||
-      (record.outputSegmentId === null && !(plan.kind === "merge-v1" && plan.totalRows === 0))
+      (record.outputSegmentId === null && !(isMergeCompactionPlan(plan) && plan.totalRows === 0))
     ) {
       throw new TypeError(`${record.state} compaction requires its transaction and output segment`);
     }
@@ -5668,7 +5713,7 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
   if (record.cursor.sourceSegmentIndex !== 0 || record.cursor.sourceBlockIndex !== 0) {
     throw new TypeError("An output-driven compaction does not use the source cursor");
   }
-  const permitsZeroMinimum = plan.kind === "merge-v1" && plan.totalRows === 0;
+  const permitsZeroMinimum = isMergeCompactionPlan(plan) && plan.totalRows === 0;
   if (memoryBudgetBytes === 0 || (minimumMemoryBytes === 0 && !permitsZeroMinimum)) {
     throw new RangeError("An output-driven compaction requires a memory budget and minimum memory");
   }
@@ -5711,7 +5756,7 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
     throw new TypeError("Logical bytes must match the immutable rewrite layout");
   }
 
-  if (plan.kind === "merge-v1") {
+  if (isMergeCompactionPlan(plan)) {
     if (
       plan.totalRows === 0 &&
       (record.outputBlockIds.length !== 0 ||
@@ -5784,7 +5829,7 @@ function validateCompactionJobProgress(
       throw new RangeError("Output cursor cannot move backwards");
     }
     if (
-      previous.rewritePlan.kind === "merge-v1" &&
+      isMergeCompactionPlan(previous.rewritePlan) &&
       previous.outputSegmentId !== next.outputSegmentId
     ) {
       throw new TypeError("Merge output segment ID is immutable");
@@ -5851,8 +5896,9 @@ function compactionOutputOrdinal(record: CompactionJobRecord): number {
 
 function isOutputDrivenCompactionPlan(
   plan: CompactionRewritePlan,
-): plan is RechunkCompactionRewritePlan | MergeCompactionRewritePlan {
-  return plan.kind === "rechunk-v1" || plan.kind === "merge-v1";
+): plan is
+  RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan {
+  return plan.kind !== "copy-v1";
 }
 
 function validateCompactionJobTransition(
@@ -5894,7 +5940,9 @@ function normalizeCompactionRewritePlan(value: unknown): CompactionRewritePlan {
   }
   const kind: unknown = Reflect.get(value, "kind");
   if (kind === "copy-v1") return { kind: "copy-v1" };
-  if (kind === "merge-v1") return normalizeMergeCompactionRewritePlan(value);
+  if (kind === "merge-v1" || kind === "merge-v2") {
+    return normalizeMergeCompactionRewritePlan(value, kind);
+  }
   if (kind !== "rechunk-v1") {
     throw new TypeError(`Invalid compaction rewrite plan: ${String(kind)}`);
   }
@@ -6026,7 +6074,10 @@ function normalizeRechunkSourceColumn(
   };
 }
 
-function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewritePlan {
+function normalizeMergeCompactionRewritePlan(
+  value: object,
+  kind: "merge-v1" | "merge-v2",
+): MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan {
   const totalRows = nonNegativeWholeNumber(
     Reflect.get(value, "totalRows"),
     "Merge total row count",
@@ -6091,9 +6142,12 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
   if (!Array.isArray(columnsValue) || columnsValue.length === 0) {
     throw new TypeError("A merge plan requires at least one output column");
   }
-  const columns = columnsValue.map((column, index) =>
-    normalizeMergeOutputColumn(column, totalRows, sourceBlocks, index),
-  );
+  const columns =
+    kind === "merge-v1"
+      ? columnsValue.map((column, index) =>
+          normalizeMergeOutputColumn(column, totalRows, sourceBlocks, index),
+        )
+      : columnsValue.map((column, index) => normalizeMergePlannedColumn(column, index));
   const columnIds = columns.map((column) => column.columnId);
   if (new Set(columnIds).size !== columnIds.length) {
     throw new TypeError("A merge plan cannot contain duplicate output columns");
@@ -6138,8 +6192,7 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
       ? undefined
       : normalizeMergeOutputPartitions(partitionsValue, totalRows, outputs);
 
-  return {
-    kind: "merge-v1",
+  const layout: MergeCompactionPlanLayout = {
     targetBlockBytes: positiveWholeNumber(
       Reflect.get(value, "targetBlockBytes"),
       "Merge target block bytes",
@@ -6152,10 +6205,69 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
     rowIdSpans,
     logicalOrder,
     sourceSegments,
-    columns,
     outputs,
     ...(partitions === undefined ? {} : { partitions }),
   };
+  if (kind === "merge-v1") {
+    return { kind, ...layout, columns: columns as MergeCompactionOutputColumn[] };
+  }
+  return {
+    kind,
+    ...layout,
+    columns,
+    resolution: normalizeMergeResolution(
+      Reflect.get(value, "resolution"),
+      totalRows,
+      columns.length,
+    ),
+  };
+}
+
+function normalizeMergePlannedColumn(
+  value: unknown,
+  columnIndex: number,
+): MergeCompactionPlannedColumn {
+  const label = `Merge output column ${String(columnIndex)}`;
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "columnId" && key !== "type") {
+      throw new TypeError(`${label} has an unknown field: ${key}`);
+    }
+  }
+  return {
+    columnId: validateStorageId(Reflect.get(value, "columnId"), `${label} ID`),
+    type: simpleDataType(Reflect.get(value, "type")),
+  };
+}
+
+/**
+ * A replay has at least one run whenever rows survive, never more runs than rows, and at most
+ * one patch per output cell; the checksum is an unsigned 32-bit CRC.
+ */
+function normalizeMergeResolution(
+  value: unknown,
+  totalRows: number,
+  columnCount: number,
+): MergeCompactionResolution {
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError("A replayed merge plan requires its resolution");
+  }
+  const runs = nonNegativeWholeNumber(Reflect.get(value, "runs"), "Merge resolution runs");
+  const patches = nonNegativeWholeNumber(Reflect.get(value, "patches"), "Merge resolution patches");
+  const checksum = nonNegativeWholeNumber(
+    Reflect.get(value, "checksum"),
+    "Merge resolution checksum",
+  );
+  if ((totalRows === 0) !== (runs === 0) || runs > totalRows) {
+    throw new RangeError("Merge resolution runs must cover the surviving rows");
+  }
+  if (patches > safeProduct(totalRows, columnCount, "Merge resolution cells")) {
+    throw new RangeError("Merge resolution has more patches than output cells");
+  }
+  if (checksum > 0xffffffff) throw new RangeError("Merge resolution checksum must fit 32 bits");
+  return { runs, patches, checksum };
 }
 
 /**
@@ -6398,7 +6510,7 @@ function normalizeMergeOutputColumn(
 
 function validateMergeSourceShapes(
   sourceSegments: readonly MergeCompactionSourceSegment[],
-  outputColumns: readonly MergeCompactionOutputColumn[],
+  outputColumns: readonly MergeCompactionPlannedColumn[],
   keyColumnId: string,
 ): void {
   const outputIds = outputColumns.map((column) => column.columnId);

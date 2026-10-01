@@ -86,7 +86,7 @@ reject with the typed error; boot code can retry, including a failed `migrate()`
 
 A follower gives up on a leader only after a full second of silence, and a leader is never
 silent while it holds a request: it posts a keepalive every half-timeout for each admitted
-request, and announces a hold before a synchronous checkpoint sized from the previous one. A
+request, and announces a hold before each checkpoint, sized from the previous one. A
 connection that is asked to run a request while it is not leading — after a handover, after
 closing, or when leadership moved while the request waited — answers with a decline, which
 proves the request never ran, so the follower simply finds the leader and sends it again. A
@@ -157,8 +157,15 @@ Collection keeps every retained segment’s block references intact, including r
 Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
 automatically repair a store already affected by missing referenced blocks.
 
-Layout 7 is the current native OPFS contract. It adds a 48-byte acknowledgement file with two
-checksummed slots, alongside the structural `schemaEpoch` and served-request ledger. Recovery
+Layout 8 is the current native OPFS contract. It stores exactly layout 7's bytes and admits
+compaction jobs whose merge plan is recomputed from its sources rather than stored cell by cell,
+which a layout-7 build cannot read. **Layout 7 upgrades automatically on open** by rewriting the
+format marker alone: a small `upgrade-7-8` witness is written and flushed first, so a crash that
+tears the marker is finished on the next open instead of refused, and the witness is removed once
+the new marker is durable. A layout-7 build then refuses the database without changing it.
+
+Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
+structural `schemaEpoch` and served-request ledger. Recovery
 requires both slots to be intact and refuses a missing file, damaged slot, or WAL ending before
 its acknowledged boundary. A zero-filled acknowledged tail is corruption, never an empty store.
 An interrupted acknowledgement update can therefore prevent reopening; this trades availability
@@ -198,7 +205,12 @@ must still encode into one checkpoint slot, and a write that would push the enco
 past it is refused with `StorageResourceLimitError` (`resource: "checkpoint byte"`), while
 aborts, rollbacks, and collection steps still go through, so the database can always be brought
 back under the bound; `getStorageStats()` reports the failed checkpoint meanwhile. Relaxed payload writes are flushed first, then the new
-checkpoint is written and flushed, and only then is the log reset. A crash at any moment therefore
+checkpoint is written and flushed, and only then is the log reset. A checkpoint encodes the whole
+metadata state, so the ones that run during normal work — when the log fills, and before
+garbage collection deletes a drained data file — encode and write a slice at a time, handing the
+thread back every few milliseconds. They still hold the write queue, so the state they publish
+cannot change underneath them, while reads keep answering from memory between slices. Their
+bytes, slots, and order are the same as a checkpoint written in one step, as at shutdown. A crash at any moment therefore
 leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
 slot and the un-reset log still holding everything. A power loss that persists a file's new length
 ahead of its bytes leaves a zero-filled tail where the unacknowledged frame was to go, or a slot

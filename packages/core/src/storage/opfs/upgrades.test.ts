@@ -58,7 +58,7 @@ async function verify(shim: MemoryOpfs, extra: string[] = []): Promise<OpfsBlock
     expect(await store.getBlock("fixture-follower-block")).toEqual(block);
     expect(await store.checkIntegrity({ mode: "full" })).toMatchObject({ ok: true, issueCount: 0 });
     expect(new TextDecoder().decode(shim.readFileBytes(`${PREFIX}format.json`))).toBe(
-      '{"formatVersion":7}',
+      '{"formatVersion":8}',
     );
     return store;
   } catch (error) {
@@ -81,7 +81,7 @@ describe("automatic OPFS upgrades", () => {
     shim.setDeleteFault((path) => writes.push(`delete: ${path}`));
     await expect(Layout6Store.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 7,
+      actualVersion: 8,
       supportedVersion: 6,
       relation: "newer",
     });
@@ -131,7 +131,7 @@ describe("automatic OPFS upgrades", () => {
           fixture.expectations.tables,
         );
       expect(new TextDecoder().decode(shim.readFileBytes(`${PREFIX}format.json`))).toBe(
-        '{"formatVersion":7}',
+        '{"formatVersion":8}',
       );
       await stores[2]?.addTable(table("concurrent-write"));
       expect((await stores[0]?.listTables())?.map(({ name }) => name)).toContain(

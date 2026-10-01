@@ -206,6 +206,8 @@ export class MemoryBlockStore implements BlockStore {
       createdAt: string;
       expiresAt: string;
       chunks: Map<number, FtsPosting[]>;
+      /** Tokens across the staged chunks, counted as each one is validated. */
+      totalTokens: number;
     }
   >();
   #snapshotFrameExport: MemorySnapshotFrameExportState | undefined;
@@ -557,6 +559,7 @@ export class MemoryBlockStore implements BlockStore {
         createdAt: input.createdAt,
         expiresAt: input.expiresAt,
         chunks: new Map(),
+        totalTokens: 0,
       });
     });
   }
@@ -576,7 +579,7 @@ export class MemoryBlockStore implements BlockStore {
       if (!Number.isSafeInteger(input.ordinal) || input.ordinal < 0) {
         throw new RangeError(`Full-text base chunk ordinal is invalid: ${String(input.ordinal)}`);
       }
-      validateFtsPostingChunks([input.chunk], "Full-text base build");
+      const tokens = validateFtsPostingChunks([input.chunk], "Full-text base build");
       const replay = build.chunks.get(input.ordinal);
       if (replay !== undefined) {
         if (!samePostingChunk(replay, input.chunk)) {
@@ -591,6 +594,7 @@ export class MemoryBlockStore implements BlockStore {
       // Chunks are row windows, not term partitions. Terms are sorted inside each chunk, but
       // adjacent chunks can legitimately overlap or restart at an earlier term.
       build.chunks.set(input.ordinal, structuredClone(input.chunk) as FtsPosting[]);
+      build.totalTokens += tokens;
       build.expiresAt = input.expiresAt;
     });
   }
@@ -624,7 +628,12 @@ export class MemoryBlockStore implements BlockStore {
         }
         return chunk;
       });
-      this.#core.writeFtsBase(input.tableId, input.columnId, {
+      if (input.totalTokens !== build.totalTokens) {
+        throw new TypeError("Full-text base total token count does not match its postings");
+      }
+      // Every chunk was validated and copied as it was written; installing them is a pointer
+      // swap, where revalidating and recopying the whole base held the thread for its size.
+      this.#core.installValidatedFtsBase(input.tableId, input.columnId, {
         coversVersion: input.coversVersion,
         chunks,
         totalTokens: input.totalTokens,
@@ -665,6 +674,7 @@ export class MemoryBlockStore implements BlockStore {
     createdAt: string;
     expiresAt: string;
     chunks: Map<number, FtsPosting[]>;
+    totalTokens: number;
   } {
     const build = this.#ftsBaseBuilds.get(`${input.tableId}/${input.columnId}`);
     if (build?.buildId !== input.buildId || build.ownerId !== input.ownerId) {

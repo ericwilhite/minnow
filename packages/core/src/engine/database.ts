@@ -102,7 +102,6 @@ import {
   MAX_STORED_BLOCK_BYTE_LENGTH,
   measurePhysicalColumnRanges,
   physicalColumnByteLength,
-  slicePhysicalColumn,
   StoredBlockPayloadTooLargeError,
   wellFormedUtf8ByteLength,
   type ColumnInput,
@@ -114,6 +113,8 @@ import {
   type ValidatedPhysicalColumn,
 } from "../block-format/index.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import { crc32Continue } from "../block-format/checksum.js";
+import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
 import {
   estimateCompactionRowsPerOutput,
   planAlignedWriteBlockRanges as writeBlockRanges,
@@ -152,7 +153,10 @@ import {
   type CatalogProbe,
   type ManifestSummary,
   type MergeCompactionOutputColumn,
+  type MergeCompactionPlannedColumn,
   type MergeCompactionRewritePlan,
+  type ReplayedMergeCompactionRewritePlan,
+  isMergeCompactionPlan,
   type MergeCompactionSourceBlock,
   type MergeCompactionSourceColumn,
   type MergeCompactionSourceSegment,
@@ -560,14 +564,12 @@ const AUTOMATIC_COMPACTION_STEP: CompactTableStepOptions = Object.freeze({
  * batch to the minimum takes at most eight, and each budget increase at least doubles it.
  */
 const MAX_AUTOMATIC_COMPACTION_FIT_ATTEMPTS = 32;
-/**
- * Output ranges an automatic fold's plan may hold beyond one per source block. The plan is the
- * job record every step of the fold reads and rewrites, so its size is paid on every step: at
- * this many extra ranges a step's record round trip stays near a tenth of a second. Rows
- * replaced in the table's own order coalesce into one range per block and never approach it;
- * upserts replacing many wide rows in an unrelated order need one range per cell.
- */
-const AUTOMATIC_COMPACTION_PATCHED_RANGES = 32_768;
+/** Fold layouts and replays kept resident between steps; one table folds at a time. */
+const COMPACTION_LAYOUT_CACHE_LIMIT = 4;
+/** Rows past which a write yields between its whole-batch passes. */
+const LARGE_WRITE_ROWS = 16_384;
+/** Key rows one grouped read hands the merge replay at once: a few milliseconds of work. */
+const MERGE_KEY_DECODE_GROUP_ROWS = 65_536;
 /** Manifest races a complete fold may lose to writers already in flight before it is abandoned. */
 const MAX_COMPACTION_PUBLICATION_CONFLICTS = 64;
 
@@ -578,22 +580,13 @@ const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 const STAGED_OVERLAY_ORDER_BASE = 2 ** 52;
 
 /**
- * Automatic compaction refuses a merge plan more fragmented than it will persist. The plan is
- * the job record every step of the fold reads and rewrites, so a plan of one range per cell —
- * upserts replacing many wide rows in an order unlike the table's — would hold the database up
- * on every step. More memory would not make it smaller: the fold is cut if it can be, and
- * otherwise waits out its backoff like any failure.
+ * A resumed replayed merge whose recomputed replay does not match its plan. The job is
+ * abandoned rather than written, and the next fold plans afresh; folds are visible-data
+ * neutral, so nothing is lost.
  */
-class CompactionPlanTooFragmentedError extends Error {
-  override readonly name = "CompactionPlanTooFragmentedError";
-
-  constructor(
-    readonly ranges: number,
-    readonly maximumRanges: number,
-  ) {
-    super(
-      `Compaction plan needs ${String(ranges)} output ranges; automatic compaction persists at most ${String(maximumRanges)}`,
-    );
+class CompactionReplayMismatchError extends Error {
+  constructor(jobId: string) {
+    super(`Compaction replay differs from its plan: ${jobId}`);
   }
 }
 
@@ -706,7 +699,8 @@ class BoundedWriteBlockStager {
   }
 }
 
-type PhysicalCompactionRewritePlan = RechunkCompactionRewritePlan | MergeCompactionRewritePlan;
+type PhysicalCompactionRewritePlan =
+  RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan;
 
 interface PhysicalCompactionSourceRange {
   readonly blockId: string;
@@ -722,7 +716,14 @@ interface PhysicalCompactionSourceRange {
 interface PhysicalCompactionSourceColumn {
   readonly columnId: string;
   readonly type: SimpleDataType;
-  readonly sourceRanges: readonly PhysicalCompactionSourceRange[];
+  /**
+   * Whether a source block several ranges of one window read counts once toward the window's
+   * memory, as it is decoded once. Plans that persisted the per-range count keep it, so a job
+   * planned by an older version reaches the minimum it recorded.
+   */
+  readonly countsDistinctBlocks: boolean;
+  /** The source ranges an output window reads, in output order. */
+  rangesFor(output: RechunkCompactionOutputWindow): readonly PhysicalCompactionSourceRange[];
 }
 
 /** What a grouped compaction read needs of a source block: its ID and the plan's two sizes. */
@@ -730,6 +731,16 @@ interface CompactionSourceBlockRef {
   readonly blockId: string;
   readonly storedBytes: number;
   readonly encodedBytes: number;
+  /** Rows the block holds, for reads that bound how many rows one group hands over. */
+  readonly rowCount?: number;
+}
+
+/** A planned physical rewrite, with what planning measured and, for a merge, its replay. */
+interface PlannedCompactionRewrite {
+  readonly plan: PhysicalCompactionRewritePlan;
+  /** The largest window memory bound among the planned outputs. */
+  readonly minimumMemoryBytes: number;
+  readonly resolution?: MergeResolution;
 }
 
 interface PhysicalCompactionLayout {
@@ -740,18 +751,20 @@ interface PhysicalCompactionLayout {
   readonly outputs: readonly RechunkCompactionOutputWindow[];
 }
 
+/** A source row, by its segment's index among the plan's sources and its row within it. */
 interface MergeResolvedSource {
-  readonly blockId: string;
-  readonly sourceRowIndex: number;
+  readonly segment: number;
+  readonly row: number;
 }
 
 /**
  * Where a live slot's columns come from once later mutations apply. An upsert that replaced
- * the row names the one row every column now comes from; an update names the columns it set.
- * Without a row source, any column `columns` does not name comes from the slot's own row.
+ * the row names the one row every column now comes from (`rowSource`, a source index, and
+ * `rowIndex`); an update names the columns it set. Without a row source, any column `columns`
+ * does not name comes from the slot's own row.
  */
 interface MergeSlotPatch {
-  rowSource: MergeCompactionSourceSegment | undefined;
+  rowSource: number | undefined;
   rowIndex: number;
   columns: Array<MergeResolvedSource | undefined> | undefined;
 }
@@ -2243,6 +2256,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #automaticCompactionBatches = new Map<string, number>();
   /** The compaction step in flight per table, so steps on one table run one at a time. */
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
+  /**
+   * Rewrite layouts of the folds this database is stepping, by job ID. A job's plan never
+   * changes, and rebuilding its column ranges every step would cost the plan's size each time.
+   */
+  readonly #compactionLayouts = new Map<string, PhysicalCompactionLayout>();
+  /** Replays of the replayed merges this database planned or resumed, by job ID. */
+  readonly #mergeResolutions = new Map<string, MergeResolution>();
 
   /** The turn a scope's transaction runs under, so a lent fold step never re-enters the queue. */
   readonly #transactionAdmissions = new WeakMap<DatabaseTransaction, WriterAdmission>();
@@ -2540,6 +2560,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     this.#liveProofContexts.clear();
     this.#gzipVerdicts.clear();
     this.#autoCompactionHints.clear();
+    this.#compactionLayouts.clear();
+    this.#mergeResolutions.clear();
     this.#artifactCache.clear();
   }
 
@@ -2876,7 +2898,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
       const keys =
         autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
-          ? batchKeys(table, batch)
+          ? await batchKeys(table, batch)
           : undefined;
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new UnknownTableError(tableName);
@@ -2911,6 +2933,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: InsertBatchInputLike,
   ): Promise<FilledBatch & { rowCount: number }> {
     const pivoted = toColumnarBatch(input);
+    // Each step below is a pass over every row; between them, a large batch lets other work in.
+    if ((pivoted.rowCount ?? 0) >= LARGE_WRITE_ROWS) await yieldToEventLoop();
     // The pivot stamps rowCount, so an all-default batch keeps its row count even after the
     // columnar form crossed the worker boundary.
     const statementNow = this.#now();
@@ -2936,7 +2960,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     }
     fillCompositePrimaryKey(table, filled.batch, inputRowCount);
-    const rowCount = validateBatch(table, filled.batch, filled.autoIncrement?.column.name);
+    if (inputRowCount >= LARGE_WRITE_ROWS) await yieldToEventLoop();
+    const rowCount = await validateBatch(table, filled.batch, filled.autoIncrement?.column.name);
     return { ...filled, rowCount };
   }
 
@@ -3035,7 +3060,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       const { batch, generated, autoIncrement } = await this.#fillDefaults(table, input);
       const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
-      const keys = deferred ? undefined : batchKeys(table, batch);
+      const keys = deferred ? undefined : await batchKeys(table, batch);
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new UnknownTableError(tableName);
       const result = await this.#writeBatch(
@@ -3774,7 +3799,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         for (const rowIndex of autoIncrement.missingIndexes) {
           validateValue(autoIncrement.column, patched[rowIndex] ?? null, rowIndex);
         }
-        resolvedKeys = batchKeys(table, input);
+        resolvedKeys = await batchKeys(table, input);
       }
       const normalizedConflictWhere =
         kind === "upsert" && conflictWhere !== undefined
@@ -3803,7 +3828,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowCount = filtered.rowCount;
         upsertFirings = filtered.firings;
         logicalBytes = estimateBatchBytes(input);
-        resolvedKeys = batchKeys(table, input);
+        resolvedKeys = await batchKeys(table, input);
         if (rowCount === 0) {
           await transaction.abort();
           const version = transaction.snapshotVersion;
@@ -6334,7 +6359,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const input = await this.#withReadReservation(() =>
           this.#queries.run(state.fullPlan, {}, probe),
         );
-        const aggregate = state.aggregate.patch(input, new Set(), liveKeyToken);
+        const aggregate = await state.aggregate.patch(input, new Set(), liveKeyToken);
         const result = aggregate.result();
         return stageLiveExecution(
           {
@@ -6420,7 +6445,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ],
       };
       const input = await this.#withReadReservation(() => this.#queries.run(deltaPlan, {}, probe));
-      const aggregate = state.aggregate.patch(input, new Set(changedKeys.keys()), liveKeyToken);
+      const aggregate = await state.aggregate.patch(
+        input,
+        new Set(changedKeys.keys()),
+        liveKeyToken,
+      );
       const result = aggregate.result();
       const changed =
         result.rows.length !== retained.rows.length ||
@@ -7579,7 +7608,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     normalizeDomainBatch(target, filled.batch);
     fillStoredGeneratedColumns(target, filled.batch, derivedRows.length, filled.generated);
     fillCompositePrimaryKey(target, filled.batch, derivedRows.length);
-    validateBatch(target, filled.batch, filled.autoIncrement?.column.name);
+    await validateBatch(target, filled.batch, filled.autoIncrement?.column.name);
     if (filled.autoIncrement !== undefined && filled.autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
         target.id,
@@ -9489,7 +9518,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (sql, params) => this.#sessionQuery(transaction, sql, { params }),
       transaction,
     );
-    const keys = batchKeys(table, batch);
+    const keys = await batchKeys(table, batch);
     // A key or UNIQUE term the scope already holds, or that is committed, fails this statement
     // before it registers anything, so the scope stays usable; commit re-validates atomically.
     // An upsert replaces rows, so only a term the batch repeats within itself refuses it here.
@@ -11245,7 +11274,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const proposed = filledProposed.batch;
     // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
     // even when every proposed row happens to find an existing key.
-    validateBatch(table, proposed, filledProposed.autoIncrement?.column.name);
+    await validateBatch(table, proposed, filledProposed.autoIncrement?.column.name);
     const keyValues = proposed.columns[keyColumn.name] ?? [];
     const keyToken = (value: QueryValue): string =>
       value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value} ${String(value)}`;
@@ -12068,7 +12097,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 rowCount: rows.length,
               };
               normalizeDomainBatch(pendingTable, batch);
-              validateBatch(pendingTable, batch);
+              await validateBatch(pendingTable, batch);
               const endExclusive = nextRowId + BigInt(rows.length);
               await this.#stageScopeDirectly(transaction, pendingTable);
               await this.#stageInsertSegment(
@@ -13750,17 +13779,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /**
    * Secondary-index key locators for one block's key column, mapped to the block rows that
    * carry them, pooled by block id. A locator is a hash, so two keys may share one; the scan's
-   * own predicate settles such collisions.
+   * own predicate settles such collisions. Hashing a block's keys yields to the event loop, so
+   * the first indexed lookup on a large table does not hold it for every block.
    */
-  #blockKeyLocators(
+  async #blockKeyLocators(
     blockId: string,
     vector: ColumnVector,
     type: SimpleDataType,
-  ): Map<bigint, number | number[]> {
+  ): Promise<Map<bigint, number | number[]>> {
     const cached = this.#cacheGet(`dkl ${blockId}`) as Map<bigint, number | number[]> | undefined;
     if (cached !== undefined) return cached;
     const locators = new Map<bigint, number | number[]>();
     for (let row = 0; row < vector.length; row += 1) {
+      if ((row & 4095) === 0) await maybeYieldToEventLoop();
       const value = vectorValue(vector, row);
       if (value === null) continue;
       const locator = secondaryKeyLocator(type, value);
@@ -14060,8 +14091,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         return undefined;
       };
-      for (const [slot, layers] of lazyPatches) {
-        if (slot < from || slot >= to) continue;
+      // The patched slots are sorted, so a window visits its own slots and stops: walking
+      // every patch for every window made a full scan of a table carrying many upserts cost
+      // windows times patches.
+      for (
+        let index = sortedLowerBound(patchedSlots, from);
+        index < patchedSlots.length;
+        index += 1
+      ) {
+        const slot = patchedSlots[index];
+        if (slot === undefined || slot >= to) break;
+        const layers = lazyPatches.get(slot);
+        if (layers === undefined) continue;
         inRange.push([slot, layers]);
         for (const column of projectedColumns) {
           const hit = winning(layers, column.id);
@@ -14419,7 +14460,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // slot means absent/deleted, so replay needs no second set of the same keys. Include the
       // numeric predicate's members in this scratch charge, rather than every key occurrence.
       const slotByKey = new Map<OverlayKey, number | undefined>();
+      // Decoded key blocks usually come from the buffer pool, so these loops can run for a
+      // long time without a real await, so they hand the event loop a turn between blocks.
       for await (const { vector, rows } of keyBlocks(baseSegments.filter(mutationSegmentKind))) {
+        await maybeYieldToEventLoop();
         if (vector === undefined) continue;
         const readKey = requiredColumnVectorKeyReader(vector);
         for (let row = 0; row < rows; row += 1) {
@@ -14471,6 +14515,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         baseSegments,
         touchedPredicate,
       )) {
+        await maybeYieldToEventLoop();
         const kind = segment.kind;
         const scans = kind === "insert" || kind === "base" || kind === "upsert";
         if (vector !== undefined) {
@@ -16716,10 +16761,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
       }
 
-      let mergePlan: MergeCompactionRewritePlan | undefined;
+      let planned: PlannedCompactionRewrite | undefined;
       if (requiresMerge) {
         try {
-          mergePlan = await this.#createMergeCompactionPlan(
+          planned = await this.#createMergeCompactionPlan(
             table,
             sourceSegments,
             targetBlockBytes,
@@ -16727,7 +16772,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             budgetBytes,
             snapshot,
             partitioning,
-            automatic ? AUTOMATIC_COMPACTION_PATCHED_RANGES : Number.POSITIVE_INFINITY,
           );
         } catch (error) {
           // A keyed L2 prefix whose mutations reference keys living in already-published
@@ -16745,18 +16789,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw error;
         }
       }
-      const rewritePlan =
-        mergePlan ??
-        (await this.#createRechunkCompactionPlan(
-          table,
-          sourceSegments,
-          targetBlockBytes,
-          outputCompression,
-          budgetBytes,
-          snapshot,
-          rechunkPartitioning,
-        ));
-      const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
+      planned ??= await this.#createRechunkCompactionPlan(
+        table,
+        sourceSegments,
+        targetBlockBytes,
+        outputCompression,
+        budgetBytes,
+        snapshot,
+        rechunkPartitioning,
+      );
+      const { plan: rewritePlan, minimumMemoryBytes, resolution } = planned;
       if (minimumMemoryBytes > budgetBytes) {
         throw new CompactionMemoryBudgetError(budgetBytes, minimumMemoryBytes);
       }
@@ -16774,6 +16816,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rewritePlan,
         minimumMemoryBytes,
         sourceStoredBytes,
+        resolution,
       };
     };
     // An explicit step plans what its options ask for, and a plan that needs more memory than
@@ -16782,10 +16825,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // to how far over it was, and planned again; the smallest selection the table allows is
     // given the memory it needs. That smallest fold costs about what the writes that produced
     // its sources already held, and a table automatic compaction could never fold would keep
-    // slowing every read until its writes were refused at the level-zero ceiling. A plan too
-    // fragmented to step through cheaply is cut the same way, but more memory cannot help it.
-    // The cut size is where the table's next fold starts, so one wide table does not re-plan
-    // from the full batch on every fold; each fold that fits doubles it back.
+    // slowing every read until its writes were refused at the level-zero ceiling. The cut size
+    // is where the table's next fold starts, so one wide table does not re-plan from the full
+    // batch on every fold; each fold that fits doubles it back.
     let levelZeroLimit = automatic
       ? Math.min(
           maxLevel0Segments,
@@ -16806,30 +16848,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         planned = await planRewrite(level0Selection, memoryBudgetBytes);
         break;
       } catch (error) {
-        const fragmented = error instanceof CompactionPlanTooFragmentedError;
         if (
           !automatic ||
-          !(fragmented || error instanceof CompactionMemoryBudgetError) ||
+          !(error instanceof CompactionMemoryBudgetError) ||
           attempt >= MAX_AUTOMATIC_COMPACTION_FIT_ATTEMPTS
         ) {
           throw error;
         }
         const selected = level0Selection.segments.length;
         if (selected > effectiveMinimumLevel0Segments && selected <= levelZeroLimit) {
-          const fits = fragmented
-            ? error.maximumRanges / error.ranges
-            : memoryBudgetBytes / error.minimumBytes;
           levelZeroLimit = Math.max(
             effectiveMinimumLevel0Segments,
-            Math.min(Math.floor(selected / 2), Math.floor(selected * fits)),
+            Math.min(
+              Math.floor(selected / 2),
+              Math.floor(selected * (memoryBudgetBytes / error.minimumBytes)),
+            ),
           );
           // A later fold starts from the cut size, even if this one never fits.
           this.#automaticCompactionBatches.set(table.id, levelZeroLimit);
           cut = true;
-        } else if (fragmented) {
-          // More memory does not make a plan smaller. The smallest fold is still too
-          // fragmented to persist and step through, so it waits out its backoff.
-          throw error;
         } else {
           memoryBudgetBytes = Math.max(error.minimumBytes, memoryBudgetBytes * 2);
         }
@@ -16848,6 +16885,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       rewritePlan,
       minimumMemoryBytes,
       sourceStoredBytes,
+      resolution,
     } = planned;
 
     const baseJobId = ["compaction", table.id, "manifest", String(version)].join("/");
@@ -16885,7 +16923,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
       const plannedOutputStoredBytesUpperBound =
         await this.#plannedPhysicalOutputStoredBytesUpperBound(
-          rewritePlan,
+          physicalRewriteLayout(rewritePlan, resolution),
           memoryBudgetBytes,
           snapshot,
         );
@@ -16953,7 +16991,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       state: "planned",
       transactionId: null,
       outputSegmentId:
-        rewritePlan.kind === "merge-v1" && rewritePlan.totalRows === 0
+        isMergeCompactionPlan(rewritePlan) && rewritePlan.totalRows === 0
           ? null
           : `${id}/output-segment`,
       publishedVersion: null,
@@ -16975,6 +17013,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       try {
         await this.store.createCompactionJob(job);
+        if (resolution !== undefined) this.#rememberMergeResolution(job.id, resolution);
         return job;
       } catch (error) {
         if (!(error instanceof CompactionJobConflictError)) throw error;
@@ -17234,7 +17273,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
     partitioning?: RechunkPartitioning,
-  ): Promise<RechunkCompactionRewritePlan> {
+  ): Promise<PlannedCompactionRewrite> {
     const first = sourceSegments[0];
     const last = sourceSegments[sourceSegments.length - 1];
     if (first === undefined || last === undefined) {
@@ -17323,7 +17362,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         });
       }
     }
-    const outputs = await this.#refinePhysicalOutputWindows(
+    const { outputs, minimumMemoryBytes } = await this.#refinePhysicalOutputWindows(
       rechunkPhysicalColumns(columns),
       estimatedOutputs,
       targetBlockBytes,
@@ -17333,16 +17372,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
 
     return {
-      kind: "rechunk-v1",
-      targetBlockBytes,
-      outputCompression,
-      totalRows,
-      rowIdStart: first.rowIdStart,
-      rowIdEndExclusive: last.rowIdEndExclusive,
-      logicalOrder,
-      columns,
-      outputs,
-      ...(partitions === undefined ? {} : { partitions }),
+      plan: {
+        kind: "rechunk-v1",
+        targetBlockBytes,
+        outputCompression,
+        totalRows,
+        rowIdStart: first.rowIdStart,
+        rowIdEndExclusive: last.rowIdEndExclusive,
+        logicalOrder,
+        columns,
+        outputs,
+        ...(partitions === undefined ? {} : { partitions }),
+      },
+      minimumMemoryBytes,
     };
   }
 
@@ -17351,6 +17393,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * is also cut into level-one partitions: each rewritten source partition keeps its rows (and
    * its logical order) in place, new rows form the tail, and every run is chunked to at most
    * `partitionRows`, using fractional orders between unchanged neighbours.
+   *
+   * The plan records the sources, the output windows, and the partitions. Which source row
+   * feeds each output cell is the replay, kept in memory and recomputed by any engine that
+   * resumes the job; the plan records only its checksum.
    */
   async #createMergeCompactionPlan(
     table: TableRecord,
@@ -17360,8 +17406,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
     partitioning: KeyedPartitioning | undefined,
-    maxPatchedRanges: number,
-  ): Promise<MergeCompactionRewritePlan> {
+  ): Promise<PlannedCompactionRewrite> {
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new Error(`Mutation compaction requires a unique key: ${table.name}`);
@@ -17373,7 +17418,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ]),
     );
     const describedSegments: MergeCompactionSourceSegment[] = [];
-    const sourceBlocksById = new Map<string, MergeCompactionSourceBlock>();
+    const sourceBlockIds = new Set<string>();
 
     for (const segment of sourceSegments) {
       const transaction = transactions.get(segment.transactionId);
@@ -17407,19 +17452,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (description.type !== column.type || description.rowCount === 0) {
             throw new Error(`Compaction source block differs from table schema: ${blockId}`);
           }
-          if (sourceBlocksById.has(blockId)) {
+          if (sourceBlockIds.has(blockId)) {
             throw new Error(`Compaction source block is referenced more than once: ${blockId}`);
           }
-          const sourceBlock: MergeCompactionSourceBlock = {
+          sourceBlockIds.add(blockId);
+          sourceBlocks.push({
             blockId,
             rowStart,
             rowCount: description.rowCount,
             storedBytes: bytes.byteLength,
             encodedBytes: description.encodedLength,
             checksum: description.checksum,
-          };
-          sourceBlocks.push(sourceBlock);
-          sourceBlocksById.set(blockId, sourceBlock);
+          });
           rowStart = safeWholeNumberSum(
             [rowStart, description.rowCount],
             "Mutation compaction source rows",
@@ -17450,15 +17494,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     assertCanonicalMergeSourceOrder(
       sourceSegments.map((segment) => sourceOrderTuple(segment, transactions, "Compaction source")),
     );
-    const resolved = await this.#resolveMergeOutput(
-      table,
+    const plannedColumns: MergeCompactionPlannedColumn[] = table.columns.map((column) => ({
+      columnId: column.id,
+      type: column.type,
+    }));
+    const resolution = await this.#resolveMergeOutput(
+      plannedColumns,
       describedSegments,
       keyColumn,
       memoryBudgetBytes,
-      maxPatchedRanges,
       snapshot,
     );
-    const { columns, rowIdSpans, totalRows } = resolved;
+    const { rowIdSpans, totalRows } = resolution;
     const rowIdEnvelope = rowIdSpanEnvelope(rowIdSpans);
     const partitions =
       partitioning === undefined
@@ -17466,24 +17513,27 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         : planOutputPartitions(
             partitioning,
             describedSegments,
-            resolved.sourceOutputRowStarts,
+            resolution.sourceOutputRowStarts,
             totalRows,
           );
     let outputs: RechunkCompactionOutputWindow[] = [];
+    let minimumMemoryBytes = 0;
     if (totalRows > 0) {
+      // Size windows by the widest rows the output can read: the sources any run or patch
+      // draws from.
+      const readSegments = new Set<number>(resolution.runSegment);
+      for (const list of resolution.patches) {
+        if (list !== undefined) for (const segment of list.segment) readSegments.add(segment);
+      }
       let maximumEncodedBytesPerRow = 0;
-      for (const column of columns) {
-        for (const range of column.sourceRanges) {
-          const source = sourceBlocksById.get(range.sourceBlockId);
-          if (source === undefined) {
-            throw new Error(
-              `Mutation compaction source fingerprint is missing: ${range.sourceBlockId}`,
+      for (const segmentIndex of readSegments) {
+        for (const column of describedSegments[segmentIndex]?.columns ?? []) {
+          for (const block of column.sourceBlocks) {
+            maximumEncodedBytesPerRow = Math.max(
+              maximumEncodedBytesPerRow,
+              block.encodedBytes / block.rowCount,
             );
           }
-          maximumEncodedBytesPerRow = Math.max(
-            maximumEncodedBytesPerRow,
-            source.encodedBytes / source.rowCount,
-          );
         }
       }
       if (!Number.isFinite(maximumEncodedBytesPerRow) || maximumEncodedBytesPerRow <= 0) {
@@ -17504,30 +17554,41 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           });
         }
       }
-      outputs = await this.#refinePhysicalOutputWindows(
-        mergePhysicalColumns(columns, describedSegments),
+      ({ outputs, minimumMemoryBytes } = await this.#refinePhysicalOutputWindows(
+        plannedColumns.map((column, columnIndex) =>
+          replayedMergeColumn(resolution, describedSegments, columnIndex, column),
+        ),
         estimatedOutputs,
         targetBlockBytes,
         outputCompression,
         memoryBudgetBytes,
         snapshot,
-      );
+      ));
     }
 
     return {
-      kind: "merge-v1",
-      targetBlockBytes,
-      outputCompression,
-      keyColumnId: keyColumn.id,
-      totalRows,
-      rowIdStart: rowIdEnvelope.start,
-      rowIdEndExclusive: rowIdEnvelope.endExclusive,
-      rowIdSpans,
-      logicalOrder: Math.min(...describedSegments.map((segment) => segment.logicalOrder)),
-      sourceSegments: describedSegments,
-      columns,
-      outputs,
-      ...(partitions === undefined ? {} : { partitions }),
+      plan: {
+        kind: "merge-v2",
+        targetBlockBytes,
+        outputCompression,
+        keyColumnId: keyColumn.id,
+        totalRows,
+        rowIdStart: rowIdEnvelope.start,
+        rowIdEndExclusive: rowIdEnvelope.endExclusive,
+        rowIdSpans,
+        logicalOrder: Math.min(...describedSegments.map((segment) => segment.logicalOrder)),
+        sourceSegments: describedSegments,
+        columns: plannedColumns,
+        outputs,
+        ...(partitions === undefined ? {} : { partitions }),
+        resolution: {
+          runs: resolution.runOutputStart.length,
+          patches: resolution.patchCount,
+          checksum: resolution.checksum,
+        },
+      },
+      minimumMemoryBytes,
+      resolution,
     };
   }
 
@@ -17541,15 +17602,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * referenced later through its key, and only delete, update, and upsert sources reference
    * keys, so the first pass collects those keys — the touched set — and the replay then tracks
    * slots for touched keys alone. An untouched row can never be deleted, patched, or replaced:
-   * it passes through as part of a run, one output range per source block rather than one per
-   * row.
+   * it passes through as part of a run.
    *
    * Nothing is kept per delta row. The replay streams the key blocks a second time instead of
-   * holding every delta's keys, and an upsert replacing a live row records the one row it came
-   * from rather than a source per column. Eighty upserts that each rewrite the same thousand
-   * wide rows therefore cost a thousand keys, not eighty thousand rows times their columns.
-   * Memory is two bytes per slot, the source block descriptions, a bounded record per touched
-   * key, and the output ranges as the builder actually coalesces them — counted, not assumed.
+   * holding every delta's keys, an upsert replacing a live row records the one row it came
+   * from, and the result is row runs and patched cells in typed arrays, twelve bytes each.
+   * Eighty upserts that each rewrite the same thousand wide rows, in any order, cost a thousand
+   * keys and at most a thousand runs. Memory is two bytes per slot, the source block
+   * descriptions, a bounded record per touched key, and the runs, patches, and row-ID spans as
+   * the builder coalesces them — counted, not assumed. Long loops hand the event loop a turn
+   * every few milliseconds.
    *
    * The semantics are those of a per-row replay:
    * - delete: the key's live slot dies; a later insert of the key takes a new slot.
@@ -17559,27 +17621,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    *   upsert row's own slot dies, so the row keeps its position and row ID; otherwise the
    *   upsert row is a new live row.
    * - insert/base: a new live row; a second live occurrence of a touched key is an error.
+   *
+   * The result is a pure function of the sources, so a fold resumed elsewhere recomputes it
+   * exactly; `snapshot`, when given, is renewed while the sources are read.
    */
   async #resolveMergeOutput(
-    table: TableRecord,
+    columns: readonly MergeCompactionPlannedColumn[],
     segments: readonly MergeCompactionSourceSegment[],
-    keyColumn: TableColumnRecord,
+    keyColumn: Pick<TableColumnRecord, "id" | "type">,
     memoryBudgetBytes: number,
-    maxPatchedRanges: number,
-    snapshot: LeasedSnapshot,
-  ): Promise<{
-    columns: MergeCompactionOutputColumn[];
-    rowIdSpans: RowIdSpan[];
-    totalRows: number;
-    /** The output row at which each row-bearing source's surviving rows begin. */
-    sourceOutputRowStarts: Map<string, number>;
-  }> {
-    const memory = mergePlannerMemory(table, segments, keyColumn.id);
+    snapshot: LeasedSnapshot | undefined,
+  ): Promise<MergeResolution> {
+    const memory = mergePlannerMemory(columns.length, segments, keyColumn.id);
     if (memory.baseBytes > memoryBudgetBytes) {
       throw new CompactionMemoryBudgetError(memoryBudgetBytes, memory.baseBytes);
     }
     const availableBytes = memoryBudgetBytes - memory.baseBytes;
-    const columnIndexById = new Map(table.columns.map((column, index) => [column.id, index]));
+    const columnIndexById = new Map(columns.map((column, index) => [column.columnId, index]));
+    const segmentIndexById = new Map(segments.map((segment, index) => [segment.segmentId, index]));
 
     // Pass 1: the distinct keys any delta references. A quarter of what the base bound left
     // decodes key blocks in groups; the rest holds the touched set, which is refused the moment
@@ -17596,10 +17655,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (_segment, value) => {
         touched.add(overlayKeyOf(keyColumn.type, value));
         if (touched.size > touchedLimit) {
+          // The touched set gets three quarters of what the base leaves, so the budget this
+          // many keys needs is the base plus four thirds of their bytes — and more keys follow.
           throw new CompactionMemoryBudgetError(
             memoryBudgetBytes,
             safeWholeNumberSum(
-              [memory.baseBytes, memory.touchedBytes(touched.size)],
+              [memory.baseBytes, Math.ceil((memory.touchedBytes(touched.size) * 4) / 3)],
               "Mutation compaction planner memory",
             ),
           );
@@ -17607,10 +17668,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       },
     );
     const touchedBytes = memory.touchedBytes(touched.size);
-    const replayBytes = availableBytes - touchedBytes;
+    const replayBytes = Math.max(0, availableBytes - touchedBytes);
 
     // Pass 2: replay into slot state. Every source's keys stream again in canonical order, in
-    // one grouped read; a row whose key nothing references passes straight through.
+    // grouped reads; a row whose key nothing references passes straight through.
     let slotCount = 0;
     const slotBases = new Map<string, number>();
     for (const segment of segments) {
@@ -17623,7 +17684,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const patches = new Map<number, MergeSlotPatch>();
     if (touched.size > 0) {
       const liveSlotByKey = new Map<OverlayKey, number>();
-      const changedColumns = new Map<string, Array<{ columnId: string; columnIndex: number }>>();
+      const changedColumns = new Map<string, number[]>();
       for (const segment of deltas) {
         if (segment.kind !== "update") continue;
         changedColumns.set(
@@ -17636,14 +17697,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               if (columnIndex === undefined) {
                 throw new Error(`Mutation compaction column is missing: ${columnId}`);
               }
-              return { columnId, columnIndex };
+              return columnIndex;
             }),
         );
       }
       await this.#forEachMergeSourceKey(
         segments,
         keyColumn,
-        Math.max(0, replayBytes),
+        replayBytes,
         snapshot,
         (segment, value, rowIndex) => {
           const key = overlayKeyOf(keyColumn.type, value);
@@ -17657,6 +17718,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             liveSlotByKey.delete(key);
             return;
           }
+          const segmentIndex = segmentIndexById.get(segment.segmentId);
+          if (segmentIndex === undefined) throw new Error("Mutation compaction source is missing");
           if (segment.kind === "update") {
             const slot = liveSlotByKey.get(key);
             if (slot === undefined) {
@@ -17668,11 +17731,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               patches.set(slot, patch);
               patched[slot] = 1;
             }
-            const columns = (patch.columns ??= new Array<MergeResolvedSource | undefined>(
-              table.columns.length,
+            const patchedColumns = (patch.columns ??= new Array<MergeResolvedSource | undefined>(
+              columns.length,
             ));
-            for (const { columnId, columnIndex } of changedColumns.get(segment.segmentId) ?? []) {
-              columns[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
+            const source = { segment: segmentIndex, row: rowIndex };
+            for (const columnIndex of changedColumns.get(segment.segmentId) ?? []) {
+              patchedColumns[columnIndex] = source;
             }
             return;
           }
@@ -17688,7 +17752,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (segment.kind !== "upsert") {
             throw new Error(`Insert segment contains a duplicate unique key: ${segment.segmentId}`);
           }
-          patches.set(existing, { rowSource: segment, rowIndex, columns: undefined });
+          patches.set(existing, { rowSource: segmentIndex, rowIndex, columns: undefined });
           patched[existing] = 1;
           dead[slot] = 1;
         },
@@ -17696,59 +17760,93 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     touched.clear();
 
-    // Pass 3: the live slots in slot order, as runs wherever nothing touched them. The ranges
-    // are counted as they coalesce; past what the budget leaves, the builder stops keeping
-    // them and only counts, so a refusal reports exactly what the plan would have needed. The
-    // ranges are also the persisted plan, which every step of the job reads and rewrites, so
-    // `maxPatchedRanges` can hold them nearer one per source block than memory alone would.
-    const memoryRangeLimit = Math.floor(Math.max(0, replayBytes) / MERGE_PLANNER_RANGE_BYTES);
-    const planRangeLimit = memory.sourceBlocks + maxPatchedRanges;
-    const output = new MergeOutputBuilder(
-      table.columns,
-      Math.min(memoryRangeLimit, planRangeLimit),
-    );
+    // Pass 3: the live slots in slot order, as runs wherever nothing touched them. Entries are
+    // counted as they coalesce; past what the budget leaves, the builder stops keeping them and
+    // only counts, so a refusal reports exactly what the replay would have needed.
+    const output = new MergeResolutionBuilder(columns.length, replayBytes);
     const sourceOutputRowStarts = new Map<string, number>();
     let slotBase = 0;
-    for (const segment of segments) {
+    for (const [segmentIndex, segment] of segments.entries()) {
       if (!mergeSourceBearsRows(segment.kind)) continue;
       sourceOutputRowStarts.set(segment.segmentId, output.totalRows);
       let runStart = -1;
       for (let rowIndex = 0; rowIndex < segment.rowCount; rowIndex += 1) {
+        if ((rowIndex & 4095) === 0) await maybeYieldToEventLoop();
         const slot = slotBase + rowIndex;
         if (dead[slot] === 1 || patched[slot] === 1) {
           if (runStart >= 0) {
-            output.appendRun(segment, runStart, rowIndex - runStart);
+            output.appendRows(segmentIndex, segment, runStart, rowIndex - runStart);
             runStart = -1;
           }
-          if (patched[slot] === 1) output.appendPatchedRow(segment, rowIndex, patches.get(slot));
+          if (patched[slot] === 1) {
+            output.appendPatchedRow(segmentIndex, segment, rowIndex, patches.get(slot));
+          }
           continue;
         }
         if (runStart < 0) runStart = rowIndex;
       }
-      if (runStart >= 0) output.appendRun(segment, runStart, segment.rowCount - runStart);
+      if (runStart >= 0) {
+        output.appendRows(segmentIndex, segment, runStart, segment.rowCount - runStart);
+      }
       slotBase += segment.rowCount;
     }
-    if (output.rangeCount > planRangeLimit) {
-      throw new CompactionPlanTooFragmentedError(output.rangeCount, planRangeLimit);
-    }
-    if (output.rangeCount > memoryRangeLimit) {
+    if (output.bytes > replayBytes) {
       throw new CompactionMemoryBudgetError(
         memoryBudgetBytes,
         safeWholeNumberSum(
-          [
-            memory.baseBytes,
-            touchedBytes,
-            safeWholeNumberProduct(
-              output.rangeCount,
-              MERGE_PLANNER_RANGE_BYTES,
-              "Mutation compaction range bytes",
-            ),
-          ],
+          [memory.baseBytes, touchedBytes, output.bytes],
           "Mutation compaction planner memory",
         ),
       );
     }
-    return { ...output.finish(), sourceOutputRowStarts };
+    return output.finish(sourceOutputRowStarts);
+  }
+
+  /**
+   * The replay a replayed merge job writes from. The planning engine keeps it; any other engine
+   * stepping the job — another tab, this tab after a reload — recomputes it from the sources,
+   * which the job protects, and refuses to write unless it matches the plan's checksum, its row
+   * count, and its row-ID spans exactly.
+   */
+  async #mergeResolutionFor(
+    job: CompactionJobRecord,
+    plan: ReplayedMergeCompactionRewritePlan,
+  ): Promise<MergeResolution> {
+    const cached = this.#mergeResolutions.get(job.id);
+    if (cached !== undefined) {
+      this.#mergeResolutions.delete(job.id);
+      this.#mergeResolutions.set(job.id, cached);
+      return cached;
+    }
+    const keyColumn = plan.columns.find((column) => column.columnId === plan.keyColumnId);
+    if (keyColumn === undefined) throw new Error("Replayed merge plan has no key column");
+    const resolution = await this.#resolveMergeOutput(
+      plan.columns,
+      plan.sourceSegments,
+      { id: keyColumn.columnId, type: keyColumn.type },
+      job.memoryBudgetBytes,
+      undefined,
+    );
+    if (
+      resolution.totalRows !== plan.totalRows ||
+      resolution.runOutputStart.length !== plan.resolution.runs ||
+      resolution.patchCount !== plan.resolution.patches ||
+      resolution.checksum !== plan.resolution.checksum ||
+      !sameRowIdSpans(resolution.rowIdSpans, plan.rowIdSpans)
+    ) {
+      throw new CompactionReplayMismatchError(job.id);
+    }
+    this.#rememberMergeResolution(job.id, resolution);
+    return resolution;
+  }
+
+  #rememberMergeResolution(jobId: string, resolution: MergeResolution): void {
+    this.#mergeResolutions.delete(jobId);
+    this.#mergeResolutions.set(jobId, resolution);
+    for (const oldest of this.#mergeResolutions.keys()) {
+      if (this.#mergeResolutions.size <= COMPACTION_LAYOUT_CACHE_LIMIT) break;
+      this.#mergeResolutions.delete(oldest);
+    }
   }
 
   /**
@@ -17760,9 +17858,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   async #forEachMergeSourceKey(
     segments: readonly MergeCompactionSourceSegment[],
-    column: TableColumnRecord,
+    column: Pick<TableColumnRecord, "id" | "type">,
     unusedBudgetBytes: number,
-    snapshot: LeasedSnapshot,
+    snapshot: LeasedSnapshot | undefined,
     action: (segment: MergeCompactionSourceSegment, value: BatchValue, rowIndex: number) => void,
   ): Promise<void> {
     const blocks: Array<
@@ -17782,6 +17880,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           blockId: source.blockId,
           storedBytes: source.storedBytes,
           encodedBytes: source.encodedBytes,
+          rowCount: source.rowCount,
           segment,
           source,
         });
@@ -17802,7 +17901,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const rowIndexes = new Map<string, number>();
     await this.#decodeCompactionBlocks(
       blocks,
-      { limitBytes, retainsDecoded: false },
+      { limitBytes, retainsDecoded: false, maxRows: MERGE_KEY_DECODE_GROUP_ROWS },
       snapshot,
       async (bytes, { source }) => {
         const description = inspectBlock(bytes);
@@ -17833,6 +17932,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  /**
+   * Cuts estimated output windows until every column of every window fits the target block
+   * size, the block format, and the memory budget, and reports the largest window memory bound
+   * among the results — the job's minimum memory. A fixed-width column's size follows from its
+   * row count, so only string columns are read to measure; the windows hand the event loop a
+   * turn between them.
+   */
   async #refinePhysicalOutputWindows(
     columns: readonly PhysicalCompactionSourceColumn[],
     estimatedOutputs: readonly RechunkCompactionOutputWindow[],
@@ -17840,21 +17946,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     outputCompression: Compression,
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
-  ): Promise<RechunkCompactionOutputWindow[]> {
-    const outputs: RechunkCompactionOutputWindow[] = [];
+  ): Promise<{ outputs: RechunkCompactionOutputWindow[]; minimumMemoryBytes: number }> {
+    const refinement = {
+      outputs: [] as RechunkCompactionOutputWindow[],
+      minimumMemoryBytes: estimatedOutputs.length === 0 ? 0 : 1,
+    };
     for (const output of estimatedOutputs) {
-      outputs.push(
-        ...(await this.#refinePhysicalOutputWindow(
-          columns,
-          output,
-          targetBlockBytes,
-          outputCompression,
-          memoryBudgetBytes,
-          snapshot,
-        )),
+      await this.#refinePhysicalOutputWindow(
+        columns,
+        output,
+        targetBlockBytes,
+        outputCompression,
+        memoryBudgetBytes,
+        snapshot,
+        refinement,
       );
     }
-    return outputs;
+    return { outputs: refinement.outputs, minimumMemoryBytes: refinement.minimumMemoryBytes };
   }
 
   async #refinePhysicalOutputWindow(
@@ -17864,7 +17972,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     outputCompression: Compression,
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
-  ): Promise<RechunkCompactionOutputWindow[]> {
+    refinement: {
+      outputs: RechunkCompactionOutputWindow[];
+      minimumMemoryBytes: number;
+    },
+  ): Promise<void> {
+    await maybeYieldToEventLoop();
     let splitReason: "target" | "format" | "memory" | null = null;
     const requiredMemoryBytes = Math.max(
       ...columns.map((column) => physicalOutputMemoryBound(column, output, outputCompression)),
@@ -17875,15 +17988,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (const column of columns) {
         let encodedByteLength: number;
         try {
-          encodedByteLength = (
-            await this.#measurePhysicalCompactionOutput(
-              column,
-              output,
-              outputCompression,
-              memoryBudgetBytes,
-              snapshot,
-            )
-          ).encodedByteLength;
+          encodedByteLength =
+            column.type === "string"
+              ? (
+                  await this.#measurePhysicalCompactionOutput(
+                    column,
+                    output,
+                    outputCompression,
+                    memoryBudgetBytes,
+                    snapshot,
+                  )
+                ).encodedByteLength
+              : physicalColumnByteLength(column.type, output.rowCount);
         } catch (error) {
           if (!isPhysicalColumnLimitError(error)) throw error;
           splitReason = "format";
@@ -17902,7 +18018,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     if (splitReason === null || (splitReason === "target" && output.rowCount === 1)) {
-      return [output];
+      refinement.outputs.push(output);
+      refinement.minimumMemoryBytes = Math.max(refinement.minimumMemoryBytes, requiredMemoryBytes);
+      return;
     }
     if (output.rowCount === 1) {
       if (splitReason === "memory") {
@@ -17914,32 +18032,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
 
     const leftRowCount = Math.floor(output.rowCount / 2);
-    const left = { rowStart: output.rowStart, rowCount: leftRowCount };
-    const right = {
-      rowStart: safeWholeNumberSum(
-        [output.rowStart, leftRowCount],
-        "Compaction split output row start",
-      ),
-      rowCount: output.rowCount - leftRowCount,
-    };
-    return [
-      ...(await this.#refinePhysicalOutputWindow(
+    for (const half of [
+      { rowStart: output.rowStart, rowCount: leftRowCount },
+      {
+        rowStart: safeWholeNumberSum(
+          [output.rowStart, leftRowCount],
+          "Compaction split output row start",
+        ),
+        rowCount: output.rowCount - leftRowCount,
+      },
+    ]) {
+      await this.#refinePhysicalOutputWindow(
         columns,
-        left,
+        half,
         targetBlockBytes,
         outputCompression,
         memoryBudgetBytes,
         snapshot,
-      )),
-      ...(await this.#refinePhysicalOutputWindow(
-        columns,
-        right,
-        targetBlockBytes,
-        outputCompression,
-        memoryBudgetBytes,
-        snapshot,
-      )),
-    ];
+        refinement,
+      );
+    }
   }
 
   async #measurePhysicalCompactionOutput(
@@ -17960,18 +18072,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #plannedPhysicalOutputStoredBytesUpperBound(
-    plan: PhysicalCompactionRewritePlan,
+    layout: PhysicalCompactionLayout,
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
   ): Promise<number> {
-    const layout = physicalRewriteLayout(plan);
     let total = 0;
     for (const output of layout.outputs) {
       for (const column of layout.columns) {
         const measurement = await this.#measurePhysicalCompactionOutput(
           column,
           output,
-          plan.outputCompression,
+          layout.outputCompression,
           memoryBudgetBytes,
           snapshot,
         );
@@ -17981,7 +18092,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             maximumPhysicalBlockByteLength(
               measurement.encodedByteLength,
               measurement.metadata,
-              plan.outputCompression,
+              layout.outputCompression,
             ),
           ],
           "Compaction planned output stored-byte upper bound",
@@ -18338,7 +18449,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (latest?.state === "cancelled" && isCompactionCoordinationRefusal(error)) {
         throw new CompactionJobCancelledError(job.id);
       }
-      if (error instanceof CompactionWriteAmplificationError) {
+      if (
+        error instanceof CompactionWriteAmplificationError ||
+        error instanceof CompactionReplayMismatchError
+      ) {
         if (transaction.status === "active") await transaction.abort();
         if (latest !== undefined && isActiveCompactionState(latest.state)) {
           try {
@@ -18371,27 +18485,58 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  async #compactionLayout(
+    job: CompactionJobRecord,
+    plan: PhysicalCompactionRewritePlan,
+  ): Promise<PhysicalCompactionLayout> {
+    const jobId = job.id;
+    let layout = this.#compactionLayouts.get(jobId);
+    if (layout === undefined) {
+      layout = physicalRewriteLayout(
+        plan,
+        plan.kind === "merge-v2" ? await this.#mergeResolutionFor(job, plan) : undefined,
+      );
+    } else {
+      this.#compactionLayouts.delete(jobId);
+    }
+    this.#compactionLayouts.set(jobId, layout);
+    for (const oldest of this.#compactionLayouts.keys()) {
+      if (this.#compactionLayouts.size <= COMPACTION_LAYOUT_CACHE_LIMIT) break;
+      this.#compactionLayouts.delete(oldest);
+    }
+    return layout;
+  }
+
+  /**
+   * Writes up to `maxBlocks` output blocks and records them in one checkpoint. Each block is
+   * journaled in the fold's transaction as it is written, so a crash before the checkpoint
+   * loses nothing but the work: the next step finds those blocks already stored, verifies them
+   * byte for byte, and records them then. One job-record update per step instead of one per
+   * block keeps the record's size — which grows with the fold — out of the per-block cost.
+   */
   async #advancePhysicalCompaction(
     initialJob: CompactionJobRecord,
     transaction: DatabaseTransaction,
     plan: PhysicalCompactionRewritePlan,
     maxBlocks: number,
   ): Promise<CompactionJobRecord> {
-    const layout = physicalRewriteLayout(plan);
-    let job = initialJob;
-    let processedBlocks = 0;
-    while ((job.outputCursor?.outputIndex ?? 0) < layout.outputs.length) {
-      if (processedBlocks >= maxBlocks) break;
-      const cursor = job.outputCursor;
-      if (cursor === null) {
-        throw new Error("Physical compaction cursor is missing");
-      }
-      const output = layout.outputs[cursor.outputIndex];
-      const column = layout.columns[cursor.columnIndex];
+    const layout = await this.#compactionLayout(initialJob, plan);
+    const job = initialJob;
+    const cursor = job.outputCursor;
+    if (cursor === null) throw new Error("Physical compaction cursor is missing");
+    let outputIndex = cursor.outputIndex;
+    let columnIndex = cursor.columnIndex;
+    const writtenBlockIds: string[] = [];
+    let outputStoredBytes = job.outputStoredBytes;
+    let outputLogicalBytes = job.outputLogicalBytes;
+    let peakWorkingBytes = job.peakWorkingBytes;
+    while (outputIndex < layout.outputs.length && writtenBlockIds.length < maxBlocks) {
+      const output = layout.outputs[outputIndex];
+      const column = layout.columns[columnIndex];
       if (output === undefined || column === undefined) {
         throw new Error("Physical compaction cursor is invalid");
       }
-      const outputBlockId = physicalOutputBlockId(job.id, cursor.outputIndex, cursor.columnIndex);
+      const outputBlockId = physicalOutputBlockId(job.id, outputIndex, columnIndex);
       const built = await this.#buildPhysicalCompactionOutput(
         layout,
         column,
@@ -18420,7 +18565,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         outputBytes = existing;
       }
       const nextOutputStoredBytes = safeWholeNumberSum(
-        [job.outputStoredBytes, outputBytes.byteLength],
+        [outputStoredBytes, outputBytes.byteLength],
         "Compaction output stored bytes",
       );
       const maximumOutputStoredBytes = job.maximumOutputStoredBytes;
@@ -18441,35 +18586,34 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       if (existing === undefined) await transaction.stageBlock(outputBlockId, outputBytes);
       else await transaction.stageExistingBlocks([outputBlockId]);
-      const description = inspectBlock(outputBytes);
-      const nextColumnIndex = cursor.columnIndex + 1;
-      const nextOutputIndex =
-        nextColumnIndex === layout.columns.length ? cursor.outputIndex + 1 : cursor.outputIndex;
-      const canonicalColumnIndex = nextColumnIndex === layout.columns.length ? 0 : nextColumnIndex;
-      const nextRowStart =
-        nextOutputIndex === layout.outputs.length
-          ? layout.totalRows
-          : (layout.outputs[nextOutputIndex]?.rowStart ?? output.rowStart);
-      job = await this.store.updateCompactionJob(job.id, job.revision, {
-        outputBlockIds: [...job.outputBlockIds, outputBlockId],
-        outputCursor: {
-          outputIndex: nextOutputIndex,
-          columnIndex: canonicalColumnIndex,
-          rowStart: nextRowStart,
-        },
-        processedRows: nextRowStart,
-        outputStoredBytes: nextOutputStoredBytes,
-        outputLogicalBytes: safeWholeNumberSum(
-          [job.outputLogicalBytes, description.encodedLength],
-          "Compaction output logical bytes",
-        ),
-        peakWorkingBytes: Math.max(job.peakWorkingBytes, built.peakWorkingBytes),
-        updatedAt: dateIsoString(this.#now()),
-        error: null,
-      });
-      processedBlocks += 1;
+      outputStoredBytes = nextOutputStoredBytes;
+      outputLogicalBytes = safeWholeNumberSum(
+        [outputLogicalBytes, inspectBlock(outputBytes).encodedLength],
+        "Compaction output logical bytes",
+      );
+      peakWorkingBytes = Math.max(peakWorkingBytes, built.peakWorkingBytes);
+      writtenBlockIds.push(outputBlockId);
+      columnIndex += 1;
+      if (columnIndex === layout.columns.length) {
+        columnIndex = 0;
+        outputIndex += 1;
+      }
     }
-    return job;
+    if (writtenBlockIds.length === 0) return job;
+    const nextRowStart =
+      outputIndex === layout.outputs.length
+        ? layout.totalRows
+        : (layout.outputs[outputIndex]?.rowStart ?? layout.totalRows);
+    return this.store.updateCompactionJob(job.id, job.revision, {
+      outputBlockIds: [...job.outputBlockIds, ...writtenBlockIds],
+      outputCursor: { outputIndex, columnIndex, rowStart: nextRowStart },
+      processedRows: nextRowStart,
+      outputStoredBytes,
+      outputLogicalBytes,
+      peakWorkingBytes,
+      updatedAt: dateIsoString(this.#now()),
+      error: null,
+    });
   }
 
   async #buildPhysicalCompactionOutput(
@@ -18484,11 +18628,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       plan.outputCompression,
       memoryBudgetBytes,
     );
-    const measurement = measurePhysicalColumnRanges(column.type, loaded.ranges);
-    if (measurement.rowCount !== output.rowCount) {
+    const physical = buildPhysicalColumnFromRanges(column.type, loaded.ranges);
+    if (physical.rowCount !== output.rowCount) {
       throw new Error("Compaction source ranges do not cover the planned output");
     }
-    const physical = buildPhysicalColumnFromRanges(column.type, loaded.ranges);
     return { physical, peakWorkingBytes: loaded.peakWorkingBytes };
   }
 
@@ -18506,7 +18649,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     memoryBudgetBytes: number,
     snapshot?: LeasedSnapshot,
   ): Promise<{ ranges: PhysicalColumnRange[]; peakWorkingBytes: number }> {
-    const memoryBound = physicalOutputMemoryBound(column, output, outputCompression);
+    const sourceBlocks = column.rangesFor(output);
+    const memoryBound = physicalOutputMemoryBound(column, output, outputCompression, sourceBlocks);
     if (memoryBound > memoryBudgetBytes) {
       throw new CompactionMemoryBudgetError(memoryBudgetBytes, memoryBound);
     }
@@ -18514,7 +18658,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       [output.rowStart, output.rowCount],
       "Compaction output row range",
     );
-    const sourceBlocks = overlappingPhysicalSourceRanges(column, output);
     const distinct: PhysicalCompactionSourceRange[] = [];
     const seen = new Set<string>();
     for (const sourceBlock of sourceBlocks) {
@@ -18562,8 +18705,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         sourceBlock.outputRowStart;
       const end =
         sourceBlock.sourceRowStart + Math.min(outputEnd, sourceEnd) - sourceBlock.outputRowStart;
-      const slice = slicePhysicalColumn(block.column, start, end);
-      ranges.push({ column: slice, start: 0, end: slice.rowCount });
+      // The decoded block was validated once when it was read; every range of it reuses that.
+      ranges.push({ column: block.column, start, end });
     }
     return { ranges, peakWorkingBytes: Math.max(memoryBound, peakWorkingBytes) };
   }
@@ -18580,11 +18723,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * commit, so a fold that decoded its sources one after another advanced by one block per
    * statement while every statement added a level-zero segment, and a fold of a few thousand
    * reads fell further behind a loop of a few thousand statements until the ceiling refused
-   * them. A group costs one turn however many blocks it holds.
+   * them. A group costs one turn however many blocks it holds. `maxRows` bounds a group the
+   * other way: `consume` runs synchronously for every block of a group, so a group of many
+   * small blocks would otherwise hand a caller millions of rows to process in one turn.
    */
   async #decodeCompactionBlocks<B extends CompactionSourceBlockRef, T>(
     blocks: readonly B[],
-    budget: { limitBytes: number; retainsDecoded: boolean },
+    budget: { limitBytes: number; retainsDecoded: boolean; maxRows?: number },
     snapshot: LeasedSnapshot | undefined,
     decode: (bytes: Uint8Array, block: B) => Promise<T>,
     consume: (decoded: T, block: B) => void,
@@ -18596,9 +18741,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       let end = start;
       let transientBytes = 0;
       let storedBytes = 0;
+      let rows = 0;
       for (; end < blocks.length && end - start < MAX_STORAGE_BULK_READ_ITEMS; end += 1) {
         const block = blocks[end];
         if (block === undefined) break;
+        if (
+          end > start &&
+          budget.maxRows !== undefined &&
+          rows + (block.rowCount ?? 0) > budget.maxRows
+        ) {
+          break;
+        }
+        rows += block.rowCount ?? 0;
         const blockTransientBytes = safeWholeNumberSum(
           [
             safeWholeNumberProduct(block.storedBytes, 2, "Compaction decode memory"),
@@ -18707,7 +18861,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         await this.#assertLevelTwoSnapshotOrder(job, plan, snapshot, transactions);
         return;
       }
-      if (plan.kind !== "merge-v1") {
+      if (!isMergeCompactionPlan(plan)) {
         throw new Error("L2 compaction requires a rechunk or merge rewrite plan");
       }
       // A keyed multi-range promotion falls through to the merge-source and ordering checks
@@ -18715,7 +18869,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     let latestSource: MergeSourceOrderTuple | null = null;
     let outputLogicalOrder: number | null = null;
-    if (plan.kind === "merge-v1") {
+    if (isMergeCompactionPlan(plan)) {
       const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
@@ -18829,7 +18983,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (plannedLayout === null) throw new Error("Compaction planned layout is no longer valid");
 
     let latestSource: MergeSourceOrderTuple | null = null;
-    if (plan.kind === "merge-v1") {
+    if (isMergeCompactionPlan(plan)) {
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
         if (actual === undefined) {
@@ -19213,6 +19367,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let inserted = 0;
     let updated = 0;
     for (const [token, value] of keys) {
+      if (((inserted + updated) & 4095) === 4095) await maybeYieldToEventLoop();
       if (existing.has(token)) {
         if (kind === "insert") {
           throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
@@ -19248,7 +19403,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     requestedTokens: readonly string[],
   ): Promise<string[]> {
     const found: string[] = [];
+    // An in-memory store answers each window without a real await; yield between them.
     for (let start = 0; start < requestedTokens.length; start += MAX_STORAGE_BULK_READ_ITEMS) {
+      await maybeYieldToEventLoop();
       found.push(
         ...(await this.store.getExistingUniqueKeys(
           tableId,
@@ -19886,37 +20043,27 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (valueVectors.some((vector) => vector === undefined) || keyVector === undefined) {
         throw new Error(`UNIQUE-index source columns are missing: ${index.name}`);
       }
-      let ordinal = 0;
-      let totalTokens = 0;
-      for (let start = 0; start < materialized.rowCount; start += this.#rowsPerBlock) {
-        const end = Math.min(materialized.rowCount, start + this.#rowsPerBlock);
-        const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
-        for (let row = start; row < end; row += 1) {
-          const values = valueVectors.map((vector, position) =>
-            vector === undefined
-              ? null
-              : storedSqlValueFromExecution(columns[position], vectorValue(vector, row)),
-          );
-          const locator = secondaryKeyLocator(
-            keyColumn.type,
-            storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
-          );
-          addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
-        }
-        const postings = sortedSecondaryPostings(byTerm);
-        for (const chunk of chunkFtsPostings(postings)) {
-          totalTokens = safeWholeNumberSum(
-            [totalTokens, postingFrequencyTotal(chunk)],
-            "Secondary-index posting count",
-          );
-          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk);
-          ordinal += 1;
-        }
+      const postings = new SecondaryPostingWriter(this.#rowsPerBlock, (ordinal, chunk) =>
+        writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
+      );
+      for (let row = 0; row < materialized.rowCount; row += 1) {
+        const values = valueVectors.map((vector, position) =>
+          vector === undefined
+            ? null
+            : storedSqlValueFromExecution(columns[position], vectorValue(vector, row)),
+        );
+        const locator = secondaryKeyLocator(
+          keyColumn.type,
+          storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
+        );
+        addSecondaryPosting(postings.byTerm, index, columns, values, locator, uniqueTerms);
+        if (postings.rowAdded()) await postings.service();
       }
+      await postings.flush();
       await finish(table.id, index.storageColumnId, buildId, {
         coversVersion,
-        chunkCount: ordinal,
-        totalTokens,
+        chunkCount: postings.ordinal,
+        totalTokens: postings.totalTokens,
       });
     } catch (error) {
       await abort(table.id, index.storageColumnId, buildId).catch(
@@ -19958,14 +20105,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keyColumn === undefined ? undefined : streamed.table.columns.get(keyColumn.name);
       const rowIdAt =
         keyColumn === undefined ? appendRowIdLocator(segments, streamed.table.rowCount) : undefined;
-      let ordinal = 0;
-      let totalTokens = 0;
+      const postings = new SecondaryPostingWriter(this.#rowsPerBlock, (ordinal, chunk) =>
+        writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
+      );
       for (let start = 0; start < streamed.table.rowCount;) {
         const requested = Math.min(this.#rowsPerBlock, streamed.table.rowCount - start);
         const residentEnd = await streamed.load(start, requested);
         const end = Math.min(start + requested, residentEnd);
         if (end <= start) throw new Error(`Secondary-index scan made no progress: ${table.name}`);
-        const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
         for (let row = start; row < end; row += 1) {
           const values = valueVectors.map((vector, position) =>
             vector === undefined
@@ -19981,23 +20128,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                     ? null
                     : storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
                 );
-          addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
+          addSecondaryPosting(postings.byTerm, index, columns, values, locator, uniqueTerms);
+          if (postings.rowAdded()) await postings.service();
         }
-        const postings = sortedSecondaryPostings(byTerm);
-        for (const chunk of chunkFtsPostings(postings)) {
-          totalTokens = safeWholeNumberSum(
-            [totalTokens, postingFrequencyTotal(chunk)],
-            "Secondary-index posting count",
-          );
-          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk);
-          ordinal += 1;
-        }
+        await postings.flush();
         start = end;
       }
+      await postings.flush();
       await finish(table.id, index.storageColumnId, buildId, {
         coversVersion,
-        chunkCount: ordinal,
-        totalTokens,
+        chunkCount: postings.ordinal,
+        totalTokens: postings.totalTokens,
       });
       return true;
     } catch (error) {
@@ -20034,8 +20175,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const segments = await this.#visibleSegmentRecords(table, snapshot);
     await begin(table.id, index.storageColumnId, buildId);
     try {
-      let ordinal = 0;
-      let totalTokens = 0;
+      const postings = new SecondaryPostingWriter(this.#rowsPerBlock, (ordinal, chunk) =>
+        writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
+      );
       for (const segment of segments) {
         const anchorIds =
           (keyColumn === undefined ? undefined : segment.columnBlockIds[keyColumn.id]) ??
@@ -20097,7 +20239,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             keyColumn === undefined || keyBlock === undefined || keyId === undefined
               ? undefined
               : this.#blockColumnVector(keyId, keyBlock);
-          const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
           for (let row = 0; row < rowCount; row += 1) {
             const values = columns.map((column, position) => {
               const vector = vectors[position];
@@ -20110,27 +20251,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                     keyColumn.type,
                     keys === undefined ? null : vectorValue(keys, row),
                   );
-            addSecondaryPosting(byTerm, index, columns, values, locator);
+            addSecondaryPosting(postings.byTerm, index, columns, values, locator);
+            if (postings.rowAdded()) await postings.service();
           }
-          const postings = sortedSecondaryPostings(byTerm);
-          for (const chunk of chunkFtsPostings(postings)) {
-            totalTokens = safeWholeNumberSum(
-              [totalTokens, postingFrequencyTotal(chunk)],
-              "Secondary-index posting count",
-            );
-            await writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk);
-            ordinal += 1;
-          }
+          await postings.flush();
           segmentRow += rowCount;
         }
         if (segmentRow !== segment.rowCount) {
           throw new Error(`Secondary-index column row count differs in segment ${segment.id}`);
         }
       }
+      await postings.flush();
       await finish(table.id, index.storageColumnId, buildId, {
         coversVersion,
-        chunkCount: ordinal,
-        totalTokens,
+        chunkCount: postings.ordinal,
+        totalTokens: postings.totalTokens,
       });
     } catch (error) {
       await abort(table.id, index.storageColumnId, buildId).catch(
@@ -20223,11 +20358,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         let totalTokens = 0;
         let pendingTokens = 0;
         let ordinal = 0;
+        // Tokenizing a resident block awaits nothing; yielding every few hundred rows keeps a
+        // large column's build from holding the event loop for the whole block.
         const flush = async (): Promise<void> => {
           if (byTerm.size === 0) return;
           for (const postings of chunkFtsPostings(sortedFtsPostings(byTerm))) {
             await writeChunk(table.id, column.id, buildId, ordinal, postings);
             ordinal += 1;
+            await maybeYieldToEventLoop();
           }
           byTerm.clear();
           pendingTokens = 0;
@@ -20241,6 +20379,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               while (segmentRow < segment.rowCount) {
                 const end = Math.min(segment.rowCount, segmentRow + this.#rowsPerBlock);
                 for (; segmentRow < end; segmentRow += 1) {
+                  if ((segmentRow & 255) === 0) await maybeYieldToEventLoop();
                   const tokens = addFtsDocument(
                     byTerm,
                     column.backfill ?? null,
@@ -20264,6 +20403,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               }
               const vector = this.#blockColumnVector(blockId, decoded);
               for (let row = 0; row < decoded.column.rowCount; row += 1) {
+                if ((row & 255) === 0) await maybeYieldToEventLoop();
                 const tokens = addFtsDocument(
                   byTerm,
                   vectorValue(vector, row),
@@ -20804,7 +20944,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // hashed once and pooled; a lookup then probes the (few) candidates against the
           // block's set instead of re-hashing every stored key on every query. A candidate
           // list wider than the block walks the block's locators against the candidate set.
-          const locators = this.#blockKeyLocators(blockId, vector, keyColumn.type);
+          const locators = await this.#blockKeyLocators(blockId, vector, keyColumn.type);
           const positions: number[] = [];
           const collect = (hit: number | number[] | undefined): boolean => {
             if (hit === undefined) return false;
@@ -23096,7 +23236,15 @@ function batchRowAt(
  */
 const validatedStringByteLengths = new WeakMap<readonly BatchValue[], readonly number[]>();
 
-function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?: string): number {
+/**
+ * Type-checks every slot of a batch and returns its row count. A large batch hands the event
+ * loop a turn between slices, so validating half a million rows does not hold other queries.
+ */
+async function validateBatch(
+  table: TableRecord,
+  input: ColumnarBatch,
+  pendingColumn?: string,
+): Promise<number> {
   const expected = new Set(table.columns.map((column) => column.name));
   for (const name of Object.keys(input.columns)) {
     if (!expected.has(name)) throw new TypeError(`Unknown column: ${name}`);
@@ -23121,6 +23269,7 @@ function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?:
     const stringByteLengths =
       column.type === "string" ? new Array<number>(values.length) : undefined;
     for (let index = 0; index < values.length; index += 1) {
+      if ((index & 4095) === 4095) await maybeYieldToEventLoop();
       const value = values[index] as BatchValue;
       if (allowNull && value === null) {
         if (stringByteLengths !== undefined) stringByteLengths[index] = 0;
@@ -23134,6 +23283,7 @@ function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?:
   // The constraints run last, over whole rows, once every column has been type-checked.
   if ((table.checks ?? []).length > 0) {
     for (let index = 0; index < rowCount; index += 1) {
+      if ((index & 1023) === 1023) await maybeYieldToEventLoop();
       assertRowChecks(table, batchRowAt(table, input, index), index);
     }
   }
@@ -23947,14 +24097,16 @@ function fillCompositePrimaryKey(table: TableRecord, input: ColumnarBatch, rowCo
   (input.columns as Record<string, readonly BatchValue[]>)[keyColumn.name] = keys;
 }
 
-function batchKeys(
+/** The batch's unique keys by token, refusing a key it repeats; sliced like `validateBatch`. */
+async function batchKeys(
   table: TableRecord,
   input: ColumnarBatch,
-): Map<string, Exclude<BatchValue, null>> | undefined {
+): Promise<Map<string, Exclude<BatchValue, null>> | undefined> {
   const keyColumn = getUniqueKeyColumn(table);
   if (keyColumn === undefined) return undefined;
   const keys = new Map<string, Exclude<BatchValue, null>>();
   for (const value of input.columns[keyColumn.name] ?? []) {
+    if ((keys.size & 4095) === 4095) await maybeYieldToEventLoop();
     if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
     const token = keyToken(keyColumn.type, value);
     if (keys.has(token)) {
@@ -24041,28 +24193,6 @@ function autoCompactionDueHint(hint: AutoCompactionHint): boolean {
 
 function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
   return autoCompactionDueHint(autoCompactionHint(null, segments));
-}
-
-/** A macrotask boundary, so background work lets queued queries and writes run between steps. */
-function yieldToEventLoop(): Promise<void> {
-  // A timer is clamped to roughly 1–4 ms in the runtimes Minnow targets. Maintenance can yield
-  // once per bounded page, so using timers turns a healthy thousand-page cleanup into seconds of
-  // artificial latency. MessageChannel is still a genuine task boundary (rendering, timers, and
-  // other clients can run) without the timer clamp.
-  // Vitest/Sinon fake timers expose a `clock` marker and intentionally expect cooperative work
-  // to remain timer-driven. Production timers have no such property.
-  if (typeof MessageChannel !== "undefined" && !Reflect.has(setTimeout, "clock")) {
-    return new Promise((resolve) => {
-      const channel = new MessageChannel();
-      channel.port1.onmessage = () => {
-        channel.port1.close();
-        channel.port2.close();
-        resolve();
-      };
-      channel.port2.postMessage(undefined);
-    });
-  }
-  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function boundedExpiryMilliseconds(nowMs: number, ttlMs: number): number {
@@ -26248,7 +26378,7 @@ function fractionalLogicalOrders(first: number, upper: number, count: number): n
  * is what a caller's `memoryBudgetBytes` is judged against, so it must not be optimistic.
  */
 function mergePlannerMemory(
-  table: TableRecord,
+  columnCount: number,
   segments: readonly MergeCompactionSourceSegment[],
   keyColumnId: string,
 ): {
@@ -26294,7 +26424,7 @@ function mergePlannerMemory(
   );
   const keyBytes = MERGE_PLANNER_KEY_BYTES + PATCH_ROW_BYTES;
   const updatePatchBytes = safeWholeNumberProduct(
-    table.columns.length,
+    columnCount,
     PATCH_CELL_BYTES,
     "Mutation patch cells",
   );
@@ -26364,170 +26494,266 @@ interface MutableRowIdSpan {
   rowIdStart: bigint;
 }
 
-interface MutableMergeOutputSourceRange {
-  outputRowStart: number;
-  sourceBlockId: string;
-  sourceRowStart: number;
-  rowCount: number;
+/** An append-only sequence of 32-bit integers that grows by doubling. */
+class Int32Sequence {
+  #values = new Int32Array(64);
+  #length = 0;
+
+  get length(): number {
+    return this.#length;
+  }
+
+  push(value: number): void {
+    if (this.#length === this.#values.length) {
+      const grown = new Int32Array(this.#values.length * 2);
+      grown.set(this.#values);
+      this.#values = grown;
+    }
+    this.#values[this.#length] = value;
+    this.#length += 1;
+  }
+
+  finish(): Int32Array {
+    return this.#values.subarray(0, this.#length);
+  }
+}
+
+/** Cells of one output column that later updates set, in output-row order. */
+interface MergeColumnPatches {
+  readonly outputRow: Int32Array;
+  readonly segment: Int32Array;
+  readonly sourceRow: Int32Array;
 }
 
 /**
- * Accumulates the merged output as coalesced row-ID spans and per-column source ranges. A run
- * of untouched rows appends at most one range per source block it crosses, whatever its
- * length; a patched row appends one range per column. Adjacent ranges over the same block
- * merge in place, so the finished plan is proportional to blocks plus patched cells — and to
- * fewer than that when patched rows arrive in source order, as a refreshed table's do.
- *
- * Past `rangeLimit` the builder keeps only the last range of each list, which is all that
- * coalescing looks at, and goes on counting: the plan is lost, but `rangeCount` still reports
- * exactly how many ranges it would have held.
+ * A merge replay in memory: which source row feeds each output row, and which cells updates
+ * patched. Run `i` covers output rows from `runOutputStart[i]` to the next run's start (the
+ * last to `totalRows`), read from consecutive rows of source segment `runSegment[i]` starting
+ * at `runSourceRow[i]`; every column reads that row unless `patches` names the cell. Runs and
+ * patches are twelve bytes each, so a replay of reordered rows costs a few bytes per row, not
+ * an object per cell.
  */
-class MergeOutputBuilder {
-  readonly #columns: readonly TableColumnRecord[];
-  readonly #rangeLimit: number;
-  readonly #rowIdSpans: MutableRowIdSpan[] = [];
-  readonly #rangesByColumn: MutableMergeOutputSourceRange[][];
-  readonly #blocksBySegment = new Map<
-    string,
-    ReadonlyArray<readonly MergeCompactionSourceBlock[]>
-  >();
-  #totalRows = 0;
-  #rangeCount = 0;
+interface MergeResolution {
+  readonly totalRows: number;
+  readonly runOutputStart: Int32Array;
+  readonly runSegment: Int32Array;
+  readonly runSourceRow: Int32Array;
+  /** Indexed like the plan's output columns. */
+  readonly patches: ReadonlyArray<MergeColumnPatches | undefined>;
+  readonly patchCount: number;
+  readonly rowIdSpans: RowIdSpan[];
+  /** The output row at which each row-bearing source's surviving rows begin. */
+  readonly sourceOutputRowStarts: ReadonlyMap<string, number>;
+  /** CRC-32 over the runs and patches, as `MergeCompactionResolution` records it. */
+  readonly checksum: number;
+}
 
-  constructor(columns: readonly TableColumnRecord[], rangeLimit = Number.POSITIVE_INFINITY) {
-    this.#columns = columns;
-    this.#rangeLimit = rangeLimit;
-    this.#rangesByColumn = columns.map(() => []);
+/**
+ * Collects one secondary-index build's postings and writes them a window at a time. A flush
+ * sorts at most one block's or `FTS_BUILD_POSTING_WINDOW` rows' terms, whichever is fewer, and
+ * the row loop and every chunk write hand the event loop a turn, so a build over a large table
+ * never holds it for a whole block. Callers also flush at each block's end. Chunks are row
+ * windows, not term partitions, so the window decides only where one chunk ends and the next
+ * begins.
+ */
+class SecondaryPostingWriter {
+  readonly byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
+  ordinal = 0;
+  totalTokens = 0;
+  #rows = 0;
+  readonly #windowRows: number;
+  readonly #write: (ordinal: number, chunk: FtsPosting[]) => Promise<void>;
+
+  constructor(
+    rowsPerBlock: number,
+    write: (ordinal: number, chunk: FtsPosting[]) => Promise<void>,
+  ) {
+    this.#windowRows = Math.min(rowsPerBlock, FTS_BUILD_POSTING_WINDOW);
+    this.#write = write;
   }
 
-  /** Output rows appended so far. */
+  /** Counts one row added to `byTerm`; true when the caller should await `service`. */
+  rowAdded(): boolean {
+    this.#rows += 1;
+    return this.#rows >= this.#windowRows || (this.#rows & 255) === 0;
+  }
+
+  async service(): Promise<void> {
+    if (this.#rows >= this.#windowRows) await this.flush();
+    else await maybeYieldToEventLoop();
+  }
+
+  async flush(): Promise<void> {
+    this.#rows = 0;
+    if (this.byTerm.size === 0) return;
+    const postings = sortedSecondaryPostings(this.byTerm);
+    this.byTerm.clear();
+    for (const chunk of chunkFtsPostings(postings)) {
+      this.totalTokens = safeWholeNumberSum(
+        [this.totalTokens, postingFrequencyTotal(chunk)],
+        "Secondary-index posting count",
+      );
+      await this.#write(this.ordinal, chunk);
+      this.ordinal += 1;
+      await maybeYieldToEventLoop();
+    }
+  }
+}
+
+/** Modeled resident bytes of one run or patch: three 32-bit values, doubled for growth. */
+const MERGE_RESOLUTION_ENTRY_BYTES = 24;
+
+/**
+ * Accumulates a replay's output in order as row runs, per-column patches, and coalesced row-ID
+ * spans. Past `byteLimit` it stops keeping entries and only counts them, so a refusal reports
+ * exactly what the replay would have held.
+ */
+class MergeResolutionBuilder {
+  readonly #columnCount: number;
+  readonly #byteLimit: number;
+  readonly #runOutputStart = new Int32Sequence();
+  readonly #runSegment = new Int32Sequence();
+  readonly #runSourceRow = new Int32Sequence();
+  readonly #patches: Array<
+    { outputRow: Int32Sequence; segment: Int32Sequence; sourceRow: Int32Sequence } | undefined
+  >;
+  readonly #rowIdSpans: MutableRowIdSpan[] = [];
+  #totalRows = 0;
+  #runs = 0;
+  #patchCount = 0;
+  #spans = 0;
+  #lastRunSegment = -1;
+  #lastRunSourceEnd = -1;
+  #overflowed = false;
+
+  constructor(columnCount: number, byteLimit: number) {
+    this.#columnCount = columnCount;
+    this.#byteLimit = byteLimit;
+    this.#patches = Array.from({ length: columnCount }, () => undefined);
+  }
+
   get totalRows(): number {
     return this.#totalRows;
   }
 
-  /** Row-ID spans and source ranges the plan holds, or would hold past the limit. */
-  get rangeCount(): number {
-    return this.#rangeCount;
+  /** Modeled bytes of everything appended so far, kept or only counted. */
+  get bytes(): number {
+    return safeWholeNumberSum(
+      [
+        safeWholeNumberProduct(
+          this.#runs + this.#patchCount,
+          MERGE_RESOLUTION_ENTRY_BYTES,
+          "Mutation compaction replay entries",
+        ),
+        safeWholeNumberProduct(this.#spans, MERGE_PLANNER_RANGE_BYTES, "Mutation compaction spans"),
+      ],
+      "Mutation compaction replay bytes",
+    );
   }
 
   /** Rows `[rowStart, rowStart + rowCount)` of a row-bearing source, unchanged. */
-  appendRun(segment: MergeCompactionSourceSegment, rowStart: number, rowCount: number): void {
+  appendRows(
+    segmentIndex: number,
+    segment: MergeCompactionSourceSegment,
+    rowStart: number,
+    rowCount: number,
+  ): void {
     if (rowCount <= 0) return;
     this.#appendRowIds(segment, rowStart, rowCount);
-    const blocksByColumn = this.#sourceBlocks(segment);
-    for (let columnIndex = 0; columnIndex < this.#columns.length; columnIndex += 1) {
-      const blocks = blocksByColumn[columnIndex];
-      const ranges = this.#rangesByColumn[columnIndex];
-      if (blocks === undefined || ranges === undefined) {
-        throw new Error("Mutation output column is missing");
-      }
-      let outputRow = this.#totalRows;
-      let remaining = rowCount;
-      let rowIndex = rowStart;
-      while (remaining > 0) {
-        const block = rowRangeAt(blocks, rowIndex);
-        if (block === undefined) {
-          throw new Error(`Mutation source row is missing: ${segment.segmentId}`);
-        }
-        const count = Math.min(remaining, block.rowStart + block.rowCount - rowIndex);
-        this.#appendRange(ranges, outputRow, block.blockId, rowIndex - block.rowStart, count);
-        outputRow += count;
-        rowIndex += count;
-        remaining -= count;
-      }
-    }
+    this.#appendRun(segmentIndex, rowStart, rowCount);
     this.#totalRows += rowCount;
   }
 
-  /** One row of a row-bearing source whose columns may come from later mutations. */
+  /** One row of a row-bearing source whose columns later mutations replaced or patched. */
   appendPatchedRow(
+    segmentIndex: number,
     segment: MergeCompactionSourceSegment,
     rowIndex: number,
     patch: MergeSlotPatch | undefined,
   ): void {
     this.#appendRowIds(segment, rowIndex, 1);
-    const rowSource = patch?.rowSource ?? segment;
-    const sourceRowIndex = patch?.rowSource === undefined ? rowIndex : patch.rowIndex;
-    const blocksByColumn = this.#sourceBlocks(rowSource);
-    for (let columnIndex = 0; columnIndex < this.#columns.length; columnIndex += 1) {
-      const ranges = this.#rangesByColumn[columnIndex];
-      if (ranges === undefined) throw new Error("Mutation output column is missing");
-      const patchedSource = patch?.columns?.[columnIndex];
-      if (patchedSource !== undefined) {
-        this.#appendRange(
-          ranges,
-          this.#totalRows,
-          patchedSource.blockId,
-          patchedSource.sourceRowIndex,
-          1,
-        );
-        continue;
+    if (patch?.rowSource === undefined) this.#appendRun(segmentIndex, rowIndex, 1);
+    else this.#appendRun(patch.rowSource, patch.rowIndex, 1);
+    const columns = patch?.columns;
+    if (columns !== undefined) {
+      for (let columnIndex = 0; columnIndex < this.#columnCount; columnIndex += 1) {
+        const source = columns[columnIndex];
+        if (source === undefined) continue;
+        this.#patchCount += 1;
+        if (this.#keeping()) {
+          let list = this.#patches[columnIndex];
+          if (list === undefined) {
+            list = {
+              outputRow: new Int32Sequence(),
+              segment: new Int32Sequence(),
+              sourceRow: new Int32Sequence(),
+            };
+            this.#patches[columnIndex] = list;
+          }
+          list.outputRow.push(this.#totalRows);
+          list.segment.push(source.segment);
+          list.sourceRow.push(source.row);
+        }
       }
-      const block = rowRangeAt(blocksByColumn[columnIndex] ?? [], sourceRowIndex);
-      if (block === undefined) {
-        throw new Error(`Mutation source row is missing: ${rowSource.segmentId}`);
-      }
-      this.#appendRange(ranges, this.#totalRows, block.blockId, sourceRowIndex - block.rowStart, 1);
     }
     this.#totalRows += 1;
   }
 
-  finish(): {
-    columns: MergeCompactionOutputColumn[];
-    rowIdSpans: RowIdSpan[];
-    totalRows: number;
-  } {
-    if (this.#rangeCount > this.#rangeLimit) {
-      throw new Error("Mutation output exceeded its range limit");
+  finish(sourceOutputRowStarts: ReadonlyMap<string, number>): MergeResolution {
+    if (this.#overflowed || this.bytes > this.#byteLimit) {
+      throw new Error("Mutation compaction replay exceeded its memory limit");
     }
+    const patches = this.#patches.map((list) =>
+      list === undefined
+        ? undefined
+        : {
+            outputRow: list.outputRow.finish(),
+            segment: list.segment.finish(),
+            sourceRow: list.sourceRow.finish(),
+          },
+    );
+    const runOutputStart = this.#runOutputStart.finish();
+    const runSegment = this.#runSegment.finish();
+    const runSourceRow = this.#runSourceRow.finish();
     return {
-      rowIdSpans: this.#rowIdSpans,
-      columns: this.#columns.map((column, columnIndex) => {
-        const sourceRanges = this.#rangesByColumn[columnIndex];
-        if (sourceRanges === undefined) throw new Error("Mutation output column is missing");
-        return { columnId: column.id, type: column.type, sourceRanges };
-      }),
       totalRows: this.#totalRows,
+      runOutputStart,
+      runSegment,
+      runSourceRow,
+      patches,
+      patchCount: this.#patchCount,
+      rowIdSpans: this.#rowIdSpans,
+      sourceOutputRowStarts,
+      checksum: mergeResolutionChecksum(
+        this.#totalRows,
+        runOutputStart,
+        runSegment,
+        runSourceRow,
+        patches,
+      ),
     };
   }
 
-  #appendRange(
-    ranges: MutableMergeOutputSourceRange[],
-    outputRowStart: number,
-    sourceBlockId: string,
-    sourceRowStart: number,
-    rowCount: number,
-  ): void {
-    if (appendMergeOutputRange(ranges, outputRowStart, sourceBlockId, sourceRowStart, rowCount)) {
-      this.#counted(ranges);
-    }
+  #keeping(): boolean {
+    if (this.#overflowed) return false;
+    if (this.bytes <= this.#byteLimit) return true;
+    this.#overflowed = true;
+    this.#rowIdSpans.splice(0, this.#rowIdSpans.length - 1);
+    return false;
   }
 
-  #counted(list: unknown[]): void {
-    this.#rangeCount += 1;
-    if (this.#rangeCount <= this.#rangeLimit) return;
-    if (this.#rangeCount === this.#rangeLimit + 1) {
-      for (const ranges of this.#rangesByColumn) ranges.splice(0, ranges.length - 1);
-      this.#rowIdSpans.splice(0, this.#rowIdSpans.length - 1);
+  #appendRun(segmentIndex: number, sourceRow: number, rowCount: number): void {
+    if (segmentIndex === this.#lastRunSegment && sourceRow === this.#lastRunSourceEnd) {
+      this.#lastRunSourceEnd += rowCount;
+      return;
     }
-    list.splice(0, list.length - 1);
-  }
-
-  #sourceBlocks(
-    segment: MergeCompactionSourceSegment,
-  ): ReadonlyArray<readonly MergeCompactionSourceBlock[]> {
-    let blocks = this.#blocksBySegment.get(segment.segmentId);
-    if (blocks === undefined) {
-      blocks = this.#columns.map((column) => {
-        const source = segment.columns.find((candidate) => candidate.columnId === column.id);
-        if (source === undefined) {
-          throw new Error(`Mutation source row is missing: ${segment.segmentId}:${column.id}`);
-        }
-        return source.sourceBlocks;
-      });
-      this.#blocksBySegment.set(segment.segmentId, blocks);
-    }
-    return blocks;
+    this.#runs += 1;
+    this.#lastRunSegment = segmentIndex;
+    this.#lastRunSourceEnd = sourceRow + rowCount;
+    if (!this.#keeping()) return;
+    this.#runOutputStart.push(this.#totalRows);
+    this.#runSegment.push(segmentIndex);
+    this.#runSourceRow.push(sourceRow);
   }
 
   #appendRowIds(segment: MergeCompactionSourceSegment, rowStart: number, rowCount: number): void {
@@ -26548,13 +26774,187 @@ class MergeOutputBuilder {
           count,
         )
       ) {
-        this.#counted(this.#rowIdSpans);
+        this.#spans += 1;
+        if (!this.#keeping()) this.#rowIdSpans.splice(0, this.#rowIdSpans.length - 1);
       }
       outputRow += count;
       rowIndex += count;
       remaining -= count;
     }
   }
+}
+
+/**
+ * CRC-32 over a replay's runs and patches in a fixed little-endian layout: the row count, each
+ * run as three integers, then each patched column's index, cell count, and cells. A resumed
+ * fold recomputes the replay and refuses to write unless it arrives at the same value.
+ */
+function mergeResolutionChecksum(
+  totalRows: number,
+  runOutputStart: Int32Array,
+  runSegment: Int32Array,
+  runSourceRow: Int32Array,
+  patches: ReadonlyArray<MergeColumnPatches | undefined>,
+): number {
+  const chunk = new Uint8Array(12 * 1024);
+  const view = new DataView(chunk.buffer);
+  let offset = 0;
+  let checksum = 0;
+  const write = (value: number): void => {
+    if (offset === chunk.byteLength) {
+      checksum = crc32Continue(checksum, chunk);
+      offset = 0;
+    }
+    view.setInt32(offset, value, true);
+    offset += 4;
+  };
+  write(totalRows);
+  write(runOutputStart.length);
+  for (let index = 0; index < runOutputStart.length; index += 1) {
+    write(runOutputStart[index] ?? 0);
+    write(runSegment[index] ?? 0);
+    write(runSourceRow[index] ?? 0);
+  }
+  for (const [columnIndex, list] of patches.entries()) {
+    if (list === undefined) continue;
+    write(columnIndex);
+    write(list.outputRow.length);
+    for (let index = 0; index < list.outputRow.length; index += 1) {
+      write(list.outputRow[index] ?? 0);
+      write(list.segment[index] ?? 0);
+      write(list.sourceRow[index] ?? 0);
+    }
+  }
+  return crc32Continue(checksum, chunk.subarray(0, offset));
+}
+
+/** Index of the last element of an ascending array that is at most `value`, or -1. */
+function lastAtMost(values: Int32Array, value: number): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((values[middle] ?? 0) <= value) low = middle + 1;
+    else high = middle;
+  }
+  return low - 1;
+}
+
+/**
+ * One output column of a replayed merge, deriving the source ranges of any window from the
+ * replay: walk the runs that overlap it, take each patched cell in place, and cut both at the
+ * source blocks of this column. A window costs the rows it covers, however the replay is
+ * stored, and a source block counts once toward its memory however many ranges read it.
+ */
+function replayedMergeColumn(
+  resolution: MergeResolution,
+  segments: readonly MergeCompactionSourceSegment[],
+  columnIndex: number,
+  column: MergeCompactionPlannedColumn,
+): PhysicalCompactionSourceColumn {
+  const blocksBySegment = segments.map(
+    (segment) =>
+      segment.columns.find((candidate) => candidate.columnId === column.columnId)?.sourceBlocks,
+  );
+  const patches = resolution.patches[columnIndex];
+  const runCount = resolution.runOutputStart.length;
+  return {
+    columnId: column.columnId,
+    type: column.type,
+    countsDistinctBlocks: true,
+    rangesFor(output) {
+      const ranges: PhysicalCompactionSourceRange[] = [];
+      const emit = (
+        segmentIndex: number,
+        sourceRow: number,
+        rowCount: number,
+        outputRow: number,
+      ) => {
+        const blocks = blocksBySegment[segmentIndex];
+        if (blocks === undefined) {
+          throw new Error(`Mutation compaction source column is missing: ${column.columnId}`);
+        }
+        let remaining = rowCount;
+        let row = sourceRow;
+        let target = outputRow;
+        while (remaining > 0) {
+          const block = rowRangeAt(blocks, row);
+          if (block === undefined) {
+            throw new Error(`Mutation source row is missing: ${column.columnId}`);
+          }
+          const count = Math.min(remaining, block.rowStart + block.rowCount - row);
+          const sourceRowStart = row - block.rowStart;
+          const previous = ranges[ranges.length - 1];
+          if (
+            previous?.blockId === block.blockId &&
+            previous.outputRowStart + previous.rowCount === target &&
+            previous.sourceRowStart + previous.rowCount === sourceRowStart
+          ) {
+            ranges[ranges.length - 1] = { ...previous, rowCount: previous.rowCount + count };
+          } else {
+            ranges.push({
+              blockId: block.blockId,
+              outputRowStart: target,
+              sourceRowStart,
+              rowCount: count,
+              sourceBlockRowCount: block.rowCount,
+              storedBytes: block.storedBytes,
+              encodedBytes: block.encodedBytes,
+              checksum: block.checksum,
+            });
+          }
+          remaining -= count;
+          row += count;
+          target += count;
+        }
+      };
+      const end = output.rowStart + output.rowCount;
+      let run = lastAtMost(resolution.runOutputStart, output.rowStart);
+      let patch =
+        patches === undefined ? 0 : lastAtMost(patches.outputRow, output.rowStart - 1) + 1;
+      let row = output.rowStart;
+      while (row < end) {
+        while (run + 1 < runCount && (resolution.runOutputStart[run + 1] ?? 0) <= row) run += 1;
+        const runStart = resolution.runOutputStart[run] ?? 0;
+        const runEnd =
+          run + 1 < runCount ? (resolution.runOutputStart[run + 1] ?? 0) : resolution.totalRows;
+        const nextPatch =
+          patches !== undefined && patch < patches.outputRow.length
+            ? (patches.outputRow[patch] ?? end)
+            : end;
+        const pieceEnd = Math.min(runEnd, end, nextPatch);
+        if (pieceEnd > row) {
+          emit(
+            resolution.runSegment[run] ?? 0,
+            (resolution.runSourceRow[run] ?? 0) + (row - runStart),
+            pieceEnd - row,
+            row,
+          );
+          row = pieceEnd;
+        }
+        if (row < end && patches !== undefined && row === nextPatch) {
+          emit(patches.segment[patch] ?? 0, patches.sourceRow[patch] ?? 0, 1, row);
+          patch += 1;
+          row += 1;
+        }
+      }
+      return ranges;
+    },
+  };
+}
+
+/** Ranges of a column stored in output order, as a v1 merge or a rechunk plan records them. */
+function storedRangeColumn(
+  columnId: string,
+  type: SimpleDataType,
+  sourceRanges: readonly PhysicalCompactionSourceRange[],
+): PhysicalCompactionSourceColumn {
+  return {
+    columnId,
+    type,
+    countsDistinctBlocks: false,
+    rangesFor: (output) => overlappingSortedRanges(sourceRanges, output),
+  };
 }
 
 /**
@@ -26578,43 +26978,6 @@ function appendRowIdSpan(
   }
   spans.push({ rowStart, rowCount, rowIdStart: rowId });
   return true;
-}
-
-/**
- * Appends `rowCount` output rows read from one source block, extending the last range when
- * contiguous. Reports whether it added a range.
- */
-function appendMergeOutputRange(
-  ranges: MutableMergeOutputSourceRange[],
-  outputRowStart: number,
-  sourceBlockId: string,
-  sourceRowStart: number,
-  rowCount: number,
-): boolean {
-  const previous = ranges[ranges.length - 1];
-  if (
-    previous?.sourceBlockId === sourceBlockId &&
-    previous.outputRowStart + previous.rowCount === outputRowStart &&
-    previous.sourceRowStart + previous.rowCount === sourceRowStart
-  ) {
-    previous.rowCount += rowCount;
-    return false;
-  }
-  ranges.push({ outputRowStart, sourceBlockId, sourceRowStart, rowCount });
-  return true;
-}
-
-function mergeSourceAt(
-  segment: MergeCompactionSourceSegment,
-  columnId: string,
-  rowIndex: number,
-): MergeResolvedSource {
-  const column = segment.columns.find((candidate) => candidate.columnId === columnId);
-  const block = column === undefined ? undefined : rowRangeAt(column.sourceBlocks, rowIndex);
-  if (block === undefined) {
-    throw new Error(`Mutation source row is missing: ${segment.segmentId}:${columnId}`);
-  }
-  return { blockId: block.blockId, sourceRowIndex: rowIndex - block.rowStart };
 }
 
 function rowRangeAt<T extends { readonly rowStart: number; readonly rowCount: number }>(
@@ -26648,7 +27011,7 @@ function validatePhysicalTablePlan(table: TableRecord, plan: PhysicalCompactionR
   ) {
     throw new Error(`Compaction table schema changed after planning: ${table.name}`);
   }
-  if (plan.kind === "merge-v1" && table.uniqueKeyColumnId !== plan.keyColumnId) {
+  if (isMergeCompactionPlan(plan) && table.uniqueKeyColumnId !== plan.keyColumnId) {
     throw new Error(`Compaction table key changed after planning: ${table.name}`);
   }
 }
@@ -26680,20 +27043,22 @@ function physicalRewriteSourceEncodedBytes(plan: PhysicalCompactionRewritePlan):
 function rechunkPhysicalColumns(
   columns: readonly RechunkCompactionSourceColumn[],
 ): PhysicalCompactionSourceColumn[] {
-  return columns.map((column) => ({
-    columnId: column.columnId,
-    type: column.type,
-    sourceRanges: column.sourceBlocks.map((block) => ({
-      blockId: block.blockId,
-      outputRowStart: block.rowStart,
-      sourceRowStart: 0,
-      rowCount: block.rowCount,
-      sourceBlockRowCount: block.rowCount,
-      storedBytes: block.storedBytes,
-      encodedBytes: block.encodedBytes,
-      checksum: block.checksum,
-    })),
-  }));
+  return columns.map((column) =>
+    storedRangeColumn(
+      column.columnId,
+      column.type,
+      column.sourceBlocks.map((block) => ({
+        blockId: block.blockId,
+        outputRowStart: block.rowStart,
+        sourceRowStart: 0,
+        rowCount: block.rowCount,
+        sourceBlockRowCount: block.rowCount,
+        storedBytes: block.storedBytes,
+        encodedBytes: block.encodedBytes,
+        checksum: block.checksum,
+      })),
+    ),
+  );
 }
 
 function mergePhysicalColumns(
@@ -26707,66 +27072,106 @@ function mergePhysicalColumns(
       ),
     ),
   );
-  return columns.map((column) => ({
-    columnId: column.columnId,
-    type: column.type,
-    sourceRanges: column.sourceRanges.map((range) => {
-      const block = blocks.get(range.sourceBlockId);
-      if (block === undefined) {
-        throw new Error(
-          `Mutation compaction source fingerprint is missing: ${range.sourceBlockId}`,
-        );
-      }
-      return {
-        blockId: block.blockId,
-        outputRowStart: range.outputRowStart,
-        sourceRowStart: range.sourceRowStart,
-        rowCount: range.rowCount,
-        sourceBlockRowCount: block.rowCount,
-        storedBytes: block.storedBytes,
-        encodedBytes: block.encodedBytes,
-        checksum: block.checksum,
-      };
-    }),
-  }));
+  return columns.map((column) =>
+    storedRangeColumn(
+      column.columnId,
+      column.type,
+      column.sourceRanges.map((range) => {
+        const block = blocks.get(range.sourceBlockId);
+        if (block === undefined) {
+          throw new Error(
+            `Mutation compaction source fingerprint is missing: ${range.sourceBlockId}`,
+          );
+        }
+        return {
+          blockId: block.blockId,
+          outputRowStart: range.outputRowStart,
+          sourceRowStart: range.sourceRowStart,
+          rowCount: range.rowCount,
+          sourceBlockRowCount: block.rowCount,
+          storedBytes: block.storedBytes,
+          encodedBytes: block.encodedBytes,
+          checksum: block.checksum,
+        };
+      }),
+    ),
+  );
 }
 
-function physicalRewriteLayout(plan: PhysicalCompactionRewritePlan): PhysicalCompactionLayout {
+/** The column layout a plan's output is built from; a replayed merge needs its replay. */
+function physicalRewriteLayout(
+  plan: PhysicalCompactionRewritePlan,
+  resolution?: MergeResolution,
+): PhysicalCompactionLayout {
+  let columns: PhysicalCompactionSourceColumn[];
+  if (plan.kind === "rechunk-v1") {
+    columns = rechunkPhysicalColumns(plan.columns);
+  } else if (plan.kind === "merge-v1") {
+    columns = mergePhysicalColumns(plan.columns, plan.sourceSegments);
+  } else {
+    if (resolution === undefined) throw new Error("A replayed merge layout requires its replay");
+    columns = plan.columns.map((column, columnIndex) =>
+      replayedMergeColumn(resolution, plan.sourceSegments, columnIndex, column),
+    );
+  }
   return {
     targetBlockBytes: plan.targetBlockBytes,
     outputCompression: plan.outputCompression,
     totalRows: plan.totalRows,
-    columns:
-      plan.kind === "rechunk-v1"
-        ? rechunkPhysicalColumns(plan.columns)
-        : mergePhysicalColumns(plan.columns, plan.sourceSegments),
+    columns,
     outputs: plan.outputs,
   };
 }
 
-function overlappingPhysicalSourceRanges(
-  column: PhysicalCompactionSourceColumn,
+/**
+ * The source ranges an output window reads, in output order. A column's ranges tile the output
+ * contiguously in order — the store refuses a plan whose ranges do not — so the first one is
+ * found by binary search and the walk stops at the window's end: a window costs the ranges it
+ * reads, not every range of the column.
+ */
+function overlappingSortedRanges(
+  ranges: readonly PhysicalCompactionSourceRange[],
   output: RechunkCompactionOutputWindow,
 ): readonly PhysicalCompactionSourceRange[] {
   const outputEnd = safeWholeNumberSum(
     [output.rowStart, output.rowCount],
     "Compaction output row range",
   );
-  return column.sourceRanges.filter((block) => {
-    const blockEnd = safeWholeNumberSum(
-      [block.outputRowStart, block.rowCount],
-      "Compaction source row range",
-    );
-    return block.outputRowStart < outputEnd && blockEnd > output.rowStart;
-  });
+  let low = 0;
+  let high = ranges.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const range = ranges[middle];
+    if (range !== undefined && range.outputRowStart + range.rowCount <= output.rowStart) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  const overlapping: PhysicalCompactionSourceRange[] = [];
+  for (let index = low; index < ranges.length; index += 1) {
+    const range = ranges[index];
+    if (range === undefined || range.outputRowStart >= outputEnd) break;
+    overlapping.push(range);
+  }
+  return overlapping;
 }
 
 function physicalOutputMemoryBound(
   column: PhysicalCompactionSourceColumn,
   output: RechunkCompactionOutputWindow,
   compression: Compression,
+  ranges: readonly PhysicalCompactionSourceRange[] = column.rangesFor(output),
 ): number {
-  const sourceBlocks = overlappingPhysicalSourceRanges(column, output);
+  let sourceBlocks = ranges;
+  if (column.countsDistinctBlocks) {
+    const seen = new Set<string>();
+    sourceBlocks = ranges.filter((range) => {
+      if (seen.has(range.blockId)) return false;
+      seen.add(range.blockId);
+      return true;
+    });
+  }
   let retainedDecodedBytes = 0;
   let decodePeakBytes = 0;
   for (const block of sourceBlocks) {
@@ -26819,20 +27224,6 @@ function physicalOutputMemoryBound(
   );
 }
 
-function compactionMinimumMemoryBytes(plan: PhysicalCompactionRewritePlan): number {
-  let minimumBytes = plan.outputs.length === 0 ? 0 : 1;
-  const layout = physicalRewriteLayout(plan);
-  for (const output of plan.outputs) {
-    for (const column of layout.columns) {
-      minimumBytes = Math.max(
-        minimumBytes,
-        physicalOutputMemoryBound(column, output, plan.outputCompression),
-      );
-    }
-  }
-  return minimumBytes;
-}
-
 function physicalOutputBlockId(jobId: string, outputIndex: number, columnIndex: number): string {
   return [
     jobId,
@@ -26882,7 +27273,7 @@ function partitionOutputSegmentId(outputSegmentId: string, index: number): strin
 function compactionOutputSegmentIds(job: CompactionJobRecord): string[] {
   if (job.outputSegmentId === null) return [];
   const plan = job.rewritePlan;
-  if ((plan.kind !== "merge-v1" && plan.kind !== "rechunk-v1") || plan.partitions === undefined) {
+  if (plan.kind === "copy-v1" || plan.partitions === undefined) {
     return [job.outputSegmentId];
   }
   const outputSegmentId = job.outputSegmentId;
@@ -26913,10 +27304,9 @@ function compactionOutputSegments(
       : { partitionOrdinal: job.outputPartitionOrdinal };
   if (plan.partitions !== undefined) {
     return plan.partitions.map((partition, index) => {
-      const rowIdSpans =
-        plan.kind === "merge-v1"
-          ? sliceRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount)
-          : undefined;
+      const rowIdSpans = isMergeCompactionPlan(plan)
+        ? sliceRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount)
+        : undefined;
       const envelope =
         rowIdSpans === undefined
           ? {
@@ -26932,7 +27322,7 @@ function compactionOutputSegments(
         rowIdStart: envelope.start,
         rowIdEndExclusive: envelope.endExclusive,
         columnBlockIds: physicalOutputColumns(job.id, plan, partition),
-        kind: plan.kind === "merge-v1" ? "base" : "insert",
+        kind: isMergeCompactionPlan(plan) ? "base" : "insert",
         ...keyColumn,
         level: job.targetLevel,
         ...partitionOrdinal,
@@ -26952,13 +27342,13 @@ function compactionOutputSegments(
       rowIdStart: plan.rowIdStart,
       rowIdEndExclusive: plan.rowIdEndExclusive,
       columnBlockIds: physicalOutputColumns(job.id, plan),
-      kind: plan.kind === "merge-v1" ? "base" : "insert",
+      kind: isMergeCompactionPlan(plan) ? "base" : "insert",
       ...keyColumn,
       level: job.targetLevel,
       ...partitionOrdinal,
       logicalOrder: plan.logicalOrder,
       commitOrdinal: 0,
-      rowIdSpans: plan.kind === "merge-v1" ? structuredClone(plan.rowIdSpans) : [],
+      rowIdSpans: isMergeCompactionPlan(plan) ? structuredClone(plan.rowIdSpans) : [],
       createdAt,
     },
   ];

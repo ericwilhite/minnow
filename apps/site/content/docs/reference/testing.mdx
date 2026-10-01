@@ -365,7 +365,11 @@ than repaired from stale staging. The native browser
 worker suite discovers the same frozen fixtures and checks automatic upgrade and new writes
 across restart. A pinned test-only alias of the released core 0.10.0 package proves that the actual
 layout-6 reader opens the old fixture and refuses the upgraded tree before mutation, in Node
-and native workers. Unsupported pre-contract prototypes are refused without changing their bytes.
+and native workers. A second alias, of core 0.12.1, is the last IndexedDB schema-2 and OPFS
+layout-7 writer: `layout8-upgrade.test.ts` and `indexeddb-schema3.test.ts` have it leave a
+merge-v1 fold in flight, then upgrade, finish that fold, write, reopen, and check that 0.12.1
+refuses the result without a byte changing. The layout-7 marker upgrade is cut at each of its
+eight I/O boundaries by tab death and by power loss. Unsupported pre-contract prototypes are refused without changing their bytes.
 The layout-7 tests also zero or truncate acknowledged WAL bytes and
 damage either acknowledgement slot; recovery must report corruption rather than roll back.
 
@@ -589,8 +593,23 @@ nothing; the buffer pool stays inside its budget under many distinct queries.
 `automatic-compaction-fit.test.ts` holds automatic folds to the same standard on tables whose
 folds do not fit the default memory budget as planned: a wide table refreshed wholesale keeps
 folding inside the budget, a fold whose distinct keys outgrow it is cut, the smallest fold gets
-the memory it needs, and a refresh in an unrelated order is refused with a reason rather than
-run as a plan of one range per cell. Each case fails with its part of the fix removed.
+the memory it needs, and a refresh written in an unrelated order folds with a job record a few
+kilobytes long. A fold resumed by another engine recomputes its replay, and one whose replay no
+longer matches its plan is abandoned unwritten. Each case fails with its part of the fix removed.
+
+`event-loop-stalls.test.ts` runs a 1 ms watchdog through the workloads that once held every
+other query for hundreds of milliseconds or minutes — a fold of reordered wide upserts, live
+aggregates patched after large commits, scans over upsert-heavy tables, secondary-index builds
+and their first lookups, and a full-text index build — and fails if any stretch the watchdog
+cannot run exceeds 250 ms (750 ms in CI). Each case fails against the code before 0.13.0.
+`checkpoint-slicing.test.ts` pins that a multi-slice OPFS checkpoint gives the event loop turns
+between its slot writes, publishes exactly the bytes a one-step checkpoint would, and survives
+power loss or a refused write at every one of its file operations, with the refused checkpoint
+retried by later writes; `wire.test.ts` checks the sliced encoder against the one-step encoder
+byte for byte, including a property test over arbitrary JSON-shaped states.
+`npm run benchmark:stalls` measures the real numbers for those shapes and a few more, during the
+writes and during the maintenance that follows; `-- --store opfs` runs them over the native
+OPFS store.
 
 The heap itself is checked by the memory soak, which the unit suites cannot do honestly:
 

@@ -8,42 +8,89 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## 0.12.2 — October 1, 2026
+## 0.13.0 — October 1, 2026
 
-Release packages: `@minnowdb/core@0.12.2`.
+Release packages: `@minnowdb/core@0.13.0`.
 
-- Automatic compaction no longer stalls on keyed tables with wide rows. Planning a fold now
-  takes memory in proportion to the distinct keys its deltas touch, so refreshing the same rows
-  again and again fits the default 32 MiB budget however wide they are. Before, every delta row
-  was charged once per column: two full refreshes of seven thousand forty-column rows already
-  overran the budget, every automatic attempt failed, and segments piled up until reads took
-  seconds.
+- Compaction no longer stalls, whatever order rows arrive in. A fold's job record now holds its
+  sources, output windows, and partitions, but not which source row feeds each output cell: that
+  replay is recomputed from the immutable sources, kept in memory as compact runs, and checked
+  against a checksum before any block is written. Before, upserts replacing rows in an order
+  unlike the table's stored a range per cell and rewrote it on every step — a fold of four
+  refreshes of 7,000 forty-column rows took 15 minutes and held the thread for 700 ms at a time.
+  It now takes under two seconds, in slices of about 20 ms. A fold resumed in another tab or
+  after a reload recomputes the replay; one that no longer matches its plan is abandoned
+  unwritten and planned afresh.
 
-- Automatic folds fit themselves to the memory budget, with no new option. A fold that does not
-  fit is cut to fewer level-zero segments and planned again, and the table's next fold starts
-  from the size that fit. When even the smallest fold a table allows does not fit, that fold is
-  given the memory it needs. A failed attempt now backs off on time alone; it no longer waits
-  for the table to double its segment count, which an idle table never did.
+- Background work and long statements run in slices of a few milliseconds and hand the event
+  loop a turn between them: fold planning and execution, live-aggregate updates, index and
+  full-text builds, OPFS checkpoints, query scans, the first lookup through a new index, and the
+  per-row passes of large writes. One clock paces every slice, so a statement made of many short
+  steps, or statements awaited back to back on OPFS, yield as often as one long loop. Across the
+  measured shapes — wide tables refreshed in any order, hundreds of thousands of rows of point
+  updates or deletes, index builds, and live aggregates under heavy writes — the longest block
+  during background work is about 40 ms on a laptop, on the memory and OPFS stores alike. The
+  worst of them held it for 250–700 ms before. `npm run benchmark:stalls` measures it (add
+  `-- --store opfs` for the native store), and `event-loop-stalls.test.ts` keeps it bounded.
+
+- `CREATE INDEX` over 200,000 rows held the thread for half a second: the build sorted and
+  wrote each 65,536-row block's postings in one turn, and the first lookup then hashed every
+  stored key. Builds now flush at most 16,384 rows' postings at a time and yield as they go,
+  and the lookup yields while it hashes; the longest block is now 15–25 ms. Creating a `UNIQUE`
+  index builds its key set in one pass instead of two.
+
+- OPFS checkpoints taken during normal work — when the log fills, and before collection deletes
+  a drained data file — encode and write a slice at a time while holding the write queue, so
+  reads keep answering between slices and the state they publish cannot change. Their bytes are
+  exactly a one-step checkpoint's. Loading a million keyed rows into OPFS 50,000 at a time held
+  the thread for up to 161 ms; it now peaks at 77 ms, the writes themselves.
+
+- Full-text matching tokenizes each distinct stored value the first time a scanned row uses it,
+  instead of tokenizing a block's whole dictionary on its first batch, which held the thread for
+  about 60 ms per block of distinct documents.
+
+- Automatic compaction no longer stalls on keyed tables with wide rows. Planning a fold takes
+  memory in proportion to the distinct keys its deltas touch, so refreshing the same rows again
+  and again fits the default 32 MiB budget however wide they are. Automatic folds fit themselves
+  to the budget with no new option: a fold that does not fit is cut to fewer level-zero segments
+  and planned again, and the smallest fold a table allows is given the memory it needs. A failed
+  attempt backs off on time alone instead of waiting for the table to double its segment count.
 
 - Deltas that hold as many rows as the data they change, once past 4,096 rows, now schedule a
-  fold. A table refreshed wholesale folds after about two refreshes instead of thirty-two, so a
-  scan reads each row about three times at most rather than more than thirty.
+  fold, so a table refreshed wholesale folds after about two refreshes instead of thirty-two.
 
-- Automatic compaction refuses a fold whose plan would need a source range for every replaced
-  cell — upserts replacing many rows in an order unrelated to the table's — and reports
-  `CompactionPlanTooFragmentedError` to `onBackgroundError` (`onWorkerError` on a worker client).
-  Running such a plan would hold the database up on every step. Upserting in the table's own
-  order avoids it, and `compactTable` still folds the table on request.
+- Folds of tables with scattered point updates or deletes plan output windows from each source
+  block's size counted once. A block read by many ranges was counted once per range, which split
+  windows down to a few rows: folding a 200,000-row table after forty update statements took 59
+  seconds and wrote 3,828 blocks. It now takes half a second and writes 52.
+
+- Scans of a table carrying many upserts visit each window's own patches instead of every patch
+  for every window, and live `COUNT`/`SUM`/`AVG` aggregates add integer contributions as numbers
+  rather than decimal strings. Writes under a live aggregate are about twice as fast.
 
 - Automatic compaction reselects active work after yielding, so another tab's schema change
   can abandon a stale fold without causing an untyped background failure. A job abandoned
   between selection and execution reports its job ID and changed revision. Explicitly resuming
   an already aborted job still reports its recorded failure, and unexpected I/O still propagates.
 
-**Migration and stored formats:** no application or data migration is needed. Public APIs,
-block format 2, snapshot format 1, IndexedDB schema 2, and OPFS layout 7 are unchanged, and a
-compaction job planned by an older version resumes and publishes as planned. Automatic upgrades
-from the supported older formats remain in place.
+- Storage contract: `CompactionRewritePlan` adds `ReplayedMergeCompactionRewritePlan`
+  (`kind: "merge-v2"`) with `MergeCompactionPlannedColumn` and `MergeCompactionResolution`;
+  `MergeCompactionPlanLayout` holds the fields both merge kinds share, and
+  `isMergeCompactionPlan` tells them apart. `RecordCore.installValidatedFtsBase` installs a
+  postings base whose chunks were validated as they were staged. The memory store's full-text
+  build no longer revalidates and copies the whole base when it finishes. The storage toolkit
+  adds `encodeSyncCheckpointSliced(state, pause)`, `encodeSyncCheckpoint`'s exact bytes encoded
+  a bounded piece at a time.
+
+**Migration and stored formats:** no application migration is needed. IndexedDB moves to schema 3
+and native OPFS to layout 8; both upgrade automatically on open and change no stored data, since
+the new version only admits compaction jobs with replayed merge plans. A layout-7 OPFS database
+has its format marker rewritten behind a small flushed witness, so an interrupted upgrade
+finishes on the next open. Minnow 0.12.x and earlier refuse the upgraded database without
+changing it, so pin the new version everywhere that opens the same database. A compaction job
+left in flight by an older version resumes and publishes as planned. Block format 2 and snapshot
+format 1 are unchanged. Adapters built on the storage toolkit that persist compaction job records
+may now be handed `merge-v2` plans; version their own stored formats accordingly.
 
 ## 0.12.1 — October 1, 2026
 

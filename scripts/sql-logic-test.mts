@@ -7,7 +7,6 @@
  */
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { createInterface } from "node:readline";
 
 import { MinnowDatabase } from "../packages/core/src/engine/index.js";
 import { MemoryBlockStore } from "../packages/core/src/storage/index.js";
@@ -141,12 +140,28 @@ function createDatabase(): SqlLogicDatabase {
 }
 
 async function* readRecords(file: string): AsyncGenerator<SqlLogicRecord> {
+  yield* parseSqlLogicTestLines(fileLines(file), file);
+}
+
+/**
+ * A file's lines, split at CRLF, LF, or a lone CR, streamed with the read stream's own
+ * backpressure. `readline`'s async iterator is not used: the engine yields to the event loop
+ * between statements, the stream reads ahead meanwhile, and once the input ends the iterator
+ * resumes a closed interface and throws "readline was closed".
+ */
+async function* fileLines(file: string): AsyncGenerator<string> {
   const input = createReadStream(file, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  let pending = "";
   try {
-    yield* parseSqlLogicTestLines(lines, file);
+    for await (const chunk of input as AsyncIterable<string>) {
+      // A CR ending the chunk may be the first half of a CRLF; keep it for the next chunk.
+      const lines = (pending + chunk).split(/\r\n|\n|\r(?!$)/);
+      pending = lines.pop() ?? "";
+      yield* lines;
+    }
+    if (pending.endsWith("\r")) pending = pending.slice(0, -1);
+    if (pending.length > 0) yield pending;
   } finally {
-    lines.close();
     input.destroy();
   }
 }

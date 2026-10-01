@@ -113,6 +113,7 @@ import {
   uniqueKeyBuildChunkRetainedBytes,
 } from "../types.js";
 import { dateIsoString } from "../../date-value.js";
+import { maybeYieldToEventLoop, yieldToEventLoop } from "../../work-slicer.js";
 import {
   decodeSnapshotMetadataItems,
   encodeSnapshotMetadataPage,
@@ -144,6 +145,7 @@ import {
   decodeSyncCheckpoint,
   encodePostingChunk,
   encodeSyncCheckpoint,
+  encodeSyncCheckpointSliced,
 } from "../toolkit/wire.js";
 import { WalWriter, iterateWalFrames } from "../toolkit/wal.js";
 import { WalAcknowledgements } from "../toolkit/wal-acknowledgement.js";
@@ -163,6 +165,8 @@ import { crc32 } from "../../block-format/checksum.js";
 
 /** Checkpoint when the WAL passes either bound; both trade replay time against pause time. */
 const CHECKPOINT_WAL_BYTES = 4 * 1024 * 1024;
+/** Checkpoint bytes one slot write covers before a sliced checkpoint offers the event loop a turn. */
+const CHECKPOINT_WRITE_SLICE_BYTES = 1024 * 1024;
 const CHECKPOINT_ENTRIES = 1024;
 /** A failed checkpoint may defer compaction, but the recovery log itself stays bounded. */
 export const MAX_OPFS_WAL_BYTES = 256 * 1024 * 1024;
@@ -1382,10 +1386,10 @@ export class OpfsLeader {
       !this.#checkpointScheduled
     ) {
       this.#checkpointScheduled = true;
-      void this.#run(() => {
+      void this.#run(async () => {
         this.#checkpointScheduled = false;
         if (this.#checkpointDue()) {
-          this.checkpointNow();
+          await this.checkpointSliced();
         }
       }).catch((error: unknown) => {
         this.#diagnostic(error, "opfs checkpoint");
@@ -2701,24 +2705,66 @@ export class OpfsLeader {
    * Therefore corruption of either post-success copy cannot expose an older database.
    */
   checkpointNow(): void {
+    this.onBeforeCheckpoint?.(this.#lastCheckpointMs);
+    const started = Date.now();
     try {
-      this.onBeforeCheckpoint?.(this.#lastCheckpointMs);
-      const started = Date.now();
-      this.#checkpointNowUnchecked();
-      this.#lastCheckpointMs = Date.now() - started;
-      this.#checkpointFailures = 0;
-      this.#lastCheckpointError = undefined;
-      this.#checkpointRetryAtEntries = 0;
+      const state = this.#checkpointState();
+      const bytes = encodeSyncCheckpoint(state);
+      const [slotIndex, mirrorIndex] = this.#checkpointSlotOrder(bytes);
+      this.#writeCheckpointSlot(slotIndex, bytes, 0, bytes.byteLength);
+      this.#checkpointSlotPublished(slotIndex, state);
+      // WAL remains intact until the redundant copy is equally durable.
+      this.#writeCheckpointSlot(mirrorIndex, bytes, 0, bytes.byteLength);
+      this.#checkpointMirrored(bytes);
     } catch (error) {
-      this.#checkpointFailures += 1;
-      this.#lastCheckpointError = error;
-      const retryEntries = 2 ** Math.min(this.#checkpointFailures, 10);
-      this.#checkpointRetryAtEntries = this.#entriesSinceCheckpoint + retryEntries;
+      this.#checkpointFailed();
       throw error;
     }
+    this.#checkpointSucceeded(started);
   }
 
-  #checkpointNowUnchecked(): void {
+  /**
+   * `checkpointNow`, encoded and written a slice at a time, so checkpointing a large database
+   * hands the event loop a turn every few milliseconds instead of holding it for the whole
+   * state. Run it only as a queued operation: every mutation waits on the queue, so the state
+   * captured at the start is still the state when both slots are written, while reads — which
+   * answer from memory without the queue — run between slices. The slots, their order, and
+   * their bytes are `checkpointNow`'s; a crash between slices leaves a torn slot, as a crash
+   * inside one synchronous write does.
+   */
+  async checkpointSliced(): Promise<void> {
+    this.onBeforeCheckpoint?.(this.#lastCheckpointMs);
+    const started = Date.now();
+    try {
+      const state = this.#checkpointState();
+      const bytes = await encodeSyncCheckpointSliced(state, maybeYieldToEventLoop);
+      const [slotIndex, mirrorIndex] = this.#checkpointSlotOrder(bytes);
+      await this.#writeCheckpointSlotSliced(slotIndex, bytes);
+      this.#checkpointSlotPublished(slotIndex, state);
+      await this.#writeCheckpointSlotSliced(mirrorIndex, bytes);
+      this.#checkpointMirrored(bytes);
+    } catch (error) {
+      this.#checkpointFailed();
+      throw error;
+    }
+    this.#checkpointSucceeded(started);
+  }
+
+  #checkpointSucceeded(started: number): void {
+    this.#lastCheckpointMs = Date.now() - started;
+    this.#checkpointFailures = 0;
+    this.#lastCheckpointError = undefined;
+    this.#checkpointRetryAtEntries = 0;
+  }
+
+  #checkpointFailed(): void {
+    this.#checkpointFailures += 1;
+    const retryEntries = 2 ** Math.min(this.#checkpointFailures, 10);
+    this.#checkpointRetryAtEntries = this.#entriesSinceCheckpoint + retryEntries;
+  }
+
+  /** Captures the state the next checkpoint publishes, after making its payloads durable. */
+  #checkpointState(): CheckpointState {
     const generation = safeSuccessor(this.#checkpointGeneration, "OPFS checkpoint generation");
     // In relaxed mode, appends deliberately avoid per-operation flushes. Make every extent
     // referenced by this checkpoint durable before publishing and flushing the checkpoint;
@@ -2726,7 +2772,7 @@ export class OpfsLeader {
     if (!this.#strict) this.#pool.flush();
     this.#snapshotFrameExportLedger?.flush();
     this.#snapshotFrameImportLedger?.flush();
-    const state: CheckpointState = {
+    return {
       formatVersion: 1,
       generation,
       lastSeq: this.#seq,
@@ -2750,7 +2796,10 @@ export class OpfsLeader {
       servedRequests: [...this.#servedLedger.values()],
       servedCoverageSince: this.#servedCoverageSince,
     };
-    const bytes = encodeSyncCheckpoint(state);
+  }
+
+  /** Refuses a checkpoint too large for a slot; otherwise the slot it writes first, then the other. */
+  #checkpointSlotOrder(bytes: Uint8Array): [number, number] {
     if (bytes.byteLength > MAX_OPFS_CHECKPOINT_BYTES) {
       // The one bound the per-resource limits share: everything they admit must still encode
       // into one checkpoint slot. Typed like the rest, so a caller can tell it from corruption.
@@ -2761,19 +2810,36 @@ export class OpfsLeader {
       );
     }
     const slotIndex = this.#newestSlot === 0 ? 1 : 0;
-    const mirrorIndex = slotIndex === 0 ? 1 : 0;
-    const writeSlot = (index: number): void => {
-      const slot = this.#slots[index];
-      if (slot === undefined) throw new Error(`Missing OPFS checkpoint slot ${String(index)}`);
-      slot.truncate(0);
-      writeFully(slot, bytes, 0, `writing checkpoint slot ${String(index)}`);
-      slot.flush();
-    };
-    writeSlot(slotIndex);
+    return [slotIndex, slotIndex === 0 ? 1 : 0];
+  }
+
+  /** Writes `bytes[start, end)` into one slot: truncated first, flushed once complete. */
+  #writeCheckpointSlot(index: number, bytes: Uint8Array, start: number, end: number): void {
+    const slot = this.#slots[index];
+    if (slot === undefined) throw new Error(`Missing OPFS checkpoint slot ${String(index)}`);
+    if (start === 0) slot.truncate(0);
+    writeFully(slot, bytes.subarray(start, end), start, `writing checkpoint slot ${String(index)}`);
+    if (end === bytes.byteLength) slot.flush();
+  }
+
+  /** Writes one slot a megabyte at a time, with a turn for the event loop between pieces. */
+  async #writeCheckpointSlotSliced(index: number, bytes: Uint8Array): Promise<void> {
+    let start = 0;
+    for (;;) {
+      const end = Math.min(bytes.byteLength, start + CHECKPOINT_WRITE_SLICE_BYTES);
+      this.#writeCheckpointSlot(index, bytes, start, end);
+      if (end === bytes.byteLength) return;
+      start = end;
+      await yieldToEventLoop();
+    }
+  }
+
+  #checkpointSlotPublished(slotIndex: number, state: CheckpointState): void {
     this.#newestSlot = slotIndex;
     this.#checkpointGeneration = state.generation;
-    // WAL remains intact until the redundant copy is equally durable.
-    writeSlot(mirrorIndex);
+  }
+
+  #checkpointMirrored(bytes: Uint8Array): void {
     this.#acknowledgements?.publish(this.#seq, this.#wal.byteLength);
     this.#wal.reset();
     this.#entriesSinceCheckpoint = 0;
@@ -2795,7 +2861,8 @@ export class OpfsLeader {
       // Recovery verifies frame payloads before replay, so deleting their last physical extent
       // is safe only after a redundant checkpoint makes the resolved indexes authoritative and
       // resets that history. A checkpoint refusal leaves the files in place as cleanup debt.
-      this.checkpointNow();
+      // Every caller holds the operation queue (or is recovering), so the checkpoint may yield.
+      await this.checkpointSliced();
     }
     for (const id of deletable) {
       await this.#pool.deleteExtent(id);
@@ -2821,7 +2888,7 @@ export class OpfsLeader {
     await attempt(async () => {
       if (await this.#reconcileRecoveredTempPages()) this.#tempLedgerNeedsCheckpoint = true;
       if (this.#tempLedgerNeedsCheckpoint) {
-        this.checkpointNow();
+        await this.checkpointSliced();
         this.#tempLedgerNeedsCheckpoint = false;
       }
     });

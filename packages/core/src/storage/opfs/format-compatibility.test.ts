@@ -4,10 +4,10 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { decodeBlock, encodeBlock } from "../../block-format/index.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
-import { decodeSyncCheckpoint, LOG_FORMAT_VERSION } from "../toolkit/wire.js";
+import { decodeSyncCheckpoint } from "../toolkit/wire.js";
 import type { TableRecord } from "../types.js";
 import { OpfsBlockStore } from "./index.js";
-import { FIRST_SUPPORTED_OPFS_LAYOUT, OPFS_UPGRADES } from "./upgrades.js";
+import { FIRST_SUPPORTED_OPFS_LAYOUT, OPFS_LAYOUT_VERSION, OPFS_UPGRADES } from "./upgrades.js";
 
 interface NativeFixture {
   layoutFormatVersion: number;
@@ -86,7 +86,7 @@ function table(name: string): TableRecord {
 describe("frozen native OPFS layout", () => {
   it("requires an ordered automatic upgrade for every retained native layout", () => {
     expect(OPFS_UPGRADES.map(({ from, to }) => [from, to])).toEqual(
-      Array.from({ length: LOG_FORMAT_VERSION - FIRST_SUPPORTED_OPFS_LAYOUT }, (_, index) => [
+      Array.from({ length: OPFS_LAYOUT_VERSION - FIRST_SUPPORTED_OPFS_LAYOUT }, (_, index) => [
         FIRST_SUPPORTED_OPFS_LAYOUT + index,
         FIRST_SUPPORTED_OPFS_LAYOUT + index + 1,
       ]),
@@ -94,7 +94,7 @@ describe("frozen native OPFS layout", () => {
   });
   it("retains exactly one fixture for every locked layout", () => {
     const expectedVersions = Array.from(
-      { length: LOG_FORMAT_VERSION - FIRST_STABLE_OPFS_LAYOUT_VERSION + 1 },
+      { length: OPFS_LAYOUT_VERSION - FIRST_STABLE_OPFS_LAYOUT_VERSION + 1 },
       (_, index) => FIRST_STABLE_OPFS_LAYOUT_VERSION + index,
     );
     expect(
@@ -113,11 +113,11 @@ describe("frozen native OPFS layout", () => {
   it("has a fixture for the layout this build writes", () => {
     expect(fixtures.length).toBeGreaterThan(0);
     const current = fixtures.find(
-      ({ fixture }) => fixture.layoutFormatVersion === LOG_FORMAT_VERSION,
+      ({ fixture }) => fixture.layoutFormatVersion === OPFS_LAYOUT_VERSION,
     );
     expect(
       current,
-      `No native OPFS fixture covers layout ${String(LOG_FORMAT_VERSION)}. Freeze the current ` +
+      `No native OPFS fixture covers layout ${String(OPFS_LAYOUT_VERSION)}. Freeze the current ` +
         `writer before changing it, and retain every prior locked fixture.`,
     ).toBeDefined();
     const fixture = current?.fixture;
@@ -146,7 +146,7 @@ describe("frozen native OPFS layout", () => {
       });
       expect(
         new TextDecoder().decode(shim.readFileBytes("minnowdb/native-fixture/format.json")),
-      ).toBe(JSON.stringify({ formatVersion: LOG_FORMAT_VERSION }));
+      ).toBe(JSON.stringify({ formatVersion: OPFS_LAYOUT_VERSION }));
       expect((await store.listTables()).map(({ name }) => name)).toEqual(
         fixture.expectations.tables,
       );

@@ -257,7 +257,8 @@ machines: https://minnowdb.com/llms.txt
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
 - Supported stored-format upgrades run automatically through ordinary open/load, including
-  OPFS layout 6 to 7. Do not add a required export/import step. Every format change needs frozen
+  IndexedDB schema 2 to 3 and OPFS layouts 6 and 7 to 8. Do not add a required export/import
+  step. Every format change needs frozen
   older-writer fixtures and data-preservation, continued-write/reopen, interruption/power-loss,
   corruption-refusal, concurrent-open and older-writer-barrier tests. Close older connections
   if they block an upgrade; quota/I/O failures must report an error and remain retryable.

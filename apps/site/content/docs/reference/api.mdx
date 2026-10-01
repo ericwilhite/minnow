@@ -318,7 +318,7 @@ adapter isolation explicit even to conservative bundlers.
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
 tooling but are storage internals. Their TypeScript API may still change during 0.x; the bytes
-written by the locked block-format 2, snapshot-format 1, IndexedDB-schema 2, and OPFS-layout 7
+written by the locked block-format 2, snapshot-format 1, IndexedDB-schema 3, and OPFS-layout 8
 writers are separate format contracts and cannot be reinterpreted in place.
 
 ## `@minnowdb/core/storage/toolkit`
@@ -336,6 +336,7 @@ have to use it.
 | `encodeRecordJson` / `decodeRecordJson`                                                             | JSON with bigints (`{"$n":"…"}`) — the codec frames and checkpoints use.                                                                                                                                                                |
 | `appendTransactionJournal(record, additions)`                                                       | Extends a transaction record's journal by the staged ids without re-validating what it already holds; the caller proves the additions are new, so a staging call costs what it stages.                                                  |
 | `encodeSyncCheckpoint` / `decodeSyncCheckpoint`, `encodeChunk` / `decodeChunk`                      | Checksummed, versioned envelopes for checkpoint payloads and immutable artifact chunks; torn bytes decode as "not written".                                                                                                             |
+| `encodeSyncCheckpointSliced(state, pause)`                                                          | The same bytes as `encodeSyncCheckpoint`, encoded a bounded piece at a time with `pause()` awaited between pieces, so a large checkpoint does not hold the thread; `state` must not change until it settles.                            |
 | `SyncFileHandle`                                                                                    | The small file interface used by the toolkit: positioned read, write, truncate, flush, and close. A browser `FileSystemSyncAccessHandle` already has this shape.                                                                        |
 | `readFully` / `writeFully`                                                                          | Complete positioned transfers across short I/O without copying; reject invalid or overflowing ranges before I/O, plus EOF, zero progress, and invalid byte counts.                                                                      |
 | `RecordCoreState`, `PhysicalBlocks`, `ExtentFiles`, `ExtentMeta`, `Placement`, `LOG_FORMAT_VERSION` | Supporting types and the on-disk envelope version.                                                                                                                                                                                      |

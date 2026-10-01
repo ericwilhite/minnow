@@ -12,11 +12,12 @@ import {
 } from "../types.js";
 import { validateTempRunPage, validateTempRunPageIdentity } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, isDomError } from "./files.js";
-import { LOG_FORMAT_VERSION } from "../toolkit/wire.js";
+
 import {
   canUpgradeOpfsLayout,
   finishOpfsUpgrade,
   hasPreparedOpfsUpgrade,
+  OPFS_LAYOUT_VERSION,
   upgradeOpfsLayout,
 } from "./upgrades.js";
 import { OpfsLeader, OpfsLeaderClosedError, type ServedMutationRequest } from "./leader.js";
@@ -1842,7 +1843,7 @@ export class OpfsBlockStore {
           `Refusing to guess their layout version.`,
       );
     }
-    const bytes = new TextEncoder().encode(JSON.stringify({ formatVersion: LOG_FORMAT_VERSION }));
+    const bytes = new TextEncoder().encode(JSON.stringify({ formatVersion: OPFS_LAYOUT_VERSION }));
     try {
       await this.#tree.writeFile(["format.json"], bytes, { flush: true });
     } catch (error) {
@@ -1881,13 +1882,13 @@ export class OpfsBlockStore {
       );
     }
     const formatVersion = (parsed as { formatVersion: number }).formatVersion;
-    if (formatVersion !== LOG_FORMAT_VERSION && !canUpgradeOpfsLayout(formatVersion)) {
+    if (formatVersion !== OPFS_LAYOUT_VERSION && !canUpgradeOpfsLayout(formatVersion)) {
       throw new StorageFormatVersionError(
         "opfs",
         "format.json",
         formatVersion,
-        LOG_FORMAT_VERSION,
-        formatVersion < LOG_FORMAT_VERSION ? "older" : "newer",
+        OPFS_LAYOUT_VERSION,
+        formatVersion < OPFS_LAYOUT_VERSION ? "older" : "newer",
       );
     }
     if (

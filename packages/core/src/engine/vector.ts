@@ -7,6 +7,7 @@ import {
 } from "../storage/types.js";
 import type { DatabaseRow } from "./database.js";
 import { throwIfAborted } from "./cancellation.js";
+import { maybeYieldToEventLoop } from "../work-slicer.js";
 import type {
   AggregateName,
   BinaryOperator,
@@ -399,6 +400,8 @@ interface FtsRowScratch {
 
 interface FtsDictionaryCache {
   dictionary: readonly string[] | undefined;
+  /** Per dictionary code: 1 once that entry is tokenized into the tables below. */
+  tokenized: Uint8Array;
   /** Per dictionary code: bitmask of query terms present in that entry's tokens. */
   termMask: Uint32Array;
   /** BM25 only — per dictionary code: token count and per-term frequencies (flattened). */
@@ -1968,11 +1971,12 @@ function boundChildren(expression: BoundExpression): BoundExpression[] {
 }
 
 /**
- * Rebuilds one string column's per-dictionary term table when the resident dictionary changes
- * (streamed vectors swap dictionaries per window). Each dictionary entry tokenizes exactly once;
- * rows then combine per-code masks. The table is real retained memory — one Uint32 per
- * dictionary entry — so it reserves against the query budget, releasing the previous window's
- * reservation on swap.
+ * Resets one string column's per-dictionary term table when the resident dictionary changes
+ * (streamed vectors swap dictionaries per window). Each dictionary entry tokenizes at most once,
+ * the first time a row uses it, so a block's cost follows the rows scanned in each batch rather
+ * than landing whole on the block's first batch; rows then combine per-code masks. The table is
+ * real retained memory — a flag and one Uint32 per dictionary entry — so it reserves against the
+ * query budget, releasing the previous window's reservation on swap.
  */
 function ensureFtsDictionaryCache(
   expression: BoundFtsExpression,
@@ -1982,7 +1986,11 @@ function ensureFtsDictionaryCache(
 ): FtsDictionaryCache {
   let cache = expression.caches[columnIndex];
   if (cache === null || cache === undefined) {
-    cache = { dictionary: undefined, termMask: new Uint32Array(0) };
+    cache = {
+      dictionary: undefined,
+      tokenized: new Uint8Array(0),
+      termMask: new Uint32Array(0),
+    };
     expression.caches[columnIndex] = cache;
   }
   // A cache built for matching upgrades in place when scoring first needs the same
@@ -1992,9 +2000,9 @@ function ensureFtsDictionaryCache(
   if (cache.dictionary !== vector.dictionary || (scoring && cache.termTf === undefined)) {
     const withScores = scoring || cache.scoring === true;
     const termCount = expression.terms.length;
-    // Match tables cost one Uint32 per entry; scoring adds a token count and per-term
-    // frequencies, all part of the modeled query memory.
-    const bytesPerEntry = 4 * (withScores ? termCount + 2 : 1);
+    // Match tables cost a flag and one Uint32 per entry; scoring adds a token count and
+    // per-term frequencies, all part of the modeled query memory.
+    const bytesPerEntry = 1 + 4 * (withScores ? termCount + 2 : 1);
     cache.reservation?.release();
     delete cache.reservation;
     const reservation = expression.memory?.reserve(
@@ -2002,23 +2010,11 @@ function ensureFtsDictionaryCache(
       "Full-text dictionary match table",
     );
     if (reservation !== undefined) cache.reservation = reservation;
-    const masks = new Uint32Array(vector.dictionary.length);
     const tokenCount = withScores ? new Uint32Array(vector.dictionary.length) : undefined;
     const termTf = withScores ? new Uint32Array(vector.dictionary.length * termCount) : undefined;
-    for (let code = 0; code < vector.dictionary.length; code += 1) {
-      const rendered = externalSqlDomainValue(vector.dictionary[code] ?? "");
-      const tokens = tokenize(typeof rendered === "string" ? rendered : "");
-      masks[code] = termsMask(tokens, expression.terms);
-      if (tokenCount !== undefined) tokenCount[code] = tokens.length;
-      if (termTf !== undefined) {
-        const frequencies = termFrequencies(tokens, expression.terms);
-        for (let index = 0; index < termCount; index += 1) {
-          termTf[code * termCount + index] = frequencies[index] ?? 0;
-        }
-      }
-    }
     cache.dictionary = vector.dictionary;
-    cache.termMask = masks;
+    cache.tokenized = new Uint8Array(vector.dictionary.length);
+    cache.termMask = new Uint32Array(vector.dictionary.length);
     // A mask-only rebuild must not leave a previous dictionary's scoring tables behind: the
     // next scored read checks `termTf === undefined` to decide whether to upgrade.
     if (tokenCount !== undefined) cache.tokenCount = tokenCount;
@@ -2028,6 +2024,28 @@ function ensureFtsDictionaryCache(
     cache.scoring = withScores;
   }
   return cache;
+}
+
+/** Tokenizes one dictionary entry into `cache` the first time a row reads it. */
+function tokenizeFtsDictionaryEntry(
+  expression: BoundFtsExpression,
+  cache: FtsDictionaryCache,
+  code: number,
+): void {
+  if (cache.tokenized[code] === 1) return;
+  const rendered = externalSqlDomainValue(cache.dictionary?.[code] ?? "");
+  const tokens = tokenize(typeof rendered === "string" ? rendered : "");
+  cache.termMask[code] = termsMask(tokens, expression.terms);
+  if (cache.tokenCount !== undefined) cache.tokenCount[code] = tokens.length;
+  const termTf = cache.termTf;
+  if (termTf !== undefined) {
+    const termCount = expression.terms.length;
+    const frequencies = termFrequencies(tokens, expression.terms);
+    for (let index = 0; index < termCount; index += 1) {
+      termTf[code * termCount + index] = frequencies[index] ?? 0;
+    }
+  }
+  cache.tokenized[code] = 1;
 }
 
 /**
@@ -2084,6 +2102,7 @@ function accumulateFtsRow(
       into.present = true;
       if (terms.length === 0 && !wantScores) continue;
       const cache = ensureFtsDictionaryCache(expression, index, column.vector, wantScores);
+      tokenizeFtsDictionaryEntry(expression, cache, code);
       into.mask |= cache.termMask[code] ?? 0;
       if (wantScores) {
         into.length += cache.tokenCount?.[code] ?? 0;
@@ -2348,8 +2367,11 @@ async function executeBoundPlanAsync(
   if (options.scanRows !== undefined && options.loadScanWindow !== undefined) {
     await scanSelectedRows(plan, options.scanRows, groups, output, memory, options);
   }
+  // Resident batches run back to back without awaiting anything, so a long scan would hold the
+  // event loop for its whole length; each batch offers it a turn once a slice has run.
   for (let start = 0; start < scanRows && options.scanRows === undefined;) {
     throwIfAborted(options.signal);
+    await maybeYieldToEventLoop();
     let length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
     // The loader answers synchronously when the batch is already resident — the common case,
     // every batch but the first per block — so the scan loop only pays await on real slides.
@@ -2378,6 +2400,7 @@ async function executeBoundPlanAsync(
     for (const range of ranges) {
       for (let row = range.begin; row < range.end; row += DEFAULT_BATCH_ROWS) {
         throwIfAborted(options.signal);
+        await maybeYieldToEventLoop();
         const rows = Math.min(DEFAULT_BATCH_ROWS, range.end - row);
         if (runScanBatch(plan, row, rows, groups, output, memory)) {
           stopped = true;
@@ -2418,6 +2441,7 @@ async function scanSelectedRows(
   let index = 0;
   while (index < selection.length) {
     throwIfAborted(options.signal);
+    await maybeYieldToEventLoop();
     const first = selection[index] ?? 0;
     if (first >= scanRows) break;
     const loaded = options.loadScanWindow?.(first, 1);
@@ -2466,6 +2490,7 @@ async function executeBoundPlanBatches(
   const step = Math.min(DEFAULT_BATCH_ROWS, options.batchRows);
   for (let start = 0; start < scanRows && (limit === undefined || emitted < limit);) {
     throwIfAborted(options.signal);
+    await maybeYieldToEventLoop();
     let length = Math.min(step, scanRows - start);
     const loaded = options.loadScanWindow?.(start, length);
     const residentEnd = typeof loaded === "number" || loaded === undefined ? loaded : await loaded;
