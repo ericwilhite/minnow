@@ -97,7 +97,7 @@ export interface LiveSubscriptionHandle {
 /**
  * A connection for the live-query suite, driven the way an application drives it — through the
  * engine's main-thread client, so every notification crosses the worker channel before it counts.
- * Only engines with a live-query layer provide one; the suite reports the others as unsupported.
+ * Only engines with an implemented comparison driver provide one; other drivers are unmeasured.
  */
 export interface LiveSession {
   engine: EngineId;

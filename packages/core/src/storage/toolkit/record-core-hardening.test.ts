@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_MANIFEST_BLOCK_PRESENCE_IDS,
   MAX_PINNED_MANIFEST_VERSION_LAG,
@@ -28,6 +28,7 @@ import {
   type SnapshotMetadataItem,
   type TransactionRecord,
   type TableRecord,
+  type WriteTransactionInput,
 } from "../types.js";
 import {
   OrderedKeyIndex,
@@ -44,6 +45,7 @@ import {
   validateTempRunPage,
   validateTempRunPageIdentity,
 } from "./record-core.js";
+import { crc32 } from "../../block-format/index.js";
 import { encodeRecordJson } from "./wire.js";
 
 function transaction(id: string, snapshotVersion: number | null): TransactionRecord {
@@ -133,6 +135,84 @@ function* uniqueSnapshotItems(
 }
 
 describe("RecordCore hardening", () => {
+  it("keeps batched block metadata exact across refusal, retry and placement replay", () => {
+    for (const placementOnly of [false, true]) {
+      const core = new RecordCore({ hasBlock: () => false, blockByteLength: () => undefined });
+      core.addTable({
+        id: "batch-table",
+        name: "batch_table",
+        columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+        managed: false,
+        revision: 0,
+        createdAt: "2026-08-24T00:00:00.000Z",
+      });
+      const blocks = Array.from({ length: 64 }, (_, index) => ({
+        id: `batch-block-${String(index).padStart(2, "0")}`,
+        bytes: new Uint8Array(index + 1).fill(index),
+      }));
+      const segments: SegmentRecord[] = blocks.map((block, index) => ({
+        id: `batch-segment-${String(index)}`,
+        tableId: "batch-table",
+        transactionId: "batch-owner",
+        rowCount: 1,
+        rowIdStart: BigInt(index + 1),
+        rowIdEndExclusive: BigInt(index + 2),
+        columnBlockIds: { value: [block.id] },
+        kind: "insert",
+        level: 0,
+        logicalOrder: 0,
+        commitOrdinal: index,
+        rowIdSpans: [],
+        createdAt: "2026-08-24T00:00:00.000Z",
+      }));
+      const input: WriteTransactionInput = {
+        transaction: {
+          record: {
+            ...transaction("batch-owner", null),
+            schemaEpochGuard: core.dump().schemaEpoch,
+          },
+        },
+        expectedManifestVersion: null,
+        blocks: placementOnly
+          ? blocks.map((block) => ({ id: block.id, bytes: new Uint8Array() }))
+          : blocks,
+        segments,
+        changedTableIds: ["batch-table"],
+        levelZeroSegmentLimits: [{ tableId: "batch-table", limit: 64 }],
+        committedAt: "2026-08-24T00:00:01.000Z",
+      };
+      const before = core.dump();
+      const firstBlock = input.blocks[0];
+      if (firstBlock === undefined) throw new Error("Missing batch fixture block");
+      expect(() =>
+        core.preflightWriteTransaction({
+          ...input,
+          blocks: [...input.blocks.slice(0, -1), firstBlock],
+        }),
+      ).toThrow(/Block already exists/);
+      expect(core.dump()).toEqual(before);
+      core.writeTransaction(
+        input,
+        placementOnly
+          ? {
+              blocksPrevalidated: true,
+              blockByteLengths: new Map(blocks.map((block) => [block.id, block.bytes.byteLength])),
+              blockChecksums: new Map(blocks.map((block) => [block.id, crc32(block.bytes)])),
+            }
+          : {},
+      );
+      expect(core.listManifestBlockPage({ version: 0, afterBlockId: null, limit: 128 })).toEqual({
+        records: blocks.map((block) => ({
+          blockId: block.id,
+          byteLength: block.bytes.byteLength,
+          checksum: crc32(block.bytes),
+        })),
+        nextCursor: null,
+      });
+      expect(core.getTransaction("batch-owner")?.status).toBe("committed");
+    }
+  });
+
   it("rejects reordered or noncanonical segment journals before replacing live checkpoint state", () => {
     const physical = new Set(["ordinal-block-0", "ordinal-block-1"]);
     const core = new RecordCore({
@@ -1853,8 +1933,13 @@ describe("RecordCore hardening", () => {
   });
 
   it("maintains ordered indexes and segment reverse indexes through delete merges and clear", () => {
-    const index = new OrderedKeyIndex<number>((left, right) => left - right);
+    let comparisons = 0;
+    const index = new OrderedKeyIndex<number>((left, right) => {
+      comparisons += 1;
+      return left - right;
+    });
     for (let value = 0; value < 260; value += 1) index.add(value);
+    expect(comparisons).toBe(259);
     index.add(129);
     expect([...index.after(127)]).toEqual(Array.from({ length: 132 }, (_, offset) => offset + 128));
     for (let value = 128; value < 260; value += 1) index.delete(value);
@@ -1895,7 +1980,7 @@ describe("RecordCore hardening", () => {
 
   it("rebuilds bulk unique-key order lazily and stays exact across later mutations", () => {
     const tokens = new OrderedStringSet();
-    tokens.addMany(["z", "a", "m", "a"]);
+    tokens.applyDelta(["z", "a", "m", "a"]);
     expect(tokens.size).toBe(3);
     expect(tokens.has("m")).toBe(true);
     expect([...tokens.orderedValues()]).toEqual(["a", "m", "z"]);
@@ -1905,16 +1990,48 @@ describe("RecordCore hardening", () => {
     tokens.delete("m");
     tokens.add("b");
     expect([...tokens.orderedValues()]).toEqual(["a", "b", "z"]);
-    tokens.addMany(["y", "c", "b"]);
+    tokens.applyDelta(["y", "c", "b"]);
     tokens.delete("a");
     expect(tokens.has("a")).toBe(false);
     expect([...tokens.orderedValues()]).toEqual(["b", "c", "y", "z"]);
-    tokens.addMany(["dirty-after-rebuild"]);
+    tokens.applyDelta(["dirty-after-rebuild"]);
     tokens.clear();
     expect(tokens.size).toBe(0);
     expect([...tokens.orderedValues()]).toEqual([]);
     tokens.add("after-clear");
     expect([...tokens.orderedValues()]).toEqual(["after-clear"]);
+  });
+
+  it("removes bulk unique keys without per-key ordered-index work", () => {
+    const values = ["z", "a", "__proto__", "a-prefix", "a-prefix-2", "m"];
+    const tokens = new OrderedStringSet(values);
+    expect([...tokens.orderedValues()]).toEqual([...values].sort());
+    const indexedDelete = vi.spyOn(OrderedKeyIndex.prototype, "delete");
+    try {
+      tokens.applyDelta(["b", "a-prefix", "m"], ["m", "z", "missing", "m", "a-prefix"]);
+      expect(indexedDelete).not.toHaveBeenCalled();
+      expect(tokens.size).toBe(6);
+      expect(tokens.has("z")).toBe(false);
+      expect(tokens.has("m")).toBe(true);
+      expect(tokens.has("missing")).toBe(false);
+      expect([...tokens.orderedValues()]).toEqual([
+        "__proto__",
+        "a",
+        "a-prefix",
+        "a-prefix-2",
+        "b",
+        "m",
+      ]);
+      tokens.applyDelta([], tokens);
+      expect(tokens.size).toBe(0);
+      expect([...tokens.orderedValues()]).toEqual([]);
+      tokens.add("after-empty");
+      expect([...tokens.orderedValues()]).toEqual(["after-empty"]);
+      tokens.clear();
+      expect([...tokens.orderedValues()]).toEqual([]);
+    } finally {
+      indexedDelete.mockRestore();
+    }
   });
 
   it("exports bulk unique-key commits in canonical order after an index rebuild", () => {

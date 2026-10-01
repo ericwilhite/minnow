@@ -1,4 +1,8 @@
 import {
+  assertCommitSchema,
+  assertCommitSnapshot,
+  planLevelZeroAdmissions,
+  planTableAccelerators,
   validateAutoIncrementReservation,
   validateBeginTransactionInput,
   assertGenericTransactionUpdateAllowed,
@@ -247,9 +251,9 @@ export class OrderedKeyIndex<Key> {
   }
 
   add(key: Key): void {
-    const chunkIndex = this.#firstChunkEndingAtOrAfter(key);
-    if (chunkIndex === this.#chunks.length) {
-      const tail = this.#chunks.at(-1);
+    const tail = this.#chunks.at(-1);
+    // Monotonic inserts, including a sorted snapshot-index rebuild, need no binary seek.
+    if (tail === undefined || this.#compare(tail.at(-1) as Key, key) < 0) {
       if (tail === undefined || tail.length >= OrderedKeyIndex.CHUNK_SIZE) {
         this.#chunks.push([key]);
       } else {
@@ -257,6 +261,7 @@ export class OrderedKeyIndex<Key> {
       }
       return;
     }
+    const chunkIndex = this.#firstChunkEndingAtOrAfter(key);
     const chunk = this.#chunks[chunkIndex];
     if (chunk === undefined) return;
     const keyIndex = this.#lowerBound(chunk, key);
@@ -353,7 +358,7 @@ export class OrderedStringSet extends Set<string> {
 
   constructor(values?: Iterable<string>) {
     super();
-    if (values !== undefined) this.addMany(values);
+    if (values !== undefined) this.applyDelta(values);
   }
 
   override add(value: string): this {
@@ -362,13 +367,14 @@ export class OrderedStringSet extends Set<string> {
   }
 
   /**
-   * Adds a commit delta without maintaining snapshot order token-by-token. Membership remains
+   * Applies a commit delta without maintaining snapshot order token-by-token. Membership remains
    * eager and exact; the snapshot-only index is rebuilt once, deterministically, if ordered
    * iteration is later requested. Clearing a stale index also releases its duplicate references.
    */
-  addMany(values: Iterable<string>): this {
+  applyDelta(added: Iterable<string>, removed: Iterable<string> = []): this {
     let changed = false;
-    for (const value of values) {
+    for (const value of removed) changed = super.delete(value) || changed;
+    for (const value of added) {
       if (this.has(value)) continue;
       super.add(value);
       changed = true;
@@ -1876,34 +1882,15 @@ export class RecordCore {
     }
     if (update.columns !== undefined) validateTableColumns(update.columns);
     const {
-      ftsColumns: previousFts,
+      ftsColumns: _previousFts,
       secondaryIndexes: previousSecondary,
       triggers: previousTriggers,
       view: previousView,
       foreignKeys: previousForeignKeys,
       ...base
     } = record;
-    let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
-    let nextSecondary =
-      update.secondaryIndexes === undefined ? previousSecondary : update.secondaryIndexes;
-    const retainedColumnIds =
-      update.columns === undefined
-        ? undefined
-        : new Set(update.columns.map(({ id: columnId }) => columnId));
-    if (nextFts !== null && nextFts !== undefined && retainedColumnIds !== undefined) {
-      nextFts = Object.fromEntries(
-        Object.entries(nextFts).filter(([columnId]) => retainedColumnIds.has(columnId)),
-      );
-      if (Object.keys(nextFts).length === 0) nextFts = null;
-    }
-    if (nextSecondary !== null && nextSecondary !== undefined && retainedColumnIds !== undefined) {
-      nextSecondary = Object.fromEntries(
-        Object.entries(nextSecondary).filter(([, index]) =>
-          secondaryIndexColumnIds(index).every((columnId) => retainedColumnIds.has(columnId)),
-        ),
-      );
-      if (Object.keys(nextSecondary).length === 0) nextSecondary = null;
-    }
+    void _previousFts;
+    const { nextFts, nextSecondary, retainedColumnIds } = planTableAccelerators(record, update);
     const nextIndexNames = new Set<string>();
     for (const index of Object.values(nextSecondary ?? {})) {
       if (nextIndexNames.has(index.name))
@@ -4105,17 +4092,17 @@ export class RecordCore {
       }
     }
     assertTransactionArtifactBatchLimits(input.blocks, input.segments);
-    const blockIds = new Set<string>();
+    const blocks = new Map<string, WriteTransactionInput["blocks"][number]>();
     for (const block of input.blocks) {
       validateId(block.id);
       validateBlockWriteBytes(block.bytes);
-      if (blockIds.has(block.id)) throw new Error(`Block already exists: ${block.id}`);
+      if (blocks.has(block.id)) throw new Error(`Block already exists: ${block.id}`);
       if (options.blocksPrevalidated !== true) {
         if (this.#physical.hasBlock(block.id)) {
           throw new Error(`Block already exists: ${block.id}`);
         }
       }
-      blockIds.add(block.id);
+      blocks.set(block.id, block);
     }
     const segments = new Map<string, SegmentRecord>();
     for (const segment of input.segments) {
@@ -4155,7 +4142,7 @@ export class RecordCore {
       }
       base = current;
     }
-    const pendingBlockIds = [...base.pendingBlockIds, ...blockIds];
+    const pendingBlockIds = [...base.pendingBlockIds, ...blocks.keys()];
     const pendingSegmentIds = [...base.pendingSegmentIds, ...segments.keys()];
     let segmentIndex = 0;
     for (const segment of segments.values()) {
@@ -4201,15 +4188,15 @@ export class RecordCore {
     const commit = this.#planCommit(
       staged,
       input,
-      (id) => blockIds.has(id) || this.#physical.hasBlock(id),
+      (id) => blocks.has(id) || this.#physical.hasBlock(id),
       (id) =>
         options.blockByteLengths?.get(id) ??
-        input.blocks.find((block) => block.id === id)?.bytes.byteLength ??
+        blocks.get(id)?.bytes.byteLength ??
         this.#physical.blockByteLength(id),
       (id) => {
         const persisted = options.blockChecksums?.get(id);
         if (persisted !== undefined) return persisted;
-        const block = input.blocks.find((candidate) => candidate.id === id);
+        const block = blocks.get(id);
         return block === undefined ? this.#physical.blockChecksum?.(id) : crc32(block.bytes);
       },
       (id) => segments.get(id) ?? this.#segments.get(id),
@@ -4231,15 +4218,8 @@ export class RecordCore {
     blockChecksum: (id: string) => number | undefined,
     getSegment: (id: string) => SegmentRecord | undefined,
   ): CommitPlan {
-    if (transaction.schemaEpochGuard !== this.#schemaEpoch) {
-      throw new SchemaConflictError(transaction.schemaEpochGuard ?? -1, this.#schemaEpoch);
-    }
-    if (this.#currentVersion !== input.expectedManifestVersion) {
-      throw new WriteConflictError(input.expectedManifestVersion, this.#currentVersion);
-    }
-    if (transaction.snapshotVersion !== input.expectedManifestVersion) {
-      throw new Error("Transaction snapshot does not match the expected manifest");
-    }
+    assertCommitSchema(transaction, this.#schemaEpoch);
+    assertCommitSnapshot(transaction, input.expectedManifestVersion, this.#currentVersion);
     const pendingTable = transaction.pendingTable;
     if (pendingTable !== undefined) {
       if (transaction.catalogEpochGuard !== this.#catalogEpoch) {
@@ -4427,42 +4407,13 @@ export class RecordCore {
         pendingSegments,
       );
     }
-    const pendingLevelZeroCounts = new Map<string, number>();
-    for (const segment of pendingSegments) {
-      if (segment.level !== 0) continue;
-      pendingLevelZeroCounts.set(
-        segment.tableId,
-        (pendingLevelZeroCounts.get(segment.tableId) ?? 0) + 1,
-      );
-    }
-    const pendingLevelZeroTables = new Set(pendingLevelZeroCounts.keys());
-    const levelZeroLimits = new Map<string, number>();
-    for (const entry of input.levelZeroSegmentLimits ?? []) {
-      validateId(entry.tableId);
-      if (
-        !Number.isSafeInteger(entry.limit) ||
-        entry.limit <= 0 ||
-        entry.limit > MAX_LEVEL_ZERO_SEGMENTS
-      ) {
-        throw new RangeError(
-          `Level-zero segment limit must be between 1 and ${String(MAX_LEVEL_ZERO_SEGMENTS)}`,
-        );
-      }
-      if (levelZeroLimits.has(entry.tableId)) {
-        throw new TypeError(`Duplicate level-zero segment limit for table: ${entry.tableId}`);
-      }
-      levelZeroLimits.set(entry.tableId, entry.limit);
-    }
-    if (
-      levelZeroLimits.size !== pendingLevelZeroTables.size ||
-      [...pendingLevelZeroTables].some((tableId) => !levelZeroLimits.has(tableId)) ||
-      [...levelZeroLimits].some(([tableId]) => !pendingLevelZeroTables.has(tableId))
-    ) {
-      throw new TypeError("Level-zero segment limits must exactly cover pending level-zero tables");
-    }
-    if (pendingLevelZeroTables.size > 0) {
+    const levelZeroAdmissions = planLevelZeroAdmissions(
+      input.levelZeroSegmentLimits ?? [],
+      pendingSegments,
+    );
+    if (levelZeroAdmissions.size > 0) {
       const visibleCounts = new Map<string, number>();
-      for (const tableId of pendingLevelZeroTables) {
+      for (const tableId of levelZeroAdmissions.keys()) {
         for (const segment of this.#segments.tableValues(tableId)) {
           if (segment.level !== 0) continue;
           const owner = this.#transactions.get(segment.transactionId);
@@ -4477,18 +4428,17 @@ export class RecordCore {
           visibleCounts.set(tableId, (visibleCounts.get(tableId) ?? 0) + 1);
         }
       }
-      for (const tableId of pendingLevelZeroTables) {
-        const count =
-          (visibleCounts.get(tableId) ?? 0) + (pendingLevelZeroCounts.get(tableId) ?? 0);
-        const limit = levelZeroLimits.get(tableId);
+      for (const [tableId, entry] of levelZeroAdmissions) {
+        const count = (visibleCounts.get(tableId) ?? 0) + entry.added;
         const table =
           this.#tables.get(tableId) ?? (pendingTable?.id === tableId ? pendingTable : undefined);
-        if (limit === undefined || table === undefined) {
+        if (table === undefined) {
           throw new Error(`Level-zero segment limit references missing table: ${tableId}`);
         }
-        if (count > limit) throw new CompactionBacklogError(table.name, count, limit);
+        if (count > entry.limit) throw new CompactionBacklogError(table.name, count, entry.limit);
       }
     }
+
     const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
     const ftsChanges = validateFtsChangesRuntime(input.ftsChanges);
     transactionCommitDeltaRetainedBytes(uniqueKeyEntries, ftsChanges);
@@ -4637,8 +4587,7 @@ export class RecordCore {
         tokens = new OrderedStringSet();
         this.#uniqueKeys.set(tableId, tokens);
       }
-      for (const token of delta.removed) tokens.delete(token);
-      tokens.addMany(delta.added);
+      tokens.applyDelta(delta.added, delta.removed);
     }
     this.#applyFtsChanges(
       pendingSegments,

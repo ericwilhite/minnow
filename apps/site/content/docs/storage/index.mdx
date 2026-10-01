@@ -14,8 +14,9 @@ for another changes nothing else about your code.
 | [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage/memory`    | No                | Tests, scratch work, throwaway analysis.           |
 
 The two durable adapters hold the same block format, and a [snapshot](/docs/storage/snapshots)
-moves a database between them. OPFS is usually faster for small reads and writes; use the
-[benchmarks page](/benchmarks) to measure both in your browser. Where OPFS is unavailable — notably
+moves a database between them. OPFS uses synchronous file access in a worker, while IndexedDB
+uses browser transactions. Their relative speed depends on the workload and browser; use the
+[benchmarks page](/benchmarks) to measure both. Where OPFS is unavailable — notably
 Safari private browsing — use IndexedDB, which remains the default.
 
 Both durable adapters default to strict per-commit flushing. Browser quota eviction is a separate

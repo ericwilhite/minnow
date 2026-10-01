@@ -22,9 +22,10 @@ export default function BenchmarksPage() {
         </p>
         <p className="mt-3 text-fd-muted-foreground">
           Reads and writes stay split by OLTP and OLAP throughout, because a blended score hides the
-          trade-off: Minnow leads on scans and bulk loads, SQLite leads on single-key lookups and
-          small writes. Every result is checked against an independent oracle before its timing
-          counts, and an engine that got the wrong answer reports no number at all.
+          trade-off: selective lookups, scans, bulk loads, and small writes can favor different
+          engines. Performance depends on the workload and browser. Every result is checked against
+          an independent oracle before its timing counts, and an engine that got the wrong answer
+          reports no number at all.
         </p>
       </header>
 
@@ -39,15 +40,19 @@ export default function BenchmarksPage() {
           back out of one of them.
         </p>
         <p className="mb-2">
-          Every engine runs its shipped defaults — no pragmas, no tuning. Each database persists to
-          the storage its own documentation recommends, named per engine above and reported exactly
-          as the engine installed it once a run has finished. The workload declares the same primary
-          keys and foreign-key secondary indexes for all engines. Bulk inserts and post-load index
-          builds are reported separately, so an index cannot make a read faster by hiding its build
-          cost in the load number. Choose primary keys only to measure the same workload without
-          those secondary indexes. The storage table separates table data from index bytes. Only the
-          engine&rsquo;s own call is timed; reshaping rows into the form each API wants is the
-          harness&rsquo;s cost and is excluded.
+          The harness uses matching declared indexes and leaves query-planner and memory settings at
+          their shipped defaults. SQLite runs PRAGMA optimize after loading. Minnow uses gzip blocks
+          and relaxed durability; PGlite uses relaxed reads and strict writes, while SQLite keeps
+          its default durability. These storage costs differ, so the timings are not isolated
+          executor costs. Each database persists to the storage its own documentation recommends,
+          named per engine above and reported exactly as the engine installed it once a run has
+          finished. The workload declares the same primary keys and foreign-key secondary indexes
+          for all engines. Bulk inserts and post-load index builds are reported separately, so an
+          index cannot make a read faster by hiding its build cost in the load number. Choose
+          primary keys only to measure the same workload without those secondary indexes. The
+          storage table separates table data from index bytes. Only the engine&rsquo;s own call is
+          timed; reshaping rows into the form each API wants is the harness&rsquo;s cost and is
+          excluded.
         </p>
         <p className="mb-2">
           All comparison engines already run in the benchmark&rsquo;s dedicated web worker. The read
@@ -57,12 +62,11 @@ export default function BenchmarksPage() {
           the behavior it measures.
         </p>
         <p className="mb-2">
-          Timings are taken by the batch. The browser&rsquo;s clock ticks every 5µs on this page and
-          every 100µs on an origin that is not cross-origin isolated, which is coarser than most of
-          what is measured here — so anything quicker than the clock is executed many times inside
-          one timed window and divided back down. A lookup that costs 150µs is reported as 150µs
-          rather than rounded to the nearest tick, which is what made every fast case look
-          identical.
+          Timings are taken by the batch. Clock resolution varies by browser and origin isolation,
+          so fast reads are repeated inside a timed window and divided by the execution count. Each
+          cell reports the median of those windows after an untimed warm-up. Cached repeats are
+          labeled separately. The live suite measures only Minnow’s implemented subscription
+          drivers; PGlite’s live-query extension is not measured here.
         </p>
         <p>
           Running a suite writes real data to your browser&rsquo;s storage for this origin. Use one

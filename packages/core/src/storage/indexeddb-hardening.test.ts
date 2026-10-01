@@ -38,6 +38,7 @@ import {
   MAX_TRANSACTION_STAGE_BLOCKS,
   MAX_TRANSACTION_STAGE_SEGMENTS,
   SchemaConflictError,
+  WriteConflictError,
   SnapshotImportConflictError,
   StorageCorruptionError,
   StorageResourceLimitError,
@@ -811,6 +812,100 @@ async function readManifestBlockIds(
 }
 
 describe("IndexedDB corruption hardening", () => {
+  it("queues independent commit reads together and keeps refusal atomic", async () => {
+    const store = await openStore(new IDBFactory());
+    await store.addTable({
+      id: "events",
+      name: "events",
+      managed: false,
+      revision: 0,
+      createdAt: NOW,
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+    });
+    await store.createTransaction(activeTransaction("batched-owner", null));
+    const staged = await store.stageTransactionArtifacts({
+      transactionId: "batched-owner",
+      expectedRevision: 0,
+      blocks: [{ id: "batched-block", bytes: Uint8Array.of(7) }],
+      segments: [segment("batched-segment", "batched-owner", "batched-block")],
+      updatedAt: NOW,
+    });
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Native receiver supplied below.
+    const originalGet = IDBObjectStore.prototype.get;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Native receiver supplied below.
+    const originalGetKey = IDBObjectStore.prototype.getKey;
+    let schemaPending = false,
+      blockPending = false;
+    let parallelCatalog = false,
+      parallelArtifacts = false;
+    const getKey = vi.spyOn(IDBObjectStore.prototype, "getKey").mockImplementation(function (
+      this: IDBObjectStore,
+      key,
+    ) {
+      const request = originalGetKey.call(this, key);
+      if (
+        this.name === "blocks" &&
+        key === "batched-block" &&
+        this.transaction.mode === "readwrite"
+      ) {
+        blockPending = true;
+        request.addEventListener(
+          "success",
+          () => {
+            blockPending = false;
+          },
+          { once: true },
+        );
+      }
+      return request;
+    });
+    const get = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (
+      this: IDBObjectStore,
+      key,
+    ) {
+      const request = originalGet.call(this, key);
+      if (this.transaction.mode === "readwrite") {
+        if (this.name === "catalog" && key === "catalog/schema-epoch") {
+          schemaPending = true;
+          request.addEventListener(
+            "success",
+            () => {
+              schemaPending = false;
+            },
+            { once: true },
+          );
+        }
+        if (this.name === "catalog" && key === "manifest/current")
+          parallelCatalog ||= schemaPending;
+        if (this.name === "segments" && key === "batched-segment")
+          parallelArtifacts ||= blockPending;
+      }
+      return request;
+    });
+    try {
+      const commit = {
+        transactionId: staged.id,
+        expectedTransactionRevision: staged.revision,
+        expectedManifestVersion: null,
+        committedAt: NOW,
+        levelZeroSegmentLimits: [{ tableId: "events", limit: 1 }],
+      } as const;
+      await expect(
+        store.commitTransaction({ ...commit, expectedManifestVersion: 100 }),
+      ).rejects.toBeInstanceOf(WriteConflictError);
+      expect(await store.getTransaction(staged.id)).toEqual(staged);
+      expect(await store.getCurrentManifestVersion()).toBeNull();
+      expect(await store.getBlock("batched-block")).toEqual(Uint8Array.of(7));
+      expect((await store.commitTransaction(commit)).version).toBe(0);
+      expect(parallelCatalog).toBe(true);
+      expect(parallelArtifacts).toBe(true);
+    } finally {
+      get.mockRestore();
+      getKey.mockRestore();
+      store.close();
+    }
+  });
+
   it("persists structural epochs and rejects an old-schema journal after reopen", async () => {
     const indexedDB = new IDBFactory();
     const name = "schema-epoch-reopen";

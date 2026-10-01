@@ -44,6 +44,32 @@ async function open(factory: () => Promise<BlockStore>, options = {}) {
 
 for (const adapter of stores)
   describe(adapter.name, () => {
+    it("preserves callback receivers through catalog and prepared-query ownership", async () => {
+      const store = await adapter.open();
+      const instant = Date.parse("2026-09-30T12:00:00.000Z");
+      let nextId = 0;
+      const db = new MinnowDatabase(store, {
+        autoCollect: false,
+        autoCompact: false,
+        now: function (this: unknown) {
+          return new Date(instant + (this instanceof MinnowDatabase ? 0 : 60_000));
+        },
+        createId: function (this: unknown) {
+          return `${this instanceof MinnowDatabase ? "database" : "other"}-id-${String(nextId++)}`;
+        },
+      });
+      cleanup.push(async () => {
+        await db.close();
+        store.close();
+      });
+      await db.createTable({ name: "callbacks", columns: [{ name: "value", type: "number" }] });
+      const table = await store.getTableByName("callbacks");
+      expect(table?.id).toMatch(/^database-id-/);
+      expect(table?.createdAt).toBe(new Date(instant).toISOString());
+      const result = await db.query("SELECT CURRENT_TIMESTAMP AS value", { spillToStorage: true });
+      expect(result.rows).toEqual([{ value: new Date(instant) }]);
+    });
+
     it("keeps timed-out SQL transactions failed until explicit acknowledgement", async () => {
       let now = Date.parse("2026-09-06T12:00:00.000Z");
       const { db } = await open(adapter.open, {

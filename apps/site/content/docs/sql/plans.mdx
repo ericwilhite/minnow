@@ -144,7 +144,8 @@ await db.query(sql, {
 ```
 
 The [benchmarks page](/benchmarks) runs the full read and write suites against SQLite WASM and
-PGlite in your own browser, on a dataset size you pick. Its `Minnow (client)` columns time the
-same reads through `MinnowDatabaseClient` over the worker channel, and its live-query suite times
-a commit until every affected subscription has been notified — the costs an application pays on
-top of execution.
+PGlite in your own browser, on a dataset size you pick. Read columns measure engine execution
+inside the benchmark worker, with optional cached repeats shown separately. The live-query suite
+uses `MinnowDatabaseClient` and times a commit until every affected subscription has been notified,
+including notification delivery across the worker channel. Only Minnow’s subscription drivers
+are implemented in this harness.

@@ -5,7 +5,7 @@ description: One major across every package, what a version change means, and ho
 
 Every Minnow package shares a major version and moves independently inside it. Each adapter names
 the oldest engine it can use and accepts later engines inside that shared major. For example, the
-current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.6.8 up to, but not including,
+current `@minnowdb/kysely` release accepts `@minnowdb/core` from 0.9.0 up to, but not including,
 1.0.0. The same rule covers the export and devtools packages; the React hook is structurally typed
 and has no engine runtime dependency.
 
@@ -18,7 +18,7 @@ APIs from working is a major change, so each package depends on its siblings by 
 the major and stops at it:
 
 ```json
-"dependencies": { "@minnowdb/core": ">=0.6.8 <1.0.0" }
+"dependencies": { "@minnowdb/core": ">=0.9.0 <1.0.0" }
 ```
 
 The ceiling is the compatibility line, and npm refuses a mixed-major install on its own. The floor
@@ -146,7 +146,7 @@ Run the full local gate and open a pull request on a release branch:
 ```bash
 npm run check:release   # fullest local gate; CI splits release checks across workflows
 # Stage the reviewed changes, then:
-git commit -m "Release core 0.12.0 and devtools 0.3.4"
+git commit -m "Prepare core 0.12.1"
 git push -u origin HEAD
 ```
 

@@ -161,7 +161,7 @@ export function BenchRunner() {
           setResults({ ...next });
         }
         // Last, because it registers subscriptions and commits through the worker client on
-        // the same storage; a Wasm engine in the selection is reported as having no live layer.
+        // the same storage; engines without a harness subscription driver are reported as unmeasured.
         if (suites.includes("live")) {
           const task = client.start<LiveSuiteResult>(
             "suiteLive",
