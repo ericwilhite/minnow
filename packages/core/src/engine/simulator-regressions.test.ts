@@ -10,6 +10,7 @@ import {
   PostingBuildConflictError,
   type CompactionJobRecord,
   GarbageCollectionJobConflictError,
+  SchemaConflictError,
 } from "../storage/types.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import {
@@ -341,6 +342,147 @@ describe.each(stores)("index pruning keeps every delete on $name", ({ open }) =>
 describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
   "compaction planning races on $name",
   ({ create }) => {
+    it.each([false, true])(
+      "refuses a concurrently aborted compaction with revision evidence without hiding I/O (fault=%s)",
+      async (fault) => {
+        const store = await create();
+        const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        let restoreReading: (() => void) | undefined;
+        try {
+          await owner.execute("CREATE TABLE events(value INTEGER)");
+          for (let value = 1; value <= 4; value += 1) await owner.insert("events", { value });
+          const partial = await owner.compactTableStep("events", {
+            maxBlocks: 1,
+            targetBlockBytes: 9,
+            outputCompression: "raw",
+          });
+          if (partial.jobId === null) throw new Error("Expected a persisted job");
+          const before = await store.getCompactionJob(partial.jobId);
+          const get = store.getCompactionJob.bind(store);
+          const failure = new Error("reading the concurrently aborted job failed");
+          let armed = true;
+          let failNext = false;
+          const reading = vi.spyOn(store, "getCompactionJob").mockImplementation(async (id) => {
+            if (failNext) {
+              failNext = false;
+              throw failure;
+            }
+            const stale = await get(id);
+            if (armed && id === partial.jobId) {
+              armed = false;
+              await owner.execute("CREATE TABLE moved(marker INTEGER)");
+              await expect(owner.resumeCompactionJob(id, { maxBlocks: 64 })).rejects.toBeInstanceOf(
+                SchemaConflictError,
+              );
+              failNext = fault;
+            }
+            return stale;
+          });
+          restoreReading = () => reading.mockRestore();
+          const resumed = contender.resumeCompactionJob(partial.jobId, { maxBlocks: 64 });
+          if (fault) await expect(resumed).rejects.toBe(failure);
+          else {
+            await expect(resumed).rejects.toBeInstanceOf(CompactionJobConflictError);
+            await expect(resumed).rejects.toMatchObject({
+              name: "CompactionJobConflictError",
+              jobId: partial.jobId,
+              expectedRevision: before?.revision,
+              actualRevision: (await get(partial.jobId))?.revision,
+            });
+          }
+          reading.mockRestore();
+          await expect(contender.resumeCompactionJob(partial.jobId)).rejects.toThrow(
+            "Schema changed during compaction",
+          );
+          expect(await contender.compactTable("events", { maxBlocksPerStep: 64 })).toMatchObject({
+            compacted: true,
+            rowCount: 4,
+          });
+          expect((await contender.query("SELECT SUM(value) AS total FROM events")).rows).toEqual([
+            { total: 10 },
+          ]);
+        } finally {
+          restoreReading?.();
+          await Promise.all([owner.close(), contender.close()]);
+          store.close();
+        }
+      },
+    );
+
+    it("replans automatic compaction when another tab aborts its yielded job after DDL", async () => {
+      // WebKit full campaign seed 2779093776: another coordinator abandoned the shared fold
+      // after its schema guard failed between this driver's bounded steps.
+      const store = await create();
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const reports: unknown[] = [];
+      let database: MinnowDatabase | undefined;
+      let restoreStepping: (() => void) | undefined;
+      let raced = false;
+      try {
+        await owner.execute(
+          "CREATE TABLE events(a INTEGER, b INTEGER, c INTEGER, d INTEGER, e INTEGER, f INTEGER)",
+        );
+        for (let value = 1; value <= 48; value += 1) {
+          await owner.insert("events", {
+            a: value,
+            b: value,
+            c: value,
+            d: value,
+            e: value,
+            f: value,
+          });
+        }
+        database = new MinnowDatabase(store, {
+          autoCollect: false,
+          onBackgroundError: (error) => reports.push(error),
+        });
+        const step = database.compactTableStep.bind(database);
+        const stepping = vi
+          .spyOn(database, "compactTableStep")
+          .mockImplementation(async (...args) => {
+            const progress = await step(...args);
+            if (!raced && progress.result === null && progress.jobId !== null) {
+              raced = true;
+              await owner.execute("CREATE TABLE moved(marker INTEGER)");
+              await expect(
+                owner.resumeCompactionJob(progress.jobId, { maxBlocks: 64 }),
+              ).rejects.toBeInstanceOf(SchemaConflictError);
+              expect(await store.getCompactionJob(progress.jobId)).toMatchObject({
+                state: "aborted",
+                publishedVersion: null,
+              });
+            }
+            return progress;
+          });
+        restoreStepping = () => stepping.mockRestore();
+        await database.insert("events", { a: 49, b: 49, c: 49, d: 49, e: 49, f: 49 });
+        await vi.waitFor(
+          async () => {
+            expect(raced).toBe(true);
+            expect(
+              (await store.listCompactionJobs()).some((job) => job.state === "published"),
+            ).toBe(true);
+          },
+          { timeout: 10_000 },
+        );
+        expect(reports).toEqual([]);
+        expect(
+          (await database.query("SELECT COUNT(*) AS n, SUM(a) AS total FROM events")).rows,
+        ).toEqual([{ n: 49, total: 1225 }]);
+        await database.close();
+        database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+        expect(
+          (await database.query("SELECT COUNT(*) AS n, SUM(a) AS total FROM events")).rows,
+        ).toEqual([{ n: 49, total: 1225 }]);
+      } finally {
+        restoreStepping?.();
+        await database?.close();
+        await owner.close();
+        store.close();
+      }
+    });
+
     it.each([
       ["published", false],
       ["published", true],

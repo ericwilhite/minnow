@@ -6840,7 +6840,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         while (progress.result === null) {
           if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
           await this.#yieldMaintenance();
-          progress = await this.resumeCompactionJob(progress.jobId, options);
+          // Another tab can abandon this shared job after a schema change while we yield.
+          // Select active work again, so an aborted job is replaced rather than resumed.
+          progress = await this.compactTableStep(table.name, options);
         }
       } catch (error) {
         // A table removed by another writer cancels its scheduled fold. Unexpected I/O and
@@ -17809,7 +17811,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<CompactionJobProgress> {
     let job = (await this.store.getCompactionJob(initialJob.id)) ?? initialJob;
     if (job.state === "cancelled") throw new CompactionJobCancelledError(job.id);
-    if (job.state === "aborted") throw new Error(job.error ?? `Compaction job aborted: ${job.id}`);
+    if (job.state === "aborted") {
+      // An active selection can be abandoned by another coordinator before this fresh read.
+      // Preserve revision evidence for that refusal; explicitly resuming an already aborted
+      // job still reports its recorded failure. Storage reads and unexpected I/O propagate.
+      if (isActiveCompactionState(initialJob.state) && job.revision !== initialJob.revision) {
+        throw new CompactionJobConflictError(job.id, initialJob.revision, job.revision);
+      }
+      throw new Error(job.error ?? `Compaction job aborted: ${job.id}`);
+    }
     if (job.state === "published") {
       return this.#publishedCompactionProgress(table, job);
     }

@@ -115,6 +115,12 @@ The store atomically admits only one non-terminal compaction for a table, so two
 plan step converge on the same durable job instead of creating parallel roots.
 Planning reads stay outside the writer turn; job registration takes a short turn alongside DDL.
 A resumer reconciles replaced sources only after confirming that the durable job advanced.
+
+Background compaction reselects active work after each yield. If another tab abandons a fold
+after a schema change, the next step plans against the current schema. A job abandoned between
+selection and execution reports a `CompactionJobConflictError` with its ID and changed revision.
+Explicitly resuming an already aborted job still reports its recorded failure; unexpected I/O
+and corruption remain errors.
 Resuming a ready job preserves its publication readiness. Automatic folds retry schema conflicts
 within the write retry limit and stop cleanly when another tab drops the table or cancels the job.
 Unexpected I/O failures still reach the caller or background diagnostic hook, including failures

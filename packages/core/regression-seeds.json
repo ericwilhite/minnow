@@ -13,7 +13,8 @@
     "Base 24 WebKit seed 3084996987 independently exposed invalid manifest checkpoints and closing an already-failed worker client.",
     "Seed 1349451771 exposed a fault-coverage gap: every randomized fault targeted a missing row, so no storage write hook fired.",
     "Base 38 Chromium seed 2654435807 exposed a collector finishing and pruning a job between another collector's conflict and reread; reduced in simulator-regressions.test.ts.",
-    "The full Chromium, Firefox and WebKit campaign seeds exposed compaction planning/publication races; deterministic three-store reductions are in simulator-regressions.test.ts."
+    "The full Chromium, Firefox and WebKit campaign seeds exposed compaction planning/publication races; deterministic three-store reductions are in simulator-regressions.test.ts.",
+    "WebKit full seed 2779093776 also exposed automatic compaction resuming a shared job another tab had aborted after DDL; the three-store reduction checks fresh planning, changed revision evidence, I/O propagation and reopening."
   ],
   "suites": {
     "sql-conformance": [12648430],

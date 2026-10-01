@@ -26,6 +26,11 @@ Release packages: `@minnowdb/core@0.12.1`.
   waiting for each request group separately. Validation, checksums, and atomic publication
   remain in place.
 
+- Automatic compaction reselects active work after yielding, so another tab's schema change
+  can abandon a stale fold without causing an untyped background failure. A job abandoned
+  between selection and execution reports its job ID and changed revision. Explicitly resuming
+  an already aborted job still reports its recorded failure, and unexpected I/O still propagates.
+
 - Documentation and benchmark labels now distinguish measured downloads from worker bundles,
   identify comparison-driver coverage, and describe competitors’ live queries, multi-tab access,
   and persistence accurately. Broad performance claims are replaced with workload-specific guidance.
