@@ -19,7 +19,11 @@ await db.compactTable("orders");
 
 It runs automatically by default: a scan or a run of commits that finds a table past the
 threshold plans a fold and drives it to publication in small steps, yielding between them, and
-keeps going while the table is still due. A step yields to the event loop or to this database's
+keeps going while the table is still due. A table is due when it has many small segments, many
+delete, update, or upsert segments, or deltas that together hold as many rows as the data they
+change (once they pass a few thousand rows). The last rule is for tables refreshed wholesale:
+each full-table upsert adds another copy of every row, and folding after the second keeps a
+scan to about three reads per row instead of more than thirty. A step yields to the event loop or to this database's
 next commit, whichever comes first, so a loop that awaits one statement after another without
 pausing still lets the fold advance. A fold reads and decodes its source blocks in groups sized
 by its memory budget, so a step costs the loop a turn per group rather than a turn per block. A
@@ -89,20 +93,37 @@ await db.compactTable("orders", { partitionRows: 4096 });
 const db = new MinnowDatabase(store, { compaction: { partitionRows: 4096 } });
 ```
 
-Merging a keyed table plans the merge in memory proportional to its deltas, not its rows, and
-every output block is measured against a memory budget before it is written. The default budget
-is 32 MiB; raise it with `memoryBudgetBytes` when a compaction reports
-`CompactionMemoryBudgetError`:
+Merging a keyed table plans the merge in memory proportional to the distinct keys its deltas
+touch. The table's size, how many times those keys were rewritten, and how wide the rows are do
+not add to it, so eighty refreshes of the same seven thousand rows cost seven thousand keys.
+Every output block is measured against a memory budget before it is written. The default budget
+is 32 MiB. An explicit `compactTable` or `compactTableStep` that needs more reports
+`CompactionMemoryBudgetError`; raise it with `memoryBudgetBytes`:
 
 ```ts
 await db.compactTable("orders", { memoryBudgetBytes: 256 * 1024 * 1024 });
 ```
 
-Automatic compaction backs off a table whose attempt fails, rather than retrying it on every
-query. The backoff is in segments and in time: the count the table must reach again is capped at
-the largest level-zero prefix one fold consumes, and the wait doubles from a quarter of a second
-per consecutive failure up to a minute, after which the table is re-checked without waiting for
-another write. A threshold crossed while another fold is running is queued. Writes are sampled
+Automatic compaction needs no setting. It sizes each fold to the budget: a fold that does not
+fit is cut to fewer level-zero segments and planned again, and the table's next fold starts from
+the size that fit. When even the smallest fold the table allows does not fit, automatic
+compaction gives that one fold the memory it needs — about what the writes that produced it
+already held — rather than leaving the table to slow every read.
+
+One kind of fold is too costly to run in the background: upserts that replace many rows in an
+order unrelated to the table's own. Each replaced row then needs its own source range for every
+column, and the job record holding those ranges is read and rewritten on every step. Past a
+fixed allowance, automatic compaction refuses the fold with `CompactionPlanTooFragmentedError`,
+reports it to `onBackgroundError` (`onWorkerError` on a worker client), and tries again after
+its backoff. Upserting rows in the order the table already has them — the order a plain
+`SELECT *` returns — keeps these folds cheap. `compactTable` folds the table either way.
+
+Automatic compaction backs off a table whose attempt does not help, rather than retrying it on
+every query. A fold that fails waits a delay that doubles from a quarter of a second per
+consecutive failure up to a minute, then runs again whether or not anything was written. A fold
+compaction declines because the table's layout or keys put it out of reach also waits for the
+table to reach twice its segment count, capped at the largest level-zero prefix one fold
+consumes. A threshold crossed while another fold is running is queued. Writes are sampled
 during a burst and its final tail is checked after a short quiet period, so the last writes cannot
 leave a table permanently above the fold threshold.
 

@@ -8,6 +8,43 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.12.2 — October 1, 2026
+
+Release packages: `@minnowdb/core@0.12.2`.
+
+- Automatic compaction no longer stalls on keyed tables with wide rows. Planning a fold now
+  takes memory in proportion to the distinct keys its deltas touch, so refreshing the same rows
+  again and again fits the default 32 MiB budget however wide they are. Before, every delta row
+  was charged once per column: two full refreshes of seven thousand forty-column rows already
+  overran the budget, every automatic attempt failed, and segments piled up until reads took
+  seconds.
+
+- Automatic folds fit themselves to the memory budget, with no new option. A fold that does not
+  fit is cut to fewer level-zero segments and planned again, and the table's next fold starts
+  from the size that fit. When even the smallest fold a table allows does not fit, that fold is
+  given the memory it needs. A failed attempt now backs off on time alone; it no longer waits
+  for the table to double its segment count, which an idle table never did.
+
+- Deltas that hold as many rows as the data they change, once past 4,096 rows, now schedule a
+  fold. A table refreshed wholesale folds after about two refreshes instead of thirty-two, so a
+  scan reads each row about three times at most rather than more than thirty.
+
+- Automatic compaction refuses a fold whose plan would need a source range for every replaced
+  cell — upserts replacing many rows in an order unrelated to the table's — and reports
+  `CompactionPlanTooFragmentedError` to `onBackgroundError` (`onWorkerError` on a worker client).
+  Running such a plan would hold the database up on every step. Upserting in the table's own
+  order avoids it, and `compactTable` still folds the table on request.
+
+- Automatic compaction reselects active work after yielding, so another tab's schema change
+  can abandon a stale fold without causing an untyped background failure. A job abandoned
+  between selection and execution reports its job ID and changed revision. Explicitly resuming
+  an already aborted job still reports its recorded failure, and unexpected I/O still propagates.
+
+**Migration and stored formats:** no application or data migration is needed. Public APIs,
+block format 2, snapshot format 1, IndexedDB schema 2, and OPFS layout 7 are unchanged, and a
+compaction job planned by an older version resumes and publishes as planned. Automatic upgrades
+from the supported older formats remain in place.
+
 ## 0.12.1 — October 1, 2026
 
 Release packages: `@minnowdb/core@0.12.1`.
@@ -25,11 +62,6 @@ Release packages: `@minnowdb/core@0.12.1`.
   each referenced block. IndexedDB queues independent commit reads together instead of
   waiting for each request group separately. Validation, checksums, and atomic publication
   remain in place.
-
-- Automatic compaction reselects active work after yielding, so another tab's schema change
-  can abandon a stale fold without causing an untyped background failure. A job abandoned
-  between selection and execution reports its job ID and changed revision. Explicitly resuming
-  an already aborted job still reports its recorded failure, and unexpected I/O still propagates.
 
 - Documentation and benchmark labels now distinguish measured downloads from worker bundles,
   identify comparison-driver coverage, and describe competitors’ live queries, multi-tab access,

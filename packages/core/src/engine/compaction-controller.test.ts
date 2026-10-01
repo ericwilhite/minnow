@@ -97,3 +97,48 @@ it("does not recreate dropped-table retries when an admitted fold fails later", 
   expect(vi.getTimerCount()).toBe(0);
   controller.stop();
 });
+
+it("retries a failed fold on time alone but holds a declined one until the table grows", async () => {
+  vi.useFakeTimers();
+  let outcome: "fail" | "decline" = "fail";
+  const run = vi.fn(async () => {
+    if (outcome === "fail") throw new Error("transient read");
+    return false;
+  });
+  const visible = { t: 48 };
+  const controller: CompactionController = new CompactionController({
+    enabled: true,
+    maximumLevelZeroSegments: 256,
+    dropping: () => false,
+    run,
+    check: async () => {
+      controller.schedule(table, visible.t);
+    },
+    yield: async () => undefined,
+    report: vi.fn(),
+  });
+
+  // A failure retries once its delay passes, though the table has not grown at all: an idle
+  // table must not wait for writes that may never come.
+  controller.schedule(table, visible.t);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(controller.retryPending("t")).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(2);
+
+  // A declined fold is held until the table doubles, whatever the timer says.
+  outcome = "decline";
+  await vi.advanceTimersByTimeAsync(500);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(60_000);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(3);
+  visible.t = 96;
+  controller.schedule(table, visible.t);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(4);
+  controller.stop();
+});

@@ -93,7 +93,7 @@ export class CompactionController {
       })
       .catch((error: unknown) => {
         this.ports.report(error, `automatic compaction for ${table.name}`);
-        if (!this.#cancelledRuns.has(run)) this.backOff(table.id, visible);
+        if (!this.#cancelledRuns.has(run)) this.backOff(table.id, visible, "failed");
       })
       .finally(() => {
         if (this.#runs.get(table.id) === run) this.#runs.delete(table.id);
@@ -110,7 +110,15 @@ export class CompactionController {
       });
     this.#runs.set(table.id, run);
   }
-  backOff(id: string, visible: number): void {
+  /**
+   * Holds a table's folds off after one that did not help. A fold compaction declined — the
+   * layout or the keys put it out of reach — is retried once the table has grown well past
+   * where it was declined, since nothing short of more segments changes the answer. A fold
+   * that failed is retried on time alone: what failed it (a lost turn, a transient read) does
+   * not depend on how many segments the table has, and an idle table must not wait forever
+   * for writes that never come. Either way the retry delay grows with each consecutive miss.
+   */
+  backOff(id: string, visible: number, outcome: "declined" | "failed" = "declined"): void {
     if (this.#stopped) return;
     const failures = (this.#backoff.get(id)?.failures ?? 0) + 1;
     this.#clearBackoff(id);
@@ -126,7 +134,10 @@ export class CompactionController {
     this.#backoff.set(id, {
       failures,
       retryTimer: timer,
-      minimumSegments: Math.min(this.ports.maximumLevelZeroSegments, Math.max(2, visible * 2)),
+      minimumSegments:
+        outcome === "failed"
+          ? 0
+          : Math.min(this.ports.maximumLevelZeroSegments, Math.max(2, visible * 2)),
     });
   }
   committed(ids: readonly string[]): void {

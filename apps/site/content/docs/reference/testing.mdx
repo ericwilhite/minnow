@@ -586,6 +586,12 @@ bigger than twice the data; repeated bursts settle to the same place instead of 
 residue; versions from a moment ago stay readable and old ones are pruned; the switches off do
 nothing; the buffer pool stays inside its budget under many distinct queries.
 
+`automatic-compaction-fit.test.ts` holds automatic folds to the same standard on tables whose
+folds do not fit the default memory budget as planned: a wide table refreshed wholesale keeps
+folding inside the budget, a fold whose distinct keys outgrow it is cut, the smallest fold gets
+the memory it needs, and a refresh in an unrelated order is refused with a reason rather than
+run as a plan of one range per cell. Each case fails with its part of the fix removed.
+
 The heap itself is checked by the memory soak, which the unit suites cannot do honestly:
 
 ```bash

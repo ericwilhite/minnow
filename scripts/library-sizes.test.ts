@@ -31,9 +31,10 @@ describe("compressed download budgets", () => {
     // disabling splitting also counts all dynamically imported adapters in the worker bundle.
     // The correctness audit adds exact JSON and bounded regex. Measured 459.5 KiB combined:
     // retain a tight absolute budget rather than claiming this two-download setup is below SQLite.
+    // Automatic compaction fitting its folds to memory adds 0.9 KiB: 465.5 KiB measured.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(465 * 1024);
+    ).toBeLessThanOrEqual(466 * 1024);
   });
 });

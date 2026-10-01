@@ -44,8 +44,10 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // turns, lent fold publications) add about 7 KiB raw: 911.3 KiB raw / 265.3 KiB gzip.
 // Exact JSON parsing, bounded regex, strict TEXT typing, and acknowledgement validation add
 // about 15 KiB raw / 5 KiB gzip; these measured correctness features intentionally expand the surface.
+// Automatic compaction fitting its folds to memory (distinct-key planning, counted ranges, the
+// cut-and-raise loop) adds 2.4 KiB raw / 0.9 KiB gzip: 937.2 KiB raw / 273.9 KiB gzip.
 const COMPLETE_ENTRY_RAW_BUDGET = 938 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 273 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 274 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -53,11 +55,13 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 273 * 1024;
 // Bounded delta-header preparation and the released cross-tab collection fix measure
 // 1285.3 KiB raw. The catalog, writer-admission and query controllers plus the storage
 // fast paths add about 4 KiB. Allow 1290 KiB raw while retaining the compressed download budget.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1290 * 1024;
+// Automatic compaction fitting its folds to memory adds 2.4 KiB raw: 1291.5 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1292 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 363 * 1024;
+// Automatic compaction fitting its folds to memory adds 0.9 KiB gzip: 363.8 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 364 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.

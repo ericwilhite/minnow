@@ -492,6 +492,13 @@ const AUTO_COMPACT_SCAN_SEGMENTS = 48;
 /** Visible delete/update segments at which a scan or a commit schedules a compaction step. */
 const AUTO_COMPACT_DELTA_SEGMENTS = 32;
 /**
+ * Delta rows below which only the segment counts above schedule a fold. Past it, deltas that
+ * hold as many rows as the data they overlay are due however few segments carry them: two
+ * full-table refreshes already make every scan read each row three times, where waiting for
+ * thirty-two would make it read each row thirty-three times.
+ */
+const AUTO_COMPACT_DELTA_MIN_ROWS = 4_096;
+/**
  * Manifest versions background collection leaves readable behind the current one, and how
  * old one may be before it is collected regardless. A version is kept only while both hold: the
  * count serves a reader that names a version it was just handed, the age keeps a burst of
@@ -539,6 +546,28 @@ const AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS = 256;
  * a statement is delayed by one step, where the absolute ceiling would refuse it.
  */
 const AUTO_COMPACT_BACKPRESSURE_LEVEL_ZERO_SEGMENTS = 2 * AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS;
+/**
+ * The options every automatic fold step passes, background and write-path alike. Planning
+ * recognises them by identity: an automatic fold fits itself to the memory budget, where an
+ * explicit step with the same numbers would be refused.
+ */
+const AUTOMATIC_COMPACTION_STEP: CompactTableStepOptions = Object.freeze({
+  maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
+  maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+});
+/**
+ * Plans one automatic fold may make while fitting itself to memory. Cutting from the full
+ * batch to the minimum takes at most eight, and each budget increase at least doubles it.
+ */
+const MAX_AUTOMATIC_COMPACTION_FIT_ATTEMPTS = 32;
+/**
+ * Output ranges an automatic fold's plan may hold beyond one per source block. The plan is the
+ * job record every step of the fold reads and rewrites, so its size is paid on every step: at
+ * this many extra ranges a step's record round trip stays near a tenth of a second. Rows
+ * replaced in the table's own order coalesce into one range per block and never approach it;
+ * upserts replacing many wide rows in an unrelated order need one range per cell.
+ */
+const AUTOMATIC_COMPACTION_PATCHED_RANGES = 32_768;
 /** Manifest races a complete fold may lose to writers already in flight before it is abandoned. */
 const MAX_COMPACTION_PUBLICATION_CONFLICTS = 64;
 
@@ -547,6 +576,26 @@ const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 
 /** Overlay logical order for a write scope's staged segments: after all committed data. */
 const STAGED_OVERLAY_ORDER_BASE = 2 ** 52;
+
+/**
+ * Automatic compaction refuses a merge plan more fragmented than it will persist. The plan is
+ * the job record every step of the fold reads and rewrites, so a plan of one range per cell —
+ * upserts replacing many wide rows in an order unlike the table's — would hold the database up
+ * on every step. More memory would not make it smaller: the fold is cut if it can be, and
+ * otherwise waits out its backoff like any failure.
+ */
+class CompactionPlanTooFragmentedError extends Error {
+  override readonly name = "CompactionPlanTooFragmentedError";
+
+  constructor(
+    readonly ranges: number,
+    readonly maximumRanges: number,
+  ) {
+    super(
+      `Compaction plan needs ${String(ranges)} output ranges; automatic compaction persists at most ${String(maximumRanges)}`,
+    );
+  }
+}
 
 /** Internal identity distinguishes an expected close refusal from an I/O failure during close.
  * The public error remains named Error, with the existing message. */
@@ -696,6 +745,17 @@ interface MergeResolvedSource {
   readonly sourceRowIndex: number;
 }
 
+/**
+ * Where a live slot's columns come from once later mutations apply. An upsert that replaced
+ * the row names the one row every column now comes from; an update names the columns it set.
+ * Without a row source, any column `columns` does not name comes from the slot's own row.
+ */
+interface MergeSlotPatch {
+  rowSource: MergeCompactionSourceSegment | undefined;
+  rowIndex: number;
+  columns: Array<MergeResolvedSource | undefined> | undefined;
+}
+
 /** A table's part of a live proof window: see `#liveProofContext`. */
 interface LiveChangedKeys {
   /** Every key the window touched, by identity token. */
@@ -729,6 +789,10 @@ interface AutoCompactionHint {
   readonly visible: number;
   readonly levelZero: number;
   readonly deltas: number;
+  /** Rows the delete, update, and upsert segments carry. */
+  readonly deltaRows: number;
+  /** Rows the base and insert segments carry: the data the deltas overlay. */
+  readonly baseRows: number;
 }
 
 interface ZonePredicate {
@@ -2175,6 +2239,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Exact current-layout counters; local commits advance them without rescanning history. */
   readonly #autoCompactionHints = new Map<string, AutoCompactionHint>();
+  /** Level-zero segments a table's next automatic fold starts from, after one had to be cut. */
+  readonly #automaticCompactionBatches = new Map<string, number>();
   /** The compaction step in flight per table, so steps on one table run one at a time. */
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
 
@@ -2371,6 +2437,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
         this.#compaction.forget(table.id);
         this.#autoCompactionHints.delete(table.id);
+        this.#automaticCompactionBatches.delete(table.id);
         const prefix = `${table.id}/`;
         for (const key of this.#postingDeltaTailCounts.keys()) {
           if (key.startsWith(prefix)) this.#postingDeltaTailCounts.delete(key);
@@ -6726,9 +6793,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    *
    * Deltas count separately from fragmentation. Folding them is what returns a table to the
    * plain append scan, and a table can carry enough of them to matter long before it has
-   * forty-eight segments. A failed attempt (a merge plan that does not fit the compaction
-   * memory budget is the usual one) doubles the count the table must reach before the next
-   * one, so a table that cannot be compacted today costs one attempt, not one per query.
+   * forty-eight segments — or, when each one rewrites much of the table, long before it has
+   * thirty-two. An attempt compaction declines doubles the count the table must reach before
+   * the next one; an attempt that fails waits out a growing delay instead. Either way a table
+   * that cannot be compacted today costs one attempt per backoff, not one per query. A fold
+   * too large for the memory budget is neither: automatic planning cuts it to fit.
    */
   #maybeScheduleAutoCompaction(table: TableRecord, segments: readonly SegmentRecord[]): void {
     this.#maybeScheduleAutoCompactionFromHint(table, autoCompactionHint(null, segments));
@@ -6792,10 +6861,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     try {
       const progress = await this.#compactTableStep(
         table.name,
-        {
-          maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
-          maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
-        },
+        AUTOMATIC_COMPACTION_STEP,
         admission,
       );
       if (!atCeiling && progress.result !== null && !progress.result.compacted) {
@@ -6804,7 +6870,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     } catch (error) {
       if (atCeiling) throw error;
       this.#reportBackgroundError(error, `compaction assistance for ${table.name}`);
-      this.#compaction.backOff(table.id, visible);
+      this.#compaction.backOff(table.id, visible, "failed");
       return;
     }
     if (!atCeiling) return;
@@ -6825,10 +6891,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * every trigger, so the caller backs it off as it would a failure.
    */
   async #runAutoCompaction(table: TableRecord): Promise<boolean> {
-    const options = {
-      maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
-      maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
-    };
+    const options = AUTOMATIC_COMPACTION_STEP;
     let folded = false;
     let planningConflicts = 0;
     for (;;) {
@@ -7045,6 +7108,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visible: hint.visible + contribution.visible,
         levelZero: hint.levelZero + contribution.levelZero,
         deltas: hint.deltas + contribution.deltas,
+        deltaRows: hint.deltaRows + contribution.deltaRows,
+        baseRows: hint.baseRows + contribution.baseRows,
       });
     }
   }
@@ -16449,7 +16514,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         `Compaction target block bytes exceed the ${outputCompression} worst-case format limit`,
       );
     }
-    const memoryBudgetBytes = positiveWholeNumber(
+    let memoryBudgetBytes = positiveWholeNumber(
       options.memoryBudgetBytes ?? DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
       "Compaction memory budget",
     );
@@ -16458,7 +16523,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       "Compaction partition rows",
     );
 
-    let anchors: readonly SegmentRecord[] = [];
+    let keyedLevelTwoAnchors: readonly SegmentRecord[] = [];
     let level0Segments: readonly SegmentRecord[];
     let effectiveMinimumLevel0Segments: number;
     let outputPartitionOrdinal: number | undefined;
@@ -16526,7 +16591,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           version,
         );
       }
-      anchors = layout.anchors;
+      keyedLevelTwoAnchors = layout.anchors;
       level0Segments = layout.level0Segments;
       effectiveMinimumLevel0Segments = minimumLevel0Segments;
       outputPartitionOrdinal = layout.levelTwoSegments.length;
@@ -16556,152 +16621,234 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     }
     if (version === null) throw new Error("Visible compaction segments require a manifest");
-    const level0Selection = await this.#selectLevelZeroSources(
-      level0Segments,
-      effectiveMinimumLevel0Segments,
-      maxLevel0Segments,
-      maxLevel0StoredBytes,
-      snapshot,
-    );
-    let partitioning: KeyedPartitioning | undefined;
-    let rechunkPartitioning: RechunkPartitioning | undefined;
-    if (keyedLevelOne !== undefined) {
-      const keyColumn = getUniqueKeyColumn(table);
-      if (keyColumn === undefined) {
-        throw new Error(`Mutation compaction requires a unique key: ${table.name}`);
+    const automatic = options === AUTOMATIC_COMPACTION_STEP;
+    // Rewrite planning for one level-zero selection under one memory budget: the sources it
+    // folds and the plan that folds them, or why the selection cannot be folded.
+    const planRewrite = async (level0Selection: LevelZeroSelection, budgetBytes: number) => {
+      let anchors = keyedLevelTwoAnchors;
+      let partitioning: KeyedPartitioning | undefined;
+      let rechunkPartitioning: RechunkPartitioning | undefined;
+      if (keyedLevelOne !== undefined) {
+        const keyColumn = getUniqueKeyColumn(table);
+        if (keyColumn === undefined) {
+          throw new Error(`Mutation compaction requires a unique key: ${table.name}`);
+        }
+        const touched = await this.#touchedPartitionIds(
+          keyColumn,
+          keyedLevelOne.partitions,
+          level0Selection.segments,
+          budgetBytes,
+          snapshot,
+        );
+        // New rows join the last partition while it is small, or when it is being rewritten
+        // anyway; otherwise they open a new partition behind it and it stays untouched.
+        const last = keyedLevelOne.partitions[keyedLevelOne.partitions.length - 1];
+        const bearsNewRows = level0Selection.segments.some((segment) =>
+          mergeSourceBearsRows(segment.kind),
+        );
+        const absorbsTail =
+          last !== undefined &&
+          bearsNewRows &&
+          (touched.has(last.id) || last.rowCount < partitionRows);
+        anchors = keyedLevelOne.partitions.filter(
+          (partition) =>
+            partition.rowCount > partitionRows ||
+            touched.has(partition.id) ||
+            (absorbsTail && partition.id === last.id),
+        );
+        partitioning = {
+          partitions: keyedLevelOne.partitions,
+          partitionRows,
+          absorbsTail,
+          nextLevelZeroOrder:
+            level0Selection.nextLogicalOrder ??
+            safeWholeNumberSum([version, 1], "Compaction successor logical order"),
+        };
+      } else if (keylessLevelOne !== undefined) {
+        const last = keylessLevelOne.partitions.at(-1);
+        // A partial tail is extended. A pre-existing oversized anchor is included once so this
+        // fold heals it into bounded partitions; a full tail stays immutable and new rows start
+        // after it.
+        const absorbsTail =
+          last !== undefined && (last.rowCount < partitionRows || last.rowCount > partitionRows);
+        anchors = absorbsTail ? [last] : [];
+        rechunkPartitioning = {
+          partitionRows,
+          nextLevelZeroOrder:
+            level0Selection.nextLogicalOrder ??
+            safeWholeNumberSum([version, 1], "Compaction successor logical order"),
+        };
       }
-      const touched = await this.#touchedPartitionIds(
-        keyColumn,
-        keyedLevelOne.partitions,
-        level0Selection.segments,
-        memoryBudgetBytes,
+      const anchorMeasurement = await this.#measureCompactionSources(
+        anchors,
+        level0Selection.blockIds,
         snapshot,
       );
-      // New rows join the last partition while it is small, or when it is being rewritten
-      // anyway; otherwise they open a new partition behind it and it stays untouched.
-      const last = keyedLevelOne.partitions[keyedLevelOne.partitions.length - 1];
-      const bearsNewRows = level0Selection.segments.some((segment) =>
-        mergeSourceBearsRows(segment.kind),
-      );
-      const absorbsTail =
-        last !== undefined &&
-        bearsNewRows &&
-        (touched.has(last.id) || last.rowCount < partitionRows);
-      anchors = keyedLevelOne.partitions.filter(
-        (partition) =>
-          partition.rowCount > partitionRows ||
-          touched.has(partition.id) ||
-          (absorbsTail && partition.id === last.id),
-      );
-      partitioning = {
-        partitions: keyedLevelOne.partitions,
-        partitionRows,
-        absorbsTail,
-        nextLevelZeroOrder:
-          level0Selection.nextLogicalOrder ??
-          safeWholeNumberSum([version, 1], "Compaction successor logical order"),
+      const selection = {
+        sourceSegments: [...anchors, ...level0Selection.segments],
+        level0SourceStoredBytes: level0Selection.storedBytes,
+        anchorSourceStoredBytes: anchorMeasurement.storedBytes,
       };
-    } else if (keylessLevelOne !== undefined) {
-      const last = keylessLevelOne.partitions.at(-1);
-      // A partial tail is extended. A pre-existing oversized anchor is included once so this fold
-      // heals it into bounded partitions; a full tail stays immutable and new rows start after it.
-      const absorbsTail =
-        last !== undefined && (last.rowCount < partitionRows || last.rowCount > partitionRows);
-      anchors = absorbsTail ? [last] : [];
-      rechunkPartitioning = {
-        partitionRows,
-        nextLevelZeroOrder:
-          level0Selection.nextLogicalOrder ??
-          safeWholeNumberSum([version, 1], "Compaction successor logical order"),
-      };
-    }
-    const anchorMeasurement = await this.#measureCompactionSources(
-      anchors,
-      level0Selection.blockIds,
-      snapshot,
-    );
-    const selection = {
-      sourceSegments: [...anchors, ...level0Selection.segments],
-      level0SourceStoredBytes: level0Selection.storedBytes,
-      anchorSourceStoredBytes: anchorMeasurement.storedBytes,
-    };
-    const sourceSegments = selection.sourceSegments;
-    const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
-    const hasContiguousSourceRowIds = hasContiguousRowIds(sourceSegments);
-    const hasPositiveSourceRowIds = (sourceSegments[0]?.rowIdStart ?? 0n) > 0n;
-    // A keyed fold always merges: one uniform partition shape (a full-row base with row-ID
-    // spans, bounded by `partitionRows`) regardless of whether the selected prefix happens to
-    // be pure inserts.
-    const requiresMerge =
-      keyedLevelTwo || keyedLevelOne !== undefined
-        ? true
-        : targetLevel === 1 &&
-          sourceSegments.some(
-            (segment) => segment.kind !== "insert" || segment.rowIdSpans.length !== 0,
-          );
-    if (
-      !requiresMerge &&
-      (!hasContiguousSourceRowIds || (targetLevel === 2 && !hasPositiveSourceRowIds))
-    ) {
-      return compactTableSkipped(
-        table.name,
-        "non-contiguous-row-ids",
-        sourceSegments,
-        sourceBlockIds,
-        version,
-      );
-    }
+      const sourceSegments = selection.sourceSegments;
+      const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
+      const hasContiguousSourceRowIds = hasContiguousRowIds(sourceSegments);
+      const hasPositiveSourceRowIds = (sourceSegments[0]?.rowIdStart ?? 0n) > 0n;
+      // A keyed fold always merges: one uniform partition shape (a full-row base with row-ID
+      // spans, bounded by `partitionRows`) regardless of whether the selected prefix happens to
+      // be pure inserts.
+      const requiresMerge =
+        keyedLevelTwo || keyedLevelOne !== undefined
+          ? true
+          : targetLevel === 1 &&
+            sourceSegments.some(
+              (segment) => segment.kind !== "insert" || segment.rowIdSpans.length !== 0,
+            );
+      if (
+        !requiresMerge &&
+        (!hasContiguousSourceRowIds || (targetLevel === 2 && !hasPositiveSourceRowIds))
+      ) {
+        return compactTableSkipped(
+          table.name,
+          "non-contiguous-row-ids",
+          sourceSegments,
+          sourceBlockIds,
+          version,
+        );
+      }
 
-    let mergePlan: MergeCompactionRewritePlan | undefined;
-    if (requiresMerge) {
-      try {
-        mergePlan = await this.#createMergeCompactionPlan(
+      let mergePlan: MergeCompactionRewritePlan | undefined;
+      if (requiresMerge) {
+        try {
+          mergePlan = await this.#createMergeCompactionPlan(
+            table,
+            sourceSegments,
+            targetBlockBytes,
+            outputCompression,
+            budgetBytes,
+            snapshot,
+            partitioning,
+            automatic ? AUTOMATIC_COMPACTION_PATCHED_RANGES : Number.POSITIVE_INFINITY,
+          );
+        } catch (error) {
+          // A keyed L2 prefix whose mutations reference keys living in already-published
+          // partitions cannot fold them without rewriting those partitions (key-range rewrite
+          // remains future work); those deltas stay as replayable level-zero history.
+          if (keyedLevelTwo && errorMessage(error).includes("references a missing key")) {
+            return compactTableSkipped(
+              table.name,
+              "keys-outside-selected-sources",
+              sourceSegments,
+              sourceBlockIds,
+              version,
+            );
+          }
+          throw error;
+        }
+      }
+      const rewritePlan =
+        mergePlan ??
+        (await this.#createRechunkCompactionPlan(
           table,
           sourceSegments,
           targetBlockBytes,
           outputCompression,
-          memoryBudgetBytes,
+          budgetBytes,
           snapshot,
-          partitioning,
-        );
+          rechunkPartitioning,
+        ));
+      const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
+      if (minimumMemoryBytes > budgetBytes) {
+        throw new CompactionMemoryBudgetError(budgetBytes, minimumMemoryBytes);
+      }
+      const sourceStoredBytes = physicalRewriteSourceStoredBytes(rewritePlan);
+      if (
+        selection.anchorSourceStoredBytes + selection.level0SourceStoredBytes !==
+        sourceStoredBytes
+      ) {
+        throw new Error("Compaction source byte accounting differs from its rewrite plan");
+      }
+      return {
+        selection,
+        sourceSegments,
+        sourceBlockIds,
+        rewritePlan,
+        minimumMemoryBytes,
+        sourceStoredBytes,
+      };
+    };
+    // An explicit step plans what its options ask for, and a plan that needs more memory than
+    // its budget is refused. Automatic compaction has nobody to refuse: it fits the fold to the
+    // budget instead. A selection that does not fit is cut, at least in half and in proportion
+    // to how far over it was, and planned again; the smallest selection the table allows is
+    // given the memory it needs. That smallest fold costs about what the writes that produced
+    // its sources already held, and a table automatic compaction could never fold would keep
+    // slowing every read until its writes were refused at the level-zero ceiling. A plan too
+    // fragmented to step through cheaply is cut the same way, but more memory cannot help it.
+    // The cut size is where the table's next fold starts, so one wide table does not re-plan
+    // from the full batch on every fold; each fold that fits doubles it back.
+    let levelZeroLimit = automatic
+      ? Math.min(
+          maxLevel0Segments,
+          this.#automaticCompactionBatches.get(table.id) ?? maxLevel0Segments,
+        )
+      : maxLevel0Segments;
+    let cut = false;
+    let planned: Awaited<ReturnType<typeof planRewrite>>;
+    for (let attempt = 1; ; attempt += 1) {
+      const level0Selection = await this.#selectLevelZeroSources(
+        level0Segments,
+        effectiveMinimumLevel0Segments,
+        levelZeroLimit,
+        maxLevel0StoredBytes,
+        snapshot,
+      );
+      try {
+        planned = await planRewrite(level0Selection, memoryBudgetBytes);
+        break;
       } catch (error) {
-        // A keyed L2 prefix whose mutations reference keys living in already-published
-        // partitions cannot fold them without rewriting those partitions (key-range rewrite
-        // remains future work); those deltas stay as replayable level-zero history.
-        if (keyedLevelTwo && errorMessage(error).includes("references a missing key")) {
-          return compactTableSkipped(
-            table.name,
-            "keys-outside-selected-sources",
-            sourceSegments,
-            sourceBlockIds,
-            version,
-          );
+        const fragmented = error instanceof CompactionPlanTooFragmentedError;
+        if (
+          !automatic ||
+          !(fragmented || error instanceof CompactionMemoryBudgetError) ||
+          attempt >= MAX_AUTOMATIC_COMPACTION_FIT_ATTEMPTS
+        ) {
+          throw error;
         }
-        throw error;
+        const selected = level0Selection.segments.length;
+        if (selected > effectiveMinimumLevel0Segments && selected <= levelZeroLimit) {
+          const fits = fragmented
+            ? error.maximumRanges / error.ranges
+            : memoryBudgetBytes / error.minimumBytes;
+          levelZeroLimit = Math.max(
+            effectiveMinimumLevel0Segments,
+            Math.min(Math.floor(selected / 2), Math.floor(selected * fits)),
+          );
+          // A later fold starts from the cut size, even if this one never fits.
+          this.#automaticCompactionBatches.set(table.id, levelZeroLimit);
+          cut = true;
+        } else if (fragmented) {
+          // More memory does not make a plan smaller. The smallest fold is still too
+          // fragmented to persist and step through, so it waits out its backoff.
+          throw error;
+        } else {
+          memoryBudgetBytes = Math.max(error.minimumBytes, memoryBudgetBytes * 2);
+        }
       }
     }
-    const rewritePlan =
-      mergePlan ??
-      (await this.#createRechunkCompactionPlan(
-        table,
-        sourceSegments,
-        targetBlockBytes,
-        outputCompression,
-        memoryBudgetBytes,
-        snapshot,
-        rechunkPartitioning,
-      ));
-    const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
-    if (minimumMemoryBytes > memoryBudgetBytes) {
-      throw new CompactionMemoryBudgetError(memoryBudgetBytes, minimumMemoryBytes);
+    if (automatic) {
+      const next = cut ? levelZeroLimit : levelZeroLimit * 2;
+      if (next >= maxLevel0Segments) this.#automaticCompactionBatches.delete(table.id);
+      else this.#automaticCompactionBatches.set(table.id, next);
     }
-    const sourceStoredBytes = physicalRewriteSourceStoredBytes(rewritePlan);
-    if (
-      selection.anchorSourceStoredBytes + selection.level0SourceStoredBytes !==
-      sourceStoredBytes
-    ) {
-      throw new Error("Compaction source byte accounting differs from its rewrite plan");
-    }
+    if ("compacted" in planned) return planned;
+    const {
+      selection,
+      sourceSegments,
+      sourceBlockIds,
+      rewritePlan,
+      minimumMemoryBytes,
+      sourceStoredBytes,
+    } = planned;
 
     const baseJobId = ["compaction", table.id, "manifest", String(version)].join("/");
     let levelTwoBudget:
@@ -16916,12 +17063,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     maxLevel0Segments: number,
     maxLevel0StoredBytes: number,
     snapshot: LeasedSnapshot,
-  ): Promise<{
-    segments: SegmentRecord[];
-    storedBytes: number;
-    blockIds: Set<string>;
-    nextLogicalOrder: number | null;
-  }> {
+  ): Promise<LevelZeroSelection> {
     const transactions = new Map(
       (await this.#transactionRecordsForSegments(level0Segments)).map((record) => [
         record.id,
@@ -16999,18 +17141,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (partitions.length === 0) return touched;
     const deltas = level0Segments.filter((segment) => mergeSourceReferencesKeys(segment.kind));
     if (deltas.length === 0) return touched;
-    const referencedBytes = safeWholeNumberProduct(
-      deltas.reduce((total, segment) => total + segment.rowCount, 0),
-      MERGE_PLANNER_KEY_BYTES,
-      "Compaction referenced keys",
-    );
-    if (referencedBytes > memoryBudgetBytes) {
-      throw new CompactionMemoryBudgetError(memoryBudgetBytes, referencedBytes);
-    }
+    // The set holds distinct keys, so it is charged as it grows: deltas rewriting the same keys
+    // over and over cost those keys once, however many rows they carry.
+    const referencedLimit = Math.floor(memoryBudgetBytes / MERGE_PLANNER_KEY_BYTES);
     const referenced = new Set<OverlayKey>();
     for (const segment of deltas) {
       await this.#forEachSegmentKey(segment, keyColumn, snapshot, (value) => {
         referenced.add(overlayKeyOf(keyColumn.type, value));
+        if (referenced.size > referencedLimit) {
+          throw new CompactionMemoryBudgetError(
+            memoryBudgetBytes,
+            safeWholeNumberProduct(
+              referenced.size,
+              MERGE_PLANNER_KEY_BYTES,
+              "Compaction referenced keys",
+            ),
+          );
+        }
       });
     }
     const predicate = touchedKeyPredicate(keyColumn, referenced);
@@ -17212,7 +17359,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     outputCompression: Compression,
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
-    partitioning?: KeyedPartitioning,
+    partitioning: KeyedPartitioning | undefined,
+    maxPatchedRanges: number,
   ): Promise<MergeCompactionRewritePlan> {
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
@@ -17307,6 +17455,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       describedSegments,
       keyColumn,
       memoryBudgetBytes,
+      maxPatchedRanges,
       snapshot,
     );
     const { columns, rowIdSpans, totalRows } = resolved;
@@ -17384,7 +17533,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /**
    * Replays the source segments' mutations into one canonical output order, in memory that
-   * scales with the deltas rather than with the table.
+   * scales with the distinct keys the deltas touch rather than with the table or with how many
+   * times those keys were written.
    *
    * Every row of every row-bearing source (base, insert, upsert) gets a slot, numbered in
    * canonical source order, and the output is the live slots in slot order. A row can only be
@@ -17392,7 +17542,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * keys, so the first pass collects those keys — the touched set — and the replay then tracks
    * slots for touched keys alone. An untouched row can never be deleted, patched, or replaced:
    * it passes through as part of a run, one output range per source block rather than one per
-   * row. Memory is O(delta rows + touched rows) plus two bytes per slot.
+   * row.
+   *
+   * Nothing is kept per delta row. The replay streams the key blocks a second time instead of
+   * holding every delta's keys, and an upsert replacing a live row records the one row it came
+   * from rather than a source per column. Eighty upserts that each rewrite the same thousand
+   * wide rows therefore cost a thousand keys, not eighty thousand rows times their columns.
+   * Memory is two bytes per slot, the source block descriptions, a bounded record per touched
+   * key, and the output ranges as the builder actually coalesces them — counted, not assumed.
    *
    * The semantics are those of a per-row replay:
    * - delete: the key's live slot dies; a later insert of the key takes a new slot.
@@ -17408,6 +17565,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     segments: readonly MergeCompactionSourceSegment[],
     keyColumn: TableColumnRecord,
     memoryBudgetBytes: number,
+    maxPatchedRanges: number,
     snapshot: LeasedSnapshot,
   ): Promise<{
     columns: MergeCompactionOutputColumn[];
@@ -17416,131 +17574,141 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     /** The output row at which each row-bearing source's surviving rows begin. */
     sourceOutputRowStarts: Map<string, number>;
   }> {
-    const plannerMemoryBytes = mergePlannerMemoryBound(table, segments, keyColumn.id);
-    if (plannerMemoryBytes > memoryBudgetBytes) {
-      throw new CompactionMemoryBudgetError(memoryBudgetBytes, plannerMemoryBytes);
+    const memory = mergePlannerMemory(table, segments, keyColumn.id);
+    if (memory.baseBytes > memoryBudgetBytes) {
+      throw new CompactionMemoryBudgetError(memoryBudgetBytes, memory.baseBytes);
     }
+    const availableBytes = memoryBudgetBytes - memory.baseBytes;
     const columnIndexById = new Map(table.columns.map((column, index) => [column.id, index]));
 
-    // Pass 1: the keys any delta references, and each delta's keys in row order. The deltas'
-    // key blocks are decoded together: the bound above reserved decode scratch for them, and
-    // whatever of the budget it left unused is theirs as well.
+    // Pass 1: the distinct keys any delta references. A quarter of what the base bound left
+    // decodes key blocks in groups; the rest holds the touched set, which is refused the moment
+    // it outgrows its share rather than after it has.
     const touched = new Set<OverlayKey>();
-    const deltaKeys = new Map<string, OverlayKey[]>();
     const deltas = segments.filter((segment) => mergeSourceReferencesKeys(segment.kind));
-    for (const segment of deltas) deltaKeys.set(segment.segmentId, []);
-    const unusedBudgetBytes = memoryBudgetBytes - plannerMemoryBytes;
+    const decodeShareBytes = Math.floor(availableBytes / 4);
+    const touchedLimit = memory.maxTouchedKeys(availableBytes - decodeShareBytes);
     await this.#forEachMergeSourceKey(
       deltas,
       keyColumn,
-      unusedBudgetBytes,
+      decodeShareBytes,
       snapshot,
-      (segment, value) => {
-        const key = overlayKeyOf(keyColumn.type, value);
-        deltaKeys.get(segment.segmentId)?.push(key);
-        touched.add(key);
+      (_segment, value) => {
+        touched.add(overlayKeyOf(keyColumn.type, value));
+        if (touched.size > touchedLimit) {
+          throw new CompactionMemoryBudgetError(
+            memoryBudgetBytes,
+            safeWholeNumberSum(
+              [memory.baseBytes, memory.touchedBytes(touched.size)],
+              "Mutation compaction planner memory",
+            ),
+          );
+        }
       },
     );
+    const touchedBytes = memory.touchedBytes(touched.size);
+    const replayBytes = availableBytes - touchedBytes;
 
-    // Pass 2: replay into slot state.
+    // Pass 2: replay into slot state. Every source's keys stream again in canonical order, in
+    // one grouped read; a row whose key nothing references passes straight through.
     let slotCount = 0;
+    const slotBases = new Map<string, number>();
     for (const segment of segments) {
-      if (mergeSourceBearsRows(segment.kind)) slotCount += segment.rowCount;
+      if (!mergeSourceBearsRows(segment.kind)) continue;
+      slotBases.set(segment.segmentId, slotCount);
+      slotCount += segment.rowCount;
     }
     const dead = new Uint8Array(slotCount);
     const patched = new Uint8Array(slotCount);
-    const patches = new Map<number, Array<MergeResolvedSource | undefined>>();
-    const liveSlotByKey = new Map<OverlayKey, number>();
-    let slotBase = 0;
-    for (const segment of segments) {
-      if (segment.kind === "delete") {
-        for (const key of deltaKeys.get(segment.segmentId) ?? []) {
-          const slot = liveSlotByKey.get(key);
-          if (slot === undefined) continue;
-          dead[slot] = 1;
-          patched[slot] = 0;
-          patches.delete(slot);
-          liveSlotByKey.delete(key);
-        }
-        continue;
+    const patches = new Map<number, MergeSlotPatch>();
+    if (touched.size > 0) {
+      const liveSlotByKey = new Map<OverlayKey, number>();
+      const changedColumns = new Map<string, Array<{ columnId: string; columnIndex: number }>>();
+      for (const segment of deltas) {
+        if (segment.kind !== "update") continue;
+        changedColumns.set(
+          segment.segmentId,
+          segment.columns
+            .map((column) => column.columnId)
+            .filter((columnId) => columnId !== keyColumn.id)
+            .map((columnId) => {
+              const columnIndex = columnIndexById.get(columnId);
+              if (columnIndex === undefined) {
+                throw new Error(`Mutation compaction column is missing: ${columnId}`);
+              }
+              return { columnId, columnIndex };
+            }),
+        );
       }
-      if (segment.kind === "update") {
-        const changedColumns = segment.columns
-          .map((column) => column.columnId)
-          .filter((columnId) => columnId !== keyColumn.id)
-          .map((columnId) => {
-            const columnIndex = columnIndexById.get(columnId);
-            if (columnIndex === undefined) {
-              throw new Error(`Mutation compaction column is missing: ${columnId}`);
+      await this.#forEachMergeSourceKey(
+        segments,
+        keyColumn,
+        Math.max(0, replayBytes),
+        snapshot,
+        (segment, value, rowIndex) => {
+          const key = overlayKeyOf(keyColumn.type, value);
+          if (!touched.has(key)) return;
+          if (segment.kind === "delete") {
+            const slot = liveSlotByKey.get(key);
+            if (slot === undefined) return;
+            dead[slot] = 1;
+            patched[slot] = 0;
+            patches.delete(slot);
+            liveSlotByKey.delete(key);
+            return;
+          }
+          if (segment.kind === "update") {
+            const slot = liveSlotByKey.get(key);
+            if (slot === undefined) {
+              throw new Error(`Update segment references a missing key: ${segment.segmentId}`);
             }
-            return { columnId, columnIndex };
-          });
-        const keys = deltaKeys.get(segment.segmentId) ?? [];
-        for (let rowIndex = 0; rowIndex < keys.length; rowIndex += 1) {
-          const key = keys[rowIndex];
-          const slot = key === undefined ? undefined : liveSlotByKey.get(key);
-          if (slot === undefined) {
-            throw new Error(`Update segment references a missing key: ${segment.segmentId}`);
+            let patch = patches.get(slot);
+            if (patch === undefined) {
+              patch = { rowSource: undefined, rowIndex: 0, columns: undefined };
+              patches.set(slot, patch);
+              patched[slot] = 1;
+            }
+            const columns = (patch.columns ??= new Array<MergeResolvedSource | undefined>(
+              table.columns.length,
+            ));
+            for (const { columnId, columnIndex } of changedColumns.get(segment.segmentId) ?? []) {
+              columns[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
+            }
+            return;
           }
-          let patch = patches.get(slot);
-          if (patch === undefined) {
-            patch = new Array<MergeResolvedSource | undefined>(table.columns.length).fill(
-              undefined,
-            );
-            patches.set(slot, patch);
-            patched[slot] = 1;
+          // A row-bearing source: base, insert, or upsert.
+          const slotBase = slotBases.get(segment.segmentId);
+          if (slotBase === undefined) throw new Error("Mutation compaction slot is missing");
+          const slot = slotBase + rowIndex;
+          const existing = liveSlotByKey.get(key);
+          if (existing === undefined) {
+            liveSlotByKey.set(key, slot);
+            return;
           }
-          for (const { columnId, columnIndex } of changedColumns) {
-            patch[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
+          if (segment.kind !== "upsert") {
+            throw new Error(`Insert segment contains a duplicate unique key: ${segment.segmentId}`);
           }
-        }
-        continue;
-      }
-      // A row-bearing source: base, insert, or upsert.
-      const base = slotBase;
-      const visit = (key: OverlayKey, rowIndex: number): void => {
-        if (!touched.has(key)) return;
-        const slot = base + rowIndex;
-        const existing = liveSlotByKey.get(key);
-        if (existing === undefined) {
-          liveSlotByKey.set(key, slot);
-          return;
-        }
-        if (segment.kind !== "upsert") {
-          throw new Error(`Insert segment contains a duplicate unique key: ${segment.segmentId}`);
-        }
-        patches.set(
-          existing,
-          table.columns.map((column) => mergeSourceAt(segment, column.id, rowIndex)),
-        );
-        patched[existing] = 1;
-        dead[slot] = 1;
-      };
-      const keys = deltaKeys.get(segment.segmentId);
-      if (keys !== undefined) {
-        keys.forEach(visit);
-      } else if (touched.size > 0) {
-        // With nothing referencing keys there is nothing to track: every row passes through.
-        await this.#forEachMergeSourceKey(
-          [segment],
-          keyColumn,
-          unusedBudgetBytes,
-          snapshot,
-          (_, value, rowIndex) => {
-            visit(overlayKeyOf(keyColumn.type, value), rowIndex);
-          },
-        );
-      }
-      slotBase += segment.rowCount;
+          patches.set(existing, { rowSource: segment, rowIndex, columns: undefined });
+          patched[existing] = 1;
+          dead[slot] = 1;
+        },
+      );
     }
     touched.clear();
-    liveSlotByKey.clear();
-    deltaKeys.clear();
 
-    // Pass 3: the live slots in slot order, as runs wherever nothing touched them.
-    const output = new MergeOutputBuilder(table.columns);
+    // Pass 3: the live slots in slot order, as runs wherever nothing touched them. The ranges
+    // are counted as they coalesce; past what the budget leaves, the builder stops keeping
+    // them and only counts, so a refusal reports exactly what the plan would have needed. The
+    // ranges are also the persisted plan, which every step of the job reads and rewrites, so
+    // `maxPatchedRanges` can hold them nearer one per source block than memory alone would.
+    const memoryRangeLimit = Math.floor(Math.max(0, replayBytes) / MERGE_PLANNER_RANGE_BYTES);
+    const planRangeLimit = memory.sourceBlocks + maxPatchedRanges;
+    const output = new MergeOutputBuilder(
+      table.columns,
+      Math.min(memoryRangeLimit, planRangeLimit),
+    );
     const sourceOutputRowStarts = new Map<string, number>();
-    slotBase = 0;
+    let slotBase = 0;
     for (const segment of segments) {
       if (!mergeSourceBearsRows(segment.kind)) continue;
       sourceOutputRowStarts.set(segment.segmentId, output.totalRows);
@@ -17559,6 +17727,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       if (runStart >= 0) output.appendRun(segment, runStart, segment.rowCount - runStart);
       slotBase += segment.rowCount;
+    }
+    if (output.rangeCount > planRangeLimit) {
+      throw new CompactionPlanTooFragmentedError(output.rangeCount, planRangeLimit);
+    }
+    if (output.rangeCount > memoryRangeLimit) {
+      throw new CompactionMemoryBudgetError(
+        memoryBudgetBytes,
+        safeWholeNumberSum(
+          [
+            memory.baseBytes,
+            touchedBytes,
+            safeWholeNumberProduct(
+              output.rangeCount,
+              MERGE_PLANNER_RANGE_BYTES,
+              "Mutation compaction range bytes",
+            ),
+          ],
+          "Mutation compaction planner memory",
+        ),
+      );
     }
     return { ...output.finish(), sourceOutputRowStarts };
   }
@@ -23803,9 +23991,9 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
 
 /**
  * Whether a table's visible history warrants a background fold: enough level-zero segments to
- * fragment a scan, or enough deltas to cost one. Partitions compaction itself published
- * (level one and above) are the folded state, not fragmentation, and do not count — a large
- * keyed table is many partitions by design.
+ * fragment a scan, enough deltas to cost one, or deltas as large as the data they overlay.
+ * Partitions compaction itself published (level one and above) are the folded state, not
+ * fragmentation, and do not count — a large keyed table is many partitions by design.
  */
 function autoCompactionHint(
   version: number | null,
@@ -23813,16 +24001,25 @@ function autoCompactionHint(
 ): AutoCompactionHint {
   let levelZero = 0;
   let deltas = 0;
+  let deltaRows = 0;
+  let baseRows = 0;
   for (const segment of segments) {
     if (segment.level === 0) levelZero += 1;
     const kind = segment.kind;
-    if (kind !== "insert" && kind !== "base") deltas += 1;
+    if (kind !== "insert" && kind !== "base") {
+      deltas += 1;
+      deltaRows += segment.rowCount;
+    } else {
+      baseRows += segment.rowCount;
+    }
   }
   return {
     version,
     visible: segments.length,
     levelZero,
     deltas,
+    deltaRows,
+    baseRows,
   };
 }
 
@@ -23835,7 +24032,11 @@ function countLevelZeroSegments(segments: readonly SegmentRecord[]): number {
 }
 
 function autoCompactionDueHint(hint: AutoCompactionHint): boolean {
-  return hint.levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || hint.deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
+  return (
+    hint.levelZero >= AUTO_COMPACT_SCAN_SEGMENTS ||
+    hint.deltas >= AUTO_COMPACT_DELTA_SEGMENTS ||
+    (hint.deltas >= 2 && hint.deltaRows >= Math.max(AUTO_COMPACT_DELTA_MIN_ROWS, hint.baseRows))
+  );
 }
 
 function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
@@ -25831,8 +26032,19 @@ function sourceOrderTuple(
 
 /** Modeled bytes per referenced key the merge planner and the partition probe hold resident. */
 const MERGE_PLANNER_KEY_BYTES = 96;
+/** Modeled bytes per output range or source block description the merge planner holds. */
+const MERGE_PLANNER_RANGE_BYTES = 80;
 /** Decode scratch the merge planner reserves, as a multiple of its largest key block. */
 const MERGE_PLANNER_DECODED_KEY_BLOCK_FACTOR = 4;
+
+/** The oldest level-zero prefix one compaction job promotes. */
+interface LevelZeroSelection {
+  readonly segments: SegmentRecord[];
+  readonly storedBytes: number;
+  readonly blockIds: Set<string>;
+  /** The order of the first segment left behind, or null when every segment was selected. */
+  readonly nextLogicalOrder: number | null;
+}
 
 /** How a keyed level-one fold cuts its output into partitions. */
 interface KeyedPartitioning {
@@ -26027,31 +26239,35 @@ function fractionalLogicalOrders(first: number, upper: number, count: number): n
 }
 
 /**
- * The planner's working memory, as `#resolveMergeOutput` allocates it: two bytes per slot, the
- * touched-key set and live-slot map over the delta keys, one patch array per patched row, one
- * decoded key block at a time, and the output ranges themselves — which number the source
- * blocks plus one per patched cell, not one per row. Deliberately generous per element; this
- * bound is what a caller's `memoryBudgetBytes` is judged against, so it must not be optimistic.
+ * The merge planner's working memory, as `#resolveMergeOutput` allocates it. The base is known
+ * before any key is read: two bytes per slot, one description per source block, and decode
+ * scratch for the largest key block. Each distinct touched key then holds a set entry, a
+ * live-slot entry, and at most one patch; a patch an update wrote also carries a source per
+ * column, and there are never more of those than update rows or touched keys. The output
+ * ranges are counted by the builder as they coalesce. Deliberately generous per element; this
+ * is what a caller's `memoryBudgetBytes` is judged against, so it must not be optimistic.
  */
-function mergePlannerMemoryBound(
+function mergePlannerMemory(
   table: TableRecord,
   segments: readonly MergeCompactionSourceSegment[],
   keyColumnId: string,
-): number {
+): {
+  readonly baseBytes: number;
+  /** Source block descriptions the plan carries, one per block of every source column. */
+  readonly sourceBlocks: number;
+  touchedBytes(keys: number): number;
+  maxTouchedKeys(bytes: number): number;
+} {
   const SLOT_BYTES = 2;
-  const KEY_BYTES = MERGE_PLANNER_KEY_BYTES;
   const PATCH_ROW_BYTES = 64;
   const PATCH_CELL_BYTES = 48;
-  const RANGE_BYTES = 80;
   let slotRows = 0;
-  let deltaKeys = 0;
-  let patchRows = 0;
+  let updateRows = 0;
   let sourceBlocks = 0;
   let largestKeyBlockBytes = 0;
   for (const segment of segments) {
     if (mergeSourceBearsRows(segment.kind)) slotRows += segment.rowCount;
-    if (mergeSourceReferencesKeys(segment.kind)) deltaKeys += segment.rowCount;
-    if (segment.kind === "update" || segment.kind === "upsert") patchRows += segment.rowCount;
+    if (segment.kind === "update") updateRows += segment.rowCount;
     for (const column of segment.columns) {
       sourceBlocks += column.sourceBlocks.length;
       if (column.columnId !== keyColumnId) continue;
@@ -26060,29 +26276,13 @@ function mergePlannerMemoryBound(
       }
     }
   }
-  const columns = table.columns.length;
-  return safeWholeNumberSum(
+  const baseBytes = safeWholeNumberSum(
     [
       safeWholeNumberProduct(slotRows, SLOT_BYTES, "Mutation compaction slots"),
-      safeWholeNumberProduct(deltaKeys, KEY_BYTES, "Mutation compaction keys"),
       safeWholeNumberProduct(
-        patchRows,
-        safeWholeNumberSum(
-          [
-            PATCH_ROW_BYTES,
-            safeWholeNumberProduct(columns, PATCH_CELL_BYTES, "Mutation patch cells"),
-          ],
-          "Mutation compaction patch row",
-        ),
-        "Mutation compaction patches",
-      ),
-      safeWholeNumberProduct(
-        safeWholeNumberSum(
-          [sourceBlocks, safeWholeNumberProduct(patchRows, columns, "Mutation patched cells")],
-          "Mutation compaction ranges",
-        ),
-        RANGE_BYTES,
-        "Mutation compaction range bytes",
+        sourceBlocks,
+        MERGE_PLANNER_RANGE_BYTES,
+        "Mutation compaction sources",
       ),
       safeWholeNumberProduct(
         largestKeyBlockBytes,
@@ -26092,6 +26292,34 @@ function mergePlannerMemoryBound(
     ],
     "Mutation compaction planner memory",
   );
+  const keyBytes = MERGE_PLANNER_KEY_BYTES + PATCH_ROW_BYTES;
+  const updatePatchBytes = safeWholeNumberProduct(
+    table.columns.length,
+    PATCH_CELL_BYTES,
+    "Mutation patch cells",
+  );
+  const updateKeyBytes = keyBytes + updatePatchBytes;
+  return {
+    baseBytes,
+    sourceBlocks,
+    touchedBytes: (keys) =>
+      safeWholeNumberSum(
+        [
+          safeWholeNumberProduct(keys, keyBytes, "Mutation compaction keys"),
+          safeWholeNumberProduct(
+            Math.min(keys, updateRows),
+            updatePatchBytes,
+            "Mutation compaction patches",
+          ),
+        ],
+        "Mutation compaction touched keys",
+      ),
+    maxTouchedKeys: (bytes) => {
+      const updateKeys = Math.floor(bytes / updateKeyBytes);
+      if (updateKeys <= updateRows) return updateKeys;
+      return updateRows + Math.floor((bytes - updateRows * updateKeyBytes) / keyBytes);
+    },
+  };
 }
 
 /** Whether a source of this kind contributes rows to the merged output. */
@@ -26147,10 +26375,16 @@ interface MutableMergeOutputSourceRange {
  * Accumulates the merged output as coalesced row-ID spans and per-column source ranges. A run
  * of untouched rows appends at most one range per source block it crosses, whatever its
  * length; a patched row appends one range per column. Adjacent ranges over the same block
- * merge in place, so the finished plan is proportional to blocks plus patched cells.
+ * merge in place, so the finished plan is proportional to blocks plus patched cells — and to
+ * fewer than that when patched rows arrive in source order, as a refreshed table's do.
+ *
+ * Past `rangeLimit` the builder keeps only the last range of each list, which is all that
+ * coalescing looks at, and goes on counting: the plan is lost, but `rangeCount` still reports
+ * exactly how many ranges it would have held.
  */
 class MergeOutputBuilder {
   readonly #columns: readonly TableColumnRecord[];
+  readonly #rangeLimit: number;
   readonly #rowIdSpans: MutableRowIdSpan[] = [];
   readonly #rangesByColumn: MutableMergeOutputSourceRange[][];
   readonly #blocksBySegment = new Map<
@@ -26158,15 +26392,22 @@ class MergeOutputBuilder {
     ReadonlyArray<readonly MergeCompactionSourceBlock[]>
   >();
   #totalRows = 0;
+  #rangeCount = 0;
 
-  constructor(columns: readonly TableColumnRecord[]) {
+  constructor(columns: readonly TableColumnRecord[], rangeLimit = Number.POSITIVE_INFINITY) {
     this.#columns = columns;
+    this.#rangeLimit = rangeLimit;
     this.#rangesByColumn = columns.map(() => []);
   }
 
   /** Output rows appended so far. */
   get totalRows(): number {
     return this.#totalRows;
+  }
+
+  /** Row-ID spans and source ranges the plan holds, or would hold past the limit. */
+  get rangeCount(): number {
+    return this.#rangeCount;
   }
 
   /** Rows `[rowStart, rowStart + rowCount)` of a row-bearing source, unchanged. */
@@ -26189,7 +26430,7 @@ class MergeOutputBuilder {
           throw new Error(`Mutation source row is missing: ${segment.segmentId}`);
         }
         const count = Math.min(remaining, block.rowStart + block.rowCount - rowIndex);
-        appendMergeOutputRange(ranges, outputRow, block.blockId, rowIndex - block.rowStart, count);
+        this.#appendRange(ranges, outputRow, block.blockId, rowIndex - block.rowStart, count);
         outputRow += count;
         rowIndex += count;
         remaining -= count;
@@ -26202,17 +26443,31 @@ class MergeOutputBuilder {
   appendPatchedRow(
     segment: MergeCompactionSourceSegment,
     rowIndex: number,
-    patch: ReadonlyArray<MergeResolvedSource | undefined> | undefined,
+    patch: MergeSlotPatch | undefined,
   ): void {
     this.#appendRowIds(segment, rowIndex, 1);
+    const rowSource = patch?.rowSource ?? segment;
+    const sourceRowIndex = patch?.rowSource === undefined ? rowIndex : patch.rowIndex;
+    const blocksByColumn = this.#sourceBlocks(rowSource);
     for (let columnIndex = 0; columnIndex < this.#columns.length; columnIndex += 1) {
-      const column = this.#columns[columnIndex];
       const ranges = this.#rangesByColumn[columnIndex];
-      if (column === undefined || ranges === undefined) {
-        throw new Error("Mutation output column is missing");
+      if (ranges === undefined) throw new Error("Mutation output column is missing");
+      const patchedSource = patch?.columns?.[columnIndex];
+      if (patchedSource !== undefined) {
+        this.#appendRange(
+          ranges,
+          this.#totalRows,
+          patchedSource.blockId,
+          patchedSource.sourceRowIndex,
+          1,
+        );
+        continue;
       }
-      const source = patch?.[columnIndex] ?? mergeSourceAt(segment, column.id, rowIndex);
-      appendMergeOutputRange(ranges, this.#totalRows, source.blockId, source.sourceRowIndex, 1);
+      const block = rowRangeAt(blocksByColumn[columnIndex] ?? [], sourceRowIndex);
+      if (block === undefined) {
+        throw new Error(`Mutation source row is missing: ${rowSource.segmentId}`);
+      }
+      this.#appendRange(ranges, this.#totalRows, block.blockId, sourceRowIndex - block.rowStart, 1);
     }
     this.#totalRows += 1;
   }
@@ -26222,6 +26477,9 @@ class MergeOutputBuilder {
     rowIdSpans: RowIdSpan[];
     totalRows: number;
   } {
+    if (this.#rangeCount > this.#rangeLimit) {
+      throw new Error("Mutation output exceeded its range limit");
+    }
     return {
       rowIdSpans: this.#rowIdSpans,
       columns: this.#columns.map((column, columnIndex) => {
@@ -26231,6 +26489,28 @@ class MergeOutputBuilder {
       }),
       totalRows: this.#totalRows,
     };
+  }
+
+  #appendRange(
+    ranges: MutableMergeOutputSourceRange[],
+    outputRowStart: number,
+    sourceBlockId: string,
+    sourceRowStart: number,
+    rowCount: number,
+  ): void {
+    if (appendMergeOutputRange(ranges, outputRowStart, sourceBlockId, sourceRowStart, rowCount)) {
+      this.#counted(ranges);
+    }
+  }
+
+  #counted(list: unknown[]): void {
+    this.#rangeCount += 1;
+    if (this.#rangeCount <= this.#rangeLimit) return;
+    if (this.#rangeCount === this.#rangeLimit + 1) {
+      for (const ranges of this.#rangesByColumn) ranges.splice(0, ranges.length - 1);
+      this.#rowIdSpans.splice(0, this.#rowIdSpans.length - 1);
+    }
+    list.splice(0, list.length - 1);
   }
 
   #sourceBlocks(
@@ -26260,12 +26540,16 @@ class MergeOutputBuilder {
         throw new Error(`Mutation source row ID is missing: ${String(rowIndex)}`);
       }
       const count = Math.min(remaining, span.rowStart + span.rowCount - rowIndex);
-      appendRowIdSpan(
-        this.#rowIdSpans,
-        outputRow,
-        span.rowIdStart + BigInt(rowIndex - span.rowStart),
-        count,
-      );
+      if (
+        appendRowIdSpan(
+          this.#rowIdSpans,
+          outputRow,
+          span.rowIdStart + BigInt(rowIndex - span.rowStart),
+          count,
+        )
+      ) {
+        this.#counted(this.#rowIdSpans);
+      }
       outputRow += count;
       rowIndex += count;
       remaining -= count;
@@ -26273,13 +26557,16 @@ class MergeOutputBuilder {
   }
 }
 
-/** Appends `rowCount` consecutive row IDs from `rowId`, extending the last span when contiguous. */
+/**
+ * Appends `rowCount` consecutive row IDs from `rowId`, extending the last span when contiguous.
+ * Reports whether it added a span.
+ */
 function appendRowIdSpan(
   spans: MutableRowIdSpan[],
   rowStart: number,
   rowId: bigint,
   rowCount: number,
-): void {
+): boolean {
   const previous = spans[spans.length - 1];
   if (
     previous !== undefined &&
@@ -26287,19 +26574,23 @@ function appendRowIdSpan(
     previous.rowIdStart + BigInt(previous.rowCount) === rowId
   ) {
     previous.rowCount += rowCount;
-  } else {
-    spans.push({ rowStart, rowCount, rowIdStart: rowId });
+    return false;
   }
+  spans.push({ rowStart, rowCount, rowIdStart: rowId });
+  return true;
 }
 
-/** Appends `rowCount` output rows read from one source block, extending the last range when contiguous. */
+/**
+ * Appends `rowCount` output rows read from one source block, extending the last range when
+ * contiguous. Reports whether it added a range.
+ */
 function appendMergeOutputRange(
   ranges: MutableMergeOutputSourceRange[],
   outputRowStart: number,
   sourceBlockId: string,
   sourceRowStart: number,
   rowCount: number,
-): void {
+): boolean {
   const previous = ranges[ranges.length - 1];
   if (
     previous?.sourceBlockId === sourceBlockId &&
@@ -26307,9 +26598,10 @@ function appendMergeOutputRange(
     previous.sourceRowStart + previous.rowCount === sourceRowStart
   ) {
     previous.rowCount += rowCount;
-  } else {
-    ranges.push({ outputRowStart, sourceBlockId, sourceRowStart, rowCount });
+    return false;
   }
+  ranges.push({ outputRowStart, sourceBlockId, sourceRowStart, rowCount });
+  return true;
 }
 
 function mergeSourceAt(
