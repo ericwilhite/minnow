@@ -53,7 +53,7 @@ test("the docs overview uses the product headline", async ({ page }) => {
 });
 
 /** The IndexedDB schema `IndexedDbBlockStore` writes; a format bump updates it here. */
-const INDEXEDDB_SCHEMA = 3;
+const INDEXEDDB_SCHEMA = 4;
 
 test("the console reopens an existing database instead of rebuilding it", async ({ page }) => {
   await page.goto("/");

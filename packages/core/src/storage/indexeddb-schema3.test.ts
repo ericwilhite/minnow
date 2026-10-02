@@ -2,9 +2,9 @@
  * IndexedDB schema 2 to 3: no stored record changes; the version bars a schema-2 reader from
  * compaction jobs with replayed merge plans, which it cannot parse. The released 0.12.1 package —
  * the last schema-2 writer — leaves a merge-v1 fold in flight; the current build upgrades through
- * the ordinary open API, finishes that fold, keeps writing, and reopens, and the released reader
- * is refused afterwards. The upgrade runs inside IndexedDB's version-change transaction, so an
- * interrupted one leaves schema 2 exactly as it was.
+ * the ordinary open API (through schema 3 to the current schema), finishes that fold, keeps
+ * writing, and reopens, and the released reader is refused afterwards. The upgrade runs inside
+ * IndexedDB's version-change transaction, so an interrupted one leaves schema 2 exactly as it was.
  */
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
@@ -12,6 +12,9 @@ import { MinnowDatabase as ReleasedDatabase } from "@minnowdb/core-layout7";
 import { IndexedDbBlockStore as ReleasedIndexedDbStore } from "@minnowdb/core-layout7/storage/indexeddb";
 import { MinnowDatabase } from "../engine/database.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
+
+/** The schema this build writes; schema 4 (multi-part postings deltas) followed schema 3. */
+const CURRENT_SCHEMA = 4;
 
 function rows(version: number, count = 600) {
   return Array.from({ length: count }, (_, id) => ({
@@ -86,7 +89,7 @@ describe("IndexedDB schema 2 to 3", () => {
     expect(await nativeVersion(indexedDB, name)).toBe(2);
 
     const store = await IndexedDbBlockStore.open({ name, indexedDB });
-    expect(await nativeVersion(indexedDB, name)).toBe(3);
+    expect(await nativeVersion(indexedDB, name)).toBe(CURRENT_SCHEMA);
     const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
     expect(await database.readTable("items")).toEqual(expected);
     let progress = await database.resumeCompactionJob(jobId, { maxBlocks: 2 });
@@ -114,18 +117,18 @@ describe("IndexedDB schema 2 to 3", () => {
     reopened.close();
   });
 
-  it("refuses the released 0.12.1 reader after the upgrade and leaves schema 3 in place", async () => {
+  it("refuses the released 0.12.1 reader after the upgrade and leaves the current schema in place", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();
     await releasedFoldInFlight(indexedDB, name);
     (await IndexedDbBlockStore.open({ name, indexedDB })).close();
     await expect(ReleasedIndexedDbStore.open({ name, indexedDB })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 3,
+      actualVersion: CURRENT_SCHEMA,
       supportedVersion: 2,
       relation: "newer",
     });
-    expect(await nativeVersion(indexedDB, name)).toBe(3);
+    expect(await nativeVersion(indexedDB, name)).toBe(CURRENT_SCHEMA);
     const store = await IndexedDbBlockStore.open({ name, indexedDB });
     expect((await store.checkIntegrity()).ok).toBe(true);
     store.close();
@@ -137,7 +140,7 @@ describe("IndexedDB schema 2 to 3", () => {
     await releasedFoldInFlight(indexedDB, name);
     const released = await ReleasedIndexedDbStore.open({ name, indexedDB });
     const current = await IndexedDbBlockStore.open({ name, indexedDB });
-    expect(await nativeVersion(indexedDB, name)).toBe(3);
+    expect(await nativeVersion(indexedDB, name)).toBe(CURRENT_SCHEMA);
     await expect(released.getCurrentManifestVersion()).rejects.toThrow(/connection is closed/);
     expect((await current.listTables()).map(({ name: table }) => table)).toEqual(["items"]);
     current.close();

@@ -33,3 +33,31 @@ for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
     });
   });
 }
+
+/** The IndexedDB schema this build writes; schema 4 stores postings deltas as ordered parts. */
+const INDEXEDDB_SCHEMA = 4;
+
+for (const writer of ["0.10.0", "0.12.1", "0.13.1"] as const) {
+  test(`automatic upgrade: IndexedDB written by ${writer} keeps its index deltas, writes past the old delta limit, and refuses the released reader`, async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    await page.goto("/packages/core/browser/");
+    const result = await page.evaluate(async (version) => {
+      const url = "/packages/core/browser/upgrade-run.ts";
+      const module = (await import(url)) as typeof import("../browser/upgrade-run.js");
+      return module.runIndexedDbUpgrade(version);
+    }, writer);
+    expect(result).toEqual({
+      releasedSchema: writer === "0.13.1" ? 3 : 2,
+      schema: INDEXEDDB_SCHEMA,
+      answersPreserved: true,
+      newRow: [{ id: 70_000 }],
+      matches: [[{ n: 2_000 }], [{ n: 1 }], [{ n: 1 }], [{ n: 1 }]],
+      reopenedSame: true,
+      integrity: true,
+      olderReadersRefused: true,
+      finalSchema: INDEXEDDB_SCHEMA,
+    });
+  });
+}

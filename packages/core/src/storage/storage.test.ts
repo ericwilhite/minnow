@@ -126,6 +126,9 @@ const frozenIndexedDbSchemas: ReadonlyArray<{
   // Schema 3 is schema 2's stores; only the version moved, to bar schema-2 readers from
   // compaction jobs with replayed merge plans.
   { version: 3, writerPackageVersion: "0.13.0", install: installFrozenIndexedDbV2 },
+  // Schema 4 is schema 3's stores too; the version bars schema-3 readers from multi-part
+  // postings deltas. Its first writer is the release that ships it, this package.
+  { version: 4, writerPackageVersion: currentPackageVersion, install: installFrozenIndexedDbV2 },
 ];
 
 /** Schema 2 adds the chunked transaction journal store; everything else is schema 1. */
@@ -5445,7 +5448,7 @@ it("retains, migrates, and writes every stable IndexedDB schema fixture", async 
 it("rejects a newer IndexedDB schema without mutating it", async () => {
   const indexedDB = new IDBFactory();
   const name = crypto.randomUUID();
-  const newer = await openNativeIndexedDb(indexedDB, name, 4, (request) => {
+  const newer = await openNativeIndexedDb(indexedDB, name, 5, (request) => {
     request.result.createObjectStore("future");
   });
   await new Promise<void>((resolve, reject) => {
@@ -5464,11 +5467,11 @@ it("rejects a newer IndexedDB schema without mutating it", async () => {
     name: "StorageFormatVersionError",
     backend: "indexeddb",
     location: name,
-    actualVersion: 4,
-    supportedVersion: 3,
+    actualVersion: 5,
+    supportedVersion: 4,
     relation: "newer",
   });
-  const unchanged = await openNativeIndexedDb(indexedDB, name, 4);
+  const unchanged = await openNativeIndexedDb(indexedDB, name, 5);
   expect(unchanged.objectStoreNames.contains("future")).toBe(true);
   unchanged.close();
 });
@@ -5497,7 +5500,7 @@ it("closes an IndexedDB connection when a newer schema version arrives", async (
   const name = crypto.randomUUID();
   const store = await IndexedDbBlockStore.open({ name, indexedDB });
   const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(name, 4);
+    const request = indexedDB.open(name, 5);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
   });

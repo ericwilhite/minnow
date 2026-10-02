@@ -75,6 +75,7 @@ import {
   invalidateUncoveredFtsColumns,
   invalidateUncoveredSecondaryIndexes,
   type FtsCandidates,
+  type FtsColumnDelta,
   type FtsPostingQuery,
   type FtsPosting,
   type GarbageCollectionCandidateSet,
@@ -220,6 +221,7 @@ import {
 } from "./types.js";
 import { crc32, verifyStoredBlock } from "../block-format/index.js";
 import { dateIsoString } from "../date-value.js";
+import { WORK_SLICE_MS } from "../work-slicer.js";
 import {
   decodeSnapshotMetadataItems,
   encodeSnapshotMetadataPage,
@@ -229,7 +231,7 @@ import {
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -307,6 +309,30 @@ const CATALOG_FTS_BUILD_EXPIRY_INDEX = "byFtsBuildExpiry";
 const CATALOG_FTS_RETIREMENT_UPDATED_INDEX = "byFtsRetirementUpdatedAt";
 const FTS_BASE_BUILD_CLEANUP_PAGE = 64;
 const FTS_CHUNK_PREFIX = "fts-chunk/";
+/**
+ * One commit's postings for one indexed column are stored as ordered parts (schema 4). Part 0
+ * keeps the schema-3 key `fts-chunk/{table}/{column}/{version}`, so a delta that fits one part
+ * is stored exactly as before; part n >= 1 lives at `[FTS_DELTA_PART, "{table}/{column}",
+ * version, n]`, and a delta of several parts also has a directory of each part's first and last
+ * term at `[FTS_DELTA_PART, "{table}/{column}", version, FTS_DELTA_DIRECTORY]`, so a lookup reads
+ * only the parts whose term range it touches, as the base's table of contents allows. A
+ * structured key cannot collide with another identity's string key, and one cursor deletes every
+ * part and the directory of a version without the IDBKeyRange global injected factories lack.
+ */
+const FTS_DELTA_PART = "fts-delta-part";
+const FTS_DELTA_DIRECTORY = "directory";
+/**
+ * Per-part ceilings. Measured in V8: cloning 8,192 one-row postings takes about 5 ms, 65,536 row
+ * ids of one term about 2.5 ms, and reading either back about twice that, so no part's
+ * structured clone or decode holds the thread for much more than one work slice. Both stay far
+ * inside the record limits every postings decoder enforces.
+ */
+const FTS_DELTA_PART_POSTINGS = 8_192;
+const FTS_DELTA_PART_ROW_IDS = 65_536;
+/** Bounds a part of long terms; one term of the maximum length always fits. */
+const FTS_DELTA_PART_TERM_CHARACTERS = 1_048_576;
+/** Sanity ceiling on one version's part count (2^20 parts is 2^36 row ids). */
+const MAX_FTS_DELTA_PARTS = 1_048_576;
 const COMPACTION_JOB_KEY_PREFIX = "compaction-job/";
 const GARBAGE_COLLECTION_JOB_KEY_PREFIX = "garbage-collection-job/";
 const ACTIVE_COMPACTION_KEY_PREFIX = "maintenance/active-compaction/";
@@ -501,6 +527,14 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     // the version is the barrier that keeps a schema-2 reader, which cannot parse those plans,
     // from opening a database that may hold one.
     targetVersion: 3,
+    migrate: () => undefined,
+  },
+  {
+    // Schema 4 stores one commit's postings delta as ordered parts, so a commit's index delta has
+    // no size limit. A schema-3 delta is a valid one-part delta, so nothing is rewritten: the
+    // version is the barrier that keeps a schema-3 reader, which would miss every later part and
+    // refuse the part count in the delta index, from opening a database that may hold one.
+    targetVersion: 4,
     migrate: () => undefined,
   },
 ];
@@ -2631,14 +2665,12 @@ export class IndexedDbBlockStore implements BlockStore {
       } satisfies FtsBaseToc,
       `${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`,
     );
-    const surviving: number[] = [];
-    const retiredVersions: number[] = [];
-    for (const version of deltaIndex?.versions ?? []) {
-      if (version <= input.coversVersion) retiredVersions.push(version);
-      else surviving.push(version);
-    }
+    const live = deltaIndex ?? { versions: [], parts: [] };
+    const surviving = filterFtsDeltaIndex(live, (version) => version > input.coversVersion);
+    // Retirement deletes every part of a version by prefix, so it needs only the versions.
+    const retiredVersions = live.versions.filter((version) => version <= input.coversVersion);
     await stageFtsRetirement(store, tableId, columnId, retiredGenerations, retiredVersions);
-    store.put({ versions: surviving }, ftsChunkIndexKey(tableId, columnId));
+    store.put(encodeFtsDeltaIndex(surviving), ftsChunkIndexKey(tableId, columnId));
     store.delete(markerKey);
     await transactionDone(transaction);
   }
@@ -2716,7 +2748,8 @@ export class IndexedDbBlockStore implements BlockStore {
       (rawDeltaIndex === undefined || deltaIndex !== undefined) &&
       (toc === undefined || deltaIndex !== undefined);
     const chunkPrefix = ftsBaseChunkPrefix(tableId, columnId, toc?.generation);
-    const wantedOrdinals = (toc?.boundaries ?? []).flatMap((boundary, ordinal) =>
+    // Base chunks and delta parts are read only when their term range meets some query.
+    const wanted = (boundary: { first: string; last: string }): boolean =>
       terms.some((query) => {
         const lower = "term" in query ? query.term : query.lower;
         const upper =
@@ -2725,14 +2758,16 @@ export class IndexedDbBlockStore implements BlockStore {
           (lower === undefined || lower <= boundary.last) &&
           (upper === undefined || upper >= boundary.first)
         );
-      })
-        ? [ordinal]
-        : [],
+      });
+    const wantedOrdinals = (toc?.boundaries ?? []).flatMap((boundary, ordinal) =>
+      wanted(boundary) ? [ordinal] : [],
     );
     const coversVersion = toc?.coversVersion ?? -1;
-    const wantedVersions = (deltaIndex?.versions ?? []).filter(
+    const wantedDeltas = filterFtsDeltaIndex(
+      deltaIndex ?? { versions: [], parts: [] },
       (version) => version > coversVersion && version <= upToVersion,
     );
+    const identity = `${tableId}/${columnId}`;
     const candidateSets = terms.map(() => new Set<bigint>());
     let retainedRowIds = 0;
     let overflow = false;
@@ -2775,22 +2810,24 @@ export class IndexedDbBlockStore implements BlockStore {
         break;
       }
     }
-    if (!overflow) {
-      for (const version of wantedVersions) {
-        const value: unknown = await requestResult(
-          store.get(ftsChunkKey(tableId, columnId, version)),
-        );
-        const chunk = decodeFtsDeltaChunk(value);
-        if (chunk === undefined) {
-          complete = false;
-        } else {
-          deltaChunkCount += 1;
-          totalTokens = safeByteSum(totalTokens, chunk.totalTokens, "Full-text token count");
-          if (consume(chunk.postings)) {
-            overflow = true;
-            break;
-          }
-        }
+    for (const [position, version] of wantedDeltas.versions.entries()) {
+      if (overflow) break;
+      const outcome = await visitFtsDeltaParts(
+        store,
+        identity,
+        version,
+        wantedDeltas.parts[position] ?? 1,
+        (chunk) => {
+          overflow = consume(chunk.postings);
+          return !overflow;
+        },
+        wanted,
+      );
+      if (outcome.status === "invalid") {
+        complete = false;
+      } else {
+        deltaChunkCount += 1;
+        totalTokens = safeByteSum(totalTokens, outcome.totalTokens, "Full-text token count");
       }
     }
     await transactionDone(transaction);
@@ -2835,9 +2872,11 @@ export class IndexedDbBlockStore implements BlockStore {
       (toc === undefined || deltaIndex !== undefined);
     const coversVersion = toc?.coversVersion ?? -1;
     const prefix = ftsBaseChunkPrefix(tableId, columnId, toc?.generation);
-    const versions = (deltaIndex?.versions ?? []).filter(
+    const deltas = filterFtsDeltaIndex(
+      deltaIndex ?? { versions: [], parts: [] },
       (version) => version > coversVersion && version <= upToVersion,
     );
+    const identity = `${tableId}/${columnId}`;
     const chunks: FtsPosting[][] = [];
     let retainedRowIds = 0;
     let retainedBytes = 0;
@@ -2869,22 +2908,20 @@ export class IndexedDbBlockStore implements BlockStore {
         break;
       }
     }
-    if (!overflow) {
-      for (const version of versions) {
-        const value: unknown = await requestResult(
-          store.get(ftsChunkKey(tableId, columnId, version)),
-        );
-        const chunk = decodeFtsDeltaChunk(value);
-        if (chunk === undefined) {
-          complete = false;
-        } else {
-          deltaChunkCount += 1;
-          if (!retain(chunk.postings)) {
-            overflow = true;
-            break;
-          }
-        }
-      }
+    for (const [position, version] of deltas.versions.entries()) {
+      if (overflow) break;
+      const outcome = await visitFtsDeltaParts(
+        store,
+        identity,
+        version,
+        deltas.parts[position] ?? 1,
+        (chunk) => {
+          overflow = !retain(chunk.postings);
+          return !overflow;
+        },
+      );
+      if (outcome.status === "invalid") complete = false;
+      else deltaChunkCount += 1;
     }
     await transactionDone(transaction);
     return {
@@ -5013,6 +5050,13 @@ export class IndexedDbBlockStore implements BlockStore {
               chunk,
             );
             let cachePresent = priorPresent;
+            if (
+              cachePresent !== undefined &&
+              uniqueKeyCacheBytesAfter(cachePresent, [], chunk, []) > this.#uniqueKeyCacheBytes
+            ) {
+              // Building a set the budget then discards would hold the thread for nothing.
+              cachePresent = undefined;
+            }
             if (cachePresent !== undefined) {
               if (cachePresent === keyState?.fullPresent) cachePresent = new Set(cachePresent);
               applyChunk(cachePresent, chunk);
@@ -5022,7 +5066,12 @@ export class IndexedDbBlockStore implements BlockStore {
                 ? { action: "drop" }
                 : { action: "replace", present: cachePresent, chunks: [], index: nextIndex };
           } else {
-            const chunkParts = writeUniqueKeyTailParts(catalog, tableId, manifest.version, chunk);
+            const chunkParts = await writeUniqueKeyTailParts(
+              catalog,
+              tableId,
+              manifest.version,
+              chunk,
+            );
             const nextIndex: UniqueKeyChunkIndex = {
               versions: [...index.versions, manifest.version],
               hasBase: index.hasBase,
@@ -5033,7 +5082,11 @@ export class IndexedDbBlockStore implements BlockStore {
             catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
             if (keyCacheValid) {
               keyCachePlan = { action: "keep", chunk, index: nextIndex };
-            } else if (keyState?.fullPresent !== undefined) {
+            } else if (
+              keyState?.fullPresent !== undefined &&
+              uniqueKeyCacheBytesAfter(keyState.fullPresent, keyState.chunks, chunk, chunkParts) <=
+                this.#uniqueKeyCacheBytes
+            ) {
               const nextPresent = new Set(keyState.fullPresent);
               applyChunk(nextPresent, chunk);
               keyCachePlan = {
@@ -5042,15 +5095,9 @@ export class IndexedDbBlockStore implements BlockStore {
                 chunks: [...keyState.chunks, ...chunkParts],
                 index: nextIndex,
               };
-            } else if (priorPresent !== undefined) {
-              applyChunk(priorPresent, chunk);
-              keyCachePlan = {
-                action: "replace",
-                present: priorPresent,
-                chunks: [...(keyState?.chunks ?? []), ...chunkParts],
-                index: nextIndex,
-              };
             } else {
+              // Unknown membership, or a cache the budget would discard: building it would hold
+              // the thread for nothing.
               keyCachePlan = { action: "drop" };
             }
           }
@@ -5087,6 +5134,15 @@ export class IndexedDbBlockStore implements BlockStore {
         return;
       }
       if (multiKeyCachePlan !== undefined || work.fullPresent === undefined) return;
+      if (
+        replacement === undefined &&
+        chunk !== undefined &&
+        uniqueKeyCacheBytesAfter(work.fullPresent, [], chunk, state.chunks) >
+          this.#uniqueKeyCacheBytes
+      ) {
+        // No plan drops the cache, as an over-budget replacement would, without building it.
+        return;
+      }
       const present = replacement ?? new Set(work.fullPresent);
       if (replacement === undefined && chunk !== undefined) applyChunk(present, chunk);
       multiKeyCachePlan = { action: "replace", tableId: work.tableId, present, ...state };
@@ -5106,7 +5162,12 @@ export class IndexedDbBlockStore implements BlockStore {
           hasBase: work.index.hasBase,
           ...uniqueKeyBaseIndexFields(work.index),
         };
-        const chunkParts = writeUniqueKeyTailParts(catalog, work.tableId, manifest.version, chunk);
+        const chunkParts = await writeUniqueKeyTailParts(
+          catalog,
+          work.tableId,
+          manifest.version,
+          chunk,
+        );
         // Appending a tail chunk leaves the base alone, so its recorded size still holds.
         catalog.put(nextIndex, uniqueKeyChunkIndexKey(work.tableId));
         rememberMultiKeyState(
@@ -5159,45 +5220,46 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
     const ftsDeltaCounts: NonNullable<ManifestSummary["ftsDeltaCounts"]> = [];
+    const ftsSlicer = new TransactionSlicer(catalog);
     for (const ftsEntry of input.ftsChanges ?? []) {
       const tableValue: unknown = await requestResult(
         catalog.get(`${TABLE_ID_PREFIX}${ftsEntry.tableId}`),
       );
-      if (tableValue === undefined) continue;
-      const table = asTableRecord(tableValue, `${TABLE_ID_PREFIX}${ftsEntry.tableId}`);
-      const active = activePostingStorageColumnIds(table);
+      const table =
+        tableValue === undefined
+          ? undefined
+          : asTableRecord(tableValue, `${TABLE_ID_PREFIX}${ftsEntry.tableId}`);
+      const active = table === undefined ? new Set<string>() : activePostingStorageColumnIds(table);
       for (const column of ftsEntry.columns) {
-        if (!active.has(column.columnId)) continue;
-        const postings = decodeFtsPostingChunk(column.postings);
-        if (
-          postings === undefined ||
-          !Number.isSafeInteger(column.totalTokens) ||
-          column.totalTokens < 0
-        ) {
-          throw new TypeError(`Full-text delta is invalid: ${ftsEntry.tableId}/${column.columnId}`);
-        }
-        const secondaryOwner = Object.values(table.secondaryIndexes ?? {}).some(
+        const identity = `${ftsEntry.tableId}/${column.columnId}`;
+        const secondaryOwner = Object.values(table?.secondaryIndexes ?? {}).some(
           (index) => index.storageColumnId === column.columnId,
         );
-        if (
-          ftsPostingTokenCount(postings) !== column.totalTokens ||
-          (secondaryOwner &&
-            postings.some((posting) => posting.tf.some((frequency) => frequency !== 1)))
-        ) {
-          throw new TypeError(
-            `Full-text delta token count is invalid: ${ftsEntry.tableId}/${column.columnId}`,
-          );
+        if (!active.has(column.columnId)) {
+          // Nothing durable to write, but a malformed delta is refused all the same.
+          await writeFtsCommitDelta(catalog, ftsSlicer, column, identity, false, undefined);
+          continue;
         }
         const indexKey = ftsChunkIndexKey(ftsEntry.tableId, column.columnId);
         const rawChunkIndex: unknown = await requestResult(catalog.get(indexKey));
         const chunkIndex = decodeFtsDeltaIndex(rawChunkIndex);
         if (
           (rawChunkIndex !== undefined && chunkIndex === undefined) ||
-          (postings.length > 0 && (chunkIndex?.versions.length ?? 0) >= MAX_FTS_DELTA_CHUNKS)
+          (column.postings.length > 0 && (chunkIndex?.versions.length ?? 0) >= MAX_FTS_DELTA_CHUNKS)
         ) {
+          await writeFtsCommitDelta(
+            catalog,
+            ftsSlicer,
+            column,
+            identity,
+            secondaryOwner,
+            undefined,
+          );
           for (const version of chunkIndex?.versions ?? []) {
-            catalog.delete(ftsChunkKey(ftsEntry.tableId, column.columnId, version));
+            catalog.delete(ftsDeltaPartKey(identity, version, 0));
           }
+          // Every later part of the column, including any an unreadable index no longer names.
+          await deleteStructuredKeyPrefix(catalog, [FTS_DELTA_PART, identity]);
           catalog.delete(indexKey);
           const currentTableValue: unknown = await requestResult(
             catalog.get(`${TABLE_ID_PREFIX}${ftsEntry.tableId}`),
@@ -5229,7 +5291,15 @@ export class IndexedDbBlockStore implements BlockStore {
         // Empty commit coverage already protected the active index from stale-writer
         // invalidation above. It has no durable query state and must not consume one of the
         // bounded delta generations.
-        if (postings.length === 0) {
+        if (column.postings.length === 0) {
+          await writeFtsCommitDelta(
+            catalog,
+            ftsSlicer,
+            column,
+            identity,
+            secondaryOwner,
+            undefined,
+          );
           ftsDeltaCounts.push({
             tableId: ftsEntry.tableId,
             columnId: column.columnId,
@@ -5237,19 +5307,24 @@ export class IndexedDbBlockStore implements BlockStore {
           });
           continue;
         }
-        catalog.put(
-          structuredClone({
-            postings,
-            totalTokens: column.totalTokens,
-          } satisfies FtsDeltaChunk),
-          ftsChunkKey(ftsEntry.tableId, column.columnId, manifest.version),
+        const partCount = await writeFtsCommitDelta(
+          catalog,
+          ftsSlicer,
+          column,
+          identity,
+          secondaryOwner,
+          { identity, version: manifest.version },
         );
-        const versions = [...(chunkIndex?.versions ?? []), manifest.version];
-        catalog.put({ versions }, indexKey);
+        const nextIndex: FtsDeltaIndex = {
+          versions: [...(chunkIndex?.versions ?? []), manifest.version],
+          parts: [...(chunkIndex?.parts ?? []), partCount],
+        };
+        catalog.put(encodeFtsDeltaIndex(nextIndex), indexKey);
         ftsDeltaCounts.push({
           tableId: ftsEntry.tableId,
           columnId: column.columnId,
-          count: versions.length,
+          // A version count: a delta of many parts is still one generation of the tail.
+          count: nextIndex.versions.length,
         });
       }
     }
@@ -5273,17 +5348,18 @@ export class IndexedDbBlockStore implements BlockStore {
             retained?.tableId === multiKeyCachePlan.tableId &&
             retained.version === input.expectedManifestVersion
           ) {
-            if (multiKeyCachePlan.chunk !== undefined) {
-              applyChunk(retained.present, multiKeyCachePlan.chunk);
-            }
-            retained.chunks = multiKeyCachePlan.chunks;
-            retained.index = multiKeyCachePlan.index;
-            retained.version = manifest.version;
+            const delta = multiKeyCachePlan.chunk ?? { addedTokens: [], removedTokens: [] };
             if (
-              uniqueKeyCacheRetainedBytes(retained.present, retained.chunks) >
+              uniqueKeyCacheBytesAfter(retained.present, [], delta, multiKeyCachePlan.chunks) >
               this.#uniqueKeyCacheBytes
             ) {
+              // Measured before applying, so an over-budget delta is never built only to drop.
               this.#uniqueKeyCache = undefined;
+            } else {
+              applyChunk(retained.present, delta);
+              retained.chunks = multiKeyCachePlan.chunks;
+              retained.index = multiKeyCachePlan.index;
+              retained.version = manifest.version;
             }
           } else {
             this.#uniqueKeyCache = undefined;
@@ -5309,16 +5385,19 @@ export class IndexedDbBlockStore implements BlockStore {
       // table's key records, so a cache for a different table just moves to the new version.
       if (uniqueKeyChanges !== undefined && keyCachePlan !== undefined) {
         if (keyCachePlan.action === "keep" && keyCacheValid) {
-          // In-place delta on the live cache: no copies of a multi-million-token set per batch.
-          applyChunk(keyCache.present, keyCachePlan.chunk);
-          keyCache.chunks.push(keyCachePlan.chunk);
-          keyCache.index = keyCachePlan.index;
-          keyCache.version = manifest.version;
           if (
-            uniqueKeyCacheRetainedBytes(keyCache.present, keyCache.chunks) >
-            this.#uniqueKeyCacheBytes
+            uniqueKeyCacheBytesAfter(keyCache.present, keyCache.chunks, keyCachePlan.chunk, [
+              keyCachePlan.chunk,
+            ]) > this.#uniqueKeyCacheBytes
           ) {
+            // Applying a delta only for the budget to discard the result would hold the thread.
             this.#uniqueKeyCache = undefined;
+          } else {
+            // In-place delta on the live cache: no copies of a multi-million-token set per batch.
+            applyChunk(keyCache.present, keyCachePlan.chunk);
+            keyCache.chunks.push(keyCachePlan.chunk);
+            keyCache.index = keyCachePlan.index;
+            keyCache.version = manifest.version;
           }
         } else if (keyCachePlan.action === "replace") {
           this.#uniqueKeyCache =
@@ -6846,13 +6925,16 @@ export class IndexedDbBlockStore implements BlockStore {
             if (!(await postingIdentityHasCatalogOwner(catalog, identity))) {
               throw corruption(key, "postings delta index has no catalog owner");
             }
-            for (const version of index.versions) {
-              const chunkKey = `${FTS_CHUNK_PREFIX}${identity}/${String(version)}`;
+            for (const [position, version] of index.versions.entries()) {
+              const partCount = index.parts[position] ?? 1;
               if (
-                decodeFtsDeltaChunk(await requestResult<unknown>(catalog.get(chunkKey))) ===
-                undefined
+                (await visitFtsDeltaParts(catalog, identity, version, partCount, () => true))
+                  .status !== "complete"
               ) {
-                throw corruption(chunkKey, "postings delta chunk is missing or invalid");
+                throw corruption(
+                  `${FTS_CHUNK_PREFIX}${identity}/${String(version)}`,
+                  `postings delta of ${String(partCount)} part(s) is missing, invalid, or out of order`,
+                );
               }
             }
           } else if (key.startsWith(FTS_CHUNK_PREFIX)) {
@@ -6930,6 +7012,38 @@ export class IndexedDbBlockStore implements BlockStore {
           if (!index?.versions.includes(ordinal as number)) {
             throw corruption(`${UNIQUE_KEY_CHUNK}/${namespaceId}`, "tail is orphaned");
           }
+        } else if (kind === FTS_DELTA_PART) {
+          // Later parts and directories of postings deltas; the index walk above proves the
+          // live ones complete and ordered, this proves none is stray or malformed.
+          const location = `${FTS_DELTA_PART}/${namespaceId}`;
+          const directory = boundary === FTS_DELTA_DIRECTORY;
+          if (
+            key.length !== 4 ||
+            !Number.isSafeInteger(ordinal) ||
+            (ordinal as number) < 0 ||
+            (!directory && (!Number.isSafeInteger(boundary) || (boundary as number) < 1))
+          ) {
+            throw corruption(location, "key shape is invalid");
+          }
+          const owner = await ftsDeltaPartOwner(catalog, namespaceId, ordinal as number);
+          const owned =
+            owner === "retiring" ||
+            (owner !== undefined &&
+              (directory ? owner.partCount > 1 : (boundary as number) < owner.partCount));
+          if (!owned) {
+            throw corruption(location, "postings delta part has no index or retirement marker");
+          }
+          // A retiring directory is checked against its own length: its index entry is gone.
+          const expectedParts =
+            owner === "retiring"
+              ? isRecord(value) && Array.isArray(value.boundaries)
+                ? value.boundaries.length
+                : -1
+              : owner.partCount;
+          const valid = directory
+            ? decodeFtsDeltaDirectory(value, expectedParts) !== undefined
+            : (decodeFtsDeltaChunk(value)?.postings.length ?? 0) > 0;
+          if (!valid) throw corruption(location, "postings delta part is invalid");
         } else throw corruption(kind, "structured catalog record kind is unknown");
       } catch (error) {
         issue("invalid-catalog-record", storageKeyLocation(key), error);
@@ -9647,6 +9761,78 @@ function openDatabaseRequest(
   });
 }
 
+/**
+ * Hands the event loop a turn from inside an open IndexedDB transaction once the thread has run
+ * for a work slice. A timer or MessageChannel turn would let the transaction auto-commit, so the
+ * turn is the wait for a request's success event — a task in its own right, during which the
+ * transaction stays active for the next request. Waiting for the most recent write also proves
+ * every earlier request in the transaction finished.
+ */
+class TransactionSlicer {
+  #sliceStart = performance.now();
+
+  constructor(private readonly store: IDBObjectStore) {}
+
+  async maybeYield(latest?: IDBRequest): Promise<void> {
+    if (performance.now() - this.#sliceStart < WORK_SLICE_MS) return;
+    await requestResult(latest ?? this.store.getKey(CURRENT_MANIFEST_KEY));
+    this.#sliceStart = performance.now();
+  }
+}
+
+/** Strings per natively sorted run in sortStringsSliced; one run sorts in a few milliseconds. */
+const SLICED_SORT_RUN = 16_384;
+
+/**
+ * The strings in UTF-16 code-unit order — what `sort()` and `<` both use — sorted a run at a
+ * time and then merged pairwise, with `slicer` handing the thread a turn between runs and every
+ * few thousand merged strings. One native sort of a million keys holds the thread for hundreds
+ * of milliseconds; this spends the same work in slices. Does not modify `values`.
+ */
+async function sortStringsSliced(
+  values: readonly string[],
+  slicer: TransactionSlicer,
+): Promise<string[]> {
+  if (values.length <= SLICED_SORT_RUN) return [...values].sort();
+  let runs: string[][] = [];
+  for (let start = 0; start < values.length; start += SLICED_SORT_RUN) {
+    runs.push(values.slice(start, start + SLICED_SORT_RUN).sort());
+    await slicer.maybeYield();
+  }
+  while (runs.length > 1) {
+    const merged: string[][] = [];
+    for (let index = 0; index < runs.length; index += 2) {
+      const left = runs[index] ?? [];
+      const right = runs[index + 1];
+      if (right === undefined) {
+        merged.push(left);
+        continue;
+      }
+      const output: string[] = [];
+      let leftIndex = 0;
+      let rightIndex = 0;
+      while (leftIndex < left.length && rightIndex < right.length) {
+        const leftValue = left[leftIndex] ?? "";
+        const rightValue = right[rightIndex] ?? "";
+        if (rightValue < leftValue) {
+          output.push(rightValue);
+          rightIndex += 1;
+        } else {
+          output.push(leftValue);
+          leftIndex += 1;
+        }
+        if ((output.length & 4_095) === 0) await slicer.maybeYield();
+      }
+      for (; leftIndex < left.length; leftIndex += 1) output.push(left[leftIndex] ?? "");
+      for (; rightIndex < right.length; rightIndex += 1) output.push(right[rightIndex] ?? "");
+      merged.push(output);
+      await slicer.maybeYield();
+    }
+    runs = merged;
+  }
+  return runs[0] ?? [];
+}
+
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   const guard = stallGuardFor(request.transaction?.db);
   return new Promise((resolve, reject) => {
@@ -10243,6 +10429,9 @@ async function removeTableMetadataInTransaction(
     `${FTS_BASE_PREFIX}${record.id}/`,
     `${FTS_BASE_BUILD_PREFIX}${record.id}/`,
     `${FTS_CHUNK_PREFIX}${record.id}/`,
+    // Each column's delta index goes with the deltas it lists. Releases through 0.13.1 left it
+    // behind, an orphan the integrity check reported.
+    `${FTS_CHUNK_PREFIX}index/${record.id}/`,
   ];
   const ownedArrayKinds = new Set([UNIQUE_KEY_CHUNK_INDEX, UNIQUE_KEY_CHUNK, UNIQUE_KEY_BASE_PART]);
   await visitObjectStoreSequentially(catalog, (_value, key) => {
@@ -10253,6 +10442,13 @@ async function removeTableMetadataInTransaction(
     if (!Array.isArray(key)) return;
     const [kind, owner] = key as unknown[];
     if (typeof kind === "string" && ownedArrayKinds.has(kind) && owner === record.id) {
+      catalog.delete(key);
+    } else if (
+      kind === FTS_DELTA_PART &&
+      typeof owner === "string" &&
+      owner.startsWith(`${record.id}/`)
+    ) {
+      // Later postings-delta parts are keyed by "{table}/{column}", like the string prefixes.
       catalog.delete(key);
     }
   });
@@ -12069,14 +12265,21 @@ async function readSnapshotPostingGeneration(
       "Snapshot posting token count",
     );
   }
-  for (const deltaVersion of deltaIndex.versions) {
-    if (deltaVersion <= toc.coversVersion || deltaVersion > version) continue;
-    const delta = decodeFtsDeltaChunk(
-      await requestResult<unknown>(catalog.get(ftsChunkKey(tableId, columnId, deltaVersion))),
+  const deltas = filterFtsDeltaIndex(
+    deltaIndex,
+    (deltaVersion) => deltaVersion > toc.coversVersion && deltaVersion <= version,
+  );
+  for (const [position, deltaVersion] of deltas.versions.entries()) {
+    const outcome = await visitFtsDeltaParts(
+      catalog,
+      identity,
+      deltaVersion,
+      deltas.parts[position] ?? 1,
+      (delta) => delta.postings.length === 0 || retain(delta.postings),
     );
-    if (delta === undefined) return undefined;
-    if (delta.postings.length > 0 && !retain(delta.postings)) return undefined;
-    totalTokens = safeByteSum(totalTokens, delta.totalTokens, "Snapshot posting token count");
+    // A malformed delta, or one too large to retain, leaves the accelerator out of the copy.
+    if (outcome.status !== "complete") return undefined;
+    totalTokens = safeByteSum(totalTokens, outcome.totalTokens, "Snapshot posting token count");
   }
   const merged = collectFtsPostings(chunks);
   if (ftsPostingChunkRetainedBounds(merged).bytes > MAX_FTS_ORDERED_READ_BYTES) {
@@ -15220,17 +15423,147 @@ function validateCommitFtsChanges(changes: CommitTransactionInput["ftsChanges"])
         throw new TypeError(`Full-text commit column is duplicated: ${column.columnId}`);
       }
       columnIds.add(column.columnId);
-      const postings = decodeFtsPostingChunk(column.postings);
+      // The postings themselves are unbounded, so they are validated a slice at a time inside
+      // the commit, in the same pass that writes them (writeFtsCommitDelta).
       if (
-        postings === undefined ||
+        !Array.isArray(column.postings) ||
         !Number.isSafeInteger(column.totalTokens) ||
-        column.totalTokens < 0 ||
-        ftsPostingTokenCount(postings) !== column.totalTokens
+        column.totalTokens < 0
       ) {
         throw new TypeError(`Full-text delta is invalid: ${entry.tableId}/${column.columnId}`);
       }
     }
   }
+}
+
+/**
+ * Validates one commit's postings for one column — strictly ascending terms, row ids ascending
+ * within a term, valid row ids and term frequencies, a token total matching `totalTokens`, and
+ * unit frequencies for a secondary index — and, given a `target`, writes them as that version's
+ * delta parts. The list may be any length and one term may carry any number of row ids: a part
+ * closes at FTS_DELTA_PART_POSTINGS postings, FTS_DELTA_PART_ROW_IDS row ids, or
+ * FTS_DELTA_PART_TERM_CHARACTERS term characters, and a term larger than a whole part continues
+ * in the next, row ids still ascending. A delta of several parts also gets its directory. Each
+ * put clones its part before control returns, so nothing else is copied, and the thread gets a
+ * turn between parts. A refusal throws, which aborts the commit with no part visible. Returns
+ * the number of parts.
+ */
+async function writeFtsCommitDelta(
+  catalog: IDBObjectStore,
+  slicer: TransactionSlicer,
+  column: FtsColumnDelta,
+  location: string,
+  unitFrequencies: boolean,
+  target: { identity: string; version: number } | undefined,
+): Promise<number> {
+  const invalid = (): TypeError => new TypeError(`Full-text delta is invalid: ${location}`);
+  const postings: unknown = column.postings;
+  if (!Array.isArray(postings)) throw invalid();
+  let part: FtsPosting[] = [];
+  let partRowIds = 0;
+  let partTermCharacters = 0;
+  let partTokens = 0;
+  let partCount = 0;
+  let tokens = 0;
+  let latest: IDBRequest | undefined;
+  const boundaries: Array<{ first: string; last: string }> = [];
+  const flush = async (): Promise<void> => {
+    if (part.length === 0) return;
+    if (target !== undefined) {
+      latest = catalog.put(
+        { postings: part, totalTokens: partTokens } satisfies FtsDeltaChunk,
+        ftsDeltaPartKey(target.identity, target.version, partCount),
+      );
+      boundaries.push({ first: part[0]?.term ?? "", last: part.at(-1)?.term ?? "" });
+    }
+    tokens = safeByteSum(tokens, partTokens, "Full-text token count");
+    partCount += 1;
+    part = [];
+    partRowIds = 0;
+    partTermCharacters = 0;
+    partTokens = 0;
+    await slicer.maybeYield(latest);
+  };
+  let previousTerm: string | undefined;
+  for (const candidate of postings as unknown[]) {
+    if (!isRecord(candidate) || !hasOnlyKnownFields(candidate, ["term", "rowIds", "tf"])) {
+      throw invalid();
+    }
+    const { term, rowIds, tf } = candidate;
+    if (
+      typeof term !== "string" ||
+      term.length === 0 ||
+      term.length > MAX_FTS_POSTING_TERM_CHARACTERS ||
+      (previousTerm !== undefined && term <= previousTerm) ||
+      !Array.isArray(rowIds) ||
+      !Array.isArray(tf) ||
+      rowIds.length !== tf.length
+    ) {
+      throw invalid();
+    }
+    previousTerm = term;
+    let previousRowId = 0n;
+    let offset = 0;
+    do {
+      if (
+        part.length === FTS_DELTA_PART_POSTINGS ||
+        partRowIds === FTS_DELTA_PART_ROW_IDS ||
+        partTermCharacters > FTS_DELTA_PART_TERM_CHARACTERS - term.length
+      ) {
+        await flush();
+      }
+      const remaining = rowIds.length - offset;
+      // A term that fits a part of its own starts one rather than splitting across two.
+      if (part.length > 0 && remaining > FTS_DELTA_PART_ROW_IDS - partRowIds) {
+        if (remaining <= FTS_DELTA_PART_ROW_IDS) {
+          await flush();
+          continue;
+        }
+      }
+      const take = Math.min(remaining, FTS_DELTA_PART_ROW_IDS - partRowIds);
+      for (let index = offset; index < offset + take; index += 1) {
+        const rowId: unknown = rowIds[index];
+        const frequency: unknown = tf[index];
+        if (
+          typeof rowId !== "bigint" ||
+          rowId <= previousRowId ||
+          rowId > MAX_ROW_ID ||
+          typeof frequency !== "number" ||
+          !Number.isSafeInteger(frequency) ||
+          frequency <= 0 ||
+          frequency > MAX_FTS_TOKENS_PER_DOCUMENT
+        ) {
+          throw invalid();
+        }
+        if (unitFrequencies && frequency !== 1) {
+          throw new TypeError(`Full-text delta token count is invalid: ${location}`);
+        }
+        previousRowId = rowId;
+        partTokens += frequency;
+      }
+      part.push(
+        take === rowIds.length
+          ? { term, rowIds: rowIds as bigint[], tf: tf as number[] }
+          : {
+              term,
+              rowIds: (rowIds as bigint[]).slice(offset, offset + take),
+              tf: (tf as number[]).slice(offset, offset + take),
+            },
+      );
+      partRowIds += take;
+      partTermCharacters += term.length;
+      offset += take;
+    } while (offset < rowIds.length);
+  }
+  await flush();
+  if (tokens !== column.totalTokens) throw invalid();
+  if (target !== undefined && partCount > 1) {
+    catalog.put(
+      { boundaries, totalTokens: tokens } satisfies FtsDeltaDirectory,
+      ftsDeltaDirectoryKey(target.identity, target.version),
+    );
+  }
+  return partCount;
 }
 
 function validateUniqueKeyBuildIdentity(input: BeginUniqueKeyBuildInput): void {
@@ -15444,11 +15777,21 @@ function decodeFtsBaseToc(value: unknown): FtsBaseToc | undefined {
   };
 }
 
-function decodeFtsDeltaIndex(value: unknown): { versions: number[] } | undefined {
+/**
+ * A column's live postings deltas: ascending commit versions, and how many ordered parts each
+ * version's delta has. Stored as `{ versions }` when every delta is one part (schema 3's shape)
+ * and `{ versions, parts }` otherwise.
+ */
+interface FtsDeltaIndex {
+  versions: number[];
+  parts: number[];
+}
+
+function decodeFtsDeltaIndex(value: unknown): FtsDeltaIndex | undefined {
   if (value === undefined) return undefined;
   if (
     !isRecord(value) ||
-    !hasOnlyKnownFields(value, ["versions"]) ||
+    !hasOnlyKnownFields(value, ["versions", "parts"]) ||
     !Array.isArray(value.versions) ||
     value.versions.length > MAX_FTS_DELTA_CHUNKS
   ) {
@@ -15457,12 +15800,175 @@ function decodeFtsDeltaIndex(value: unknown): { versions: number[] } | undefined
   const versions = value.versions;
   if (
     !versions.every((entry) => Number.isSafeInteger(entry) && entry >= 0) ||
-    new Set(versions).size !== versions.length ||
     versions.some((entry, index) => index > 0 && entry <= (versions[index - 1] ?? -1))
   ) {
     return undefined;
   }
-  return { versions: [...(versions as number[])] };
+  const parts = value.parts ?? versions.map(() => 1);
+  if (
+    !Array.isArray(parts) ||
+    parts.length !== versions.length ||
+    !parts.every(
+      (count) => Number.isSafeInteger(count) && count >= 1 && count <= MAX_FTS_DELTA_PARTS,
+    )
+  ) {
+    return undefined;
+  }
+  return { versions: [...(versions as number[])], parts: [...(parts as number[])] };
+}
+
+/** The stored form: `parts` only when some delta has more than one, so schema-3 indexes stay. */
+function encodeFtsDeltaIndex(index: FtsDeltaIndex): { versions: number[]; parts?: number[] } {
+  return index.parts.every((count) => count === 1)
+    ? { versions: [...index.versions] }
+    : { versions: [...index.versions], parts: [...index.parts] };
+}
+
+/** Keeps the deltas whose versions pass `keep`, with their part counts. */
+function filterFtsDeltaIndex(index: FtsDeltaIndex, keep: (version: number) => boolean) {
+  const kept: FtsDeltaIndex = { versions: [], parts: [] };
+  index.versions.forEach((version, position) => {
+    if (!keep(version)) return;
+    kept.versions.push(version);
+    kept.parts.push(index.parts[position] ?? 1);
+  });
+  return kept;
+}
+
+function ftsDeltaPartKey(identity: string, version: number, part: number): IDBValidKey {
+  return part === 0
+    ? `${FTS_CHUNK_PREFIX}${identity}/${String(version)}`
+    : [FTS_DELTA_PART, identity, version, part];
+}
+
+/** Deletes every part of one version's delta: the keyed first part and the structured rest. */
+async function deleteFtsDeltaVersion(
+  store: IDBObjectStore,
+  identity: string,
+  version: number,
+): Promise<void> {
+  store.delete(ftsDeltaPartKey(identity, version, 0));
+  await deleteStructuredKeyPrefix(store, [FTS_DELTA_PART, identity, version]);
+}
+
+/**
+ * Whether `next`, the first posting of a delta part, may follow `previous`, the last posting of
+ * the part before it: terms ascend, and a term split across the boundary continues with larger
+ * row ids.
+ */
+function ftsDeltaPartsContinue(previous: FtsPosting, next: FtsPosting): boolean {
+  if (next.term !== previous.term) return next.term > previous.term;
+  const lastRowId = previous.rowIds.at(-1);
+  const firstRowId = next.rowIds[0];
+  return lastRowId !== undefined && firstRowId !== undefined && firstRowId > lastRowId;
+}
+
+function ftsDeltaDirectoryKey(identity: string, version: number): IDBValidKey {
+  return [FTS_DELTA_PART, identity, version, FTS_DELTA_DIRECTORY];
+}
+
+interface FtsDeltaDirectory {
+  boundaries: Array<{ first: string; last: string }>;
+  /** Every part's tokens, so a read that skips parts still reports exact BM25 totals. */
+  totalTokens: number;
+}
+
+/**
+ * A multi-part delta's directory: each part's first and last term, in part order, and the
+ * version's token total. Consecutive parts may share a boundary term (one term's row ids
+ * continuing), never overlap further.
+ */
+function decodeFtsDeltaDirectory(value: unknown, partCount: number): FtsDeltaDirectory | undefined {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKnownFields(value, ["boundaries", "totalTokens"]) ||
+    !isBoundedCursor(value.totalTokens, Number.MAX_SAFE_INTEGER) ||
+    !Array.isArray(value.boundaries) ||
+    value.boundaries.length !== partCount
+  ) {
+    return undefined;
+  }
+  const boundaries: Array<{ first: string; last: string }> = [];
+  for (const candidate of value.boundaries as unknown[]) {
+    if (
+      !isRecord(candidate) ||
+      !hasOnlyKnownFields(candidate, ["first", "last"]) ||
+      typeof candidate.first !== "string" ||
+      candidate.first.length === 0 ||
+      candidate.first.length > MAX_FTS_POSTING_TERM_CHARACTERS ||
+      typeof candidate.last !== "string" ||
+      candidate.last.length > MAX_FTS_POSTING_TERM_CHARACTERS ||
+      candidate.first > candidate.last ||
+      (boundaries.at(-1)?.last ?? "") > candidate.first
+    ) {
+      return undefined;
+    }
+    boundaries.push({ first: candidate.first, last: candidate.last });
+  }
+  return { boundaries, totalTokens: value.totalTokens };
+}
+
+/**
+ * Reads one version's delta part by part, in order, handing each to `visit`, which returns false
+ * to stop early. With `overlaps`, a multi-part delta reads only the parts whose directory range
+ * it accepts. A missing or malformed part or directory, a part that disagrees with its directory
+ * range, consecutive parts that break the version's term and row order, or (on a full read)
+ * part totals that disagree with the directory make the delta `invalid`; readers then treat the
+ * index as incomplete and scan, and the integrity check reports it. `totalTokens` is the whole
+ * version's, whichever parts were read.
+ */
+async function visitFtsDeltaParts(
+  store: IDBObjectStore,
+  identity: string,
+  version: number,
+  partCount: number,
+  visit: (chunk: FtsDeltaChunk) => boolean,
+  overlaps?: (boundary: { first: string; last: string }) => boolean,
+): Promise<{ status: "complete" | "stopped" | "invalid"; totalTokens: number }> {
+  const invalid = { status: "invalid", totalTokens: 0 } as const;
+  let directory: FtsDeltaDirectory | undefined;
+  if (partCount > 1) {
+    directory = decodeFtsDeltaDirectory(
+      await requestResult<unknown>(store.get(ftsDeltaDirectoryKey(identity, version))),
+      partCount,
+    );
+    if (directory === undefined) return invalid;
+  }
+  let previous: { part: number; posting: FtsPosting } | undefined;
+  let readAll = true;
+  let partTokens = 0;
+  for (let part = 0; part < partCount; part += 1) {
+    const boundary = directory?.boundaries[part];
+    if (boundary !== undefined && overlaps !== undefined && !overlaps(boundary)) {
+      readAll = false;
+      continue;
+    }
+    const chunk = decodeFtsDeltaChunk(
+      await requestResult<unknown>(store.get(ftsDeltaPartKey(identity, version, part))),
+    );
+    if (
+      chunk === undefined ||
+      (boundary !== undefined && !ftsChunkMatchesBoundary(chunk.postings, boundary))
+    ) {
+      return invalid;
+    }
+    const first = chunk.postings[0];
+    if (
+      previous?.part === part - 1 &&
+      first !== undefined &&
+      !ftsDeltaPartsContinue(previous.posting, first)
+    ) {
+      return invalid;
+    }
+    const last = chunk.postings.at(-1);
+    previous = last === undefined ? undefined : { part, posting: last };
+    partTokens = safeByteSum(partTokens, chunk.totalTokens, "Full-text token count");
+    if (!visit(chunk)) {
+      return { status: "stopped", totalTokens: directory?.totalTokens ?? partTokens };
+    }
+  }
+  if (directory !== undefined && readAll && partTokens !== directory.totalTokens) return invalid;
+  return { status: "complete", totalTokens: directory?.totalTokens ?? partTokens };
 }
 
 function decodeFtsPostingChunk(value: unknown): FtsPosting[] | undefined {
@@ -15543,10 +16049,7 @@ function asOptionalFtsBaseToc(value: unknown, location: string): FtsBaseToc | un
   return decoded;
 }
 
-function asOptionalFtsDeltaIndex(
-  value: unknown,
-  location: string,
-): { versions: number[] } | undefined {
+function asOptionalFtsDeltaIndex(value: unknown, location: string): FtsDeltaIndex | undefined {
   if (value === undefined) return undefined;
   const decoded = decodeFtsDeltaIndex(value);
   if (decoded === undefined) throw corruption(location, "postings delta index is invalid");
@@ -15784,10 +16287,6 @@ function sameFtsPostingChunk(left: readonly FtsPosting[], right: readonly FtsPos
   );
 }
 
-function ftsChunkKey(tableId: string, columnId: string, version: number): string {
-  return `${FTS_CHUNK_PREFIX}${tableId}/${columnId}/${String(version)}`;
-}
-
 function ftsChunkIndexKey(tableId: string, columnId: string): string {
   return `${FTS_CHUNK_PREFIX}index/${tableId}/${columnId}`;
 }
@@ -15897,6 +16396,28 @@ async function ftsDeltaChunkHasProvenance(catalog: IDBObjectStore, key: string):
   if (decodeFtsDeltaIndex(indexValue)?.versions.includes(version) === true) return true;
   const retirement = decodeFtsRetirementMarker(retirementValue);
   return retirement?.deltaVersions.slice(retirement.deltaCleanupIndex).includes(version) === true;
+}
+
+/**
+ * Who owns a version's later delta parts: the live index, with the part count it records, or a
+ * retirement marker that has yet to delete them. Undefined means the parts are stray.
+ */
+async function ftsDeltaPartOwner(
+  catalog: IDBObjectStore,
+  identity: string,
+  version: number,
+): Promise<{ partCount: number } | "retiring" | undefined> {
+  const [indexValue, retirementValue] = await Promise.all([
+    requestResult<unknown>(catalog.get(`${FTS_CHUNK_PREFIX}index/${identity}`)),
+    requestResult<unknown>(catalog.get(`${FTS_RETIREMENT_PREFIX}${identity}`)),
+  ]);
+  const index = decodeFtsDeltaIndex(indexValue);
+  const position = index?.versions.indexOf(version) ?? -1;
+  if (position >= 0) return { partCount: index?.parts[position] ?? 1 };
+  const retirement = decodeFtsRetirementMarker(retirementValue);
+  return retirement?.deltaVersions.slice(retirement.deltaCleanupIndex).includes(version) === true
+    ? "retiring"
+    : undefined;
 }
 
 function firstFtsBaseBuildByExpiry(
@@ -16069,9 +16590,7 @@ async function deleteFtsRetirementPage(store: IDBObjectStore, identity: string):
   let deltaCleanupIndex = marker.deltaCleanupIndex;
   const deltaEnd = Math.min(deltaCleanupIndex + remaining, marker.deltaVersions.length);
   for (; deltaCleanupIndex < deltaEnd; deltaCleanupIndex += 1) {
-    store.delete(
-      `${FTS_CHUNK_PREFIX}${identity}/${String(marker.deltaVersions[deltaCleanupIndex] ?? -1)}`,
-    );
+    await deleteFtsDeltaVersion(store, identity, marker.deltaVersions[deltaCleanupIndex] ?? -1);
   }
   const complete =
     generations.every((entry) => entry.cleanupIndex === entry.chunkCount) &&
@@ -18029,10 +18548,10 @@ async function replaceUniqueKeyMembership(
   const raw = await requestResult<unknown>(store.get(uniqueKeyChunkIndexKey(namespaceId)));
   const previous = raw === undefined ? undefined : asUniqueKeyChunkIndex(raw);
   if (previous?.baseGenerationId !== undefined) {
-    await deleteUniqueKeyPartPrefix(store, [UNIQUE_KEY_BASE_PART, previous.baseGenerationId]);
+    await deleteStructuredKeyPrefix(store, [UNIQUE_KEY_BASE_PART, previous.baseGenerationId]);
   }
   for (const version of previous?.versions ?? []) {
-    await deleteUniqueKeyPartPrefix(store, [UNIQUE_KEY_CHUNK, namespaceId, version]);
+    await deleteStructuredKeyPrefix(store, [UNIQUE_KEY_CHUNK, namespaceId, version]);
   }
   const tokenCount = keyTokens instanceof Set ? keyTokens.size : keyTokens.length;
   if (!retainEmpty && tokenCount === 0) {
@@ -18129,6 +18648,23 @@ function applyChunk(present: Set<string>, chunk: UniqueKeyChunk): void {
 }
 
 /**
+ * What uniqueKeyCacheRetainedBytes would report after applying `delta` to `present` and appending
+ * `appended` to `chunks`, computed without building either. Exact, because a committed delta
+ * only adds tokens absent from the membership and removes tokens in it, never repeating one.
+ */
+function uniqueKeyCacheBytesAfter(
+  present: ReadonlySet<string>,
+  chunks: readonly UniqueKeyChunk[],
+  delta: UniqueKeyChunk,
+  appended: readonly UniqueKeyChunk[],
+): number {
+  let bytes = uniqueKeyCacheRetainedBytes(present, chunks);
+  for (const token of delta.addedTokens) bytes += 32 + token.length * 2;
+  for (const token of delta.removedTokens) bytes -= 32 + token.length * 2;
+  return bytes + uniqueKeyCacheRetainedBytes(new Set(), appended) - 256;
+}
+
+/**
  * Conservative retained-size model for the optional complete-membership cache. Strings are the
  * dominant payload; the fixed allowance covers Set buckets, array slots, and chunk objects.
  * This is deliberately not the on-disk size — it models the JavaScript graph we keep alive.
@@ -18201,56 +18737,52 @@ function splitUniqueMembershipTokens(tokens: readonly string[]): string[][] {
   return parts;
 }
 
-function canonicalUniqueKeyChunk(chunk: UniqueKeyChunk): UniqueKeyChunk {
-  const states = new Map<string, boolean>();
-  for (const token of chunk.addedTokens) {
-    uniqueMembershipTokenRetainedBytes(token);
-    if (states.has(token)) throw new TypeError("UNIQUE tail chunk repeats a token");
-    states.set(token, true);
-  }
-  for (const token of chunk.removedTokens) {
-    uniqueMembershipTokenRetainedBytes(token);
-    if (states.has(token)) throw new TypeError("UNIQUE tail chunk repeats a token");
-    states.set(token, false);
-  }
-  const entries = [...states].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
-  return {
-    addedTokens: entries.flatMap(([token, present]) => (present ? [token] : [])),
-    removedTokens: entries.flatMap(([token, present]) => (present ? [] : [token])),
-  };
-}
-
-function splitUniqueKeyChunk(chunk: UniqueKeyChunk): UniqueKeyChunk[] {
-  const canonical = canonicalUniqueKeyChunk(chunk);
-  const states = [
-    ...canonical.addedTokens.map((token) => [token, true] as const),
-    ...canonical.removedTokens.map((token) => [token, false] as const),
-  ].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+/**
+ * Cuts a tail chunk into its stored parts: every token once, in canonical order, validated
+ * against the public token domain, with a part closing at UNIQUE_KEY_MEMBERSHIP_PART_TOKENS
+ * tokens or its byte budget. A token may be either added or removed, never both or twice. The
+ * two lists sort in slices and merge, so a million-key commit never holds the thread for the
+ * whole sort, and the merge finds every repeat as two equal neighbours.
+ */
+async function splitUniqueKeyChunk(
+  chunk: UniqueKeyChunk,
+  slicer: TransactionSlicer,
+): Promise<UniqueKeyChunk[]> {
+  const added = await sortStringsSliced(chunk.addedTokens, slicer);
+  const removed = await sortStringsSliced(chunk.removedTokens, slicer);
   const parts: UniqueKeyChunk[] = [];
-  let entries: Array<readonly [string, boolean]> = [];
+  let part: UniqueKeyChunk = { addedTokens: [], removedTokens: [] };
+  let partTokens = 0;
   let retainedBytes = 0;
-  for (const entry of states) {
-    const tokenBytes = uniqueMembershipTokenRetainedBytes(entry[0]);
+  let previous: string | undefined;
+  let addedIndex = 0;
+  let removedIndex = 0;
+  while (addedIndex < added.length || removedIndex < removed.length) {
+    const nextAdded = added[addedIndex];
+    const nextRemoved = removed[removedIndex];
+    const present =
+      nextRemoved === undefined || (nextAdded !== undefined && nextAdded < nextRemoved);
+    const token = (present ? nextAdded : nextRemoved) ?? "";
+    if (present) addedIndex += 1;
+    else removedIndex += 1;
+    if (token === previous) throw new TypeError("UNIQUE tail chunk repeats a token");
+    previous = token;
+    const tokenBytes = uniqueMembershipTokenRetainedBytes(token);
     if (
-      entries.length === UNIQUE_KEY_MEMBERSHIP_PART_TOKENS ||
+      partTokens === UNIQUE_KEY_MEMBERSHIP_PART_TOKENS ||
       retainedBytes > UNIQUE_KEY_MEMBERSHIP_PART_RETAINED_BYTES - tokenBytes
     ) {
-      parts.push({
-        addedTokens: entries.flatMap(([token, present]) => (present ? [token] : [])),
-        removedTokens: entries.flatMap(([token, present]) => (present ? [] : [token])),
-      });
-      entries = [];
+      parts.push(part);
+      part = { addedTokens: [], removedTokens: [] };
+      partTokens = 0;
       retainedBytes = 0;
+      await slicer.maybeYield();
     }
-    entries.push(entry);
+    (present ? part.addedTokens : part.removedTokens).push(token);
+    partTokens += 1;
     retainedBytes += tokenBytes;
   }
-  if (entries.length > 0) {
-    parts.push({
-      addedTokens: entries.flatMap(([token, present]) => (present ? [token] : [])),
-      removedTokens: entries.flatMap(([token, present]) => (present ? [] : [token])),
-    });
-  }
+  if (partTokens > 0) parts.push(part);
   return parts;
 }
 
@@ -18262,15 +18794,19 @@ function uniqueChunkFirstToken(chunk: UniqueKeyChunk): string {
   return added < removed ? added : removed;
 }
 
-function writeUniqueKeyTailParts(
+/** Writes a tail chunk's parts, handing the thread a turn between puts once a slice runs out. */
+async function writeUniqueKeyTailParts(
   store: IDBObjectStore,
   namespaceId: string,
   version: number,
   chunk: UniqueKeyChunk,
-): UniqueKeyChunk[] {
-  const parts = splitUniqueKeyChunk(chunk);
+): Promise<UniqueKeyChunk[]> {
+  const slicer = new TransactionSlicer(store);
+  const parts = await splitUniqueKeyChunk(chunk, slicer);
   for (const part of parts) {
-    store.put(part, uniqueKeyChunkKey(namespaceId, version, uniqueChunkFirstToken(part)));
+    await slicer.maybeYield(
+      store.put(part, uniqueKeyChunkKey(namespaceId, version, uniqueChunkFirstToken(part))),
+    );
   }
   return parts;
 }
@@ -18285,7 +18821,7 @@ function writeUniqueKeyBaseParts(
   }
 }
 
-function deleteUniqueKeyPartPrefix(
+function deleteStructuredKeyPrefix(
   store: IDBObjectStore,
   prefix: ReadonlyArray<string | number>,
 ): Promise<void> {
@@ -18617,7 +19153,7 @@ async function foldUniqueMembershipGeneration(
   version: number,
   pending: UniqueKeyChunk,
 ): Promise<UniqueKeyChunkIndex> {
-  writeUniqueKeyTailParts(store, namespaceId, version, pending);
+  await writeUniqueKeyTailParts(store, namespaceId, version, pending);
   const inputIndex: UniqueKeyChunkIndex = {
     versions: [...index.versions, version],
     hasBase: index.hasBase,
@@ -18651,10 +19187,10 @@ async function foldUniqueMembershipGeneration(
   flush();
 
   if (index.baseGenerationId !== undefined) {
-    await deleteUniqueKeyPartPrefix(store, [UNIQUE_KEY_BASE_PART, index.baseGenerationId]);
+    await deleteStructuredKeyPrefix(store, [UNIQUE_KEY_BASE_PART, index.baseGenerationId]);
   }
   for (const tailVersion of inputIndex.versions) {
-    await deleteUniqueKeyPartPrefix(store, [UNIQUE_KEY_CHUNK, namespaceId, tailVersion]);
+    await deleteStructuredKeyPrefix(store, [UNIQUE_KEY_CHUNK, namespaceId, tailVersion]);
   }
   const folded: UniqueKeyChunkIndex =
     result.tokenCount === 0
@@ -18881,10 +19417,14 @@ async function readChunkedUniqueKeys(
     throw corruption(`${UNIQUE_KEY_CHUNK_INDEX}/${tableId}`, "membership index is missing");
   }
   const index = asUniqueKeyChunkIndex(rawIndex);
-  const requested = new Set(requestedTokens);
-  const requestedDescending = [...requested].sort((left, right) =>
-    left < right ? 1 : left > right ? -1 : 0,
-  );
+  // An empty namespace proves every token absent; ordering the request would only cost a sort,
+  // which on a first bulk load is a million strings.
+  const requestedDescending =
+    !index.hasBase && index.versions.length === 0
+      ? []
+      : [...new Set(requestedTokens)].sort((left, right) =>
+          left < right ? 1 : left > right ? -1 : 0,
+        );
   const existing = new Set<string>();
   if (index.hasBase) {
     if (index.baseGenerationId === undefined) {
