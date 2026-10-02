@@ -737,7 +737,8 @@ export async function sortedUniqueRowIdsSliced(values: readonly bigint[]): Promi
   const only = runs[0] ?? [];
   const unique: bigint[] = [];
   for (let index = 0; index < only.length; index += 1) {
-    const value = only[index] as bigint;
+    const value = only[index];
+    if (value === undefined) continue;
     if (unique.length === 0 || unique[unique.length - 1] !== value) unique.push(value);
     if (index % ROW_ID_SORT_RUN === ROW_ID_SORT_RUN - 1) await maybeYieldToEventLoop();
   }
@@ -754,12 +755,14 @@ async function mergeRowIdRuns(
   while (leftIndex < left.length || rightIndex < right.length) {
     const leftValue = left[leftIndex];
     const rightValue = right[rightIndex];
-    if (rightValue === undefined || (leftValue !== undefined && leftValue <= rightValue)) {
-      merged.push(leftValue as bigint);
+    if (leftValue !== undefined && (rightValue === undefined || leftValue <= rightValue)) {
+      merged.push(leftValue);
       leftIndex += 1;
-    } else {
+    } else if (rightValue !== undefined) {
       merged.push(rightValue);
       rightIndex += 1;
+    } else {
+      break;
     }
     if (merged.length % ROW_ID_SORT_RUN === 0) await maybeYieldToEventLoop();
   }

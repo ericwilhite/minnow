@@ -42,7 +42,7 @@ async function lookup(db: MinnowDatabase, amount: number): Promise<number> {
     params: [amount],
     memoize: false,
   });
-  return Number((result.rows[0] as { n: number }).n);
+  return (result.rows[0] as { n: number }).n;
 }
 
 describe("OPFS index lookups", () => {
@@ -60,6 +60,7 @@ describe("OPFS index lookups", () => {
     const preparing = new Promise<void>((resolve) => {
       entered = resolve;
     });
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with the mock receiver below.
     const prepare = RecordCore.prototype.prepareCommit;
     vi.spyOn(RecordCore.prototype, "prepareCommit").mockImplementation(async function (
       this: RecordCore,

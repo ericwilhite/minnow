@@ -1162,7 +1162,7 @@ export class DatabaseTransaction {
     const materialized: FtsChanges[] = [];
     const large: Array<{ tableId: string; columnId: string }> = [];
     for (const [tableId, columns] of this.#ftsChanges) {
-      const entries: FtsChanges["columns"][number][] = [];
+      const entries: Array<FtsChanges["columns"][number]> = [];
       for (const [columnId, entry] of columns) {
         const postings = await runStepsSliced(mergedFtsRunsSteps(entry));
         entries.push({ columnId, postings, totalTokens: entry.totalTokens });

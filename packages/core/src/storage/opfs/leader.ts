@@ -1098,7 +1098,7 @@ export class OpfsLeader {
             importLedgerState.ledgerLength,
             false,
           );
-    if (this.#closed) {
+    if (this.isClosed()) {
       this.#snapshotFrameExportLedger?.close();
       this.#snapshotFrameImportLedger?.close();
       throw new Error("The OPFS leader closed while it reloaded");

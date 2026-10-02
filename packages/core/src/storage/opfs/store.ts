@@ -1578,11 +1578,7 @@ export class OpfsBlockStore {
     this.#incomingPiecesBytes -= entry.bytes;
     if (entry.refused) return "refused";
     const expected = message.encoded;
-    if (
-      expected === undefined ||
-      entry.pieces.length !== expected.pieces ||
-      entry.bytes !== expected.bytes
-    ) {
+    if (expected?.pieces !== entry.pieces.length || expected.bytes !== entry.bytes) {
       return "missing";
     }
     const joined = new Uint8Array(entry.bytes);
