@@ -20,7 +20,12 @@ import {
   OPFS_LAYOUT_VERSION,
   upgradeOpfsLayout,
 } from "./upgrades.js";
-import { OpfsLeader, OpfsLeaderClosedError, type ServedMutationRequest } from "./leader.js";
+import {
+  LEASE_LANE_METHODS,
+  OpfsLeader,
+  OpfsLeaderClosedError,
+  type ServedMutationRequest,
+} from "./leader.js";
 import {
   rehydrateStoreError,
   estimateRpcValueBytes,
@@ -1308,7 +1313,9 @@ export class OpfsBlockStore {
    * Mutations run through the leader one at a time, from call to completion, whether a
    * follower sent them or this connection issued them. The leader appends each one's frame
    * from its own queue anyway; what the turn adds is that the request identity the leader is
-   * handed belongs to exactly one operation, so no frame can ever carry another's.
+   * handed belongs to exactly one operation, so no frame can ever carry another's. Leases
+   * (`LEASE_LANE_METHODS`) skip the turn: they hand the leader their identity directly and
+   * never touch `servingRequest`, so a reader's pin does not wait out a large commit.
    */
   #withMutationTurn<T>(run: () => Promise<T>): Promise<T> {
     const turn = this.#mutationTail.then(run);
@@ -1338,6 +1345,12 @@ export class OpfsBlockStore {
       }
       if (request === undefined) {
         return { ok: true, value: await method.apply(leader, message.args) };
+      }
+      if (LEASE_LANE_METHODS.has(message.method)) {
+        // No mutation turn: the leader logs a lease under this request's own identity, never
+        // through `servingRequest`, and runs it between the slices of whatever holds its queue.
+        const value = await leader.serveLeaseOperation(message.method, message.args, request);
+        return { ok: true, value };
       }
       return await this.#withMutationTurn(async () => {
         if (leader.isClosed() || !this.#leads(leader)) {
@@ -1497,6 +1510,12 @@ export class OpfsBlockStore {
               return logged.result;
             }
             if (sentAt < leader.servedCoverageSince) throw new OpfsUncertainOutcomeError(method);
+          }
+          if (LEASE_LANE_METHODS.has(method)) {
+            // A lease carries no request identity, so it needs no mutation turn; the leader
+            // runs it in its lease lane rather than behind a large commit or checkpoint.
+            if (leader.isClosed() || !this.#leads(leader)) throw new OpfsLeaderClosedError();
+            return await bound.apply(leader, args);
           }
           return await this.#withMutationTurn(() => {
             if (leader.isClosed() || !this.#leads(leader)) throw new OpfsLeaderClosedError();

@@ -658,12 +658,69 @@ export class OpfsLeaderClosedError extends Error {
   }
 }
 
-/** A WAL frame encoded ahead of its append, with the sequence and request it encodes. */
-interface EncodedWalFrame {
+/**
+ * @internal A WAL frame encoded ahead of its append, with the sequence and request it encodes;
+ * exported only for the renumbering regression.
+ */
+export interface EncodedWalFrame {
   seq: number;
   request: unknown;
   bytes: Uint8Array;
 }
+
+const frameTextEncoder = new TextEncoder();
+
+/**
+ * @internal Renumbers `encoded` to `seq` in place; false when its bytes do not start the way a frame
+ * encoding does. A frame encodes `{ seq, ...body, request }` as record JSON, so the sequence is
+ * its first member and nothing after it depends on it: lease frames logged while a large
+ * commit's frame was being encoded cost that commit a rewrite of its first few bytes (one copy
+ * when the sequence gains a digit), not a synchronous re-encode of the whole commit.
+ */
+export function renumberEncodedFrame(encoded: EncodedWalFrame, seq: number): boolean {
+  const encodedPrefix = frameTextEncoder.encode(`{"seq":${String(encoded.seq)},`);
+  const { bytes } = encoded;
+  if (bytes.byteLength <= encodedPrefix.byteLength) return false;
+  for (let index = 0; index < encodedPrefix.byteLength; index += 1) {
+    if (bytes[index] !== encodedPrefix[index]) return false;
+  }
+  const prefix = frameTextEncoder.encode(`{"seq":${String(seq)},`);
+  if (prefix.byteLength === encodedPrefix.byteLength) {
+    bytes.set(prefix, 0);
+  } else {
+    const renumbered = new Uint8Array(
+      prefix.byteLength + bytes.byteLength - encodedPrefix.byteLength,
+    );
+    renumbered.set(prefix, 0);
+    renumbered.set(bytes.subarray(encodedPrefix.byteLength), prefix.byteLength);
+    encoded.bytes = renumbered;
+  }
+  encoded.seq = seq;
+  return true;
+}
+
+/**
+ * Store operations the leader runs in its lease lane (see `OpfsLeader.serveLeaseOperation`):
+ * a reader's pin on a version — create, renew, move, release, expire — and nothing else.
+ */
+export const LEASE_LANE_METHODS: ReadonlySet<string> = new Set([
+  "createLease",
+  "renewLease",
+  "moveLease",
+  "removeLease",
+  "removeLeaseIfExpired",
+] satisfies LoggedMethod[]);
+
+function leaseLaneBody(method: string, args: unknown[]): WalEntryBody {
+  if (!LEASE_LANE_METHODS.has(method)) throw new Error(`Not a lease operation: ${method}`);
+  return LOGGED_BODY_BUILDERS[method as LoggedMethod](args);
+}
+
+/** Quiet time after which a checkpoint that kept its log runs again to reset it. */
+const COVERED_LOG_RESET_QUIET_MS = 1_000;
+
+/** The WAL length past which an operation must first make room by checkpointing. */
+const WAL_HEADROOM_LIMIT = MAX_OPFS_WAL_BYTES - 64 * 1024 * 1024;
 
 /** UNIQUE key changes past which a commit prepares its work and frame a slice at a time. */
 const LARGE_COMMIT_KEYS = 16_384;
@@ -738,6 +795,25 @@ export class OpfsLeader {
   readonly #checkpointEntries: number;
   readonly #cleanupLimitBytes: number;
   #lastCheckpointBytes = 0;
+  /**
+   * WAL bytes, from the start, that the newest checkpoint covers but could not reset away
+   * because lease frames were logged after its capture. Zero after every reset.
+   */
+  #walCoveredBytes = 0;
+  /** Set while a checkpoint runs, so a lease logged between its slices schedules no other. */
+  #checkpointRunning = false;
+  /** Drained extents a checkpoint that kept its log left in place, for the next reset. */
+  #drainedExtentsAwaitWalReset = false;
+  #coveredLogResetTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * @internal How long the log must stay quiet before a checkpoint that kept it runs again to
+   * reset it; a test seam.
+   */
+  coveredLogResetQuietMs = COVERED_LOG_RESET_QUIET_MS;
+  /** Open lease-lane windows, nested; the lane is open while this is above zero. */
+  #leaseLaneDepth = 0;
+  /** Lease operations waiting for the lane to open or for their own queue turn. */
+  readonly #leaseLaneWaiting = new Set<() => void>();
   #checkpointScheduled = false;
   #checkpointGeneration = 0;
   #checkpointFailures = 0;
@@ -755,7 +831,8 @@ export class OpfsLeader {
    * mutation can take it. A background step queued earlier (post-commit cleanup, collection)
    * that appends first takes it instead; the ledger then names that frame as the request's,
    * which costs an uncertain answer only if a crash keeps that frame and loses the mutation's
-   * own — never a wrong one, and never a second execution.
+   * own — never a wrong one, and never a second execution. Lease operations, which skip the
+   * store's turn, never take it: they log under their own identity and put this one back.
    */
   servingRequest: ServedMutationRequest | undefined;
   /** Served follower mutations, oldest first, from the checkpoint plus every frame since. */
@@ -1044,6 +1121,7 @@ export class OpfsLeader {
     this.#lastCheckpointBytes = newest === undefined ? 0 : newest.getSize();
     let applied = 0;
     let recoveryEndOffset = 0;
+    let coveredEndOffset = 0;
     let previousWalSeq: number | undefined;
     let tailExtent = checkpoint?.extents.tailExtentId ?? 0;
     let tailEnd = checkpoint?.extents.tailOffset ?? 0;
@@ -1086,7 +1164,10 @@ export class OpfsLeader {
       previousWalSeq = entry.seq;
       if (entry.seq <= this.#seq) {
         recoveryEndOffset = frameEnd;
-        continue; // Covered by the checkpoint; reset had not run yet.
+        coveredEndOffset = frameEnd;
+        // Covered by the checkpoint: its reset had not run yet, or it kept the log because
+        // lease frames were logged after its capture.
+        continue;
       }
       if (!isSafeSuccessor(this.#seq, entry.seq)) {
         throw new Error(`OPFS WAL sequence gap after ${String(this.#seq)}: ${String(entry.seq)}`);
@@ -1164,6 +1245,7 @@ export class OpfsLeader {
     // power loss did not persist. Discard that frame and every dependent successor; future
     // appends overwrite the inconsistent suffix from the last fully verified boundary.
     this.#wal = new WalWriter(this.#walHandle, recoveryEndOffset);
+    this.#walCoveredBytes = coveredEndOffset;
     this.#entriesSinceCheckpoint = applied;
     this.#poisoned = false;
 
@@ -1236,6 +1318,8 @@ export class OpfsLeader {
     // that durable state, expose the debt, and let the ordinary bounded-maintenance path retry
     // it before accepting more payload growth.
     await this.#postCommitCleanup(() => this.#cleanupRecoveryArtifacts(recoveryEndOffset));
+    // A checkpoint before the crash kept its log; reset the frames it covers once quiet.
+    if (this.#walCoveredBytes > 0) this.#scheduleCoveredLogReset();
   }
 
   // ---------------------------------------------------------------------------------------
@@ -1262,6 +1346,170 @@ export class OpfsLeader {
   async #healthy(): Promise<void> {
     if (!this.#poisoned) return;
     await this.#run(() => undefined);
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // The lease lane.
+  //
+  // A reader's lease is logged like any other mutation — the core lives only in this leader's
+  // memory, and a follower's reader outlives a leader crash or handover — but it is a tiny
+  // frame that touches only lease records and, for a follower's request, the served ledger.
+  // Queued behind a large commit or a sliced checkpoint, every query needing a fresh pin
+  // would wait out that whole step. Instead, a step holding the queue opens the lane around
+  // its long awaits, and lease operations apply and log at once, between its slices.
+  //
+  // Invariants:
+  // - A lane operation is one synchronous run: apply, append its frame, and for a follower
+  //   append its result frame. WAL order is apply order, and nothing interleaves with it.
+  // - The lane is open only inside `#withLeaseLane`, which a step uses only where everything
+  //   it has applied is also logged: a large commit's prepare, block appends and frame encode
+  //   (none of which apply anything), and a sliced checkpoint's encode and slot writes.
+  // - A lane operation logs under its own request identity and puts the holder's
+  //   `servingRequest` back, so a served commit's frame still carries the commit's identity.
+  // - Lease frames carry no payload, so a lane operation never flushes the extent pool and
+  //   never touches a batch in flight.
+  // - It never checkpoints: near the WAL headroom limit it waits for its own queue turn. A
+  //   large write whose block window ends past that limit drops its blocks and runs again
+  //   with the lane closed, so no checkpoint ever captures a half-published batch.
+  // - One that fails to log poisons the leader like any refused append. The holder checks
+  //   `#poisoned` before it publishes anything after its window: a commit reloads and runs
+  //   again with the lane closed, and `#logged`, `#appendFrame`, and `#checkpointState`
+  //   refuse a poisoned leader outright.
+  // - Lease frames logged during a sliced checkpoint follow its captured sequence, so that
+  //   checkpoint keeps the log (see `checkpointSliced`): `#walCoveredBytes` marks the prefix
+  //   it covers, and drained extents wait for a reset. A due checkpoint that starts with a
+  //   covered prefix keeps the lane closed (only the quiet reset opens it then), so covered
+  //   frames never pile up past one checkpoint's worth.
+  // ---------------------------------------------------------------------------------------
+
+  /**
+   * Runs `work` with the lease lane open — when `open`, and first running the lease
+   * operations that were waiting for it. `work` must apply nothing it has not logged.
+   */
+  async #withLeaseLane<T>(open: boolean, work: () => Promise<T>): Promise<T> {
+    if (!open) return work();
+    this.#leaseLaneDepth += 1;
+    try {
+      for (const waiting of this.#leaseLaneWaiting) {
+        if (!this.#leaseLaneAvailable()) break;
+        waiting();
+      }
+      return await work();
+    } finally {
+      this.#leaseLaneDepth -= 1;
+    }
+  }
+
+  #leaseLaneAvailable(): boolean {
+    return (
+      this.#leaseLaneDepth > 0 &&
+      !this.#closed &&
+      !this.#poisoned &&
+      this.#wal.byteLength < WAL_HEADROOM_LIMIT
+    );
+  }
+
+  /**
+   * A lease operation: run now in the lane when it is open, otherwise at whichever comes
+   * first — the lane opening, or its own turn on the queue.
+   */
+  #leaseOperation(
+    body: WalEntryBody,
+    request: ServedMutationRequest | undefined,
+  ): Promise<unknown> {
+    if (this.#leaseLaneAvailable()) {
+      try {
+        return Promise.resolve(this.#applyLeaseOperation(body, request, false));
+      } catch (error) {
+        return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+    return new Promise((resolve, reject) => {
+      let ran = false;
+      const run = (inQueueTurn: boolean): void => {
+        if (ran) return;
+        ran = true;
+        this.#leaseLaneWaiting.delete(runInLane);
+        try {
+          resolve(this.#applyLeaseOperation(body, request, inQueueTurn));
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      };
+      const runInLane = (): void => {
+        run(false);
+      };
+      this.#leaseLaneWaiting.add(runInLane);
+      this.#run(() => {
+        run(true);
+      }).catch((error: unknown) => {
+        // The queue refused it — the leader closed, or could not reload — before it ran.
+        if (ran) return;
+        ran = true;
+        this.#leaseLaneWaiting.delete(runInLane);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+
+  /**
+   * Applies and logs one lease operation and, for a follower's request, its result, in one
+   * synchronous run. In its own queue turn it may make WAL headroom as any operation does; in
+   * the lane `#leaseLaneAvailable` already proved there is room.
+   */
+  #applyLeaseOperation(
+    body: WalEntryBody,
+    request: ServedMutationRequest | undefined,
+    inQueueTurn: boolean,
+  ): unknown {
+    if (inQueueTurn) this.#makeWalHeadroom(body);
+    const holder = this.servingRequest;
+    this.servingRequest = request;
+    try {
+      safeSuccessor(this.#seq, "OPFS WAL sequence");
+      safeSuccessor(this.#entriesSinceCheckpoint, "OPFS checkpoint entry count");
+      const result = this.#applyBody(body);
+      this.#clearCompletedSnapshotImportIfAdvanced();
+      // No extent flush: a lease frame names no payload, and a strict leader flushed every
+      // payload an earlier frame names before appending that frame. The append consumes
+      // `request`, so the result frame below carries no identity either.
+      this.#appendFrame(body, this.#strict);
+      if (request !== undefined) {
+        try {
+          this.#settleServed(request.key, result, estimateRpcValueBytes(result));
+        } catch (error) {
+          // As for any served mutation: the lease is durable, and a lost result frame turns a
+          // re-send into an uncertain answer, never a second execution.
+          this.#diagnostic(error, `opfs served result for ${body.op}`);
+        }
+      }
+      return result;
+    } finally {
+      this.servingRequest = holder;
+    }
+  }
+
+  /**
+   * Runs a follower's lease operation under its request identity: the lease frame carries the
+   * identity and its result frame follows in the same synchronous run, so the ledger can
+   * answer a re-send after a failover. Called without the store's mutation turn.
+   */
+  serveLeaseOperation(
+    method: string,
+    args: unknown[],
+    request: ServedMutationRequest,
+  ): Promise<unknown> {
+    return this.#leaseOperation(leaseLaneBody(method, args), request);
+  }
+
+  /**
+   * A lease operation in the lane failed to log and poisoned this leader while the calling
+   * step was suspended. Reloads, so the step can run again on the state the disk holds.
+   */
+  async #reloadIfPoisonedByLeaseLane(): Promise<boolean> {
+    if (!this.#poisoned) return false;
+    await this.#loadFromDisk();
+    return true;
   }
 
   #recordServed(outcome: ServedMutationOutcome): void {
@@ -1315,23 +1563,28 @@ export class OpfsLeader {
     if (!this.#servedLedger.has(key)) return;
     const bytes = estimateRpcValueBytes(result);
     await this.#run(() => {
-      // Looked up inside the step: a poisoned leader reloads from disk first, and the ledger
-      // it rebuilds holds a new object for this key — settling the old one would leave the
-      // live entry unsettled, and the next checkpoint would forget the value.
-      const entry = this.#servedLedger.get(key);
-      if (entry === undefined || entry.settled) return;
-      if (bytes > this.#servedLedgerResultBytes) {
-        this.#appendFrame({ op: "servedResult", key, withheld: true }, false);
-        entry.settled = true;
-        entry.withheld = true;
-        return;
-      }
-      this.#appendFrame({ op: "servedResult", key, result }, false);
-      entry.result = result;
-      entry.settled = true;
-      this.#retainServedResult(key, bytes);
-      this.#trimServedLedger(Number.NEGATIVE_INFINITY);
+      this.#settleServed(key, result, bytes);
     });
+  }
+
+  /** Logs a served mutation's value and settles its ledger entry; one synchronous step. */
+  #settleServed(key: string, result: unknown, bytes: number): void {
+    // Looked up inside the step: a poisoned leader reloads from disk first, and the ledger
+    // it rebuilds holds a new object for this key — settling the old one would leave the
+    // live entry unsettled, and the next checkpoint would forget the value.
+    const entry = this.#servedLedger.get(key);
+    if (entry === undefined || entry.settled) return;
+    if (bytes > this.#servedLedgerResultBytes) {
+      this.#appendFrame({ op: "servedResult", key, withheld: true }, false);
+      entry.settled = true;
+      entry.withheld = true;
+      return;
+    }
+    this.#appendFrame({ op: "servedResult", key, result }, false);
+    entry.result = result;
+    entry.settled = true;
+    this.#retainServedResult(key, bytes);
+    this.#trimServedLedger(Number.NEGATIVE_INFINITY);
   }
 
   /**
@@ -1356,30 +1609,46 @@ export class OpfsLeader {
   }
 
   /**
+   * A step's state matches the log only while this leader is not poisoned, and a lease
+   * operation that fails to log in the lane can poison it while the step is suspended.
+   */
+  #refuseIfPoisonedMidStep(): void {
+    if (this.#poisoned) {
+      throw new Error("The OPFS leader must reload from disk before it logs another operation");
+    }
+  }
+
+  /**
+   * Keeps one maximum-sized frame of headroom. A checkpoint refusal happens before the record
+   * state mutates, applying bounded backpressure instead of growing forever.
+   */
+  #makeWalHeadroom(body: WalEntryBody): void {
+    if (this.#wal.byteLength < WAL_HEADROOM_LIMIT) return;
+    try {
+      this.checkpointNow();
+    } catch (error) {
+      // A checkpoint that no longer fits its slot must not trap the operations that shrink
+      // the state it encodes. An abort, a rollback, or a removal is a small frame; it goes
+      // into the remaining headroom, so an over-limit database can always be brought back
+      // under the limit instead of refusing every write, including the ones that would fix it.
+      if (
+        !shrinksLoggedState(body) ||
+        this.#wal.byteLength >= MAX_OPFS_WAL_BYTES - 16 * 1024 * 1024
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  /**
    * The critical section: apply to the core and append the frame in one synchronous run.
    * A validation throw leaves the core untouched (validate-then-mutate bodies); a WAL write
    * failure after mutation poisons the leader, which reloads from its own handles before the
    * next operation, and the original error — quota, most importantly — escapes unwrapped.
    */
   #logged(body: WalEntryBody, encoded?: EncodedWalFrame): unknown {
-    if (this.#wal.byteLength >= MAX_OPFS_WAL_BYTES - 64 * 1024 * 1024) {
-      // Keep one maximum-sized frame of headroom. A checkpoint refusal happens before the
-      // record state mutates, applying bounded backpressure instead of growing forever.
-      try {
-        this.checkpointNow();
-      } catch (error) {
-        // A checkpoint that no longer fits its slot must not trap the operations that shrink
-        // the state it encodes. An abort, a rollback, or a removal is a small frame; it goes
-        // into the remaining headroom, so an over-limit database can always be brought back
-        // under the limit instead of refusing every write, including the ones that would fix it.
-        if (
-          !shrinksLoggedState(body) ||
-          this.#wal.byteLength >= MAX_OPFS_WAL_BYTES - 16 * 1024 * 1024
-        ) {
-          throw error;
-        }
-      }
-    }
+    this.#refuseIfPoisonedMidStep();
+    this.#makeWalHeadroom(body);
     // Strict durability is per published frame, not per payload. A batch may append many
     // blocks into the tail; flush that dirty tail once after all writes complete and before
     // either the in-memory mutation or the WAL frame can publish them. Sealing already flushes
@@ -1408,7 +1677,8 @@ export class OpfsLeader {
   /**
    * A large commit's frame, encoded a slice at a time before `#logged` applies it, so the
    * mutation and the append stay one short step. `#appendFrame` uses it only while the
-   * sequence number and the request it was encoded with are still the frame's.
+   * request it was encoded with is still the frame's, renumbering it when lease frames took
+   * the sequence numbers in between.
    */
   async #encodeFrameSliced(body: WalEntryBody): Promise<EncodedWalFrame> {
     const seq = safeSuccessor(this.#seq, "OPFS WAL sequence");
@@ -1420,26 +1690,43 @@ export class OpfsLeader {
     return { seq, request, bytes };
   }
 
-  /** Logs `body`, preparing its commit work and frame in slices first when it is large. */
+  /**
+   * Logs `body`, preparing its commit work and frame in slices first when it is large. Lease
+   * operations run in the lane meanwhile: neither step applies anything, the prepared work
+   * depends only on UNIQUE memberships (which leases never change), and a frame they push
+   * past is renumbered, not re-encoded.
+   */
   async #loggedCommit(
     body: WalEntryBody,
     input: { readonly uniqueKeyChanges?: readonly UniqueKeyChanges[] },
   ): Promise<unknown> {
     if (uniqueKeyChangeCount(input) < LARGE_COMMIT_KEYS) return this.#logged(body);
-    await this.#core.prepareCommit(input, maybeYieldToEventLoop);
-    const encoded = await this.#encodeFrameSliced(body);
-    // A turn before the one step that must not be split: applying the commit and its frame.
-    await yieldToEventLoop();
-    return this.#logged(body, encoded);
+    for (let attempt = 1; ; attempt += 1) {
+      // A retry after a lease poisoned the first attempt keeps the lane closed.
+      const encoded = await this.#withLeaseLane(attempt === 1, async () => {
+        await this.#core.prepareCommit(input, maybeYieldToEventLoop);
+        const frame = await this.#encodeFrameSliced(body);
+        // A turn before the one step that must not be split: applying the commit and frame.
+        await yieldToEventLoop();
+        return frame;
+      });
+      if (await this.#reloadIfPoisonedByLeaseLane()) continue;
+      return this.#logged(body, encoded);
+    }
   }
 
   #appendFrame(body: WalEntryBody, flush = this.#strict, encoded?: EncodedWalFrame): void {
+    this.#refuseIfPoisonedMidStep();
     const request = this.servingRequest;
     this.servingRequest = undefined;
     let nextSeq: number;
     try {
       nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
-      if (encoded?.seq === nextSeq && encoded.request === request) {
+      if (
+        encoded !== undefined &&
+        encoded.request === request &&
+        (encoded.seq === nextSeq || renumberEncodedFrame(encoded, nextSeq))
+      ) {
         this.#wal.appendEncoded(encoded.bytes, flush);
       } else {
         this.#wal.append(
@@ -1473,6 +1760,7 @@ export class OpfsLeader {
     // checkpoint (quota, most plausibly) leaves the WAL covering everything and retries on a
     // later trigger; the operations themselves stay correct throughout.
     if (
+      !this.#checkpointRunning &&
       this.#checkpointDue() &&
       this.#entriesSinceCheckpoint >= this.#checkpointRetryAtEntries &&
       !this.#checkpointScheduled
@@ -1482,6 +1770,7 @@ export class OpfsLeader {
         this.#checkpointScheduled = false;
         if (this.#checkpointDue()) {
           await this.checkpointSliced();
+          await this.#deleteDrainedExtentsAfterReset();
         }
       }).catch((error: unknown) => {
         this.#diagnostic(error, "opfs checkpoint");
@@ -1493,11 +1782,12 @@ export class OpfsLeader {
    * Due when the WAL outgrows the larger of the floor and the previous checkpoint's own size —
    * so checkpointing amortizes to O(bytes written) instead of re-serializing the whole state
    * every fixed interval during a bulk load — or when the frame count alone would make a
-   * replay slow.
+   * replay slow. Bytes the newest checkpoint already covers do not count.
    */
   #checkpointDue(): boolean {
     return (
-      this.#wal.byteLength >= Math.max(CHECKPOINT_WAL_BYTES, this.#lastCheckpointBytes) ||
+      this.#wal.byteLength - this.#walCoveredBytes >=
+        Math.max(CHECKPOINT_WAL_BYTES, this.#lastCheckpointBytes) ||
       this.#entriesSinceCheckpoint >= this.#checkpointEntries
     );
   }
@@ -2807,7 +3097,7 @@ export class OpfsLeader {
       this.#checkpointSlotPublished(slotIndex, state);
       // WAL remains intact until the redundant copy is equally durable.
       this.#writeCheckpointSlot(mirrorIndex, bytes, 0, bytes.byteLength);
-      this.#checkpointMirrored(bytes);
+      this.#checkpointMirrored(bytes, state.lastSeq, this.#wal.byteLength);
     } catch (error) {
       this.#checkpointFailed();
       throw error;
@@ -2818,26 +3108,45 @@ export class OpfsLeader {
   /**
    * `checkpointNow`, encoded and written a slice at a time, so checkpointing a large database
    * hands the event loop a turn every few milliseconds instead of holding it for the whole
-   * state. Run it only as a queued operation: every mutation waits on the queue, so the state
-   * captured at the start is still the state when both slots are written, while reads — which
-   * answer from memory without the queue — run between slices. The slots, their order, and
-   * their bytes are `checkpointNow`'s; a crash between slices leaves a torn slot, as a crash
-   * inside one synchronous write does.
+   * state. Run it only as a queued operation: every other mutation waits on the queue, so the
+   * state captured at the start is the state both slots publish, while reads — which answer
+   * from memory without the queue — run between slices. The slots, their order, and their
+   * bytes are `checkpointNow`'s; a crash between slices leaves a torn slot, as a crash inside
+   * one synchronous write does.
+   *
+   * Lease operations run in the lane between slices. The state the encoder walks still never
+   * changes: a lease operation replaces lease records instead of editing them, and the served
+   * ledger entry it adds is new. Their frames follow the captured sequence in the log, so a
+   * checkpoint they landed in keeps the log instead of resetting it: recovery skips the frames
+   * the checkpoint covers and replays the leases after them. The lane stays closed while the
+   * log still holds an earlier checkpoint's covered frames, so this one resets them: the log
+   * never carries more than one checkpoint's worth of covered frames.
    */
   async checkpointSliced(): Promise<void> {
+    await this.#checkpointSliced(this.#walCoveredBytes === 0);
+  }
+
+  async #checkpointSliced(leaseLane: boolean): Promise<void> {
     this.onBeforeCheckpoint?.(this.#lastCheckpointMs);
     const started = Date.now();
+    this.#checkpointRunning = true;
     try {
       const state = this.#checkpointState();
-      const bytes = await encodeSyncCheckpointSliced(state, maybeYieldToEventLoop);
-      const [slotIndex, mirrorIndex] = this.#checkpointSlotOrder(bytes);
-      await this.#writeCheckpointSlotSliced(slotIndex, bytes);
-      this.#checkpointSlotPublished(slotIndex, state);
-      await this.#writeCheckpointSlotSliced(mirrorIndex, bytes);
-      this.#checkpointMirrored(bytes);
+      const walBytesAtCapture = this.#wal.byteLength;
+      const bytes = await this.#withLeaseLane(leaseLane, async () => {
+        const encoded = await encodeSyncCheckpointSliced(state, maybeYieldToEventLoop);
+        const [slotIndex, mirrorIndex] = this.#checkpointSlotOrder(encoded);
+        await this.#writeCheckpointSlotSliced(slotIndex, encoded);
+        this.#checkpointSlotPublished(slotIndex, state);
+        await this.#writeCheckpointSlotSliced(mirrorIndex, encoded);
+        return encoded;
+      });
+      this.#checkpointMirrored(bytes, state.lastSeq, walBytesAtCapture);
     } catch (error) {
       this.#checkpointFailed();
       throw error;
+    } finally {
+      this.#checkpointRunning = false;
     }
     this.#checkpointSucceeded(started);
   }
@@ -2857,6 +3166,8 @@ export class OpfsLeader {
 
   /** Captures the state the next checkpoint publishes, after making its payloads durable. */
   #checkpointState(): CheckpointState {
+    // A poisoned leader's memory ran ahead of its log; publishing it would make that durable.
+    this.#refuseIfPoisonedMidStep();
     const generation = safeSuccessor(this.#checkpointGeneration, "OPFS checkpoint generation");
     // In relaxed mode, appends deliberately avoid per-operation flushes. Make every extent
     // referenced by this checkpoint durable before publishing and flushing the checkpoint;
@@ -2931,11 +3242,76 @@ export class OpfsLeader {
     this.#checkpointGeneration = state.generation;
   }
 
-  #checkpointMirrored(bytes: Uint8Array): void {
-    this.#acknowledgements?.publish(this.#seq, this.#wal.byteLength);
-    this.#wal.reset();
-    this.#entriesSinceCheckpoint = 0;
+  /**
+   * Both slots hold the checkpoint captured at `capturedSeq`, when the log was
+   * `walBytesAtCapture` long. Resets the log — unless lease frames were logged since the
+   * capture (or a failed one poisoned this leader), which the checkpoint does not cover.
+   */
+  #checkpointMirrored(bytes: Uint8Array, capturedSeq: number, walBytesAtCapture: number): void {
+    if (this.#seq === capturedSeq && !this.#poisoned) {
+      this.#acknowledgements?.publish(this.#seq, this.#wal.byteLength);
+      try {
+        this.#wal.reset();
+      } finally {
+        // A reset whose flush was refused has still emptied the log.
+        if (this.#wal.byteLength === 0) this.#walCoveredBytes = 0;
+      }
+      this.#entriesSinceCheckpoint = 0;
+      this.#lastCheckpointBytes = bytes.byteLength;
+      return;
+    }
+    // Keep the log: recovery skips its first `walBytesAtCapture` bytes as covered and replays
+    // the frames after them. Witness the checkpoint's own boundary when the acknowledgement
+    // trails it (a relaxed log); never lower it past a strict lease frame already acknowledged,
+    // and never acknowledge frames a relaxed log has not flushed.
+    if ((this.#acknowledgements?.latest.sequence ?? capturedSeq) < capturedSeq) {
+      this.#acknowledgements?.publish(capturedSeq, walBytesAtCapture);
+    }
+    this.#walCoveredBytes = walBytesAtCapture;
+    this.#entriesSinceCheckpoint = this.#seq - capturedSeq;
     this.#lastCheckpointBytes = bytes.byteLength;
+    this.#scheduleCoveredLogReset();
+  }
+
+  /**
+   * A checkpoint that kept its log leaves covered frames for recovery to skip, and for the
+   * next due checkpoint to reset with the lane closed. Once the log has been quiet for a
+   * moment — readers caught up, no commits — a checkpoint with the lane open will most likely
+   * reset it instead, and delete the drained extents that waited for that reset. Under steady
+   * writes the timer keeps moving and the due checkpoint does the job.
+   */
+  #scheduleCoveredLogReset(): void {
+    if (this.#coveredLogResetTimer !== undefined || this.#closed) return;
+    const seqAtSchedule = this.#seq;
+    const timer = setTimeout(() => {
+      this.#coveredLogResetTimer = undefined;
+      if (this.#closed || this.#walCoveredBytes === 0) return;
+      if (this.#seq !== seqAtSchedule) {
+        this.#scheduleCoveredLogReset();
+        return;
+      }
+      void this.#run(async () => {
+        if (this.#walCoveredBytes === 0) return;
+        await this.#checkpointSliced(true);
+        await this.#deleteDrainedExtentsAfterReset();
+      }).catch((error: unknown) => {
+        if (!(error instanceof OpfsLeaderClosedError)) this.#diagnostic(error, "opfs checkpoint");
+      });
+    }, this.coveredLogResetQuietMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.#coveredLogResetTimer = timer;
+  }
+
+  #cancelCoveredLogReset(): void {
+    if (this.#coveredLogResetTimer !== undefined) clearTimeout(this.#coveredLogResetTimer);
+    this.#coveredLogResetTimer = undefined;
+  }
+
+  /** Deletes the drained extents a checkpoint that kept its log left, once the log is reset. */
+  async #deleteDrainedExtentsAfterReset(): Promise<void> {
+    if (this.#drainedExtentsAwaitWalReset && this.#wal.byteLength === 0) {
+      await this.#postCommitCleanup(() => this.#deleteDrainedExtents());
+    }
   }
 
   #checkpointBeforeDeletingWalPayload(): void {
@@ -2955,10 +3331,18 @@ export class OpfsLeader {
       // resets that history. A checkpoint refusal leaves the files in place as cleanup debt.
       // Every caller holds the operation queue (or is recovering), so the checkpoint may yield.
       await this.checkpointSliced();
+      if (this.#wal.byteLength > 0) {
+        // Lease frames were logged during the checkpoint, so it kept the log, history and all.
+        // The files stay as cleanup debt until the next scheduled checkpoint resets the log
+        // (the lane stays closed while covered frames remain) and deletes them.
+        this.#drainedExtentsAwaitWalReset = true;
+        return;
+      }
     }
     for (const id of deletable) {
       await this.#pool.deleteExtent(id);
     }
+    this.#drainedExtentsAwaitWalReset = false;
   }
 
   async #cleanupRecoveryArtifacts(walEndOffset = this.#wal.byteLength): Promise<void> {
@@ -3484,6 +3868,8 @@ export class OpfsLeader {
 
   /** @internal Shared implementation installed for ordinary one-frame mutations below. */
   _loggedGenerated(method: LoggedMethod, args: unknown[]): Promise<unknown> {
+    if (LEASE_LANE_METHODS.has(method))
+      return this.#leaseOperation(leaseLaneBody(method, args), undefined);
     if (method === "commitTransaction") {
       return this.#run(() =>
         this.#loggedCommit(LOGGED_BODY_BUILDERS[method](args), args[0] as CommitTransactionInput),
@@ -3686,46 +4072,66 @@ export class OpfsLeader {
 
   async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
     return this.#run(async () => {
-      if (uniqueKeyChangeCount(input) >= LARGE_COMMIT_KEYS) {
-        await this.#core.prepareCommit(input, maybeYieldToEventLoop);
-      }
-      this.#core.preflightWriteTransaction(input);
-      const ids = new Set<string>();
-      for (const block of input.blocks) {
-        validateId(block.id);
-        validateBlockWriteBytes(block.bytes);
-        if (ids.has(block.id) || this.#blockIndex.has(block.id)) {
-          throw new Error(`Block already exists: ${block.id}`);
+      const large = uniqueKeyChangeCount(input) >= LARGE_COMMIT_KEYS;
+      for (let attempt = 1; ; attempt += 1) {
+        // Lease operations run in the lane while a large write prepares, appends its blocks,
+        // and encodes its frame, none of which applies anything (see `#loggedCommit`). A retry
+        // after one of them poisoned the first attempt keeps the lane closed.
+        const lane = large && attempt === 1;
+        if (large) {
+          await this.#withLeaseLane(lane, () =>
+            this.#core.prepareCommit(input, maybeYieldToEventLoop),
+          );
+          if (await this.#reloadIfPoisonedByLeaseLane()) continue;
         }
-        ids.add(block.id);
-      }
-      const { blocks: bytes, ...rest } = input;
-      const blocks: IdPlacement[] = [];
-      await this.#preparePayloadGrowth();
-      const mark = this.#beginUnpublishedBatch();
-      try {
-        for (const block of bytes) {
-          blocks.push({
-            id: block.id,
-            placement: await this.#pool.append(block.bytes, false),
+        this.#core.preflightWriteTransaction(input);
+        const ids = new Set<string>();
+        for (const block of input.blocks) {
+          validateId(block.id);
+          validateBlockWriteBytes(block.bytes);
+          if (ids.has(block.id) || this.#blockIndex.has(block.id)) {
+            throw new Error(`Block already exists: ${block.id}`);
+          }
+          ids.add(block.id);
+        }
+        const { blocks: bytes, ...rest } = input;
+        await this.#preparePayloadGrowth();
+        if (await this.#reloadIfPoisonedByLeaseLane()) continue;
+        const mark = this.#beginUnpublishedBatch();
+        try {
+          const { body, encoded } = await this.#withLeaseLane(lane, async () => {
+            const blocks: IdPlacement[] = [];
+            for (const block of bytes) {
+              blocks.push({
+                id: block.id,
+                placement: await this.#pool.append(block.bytes, false),
+              });
+            }
+            const frameBody: WalEntryBody = {
+              op: "writeTransaction",
+              input: { ...rest, segments: [...input.segments] },
+              blocks,
+            };
+            if (!large) return { body: frameBody, encoded: undefined };
+            const frame = await this.#encodeFrameSliced(frameBody);
+            // A turn before the one step that must not be split: applying the commit and frame.
+            await yieldToEventLoop();
+            return { body: frameBody, encoded: frame };
           });
+          if (!this.#poisoned && this.#wal.byteLength < WAL_HEADROOM_LIMIT) {
+            const summary = this.#logged(body, encoded) as ManifestSummary;
+            this.#pool.commitBatch(mark);
+            return summary;
+          }
+        } catch (error) {
+          return this.#rollbackUnpublishedBatch(mark, error);
         }
-        const body: WalEntryBody = {
-          op: "writeTransaction",
-          input: { ...rest, segments: [...input.segments] },
-          blocks,
-        };
-        let encoded: EncodedWalFrame | undefined;
-        if (uniqueKeyChangeCount(input) >= LARGE_COMMIT_KEYS) {
-          encoded = await this.#encodeFrameSliced(body);
-          // A turn before the one step that must not be split: applying the commit and frame.
-          await yieldToEventLoop();
-        }
-        const summary = this.#logged(body, encoded) as ManifestSummary;
-        this.#pool.commitBatch(mark);
-        return summary;
-      } catch (error) {
-        return this.#rollbackUnpublishedBatch(mark, error);
+        // Lease operations logged while the blocks went in poisoned this leader, or filled the
+        // log's headroom so `#logged` would checkpoint mid-batch, capturing live-byte counts
+        // for blocks no index names yet. Drop the blocks, reload if poisoned, and run again
+        // with the lane closed; `#beginUnpublishedBatch` makes the room first.
+        await this.#pool.rollbackBatch(mark);
+        if (this.#poisoned) await this.#loadFromDisk();
       }
     });
   }
@@ -5265,6 +5671,7 @@ export class OpfsLeader {
    * intact one and the log, which recovery reads as it would after a crash.
    */
   async shutdown(): Promise<void> {
+    this.#cancelCoveredLogReset();
     await this.#run(async () => {
       await this.checkpointSliced();
       this.#closed = true;
@@ -5285,6 +5692,7 @@ export class OpfsLeader {
 
   /** Test-only: what tab death does — locks release, nothing is flushed or checkpointed. */
   crash(): void {
+    this.#cancelCoveredLogReset();
     this.#closed = true;
     this.#walHandle.close();
     this.#acknowledgementHandle.close();

@@ -58,6 +58,11 @@ other designs pay simply do not exist. That is why the store is fast: on the
 [benchmarks page](/benchmarks) both Minnow columns run the identical engine and workload, and
 the results show the cost of each store in the browser running them.
 
+A reader's lease — the pin that stops collection from removing the version a query reads — is
+logged like any write, because a reader in another tab must keep its pin when the leader crashes
+or hands over. A lease is a tiny log frame, though, so it does not wait for a large commit or a
+checkpoint to finish: the leader logs it between their slices, ahead of the commit it overtook.
+
 Other tabs are **followers**: their operations travel a `BroadcastChannel` to the leader and are
 acknowledged only after the leader's log holds them. Requests and answers are addressed — an
 operation goes to the leader's own channel and its answer to the asking tab's — so a block read's
@@ -210,7 +215,12 @@ metadata state, so checkpoints — when the log fills, before garbage collection
 data file, and at shutdown — encode and write a slice at a time, handing the thread back every
 few milliseconds. They still hold the write queue, so the state they publish cannot change
 underneath them, while reads keep answering from memory between slices. Their bytes, slots, and
-order are the same as a checkpoint written in one step. A crash at any moment therefore
+order are the same as a checkpoint written in one step. Reader leases are the one exception:
+they are logged between slices too, after the state the checkpoint captured, so a checkpoint that
+logged leases keeps the log instead of resetting it. Recovery skips the frames that checkpoint
+covers and replays the leases after them. The log is reset once it has been quiet for a second,
+or else by the next checkpoint, which makes leases wait for it so that it can reset; a drained
+data file waiting for deletion waits for that reset too. A crash at any moment therefore
 leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
 slot and the un-reset log still holding everything. A power loss that persists a file's new length
 ahead of its bytes leaves a zero-filled tail where the unacknowledged frame was to go, or a slot
