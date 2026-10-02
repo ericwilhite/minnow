@@ -88,6 +88,20 @@ function settled(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 20));
 }
 
+/** The table's row count once it reaches `expected`, or the last count after about four seconds. */
+async function rowCountReaching(
+  client: { query(sql: string): Promise<{ rows: Array<Record<string, unknown>> }> },
+  expected: number,
+): Promise<unknown> {
+  let count: unknown;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    count = (await client.query('SELECT count(*) AS n FROM "items"')).rows[0]?.n;
+    if (count === expected) return count;
+    await settled();
+  }
+  return count;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -413,12 +427,11 @@ it("asks a buffered writer to flush when the page is hidden or unloading", async
     expect((await client.query('SELECT count(*) AS n FROM "items"')).rows[0]?.n).toBe(0);
     fakeDocument.visibilityState = "hidden";
     documentListeners.get("visibilitychange")?.();
-    await settled();
-    expect((await client.query('SELECT count(*) AS n FROM "items"')).rows[0]?.n).toBe(1);
+    // The flush is a write through the worker: wait for it, not for a fixed delay.
+    expect(await rowCountReaching(client, 1)).toBe(1);
     await writer.add({ id: 2, value: "unload" });
     windowListeners.get("pagehide")?.();
-    await settled();
-    expect((await client.query('SELECT count(*) AS n FROM "items"')).rows[0]?.n).toBe(2);
+    expect(await rowCountReaching(client, 2)).toBe(2);
     await writer.close();
     expect(documentListeners.has("visibilitychange")).toBe(false);
     expect(windowListeners.has("pagehide")).toBe(false);
