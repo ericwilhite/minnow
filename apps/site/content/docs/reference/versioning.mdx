@@ -40,7 +40,7 @@ A change is breaking when it is one of these:
   differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
 - **Stored data.** A database written by the old version that the new one cannot open. The locked
   byte contracts below narrow this category: a release cannot reinterpret or drop an existing
-  block-format-2, snapshot-format-1, IndexedDB-schema-1/2, or OPFS-layout-6/7 reader or automatic converter.
+  block-format-2, snapshot-format-1, IndexedDB-schema-1/2/3, or OPFS-layout-6/7/8 reader or automatic converter.
 
 From 1.0 onwards these move the major version — every package's, together — and minor releases
 stay additive.

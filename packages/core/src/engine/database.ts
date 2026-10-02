@@ -41,7 +41,7 @@ import { applyWindowFunctionsAsync } from "./windows.js";
 import { crossJoinPlan } from "../plan/model.js";
 import {
   definedVectors,
-  toColumnarBatch,
+  toColumnarBatchSteps,
   type BatchRow,
   type BatchValue,
   type ColumnarBatch,
@@ -397,6 +397,9 @@ import {
   buildSecondaryDeleteCoverage,
   buildSecondaryInsertDeltas,
   buildSecondaryUpdateDeltas,
+  mergeSortedRuns,
+  SORTED_RUN_TERMS,
+  sortedSecondaryPostingsSliced,
   chunkFtsPostings,
   decodeSecondaryTupleTerm,
   getUniqueKeyColumn,
@@ -2936,7 +2939,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     table: TableRecord,
     input: InsertBatchInputLike,
   ): Promise<FilledBatch & { rowCount: number }> {
-    const pivoted = toColumnarBatch(input);
+    const pivoted = await runStepsSliced(toColumnarBatchSteps(input));
     // Each step below is a pass over every row; between them, a large batch lets other work in.
     if ((pivoted.rowCount ?? 0) >= LARGE_WRITE_ROWS) await yieldToEventLoop();
     // The pivot stamps rowCount, so an all-default batch keeps its row count even after the
@@ -3589,7 +3592,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         columnBlockIds[column.id] = blockIds;
       }
       stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
-      const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
+      const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
       if (secondaryDeltas.length > 0) {
         transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
       }
@@ -3752,6 +3755,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const requestedRowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     let rowCount = requestedRowCount;
     let logicalBytes = estimateBatchBytes(input);
+    // A large batch's passes over its rows each run whole; a turn between them keeps any one
+    // short instead of letting them run back to back.
+    await maybeYieldToEventLoop();
     const {
       transaction,
       rowIds: reservedRowIds,
@@ -3863,7 +3869,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       if (resolvedKeys !== undefined) {
-        transaction.setUniqueKeyChanges({
+        await transaction.setUniqueKeyChangesSliced({
           tableId: table.id,
           keyTokens: [...resolvedKeys.keys()],
           requireAbsent: kind === "insert",
@@ -3898,18 +3904,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // rule then flips the index to "invalid" (keyed histories are unindexable) and the scan
       // path stays correct.
       if (kind === "insert") {
-        const ftsDeltas = buildFtsColumnDeltas(table, input, rowIds.start);
+        const ftsDeltas = await buildFtsColumnDeltas(table, input, rowIds.start);
         if (ftsDeltas.length > 0) {
           transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
         }
       }
-      const secondaryDeltas = buildSecondaryInsertDeltas(table, input, rowIds.start);
+      const secondaryDeltas = await buildSecondaryInsertDeltas(table, input, rowIds.start);
       if (secondaryDeltas.length > 0) {
         transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
       }
+      await maybeYieldToEventLoop();
       const plannedColumns = table.columns.map((column) =>
         writeColumnValues(column.type, input.columns[column.name] ?? []),
       );
+      await maybeYieldToEventLoop();
       const ranges = writeBlockRanges(
         plannedColumns,
         rowCount,
@@ -3955,8 +3963,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         await blockStager.prepareBatch(group.length, maximumGroupBytes);
         const encodeStarted = performance.now();
-        const encoded = await Promise.all(
-          group.map(async ({ column, values, start, end, part }) => {
+        // Each encode runs its synchronous part before its first await. Starting them one at a
+        // time, with a turn offered before each, keeps those parts apart while their
+        // compression still runs concurrently.
+        const pending: Array<Promise<{ columnId: string; blockId: string; bytes: Uint8Array }>> =
+          [];
+        for (const { column, values, start, end, part } of group) {
+          await maybeYieldToEventLoop();
+          const encoding = (async () => {
             const bytes = await this.#encodeColumnBlock(
               column.id,
               asColumnInput(column.type, values.slice(start, end)),
@@ -3972,8 +3986,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               String(part).padStart(6, "0"),
             ].join("/");
             return { columnId: column.id, blockId, bytes };
-          }),
-        );
+          })();
+          // Observed now: one that fails while a later one is still being started must not
+          // surface as unhandled. Promise.all below still receives the failure.
+          encoding.catch(() => undefined);
+          pending.push(encoding);
+        }
+        const encoded = await Promise.all(pending);
         encodeMs += performance.now() - encodeStarted;
         // Promise.all preserves column/range order even when native compressors finish out of
         // order. The group bound means their completed buffers plus the accumulator stay finite.
@@ -7771,12 +7790,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<string> {
     const rowIds = reservedRowIds ?? (await this.store.reserveRowIds(table.id, rowCount));
     if (kind === "insert") {
-      const ftsDeltas = buildFtsColumnDeltas(table, batch, rowIds.start);
+      const ftsDeltas = await buildFtsColumnDeltas(table, batch, rowIds.start);
       if (ftsDeltas.length > 0) {
         transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
       }
     }
-    const secondaryDeltas = buildSecondaryInsertDeltas(table, batch, rowIds.start);
+    const secondaryDeltas = await buildSecondaryInsertDeltas(table, batch, rowIds.start);
     if (secondaryDeltas.length > 0) {
       transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
     }
@@ -9685,7 +9704,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await this.#assertUpdateUniqueTermsAbsent(transaction, table, input, preImages);
     }
     stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
-    const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
+    const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
     if (secondaryDeltas.length > 0) {
       transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
     }
@@ -19390,7 +19409,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     requestedTokens: readonly string[],
   ): Promise<Set<string>> {
     if (table.uniqueKeyLookupReady === true) {
-      return new Set(await this.#existingUniqueKeysWindowed(table.id, requestedTokens));
+      return this.#existingUniqueKeySet(table.id, requestedTokens);
     }
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) throw new Error("Unique key metadata is missing");
@@ -19400,6 +19419,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         .map((row) => keyToken(keyColumn.type, row[keyColumn.name] ?? null))
         .filter((token) => requested.has(token)),
     );
+  }
+
+  /** `#existingUniqueKeysWindowed` as a set, built window by window between turns. */
+  async #existingUniqueKeySet(
+    tableId: string,
+    requestedTokens: readonly string[],
+  ): Promise<Set<string>> {
+    const found = new Set<string>();
+    for (let start = 0; start < requestedTokens.length; start += MAX_STORAGE_BULK_READ_ITEMS) {
+      await maybeYieldToEventLoop();
+      for (const token of await this.store.getExistingUniqueKeys(
+        tableId,
+        requestedTokens.slice(start, start + MAX_STORAGE_BULK_READ_ITEMS),
+      )) {
+        found.add(token);
+      }
+    }
+    return found;
   }
 
   async #existingUniqueKeysWindowed(
@@ -26645,12 +26682,9 @@ interface MergeResolution {
   readonly checksum: number;
 }
 
-/** Terms a UNIQUE build sorts as one run: a few milliseconds of sorting. */
-const UNIQUE_TERM_RUN = 16_384;
-
 /**
  * A UNIQUE index build's key terms: the set the build checks duplicates against, also kept as
- * sorted runs of at most `UNIQUE_TERM_RUN` terms. `orderedChunks` merges the runs into the
+ * sorted runs of at most `SORTED_RUN_TERMS` terms. `orderedChunks` merges the runs into the
  * globally ordered chunks the store's staged build takes, yielding between chunks, so neither a
  * database-sized sort nor a database-sized copy runs in one turn.
  */
@@ -26662,7 +26696,7 @@ class UniqueTermRuns extends Set<string> {
     if (this.has(term)) return this;
     super.add(term);
     this.#pending.push(term);
-    if (this.#pending.length >= UNIQUE_TERM_RUN) this.#seal();
+    if (this.#pending.length >= SORTED_RUN_TERMS) this.#seal();
     return this;
   }
 
@@ -26700,6 +26734,16 @@ class UniqueTermRuns extends Set<string> {
     }
     if (chunk.length > 0) yield chunk;
   }
+}
+
+/** Drives a step generator to its result, offering the event loop a turn between steps. */
+async function runStepsSliced<T>(steps: Generator<void, T>): Promise<T> {
+  let step = steps.next();
+  while (step.done !== true) {
+    await maybeYieldToEventLoop();
+    step = steps.next();
+  }
+  return step.value;
 }
 
 /** Postings per stored chunk while the base stays far from MAX_FTS_BASE_CHUNKS. */
@@ -26809,85 +26853,6 @@ class SecondaryPostingWriter {
       await maybeYieldToEventLoop();
     }
   }
-}
-
-/**
- * `sortedSecondaryPostings`, a bounded run at a time: the terms sort in runs of
- * `UNIQUE_TERM_RUN` and merge, with the event loop offered a turn between runs and merged
- * batches, so a block of distinct terms never sorts in one call.
- */
-async function sortedSecondaryPostingsSliced(
-  byTerm: ReadonlyMap<string, { rowIds: bigint[]; tf: number[] }>,
-): Promise<FtsPosting[]> {
-  const terms = [...byTerm.keys()];
-  const runs: string[][] = [];
-  for (let start = 0; start < terms.length; start += UNIQUE_TERM_RUN) {
-    await maybeYieldToEventLoop();
-    runs.push(terms.slice(start, start + UNIQUE_TERM_RUN).sort());
-  }
-  const postings: FtsPosting[] = [];
-  for await (const batch of mergeSortedRuns(runs)) {
-    for (const term of batch) {
-      const rowIds = [...new Set(byTerm.get(term)?.rowIds ?? [])].sort((left, right) =>
-        left < right ? -1 : left > right ? 1 : 0,
-      );
-      postings.push({ term, rowIds, tf: rowIds.map(() => 1) });
-    }
-    await maybeYieldToEventLoop();
-  }
-  return postings;
-}
-
-/** Terms per batch `mergeSortedRuns` hands back between turns. */
-const MERGE_BATCH_TERMS = 4_096;
-
-/**
- * The terms of sorted `runs` in one code-unit order, a batch of at most `MERGE_BATCH_TERMS` at a
- * time, merged through a binary min-heap of the runs' next terms.
- */
-async function* mergeSortedRuns(runs: readonly string[][]): AsyncGenerator<string[]> {
-  if (runs.length === 1) {
-    const run = runs[0] ?? [];
-    for (let start = 0; start < run.length; start += MERGE_BATCH_TERMS) {
-      yield run.slice(start, start + MERGE_BATCH_TERMS);
-    }
-    return;
-  }
-  const positions = new Int32Array(runs.length);
-  const head = (run: number): string => runs[run]?.[positions[run] ?? 0] ?? "";
-  const heap = runs.flatMap((run, index) => (run.length > 0 ? [index] : []));
-  const siftDown = (from: number): void => {
-    let at = from;
-    for (;;) {
-      const left = at * 2 + 1;
-      const right = left + 1;
-      let least = at;
-      if (left < heap.length && head(heap[left] ?? 0) < head(heap[least] ?? 0)) least = left;
-      if (right < heap.length && head(heap[right] ?? 0) < head(heap[least] ?? 0)) least = right;
-      if (least === at) return;
-      const swap = heap[at] ?? 0;
-      heap[at] = heap[least] ?? 0;
-      heap[least] = swap;
-      at = least;
-    }
-  };
-  for (let index = (heap.length >> 1) - 1; index >= 0; index -= 1) siftDown(index);
-  let batch: string[] = [];
-  while (heap.length > 0) {
-    const run = heap[0] ?? 0;
-    batch.push(head(run));
-    positions[run] = (positions[run] ?? 0) + 1;
-    if ((positions[run] ?? 0) >= (runs[run]?.length ?? 0)) {
-      const last = heap.pop() ?? 0;
-      if (heap.length > 0) heap[0] = last;
-    }
-    siftDown(0);
-    if (batch.length === MERGE_BATCH_TERMS) {
-      yield batch;
-      batch = [];
-    }
-  }
-  if (batch.length > 0) yield batch;
 }
 
 /** Modeled resident bytes of one run or patch: three 32-bit values, doubled for growth. */

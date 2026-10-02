@@ -89,8 +89,10 @@ import {
   assertStorageBulkReadItems,
   validateStorageId,
   assertTempRunPageBatchLimits,
+  type UniqueKeyChanges,
 } from "./types.js";
 import { verifyStoredBlock } from "../block-format/index.js";
+import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
 import { crc32 } from "../block-format/checksum.js";
 import {
   decodeSnapshotMetadataItems,
@@ -103,6 +105,7 @@ import {
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
 import {
+  blockBytesChecksum,
   RecordCore,
   validateFtsPostingChunks,
   validateId,
@@ -137,6 +140,9 @@ interface MemorySnapshotFrameImportState {
   lastBatchFrames: SnapshotFrame[];
   completedReplay: boolean;
 }
+
+/** UNIQUE key changes past which a commit checks them a slice at a time before committing. */
+const LARGE_COMMIT_KEYS = 16_384;
 
 /**
  * One event-loop turn after a commit, as a store backed by real I/O gives every commit for
@@ -921,13 +927,13 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
-    const summary = await this.#runAtomic(() => this.#core.commitTransaction(input));
+    const summary = await this.#runCommit(input, () => this.#core.commitTransaction(input));
     await commitTurn();
     return summary;
   }
 
   async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
-    const summary = await this.#runAtomic(() => {
+    const summary = await this.#runCommit(input, () => {
       const summary = this.#core.writeTransaction(input);
       // The record half validated everything; the bytes land in this same atomic step.
       for (const block of input.blocks) this.#putBlock(block.id, block.bytes);
@@ -935,6 +941,32 @@ export class MemoryBlockStore implements BlockStore {
     });
     await commitTurn();
     return summary;
+  }
+
+  /**
+   * Runs a commit atomically. One with many UNIQUE key changes first checks them a slice at a
+   * time, still holding its place in the queue so nothing else commits meanwhile, and the
+   * commit itself then reuses that work.
+   */
+  #runCommit<T>(
+    input: { readonly uniqueKeyChanges?: readonly UniqueKeyChanges[] },
+    commit: () => T,
+  ): Promise<T> {
+    let keys = 0;
+    for (const change of input.uniqueKeyChanges ?? []) keys += change.keyTokens.length;
+    if (keys < LARGE_COMMIT_KEYS) return this.#runAtomic(commit);
+    const result = this.#commitQueue.then(async () => {
+      await this.#core.prepareCommit(input, maybeYieldToEventLoop);
+      // A turn before the one step that must not be split.
+      await yieldToEventLoop();
+      this.#clearStaleSnapshotImport();
+      return commit();
+    });
+    this.#commitQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   async createLease(record: LeaseRecord): Promise<void> {
@@ -1657,7 +1689,8 @@ export class MemoryBlockStore implements BlockStore {
     const previous = this.#blocks.get(id);
     this.#physicalBlockBytes += stored.byteLength - (previous?.byteLength ?? 0);
     this.#blocks.set(id, stored);
-    this.#blockChecksums.set(id, crc32(stored));
+    // The copy holds the same bytes, so a checksum the commit prepared for them still applies.
+    this.#blockChecksums.set(id, blockBytesChecksum(bytes));
   }
 
   #deleteBlock(id: string): void {
@@ -1676,6 +1709,15 @@ export class MemoryBlockStore implements BlockStore {
     // The in-memory implementation owns no external resources.
   }
 
+  #clearStaleSnapshotImport(): void {
+    if (
+      this.#completedSnapshotFrameImport !== undefined &&
+      this.#core.getCurrentManifestVersion() !== this.#completedSnapshotFrameImport.version
+    ) {
+      this.#completedSnapshotFrameImport = undefined;
+    }
+  }
+
   #runAtomic<T>(operation: () => T): Promise<T> {
     let resolveResult: (value: T | PromiseLike<T>) => void;
     let rejectResult: (reason: unknown) => void;
@@ -1685,12 +1727,7 @@ export class MemoryBlockStore implements BlockStore {
     });
     this.#commitQueue = this.#commitQueue.then(() => {
       try {
-        if (
-          this.#completedSnapshotFrameImport !== undefined &&
-          this.#core.getCurrentManifestVersion() !== this.#completedSnapshotFrameImport.version
-        ) {
-          this.#completedSnapshotFrameImport = undefined;
-        }
+        this.#clearStaleSnapshotImport();
         resolveResult(operation());
       } catch (error) {
         rejectResult(error);

@@ -48,7 +48,8 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // memory fitted to the budget, time-sliced folds, scans, writes, and live patches, and the
 // schema-3 / layout-8 barriers) adds 6.3 KiB raw / 2.4 KiB gzip: 941.1 KiB raw / 275.3 KiB gzip.
 // Staged UNIQUE builds, index capacity, and sliced OPFS recovery: 944.2 KiB raw / 276.3 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 945 * 1024;
+// Sliced commits and checkpoint parsing (0.13.1): 945.4 KiB raw / 276.8 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 946 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 277 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
@@ -59,23 +60,26 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 277 * 1024;
 // fast paths add about 4 KiB. Allow 1290 KiB raw while retaining the compressed download budget.
 // Compaction that never stalls (0.13.0) adds 8.3 KiB raw: 1297.3 KiB raw. Sliced OPFS
 // checkpoints and windowed index builds add 2.6 KiB: 1299.9 KiB raw. Staged UNIQUE builds,
-// index capacity, and sliced OPFS recovery: 1304.6 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1305 * 1024;
+// index capacity, and sliced OPFS recovery: 1304.6 KiB raw. Sliced commits and checkpoint
+// parsing (0.13.1): 1309.4 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1310 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
 // Compaction that never stalls (0.13.0) adds 2.8 KiB gzip: 365.6 KiB measured. Sliced OPFS
 // checkpoints and windowed index builds: 366.5 KiB measured. Staged UNIQUE builds, index
-// capacity, and sliced OPFS recovery: 368.0 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 369 * 1024;
+// capacity, and sliced OPFS recovery: 368.0 KiB measured. Sliced commits and checkpoint
+// parsing (0.13.1): 369.8 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 370 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
 // With the scope write set: 1257.8 KiB raw. The chunked transaction journal (schema 2) adds
 // about 6 KiB gzip: 351.7 KiB gzip. Writer turns: 357.4 KiB gzip. Compaction that never stalls
 // (0.13.0): 1310.5 KiB raw / 368.2 KiB gzip; with staged UNIQUE builds, index capacity, and
-// sliced OPFS recovery, 1313.8 KiB raw / 369.3 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1314 * 1024;
+// sliced OPFS recovery, 1313.8 KiB raw / 369.3 KiB gzip; with sliced commits (0.13.1),
+// 1315.0 KiB raw / 369.7 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1316 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 370 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");

@@ -132,12 +132,16 @@ short steps, or a run of statements awaited back to back, yields as often as one
 On a laptop, the longest single block measured during background work is about 40 ms, on the
 memory and OPFS stores alike, for every shape in `scripts/stall-survey.mts`: wide tables
 refreshed in any order, hundreds of thousands of rows of point updates or deletes, index and
-full-text builds, and live aggregates under heavy writes. Foreground statements hold it longer
-only in proportion to their own size: a 50,000-row write holds it for about 50–80 ms, and a
-single write of half a million rows for up to about 160 ms. On an OPFS database of a million
-keyed rows, the longest block while loading it 50,000 rows at a time is under 80 ms, creating
-a `UNIQUE` index over all of it never holds the thread for more than about 30 ms, and opening it
-again holds it for under 100 ms at a time.
+full-text builds, and live aggregates under heavy writes. Writes are sliced the same way: a
+large one checks its keys, checksums its blocks, and on OPFS encodes its log frame a slice at a
+time before it commits. The one step a commit cannot split is publishing its keys, at about 70 ns
+a key. Writing 500,000 rows in one call and then upserting all of them holds the thread for at
+most about 55 ms on the memory store and 85 ms on OPFS, about 35 ms of it that publication; on
+OPFS a query issued meanwhile can still wait for the commit to finish, up to about 185 ms, while
+the thread stays free. On an OPFS database of a million keyed rows, the longest block while
+loading it 50,000 rows at a time is under 80 ms, creating a `UNIQUE` index over all of it never
+holds the thread for more than about 30 ms, and opening it again holds it for under 40 ms at a
+time.
 
 Automatic compaction backs off a table whose attempt does not help, rather than retrying it on
 every query. A fold that fails waits a delay that doubles from a quarter of a second per

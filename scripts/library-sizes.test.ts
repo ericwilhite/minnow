@@ -33,10 +33,11 @@ describe("compressed download budgets", () => {
     // retain a tight absolute budget rather than claiming this two-download setup is below SQLite.
     // Compaction that never stalls (0.13.0) adds 3.0 KiB: 467.6 KiB measured. Sliced OPFS
     // checkpoints and windowed index builds: 468.6 KiB measured. Staged UNIQUE builds, index
-    // capacity, and sliced OPFS recovery: 470.1 KiB measured.
+    // capacity, and sliced OPFS recovery: 470.1 KiB measured. Sliced commits and checkpoint
+    // parsing (0.13.1): 472.2 KiB measured.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(471 * 1024);
+    ).toBeLessThanOrEqual(473 * 1024);
   });
 });

@@ -600,13 +600,18 @@ longer matches its plan is abandoned unwritten. Each case fails with its part of
 `event-loop-stalls.test.ts` runs a 1 ms watchdog through the workloads that once held every
 other query for hundreds of milliseconds or minutes — a fold of reordered wide upserts, live
 aggregates patched after large commits, scans over upsert-heavy tables, secondary-index builds
-and their first lookups, and a full-text index build — and fails if any stretch the watchdog
+and their first lookups, a full-text index build, and a 600,000-row write and upsert on OPFS —
+and fails if any stretch the watchdog
 cannot run exceeds 250 ms (750 ms in CI). Each case fails against the code before 0.13.0.
 `checkpoint-slicing.test.ts` pins that a multi-slice OPFS checkpoint gives the event loop turns
 between its slot writes, publishes exactly the bytes a one-step checkpoint would, and survives
 power loss or a refused write at every one of its file operations, with the refused checkpoint
 retried by later writes; `wire.test.ts` checks the sliced encoder against the one-step encoder
-byte for byte, including a property test over arbitrary JSON-shaped states.
+byte for byte, and the sliced checkpoint parser against `JSON.parse`, each with a property test
+over arbitrary JSON-shaped states and, for the parser, malformed input it must refuse.
+`large-commit.test.ts` pins on the memory and OPFS stores that a commit large enough to check its
+keys in slices still refuses a conflicting key without changing anything, and that its
+ahead-encoded log frame replays after a crash.
 `unique-index-staged-build.test.ts` pins, on the memory, IndexedDB, and OPFS stores, that
 creating a `UNIQUE` index stages its keys in ordered chunks of at most 4,096 and never sends
 them in one catalog update, enforces the index across a reopen, handles an empty table, and

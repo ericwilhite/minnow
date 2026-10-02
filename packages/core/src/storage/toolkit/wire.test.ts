@@ -12,6 +12,7 @@ import {
   encodeSyncCheckpoint,
   encodeSyncCheckpointSliced,
   LOG_FORMAT_VERSION,
+  parseRecordJsonSliced,
 } from "./wire.js";
 import { RecordCore, type RecordCoreState } from "./record-core.js";
 import { crc32 } from "../../block-format/index.js";
@@ -643,5 +644,90 @@ describe("sliced checkpoint decoding", () => {
     await expect(decodeSyncCheckpointSliced(newer, pause)).rejects.toMatchObject({
       name: "StorageFormatVersionError",
     });
+  });
+});
+
+describe("sliced record JSON parsing", () => {
+  const pause = async (): Promise<void> => undefined;
+  const bytesOf = (text: string): Uint8Array => new TextEncoder().encode(text);
+  /** Strings built to trip a structure scan: every JSON structure byte, escapes, and UTF-8. */
+  const tricky = fc.oneof(
+    fc.string({ unit: "grapheme", maxLength: 10 }),
+    fc.constantFrom('"', "\\", '\\"', "[{,:}]", "$n", "__proto__", "é😀\u2028", "\n\t"),
+  );
+
+  it("parses what decodeRecordJson parses, across slices of nested large containers", async () => {
+    const leaf = fc.oneof(
+      tricky,
+      fc.integer(),
+      fc.double({ noNaN: true, noDefaultInfinity: true }),
+      fc.boolean(),
+      fc.constant(null),
+      fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
+    );
+    const { tree } = fc.letrec((node) => ({
+      tree: fc.oneof(
+        { depthSize: "small", withCrossShrink: true },
+        leaf,
+        fc.array(node("tree"), { maxLength: 5 }),
+        fc.dictionary(tricky, node("tree"), { maxKeys: 5 }),
+        // Wide enough to pass one parse slice, so runs, recursion, and native pieces mix.
+        fc.array(leaf, { minLength: 3_000, maxLength: 6_000 }),
+        fc.dictionary(tricky, leaf, { minKeys: 2_000, maxKeys: 4_000 }),
+      ),
+    }));
+    await fc.assert(
+      fc.asyncProperty(tree, async (value) => {
+        const bytes = encodeRecordJson(value);
+        expect(await parseRecordJsonSliced(bytes, pause)).toEqual(decodeRecordJson(bytes));
+      }),
+      { numRuns: 80 },
+    );
+  });
+
+  it("parses pretty-printed JSON and keeps __proto__ keys own properties", async () => {
+    const large = {
+      __proto__: Array.from({ length: 20_000 }, (_, index) => ({ $n: String(index) })),
+      rows: Array.from({ length: 20_000 }, (_, index) => [index, `r[${String(index)}],"x"`]),
+      nested: {
+        deep: { list: Array.from({ length: 30_000 }, (_, index) => `\\${String(index)}`) },
+      },
+    };
+    const text = JSON.stringify(
+      JSON.parse(JSON.stringify({ wrapper: "x" })) &&
+        Object.defineProperty({}, "__proto__", {
+          value: large.__proto__,
+          enumerable: true,
+        }),
+    );
+    const pretty = JSON.stringify(
+      { ...JSON.parse(text), rows: large.rows, nested: large.nested },
+      null,
+      2,
+    );
+    const bytes = bytesOf(pretty);
+    const sliced = (await parseRecordJsonSliced(bytes, pause)) as Record<string, unknown>;
+    expect(sliced).toEqual(decodeRecordJson(bytes));
+    expect(Object.getPrototypeOf(sliced)).toBe(Object.prototype);
+    expect(Array.isArray(Object.getOwnPropertyDescriptor(sliced, "__proto__")?.value)).toBe(true);
+  });
+
+  it("refuses what decodeRecordJson refuses", async () => {
+    for (const text of [
+      `{"rows":[${Array.from({ length: 20_000 }, () => '{"$n":"01"}').join(",")}]}`,
+      `[${Array.from({ length: 20_000 }, () => '{"$n":"99999999999999999999999"}').join(",")}]`,
+      `[${"1,".repeat(40_000)}`,
+      `[${"1,".repeat(40_000)}]`,
+      `[${"1,".repeat(20_000)},${"2,".repeat(20_000)}3]`,
+      `{"a":[${"1,".repeat(40_000)}1],b:[${"1,".repeat(40_000)}1]}`,
+      `{"a":[${"1,".repeat(40_000)}1],"b" [${"1,".repeat(40_000)}1]}`,
+      `["${"x".repeat(80_000)}`,
+      `[${"[1],".repeat(40_000)}[1]]]`,
+      `[${"[1],".repeat(40_000)}[1]}`,
+    ]) {
+      const bytes = bytesOf(text);
+      expect(() => decodeRecordJson(bytes)).toThrow();
+      await expect(parseRecordJsonSliced(bytes, pause)).rejects.toThrow();
+    }
   });
 });

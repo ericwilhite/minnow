@@ -117,6 +117,7 @@ import {
   TransactionRecordConflictError,
   type TransactionRecordUpdate,
   type UniqueKeyBuildRecord,
+  type UniqueKeyChanges,
   type BeginUniqueKeyBuildInput,
   type RenewUniqueKeyBuildInput,
   type AppendUniqueKeyBuildChunkInput,
@@ -171,6 +172,7 @@ import { dateIsoString } from "../../date-value.js";
 import {
   assertWellFormedString,
   crc32,
+  crc32Continue,
   MAX_STORED_BLOCK_BYTE_LENGTH,
 } from "../../block-format/index.js";
 
@@ -378,11 +380,11 @@ export class OrderedStringSet extends Set<string> {
   applyDelta(added: Iterable<string>, removed: Iterable<string> = []): this {
     let changed = false;
     for (const value of removed) changed = super.delete(value) || changed;
-    for (const value of added) {
-      if (this.has(value)) continue;
-      super.add(value);
-      changed = true;
-    }
+    // Set.add ignores a value already present, so one hash per value — not a membership test
+    // and an add — publishes a large commit's keys; the size says whether any was new.
+    const before = this.size;
+    for (const value of added) super.add(value);
+    changed ||= this.size !== before;
     if (changed && this.#indexCurrent) {
       this.#index.clear();
       this.#indexCurrent = false;
@@ -1058,6 +1060,8 @@ export class RecordCore {
   >();
   readonly #uniqueKeys = new OrderedRecordMap<string, OrderedStringSet>();
   readonly #uniqueKeyBuilds = new Map<string, UniqueKeyBuildState>();
+  /** Advances whenever any UNIQUE membership changes, so prepared commit work can tell. */
+  #membershipEpoch = 0;
   #activeUniqueKeyBuildCount = 0;
   #uniqueKeyBuildStagedBytes = 0;
   #uniqueKeyBuildStagedEntries = 0;
@@ -1821,10 +1825,13 @@ export class RecordCore {
   #installTableRecord(record: TableRecord): void {
     this.#setTable(cloneRecord(record));
     this.#tableIdsByName.set(record.name, record.id);
-    if (record.uniqueKeyColumnId !== undefined)
+    if (record.uniqueKeyColumnId !== undefined) {
+      this.#membershipEpoch += 1;
       this.#uniqueKeys.set(record.id, new OrderedStringSet());
+    }
     for (const [indexId, index] of Object.entries(record.secondaryIndexes ?? {})) {
       if (index.unique === true && index.uniqueEnforced === true) {
+        this.#membershipEpoch += 1;
         this.#uniqueKeys.set(
           secondaryUniqueKeyNamespace(record.id, indexId),
           new OrderedStringSet(),
@@ -1989,10 +1996,12 @@ export class RecordCore {
     }
     for (const [indexId, previous] of Object.entries(previousSecondary ?? {})) {
       if (previous.unique === true && nextSecondary?.[indexId]?.unique !== true) {
+        this.#membershipEpoch += 1;
         this.#uniqueKeys.delete(secondaryUniqueKeyNamespace(record.id, indexId));
       }
     }
     if (update.uniqueKeySeed !== undefined) {
+      this.#membershipEpoch += 1;
       this.#uniqueKeys.set(update.uniqueKeySeed.namespaceId, uniqueSeed ?? new OrderedStringSet());
     }
     if (autoIncrementCounter !== undefined) {
@@ -2294,6 +2303,7 @@ export class RecordCore {
     for (const key of [...this.#nextAutoIncrement.keys()]) {
       if (key.startsWith(owned)) this.#nextAutoIncrement.delete(key);
     }
+    this.#membershipEpoch += 1;
     this.#uniqueKeys.delete(id);
     const secondaryUniquePrefix = `${id}\u0000secondary-index\u0000`;
     for (const namespaceId of [...this.#uniqueKeys.keys()]) {
@@ -3333,6 +3343,7 @@ export class RecordCore {
     this.#setTable(updated);
     // The staged set becomes the membership as it stands, so finishing costs the same for a
     // thousand keys as for a million; later commits then mutate it as the namespace's own.
+    this.#membershipEpoch += 1;
     this.#uniqueKeys.set(state.record.namespaceId, state.tokens);
     this.#setUniqueKeyBuild(
       {
@@ -4062,6 +4073,59 @@ export class RecordCore {
     }
   }
 
+  /**
+   * Does the part of a coming `writeTransaction`, `preflightWriteTransaction`, or
+   * `commitTransaction` for `input` that grows with its keys — every UNIQUE key change checked
+   * against its membership — a slice at a time, with `pause` awaited between slices. The commit
+   * then reuses that work, provided it passes the same `uniqueKeyChanges` array and no
+   * membership changed in between; otherwise it does the work itself. A conflict found here is
+   * raised by the commit, at the point it would have found it.
+   */
+  async prepareCommit(
+    input: {
+      readonly uniqueKeyChanges?: readonly UniqueKeyChanges[];
+      readonly blocks?: ReadonlyArray<{ readonly bytes: Uint8Array }>;
+    },
+    pause: () => Promise<void>,
+  ): Promise<void> {
+    // A single-shot write's new blocks are checksummed as it is planned; take those a megabyte
+    // at a time now, and the plan (and a store keeping the bytes) reuses them.
+    for (const block of input.blocks ?? []) {
+      if (preparedBlockChecksums.has(block.bytes)) continue;
+      let checksum = 0;
+      for (let start = 0; start < block.bytes.byteLength; start += PREPARED_CHECKSUM_SLICE_BYTES) {
+        checksum = crc32Continue(
+          checksum,
+          block.bytes.subarray(start, start + PREPARED_CHECKSUM_SLICE_BYTES),
+        );
+        await pause();
+      }
+      preparedBlockChecksums.set(block.bytes, checksum);
+    }
+    const entries = input.uniqueKeyChanges;
+    if (entries === undefined || entries.length === 0) return;
+    const epoch = this.#membershipEpoch;
+    let work: PreparedUniqueKeyDeltas;
+    try {
+      const deltas = await runCommitStepsSliced(
+        uniqueKeyDeltaSteps(entries, (id) => this.#uniqueKeys.get(id)),
+        pause,
+      );
+      work = { core: this, epoch, deltas };
+    } catch (error) {
+      work = { core: this, epoch, error };
+    }
+    // A membership changed while this ran: there is nothing safe to keep.
+    if (this.#membershipEpoch === epoch) preparedUniqueKeyDeltas.set(entries, work);
+  }
+
+  #preparedUniqueKeyDeltas(entries: readonly UniqueKeyChanges[]): UniqueKeyDeltas | undefined {
+    const work = preparedUniqueKeyDeltas.get(entries);
+    if (work?.core !== this || work.epoch !== this.#membershipEpoch) return undefined;
+    if ("error" in work) throw work.error;
+    return work.deltas;
+  }
+
   commitTransaction(input: CommitTransactionInput): ManifestSummary {
     const transaction = this.#transactions.get(input.transactionId);
     if (
@@ -4237,7 +4301,9 @@ export class RecordCore {
         const persisted = options.blockChecksums?.get(id);
         if (persisted !== undefined) return persisted;
         const block = blocks.get(id);
-        return block === undefined ? this.#physical.blockChecksum?.(id) : crc32(block.bytes);
+        return block === undefined
+          ? this.#physical.blockChecksum?.(id)
+          : blockBytesChecksum(block.bytes);
       },
       (id) => segments.get(id) ?? this.#segments.get(id),
     );
@@ -4510,29 +4576,9 @@ export class RecordCore {
     // would. A delta rather than a working copy of the table's whole key set: the copy made
     // every keyed commit cost O(table), and it is only ever adopted after validation passes,
     // which the delta achieves by being applied at the mutation step below.
-    const uniqueKeyDeltas = new Map<string, { added: Set<string>; removed: Set<string> }>();
-    for (const entry of uniqueKeyEntries) {
-      let delta = uniqueKeyDeltas.get(entry.tableId);
-      if (delta === undefined) {
-        delta = { added: new Set(), removed: new Set() };
-        uniqueKeyDeltas.set(entry.tableId, delta);
-      }
-      const existing = this.#uniqueKeys.get(entry.tableId);
-      for (const token of entry.keyTokens) {
-        if (entry.remove === true) {
-          delta.added.delete(token);
-          delta.removed.add(token);
-          continue;
-        }
-        const present =
-          delta.added.has(token) || (existing?.has(token) === true && !delta.removed.has(token));
-        if (entry.requireAbsent && present) {
-          throw new UniqueKeyConflictError(entry.tableId, token);
-        }
-        delta.removed.delete(token);
-        delta.added.add(token);
-      }
-    }
+    const uniqueKeyDeltas =
+      this.#preparedUniqueKeyDeltas(uniqueKeyEntries) ??
+      runCommitSteps(uniqueKeyDeltaSteps(uniqueKeyEntries, (id) => this.#uniqueKeys.get(id)));
     const nextVersion = nextManifestVersion(input.expectedManifestVersion);
     this.#assertNextManifestPinLag(nextVersion, input.committedAt, transaction.snapshotVersion);
     const removedManifestBlocks = removedBlockIds.map((id) => {
@@ -4627,6 +4673,7 @@ export class RecordCore {
         tokens = new OrderedStringSet();
         this.#uniqueKeys.set(tableId, tokens);
       }
+      this.#membershipEpoch += 1;
       tokens.applyDelta(delta.added, delta.removed);
     }
     this.#applyFtsChanges(
@@ -6133,6 +6180,7 @@ export class RecordCore {
     }
     for (const [tableId, tokens] of cloned.uniqueKeys) {
       // Validation already built this membership to find duplicates; install that one.
+      this.#membershipEpoch += 1;
       this.#uniqueKeys.set(
         tableId,
         validatedMemberships.get(tokens) ?? new OrderedStringSet(tokens),
@@ -6754,6 +6802,87 @@ function exactStringPartition(
 }
 
 /** Exhaustive checkpoint validation before `load` clears any live state. */
+type UniqueKeyDeltas = Map<string, { added: Set<string>; removed: Set<string> }>;
+
+type PreparedUniqueKeyDeltas = { core: RecordCore; epoch: number } & (
+  { deltas: UniqueKeyDeltas } | { error: unknown }
+);
+
+/** Block checksums `RecordCore.prepareCommit` took, by byte-array identity. */
+const preparedBlockChecksums = new WeakMap<Uint8Array, number>();
+
+/** Block bytes `RecordCore.prepareCommit` checksums between pauses. */
+const PREPARED_CHECKSUM_SLICE_BYTES = 1024 * 1024;
+
+/** `crc32(bytes)`, reusing the checksum `RecordCore.prepareCommit` took of the same array. */
+export function blockBytesChecksum(bytes: Uint8Array): number {
+  return preparedBlockChecksums.get(bytes) ?? crc32(bytes);
+}
+
+/** `RecordCore.prepareCommit`'s work, by key-change list identity. */
+const preparedUniqueKeyDeltas = new WeakMap<readonly UniqueKeyChanges[], PreparedUniqueKeyDeltas>();
+
+/** Key changes `uniqueKeyDeltaSteps` checks between yields. */
+const UNIQUE_KEY_DELTA_SLICE = 16_384;
+
+/**
+ * The membership delta a commit's UNIQUE key changes make, per namespace, refusing a key an
+ * insert requires absent; it yields every `UNIQUE_KEY_DELTA_SLICE` keys so a caller can pause.
+ */
+function* uniqueKeyDeltaSteps(
+  entries: readonly UniqueKeyChanges[],
+  membership: (namespaceId: string) => ReadonlySet<string> | undefined,
+): Generator<void, UniqueKeyDeltas> {
+  const deltas: UniqueKeyDeltas = new Map();
+  let sinceYield = 0;
+  for (const entry of entries) {
+    let delta = deltas.get(entry.tableId);
+    if (delta === undefined) {
+      delta = { added: new Set(), removed: new Set() };
+      deltas.set(entry.tableId, delta);
+    }
+    const existing = membership(entry.tableId);
+    for (const token of entry.keyTokens) {
+      sinceYield += 1;
+      if (sinceYield >= UNIQUE_KEY_DELTA_SLICE) {
+        sinceYield = 0;
+        yield;
+      }
+      if (entry.remove === true) {
+        delta.added.delete(token);
+        delta.removed.add(token);
+        continue;
+      }
+      const present =
+        delta.added.has(token) || (existing?.has(token) === true && !delta.removed.has(token));
+      if (entry.requireAbsent && present) {
+        throw new UniqueKeyConflictError(entry.tableId, token);
+      }
+      delta.removed.delete(token);
+      delta.added.add(token);
+    }
+  }
+  return deltas;
+}
+
+function runCommitSteps<T>(steps: Generator<void, T>): T {
+  let step = steps.next();
+  while (step.done !== true) step = steps.next();
+  return step.value;
+}
+
+async function runCommitStepsSliced<T>(
+  steps: Generator<void, T>,
+  pause: () => Promise<void>,
+): Promise<T> {
+  let step = steps.next();
+  while (step.done !== true) {
+    await pause();
+    step = steps.next();
+  }
+  return step.value;
+}
+
 /** Tokens `buildMembershipSliced` checks and adds between pauses. */
 const MEMBERSHIP_SLICE = 16_384;
 

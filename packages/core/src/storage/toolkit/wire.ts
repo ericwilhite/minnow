@@ -147,6 +147,24 @@ async function encodeRecordJsonSliced(
 }
 
 /**
+ * `encodeRecordJson(value)`'s exact bytes, built a bounded piece at a time with `pause` awaited
+ * between pieces. `value` must not change until the returned promise settles.
+ */
+export async function encodeRecordJsonBytesSliced(
+  value: unknown,
+  pause: () => Promise<void>,
+): Promise<Uint8Array> {
+  const encoded = await encodeRecordJsonSliced(value, pause);
+  const bytes = new Uint8Array(encoded.byteLength);
+  let offset = 0;
+  for (const chunk of encoded.chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+/**
  * JSON values in `entry`, counted until `limit` is passed. Only arrays and plain objects are
  * walked: anything else, a Date or a typed array included, stringifies natively as one piece.
  */
@@ -560,9 +578,9 @@ export function decodeSyncCheckpoint(bytes: Uint8Array): unknown {
 }
 
 /**
- * `decodeSyncCheckpoint`, with `pause` awaited between its steps: the checksum a megabyte at a
- * time, then the text decode, the parse, and the bigint pass each as their own step. The parse
- * itself is one call, about a millisecond and a half per megabyte of checkpoint.
+ * `decodeSyncCheckpoint`, a bounded piece at a time with `pause` awaited between pieces: the
+ * checksum a megabyte at a time, then the record JSON parsed by `parseRecordJsonSliced`, so no
+ * single parse covers more than a slice of the checkpoint.
  */
 export async function decodeSyncCheckpointSliced(
   bytes: Uint8Array,
@@ -570,9 +588,198 @@ export async function decodeSyncCheckpointSliced(
 ): Promise<unknown> {
   const payload = await decodeEnvelopeSliced(SYNC_CHECKPOINT_MAGIC, bytes, pause);
   if (payload === undefined) return undefined;
-  const json = textDecoder.decode(payload);
-  await pause();
-  const parsed = JSON.parse(json) as unknown;
-  await pause();
-  return reviveRecordBigints(parsed);
+  return parseRecordJsonSliced(payload, pause);
+}
+
+/** UTF-8 bytes of record JSON one native parse may cover in a sliced decode. */
+const SLICED_PARSE_BYTES = 64 * 1024;
+/** Bytes a sliced decode scans for structure between pauses. */
+const SLICED_SCAN_BYTES = 1024 * 1024;
+
+const QUOTE = 0x22;
+const BACKSLASH = 0x5c;
+const COMMA = 0x2c;
+const COLON = 0x3a;
+const OPEN_ARRAY = 0x5b;
+const CLOSE_ARRAY = 0x5d;
+const OPEN_OBJECT = 0x7b;
+const CLOSE_OBJECT = 0x7d;
+
+/**
+ * `decodeRecordJson` over UTF-8 `bytes`, a bounded piece at a time. An array or object too large
+ * for one piece is scanned for its top-level members — structure bytes are ASCII, and UTF-8
+ * never repeats them inside a multi-byte character, so the scan needs no decoding — and its runs
+ * of small members are decoded and parsed natively, larger members recursively, with `pause`
+ * awaited between pieces and every megabyte scanned. The value is the one `decodeRecordJson`
+ * returns for the same bytes.
+ */
+export async function parseRecordJsonSliced(
+  bytes: Uint8Array,
+  pause: () => Promise<void>,
+): Promise<unknown> {
+  let scanned = 0;
+  const scanPause = async (count: number): Promise<void> => {
+    scanned += count;
+    if (scanned < SLICED_SCAN_BYTES) return;
+    scanned = 0;
+    await pause();
+  };
+  const parsePiece = async (text: string): Promise<unknown> => {
+    const value = reviveRecordBigints(JSON.parse(text) as unknown);
+    await pause();
+    return value;
+  };
+  /** The first byte of `[start, end)` that is not JSON whitespace. */
+  const skipSpace = (start: number, end: number): number => {
+    let at = start;
+    while (at < end) {
+      const byte = bytes[at] ?? 0;
+      if (byte !== 0x20 && byte !== 0x0a && byte !== 0x0d && byte !== 0x09) break;
+      at += 1;
+    }
+    return at;
+  };
+  const malformed = (): SyntaxError => new SyntaxError("Record JSON is malformed");
+  /**
+   * Calls `member(start, end)` for each top-level member of the container whose contents are
+   * `[start, end)`, in order: a string-aware scan that tracks nesting depth. Unbalanced nesting,
+   * an unterminated string, and an empty member — a trailing comma included — are refused, as
+   * `JSON.parse` refuses them.
+   */
+  const forEachMember = async (
+    start: number,
+    end: number,
+    member: (memberStart: number, memberEnd: number) => Promise<void>,
+  ): Promise<void> => {
+    let depth = 0;
+    let inString = false;
+    let memberStart = start;
+    let sinceLastPause = 0;
+    for (let at = start; at < end; at += 1) {
+      const byte = bytes[at] ?? 0;
+      if (byte === QUOTE) {
+        // Strings are most of a checkpoint's bytes: jump to the closing quote natively, past
+        // any quote that an odd run of backslashes escapes.
+        let closing = bytes.indexOf(QUOTE, at + 1);
+        while (closing >= 0 && closing < end) {
+          let backslashes = 0;
+          while (bytes[closing - 1 - backslashes] === BACKSLASH) backslashes += 1;
+          if (backslashes % 2 === 0) break;
+          closing = bytes.indexOf(QUOTE, closing + 1);
+        }
+        if (closing < 0 || closing >= end) {
+          inString = true;
+          break;
+        }
+        sinceLastPause += closing - at;
+        at = closing;
+      } else if (byte === OPEN_ARRAY || byte === OPEN_OBJECT) {
+        depth += 1;
+      } else if (byte === CLOSE_ARRAY || byte === CLOSE_OBJECT) {
+        depth -= 1;
+      } else if (byte === COMMA && depth === 0) {
+        if (skipSpace(memberStart, at) === at) throw malformed();
+        await member(memberStart, at);
+        memberStart = at + 1;
+      }
+      sinceLastPause += 1;
+      if (sinceLastPause >= 65_536) {
+        await scanPause(sinceLastPause);
+        sinceLastPause = 0;
+      }
+    }
+    await scanPause(sinceLastPause);
+    if (depth !== 0 || inString) throw malformed();
+    if (skipSpace(memberStart, end) < end) await member(memberStart, end);
+    else if (memberStart !== start) throw malformed();
+  };
+  /** The value whose JSON is `[start, end)`. */
+  const parseRange = async (start: number, end: number): Promise<unknown> => {
+    const first = skipSpace(start, end);
+    const opener = bytes[first];
+    if (end - start <= SLICED_PARSE_BYTES || (opener !== OPEN_ARRAY && opener !== OPEN_OBJECT)) {
+      return parsePiece(textDecoder.decode(bytes.subarray(start, end)));
+    }
+    let close = end - 1;
+    while (close > first && skipSpace(close, close + 1) === close + 1) close -= 1;
+    if (close === first || bytes[close] !== (opener === OPEN_ARRAY ? CLOSE_ARRAY : CLOSE_OBJECT)) {
+      throw malformed();
+    }
+    if (opener === OPEN_ARRAY) {
+      const values: unknown[] = [];
+      // A run of adjacent small elements parses as one array: their bytes are contiguous.
+      let runStart = -1;
+      let runEnd = -1;
+      const flushRun = async (): Promise<void> => {
+        if (runStart < 0) return;
+        const run = (await parsePiece(
+          `[${textDecoder.decode(bytes.subarray(runStart, runEnd))}]`,
+        )) as unknown[];
+        for (const value of run) values.push(value);
+        runStart = -1;
+      };
+      await forEachMember(first + 1, close, async (memberStart, memberEnd) => {
+        if (memberEnd - memberStart > SLICED_PARSE_BYTES) {
+          await flushRun();
+          values.push(await parseRange(memberStart, memberEnd));
+          return;
+        }
+        if (runStart >= 0 && memberEnd - runStart > SLICED_PARSE_BYTES) await flushRun();
+        if (runStart < 0) runStart = memberStart;
+        runEnd = memberEnd;
+      });
+      await flushRun();
+      return values;
+    }
+    const record: Record<string, unknown> = {};
+    const assign = (key: string, value: unknown): void => {
+      Object.defineProperty(record, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    };
+    // A run of adjacent small members parses as one object; a large member's value recurses.
+    let runStart = -1;
+    let runEnd = -1;
+    const flushRun = async (): Promise<void> => {
+      if (runStart < 0) return;
+      // Revived member by member: a run holding only a `$n` member is not a tagged bigint.
+      const run = JSON.parse(`{${textDecoder.decode(bytes.subarray(runStart, runEnd))}}`) as Record<
+        string,
+        unknown
+      >;
+      for (const key of Object.keys(run)) assign(key, reviveRecordBigints(run[key]));
+      runStart = -1;
+      await pause();
+    };
+    await forEachMember(first + 1, close, async (memberStart, memberEnd) => {
+      if (memberEnd - memberStart <= SLICED_PARSE_BYTES) {
+        if (runStart >= 0 && memberEnd - runStart > SLICED_PARSE_BYTES) await flushRun();
+        if (runStart < 0) runStart = memberStart;
+        runEnd = memberEnd;
+        return;
+      }
+      await flushRun();
+      // The key is the member's leading string; its value follows the first colon after it.
+      const keyStart = skipSpace(memberStart, memberEnd);
+      if (bytes[keyStart] !== QUOTE) throw malformed();
+      let keyEnd = keyStart + 1;
+      while (keyEnd < memberEnd && bytes[keyEnd] !== QUOTE) {
+        keyEnd += bytes[keyEnd] === BACKSLASH ? 2 : 1;
+      }
+      const colon = skipSpace(keyEnd + 1, memberEnd);
+      if (bytes[colon] !== COLON) throw malformed();
+      const key = JSON.parse(textDecoder.decode(bytes.subarray(keyStart, keyEnd + 1))) as string;
+      assign(key, await parseRange(colon + 1, memberEnd));
+    });
+    await flushRun();
+    const keys = Object.keys(record);
+    if (keys.length === 1 && keys[0] === "$n" && typeof record.$n === "string") {
+      return recordBigint(record.$n);
+    }
+    return record;
+  };
+  return parseRange(0, bytes.byteLength);
 }

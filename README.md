@@ -38,7 +38,7 @@ and benchmarks that run in your browser.
   read anything, so concurrent writes land in a serial order without an application-side queue
   or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
   bypassed.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 368 KiB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 370 KiB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so

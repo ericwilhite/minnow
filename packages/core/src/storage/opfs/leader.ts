@@ -48,6 +48,7 @@ import {
   type AppendUniqueKeyBuildChunkInput,
   type FinishUniqueKeyBuildInput,
   type AbortUniqueKeyBuildInput,
+  type UniqueKeyChanges,
   type BeginPostingBuildInput,
   type RenewPostingBuildInput,
   type AppendPostingBuildChunkInput,
@@ -145,6 +146,7 @@ import {
   decodeSyncCheckpointSliced,
   encodePostingChunk,
   encodeSyncCheckpoint,
+  encodeRecordJsonBytesSliced,
   encodeSyncCheckpointSliced,
 } from "../toolkit/wire.js";
 import { WalWriter, iterateWalFrames } from "../toolkit/wal.js";
@@ -653,6 +655,24 @@ export class OpfsLeaderClosedError extends Error {
   constructor() {
     super("This OPFS store connection is closed");
   }
+}
+
+/** A WAL frame encoded ahead of its append, with the sequence and request it encodes. */
+interface EncodedWalFrame {
+  seq: number;
+  request: unknown;
+  bytes: Uint8Array;
+}
+
+/** UNIQUE key changes past which a commit prepares its work and frame a slice at a time. */
+const LARGE_COMMIT_KEYS = 16_384;
+
+function uniqueKeyChangeCount(input: {
+  readonly uniqueKeyChanges?: readonly UniqueKeyChanges[];
+}): number {
+  let count = 0;
+  for (const change of input.uniqueKeyChanges ?? []) count += change.keyTokens.length;
+  return count;
 }
 
 /** One checkpoint slot as recovery read it: its decoded state, or why it has none. */
@@ -1340,7 +1360,7 @@ export class OpfsLeader {
    * failure after mutation poisons the leader, which reloads from its own handles before the
    * next operation, and the original error — quota, most importantly — escapes unwrapped.
    */
-  #logged(body: WalEntryBody): unknown {
+  #logged(body: WalEntryBody, encoded?: EncodedWalFrame): unknown {
     if (this.#wal.byteLength >= MAX_OPFS_WAL_BYTES - 64 * 1024 * 1024) {
       // Keep one maximum-sized frame of headroom. A checkpoint refusal happens before the
       // record state mutates, applying bounded backpressure instead of growing forever.
@@ -1380,20 +1400,52 @@ export class OpfsLeader {
     safeSuccessor(this.#entriesSinceCheckpoint, "OPFS checkpoint entry count");
     const result = this.#applyBody(body);
     this.#clearCompletedSnapshotImportIfAdvanced();
-    this.#appendFrame(body);
+    this.#appendFrame(body, this.#strict, encoded);
     return result;
   }
 
-  #appendFrame(body: WalEntryBody, flush = this.#strict): void {
+  /**
+   * A large commit's frame, encoded a slice at a time before `#logged` applies it, so the
+   * mutation and the append stay one short step. `#appendFrame` uses it only while the
+   * sequence number and the request it was encoded with are still the frame's.
+   */
+  async #encodeFrameSliced(body: WalEntryBody): Promise<EncodedWalFrame> {
+    const seq = safeSuccessor(this.#seq, "OPFS WAL sequence");
+    const request = this.servingRequest;
+    const bytes = await encodeRecordJsonBytesSliced(
+      { seq, ...body, ...(request === undefined ? {} : { request }) },
+      maybeYieldToEventLoop,
+    );
+    return { seq, request, bytes };
+  }
+
+  /** Logs `body`, preparing its commit work and frame in slices first when it is large. */
+  async #loggedCommit(
+    body: WalEntryBody,
+    input: { readonly uniqueKeyChanges?: readonly UniqueKeyChanges[] },
+  ): Promise<unknown> {
+    if (uniqueKeyChangeCount(input) < LARGE_COMMIT_KEYS) return this.#logged(body);
+    await this.#core.prepareCommit(input, maybeYieldToEventLoop);
+    const encoded = await this.#encodeFrameSliced(body);
+    // A turn before the one step that must not be split: applying the commit and its frame.
+    await yieldToEventLoop();
+    return this.#logged(body, encoded);
+  }
+
+  #appendFrame(body: WalEntryBody, flush = this.#strict, encoded?: EncodedWalFrame): void {
     const request = this.servingRequest;
     this.servingRequest = undefined;
     let nextSeq: number;
     try {
       nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
-      this.#wal.append(
-        { seq: nextSeq, ...body, ...(request === undefined ? {} : { request }) },
-        flush,
-      );
+      if (encoded?.seq === nextSeq && encoded.request === request) {
+        this.#wal.appendEncoded(encoded.bytes, flush);
+      } else {
+        this.#wal.append(
+          { seq: nextSeq, ...body, ...(request === undefined ? {} : { request }) },
+          flush,
+        );
+      }
       if (flush) {
         try {
           this.#acknowledgements?.publish(nextSeq, this.#wal.byteLength);
@@ -3431,6 +3483,11 @@ export class OpfsLeader {
 
   /** @internal Shared implementation installed for ordinary one-frame mutations below. */
   _loggedGenerated(method: LoggedMethod, args: unknown[]): Promise<unknown> {
+    if (method === "commitTransaction") {
+      return this.#run(() =>
+        this.#loggedCommit(LOGGED_BODY_BUILDERS[method](args), args[0] as CommitTransactionInput),
+      );
+    }
     return this.#run(() => this.#logged(LOGGED_BODY_BUILDERS[method](args)));
   }
 
@@ -3628,6 +3685,9 @@ export class OpfsLeader {
 
   async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
     return this.#run(async () => {
+      if (uniqueKeyChangeCount(input) >= LARGE_COMMIT_KEYS) {
+        await this.#core.prepareCommit(input, maybeYieldToEventLoop);
+      }
       this.#core.preflightWriteTransaction(input);
       const ids = new Set<string>();
       for (const block of input.blocks) {
@@ -3649,11 +3709,18 @@ export class OpfsLeader {
             placement: await this.#pool.append(block.bytes, false),
           });
         }
-        const summary = this.#logged({
+        const body: WalEntryBody = {
           op: "writeTransaction",
           input: { ...rest, segments: [...input.segments] },
           blocks,
-        }) as ManifestSummary;
+        };
+        let encoded: EncodedWalFrame | undefined;
+        if (uniqueKeyChangeCount(input) >= LARGE_COMMIT_KEYS) {
+          encoded = await this.#encodeFrameSliced(body);
+          // A turn before the one step that must not be split: applying the commit and frame.
+          await yieldToEventLoop();
+        }
+        const summary = this.#logged(body, encoded) as ManifestSummary;
         this.#pool.commitBatch(mark);
         return summary;
       } catch (error) {

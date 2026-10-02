@@ -8,6 +8,37 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.13.1 — October 1, 2026
+
+Release packages: `@minnowdb/core@0.13.1`.
+
+- Opening an OPFS database parses its checkpoint a bounded piece at a time. The checkpoint was
+  one `JSON.parse` call, about 1.5 ms per megabyte; the decoder now scans the bytes for structure
+  and parses runs of up to 64 KiB natively, with turns in between. Opening a million keyed rows
+  holds the thread for at most about 35 ms at a time, down from 94 ms.
+
+- Large writes no longer hold the thread for their whole commit. A commit with many UNIQUE keys
+  checks them and checksums its new blocks a slice at a time before it commits, while the store
+  holds its place so nothing else commits meanwhile; on OPFS it also encodes its log frame that
+  way, and its preflight and its commit share one check of the keys. The engine's own passes over
+  a large batch — the row-to-column pivot, unique-key accounting, index and full-text deltas, and
+  block encoding — hand the event loop a turn between slices too. Writing and then upserting
+  800,000 rows on OPFS held the thread for up to 505 ms; it now peaks at 127 ms, most of it the
+  one step a commit cannot split, publishing its keys at about 70 ns a key. At 500,000 rows the
+  peak is about 55 ms on the memory store and 85 ms on OPFS.
+
+- Storage toolkit: `RecordCore.prepareCommit(input, pause)` does that work ahead of a commit,
+  which reuses it while no membership has changed; `WalWriter.appendEncoded(bytes, flush)`
+  appends a frame encoded beforehand; `DatabaseTransaction.setUniqueKeyChangesSliced` records a
+  large key list a slice at a time.
+
+- The transactions guide now states the commit-delta bound: one transaction's key and index
+  changes may hold at most 1,048,576 entries and 64 MiB, which a single 500,000-row write into a
+  keyed table with one secondary index reaches.
+
+**Migration and stored formats:** no application migration is needed, and no stored format
+changes: IndexedDB schema 3 and OPFS layout 8, as in 0.13.0.
+
 ## 0.13.0 — October 1, 2026
 
 Release packages: `@minnowdb/core@0.13.0`.

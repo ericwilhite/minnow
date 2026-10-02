@@ -15,6 +15,7 @@ import {
   GarbageCollectionJobConflictError,
   StorageResourceLimitError,
   UniqueKeyConflictError,
+  WriteConflictError,
   secondaryUniqueKeyNamespace,
   catalogRecordRetainedBytes,
   manifestRecordRetainedBytes,
@@ -2243,4 +2244,78 @@ describe("RecordCore sliced load", () => {
       expect(core.dump()).toEqual(before);
     },
   );
+});
+
+describe("RecordCore prepared commits", () => {
+  const table: TableRecord = {
+    id: "prepared-table",
+    name: "prepared_table",
+    columns: [{ id: "key", name: "key", type: "string", nullable: false }],
+    uniqueKeyColumnId: "key",
+    managed: false,
+    revision: 0,
+    createdAt: "2026-10-02T00:00:00.000Z",
+  };
+  const tokens = (count: number, prefix: string): string[] =>
+    Array.from({ length: count }, (_, index) => `string:${prefix}${String(index)}`);
+
+  function core(): RecordCore {
+    const created = new RecordCore({ hasBlock: () => false, blockByteLength: () => undefined });
+    created.addTable(table);
+    return created;
+  }
+
+  function commit(id: string, version: number | null, keyTokens: string[]) {
+    return {
+      transactionId: id,
+      expectedTransactionRevision: 0,
+      expectedManifestVersion: version,
+      changedTableIds: [table.id],
+      uniqueKeyChanges: [{ tableId: table.id, keyTokens, requireAbsent: true }],
+      levelZeroSegmentLimits: [],
+      committedAt: "2026-10-02T00:00:01.000Z",
+    };
+  }
+
+  it("commits what an unprepared commit would, pausing while it checks many keys", async () => {
+    const eager = core();
+    const prepared = core();
+    const keys = tokens(40_000, "k");
+    for (const target of [eager, prepared]) target.createTransaction(transaction("first", null));
+    eager.commitTransaction(commit("first", null, keys));
+    const input = commit("first", null, keys);
+    let pauses = 0;
+    await prepared.prepareCommit(input, async () => {
+      pauses += 1;
+    });
+    prepared.commitTransaction(input);
+    expect(pauses).toBeGreaterThanOrEqual(2);
+    expect(prepared.dump()).toEqual(eager.dump());
+  });
+
+  it("raises a prepared conflict where the commit finds it, after a stale version", async () => {
+    const target = core();
+    target.createTransaction(transaction("seed", null));
+    target.commitTransaction(commit("seed", null, ["string:taken"]));
+    target.createTransaction(transaction("late", 0));
+    const conflicting = commit("late", 0, [...tokens(20_000, "n"), "string:taken"]);
+    await target.prepareCommit(conflicting, async () => undefined);
+    expect(() => target.commitTransaction({ ...conflicting, expectedManifestVersion: 7 })).toThrow(
+      WriteConflictError,
+    );
+    const before = target.dump();
+    expect(() => target.commitTransaction(conflicting)).toThrow(UniqueKeyConflictError);
+    expect(target.dump()).toEqual(before);
+  });
+
+  it("checks again when a membership changed after preparing", async () => {
+    const target = core();
+    const second = commit("b", 0, ["string:x7"]);
+    await target.prepareCommit(second, async () => undefined);
+    target.createTransaction(transaction("a", null));
+    target.commitTransaction(commit("a", null, tokens(20_000, "x")));
+    target.createTransaction(transaction("b", 0));
+    // The prepared work found the key absent; the membership now holds it.
+    expect(() => target.commitTransaction(second)).toThrow(UniqueKeyConflictError);
+  });
 });

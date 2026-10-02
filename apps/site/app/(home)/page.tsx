@@ -45,7 +45,7 @@ const FEATURES = [
   },
   {
     title: "No server or Wasm",
-    body: "Minnow is plain JavaScript, about 368 KiB gzipped with the engine and OPFS adapter. There is no database process, Wasm module, compile delay, or special hosting setup.",
+    body: "Minnow is plain JavaScript, about 370 KiB gzipped with the engine and OPFS adapter. There is no database process, Wasm module, compile delay, or special hosting setup.",
   },
   {
     title: "Safe across workers and tabs",

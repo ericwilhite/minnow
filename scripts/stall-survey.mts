@@ -32,7 +32,14 @@ interface Workload {
   columns: Column[];
   rows: number;
   row: (id: number, version: number) => Row;
-  churn: (database: MinnowDatabase, ids: number[], row: Workload["row"]) => Promise<void>;
+  /** Builds what `churn` writes before the watchdog starts, so it times only the database. */
+  prepare?: () => unknown;
+  churn: (
+    database: MinnowDatabase,
+    ids: number[],
+    row: Workload["row"],
+    prepared: unknown,
+  ) => Promise<void>;
 }
 
 function shuffle<T>(values: readonly T[], seed: number): T[] {
@@ -211,6 +218,21 @@ const workloads: Workload[] = [
     },
   },
   {
+    name: "one write of 500k rows, then one upsert of all",
+    columns: narrowColumns,
+    rows: 1,
+    row: narrowRow,
+    prepare: () => {
+      const ids = Array.from({ length: 500_000 }, (_, id) => id + 1);
+      return [ids.map((id) => narrowRow(id, 0)), ids.map((id) => narrowRow(id, 1))];
+    },
+    churn: async (database, _ids, _row, prepared) => {
+      const [inserted, upserted] = prepared as [Row[], Row[]];
+      await database.insertBatch("t", inserted as never);
+      await database.upsertBatch("t", upserted as never);
+    },
+  },
+  {
     name: "live aggregate under 20 upserts of 10k rows",
     columns: narrowColumns,
     rows: 200_000,
@@ -273,6 +295,8 @@ async function measure(workload: Workload) {
     );
   }
 
+  const prepared = workload.prepare?.();
+  await new Promise((resolve) => setTimeout(resolve, 200));
   let longest = 0;
   let last = performance.now();
   const watchdog = setInterval(() => {
@@ -294,7 +318,7 @@ async function measure(workload: Workload) {
   })();
 
   const writeStarted = performance.now();
-  await workload.churn(database, ids, workload.row);
+  await workload.churn(database, ids, workload.row, prepared);
   const writeMs = performance.now() - writeStarted;
   // Let the watchdog fire once, so a block that ends with the writes is counted with them.
   await new Promise((resolve) => setTimeout(resolve, 5));

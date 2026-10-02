@@ -79,6 +79,20 @@ function isColumnarBatch(input: InsertBatchInputLike): input is ColumnarBatchLik
 
 /** Pivots rows into the engine's columnar form; a columnar batch passes straight through. */
 export function toColumnarBatch(input: InsertBatchInputLike): ColumnarBatch {
+  const steps = toColumnarBatchSteps(input);
+  let step = steps.next();
+  while (step.done !== true) step = steps.next();
+  return step.value;
+}
+
+/** Rows `toColumnarBatchSteps` pivots between yields, less one: a mask. */
+const PIVOT_SLICE_MASK = 4_095;
+
+/**
+ * `toColumnarBatch` as steps: the pivot yields every few thousand rows, so a caller with a
+ * large batch can hand the event loop a turn between them.
+ */
+export function* toColumnarBatchSteps(input: InsertBatchInputLike): Generator<void, ColumnarBatch> {
   if (isColumnarBatch(input)) {
     const columnsComplete = !hasUndefinedVector(input.columns);
     const omittedComplete = input.omitted === undefined || !hasUndefinedVector(input.omitted);
@@ -95,6 +109,7 @@ export function toColumnarBatch(input: InsertBatchInputLike): ColumnarBatch {
   const columnsByName = new Map<string, BatchValue[]>();
   const omittedByName = new Map<string, boolean[]>();
   for (let index = 0; index < input.length; index += 1) {
+    if ((index & PIVOT_SLICE_MASK) === PIVOT_SLICE_MASK) yield;
     const row = input[index];
     if (row === undefined) continue;
     for (const name of Object.keys(row)) {

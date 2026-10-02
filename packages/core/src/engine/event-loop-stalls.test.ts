@@ -2,12 +2,15 @@
  * No background task holds the event loop. Each workload below once blocked every other query
  * for hundreds of milliseconds or minutes: a fold of upserts written in an unrelated order,
  * live aggregates patched after large commits, scans over tables carrying many upserts,
- * secondary-index builds and their first lookups, and full-text index builds. A watchdog timer records the longest interval it could not run; the
+ * secondary-index builds and their first lookups, full-text index builds, and single writes of
+ * hundreds of thousands of rows. A watchdog timer records the longest interval it could not run; the
  * bound is loose enough for a loaded machine and tight enough that a task working through its
  * whole input without yielding fails here. `scripts/stall-survey.mts` measures the real numbers.
  */
 import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
+import { OpfsBlockStore } from "../storage/opfs/index.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
 import { heavyTestTimeout } from "./storage-test-helpers.js";
 
@@ -182,6 +185,38 @@ describe("background work never holds the event loop", () => {
     });
     expect(stall).toBeLessThan(STALL_BOUND_MS);
     await database.close();
+  });
+
+  it("writes and upserts 600,000 rows on OPFS in short slices", async () => {
+    const store = await OpfsBlockStore.open({ name: "large-write", root: new MemoryOpfs().root });
+    const database = new MinnowDatabase(store, { autoCompact: false });
+    await database.createTable({
+      name: "t",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    const batch = (version: number) =>
+      Array.from({ length: 600_000 }, (_, id) => ({
+        id,
+        label: `l-${String(id)}-${String(version)}`,
+      }));
+    const inserted = batch(0);
+    const upserted = batch(1);
+    const stall = await longestStall(async () => {
+      await database.insertBatch("t", inserted);
+      await database.upsertBatch("t", upserted);
+    });
+    expect(stall).toBeLessThan(STALL_BOUND_MS);
+    for (const id of [0, 123_456, 599_999]) {
+      expect(
+        (await database.query("SELECT label FROM t WHERE id = ?", { params: [id] })).rows,
+      ).toEqual([{ label: `l-${String(id)}-1` }]);
+    }
+    await database.close();
+    store.close();
   });
 
   it("builds a full-text index in short slices", async () => {

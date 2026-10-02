@@ -48,7 +48,14 @@ export class WalWriter {
 
   /** Appends one frame; with `flush`, durable before return. Synchronous — never yields. */
   append(payload: unknown, flush: boolean): void {
-    const bytes = encodeRecordJson(payload);
+    this.appendEncoded(encodeRecordJson(payload), flush);
+  }
+
+  /**
+   * `append` for a payload already encoded — `encodeRecordJson`'s bytes, which a caller may
+   * produce a slice at a time beforehand so the append itself stays short.
+   */
+  appendEncoded(bytes: Uint8Array, flush: boolean): void {
     if (bytes.byteLength > MAX_WAL_FRAME_BYTES) {
       throw new RangeError(
         `WAL frame payload exceeds the ${String(MAX_WAL_FRAME_BYTES)} byte limit: ` +

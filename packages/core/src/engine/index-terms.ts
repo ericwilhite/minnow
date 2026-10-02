@@ -8,6 +8,7 @@
  * names its row by, so the two encodings are read together.
  */
 import { dateMilliseconds } from "../date-value.js";
+import { maybeYieldToEventLoop } from "../work-slicer.js";
 import type { BatchValue, ColumnarBatch } from "./batch.js";
 import { renderDocumentValue, tokenize as ftsTokenize } from "./fts.js";
 import { protectedSqlTextValue } from "./sql-domains.js";
@@ -530,54 +531,69 @@ export function chunkFtsPostings(postings: FtsPosting[], size = 128): FtsPosting
   return chunks;
 }
 
-/** Tokenizes an insert batch's values for every active full-text column into commit deltas. */
-export function buildFtsColumnDeltas(
+/**
+ * Tokenizes an insert batch's values for every active full-text column into commit deltas,
+ * offering the event loop a turn every few thousand rows and sorting terms a run at a time.
+ */
+export async function buildFtsColumnDeltas(
   table: TableRecord,
   input: ColumnarBatch,
   rowIdStart: bigint,
-): FtsColumnDelta[] {
+): Promise<FtsColumnDelta[]> {
   const active = Object.entries(table.ftsColumns ?? {}).filter(
     ([, record]) => record.state !== "invalid",
   );
   if (active.length === 0) return [];
   const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
-  return active.flatMap(([columnId]) => {
+  const deltas: FtsColumnDelta[] = [];
+  for (const [columnId] of active) {
     const column = columnsById.get(columnId);
-    if (column === undefined) return [];
+    if (column === undefined) continue;
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
     let totalTokens = 0;
-    (input.columns[column.name] ?? []).forEach((value, index) => {
+    const values = input.columns[column.name] ?? [];
+    for (let index = 0; index < values.length; index += 1) {
+      if ((index & DELTA_ROW_SLICE_MASK) === DELTA_ROW_SLICE_MASK) await maybeYieldToEventLoop();
+      const value = values[index] ?? null;
       const documentValue =
         column.type === "string" && column.sqlDomain === undefined && typeof value === "string"
           ? protectedSqlTextValue(value)
           : value;
       totalTokens += addFtsDocument(byTerm, documentValue, rowIdStart + BigInt(index));
-    });
-    return [{ columnId, postings: sortedFtsPostings(byTerm), totalTokens }];
-  });
+    }
+    const postings: FtsPosting[] = [];
+    for (const term of await sortedTermsSliced(byTerm.keys())) {
+      const posting = byTerm.get(term);
+      if (posting !== undefined) postings.push({ term, rowIds: posting.rowIds, tf: posting.tf });
+    }
+    deltas.push({ columnId, postings, totalTokens });
+  }
+  return deltas;
 }
 
 /** Scalar postings for an inserted/replaced full row, including empty coverage entries. */
-export function buildSecondaryInsertDeltas(
+export async function buildSecondaryInsertDeltas(
   table: TableRecord,
   input: ColumnarBatch,
   rowIdStart: bigint,
-): FtsColumnDelta[] {
+): Promise<FtsColumnDelta[]> {
   const active = Object.values(table.secondaryIndexes ?? {}).filter(
     (index) => index.state !== "invalid",
   );
   if (active.length === 0) return [];
   const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
   const keyColumn = getUniqueKeyColumn(table);
-  return active.flatMap((index) => {
+  const keys = keyColumn === undefined ? undefined : (input.columns[keyColumn.name] ?? []);
+  const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
+  const deltas: FtsColumnDelta[] = [];
+  for (const index of active) {
     const columns = secondaryIndexColumnIds(index).map((columnId) => columnsById.get(columnId));
-    if (columns.some((column) => column === undefined)) return [];
+    if (columns.some((column) => column === undefined)) continue;
     const indexedColumns = columns as TableColumnRecord[];
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
-    const keys = keyColumn === undefined ? undefined : (input.columns[keyColumn.name] ?? []);
-    const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
     try {
       for (let row = 0; row < rowCount; row += 1) {
+        if ((row & DELTA_ROW_SLICE_MASK) === DELTA_ROW_SLICE_MASK) await maybeYieldToEventLoop();
         const values = indexedColumns.map((column) => input.columns[column.name]?.[row] ?? null);
         const locator =
           keyColumn === undefined
@@ -586,26 +602,25 @@ export function buildSecondaryInsertDeltas(
         addSecondaryPosting(byTerm, index, indexedColumns, values, locator);
       }
     } catch (error) {
-      if (error instanceof RangeError && index.unique !== true) return [];
+      if (error instanceof RangeError && index.unique !== true) continue;
       throw error;
     }
-    const postings = sortedSecondaryPostings(byTerm);
-    return [
-      {
-        columnId: index.storageColumnId,
-        postings,
-        totalTokens: postingFrequencyTotal(postings),
-      },
-    ];
-  });
+    const postings = await sortedSecondaryPostingsSliced(byTerm);
+    deltas.push({
+      columnId: index.storageColumnId,
+      postings,
+      totalTokens: postingFrequencyTotal(postings),
+    });
+  }
+  return deltas;
 }
 
 /** Scalar postings for changed indexed values; unchanged indexes still carry stale-writer coverage. */
-export function buildSecondaryUpdateDeltas(
+export async function buildSecondaryUpdateDeltas(
   table: TableRecord,
   input: UpdateBatchInput,
   preImages: ReadonlyArray<Record<string, BatchValue> | undefined> = [],
-): FtsColumnDelta[] {
+): Promise<FtsColumnDelta[]> {
   const active = Object.values(table.secondaryIndexes ?? {}).filter(
     (index) => index.state !== "invalid",
   );
@@ -613,15 +628,17 @@ export function buildSecondaryUpdateDeltas(
   const keyColumn = getUniqueKeyColumn(table);
   if (keyColumn === undefined) return [];
   const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
-  return active.flatMap((index) => {
+  const deltas: FtsColumnDelta[] = [];
+  for (const index of active) {
     const columns = secondaryIndexColumnIds(index).map((columnId) => columnsById.get(columnId));
-    if (columns.some((column) => column === undefined)) return [];
+    if (columns.some((column) => column === undefined)) continue;
     const indexedColumns = columns as TableColumnRecord[];
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
     const affected = indexedColumns.some((column) => input.changes[column.name] !== undefined);
     if (affected) {
       try {
         for (let row = 0; row < input.keys.length; row += 1) {
+          if ((row & DELTA_ROW_SLICE_MASK) === DELTA_ROW_SLICE_MASK) await maybeYieldToEventLoop();
           const values = indexedColumns.map((column) =>
             input.changes[column.name] === undefined
               ? (preImages[row]?.[column.name] ?? null)
@@ -636,19 +653,119 @@ export function buildSecondaryUpdateDeltas(
           );
         }
       } catch (error) {
-        if (error instanceof RangeError && index.unique !== true) return [];
+        if (error instanceof RangeError && index.unique !== true) continue;
         throw error;
       }
     }
-    const postings = sortedSecondaryPostings(byTerm);
-    return [
-      {
-        columnId: index.storageColumnId,
-        postings,
-        totalTokens: postingFrequencyTotal(postings),
-      },
-    ];
-  });
+    const postings = await sortedSecondaryPostingsSliced(byTerm);
+    deltas.push({
+      columnId: index.storageColumnId,
+      postings,
+      totalTokens: postingFrequencyTotal(postings),
+    });
+  }
+  return deltas;
+}
+
+/** Rows a delta builder handles between offers of an event-loop turn, less one: a mask. */
+const DELTA_ROW_SLICE_MASK = 4_095;
+
+/** Terms one sorted run holds before a sliced sort merges runs: a few milliseconds each. */
+export const SORTED_RUN_TERMS = 16_384;
+
+/** Terms per batch `mergeSortedRuns` hands back between turns. */
+const MERGE_BATCH_TERMS = 4_096;
+
+/**
+ * `terms` in code-unit order, sorted in runs of `SORTED_RUN_TERMS` and merged, with the event
+ * loop offered a turn between runs and merged batches, so no single call sorts them all.
+ */
+export async function sortedTermsSliced(terms: Iterable<string>): Promise<string[]> {
+  const all = [...terms];
+  if (all.length <= SORTED_RUN_TERMS) return all.sort();
+  const runs: string[][] = [];
+  for (let start = 0; start < all.length; start += SORTED_RUN_TERMS) {
+    await maybeYieldToEventLoop();
+    runs.push(all.slice(start, start + SORTED_RUN_TERMS).sort());
+  }
+  const sorted: string[] = [];
+  for await (const batch of mergeSortedRuns(runs)) {
+    for (const term of batch) sorted.push(term);
+    await maybeYieldToEventLoop();
+  }
+  return sorted;
+}
+
+/**
+ * `sortedSecondaryPostings`, a bounded run at a time: the terms sort by `sortedTermsSliced`, and
+ * each posting's row locators deduplicate and sort with turns offered between batches.
+ */
+export async function sortedSecondaryPostingsSliced(
+  byTerm: ReadonlyMap<string, { rowIds: bigint[]; tf: number[] }>,
+): Promise<FtsPosting[]> {
+  const postings: FtsPosting[] = [];
+  let sinceYield = 0;
+  for (const term of await sortedTermsSliced(byTerm.keys())) {
+    const rowIds = [...new Set(byTerm.get(term)?.rowIds ?? [])].sort((left, right) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    );
+    postings.push({ term, rowIds, tf: rowIds.map(() => 1) });
+    sinceYield += rowIds.length + 1;
+    if (sinceYield >= MERGE_BATCH_TERMS) {
+      sinceYield = 0;
+      await maybeYieldToEventLoop();
+    }
+  }
+  return postings;
+}
+
+/**
+ * The terms of sorted `runs` in one code-unit order, a batch of at most `MERGE_BATCH_TERMS` at a
+ * time, merged through a binary min-heap of the runs' next terms.
+ */
+export async function* mergeSortedRuns(runs: readonly string[][]): AsyncGenerator<string[]> {
+  if (runs.length === 1) {
+    const run = runs[0] ?? [];
+    for (let start = 0; start < run.length; start += MERGE_BATCH_TERMS) {
+      yield run.slice(start, start + MERGE_BATCH_TERMS);
+    }
+    return;
+  }
+  const positions = new Int32Array(runs.length);
+  const head = (run: number): string => runs[run]?.[positions[run] ?? 0] ?? "";
+  const heap = runs.flatMap((run, index) => (run.length > 0 ? [index] : []));
+  const siftDown = (from: number): void => {
+    let at = from;
+    for (;;) {
+      const left = at * 2 + 1;
+      const right = left + 1;
+      let least = at;
+      if (left < heap.length && head(heap[left] ?? 0) < head(heap[least] ?? 0)) least = left;
+      if (right < heap.length && head(heap[right] ?? 0) < head(heap[least] ?? 0)) least = right;
+      if (least === at) return;
+      const swap = heap[at] ?? 0;
+      heap[at] = heap[least] ?? 0;
+      heap[least] = swap;
+      at = least;
+    }
+  };
+  for (let index = (heap.length >> 1) - 1; index >= 0; index -= 1) siftDown(index);
+  let batch: string[] = [];
+  while (heap.length > 0) {
+    const run = heap[0] ?? 0;
+    batch.push(head(run));
+    positions[run] = (positions[run] ?? 0) + 1;
+    if ((positions[run] ?? 0) >= (runs[run]?.length ?? 0)) {
+      const last = heap.pop() ?? 0;
+      if (heap.length > 0) heap[0] = last;
+    }
+    siftDown(0);
+    if (batch.length === MERGE_BATCH_TERMS) {
+      yield batch;
+      batch = [];
+    }
+  }
+  if (batch.length > 0) yield batch;
 }
 
 export function secondaryIndexUpdateNeedsPreImages(

@@ -1,4 +1,6 @@
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import { maybeYieldToEventLoop } from "../work-slicer.js";
+
 import {
   assertTransactionArtifactBatchLimits,
   type BlockStore,
@@ -30,6 +32,9 @@ import {
   UnknownOutcomeError,
   WriteConflictError,
 } from "../storage/types.js";
+
+/** Keys `setUniqueKeyChangesSliced` deduplicates between turns. */
+const UNIQUE_KEY_CHANGE_SLICE = 16_384;
 
 export interface TransactionManagerOptions {
   now?: () => Date;
@@ -1019,6 +1024,41 @@ export class DatabaseTransaction {
       // Deduplicated, not sorted: membership is all a store reads from these, and sorting fifty
       // thousand tokens cost a bulk delete a fifth of its time.
       keyTokens: [...new Set(changes.keyTokens)],
+      requireAbsent: changes.requireAbsent,
+      ...(changes.remove === undefined ? {} : { remove: changes.remove }),
+    };
+    this.#reserveCommitDelta([normalized], []);
+    this.#uniqueKeyChanges.push(normalized);
+  }
+
+  /**
+   * `setUniqueKeyChanges` for a large key list, deduplicated a slice at a time with the event
+   * loop offered a turn between slices; the same checks run before and after.
+   */
+  async setUniqueKeyChangesSliced(changes: UniqueKeyChanges): Promise<void> {
+    this.#assertActive();
+    if (changes.keyTokens.length < UNIQUE_KEY_CHANGE_SLICE) {
+      this.setUniqueKeyChanges(changes);
+      return;
+    }
+    if (changes.keyTokens.length > MAX_TRANSACTION_COMMIT_DELTA_ENTRIES) {
+      throw new RangeError(
+        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_ENTRIES)} entries`,
+      );
+    }
+    await maybeYieldToEventLoop();
+    transactionCommitDeltaRetainedBytes([changes], []);
+    const unique = new Set<string>();
+    for (let start = 0; start < changes.keyTokens.length; start += UNIQUE_KEY_CHANGE_SLICE) {
+      await maybeYieldToEventLoop();
+      const end = Math.min(changes.keyTokens.length, start + UNIQUE_KEY_CHANGE_SLICE);
+      for (let index = start; index < end; index += 1) unique.add(changes.keyTokens[index] ?? "");
+    }
+    await maybeYieldToEventLoop();
+    this.#assertActive();
+    const normalized: UniqueKeyChanges = {
+      tableId: changes.tableId,
+      keyTokens: [...unique],
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
     };
