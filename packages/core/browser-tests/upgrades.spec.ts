@@ -27,7 +27,7 @@ for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
       blockValues: fixture.expectations.blockValues,
       walOnlyPreserved: true,
       rows: [{ id: 1, value: "retained" }],
-      format: 8,
+      format: 9,
       integrity: true,
       olderReaderRefused: true,
     });

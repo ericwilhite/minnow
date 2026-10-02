@@ -135,19 +135,29 @@ a large write yields between its passes over the rows, and the first lookup thro
 yields while it hashes each block's keys. One clock paces all of it, so a statement made of many
 short steps, or a run of statements awaited back to back, yields as often as one long loop.
 
-On a laptop, the longest single block measured during background work is about 40 ms, on the
+On a laptop, the longest single block measured during background work is about 35 ms, on the
 memory and OPFS stores alike, for every shape in `scripts/stall-survey.mts`: wide tables
 refreshed in any order, hundreds of thousands of rows of point updates or deletes, index and
-full-text builds, and live aggregates under heavy writes. Writes are sliced the same way: a
-large one checks its keys, checksums its blocks, and on OPFS encodes its log frame a slice at a
-time before it commits. The one step a commit cannot split is publishing its keys, at about 70 ns
-a key. Writing 500,000 rows in one call and then upserting all of them holds the thread for at
-most about 55 ms on the memory store and 85 ms on OPFS, about 35 ms of it that publication; on
-OPFS a query issued meanwhile can still wait for the commit to finish, up to about 185 ms, while
-the thread stays free. On an OPFS database of a million keyed rows, the longest block while
-loading it 50,000 rows at a time is under 80 ms, creating a `UNIQUE` index over all of it never
-holds the thread for more than about 30 ms, and opening it again holds it for under 40 ms at a
-time.
+full-text builds, and live aggregates under heavy writes. Writes are sliced the same way. A large
+one checks its keys and adds them to their memberships behind a mask that keeps them invisible,
+checks its index changes, checksums its blocks, and on OPFS encodes its log frame and writes all
+but its last piece, a slice at a time, before it commits; committing then drops the mask, at no
+cost per key. Upserting keys that already exist adds nothing to publish. Writing 500,000 rows
+in one call and then upserting all of them holds the thread for at most about 21 ms on the
+memory store and 22 ms on OPFS. A query on OPFS does not wait for that commit either: reader
+leases are logged between its slices, and index lookups read without the leader's queue. A
+single write of 2,000,000 rows into a keyed table with two indexes, and an upsert of all of
+them, succeed on every store; the longest blocks are then the JavaScript engine's own garbage
+collection of millions of rows, up to about 200 ms in Node. On an OPFS database of a million
+keyed rows, the longest block while loading it 50,000 rows at a time is under 80 ms, creating a
+`UNIQUE` index over all of it never holds the thread for more than about 30 ms, and opening it
+again holds it for under 40 ms at a time.
+
+An index change larger than one stored chunk — a write of more than 65,536 distinct values
+into one index — is folded into the index's base right after its commit instead of after more
+commits. Until it is, an OPFS checkpoint can outgrow its 256 MiB slot; such a checkpoint stops
+as soon as it passes the slot and is tried again once the fold has pruned the change, while the
+log keeps everything durable.
 
 Automatic compaction backs off a table whose attempt does not help, rather than retrying it on
 every query. A fold that fails waits a delay that doubles from a quarter of a second per

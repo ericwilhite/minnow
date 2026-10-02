@@ -8,6 +8,78 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.14.0 — October 2, 2026
+
+Release packages: `@minnowdb/core@0.14.0`.
+
+- **A large upsert no longer breaks every query on its table.** Upserting 316,179 or more
+  existing rows in one statement made every later query on that table fail with
+  `QueryMemoryBudgetError`, `SELECT COUNT(*) FROM t WHERE id = 5` included, on every store and
+  with default settings, and the table never recovered on its own. A query merging unmerged
+  changes now keeps about 8 bytes per changed row (it was 148 to 212). Past a quarter of the
+  query's memory budget it replays them one range of rows at a time instead of failing, and one
+  such change is enough to queue an automatic fold. After a 1,000,000-row upsert, `COUNT(*)`
+  takes 0.1 ms (was 1.1 s), `SUM` 32 ms (was 1.4 s), and `SELECT *` 0.6 s (was 2.5 s).
+  `compactTable()` without `memoryBudgetBytes` now sizes its fold the way automatic compaction
+  does, instead of refusing.
+
+- **One transaction's key and index changes have no fixed limit.** A single statement failed
+  past 1,048,576 changes, or past 65,536 distinct values in one indexed column (`Full-text change
+chunk exceeds the posting-count limit`). Each store now persists those changes in bounded
+  pieces: IndexedDB as part records (schema 4), OPFS as continuation frames in its log (layout 9),
+  and an OPFS follower sends them to the leader as 8 MiB pieces. A 2,000,000-row write into a
+  keyed table with two indexes, and an upsert of all of it, now succeed on every store, and a
+  400,000-row indexed write from an OPFS follower, which hit the message's structural limit,
+  commits. On OPFS one commit's log frame must fit the log, now 1 GiB (it was 64 MiB per frame),
+  and the database's metadata, every keyed table's keys among it, must still fit one 256 MiB
+  checkpoint.
+
+- **Large commits don't hold the thread.** A large commit adds its keys to their memberships a
+  slice at a time behind a mask, and committing drops the mask instead of touching each key;
+  upserting keys that already exist publishes nothing. Its index changes are checked a slice at
+  a time and kept without copying, a transaction merges each statement's changes once at commit,
+  and the engine's remaining passes over a large batch (byte estimates, block planning, key lists,
+  a term's row ids) yield between slices. On OPFS, checkpoints copy key memberships a slice at a
+  time, opening a database checks large index changes a slice at a time, and recovery decodes a
+  large log frame a slice at a time. Writing 500,000 rows and then upserting all of them holds
+  the thread for at most 21 ms on the memory store (was 55 ms) and 22 ms on OPFS (was 83 ms).
+
+- **OPFS reads don't wait behind large writes.** Reader leases are logged between the slices of a
+  large commit or checkpoint instead of after them: during a 500,000-row upsert a lease waited
+  370 ms, now under 1 ms. Index lookups read without the leader's queue and use it only when
+  the chunks they read moved meanwhile, so they no longer wait for folds, checkpoints, or large
+  commits.
+
+- An index change larger than one stored chunk is folded into its index's base right after its
+  commit. An OPFS checkpoint that outgrows its slot meanwhile stops as soon as it passes it and is
+  tried again once the fold has pruned the change, instead of encoding the whole state on every
+  attempt.
+
+- IndexedDB `DROP TABLE` now also removes each indexed column's change index; earlier versions
+  left it behind, and `checkIntegrity` reported it. An OPFS connection that closes while it
+  reloads no longer keeps a file locked, which stopped any other connection from leading.
+
+- Storage contract and toolkit: `MAX_TRANSACTION_COMMIT_DELTA_BYTES`,
+  `MAX_TRANSACTION_COMMIT_DELTA_ENTRIES`, and `transactionCommitDeltaRetainedBytes` are removed.
+  A commit's index postings may be any length, and one posting's row ids may exceed a stored
+  chunk's limit. New: `seekFtsPostingQuery`; the `StorageResourceLimitError` resource
+  `"log frame byte"`; `WalWriter.appendContinuation`, `appendEncodedSliced`, and `rewind`;
+  `iterateWalFramesSliced`; `WAL_CONTINUATION_PIECE_BYTES`; `EncodedRecordTooLargeError` and a
+  byte ceiling on `encodeSyncCheckpointSliced`; `RecordCore.discardPreparedCommit`, `dumpSliced`,
+  `ftsDeltaPostingCount`, and `loadSliced(state, pause, { owned })`. `RecordCore.prepareCommit`
+  also takes `ftsChanges`, and `RecordCore` keeps the postings a commit hands it rather than
+  copying them, so do not change them afterwards. `DatabaseTransaction.setFtsChangesSliced`
+  (with `{ owned }`), `setUniqueKeyChangesSliced(changes, { distinct })`, and
+  `largeFtsDeltaColumns` are new.
+
+**Migration and stored formats:** no application changes are needed. IndexedDB schema 3 upgrades
+to 4, and OPFS layout 8 to 9, automatically on open without rewriting stored data: IndexedDB
+raises its version, and OPFS rewrites its format marker behind a witness file. Older IndexedDB
+schemas and OPFS layouts 6 and 7 still upgrade too. After the upgrade, 0.13.1 and older refuse the
+database without changing it. Block format 2 and snapshot format 1 are unchanged. Storage-toolkit
+users: a log holding continuation frames is refused by an older toolkit reader, so gate older
+readers with your own format marker before writing them.
+
 ## 0.13.1 — October 2, 2026
 
 Release packages: `@minnowdb/core@0.13.1`.

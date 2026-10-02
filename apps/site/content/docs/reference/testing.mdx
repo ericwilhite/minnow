@@ -627,8 +627,18 @@ retried by later writes; `wire.test.ts` checks the sliced encoder against the on
 byte for byte, and the sliced checkpoint parser against `JSON.parse`, each with a property test
 over arbitrary JSON-shaped states and, for the parser, malformed input it must refuse.
 `large-commit.test.ts` pins on the memory and OPFS stores that a commit large enough to check its
-keys in slices still refuses a conflicting key without changing anything, and that its
-ahead-encoded log frame replays after a crash.
+keys in slices still refuses a conflicting key without changing anything, that its
+ahead-encoded log frame replays after a crash, and that an index change of 70,000 postings —
+more than one stored chunk — commits, replays from the OPFS log, and loads from a checkpoint.
+`wal.test.ts` writes payloads that span continuation frames and checks that replay joins them,
+treats pieces with nothing after them as an unwritten tail wherever the log stops, takes pieces
+back when an append fails, and refuses a corrupt piece inside the acknowledged log.
+`follower-large-commit.test.ts` commits 400,000 indexed rows from an OPFS follower — past the
+message's structural limit — and checks that a re-sent large commit runs once under its first
+delivery's identity. `index-reads.test.ts` pins that an OPFS index lookup answers while a large
+commit holds the leader's queue, and that a chunk read failing partway runs again on the queue.
+`lease-lane.test.ts` pins that OPFS reader leases run between the slices of a large commit and a
+checkpoint, with every power-loss and torn-write boundary of such a checkpoint recovered.
 `unique-index-staged-build.test.ts` pins, on the memory, IndexedDB, and OPFS stores, that
 creating a `UNIQUE` index stages its keys in ordered chunks of at most 4,096 and never sends
 them in one catalog update, enforces the index across a reopen, handles an empty table, and

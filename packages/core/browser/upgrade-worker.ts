@@ -10,6 +10,7 @@ import { IndexedDbBlockStore as Layout7IndexedDb } from "@minnowdb/core-layout7/
 import { OpfsBlockStore as Layout7Store } from "@minnowdb/core-layout7/storage/opfs";
 import { MinnowDatabase as Layout8Database } from "@minnowdb/core-layout8";
 import { IndexedDbBlockStore as Layout8IndexedDb } from "@minnowdb/core-layout8/storage/indexeddb";
+import { OpfsBlockStore as Layout8Store } from "@minnowdb/core-layout8/storage/opfs";
 import type {
   IndexedDbUpgradeResult,
   IndexedDbWriterVersion,
@@ -85,6 +86,7 @@ async function run({
     const olderReaders = [
       { open: (options: { name: string }) => Layout6Store.open(options), supported: 6 },
       { open: (options: { name: string }) => Layout7Store.open(options), supported: 7 },
+      { open: (options: { name: string }) => Layout8Store.open(options), supported: 8 },
     ];
     let refusals = 0;
     for (const reader of olderReaders) {
@@ -99,7 +101,7 @@ async function run({
         };
         if (
           error.name !== "StorageFormatVersionError" ||
-          properties.actualVersion !== 8 ||
+          properties.actualVersion !== 9 ||
           properties.supportedVersion !== reader.supported
         )
           throw error;

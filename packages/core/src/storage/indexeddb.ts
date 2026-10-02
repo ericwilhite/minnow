@@ -1289,6 +1289,7 @@ export class IndexedDbBlockStore implements BlockStore {
       validateAutoIncrementReservation(0, update.autoIncrementSeed.atLeast);
     }
     const transaction = this.#transaction(["catalog", "statistics"], "readwrite");
+    const retiredPostingColumns: string[] = [];
     try {
       const store = transaction.objectStore("catalog");
       const idKey = `${TABLE_ID_PREFIX}${id}`;
@@ -1472,6 +1473,7 @@ export class IndexedDbBlockStore implements BlockStore {
         for (const column of record.columns) {
           if (!retainedColumnIds.has(column.id)) {
             await deleteFtsColumnRecords(store, record.id, column.id);
+            retiredPostingColumns.push(column.id);
           }
         }
       }
@@ -1481,6 +1483,7 @@ export class IndexedDbBlockStore implements BlockStore {
       for (const index of Object.values(previousSecondary ?? {})) {
         if (!retainedIndexStorage.has(index.storageColumnId)) {
           await deleteFtsColumnRecords(store, record.id, index.storageColumnId);
+          retiredPostingColumns.push(index.storageColumnId);
         }
       }
       for (const [indexId, previous] of Object.entries(previousSecondary ?? {})) {
@@ -1520,6 +1523,11 @@ export class IndexedDbBlockStore implements BlockStore {
         )
       ) {
         this.#uniqueKeyCache = undefined;
+      }
+      // A dropped index or column has no readers left to protect: reclaim its postings now, a
+      // bounded page per transaction, as removeFtsColumn does, rather than one page per open.
+      for (const columnId of retiredPostingColumns) {
+        await this.#cleanupFtsRetirementFully(id, columnId);
       }
       return updated;
     } catch (error) {
