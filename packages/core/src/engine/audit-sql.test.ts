@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
 import { MinnowDatabase } from "./database.js";
 import { MemoryBlockStore } from "../storage/memory.js";
@@ -170,12 +170,21 @@ describe("window audit regressions", () => {
     expect(small.usage.usedBytes).toBe(0);
     const memory = new QueryMemoryContext();
     const controller = new AbortController();
-    const pending = applyWindowFunctionsAsync(result, [window], {
-      memoryContext: memory,
-      signal: controller.signal,
-    });
-    setTimeout(() => controller.abort(), 0);
-    await expect(pending).rejects.toThrow();
+    // A clock that runs 10 ms per reading makes every step past the slice, so the passes yield
+    // on any machine — 50,000 rows can otherwise finish inside one slice and never let the
+    // abort in.
+    let clock = 0;
+    const now = vi.spyOn(performance, "now").mockImplementation(() => (clock += 10));
+    try {
+      const pending = applyWindowFunctionsAsync(result, [window], {
+        memoryContext: memory,
+        signal: controller.signal,
+      });
+      setTimeout(() => controller.abort(), 0);
+      await expect(pending).rejects.toThrow();
+    } finally {
+      now.mockRestore();
+    }
     memory.close();
     expect(memory.usage.usedBytes).toBe(0);
   });

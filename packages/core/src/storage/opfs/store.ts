@@ -455,23 +455,31 @@ export class OpfsBlockStore {
       await store.#tryBecomeLeader();
       const upgradeStarted = Date.now();
       while (store.#upgradePending) {
-        if (Date.now() - Math.max(upgradeStarted, store.#waitHeardAt) > store.#dispatchBudgetMs) {
-          throw new Error(
-            "Automatic OPFS upgrade is waiting for exclusive access; close older connections and reopen",
-          );
-        }
         // Recovery answers pings with a wait announcement. Refresh that evidence while a
         // large conversion is alive, including when this opener missed its first broadcast.
         store.#post({ kind: "ping" });
         await sleep(20);
         await store.#ensureFormatMarker();
         await store.#tryBecomeLeader();
+        // Judge patience only after looking again: a long step elsewhere on this thread can
+        // outlast the budget while the conversion it belongs to is finishing.
+        if (!store.#upgradeStillPending()) break;
+        if (Date.now() - Math.max(upgradeStarted, store.#waitHeardAt) > store.#dispatchBudgetMs) {
+          throw new Error(
+            "Automatic OPFS upgrade is waiting for exclusive access; close older connections and reopen",
+          );
+        }
       }
       return store;
     } catch (error) {
       store.close();
       throw error;
     }
+  }
+
+  /** Read through a call: the awaits in `open`'s upgrade wait change the field underneath it. */
+  #upgradeStillPending(): boolean {
+    return this.#upgradePending;
   }
 
   // ---------------------------------------------------------------------------------------

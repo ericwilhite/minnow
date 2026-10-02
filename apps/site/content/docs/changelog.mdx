@@ -27,6 +27,11 @@ Release packages: `@minnowdb/core@0.13.1`.
   one step a commit cannot split, publishing its keys at about 70 ns a key. At 500,000 rows the
   peak is about 55 ms on the memory store and 85 ms on OPFS.
 
+- A connection opening an OPFS database while another converts it to the current layout checks
+  whether the conversion finished before judging its own patience. A long step elsewhere on the
+  same thread could outlast that patience as the conversion completed, and the opener gave up
+  with the "close older connections" error instead of opening.
+
 - Storage toolkit: `RecordCore.prepareCommit(input, pause)` does that work ahead of a commit,
   which reuses it while no membership has changed; `WalWriter.appendEncoded(bytes, flush)`
   appends a frame encoded beforehand; `DatabaseTransaction.setUniqueKeyChangesSliced` records a
