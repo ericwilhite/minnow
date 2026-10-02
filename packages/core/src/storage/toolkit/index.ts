@@ -49,6 +49,7 @@ export {
   decodePostingChunk,
   decodeRecordJson,
   decodeSyncCheckpoint,
+  decodeSyncCheckpointSliced,
   encodeChunk,
   encodePostingChunk,
   encodeRecordJson,

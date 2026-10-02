@@ -133,11 +133,11 @@ On a laptop, the longest single block measured during background work is about 4
 memory and OPFS stores alike, for every shape in `scripts/stall-survey.mts`: wide tables
 refreshed in any order, hundreds of thousands of rows of point updates or deletes, index and
 full-text builds, and live aggregates under heavy writes. Foreground statements hold it longer
-only in proportion to their own size: a 50,000-row write holds it for about 50–80 ms, a
-single write of half a million rows for up to about 160 ms, and creating a `UNIQUE` index on
-an existing table installs its whole key set in one step — about 30 ms per 200,000 rows on the
-memory store and 70 ms on OPFS. On an OPFS database of a million keyed rows, the longest block
-while loading it 50,000 rows at a time is under 80 ms.
+only in proportion to their own size: a 50,000-row write holds it for about 50–80 ms, and a
+single write of half a million rows for up to about 160 ms. On an OPFS database of a million
+keyed rows, the longest block while loading it 50,000 rows at a time is under 80 ms, creating
+a `UNIQUE` index over all of it never holds the thread for more than about 30 ms, and opening it
+again holds it for under 100 ms at a time.
 
 Automatic compaction backs off a table whose attempt does not help, rather than retrying it on
 every query. A fold that fails waits a delay that doubles from a quarter of a second per

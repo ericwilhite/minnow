@@ -206,17 +206,20 @@ past it is refused with `StorageResourceLimitError` (`resource: "checkpoint byte
 aborts, rollbacks, and collection steps still go through, so the database can always be brought
 back under the bound; `getStorageStats()` reports the failed checkpoint meanwhile. Relaxed payload writes are flushed first, then the new
 checkpoint is written and flushed, and only then is the log reset. A checkpoint encodes the whole
-metadata state, so the ones that run during normal work — when the log fills, and before
-garbage collection deletes a drained data file — encode and write a slice at a time, handing the
-thread back every few milliseconds. They still hold the write queue, so the state they publish
-cannot change underneath them, while reads keep answering from memory between slices. Their
-bytes, slots, and order are the same as a checkpoint written in one step, as at shutdown. A crash at any moment therefore
+metadata state, so checkpoints — when the log fills, before garbage collection deletes a drained
+data file, and at shutdown — encode and write a slice at a time, handing the thread back every
+few milliseconds. They still hold the write queue, so the state they publish cannot change
+underneath them, while reads keep answering from memory between slices. Their bytes, slots, and
+order are the same as a checkpoint written in one step. A crash at any moment therefore
 leaves either a truncated tail frame — detectably incomplete and invisible — or a torn slot with the other
 slot and the un-reset log still holding everything. A power loss that persists a file's new length
 ahead of its bytes leaves a zero-filled tail where the unacknowledged frame was to go, or a slot
 whose magic landed ahead of its header. A zero-filled WAL suffix is accepted as unwritten only
 when it is beyond the independently recorded acknowledged boundary; missing acknowledged bytes
-stop recovery. An incomplete checkpoint can fall back to its intact mirror and WAL. Opening the database is the recovery; there is no separate repair step. Recovery reclaims only a proven unpublished suffix or an artifact absent
+stop recovery. An incomplete checkpoint can fall back to its intact mirror and WAL. Opening the database is the recovery; there is no separate repair step. Recovery runs in steps too: it decodes
+one slot and reuses that work when the mirror holds the same bytes, builds each table's key
+membership a slice at a time, and replays the log with turns in between, so opening a database
+of a million keyed rows holds the thread for under 100 ms at a time on a laptop. Recovery reclaims only a proven unpublished suffix or an artifact absent
 from the fully validated current layout. A recognized but unsupported envelope or checkpoint
 version stops before redundant-slot fallback and before any truncation or deletion.
 

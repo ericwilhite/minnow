@@ -607,6 +607,13 @@ between its slot writes, publishes exactly the bytes a one-step checkpoint would
 power loss or a refused write at every one of its file operations, with the refused checkpoint
 retried by later writes; `wire.test.ts` checks the sliced encoder against the one-step encoder
 byte for byte, including a property test over arbitrary JSON-shaped states.
+`unique-index-staged-build.test.ts` pins, on the memory, IndexedDB, and OPFS stores, that
+creating a `UNIQUE` index stages its keys in ordered chunks of at most 4,096 and never sends
+them in one catalog update, enforces the index across a reopen, handles an empty table, and
+releases staged keys when publication fails. `index-capacity.test.ts` builds a secondary index
+over 600,000 distinct values and a full-text index over 450,000 documents, both of which the
+chunk limit once refused, and pins that at most one chunk per block of rows covers a term, so a
+lookup reads no more chunks than before.
 `npm run benchmark:stalls` measures the real numbers for those shapes and a few more, during the
 writes and during the maintenance that follows; `-- --store opfs` runs them over the native
 OPFS store.

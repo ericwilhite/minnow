@@ -142,7 +142,7 @@ import {
 } from "./snapshot-ledger.js";
 import {
   decodePostingChunk,
-  decodeSyncCheckpoint,
+  decodeSyncCheckpointSliced,
   encodePostingChunk,
   encodeSyncCheckpoint,
   encodeSyncCheckpointSliced,
@@ -655,6 +655,15 @@ export class OpfsLeaderClosedError extends Error {
   }
 }
 
+/** One checkpoint slot as recovery read it: its decoded state, or why it has none. */
+interface DecodedCheckpointSlot {
+  index: number;
+  size: number;
+  bytes?: Uint8Array;
+  state: CheckpointState | undefined;
+  error?: unknown;
+}
+
 export class OpfsLeader {
   readonly #tree: OpfsTree;
   readonly #strict: boolean;
@@ -826,34 +835,56 @@ export class OpfsLeader {
     return leader;
   }
 
+  /**
+   * Reads and decodes one checkpoint slot. A slot byte-identical to `first` — the normal state
+   * after a mirrored checkpoint — reuses its decoded state instead of decoding it again.
+   */
+  async #decodeSlot(
+    slot: FileSystemSyncAccessHandle,
+    index: number,
+    first: { bytes: Uint8Array; state: CheckpointState | undefined } | undefined,
+  ): Promise<DecodedCheckpointSlot> {
+    const size = slot.getSize();
+    if (size === 0) return { index, size, state: undefined };
+    if (size > MAX_OPFS_CHECKPOINT_BYTES) {
+      return {
+        index,
+        size,
+        state: undefined,
+        error: new Error(
+          `Checkpoint slot ${String(index)} exceeds ${String(MAX_OPFS_CHECKPOINT_BYTES)} bytes`,
+        ),
+      };
+    }
+    const bytes = new Uint8Array(size);
+    readFully(slot, bytes, 0, `reading checkpoint slot ${String(index)}`);
+    if (first !== undefined && equalBytes(first.bytes, bytes)) {
+      return { index, size, bytes, state: first.state };
+    }
+    try {
+      const decoded = await decodeSyncCheckpointSliced(bytes, maybeYieldToEventLoop);
+      const state = decoded === undefined ? undefined : validateCheckpointState(decoded);
+      return { index, size, bytes, state };
+    } catch (error) {
+      return { index, size, state: undefined, error };
+    }
+  }
+
   async #loadFromDisk(): Promise<void> {
-    const decodedSlots = this.#slots.map((slot, index) => {
-      const size = slot.getSize();
-      if (size === 0) return { index, size, state: undefined };
-      if (size > MAX_OPFS_CHECKPOINT_BYTES) {
-        return {
-          index,
-          size,
-          state: undefined,
-          error: new Error(
-            `Checkpoint slot ${String(index)} exceeds ${String(MAX_OPFS_CHECKPOINT_BYTES)} bytes`,
-          ),
-        };
+    // A mirrored checkpoint leaves both slots byte-identical; decoding and validating the
+    // second copy again would double the cost of opening a large database for nothing.
+    let firstDecoded: { bytes: Uint8Array; state: CheckpointState | undefined } | undefined;
+    // Recovery of a large database runs phase by phase, each its own task: nothing else can
+    // reach this leader until it finishes, but the thread it shares stays responsive.
+    const decodedSlots: DecodedCheckpointSlot[] = [];
+    for (const [index, slot] of this.#slots.entries()) {
+      await yieldToEventLoop();
+      decodedSlots.push(await this.#decodeSlot(slot, index, firstDecoded));
+      const decoded = decodedSlots.at(-1);
+      if (firstDecoded === undefined && decoded?.bytes !== undefined && !("error" in decoded)) {
+        firstDecoded = { bytes: decoded.bytes, state: decoded.state };
       }
-      const bytes = new Uint8Array(size);
-      readFully(slot, bytes, 0, `reading checkpoint slot ${String(index)}`);
-      try {
-        const decoded = decodeSyncCheckpoint(bytes);
-        return {
-          index,
-          size,
-          bytes,
-          state: decoded === undefined ? undefined : validateCheckpointState(decoded),
-        };
-      } catch (error) {
-        return { index, size, state: undefined, error };
-      }
-    });
+    }
     for (const slot of decodedSlots) {
       if ("error" in slot && slot.error instanceof StorageFormatVersionError) throw slot.error;
     }
@@ -902,6 +933,7 @@ export class OpfsLeader {
       }
     }
     this.#newestSlot = selected?.index ?? 0;
+    await yieldToEventLoop();
     if (checkpoint !== undefined) await validateCheckpointPhysical(checkpoint, this.#tree);
 
     this.#blockIndex.clear();
@@ -967,7 +999,8 @@ export class OpfsLeader {
       this.#seq = 0;
     } else {
       for (const [id, placement] of checkpoint.blockIndex) this.#setBlockPlacement(id, placement);
-      this.#core.load(checkpoint.core);
+      await this.#core.loadSliced(checkpoint.core, maybeYieldToEventLoop);
+      await yieldToEventLoop();
       for (const [key, pointer] of checkpoint.ftsBases) this.#setFtsBasePointer(key, pointer);
       for (const [key, pointer] of checkpoint.ftsBuilds) this.#setFtsBuildPointer(key, pointer);
       await this.#validateStagedPostingBuilds();
@@ -1002,6 +1035,7 @@ export class OpfsLeader {
     const acknowledged = this.#acknowledgements.latest;
     const acknowledgedEnd = acknowledged.sequence > checkpointSequence ? acknowledged.endOffset : 0;
     for (const { payload, frameEnd } of iterateWalFrames(this.#walHandle, acknowledgedEnd)) {
+      await maybeYieldToEventLoop();
       const entry = validateWalEntry(payload);
       if (
         entry.seq === acknowledged.sequence &&
@@ -1116,13 +1150,18 @@ export class OpfsLeader {
     // state through RecordCore's exhaustive runtime/cross-record validator before any physical
     // reclamation or external request can observe it. This catches malformed nested WAL bodies
     // that a mutation's narrow hot-path validator could otherwise ignore, without cloning the
-    // complete catalog once per frame (quadratic recovery on long logs).
-    const replayValidator = new RecordCore({
-      hasBlock: (id) => this.#blockIndex.has(id),
-      blockByteLength: (id) => this.#blockIndex.get(id)?.length,
-      blockChecksum: (id) => this.#blockIndex.get(id)?.checksum,
-    });
-    replayValidator.load(this.#core.dump());
+    // complete catalog once per frame (quadratic recovery on long logs). With no frame replayed
+    // the state is the checkpoint `load` validated a moment ago, and a second pass would only
+    // double the cost of opening a large database.
+    if (applied > 0) {
+      await yieldToEventLoop();
+      const replayValidator = new RecordCore({
+        hasBlock: (id) => this.#blockIndex.has(id),
+        blockByteLength: (id) => this.#blockIndex.get(id)?.length,
+        blockChecksum: (id) => this.#blockIndex.get(id)?.checksum,
+      });
+      await replayValidator.loadSliced(this.#core.dump(), maybeYieldToEventLoop);
+    }
 
     await this.#validateRecoveredSnapshotFrameSessions();
 
@@ -5150,10 +5189,14 @@ export class OpfsLeader {
     return this.#closed;
   }
 
-  /** Graceful: flush, checkpoint (so the next leader's takeover is instant), release. */
+  /**
+   * Graceful: flush, checkpoint (so the next leader's takeover is instant), release. The
+   * checkpoint is sliced like any other: a page that dies part-way leaves a torn slot beside an
+   * intact one and the log, which recovery reads as it would after a crash.
+   */
   async shutdown(): Promise<void> {
-    await this.#run(() => {
-      this.checkpointNow();
+    await this.#run(async () => {
+      await this.checkpointSliced();
       this.#closed = true;
     }).catch((error: unknown) => {
       // Shutting down a poisoned leader still releases its handles below.
@@ -6136,7 +6179,18 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   if (left.byteLength !== right.byteLength) return false;
-  for (let index = 0; index < left.byteLength; index += 1) {
+  let index = 0;
+  // Checkpoint slots run to many megabytes: compare aligned buffers a word at a time.
+  if (left.byteOffset % 4 === 0 && right.byteOffset % 4 === 0) {
+    const words = left.byteLength >>> 2;
+    const leftWords = new Uint32Array(left.buffer, left.byteOffset, words);
+    const rightWords = new Uint32Array(right.buffer, right.byteOffset, words);
+    for (let word = 0; word < words; word += 1) {
+      if (leftWords[word] !== rightWords[word]) return false;
+    }
+    index = words * 4;
+  }
+  for (; index < left.byteLength; index += 1) {
     if (left[index] !== right[index]) return false;
   }
   return true;

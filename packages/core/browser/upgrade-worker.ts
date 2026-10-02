@@ -2,6 +2,7 @@ import { MinnowDatabase } from "@minnowdb/core";
 import { decodeBlock } from "@minnowdb/core/block-format";
 import { OpfsBlockStore } from "@minnowdb/core/storage/opfs";
 import { OpfsBlockStore as Layout6Store } from "@minnowdb/core-layout6/storage/opfs";
+import { OpfsBlockStore as Layout7Store } from "@minnowdb/core-layout7/storage/opfs";
 import type { NativeUpgradeResult } from "./upgrade-run.js";
 
 self.onmessage = (event: MessageEvent<{ files: Record<string, string>; name: string }>) => {
@@ -62,21 +63,32 @@ async function run({
     const marker = JSON.parse(
       await (await (await directory.getFileHandle("format.json")).getFile()).text(),
     ) as { formatVersion: number };
-    let olderReaderRefused = false;
-    try {
-      const old = await Layout6Store.open({ name });
-      old.close();
-    } catch (error) {
-      if (!(error instanceof Error)) throw error;
-      const properties = error as Error & { actualVersion?: unknown; supportedVersion?: unknown };
-      if (
-        error.name !== "StorageFormatVersionError" ||
-        properties.actualVersion !== 7 ||
-        properties.supportedVersion !== 6
-      )
-        throw error;
-      olderReaderRefused = true;
+    // Every released reader of an older layout refuses the upgraded database unchanged.
+    const olderReaders = [
+      { open: (options: { name: string }) => Layout6Store.open(options), supported: 6 },
+      { open: (options: { name: string }) => Layout7Store.open(options), supported: 7 },
+    ];
+    let refusals = 0;
+    for (const reader of olderReaders) {
+      try {
+        const old = await reader.open({ name });
+        old.close();
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        const properties = error as Error & {
+          actualVersion?: unknown;
+          supportedVersion?: unknown;
+        };
+        if (
+          error.name !== "StorageFormatVersionError" ||
+          properties.actualVersion !== 8 ||
+          properties.supportedVersion !== reader.supported
+        )
+          throw error;
+        refusals += 1;
+      }
     }
+    const olderReaderRefused = refusals === olderReaders.length;
     return {
       tables,
       blockValues: Array.from<unknown>(values),

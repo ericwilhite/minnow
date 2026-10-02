@@ -35,15 +35,36 @@ Release packages: `@minnowdb/core@0.13.0`.
 
 - `CREATE INDEX` over 200,000 rows held the thread for half a second: the build sorted and
   wrote each 65,536-row block's postings in one turn, and the first lookup then hashed every
-  stored key. Builds now flush at most 16,384 rows' postings at a time and yield as they go,
-  and the lookup yields while it hashes; the longest block is now 15–25 ms. Creating a `UNIQUE`
-  index builds its key set in one pass instead of two.
+  stored key. A block's terms now sort in bounded runs that merge with turns in between, writes
+  yield as they go, and the lookup yields while it hashes; the longest block is now 15–25 ms.
+  Blocks stay the unit a chunk's terms come from, so a lookup still reads one chunk per block.
 
-- OPFS checkpoints taken during normal work — when the log fills, and before collection deletes
-  a drained data file — encode and write a slice at a time while holding the write queue, so
-  reads keep answering between slices and the state they publish cannot change. Their bytes are
-  exactly a one-step checkpoint's. Loading a million keyed rows into OPFS 50,000 at a time held
-  the thread for up to 161 ms; it now peaks at 77 ms, the writes themselves.
+- Creating a `UNIQUE` index stages its key set through the store's chunked build — ordered
+  chunks of at most 4,096 keys — and publishes it with the ready index in one atomic step,
+  instead of sending every key in one catalog update. On OPFS a million-row `UNIQUE` index no
+  longer writes one log frame of every key, and no step holds the thread for more than about
+  30 ms. Staged chunks grow in place rather than being copied per chunk, and an IndexedDB build
+  over an empty table now publishes an empty key set that later reads accept.
+
+- Indexes build over tables of any size. Posting chunks held 128 postings each and a base may
+  hold 4,096 chunks, so a secondary index over more than about 524,000 distinct values, or a
+  full-text index over a few hundred thousand documents, failed to build on every store:
+  `CREATE INDEX` was refused, and full-text search fell back to scanning. Chunks keep 128
+  postings until a build nears the limit and grow from there.
+
+- OPFS checkpoints — when the log fills, before collection deletes a drained data file, and at
+  shutdown — encode and write a slice at a time while holding the write queue, so reads keep
+  answering between slices and the state they publish cannot change. Their bytes are exactly a
+  one-step checkpoint's. Loading a million keyed rows into OPFS 50,000 at a time held the thread
+  for up to 161 ms; it now peaks at 77 ms, the writes themselves.
+
+- Opening an OPFS database of a million keyed rows with a `UNIQUE` index held the thread for
+  4.5 seconds in one block. Recovery decoded both checkpoint copies through a per-value JSON
+  reviver, validated the state twice, and built every key membership twice. It now parses
+  once and converts tagged bigints in one pass, reuses the first copy when the mirror holds the
+  same bytes, skips the second validation when no log frame was replayed, and builds each
+  membership a slice at a time: the open runs in steps of under 100 ms. The storage toolkit
+  adds `decodeSyncCheckpointSliced` and `RecordCore.loadSliced`.
 
 - Full-text matching tokenizes each distinct stored value the first time a scanned row uses it,
   instead of tokenizing a block's whole dictionary on its first batch, which held the thread for

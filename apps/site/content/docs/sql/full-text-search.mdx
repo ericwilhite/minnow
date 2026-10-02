@@ -63,7 +63,8 @@ Multiple terms are combined; a row matches when it contains all of them.
 A `MATCH` on an unindexed column scans and re-verifies, which is fast enough on small tables and
 slow on large ones. Above a threshold — 4,096 visible rows by default — the first `MATCH` on an
 append-only column schedules a background index build and answers from the scan meanwhile.
-Correctness never waits on it.
+Correctness never waits on it. The build runs a few milliseconds at a time between other work,
+and its stored chunks grow as a large corpus needs, so it completes whatever the table's size.
 
 To build one explicitly, before a user's first search rather than during it:
 

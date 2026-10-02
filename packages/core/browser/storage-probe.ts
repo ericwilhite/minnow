@@ -402,8 +402,8 @@ export async function runFailedIndexedDbProbe(): Promise<IndexedDbProbeResult> {
       await seeded.close({ terminateWorker: true });
     }
 
-    // The real engine database is schema 2. Hide databases(), then make only the existence probe
-    // open it as schema 1, which produces a native asynchronous VersionError. Choice-database
+    // The real engine database is past schema 1. Hide databases(), then make only the existence
+    // probe open it as schema 1, which produces a native asynchronous VersionError. Choice-database
     // calls still reach the browser unchanged so the complete auto-store path runs.
     const probeFactory = new Proxy(indexedDB, {
       get(target, property) {

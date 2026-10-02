@@ -1766,7 +1766,10 @@ export class IndexedDbBlockStore implements BlockStore {
           table === undefined ||
           index?.state !== "ready" ||
           index.uniqueEnforced !== true ||
-          membership?.baseGenerationId !== input.buildId
+          membership === undefined ||
+          // An empty build published no base; any other build published its own generation.
+          ((envelope.record.nextOrdinal > 0 || membership.hasBase) &&
+            membership.baseGenerationId !== input.buildId)
         ) {
           throw new UniqueKeyBuildConflictError(input.buildId, "completed publication changed");
         }
@@ -1825,19 +1828,23 @@ export class IndexedDbBlockStore implements BlockStore {
             ...readyIndex,
             state: "ready",
             uniqueEnforced: true,
+            buildFromVersion: input.coversVersion,
           },
         },
         revision: incrementSafeInteger(table.revision, "Table revision"),
       };
       asIncomingTableRecord(updated, tableKey);
       await updateCatalogResourceLedger(transaction.objectStore("statistics"), table, updated);
+      // A build of an empty table staged no parts; its membership has no base to read.
       catalog.put(
-        {
-          versions: [],
-          hasBase: true,
-          baseGenerationId: input.buildId,
-          tokenCount: envelope.record.tokenCount,
-        } satisfies UniqueKeyChunkIndex,
+        (envelope.record.nextOrdinal > 0
+          ? {
+              versions: [],
+              hasBase: true,
+              baseGenerationId: input.buildId,
+              tokenCount: envelope.record.tokenCount,
+            }
+          : { versions: [], hasBase: false }) satisfies UniqueKeyChunkIndex,
         membershipKey,
       );
       catalog.put(updated, tableKey);

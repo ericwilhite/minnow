@@ -5,6 +5,7 @@ import {
   decodePostingChunk,
   decodeRecordJson,
   decodeSyncCheckpoint,
+  decodeSyncCheckpointSliced,
   encodeChunk,
   encodePostingChunk,
   encodeRecordJson,
@@ -475,6 +476,51 @@ describe("synchronous checkpoint slots", () => {
   });
 });
 
+describe("record JSON decoding", () => {
+  it("round-trips arbitrary JSON-shaped records holding bigints", () => {
+    const leaf = fc.oneof(
+      fc.string({ maxLength: 8 }),
+      fc.integer(),
+      fc.boolean(),
+      fc.constant(null),
+      fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
+    );
+    const { tree } = fc.letrec((node) => ({
+      tree: fc.oneof(
+        { depthSize: "small", withCrossShrink: true },
+        leaf,
+        fc.array(node("tree"), { maxLength: 6 }),
+        fc.dictionary(fc.string({ maxLength: 6 }), node("tree"), { maxKeys: 6 }),
+      ),
+    }));
+    fc.assert(
+      fc.property(tree, (value) => {
+        expect(decodeRecordJson(encodeRecordJson(value))).toEqual(value);
+      }),
+      { numRuns: 300 },
+    );
+  });
+
+  it("keeps a __proto__ key an own property when its value is a bigint or a record", () => {
+    const bytes = new TextEncoder().encode(
+      '{"__proto__":{"$n":"7"},"nested":{"__proto__":{"rows":[{"$n":"9"}]}}}',
+    );
+    const decoded = decodeRecordJson(bytes) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(decoded)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyDescriptor(decoded, "__proto__")?.value).toBe(7n);
+    const nested = decoded.nested as Record<string, unknown>;
+    expect(Object.getPrototypeOf(nested)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyDescriptor(nested, "__proto__")?.value).toEqual({ rows: [9n] });
+  });
+
+  it("converts only an object whose sole key is a string $n", () => {
+    const decoded = decodeRecordJson(
+      new TextEncoder().encode('[{"$n":"1","x":1},{"$n":2},{"$n":"3"}]'),
+    );
+    expect(decoded).toEqual([{ $n: "1", x: 1 }, { $n: 2 }, 3n]);
+  });
+});
+
 describe("sliced checkpoint encoding", () => {
   let pauses = 0;
   const pause = (): Promise<void> => {
@@ -560,5 +606,42 @@ describe("sliced checkpoint encoding", () => {
     const outOfRange = { rows: Array.from({ length: 9_000 }, () => MAX_ROW_ID_EXCLUSIVE_END + 1n) };
     expect(() => encodeSyncCheckpoint(outOfRange)).toThrow(RangeError);
     await expect(encodeSyncCheckpointSliced(outOfRange, pause)).rejects.toThrow(RangeError);
+  });
+});
+
+describe("sliced checkpoint decoding", () => {
+  it("decodes what the one-step decoder decodes, pausing over a large payload", async () => {
+    const state = {
+      generation: 3,
+      rows: Array.from({ length: 60_000 }, (_, index) => ({
+        id: BigInt(index),
+        tag: `t${String(index)}`,
+      })),
+    };
+    const bytes = encodeSyncCheckpoint(state);
+    let pauses = 0;
+    const decoded = await decodeSyncCheckpointSliced(bytes, async () => {
+      pauses += 1;
+    });
+    expect(decoded).toEqual(decodeSyncCheckpoint(bytes));
+    expect(decoded).toEqual(state);
+    expect(pauses).toBeGreaterThanOrEqual(Math.ceil((bytes.byteLength - 20) / (1024 * 1024)));
+  });
+
+  it("reads torn and foreign bytes as not written, and refuses a newer version", async () => {
+    const bytes = encodeSyncCheckpoint({ generation: 1 });
+    const pause = async (): Promise<void> => undefined;
+    expect(await decodeSyncCheckpointSliced(bytes.subarray(0, bytes.byteLength - 1), pause)).toBe(
+      undefined,
+    );
+    const corrupted = bytes.slice();
+    corrupted[corrupted.byteLength - 1] = (corrupted[corrupted.byteLength - 1] ?? 0) ^ 0xff;
+    expect(await decodeSyncCheckpointSliced(corrupted, pause)).toBe(undefined);
+    expect(await decodeSyncCheckpointSliced(new Uint8Array(0), pause)).toBe(undefined);
+    const newer = bytes.slice();
+    new DataView(newer.buffer).setUint32(8, LOG_FORMAT_VERSION + 1, true);
+    await expect(decodeSyncCheckpointSliced(newer, pause)).rejects.toMatchObject({
+      name: "StorageFormatVersionError",
+    });
   });
 });

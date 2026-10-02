@@ -157,11 +157,13 @@ Concurrent tabs cannot both publish the same key. A key with any `NULL` componen
 conflict, matching SQL unique-constraint semantics. Failed builds leave no catalog entry, and
 snapshot restore keeps enforcement active even when the accelerator postings need rebuilding.
 
-Indexes are maintained across inserts, updates, deletes, and upserts. Their base is built in
-row-group-sized chunks, new commits append bounded deltas, and background folding prevents a
-long-running write workload from retaining one index object per transaction. A build is published
-with one atomic pointer change; a crash can leave reclaimable staging bytes but cannot expose a
-partial index. Multi-tab writers that cannot prove they updated an index invalidate the
+Indexes are maintained across inserts, updates, deletes, and upserts. Their base is built a row
+group at a time, in chunks that grow only as far as a large table needs to stay within the
+store's chunk limit, so an index can be built over any table. New commits append bounded deltas,
+and background folding prevents a long-running write workload from retaining one index object
+per transaction. A `UNIQUE` index stages its key set in bounded, ordered chunks and publishes it
+together with the ready index. A build is published with one atomic pointer change; a crash can
+leave reclaimable staging bytes but cannot expose a partial index. Multi-tab writers that cannot prove they updated an index invalidate the
 accelerator, and the next relevant query rebuilds it while answering correctly from a scan.
 
 ```sql

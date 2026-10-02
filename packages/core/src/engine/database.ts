@@ -171,6 +171,11 @@ import {
   MAX_TRANSACTION_STAGE_BYTES,
   MAX_SNAPSHOT_SESSION_TTL_MS,
   MAX_POSTING_BUILD_TTL_MS,
+  MAX_UNIQUE_KEY_BUILD_CHUNK_BYTES,
+  MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK,
+  MAX_UNIQUE_KEY_BUILD_TTL_MS,
+  MAX_FTS_BASE_CHUNKS,
+  MAX_FTS_POSTINGS_PER_CHUNK,
   MAX_TEMP_OWNER_TTL_MS,
   type QueryCatalogState,
   type RowIdRange,
@@ -408,7 +413,6 @@ import {
   secondaryTupleComponent,
   secondaryUniqueTerm,
   sortedFtsPostings,
-  sortedSecondaryPostings,
   stageSecondaryUniqueInsertChanges,
   stageSecondaryUniqueMutationChanges,
 } from "./index-terms.js";
@@ -19798,6 +19802,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     if (entered === undefined) return;
     const { marked, buildId } = entered;
+    // Set while a UNIQUE key set is staged and not yet published; written inside the snapshot.
+    const uniqueBuild = { staged: false };
     try {
       await this.#withLeasedSnapshot(undefined, async (snapshot) => {
         const columns = secondaryIndexColumnIds(index).map((columnId) =>
@@ -19809,7 +19815,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const projected = keyColumn === undefined ? indexedColumns : [...indexedColumns, keyColumn];
         const coversVersion = snapshot.version ?? -1;
         const projectedColumns = [...new Map(projected.map((entry) => [entry.id, entry])).values()];
-        const uniqueTerms = index.unique === true ? new Set<string>() : undefined;
+        const uniqueTerms = index.unique === true ? new UniqueTermRuns() : undefined;
         const streamed = await this.#writeStreamedSecondaryIndexBase(
           marked,
           indexedColumns,
@@ -19832,7 +19838,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               snapshot,
               coversVersion,
               buildId,
-              uniqueTerms ?? new Set<string>(),
+              uniqueTerms ?? new UniqueTermRuns(),
             );
           } else {
             await this.#writeHistoricalSecondaryIndexBase(
@@ -19845,6 +19851,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               buildId,
             );
           }
+        }
+        // A UNIQUE index's key set is staged outside the catalog turn, a bounded chunk per store
+        // call, so a large table's membership is never one database-sized step.
+        let uniqueChunks = 0;
+        if (uniqueTerms !== undefined) {
+          uniqueBuild.staged = true;
+          uniqueChunks = await this.#stageUniqueKeys(marked.id, indexId, buildId, uniqueTerms);
         }
         await this.#admissions.admit(
           "catalog",
@@ -19859,40 +19872,45 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               return;
             }
             if (
-              fresh !== undefined &&
-              freshIndex.state === "building" &&
-              freshIndex.buildId === buildId
+              fresh === undefined ||
+              freshIndex.state !== "building" ||
+              freshIndex.buildId !== buildId
             ) {
-              const { buildId: _completedBuild, ...readyIndex } = freshIndex;
-              void _completedBuild;
-              await this.store.updateTable(fresh.id, fresh.revision, {
-                secondaryIndexes: {
-                  ...fresh.secondaryIndexes,
-                  [indexId]: {
-                    ...readyIndex,
-                    state: "ready",
-                    buildFromVersion: coversVersion,
-                    ...(index.unique === true ? { uniqueEnforced: true as const } : {}),
-                  },
-                },
-                ...(index.unique === true
-                  ? {
-                      expectedManifestVersion: {
-                        value: coversVersion < 0 ? null : coversVersion,
-                      },
-                      uniqueKeySeed: {
-                        namespaceId: secondaryUniqueKeyNamespace(fresh.id, indexId),
-                        keyTokens: [...(uniqueTerms ?? [])],
-                      },
-                    }
-                  : {}),
-              });
+              return;
             }
+            if (uniqueTerms !== undefined) {
+              // One atomic step: membership, the ready flip, and the table+manifest check that
+              // nothing committed since the snapshot the keys were read from.
+              const now = dateIsoString(this.#now());
+              await this.store.finishUniqueKeyBuild({
+                buildId,
+                ownerId: this.#internalLeaseOwnerId,
+                expiresAtCutoff: now,
+                expectedTableRevision: fresh.revision,
+                expectedManifestVersion: coversVersion < 0 ? null : coversVersion,
+                chunkCount: uniqueChunks,
+                coversVersion,
+                completedAt: now,
+              });
+              uniqueBuild.staged = false;
+              return;
+            }
+            const { buildId: _completedBuild, ...readyIndex } = freshIndex;
+            void _completedBuild;
+            await this.store.updateTable(fresh.id, fresh.revision, {
+              secondaryIndexes: {
+                ...fresh.secondaryIndexes,
+                [indexId]: { ...readyIndex, state: "ready", buildFromVersion: coversVersion },
+              },
+            });
           },
           this.#maintenanceSignal,
         );
       });
+      // Still staged after the publication turn: the index was dropped or rebuilt meanwhile.
+      if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
     } catch (error) {
+      if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
       const fresh = await this.store
         .getTable(table.id)
         .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
@@ -19943,6 +19961,72 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const expiresAt = dateMilliseconds(now) + MAX_POSTING_BUILD_TTL_MS;
     if (!Number.isSafeInteger(expiresAt)) throw new RangeError("Posting build expiry overflow");
     return dateIsoString(new Date(expiresAt));
+  }
+
+  /**
+   * Stages a UNIQUE index's key set through the store's chunked build: globally ordered chunks
+   * of at most `MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK` keys, one store call each, renewing the
+   * build's lease halfway through its lifetime. Returns the chunk count `finish` must match.
+   */
+  async #stageUniqueKeys(
+    tableId: string,
+    indexId: string,
+    buildId: string,
+    terms: UniqueTermRuns,
+  ): Promise<number> {
+    const ownerId = this.#internalLeaseOwnerId;
+    const leaseUntil = (now: Date): string =>
+      dateIsoString(new Date(dateMilliseconds(now) + MAX_UNIQUE_KEY_BUILD_TTL_MS));
+    const begun = this.#now();
+    await this.store.beginUniqueKeyBuild({
+      buildId,
+      tableId,
+      indexId,
+      namespaceId: secondaryUniqueKeyNamespace(tableId, indexId),
+      ownerId,
+      createdAt: dateIsoString(begun),
+      expiresAt: leaseUntil(begun),
+    });
+    let renewAt = dateMilliseconds(begun) + MAX_UNIQUE_KEY_BUILD_TTL_MS / 2;
+    let ordinal = 0;
+    for await (const keyTokens of terms.orderedChunks()) {
+      const now = this.#now();
+      if (dateMilliseconds(now) >= renewAt) {
+        await this.store.renewUniqueKeyBuild({
+          buildId,
+          ownerId,
+          expiresAtCutoff: dateIsoString(now),
+          expiresAt: leaseUntil(now),
+          updatedAt: dateIsoString(now),
+        });
+        renewAt = dateMilliseconds(now) + MAX_UNIQUE_KEY_BUILD_TTL_MS / 2;
+      }
+      await this.store.appendUniqueKeyBuildChunk({
+        buildId,
+        ownerId,
+        expiresAtCutoff: dateIsoString(now),
+        ordinal,
+        keyTokens,
+        updatedAt: dateIsoString(now),
+      });
+      ordinal += 1;
+    }
+    return ordinal;
+  }
+
+  /** Releases a staged UNIQUE key set whose build failed or lost its catalog owner. */
+  async #abortUniqueKeyBuild(
+    tableId: string,
+    index: SecondaryIndexRecord,
+    buildId: string,
+  ): Promise<void> {
+    await this.store
+      .abortUniqueKeyBuild({
+        buildId,
+        ownerId: this.#internalLeaseOwnerId,
+        expiresAtCutoff: dateIsoString(this.#now()),
+      })
+      .catch(this.#postingCleanupFailure(tableId, index.storageColumnId));
   }
 
   async #beginPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
@@ -20043,8 +20127,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (valueVectors.some((vector) => vector === undefined) || keyVector === undefined) {
         throw new Error(`UNIQUE-index source columns are missing: ${index.name}`);
       }
-      const postings = new SecondaryPostingWriter(this.#rowsPerBlock, (ordinal, chunk) =>
-        writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
+      const postings = new SecondaryPostingWriter(
+        this.#rowsPerBlock,
+        materialized.rowCount,
+        (ordinal, chunk) => writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
       );
       for (let row = 0; row < materialized.rowCount; row += 1) {
         const values = valueVectors.map((vector, position) =>
@@ -20105,8 +20191,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keyColumn === undefined ? undefined : streamed.table.columns.get(keyColumn.name);
       const rowIdAt =
         keyColumn === undefined ? appendRowIdLocator(segments, streamed.table.rowCount) : undefined;
-      const postings = new SecondaryPostingWriter(this.#rowsPerBlock, (ordinal, chunk) =>
-        writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
+      const postings = new SecondaryPostingWriter(
+        this.#rowsPerBlock,
+        streamed.table.rowCount,
+        (ordinal, chunk) => writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
       );
       for (let start = 0; start < streamed.table.rowCount;) {
         const requested = Math.min(this.#rowsPerBlock, streamed.table.rowCount - start);
@@ -20131,7 +20219,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           addSecondaryPosting(postings.byTerm, index, columns, values, locator, uniqueTerms);
           if (postings.rowAdded()) await postings.service();
         }
-        await postings.flush();
         start = end;
       }
       await postings.flush();
@@ -20175,8 +20262,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const segments = await this.#visibleSegmentRecords(table, snapshot);
     await begin(table.id, index.storageColumnId, buildId);
     try {
-      const postings = new SecondaryPostingWriter(this.#rowsPerBlock, (ordinal, chunk) =>
-        writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
+      const postings = new SecondaryPostingWriter(
+        this.#rowsPerBlock,
+        segments.reduce((rows, segment) => rows + segment.rowCount, 0),
+        (ordinal, chunk) => writeChunk(table.id, index.storageColumnId, buildId, ordinal, chunk),
       );
       for (const segment of segments) {
         const anchorIds =
@@ -20254,7 +20343,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             addSecondaryPosting(postings.byTerm, index, columns, values, locator);
             if (postings.rowAdded()) await postings.service();
           }
-          await postings.flush();
           segmentRow += rowCount;
         }
         if (segmentRow !== segment.rowCount) {
@@ -20357,18 +20445,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
         let totalTokens = 0;
         let pendingTokens = 0;
+        let pendingRows = 0;
         let ordinal = 0;
+        const sizer = new FtsChunkSizer(
+          segments.reduce((rows, segment) => rows + segment.rowCount, 0),
+        );
         // Tokenizing a resident block awaits nothing; yielding every few hundred rows keeps a
         // large column's build from holding the event loop for the whole block.
         const flush = async (): Promise<void> => {
           if (byTerm.size === 0) return;
-          for (const postings of chunkFtsPostings(sortedFtsPostings(byTerm))) {
+          const sorted = sortedFtsPostings(byTerm);
+          const size = sizer.chunkPostings(sorted.length, pendingRows, ordinal);
+          for (const postings of chunkFtsPostings(sorted, size)) {
             await writeChunk(table.id, column.id, buildId, ordinal, postings);
             ordinal += 1;
             await maybeYieldToEventLoop();
           }
           byTerm.clear();
           pendingTokens = 0;
+          pendingRows = 0;
         };
         await begin(table.id, column.id, buildId);
         try {
@@ -20390,6 +20485,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                     "Full-text base token count",
                   );
                   pendingTokens += tokens;
+                  pendingRows += 1;
                   if (pendingTokens >= FTS_BUILD_POSTING_WINDOW) await flush();
                 }
               }
@@ -20414,6 +20510,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                   "Full-text base token count",
                 );
                 pendingTokens += tokens;
+                pendingRows += 1;
                 segmentRow += 1;
                 if (pendingTokens >= FTS_BUILD_POSTING_WINDOW) await flush();
               }
@@ -26548,13 +26645,124 @@ interface MergeResolution {
   readonly checksum: number;
 }
 
+/** Terms a UNIQUE build sorts as one run: a few milliseconds of sorting. */
+const UNIQUE_TERM_RUN = 16_384;
+
 /**
- * Collects one secondary-index build's postings and writes them a window at a time. A flush
- * sorts at most one block's or `FTS_BUILD_POSTING_WINDOW` rows' terms, whichever is fewer, and
- * the row loop and every chunk write hand the event loop a turn, so a build over a large table
- * never holds it for a whole block. Callers also flush at each block's end. Chunks are row
- * windows, not term partitions, so the window decides only where one chunk ends and the next
- * begins.
+ * A UNIQUE index build's key terms: the set the build checks duplicates against, also kept as
+ * sorted runs of at most `UNIQUE_TERM_RUN` terms. `orderedChunks` merges the runs into the
+ * globally ordered chunks the store's staged build takes, yielding between chunks, so neither a
+ * database-sized sort nor a database-sized copy runs in one turn.
+ */
+class UniqueTermRuns extends Set<string> {
+  readonly #runs: string[][] = [];
+  #pending: string[] = [];
+
+  override add(term: string): this {
+    if (this.has(term)) return this;
+    super.add(term);
+    this.#pending.push(term);
+    if (this.#pending.length >= UNIQUE_TERM_RUN) this.#seal();
+    return this;
+  }
+
+  #seal(): void {
+    if (this.#pending.length === 0) return;
+    // Code-unit order, the order every store compares keys in.
+    this.#runs.push(this.#pending.sort());
+    this.#pending = [];
+  }
+
+  /**
+   * The terms in code-unit order, as chunks of at most `MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK`
+   * terms and `MAX_UNIQUE_KEY_BUILD_CHUNK_BYTES` modeled bytes.
+   */
+  async *orderedChunks(): AsyncGenerator<string[]> {
+    this.#seal();
+    let chunk: string[] = [];
+    let chunkBytes = 0;
+    for await (const batch of mergeSortedRuns(this.#runs)) {
+      for (const term of batch) {
+        // The store's modeled bytes per staged token.
+        const termBytes = 16 + term.length * 2;
+        if (
+          chunk.length === MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK ||
+          chunkBytes + termBytes > MAX_UNIQUE_KEY_BUILD_CHUNK_BYTES
+        ) {
+          yield chunk;
+          chunk = [];
+          chunkBytes = 0;
+        }
+        chunk.push(term);
+        chunkBytes += termBytes;
+      }
+      await maybeYieldToEventLoop();
+    }
+    if (chunk.length > 0) yield chunk;
+  }
+}
+
+/** Postings per stored chunk while the base stays far from MAX_FTS_BASE_CHUNKS. */
+const POSTING_CHUNK_POSTINGS = 128;
+
+/**
+ * Postings per stored chunk for a secondary-index base over `rows` rows written in windows of
+ * `windowRows`. Small chunks keep a lookup's decode short, so the size stays at
+ * `POSTING_CHUNK_POSTINGS` until the base would pass MAX_FTS_BASE_CHUNKS: a row adds at most one
+ * posting to its window, and a window ends at most one partial chunk, so a base of `rows`
+ * postings in this size fits with room to spare.
+ */
+function secondaryPostingChunkSize(rows: number, windowRows: number): number {
+  const windows = Math.ceil(rows / Math.max(1, windowRows));
+  const budget = MAX_FTS_BASE_CHUNKS - windows - 64;
+  if (budget <= 0) return MAX_FTS_POSTINGS_PER_CHUNK;
+  return Math.min(
+    MAX_FTS_POSTINGS_PER_CHUNK,
+    Math.max(POSTING_CHUNK_POSTINGS, Math.ceil(rows / budget)),
+  );
+}
+
+/**
+ * Postings per stored chunk at each flush of a full-text build, whose total postings are known
+ * only once it ends. From the postings and flushes per row so far it projects what the
+ * remaining rows add — each flush ending at most one partial chunk — and sizes chunks so the
+ * projected base fills at most three quarters of MAX_FTS_BASE_CHUNKS, leaving room for a
+ * projection that ran low. A build far from that keeps `POSTING_CHUNK_POSTINGS`.
+ */
+class FtsChunkSizer {
+  readonly #totalRows: number;
+  #rows = 0;
+  #postings = 0;
+  #flushes = 0;
+
+  constructor(totalRows: number) {
+    this.#totalRows = totalRows;
+  }
+
+  /** For a flush of `postings` postings from `rows` rows, after `written` stored chunks. */
+  chunkPostings(postings: number, rows: number, written: number): number {
+    this.#rows += rows;
+    this.#postings += postings;
+    this.#flushes += 1;
+    const remainingRows = Math.max(0, this.#totalRows - this.#rows);
+    const perRow = this.#rows === 0 ? 0 : this.#postings / this.#rows;
+    const flushesPerRow = this.#rows === 0 ? 0 : this.#flushes / this.#rows;
+    const pending = (postings + perRow * remainingRows) * 1.25;
+    const budget =
+      MAX_FTS_BASE_CHUNKS * 0.75 - written - (1 + flushesPerRow * remainingRows) * 1.25;
+    if (budget < 1) return MAX_FTS_POSTINGS_PER_CHUNK;
+    return Math.min(
+      MAX_FTS_POSTINGS_PER_CHUNK,
+      Math.max(POSTING_CHUNK_POSTINGS, Math.ceil(pending / budget)),
+    );
+  }
+}
+
+/**
+ * Collects one secondary-index build's postings and writes them a block's rows at a time. A
+ * lookup reads about one chunk per window, so windows stay a whole block: sorting a block's terms
+ * runs a bounded run at a time, and the row loop and every chunk write hand the event loop a
+ * turn, so a build over a large table never holds it for a whole block.
  */
 class SecondaryPostingWriter {
   readonly byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
@@ -26562,13 +26770,16 @@ class SecondaryPostingWriter {
   totalTokens = 0;
   #rows = 0;
   readonly #windowRows: number;
+  readonly #chunkPostings: number;
   readonly #write: (ordinal: number, chunk: FtsPosting[]) => Promise<void>;
 
   constructor(
     rowsPerBlock: number,
+    rows: number,
     write: (ordinal: number, chunk: FtsPosting[]) => Promise<void>,
   ) {
-    this.#windowRows = Math.min(rowsPerBlock, FTS_BUILD_POSTING_WINDOW);
+    this.#windowRows = rowsPerBlock;
+    this.#chunkPostings = secondaryPostingChunkSize(rows, rowsPerBlock);
     this.#write = write;
   }
 
@@ -26586,9 +26797,9 @@ class SecondaryPostingWriter {
   async flush(): Promise<void> {
     this.#rows = 0;
     if (this.byTerm.size === 0) return;
-    const postings = sortedSecondaryPostings(this.byTerm);
+    const postings = await sortedSecondaryPostingsSliced(this.byTerm);
     this.byTerm.clear();
-    for (const chunk of chunkFtsPostings(postings)) {
+    for (const chunk of chunkFtsPostings(postings, this.#chunkPostings)) {
       this.totalTokens = safeWholeNumberSum(
         [this.totalTokens, postingFrequencyTotal(chunk)],
         "Secondary-index posting count",
@@ -26598,6 +26809,85 @@ class SecondaryPostingWriter {
       await maybeYieldToEventLoop();
     }
   }
+}
+
+/**
+ * `sortedSecondaryPostings`, a bounded run at a time: the terms sort in runs of
+ * `UNIQUE_TERM_RUN` and merge, with the event loop offered a turn between runs and merged
+ * batches, so a block of distinct terms never sorts in one call.
+ */
+async function sortedSecondaryPostingsSliced(
+  byTerm: ReadonlyMap<string, { rowIds: bigint[]; tf: number[] }>,
+): Promise<FtsPosting[]> {
+  const terms = [...byTerm.keys()];
+  const runs: string[][] = [];
+  for (let start = 0; start < terms.length; start += UNIQUE_TERM_RUN) {
+    await maybeYieldToEventLoop();
+    runs.push(terms.slice(start, start + UNIQUE_TERM_RUN).sort());
+  }
+  const postings: FtsPosting[] = [];
+  for await (const batch of mergeSortedRuns(runs)) {
+    for (const term of batch) {
+      const rowIds = [...new Set(byTerm.get(term)?.rowIds ?? [])].sort((left, right) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      );
+      postings.push({ term, rowIds, tf: rowIds.map(() => 1) });
+    }
+    await maybeYieldToEventLoop();
+  }
+  return postings;
+}
+
+/** Terms per batch `mergeSortedRuns` hands back between turns. */
+const MERGE_BATCH_TERMS = 4_096;
+
+/**
+ * The terms of sorted `runs` in one code-unit order, a batch of at most `MERGE_BATCH_TERMS` at a
+ * time, merged through a binary min-heap of the runs' next terms.
+ */
+async function* mergeSortedRuns(runs: readonly string[][]): AsyncGenerator<string[]> {
+  if (runs.length === 1) {
+    const run = runs[0] ?? [];
+    for (let start = 0; start < run.length; start += MERGE_BATCH_TERMS) {
+      yield run.slice(start, start + MERGE_BATCH_TERMS);
+    }
+    return;
+  }
+  const positions = new Int32Array(runs.length);
+  const head = (run: number): string => runs[run]?.[positions[run] ?? 0] ?? "";
+  const heap = runs.flatMap((run, index) => (run.length > 0 ? [index] : []));
+  const siftDown = (from: number): void => {
+    let at = from;
+    for (;;) {
+      const left = at * 2 + 1;
+      const right = left + 1;
+      let least = at;
+      if (left < heap.length && head(heap[left] ?? 0) < head(heap[least] ?? 0)) least = left;
+      if (right < heap.length && head(heap[right] ?? 0) < head(heap[least] ?? 0)) least = right;
+      if (least === at) return;
+      const swap = heap[at] ?? 0;
+      heap[at] = heap[least] ?? 0;
+      heap[least] = swap;
+      at = least;
+    }
+  };
+  for (let index = (heap.length >> 1) - 1; index >= 0; index -= 1) siftDown(index);
+  let batch: string[] = [];
+  while (heap.length > 0) {
+    const run = heap[0] ?? 0;
+    batch.push(head(run));
+    positions[run] = (positions[run] ?? 0) + 1;
+    if ((positions[run] ?? 0) >= (runs[run]?.length ?? 0)) {
+      const last = heap.pop() ?? 0;
+      if (heap.length > 0) heap[0] = last;
+    }
+    siftDown(0);
+    if (batch.length === MERGE_BATCH_TERMS) {
+      yield batch;
+      batch = [];
+    }
+  }
+  if (batch.length > 0) yield batch;
 }
 
 /** Modeled resident bytes of one run or patch: three 32-bit values, doubled for growth. */

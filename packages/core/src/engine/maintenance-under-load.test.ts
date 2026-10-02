@@ -230,16 +230,24 @@ describe("a single-row update loop over a folded table", () => {
   }
 
   /**
+   * Event-loop turns each compaction checkpoint takes. Far more than the turns a statement
+   * hands the background between its own steps, on any machine: a statement on a loaded runner
+   * yields more often, and with too few turns per checkpoint the background fold kept up there,
+   * so the loop never outran it and nothing was lent.
+   */
+  const CHECKPOINT_TURNS = 400;
+
+  /**
    * A store whose compaction checkpoints each take many event-loop turns, as a durable store's
    * record writes do. A fold then needs far more turns than the segments it retires, and a loop
-   * that gives it one turn per statement outruns it however cheap its reads are.
+   * that gives it a few turns per statement outruns it however cheap its reads are.
    */
   class SlowCheckpointStore extends MemoryBlockStore {
     checkpointTurns = 0;
     override async updateCompactionJob(
       ...args: Parameters<MemoryBlockStore["updateCompactionJob"]>
     ): ReturnType<MemoryBlockStore["updateCompactionJob"]> {
-      for (let turn = 0; turn < 40; turn += 1) {
+      for (let turn = 0; turn < CHECKPOINT_TURNS; turn += 1) {
         await new Promise((resolve) => setImmediate(resolve));
         this.checkpointTurns += 1;
       }
@@ -269,7 +277,7 @@ describe("a single-row update loop over a folded table", () => {
     // ceiling one segment per statement.
     // Samples can miss the threshold when a fold publishes between them. Instead, prove a
     // statement waited through a whole slow checkpoint, lending its turn to maintenance.
-    expect(mostTurnsPerWrite).toBeGreaterThanOrEqual(40);
+    expect(mostTurnsPerWrite).toBeGreaterThanOrEqual(CHECKPOINT_TURNS);
     expect(await publishedFolds(database, "t")).toBeGreaterThan(1);
     expect(mostLevelZero).toBeLessThan(512 + 64);
     expect(database.maintenanceStatus()).toMatchObject({ lastError: null });

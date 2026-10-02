@@ -175,27 +175,58 @@ function jsonNodes(entry: unknown, limit: number): number {
 }
 
 export function decodeRecordJson(bytes: Uint8Array): unknown {
-  const json = textDecoder.decode(bytes);
-  return JSON.parse(json, (_key, entry: unknown) => {
-    if (
-      typeof entry === "object" &&
-      entry !== null &&
-      !Array.isArray(entry) &&
-      Object.keys(entry).length === 1 &&
-      typeof (entry as { $n?: unknown }).$n === "string"
-    ) {
-      const decimal = (entry as { $n: string }).$n;
-      if (!/^(?:0|[1-9][0-9]{0,19})$/.test(decimal)) {
-        throw new TypeError("Record bigint is not a canonical bounded unsigned decimal");
-      }
-      const value = BigInt(decimal);
-      if (value > MAX_ROW_ID_EXCLUSIVE_END) {
-        throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
-      }
-      return value;
+  // A reviver runs once per parsed value and made a large checkpoint parse fifteen times slower
+  // than the parse itself; tagged bigints are rare, so one pass after parsing finds them.
+  return reviveRecordBigints(JSON.parse(textDecoder.decode(bytes)) as unknown);
+}
+
+/**
+ * Replaces every `{"$n":"<decimal>"}` object in a parsed record with its bigint, in place, and
+ * returns the value. Only an object whose sole key is `$n` with a string value converts, as
+ * the reviver this replaces did; a replaced property is defined rather than assigned, so a key
+ * such as `__proto__` stays an own property.
+ */
+function reviveRecordBigints(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const entry: unknown = value[index];
+      if (typeof entry !== "object" || entry === null) continue;
+      const revived = reviveRecordBigints(entry);
+      if (revived !== entry) value[index] = revived;
     }
-    return entry;
-  });
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 1 && keys[0] === "$n" && typeof record.$n === "string") {
+    return recordBigint(record.$n);
+  }
+  for (const key of keys) {
+    const entry = record[key];
+    if (typeof entry !== "object" || entry === null) continue;
+    const revived = reviveRecordBigints(entry);
+    if (revived !== entry) {
+      Object.defineProperty(record, key, {
+        value: revived,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  return value;
+}
+
+function recordBigint(decimal: string): bigint {
+  if (!/^(?:0|[1-9][0-9]{0,19})$/.test(decimal)) {
+    throw new TypeError("Record bigint is not a canonical bounded unsigned decimal");
+  }
+  const value = BigInt(decimal);
+  if (value > MAX_ROW_ID_EXCLUSIVE_END) {
+    throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
+  }
+  return value;
 }
 
 const ENVELOPE_HEADER_BYTES = 8 + 4 + 4 + 4;
@@ -224,16 +255,64 @@ function decodeEnvelope(
   bytes: Uint8Array,
   retainLayout6 = false,
 ): Uint8Array | undefined {
+  const framed = envelopeFrame(magic, bytes);
+  if (framed === undefined) return undefined;
+  if (crc32(framed.payload) !== framed.checksum) return undefined;
+  return verifiedEnvelopePayload(magic, framed, retainLayout6);
+}
+
+/** `decodeEnvelope`, with the checksum taken a megabyte at a time and `pause` between pieces. */
+async function decodeEnvelopeSliced(
+  magic: string,
+  bytes: Uint8Array,
+  pause: () => Promise<void>,
+): Promise<Uint8Array | undefined> {
+  const framed = envelopeFrame(magic, bytes);
+  if (framed === undefined) return undefined;
+  let checksum = 0;
+  for (let start = 0; start < framed.payload.byteLength; start += ENVELOPE_CHECKSUM_SLICE_BYTES) {
+    checksum = crc32Continue(
+      checksum,
+      framed.payload.subarray(start, start + ENVELOPE_CHECKSUM_SLICE_BYTES),
+    );
+    await pause();
+  }
+  if (checksum !== framed.checksum) return undefined;
+  return verifiedEnvelopePayload(magic, framed, false);
+}
+
+/** Payload bytes a sliced envelope decode checksums between pauses. */
+const ENVELOPE_CHECKSUM_SLICE_BYTES = 1024 * 1024;
+
+interface EnvelopeFrame {
+  version: number;
+  checksum: number;
+  payload: Uint8Array;
+}
+
+/** The header and payload of a well-framed envelope, before its checksum is trusted. */
+function envelopeFrame(magic: string, bytes: Uint8Array): EnvelopeFrame | undefined {
   if (bytes.byteLength < ENVELOPE_HEADER_BYTES) return undefined;
   for (let index = 0; index < 8; index += 1) {
     if (bytes[index] !== magic.charCodeAt(index)) return undefined;
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const version = view.getUint32(8, true);
   const payloadLength = view.getUint32(12, true);
   if (bytes.byteLength !== ENVELOPE_HEADER_BYTES + payloadLength) return undefined;
-  const payload = bytes.subarray(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + payloadLength);
-  if (crc32(payload) !== view.getUint32(16, true)) return undefined;
+  return {
+    version: view.getUint32(8, true),
+    checksum: view.getUint32(16, true),
+    payload: bytes.subarray(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + payloadLength),
+  };
+}
+
+/** A checksum-verified frame's payload, once its version is one this build reads. */
+function verifiedEnvelopePayload(
+  magic: string,
+  framed: EnvelopeFrame,
+  retainLayout6: boolean,
+): Uint8Array {
+  const version = framed.version;
   if (version !== LOG_FORMAT_VERSION && !(retainLayout6 && version === 6)) {
     throw new StorageFormatVersionError(
       "opfs",
@@ -243,7 +322,7 @@ function decodeEnvelope(
       version < LOG_FORMAT_VERSION ? "older" : "newer",
     );
   }
-  return payload;
+  return framed.payload;
 }
 
 const CHUNK_MAGIC = "MNWCHNK1";
@@ -478,4 +557,22 @@ export async function encodeSyncCheckpointSliced(
 export function decodeSyncCheckpoint(bytes: Uint8Array): unknown {
   const payload = decodeEnvelope(SYNC_CHECKPOINT_MAGIC, bytes);
   return payload === undefined ? undefined : decodeRecordJson(payload);
+}
+
+/**
+ * `decodeSyncCheckpoint`, with `pause` awaited between its steps: the checksum a megabyte at a
+ * time, then the text decode, the parse, and the bigint pass each as their own step. The parse
+ * itself is one call, about a millisecond and a half per megabyte of checkpoint.
+ */
+export async function decodeSyncCheckpointSliced(
+  bytes: Uint8Array,
+  pause: () => Promise<void>,
+): Promise<unknown> {
+  const payload = await decodeEnvelopeSliced(SYNC_CHECKPOINT_MAGIC, bytes, pause);
+  if (payload === undefined) return undefined;
+  const json = textDecoder.decode(payload);
+  await pause();
+  const parsed = JSON.parse(json) as unknown;
+  await pause();
+  return reviveRecordBigints(parsed);
 }

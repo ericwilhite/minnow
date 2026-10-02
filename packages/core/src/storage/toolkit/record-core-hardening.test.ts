@@ -2195,3 +2195,52 @@ describe("RecordCore hardening", () => {
     expect(core.removeLease({ id: lease.id, ownerId: lease.ownerId })).toBe(false);
   });
 });
+
+describe("RecordCore sliced load", () => {
+  const physical = { hasBlock: () => true, blockByteLength: () => 8 };
+
+  /** A keyed table's state with `tokens` as its key membership. */
+  function keyedState(tokens: string[]): ReturnType<RecordCore["dump"]> {
+    const core = new RecordCore(physical);
+    core.addTable({
+      id: "t1",
+      name: "items",
+      columns: [{ id: "c1", name: "id", type: "number", nullable: false }],
+      uniqueKeyColumnId: "c1",
+      managed: false,
+      revision: 0,
+      createdAt: "2026-10-01T00:00:00.000Z",
+    });
+    return { ...core.dump(), uniqueKeys: [["t1", tokens]] };
+  }
+
+  it("loads what load loads, pausing while it builds a large membership", async () => {
+    const tokens = Array.from({ length: 70_000 }, (_, index) => `key-${String(index)}`);
+    const state = keyedState(tokens);
+    const eager = new RecordCore(physical);
+    eager.load(state);
+    const sliced = new RecordCore(physical);
+    let pauses = 0;
+    await sliced.loadSliced(state, async () => {
+      pauses += 1;
+    });
+    expect(sliced.dump()).toEqual(eager.dump());
+    expect(pauses).toBeGreaterThanOrEqual(Math.ceil(tokens.length / 16_384));
+    expect(sliced.getExistingUniqueKeys("t1", ["key-5", "absent"])).toEqual(["key-5"]);
+  });
+
+  it.each([
+    ["duplicates", ["a", "b", "a"]],
+    ["an empty identity", ["a", ""]],
+  ])(
+    "refuses a membership with %s as load does, leaving the state untouched",
+    async (what, tokens) => {
+      const state = keyedState(tokens);
+      expect(() => new RecordCore(physical).load(state)).toThrow(what);
+      const core = new RecordCore(physical);
+      const before = core.dump();
+      await expect(core.loadSliced(state, async () => undefined)).rejects.toThrow(what);
+      expect(core.dump()).toEqual(before);
+    },
+  );
+});

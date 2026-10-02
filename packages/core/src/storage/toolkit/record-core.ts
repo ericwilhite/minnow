@@ -358,7 +358,11 @@ export class OrderedStringSet extends Set<string> {
 
   constructor(values?: Iterable<string>) {
     super();
-    if (values !== undefined) this.applyDelta(values);
+    if (values === undefined) return;
+    // A new set needs no membership test per value, and its ordered index is rebuilt on first
+    // use either way; Set.add ignores repeats, which a caller detects by comparing sizes.
+    for (const value of values) super.add(value);
+    this.#indexCurrent = this.size === 0;
   }
 
   override add(value: string): this {
@@ -909,8 +913,10 @@ export interface RecordCoreState {
 
 interface UniqueKeyBuildState {
   record: UniqueKeyBuildRecord;
+  /** Grown in place by each append once it is admitted; a completed build keeps none. */
   chunks: string[][];
-  tokens: Set<string>;
+  /** Every staged token; finish installs this set as the namespace's membership. */
+  tokens: OrderedStringSet;
   completedInput: FinishUniqueKeyBuildInput | null;
 }
 
@@ -3159,7 +3165,7 @@ export class RecordCore {
       updatedAt: input.createdAt,
     };
     this.#setUniqueKeyBuild(
-      { record, chunks: [], tokens: new Set(), completedInput: null },
+      { record, chunks: [], tokens: new OrderedStringSet(), completedInput: null },
       input.buildId,
     );
     return cloneRecord(record);
@@ -3236,8 +3242,8 @@ export class RecordCore {
         MAX_UNIQUE_KEY_BUILD_STAGED_BYTES,
       );
     }
-    const nextTokens = new Set(state.tokens);
-    for (const token of input.keyTokens) nextTokens.add(token);
+    // The staged chunks and tokens grow in place once the limits admit this chunk: copying
+    // them per append made a build quadratic in its key count. Nothing below can throw.
     const next: UniqueKeyBuildState = {
       record: {
         ...state.record,
@@ -3246,11 +3252,13 @@ export class RecordCore {
         retainedBytes: nextRetainedBytes,
         updatedAt: input.updatedAt,
       },
-      chunks: [...state.chunks, [...input.keyTokens]],
-      tokens: nextTokens,
+      chunks: state.chunks,
+      tokens: state.tokens,
       completedInput: null,
     };
     this.#setUniqueKeyBuild(next, input.buildId);
+    next.chunks.push([...input.keyTokens]);
+    next.tokens.applyDelta(input.keyTokens);
     return cloneRecord(next.record);
   }
 
@@ -3323,12 +3331,14 @@ export class RecordCore {
       completedAt: input.completedAt,
     };
     this.#setTable(updated);
-    this.#uniqueKeys.set(state.record.namespaceId, new OrderedStringSet(state.tokens));
+    // The staged set becomes the membership as it stands, so finishing costs the same for a
+    // thousand keys as for a million; later commits then mutate it as the namespace's own.
+    this.#uniqueKeys.set(state.record.namespaceId, state.tokens);
     this.#setUniqueKeyBuild(
       {
         record: completedRecord,
         chunks: [],
-        tokens: state.tokens,
+        tokens: new OrderedStringSet(),
         completedInput: cloneRecord(input),
       },
       input.buildId,
@@ -6029,7 +6039,29 @@ export class RecordCore {
 
   /** Replaces the whole record state with a dump's content. */
   load(state: RecordCoreState): void {
+    this.#loadCloned(cloneRecord(state));
+  }
+
+  /**
+   * `load`, with the part that grows with the database run a slice at a time: each UNIQUE
+   * membership — a key per row of a keyed table — is checked and built in bounded pieces with
+   * `pause` awaited between them, and the rest of the validation and the swap then run as in
+   * `load`. `state` must not change until the returned promise settles.
+   */
+  async loadSliced(state: RecordCoreState, pause: () => Promise<void>): Promise<void> {
     const cloned = cloneRecord(state);
+    for (const [key, tokens] of cloned.uniqueKeys) {
+      await pause();
+      validatedMemberships.set(
+        tokens,
+        await buildMembershipSliced(tokens, `Unique membership ${key}`, pause),
+      );
+    }
+    await pause();
+    this.#loadCloned(cloned);
+  }
+
+  #loadCloned(cloned: RecordCoreState): void {
     validateRecordCoreState(cloned, this.#physical);
     // A recovery candidate may intentionally discard an unpublished WAL suffix whose physical
     // blocks were already reclaimed. Clearing the old candidate state must therefore not need
@@ -6100,13 +6132,18 @@ export class RecordCore {
       if (retained.length > 0) this.#ftsDeltas.set(key, new Map(retained));
     }
     for (const [tableId, tokens] of cloned.uniqueKeys) {
-      this.#uniqueKeys.set(tableId, new OrderedStringSet(tokens));
+      // Validation already built this membership to find duplicates; install that one.
+      this.#uniqueKeys.set(
+        tableId,
+        validatedMemberships.get(tokens) ?? new OrderedStringSet(tokens),
+      );
+      validatedMemberships.delete(tokens);
     }
     this.#activeUniqueKeyBuildCount = 0;
     this.#uniqueKeyBuildStagedBytes = 0;
     this.#uniqueKeyBuildStagedEntries = 0;
     for (const [record, chunks, completedInput] of cloned.uniqueKeyBuilds) {
-      const tokens = new Set(chunks.flat());
+      const tokens = new OrderedStringSet(chunks.flat());
       this.#uniqueKeyBuilds.set(record.buildId, { record, chunks, tokens, completedInput });
       if (record.state === "active") {
         this.#activeUniqueKeyBuildCount += 1;
@@ -6717,6 +6754,38 @@ function exactStringPartition(
 }
 
 /** Exhaustive checkpoint validation before `load` clears any live state. */
+/** Tokens `buildMembershipSliced` checks and adds between pauses. */
+const MEMBERSHIP_SLICE = 16_384;
+
+/**
+ * One UNIQUE membership list checked and built as `validateRecordCoreState` would — every
+ * token a non-empty string, none repeated — a slice of `MEMBERSHIP_SLICE` tokens at a time.
+ */
+async function buildMembershipSliced(
+  values: readonly string[],
+  label: string,
+  pause: () => Promise<void>,
+): Promise<OrderedStringSet> {
+  const set = new OrderedStringSet();
+  for (let start = 0; start < values.length; start += MEMBERSHIP_SLICE) {
+    const slice = values.slice(start, start + MEMBERSHIP_SLICE);
+    if (slice.some((value) => typeof value !== "string" || value.length === 0)) {
+      throw new TypeError(`${label} contains an empty identity`);
+    }
+    set.applyDelta(slice);
+    await pause();
+  }
+  if (set.size !== values.length) throw new TypeError(`${label} contains duplicates`);
+  return set;
+}
+
+/**
+ * Memberships `validateRecordCoreState` built while checking a state's token lists for
+ * duplicates, by list identity, so `load` installs each instead of building a second set of the
+ * same keys. Weak, so a state validated and never loaded leaves nothing behind.
+ */
+const validatedMemberships = new WeakMap<readonly string[], OrderedStringSet>();
+
 function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlocks): void {
   const runtimeState: unknown = state;
   if (typeof runtimeState !== "object" || runtimeState === null) {
@@ -6762,11 +6831,16 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
     }
     return keys;
   };
-  const uniqueStrings = (values: readonly string[], label: string): void => {
+  const uniqueStrings = (values: readonly string[], label: string): OrderedStringSet => {
+    // `loadSliced` checked and built this list a slice at a time already.
+    const prebuilt = validatedMemberships.get(values);
+    if (prebuilt !== undefined) return prebuilt;
     if (values.some((value) => typeof value !== "string" || value.length === 0)) {
       throw new TypeError(`${label} contains an empty identity`);
     }
-    if (new Set(values).size !== values.length) throw new TypeError(`${label} contains duplicates`);
+    const set = new OrderedStringSet(values);
+    if (set.size !== values.length) throw new TypeError(`${label} contains duplicates`);
+    return set;
   };
   if (state.currentVersion !== null) whole(state.currentVersion, "Current manifest version");
   whole(state.catalogEpoch, "Catalog epoch");
@@ -7550,7 +7624,9 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
     ([key]) => key,
     "Checkpoint unique memberships",
   );
-  for (const [key, tokens] of state.uniqueKeys) uniqueStrings(tokens, `Unique membership ${key}`);
+  for (const [key, tokens] of state.uniqueKeys) {
+    validatedMemberships.set(tokens, uniqueStrings(tokens, `Unique membership ${key}`));
+  }
   const expectedMembershipNamespaces = new Set<string>();
   for (const table of state.tables) {
     if (table.uniqueKeyColumnId !== undefined) expectedMembershipNamespaces.add(table.id);
