@@ -54,7 +54,7 @@ one checksummed frame to the log. In strict mode it also flushes a separate chec
 acknowledgement boundary before replying. A large commit prepares its keys and index changes a
 slice at a time first. When its frame is larger than one piece of a few megabytes, it writes all
 but the last piece as continuation frames, then applies itself and appends the last piece in
-one short step. A commit whose frame could never fit the log's headroom (about 192 MiB) is
+one short step. A commit whose frame could never fit the log's headroom (about 960 MiB) is
 refused with `StorageResourceLimitError` (`"log frame byte"`) before anything changes. Reads answer from memory
 and from synchronous reads of the data files. And because the leader is provably the only
 writer, it never checks anything for freshness — the per-operation probes and version checks
@@ -215,8 +215,9 @@ and relocation is split into WAL frames of at most 256 placements. Each batch su
 without changing block IDs, and the source extent is deleted only after all of its live placements
 have moved.
 
-The WAL and either checkpoint are each capped at 256 MiB. The log is folded into a checkpoint slot
-before approaching that bound. The per-resource limits below share it: everything they admit
+The WAL is capped at 1 GiB and either checkpoint at 256 MiB. The log is folded into a checkpoint
+slot well before its bound; one commit's frame may take all but 64 MiB of it. The per-resource
+limits below share the checkpoint bound: everything they admit
 must still encode into one checkpoint slot, and a write that would push the encoded metadata
 past it is refused with `StorageResourceLimitError` (`resource: "checkpoint byte"`), while
 aborts, rollbacks, and collection steps still go through, so the database can always be brought

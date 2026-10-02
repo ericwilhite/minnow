@@ -99,8 +99,9 @@ and its lease, which a crashed tab's transaction loses. A transaction's commit a
 key and index changes — one key per row of a keyed table plus one entry per row for each
 secondary or full-text index — and those have no fixed limit: each store writes them in bounded
 pieces, and a large commit prepares them a slice at a time so that it never holds the thread for
-long. On OPFS a single commit's log frame must still fit the log, about 192 MiB, which is
-several million rows. A database also admits at most 64 pending
+long. On OPFS a single commit's log frame must still fit the log, about 960 MiB, which is
+millions of rows, and the database's metadata — every keyed table's keys among it — must fit one
+256 MiB checkpoint. A database also admits at most 64 pending
 write calls, and a buffered writer at most 64 unawaited `add()` calls, so a producer must await
 writes when it reaches backpressure.
 

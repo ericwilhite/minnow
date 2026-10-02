@@ -29,7 +29,7 @@ export const OVERLAY_NONE = 0xffffffff;
 export const OVERLAY_PATCH_BYTES = 8;
 
 /** Bytes per key-index cell: the key (eight) and its entry (four). */
-const NUMBER_INDEX_CELL_BYTES = 12;
+export const NUMBER_INDEX_CELL_BYTES = 12;
 /** Modeled bytes per key in the string/boolean index: a map entry and its key reference. */
 const MAP_INDEX_ENTRY_BYTES = 64;
 /** Modeled bytes per entry: slot, newest location, and the slot's segment, four bytes each. */
@@ -606,10 +606,19 @@ abstract class OverlayKeyState {
   #olderBytes = 0;
   #olderCharged = 0;
 
-  constructor(numeric: boolean, sources: OverlayPatchSources, charge: OverlayCharge) {
+  /**
+   * `expectedKeys` sizes a number index up front, so a replay of millions of keys never stops
+   * the thread to rehash its whole table at a doubling.
+   */
+  constructor(
+    numeric: boolean,
+    sources: OverlayPatchSources,
+    charge: OverlayCharge,
+    expectedKeys = 8,
+  ) {
     this.charge = charge;
     this.sources = sources;
-    if (numeric) this.numbers = new NumberKeyIndex(charge);
+    if (numeric) this.numbers = new NumberKeyIndex(charge, expectedKeys);
     else this.map = new Map();
   }
 
@@ -873,8 +882,10 @@ export class OverlayReplay extends OverlayKeyState {
     readonly zonePruned: boolean;
     readonly tableName: string;
     readonly charge: OverlayCharge;
+    /** About how many keys this pass collects; sizes its index up front. */
+    readonly expectedKeys?: number;
   }) {
-    super(options.numeric, options.sources, options.charge);
+    super(options.numeric, options.sources, options.charge, options.expectedKeys);
     this.#dead = options.dead;
     this.#partition = options.partition;
     this.#partitions = options.partitions;

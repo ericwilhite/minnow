@@ -3850,7 +3850,7 @@ describe("OPFS leadership", () => {
     const degraded = await store.getStorageStats();
     expect(degraded.maintenance).toMatchObject({
       degraded: true,
-      walLimitBytes: 256 * 1024 * 1024,
+      walLimitBytes: MAX_OPFS_WAL_BYTES,
     });
     expect(degraded.maintenance?.consecutiveFailures).toBeGreaterThan(0);
     expect(checkpointAttempts).toBeLessThan(12);

@@ -121,6 +121,7 @@ import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { crc32Continue } from "../block-format/checksum.js";
 import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
 import {
+  NUMBER_INDEX_CELL_BYTES,
   OVERLAY_PATCH_BYTES,
   OVERLAY_RANGE_BYTES_PER_ROW,
   OverlayPatchCollector,
@@ -14786,6 +14787,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               zonePruned,
               tableName: table.name,
               charge,
+              // Sized for this pass's share of the keys, within a quarter of its scratch.
+              expectedKeys: Math.min(
+                Math.ceil(keyRows / partitions),
+                Math.floor(scratchLimit / (8 * NUMBER_INDEX_CELL_BYTES)),
+              ),
             });
             // Decoded key blocks usually come from the buffer pool, so these loops can run for a
             // long time without a real await, so they hand the event loop a turn between blocks.

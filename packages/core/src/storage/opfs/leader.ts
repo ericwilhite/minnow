@@ -174,7 +174,13 @@ const CHECKPOINT_WAL_BYTES = 4 * 1024 * 1024;
 const CHECKPOINT_WRITE_SLICE_BYTES = 1024 * 1024;
 const CHECKPOINT_ENTRIES = 1024;
 /** A failed checkpoint may defer compaction, but the recovery log itself stays bounded. */
-export const MAX_OPFS_WAL_BYTES = 256 * 1024 * 1024;
+/**
+ * The log's safety fuse against growth that no checkpoint folds. Layout 9 raised it from
+ * 256 MiB so that one commit's frame — written as continuation pieces and replayed a slice at a
+ * time — may be most of a gigabyte; a layout-8 build never reads such a log, since the marker
+ * refuses it first.
+ */
+export const MAX_OPFS_WAL_BYTES = 1024 * 1024 * 1024;
 export const MAX_OPFS_CHECKPOINT_BYTES = 256 * 1024 * 1024;
 /** Failed physical reclamation cannot permit byte-growing work forever. */
 const MAX_OPFS_CLEANUP_DEBT_BYTES = 64 * 1024 * 1024;
@@ -4470,11 +4476,7 @@ export class OpfsLeader {
     validateFtsPostingQueries(terms);
     validateFtsReadVersion(upToVersion);
     validateFtsCandidateLimit(maxRowIds);
-    return this.#run(async () => {
-      // Unlike immutable table blocks, derived-index extents are not protected by reader leases:
-      // DROP INDEX may reclaim them immediately. Hold the leader queue until every selected
-      // chunk is copied so a concurrent drop yields either the complete old base or no base,
-      // never a missing file halfway through a query.
+    return this.#readPostingsOffQueue(async () => {
       const key = postingStorageKey(tableId, columnId);
       const pointer = this.#ftsBases.get(key);
       const coversVersion = pointer?.coversVersion ?? -1;
@@ -4557,7 +4559,7 @@ export class OpfsLeader {
     validateId(columnId);
     validateFtsReadVersion(upToVersion);
     validateFtsOrderedReadLimits(maxRowIds, maxRetainedBytes);
-    return this.#run(async () => {
+    return this.#readPostingsOffQueue(async () => {
       const key = postingStorageKey(tableId, columnId);
       const pointer = this.#ftsBases.get(key);
       const coversVersion = pointer?.coversVersion ?? -1;
@@ -4592,6 +4594,24 @@ export class OpfsLeader {
         hasBase: pointer !== undefined,
       };
     });
+  }
+
+  /**
+   * Runs an index read without waiting for the queue. The read takes its base pointer and
+   * deltas in one synchronous step, so they agree, and reads the base's chunks afterwards.
+   * Derived-index extents are not protected by reader leases — DROP INDEX, a fold's new base,
+   * or a repack may reclaim them meanwhile — but every chunk read is checksummed and extent ids
+   * are never reused, so a reclaimed chunk fails to read rather than reading wrong. Then the
+   * read runs again on the queue, where nothing can reclaim what it reads: a lookup waits for
+   * neither a long fold nor a checkpoint unless the base moved under it.
+   */
+  async #readPostingsOffQueue<T>(read: () => Promise<T>): Promise<T> {
+    if (this.#poisoned || this.#closed) return this.#run(read);
+    try {
+      return await read();
+    } catch {
+      return this.#run(read);
+    }
   }
 
   async #loadFtsChunksBounded(
