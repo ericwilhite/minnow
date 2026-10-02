@@ -65,6 +65,7 @@
     "@eslint/js": "^10.0.1",
     "@minnowdb/core-layout6": "npm:@minnowdb/core@0.10.0",
     "@minnowdb/core-layout7": "npm:@minnowdb/core@0.12.1",
+    "@minnowdb/core-layout8": "npm:@minnowdb/core@0.13.1",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^4.1.11",

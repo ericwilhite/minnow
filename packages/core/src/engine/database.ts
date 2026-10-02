@@ -49,7 +49,12 @@ import {
   type InsertBatchInputLike,
 } from "./batch.js";
 import { ArtifactCache } from "./artifact-cache.js";
-import { estimateBatchBytes, estimateRowBytes, estimateValuesBytes } from "./byte-estimates.js";
+import {
+  estimateBatchBytes,
+  estimateBatchBytesSliced,
+  estimateRowBytes,
+  estimateValuesBytes,
+} from "./byte-estimates.js";
 import {
   composeScopeEffect,
   netScopeEffect,
@@ -117,7 +122,7 @@ import { crc32Continue } from "../block-format/checksum.js";
 import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
 import {
   estimateCompactionRowsPerOutput,
-  planAlignedWriteBlockRanges as writeBlockRanges,
+  planAlignedWriteBlockRangesSliced as writeBlockRangesSliced,
   type WriteColumnValues,
 } from "./write-block-planner.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_PARAMETERS } from "./cache-limits.js";
@@ -3297,7 +3302,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
     const secondaryCoverage = buildSecondaryDeleteCoverage(table);
     if (secondaryCoverage.length > 0) {
-      transaction.setFtsChanges({ tableId: table.id, columns: secondaryCoverage });
+      await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
     }
     let deletedRowCount: number;
     let storedBytes = 0;
@@ -3339,7 +3344,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         validatedStringByteLengths.set(values, keyStringByteLengths);
       }
       const plannedColumn = writeColumnValues(keyColumn.type, values);
-      const ranges = writeBlockRanges(
+      const ranges = await writeBlockRangesSliced(
         [plannedColumn],
         values.length,
         this.#rowsPerBlock,
@@ -3553,7 +3558,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
         ),
       );
-      const ranges = writeBlockRanges(
+      const ranges = await writeBlockRangesSliced(
         plannedColumns,
         input.keys.length,
         this.#rowsPerBlock,
@@ -3594,7 +3599,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
       const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
       if (secondaryDeltas.length > 0) {
-        transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
+        await transaction.setFtsChangesSliced(
+          { tableId: table.id, columns: secondaryDeltas },
+          { owned: true },
+        );
       }
       const updateValueAt = (
         source: "new" | "old",
@@ -3754,7 +3762,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const started = performance.now();
     const requestedRowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     let rowCount = requestedRowCount;
-    let logicalBytes = estimateBatchBytes(input);
+    let logicalBytes = await estimateBatchBytesSliced(input);
     // A large batch's passes over its rows each run whole; a turn between them keeps any one
     // short instead of letting them run back to back.
     await maybeYieldToEventLoop();
@@ -3783,7 +3791,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let blockCount = 0;
     let counts: { inserted: number; updated: number } | undefined;
     let skippedRowCount = 0;
-    let acceptedRowIndexes = Array.from({ length: requestedRowCount }, (_, index) => index);
+    let acceptedRowIndexes = await rowIndexesSliced(requestedRowCount);
     let upsertFirings: UpsertFirings | undefined;
     let encodeMs = 0;
     let stageMs = 0;
@@ -3837,7 +3845,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         input = filtered.batch;
         rowCount = filtered.rowCount;
         upsertFirings = filtered.firings;
-        logicalBytes = estimateBatchBytes(input);
+        logicalBytes = await estimateBatchBytesSliced(input);
         resolvedKeys = await batchKeys(table, input);
         if (rowCount === 0) {
           await transaction.abort();
@@ -3869,11 +3877,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       if (resolvedKeys !== undefined) {
-        await transaction.setUniqueKeyChangesSliced({
-          tableId: table.id,
-          keyTokens: [...resolvedKeys.keys()],
-          requireAbsent: kind === "insert",
-        });
+        await transaction.setUniqueKeyChangesSliced(
+          {
+            tableId: table.id,
+            keyTokens: await mapKeysSliced(resolvedKeys),
+            requireAbsent: kind === "insert",
+          },
+          { distinct: true },
+        );
       }
       const assertForeignKeys = (): Promise<void> =>
         this.#assertForeignKeysPresent(
@@ -3906,45 +3917,64 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (kind === "insert") {
         const ftsDeltas = await buildFtsColumnDeltas(table, input, rowIds.start);
         if (ftsDeltas.length > 0) {
-          transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
+          await transaction.setFtsChangesSliced(
+            { tableId: table.id, columns: ftsDeltas },
+            { owned: true },
+          );
         }
       }
       const secondaryDeltas = await buildSecondaryInsertDeltas(table, input, rowIds.start);
       if (secondaryDeltas.length > 0) {
-        transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
+        await transaction.setFtsChangesSliced(
+          { tableId: table.id, columns: secondaryDeltas },
+          { owned: true },
+        );
       }
       await maybeYieldToEventLoop();
       const plannedColumns = table.columns.map((column) =>
         writeColumnValues(column.type, input.columns[column.name] ?? []),
       );
       await maybeYieldToEventLoop();
-      const ranges = writeBlockRanges(
+      const ranges = await writeBlockRangesSliced(
         plannedColumns,
         rowCount,
         this.#rowsPerBlock,
         this.#targetBlockBytes,
       );
-      const plannedBlocks = table.columns.flatMap((column, columnIndex) => {
+      const plannedBlocks: Array<{
+        column: TableColumnRecord;
+        values: readonly BatchValue[];
+        plannedColumn: WriteColumnValues;
+        start: number;
+        end: number;
+        part: number;
+        maximumStoredBytes: number;
+      }> = [];
+      for (const [columnIndex, column] of table.columns.entries()) {
         const values = input.columns[column.name] ?? [];
         const plannedColumn = plannedColumns[columnIndex];
         if (plannedColumn === undefined)
           throw new Error(`Write column disappeared: ${column.name}`);
         columnBlockIds[column.id] = [];
-        return ranges.map(({ start, end }, part) => ({
-          column,
-          values,
-          plannedColumn,
-          start,
-          end,
-          part,
-          maximumStoredBytes: maximumWriteBlockStoredBytes(
+        for (const [part, { start, end }] of ranges.entries()) {
+          // Measuring a string block's bytes reads each of its values.
+          await maybeYieldToEventLoop();
+          plannedBlocks.push({
+            column,
+            values,
             plannedColumn,
             start,
             end,
-            this.#compression,
-          ),
-        }));
-      });
+            part,
+            maximumStoredBytes: maximumWriteBlockStoredBytes(
+              plannedColumn,
+              start,
+              end,
+              this.#compression,
+            ),
+          });
+        }
+      }
       for (let next = 0; next < plannedBlocks.length;) {
         const group: typeof plannedBlocks = [];
         let maximumGroupBytes = 0;
@@ -7792,12 +7822,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (kind === "insert") {
       const ftsDeltas = await buildFtsColumnDeltas(table, batch, rowIds.start);
       if (ftsDeltas.length > 0) {
-        transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
+        await transaction.setFtsChangesSliced(
+          { tableId: table.id, columns: ftsDeltas },
+          { owned: true },
+        );
       }
     }
     const secondaryDeltas = await buildSecondaryInsertDeltas(table, batch, rowIds.start);
     if (secondaryDeltas.length > 0) {
-      transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
+      await transaction.setFtsChangesSliced(
+        { tableId: table.id, columns: secondaryDeltas },
+        { owned: true },
+      );
     }
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
@@ -7805,7 +7841,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const plannedColumns = table.columns.map((column) =>
       writeColumnValues(column.type, batch.columns[column.name] ?? []),
     );
-    const ranges = writeBlockRanges(
+    const ranges = await writeBlockRangesSliced(
       plannedColumns,
       rowCount,
       this.#rowsPerBlock,
@@ -9706,7 +9742,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
     const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
     if (secondaryDeltas.length > 0) {
-      transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
+      await transaction.setFtsChangesSliced(
+        { tableId: table.id, columns: secondaryDeltas },
+        { owned: true },
+      );
     }
     const sessionUpdateValueAt = (
       source: "new" | "old",
@@ -9844,7 +9883,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
     const secondaryCoverage = buildSecondaryDeleteCoverage(table);
     if (secondaryCoverage.length > 0) {
-      transaction.setFtsChanges({ tableId: table.id, columns: secondaryCoverage });
+      await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
     }
     // Fire only per existing row (session-visible state included): missing keys must not
     // produce phantom all-null OLD images.
@@ -9919,7 +9958,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
       ),
     );
-    const ranges = writeBlockRanges(
+    const ranges = await writeBlockRangesSliced(
       plannedColumns,
       input.keys.length,
       this.#rowsPerBlock,
@@ -9983,7 +10022,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const blockIds: string[] = [];
     const blockStager = new BoundedWriteBlockStager(transaction);
     const plannedColumn = writeColumnValues(keyColumn.type, values);
-    const ranges = writeBlockRanges(
+    const ranges = await writeBlockRangesSliced(
       [plannedColumn],
       values.length,
       this.#rowsPerBlock,
@@ -26737,6 +26776,29 @@ class UniqueTermRuns extends Set<string> {
 }
 
 /** Drives a step generator to its result, offering the event loop a turn between steps. */
+/** Values the sliced array builders below copy between turns. */
+const ARRAY_BUILD_SLICE = 16_384;
+
+/** `[0, 1, …, count - 1]`, built with the event loop offered a turn between slices. */
+async function rowIndexesSliced(count: number): Promise<number[]> {
+  const indexes = new Array<number>(count);
+  for (let index = 0; index < count; index += 1) {
+    indexes[index] = index;
+    if (index % ARRAY_BUILD_SLICE === ARRAY_BUILD_SLICE - 1) await maybeYieldToEventLoop();
+  }
+  return indexes;
+}
+
+/** A map's keys as an array, built with the event loop offered a turn between slices. */
+async function mapKeysSliced<Key>(map: ReadonlyMap<Key, unknown>): Promise<Key[]> {
+  const keys: Key[] = [];
+  for (const key of map.keys()) {
+    keys.push(key);
+    if (keys.length % ARRAY_BUILD_SLICE === 0) await maybeYieldToEventLoop();
+  }
+  return keys;
+}
+
 async function runStepsSliced<T>(steps: Generator<void, T>): Promise<T> {
   let step = steps.next();
   while (step.done !== true) {

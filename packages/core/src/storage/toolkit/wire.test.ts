@@ -679,7 +679,19 @@ describe("sliced record JSON parsing", () => {
     await fc.assert(
       fc.asyncProperty(tree, async (value) => {
         const bytes = encodeRecordJson(value);
-        expect(await parseRecordJsonSliced(bytes, pause)).toEqual(decodeRecordJson(bytes));
+        // A generated record can hold an object whose sole key is `$n` with a value that is no
+        // decimal, which no stored record contains and both decoders refuse. Compare outcomes,
+        // so such a case checks refusal parity instead of failing and shrinking a huge tree.
+        let expected: unknown;
+        try {
+          expected = decodeRecordJson(bytes);
+        } catch (error) {
+          await expect(parseRecordJsonSliced(bytes, pause)).rejects.toThrow(
+            (error as Error).message,
+          );
+          return;
+        }
+        expect(await parseRecordJsonSliced(bytes, pause)).toEqual(expected);
       }),
       { numRuns: 80 },
     );

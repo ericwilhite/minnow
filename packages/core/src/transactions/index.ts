@@ -1,5 +1,5 @@
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
-import { maybeYieldToEventLoop } from "../work-slicer.js";
+import { maybeYieldToEventLoop, runSteps, runStepsSliced } from "../work-slicer.js";
 
 import {
   assertTransactionArtifactBatchLimits,
@@ -16,9 +16,6 @@ import {
   MAX_TRANSACTION_STAGE_BLOCKS,
   MAX_TRANSACTION_STAGE_BYTES,
   MAX_TRANSACTION_STAGE_SEGMENTS,
-  MAX_TRANSACTION_COMMIT_DELTA_BYTES,
-  MAX_TRANSACTION_COMMIT_DELTA_ENTRIES,
-  transactionCommitDeltaRetainedBytes,
   type ManifestSummary,
   type RowIdRange,
   type SegmentRecord,
@@ -35,6 +32,17 @@ import {
 
 /** Keys `setUniqueKeyChangesSliced` deduplicates between turns. */
 const UNIQUE_KEY_CHANGE_SLICE = 16_384;
+
+/**
+ * One indexed column's postings from the operations of one transaction. Each operation adds a
+ * term-sorted run, and the runs are merged only when the commit needs one list; merging on
+ * every operation rebuilt a map of every term the transaction had touched so far.
+ */
+interface FtsColumnRuns {
+  runs: FtsPosting[][];
+  /** Sum of the runs' token totals; merging subtracts tokens of duplicate row locators. */
+  totalTokens: number;
+}
 
 export interface TransactionManagerOptions {
   now?: () => Date;
@@ -238,12 +246,7 @@ interface JournalView {
 export class DatabaseTransaction {
   #record: TransactionRecord;
   readonly #uniqueKeyChanges: UniqueKeyChanges[] = [];
-  readonly #ftsChanges = new Map<
-    string,
-    Map<string, { postings: Map<string, FtsPosting>; totalTokens: number }>
-  >();
-  #commitDeltaBytes = 0;
-  #commitDeltaEntries = 0;
+  readonly #ftsChanges = new Map<string, Map<string, FtsColumnRuns>>();
   #compactionJobId: string | null = null;
   readonly #compactionSourceBlockIds = new Set<string>();
   readonly #changedTableIds = new Set<string>();
@@ -528,14 +531,19 @@ export class DatabaseTransaction {
       for (const token of change.keyTokens) addString(token);
       bytes = checkpointByteSum(bytes, 32);
     }
-    for (const change of this.#materializedFtsChanges()) {
-      addString(change.tableId);
-      for (const column of change.columns) {
-        addString(column.columnId);
+    for (const [tableId, columns] of this.#ftsChanges) {
+      addString(tableId);
+      for (const [columnId, entry] of columns) {
+        addString(columnId);
         bytes = checkpointByteSum(bytes, 48);
-        for (const posting of column.postings) {
-          addString(posting.term);
-          bytes = checkpointByteSum(bytes, posting.rowIds.length * 8 + posting.tf.length * 8 + 32);
+        for (const run of entry.runs) {
+          for (const posting of run) {
+            addString(posting.term);
+            bytes = checkpointByteSum(
+              bytes,
+              posting.rowIds.length * 8 + posting.tf.length * 8 + 32,
+            );
+          }
         }
       }
     }
@@ -595,8 +603,6 @@ export class DatabaseTransaction {
     this.#stagedSegmentsView = undefined;
     this.#uniqueKeyChanges.splice(0);
     this.#ftsChanges.clear();
-    this.#commitDeltaBytes = 0;
-    this.#commitDeltaEntries = 0;
     for (const changes of checkpoint.uniqueKeyChanges) this.setUniqueKeyChanges(changes);
     for (const changes of checkpoint.ftsChanges) this.setFtsChanges(changes);
     this.#compactionJobId = checkpoint.compactionJobId;
@@ -818,7 +824,7 @@ export class DatabaseTransaction {
     const committedAt = dateIsoString(this.now());
     const committedRevision = advanceRevision(this.#record.revision, 2);
     const compactionJobId = this.#compactionJobId;
-    const ftsChanges = this.#materializedFtsChanges();
+    const ftsChanges = await this.#materializedFtsChangesSliced();
     // Keep the exact staged metadata before issuing the atomic write. A store is allowed to
     // commit and then lose the acknowledgement; #recoverCommitted turns that into success, so
     // recording this only after the await would make the caller's local catalog advancement
@@ -1010,15 +1016,6 @@ export class DatabaseTransaction {
   /** Appends one operation's key changes; entries commit in operation order. */
   setUniqueKeyChanges(changes: UniqueKeyChanges): void {
     this.#assertActive();
-    if (changes.keyTokens.length > MAX_TRANSACTION_COMMIT_DELTA_ENTRIES) {
-      throw new RangeError(
-        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_ENTRIES)} entries`,
-      );
-    }
-    // Walk the caller-owned array before allocating a Set or clone. The aggregate tracker below
-    // charges the deduplicated retained form, while this preflight prevents one hostile call from
-    // creating a database-sized temporary allocation first.
-    transactionCommitDeltaRetainedBytes([changes], []);
     const normalized: UniqueKeyChanges = {
       tableId: changes.tableId,
       // Deduplicated, not sorted: membership is all a store reads from these, and sorting fifty
@@ -1027,42 +1024,52 @@ export class DatabaseTransaction {
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
     };
-    this.#reserveCommitDelta([normalized], []);
     this.#uniqueKeyChanges.push(normalized);
   }
 
   /**
    * `setUniqueKeyChanges` for a large key list, deduplicated a slice at a time with the event
-   * loop offered a turn between slices; the same checks run before and after.
+   * loop offered a turn between slices. With `distinct`, the caller vouches that no token
+   * repeats — a map's keys — and the list is kept as given.
    */
-  async setUniqueKeyChangesSliced(changes: UniqueKeyChanges): Promise<void> {
+  async setUniqueKeyChangesSliced(
+    changes: UniqueKeyChanges,
+    options: { distinct?: boolean } = {},
+  ): Promise<void> {
     this.#assertActive();
+    if (options.distinct === true) {
+      this.#uniqueKeyChanges.push({
+        tableId: changes.tableId,
+        keyTokens: changes.keyTokens,
+        requireAbsent: changes.requireAbsent,
+        ...(changes.remove === undefined ? {} : { remove: changes.remove }),
+      });
+      return;
+    }
     if (changes.keyTokens.length < UNIQUE_KEY_CHANGE_SLICE) {
       this.setUniqueKeyChanges(changes);
       return;
     }
-    if (changes.keyTokens.length > MAX_TRANSACTION_COMMIT_DELTA_ENTRIES) {
-      throw new RangeError(
-        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_ENTRIES)} entries`,
-      );
-    }
-    await maybeYieldToEventLoop();
-    transactionCommitDeltaRetainedBytes([changes], []);
     const unique = new Set<string>();
+    const keyTokens: string[] = [];
     for (let start = 0; start < changes.keyTokens.length; start += UNIQUE_KEY_CHANGE_SLICE) {
       await maybeYieldToEventLoop();
       const end = Math.min(changes.keyTokens.length, start + UNIQUE_KEY_CHANGE_SLICE);
-      for (let index = start; index < end; index += 1) unique.add(changes.keyTokens[index] ?? "");
+      for (let index = start; index < end; index += 1) {
+        const token = changes.keyTokens[index] ?? "";
+        const before = unique.size;
+        unique.add(token);
+        if (unique.size !== before) keyTokens.push(token);
+      }
     }
     await maybeYieldToEventLoop();
     this.#assertActive();
     const normalized: UniqueKeyChanges = {
       tableId: changes.tableId,
-      keyTokens: [...unique],
+      keyTokens,
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
     };
-    this.#reserveCommitDelta([normalized], []);
     this.#uniqueKeyChanges.push(normalized);
   }
 
@@ -1076,99 +1083,81 @@ export class DatabaseTransaction {
    */
   setFtsChanges(changes: FtsChanges): void {
     this.#assertActive();
-    const existingColumns = this.#ftsChanges.get(changes.tableId);
-    const tokenTotals = new Map<string, number>();
+    const runs = changes.columns.map((column) => runSteps(copiedFtsRunSteps(column.postings)));
+    this.#addFtsRuns(changes, runs);
+  }
+
+  /**
+   * `setFtsChanges` for a large batch, checked and copied a slice at a time between event-loop
+   * turns. With `owned`, the caller built these postings for this call and hands them over, so
+   * they are kept rather than copied.
+   */
+  async setFtsChangesSliced(changes: FtsChanges, options: { owned?: boolean } = {}): Promise<void> {
+    this.#assertActive();
+    const runs: CopiedFtsRun[] = [];
     for (const column of changes.columns) {
-      const prior =
-        tokenTotals.get(column.columnId) ?? existingColumns?.get(column.columnId)?.totalTokens ?? 0;
-      tokenTotals.set(
+      runs.push(await runStepsSliced(copiedFtsRunSteps(column.postings, options.owned === true)));
+    }
+    this.#assertActive();
+    this.#addFtsRuns(changes, runs);
+  }
+
+  #addFtsRuns(changes: FtsChanges, runs: readonly CopiedFtsRun[]): void {
+    let columns = this.#ftsChanges.get(changes.tableId);
+    const totals = new Map<string, number>();
+    for (const [index, column] of changes.columns.entries()) {
+      const prior = totals.get(column.columnId) ?? columns?.get(column.columnId)?.totalTokens ?? 0;
+      const duplicates = runs[index]?.duplicateTokens ?? 0;
+      if (duplicates > column.totalTokens) throw new Error("Posting token merge is inconsistent");
+      totals.set(
         column.columnId,
-        safeWholeNumberSum([prior, column.totalTokens], "Full-text transaction token count"),
+        safeWholeNumberSum(
+          [prior, column.totalTokens - duplicates],
+          "Full-text transaction token count",
+        ),
       );
     }
-    this.#reserveCommitDelta([], [changes]);
-    let columns = this.#ftsChanges.get(changes.tableId);
     if (columns === undefined) {
       columns = new Map();
       this.#ftsChanges.set(changes.tableId, columns);
     }
-    for (const column of changes.columns) {
+    for (const [index, column] of changes.columns.entries()) {
+      const run = runs[index]?.postings ?? [];
       const present = columns.get(column.columnId);
+      const totalTokens = totals.get(column.columnId) ?? 0;
       if (present === undefined) {
-        columns.set(column.columnId, {
-          postings: new Map(
-            column.postings.map((posting) => [
-              posting.term,
-              {
-                term: posting.term,
-                rowIds: [...posting.rowIds],
-                tf: [...posting.tf],
-              },
-            ]),
-          ),
-          totalTokens: column.totalTokens,
-        });
-        continue;
+        // An empty run still records the column: its presence proves the writer saw the index.
+        columns.set(column.columnId, { runs: run.length === 0 ? [] : [run], totalTokens });
+      } else {
+        if (run.length > 0) present.runs.push(run);
+        present.totalTokens = totalTokens;
       }
-      let duplicateTokens = 0;
-      for (const posting of column.postings) {
-        const held = present.postings.get(posting.term);
-        if (held === undefined) {
-          present.postings.set(posting.term, {
-            term: posting.term,
-            rowIds: [...posting.rowIds],
-            tf: [...posting.tf],
-          });
-        } else {
-          const merged = mergeFtsPostingRows(held, posting);
-          duplicateTokens = safeWholeNumberSum(
-            [
-              duplicateTokens,
-              postingTokenCount(held) + postingTokenCount(posting) - postingTokenCount(merged),
-            ],
-            "Duplicate posting token count",
-          );
-          present.postings.set(posting.term, merged);
-        }
-      }
-      const totalTokens = tokenTotals.get(column.columnId) ?? present.totalTokens;
-      if (duplicateTokens > totalTokens) throw new Error("Posting token merge is inconsistent");
-      present.totalTokens = totalTokens - duplicateTokens;
     }
   }
 
   #materializedFtsChanges(): FtsChanges[] {
     return [...this.#ftsChanges].map(([tableId, columns]) => ({
       tableId,
-      columns: [...columns].map(([columnId, change]) => ({
+      columns: [...columns].map(([columnId, entry]) => ({
         columnId,
-        postings: [...change.postings.values()].sort((left, right) =>
-          left.term < right.term ? -1 : left.term > right.term ? 1 : 0,
-        ),
-        totalTokens: change.totalTokens,
+        postings: runSteps(mergedFtsRunsSteps(entry)),
+        totalTokens: entry.totalTokens,
       })),
     }));
   }
 
-  #reserveCommitDelta(
-    uniqueKeyChanges: readonly UniqueKeyChanges[],
-    ftsChanges: readonly FtsChanges[],
-  ): void {
-    const added = transactionCommitDeltaRetainedBytes(uniqueKeyChanges, ftsChanges);
-    const bytes = this.#commitDeltaBytes + added.bytes;
-    const entries = this.#commitDeltaEntries + added.entries;
-    if (!Number.isSafeInteger(bytes) || bytes > MAX_TRANSACTION_COMMIT_DELTA_BYTES) {
-      throw new RangeError(
-        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_BYTES)} retained bytes`,
-      );
+  /** `#materializedFtsChanges` with the merge of each column's runs sliced between turns. */
+  async #materializedFtsChangesSliced(): Promise<FtsChanges[]> {
+    const materialized: FtsChanges[] = [];
+    for (const [tableId, columns] of this.#ftsChanges) {
+      const entries: FtsChanges["columns"][number][] = [];
+      for (const [columnId, entry] of columns) {
+        const postings = await runStepsSliced(mergedFtsRunsSteps(entry));
+        entries.push({ columnId, postings, totalTokens: entry.totalTokens });
+      }
+      materialized.push({ tableId, columns: entries });
     }
-    if (!Number.isSafeInteger(entries) || entries > MAX_TRANSACTION_COMMIT_DELTA_ENTRIES) {
-      throw new RangeError(
-        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_ENTRIES)} entries`,
-      );
-    }
-    this.#commitDeltaBytes = bytes;
-    this.#commitDeltaEntries = entries;
+    return materialized;
   }
 
   /**
@@ -1256,7 +1245,7 @@ export class DatabaseTransaction {
     const committedAt = dateIsoString(this.now());
     const committedRevision = advanceRevision(this.#record.revision, 1);
     const compactionJobId = this.#compactionJobId;
-    const ftsChanges = this.#materializedFtsChanges();
+    const ftsChanges = await this.#materializedFtsChangesSliced();
     try {
       const manifest = await this.store.commitTransaction({
         transactionId: this.id,
@@ -2099,6 +2088,158 @@ function safeWholeNumberSum(values: readonly number[], label: string): number {
 }
 
 /** Linear merge of two canonical postings for one term. */
+interface CopiedFtsRun {
+  postings: FtsPosting[];
+  /** Tokens of row locators a run repeated under one term, which the copy merged. */
+  duplicateTokens: number;
+}
+
+/** Work units — a posting plus its row locators — a run copy or merge does per step. */
+const FTS_RUN_STEP_UNITS = 4_096;
+
+/**
+ * An operation's postings, copied so the transaction owns them unless they were handed over.
+ * Operations hand over runs already sorted by term; one that is not is sorted here and its
+ * repeated terms merged.
+ */
+function* copiedFtsRunSteps(
+  postings: readonly FtsPosting[],
+  owned = false,
+): Generator<void, CopiedFtsRun> {
+  const copy: FtsPosting[] = [];
+  let sorted = true;
+  let units = 0;
+  for (const posting of postings) {
+    units += 1 + posting.rowIds.length;
+    if (units >= FTS_RUN_STEP_UNITS) {
+      units = 0;
+      yield;
+    }
+    if (posting.rowIds.length !== posting.tf.length) {
+      throw new TypeError("Full-text posting row and frequency counts differ");
+    }
+    const previous = copy[copy.length - 1];
+    if (previous !== undefined && posting.term <= previous.term) sorted = false;
+    copy.push(
+      owned ? posting : { term: posting.term, rowIds: [...posting.rowIds], tf: [...posting.tf] },
+    );
+  }
+  if (sorted) return { postings: copy, duplicateTokens: 0 };
+  copy.sort((left, right) => (left.term < right.term ? -1 : left.term > right.term ? 1 : 0));
+  const merged: FtsPosting[] = [];
+  let duplicateTokens = 0;
+  for (const posting of copy) {
+    const last = merged[merged.length - 1];
+    if (last?.term !== posting.term) {
+      merged.push(posting);
+      continue;
+    }
+    const combined = mergeFtsPostingRows(last, posting);
+    duplicateTokens = safeWholeNumberSum(
+      [
+        duplicateTokens,
+        postingTokenCount(last) + postingTokenCount(posting) - postingTokenCount(combined),
+      ],
+      "Duplicate posting token count",
+    );
+    merged[merged.length - 1] = combined;
+  }
+  return { postings: merged, duplicateTokens };
+}
+
+/**
+ * One column's runs merged into a single term-sorted list: equal terms combine their row
+ * locators, a repeated locator keeping its greatest frequency, and the column's token total
+ * drops by the repeated tokens. The merged list replaces the runs, so a second call is free.
+ */
+function* mergedFtsRunsSteps(entry: FtsColumnRuns): Generator<void, FtsPosting[]> {
+  const runs = entry.runs;
+  if (runs.length <= 1) return runs[0] ?? [];
+  const positions = runs.map(() => 0);
+  const heap: number[] = [];
+  const termAt = (run: number): string => runs[run]?.[positions[run] ?? 0]?.term ?? "";
+  const before = (left: number, right: number): boolean => {
+    const leftTerm = termAt(left);
+    const rightTerm = termAt(right);
+    return leftTerm < rightTerm || (leftTerm === rightTerm && left < right);
+  };
+  const siftUp = (from: number): void => {
+    let child = from;
+    while (child > 0) {
+      const parent = (child - 1) >>> 1;
+      const childRun = heap[child] ?? 0;
+      const parentRun = heap[parent] ?? 0;
+      if (!before(childRun, parentRun)) break;
+      heap[parent] = childRun;
+      heap[child] = parentRun;
+      child = parent;
+    }
+  };
+  const siftDown = (): void => {
+    let parent = 0;
+    for (;;) {
+      const left = parent * 2 + 1;
+      if (left >= heap.length) return;
+      const right = left + 1;
+      const child = right < heap.length && before(heap[right] ?? 0, heap[left] ?? 0) ? right : left;
+      const childRun = heap[child] ?? 0;
+      const parentRun = heap[parent] ?? 0;
+      if (!before(childRun, parentRun)) return;
+      heap[parent] = childRun;
+      heap[child] = parentRun;
+      parent = child;
+    }
+  };
+  for (const [run, postings] of runs.entries()) {
+    if (postings.length === 0) continue;
+    heap.push(run);
+    siftUp(heap.length - 1);
+  }
+  const merged: FtsPosting[] = [];
+  let duplicateTokens = 0;
+  let units = 0;
+  while (heap.length > 0) {
+    const run = heap[0] ?? 0;
+    const position = positions[run] ?? 0;
+    const postings = runs[run] ?? [];
+    const posting = postings[position];
+    if (posting === undefined) throw new Error("Posting run merge is inconsistent");
+    positions[run] = position + 1;
+    if (position + 1 < postings.length) {
+      siftDown();
+    } else {
+      const last = heap.pop() ?? 0;
+      if (heap.length > 0) {
+        heap[0] = last;
+        siftDown();
+      }
+    }
+    units += 1 + posting.rowIds.length;
+    if (units >= FTS_RUN_STEP_UNITS) {
+      units = 0;
+      yield;
+    }
+    const last = merged[merged.length - 1];
+    if (last?.term !== posting.term) {
+      merged.push(posting);
+      continue;
+    }
+    const combined = mergeFtsPostingRows(last, posting);
+    duplicateTokens = safeWholeNumberSum(
+      [
+        duplicateTokens,
+        postingTokenCount(last) + postingTokenCount(posting) - postingTokenCount(combined),
+      ],
+      "Duplicate posting token count",
+    );
+    merged[merged.length - 1] = combined;
+  }
+  if (duplicateTokens > entry.totalTokens) throw new Error("Posting token merge is inconsistent");
+  entry.runs = [merged];
+  entry.totalTokens -= duplicateTokens;
+  return merged;
+}
+
 function mergeFtsPostingRows(left: FtsPosting, right: FtsPosting): FtsPosting {
   if (left.term !== right.term)
     throw new TypeError("Posting terms differ during transaction merge");

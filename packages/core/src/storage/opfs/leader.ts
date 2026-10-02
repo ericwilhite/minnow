@@ -74,6 +74,7 @@ import {
   BlockReadBatchTooLargeError,
   collectFtsPostingsBounded,
   ftsPostingQueryMatches,
+  seekFtsPostingQuery,
   MAX_BLOCK_READ_BATCH_BYTES,
   MAX_FTS_BASE_CHUNKS,
   MAX_POSTING_BUILD_TTL_MS,
@@ -1019,7 +1020,7 @@ export class OpfsLeader {
       this.#seq = 0;
     } else {
       for (const [id, placement] of checkpoint.blockIndex) this.#setBlockPlacement(id, placement);
-      await this.#core.loadSliced(checkpoint.core, maybeYieldToEventLoop);
+      await this.#core.loadSliced(checkpoint.core, maybeYieldToEventLoop, { owned: true });
       await yieldToEventLoop();
       for (const [key, pointer] of checkpoint.ftsBases) this.#setFtsBasePointer(key, pointer);
       for (const [key, pointer] of checkpoint.ftsBuilds) this.#setFtsBuildPointer(key, pointer);
@@ -3947,18 +3948,20 @@ export class OpfsLeader {
   ): Promise<FtsCandidates> {
     const sets = terms.map(() => new Set<bigint>());
     let retainedRowIds = 0;
+    // Chunks are term-sorted: each query seeks its first possible posting and walks only its
+    // run, so a lookup costs the matches, not the size of every chunk it opens.
     const addChunk = (postings: readonly FtsPosting[]): boolean => {
-      for (const posting of postings) {
-        for (let index = 0; index < terms.length; index += 1) {
-          const query = terms[index];
-          const set = sets[index];
-          if (
-            query === undefined ||
-            set === undefined ||
-            !ftsPostingQueryMatches(posting.term, query)
-          ) {
-            continue;
-          }
+      for (let index = 0; index < terms.length; index += 1) {
+        const query = terms[index];
+        const set = sets[index];
+        if (query === undefined || set === undefined) continue;
+        for (
+          let position = seekFtsPostingQuery(postings, query);
+          position < postings.length;
+          position += 1
+        ) {
+          const posting = postings[position];
+          if (posting === undefined || !ftsPostingQueryMatches(posting.term, query)) break;
           for (const rowId of posting.rowIds) {
             if (set.has(rowId)) continue;
             if (retainedRowIds === maxRowIds) return false;

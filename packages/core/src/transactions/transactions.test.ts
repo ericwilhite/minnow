@@ -1277,7 +1277,7 @@ it("never resumes an active transaction after its durable ownership deadline", a
   store.close();
 });
 
-it("bounds and incrementally merges transaction full-text deltas without partial registration", async () => {
+it("validates and incrementally merges transaction full-text deltas without partial registration", async () => {
   const store = new MemoryBlockStore();
   await store.addTable({
     id: "fts-delta-table",

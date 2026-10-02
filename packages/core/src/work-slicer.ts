@@ -51,3 +51,20 @@ function macrotask(): Promise<void> {
   }
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+/** Runs a step generator to completion without yielding: its synchronous form. */
+export function runSteps<T>(steps: Generator<void, T>): T {
+  let step = steps.next();
+  while (step.done !== true) step = steps.next();
+  return step.value;
+}
+
+/** Runs a step generator, offering the event loop a turn between steps once a slice has run. */
+export async function runStepsSliced<T>(steps: Generator<void, T>): Promise<T> {
+  let step = steps.next();
+  while (step.done !== true) {
+    await maybeYieldToEventLoop();
+    step = steps.next();
+  }
+  return step.value;
+}

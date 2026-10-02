@@ -1,3 +1,4 @@
+import { maybeYieldToEventLoop } from "../work-slicer.js";
 import type { ColumnarBatch } from "./batch.js";
 
 /**
@@ -26,4 +27,19 @@ export function estimateBatchBytes(input: ColumnarBatch): number {
     (total, values) => total + estimateValuesBytes(values),
     0,
   );
+}
+
+/** Values `estimateBatchBytesSliced` measures between turns. */
+const ESTIMATE_SLICE_VALUES = 16_384;
+
+/** `estimateBatchBytes` with the event loop offered a turn between slices of values. */
+export async function estimateBatchBytesSliced(input: ColumnarBatch): Promise<number> {
+  let total = 0;
+  for (const values of Object.values(input.columns)) {
+    for (let start = 0; start < values.length; start += ESTIMATE_SLICE_VALUES) {
+      await maybeYieldToEventLoop();
+      total += estimateValuesBytes(values.slice(start, start + ESTIMATE_SLICE_VALUES));
+    }
+  }
+  return total;
 }

@@ -3105,62 +3105,6 @@ export interface FtsChanges {
   columns: readonly FtsColumnDelta[];
 }
 
-/** In-memory and atomic-publish bounds for one transaction's accelerator/key deltas. */
-export const MAX_TRANSACTION_COMMIT_DELTA_BYTES = 64 * 1024 * 1024;
-export const MAX_TRANSACTION_COMMIT_DELTA_ENTRIES = 1_048_576;
-
-export function transactionCommitDeltaRetainedBytes(
-  uniqueKeyChanges: readonly UniqueKeyChanges[],
-  ftsChanges: readonly FtsChanges[],
-): { bytes: number; entries: number } {
-  let bytes = 0;
-  let entries = 0;
-  const add = (amount: number): void => {
-    bytes += amount;
-    if (!Number.isSafeInteger(bytes) || bytes > MAX_TRANSACTION_COMMIT_DELTA_BYTES) {
-      throw new RangeError(
-        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_BYTES)} retained bytes`,
-      );
-    }
-  };
-  const addEntry = (): void => {
-    entries += 1;
-    if (entries > MAX_TRANSACTION_COMMIT_DELTA_ENTRIES) {
-      throw new RangeError(
-        `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_ENTRIES)} entries`,
-      );
-    }
-  };
-  for (const change of uniqueKeyChanges) {
-    add(48 + change.tableId.length * 2);
-    for (const token of change.keyTokens) {
-      addEntry();
-      add(16 + token.length * 2);
-    }
-  }
-  for (const change of ftsChanges) {
-    add(32 + change.tableId.length * 2);
-    for (const column of change.columns) {
-      add(48 + column.columnId.length * 2);
-      for (const posting of column.postings) {
-        addEntry();
-        add(32 + posting.term.length * 2);
-        if (posting.rowIds.length !== posting.tf.length) {
-          throw new TypeError("Full-text posting row and frequency counts differ");
-        }
-        entries += posting.rowIds.length;
-        if (entries > MAX_TRANSACTION_COMMIT_DELTA_ENTRIES) {
-          throw new RangeError(
-            `Transaction commit deltas exceed ${String(MAX_TRANSACTION_COMMIT_DELTA_ENTRIES)} entries`,
-          );
-        }
-        add(posting.rowIds.length * 16);
-      }
-    }
-  }
-  return { bytes, entries };
-}
-
 /** The per-term candidate row IDs a full-text index lookup returns, aligned with the query. */
 export interface FtsCandidates {
   /** Per requested term: ascending unique row IDs whose indexed column contained the term. */
@@ -3294,17 +3238,11 @@ export function collectFtsCandidates(
       const term = terms[index];
       const set = sets[index];
       if (term === undefined || set === undefined) continue;
-      const seek = "term" in term ? term.term : term.lower;
-      let position = seek === undefined ? 0 : lowerBoundPosting(postings, seek);
-      // An exclusive lower bound starts one past its own term, which the seek lands on.
-      if (
-        !("term" in term) &&
-        term.lowerInclusive === false &&
-        postings[position]?.term === term.lower
+      for (
+        let position = seekFtsPostingQuery(postings, term);
+        position < postings.length;
+        position += 1
       ) {
-        position += 1;
-      }
-      for (; position < postings.length; position += 1) {
         const posting = postings[position];
         if (posting === undefined) break;
         if (!ftsPostingQueryMatches(posting.term, term)) {
@@ -3328,6 +3266,27 @@ export function collectFtsCandidates(
     ),
     overflow: false,
   };
+}
+
+/**
+ * Where a query's matches can start in a term-sorted chunk, found by binary search. Every
+ * posting before it misses; from it, matches run until the first miss, for every query shape.
+ */
+export function seekFtsPostingQuery(
+  postings: readonly FtsPosting[],
+  query: FtsPostingQuery,
+): number {
+  const seek = "term" in query ? query.term : query.lower;
+  let position = seek === undefined ? 0 : lowerBoundPosting(postings, seek);
+  // An exclusive lower bound starts one past its own term, which the seek lands on.
+  if (
+    !("term" in query) &&
+    query.lowerInclusive === false &&
+    postings[position]?.term === query.lower
+  ) {
+    position += 1;
+  }
+  return position;
 }
 
 /** Index of the first posting whose term is not below `term` in a term-sorted chunk. */

@@ -89,10 +89,12 @@ import {
   assertStorageBulkReadItems,
   validateStorageId,
   assertTempRunPageBatchLimits,
+  type FtsChanges,
   type UniqueKeyChanges,
 } from "./types.js";
 import { verifyStoredBlock } from "../block-format/index.js";
 import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
+import { commitDeltaUnits, LARGE_COMMIT_DELTA_UNITS } from "./commit-size.js";
 import { crc32 } from "../block-format/checksum.js";
 import {
   decodeSnapshotMetadataItems,
@@ -140,9 +142,6 @@ interface MemorySnapshotFrameImportState {
   lastBatchFrames: SnapshotFrame[];
   completedReplay: boolean;
 }
-
-/** UNIQUE key changes past which a commit checks them a slice at a time before committing. */
-const LARGE_COMMIT_KEYS = 16_384;
 
 /**
  * One event-loop turn after a commit, as a store backed by real I/O gives every commit for
@@ -944,23 +943,29 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   /**
-   * Runs a commit atomically. One with many UNIQUE key changes first checks them a slice at a
-   * time, still holding its place in the queue so nothing else commits meanwhile, and the
-   * commit itself then reuses that work.
+   * Runs a commit atomically. One with a large delta first prepares it a slice at a time —
+   * keys checked and applied behind a mask, postings validated and copied — still holding its
+   * place in the queue so nothing else commits meanwhile, and the commit then reuses that work.
    */
   #runCommit<T>(
-    input: { readonly uniqueKeyChanges?: readonly UniqueKeyChanges[] },
+    input: {
+      readonly uniqueKeyChanges?: readonly UniqueKeyChanges[];
+      readonly ftsChanges?: readonly FtsChanges[];
+    },
     commit: () => T,
   ): Promise<T> {
-    let keys = 0;
-    for (const change of input.uniqueKeyChanges ?? []) keys += change.keyTokens.length;
-    if (keys < LARGE_COMMIT_KEYS) return this.#runAtomic(commit);
+    if (commitDeltaUnits(input) < LARGE_COMMIT_DELTA_UNITS) return this.#runAtomic(commit);
     const result = this.#commitQueue.then(async () => {
-      await this.#core.prepareCommit(input, maybeYieldToEventLoop);
-      // A turn before the one step that must not be split.
-      await yieldToEventLoop();
-      this.#clearStaleSnapshotImport();
-      return commit();
+      try {
+        await this.#core.prepareCommit(input, maybeYieldToEventLoop);
+        // A turn before the one step that must not be split.
+        await yieldToEventLoop();
+        this.#clearStaleSnapshotImport();
+        return commit();
+      } catch (error) {
+        await this.#core.discardPreparedCommit(maybeYieldToEventLoop);
+        throw error;
+      }
     });
     this.#commitQueue = result.then(
       () => undefined,

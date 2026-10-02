@@ -214,7 +214,6 @@ import {
   secondaryIndexColumnIds,
   secondaryIndexWriteContractChanged,
   secondaryUniqueKeyNamespace,
-  transactionCommitDeltaRetainedBytes,
   uniqueKeyBuildChunkRetainedBytes,
   WriteConflictError,
   type WriteTransactionInput,
@@ -4384,7 +4383,6 @@ export class IndexedDbBlockStore implements BlockStore {
       validateId(input.compactionJobId, "Compaction job ID");
     }
     validateCommitFtsChanges(input.ftsChanges);
-    transactionCommitDeltaRetainedBytes(input.uniqueKeyChanges ?? [], input.ftsChanges ?? []);
     const storeNames = [
       "blocks",
       "catalog",
@@ -4421,7 +4419,6 @@ export class IndexedDbBlockStore implements BlockStore {
       validateId(input.compactionJobId, "Compaction job ID");
     }
     validateCommitFtsChanges(input.ftsChanges);
-    transactionCommitDeltaRetainedBytes(input.uniqueKeyChanges ?? [], input.ftsChanges ?? []);
     assertTransactionArtifactBatchLimits(input.blocks, input.segments);
     const blockIds = new Set<string>();
     for (const block of input.blocks) {

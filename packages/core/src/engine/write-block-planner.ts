@@ -1,3 +1,4 @@
+import { runSteps, runStepsSliced } from "../work-slicer.js";
 import {
   MAX_BLOCK_ROW_COUNT,
   physicalColumnByteLength,
@@ -28,6 +29,30 @@ export function planAlignedWriteBlockRanges(
   targetBytes: number,
   measureString: (value: string) => number = wellFormedUtf8ByteLength,
 ): WriteBlockRange[] {
+  return runSteps(planSteps(columns, rowCount, maximumRows, targetBytes, measureString));
+}
+
+/** `planAlignedWriteBlockRanges` with the event loop offered a turn between slices of rows. */
+export function planAlignedWriteBlockRangesSliced(
+  columns: readonly WriteColumnValues[],
+  rowCount: number,
+  maximumRows: number,
+  targetBytes: number,
+  measureString: (value: string) => number = wellFormedUtf8ByteLength,
+): Promise<WriteBlockRange[]> {
+  return runStepsSliced(planSteps(columns, rowCount, maximumRows, targetBytes, measureString));
+}
+
+/** Rows the planner visits between steps. */
+const PLAN_STEP_ROWS = 8_192;
+
+function* planSteps(
+  columns: readonly WriteColumnValues[],
+  rowCount: number,
+  maximumRows: number,
+  targetBytes: number,
+  measureString: (value: string) => number,
+): Generator<void, WriteBlockRange[]> {
   if (rowCount === 0) return [];
   if (!Number.isSafeInteger(maximumRows) || maximumRows <= 0 || maximumRows > MAX_BLOCK_ROW_COUNT) {
     throw new RangeError("Maximum rows per write block exceeds the format limit");
@@ -57,11 +82,17 @@ export function planAlignedWriteBlockRanges(
     }
     return ranges;
   }
+  let visited = 0;
   for (let start = 0; start < rowCount;) {
     const rowLimit = Math.min(rowCount, start + maximumRowsPerRange);
     const stringContentBytes = new Array<number>(stringColumns.length).fill(0);
     let end = start;
     for (let row = start; row < rowLimit; row += 1) {
+      visited += 1;
+      if (visited >= PLAN_STEP_ROWS) {
+        visited = 0;
+        yield;
+      }
       const count = row - start + 1;
       let fitsTarget = true;
       for (let columnIndex = 0; columnIndex < stringColumns.length; columnIndex += 1) {

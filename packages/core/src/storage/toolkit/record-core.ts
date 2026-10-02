@@ -41,6 +41,7 @@ import {
   invalidateUncoveredSecondaryIndexes,
   type FtsCandidates,
   type FtsChanges,
+  type FtsColumnDelta,
   type FtsPostingQuery,
   type FtsPosting,
   type GarbageCollectionCandidateSet,
@@ -144,7 +145,6 @@ import {
   secondaryIndexColumnIds,
   secondaryIndexWriteContractChanged,
   secondaryUniqueKeyNamespace,
-  transactionCommitDeltaRetainedBytes,
   uniqueKeyBuildChunkRetainedBytes,
   MAX_UNIQUE_KEY_BUILD_TTL_MS,
   MAX_UNIQUE_KEY_BUILD_STAGED_BYTES,
@@ -1062,6 +1062,12 @@ export class RecordCore {
   readonly #uniqueKeyBuilds = new Map<string, UniqueKeyBuildState>();
   /** Advances whenever any UNIQUE membership changes, so prepared commit work can tell. */
   #membershipEpoch = 0;
+  /**
+   * A prepared commit's key changes, already applied to the memberships they touch but not yet
+   * visible: `prepareCommit` applies them a slice at a time, every reader sees through this
+   * mask (`#membershipView`), and the commit publishes them by dropping it.
+   */
+  #unpublished: UnpublishedMembership | undefined;
   #activeUniqueKeyBuildCount = 0;
   #uniqueKeyBuildStagedBytes = 0;
   #uniqueKeyBuildStagedEntries = 0;
@@ -1826,12 +1832,12 @@ export class RecordCore {
     this.#setTable(cloneRecord(record));
     this.#tableIdsByName.set(record.name, record.id);
     if (record.uniqueKeyColumnId !== undefined) {
-      this.#membershipEpoch += 1;
+      this.#membershipChanged();
       this.#uniqueKeys.set(record.id, new OrderedStringSet());
     }
     for (const [indexId, index] of Object.entries(record.secondaryIndexes ?? {})) {
       if (index.unique === true && index.uniqueEnforced === true) {
-        this.#membershipEpoch += 1;
+        this.#membershipChanged();
         this.#uniqueKeys.set(
           secondaryUniqueKeyNamespace(record.id, indexId),
           new OrderedStringSet(),
@@ -1996,12 +2002,12 @@ export class RecordCore {
     }
     for (const [indexId, previous] of Object.entries(previousSecondary ?? {})) {
       if (previous.unique === true && nextSecondary?.[indexId]?.unique !== true) {
-        this.#membershipEpoch += 1;
+        this.#membershipChanged();
         this.#uniqueKeys.delete(secondaryUniqueKeyNamespace(record.id, indexId));
       }
     }
     if (update.uniqueKeySeed !== undefined) {
-      this.#membershipEpoch += 1;
+      this.#membershipChanged();
       this.#uniqueKeys.set(update.uniqueKeySeed.namespaceId, uniqueSeed ?? new OrderedStringSet());
     }
     if (autoIncrementCounter !== undefined) {
@@ -2303,7 +2309,7 @@ export class RecordCore {
     for (const key of [...this.#nextAutoIncrement.keys()]) {
       if (key.startsWith(owned)) this.#nextAutoIncrement.delete(key);
     }
-    this.#membershipEpoch += 1;
+    this.#membershipChanged();
     this.#uniqueKeys.delete(id);
     const secondaryUniquePrefix = `${id}\u0000secondary-index\u0000`;
     for (const namespaceId of [...this.#uniqueKeys.keys()]) {
@@ -2477,10 +2483,8 @@ export class RecordCore {
         this.#ftsDeltas.delete(key);
         continue;
       }
-      deltas.set(version, {
-        postings: cloneRecord(column.postings),
-        totalTokens: column.totalTokens,
-      });
+      // The plan's postings are already this core's own validated copy.
+      deltas.set(version, { postings: column.postings, totalTokens: column.totalTokens });
       this.#ftsDeltas.set(key, deltas);
     }
   }
@@ -2495,16 +2499,22 @@ export class RecordCore {
     columnId: string,
     coversVersion: number,
     upToVersion: number,
-  ): { chunkLists: FtsPosting[][]; deltaChunkCount: number; deltaTokens: number } {
+  ): {
+    chunkLists: Array<readonly FtsPosting[]>;
+    deltaChunkCount: number;
+    deltaTokens: number;
+  } {
     const deltas = this.#ftsDeltas.get(`${tableId}/${columnId}`);
-    const chunkLists: FtsPosting[][] = [];
+    // Stored deltas are never changed in place, so readers share them rather than copy them:
+    // a copy per lookup cost as much as the delta was large.
+    const chunkLists: Array<readonly FtsPosting[]> = [];
     let deltaChunkCount = 0;
     let deltaTokens = 0;
     for (const [version, delta] of deltas ?? []) {
       if (version <= coversVersion || version > upToVersion) continue;
       deltaChunkCount += 1;
       deltaTokens += delta.totalTokens;
-      chunkLists.push(cloneRecord(delta.postings));
+      chunkLists.push(delta.postings);
     }
     return { chunkLists, deltaChunkCount, deltaTokens };
   }
@@ -3038,7 +3048,7 @@ export class RecordCore {
   getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): string[] {
     validateId(tableId);
     assertStorageBulkReadItems(keyTokens, "Unique-key lookup");
-    const existing = this.#uniqueKeys.get(tableId);
+    const existing = this.#membershipView(tableId);
     if (existing === undefined) return [];
     return [...new Set(keyTokens)].filter((token) => existing.has(token)).sort();
   }
@@ -3343,7 +3353,7 @@ export class RecordCore {
     this.#setTable(updated);
     // The staged set becomes the membership as it stands, so finishing costs the same for a
     // thousand keys as for a million; later commits then mutate it as the namespace's own.
-    this.#membershipEpoch += 1;
+    this.#membershipChanged();
     this.#uniqueKeys.set(state.record.namespaceId, state.tokens);
     this.#setUniqueKeyBuild(
       {
@@ -4075,19 +4085,25 @@ export class RecordCore {
 
   /**
    * Does the part of a coming `writeTransaction`, `preflightWriteTransaction`, or
-   * `commitTransaction` for `input` that grows with its keys — every UNIQUE key change checked
-   * against its membership — a slice at a time, with `pause` awaited between slices. The commit
-   * then reuses that work, provided it passes the same `uniqueKeyChanges` array and no
-   * membership changed in between; otherwise it does the work itself. A conflict found here is
-   * raised by the commit, at the point it would have found it.
+   * `commitTransaction` for `input` that grows with its size, a slice at a time with `pause`
+   * awaited between slices: its new blocks are checksummed, its index postings validated and
+   * copied, and its UNIQUE key changes checked against their memberships and then applied to
+   * them behind a mask that keeps them invisible, so publishing them costs nothing per key. The
+   * commit reuses that work provided it passes the same arrays and no membership changed in
+   * between; otherwise it does the work itself. A conflict found here is raised by the commit,
+   * at the point it would have found it. A store whose commit does not follow its preparation
+   * calls `discardPreparedCommit`.
    */
   async prepareCommit(
     input: {
       readonly uniqueKeyChanges?: readonly UniqueKeyChanges[];
+      readonly ftsChanges?: readonly FtsChanges[];
       readonly blocks?: ReadonlyArray<{ readonly bytes: Uint8Array }>;
     },
     pause: () => Promise<void>,
   ): Promise<void> {
+    // Keys an abandoned preparation applied are still in the memberships; take them out first.
+    await this.discardPreparedCommit(pause);
     // A single-shot write's new blocks are checksummed as it is planned; take those a megabyte
     // at a time now, and the plan (and a store keeping the bytes) reuses them.
     for (const block of input.blocks ?? []) {
@@ -4102,13 +4118,26 @@ export class RecordCore {
       }
       preparedBlockChecksums.set(block.bytes, checksum);
     }
+    const ftsChanges = input.ftsChanges;
+    if (ftsChanges !== undefined && preparedFtsChanges.get(ftsChanges)?.core !== this) {
+      let work: PreparedFtsChanges;
+      try {
+        work = {
+          core: this,
+          changes: await runCommitStepsSliced(ftsChangesSteps(ftsChanges), pause),
+        };
+      } catch (error) {
+        work = { core: this, error };
+      }
+      preparedFtsChanges.set(ftsChanges, work);
+    }
     const entries = input.uniqueKeyChanges;
     if (entries === undefined || entries.length === 0) return;
     const epoch = this.#membershipEpoch;
     let work: PreparedUniqueKeyDeltas;
     try {
       const deltas = await runCommitStepsSliced(
-        uniqueKeyDeltaSteps(entries, (id) => this.#uniqueKeys.get(id)),
+        uniqueKeyDeltaSteps(entries, (id) => this.#membershipView(id)),
         pause,
       );
       work = { core: this, epoch, deltas };
@@ -4116,7 +4145,106 @@ export class RecordCore {
       work = { core: this, epoch, error };
     }
     // A membership changed while this ran: there is nothing safe to keep.
-    if (this.#membershipEpoch === epoch) preparedUniqueKeyDeltas.set(entries, work);
+    if (this.#membershipEpoch !== epoch) return;
+    preparedUniqueKeyDeltas.set(entries, work);
+    if ("deltas" in work) await this.#applyUnpublished(work.deltas, pause);
+  }
+
+  /**
+   * Takes back the keys a preparation applied without publishing — its commit failed or never
+   * came — a slice at a time. Readers see through the mask the whole time, so nothing they
+   * read changes.
+   */
+  async discardPreparedCommit(pause: () => Promise<void>): Promise<void> {
+    const unpublished = this.#unpublished;
+    if (unpublished === undefined) return;
+    for (const [namespaceId, applied] of unpublished.applied) {
+      const delta = unpublished.deltas.get(namespaceId);
+      if (delta === undefined) continue;
+      for (const slice of setSlices(delta.added)) {
+        if (this.#unpublished !== unpublished) return;
+        applied.tokens.applyDelta([], slice);
+        await pause();
+      }
+      for (const slice of setSlices(delta.removed)) {
+        if (this.#unpublished !== unpublished) return;
+        applied.tokens.applyDelta(slice);
+        await pause();
+      }
+    }
+    if (this.#unpublished === unpublished) this.#unpublished = undefined;
+  }
+
+  /** Applies prepared deltas to their memberships a slice at a time, masked until publication. */
+  async #applyUnpublished(deltas: UniqueKeyDeltas, pause: () => Promise<void>): Promise<void> {
+    const unpublished: UnpublishedMembership = { deltas, applied: new Map() };
+    this.#unpublished = unpublished;
+    for (const [namespaceId, delta] of deltas) {
+      const tokens = this.#uniqueKeys.get(namespaceId);
+      // A namespace the commit creates gets its keys at publication.
+      if (tokens === undefined || (delta.added.size === 0 && delta.removed.size === 0)) continue;
+      const applied = { tokens, complete: false };
+      unpublished.applied.set(namespaceId, applied);
+      for (const slice of setSlices(delta.removed)) {
+        if (this.#unpublished !== unpublished) return;
+        tokens.applyDelta([], slice);
+        await pause();
+      }
+      for (const slice of setSlices(delta.added)) {
+        if (this.#unpublished !== unpublished) return;
+        tokens.applyDelta(slice);
+        await pause();
+      }
+      applied.complete = true;
+    }
+  }
+
+  /**
+   * One membership as readers must see it: with a prepared commit's applied keys masked — an
+   * applied add reads as absent, an applied removal as present — exactly as before it began.
+   */
+  #membershipView(namespaceId: string): MembershipView | undefined {
+    const tokens = this.#uniqueKeys.get(namespaceId);
+    if (tokens === undefined) return undefined;
+    const unpublished = this.#unpublished;
+    if (unpublished?.applied.get(namespaceId)?.tokens !== tokens) return tokens;
+    const delta = unpublished.deltas.get(namespaceId);
+    if (delta === undefined) return tokens;
+    return {
+      has: (token) => (tokens.has(token) ? !delta.added.has(token) : delta.removed.has(token)),
+    };
+  }
+
+  /** The visible tokens of one membership; a copy only while a preparation is applied to it. */
+  #visibleMembership(namespaceId: string): OrderedStringSet | undefined {
+    const tokens = this.#uniqueKeys.get(namespaceId);
+    if (tokens === undefined) return undefined;
+    const unpublished = this.#unpublished;
+    if (unpublished?.applied.get(namespaceId)?.tokens !== tokens) return tokens;
+    const delta = unpublished.deltas.get(namespaceId);
+    if (delta === undefined) return tokens;
+    const visible = new OrderedStringSet();
+    for (const token of tokens) if (!delta.added.has(token)) visible.add(token);
+    for (const token of delta.removed) visible.add(token);
+    return visible;
+  }
+
+  /** Puts back what a preparation applied, at once; for changes that cannot wait for slices. */
+  #rollbackUnpublished(): void {
+    const unpublished = this.#unpublished;
+    if (unpublished === undefined) return;
+    this.#unpublished = undefined;
+    for (const [namespaceId, applied] of unpublished.applied) {
+      const delta = unpublished.deltas.get(namespaceId);
+      // Deleting an add not yet applied, or re-adding a removal not yet applied, changes nothing.
+      if (delta !== undefined) applied.tokens.applyDelta(delta.removed, delta.added);
+    }
+  }
+
+  /** Any membership change but a publication: prepared work against the old state is void. */
+  #membershipChanged(): void {
+    this.#rollbackUnpublished();
+    this.#membershipEpoch += 1;
   }
 
   #preparedUniqueKeyDeltas(entries: readonly UniqueKeyChanges[]): UniqueKeyDeltas | undefined {
@@ -4124,6 +4252,14 @@ export class RecordCore {
     if (work?.core !== this || work.epoch !== this.#membershipEpoch) return undefined;
     if ("error" in work) throw work.error;
     return work.deltas;
+  }
+
+  #preparedFtsChanges(changes: readonly FtsChanges[] | undefined): FtsChanges[] | undefined {
+    if (changes === undefined) return undefined;
+    const work = preparedFtsChanges.get(changes);
+    if (work?.core !== this) return undefined;
+    if ("error" in work) throw work.error;
+    return work.changes;
   }
 
   commitTransaction(input: CommitTransactionInput): ManifestSummary {
@@ -4546,8 +4682,9 @@ export class RecordCore {
     }
 
     const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
-    const ftsChanges = validateFtsChangesRuntime(input.ftsChanges);
-    transactionCommitDeltaRetainedBytes(uniqueKeyEntries, ftsChanges);
+    const ftsChanges =
+      this.#preparedFtsChanges(input.ftsChanges) ??
+      runCommitSteps(ftsChangesSteps(input.ftsChanges));
     const coveredUniqueNamespaces = new Set(uniqueKeyEntries.map((entry) => entry.tableId));
     // Pending segments are a fail-closed proof of a logical table change for an ordinary
     // commit: a caller cannot hide a write from live readers by supplying an empty or partial
@@ -4578,7 +4715,7 @@ export class RecordCore {
     // which the delta achieves by being applied at the mutation step below.
     const uniqueKeyDeltas =
       this.#preparedUniqueKeyDeltas(uniqueKeyEntries) ??
-      runCommitSteps(uniqueKeyDeltaSteps(uniqueKeyEntries, (id) => this.#uniqueKeys.get(id)));
+      runCommitSteps(uniqueKeyDeltaSteps(uniqueKeyEntries, (id) => this.#membershipView(id)));
     const nextVersion = nextManifestVersion(input.expectedManifestVersion);
     this.#assertNextManifestPinLag(nextVersion, input.committedAt, transaction.snapshotVersion);
     const removedManifestBlocks = removedBlockIds.map((id) => {
@@ -4667,6 +4804,12 @@ export class RecordCore {
       this.#installTableRecord(plan.pendingTable);
       this.#nextRowIds.set(plan.pendingTable.id, plan.pendingTableNextRowId ?? 1n);
     }
+    // A prepared commit's keys are already in their memberships; dropping the mask publishes
+    // them. Any other commit first puts back a preparation it overtook.
+    const unpublished = this.#unpublished;
+    const prepared = unpublished?.deltas === plan.uniqueKeyDeltas ? unpublished : undefined;
+    if (prepared === undefined) this.#rollbackUnpublished();
+    this.#unpublished = undefined;
     for (const [tableId, delta] of plan.uniqueKeyDeltas) {
       let tokens = this.#uniqueKeys.get(tableId);
       if (tokens === undefined) {
@@ -4674,6 +4817,8 @@ export class RecordCore {
         this.#uniqueKeys.set(tableId, tokens);
       }
       this.#membershipEpoch += 1;
+      const applied = prepared?.applied.get(tableId);
+      if (applied?.tokens === tokens && applied.complete) continue;
       tokens.applyDelta(delta.added, delta.removed);
     }
     this.#applyFtsChanges(
@@ -5471,7 +5616,7 @@ export class RecordCore {
         // it distinct for every UNIQUE namespace in the snapshot.
         const generationId = `snapshot-u-${String(version)}-${String(uniqueGenerationOrdinal)}`;
         uniqueGenerationOrdinal += 1;
-        const membership = this.#uniqueKeys.get(namespaceId) ?? new OrderedStringSet();
+        const membership = this.#visibleMembership(namespaceId) ?? new OrderedStringSet();
         const chunkCount = Math.ceil(membership.size / SNAPSHOT_UNIQUE_TOKENS_PER_CHUNK);
         yield {
           kind: "unique-generation",
@@ -6072,8 +6217,8 @@ export class RecordCore {
       ftsDeltas: [...this.#ftsDeltas.entries()].map(
         ([key, deltas]) => [key, [...deltas.entries()]] as const,
       ),
-      uniqueKeys: [...this.#uniqueKeys.entries()].map(
-        ([tableId, tokens]) => [tableId, [...tokens]] as const,
+      uniqueKeys: [...this.#uniqueKeys.keys()].map(
+        (tableId) => [tableId, [...(this.#visibleMembership(tableId) ?? [])]] as const,
       ),
       uniqueKeyBuilds: [...this.#uniqueKeyBuilds.values()].map((state) => [
         state.record,
@@ -6095,8 +6240,18 @@ export class RecordCore {
    * `pause` awaited between them, and the rest of the validation and the swap then run as in
    * `load`. `state` must not change until the returned promise settles.
    */
-  async loadSliced(state: RecordCoreState, pause: () => Promise<void>): Promise<void> {
-    const cloned = cloneRecord(state);
+  /**
+   * `load` a slice at a time: the copy, each membership, and each index delta are checked and
+   * built between pauses. With `owned`, the state was decoded for this call alone and is
+   * adopted rather than copied.
+   */
+  async loadSliced(
+    state: RecordCoreState,
+    pause: () => Promise<void>,
+    options: { owned?: boolean } = {},
+  ): Promise<void> {
+    const cloned =
+      options.owned === true ? state : ((await cloneRecordSliced(state, pause)) as RecordCoreState);
     for (const [key, tokens] of cloned.uniqueKeys) {
       await pause();
       validatedMemberships.set(
@@ -6104,12 +6259,25 @@ export class RecordCore {
         await buildMembershipSliced(tokens, `Unique membership ${key}`, pause),
       );
     }
+    for (const [key, deltas] of cloned.ftsDeltas) {
+      for (const [, delta] of deltas) {
+        if (!Array.isArray(delta.postings)) continue;
+        const total = await runCommitStepsSliced(
+          ftsDeltaPostingsSteps(delta.postings, `Full-text delta ${key}`),
+          pause,
+        );
+        if (total === delta.totalTokens) validatedFtsDeltaPostings.add(delta.postings);
+      }
+    }
     await pause();
     this.#loadCloned(cloned);
   }
 
   #loadCloned(cloned: RecordCoreState): void {
     validateRecordCoreState(cloned, this.#physical);
+    // Every membership is replaced, so nothing prepared against the old ones may be reused.
+    this.#unpublished = undefined;
+    this.#membershipEpoch += 1;
     // A recovery candidate may intentionally discard an unpublished WAL suffix whose physical
     // blocks were already reclaimed. Clearing the old candidate state must therefore not need
     // those obsolete bytes merely to decrement counters; the counters are reset immediately.
@@ -6430,10 +6598,88 @@ function* mergedFtsPostingIterator(
   }
 }
 
-function validateFtsChangesRuntime(value: unknown): readonly FtsChanges[] {
+/** Postings plus row locators `ftsDeltaPostingsSteps` checks between yields. */
+const FTS_DELTA_STEP_UNITS = 8_192;
+
+/**
+ * Checks one commit delta's postings — strictly term-sorted, row locators positive and strictly
+ * ascending within a term, frequencies positive whole numbers — and returns their token total.
+ * A delta has no count limit: stores split what they persist into bounded chunks, and readers
+ * merge a term's locators across chunks.
+ */
+function* ftsDeltaPostingsSteps(postings: unknown, label: string): Generator<void, number> {
+  if (!Array.isArray(postings)) throw new TypeError(`${label} postings must be an array`);
+  let totalTokens = 0;
+  let previousTerm: string | undefined;
+  let units = 0;
+  for (const postingValue of postings as unknown[]) {
+    if (
+      typeof postingValue !== "object" ||
+      postingValue === null ||
+      Array.isArray(postingValue) ||
+      Object.keys(postingValue).some((key) => key !== "term" && key !== "rowIds" && key !== "tf")
+    ) {
+      throw new TypeError(`${label} posting is invalid`);
+    }
+    const record = postingValue as Partial<FtsPosting>;
+    if (
+      typeof record.term !== "string" ||
+      record.term.length === 0 ||
+      !Array.isArray(record.rowIds) ||
+      !Array.isArray(record.tf) ||
+      (previousTerm !== undefined && record.term <= previousTerm)
+    ) {
+      throw new TypeError(`${label} terms are not strictly sorted`);
+    }
+    assertWellFormedString(record.term, `${label} posting term`);
+    if (record.term.length > MAX_FTS_POSTING_TERM_CHARACTERS) {
+      throw new RangeError(`${label} posting term exceeds the character limit`);
+    }
+    if (record.rowIds.length !== record.tf.length || record.rowIds.length === 0) {
+      throw new TypeError(`${label} posting arrays are empty or have different lengths`);
+    }
+    let previousRowId: bigint | undefined;
+    for (const [index, rowId] of record.rowIds.entries()) {
+      if (
+        typeof rowId !== "bigint" ||
+        rowId < 1n ||
+        rowId > MAX_ROW_ID ||
+        (previousRowId !== undefined && rowId <= previousRowId)
+      ) {
+        throw new TypeError(`${label} posting row IDs are not positive and strictly sorted`);
+      }
+      const frequency = record.tf[index];
+      if (
+        typeof frequency !== "number" ||
+        !Number.isSafeInteger(frequency) ||
+        frequency <= 0 ||
+        frequency > MAX_FTS_TOKENS_PER_DOCUMENT
+      ) {
+        throw new TypeError(`${label} posting frequency must be a positive whole number`);
+      }
+      totalTokens = safeStorageSum(totalTokens, frequency);
+      previousRowId = rowId;
+    }
+    previousTerm = record.term;
+    units += 1 + record.rowIds.length;
+    if (units >= FTS_DELTA_STEP_UNITS) {
+      units = 0;
+      yield;
+    }
+  }
+  return totalTokens;
+}
+
+/**
+ * A commit's index deltas, checked. The core keeps the postings it is given, as a store keeps
+ * the block bytes a commit hands it: a copy of a large delta cost as much again in allocation
+ * and collection as building it did.
+ */
+function* ftsChangesSteps(value: unknown): Generator<void, FtsChanges[]> {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new TypeError("Full-text changes must be an array");
   const tableIds = new Set<string>();
+  const checked: FtsChanges[] = [];
   for (const [changeIndex, changeValue] of (value as unknown[]).entries()) {
     if (
       typeof changeValue !== "object" ||
@@ -6456,6 +6702,7 @@ function validateFtsChangesRuntime(value: unknown): readonly FtsChanges[] {
       throw new TypeError(`Full-text change ${String(changeIndex)} columns must be an array`);
     }
     const columnIds = new Set<string>();
+    const columns: FtsColumnDelta[] = [];
     for (const [columnIndex, columnValue] of (change.columns as unknown[]).entries()) {
       if (
         typeof columnValue !== "object" ||
@@ -6483,21 +6730,20 @@ function validateFtsChangesRuntime(value: unknown): readonly FtsChanges[] {
       if (!Number.isSafeInteger(column.totalTokens) || (column.totalTokens as number) < 0) {
         throw new TypeError("Full-text change token count must be a non-negative whole number");
       }
-      if (!Array.isArray(column.postings)) {
-        throw new TypeError("Full-text change postings must be an array");
+      const totalTokens = yield* ftsDeltaPostingsSteps(column.postings, "Full-text change");
+      const postings = column.postings as FtsPosting[];
+      if (totalTokens !== column.totalTokens) {
+        throw new TypeError(
+          postings.length === 0
+            ? "Empty full-text changes must have a zero token total"
+            : "Full-text change token total does not match its postings",
+        );
       }
-      if (column.postings.length > 0) {
-        if (
-          validateFtsPostingChunks([column.postings], "Full-text change") !== column.totalTokens
-        ) {
-          throw new TypeError("Full-text change token total does not match its postings");
-        }
-      } else if (column.totalTokens !== 0) {
-        throw new TypeError("Empty full-text changes must have a zero token total");
-      }
+      columns.push({ columnId: column.columnId, postings, totalTokens });
     }
+    checked.push({ tableId: change.tableId, columns });
   }
-  return value as FtsChanges[];
+  return checked;
 }
 
 function hasExactFields(value: object, fields: readonly string[]): boolean {
@@ -6804,6 +7050,39 @@ function exactStringPartition(
 /** Exhaustive checkpoint validation before `load` clears any live state. */
 type UniqueKeyDeltas = Map<string, { added: Set<string>; removed: Set<string> }>;
 
+/** What a delta computation reads of one membership. */
+interface MembershipView {
+  has(token: string): boolean;
+}
+
+/** A prepared commit's deltas and the memberships they were applied to, behind a mask. */
+interface UnpublishedMembership {
+  /** The commit whose plan carries this exact object publishes it. */
+  readonly deltas: UniqueKeyDeltas;
+  /** Per namespace: the membership the keys went into, and whether all of them did. */
+  readonly applied: Map<string, { tokens: OrderedStringSet; complete: boolean }>;
+}
+
+type PreparedFtsChanges = { core: RecordCore } & ({ changes: FtsChanges[] } | { error: unknown });
+
+/** `RecordCore.prepareCommit`'s validated copies of index postings, by input identity. */
+const preparedFtsChanges = new WeakMap<readonly FtsChanges[], PreparedFtsChanges>();
+
+/** Tokens one slice of a sliced membership change adds or removes. */
+const MEMBERSHIP_CHANGE_SLICE = 16_384;
+
+/** A set's values as arrays of at most `MEMBERSHIP_CHANGE_SLICE`. */
+function* setSlices(values: ReadonlySet<string>): Generator<string[]> {
+  let slice: string[] = [];
+  for (const value of values) {
+    slice.push(value);
+    if (slice.length < MEMBERSHIP_CHANGE_SLICE) continue;
+    yield slice;
+    slice = [];
+  }
+  if (slice.length > 0) yield slice;
+}
+
 type PreparedUniqueKeyDeltas = { core: RecordCore; epoch: number } & (
   { deltas: UniqueKeyDeltas } | { error: unknown }
 );
@@ -6828,10 +7107,12 @@ const UNIQUE_KEY_DELTA_SLICE = 16_384;
 /**
  * The membership delta a commit's UNIQUE key changes make, per namespace, refusing a key an
  * insert requires absent; it yields every `UNIQUE_KEY_DELTA_SLICE` keys so a caller can pause.
+ * The delta is minimal: `added` holds only keys the membership lacks and `removed` only keys it
+ * has, so an upsert of existing keys, or a key removed and written again, publishes nothing.
  */
 function* uniqueKeyDeltaSteps(
   entries: readonly UniqueKeyChanges[],
-  membership: (namespaceId: string) => ReadonlySet<string> | undefined,
+  membership: (namespaceId: string) => MembershipView | undefined,
 ): Generator<void, UniqueKeyDeltas> {
   const deltas: UniqueKeyDeltas = new Map();
   let sinceYield = 0;
@@ -6849,17 +7130,18 @@ function* uniqueKeyDeltaSteps(
         yield;
       }
       if (entry.remove === true) {
-        delta.added.delete(token);
-        delta.removed.add(token);
+        // A key this commit added was never a member: removing it only cancels the add.
+        if (delta.added.delete(token)) continue;
+        if (existing?.has(token) === true) delta.removed.add(token);
         continue;
       }
-      const present =
-        delta.added.has(token) || (existing?.has(token) === true && !delta.removed.has(token));
+      const member = existing?.has(token) === true;
+      const present = delta.added.has(token) || (member && !delta.removed.has(token));
       if (entry.requireAbsent && present) {
         throw new UniqueKeyConflictError(entry.tableId, token);
       }
-      delta.removed.delete(token);
-      delta.added.add(token);
+      if (member) delta.removed.delete(token);
+      else delta.added.add(token);
     }
   }
   return deltas;
@@ -6914,6 +7196,83 @@ async function buildMembershipSliced(
  * same keys. Weak, so a state validated and never loaded leaves nothing behind.
  */
 const validatedMemberships = new WeakMap<readonly string[], OrderedStringSet>();
+
+/** Index delta postings `loadSliced` already checked, which validation need not walk again. */
+const validatedFtsDeltaPostings = new WeakSet<readonly FtsPosting[]>();
+
+/** Array elements, or a posting's row locators, `cloneRecordSliced` copies between pauses. */
+const CLONE_SLICE_UNITS = 16_384;
+
+function largeRecordValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > CLONE_SLICE_UNITS;
+  if (typeof value !== "object" || value === null) return false;
+  if (Object.getPrototypeOf(value) !== Object.prototype) return false;
+  return Object.values(value).some(
+    (child) => Array.isArray(child) && child.length > CLONE_SLICE_UNITS,
+  );
+}
+
+function recordValueUnits(value: unknown): number {
+  if (Array.isArray(value)) return 1 + value.length;
+  if (typeof value !== "object" || value === null) return 1;
+  let units = 1;
+  for (const child of Object.values(value)) if (Array.isArray(child)) units += child.length;
+  return units;
+}
+
+/** `cloneRecord` with a pause after every slice of copying inside long arrays. */
+async function cloneRecordSliced(value: unknown, pause: () => Promise<void>): Promise<unknown> {
+  if (!largeRecordValue(value)) {
+    if (!Array.isArray(value) && typeof value === "object" && value !== null) {
+      // A record with no long array of its own may still hold one deeper down.
+      if (Object.getPrototypeOf(value) === Object.prototype) {
+        const copy: Record<string, unknown> = {};
+        for (const key of Object.keys(value)) {
+          copy[key] = await cloneRecordSliced((value as Record<string, unknown>)[key], pause);
+        }
+        return copy;
+      }
+    } else if (Array.isArray(value)) {
+      let units = 0;
+      const copy = new Array<unknown>(value.length);
+      for (let index = 0; index < value.length; index += 1) {
+        const element: unknown = value[index];
+        copy[index] =
+          typeof element === "object" && element !== null
+            ? await cloneRecordSliced(element, pause)
+            : element;
+        units += recordValueUnits(element);
+        if (units >= CLONE_SLICE_UNITS) {
+          units = 0;
+          await pause();
+        }
+      }
+      return copy;
+    }
+    return cloneRecordValue(value);
+  }
+  if (Array.isArray(value)) {
+    const copy = new Array<unknown>(value.length);
+    let units = 0;
+    for (let index = 0; index < value.length; index += 1) {
+      const element: unknown = value[index];
+      copy[index] = largeRecordValue(element)
+        ? await cloneRecordSliced(element, pause)
+        : cloneRecordValue(element);
+      units += recordValueUnits(element);
+      if (units >= CLONE_SLICE_UNITS) {
+        units = 0;
+        await pause();
+      }
+    }
+    return copy;
+  }
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value as object)) {
+    copy[key] = await cloneRecordSliced((value as Record<string, unknown>)[key], pause);
+  }
+  return copy;
+}
 
 function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlocks): void {
   const runtimeState: unknown = state;
@@ -7742,7 +8101,9 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
           throw new TypeError(`Empty full-text delta ${key} must have a zero token total`);
         }
       } else if (
-        validateFtsPostingChunks([delta.postings], `Full-text delta ${key}`) !== delta.totalTokens
+        !validatedFtsDeltaPostings.has(delta.postings) &&
+        runCommitSteps(ftsDeltaPostingsSteps(delta.postings, `Full-text delta ${key}`)) !==
+          delta.totalTokens
       ) {
         throw new TypeError(`Full-text delta ${key} token total does not match its postings`);
       }
