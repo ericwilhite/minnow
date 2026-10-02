@@ -12,6 +12,9 @@
  *   `InvalidModificationError`, `NoModificationAllowedError`, and injected
  *   `QuotaExceededError`s are actual `DOMException`s, since error identity is part of the
  *   storage contract.
+ * - **Handles resolve by path.** A handle names a location, not an entry, as the File System
+ *   spec's locators do in every browser: after its directory is removed, a handle throws
+ *   `NotFoundError`, and once something is created at that path again it sees the new entry.
  * - **Injectable write faults and short transfers.** `setWriteFault` throws from inside sync
  *   writes, creates, or flushes; `setTransferLimit` makes reads or writes return any valid short
  *   byte count, including zero progress, at deterministic offsets.
@@ -54,7 +57,7 @@ export class MemoryOpfs {
     return new ShimDirectoryHandle(
       this,
       this.#rootNode,
-      "",
+      [],
     ) as unknown as FileSystemDirectoryHandle;
   }
 
@@ -138,15 +141,25 @@ export class MemoryOpfs {
   }
 
   #find(path: string): FileNode | DirectoryNode | undefined {
-    let node: FileNode | DirectoryNode = this.#rootNode;
-    for (const segment of path.split("/").filter((segment) => segment.length > 0)) {
-      if (node.kind !== "directory") return undefined;
-      const child = node.children.get(segment);
-      if (child === undefined) return undefined;
-      node = child;
-    }
-    return node;
+    return entryAt(
+      this.#rootNode,
+      path.split("/").filter((segment) => segment.length > 0),
+    );
   }
+}
+
+function entryAt(
+  root: DirectoryNode,
+  segments: readonly string[],
+): FileNode | DirectoryNode | undefined {
+  let node: FileNode | DirectoryNode = root;
+  for (const segment of segments) {
+    if (node.kind !== "directory") return undefined;
+    const child = node.children.get(segment);
+    if (child === undefined) return undefined;
+    node = child;
+  }
+  return node;
 }
 
 function notFound(name: string): DOMException {
@@ -170,35 +183,52 @@ function locked(name: string): DOMException {
 class ShimDirectoryHandle {
   readonly kind = "directory" as const;
   readonly #shim: MemoryOpfs;
-  readonly #node: DirectoryNode;
-  readonly #path: string;
+  readonly #root: DirectoryNode;
+  readonly #segments: readonly string[];
 
-  constructor(shim: MemoryOpfs, node: DirectoryNode, path: string) {
+  constructor(shim: MemoryOpfs, root: DirectoryNode, segments: readonly string[]) {
     this.#shim = shim;
-    this.#node = node;
-    this.#path = path;
+    this.#root = root;
+    this.#segments = segments;
   }
 
   get name(): string {
-    return this.#node.name;
+    return this.#segments[this.#segments.length - 1] ?? "";
+  }
+
+  /** The directory at this handle's path now; a removed one is not found, like a browser's. */
+  #node(): DirectoryNode {
+    const node = entryAt(this.#root, this.#segments);
+    if (node === undefined) throw notFound(this.name);
+    if (node.kind !== "directory") throw typeMismatch(this.name);
+    return node;
+  }
+
+  #child(name: string): readonly string[] {
+    return [...this.#segments, name];
   }
 
   #childPath(name: string): string {
-    return this.#path.length === 0 ? name : `${this.#path}/${name}`;
+    return this.#child(name).join("/");
   }
 
   async getFileHandle(name: string, options?: { create?: boolean }): Promise<ShimFileHandle> {
     validateEntryName(name);
-    const existing = this.#node.children.get(name);
+    const directory = this.#node();
+    const existing = directory.children.get(name);
     if (existing === undefined) {
       if (options?.create !== true) throw notFound(name);
       this.#shim.maybeFault(this.#childPath(name), "create");
-      const node: FileNode = { kind: "file", name, bytes: new Uint8Array(0), lockHolder: null };
-      this.#node.children.set(name, node);
-      return new ShimFileHandle(this.#shim, node, this.#childPath(name));
+      directory.children.set(name, {
+        kind: "file",
+        name,
+        bytes: new Uint8Array(0),
+        lockHolder: null,
+      });
+    } else if (existing.kind !== "file") {
+      throw typeMismatch(name);
     }
-    if (existing.kind !== "file") throw typeMismatch(name);
-    return new ShimFileHandle(this.#shim, existing, this.#childPath(name));
+    return new ShimFileHandle(this.#shim, this.#root, this.#child(name));
   }
 
   async getDirectoryHandle(
@@ -206,21 +236,22 @@ class ShimDirectoryHandle {
     options?: { create?: boolean },
   ): Promise<ShimDirectoryHandle> {
     validateEntryName(name);
-    const existing = this.#node.children.get(name);
+    const directory = this.#node();
+    const existing = directory.children.get(name);
     if (existing === undefined) {
       if (options?.create !== true) throw notFound(name);
       this.#shim.maybeFault(this.#childPath(name), "create");
-      const node: DirectoryNode = { kind: "directory", name, children: new Map() };
-      this.#node.children.set(name, node);
-      return new ShimDirectoryHandle(this.#shim, node, this.#childPath(name));
+      directory.children.set(name, { kind: "directory", name, children: new Map() });
+    } else if (existing.kind !== "directory") {
+      throw typeMismatch(name);
     }
-    if (existing.kind !== "directory") throw typeMismatch(name);
-    return new ShimDirectoryHandle(this.#shim, existing, this.#childPath(name));
+    return new ShimDirectoryHandle(this.#shim, this.#root, this.#child(name));
   }
 
   async removeEntry(name: string, options?: { recursive?: boolean }): Promise<void> {
     validateEntryName(name);
-    const existing = this.#node.children.get(name);
+    const directory = this.#node();
+    const existing = directory.children.get(name);
     if (existing === undefined) throw notFound(name);
     this.#shim.maybeDeleteFault(this.#childPath(name));
     if (existing.kind === "file") {
@@ -232,11 +263,15 @@ class ShimDirectoryHandle {
     } else {
       assertSubtreeUnlocked(existing, name);
     }
-    this.#node.children.delete(name);
+    directory.children.delete(name);
   }
 
   async isSameEntry(other: unknown): Promise<boolean> {
-    return other instanceof ShimDirectoryHandle && other.#node === this.#node;
+    return (
+      other instanceof ShimDirectoryHandle &&
+      other.#root === this.#root &&
+      other.#segments.join("/") === this.#segments.join("/")
+    );
   }
 
   async resolve(): Promise<string[] | null> {
@@ -244,14 +279,15 @@ class ShimDirectoryHandle {
   }
 
   async *entries(): AsyncIterableIterator<[string, ShimFileHandle | ShimDirectoryHandle]> {
+    const directory = this.#node();
     // Snapshot first: callers may mutate while iterating, as with the real API.
-    for (const [name, node] of [...this.#node.children.entries()]) {
-      if (this.#node.children.get(name) !== node) continue;
+    for (const [name, node] of [...directory.children.entries()]) {
+      if (directory.children.get(name) !== node) continue;
       yield [
         name,
         node.kind === "file"
-          ? new ShimFileHandle(this.#shim, node, this.#childPath(name))
-          : new ShimDirectoryHandle(this.#shim, node, this.#childPath(name)),
+          ? new ShimFileHandle(this.#shim, this.#root, this.#child(name))
+          : new ShimDirectoryHandle(this.#shim, this.#root, this.#child(name)),
       ];
     }
   }
@@ -306,33 +342,46 @@ function validateEntryName(name: string): void {
 class ShimFileHandle {
   readonly kind = "file" as const;
   readonly #shim: MemoryOpfs;
-  readonly #node: FileNode;
-  readonly #path: string;
+  readonly #root: DirectoryNode;
+  readonly #segments: readonly string[];
 
-  constructor(shim: MemoryOpfs, node: FileNode, path: string) {
+  constructor(shim: MemoryOpfs, root: DirectoryNode, segments: readonly string[]) {
     this.#shim = shim;
-    this.#node = node;
-    this.#path = path;
+    this.#root = root;
+    this.#segments = segments;
   }
 
   get name(): string {
-    return this.#node.name;
+    return this.#segments[this.#segments.length - 1] ?? "";
+  }
+
+  #node(): FileNode {
+    const node = entryAt(this.#root, this.#segments);
+    if (node === undefined) throw notFound(this.name);
+    if (node.kind !== "file") throw typeMismatch(this.name);
+    return node;
   }
 
   async getFile(): Promise<File> {
-    if (this.#node.lockHolder !== null) throw locked(this.#node.name);
-    return new File([this.#node.bytes.slice()], this.#node.name);
+    const node = this.#node();
+    if (node.lockHolder !== null) throw locked(node.name);
+    return new File([node.bytes.slice()], node.name);
   }
 
   async createSyncAccessHandle(): Promise<ShimSyncAccessHandle> {
-    if (this.#node.lockHolder !== null) throw locked(this.#node.name);
-    const handle = new ShimSyncAccessHandle(this.#shim, this.#node, this.#path);
-    this.#node.lockHolder = handle;
+    const node = this.#node();
+    if (node.lockHolder !== null) throw locked(node.name);
+    const handle = new ShimSyncAccessHandle(this.#shim, node, this.#segments.join("/"));
+    node.lockHolder = handle;
     return handle;
   }
 
   async isSameEntry(other: unknown): Promise<boolean> {
-    return other instanceof ShimFileHandle && other.#node === this.#node;
+    return (
+      other instanceof ShimFileHandle &&
+      other.#root === this.#root &&
+      other.#segments.join("/") === this.#segments.join("/")
+    );
   }
 }
 

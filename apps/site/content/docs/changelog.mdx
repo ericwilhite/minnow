@@ -8,7 +8,7 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## 0.13.1 — October 1, 2026
+## 0.13.1 — October 2, 2026
 
 Release packages: `@minnowdb/core@0.13.1`.
 
@@ -31,6 +31,12 @@ Release packages: `@minnowdb/core@0.13.1`.
   whether the conversion finished before judging its own patience. A long step elsewhere on the
   same thread could outlast that patience as the conversion completed, and the opener gave up
   with the "close older connections" error instead of opening.
+
+- `MemoryOpfs`, the in-memory OPFS for Node tests, resolves handles by path, as browsers do. A
+  handle to a removed directory kept seeing the removed files, so an OPFS connection that opened
+  alongside a layout conversion could keep reading the finished conversion's leftovers and wait
+  until it gave up. Browsers were never affected; the shim now throws `NotFoundError` there, and
+  a handle sees new entries once its path is created again.
 
 - Storage toolkit: `RecordCore.prepareCommit(input, pause)` does that work ahead of a commit,
   which reuses it while no membership has changed; `WalWriter.appendEncoded(bytes, flush)`

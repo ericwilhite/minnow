@@ -98,6 +98,31 @@ describe("MemoryOpfs", () => {
     });
   });
 
+  it("resolves handles by path, so a removed directory's handle stops seeing its files", async () => {
+    // Browsers resolve a handle's location on every call. A cached handle to a removed
+    // directory must not keep answering for files that are gone — OPFS followers read the
+    // upgrade's ready file through one and would wait forever.
+    const shim = new MemoryOpfs();
+    const dir = await shim.root.getDirectoryHandle("upgrade", { create: true });
+    const ready = await dir.getFileHandle("ready", { create: true });
+    await shim.root.removeEntry("upgrade", { recursive: true });
+    await expect(dir.getFileHandle("ready")).rejects.toMatchObject({ name: "NotFoundError" });
+    await expect(ready.getFile()).rejects.toMatchObject({ name: "NotFoundError" });
+    await expect(dir.getFileHandle("new", { create: true })).rejects.toMatchObject({
+      name: "NotFoundError",
+    });
+    await expect(dir.keys().next()).rejects.toMatchObject({ name: "NotFoundError" });
+
+    // Recreated at the same path, the old handles see the new entries.
+    const again = await shim.root.getDirectoryHandle("upgrade", { create: true });
+    const file = await again.getFileHandle("ready", { create: true });
+    const handle = await file.createSyncAccessHandle();
+    handle.write(new TextEncoder().encode("v2"), { at: 0 });
+    handle.close();
+    expect(new TextDecoder().decode(await readAll(ready))).toBe("v2");
+    expect(await dir.isSameEntry(again)).toBe(true);
+  });
+
   it("iterates entries", async () => {
     const shim = new MemoryOpfs();
     const dir = await shim.root.getDirectoryHandle("dir", { create: true });

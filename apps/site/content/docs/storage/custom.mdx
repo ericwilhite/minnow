@@ -296,8 +296,9 @@ to see where your storage system fits.
 
 For running your adapter in plain Node tests, `MemoryOpfs` from `@minnowdb/core/testing` is an
 in-memory origin-private file system with the behaviour that matters in storage tests:
-exclusive sync-access locks that throw the real `DOMException`s, injectable write faults, and
-deterministic short-transfer limits for quota, crash, and partial-I/O suites.
+exclusive sync-access locks that throw the real `DOMException`s, handles that resolve by path as
+browsers do (a handle to a removed directory throws `NotFoundError`), injectable write faults,
+and deterministic short-transfer limits for quota, crash, and partial-I/O suites.
 
 ## What the fused methods buy
 
