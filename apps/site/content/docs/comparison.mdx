@@ -146,9 +146,9 @@ adapter ships with the project.
 ## Minnow's limits
 
 - Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Block format 2,
-  snapshot format 1, IndexedDB schema 3, and native OPFS layout 8 are separately versioned and
-  locked. Supported storage upgrades run automatically on open, including IndexedDB schema 2 to 3
-  and OPFS layouts 6 and 7 to 8; see the [OPFS guide](/docs/storage/opfs#what-it-creates).
+  snapshot format 1, IndexedDB schema 4, and native OPFS layout 9 are separately versioned and
+  locked. Supported storage upgrades run automatically on open, including IndexedDB schemas 1–3
+  to 4 and OPFS layouts 6–8 to 9; see the [OPFS guide](/docs/storage/opfs#what-it-creates).
 - Its SQL dialect is an embedded PostgreSQL subset, not the PostgreSQL server.
 - `UPDATE` and `DELETE` require row identity: a primary key or one inline unique column.
 - Secondary indexes support scalar and composite left-prefix equality, `IN`, range filtering, and

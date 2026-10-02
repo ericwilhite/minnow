@@ -56,8 +56,8 @@ detection must fail clearly; it must not silently select a less durable store.
 
 Package versions and stored formats move independently. Every supported stored format remains
 readable through the ordinary open/load API, including during 0.x. A newer reader keeps the old
-reader or performs an automatic conversion that preserves data. IndexedDB schema 2 upgrades to 3,
-and OPFS layouts 6 and 7 upgrade to 8, on open; manual export/import is not a required upgrade
+reader or performs an automatic conversion that preserves data. IndexedDB schemas 1–3 upgrade
+to 4, and OPFS layouts 6–8 upgrade to 9, on open; manual export/import is not a required upgrade
 step. Unknown future native formats are
 rejected without mutation.
 

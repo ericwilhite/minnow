@@ -427,19 +427,6 @@ export function addSecondaryPosting(
   byTerm.set(term, posting);
 }
 
-export function sortedSecondaryPostings(
-  byTerm: Map<string, { rowIds: bigint[]; tf: number[] }>,
-): FtsPosting[] {
-  return [...byTerm.entries()]
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .map(([term, posting]) => {
-      const rowIds = [...new Set(posting.rowIds)].sort((left, right) =>
-        left < right ? -1 : left > right ? 1 : 0,
-      );
-      return { term, rowIds, tf: rowIds.map(() => 1) };
-    });
-}
-
 /** Hidden row-ID lookup over append/base segment order without retaining one bigint per row. */
 export function appendRowIdLocator(
   segments: readonly SegmentRecord[],
@@ -697,8 +684,9 @@ export async function sortedTermsSliced(terms: Iterable<string>): Promise<string
 }
 
 /**
- * `sortedSecondaryPostings`, a bounded run at a time: the terms sort by `sortedTermsSliced`, and
- * each posting's row locators deduplicate and sort with turns offered between batches.
+ * A batch's secondary postings in term order, each with its row locators ascending and without
+ * repeats: the terms sort by `sortedTermsSliced`, and each posting's locators by
+ * `sortedUniqueRowIdsSliced`, with turns offered between batches.
  */
 export async function sortedSecondaryPostingsSliced(
   byTerm: ReadonlyMap<string, { rowIds: bigint[]; tf: number[] }>,
@@ -706,10 +694,8 @@ export async function sortedSecondaryPostingsSliced(
   const postings: FtsPosting[] = [];
   let sinceYield = 0;
   for (const term of await sortedTermsSliced(byTerm.keys())) {
-    const rowIds = [...new Set(byTerm.get(term)?.rowIds ?? [])].sort((left, right) =>
-      left < right ? -1 : left > right ? 1 : 0,
-    );
-    postings.push({ term, rowIds, tf: rowIds.map(() => 1) });
+    const rowIds = await sortedUniqueRowIdsSliced(byTerm.get(term)?.rowIds ?? []);
+    postings.push({ term, rowIds, tf: new Array<number>(rowIds.length).fill(1) });
     sinceYield += rowIds.length + 1;
     if (sinceYield >= MERGE_BATCH_TERMS) {
       sinceYield = 0;
@@ -717,6 +703,67 @@ export async function sortedSecondaryPostingsSliced(
     }
   }
   return postings;
+}
+
+const compareRowIds = (left: bigint, right: bigint): number =>
+  left < right ? -1 : left > right ? 1 : 0;
+
+/** Row locators one native sort takes, or one merge step copies, between turns. */
+const ROW_ID_SORT_RUN = 16_384;
+
+/**
+ * One term's row locators, ascending and without repeats. A term shared by most of a large
+ * batch — a low-cardinality index — has as many locators as the batch has rows: they are sorted
+ * in runs and merged pairwise, with the event loop offered a turn between steps, rather than in
+ * one synchronous sort.
+ */
+export async function sortedUniqueRowIdsSliced(values: readonly bigint[]): Promise<bigint[]> {
+  if (values.length <= ROW_ID_SORT_RUN) return [...new Set(values)].sort(compareRowIds);
+  let runs: bigint[][] = [];
+  for (let start = 0; start < values.length; start += ROW_ID_SORT_RUN) {
+    runs.push(values.slice(start, start + ROW_ID_SORT_RUN).sort(compareRowIds));
+    await maybeYieldToEventLoop();
+  }
+  while (runs.length > 1) {
+    const merged: bigint[][] = [];
+    for (let index = 0; index < runs.length; index += 2) {
+      const left = runs[index] ?? [];
+      const right = runs[index + 1];
+      merged.push(right === undefined ? left : await mergeRowIdRuns(left, right));
+    }
+    runs = merged;
+  }
+  // A run sorted whole may still hold repeats; merging drops repeats across runs.
+  const only = runs[0] ?? [];
+  const unique: bigint[] = [];
+  for (let index = 0; index < only.length; index += 1) {
+    const value = only[index] as bigint;
+    if (unique.length === 0 || unique[unique.length - 1] !== value) unique.push(value);
+    if (index % ROW_ID_SORT_RUN === ROW_ID_SORT_RUN - 1) await maybeYieldToEventLoop();
+  }
+  return unique;
+}
+
+async function mergeRowIdRuns(
+  left: readonly bigint[],
+  right: readonly bigint[],
+): Promise<bigint[]> {
+  const merged: bigint[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length || rightIndex < right.length) {
+    const leftValue = left[leftIndex];
+    const rightValue = right[rightIndex];
+    if (rightValue === undefined || (leftValue !== undefined && leftValue <= rightValue)) {
+      merged.push(leftValue as bigint);
+      leftIndex += 1;
+    } else {
+      merged.push(rightValue);
+      rightIndex += 1;
+    }
+    if (merged.length % ROW_ID_SORT_RUN === 0) await maybeYieldToEventLoop();
+  }
+  return merged;
 }
 
 /**

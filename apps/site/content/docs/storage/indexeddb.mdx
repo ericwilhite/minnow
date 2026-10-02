@@ -237,12 +237,15 @@ reload the page. See [Errors](/docs/engine/errors) for what a caller should do w
 
 ## Schema compatibility and recovery
 
-The current IndexedDB schema is 3. Schema 1 kept each transaction's journal ids on the record
+The current IndexedDB schema is 4. Schema 1 kept each transaction's journal ids on the record
 itself; opening a schema-1 database moves them into `transactionJournal` chunks and rewrites the
 records with their counts. Schema 3 changes no stored record: it admits compaction jobs whose
 merge plan is recomputed from its sources rather than stored cell by cell, which a schema-2 build
-cannot read, so opening a schema-2 database only raises the version and a schema-2 build then
-refuses it. There are no pre-contract schemas or compatibility branches. Every
+cannot read. Schema 4 rewrites nothing either: one commit may store an indexed column's changes as
+several part records, with a small directory of their term ranges, so a commit's index changes
+have no size limit and a lookup reads only the parts its terms fall in. A schema-3 build cannot
+read those parts. Opening a schema-2 or schema-3 database only raises the version, and the older
+build then refuses it. There are no pre-contract schemas or compatibility branches. Every
 schema change adds one ordered migration for every integer version between the database and the
 current build. All of those migrations run inside the browser's single `versionchange`
 transaction: either the complete chain and its data changes commit, or the old database remains

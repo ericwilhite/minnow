@@ -10,6 +10,7 @@ import {
   LeaseExpiredError,
   type LeaseKind,
   type LeaseRecord,
+  MAX_FTS_POSTINGS_PER_CHUNK,
   MAX_LEVEL_ZERO_SEGMENTS,
   MAX_MANIFEST_BLOCK_PRESENCE_IDS,
   MAX_LEASE_TTL_MS,
@@ -247,6 +248,7 @@ export class DatabaseTransaction {
   #record: TransactionRecord;
   readonly #uniqueKeyChanges: UniqueKeyChanges[] = [];
   readonly #ftsChanges = new Map<string, Map<string, FtsColumnRuns>>();
+  #largeFtsDeltaColumns: Array<{ tableId: string; columnId: string }> = [];
   #compactionJobId: string | null = null;
   readonly #compactionSourceBlockIds = new Set<string>();
   readonly #changedTableIds = new Set<string>();
@@ -1146,17 +1148,29 @@ export class DatabaseTransaction {
     }));
   }
 
+  /**
+   * The indexed columns this transaction's commit changed by more postings than one stored chunk
+   * holds. Such a delta is folded into its index's base right away instead of waiting for a
+   * count of commits.
+   */
+  get largeFtsDeltaColumns(): ReadonlyArray<{ tableId: string; columnId: string }> {
+    return this.#largeFtsDeltaColumns;
+  }
+
   /** `#materializedFtsChanges` with the merge of each column's runs sliced between turns. */
   async #materializedFtsChangesSliced(): Promise<FtsChanges[]> {
     const materialized: FtsChanges[] = [];
+    const large: Array<{ tableId: string; columnId: string }> = [];
     for (const [tableId, columns] of this.#ftsChanges) {
       const entries: FtsChanges["columns"][number][] = [];
       for (const [columnId, entry] of columns) {
         const postings = await runStepsSliced(mergedFtsRunsSteps(entry));
         entries.push({ columnId, postings, totalTokens: entry.totalTokens });
+        if (postings.length > MAX_FTS_POSTINGS_PER_CHUNK) large.push({ tableId, columnId });
       }
       materialized.push({ tableId, columns: entries });
     }
+    this.#largeFtsDeltaColumns = large;
     return materialized;
   }
 

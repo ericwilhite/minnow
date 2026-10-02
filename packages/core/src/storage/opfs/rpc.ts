@@ -64,7 +64,18 @@ export type StoreRpcMessage =
       args: unknown[];
       /** When the requester first sent it; a re-send keeps it, so the ledger can vouch. */
       sentAt: number;
+      /**
+       * Set when a commit's deltas were too large for one message: its key and index changes,
+       * fields of `args[0]`, arrived just before as `pieces` `opPiece` messages holding `bytes`
+       * of record JSON, and the receiver merges them back into `args[0]`.
+       */
+      encoded?: { pieces: number; bytes: number };
     }
+  /**
+   * One piece of a large request's arguments, encoded as record JSON, posted ahead of its `op`
+   * in order. A re-send posts every piece again, from index zero.
+   */
+  | { kind: "opPiece"; requestId: string; from: string; index: number; bytes: Uint8Array }
   | { kind: "result"; requestId: string; ok: true; value: unknown }
   | { kind: "result"; requestId: string; ok: false; error: SerializedStoreError }
   /** The leader is still executing this request — reset the caller's patience. */
@@ -110,6 +121,13 @@ const MAX_OPFS_RPC_STACK_CHARACTERS = 64 * 1024;
 
 /** One legal maximum payload plus bounded envelope/catalog metadata. */
 export const MAX_OPFS_RPC_MESSAGE_BYTES = 66 * 1024 * 1024;
+/** The encoded argument bytes one `opPiece` carries at most. */
+export const OPFS_RPC_PIECE_BYTES = 8 * 1024 * 1024;
+/**
+ * The largest request a follower sends encoded in pieces: beyond the largest commit frame the
+ * leader's log could hold, so no legal request is refused here.
+ */
+export const MAX_OPFS_RPC_ENCODED_BYTES = 512 * 1024 * 1024;
 /** The longest patience a `hold` may ask for; a leader busier than this is treated as gone. */
 export const MAX_OPFS_RPC_HOLD_MS = 60_000;
 export const MAX_OPFS_RPC_IDENTIFIER_CHARACTERS = 1024;
@@ -203,6 +221,37 @@ function validSerializedError(value: unknown, depth = 0): value is SerializedSto
   );
 }
 
+function validEncodedArguments(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    exactKeys(record, ["pieces", "bytes"]) &&
+    Number.isSafeInteger(record.pieces) &&
+    Number.isSafeInteger(record.bytes) &&
+    (record.bytes as number) > 0 &&
+    (record.bytes as number) <= MAX_OPFS_RPC_ENCODED_BYTES &&
+    record.pieces === Math.ceil((record.bytes as number) / OPFS_RPC_PIECE_BYTES)
+  );
+}
+
+/**
+ * A large request's identity: its structured arguments as `fingerprintStoreRequest` sees them,
+ * plus the digest of its encoded deltas. The same request sent again encodes to the same bytes,
+ * so a re-send matches its first delivery without walking millions of keys and postings.
+ */
+export async function fingerprintEncodedStoreRequest(
+  method: string,
+  args: unknown[],
+  encoded: Uint8Array<ArrayBuffer>,
+): Promise<{ signature: string; retainedBytes: number }> {
+  const structured = await fingerprintStoreRequest(method, args);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoded));
+  return {
+    signature: `${structured.signature}:encoded:${String(encoded.byteLength)}:${hex(digest)}`,
+    retainedBytes: structured.retainedBytes + encoded.byteLength,
+  };
+}
+
 /** Total non-throwing parser for same-origin-but-untrusted BroadcastChannel traffic. */
 export function parseStoreRpcMessage(
   value: unknown,
@@ -215,7 +264,21 @@ export function parseStoreRpcMessage(
     switch (record.kind) {
       case "op":
         if (
-          !exactKeys(record, ["kind", "requestId", "from", "method", "args", "sentAt"]) ||
+          !(
+            exactKeys(record, ["kind", "requestId", "from", "method", "args", "sentAt"]) ||
+            (exactKeys(record, [
+              "kind",
+              "requestId",
+              "from",
+              "method",
+              "args",
+              "sentAt",
+              "encoded",
+            ]) &&
+              validEncodedArguments(record.encoded) &&
+              Array.isArray(record.args) &&
+              record.args.length === 1)
+          ) ||
           !boundedRpcString(record.requestId) ||
           !boundedRpcString(record.from) ||
           !boundedRpcString(record.method) ||
@@ -227,6 +290,18 @@ export function parseStoreRpcMessage(
         )
           return undefined;
         return record as StoreRpcMessage;
+      case "opPiece":
+        return exactKeys(record, ["kind", "requestId", "from", "index", "bytes"]) &&
+          boundedRpcString(record.requestId) &&
+          boundedRpcString(record.from) &&
+          Number.isSafeInteger(record.index) &&
+          (record.index as number) >= 0 &&
+          (record.index as number) < Math.ceil(MAX_OPFS_RPC_ENCODED_BYTES / OPFS_RPC_PIECE_BYTES) &&
+          record.bytes instanceof Uint8Array &&
+          record.bytes.byteLength > 0 &&
+          record.bytes.byteLength <= OPFS_RPC_PIECE_BYTES
+          ? (record as StoreRpcMessage)
+          : undefined;
       case "result":
         if (!boundedRpcString(record.requestId) || typeof record.ok !== "boolean") return undefined;
         if (record.ok) {

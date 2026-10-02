@@ -98,3 +98,99 @@ describe("large commits on OPFS", () => {
     reopened.close();
   });
 });
+
+describe("index deltas larger than one stored chunk", () => {
+  const POSTINGS = 70_000;
+  const createdAt = "2026-10-02T00:00:00.000Z";
+  const later = new Date(Date.parse(createdAt) + 60 * 60_000).toISOString();
+
+  async function commitWideDelta(store: BlockStore): Promise<void> {
+    await store.addTable({
+      id: "docs",
+      name: "docs",
+      columns: [{ id: "body", name: "body", type: "string", nullable: false }],
+      managed: false,
+      ftsColumns: {
+        body: {
+          storage: "fts-chunks-v1",
+          tokenizerVersion: 1,
+          state: "ready",
+          buildFromVersion: -1,
+        },
+      },
+      revision: 0,
+      createdAt,
+    });
+    const record = await store.beginTransaction({
+      record: {
+        id: "wide",
+        ownerId: "owner",
+        expiresAt: later,
+        pendingBlockIds: [],
+        pendingSegmentIds: [],
+        status: "active",
+        revision: 0,
+        startedAt: createdAt,
+        updatedAt: createdAt,
+        committedVersion: null,
+      },
+    });
+    const postings = Array.from({ length: POSTINGS }, (_, index) => ({
+      term: `term-${String(index).padStart(6, "0")}`,
+      rowIds: [BigInt(index + 1)],
+      tf: [1],
+    }));
+    await store.commitTransaction({
+      transactionId: record.record.id,
+      expectedTransactionRevision: record.record.revision,
+      expectedManifestVersion: await store.getCurrentManifestVersion(),
+      changedTableIds: ["docs"],
+      ftsChanges: [
+        { tableId: "docs", columns: [{ columnId: "body", postings, totalTokens: POSTINGS }] },
+      ],
+      committedAt: later,
+    });
+  }
+
+  async function expectWideDelta(store: BlockStore): Promise<void> {
+    const version = (await store.getCurrentManifestVersion()) ?? -1;
+    const candidates = await store.readFtsCandidates(
+      "docs",
+      "body",
+      [
+        { term: "term-000000", prefix: false },
+        { term: `term-${String(POSTINGS - 1).padStart(6, "0")}`, prefix: false },
+      ],
+      version,
+    );
+    expect(candidates.rowIdsByTerm).toEqual([[1n], [BigInt(POSTINGS)]]);
+  }
+
+  it("commits and reads one on the memory store", async () => {
+    const store = new MemoryBlockStore();
+    await commitWideDelta(store);
+    await expectWideDelta(store);
+    store.close();
+  });
+
+  it("replays one from the OPFS log and loads one from a checkpoint", async () => {
+    const shim = new MemoryOpfs();
+    const store = await OpfsBlockStore.open({
+      name: "wide-delta",
+      root: shim.root,
+      checkpointEntries: 1_000_000,
+    });
+    await commitWideDelta(store);
+    await expectWideDelta(store);
+    store._crashForTests();
+
+    const replayed = await OpfsBlockStore.open({ name: "wide-delta", root: shim.root });
+    await expectWideDelta(replayed);
+    // Closing checkpoints; the next open loads the delta from the checkpoint alone.
+    replayed.close();
+    const checkpointed = await OpfsBlockStore.open({ name: "wide-delta", root: shim.root });
+    await expectWideDelta(checkpointed);
+    expect((await checkpointed.checkIntegrity({ mode: "full" })).ok).toBe(true);
+    checkpointed.close();
+  });
+});

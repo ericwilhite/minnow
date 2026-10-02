@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { encodeBlock } from "../packages/core/src/block-format/index.ts";
 import { MemoryOpfs } from "../packages/core/src/testing/opfs-shim.ts";
 import { OpfsBlockStore } from "../packages/core/src/storage/opfs/index.ts";
+import { walStagingTestHooks } from "../packages/core/src/storage/opfs/leader.ts";
 import { OPFS_LAYOUT_VERSION } from "../packages/core/src/storage/opfs/upgrades.ts";
 import type { TableRecord } from "../packages/core/src/storage/types.ts";
 
@@ -104,6 +105,66 @@ await follower.stageTransactionArtifacts({
   segments: [],
   updatedAt: "2026-08-24T12:00:04.000Z",
 });
+// Layout 9's own shape in the log's tail: one commit whose frame spans continuation frames.
+// A real one is megabytes; smaller pieces freeze the same framing in a few hundred kilobytes.
+walStagingTestHooks.pieceBytes = 16 * 1024;
+await store.addTable({
+  ...table("fixture-keyed", "keyed"),
+  columns: [{ id: "id", name: "id", type: "number", nullable: false }],
+  uniqueKeyColumnId: "id",
+});
+const keyedTransaction = await store.beginTransaction({
+  record: {
+    id: "fixture-keyed-transaction",
+    ownerId: "fixture-owner",
+    expiresAt: "2026-08-24T13:00:00.000Z",
+    pendingBlockIds: [],
+    pendingSegmentIds: [],
+    status: "active",
+    revision: 0,
+    startedAt: "2026-08-24T12:00:05.000Z",
+    updatedAt: "2026-08-24T12:00:05.000Z",
+    committedVersion: null,
+  },
+});
+const keyedBlock = await encodeBlock({ type: "number", values: [1] }, "raw");
+const keyedStaged = await store.stageTransactionArtifacts({
+  transactionId: keyedTransaction.record.id,
+  expectedRevision: keyedTransaction.record.revision,
+  blocks: [{ id: "fixture-keyed-block", bytes: keyedBlock }],
+  segments: [
+    {
+      id: "fixture-keyed-segment",
+      tableId: "fixture-keyed",
+      transactionId: keyedTransaction.record.id,
+      kind: "insert",
+      level: 0,
+      logicalOrder: 0,
+      commitOrdinal: 0,
+      rowCount: 1,
+      rowIdStart: 1n,
+      rowIdEndExclusive: 2n,
+      rowIdSpans: [],
+      columnBlockIds: { id: ["fixture-keyed-block"] },
+      createdAt: "2026-08-24T12:00:06.000Z",
+    },
+  ],
+  updatedAt: "2026-08-24T12:00:06.000Z",
+});
+await store.commitTransaction({
+  transactionId: keyedTransaction.record.id,
+  expectedTransactionRevision: keyedStaged.revision,
+  expectedManifestVersion: (await store.getCurrentManifestVersion()) ?? null,
+  levelZeroSegmentLimits: [{ tableId: "fixture-keyed", limit: 4096 }],
+  uniqueKeyChanges: [
+    {
+      tableId: "fixture-keyed",
+      keyTokens: Array.from({ length: 16_384 }, (_, index) => `number:${String(index)}`),
+      requireAbsent: true,
+    },
+  ],
+  committedAt: "2026-08-24T12:00:07.000Z",
+});
 await store.addTable(table("fixture-wal-tail", "wal-tail"));
 follower.close();
 store._crashForTests();
@@ -130,7 +191,7 @@ const fixture = {
   writerPackageVersion,
   files,
   expectations: {
-    tables: ["checkpoint-b", "data", "wal-tail"],
+    tables: ["checkpoint-b", "data", "keyed", "wal-tail"],
     blockId: "fixture-block",
     blockValues: ["native", null, "fixture"],
   },

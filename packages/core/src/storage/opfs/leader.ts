@@ -730,8 +730,12 @@ const COVERED_LOG_RESET_QUIET_MS = 1_000;
 /** The WAL length past which an operation must first make room by checkpointing. */
 const WAL_HEADROOM_LIMIT = MAX_OPFS_WAL_BYTES - 64 * 1024 * 1024;
 
-/** A frame up to this size is appended whole; a larger one is staged in continuation pieces. */
-const STAGED_FRAME_BYTES = WAL_CONTINUATION_PIECE_BYTES;
+/**
+ * @internal A frame up to `pieceBytes` is appended whole; a larger one is staged in pieces of
+ * that size. Lowered only by tests and the fixture writer, so a small commit spans continuation
+ * frames without writing megabytes.
+ */
+export const walStagingTestHooks = { pieceBytes: WAL_CONTINUATION_PIECE_BYTES };
 
 /** One checkpoint slot as recovery read it: its decoded state, or why it has none. */
 interface DecodedCheckpointSlot {
@@ -1790,18 +1794,19 @@ export class OpfsLeader {
    * log until that step: the lease lane stays closed, and the frame's sequence is fixed here.
    */
   async #stageEncodedFrame(encoded: EncodedWalFrame): Promise<void> {
-    if (encoded.bytes.byteLength <= STAGED_FRAME_BYTES) return;
+    const pieceBytes = walStagingTestHooks.pieceBytes;
+    if (encoded.bytes.byteLength <= pieceBytes) return;
     const nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
     if (encoded.seq !== nextSeq && !renumberEncodedFrame(encoded, nextSeq)) {
       throw new Error("A staged OPFS log frame cannot take its sequence number");
     }
     const offset = this.#wal.byteLength;
-    const prefixBytes = encoded.bytes.byteLength - STAGED_FRAME_BYTES;
+    const prefixBytes = encoded.bytes.byteLength - pieceBytes;
     try {
-      for (let at = 0; at < prefixBytes; at += STAGED_FRAME_BYTES) {
+      for (let at = 0; at < prefixBytes; at += pieceBytes) {
         this.#refuseIfPoisonedMidStep();
         this.#wal.appendContinuation(
-          encoded.bytes.subarray(at, Math.min(prefixBytes, at + STAGED_FRAME_BYTES)),
+          encoded.bytes.subarray(at, Math.min(prefixBytes, at + pieceBytes)),
           this.#strict,
         );
         await maybeYieldToEventLoop();

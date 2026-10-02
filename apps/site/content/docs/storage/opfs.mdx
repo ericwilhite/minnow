@@ -51,7 +51,11 @@ becoming leader is opening the file, and failover is the next connection's open 
 
 The leader does every operation at held-handle speed. A commit validates in memory and appends
 one checksummed frame to the log. In strict mode it also flushes a separate checksummed
-acknowledgement boundary before replying. Reads answer from memory
+acknowledgement boundary before replying. A large commit prepares its keys and index changes a
+slice at a time first. When its frame is larger than one piece of a few megabytes, it writes all
+but the last piece as continuation frames, then applies itself and appends the last piece in
+one short step. A commit whose frame could never fit the log's headroom (about 192 MiB) is
+refused with `StorageResourceLimitError` (`"log frame byte"`) before anything changes. Reads answer from memory
 and from synchronous reads of the data files. And because the leader is provably the only
 writer, it never checks anything for freshness — the per-operation probes and version checks
 other designs pay simply do not exist. That is why the store is fast: on the
@@ -72,12 +76,15 @@ serving. In-flight mutations are never evicted from deduplication; completed ans
 512-entry, 128 MiB cache that retains request fingerprints rather than request payloads. Each
 follower admits at most 512 pending requests or 128 MiB of request data. The leader admits at most
 1,024 requests in total, with separate 128 MiB mutation and 256 MiB read ceilings; an individual
-message cannot exceed 66 MiB. Admitted reads wait for response capacity, reserving the maximum
+message cannot exceed 66 MiB. A follower's commit whose keys and index changes are too large for
+that sends them ahead as record JSON in 8 MiB pieces, and the leader joins them back into the
+commit. One such request is admitted even past the byte ceilings when nothing else is waiting. Admitted reads wait for response capacity, reserving the maximum
 response size only while they execute. Small metadata bursts therefore queue behind the read
 memory limit. Request-count and request-byte overload is still rejected before creating more
 work, so a stalled tab cannot create an unbounded message queue.
 Request identity includes the follower, request id, method, and a canonical SHA fingerprint of
-the arguments. Reusing an identity with different arguments is refused.
+the arguments — for a commit sent in pieces, of the pieces' bytes. Reusing an identity with
+different arguments is refused.
 After failover, an operation keeps looking for a leader — discovering, calling, electing — for
 ten seconds. That budget restarts whenever a connection holding the handles answers that it is
 still recovering the log or checkpointing on its way out, so a long recovery of a large database
@@ -162,12 +169,16 @@ Collection keeps every retained segment’s block references intact, including r
 Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
 automatically repair a store already affected by missing referenced blocks.
 
-Layout 8 is the current native OPFS contract. It stores exactly layout 7's bytes and admits
-compaction jobs whose merge plan is recomputed from its sources rather than stored cell by cell,
-which a layout-7 build cannot read. **Layout 7 upgrades automatically on open** by rewriting the
-format marker alone: a small `upgrade-7-8` witness is written and flushed first, so a crash that
-tears the marker is finished on the next open instead of refused, and the witness is removed once
-the new marker is durable. A layout-7 build then refuses the database without changing it.
+Layout 9 is the current native OPFS contract. Like layout 8, it stores layout 7's bytes. Layout 8
+admits compaction jobs whose merge plan is recomputed from its sources rather than stored cell by
+cell, which a layout-7 build cannot read. Layout 9 admits a commit too large for one WAL frame:
+its frame is written as continuation frames, a few megabytes each, completed by an ordinary
+frame, and recovery joins them. A checkpoint may also hold one commit's index changes at any
+size. A layout-8 build cannot read either. **Layouts 7 and 8 upgrade automatically on open** by
+rewriting the format marker alone: a small `upgrade-8-9` witness is written and flushed first, so
+a crash that tears the marker is finished on the next open instead of refused, and the witness is
+removed once the new marker is durable. An older build then refuses the database without
+changing it.
 
 Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
 structural `schemaEpoch` and served-request ledger. Recovery

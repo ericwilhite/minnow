@@ -366,10 +366,15 @@ worker suite discovers the same frozen fixtures and checks automatic upgrade and
 across restart. A pinned test-only alias of the released core 0.10.0 package proves that the actual
 layout-6 reader opens the old fixture and refuses the upgraded tree before mutation, in Node
 and native workers. A second alias, of core 0.12.1, is the last IndexedDB schema-2 and OPFS
-layout-7 writer: `layout8-upgrade.test.ts` and `indexeddb-schema3.test.ts` have it leave a
+layout-7 writer: `marker-upgrade.test.ts` and `indexeddb-schema3.test.ts` have it leave a
 merge-v1 fold in flight, then upgrade, finish that fold, write, reopen, and check that 0.12.1
-refuses the result without a byte changing. The layout-7 marker upgrade is cut at each of its
-eight I/O boundaries by tab death and by power loss. Unsupported pre-contract prototypes are refused without changing their bytes.
+refuses the result without a byte changing. A third alias, of core 0.13.1, is the last IndexedDB
+schema-3 and OPFS layout-8 writer: `marker-upgrade.test.ts` upgrades its database to layout 9,
+logs a commit whose frame spans continuation frames and whose index changes exceed one layout-8
+chunk, reopens from the log and from a checkpoint, and checks that 0.13.1 then refuses the
+database; `indexeddb-schema4.test.ts` does the same for schema 4 with every older writer. The
+marker upgrade is cut at each of its eight I/O boundaries by tab death and by power loss, from
+both older layouts. Unsupported pre-contract prototypes are refused without changing their bytes.
 The layout-7 tests also zero or truncate acknowledged WAL bytes and
 damage either acknowledgement slot; recovery must report corruption rather than roll back.
 

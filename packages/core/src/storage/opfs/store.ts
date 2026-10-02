@@ -8,8 +8,13 @@ import {
   StorageFormatVersionError,
   validateStorageDatabaseName,
   type BlockStore,
+  type FtsChanges,
   type TempRunPage,
+  type UniqueKeyChanges,
 } from "../types.js";
+import { maybeYieldToEventLoop } from "../../work-slicer.js";
+import { commitDeltaUnits, LARGE_COMMIT_DELTA_UNITS } from "../commit-size.js";
+import { encodeRecordJsonBytesSliced, parseRecordJsonSliced } from "../toolkit/wire.js";
 import { validateTempRunPage, validateTempRunPageIdentity } from "../toolkit/record-core.js";
 import { OpfsTree, encodeSegment, isDomError } from "./files.js";
 
@@ -29,6 +34,9 @@ import {
 import {
   rehydrateStoreError,
   estimateRpcValueBytes,
+  fingerprintEncodedStoreRequest,
+  MAX_OPFS_RPC_ENCODED_BYTES,
+  OPFS_RPC_PIECE_BYTES,
   fingerprintStoreRequest,
   MAX_OPFS_RPC_HOLD_MS,
   MAX_OPFS_RPC_MESSAGE_BYTES,
@@ -301,6 +309,26 @@ function sameServedRequest(
   return remembered.method === message.method && remembered.signature === signature;
 }
 
+/** A commit sent with its deltas encoded in pieces: `args` hold the rest of its input. */
+interface EncodedRequest {
+  args: unknown[];
+  pieces: Array<Uint8Array<ArrayBuffer>>;
+  bytes: number;
+}
+
+interface IncomingPieces {
+  pieces: Array<Uint8Array<ArrayBuffer>>;
+  bytes: number;
+  receivedAt: number;
+  /** Over the buffer's budget: the request is answered "queue full" when it arrives. */
+  refused: boolean;
+}
+
+/** Bytes of large-request pieces a leader buffers at once, across requesters. */
+const MAX_INCOMING_PIECES_BYTES = 1024 * 1024 * 1024;
+/** Pieces whose request has not followed within this long are dropped. */
+const INCOMING_PIECES_TTL_MS = 120_000;
+
 interface PendingRpc {
   message: OpMessage;
   retainedBytes: number;
@@ -379,6 +407,11 @@ export class OpfsBlockStore {
   /** When a connection holding the handles last said it was still recovering or leaving. */
   #waitHeardAt = 0;
   readonly #pending = new Map<string, PendingRpc>();
+  /** The pieces of each encoded request message, posted ahead of it on every send. */
+  readonly #messagePieces = new WeakMap<OpMessage, Array<Uint8Array<ArrayBuffer>>>();
+  /** Leader side: pieces of large requests received so far, oldest first, by request key. */
+  readonly #incomingPieces = new Map<string, IncomingPieces>();
+  #incomingPiecesBytes = 0;
   readonly #inFlightMutations = new Map<string, ServedMutation<Promise<ServedOutcome>>>();
   readonly #settledMutations = new Map<string, ServedMutation<ServedOutcome>>();
   readonly #servedRequestLocks = new Map<string, Promise<void>>();
@@ -830,16 +863,46 @@ export class OpfsBlockStore {
     if (this.#coordinationPausedForTests) return;
     this.#othersSeen = true;
     switch (message.kind) {
+      case "opPiece": {
+        if (this.#leader !== undefined) this.#receivePiece(message);
+        return;
+      }
       case "op": {
         if (this.#leader === undefined) {
+          this.#incomingPieces.delete(servedRequestKey(message.from, message.requestId));
           this.#decline(message);
           return;
         }
+        let encoded: Uint8Array<ArrayBuffer> | undefined;
+        if (message.encoded !== undefined) {
+          const assembled = this.#takeAssembledPieces(message);
+          if (assembled === "missing") {
+            // A piece went astray (a leader change between them): nothing ran, so the
+            // requester sends the whole request again.
+            this.#decline(message);
+            return;
+          }
+          if (assembled === "refused") {
+            this.#answer(message.from, {
+              kind: "result",
+              requestId: message.requestId,
+              ok: false,
+              error: serializeStoreError(
+                new OpfsCoordinationError("leader-queue-full", message.method),
+              ),
+            });
+            return;
+          }
+          encoded = assembled;
+        }
         {
-          const requestBytes = estimateRpcValueBytes(message.args);
+          const requestBytes = estimateRpcValueBytes(message.args) + (encoded?.byteLength ?? 0);
+          // One request larger than the byte budget — a big commit's deltas — is admitted when
+          // it would be alone; it still waits behind nothing else's bytes.
           if (
             this.#servedRequestCount >= RPC_SERVER_ADMISSION_LIMIT ||
-            this.#servedRequestBytes + requestBytes > RPC_SERVER_ADMISSION_BYTES
+            (this.#servedRequestBytes > 0 &&
+              this.#servedRequestBytes + requestBytes > RPC_SERVER_ADMISSION_BYTES)
           ) {
             this.#answer(message.from, {
               kind: "result",
@@ -857,7 +920,9 @@ export class OpfsBlockStore {
           const alreadyServing = this.#served.has(message.requestId);
           this.#served.set(message.requestId, message.from);
           this.#startKeepalive();
-          void this.#serveOp(message)
+          void (
+            encoded === undefined ? this.#serveOp(message) : this.#serveEncodedOp(message, encoded)
+          )
             .catch((error: unknown) => {
               // The requester must not wait out its timeout for an answer that will never come.
               this.#diagnostic(error, `opfs served ${message.method}`);
@@ -1049,13 +1114,30 @@ export class OpfsBlockStore {
     return pending;
   }
 
-  async #serveOp(message: OpMessage): Promise<void> {
+  /**
+   * A request whose commit deltas came in pieces: decoded a slice at a time, merged back into
+   * its input, and served with an identity taken from the encoded bytes.
+   */
+  async #serveEncodedOp(message: OpMessage, encoded: Uint8Array<ArrayBuffer>): Promise<void> {
+    const fingerprint = await fingerprintEncodedStoreRequest(message.method, message.args, encoded);
+    const deltas = (await parseRecordJsonSliced(encoded, maybeYieldToEventLoop)) as Record<
+      string,
+      unknown
+    >;
+    const [input] = message.args as [Record<string, unknown>];
+    await this.#serveOp({ ...message, args: [{ ...input, ...deltas }] }, fingerprint);
+  }
+
+  async #serveOp(
+    message: OpMessage,
+    precomputed?: { signature: string; retainedBytes: number },
+  ): Promise<void> {
     const requestKey = servedRequestKey(message.from, message.requestId);
     // Once an identity is admitted, duplicates can compare their fingerprint immediately and
     // either attach to the exact execution or fail closed. The short lock below exists only for
     // the pre-admission fingerprint race between two first deliveries.
     if (this.#inFlightMutations.has(requestKey) || this.#settledMutations.has(requestKey)) {
-      await this.#serveOpLocked(message, requestKey);
+      await this.#serveOpLocked(message, requestKey, precomputed);
       return;
     }
     const previous = this.#servedRequestLocks.get(requestKey) ?? Promise.resolve();
@@ -1067,7 +1149,7 @@ export class OpfsBlockStore {
     this.#servedRequestLocks.set(requestKey, tail);
     await previous;
     try {
-      await this.#serveOpLocked(message, requestKey);
+      await this.#serveOpLocked(message, requestKey, precomputed);
     } finally {
       release();
       if (this.#servedRequestLocks.get(requestKey) === tail) {
@@ -1076,13 +1158,17 @@ export class OpfsBlockStore {
     }
   }
 
-  async #serveOpLocked(message: OpMessage, requestKey: string): Promise<void> {
+  async #serveOpLocked(
+    message: OpMessage,
+    requestKey: string,
+    precomputed?: { signature: string; retainedBytes: number },
+  ): Promise<void> {
     const leader = this.#leader;
     if (leader === undefined || !RPC_METHODS.has(message.method)) return;
     const isRead = READ_METHODS.has(message.method);
     let fingerprint: { signature: string; retainedBytes: number };
     try {
-      fingerprint = await fingerprintStoreRequest(message.method, message.args);
+      fingerprint = precomputed ?? (await fingerprintStoreRequest(message.method, message.args));
     } catch (error) {
       this.#answer(message.from, {
         kind: "result",
@@ -1398,7 +1484,114 @@ export class OpfsBlockStore {
   #send(leaderId: string, message: OpMessage): void {
     // Once the channels are torn down nothing may be posted.
     if (this.#channel === undefined) return;
+    // A large request's pieces go first, every time it is sent: the receiver assembles them
+    // when the request itself arrives.
+    const pieces = this.#messagePieces.get(message) ?? [];
+    for (const [index, bytes] of pieces.entries()) {
+      this.#postOnce(leaderId, {
+        kind: "opPiece",
+        requestId: message.requestId,
+        from: message.from,
+        index,
+        bytes,
+      });
+    }
     this.#postOnce(leaderId, message);
+  }
+
+  /**
+   * A commit too large for one message, with its key and index changes encoded as record JSON
+   * in pieces; `undefined` for every other request. Encoding a slice at a time also spares the
+   * structured clone of millions of small values.
+   */
+  async #encodedRequest(method: string, args: unknown[]): Promise<EncodedRequest | undefined> {
+    if (method !== "commitTransaction" && method !== "writeTransaction") return undefined;
+    const input = args[0] as {
+      uniqueKeyChanges?: readonly UniqueKeyChanges[];
+      ftsChanges?: readonly FtsChanges[];
+    };
+    if (commitDeltaUnits(input) < LARGE_COMMIT_DELTA_UNITS) return undefined;
+    const { uniqueKeyChanges, ftsChanges, ...rest } = input;
+    const bytes = await encodeRecordJsonBytesSliced(
+      {
+        ...(uniqueKeyChanges === undefined ? {} : { uniqueKeyChanges }),
+        ...(ftsChanges === undefined ? {} : { ftsChanges }),
+      },
+      maybeYieldToEventLoop,
+    );
+    if (bytes.byteLength > MAX_OPFS_RPC_ENCODED_BYTES) {
+      throw new RangeError(
+        `OPFS request deltas exceed ${String(MAX_OPFS_RPC_ENCODED_BYTES)} encoded bytes`,
+      );
+    }
+    const pieces: Array<Uint8Array<ArrayBuffer>> = [];
+    for (let at = 0; at < bytes.byteLength; at += OPFS_RPC_PIECE_BYTES) {
+      pieces.push(bytes.slice(at, at + OPFS_RPC_PIECE_BYTES));
+    }
+    return { args: [rest], pieces, bytes: bytes.byteLength };
+  }
+
+  /** Buffers one piece of a large request until the request itself arrives. */
+  #receivePiece(message: Extract<StoreRpcMessage, { kind: "opPiece" }>): void {
+    const key = servedRequestKey(message.from, message.requestId);
+    const now = Date.now();
+    for (const [staleKey, stale] of this.#incomingPieces) {
+      if (now - stale.receivedAt <= INCOMING_PIECES_TTL_MS) break;
+      this.#incomingPiecesBytes -= stale.bytes;
+      this.#incomingPieces.delete(staleKey);
+    }
+    let entry = this.#incomingPieces.get(key);
+    if (message.index === 0 && entry !== undefined) {
+      // A re-send starts over.
+      this.#incomingPiecesBytes -= entry.bytes;
+      this.#incomingPieces.delete(key);
+      entry = undefined;
+    }
+    if (entry === undefined) {
+      if (message.index !== 0) return;
+      entry = { pieces: [], bytes: 0, receivedAt: now, refused: false };
+    } else {
+      this.#incomingPieces.delete(key);
+    }
+    // Re-inserted, so the map stays ordered by the last piece received.
+    this.#incomingPieces.set(key, entry);
+    entry.receivedAt = now;
+    if (entry.refused || message.index !== entry.pieces.length) return;
+    if (this.#incomingPiecesBytes + message.bytes.byteLength > MAX_INCOMING_PIECES_BYTES) {
+      this.#incomingPiecesBytes -= entry.bytes;
+      entry.pieces = [];
+      entry.bytes = 0;
+      entry.refused = true;
+      return;
+    }
+    entry.pieces.push(message.bytes as Uint8Array<ArrayBuffer>);
+    entry.bytes += message.bytes.byteLength;
+    this.#incomingPiecesBytes += message.bytes.byteLength;
+  }
+
+  /** The assembled encoded deltas of a request, or why there are none. */
+  #takeAssembledPieces(message: OpMessage): Uint8Array<ArrayBuffer> | "missing" | "refused" {
+    const key = servedRequestKey(message.from, message.requestId);
+    const entry = this.#incomingPieces.get(key);
+    if (entry === undefined) return "missing";
+    this.#incomingPieces.delete(key);
+    this.#incomingPiecesBytes -= entry.bytes;
+    if (entry.refused) return "refused";
+    const expected = message.encoded;
+    if (
+      expected === undefined ||
+      entry.pieces.length !== expected.pieces ||
+      entry.bytes !== expected.bytes
+    ) {
+      return "missing";
+    }
+    const joined = new Uint8Array(entry.bytes);
+    let at = 0;
+    for (const piece of entry.pieces) {
+      joined.set(piece, at);
+      at += piece.byteLength;
+    }
+    return joined;
   }
 
   /**
@@ -1480,6 +1673,9 @@ export class OpfsBlockStore {
     const requestId = crypto.randomUUID();
     const sentAt = Date.now();
     const isRead = READ_METHODS.has(method);
+    // A large commit's deltas, encoded once on its first remote attempt and sent the same way
+    // on every re-send, so the leader sees one request identity.
+    let encodedRequest: EncodedRequest | undefined | null = null;
     let sentRemotely = false;
     // Set once an attempt may have executed somewhere: a timed-out delivery. A decline is a
     // proof that it did not.
@@ -1551,7 +1747,10 @@ export class OpfsBlockStore {
       }
       try {
         sentRemotely = true;
-        return await this.#rpc(requestId, method, args, sentAt);
+        if (!isRead && encodedRequest === null) {
+          encodedRequest = (await this.#encodedRequest(method, args)) ?? undefined;
+        }
+        return await this.#rpc(requestId, method, args, sentAt, encodedRequest ?? undefined);
       } catch (error) {
         if (error === RPC_DECLINED || error === RPC_TIMED_OUT) {
           // Declined: provably never ran there. Timed out: the leader is gone; whoever leads
@@ -1574,16 +1773,23 @@ export class OpfsBlockStore {
     return this.#knownLeader !== undefined;
   }
 
-  #rpc(requestId: string, method: string, args: unknown[], sentAt: number): Promise<unknown> {
+  #rpc(
+    requestId: string,
+    method: string,
+    args: unknown[],
+    sentAt: number,
+    encoded?: EncodedRequest,
+  ): Promise<unknown> {
     let retainedBytes: number;
     try {
-      retainedBytes = estimateRpcValueBytes(args);
+      retainedBytes = estimateRpcValueBytes(encoded?.args ?? args) + (encoded?.bytes ?? 0);
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
     if (
       this.#pending.size >= RPC_IN_FLIGHT_LIMIT ||
-      this.#pendingRpcBytes + retainedBytes > RPC_IN_FLIGHT_MUTATION_BYTES
+      (this.#pendingRpcBytes > 0 &&
+        this.#pendingRpcBytes + retainedBytes > RPC_IN_FLIGHT_MUTATION_BYTES)
     ) {
       return Promise.reject(new OpfsCoordinationError("follower-queue-full", method));
     }
@@ -1593,9 +1799,13 @@ export class OpfsBlockStore {
         requestId,
         from: this.#instanceId,
         method,
-        args,
+        args: encoded?.args ?? args,
         sentAt,
+        ...(encoded === undefined
+          ? {}
+          : { encoded: { pieces: encoded.pieces.length, bytes: encoded.bytes } }),
       };
+      if (encoded !== undefined) this.#messagePieces.set(message, encoded.pieces);
       const timer = setTimeout(() => {
         this.#onPendingTimeout(requestId);
       }, this.#rpcTimeoutMs);

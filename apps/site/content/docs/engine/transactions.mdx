@@ -96,10 +96,11 @@ no length limit: staging costs what it stages, not what the journal already hold
 adapter. What bounds an unpublished transaction is the store's aggregate quota — 512 MiB of
 staged artifact bytes across all active transactions, and 1,048,576 staged blocks or segments —
 and its lease, which a crashed tab's transaction loses. A transaction's commit also carries its
-key and index changes, at most 1,048,576 entries and 64 MiB: one key per row of a keyed table plus
-one per row for each secondary index. A single write of 500,000 rows into a keyed table with one
-index reaches that bound, so split writes that large into several batches, each its own
-commit; the statements of one write scope share a single commit and its bound. A database also admits at most 64 pending
+key and index changes — one key per row of a keyed table plus one entry per row for each
+secondary or full-text index — and those have no fixed limit: each store writes them in bounded
+pieces, and a large commit prepares them a slice at a time so that it never holds the thread for
+long. On OPFS a single commit's log frame must still fit the log, about 192 MiB, which is
+several million rows. A database also admits at most 64 pending
 write calls, and a buffered writer at most 64 unawaited `add()` calls, so a producer must await
 writes when it reaches backpressure.
 

@@ -79,24 +79,29 @@ must use a new snapshot format number and keep the format-1 reader.
 IndexedDB schema 1 was its first locked native layout; schema 2 (core 0.10.0) moved each
 transaction's artifact journal into chunked records and migrates a schema-1 database in place on
 open. Schema 3 (core 0.13.0) changes no stored record: it admits compaction jobs with replayed
-merge plans, so a schema-2 build, which cannot read them, refuses the database. No pre-contract
+merge plans, so a schema-2 build, which cannot read them, refuses the database. Schema 4 (core
+0.14.0) rewrites nothing either: it lets one commit store an indexed column's changes as several
+part records, so a commit's index changes have no size limit, and a schema-3 build refuses the
+database. No pre-contract
 schema readers or recreation policy ship. Every future integer schema
 version must add one ordered migration to the explicit registry and a frozen fixture for the
 version it supersedes. The browser runs the complete chain
 inside one `versionchange` transaction, so either every schema and data step commits or the old
 database remains intact. An older application build refuses a newer database without mutation.
 
-OPFS native layout 8 (core 0.13.0) is the current contract. It keeps layout 7's bytes — the
-checkpoint, WAL, and extents still carry encoding version 7 — and admits compaction jobs with
-replayed merge plans, which a layout-7 build cannot read; the format marker is the barrier, and
-upgrading a layout-7 database rewrites only that marker. Layout 7's fixture freezes the format
+OPFS native layout 9 (core 0.14.0) is the current contract. Like layout 8 (core 0.13.0) it keeps
+layout 7's bytes — the checkpoint, WAL, and extents still carry encoding version 7. Layout 8
+admits compaction jobs with replayed merge plans, which a layout-7 build cannot read. Layout 9
+admits a WAL entry whose payload spans several frames, for a commit too large for one, and
+checkpointed index changes of any size, which a layout-8 build cannot read. The format marker is
+the barrier, and upgrading a layout-7 or layout-8 database rewrites only that marker. Layout 7's fixture freezes the format
 marker, checkpoint, WAL tail, extent payloads, and a separate checksummed acknowledgement file. That file records
 which WAL boundary completed a strict flush, so recovery can distinguish an unwritten suffix
 from damage to an acknowledged write. Missing or corrupt acknowledgement bytes stop recovery.
 
 **Supported upgrades are automatic, including during 0.x.** Opening a layout-6 database with
 the current build validates its native data and converts it under exclusive ownership; a layout-7
-database only has its marker rewritten. Both end at layout 8. No export/import or separate
+or layout-8 database only has its marker rewritten. All of them end at layout 9. No export/import or separate
 migration call is needed. Block format 2 and snapshot format 1 are unchanged. Frozen older
 immutable posting envelopes remain readable. Older application builds refuse the upgraded
 database.

@@ -7160,6 +7160,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         this.#scheduleFtsDeltaFold(hint.tableId, hint.columnId);
       }
     }
+    // A commit whose index delta is larger than one stored chunk is folded into the base now:
+    // waiting for a count of commits would keep that delta in memory and every checkpoint.
+    for (const { tableId, columnId } of transaction?.largeFtsDeltaColumns ?? []) {
+      this.#scheduleFtsDeltaFold(tableId, columnId);
+    }
     this.#collection.committed();
     this.#compaction.committed(manifest.changedTableIds);
   }
