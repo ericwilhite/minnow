@@ -52,6 +52,9 @@ test("the docs overview uses the product headline", async ({ page }) => {
   await expect(page.locator("h1")).toHaveText("A browser native SQL database");
 });
 
+/** The IndexedDB schema `IndexedDbBlockStore` writes; a format bump updates it here. */
+const INDEXEDDB_SCHEMA = 3;
+
 test("the console reopens an existing database instead of rebuilding it", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator("[data-minnow-devtools] .statusbar").first()).toBeVisible({
@@ -89,7 +92,7 @@ test("the console reopens an existing database instead of rebuilding it", async 
           );
         }),
     ),
-  ).toBe(2);
+  ).toBe(INDEXEDDB_SCHEMA);
 
   await page.reload();
   await expect(page.getByText("this database was already on your machine")).toBeVisible({
@@ -101,15 +104,16 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
   page,
 }) => {
   await page.goto("/docs/");
+  const newer = INDEXEDDB_SCHEMA + 1;
   await page.evaluate(
-    () =>
+    (version) =>
       new Promise<void>((resolve, reject) => {
         // One past the schema this build writes: a database a newer build left behind.
-        const request = indexedDB.open("minnow-playground", 3);
+        const request = indexedDB.open("minnow-playground", version);
         request.addEventListener(
           "upgradeneeded",
           () => {
-            request.result.createObjectStore("future-v3-sentinel");
+            request.result.createObjectStore("future-sentinel");
           },
           { once: true },
         );
@@ -127,6 +131,7 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
           { once: true },
         );
       }),
+    newer,
   );
 
   await page.goto("/");
@@ -144,7 +149,7 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
             const database = request.result;
             resolve({
               version: database.version,
-              hasFutureSentinel: database.objectStoreNames.contains("future-v3-sentinel"),
+              hasFutureSentinel: database.objectStoreNames.contains("future-sentinel"),
             });
             database.close();
           },
@@ -157,7 +162,7 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
         );
       }),
   );
-  expect(untouched).toEqual({ version: 3, hasFutureSentinel: true });
+  expect(untouched).toEqual({ version: newer, hasFutureSentinel: true });
 });
 
 test("the TypeScript tab checks a snippet against the schema and runs it", async ({ page }) => {
