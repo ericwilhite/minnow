@@ -58,6 +58,7 @@ const SLICED_JSON_FLUSH_CHARS = 64 * 1024;
 async function encodeRecordJsonSliced(
   value: unknown,
   pause: () => Promise<void>,
+  maxBytes = Number.POSITIVE_INFINITY,
 ): Promise<{ chunks: Uint8Array[]; byteLength: number; checksum: number }> {
   const chunks: Uint8Array[] = [];
   let pending: string[] = [];
@@ -71,6 +72,7 @@ async function encodeRecordJsonSliced(
       pendingChars = 0;
       chunks.push(bytes);
       byteLength += bytes.byteLength;
+      if (byteLength > maxBytes) throw new EncodedRecordTooLargeError(byteLength, maxBytes);
       checksum = crc32Continue(checksum, bytes);
     }
     await pause();
@@ -553,11 +555,28 @@ export function encodeSyncCheckpoint(state: unknown): Uint8Array {
  * between pieces, so checkpointing a large database does not hold the thread for its whole
  * size. `state` must not change until the returned promise settles.
  */
+/**
+ * Thrown by a sliced encoding given a ceiling as soon as its output passes it, so a record too
+ * large to keep costs the encoding of the ceiling, not of the whole record.
+ */
+export class EncodedRecordTooLargeError extends RangeError {
+  constructor(
+    readonly bytes: number,
+    readonly maxBytes: number,
+  ) {
+    super(
+      `Encoded record reached ${String(bytes)} bytes, past its ${String(maxBytes)} byte ceiling`,
+    );
+    this.name = "EncodedRecordTooLargeError";
+  }
+}
+
 export async function encodeSyncCheckpointSliced(
   state: unknown,
   pause: () => Promise<void>,
+  maxPayloadBytes = Number.POSITIVE_INFINITY,
 ): Promise<Uint8Array> {
-  const payload = await encodeRecordJsonSliced(state, pause);
+  const payload = await encodeRecordJsonSliced(state, pause, maxPayloadBytes);
   const bytes = new Uint8Array(ENVELOPE_HEADER_BYTES + payload.byteLength);
   const view = new DataView(bytes.buffer);
   textEncoder.encodeInto(SYNC_CHECKPOINT_MAGIC, bytes);

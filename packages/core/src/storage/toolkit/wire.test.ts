@@ -11,6 +11,7 @@ import {
   encodeRecordJson,
   encodeSyncCheckpoint,
   encodeSyncCheckpointSliced,
+  EncodedRecordTooLargeError,
   LOG_FORMAT_VERSION,
   parseRecordJsonSliced,
 } from "./wire.js";
@@ -523,6 +524,26 @@ describe("record JSON decoding", () => {
 });
 
 describe("sliced checkpoint encoding", () => {
+  it("stops at its byte ceiling instead of encoding the whole state", async () => {
+    const state = { rows: Array.from({ length: 200_000 }, (_, index) => `row-${String(index)}`) };
+    const full = (await encodeSyncCheckpointSliced(state, async () => undefined)).byteLength;
+    const ceiling = 256 * 1024;
+    const failure = await encodeSyncCheckpointSliced(state, async () => undefined, ceiling).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(EncodedRecordTooLargeError);
+    const { bytes, maxBytes } = failure as EncodedRecordTooLargeError;
+    expect(maxBytes).toBe(ceiling);
+    expect(bytes).toBeGreaterThan(ceiling);
+    // It stopped within a slice of the ceiling, far short of the full encoding.
+    expect(bytes).toBeLessThan(ceiling + 256 * 1024);
+    expect(full).toBeGreaterThan(bytes * 4);
+    await expect(
+      encodeSyncCheckpointSliced(state, async () => undefined, full),
+    ).resolves.toHaveLength(full);
+  });
+
   let pauses = 0;
   const pause = (): Promise<void> => {
     pauses += 1;

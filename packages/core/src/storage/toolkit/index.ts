@@ -57,5 +57,6 @@ export {
   encodeRecordJson,
   encodeSyncCheckpoint,
   encodeSyncCheckpointSliced,
+  EncodedRecordTooLargeError,
   type PostingChunkEntry,
 } from "./wire.js";

@@ -2551,6 +2551,18 @@ export class RecordCore {
     };
   }
 
+  /**
+   * Postings held in index deltas across every indexed column. A store whose checkpoint grew
+   * past its bound after a large write watches this fall as folds prune the deltas.
+   */
+  ftsDeltaPostingCount(): number {
+    let count = 0;
+    for (const deltas of this.#ftsDeltas.values()) {
+      for (const delta of deltas.values()) count += delta.postings.length;
+    }
+    return count;
+  }
+
   /** The delta-pruning half of `writeFtsBase`, for stores that keep the base itself outside. */
   pruneFtsDeltas(tableId: string, columnId: string, coversVersion: number): void {
     const deltas = this.#ftsDeltas.get(`${tableId}/${columnId}`);

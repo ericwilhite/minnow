@@ -150,6 +150,7 @@ import {
   encodeSyncCheckpoint,
   encodeRecordJsonBytesSliced,
   encodeSyncCheckpointSliced,
+  EncodedRecordTooLargeError,
 } from "../toolkit/wire.js";
 import { WAL_CONTINUATION_PIECE_BYTES, WalWriter, iterateWalFramesSliced } from "../toolkit/wal.js";
 import { commitDeltaUnits, LARGE_COMMIT_DELTA_UNITS } from "../commit-size.js";
@@ -805,6 +806,8 @@ export class OpfsLeader {
   readonly #checkpointEntries: number;
   readonly #cleanupLimitBytes: number;
   #lastCheckpointBytes = 0;
+  /** Set when the newest checkpoint attempt did not fit its slot: what it took, and when. */
+  #oversizeCheckpoint: { bytes: number; walBytes: number; deltaPostings: number } | undefined;
   /**
    * WAL bytes, from the start, that the newest checkpoint covers but could not reset away
    * because lease frames were logged after its capture. Zero after every reset.
@@ -1916,6 +1919,17 @@ export class OpfsLeader {
    * replay slow. Bytes the newest checkpoint already covers do not count.
    */
   #checkpointDue(): boolean {
+    const oversize = this.#oversizeCheckpoint;
+    if (
+      oversize !== undefined &&
+      this.#core.ftsDeltaPostingCount() >= oversize.deltaPostings &&
+      this.#wal.byteLength - oversize.walBytes < oversize.bytes
+    ) {
+      // The last checkpoint did not fit its slot. Until a fold has pruned index deltas — what
+      // grows the state past the slot after a large write — or the log has grown by that
+      // checkpoint's size, another attempt would only fail again at the same cost.
+      return false;
+    }
     return (
       this.#wal.byteLength - this.#walCoveredBytes >=
         Math.max(CHECKPOINT_WAL_BYTES, this.#lastCheckpointBytes) ||
@@ -3267,7 +3281,24 @@ export class OpfsLeader {
       const state = this.#checkpointState(await this.#core.dumpSliced(maybeYieldToEventLoop));
       const walBytesAtCapture = this.#wal.byteLength;
       const bytes = await this.#withLeaseLane(leaseLane, async () => {
-        const encoded = await encodeSyncCheckpointSliced(state, maybeYieldToEventLoop);
+        let encoded: Uint8Array;
+        try {
+          // Stop as soon as the encoding passes the slot: a state that does not fit costs one
+          // slot's worth of encoding, not the whole state.
+          encoded = await encodeSyncCheckpointSliced(
+            state,
+            maybeYieldToEventLoop,
+            MAX_OPFS_CHECKPOINT_BYTES,
+          );
+        } catch (error) {
+          if (!(error instanceof EncodedRecordTooLargeError)) throw error;
+          this.#checkpointTooLarge(error.bytes);
+          throw new StorageResourceLimitError(
+            "checkpoint byte",
+            error.bytes,
+            MAX_OPFS_CHECKPOINT_BYTES,
+          );
+        }
         const [slotIndex, mirrorIndex] = this.#checkpointSlotOrder(encoded);
         await this.#writeCheckpointSlotSliced(slotIndex, encoded);
         this.#checkpointSlotPublished(slotIndex, state);
@@ -3284,7 +3315,17 @@ export class OpfsLeader {
     this.#checkpointSucceeded(started);
   }
 
+  /** Records a checkpoint that did not fit its slot, so `#checkpointDue` waits to retry. */
+  #checkpointTooLarge(bytes: number): void {
+    this.#oversizeCheckpoint = {
+      bytes,
+      walBytes: this.#wal.byteLength,
+      deltaPostings: this.#core.ftsDeltaPostingCount(),
+    };
+  }
+
   #checkpointSucceeded(started: number): void {
+    this.#oversizeCheckpoint = undefined;
     this.#lastCheckpointMs = Date.now() - started;
     this.#checkpointFailures = 0;
     this.#lastCheckpointError = undefined;
