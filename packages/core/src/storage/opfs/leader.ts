@@ -16,6 +16,7 @@ import {
   type DropTableInput,
   type FtsCandidates,
   type FtsPostingQuery,
+  type FtsChanges,
   type FtsPosting,
   type GarbageCollectionJobRecord,
   type GarbageCollectionStepResult,
@@ -150,7 +151,8 @@ import {
   encodeRecordJsonBytesSliced,
   encodeSyncCheckpointSliced,
 } from "../toolkit/wire.js";
-import { WalWriter, iterateWalFrames } from "../toolkit/wal.js";
+import { WAL_CONTINUATION_PIECE_BYTES, WalWriter, iterateWalFramesSliced } from "../toolkit/wal.js";
+import { commitDeltaUnits, LARGE_COMMIT_DELTA_UNITS } from "../commit-size.js";
 import { WalAcknowledgements } from "../toolkit/wal-acknowledgement.js";
 import { OpfsUncertainOutcomeError } from "../types.js";
 import {
@@ -666,6 +668,12 @@ export interface EncodedWalFrame {
   seq: number;
   request: unknown;
   bytes: Uint8Array;
+  /**
+   * Set once the bytes before the last piece are in the log as continuation frames
+   * (`#stageEncodedFrame`): from `offset`, `prefixBytes` of `bytes` are written, and the frame
+   * appended next must complete them. Its sequence can no longer change.
+   */
+  staged?: { offset: number; prefixBytes: number };
 }
 
 const frameTextEncoder = new TextEncoder();
@@ -722,16 +730,8 @@ const COVERED_LOG_RESET_QUIET_MS = 1_000;
 /** The WAL length past which an operation must first make room by checkpointing. */
 const WAL_HEADROOM_LIMIT = MAX_OPFS_WAL_BYTES - 64 * 1024 * 1024;
 
-/** UNIQUE key changes past which a commit prepares its work and frame a slice at a time. */
-const LARGE_COMMIT_KEYS = 16_384;
-
-function uniqueKeyChangeCount(input: {
-  readonly uniqueKeyChanges?: readonly UniqueKeyChanges[];
-}): number {
-  let count = 0;
-  for (const change of input.uniqueKeyChanges ?? []) count += change.keyTokens.length;
-  return count;
-}
+/** A frame up to this size is appended whole; a larger one is staged in continuation pieces. */
+const STAGED_FRAME_BYTES = WAL_CONTINUATION_PIECE_BYTES;
 
 /** One checkpoint slot as recovery read it: its decoded state, or why it has none. */
 interface DecodedCheckpointSlot {
@@ -1050,7 +1050,15 @@ export class OpfsLeader {
     this.#ftsChunkCache.clear();
     this.#ftsChunkCacheBytes = 0;
     this.#extents?.close();
-    this.#extents = await ExtentPool.open(this.#tree, checkpoint?.extents);
+    const extents = await ExtentPool.open(this.#tree, checkpoint?.extents);
+    // A crash or close while this reload awaited released every handle the leader held; a pool
+    // opened now would keep its tail file locked after the tab is gone, and no other connection
+    // could lead.
+    if (this.#closed) {
+      extents.close();
+      throw new Error("The OPFS leader closed while it reloaded");
+    }
+    this.#extents = extents;
     this.#snapshotFrameExportLedger?.close();
     this.#snapshotFrameImportLedger?.close();
     this.#snapshotFrameExport = checkpoint?.snapshotFrameExport;
@@ -1077,6 +1085,11 @@ export class OpfsLeader {
             importLedgerState.ledgerLength,
             false,
           );
+    if (this.#closed) {
+      this.#snapshotFrameExportLedger?.close();
+      this.#snapshotFrameImportLedger?.close();
+      throw new Error("The OPFS leader closed while it reloaded");
+    }
     if (
       checkpoint !== undefined &&
       this.#snapshotFrameImport !== undefined &&
@@ -1133,7 +1146,11 @@ export class OpfsLeader {
     );
     const acknowledged = this.#acknowledgements.latest;
     const acknowledgedEnd = acknowledged.sequence > checkpointSequence ? acknowledged.endOffset : 0;
-    for (const { payload, frameEnd } of iterateWalFrames(this.#walHandle, acknowledgedEnd)) {
+    for await (const { payload, frameEnd } of iterateWalFramesSliced(
+      this.#walHandle,
+      acknowledgedEnd,
+      maybeYieldToEventLoop,
+    )) {
       await maybeYieldToEventLoop();
       const entry = validateWalEntry(payload);
       if (
@@ -1210,6 +1227,14 @@ export class OpfsLeader {
         break;
       }
       applied += 1;
+      // A large commit's work is prepared a slice at a time, as it was when it was logged, so
+      // replaying it is one short step too.
+      if (
+        (entry.op === "commitTransaction" || entry.op === "writeTransaction") &&
+        commitDeltaUnits(entry.input) >= LARGE_COMMIT_DELTA_UNITS
+      ) {
+        await this.#core.prepareCommit(entry.input, maybeYieldToEventLoop);
+      }
       this.#applyReplayed(entry);
       if (entry.request !== undefined) {
         this.#recordServed({ ...entry.request, seq: entry.seq, settled: false });
@@ -1263,7 +1288,10 @@ export class OpfsLeader {
         blockByteLength: (id) => this.#blockIndex.get(id)?.length,
         blockChecksum: (id) => this.#blockIndex.get(id)?.checksum,
       });
-      await replayValidator.loadSliced(this.#core.dump(), maybeYieldToEventLoop);
+      await replayValidator.loadSliced(
+        await this.#core.dumpSliced(maybeYieldToEventLoop),
+        maybeYieldToEventLoop,
+      );
     }
 
     await this.#validateRecoveredSnapshotFrameSessions();
@@ -1648,7 +1676,9 @@ export class OpfsLeader {
    */
   #logged(body: WalEntryBody, encoded?: EncodedWalFrame): unknown {
     this.#refuseIfPoisonedMidStep();
-    this.#makeWalHeadroom(body);
+    // A staged frame made its room before its pieces went in; a checkpoint now would reset the
+    // log under them.
+    if (encoded?.staged === undefined) this.#makeWalHeadroom(body);
     // Strict durability is per published frame, not per payload. A batch may append many
     // blocks into the tail; flush that dirty tail once after all writes complete and before
     // either the in-memory mutation or the WAL frame can publish them. Sealing already flushes
@@ -1698,20 +1728,103 @@ export class OpfsLeader {
    */
   async #loggedCommit(
     body: WalEntryBody,
-    input: { readonly uniqueKeyChanges?: readonly UniqueKeyChanges[] },
+    input: {
+      readonly uniqueKeyChanges?: readonly UniqueKeyChanges[];
+      readonly ftsChanges?: readonly FtsChanges[];
+    },
   ): Promise<unknown> {
-    if (uniqueKeyChangeCount(input) < LARGE_COMMIT_KEYS) return this.#logged(body);
+    if (commitDeltaUnits(input) < LARGE_COMMIT_DELTA_UNITS) return this.#logged(body);
     for (let attempt = 1; ; attempt += 1) {
-      // A retry after a lease poisoned the first attempt keeps the lane closed.
-      const encoded = await this.#withLeaseLane(attempt === 1, async () => {
-        await this.#core.prepareCommit(input, maybeYieldToEventLoop);
-        const frame = await this.#encodeFrameSliced(body);
-        // A turn before the one step that must not be split: applying the commit and frame.
-        await yieldToEventLoop();
-        return frame;
-      });
-      if (await this.#reloadIfPoisonedByLeaseLane()) continue;
-      return this.#logged(body, encoded);
+      let encoded: EncodedWalFrame;
+      try {
+        // A retry after a lease poisoned the first attempt keeps the lane closed.
+        encoded = await this.#withLeaseLane(attempt === 1, async () => {
+          await this.#core.prepareCommit(input, maybeYieldToEventLoop);
+          const frame = await this.#encodeFrameSliced(body);
+          // A turn before the one step that must not be split: applying the commit and frame.
+          await yieldToEventLoop();
+          return frame;
+        });
+        if (await this.#reloadIfPoisonedByLeaseLane()) continue;
+        // With the lane closed, nothing else logs until the commit's own frame completes.
+        await this.#makeRoomForFrame(encoded.bytes.byteLength);
+        await this.#stageEncodedFrame(encoded);
+      } catch (error) {
+        await this.#core.discardPreparedCommit(maybeYieldToEventLoop);
+        throw error;
+      }
+      try {
+        return this.#logged(body, encoded);
+      } catch (error) {
+        this.#unstageEncodedFrame(encoded);
+        await this.#core.discardPreparedCommit(maybeYieldToEventLoop);
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Makes the log room for a frame of `frameBytes` before anything is staged or applied: a
+   * checkpoint when the frame would leave no headroom, and a refusal when it could never fit.
+   */
+  async #makeRoomForFrame(frameBytes: number): Promise<void> {
+    if (this.#wal.byteLength + frameBytes < WAL_HEADROOM_LIMIT) return;
+    if (frameBytes >= WAL_HEADROOM_LIMIT) {
+      throw new StorageResourceLimitError("log frame byte", frameBytes, WAL_HEADROOM_LIMIT - 1);
+    }
+    await this.#checkpointSliced(false);
+    await this.#deleteDrainedExtentsAfterReset();
+    this.#refuseIfPoisonedMidStep();
+    if (this.#wal.byteLength + frameBytes >= WAL_HEADROOM_LIMIT) {
+      throw new StorageResourceLimitError(
+        "log frame byte",
+        this.#wal.byteLength + frameBytes,
+        WAL_HEADROOM_LIMIT - 1,
+      );
+    }
+  }
+
+  /**
+   * Writes a large frame's bytes before its last piece as continuation frames, a piece per
+   * turn, so the one step that must not be split appends only the last piece. Nothing else may
+   * log until that step: the lease lane stays closed, and the frame's sequence is fixed here.
+   */
+  async #stageEncodedFrame(encoded: EncodedWalFrame): Promise<void> {
+    if (encoded.bytes.byteLength <= STAGED_FRAME_BYTES) return;
+    const nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
+    if (encoded.seq !== nextSeq && !renumberEncodedFrame(encoded, nextSeq)) {
+      throw new Error("A staged OPFS log frame cannot take its sequence number");
+    }
+    const offset = this.#wal.byteLength;
+    const prefixBytes = encoded.bytes.byteLength - STAGED_FRAME_BYTES;
+    try {
+      for (let at = 0; at < prefixBytes; at += STAGED_FRAME_BYTES) {
+        this.#refuseIfPoisonedMidStep();
+        this.#wal.appendContinuation(
+          encoded.bytes.subarray(at, Math.min(prefixBytes, at + STAGED_FRAME_BYTES)),
+          this.#strict,
+        );
+        await maybeYieldToEventLoop();
+      }
+    } catch (error) {
+      this.#unstageEncodedFrame({ ...encoded, staged: { offset, prefixBytes } });
+      throw error;
+    }
+    encoded.staged = { offset, prefixBytes };
+  }
+
+  /** Takes back a staged frame's pieces when its completing frame never went in. */
+  #unstageEncodedFrame(encoded: EncodedWalFrame): void {
+    const staged = encoded.staged;
+    if (staged === undefined || this.#wal.byteLength < staged.offset) return;
+    // The completing frame went in when the sequence advanced past the frame's own.
+    if (this.#seq >= encoded.seq) return;
+    try {
+      this.#wal.rewind(staged.offset);
+    } catch (error) {
+      // Recovery truncates orphaned pieces as a torn tail; reload so it does.
+      this.#poisoned = true;
+      this.#diagnostic(error, "opfs WAL rewind");
     }
   }
 
@@ -1722,7 +1835,14 @@ export class OpfsLeader {
     let nextSeq: number;
     try {
       nextSeq = safeSuccessor(this.#seq, "OPFS WAL sequence");
-      if (
+      if (encoded?.staged !== undefined) {
+        // Its pieces are in the log, carrying its sequence and request; only this frame may
+        // complete them.
+        if (encoded.request !== request || encoded.seq !== nextSeq) {
+          throw new Error("A staged OPFS log frame lost its place in the log");
+        }
+        this.#wal.appendEncoded(encoded.bytes.subarray(encoded.staged.prefixBytes), flush);
+      } else if (
         encoded !== undefined &&
         encoded.request === request &&
         (encoded.seq === nextSeq || renumberEncodedFrame(encoded, nextSeq))
@@ -3131,7 +3251,9 @@ export class OpfsLeader {
     const started = Date.now();
     this.#checkpointRunning = true;
     try {
-      const state = this.#checkpointState();
+      // The memberships copy a slice at a time; nothing changes them while this step holds the
+      // queue, and the lane is not open yet.
+      const state = this.#checkpointState(await this.#core.dumpSliced(maybeYieldToEventLoop));
       const walBytesAtCapture = this.#wal.byteLength;
       const bytes = await this.#withLeaseLane(leaseLane, async () => {
         const encoded = await encodeSyncCheckpointSliced(state, maybeYieldToEventLoop);
@@ -3165,7 +3287,7 @@ export class OpfsLeader {
   }
 
   /** Captures the state the next checkpoint publishes, after making its payloads durable. */
-  #checkpointState(): CheckpointState {
+  #checkpointState(core: RecordCoreState = this.#core.dump()): CheckpointState {
     // A poisoned leader's memory ran ahead of its log; publishing it would make that durable.
     this.#refuseIfPoisonedMidStep();
     const generation = safeSuccessor(this.#checkpointGeneration, "OPFS checkpoint generation");
@@ -3179,7 +3301,7 @@ export class OpfsLeader {
       formatVersion: 1,
       generation,
       lastSeq: this.#seq,
-      core: this.#core.dump(),
+      core,
       blockIndex: [...this.#blockIndex.entries()],
       ftsBases: [...this.#ftsBases.entries()],
       ftsBuilds: [...this.#ftsBuilds.entries()],
@@ -4072,68 +4194,92 @@ export class OpfsLeader {
 
   async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
     return this.#run(async () => {
-      const large = uniqueKeyChangeCount(input) >= LARGE_COMMIT_KEYS;
-      for (let attempt = 1; ; attempt += 1) {
-        // Lease operations run in the lane while a large write prepares, appends its blocks,
-        // and encodes its frame, none of which applies anything (see `#loggedCommit`). A retry
-        // after one of them poisoned the first attempt keeps the lane closed.
-        const lane = large && attempt === 1;
-        if (large) {
-          await this.#withLeaseLane(lane, () =>
-            this.#core.prepareCommit(input, maybeYieldToEventLoop),
-          );
-          if (await this.#reloadIfPoisonedByLeaseLane()) continue;
-        }
-        this.#core.preflightWriteTransaction(input);
-        const ids = new Set<string>();
-        for (const block of input.blocks) {
-          validateId(block.id);
-          validateBlockWriteBytes(block.bytes);
-          if (ids.has(block.id) || this.#blockIndex.has(block.id)) {
-            throw new Error(`Block already exists: ${block.id}`);
-          }
-          ids.add(block.id);
-        }
-        const { blocks: bytes, ...rest } = input;
-        await this.#preparePayloadGrowth();
+      const large = commitDeltaUnits(input) >= LARGE_COMMIT_DELTA_UNITS;
+      try {
+        return await this.#writeTransactionAttempts(input, large);
+      } catch (error) {
+        if (large) await this.#core.discardPreparedCommit(maybeYieldToEventLoop);
+        throw error;
+      }
+    });
+  }
+
+  async #writeTransactionAttempts(
+    input: WriteTransactionInput,
+    large: boolean,
+  ): Promise<ManifestSummary> {
+    /** The frame size an earlier attempt found no room for; made before the next batch. */
+    let roomFor = 0;
+    for (let attempt = 1; ; attempt += 1) {
+      // Lease operations run in the lane while a large write prepares, appends its blocks,
+      // and encodes its frame, none of which applies anything (see `#loggedCommit`). A retry
+      // after one of them poisoned the first attempt keeps the lane closed.
+      const lane = large && attempt === 1;
+      if (large) {
+        await this.#withLeaseLane(lane, () =>
+          this.#core.prepareCommit(input, maybeYieldToEventLoop),
+        );
         if (await this.#reloadIfPoisonedByLeaseLane()) continue;
-        const mark = this.#beginUnpublishedBatch();
-        try {
-          const { body, encoded } = await this.#withLeaseLane(lane, async () => {
-            const blocks: IdPlacement[] = [];
-            for (const block of bytes) {
-              blocks.push({
-                id: block.id,
-                placement: await this.#pool.append(block.bytes, false),
-              });
-            }
-            const frameBody: WalEntryBody = {
-              op: "writeTransaction",
-              input: { ...rest, segments: [...input.segments] },
-              blocks,
-            };
-            if (!large) return { body: frameBody, encoded: undefined };
-            const frame = await this.#encodeFrameSliced(frameBody);
-            // A turn before the one step that must not be split: applying the commit and frame.
-            await yieldToEventLoop();
-            return { body: frameBody, encoded: frame };
-          });
-          if (!this.#poisoned && this.#wal.byteLength < WAL_HEADROOM_LIMIT) {
+      }
+      this.#core.preflightWriteTransaction(input);
+      const ids = new Set<string>();
+      for (const block of input.blocks) {
+        validateId(block.id);
+        validateBlockWriteBytes(block.bytes);
+        if (ids.has(block.id) || this.#blockIndex.has(block.id)) {
+          throw new Error(`Block already exists: ${block.id}`);
+        }
+        ids.add(block.id);
+      }
+      const { blocks: bytes, ...rest } = input;
+      await this.#preparePayloadGrowth();
+      if (roomFor > 0) await this.#makeRoomForFrame(roomFor);
+      if (await this.#reloadIfPoisonedByLeaseLane()) continue;
+      const mark = this.#beginUnpublishedBatch();
+      try {
+        const { body, encoded } = await this.#withLeaseLane(lane, async () => {
+          const blocks: IdPlacement[] = [];
+          for (const block of bytes) {
+            blocks.push({
+              id: block.id,
+              placement: await this.#pool.append(block.bytes, false),
+            });
+          }
+          const frameBody: WalEntryBody = {
+            op: "writeTransaction",
+            input: { ...rest, segments: [...input.segments] },
+            blocks,
+          };
+          if (!large) return { body: frameBody, encoded: undefined };
+          const frame = await this.#encodeFrameSliced(frameBody);
+          // A turn before the one step that must not be split: applying the commit and frame.
+          await yieldToEventLoop();
+          return { body: frameBody, encoded: frame };
+        });
+        const frameBytes = encoded?.bytes.byteLength ?? 0;
+        if (!this.#poisoned && this.#wal.byteLength + frameBytes < WAL_HEADROOM_LIMIT) {
+          if (encoded !== undefined) await this.#stageEncodedFrame(encoded);
+          try {
             const summary = this.#logged(body, encoded) as ManifestSummary;
             this.#pool.commitBatch(mark);
             return summary;
+          } catch (error) {
+            if (encoded !== undefined) this.#unstageEncodedFrame(encoded);
+            throw error;
           }
-        } catch (error) {
-          return this.#rollbackUnpublishedBatch(mark, error);
         }
-        // Lease operations logged while the blocks went in poisoned this leader, or filled the
-        // log's headroom so `#logged` would checkpoint mid-batch, capturing live-byte counts
-        // for blocks no index names yet. Drop the blocks, reload if poisoned, and run again
-        // with the lane closed; `#beginUnpublishedBatch` makes the room first.
-        await this.#pool.rollbackBatch(mark);
-        if (this.#poisoned) await this.#loadFromDisk();
+        roomFor = frameBytes;
+      } catch (error) {
+        return this.#rollbackUnpublishedBatch(mark, error);
       }
-    });
+      // Lease operations logged while the blocks went in poisoned this leader, or filled the
+      // log's headroom so `#logged` would checkpoint mid-batch, capturing live-byte counts
+      // for blocks no index names yet — or the frame itself needs more room than is left.
+      // Drop the blocks, reload if poisoned, and run again with the lane closed, making the
+      // room before the next batch.
+      await this.#pool.rollbackBatch(mark);
+      if (this.#poisoned) await this.#loadFromDisk();
+    }
   }
 
   async runGarbageCollectionStep(

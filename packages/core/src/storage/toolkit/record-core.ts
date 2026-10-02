@@ -6199,6 +6199,38 @@ export class RecordCore {
    * checkpoint at scale.
    */
   dump(): RecordCoreState {
+    return this.#dumpWith(
+      [...this.#uniqueKeys.keys()].map(
+        (tableId) => [tableId, [...(this.#visibleMembership(tableId) ?? [])]] as const,
+      ),
+    );
+  }
+
+  /**
+   * `dump`, with the UNIQUE memberships — the part that grows with the data — copied a slice at
+   * a time. Everything else is captured in one step after the copy, so the state is the one of
+   * a single moment provided no membership changes meanwhile: a store calls it while holding
+   * its queue against commits.
+   */
+  async dumpSliced(pause: () => Promise<void>): Promise<RecordCoreState> {
+    const uniqueKeys: Array<readonly [string, string[]]> = [];
+    for (const tableId of this.#uniqueKeys.keys()) {
+      const tokens: string[] = [];
+      for (const token of this.#visibleMembership(tableId) ?? []) {
+        tokens.push(token);
+        if (tokens.length % MEMBERSHIP_CHANGE_SLICE === 0) await pause();
+      }
+      uniqueKeys.push([tableId, tokens]);
+    }
+    const epoch = this.#membershipEpoch;
+    await pause();
+    if (this.#membershipEpoch !== epoch) {
+      throw new Error("A UNIQUE membership changed while its checkpoint copy was taken");
+    }
+    return this.#dumpWith(uniqueKeys);
+  }
+
+  #dumpWith(uniqueKeys: ReadonlyArray<readonly [string, string[]]>): RecordCoreState {
     return {
       currentVersion: this.#currentVersion,
       catalogEpoch: this.#catalogEpoch,
@@ -6217,9 +6249,7 @@ export class RecordCore {
       ftsDeltas: [...this.#ftsDeltas.entries()].map(
         ([key, deltas]) => [key, [...deltas.entries()]] as const,
       ),
-      uniqueKeys: [...this.#uniqueKeys.keys()].map(
-        (tableId) => [tableId, [...(this.#visibleMembership(tableId) ?? [])]] as const,
-      ),
+      uniqueKeys: [...uniqueKeys],
       uniqueKeyBuilds: [...this.#uniqueKeyBuilds.values()].map((state) => [
         state.record,
         state.chunks,

@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { OpfsTree } from "../opfs/files.js";
-import { MAX_WAL_FRAME_BYTES, WalWriter, replayWalFrames } from "./wal.js";
+import {
+  MAX_WAL_FRAME_BYTES,
+  WAL_CONTINUATION_PIECE_BYTES,
+  WalWriter,
+  iterateWalFrames,
+  iterateWalFramesSliced,
+  replayWalFrames,
+} from "./wal.js";
+import { encodeRecordJson } from "./wire.js";
 import { ExtentPool } from "./extents.js";
 import { crc32 } from "../../block-format/index.js";
 import { readFully, writeFully, type SyncFileHandle } from "./sync-file.js";
@@ -251,6 +259,128 @@ describe("WAL frames", () => {
     };
     expect(() => replayWalFrames(handle)).toThrow(/exceeds the .* byte limit/);
     expect(largestRead).toBe(12);
+  });
+});
+
+describe("WAL payloads spanning several frames", () => {
+  /** A record whose encoding spans `pieces` continuation pieces plus a final frame. */
+  function largeRecord(seq: number, pieces: number): { seq: number; keys: string[] } {
+    const keys: string[] = [];
+    let bytes = 0;
+    for (let index = 0; bytes < pieces * WAL_CONTINUATION_PIECE_BYTES + 1_000; index += 1) {
+      const key = `key-${String(seq)}-${String(index).padStart(9, "0")}`;
+      keys.push(key);
+      bytes += key.length + 3;
+    }
+    return { seq, keys };
+  }
+  const pause = async (): Promise<void> => undefined;
+
+  it("joins the pieces of a large payload back into one frame on replay", async () => {
+    const shim = new MemoryOpfs();
+    const handle = await walHandle(shim);
+    const writer = new WalWriter(handle, 0);
+    writer.append({ seq: 1, op: "small" }, false);
+    const large = largeRecord(2, 3);
+    let pauses = 0;
+    await writer.appendEncodedSliced(encodeRecordJson(large), true, async () => {
+      pauses += 1;
+    });
+    writer.append({ seq: 3, op: "after", big: 9n }, false);
+    expect(pauses).toBeGreaterThanOrEqual(3);
+
+    const { payloads, endOffset } = replayWalFrames(handle);
+    expect(payloads).toEqual([{ seq: 1, op: "small" }, large, { seq: 3, op: "after", big: 9n }]);
+    expect(endOffset).toBe(writer.byteLength);
+    const sliced: unknown[] = [];
+    for await (const frame of iterateWalFramesSliced(handle, 0, pause)) sliced.push(frame.payload);
+    expect(sliced).toEqual(payloads);
+    handle.close();
+  });
+
+  it("treats pieces with no completing frame as a torn tail, wherever the log stops", async () => {
+    const shim = new MemoryOpfs();
+    const handle = await walHandle(shim);
+    const writer = new WalWriter(handle, 0);
+    writer.append({ seq: 1, op: "kept" }, false);
+    const kept = writer.byteLength;
+    await writer.appendEncodedSliced(encodeRecordJson(largeRecord(2, 2)), false, pause);
+    const full = shim.readFileBytes("wal");
+    if (full === undefined) throw new Error("Expected WAL bytes");
+    const step = Math.floor((full.byteLength - kept) / 9);
+    for (const cut of [kept + 1, kept + 12, kept + step, kept + 5 * step, full.byteLength - 1]) {
+      writeFully(handle, full, 0, "restoring WAL before torn-piece test");
+      handle.truncate(cut);
+      const { payloads, endOffset } = replayWalFrames(handle);
+      expect(payloads).toEqual([{ seq: 1, op: "kept" }]);
+      expect(endOffset).toBe(kept);
+      // A writer resuming at the replayed end overwrites the orphaned pieces.
+      const resumed = new WalWriter(handle, endOffset);
+      handle.truncate(endOffset);
+      resumed.append({ seq: 2, op: "retried" }, false);
+      expect(replayWalFrames(handle).payloads).toEqual([
+        { seq: 1, op: "kept" },
+        { seq: 2, op: "retried" },
+      ]);
+    }
+    handle.close();
+  });
+
+  it("refuses orphaned pieces that the acknowledged boundary says were written", async () => {
+    const shim = new MemoryOpfs();
+    const handle = await walHandle(shim);
+    const writer = new WalWriter(handle, 0);
+    writer.appendContinuation(new TextEncoder().encode('{"seq":1,"op":"to'), true);
+    expect(() => [...iterateWalFrames(handle, writer.byteLength)]).toThrow(
+      /continuation frames end before their acknowledged boundary/,
+    );
+    expect([...iterateWalFrames(handle, 0)]).toEqual([]);
+    handle.close();
+  });
+
+  it("takes back every piece when a payload's append fails, and on rewind", async () => {
+    const shim = new MemoryOpfs();
+    const handle = await walHandle(shim);
+    const writer = new WalWriter(handle, 0);
+    writer.append({ seq: 1, op: "kept" }, false);
+    const kept = writer.byteLength;
+    let writes = 0;
+    shim.setWriteFault((path, phase) => {
+      if (path === "wal" && phase === "write" && (writes += 1) === 3) {
+        throw new DOMException("No room", "QuotaExceededError");
+      }
+    });
+    await expect(
+      writer.appendEncodedSliced(encodeRecordJson(largeRecord(2, 3)), false, pause),
+    ).rejects.toMatchObject({ name: "QuotaExceededError" });
+    shim.setWriteFault(null);
+    expect(writer.byteLength).toBe(kept);
+    expect(handle.getSize()).toBe(kept);
+    writer.appendContinuation(Uint8Array.of(1, 2, 3), false);
+    writer.rewind(kept);
+    expect(() => writer.rewind(kept + 1)).toThrow(/outside the written log/);
+    writer.append({ seq: 2, op: "next" }, false);
+    expect(replayWalFrames(handle).payloads).toEqual([
+      { seq: 1, op: "kept" },
+      { seq: 2, op: "next" },
+    ]);
+    handle.close();
+  });
+
+  it("fails closed on a corrupt piece inside the acknowledged log", async () => {
+    const shim = new MemoryOpfs();
+    const handle = await walHandle(shim);
+    const writer = new WalWriter(handle, 0);
+    await writer.appendEncodedSliced(encodeRecordJson(largeRecord(1, 2)), true, pause);
+    writer.append({ seq: 2, op: "after" }, true);
+    handle.close();
+    const bytes = shim.readFileBytes("wal");
+    if (bytes === undefined) throw new Error("Expected WAL bytes");
+    bytes[100] = (bytes[100] ?? 0) ^ 0xff;
+    shim.writeFileBytes("wal", bytes);
+    const reopened = await walHandle(shim);
+    expect(() => replayWalFrames(reopened)).toThrow(/checksum mismatch at offset 0/);
+    reopened.close();
   });
 });
 

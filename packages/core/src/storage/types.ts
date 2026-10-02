@@ -1227,7 +1227,8 @@ export class StorageResourceLimitError extends Error {
       | "snapshot accelerator byte"
       | "snapshot accelerator entry"
       | "retired history byte"
-      | "checkpoint byte",
+      | "checkpoint byte"
+      | "log frame byte",
     readonly count: number,
     readonly limit: number,
   ) {

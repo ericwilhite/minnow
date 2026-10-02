@@ -26,8 +26,10 @@ export { readFully, writeFully, type SyncFileHandle } from "./sync-file.js";
 export { RecordCore, type PhysicalBlocks, type RecordCoreState } from "./record-core.js";
 export {
   MAX_WAL_FRAME_BYTES,
+  WAL_CONTINUATION_PIECE_BYTES,
   WalWriter,
   iterateWalFrames,
+  iterateWalFramesSliced,
   replayWalFrames,
   type ReplayedWalFrame,
 } from "./wal.js";
