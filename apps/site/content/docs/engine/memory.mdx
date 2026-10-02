@@ -28,11 +28,13 @@ If a statement cannot proceed even with spilling, it throws `QueryMemoryBudgetEr
 letting the tab die.
 
 The `Streamed mutation replay` label identifies the state needed to apply updates, deletes,
-and upserts during a scan. It tracks distinct touched keys and surviving column patches, plus
-a bitmap over historical scan rows. Repeated replacements discard superseded patches, and
-temporary data is released between scan windows. This state does not spill; if it exceeds the
-budget, [compact the table](/docs/storage/maintenance#deletes-and-updates-before-compaction) or
-raise the query's budget. Reopening a persistent database does not remove its mutation history.
+and upserts during a scan: a bitmap with one bit per historical scan row, and about eight bytes
+per row an update or upsert changed. Repeated replacements discard superseded patches, and
+temporary data is released between scan windows. A query keeps those patches only while they fit
+a quarter of its budget. Past that, it replays them one range of rows at a time as the scan
+reaches each range, so a large unmerged delta makes a query slower, never a failed one, and the
+table is queued for [compaction](/docs/storage/maintenance#deletes-and-updates-before-compaction).
+Only the bitmap must always fit: one bit per row, 64 MiB for half a billion rows.
 
 ```ts
 import { QueryMemoryBudgetError } from "@minnowdb/core";

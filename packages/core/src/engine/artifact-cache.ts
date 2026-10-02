@@ -124,6 +124,22 @@ export class ArtifactCache {
     }
   }
 
+  /**
+   * Keeps `payload` resident under `key` for a caller still using it: renews its recency, or
+   * puts it back if it was evicted. A key that now holds a different payload — a newer artifact
+   * for the same identity — is left alone. Counts as neither a hit nor a miss.
+   */
+  retain(key: string, payload: unknown, bytes: number): void {
+    const existing = this.#entries.get(key);
+    if (existing === undefined) {
+      this.put(key, payload, bytes);
+      return;
+    }
+    if (existing.payload !== payload || this.#newest === existing) return;
+    this.#unlink(existing);
+    this.#appendNewest(existing);
+  }
+
   /** Releases every retained payload while preserving lifetime counters for final diagnostics. */
   clear(): void {
     this.#entries.clear();

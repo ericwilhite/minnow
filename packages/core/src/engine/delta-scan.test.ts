@@ -17,6 +17,7 @@ import { MinnowDatabase } from "./database.js";
 import { type QueryValue } from "./query.js";
 import { mulberry32 } from "../testing/seeds.js";
 import { heavyTestTimeout } from "./storage-test-helpers.js";
+import { overlayReplayTestHooks } from "./overlay-replay.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
@@ -58,7 +59,8 @@ describe("scans over mutation histories", () => {
   it("matches SQLite after every delete, update, re-insert, and upsert", async () => {
     // Sixteen rows per block makes the table many blocks wide, so zone-map elimination and the
     // streamed loader's window boundaries are both live at this size.
-    const minnow = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 16 });
+    const store = new MemoryBlockStore();
+    const minnow = new MinnowDatabase(store, { rowsPerBlock: 16 });
     await minnow.createTable({
       name: "items",
       uniqueKey: "id",
@@ -92,6 +94,13 @@ describe("scans over mutation histories", () => {
       insert.run(row.id, row.region, row.amount, row.active ? 1 : 0, row.label);
     }
 
+    // A second connection without a buffer pool rebuilds the replay for every query, so it can
+    // force the bounded paths on a fresh build: hash partitions, and patches replayed per range.
+    const bounded = new MinnowDatabase(store, {
+      rowsPerBlock: 16,
+      autoCompact: false,
+      bufferPoolBytes: 0,
+    });
     const compare = async (step: string): Promise<void> => {
       for (const sql of SCANS) {
         const expected = normalize(sqlite.prepare(sql).all());
@@ -105,9 +114,23 @@ describe("scans over mutation histories", () => {
             `${step} :: ${sql} :: ${budget === undefined ? "materialized" : "streamed"}`,
           ).toEqual(expected);
         }
+        overlayReplayTestHooks.fairShareBytes = 0;
+        overlayReplayTestHooks.scratchBytes = 1_024;
+        try {
+          const actual = await bounded.query(sql, {
+            memoize: false,
+            executionMemoryBudgetBytes: 64 * 1024,
+          });
+          expect(normalize(actual.rows), `${step} :: ${sql} :: bounded replay`).toEqual(expected);
+        } finally {
+          overlayReplayTestHooks.fairShareBytes = undefined;
+          overlayReplayTestHooks.scratchBytes = undefined;
+        }
       }
     };
 
+    const partitionedBefore = overlayReplayTestHooks.partitionedBuilds;
+    const rangesBefore = overlayReplayTestHooks.rangeReplays;
     await compare("seeded");
 
     const live = new Set(rows.map((row) => row.id));
@@ -169,6 +192,11 @@ describe("scans over mutation histories", () => {
       await compare(`step ${String(step)}`);
     }
     sqlite.close();
+    // The bounded connection really took both paths, not the in-memory replay.
+    expect(overlayReplayTestHooks.partitionedBuilds).toBeGreaterThan(partitionedBefore);
+    expect(overlayReplayTestHooks.rangeReplays).toBeGreaterThan(rangesBefore);
+    await bounded.close();
+    await minnow.close();
   });
   it("keeps a deleted row out of a range its zone map still covers", async () => {
     // The deleted row sits inside the queried key range, so elimination keeps its row group and

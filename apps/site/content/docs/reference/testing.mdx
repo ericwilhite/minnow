@@ -595,7 +595,19 @@ folds do not fit the default memory budget as planned: a wide table refreshed wh
 folding inside the budget, a fold whose distinct keys outgrow it is cut, the smallest fold gets
 the memory it needs, and a refresh written in an unrelated order folds with a job record a few
 kilobytes long. A fold resumed by another engine recomputes its replay, and one whose replay no
-longer matches its plan is abandoned unwritten. Each case fails with its part of the fix removed.
+longer matches its plan is abandoned unwritten. A single delta as large as its table folds with
+no further write, including a lone one over already-folded partitions. Each case fails with its
+part of the fix removed.
+
+`large-delta-reads.test.ts` refreshes 400,000- and 1,000,000-row tables with one full-table
+upsert under default settings, on memory, OPFS, and IndexedDB stores, and checks exact results
+at once — while the fold runs — and after it; it also folds such a table with a `compactTable`
+that names no budget. `overlay-fallback.test.ts` forces the replay's two bounded paths — patches
+replayed per range of rows, and touched keys replayed in hash partitions — through projections,
+aggregates, ordering, index-selected rows, layered partial updates, deletes, and reads of older
+versions, and requires the in-memory replay's exact rows in its exact order; one case reaches
+both paths through a real small budget. `delta-scan.test.ts` runs its SQLite-checked mutation
+script through both paths as well.
 
 `event-loop-stalls.test.ts` runs a 1 ms watchdog through the workloads that once held every
 other query for hundreds of milliseconds or minutes — a fold of reordered wide upserts, live

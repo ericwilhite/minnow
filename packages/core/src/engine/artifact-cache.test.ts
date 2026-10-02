@@ -32,6 +32,25 @@ describe("artifact cache", () => {
     expect(cache.stats().entries).toBe(1);
   });
 
+  it("retains an entry in use without counting a lookup or replacing a newer one", () => {
+    const cache = new ArtifactCache(250);
+    const first = { replay: 1 };
+    cache.put("a", first, 4);
+    cache.put("b", "second", 4);
+    // Renewed: "b" is now the oldest, and the next put evicts it rather than "a".
+    cache.retain("a", first, 4);
+    cache.put("c", "third", 4);
+    expect(cache.stats()).toMatchObject({ entries: 2, hits: 0, misses: 0, evictions: 1 });
+    // Evicted, then retained by a caller still holding it: restored.
+    cache.put("d", "fourth", 4);
+    cache.retain("a", first, 4);
+    // A newer payload under the same key is left alone.
+    const newer = { replay: 2 };
+    cache.put("a", newer, 4);
+    cache.retain("a", first, 4);
+    expect(cache.get("a")).toBe(newer);
+  });
+
   it("validates limits and entry estimates", () => {
     expect(() => new ArtifactCache(-1)).toThrow(RangeError);
     const cache = new ArtifactCache(106);

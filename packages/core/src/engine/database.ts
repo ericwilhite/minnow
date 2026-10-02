@@ -121,6 +121,21 @@ import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { crc32Continue } from "../block-format/checksum.js";
 import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
 import {
+  OVERLAY_PATCH_BYTES,
+  OVERLAY_RANGE_BYTES_PER_ROW,
+  OverlayPatchCollector,
+  OverlayPatchSources,
+  OverlayDeadCounts,
+  OverlayRangeReplay,
+  OverlayReplay,
+  OverlayScanLayout,
+  OverlayScratchOverflow,
+  overlayPatchRange,
+  overlayReplayTestHooks,
+  type OverlayKey,
+  type OverlayPatchList,
+} from "./overlay-replay.js";
+import {
   estimateCompactionRowsPerOutput,
   planAlignedWriteBlockRangesSliced as writeBlockRangesSliced,
   type WriteColumnValues,
@@ -571,6 +586,11 @@ const AUTOMATIC_COMPACTION_STEP: CompactTableStepOptions = Object.freeze({
   maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
   maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
 });
+/**
+ * Step options of a `compactTable` call that named no memory budget: planning fits such a fold
+ * to the default budget, as it fits an automatic one, instead of refusing it.
+ */
+const FITTED_COMPACTION_OPTIONS = new WeakSet<CompactTableOptions>();
 /**
  * Plans one automatic fold may make while fitting itself to memory. Cutting from the full
  * batch to the minimum takes at most eight, and each budget increase at least doubles it.
@@ -6889,7 +6909,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (this.#closed) return;
     if (!this.#autoCompact) return;
     if (this.#catalogMutations.droppingTables.has(table.id)) return;
-    if (!autoCompactionDueHint(hint)) return;
+    if (!autoCompactionDueHint(hint, this.#queryExecutionMemoryBudgetBytes)) return;
     this.#compaction.schedule(table, hint.visible);
   }
 
@@ -7018,7 +7038,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const current = await this.store.getTable(table.id);
       if (
         current === undefined ||
-        !autoCompactionDue(await this.#currentVisibleSegments(current))
+        !autoCompactionDue(
+          await this.#currentVisibleSegments(current),
+          this.#queryExecutionMemoryBudgetBytes,
+        )
       ) {
         return folded;
       }
@@ -14085,16 +14108,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /**
    * Builds a streamed view of a keyed table whose history contains updates, deletes, and
-   * upserts. Replay keeps a dead-row bitmap over historical scan rows and the
-   * surviving per-slot column patches, while the base rows stream through the block-aligned inner
-   * window. The outer view compacts dead rows and overlays patches per window, producing
-   * exactly the materialized replay's rows in exactly its order.
+   * upserts. Replay keeps a dead-row bitmap over historical scan rows and the surviving
+   * per-slot patches, while the base rows stream through the block-aligned inner window. The
+   * outer view compacts dead rows and overlays patches per window, producing exactly the
+   * materialized replay's rows in exactly its order.
    *
    * The replay is a pure function of the visible segment set, so it is built once per commit
    * and shared by every query until the next one (`#streamedOverlayState`). The outer loader
    * serves whole inner windows: one whose rows nothing touched is installed by reference, the
    * difference between a copy per window and none; one with a dead or patched row is compacted
    * once, in runs rather than cells.
+   *
+   * A delta too large for its patches to fit a quarter of the query budget does not fail the
+   * query: the replay keeps only the bitmap, and the scan replays the patches one range of
+   * slots at a time as it reaches each range (`#overlayRangePatches`).
    *
    * Apart from the bitmap, replay tracks only distinct mutation-touched keys and surviving
    * patches; the duplicate-key corruption guard consequently only fires for
@@ -14118,7 +14145,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const kind = segment.kind;
       return kind === "insert" || kind === "base" || kind === "upsert";
     });
-    const overlay = await this.#streamedOverlayState(
+    const {
+      state: overlay,
+      patches,
+      retain,
+    } = await this.#streamedOverlayState(
       table,
       keyColumn,
       baseSegments,
@@ -14127,82 +14158,181 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       memory,
       zonePruned,
     );
-    const { baseRows, dead, deadCount, lazyPatches, patchedSlots } = overlay;
-    const hasPatches = patchedSlots.length > 0;
-    /**
-     * The window's patches with every lazy one resolved: the blocks an upsert wrote come out
-     * of the buffer pool, as block vectors, for the projected columns of the slots in range.
-     */
-    const windowPatches = async (
-      from: number,
-      to: number,
-      windowMemory: QueryMemoryContext,
-    ): Promise<ReadonlyMap<number, ReadonlyMap<string, OverlayPatch>>> => {
-      const needed = new Set<string>();
-      const inRange: Array<[number, readonly OverlayLazyPatch[]]> = [];
-      // Per slot and projected column, the newest layer that carries the column decides.
-      const winning = (
-        layers: readonly OverlayLazyPatch[],
-        columnId: string,
-      ): { blockId: string; row: number } | undefined => {
-        for (let index = layers.length - 1; index >= 0; index -= 1) {
-          const candidate = layers[index];
-          if (candidate === undefined) continue;
-          const blockId = candidate.segment.columnBlockIds[columnId]?.[candidate.blockIndex];
-          if (blockId !== undefined) return { blockId, row: candidate.row };
-        }
-        return undefined;
-      };
-      // The patched slots are sorted, so a window visits its own slots and stops: walking
-      // every patch for every window made a full scan of a table carrying many upserts cost
-      // windows times patches.
-      for (
-        let index = sortedLowerBound(patchedSlots, from);
-        index < patchedSlots.length;
-        index += 1
-      ) {
-        const slot = patchedSlots[index];
-        if (slot === undefined || slot >= to) break;
-        const layers = lazyPatches.get(slot);
-        if (layers === undefined) continue;
-        inRange.push([slot, layers]);
-        for (const column of projectedColumns) {
-          const hit = winning(layers, column.id);
-          if (hit !== undefined) needed.add(hit.blockId);
-        }
+    const { baseRows, dead, deadCount, sources } = overlay;
+    // Patches only matter to a scan that projects a column some delta carries, other than the
+    // key: one projecting the key alone, as a key lookup does, reads its windows as they stand.
+    const hasPatches =
+      overlay.patchCount > 0 &&
+      projectedColumns.some(
+        (column) =>
+          column.id !== keyColumn.id &&
+          sources.segments.some((segment) => segment.columnBlockIds[column.id] !== undefined),
+      );
+    const label = "Streamed mutation replay";
+    // The patches of a slot range: a view of the kept ones, or, when there were too many to
+    // keep, the range replayed now — a quarter of the budget's worth of slots, held until the
+    // scan moves past it.
+    const rangeRows = Math.max(
+      this.#rowsPerBlock,
+      Math.floor(overlayKeptShare(memory.usage.budgetBytes) / OVERLAY_RANGE_BYTES_PER_ROW),
+    );
+    let range:
+      | { from: number; to: number; patches: OverlayPatchList; memory: QueryMemoryContext }
+      | undefined;
+    const replayRange = async (from: number, to: number): Promise<OverlayPatchList> => {
+      range?.memory.close();
+      range = undefined;
+      const rangeMemory = memory.createChild();
+      try {
+        const end = Math.min(baseRows, Math.max(to, from + rangeRows));
+        const replayed = await this.#overlayRangePatches(
+          table,
+          keyColumn,
+          overlay,
+          from,
+          end,
+          snapshot,
+          rangeMemory,
+        );
+        range = { from, to: end, patches: replayed, memory: rangeMemory };
+        return overlayPatchRange(replayed, from, to);
+      } catch (error) {
+        rangeMemory.close();
+        throw error;
       }
-      const empty = new Map<number, ReadonlyMap<string, OverlayPatch>>();
-      if (inRange.length === 0) return empty;
-      const ids = [...needed];
-      const decoded = await this.#decodedBlocksThroughCache(ids, snapshot);
-      const vectors = new Map<string, ColumnVector>();
+    };
+    // Synchronous unless a range must be replayed: a scan awaits it once per window.
+    const patchesIn = (from: number, to: number): OverlayPatchList | Promise<OverlayPatchList> => {
+      if (!hasPatches) return EMPTY_OVERLAY_PATCHES;
+      if (patches !== undefined) return overlayPatchRange(patches, from, to);
+      if (range === undefined || from < range.from || to > range.to) return replayRange(from, to);
+      return overlayPatchRange(range.patches, from, to);
+    };
+    // Per patch source and projected column, the blocks the source wrote for that column. The
+    // key column has none here: a delta row lands on the row holding its key, so its key is the
+    // value already there.
+    const sourceColumnBlocks = sources.segments.map((segment) =>
+      projectedColumns.map((column) =>
+        column.id === keyColumn.id ? undefined : segment.columnBlockIds[column.id],
+      ),
+    );
+    /**
+     * A window's patches resolved per projected column. Per patched row and column the newest
+     * layer that carries the column decides, and the block it names comes out of the buffer
+     * pool as a block vector. Patches whose newest layers read on in one delta block resolve as
+     * one run: every column takes the same block for the whole run, and every column shares the
+     * newest layers' rows; only a column an older layer serves keeps rows of its own.
+     */
+    const resolvePatches = async (
+      windowPatches: OverlayPatchList,
+      windowMemory: QueryMemoryContext,
+    ): Promise<Array<OverlayColumnPatches | undefined>> => {
+      const { slots, locations, older } = windowPatches;
+      const count = slots.length;
+      const columnCount = projectedColumns.length;
+      windowMemory.tally(count * (4 + columnCount * 4), label);
+      const blockIds: string[] = [];
+      const blockColumns: TableColumnRecord[] = [];
+      const blockIndexes = new Map<string, number>();
+      const vectorIndexOf = (blockId: string, column: number): number => {
+        let vectorIndex = blockIndexes.get(blockId);
+        if (vectorIndex === undefined) {
+          vectorIndex = blockIds.length;
+          blockIds.push(blockId);
+          blockColumns.push(projectedColumns[column] ?? keyColumn);
+          blockIndexes.set(blockId, vectorIndex);
+        }
+        return vectorIndex;
+      };
+      const vectorIndexes: Array<Int32Array | undefined> = projectedColumns.map(() => undefined);
+      const columnIndexes = (column: number): Int32Array => {
+        let indexes = vectorIndexes[column];
+        if (indexes === undefined) {
+          indexes = new Int32Array(count).fill(-1);
+          vectorIndexes[column] = indexes;
+        }
+        return indexes;
+      };
+      const newestRows = new Uint32Array(count);
+      // Per column served by an older layer somewhere: (patch, row) pairs that differ from the
+      // newest layer's row.
+      const olderRows: Array<number[] | undefined> = projectedColumns.map(() => undefined);
+      let index = 0;
+      while (index < count) {
+        const location = locations[index] ?? 0;
+        const source = sources.sourceOf(location);
+        const base = sources.rowBase[source] ?? 0;
+        const block = sources.blockOf(source, location - base);
+        const blockFrom = base + (sources.blockStarts[source]?.[block] ?? 0);
+        const blockTo = base + (sources.blockStarts[source]?.[block + 1] ?? 0);
+        const layers = older?.get(slots[index] ?? 0);
+        if (layers !== undefined) {
+          newestRows[index] = location - blockFrom;
+          for (let column = 0; column < columnCount; column += 1) {
+            let blockId = sourceColumnBlocks[source]?.[column]?.[block];
+            if (blockId !== undefined) {
+              columnIndexes(column)[index] = vectorIndexOf(blockId, column);
+              continue;
+            }
+            // Older layers only survive for columns no newer layer carries.
+            for (let layer = layers.length - 1; layer >= 0; layer -= 1) {
+              const olderLocation = layers[layer] ?? 0;
+              const olderSource = sources.sourceOf(olderLocation);
+              const olderBase = sources.rowBase[olderSource] ?? 0;
+              const olderBlock = sources.blockOf(olderSource, olderLocation - olderBase);
+              blockId = sourceColumnBlocks[olderSource]?.[column]?.[olderBlock];
+              if (blockId === undefined) continue;
+              columnIndexes(column)[index] = vectorIndexOf(blockId, column);
+              const pairs = olderRows[column] ?? [];
+              pairs.push(
+                index,
+                olderLocation - olderBase - (sources.blockStarts[olderSource]?.[olderBlock] ?? 0),
+              );
+              olderRows[column] = pairs;
+              break;
+            }
+          }
+          index += 1;
+          continue;
+        }
+        let end = index;
+        while (end < count) {
+          const next = locations[end] ?? 0;
+          if (next < blockFrom || next >= blockTo) break;
+          if (end > index && older?.has(slots[end] ?? 0) === true) break;
+          newestRows[end] = next - blockFrom;
+          end += 1;
+        }
+        for (let column = 0; column < columnCount; column += 1) {
+          const blockId = sourceColumnBlocks[source]?.[column]?.[block];
+          if (blockId === undefined) continue;
+          columnIndexes(column).fill(vectorIndexOf(blockId, column), index, end);
+        }
+        index = end;
+      }
+      if (blockIds.length === 0) return projectedColumns.map(() => undefined);
+      const decoded = await this.#decodedBlocksThroughCache(blockIds, snapshot);
       // The block vectors live in the buffer pool, which bounds them and shares them with the
       // scan; the window pays for the cells it copies out, in overlayWindowCompacted.
-      ids.forEach((id, index) => {
-        const block = decoded[index];
-        if (block === undefined) throw new Error(`Visible block is missing: ${id}`);
-        vectors.set(id, this.#blockColumnVector(id, block));
-      });
-      windowMemory.tally(inRange.length * 96, "Streamed mutation replay");
-      const resolved = new Map<number, Map<string, OverlayPatch>>();
-      const plain = new Map<string, ColumnVector>();
-      for (const [slot, layers] of inRange) {
-        const slotPatches = new Map<string, OverlayPatch>();
-        for (const column of projectedColumns) {
-          const hit = winning(layers, column.id);
-          if (hit === undefined) continue;
-          let vector = plain.get(hit.blockId);
-          if (vector === undefined) {
-            const raw = vectors.get(hit.blockId);
-            if (raw === undefined) throw new Error(`Visible block is missing: ${hit.blockId}`);
-            vector = plainTextExecutionVector(column, raw);
-            plain.set(hit.blockId, vector);
-          }
-          slotPatches.set(column.id, { vector, row: hit.row });
+      const vectors = blockIds.map((id, position) => {
+        const physical = decoded[position];
+        const column = blockColumns[position];
+        if (physical === undefined || column === undefined) {
+          throw new Error(`Visible block is missing: ${id}`);
         }
-        if (slotPatches.size > 0) resolved.set(slot, slotPatches);
-      }
-      return resolved;
+        return plainTextExecutionVector(column, this.#blockColumnVector(id, physical));
+      });
+      return vectorIndexes.map((vectorIndex, column) => {
+        if (vectorIndex === undefined) return undefined;
+        const pairs = olderRows[column];
+        if (pairs === undefined) return { vectors, vectorIndex, rows: newestRows };
+        windowMemory.tally(count * 4, label);
+        const rows = newestRows.slice();
+        for (let pair = 0; pair < pairs.length; pair += 2) {
+          rows[pairs[pair] ?? 0] = pairs[pair + 1] ?? 0;
+        }
+        return { vectors, vectorIndex, rows };
+      });
     };
     const outputRows = baseRows - deadCount;
     const inner = this.#createStreamedTable(
@@ -14264,9 +14394,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const innerBaseEnd = typeof innerEnd === "number" ? Math.min(innerEnd, baseRows) : baseRows;
       if (innerBaseEnd <= baseStart) throw new Error(`Column row count mismatch: ${table.name}`);
       let baseEnd = innerBaseEnd;
-      let deadInWindow = bitmapCountRange(dead, baseStart, baseEnd);
-      let patchedInWindow = hasPatches ? sortedCountRange(patchedSlots, baseStart, baseEnd) : 0;
-      const untouched = deadInWindow === 0 && patchedInWindow === 0;
+      let deadInWindow = overlay.deadCounts.count(baseStart, baseEnd);
+      const pending = patchesIn(baseStart, baseEnd);
+      let windowPatches = pending instanceof Promise ? await pending : pending;
+      const untouched = deadInWindow === 0 && windowPatches.slots.length === 0;
       if (!untouched) {
         // A window that must be copied out is bounded to what the scan asked for: compacting
         // the block's whole remaining suffix for every projected column, with the previous
@@ -14275,19 +14406,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         let live = 0;
         let row = baseStart;
         while (row < innerBaseEnd && live < length) {
+          // A whole bitmap byte at a time where it cannot carry the count past the request.
+          if ((row & 7) === 0 && row + 8 <= innerBaseEnd && live + 8 <= length) {
+            live += 8 - (BYTE_POPCOUNT[dead[row >>> 3] ?? 0] ?? 0);
+            row += 8;
+            continue;
+          }
           if (!bitmapHasValue(dead, row)) live += 1;
           row += 1;
         }
         if (row < baseEnd) {
           baseEnd = row;
-          deadInWindow = bitmapCountRange(dead, baseStart, baseEnd);
-          patchedInWindow = hasPatches ? sortedCountRange(patchedSlots, baseStart, baseEnd) : 0;
+          deadInWindow = overlay.deadCounts.count(baseStart, baseEnd);
+          windowPatches = overlayPatchRange(windowPatches, baseStart, baseEnd);
         }
       }
       const liveRows = baseEnd - baseStart - deadInWindow;
       const runs = untouched
         ? undefined
-        : overlayWindowRuns(dead, patchedSlots, baseStart, baseEnd, patchedInWindow);
+        : overlayWindowRuns(dead, windowPatches.slots, baseStart, baseEnd);
       interface OuterTarget {
         state: OuterColumnState;
         fields: MutableStreamedVectorFields;
@@ -14297,10 +14434,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const windowMemory = memory.createChild();
       try {
         const resolvedPatches =
-          runs === undefined || !hasPatches
+          runs === undefined || windowPatches.slots.length === 0
             ? undefined
-            : await windowPatches(baseStart, baseEnd, windowMemory);
-        for (const state of states) {
+            : await resolvePatches(windowPatches, windowMemory);
+        for (const [position, state] of states.entries()) {
           const innerVector = inner.table.columns.get(state.column.name);
           const innerWindow = innerVector?.window;
           if (innerVector === undefined || innerWindow === undefined) {
@@ -14319,7 +14456,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                   innerWindow.start,
                   runs,
                   liveRows,
-                  resolvedPatches,
+                  resolvedPatches?.[position],
                   state.column,
                   memory,
                   replacements,
@@ -14349,6 +14486,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       } finally {
         windowMemory.close();
       }
+      retain();
       cursorOutput = start + liveRows;
       cursorBase = baseEnd;
       return start + liveRows;
@@ -14383,11 +14521,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /**
    * The replayed mutation state for one visible segment set: which base rows are dead, and
-   * which columns of which slots an update replaced. Cached under the segment ids in the
-   * artifact LRU, because nothing about it changes between commits — before this, every query
-   * over a table with so much as one deleted row rebuilt it, which made COUNT(*) on such a
-   * table cost twenty times what it costs on a clean one. Cached state is charged to each
-   * query; a cold build also budgets its temporary key lookup.
+   * which delta rows patch which surviving ones. Cached under the segment ids in the artifact
+   * LRU, because nothing about it changes between commits — before this, every query over a
+   * table with so much as one deleted row rebuilt it, which made COUNT(*) on such a table cost
+   * twenty times what it costs on a clean one.
+   *
+   * Cached state is charged to each query that reads through it, but its patches only when
+   * they fit the query's fair share of its budget (`overlayFairShare`); otherwise the query
+   * leaves them aside and replays them per slot range, so one large replay cannot starve the
+   * queries after it. A cold build also budgets its temporary key lookup.
    */
   async #streamedOverlayState(
     table: TableRecord,
@@ -14397,7 +14539,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     snapshot: LeasedSnapshot,
     memory: QueryMemoryContext,
     zonePruned: boolean,
-  ): Promise<StreamedOverlayState> {
+  ): Promise<{
+    state: StreamedOverlayState;
+    patches: OverlayPatchList | undefined;
+    /** Puts the state back in the buffer pool if the scan's own blocks pushed it out. */
+    retain: () => void;
+  }> {
     // A zone-pruned scan keeps a segment's id with a subset of its blocks, and the slots the
     // replay addresses are the key blocks' rows in order — so the key blocks, not the segment
     // ids alone, are what identify the state.
@@ -14413,24 +14560,67 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         )
         .join(","),
     ].join(" ");
-    const cached = this.#cacheGet(key) as StreamedOverlayState | undefined;
-    if (cached !== undefined) {
-      memory.tally(cached.bytes, "Streamed mutation replay");
-      return cached;
+    const fairShare = overlayKeptShare(memory.usage.budgetBytes);
+    let state = this.#cacheGet(key) as StreamedOverlayState | undefined;
+    // A replay built under a smaller budget may have left aside patches this query can keep.
+    const rebuild =
+      state === undefined ||
+      (state.patches === undefined && state.patchBytes > 0 && state.patchBytes <= fairShare);
+    if (state === undefined || rebuild) {
+      state = await this.#buildStreamedOverlayState(
+        table,
+        keyColumn,
+        baseSegments,
+        scanSegments,
+        snapshot,
+        memory,
+        zonePruned,
+      );
+      this.#cachePut(key, state, state.bytes);
     }
-    const state = await this.#buildStreamedOverlayState(
-      table,
-      keyColumn,
-      baseSegments,
-      scanSegments,
-      snapshot,
-      memory,
-      zonePruned,
-    );
-    this.#cachePut(key, state, state.bytes);
-    return state;
+    const keeps = state.patches !== undefined && state.patchBytes <= fairShare;
+    if (!rebuild) {
+      memory.tally(
+        state.bytes - (state.patches !== undefined && !keeps ? state.patchBytes : 0),
+        "Streamed mutation replay",
+      );
+    }
+    // A replay that did not fit the budget is the read's cue to fold the table away.
+    if (state.partitions > 1 || (!keeps && state.patchCount > 0)) {
+      this.#scheduleFoldForReads(table, baseSegments.length);
+    }
+    // Every query over this segment set reads through the state, while a scan's blocks serve
+    // only the queries that project them: a wide scan whose blocks outgrew the buffer pool
+    // must not leave the next query to rebuild the replay. Retaining renews the entry's recency
+    // or restores it if evicted, never replaces a newer replay for the same segments, and does
+    // not count as a lookup.
+    const retained = state;
+    const retain = (): void => this.#artifactCache.retain(key, retained, retained.bytes);
+    return { state, patches: keeps ? state.patches : undefined, retain };
   }
 
+  /**
+   * A read that found a table's deltas too large to replay within its budget asks for the fold
+   * that removes them, through the scheduler every automatic fold uses: its backoff applies, so
+   * a table that cannot fold costs one attempt per backoff period, not one per query.
+   */
+  #scheduleFoldForReads(table: TableRecord, visible: number): void {
+    if (this.#closed || !this.#autoCompact) return;
+    if (this.#catalogMutations.droppingTables.has(table.id)) return;
+    this.#compaction.schedule(table, visible);
+  }
+
+  /**
+   * The replay itself: a join from the keys the deltas name to the scan rows holding them,
+   * walked in visible order over the key blocks (see `OverlayReplay` for the rules).
+   *
+   * Its scratch — a typed key index over the touched keys — is sized to what the budget leaves
+   * once the bitmap and a fair share for kept patches are set aside. A delta whose touched keys
+   * do not fit is replayed in key-hash partitions, each walking the whole history for its
+   * share of the keys; equal keys share a partition, so the result is exactly a single pass's.
+   * The surviving patches are kept, sorted by slot, while they fit the fair share; past it only
+   * their count is, and each scan replays them per range (`#overlayRangePatches`).
+   */
   async #buildStreamedOverlayState(
     table: TableRecord,
     keyColumn: TableColumnRecord,
@@ -14441,186 +14631,387 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     zonePruned: boolean,
   ): Promise<StreamedOverlayState> {
     const label = "Streamed mutation replay";
-    const scratch = memory.createChild();
-    try {
-      // Read keys in bounded groups in both passes. In particular, do not concatenate or
-      // retain every historical upsert's key vector: those rows may all name the same keys.
-      let keyDescriptions = new Map<string, ReturnType<typeof inspectBlock>>();
-      function* keyBlockIds(segments: readonly SegmentRecord[]) {
-        for (const segment of segments) {
-          const ids = segment.columnBlockIds[keyColumn.id] ?? [];
-          if (ids.length === 0 && segment.rowCount !== 0) {
-            throw new Error(`Column row count mismatch: ${keyColumn.name}`);
-          }
-          for (const [blockIndex, blockId] of ids.entries()) {
-            yield { segment, blockIndex, blockId };
-          }
-        }
-      }
-      const keyBlocks = async function* (
-        this: MinnowDatabase,
-        segments: readonly SegmentRecord[],
-        predicate?: ZonePredicate,
-      ) {
-        const pending = keyBlockIds(segments);
-        let previous: SegmentRecord | undefined;
-        let segmentRows = 0;
-        for (;;) {
-          const batch = [];
-          for (let count = 0; count < STREAMED_SCAN_LOOKAHEAD_BLOCKS; count += 1) {
-            const next = pending.next();
-            if (next.done) break;
-            const description = keyDescriptions.get(next.value.blockId);
-            const skip =
-              predicate !== undefined &&
-              !mutationSegmentKind(next.value.segment) &&
-              description !== undefined &&
-              !zoneMapCanMatch(description, predicate);
-            batch.push({ ...next.value, description, skip });
-          }
-          if (batch.length === 0) break;
-          const decoded = await this.#decodedBlocksThroughCache(
-            batch.filter((entry) => !entry.skip).map((entry) => entry.blockId),
-            snapshot,
-          );
-          let decodedIndex = 0;
-          for (const entry of batch) {
-            const { segment, blockIndex, blockId, description, skip } = entry;
-            if (previous !== segment) {
-              if (previous !== undefined && segmentRows !== previous.rowCount) {
-                throw new Error(`Column row count mismatch: ${keyColumn.name}`);
-              }
-              previous = segment;
-              segmentRows = 0;
-            }
-            let vector: ColumnVector | undefined;
-            let rows: number;
-            if (skip && description !== undefined) {
-              if (description.type !== keyColumn.type) {
-                throw new Error(`Column type mismatch: ${keyColumn.name}`);
-              }
-              rows = description.rowCount;
-            } else {
-              const block = decoded[decodedIndex++];
-              if (block === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-              if (block.column.type !== keyColumn.type) {
-                throw new Error(`Column type mismatch: ${keyColumn.name}`);
-              }
-              vector = this.#blockColumnVector(blockId, block);
-              rows = vector.length;
-            }
-            segmentRows += rows;
-            yield { segment, blockIndex, vector, rows };
-          }
-        }
-        if (previous !== undefined && segmentRows !== previous.rowCount) {
+    const budget = memory.usage.budgetBytes;
+    const fairShare = overlayKeptShare(budget);
+    const numeric = keyColumn.type === "number" || keyColumn.type === "datetime";
+    // Read keys in bounded groups in both passes. In particular, do not concatenate or
+    // retain every historical upsert's key vector: those rows may all name the same keys.
+    let keyDescriptions = new Map<string, ReturnType<typeof inspectBlock>>();
+    function* keyBlockIds(segments: readonly SegmentRecord[]) {
+      for (const segment of segments) {
+        const ids = segment.columnBlockIds[keyColumn.id] ?? [];
+        if (ids.length === 0 && segment.rowCount !== 0) {
           throw new Error(`Column row count mismatch: ${keyColumn.name}`);
         }
-      }.bind(this);
-
-      // One entry per distinct touched key also holds its current live slot. An undefined
-      // slot means absent/deleted, so replay needs no second set of the same keys. Include the
-      // numeric predicate's members in this scratch charge, rather than every key occurrence.
-      const slotByKey = new Map<OverlayKey, number | undefined>();
-      // Decoded key blocks usually come from the buffer pool, so these loops can run for a
-      // long time without a real await, so they hand the event loop a turn between blocks.
-      for await (const { vector, rows } of keyBlocks(baseSegments.filter(mutationSegmentKind))) {
-        await maybeYieldToEventLoop();
-        if (vector === undefined) continue;
-        const readKey = requiredColumnVectorKeyReader(vector);
-        for (let row = 0; row < rows; row += 1) {
-          const key = readKey(row);
-          if (slotByKey.has(key)) continue;
-          scratch.tally(64 + (typeof key === "string" ? key.length * 2 : 0), label);
-          slotByKey.set(key, undefined);
+        for (const [blockIndex, blockId] of ids.entries()) {
+          yield { segment, blockIndex, blockId };
         }
       }
-      const touchedPredicate = touchedKeyPredicate(keyColumn, slotByKey);
-      if (touchedPredicate !== undefined) {
-        keyDescriptions = await this.#zoneDescriptions(
-          scanSegments.flatMap((segment) => segment.columnBlockIds[keyColumn.id] ?? []),
+    }
+    const keyBlocks = async function* (
+      this: MinnowDatabase,
+      segments: readonly SegmentRecord[],
+      canMatch?: (description: ReturnType<typeof inspectBlock>) => boolean,
+    ) {
+      const pending = keyBlockIds(segments);
+      let previous: SegmentRecord | undefined;
+      let segmentRows = 0;
+      for (;;) {
+        const batch = [];
+        for (let count = 0; count < STREAMED_SCAN_LOOKAHEAD_BLOCKS; count += 1) {
+          const next = pending.next();
+          if (next.done) break;
+          const description = keyDescriptions.get(next.value.blockId);
+          const skip =
+            canMatch !== undefined &&
+            !mutationSegmentKind(next.value.segment) &&
+            description !== undefined &&
+            !canMatch(description);
+          batch.push({ ...next.value, description, skip });
+        }
+        if (batch.length === 0) break;
+        const decoded = await this.#decodedBlocksThroughCache(
+          batch.filter((entry) => !entry.skip).map((entry) => entry.blockId),
           snapshot,
         );
-      }
-      const baseRows = scanSegments.reduce((sum, segment) => sum + segment.rowCount, 0);
-      memory.tally(Math.ceil(baseRows / 8), label);
-      const dead = new Uint8Array(Math.ceil(baseRows / 8));
-      const lazyPatches = new Map<number, OverlayLazyPatch[]>();
-      // Reserve each surviving slot separately so overwrites and deletes release their charge.
-      const patchReservations = new Map<number, QueryMemoryReservation>();
-      let deadCount = 0;
-      const layer = (slot: number, patch: OverlayLazyPatch): void => {
-        const layers = lazyPatches.get(slot) ?? [];
-        // Remove an older layer only when newer layers cover every column it carried. A
-        // partial update must leave other columns from an earlier upsert/update available.
-        const covered = new Set(Object.keys(patch.segment.columnBlockIds));
-        const surviving: OverlayLazyPatch[] = [];
-        for (let index = layers.length - 1; index >= 0; index -= 1) {
-          const previous = layers[index];
-          if (previous === undefined) continue;
-          const columns = Object.keys(previous.segment.columnBlockIds);
-          if (columns.every((column) => covered.has(column))) continue;
-          surviving.push(previous);
-          for (const column of columns) covered.add(column);
-        }
-        surviving.reverse();
-        surviving.push(patch);
-        patchReservations.get(slot)?.release();
-        // The slot includes its map entry and its eventual Uint32 patchedSlots entry.
-        patchReservations.set(slot, memory.reserve(100 + surviving.length * 48, label));
-        lazyPatches.set(slot, surviving);
-      };
-      let baseSlot = 0;
-      // Replay directly from each block. Keeping all touched scan rows until replay starts
-      // makes memory grow with historical row count even when the live table stays tiny.
-      for await (const { segment, blockIndex, vector, rows } of keyBlocks(
-        baseSegments,
-        touchedPredicate,
-      )) {
-        await maybeYieldToEventLoop();
-        const kind = segment.kind;
-        const scans = kind === "insert" || kind === "base" || kind === "upsert";
-        if (vector !== undefined) {
-          const readKey = requiredColumnVectorKeyReader(vector);
-          for (let row = 0; row < rows; row += 1) {
-            const key = readKey(row);
-            if (!slotByKey.has(key)) continue;
-            const slot = slotByKey.get(key);
-            if (scans) {
-              if (slot === undefined) {
-                slotByKey.set(key, baseSlot + row);
-              } else if (kind === "upsert") {
-                layer(slot, { segment, blockIndex, row });
-                setBitmapValue(dead, baseSlot + row);
-                deadCount += 1;
-              } else {
-                throw new Error(`Stored table contains a duplicate unique key: ${table.name}`);
-              }
-            } else if (kind === "delete") {
-              if (slot !== undefined) {
-                setBitmapValue(dead, slot);
-                deadCount += 1;
-                lazyPatches.delete(slot);
-                patchReservations.get(slot)?.release();
-                patchReservations.delete(slot);
-                slotByKey.set(key, undefined);
-              }
-            } else if (slot !== undefined) {
-              layer(slot, { segment, blockIndex, row });
-            } else if (!zonePruned) {
-              throw new Error(`Update segment references a missing key: ${segment.id}`);
+        let decodedIndex = 0;
+        for (const entry of batch) {
+          const { segment, blockIndex, blockId, description, skip } = entry;
+          if (previous !== segment) {
+            if (previous !== undefined && segmentRows !== previous.rowCount) {
+              throw new Error(`Column row count mismatch: ${keyColumn.name}`);
             }
+            previous = segment;
+            segmentRows = 0;
+          }
+          let vector: ColumnVector | undefined;
+          let rows: number;
+          if (skip && description !== undefined) {
+            if (description.type !== keyColumn.type) {
+              throw new Error(`Column type mismatch: ${keyColumn.name}`);
+            }
+            rows = description.rowCount;
+          } else {
+            const block = decoded[decodedIndex++];
+            if (block === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+            if (block.column.type !== keyColumn.type) {
+              throw new Error(`Column type mismatch: ${keyColumn.name}`);
+            }
+            vector = this.#blockColumnVector(blockId, block);
+            rows = vector.length;
+          }
+          segmentRows += rows;
+          yield { segment, blockIndex, blockId, vector, rows };
+        }
+      }
+      if (previous !== undefined && segmentRows !== previous.rowCount) {
+        throw new Error(`Column row count mismatch: ${keyColumn.name}`);
+      }
+    }.bind(this);
+
+    const baseRows = scanSegments.reduce((sum, segment) => sum + segment.rowCount, 0);
+    const bitmapBytes = Math.ceil(baseRows / 8);
+    memory.tally(bitmapBytes, label);
+    const dead = new Uint8Array(bitmapBytes);
+    const sourceSegments = baseSegments.filter(
+      (segment) => segment.kind === "update" || segment.kind === "upsert",
+    );
+    const sources = new OverlayPatchSources(sourceSegments, keyColumn.id);
+    const sourceIndexes = new Map(sourceSegments.map((segment, index) => [segment, index]));
+    const segmentOrders = new Map(baseSegments.map((segment, index) => [segment, index]));
+    const sourceOrders = Uint32Array.from(
+      sourceSegments,
+      (segment) => segmentOrders.get(segment) ?? 0,
+    );
+    const layout = new OverlayScanLayout();
+    const mutationSegments = baseSegments.filter(mutationSegmentKind);
+    const mutationRows = mutationSegments.reduce((sum, segment) => sum + segment.rowCount, 0);
+    const scanKeyBlockIds = scanSegments.flatMap(
+      (segment) => segment.columnBlockIds[keyColumn.id] ?? [],
+    );
+    // Which keys to replay: the ones the deltas name, or — for a pruned scan reading fewer rows
+    // than the deltas hold — the ones the scan reads. Either set holds the key of every row the
+    // replay can find dead or patched, and replaying a key's whole history is exact whatever
+    // other keys are left out. Only the guard against an update naming a missing key needs the
+    // deltas' keys, and a pruned scan never applies it.
+    const fromScan = zonePruned && baseRows < mutationRows;
+    const keySegments = fromScan ? scanSegments : mutationSegments;
+    const keyRows = fromScan ? baseRows : mutationRows;
+    let partitions = 1;
+    for (;;) {
+      dead.fill(0);
+      layout.clear();
+      let laidOut = false;
+      let deadCount = 0;
+      let patchCount = 0;
+      let patchBytes = 0;
+      let keep = true;
+      const collector = new OverlayPatchCollector(fairShare, (bytes) => {
+        const reservation = memory.reserve(bytes, label);
+        return () => reservation.release();
+      });
+      const scratchLimit =
+        overlayReplayTestHooks.scratchBytes ??
+        Math.max(
+          OVERLAY_MIN_SCRATCH_BYTES,
+          Math.floor(((budget - memory.usage.usedBytes - fairShare) * 3) / 4),
+        );
+      try {
+        for (let partition = 0; partition < partitions; partition += 1) {
+          const scratch = memory.createChild();
+          try {
+            let scratchBytes = 0;
+            let collected = 0;
+            const charge = (bytes: number): void => {
+              scratchBytes += bytes;
+              if (scratchBytes > scratchLimit) {
+                throw new OverlayScratchOverflow(
+                  scratchBytes,
+                  Math.min(1, collected / Math.max(1, keyRows)),
+                );
+              }
+              scratch.tally(bytes, label);
+            };
+            const replay = new OverlayReplay({
+              numeric,
+              sources,
+              dead,
+              partition,
+              partitions,
+              zonePruned,
+              tableName: table.name,
+              charge,
+            });
+            // Decoded key blocks usually come from the buffer pool, so these loops can run for a
+            // long time without a real await, so they hand the event loop a turn between blocks.
+            for await (const { vector, rows } of keyBlocks(keySegments)) {
+              await maybeYieldToEventLoop();
+              collected += rows;
+              if (vector !== undefined) replay.collect(vector, rows);
+            }
+            if (replay.size === 0) continue;
+            // Scan blocks whose zone maps rule out every touched key hold no row to replay.
+            let canMatch: ((description: ReturnType<typeof inspectBlock>) => boolean) | undefined;
+            if (numeric && !fromScan) {
+              if (keyDescriptions.size === 0 && scanKeyBlockIds.length > 0) {
+                keyDescriptions = await this.#zoneDescriptions(scanKeyBlockIds, snapshot);
+              }
+              if (replay.size <= OVERLAY_IN_PREDICATE_KEYS) {
+                charge(replay.size * Float64Array.BYTES_PER_ELEMENT);
+                const members = replay.sortedKeys() ?? new Float64Array(0);
+                const predicate: ZonePredicate = {
+                  column: keyColumn,
+                  operator: "IN",
+                  value: members[0] ?? 0,
+                  members,
+                };
+                canMatch = (description) => zoneMapCanMatch(description, predicate);
+              } else {
+                const { minimum, maximum } = replay.keyRange;
+                canMatch = (description) => zoneMapCanMatchRange(description, minimum, maximum);
+              }
+            }
+            let baseSlot = 0;
+            let previous: SegmentRecord | undefined;
+            let segmentRow = 0;
+            // Replay directly from each block. Keeping all touched scan rows until replay starts
+            // makes memory grow with historical row count even when the live table stays tiny.
+            for await (const { segment, blockIndex, blockId, vector, rows } of keyBlocks(
+              baseSegments,
+              canMatch,
+            )) {
+              await maybeYieldToEventLoop();
+              if (segment !== previous) {
+                previous = segment;
+                segmentRow = 0;
+              }
+              const kind = segment.kind;
+              const scans = kind === "insert" || kind === "base" || kind === "upsert";
+              const source = sourceIndexes.get(segment) ?? -1;
+              if (!laidOut) {
+                if (scans) layout.push(blockId, rows, segmentOrders.get(segment) ?? 0);
+                if (source >= 0) sources.recordBlock(source, blockIndex, rows);
+              }
+              if (vector !== undefined) {
+                replay.replay(
+                  kind,
+                  vector,
+                  rows,
+                  baseSlot,
+                  source,
+                  source < 0 ? 0 : (sources.rowBase[source] ?? 0) + segmentRow,
+                  segment.id,
+                );
+              }
+              if (scans) baseSlot += rows;
+              segmentRow += rows;
+            }
+            laidOut = true;
+            deadCount += replay.deadCount;
+            const stats = replay.patchStats();
+            patchCount += stats.count;
+            patchBytes += stats.bytes;
+            if (keep && !replay.emit(collector)) {
+              keep = false;
+              collector.clear();
+            }
+          } finally {
+            scratch.close();
           }
         }
-        if (scans) baseSlot += rows;
+        let patches: OverlayPatchList | undefined;
+        if (keep && patchCount > 0) {
+          const scratch = memory.createChild();
+          try {
+            patches = await collector.finish((bytes) => scratch.tally(bytes, label));
+          } finally {
+            scratch.close();
+          }
+          // The state holds the trimmed, sorted copies: charge those instead of the collector's.
+          collector.clear();
+          memory.tally(patchBytes, label);
+        }
+        collector.clear();
+        if (partitions > 1) overlayReplayTestHooks.partitionedBuilds += 1;
+        if (fromScan) overlayReplayTestHooks.scanKeyedBuilds += 1;
+        const deadCounts = await OverlayDeadCounts.of(dead);
+        const fixedBytes =
+          deadCounts.bytes + sources.bytes + layout.bytes + sourceOrders.byteLength;
+        memory.tally(fixedBytes, label);
+        return {
+          baseRows,
+          deadCount,
+          dead,
+          deadCounts,
+          patchCount,
+          patches,
+          patchBytes,
+          sources,
+          sourceOrders,
+          layout,
+          partitions,
+          bytes: bitmapBytes + (patches === undefined ? 0 : patchBytes) + fixedBytes,
+        };
+      } catch (error) {
+        collector.clear();
+        if (!(error instanceof OverlayScratchOverflow)) throw error;
+        // Size the next attempt from how far key collection got before it overflowed, so a
+        // delta larger than the estimate costs one more attempt, not a doubling series.
+        const estimated = error.bytes / Math.max(error.progress, 1 / 1_024);
+        const next = Math.max(
+          partitions * 2,
+          Math.ceil((partitions * estimated * 5) / (4 * scratchLimit)),
+        );
+        // Past a few dozen keys a partition, more partitions cannot be what is missing.
+        if (next > Math.max(64, Math.ceil(keyRows / 32))) {
+          throw new QueryMemoryBudgetError(label, error.bytes, memory.usage.usedBytes, budget);
+        }
+        partitions = next;
       }
-      const patchedSlots = Uint32Array.from(lazyPatches.keys()).sort();
-      let bytes = dead.byteLength;
-      for (const reservation of patchReservations.values()) bytes += reservation.bytes;
-      return { baseRows, deadCount, dead, lazyPatches, patchedSlots, bytes };
-    } finally {
-      scratch.close();
     }
+  }
+
+  /**
+   * The patches of scan slots `[from, to)` for a scan whose replay could not keep them all:
+   * the range's live keys, then every update/upsert row naming one of them in a later segment,
+   * in visible order (see `OverlayRangeReplay`). Memory follows the range, not the delta. A
+   * scan pays one pass over the update/upsert keys per range, and zone maps skip the blocks
+   * whose keys cannot reach the range's.
+   */
+  async #overlayRangePatches(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    overlay: StreamedOverlayState,
+    from: number,
+    to: number,
+    snapshot: LeasedSnapshot,
+    memory: QueryMemoryContext,
+  ): Promise<OverlayPatchList> {
+    const label = "Streamed mutation replay";
+    const numeric = keyColumn.type === "number" || keyColumn.type === "datetime";
+    overlayReplayTestHooks.rangeReplays += 1;
+    const replay = new OverlayRangeReplay(numeric, overlay.sources, table.name, (bytes) =>
+      memory.tally(bytes, label),
+    );
+    const keyVector = (id: string, physical: DecodedPhysicalBlock | undefined): ColumnVector => {
+      if (physical === undefined) throw new Error(`Visible block is missing: ${id}`);
+      if (physical.column.type !== keyColumn.type) {
+        throw new Error(`Column type mismatch: ${keyColumn.name}`);
+      }
+      return this.#blockColumnVector(id, physical);
+    };
+    const layout = overlay.layout;
+    const first = layout.blockAt(from);
+    let last = first;
+    while (last < layout.blocks && layout.start(last) < to) last += 1;
+    let earliestSegment = Number.POSITIVE_INFINITY;
+    for (let block = first; block < last; block += STREAMED_SCAN_LOOKAHEAD_BLOCKS) {
+      const end = Math.min(last, block + STREAMED_SCAN_LOOKAHEAD_BLOCKS);
+      const ids: string[] = [];
+      for (let index = block; index < end; index += 1) ids.push(layout.blockId(index));
+      const decoded = await this.#decodedBlocksThroughCache(ids, snapshot);
+      for (let index = block; index < end; index += 1) {
+        const id = ids[index - block] ?? "";
+        const vector = keyVector(id, decoded[index - block]);
+        const start = layout.start(index);
+        const rowTo = Math.min(layout.end(index), to) - start;
+        if (layout.end(index) - start !== vector.length) {
+          throw new Error(`Column row count mismatch: ${keyColumn.name}`);
+        }
+        const rowFrom = Math.max(0, from - start);
+        replay.addLive(
+          vector,
+          rowFrom,
+          rowTo,
+          start + rowFrom,
+          layout.segment(index),
+          overlay.dead,
+        );
+        earliestSegment = Math.min(earliestSegment, layout.segment(index));
+        await maybeYieldToEventLoop();
+      }
+    }
+    if (replay.size === 0) return EMPTY_OVERLAY_PATCHES;
+    const { minimum, maximum } = replay.keyRange;
+    const sources = overlay.sources;
+    for (let source = 0; source < sources.segments.length; source += 1) {
+      const order = overlay.sourceOrders[source] ?? 0;
+      // A source no later than every slot in the range wrote nothing those slots still carry.
+      if (order <= earliestSegment) continue;
+      const ids = sources.segments[source]?.columnBlockIds[keyColumn.id] ?? [];
+      const starts = sources.blockStarts[source];
+      const descriptions = numeric ? await this.#zoneDescriptions(ids, snapshot) : undefined;
+      const wanted: number[] = [];
+      for (const [blockIndex, id] of ids.entries()) {
+        const description = descriptions?.get(id);
+        if (description !== undefined && !zoneMapCanMatchRange(description, minimum, maximum)) {
+          continue;
+        }
+        wanted.push(blockIndex);
+      }
+      for (let batch = 0; batch < wanted.length; batch += STREAMED_SCAN_LOOKAHEAD_BLOCKS) {
+        const blockIndexes = wanted.slice(batch, batch + STREAMED_SCAN_LOOKAHEAD_BLOCKS);
+        const batchIds = blockIndexes.map((blockIndex) => ids[blockIndex] ?? "");
+        const decoded = await this.#decodedBlocksThroughCache(batchIds, snapshot);
+        for (const [position, blockIndex] of blockIndexes.entries()) {
+          const id = batchIds[position] ?? "";
+          const vector = keyVector(id, decoded[position]);
+          const blockStart = starts?.[blockIndex] ?? 0;
+          if ((starts?.[blockIndex + 1] ?? 0) - blockStart !== vector.length) {
+            throw new Error(`Column row count mismatch: ${keyColumn.name}`);
+          }
+          replay.replay(
+            vector,
+            vector.length,
+            source,
+            (sources.rowBase[source] ?? 0) + blockStart,
+            order,
+          );
+          await maybeYieldToEventLoop();
+        }
+      }
+    }
+    return replay.emit();
   }
 
   /** Prepares one block's inputs and executes it, returning the caller-owned result. */
@@ -15337,9 +15728,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // A background index build finishing, or another connection's DDL, moves the schema
       // epoch under a fold in flight; the fold's commit is refused and the next attempt plans
       // against the new schema. Writes restart the same way (#runWrite).
+      // Without a budget of its own, the fold is fitted to the default one exactly as an
+      // automatic fold is, rather than refused for needing more.
+      const stepOptions = { ...options, maxBlocks };
+      if (options.memoryBudgetBytes === undefined) FITTED_COMPACTION_OPTIONS.add(stepOptions);
       for (let attempt = 0; ; attempt += 1) {
         try {
-          let progress = await this.compactTableStep(tableName, { ...options, maxBlocks });
+          let progress = await this.compactTableStep(tableName, stepOptions);
           while (progress.result === null) {
             if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
             progress = await this.resumeCompactionJob(progress.jobId, { maxBlocks });
@@ -16655,6 +17050,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       level0Segments = layout.level0Segments;
       effectiveMinimumLevel0Segments =
         layout.partitions.length > 0 ? minimumLevel0Segments : Math.max(2, minimumLevel0Segments);
+      // One delta over folded partitions is a fold of its own for automatic compaction: the due
+      // rule asks for it once it is as large as the table, and nothing short of another write
+      // would otherwise ever fold it, leaving every read to replay it.
+      const lone = level0Segments[0];
+      if (
+        options === AUTOMATIC_COMPACTION_STEP &&
+        layout.partitions.length > 0 &&
+        level0Segments.length === 1 &&
+        lone !== undefined &&
+        mutationSegmentKind(lone)
+      ) {
+        effectiveMinimumLevel0Segments = 1;
+      }
     } else if (targetLevel === 1) {
       const layout = keylessLevelOneLayout(visibleSegments);
       if (layout === null) {
@@ -16882,14 +17290,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       };
     };
     // An explicit step plans what its options ask for, and a plan that needs more memory than
-    // its budget is refused. Automatic compaction has nobody to refuse: it fits the fold to the
-    // budget instead. A selection that does not fit is cut, at least in half and in proportion
-    // to how far over it was, and planned again; the smallest selection the table allows is
-    // given the memory it needs. That smallest fold costs about what the writes that produced
-    // its sources already held, and a table automatic compaction could never fold would keep
-    // slowing every read until its writes were refused at the level-zero ceiling. The cut size
-    // is where the table's next fold starts, so one wide table does not re-plan from the full
-    // batch on every fold; each fold that fits doubles it back.
+    // its budget is refused. Automatic compaction has nobody to refuse, and neither has
+    // `compactTable` called without a budget of its own: the fold is fitted to the budget
+    // instead. A selection that does not fit is cut, at least in half and in proportion to how
+    // far over it was, and planned again; the smallest selection the table allows is given the
+    // memory it needs. That smallest fold costs about what the writes that produced its sources
+    // already held, and a table automatic compaction could never fold would keep slowing every
+    // read until its writes were refused at the level-zero ceiling. For automatic folds the cut
+    // size is where the table's next fold starts, so one wide table does not re-plan from the
+    // full batch on every fold; each fold that fits doubles it back.
+    const fitsToBudget = automatic || FITTED_COMPACTION_OPTIONS.has(options);
     let levelZeroLimit = automatic
       ? Math.min(
           maxLevel0Segments,
@@ -16911,7 +17321,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         break;
       } catch (error) {
         if (
-          !automatic ||
+          !fitsToBudget ||
           !(error instanceof CompactionMemoryBudgetError) ||
           attempt >= MAX_AUTOMATIC_COMPACTION_FIT_ATTEMPTS
         ) {
@@ -16926,8 +17336,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               Math.floor(selected * (memoryBudgetBytes / error.minimumBytes)),
             ),
           );
-          // A later fold starts from the cut size, even if this one never fits.
-          this.#automaticCompactionBatches.set(table.id, levelZeroLimit);
+          // A later automatic fold starts from the cut size, even if this one never fits.
+          if (automatic) this.#automaticCompactionBatches.set(table.id, levelZeroLimit);
           cut = true;
         } else {
           memoryBudgetBytes = Math.max(error.minimumBytes, memoryBudgetBytes * 2);
@@ -24356,16 +24766,27 @@ function countLevelZeroSegments(segments: readonly SegmentRecord[]): number {
   return levelZero;
 }
 
-function autoCompactionDueHint(hint: AutoCompactionHint): boolean {
+/**
+ * Whether a table's history is worth folding now. Past the segment counts, a delta is due once
+ * it holds `AUTO_COMPACT_DELTA_MIN_ROWS` rows and either matches the rows it overlays — every
+ * scan then reads each row at least twice — or holds more patches than a query keeps within its
+ * fair share of `queryBudgetBytes`, past which every scan replays them range by range. One
+ * delta is enough: a single full-table upsert left unfolded costs every read until the next
+ * write, and an idle table may never see one.
+ */
+function autoCompactionDueHint(hint: AutoCompactionHint, queryBudgetBytes: number): boolean {
   return (
     hint.levelZero >= AUTO_COMPACT_SCAN_SEGMENTS ||
     hint.deltas >= AUTO_COMPACT_DELTA_SEGMENTS ||
-    (hint.deltas >= 2 && hint.deltaRows >= Math.max(AUTO_COMPACT_DELTA_MIN_ROWS, hint.baseRows))
+    (hint.deltas >= 1 &&
+      hint.deltaRows >= AUTO_COMPACT_DELTA_MIN_ROWS &&
+      (hint.deltaRows >= hint.baseRows ||
+        hint.deltaRows * OVERLAY_PATCH_BYTES > overlayFairShare(queryBudgetBytes)))
   );
 }
 
-function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
-  return autoCompactionDueHint(autoCompactionHint(null, segments));
+function autoCompactionDue(segments: readonly SegmentRecord[], queryBudgetBytes: number): boolean {
+  return autoCompactionDueHint(autoCompactionHint(null, segments), queryBudgetBytes);
 }
 
 function boundedExpiryMilliseconds(nowMs: number, ttlMs: number): number {
@@ -25072,9 +25493,6 @@ function estimatedColumnarBytes(
   return rows * Math.max(rowWidth, 1);
 }
 
-/** A unique key read straight out of a vector: no per-row string token, no allocation. */
-type OverlayKey = string | number | boolean;
-
 /** One update segment row: which columns it changed, and whether a base row took it. */
 interface OverlayUpdate {
   readonly order: number;
@@ -25089,28 +25507,11 @@ function mutationSegmentKind(segment: SegmentRecord): boolean {
   return kind !== "insert" && kind !== "base";
 }
 
-/** One update row standing in for a base row's column: the resident update vector and the row in it. */
-interface OverlayPatch {
-  readonly vector: ColumnVector;
-  readonly row: number;
-}
-
-/**
- * One delta row that patched a base row: the segment holding the values, and the block and row
- * within it. A segment's columns share one block layout, so the pair locates the value in every
- * column the segment carries; a later layer overrides an earlier one column by column. Only
- * block locations are retained, and fully superseded layers are discarded. A window resolves
- * the surviving layers through the buffer pool as it is built.
- */
-interface OverlayLazyPatch {
-  readonly segment: SegmentRecord;
-  readonly blockIndex: number;
-  readonly row: number;
-}
-
 /**
  * The replayed mutation state of one visible segment set, shared by every query over it until
- * the next commit: see `#streamedOverlayState`.
+ * the next commit: see `#streamedOverlayState`. Patches name delta rows by location (see
+ * `OverlayPatchSources`): only locations are retained, fully superseded layers are discarded,
+ * and a window resolves the surviving layers through the buffer pool as it is built.
  */
 interface StreamedOverlayState {
   /** Rows in the scan (insert/base/upsert) segments, before replay removes any. */
@@ -25118,19 +25519,91 @@ interface StreamedOverlayState {
   readonly deadCount: number;
   /** One bit per scan row; set when a delete or a repeated upsert removed it. */
   readonly dead: Uint8Array;
-  /** Per patched base row, the delta rows that wrote it, oldest first. */
-  readonly lazyPatches: ReadonlyMap<number, readonly OverlayLazyPatch[]>;
-  /** The patched base rows (resident or lazy) in ascending order, for range counts. */
-  readonly patchedSlots: Uint32Array;
+  /** Live rows an update or upsert patched. */
+  readonly patchCount: number;
+  /**
+   * The surviving patches sorted by slot, or undefined when they would not fit a query's fair
+   * share of its budget: each scan then replays them per slot range as it reaches the range.
+   */
+  readonly patches: OverlayPatchList | undefined;
+  /** Modeled bytes of `patches`; zero without them. */
+  readonly patchBytes: number;
+  /** The update/upsert segments patches are read from, with their key block layout. */
+  readonly sources: OverlayPatchSources;
+  /** Visible-order position of each patch source, for the per-range replay. */
+  readonly sourceOrders: Uint32Array;
+  /** Range counts over `dead`, so a window counts its dead rows without walking them. */
+  readonly deadCounts: OverlayDeadCounts;
+  /** The scan key blocks, for the per-range replay. */
+  readonly layout: OverlayScanLayout;
+  /** Key-hash partitions the replay took to fit its scratch in the budget; one when it fit. */
+  readonly partitions: number;
   /** Modeled retained bytes, as charged to the buffer pool and tallied to each query. */
   readonly bytes: number;
+}
+
+/** No patches: a window or range nothing patched. */
+const EMPTY_OVERLAY_PATCHES: OverlayPatchList = {
+  slots: new Uint32Array(0),
+  locations: new Uint32Array(0),
+  older: undefined,
+};
+
+/**
+ * The most a replay's kept patches may cost a query: a quarter of its budget. A cached replay is
+ * charged to every query that reads through it, so a larger one would leave the query itself
+ * too little; past this share the patches are replayed per slot range instead.
+ */
+function overlayFairShare(budgetBytes: number): number {
+  return Math.floor(budgetBytes / 4);
+}
+
+/** The fair share a replay's kept patches get, unless a test forces range replay. */
+function overlayKeptShare(budgetBytes: number): number {
+  return overlayReplayTestHooks.fairShareBytes ?? overlayFairShare(budgetBytes);
+}
+
+/**
+ * Scratch a replay pass may always take, however little the budget leaves: a few hundred keys,
+ * so a small budget costs more partitions rather than a pass that cannot start.
+ */
+const OVERLAY_MIN_SCRATCH_BYTES = 16 * 1024;
+
+/**
+ * Touched keys up to which the replay prunes scan blocks with an exact IN zone predicate; past
+ * it, sorting the keys costs more than the blocks it could skip, and the replay prunes by their
+ * range instead.
+ */
+const OVERLAY_IN_PREDICATE_KEYS = 65_536;
+
+/**
+ * One window's patches resolved for one projected column: per patched row of the window (in
+ * slot order), the index of the delta block vector holding its value, or -1 when no surviving
+ * layer carries the column, and the row in that vector.
+ */
+interface OverlayColumnPatches {
+  readonly vectors: readonly ColumnVector[];
+  readonly vectorIndex: Int32Array;
+  readonly rows: Uint32Array;
+}
+
+/** Whether a block's key zone map can hold a key in `[minimum, maximum]`. */
+function zoneMapCanMatchRange(
+  description: ReturnType<typeof inspectBlock>,
+  minimum: number,
+  maximum: number,
+): boolean {
+  if (description.nullCount === description.rowCount) return false;
+  const zoneMap = description.metadata.zoneMap;
+  return zoneMap === undefined || (zoneMap.max >= minimum && zoneMap.min <= maximum);
 }
 
 /**
  * The shape of one outer overlay window over base rows `[from, to)`, as a flat list of steps
  * in base order: a pair `(start, length)` with a positive length is a run of live rows nothing
- * patched, copied as one slice; a pair `(row, 0)` is a single patched live row. Dead rows
- * appear in neither. Built once per window and applied to every projected column.
+ * patched, copied as one slice; a pair `(row, -(p + 1))` is a single patched live row, the
+ * window's patch `p`. Dead rows appear in neither. Built once per window and applied to every
+ * projected column.
  */
 type OverlayWindowSteps = number[];
 
@@ -25140,51 +25613,18 @@ const BYTE_POPCOUNT = new Uint8Array(256).map((_, byte) => {
   return count;
 });
 
-/** Set bits in `bitmap` over bit indexes `[from, to)`. */
-function bitmapCountRange(bitmap: Uint8Array, from: number, to: number): number {
-  let count = 0;
-  let index = from;
-  while (index < to && (index & 7) !== 0) {
-    if (bitmapHasValue(bitmap, index)) count += 1;
-    index += 1;
-  }
-  while (index + 8 <= to) {
-    count += BYTE_POPCOUNT[bitmap[index >>> 3] ?? 0] ?? 0;
-    index += 8;
-  }
-  while (index < to) {
-    if (bitmapHasValue(bitmap, index)) count += 1;
-    index += 1;
-  }
-  return count;
-}
-
-/** The first index in ascending `sorted` whose value is at least `value`. */
-function sortedLowerBound(sorted: Uint32Array, value: number): number {
-  let low = 0;
-  let high = sorted.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    if ((sorted[middle] ?? 0) < value) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
-/** Members of ascending `sorted` in `[from, to)`. */
-function sortedCountRange(sorted: Uint32Array, from: number, to: number): number {
-  return sortedLowerBound(sorted, to) - sortedLowerBound(sorted, from);
-}
-
+/**
+ * The steps of the window `[from, to)`. `patchedSlots` are the window's patched slots in
+ * ascending order; a step names a patch by its index there.
+ */
 function overlayWindowRuns(
   dead: Uint8Array,
   patchedSlots: Uint32Array,
   from: number,
   to: number,
-  patchedInWindow: number,
 ): OverlayWindowSteps {
   const steps: OverlayWindowSteps = [];
-  let nextPatched = patchedInWindow > 0 ? sortedLowerBound(patchedSlots, from) : -1;
+  let nextPatched = 0;
   let row = from;
   while (row < to) {
     // Dead rows, eight at a time where a whole byte is dead.
@@ -25194,12 +25634,15 @@ function overlayWindowRuns(
       while (row < to && bitmapHasValue(dead, row)) row += 1;
       continue;
     }
-    const patchedRow = nextPatched >= 0 ? (patchedSlots[nextPatched] ?? to) : to;
+    // A patch is only ever kept on a live row; one before this row has nothing to patch.
+    while (nextPatched < patchedSlots.length && (patchedSlots[nextPatched] ?? to) < row) {
+      nextPatched += 1;
+    }
+    const patchedRow = nextPatched < patchedSlots.length ? (patchedSlots[nextPatched] ?? to) : to;
     if (row === patchedRow) {
-      steps.push(row, 0);
+      steps.push(row, -(nextPatched + 1));
       row += 1;
       nextPatched += 1;
-      if (nextPatched >= patchedSlots.length) nextPatched = -1;
       continue;
     }
     // A live run: up to the next patched row, the window end, or the next dead row — live
@@ -25296,16 +25739,90 @@ function overlayWindowView(
 }
 
 /**
+ * Re-encodes string cells from several block dictionaries into one window dictionary of
+ * distinct values. Each source dictionary gets a code map filled as its codes first appear, so
+ * the string lookup happens once per distinct source code and every cell after it costs one
+ * typed-array read. The code maps are charged while the window is built and released after.
+ */
+class WindowStringEncoder {
+  readonly #dictionary: string[];
+  readonly #codes: Uint32Array;
+  readonly #validity: Uint8Array;
+  readonly #memory: QueryMemoryContext;
+  readonly #column: TableColumnRecord;
+  readonly #index = new Map<string, number>();
+  readonly #maps = new Map<readonly string[], Uint32Array>();
+  readonly #reservations: QueryMemoryReservation[] = [];
+
+  constructor(
+    dictionary: string[],
+    codes: Uint32Array,
+    validity: Uint8Array,
+    memory: QueryMemoryContext,
+    column: TableColumnRecord,
+  ) {
+    this.#dictionary = dictionary;
+    this.#codes = codes;
+    this.#validity = validity;
+    this.#memory = memory;
+    this.#column = column;
+  }
+
+  /** Copies `count` cells of `source` from `sourceRow` to window rows from `targetRow`. */
+  copy(source: ColumnVector, sourceRow: number, count: number, targetRow: number): void {
+    if (source.kind !== "string") throw new Error("Column vector type mismatch");
+    let map = this.#maps.get(source.dictionary);
+    if (map === undefined) {
+      this.#reservations.push(
+        this.#memory.reserve(
+          source.dictionary.length * Uint32Array.BYTES_PER_ELEMENT,
+          `Streamed window ${this.#column.name}`,
+        ),
+      );
+      map = new Uint32Array(source.dictionary.length).fill(NULL_STRING_VECTOR_CODE);
+      this.#maps.set(source.dictionary, map);
+    }
+    const sourceCodes = source.codes;
+    const sourceValidity = source.validity;
+    for (let offset = 0; offset < count; offset += 1) {
+      const from = sourceRow + offset;
+      if (!bitmapHasValue(sourceValidity, from)) continue;
+      const code = sourceCodes[from] ?? NULL_STRING_VECTOR_CODE;
+      let mapped = map[code] ?? NULL_STRING_VECTOR_CODE;
+      if (mapped === NULL_STRING_VECTOR_CODE) {
+        const value = source.dictionary[code];
+        if (value === undefined) throw new Error("String vector code is invalid");
+        mapped = this.#index.get(value) ?? this.#dictionary.length;
+        if (mapped === this.#dictionary.length) {
+          this.#dictionary.push(value);
+          this.#index.set(value, mapped);
+        }
+        map[code] = mapped;
+      }
+      setBitmapValue(this.#validity, targetRow + offset);
+      this.#codes[targetRow + offset] = mapped;
+    }
+  }
+
+  release(): void {
+    for (const reservation of this.#reservations) reservation.release();
+    this.#reservations.length = 0;
+  }
+}
+
+/**
  * An outer window compacted from an inner window: live runs copied as slices, patched rows
- * read from their update vectors. A string window shares the inner dictionary unless a patch
- * has to add to it, in which case it copies the dictionary first.
+ * read from their update vectors — as slices too, where consecutive patched rows read
+ * consecutive rows of one delta block, as a delta written in the table's order does. A string
+ * window shares the inner dictionary unless a patch has to add to it, in which case it is
+ * re-encoded.
  */
 function overlayWindowCompacted(
   inner: ColumnVector,
   innerWindowStart: number,
   steps: OverlayWindowSteps,
   rows: number,
-  patches: ReadonlyMap<number, ReadonlyMap<string, OverlayPatch>> | undefined,
+  patches: OverlayColumnPatches | undefined,
   column: TableColumnRecord,
   memory: QueryMemoryContext,
   reservations: QueryMemoryReservation[],
@@ -25333,51 +25850,56 @@ function overlayWindowCompacted(
   // rows: the block's dictionary can hold tens of thousands of values the window never uses,
   // and copying and indexing it per column per window is what made a wide patched scan cost
   // memory and time proportional to the table, not to the window.
-  let patched = false;
-  if (inner.kind === "string" && patches !== undefined) {
-    for (let index = 0; index < steps.length; index += 2) {
-      if (
-        (steps[index + 1] ?? 0) === 0 &&
-        patches.get(steps[index] ?? 0)?.has(column.id) === true
-      ) {
-        patched = true;
-        break;
-      }
-    }
-  }
+  // A column's patches exist only where some patched row of this window takes the column.
+  const patched = inner.kind === "string" && patches !== undefined;
   const dictionary: string[] | undefined =
     inner.kind === "string" ? (patched ? [] : (inner.dictionary as string[])) : undefined;
-  const dictionaryIndex = patched ? new Map<string, number>() : undefined;
+  const encoder =
+    patched && codes !== undefined && dictionary !== undefined
+      ? new WindowStringEncoder(dictionary, codes, validity, memory, column)
+      : undefined;
   const target = (
     codes !== undefined
       ? { kind: "string", length: rows, validity, codes, dictionary: dictionary ?? [] }
       : { kind: inner.kind, length: rows, validity, values }
   ) as ColumnVector;
+  const vectorIndexes = patches?.vectorIndex;
+  const patchRows = patches?.rows;
   let out = 0;
-  for (let index = 0; index < steps.length; index += 2) {
-    const start = steps[index] ?? 0;
-    const length = steps[index + 1] ?? 0;
-    const patch = length === 0 ? patches?.get(start)?.get(column.id) : undefined;
-    if (patch === undefined) {
-      const count = Math.max(1, length);
-      if (dictionaryIndex === undefined) {
-        copyVectorSpan(inner, start - innerWindowStart, count, target, out);
-      } else {
-        for (let row = 0; row < count; row += 1) {
-          copyColumnVectorValue(
-            inner,
-            start - innerWindowStart + row,
-            target,
-            out + row,
-            dictionaryIndex,
-          );
+  try {
+    for (let index = 0; index < steps.length; index += 2) {
+      const start = steps[index] ?? 0;
+      const length = steps[index + 1] ?? 0;
+      const patch = length < 0 ? -length - 1 : -1;
+      const vectorIndex = patch < 0 ? -1 : (vectorIndexes?.[patch] ?? -1);
+      let source = inner;
+      let sourceRow = start - innerWindowStart;
+      let count = Math.max(1, length);
+      if (vectorIndex >= 0) {
+        const patchVector = patches?.vectors[vectorIndex];
+        if (patchVector === undefined || patchRows === undefined) {
+          throw new Error(`Column row count mismatch: ${column.name}`);
+        }
+        source = patchVector;
+        sourceRow = patchRows[patch] ?? 0;
+        // Extend over the following patched rows that read on in the same delta block.
+        while (index + 2 < steps.length) {
+          const nextLength = steps[index + 3] ?? 0;
+          if (nextLength >= 0) break;
+          const next = -nextLength - 1;
+          if (vectorIndexes?.[next] !== vectorIndex || patchRows[next] !== sourceRow + count) {
+            break;
+          }
+          count += 1;
+          index += 2;
         }
       }
+      if (encoder === undefined) copyVectorSpan(source, sourceRow, count, target, out);
+      else encoder.copy(source, sourceRow, count, out);
       out += count;
-      continue;
     }
-    copyColumnVectorValue(patch.vector, patch.row, target, out, dictionaryIndex);
-    out += 1;
+  } finally {
+    encoder?.release();
   }
   if (out !== rows) throw new Error(`Column row count mismatch: ${column.name}`);
   if (patched && dictionary !== undefined) {
@@ -25418,24 +25940,13 @@ function columnVectorKeyReader(
   return (row) => (bitmapHasValue(validity, row) ? values[row] : undefined);
 }
 
-/** `columnVectorKeyReader` for a key column that must be readable: a null key is corruption. */
-function requiredColumnVectorKeyReader(vector: ColumnVector): (row: number) => OverlayKey {
-  const read = columnVectorKeyReader(vector);
-  if (read === undefined) throw new Error("Unique key vector cannot be read as keys");
-  return (row) => {
-    const key = read(row);
-    if (key === undefined) throw new TypeError("Unique key cannot be null");
-    return key;
-  };
-}
-
 /**
  * The touched keys as one IN zone predicate, or undefined when zone maps cannot judge them
  * (a string key has no numeric zone map, and an empty set has nothing to prune against).
  */
 function touchedKeyPredicate(
   keyColumn: TableColumnRecord,
-  touched: ReadonlySet<OverlayKey> | ReadonlyMap<OverlayKey, number | undefined>,
+  touched: ReadonlySet<OverlayKey>,
 ): ZonePredicate | undefined {
   if (keyColumn.type !== "number" && keyColumn.type !== "datetime") return undefined;
   if (touched.size === 0) return undefined;

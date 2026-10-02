@@ -20,10 +20,12 @@ await db.compactTable("orders");
 It runs automatically by default: a scan or a run of commits that finds a table past the
 threshold plans a fold and drives it to publication in small steps, yielding between them, and
 keeps going while the table is still due. A table is due when it has many small segments, many
-delete, update, or upsert segments, or deltas that together hold as many rows as the data they
-change (once they pass a few thousand rows). The last rule is for tables refreshed wholesale:
-each full-table upsert adds another copy of every row, and folding after the second keeps a
-scan to about three reads per row instead of more than thirty. A step yields to the event loop or to this database's
+delete, update, or upsert segments, or deltas that hold as many rows as the data they change
+(once they pass a few thousand rows) or more patched rows than a query keeps in a quarter of its
+memory budget. A single such delta is enough. That rule is for tables refreshed wholesale: each
+full-table upsert adds another copy of every row, and folding it right away, with no further
+write needed, keeps a scan at about two reads per row instead of more than thirty. A query that
+finds a delta too large for its budget also queues the fold. A step yields to the event loop or to this database's
 next commit, whichever comes first, so a loop that awaits one statement after another without
 pausing still lets the fold advance. A fold reads and decodes its source blocks in groups sized
 by its memory budget, so a step costs the loop a turn per group rather than a turn per block. A
@@ -58,15 +60,17 @@ query, and the storage they occupy is freed.
 
 Upserts replay through the same streamed scan. Repeated writes to one key keep only the
 patches needed for its latest column values. Replay reads historical key blocks in bounded
-groups and tracks distinct touched keys, surviving patches, and a bitmap with one bit per
-historical insert, base, or upsert row. Temporary patch data is released after each scan window.
-Compaction still reduces the history that must be read and the bitmap's size.
+groups and keeps a bitmap with one bit per historical insert, base, or upsert row plus about
+eight bytes per patched row, built once per commit and shared by the queries after it. Temporary
+patch data is released after each scan window. Compaction still reduces the history that must be
+read and the bitmap's size.
 
-`QueryMemoryBudgetError` with the label `Streamed mutation replay` means this replay state
-exceeded the query's execution budget; it does not mean the browser ran out of memory. This
-state does not spill. Run `await db.compactTable("orders")` to fold accumulated history and
-inspect its result, or raise `executionMemoryBudgetBytes` for the query. Compaction has its own
-memory budget, described below. A reload alone preserves the stored mutation history.
+A delta of any size stays readable. When a query's patches would take more than a quarter of its
+execution budget, the query keeps only the bitmap and replays the patches one range of rows at a
+time as its scan reaches each range. When even the replay's temporary key lookup would not fit,
+it splits the touched keys into groups and replays each group in turn. Both paths return exactly
+the rows the in-memory replay returns, in the same order — they cost time, not correctness — and
+both queue the fold that removes the delta. A reload alone preserves the stored mutation history.
 
 ### Partitioned folds
 
@@ -97,18 +101,20 @@ Merging a keyed table plans the merge in memory proportional to the distinct key
 touch. The table's size, how many times those keys were rewritten, and how wide the rows are do
 not add to it, so eighty refreshes of the same seven thousand rows cost seven thousand keys.
 Every output block is measured against a memory budget before it is written. The default budget
-is 32 MiB. An explicit `compactTable` or `compactTableStep` that needs more reports
-`CompactionMemoryBudgetError`; raise it with `memoryBudgetBytes`:
-
-```ts
-await db.compactTable("orders", { memoryBudgetBytes: 256 * 1024 * 1024 });
-```
+is 32 MiB.
 
 Automatic compaction needs no setting. It sizes each fold to the budget: a fold that does not
 fit is cut to fewer level-zero segments and planned again, and the table's next fold starts from
 the size that fit. When even the smallest fold the table allows does not fit, automatic
 compaction gives that one fold the memory it needs — about what the writes that produced it
-already held — rather than leaving the table to slow every read.
+already held — rather than leaving the table to slow every read. `compactTable` without a
+`memoryBudgetBytes` option fits its fold the same way. A `compactTable` given an explicit budget,
+and every `compactTableStep`, plans exactly what its options ask for and reports
+`CompactionMemoryBudgetError` when that needs more:
+
+```ts
+await db.compactTable("orders", { memoryBudgetBytes: 256 * 1024 * 1024 });
+```
 
 The order rows arrive in does not matter. A fold's job record holds its sources, output windows,
 and partitions — not which source row feeds each output cell. That mapping, the replay, is a pure

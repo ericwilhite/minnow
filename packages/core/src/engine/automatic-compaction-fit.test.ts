@@ -201,11 +201,11 @@ describe("automatic compaction fits its folds to memory", () => {
     await database.execute(`UPDATE "t" SET "n1" = "n1" + 1`);
     const segments = await settled(database, store);
     expect(errors).toEqual([]);
-    // Two partitions of the folded rows, and the second update waiting for company.
+    // Two partitions of the folded rows. The second update, alone over them but as large as
+    // the table, is due on its own and folded into them too.
     expect(segments.map((segment) => [segment.level, segment.kind])).toEqual([
       [1, "base"],
       [1, "base"],
-      [0, "update"],
     ]);
     const jobs = await publishedJobs(database);
     expect(jobs.some((job) => job.memoryBudgetBytes > DEFAULT_BUDGET)).toBe(true);
@@ -251,6 +251,34 @@ describe("automatic compaction fits its folds to memory", () => {
       expect(recordBytes).toBeLessThan(128 * 1024);
       expect(plan.outputs.length).toBeLessThanOrEqual(4);
     }
+    await database.close();
+  });
+
+  it("folds one delta as large as its table without waiting for another write", async () => {
+    const { store, database, errors } = openDatabase();
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    const rows = (version: number) =>
+      Array.from({ length: 8_000 }, (_, id) => ({ id, amount: id + version }));
+    await database.insertBatch("items", rows(0));
+    // A single full-table refresh: one delta, then nothing more is written.
+    await database.upsertBatch("items", rows(1));
+    let segments = await settled(database, store, "items");
+    expect(segments.map((segment) => segment.kind)).toEqual(["base"]);
+    // The next refresh is a lone delta over the folded partition, and is folded as well.
+    await database.upsertBatch("items", rows(2));
+    segments = await settled(database, store, "items");
+    expect(segments.map((segment) => segment.kind)).toEqual(["base"]);
+    expect(errors).toEqual([]);
+    expect(
+      (await database.query("SELECT COUNT(*) AS n, SUM(amount) AS total FROM items")).rows,
+    ).toEqual([{ n: 8_000, total: (7_999 * 8_000) / 2 + 2 * 8_000 }]);
     await database.close();
   });
 
