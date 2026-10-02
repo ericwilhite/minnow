@@ -10,17 +10,8 @@
     "minnowdb/native-fixture/extents/000000": "QlJEQoGuFhoCACwAAwMAAAMAAAABAAAAAgAAAB4AAAAeAAAAvehv5b3ob+V7fQUAAAAABgAAAAYAAAANAAAAbmF0aXZlZml4dHVyZUJSREKBrhYaAgAsAAMDAAADAAAAAQAAAAIAAAAeAAAAHgAAAL3ob+W96G/le30FAAAAAAYAAAAGAAAADQAAAG5hdGl2ZWZpeHR1cmVCUkRC0nySxAIALAACAgAAAQAAAAAAAAAdAAAACQAAAAkAAABtzKhTbcyoU3siem9uZU1hcCI6eyJtaW4iOjEsIm1heCI6MX19AQAAAAAAAPA/"
   },
   "expectations": {
-    "tables": [
-      "checkpoint-b",
-      "data",
-      "keyed",
-      "wal-tail"
-    ],
+    "tables": ["checkpoint-b", "data", "keyed", "wal-tail"],
     "blockId": "fixture-block",
-    "blockValues": [
-      "native",
-      null,
-      "fixture"
-    ]
+    "blockValues": ["native", null, "fixture"]
   }
 }
