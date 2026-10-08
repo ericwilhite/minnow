@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
+import { encodeBlock } from "../../block-format/index.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
-import { MAX_POSTING_BUILD_TTL_MS } from "../types.js";
+import { MAX_POSTING_BUILD_TTL_MS, type TableRecord } from "../types.js";
 import { decodeSyncCheckpoint, encodeSyncCheckpoint } from "../toolkit/wire.js";
 import { OpfsBlockStore } from "./store.js";
 
@@ -9,7 +10,26 @@ interface Checkpoint {
   lastSeq: number;
 }
 
-async function checkpointedStore(name: string): Promise<{
+type PostingOwnerKind = "fts-column" | "secondary-index";
+
+/** The postings storage column each owner kind builds in `checkpointedStore`'s table. */
+const POSTING_COLUMN: Record<PostingOwnerKind, string> = {
+  "fts-column": "posting",
+  "secondary-index": "secondary-index:by-id",
+};
+
+async function waitForEmptyWal(shim: MemoryOpfs, prefix: string): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt++) {
+    if (shim.readFileBytes(`${prefix}wal`)?.byteLength === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("The mirrored checkpoint did not finish");
+}
+
+async function checkpointedStore(
+  name: string,
+  ownerKind: PostingOwnerKind = "fts-column",
+): Promise<{
   shim: MemoryOpfs;
   store: OpfsBlockStore;
   prefix: string;
@@ -24,20 +44,99 @@ async function checkpointedStore(name: string): Promise<{
     managed: false,
     revision: 0,
     createdAt: "2026-09-14T00:00:00.000Z",
-    ftsColumns: {
-      posting: {
-        storage: "fts-chunks-v1",
-        tokenizerVersion: 1,
-        state: "building",
-        buildFromVersion: -1,
-      },
-    },
+    ...(ownerKind === "fts-column"
+      ? {
+          ftsColumns: {
+            posting: {
+              storage: "fts-chunks-v1",
+              tokenizerVersion: 1,
+              state: "building",
+              buildFromVersion: -1,
+            },
+          },
+        }
+      : {
+          secondaryIndexes: {
+            "by-id": {
+              name: "durable_by_id",
+              columnId: "id",
+              columnIds: ["id"],
+              directions: ["asc"],
+              termEncoding: "tuple-v2",
+              storage: "postings-v1",
+              storageColumnId: POSTING_COLUMN["secondary-index"],
+              locator: "row-id",
+              state: "building",
+              buildId: "build",
+              buildFromVersion: -1,
+            },
+          },
+        }),
   });
-  for (let attempt = 0; attempt < 400; attempt++) {
-    if (shim.readFileBytes(`${prefix}wal`)?.byteLength === 0) return { shim, store, prefix };
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("The initial mirrored checkpoint did not finish");
+  await waitForEmptyWal(shim, prefix);
+  return { shim, store, prefix };
+}
+
+function postingState(table: TableRecord | undefined, ownerKind: PostingOwnerKind): string {
+  return (
+    (ownerKind === "fts-column"
+      ? table?.ftsColumns?.posting?.state
+      : table?.secondaryIndexes?.["by-id"]?.state) ?? "missing"
+  );
+}
+
+/** Commits one segment with no postings delta: the stale-writer rule invalidates the index. */
+async function commitStaleWriterSegment(store: OpfsBlockStore): Promise<void> {
+  const timestamp = "2026-09-14T00:00:01.000Z";
+  const transactionId = "stale-writer";
+  await store.createTransaction({
+    id: transactionId,
+    ownerId: "stale-writer/owner",
+    expiresAt: "2026-09-14T00:30:00.000Z",
+    snapshotVersion: null,
+    pendingBlockIds: [],
+    pendingSegmentIds: [],
+    status: "active",
+    revision: 0,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    committedVersion: null,
+  });
+  const created = await store.getTransaction(transactionId);
+  if (created === undefined) throw new Error("The stale writer's transaction is missing");
+  const staged = await store.stageTransactionArtifacts({
+    transactionId,
+    expectedRevision: created.revision,
+    blocks: [
+      { id: "stale-block", bytes: await encodeBlock({ type: "number", values: [1] }, "raw") },
+    ],
+    segments: [
+      {
+        id: "stale-segment",
+        tableId: "durable-table",
+        transactionId,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        rowIdSpans: [],
+        columnBlockIds: { id: ["stale-block"] },
+        kind: "insert",
+        level: 0,
+        logicalOrder: 0,
+        commitOrdinal: 0,
+        createdAt: timestamp,
+      },
+    ],
+    updatedAt: timestamp,
+  });
+  await store.commitTransaction({
+    transactionId,
+    expectedTransactionRevision: staged.revision,
+    expectedManifestVersion: null,
+    changedTableIds: ["durable-table"],
+    levelZeroSegmentLimits: [{ tableId: "durable-table", limit: 4096 }],
+    committedAt: timestamp,
+  });
 }
 
 it("recovers an interrupted WAL-empty checkpoint without losing acknowledged catalog state", async () => {
@@ -271,6 +370,85 @@ it.each([
       expect((await reopened.checkIntegrity({ mode: "full" })).ok).toBe(true);
     } finally {
       reopened.close();
+    }
+  },
+);
+
+it.each([
+  ["fts-column", "catalog update"],
+  ["fts-column", "stale writer commit"],
+  ["secondary-index", "catalog update"],
+  ["secondary-index", "stale writer commit"],
+] as const)(
+  "reopens a checkpoint holding a %s build whose index a %s invalidated",
+  async (ownerKind, invalidation) => {
+    const name = `abandoned-${ownerKind}-build-${invalidation.replaceAll(" ", "-")}`;
+    const { shim, store, prefix } = await checkpointedStore(name, ownerKind);
+    const start = Date.now();
+    const time = (offset: number): string => new Date(start + offset).toISOString();
+    const identity = {
+      tableId: "durable-table",
+      columnId: POSTING_COLUMN[ownerKind],
+      buildId: "build",
+      ownerId: "owner",
+    };
+    await store.beginFtsBaseBuild({ ...identity, createdAt: time(0), expiresAt: time(3_600_000) });
+    await store.writeFtsBaseBuildChunk({
+      ...identity,
+      expiresAtCutoff: time(1),
+      expiresAt: time(3_600_001),
+      updatedAt: time(1),
+      ordinal: 0,
+      chunk: [{ term: "alpha", rowIds: [3n], tf: [1] }],
+    });
+    if (invalidation === "catalog update") {
+      const current = await store.getTable("durable-table");
+      const fts = current?.ftsColumns?.posting;
+      const index = current?.secondaryIndexes?.["by-id"];
+      if (current === undefined) throw new Error("The indexed table is missing");
+      if (fts !== undefined) {
+        await store.updateTable(current.id, current.revision, {
+          ftsColumns: { posting: { ...fts, state: "invalid" } },
+        });
+      } else {
+        if (index === undefined) throw new Error("The secondary index is missing");
+        const { buildId: _abandonedBuild, ...invalid } = index;
+        void _abandonedBuild;
+        await store.updateTable(current.id, current.revision, {
+          secondaryIndexes: { "by-id": { ...invalid, state: "invalid" } },
+        });
+      }
+    } else {
+      await commitStaleWriterSegment(store);
+    }
+    await waitForEmptyWal(shim, prefix);
+    store._crashForTests();
+    // The live store keeps an abandoned build's lease until its owner aborts, finishes, or the
+    // lease expires, so a checkpoint can hold an invalid index together with its staged build.
+    const checkpoint = decodeSyncCheckpoint(
+      shim.readFileBytes(`${prefix}checkpoint-a`) ?? new Uint8Array(),
+    ) as { core: { tables: TableRecord[] }; ftsBuilds: Array<[string, unknown]> };
+    expect(checkpoint.ftsBuilds).toHaveLength(1);
+    expect(postingState(checkpoint.core.tables[0], ownerKind)).toBe("invalid");
+
+    const reopened = await OpfsBlockStore.open({ name, root: shim.root });
+    try {
+      expect(postingState(await reopened.getTable("durable-table"), ownerKind)).toBe("invalid");
+      expect(await reopened.checkIntegrity({ mode: "full" })).toMatchObject({
+        ok: true,
+        issueCount: 0,
+      });
+      // Its owner can still release it, and recovery replays that release over the checkpoint.
+      await reopened.abortFtsBaseBuild({ ...identity, expiresAtCutoff: time(2) });
+    } finally {
+      reopened._crashForTests();
+    }
+    const recovered = await OpfsBlockStore.open({ name, root: shim.root });
+    try {
+      expect(postingState(await recovered.getTable("durable-table"), ownerKind)).toBe("invalid");
+      expect((await recovered.checkIntegrity({ mode: "full" })).ok).toBe(true);
+    } finally {
+      recovered.close();
     }
   },
 );

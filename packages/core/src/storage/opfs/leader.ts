@@ -2562,11 +2562,11 @@ export class OpfsLeader {
     for (const [key, build] of this.#ftsBuilds) {
       const [tableId, columnId] = parsePostingStorageKey(key, "staged full-text base");
       const table = this.#core.getTable(tableId);
-      if (
-        table === undefined ||
-        !activePostingStorageColumnIds(table).has(columnId) ||
-        this.#postingBuildOwnerKind(table, columnId) !== build.ownerKind
-      ) {
+      // Removing a table, index, or column releases its build, so the owner must still exist.
+      // It need not be active: an index invalidated by a stale writer or a catalog update keeps
+      // its abandoned build until the owner aborts or finishes it or the lease expires, and a
+      // checkpoint taken in that window is consistent.
+      if (table === undefined || postingStorageOwnerKind(table, columnId) !== build.ownerKind) {
         throw new Error(`Staged postings build has invalid catalog ownership: ${key}`);
       }
       let retainedBytes = 0;
@@ -2608,11 +2608,11 @@ export class OpfsLeader {
     table: TableRecord,
     storageColumnId: string,
   ): "fts-column" | "secondary-index" {
-    if (table.ftsColumns?.[storageColumnId] !== undefined) return "fts-column";
-    for (const index of Object.values(table.secondaryIndexes ?? {})) {
-      if (index.storageColumnId === storageColumnId) return "secondary-index";
+    const ownerKind = postingStorageOwnerKind(table, storageColumnId);
+    if (ownerKind === undefined) {
+      throw new Error(`Postings index is no longer active: ${table.id}/${storageColumnId}`);
     }
-    throw new Error(`Postings index is no longer active: ${table.id}/${storageColumnId}`);
+    return ownerKind;
   }
 
   #replaceExpiredPostingBuilds(key: string, cutoff: string, pointer: FtsBaseBuildPointer): void {
@@ -5915,6 +5915,18 @@ export class OpfsLeader {
     this.#preparedSnapshotFrameImportLedger?.close();
     this.#extents?.close();
   }
+}
+
+/** Which catalog entry owns a postings storage column, in any state; undefined once removed. */
+function postingStorageOwnerKind(
+  table: TableRecord,
+  storageColumnId: string,
+): "fts-column" | "secondary-index" | undefined {
+  if (table.ftsColumns?.[storageColumnId] !== undefined) return "fts-column";
+  for (const index of Object.values(table.secondaryIndexes ?? {})) {
+    if (index.storageColumnId === storageColumnId) return "secondary-index";
+  }
+  return undefined;
 }
 
 /** @internal Exact pre-read aggregate limit, exported only for the no-allocation regression. */
