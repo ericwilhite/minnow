@@ -1,4 +1,5 @@
 import type { TableRecord } from "../storage/types.js";
+import { isReconciledByMaintenanceRetry } from "./background-diagnostics.js";
 
 interface Backoff {
   minimumSegments: number;
@@ -92,7 +93,10 @@ export class CompactionController {
         else this.backOff(table.id, visible);
       })
       .catch((error: unknown) => {
-        this.ports.report(error, `automatic compaction for ${table.name}`);
+        // A fold step lost with its OPFS leader is retried after the same backoff; the retry
+        // re-reads the durable job, so only other failures reach the app's error hook.
+        if (!isReconciledByMaintenanceRetry(error))
+          this.ports.report(error, `automatic compaction for ${table.name}`);
         if (!this.#cancelledRuns.has(run)) this.backOff(table.id, visible, "failed");
       })
       .finally(() => {

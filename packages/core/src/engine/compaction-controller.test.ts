@@ -1,6 +1,10 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { CompactionController } from "./compaction-controller.js";
-import type { TableRecord } from "../storage/types.js";
+import {
+  OpfsUncertainOutcomeError,
+  StorageUnresponsiveError,
+  type TableRecord,
+} from "../storage/types.js";
 const table = { id: "t", name: "table" } as TableRecord;
 afterEach(() => vi.useRealTimers());
 it("owns retry and debounce timers and drains admitted checks before disposal", async () => {
@@ -65,6 +69,34 @@ it("coalesces overlapping table folds, reports failures, and forgets dropped-tab
   expect(controller.retryPending("t")).toBe(false);
   await vi.advanceTimersByTimeAsync(60_000);
   expect(check).toHaveBeenCalledTimes(1);
+  controller.stop();
+});
+
+it("retries a fold lost with its OPFS leader without reporting it, but reports a wedged store", async () => {
+  vi.useFakeTimers();
+  const lost = new OpfsUncertainOutcomeError("updateCompactionJob");
+  const wedged = new StorageUnresponsiveError("indexeddb", "app", 30_000);
+  const run = vi.fn().mockRejectedValueOnce(lost).mockRejectedValueOnce(wedged);
+  const report = vi.fn();
+  const controller = new CompactionController({
+    enabled: true,
+    maximumLevelZeroSegments: 256,
+    dropping: () => false,
+    run,
+    check: async () => undefined,
+    yield: async () => undefined,
+    report,
+  });
+  controller.schedule(table, 48);
+  await controller.drain();
+  expect(report).not.toHaveBeenCalled();
+  expect(controller.retryPending("t")).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  controller.schedule(table, 48);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(2);
+  expect(report).toHaveBeenCalledExactlyOnceWith(wedged, "automatic compaction for table");
+  expect(controller.retryPending("t")).toBe(true);
   controller.stop();
 });
 

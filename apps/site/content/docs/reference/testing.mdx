@@ -585,7 +585,13 @@ connection, which is why the Node driver opens one per connection for IndexedDB 
 first real-browser runs then added two more: WebKit keeping a terminated worker's IndexedDB
 connection and open transaction alive until its document goes away, which wedged every tab
 (now bounded by `StorageUnresponsiveError`), and a crashed tab's pending call waiting out the
-client's silence deadline long enough for another tab's idle transaction rollback to fire.
+client's silence deadline long enough for another tab's idle transaction rollback to fire. The
+nightly Firefox OPFS crash campaign later found an OPFS database that would not reopen after a
+crash, because its checkpoint held a staged index build for an index a stale writer had just
+marked invalid; a fold that reported a failure when another tab dropped its table just before
+the fold began; and background collection reporting a crashed leader tab's lost step, which its
+own retry reconciles. Each is pinned in Node: `checkpoint-interruption.test.ts`,
+`simulator-regressions.test.ts`, and the collection and compaction controller tests.
 
 ## Background maintenance, size, and memory
 

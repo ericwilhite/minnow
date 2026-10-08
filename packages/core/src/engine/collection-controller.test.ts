@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { OpfsUncertainOutcomeError, StorageUnresponsiveError } from "../storage/types.js";
 import { CollectionController } from "./collection-controller.js";
 import { MaintenanceBacklogError } from "./errors.js";
 
@@ -74,6 +75,34 @@ it("retries I/O failures without a new commit and cancels every timer on stop", 
   await vi.advanceTimersByTimeAsync(120_000);
   expect(run).toHaveBeenCalledTimes(2);
   expect(vi.getTimerCount()).toBe(0);
+});
+
+it("retries a step lost with its OPFS leader without reporting it, but reports a wedged store", async () => {
+  vi.useFakeTimers();
+  const lost = new OpfsUncertainOutcomeError("updateGarbageCollectionPlanning");
+  const wedged = new StorageUnresponsiveError("indexeddb", "app", 30_000);
+  const run = vi
+    .fn()
+    .mockRejectedValueOnce(lost)
+    .mockRejectedValueOnce(wedged)
+    .mockResolvedValue({ moreWork: false, reclaimed: true });
+  const { collection, report } = controller({ run });
+  collection.schedule();
+  await collection.drain();
+  expect(report).not.toHaveBeenCalled();
+  expect(collection.status()).toMatchObject({
+    consecutiveFailures: 1,
+    lastError: { name: "OpfsUncertainOutcomeError" },
+  });
+  expect(collection.status().nextRetryAt).not.toBeNull();
+  await vi.advanceTimersByTimeAsync(1000);
+  await collection.drain();
+  expect(report).toHaveBeenCalledExactlyOnceWith(wedged, "auto collection");
+  await vi.advanceTimersByTimeAsync(2000);
+  await collection.drain();
+  expect(run).toHaveBeenCalledTimes(3);
+  expect(collection.status().consecutiveFailures).toBe(0);
+  collection.stop();
 });
 
 it("keeps manual backpressure across reopen until a successful explicit collection", async () => {

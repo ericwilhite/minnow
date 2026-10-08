@@ -1,6 +1,9 @@
 import { GarbageCollectionJobConflictError } from "../storage/types.js";
 import { MaintenanceBacklogError } from "./errors.js";
-import { backgroundErrorSummary } from "./background-diagnostics.js";
+import {
+  backgroundErrorSummary,
+  isReconciledByMaintenanceRetry,
+} from "./background-diagnostics.js";
 import type { MaintenanceStatus } from "./database.js";
 
 const AUTO_COLLECT_COMMIT_INTERVAL = 64;
@@ -192,7 +195,9 @@ export class CollectionController {
           ...backgroundErrorSummary(error),
           at,
         };
-        this.#ports.report(error, "auto collection");
+        // A step lost with its OPFS leader stays visible here and retries like any failure; the
+        // retry re-reads the job, so there is nothing for the app's error hook to act on.
+        if (!isReconciledByMaintenanceRetry(error)) this.#ports.report(error, "auto collection");
         this.#scheduleRetry();
       })
       .finally(() => {

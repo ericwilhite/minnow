@@ -278,8 +278,17 @@ remain available when an optional index build fails. `maintenanceStatus().backgr
 counts all reported background failures; `backgroundErrors` keeps the last 32 in reporting order,
 with sequence, context, name, message and time. Each text field is capped at 1,024 characters.
 The snapshot is defensive and stays available after close. Observers still receive the original
-error. Collection-specific counters and `lastError` describe collection only. Foreground failures
-reject their owning call; a successful fallback still reports the unexpected accelerator failure.
+error. Collection-specific counters and `lastError` describe collection only.
+
+One failure is retried without a report. When another tab holding OPFS leadership closes or
+crashes in the middle of a collection or compaction step, that step fails with
+`OpfsUncertainOutcomeError`. Every maintenance job is durable and revision-guarded, and the retry
+reads it back before stepping, so there is nothing for an application to reconcile. Collection
+still counts the failure in `consecutiveFailures` and `lastError`. A store that stops answering
+(`StorageUnresponsiveError`) is still reported, because only reloading the tab clears it.
+
+Foreground failures reject their owning call; a successful fallback still reports the unexpected
+accelerator failure.
 Failures retry on a capped timer even when no more writes arrive. Debt resets after any pass
 that reclaims something. If repeated failures let it reach the safety ceiling, the next write
 first assists collection and, if that pass still reclaims nothing, throws

@@ -119,7 +119,9 @@ answers with the whole transaction record, and the ledger records that such a re
 without keeping what it answered. The engine's transaction layer recovers a lost staging or
 commit acknowledgement by reading the record back, so that last case never reaches an
 application through `write()`. The mutation may have committed in any of these cases; reconcile the operation's stable ids or revisions
-before deciding whether to retry. Correctness never rides on a message; the channel affects how
+before deciding whether to retry. Background collection and compaction do this themselves: their
+jobs are durable and revision-guarded, so a step lost with its leader is retried without a report
+through `onBackgroundError` (see [Maintenance](/docs/storage/maintenance)). Correctness never rides on a message; the channel affects how
 fast multi-tab work moves, never whether it is right.
 Temporary spill writes are reserved in the leader's durable ledger before a follower writes the
 file, so all tabs share the same page, run, and byte limits.

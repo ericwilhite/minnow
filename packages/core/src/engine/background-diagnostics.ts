@@ -1,3 +1,16 @@
+import { OpfsUncertainOutcomeError } from "../storage/types.js";
+
+/**
+ * A maintenance mutation whose OPFS leader vanished before acknowledging it — another tab closed
+ * or crashed mid-step. Each maintenance job is durable and revision-guarded, and its next run
+ * re-reads it before stepping, so the scheduled retry reconciles the outcome; reporting it would
+ * only tell the app that a tab went away. A wedged store (`StorageUnresponsiveError`) and every
+ * other failure are still reported.
+ */
+export function isReconciledByMaintenanceRetry(error: unknown): boolean {
+  return error instanceof OpfsUncertainOutcomeError;
+}
+
 /** One bounded owner of background evidence. Observers receive the original error; history
  * keeps only bounded text and timestamps so error graphs cannot retain database resources. */
 function boundedText(read: () => unknown, fallback: string): string {
