@@ -8,6 +8,35 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.14.1 — October 8, 2026
+
+Release packages: `@minnowdb/core@0.14.1`.
+
+- **An OPFS database opens again after a crash during an index rebuild.** A write from a tab that
+  had not seen a new index yet marks that index invalid so it rebuilds, while the index's
+  half-finished build stays recorded until its owner aborts or finishes it, or its lease runs
+  out. A checkpoint taken in that window is consistent, but reopening the database refused it
+  with `StorageCorruptionError: … Staged postings build has invalid catalog ownership`, and the
+  database stayed unopenable. Opening now accepts a build whose index still exists, whatever its
+  state, and still refuses one whose table, index, or column is gone. A database already stuck
+  this way opens with 0.14.1 without any repair. Found by the nightly Firefox OPFS crash test.
+
+- **Dropping a table no longer makes its compaction report a failure.** When another tab dropped
+  a table just before its automatic compaction started, the compaction reported
+  `Compaction table is missing` through `onBackgroundError`. It now ends as cancelled, which
+  automatic compaction treats as done; `compactTableStep()` raises `CompactionJobCancelledError`.
+
+- **A tab closing mid-maintenance is no longer reported as a failure.** When the tab holding
+  OPFS leadership closes or crashes during another tab's collection or compaction step, that
+  step fails with `OpfsUncertainOutcomeError`. Maintenance jobs are durable and revision-guarded,
+  and the retry reads the job back before stepping, so the engine now retries without reporting
+  it through `onBackgroundError`. Collection still counts it in `maintenanceStatus()`'s
+  `consecutiveFailures` and `lastError`. `StorageUnresponsiveError` and every other background
+  failure are still reported.
+
+**Migration and stored formats:** no application migration is needed, and no stored format
+changes: IndexedDB schema 4 and OPFS layout 9, as in 0.14.0.
+
 ## 0.14.0 — October 2, 2026
 
 Release packages: `@minnowdb/core@0.14.0`.
