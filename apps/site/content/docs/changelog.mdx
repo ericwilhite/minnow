@@ -26,6 +26,14 @@ Release packages: `@minnowdb/core@0.14.1`.
   `Compaction table is missing` through `onBackgroundError`. It now ends as cancelled, which
   automatic compaction treats as done; `compactTableStep()` raises `CompactionJobCancelledError`.
 
+- **A fold abandoned by another tab as it begins reports a typed conflict.** When another tab
+  abandoned a shared fold after a schema change while this tab was starting that fold's
+  transaction, the step failed with the other tab's recorded message,
+  `Schema changed during compaction`, as a plain `Error`. It now raises
+  `CompactionJobConflictError` with the job's ID and changed revision, as a fold abandoned at any
+  other point between selection and execution already did, and the next step plans against the
+  current schema.
+
 - **A tab closing mid-maintenance is no longer reported as a failure.** When the tab holding
   OPFS leadership closes or crashes during another tab's collection or compaction step, that
   step fails with `OpfsUncertainOutcomeError`. Maintenance jobs are durable and revision-guarded,

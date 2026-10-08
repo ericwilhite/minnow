@@ -18646,7 +18646,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (job.transactionId === null || linkedTransaction?.status !== "active") {
         const linked = await this.#beginCompactionTransaction(job);
         if (linked.transaction === null) {
-          return await this.#runCompactionJob(table, linked.job, maxBlocks, admission);
+          // Pass the active record this step selected, not the newer one: the fresh read then
+          // sees a job another coordinator abandoned meanwhile as a revision conflict.
+          return await this.#runCompactionJob(table, job, maxBlocks, admission);
         }
         ({ job, transaction } = linked);
       } else {

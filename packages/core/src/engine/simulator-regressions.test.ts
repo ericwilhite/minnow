@@ -892,6 +892,58 @@ describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
       }
     });
 
+    it("refuses with revision evidence when another tab abandons a job as its transaction begins", async () => {
+      // WebKit release conformance on 0.14.1: another coordinator aborted the shared fold after
+      // a schema change while this step was linking its transaction, and the step reported the
+      // recorded "Schema changed during compaction" as an untyped background failure.
+      const store = await create();
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const update = store.updateCompactionJob.bind(store);
+      let selected: CompactionJobRecord | undefined;
+      const updating = vi
+        .spyOn(store, "updateCompactionJob")
+        .mockImplementation(async (id, expectedRevision, patch) => {
+          if (selected === undefined && patch.state === "running" && patch.transactionId) {
+            selected = await store.getCompactionJob(id);
+            // What the other tab's #abortCompactionJob writes when its publish meets new DDL.
+            await update(id, expectedRevision, {
+              state: "aborted",
+              updatedAt: new Date().toISOString(),
+              error: "Schema changed during compaction",
+            });
+          }
+          return update(id, expectedRevision, patch);
+        });
+      try {
+        await owner.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await owner.insert("events", { value });
+        const step = contender.compactTableStep("events");
+        await expect(step).rejects.toBeInstanceOf(CompactionJobConflictError);
+        if (selected === undefined) throw new Error("Expected the step to link a transaction");
+        const aborted = await store.getCompactionJob(selected.id);
+        expect(aborted).toMatchObject({ state: "aborted" });
+        await expect(step).rejects.toMatchObject({
+          jobId: selected.id,
+          expectedRevision: selected.revision,
+          actualRevision: aborted?.revision,
+        });
+        expect(
+          (await allTransactionRecords(store)).some((record) => record.status === "active"),
+        ).toBe(false);
+        updating.mockRestore();
+        // The next step plans against the current schema instead of resuming the abandoned job.
+        expect(await contender.compactTable("events", { maxBlocksPerStep: 64 })).toMatchObject({
+          compacted: true,
+          rowCount: 4,
+        });
+      } finally {
+        updating.mockRestore();
+        await Promise.all([owner.close(), contender.close()]);
+        store.close();
+      }
+    });
+
     it("does not register a stale plan after another job replaces its sources", async () => {
       const store = await create();
       const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
