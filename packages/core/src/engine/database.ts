@@ -19328,7 +19328,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       plan.partitions !== undefined
     ) {
       const table = await this.store.getTable(job.tableId);
-      if (table === undefined) throw new Error(`Compaction table is missing: ${job.tableId}`);
+      // DROP TABLE cancels the job before removing the table; the typed refusal lets the
+      // caller reconcile against that cancellation instead of reporting a failure.
+      if (table === undefined) throw new CompactionSourceChangedError(job.tableId, true);
       await this.#assertPartitionedLevelOneSnapshotOrder(
         job,
         plan,
@@ -19545,7 +19547,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     transactions: ReadonlyMap<string, { status: string; committedVersion: number | null }>,
   ): Promise<void> {
     const table = await this.store.getTable(job.tableId);
-    if (table === undefined) throw new Error(`Compaction table is missing: ${job.tableId}`);
+    if (table === undefined) throw new CompactionSourceChangedError(job.tableId, true);
     const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
     if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
       throw new Error(

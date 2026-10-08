@@ -844,6 +844,54 @@ describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
       }
     });
 
+    it("reports cancellation when another tab drops a partitioned fold's table before it begins", async () => {
+      const store = await create();
+      const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      const contender = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      try {
+        await owner.execute("CREATE TABLE events(value INTEGER)");
+        for (let value = 1; value <= 4; value += 1) await owner.insert("events", { value });
+        await contender.compactTable("events");
+        // New level-zero rows over existing level-one partitions plan a partitioned merge.
+        for (let value = 5; value <= 8; value += 1) await owner.insert("events", { value });
+        const createJob = store.createCompactionJob.bind(store);
+        let planned: CompactionJobRecord | undefined;
+        const creating = vi.spyOn(store, "createCompactionJob").mockImplementation(async (job) => {
+          planned = job;
+          return createJob(job);
+        });
+        const get = store.getCompactionJob.bind(store);
+        let dropped = false;
+        const reading = vi.spyOn(store, "getCompactionJob").mockImplementation(async (id) => {
+          const job = await get(id);
+          if (!dropped && id === planned?.id) {
+            // The fold holds this pre-drop read, as a tab does when another tab drops the
+            // table between the job read and the transaction that begins the rewrite.
+            dropped = true;
+            await owner.execute("DROP TABLE events");
+          }
+          return job;
+        });
+        try {
+          await expect(contender.compactTableStep("events")).rejects.toBeInstanceOf(
+            CompactionJobCancelledError,
+          );
+          expect(dropped).toBe(true);
+          const plan = planned?.rewritePlan;
+          expect(plan !== undefined && plan.kind !== "copy-v1" && plan.partitions).toBeTruthy();
+          expect(
+            (await allTransactionRecords(store)).some((record) => record.status === "active"),
+          ).toBe(false);
+        } finally {
+          creating.mockRestore();
+          reading.mockRestore();
+        }
+      } finally {
+        await Promise.all([owner.close(), contender.close()]);
+        store.close();
+      }
+    });
+
     it("does not register a stale plan after another job replaces its sources", async () => {
       const store = await create();
       const owner = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
