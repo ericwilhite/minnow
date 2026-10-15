@@ -34,6 +34,7 @@ import {
   buildFixtureDatabase,
   createFormatFixtureArtifact,
   FIXTURE_QUERIES,
+  FORMAT_FIXTURE_CREATED_AT,
 } from "./fixture-shape.js";
 
 const FIXTURE_DIRECTORY = new URL("../../format-fixtures/", import.meta.url);
@@ -384,5 +385,48 @@ describe("v1 format compatibility", () => {
       );
       expect(() => inspectBlock(tampered)).toThrow(/Unsupported block version/);
     }
+  });
+});
+
+describe("key forwards in the stored formats", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  it("restores the forward a format-2 fixture stored, and lets it expire on schedule", async () => {
+    const frozen = fixtures.find(({ manifest }) => manifest.snapshotFormatVersion === 2);
+    if (frozen === undefined) throw new Error("No format-2 fixture is on file");
+    // The writer retired `name-0009` at its frozen clock with the default ten-day retention.
+    let now = Date.parse(FORMAT_FIXTURE_CREATED_AT) + DAY;
+    const database = new MinnowDatabase(new MemoryBlockStore(), { now: () => new Date(now) });
+    await database.importSnapshot(frozen.bytes);
+    const retired = "SELECT name FROM keyed_by_name WHERE name = 'name-0009'";
+    expect((await database.query(retired, { memoize: false })).rows).toEqual([
+      { name: "name-renamed" },
+    ]);
+    expect(await database.resolveKey("keyed_by_name", "name-0009")).toBe("name-renamed");
+    await expect(
+      database.execute("INSERT INTO keyed_by_name (name, score) VALUES ('name-0009', 1)"),
+    ).rejects.toThrow(/duplicate/i);
+    now += 10 * DAY;
+    expect((await database.query(retired, { memoize: false })).rows).toEqual([]);
+    expect(await database.resolveKey("keyed_by_name", "name-0009")).toBe("name-0009");
+    await database.close();
+  });
+
+  it("rekeys data an older writer exported, then round-trips the forward as format 2", async () => {
+    const older = fixtures.find(({ manifest }) => manifest.snapshotFormatVersion === 1);
+    if (older === undefined) throw new Error("No format-1 fixture is on file");
+    const now = (): Date => new Date(Date.parse(FORMAT_FIXTURE_CREATED_AT) + DAY);
+    const source = new MinnowDatabase(new MemoryBlockStore(), { now });
+    await source.importSnapshot(older.bytes);
+    await source.execute("UPDATE keyed_by_name SET name = 'name-moved' WHERE name = 'name-0007'");
+    const bytes = await source.exportSnapshot();
+    await source.close();
+    expect((await readSnapshotSummary(bytes)).formatVersion).toBe(2);
+    const target = new MinnowDatabase(new MemoryBlockStore(), { now });
+    await target.importSnapshot(bytes);
+    expect(
+      (await target.query("SELECT name, score FROM keyed_by_name WHERE name = 'name-0007'")).rows,
+    ).toEqual([{ name: "name-moved", score: 999 }]);
+    await target.close();
   });
 });

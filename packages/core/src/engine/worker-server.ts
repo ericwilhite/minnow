@@ -458,8 +458,9 @@ type Handle =
 
 /** A sweep's events for one live set, waiting to cross the channel together. */
 interface LiveSweepEvents {
-  events: Array<{ handleId: string; event: string; payload: unknown }>;
-  transfer: ArrayBuffer[];
+  events: Array<{ handleId: string; event: string; payload: unknown; transfer: ArrayBuffer[] }>;
+  /** Subscriptions whose last delivery never reached the client: the next one is a full reset. */
+  reset: Set<string>;
 }
 
 /** Hard per-connection ceiling for resident worker resources abandoned by a client. */
@@ -782,7 +783,7 @@ class DatabaseRpcServer {
         };
         // The database owns channelName resolution (and closes the channel with the set).
         let set: LiveQuerySet | undefined;
-        const pending: LiveSweepEvents = { events: [], transfer: [] };
+        const pending: LiveSweepEvents = { events: [], reset: new Set() };
         try {
           // Results are encoded for the channel synchronously inside onChange, so the set's
           // retained result serves as it is and no per-subscriber copy is made. A sweep's
@@ -795,8 +796,38 @@ class DatabaseRpcServer {
             onSweepDelivered: () => {
               if (pending.events.length === 0) return;
               const events = pending.events.splice(0);
-              const transfer = pending.transfer.splice(0);
-              this.scope.postMessage(rpcEvent(handleId, "batch", { events }), { transfer });
+              try {
+                this.scope.postMessage(
+                  rpcEvent(handleId, "batch", {
+                    events: events.map(({ handleId: id, event, payload }) => ({
+                      handleId: id,
+                      event,
+                      payload,
+                    })),
+                  }),
+                  { transfer: events.flatMap((item) => item.transfer) },
+                );
+              } catch {
+                // One event the channel cannot carry must not cost the others theirs. Each goes on
+                // its own; one that still fails reaches its subscriber as an error, and that
+                // subscriber's next delivery is a full result rather than a patch on top of it.
+                for (const item of events) {
+                  try {
+                    this.scope.postMessage(rpcEvent(item.handleId, item.event, item.payload), {
+                      transfer: item.transfer,
+                    });
+                  } catch (error) {
+                    pending.reset.add(item.handleId);
+                    try {
+                      this.scope.postMessage(
+                        rpcEvent(item.handleId, "error", serializeError(error)),
+                      );
+                    } catch {
+                      // The channel itself is gone; the connection reports that on its own.
+                    }
+                  }
+                }
+              }
             },
           });
           this.#publishHandle(handleId, {
@@ -1191,6 +1222,13 @@ class DatabaseRpcServer {
         try {
           subscription = await handle.set.subscribe(query, {
             onChange: (result, delivery) => {
+              // After a delivery the client never got, the next one starts the subscriber over.
+              const reset = handle.pending.reset.delete(subscriptionId);
+              if (reset) {
+                const { retained: _dropped, ...whole } = delivery;
+                void _dropped;
+                delivery = whole;
+              }
               const patch = patches && !delivery.initial && delivery.retained !== undefined;
               const encoded = encodeQueryResult(
                 patch
@@ -1219,8 +1257,12 @@ class DatabaseRpcServer {
                 });
                 return;
               }
-              handle.pending.events.push({ handleId: subscriptionId, event, payload });
-              handle.pending.transfer.push(...encoded.transfer);
+              handle.pending.events.push({
+                handleId: subscriptionId,
+                event,
+                payload,
+                transfer: encoded.transfer,
+              });
             },
             onError: (error) => {
               this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));
@@ -1262,6 +1304,7 @@ class DatabaseRpcServer {
                 handleId: subscriptionId,
                 event: "invalidate",
                 payload: invalidation,
+                transfer: [],
               });
             },
             onError: (error) => {

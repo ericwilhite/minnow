@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  parseSqlTimestampText,
   compareSqlValues,
   compileLikePattern,
   compileSimilarPattern,
@@ -194,5 +195,42 @@ describe("shared SQL value semantics", () => {
 
   it("normalizes signed zero in SQL equality keys", () => {
     expect(encodeSqlEqualityValue(-0)).toEqual(encodeSqlEqualityValue(0));
+  });
+});
+
+describe("timestamp text", () => {
+  // Expected instants are PostgreSQL's (PGlite, TIME ZONE 'UTC') for the same text cast to
+  // timestamptz.
+  it.each([
+    ["2026-10-15 08:00:00+00", "2026-10-15T08:00:00.000Z"],
+    ["2026-10-15 08:00:00-08", "2026-10-15T16:00:00.000Z"],
+    ["2026-10-15 08:00:00+05:30", "2026-10-15T02:30:00.000Z"],
+    ["2026-10-15 08:00:00+0530", "2026-10-15T02:30:00.000Z"],
+    ["2026-10-15 08:00:00 +02", "2026-10-15T06:00:00.000Z"],
+    ["2026-10-15T08:00:00+00", "2026-10-15T08:00:00.000Z"],
+    ["2026-10-15 08:00+01", "2026-10-15T07:00:00.000Z"],
+    ["2026-10-15 08:00:00.5-03", "2026-10-15T11:00:00.500Z"],
+    ["2026-10-15+02", "2026-10-14T22:00:00.000Z"],
+    ["2026-10-15 08:00:00 Z", "2026-10-15T08:00:00.000Z"],
+    ["2026-10-15 08:00:00z", "2026-10-15T08:00:00.000Z"],
+    ["2026-10-15 08:00:00+15:59", "2026-10-14T16:01:00.000Z"],
+    ["2026-10-15T08:00:00.250Z", "2026-10-15T08:00:00.250Z"],
+    ["2026-10-15", "2026-10-15T00:00:00.000Z"],
+  ])("reads %s as PostgreSQL does", (text, instant) => {
+    expect(parseSqlTimestampText(text)?.toISOString()).toBe(instant);
+  });
+
+  it("refuses an offset past ±15:59, as PostgreSQL does", () => {
+    expect(() => parseSqlTimestampText("2026-10-15 08:00:00+16")).toThrow(
+      "Invalid TIMESTAMP fields",
+    );
+    expect(() => parseSqlTimestampText("2026-10-15 08:00:00+05:60")).toThrow(
+      "Invalid TIMESTAMP fields",
+    );
+  });
+
+  it("leaves other text unread", () => {
+    expect(parseSqlTimestampText("not a time")).toBeUndefined();
+    expect(parseSqlTimestampText("2026-10-15 08:00:00+5")).toBeUndefined();
   });
 });

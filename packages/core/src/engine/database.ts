@@ -184,6 +184,7 @@ import {
   type MergeOutputPartition,
   MAX_LEVEL_ZERO_SEGMENTS,
   MAX_FTS_CANDIDATE_ROW_IDS,
+  MAX_FTS_QUERY_TERMS,
   MAX_MANIFEST_BLOCK_PRESENCE_IDS,
   MAX_MAINTENANCE_BATCH_ITEMS,
   MAX_STORAGE_BULK_READ_ITEMS,
@@ -475,6 +476,7 @@ import {
   KEY_FORWARDS_TABLE,
   KEY_FORWARDS_TABLE_ID,
   KeyForwardSet,
+  keyForwardTestHooks,
   ScopedKeyForwards,
   addressStorageKey,
   encodeKeyValues,
@@ -485,6 +487,7 @@ import {
   tableAddress,
   type KeyChange,
   type KeyForward,
+  type KeyForwardChange,
   type KeyForwardLookup,
 } from "./key-forwards.js";
 import {
@@ -840,6 +843,8 @@ interface LiveProofTable {
   readonly windowSegments: readonly SegmentRecord[];
   /** The committed versions those segments account for. */
   readonly coveredVersions: ReadonlySet<number>;
+  /** Each window segment's committed version. */
+  readonly windowVersions: ReadonlyMap<string, number>;
   /** Decoded window keys per key column, filled in as maintainable statements ask. */
   readonly changedKeys: Map<string, Promise<LiveChangedKeys | undefined>>;
 }
@@ -1487,7 +1492,7 @@ const REFERENTIAL_CASCADES = 8;
 const NO_TABLES: ReadonlyMap<string, TableRecord> = new Map();
 
 /** Expired key forwards one maintenance pass deletes. */
-const KEY_FORWARD_TRIM_PAGE = 512;
+const KEY_FORWARD_TRIM_PAGE = 2_048;
 /** Parent keys per lookup when a rekey finds the rows referencing them. */
 const REKEY_REFERENCE_WINDOW = 256;
 /** The alias a rekey's reference lookup gives the child's own key. */
@@ -2291,14 +2296,28 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * pair reuses them without asking the generation tracker.
    */
   #committedKeyForwardsAt: { manifestVersion: number | null; catalogEpoch: number } | undefined;
+  /** The last key-change diff between two forwards generations, shared by live sets. */
+  #keyChangeDiff:
+    | {
+        prior: CommittedKeyForwards | undefined;
+        next: CommittedKeyForwards;
+        changes: readonly KeyChange[];
+      }
+    | undefined;
   /** The plan that reads the forwards table itself; the forwarding rewrite leaves it alone. */
   readonly #keyForwardsReads = new WeakSet<CompiledQuery>();
   /** Set once the forwards table is seen; it is never dropped, so the answer never changes. */
   #keyForwardsTableSeen = false;
+  #forwardedNames:
+    { generation: string; schemaEpoch: number; names: ReadonlySet<string> } | undefined;
+  /** The catalog epoch at which the forwards table was last proved absent. */
+  #keyForwardsTableAbsentAt: number | undefined;
   /** The one read of the forwards table in flight, keyed by the generation it reads. */
   #keyForwardsLoad: { generation: string; promise: Promise<CommittedKeyForwards> } | undefined;
   /** Forwards a write scope staged, layered over the committed ones; created on its first rekey. */
   readonly #scopeKeyForwards = new WeakMap<DatabaseTransaction, ScopedKeyForwards>();
+  /** The forwards a scope had staged when it took each savepoint; undefined staged none. */
+  readonly #savepointForwards = new WeakMap<TransactionCheckpoint, KeyForwardSet | undefined>();
   /** The transaction behind each scope's statement writer, so SQL paths see its forwards. */
   readonly #writerTransactions = new WeakMap<StatementWriter, DatabaseTransaction>();
   /** What the catalog says, derived once per epoch; see `#catalogFacts`. */
@@ -3054,8 +3073,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const completed = await this.#runWrite(async (admission) => {
       const forwards = this.#startWriteForwards();
       const table = await this.#findTable(tableName);
-      const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
-      await this.#forwardInsertBatch("insert", table, batch, rowCount, undefined, forwards);
+      const filled: FilledBatch & { rowCount: number } = await this.#fillDefaults(
+        table,
+        input,
+        (pending, count) =>
+          this.#forwardInsertBatch("insert", table, pending, count, undefined, forwards),
+      );
+      const { batch, generated, autoIncrement, rowCount } = filled;
       const keys =
         autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
           ? await batchKeys(table, batch)
@@ -3087,10 +3111,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     };
   }
 
-  /** Pivots, evaluates SQL defaults, and validates — shared by insert and upsert. */
+  /**
+   * Pivots, evaluates SQL defaults, and validates — shared by insert and upsert. `forward`
+   * follows retired keys once values are in their stored form, before generated columns and
+   * CHECK constraints read them.
+   */
   async #fillDefaults(
     table: TableRecord,
     input: InsertBatchInputLike,
+    forward?: (batch: ColumnarBatch, rowCount: number) => Promise<void>,
   ): Promise<FilledBatch & { rowCount: number }> {
     const pivoted = await runStepsSliced(toColumnarBatchSteps(input));
     // Each step below is a pass over every row; between them, a large batch lets other work in.
@@ -3109,6 +3138,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       Object.values(pivoted.columns).find((values) => values.length > 0)?.length ??
       0;
     normalizeDomainBatch(table, filled.batch);
+    await forward?.(filled.batch, inputRowCount);
     fillStoredGeneratedColumns(table, filled.batch, inputRowCount, filled.generated);
     for (const name of filled.generated.keys()) {
       const column = table.columns.find((candidate) => candidate.name === name);
@@ -3219,8 +3249,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (keyColumn === undefined) {
         throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
       }
-      const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
-      await this.#forwardInsertBatch("upsert", table, batch, rowCount, undefined, forwards);
+      const { batch, generated, autoIncrement }: FilledBatch = await this.#fillDefaults(
+        table,
+        input,
+        (pending, count) =>
+          this.#forwardInsertBatch("upsert", table, pending, count, undefined, forwards),
+      );
       const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
       const keys = deferred ? undefined : await batchKeys(table, batch);
       const current = await this.store.getTable(table.id);
@@ -5364,7 +5398,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         (table) => table.id,
       );
       // A key constant may name a retired key, so a rekey anywhere can change the answer.
-      if (planHasKeyLiterals(plan, (await this.#catalogFacts(before)).tables)) {
+      if (planHasKeyLiterals(rewritten, (await this.#catalogFacts(before)).tables)) {
         dependencies.push(KEY_FORWARDS_TABLE_ID);
       }
       dependencies.sort();
@@ -5382,7 +5416,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // dependency record, under the schema epoch, and check it before any result-memo lookup.
     if (!proof.deterministic) return undefined;
     const generation = await this.#queryGenerations.key(proof.dependencies, before.manifestVersion);
-    return `${key}\u0001${String(before.schemaEpoch)}\u0001${generation}`;
+    // A forward that expires changes what a key constant names without any commit, so the
+    // count of expired forwards is part of the answer's identity.
+    const expired = proof.dependencies.includes(KEY_FORWARDS_TABLE_ID)
+      ? `\u0001${String((await this.#committedForwards(before))?.expiredCount() ?? 0)}`
+      : "";
+    return `${key}\u0001${String(before.schemaEpoch)}\u0001${generation}${expired}`;
   }
 
   /** An observer's adapter can reuse an accepted patch exactly as it reuses a full execution.
@@ -5463,7 +5502,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       rewritten = normalizePlanDomainLiterals(rewritten, domains, types);
     }
     // A key constant naming a retired key reads the row's current key; see key-forward-plan.ts.
-    if (keyForwardsTableId !== undefined && !this.#keyForwardsReads.has(plan)) {
+    if (
+      keyForwardsTableId !== undefined &&
+      !this.#keyForwardsReads.has(plan) &&
+      planHasKeyLiterals(rewritten, tables)
+    ) {
       const lookup =
         (transaction === undefined ? undefined : this.#scopeKeyForwards.get(transaction)) ??
         (await this.#committedForwards(probe));
@@ -5756,8 +5799,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   // --- Rekeying and key forwards --------------------------------------------------------------
 
   /**
-   * The committed forwards, read once per generation of the internal table. Undefined while no
-   * rekey has created that table — the common case, which costs one epoch-cached catalog lookup.
+   * The committed forwards as of the probe. Undefined while no rekey has created the table — the
+   * common case, which costs one epoch-cached catalog lookup. The first read loads the table;
+   * after that, a new generation reads only the rows its commit window changed and layers them
+   * over the one before (see `CommittedKeyForwards`).
    */
   async #committedForwards(probe?: CatalogProbe): Promise<CommittedKeyForwards | undefined> {
     probe ??= await this.store.getCatalogProbe();
@@ -5770,7 +5815,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ) {
       return current;
     }
-    if (!(await this.#keyForwardsTableExists())) return undefined;
+    if (!(await this.#keyForwardsTableExists(probe))) return undefined;
     const generation = await this.#queryGenerations.key(
       [KEY_FORWARDS_TABLE_ID],
       probe.manifestVersion,
@@ -5784,41 +5829,135 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (loading?.generation === generation) return loading.promise;
     const version = probe.manifestVersion;
     const promise = (async () => {
-      const read: CompiledQuery = {
-        sql: "(key forwards)",
-        base: { table: KEY_FORWARDS_TABLE, alias: KEY_FORWARDS_TABLE },
-        joins: [],
-        select: Object.values(KEY_FORWARD_COLUMNS).map((name) => ({
-          expression: { kind: "column" as const, reference: name },
-          alias: name,
-        })),
-        predicates: [],
-        groupBy: [],
-        having: [],
-        orderBy: [],
-      };
-      this.#keyForwardsReads.add(read);
-      const result = await this.#queries.run(read, {
-        memoize: false,
-        ...(version === null ? {} : { version }),
-      });
-      const forwards = new KeyForwardSet();
-      for (const row of result.rows) forwards.add(forwardFromRow(row));
-      return new CommittedKeyForwards(
+      const after = provedAt?.manifestVersion;
+      if (current !== undefined && after !== undefined && after !== null && version !== null) {
+        const changes = after < version ? await this.#keyForwardChanges(after, version) : undefined;
+        if (changes !== undefined) return current.next(generation, changes);
+      }
+      keyForwardTestHooks.wholeReads += 1;
+      const rows = await this.#readKeyForwardRows([], version);
+      return CommittedKeyForwards.load(
         generation,
-        forwards,
-        () => dateMilliseconds(this.#now()) - this.#keyForwardRetentionMs,
+        rows.map((row) => forwardFromRow(row)),
+        () => dateMilliseconds(this.#now()),
       );
     })();
     this.#keyForwardsLoad = { generation, promise };
     try {
       const loaded = await promise;
-      this.#committedKeyForwards = loaded;
-      this.#committedKeyForwardsAt = proved;
+      // A slower read of an older generation must not replace a newer one.
+      if ((proved.manifestVersion ?? -1) >= (this.#committedKeyForwardsAt?.manifestVersion ?? -1)) {
+        this.#committedKeyForwards = loaded;
+        this.#committedKeyForwardsAt = proved;
+      }
       return loaded;
     } finally {
       this.#settleKeyForwardsLoad(promise);
     }
+  }
+
+  /** Reads the forwards table's rows at a version, all of them or those the predicates match. */
+  async #readKeyForwardRows(
+    predicates: CompiledQuery["predicates"],
+    version: number | null,
+    limit?: number,
+  ): Promise<QueryResult["rows"]> {
+    const read: CompiledQuery = {
+      sql: "(key forwards)",
+      base: { table: KEY_FORWARDS_TABLE, alias: KEY_FORWARDS_TABLE },
+      joins: [],
+      select: Object.values(KEY_FORWARD_COLUMNS).map((name) => ({
+        expression: { kind: "column" as const, reference: name },
+        alias: name,
+      })),
+      predicates,
+      groupBy: [],
+      having: [],
+      orderBy: [],
+      ...(limit === undefined ? {} : { limit }),
+    };
+    this.#keyForwardsReads.add(read);
+    const result = await this.#queries.run(read, {
+      memoize: false,
+      ...(version === null ? {} : { version }),
+    });
+    return result.rows;
+  }
+
+  /**
+   * The forwards a commit window (after, until] wrote or deleted, replayed from the segments it
+   * committed: a forwards write is an upsert carrying every column, and a trim a delete carrying
+   * the key, so the window's own blocks say everything without reading the table. Undefined
+   * when the surviving segments do not account for every version in the window (compaction
+   * folded them, or collection reclaimed them) or hold a shape this replay does not read; the
+   * caller then reads the table whole.
+   */
+  async #keyForwardChanges(after: number, until: number): Promise<KeyForwardChange[] | undefined> {
+    const context = await this.#liveProofContext(after, until);
+    const versions = context.changedVersions.get(KEY_FORWARDS_TABLE_ID);
+    if (versions === undefined || versions.size === 0) return [];
+    const entry = await this.#liveProofTable(context, KEY_FORWARDS_TABLE_ID);
+    if (entry === undefined) return undefined;
+    for (const changed of versions) if (!entry.coveredVersions.has(changed)) return undefined;
+    const columnIds = new Map(entry.table.columns.map((column) => [column.name, column.id]));
+    const version = (segment: SegmentRecord): number => entry.windowVersions.get(segment.id) ?? 0;
+    // Compaction output is visibility-neutral; every other segment replays in canonical order.
+    const segments = entry.windowSegments
+      .filter((segment) => segment.kind !== "base" && segment.rowCount > 0)
+      .sort(
+        (left, right) =>
+          left.logicalOrder - right.logicalOrder ||
+          version(left) - version(right) ||
+          left.commitOrdinal - right.commitOrdinal ||
+          left.id.localeCompare(right.id),
+      );
+    const changes = new Map<string, KeyForwardChange>();
+    for (const segment of segments) {
+      if (segment.kind !== "upsert" && segment.kind !== "insert" && segment.kind !== "delete") {
+        return undefined;
+      }
+      const names =
+        segment.kind === "delete" ? [KEY_FORWARD_COLUMNS.key] : Object.values(KEY_FORWARD_COLUMNS);
+      const columns = new Map<string, unknown[]>();
+      for (const name of names) {
+        const blockIds = segment.columnBlockIds[columnIds.get(name) ?? ""];
+        if (blockIds === undefined) return undefined;
+        const decoded = await this.#loadDecodedBlocks(blockIds);
+        const values: unknown[] = [];
+        for (const id of blockIds) {
+          const block = decoded.get(id);
+          if (block === undefined) return undefined;
+          for (const value of block.values) values.push(value);
+        }
+        if (values.length !== segment.rowCount) return undefined;
+        columns.set(name, values);
+      }
+      const keys = columns.get(KEY_FORWARD_COLUMNS.key) ?? [];
+      for (let row = 0; row < segment.rowCount; row += 1) {
+        const key = keys[row];
+        if (typeof key !== "string") return undefined;
+        if (segment.kind === "delete") {
+          const separator = key.indexOf("\u0000");
+          if (separator < 0) return undefined;
+          changes.set(key, {
+            tableId: key.slice(0, separator),
+            token: key.slice(separator + 1),
+            forward: null,
+          });
+        } else {
+          const forward = forwardFromRow(
+            Object.fromEntries(names.map((name) => [name, columns.get(name)?.[row]])),
+          );
+          changes.set(key, {
+            tableId: forward.tableId,
+            token: storageKeyToken(forward.from),
+            forward,
+          });
+        }
+        if (row % 256 === 255) await maybeYieldToEventLoop();
+      }
+    }
+    return [...changes.values()];
   }
 
   /** Forgets a finished read of the forwards, unless a newer one has replaced it. */
@@ -5836,7 +5975,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #writeForwards(transaction?: DatabaseTransaction): Promise<WriteForwards | undefined> {
     const scoped = transaction === undefined ? undefined : this.#scopeKeyForwards.get(transaction);
     if (scoped !== undefined) return { lookup: scoped };
-    if (!(await this.#keyForwardsTableExists())) return undefined;
+    if (!(await this.#keyForwardsTableExists(transaction?.initialCatalogProbe))) return undefined;
     const committed = await this.#committedForwards(transaction?.initialCatalogProbe);
     return committed === undefined || committed.isEmpty() ? undefined : { lookup: committed };
   }
@@ -5844,11 +5983,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /**
    * Whether any rekey has created the forwards table: one keyed catalog read until it has, then
    * nothing, since the table is never dropped. Writes ask this rather than reading the whole
-   * catalog, whose cached form every commit invalidates.
+   * catalog, whose cached form every commit invalidates. A caller holding a catalog probe taken
+   * before this call reuses an absence proved at the same catalog epoch: creating the table
+   * moves that epoch, so a database that never rekeys pays no read per point read.
    */
-  async #keyForwardsTableExists(): Promise<boolean> {
+  async #keyForwardsTableExists(probe?: CatalogProbe): Promise<boolean> {
     if (this.#keyForwardsTableSeen) return true;
-    if ((await this.store.getTable(KEY_FORWARDS_TABLE_ID))?.keyForwards !== true) return false;
+    if (probe !== undefined && this.#keyForwardsTableAbsentAt === probe.catalogEpoch) return false;
+    if ((await this.store.getTable(KEY_FORWARDS_TABLE_ID))?.keyForwards !== true) {
+      if (probe !== undefined) this.#keyForwardsTableAbsentAt = probe.catalogEpoch;
+      return false;
+    }
     this.#keyForwardsTableSeen = true;
     return true;
   }
@@ -5964,7 +6109,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const columns = batch.columns as Record<string, readonly BatchValue[]>;
     const address = tableAddress(table);
     if (address !== undefined && lookup.hasTable(table.id)) {
-      let moved = false;
+      // Each column is copied once, on its first forwarded row; the caller's vectors stay as given.
+      const copied = new Set<string>();
       for (let row = 0; row < rowCount; row += 1) {
         const tuple = address.columns.map((column) => columns[column.name]?.[row] ?? null);
         const forward = lookupAddressForward(lookup, table.id, address, tuple);
@@ -5977,13 +6123,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           );
         }
         for (const [position, column] of address.columns.entries()) {
-          const values = [...(columns[column.name] ?? [])];
-          values[row] = forward.toValues[position] ?? null;
-          columns[column.name] = values;
+          if (!copied.has(column.name)) {
+            columns[column.name] = [...(columns[column.name] ?? [])];
+            copied.add(column.name);
+          }
+          (columns[column.name] as BatchValue[])[row] = forward.toValues[position] ?? null;
         }
-        moved = true;
       }
-      if (moved) fillCompositePrimaryKey(table, batch, rowCount);
     }
     const references = await this.#forwardReferenceColumns(
       forwards,
@@ -6346,20 +6492,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<void> {
     await this.#ensureKeyForwardsTable();
     const scoped = await this.#scopedForwards(transaction);
-    const retiredAt = dateMilliseconds(this.#now());
+    const expiresAt = dateMilliseconds(this.#now()) + this.#keyForwardRetentionMs;
     // A key another moved row now holds — a swap or rotation — is not retired, so it gets no
     // forward; one would shadow the row that holds it.
     const reused = new Set(moved.map((row) => storageKeyToken(row.to)));
     const forwards: KeyForward[] = [];
     for (const row of moved) {
       const fromToken = storageKeyToken(row.from);
-      if (!reused.has(fromToken)) forwards.push({ tableId: table.id, ...row, retiredAt });
+      if (!reused.has(fromToken)) forwards.push({ tableId: table.id, ...row, expiresAt });
       for (const source of scoped.sourcesOf(table.id, fromToken)) {
         forwards.push({ ...source, to: row.to, toValues: row.toValues });
       }
     }
     if (forwards.length === 0) {
-      scoped.changes.push(...moved.map((row) => ({ tableId: table.id, ...row, retiredAt })));
       return;
     }
     await this.#sessionInsert(
@@ -6379,7 +6524,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           [KEY_FORWARD_COLUMNS.toValues]: forwards.map((forward) =>
             encodeKeyValues(forward.toValues),
           ),
-          [KEY_FORWARD_COLUMNS.retiredAt]: forwards.map((forward) => forward.retiredAt),
+          [KEY_FORWARD_COLUMNS.expiresAt]: forwards.map((forward) => forward.expiresAt),
         },
         rowCount: forwards.length,
       },
@@ -6388,7 +6533,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (const forward of forwards) scoped.staged.add(forward);
     // A reused key's stale staged forward, from earlier in this scope, would shadow its row.
     for (const token of reused) scoped.staged.delete(table.id, token);
-    scoped.changes.push(...moved.map((row) => ({ tableId: table.id, ...row, retiredAt })));
   }
 
   /**
@@ -6407,10 +6551,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     pointReadTestHooks.attempted += 1;
     const probe = await this.store.getCatalogProbe();
     const forwards = await this.#pointReadForwards(probe);
+    const forwardedTables =
+      forwards === undefined ? undefined : await this.#forwardedTableNames(forwards, probe);
     const result = await this.#withSharedCatalogSnapshot(
       [shape.table],
       (snapshot, realTables, visibility) =>
-        this.#pointReadAtSnapshot(shape, snapshot, realTables, visibility, options, forwards),
+        this.#pointReadAtSnapshot(
+          shape,
+          snapshot,
+          realTables,
+          visibility,
+          options,
+          forwards,
+          forwardedTables,
+        ),
       probe,
     );
     if (result !== undefined) {
@@ -6420,6 +6574,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return result;
   }
 
+  /**
+   * The names of the tables that have forwards, read once per forwards generation and schema
+   * epoch. A point read pinning a foreign-key column leaves its fast path only when that key's
+   * parent is one of them, not whenever any table anywhere was rekeyed.
+   */
+  async #forwardedTableNames(
+    lookup: KeyForwardLookup,
+    probe: CatalogProbe,
+  ): Promise<ReadonlySet<string> | undefined> {
+    if (!(lookup instanceof CommittedKeyForwards)) return undefined;
+    const memo = this.#forwardedNames;
+    if (memo?.generation === lookup.generation && memo.schemaEpoch === probe.schemaEpoch) {
+      return memo.names;
+    }
+    const names = new Set<string>();
+    for (const id of lookup.tableIds()) {
+      const table = await this.store.getTable(id);
+      if (table !== undefined) names.add(table.name);
+    }
+    this.#forwardedNames = {
+      generation: lookup.generation,
+      schemaEpoch: probe.schemaEpoch,
+      names,
+    };
+    return names;
+  }
+
   /** What a point read forwards through, or undefined while no rekey has created forwards. */
   async #pointReadForwards(
     probe?: CatalogProbe,
@@ -6427,7 +6608,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<KeyForwardLookup | undefined> {
     const scoped = transaction === undefined ? undefined : this.#scopeKeyForwards.get(transaction);
     if (scoped !== undefined) return scoped;
-    if (!(await this.#keyForwardsTableExists())) return undefined;
+    if (!(await this.#keyForwardsTableExists(probe))) return undefined;
     const committed = await this.#committedForwards(probe);
     return committed === undefined || committed.isEmpty() ? undefined : committed;
   }
@@ -6439,13 +6620,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     visibility: SegmentVisibilityCatalog,
     options: QueryOptions,
     forwards?: KeyForwardLookup,
+    /** The tables that have forwards, when known; unknown means any might. */
+    forwardedTables?: ReadonlySet<string>,
   ): Promise<QueryResult | undefined> {
     const table = realTables.get(shape.table);
     if (table === undefined || table.view !== undefined) return undefined;
     if (forwards !== undefined) {
       // A pinned foreign-key column may name a retired parent key; the general path follows it.
       const pinned = new Set(shape.equalities.map(({ column }) => column));
-      if ((table.foreignKeys ?? []).some((key) => key.columns.some((name) => pinned.has(name)))) {
+      if (
+        (table.foreignKeys ?? []).some(
+          (key) =>
+            (forwardedTables === undefined || forwardedTables.has(key.parentTable)) &&
+            key.columns.some((name) => pinned.has(name)),
+        )
+      ) {
         return undefined;
       }
       const equalities = forwardKeyEqualities(table, shape.equalities, NO_TABLES, forwards);
@@ -7025,7 +7214,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           const tables = await this.#findRealBlockTables(plan);
           const ids = new Set([...tables.values()].map((record) => record.id));
           // The forwards table's ID is fixed, so this holds before the first rekey creates it.
-          if (planHasKeyLiterals(compiled, (await this.#catalogFacts(probe)).tables)) {
+          if (planHasKeyLiterals(plan, (await this.#catalogFacts(probe)).tables)) {
             ids.add(KEY_FORWARDS_TABLE_ID);
           }
           return ids;
@@ -7038,7 +7227,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#liveMaintain(result, state as LiveMaintenanceState, tableIds, after, until, probe),
         changeCanAffect: (query, tableIds, after, until) =>
           this.#liveChangeCanAffect(query, tableIds, after, until),
-        keyChanges: (previous, probe) => this.#liveKeyChanges(previous, probe),
+        keyChanges: (previous, probe, report) => this.#liveKeyChanges(previous, probe, report),
       },
       {
         ...options,
@@ -7061,18 +7250,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #liveKeyChanges(
     previous: { readonly value: unknown } | undefined,
     probe: CatalogProbe,
+    report = true,
   ): Promise<{ changes: readonly KeyChange[]; state: unknown }> {
     const committed = await this.#committedForwards(probe);
-    if (previous === undefined) return { changes: [], state: committed };
+    if (previous === undefined || !report) return { changes: [], state: committed };
     const prior = previous.value as CommittedKeyForwards | undefined;
     if (committed === undefined || committed === prior) return { changes: [], state: committed };
+    // Every live set over this database diffs the same two generations; do it once.
+    const memo = this.#keyChangeDiff;
+    if (memo !== undefined && memo.prior === prior && memo.next === committed) {
+      return { changes: memo.changes, state: committed };
+    }
     const { tables } = await this.#catalogFacts(probe);
     const byId = new Map([...tables.values()].map((table) => [table.id, table]));
     const changes: KeyChange[] = [];
-    for (const forward of committed.forwards.entries()) {
+    // A generation layered over `prior` knows what it wrote since; otherwise compare in full.
+    const written = prior === undefined ? undefined : committed.writtenSince(prior);
+    for (const forward of written ?? committed.entries()) {
       const token = storageKeyToken(forward.from);
       if (committed.get(forward.tableId, token) === undefined) continue;
-      const before = prior?.forwards.get(forward.tableId, token);
+      const before = prior?.stored(forward.tableId, token);
       if (before !== undefined && storageKeyToken(before.to) === storageKeyToken(forward.to)) {
         continue;
       }
@@ -7094,6 +7291,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         to: external(forward.toValues),
       });
     }
+    this.#keyChangeDiff = { prior, next: committed, changes };
     return { changes, state: committed };
   }
 
@@ -7762,15 +7960,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
       const windowSegments: SegmentRecord[] = [];
       const coveredVersions = new Set<number>();
+      const windowVersions = new Map<string, number>();
       for (const segment of segments) {
         const committed = transactions.get(segment.transactionId)?.committedVersion ?? null;
         if (committed === null || committed <= (context.after ?? -1) || committed > context.until) {
           continue;
         }
         coveredVersions.add(committed);
+        windowVersions.set(segment.id, committed);
         windowSegments.push(segment);
       }
-      return { table, windowSegments, coveredVersions, changedKeys: new Map() };
+      return { table, windowSegments, coveredVersions, windowVersions, changedKeys: new Map() };
     })();
     context.tables.set(tableId, entry);
     return entry;
@@ -9130,7 +9330,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         open();
         // A savepoint captures staged state; what is only buffered would be lost to it.
         await this.#flushScopeWriteSets(transaction);
-        return transaction.checkpoint();
+        const checkpoint = transaction.checkpoint();
+        this.#savepointForwards.set(
+          checkpoint,
+          this.#scopeKeyForwards.get(transaction)?.staged.clone(),
+        );
+        return checkpoint;
       },
       checkpointRetainedBytes: () => {
         open();
@@ -9149,6 +9354,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw error;
         }
         this.#discardScopeWriteSets(transaction);
+        // Forwards a rekey staged after the savepoint go with its rows.
+        const forwards = this.#savepointForwards.get(checkpoint);
+        const scoped = this.#scopeKeyForwards.get(transaction);
+        if (scoped !== undefined) scoped.staged = forwards?.clone() ?? new KeyForwardSet();
         poisoned = undefined;
         staged = transaction.stagedWorkCount === 0 ? 0 : 1;
       },
@@ -10483,11 +10692,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (normalizedConflictWhere !== undefined && sessionUpsertKeyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
     }
-    const filled = await this.#fillDefaults(table, input);
+    const filled = await this.#fillDefaults(table, input, (pending, count) =>
+      this.#forwardInsertBatch(kind, table, pending, count, transaction),
+    );
     const { generated, autoIncrement } = filled;
     let batch = filled.batch;
     let rowCount = filled.rowCount;
-    await this.#forwardInsertBatch(kind, table, batch, rowCount, transaction);
     if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
         table.id,
@@ -12349,13 +12559,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       statement.rows.length,
     );
     normalizeDomainBatch(table, filledProposed.batch);
-    fillStoredGeneratedColumns(
-      table,
-      filledProposed.batch,
-      statement.rows.length,
-      filledProposed.generated,
-    );
-    fillCompositePrimaryKey(table, filledProposed.batch, statement.rows.length);
     // A retired key names its row: the conflict is with that row, under its current key.
     await this.#forwardInsertBatch(
       "upsert",
@@ -12364,6 +12567,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       statement.rows.length,
       options.writer === undefined ? undefined : this.#writerTransactions.get(options.writer),
     );
+    fillStoredGeneratedColumns(
+      table,
+      filledProposed.batch,
+      statement.rows.length,
+      filledProposed.generated,
+    );
+    fillCompositePrimaryKey(table, filledProposed.batch, statement.rows.length);
     const proposed = filledProposed.batch;
     // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
     // even when every proposed row happens to find an existing key.
@@ -12673,8 +12883,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       statement.rows.length,
     );
     normalizeDomainBatch(table, filled.batch);
-    fillStoredGeneratedColumns(table, filled.batch, statement.rows.length, filled.generated);
-    fillCompositePrimaryKey(table, filled.batch, statement.rows.length);
     // A retired key names its row, so it conflicts the way the row's current key would.
     await this.#forwardInsertBatch(
       "upsert",
@@ -12683,6 +12891,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       statement.rows.length,
       writer === undefined ? undefined : this.#writerTransactions.get(writer),
     );
+    fillStoredGeneratedColumns(table, filled.batch, statement.rows.length, filled.generated);
+    fillCompositePrimaryKey(table, filled.batch, statement.rows.length);
     const columns = visibleTableColumns(table).map(({ name }) => name);
     const deferredAutoIncrement = new Set(filled.autoIncrement?.missingIndexes ?? []);
     const generatedColumns = new Set(
@@ -12771,7 +12981,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     writer: StatementWriter,
   ): Promise<void> {
     if (keyColumn.hidden === true) return;
-    const keys = insertBatchKeyValues(input, keyColumn.name);
+    // A key the column cannot hold is left for validation, which names the column and row.
+    const keys = insertBatchKeyValues(input, keyColumn.name).filter(
+      (value) =>
+        value === null ||
+        keyColumn.sqlDomain !== undefined ||
+        valueMatchesColumnType(keyColumn, value),
+    );
     if (keys.length === 0) return;
     const present = await writer.stagedKeyPresence?.(
       table,
@@ -16921,9 +17137,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /** Runs restart-safe lease-aware reclamation to completion in bounded durable steps. */
   async collectGarbage(options: CollectGarbageOptions = {}): Promise<GarbageCollectionResult> {
     return this.#foreground(async () => {
-      while (await this.#trimExpiredKeyForwards()) {
-        // Each page is one small delete; an explicit call finishes them all.
-      }
+      // Each page is one small delete; an explicit call finishes them all.
+      let more = await this.#trimExpiredKeyForwards();
+      while (more) more = await this.#trimExpiredKeyForwards(true);
       const maxItems = boundedMaintenanceBatchItems(
         options.maxItemsPerStep ?? 64,
         "Garbage collection items per step",
@@ -17122,17 +17338,35 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /**
    * Deletes a bounded page of forwards past `keyForwardRetentionMs`. Reads already treat them as
-   * gone; this reclaims their rows. Returns whether expired forwards remain.
+   * gone; this reclaims their rows. Returns whether expired forwards remain. `checked` skips the
+   * look at the committed forwards, for a caller continuing a trim the last page said is not
+   * done.
    */
-  async #trimExpiredKeyForwards(): Promise<boolean> {
-    const committed = await this.#committedForwards();
-    const expired = committed?.expired() ?? [];
-    if (expired.length === 0) return false;
-    const page = expired.slice(0, KEY_FORWARD_TRIM_PAGE);
-    await this.#erased.deleteBatch(KEY_FORWARDS_TABLE, {
-      keys: page.map((forward) => forwardRowKey(forward.tableId, storageKeyToken(forward.from))),
+  async #trimExpiredKeyForwards(checked = false): Promise<boolean> {
+    if (!checked && ((await this.#committedForwards())?.expiredCount() ?? 0) === 0) return false;
+    // The turn directly, not #runWrite: maintenance calls this, and #runWrite assists maintenance.
+    return this.#admissions.admit("autocommit", async (admission) => {
+      // Read inside the writer turn: a key retired again since the check above carries a new
+      // expiry under the same row, and no other writer can change the table until this ends.
+      // The scan reads one column's blocks, so a page costs the same however many forwards live.
+      const expired = await this.#readKeyForwardRows(
+        [
+          {
+            left: { kind: "column", reference: KEY_FORWARD_COLUMNS.expiresAt },
+            operator: "<=",
+            right: { kind: "literal", value: dateMilliseconds(this.#now()) },
+          },
+        ],
+        null,
+        KEY_FORWARD_TRIM_PAGE + 1,
+      );
+      if (expired.length === 0) return false;
+      const page = expired.slice(0, KEY_FORWARD_TRIM_PAGE);
+      await this.#deleteBatchOnce(admission, KEY_FORWARDS_TABLE, {
+        keys: page.map((row) => row[KEY_FORWARD_COLUMNS.key] as string),
+      });
+      return expired.length > page.length;
     });
-    return expired.length > page.length;
   }
 
   /**
@@ -22183,6 +22417,35 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     terms: readonly FtsPostingQuery[],
     upToVersion: number,
   ): Promise<FtsCandidatesResult> {
+    // A store reads at most MAX_FTS_QUERY_TERMS terms at once. A longer list — an index probe
+    // for `IN (…)` with many values, or a rekey moving many parents' children — is read in
+    // groups and merged, term order kept.
+    if (terms.length > MAX_FTS_QUERY_TERMS) {
+      const groups: Array<Promise<FtsCandidatesResult>> = [];
+      for (let start = 0; start < terms.length; start += MAX_FTS_QUERY_TERMS) {
+        groups.push(
+          this.#readFtsCandidatesMemoized(
+            snapshot,
+            tableId,
+            columnId,
+            terms.slice(start, start + MAX_FTS_QUERY_TERMS),
+            upToVersion,
+          ),
+        );
+      }
+      return Promise.all(groups).then((results) => {
+        const rowIdsByTerm = results.flatMap((result) => result.rowIdsByTerm);
+        const rowIds = rowIdsByTerm.reduce((total, ids) => total + ids.length, 0);
+        return {
+          rowIdsByTerm,
+          overflow: results.some((result) => result.overflow) || rowIds > MAX_FTS_CANDIDATE_ROW_IDS,
+          deltaChunkCount: Math.max(...results.map((result) => result.deltaChunkCount)),
+          totalTokens: Math.max(...results.map((result) => result.totalTokens)),
+          coversVersion: Math.max(...results.map((result) => result.coversVersion)),
+          hasBase: results.every((result) => result.hasBase),
+        };
+      });
+    }
     let memo = this.#ftsCandidatesMemo.get(snapshot);
     if (memo === undefined) {
       memo = new Map();

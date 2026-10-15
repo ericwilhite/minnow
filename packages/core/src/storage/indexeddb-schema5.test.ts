@@ -92,7 +92,8 @@ interface ReleasedBuild {
   openDatabase(store: never): ReleasedDatabase;
 }
 
-const options = { autoCompact: false, autoCollect: false } as const;
+// The clock is the fixture's, so the forwards table a rekey creates is exactly KEY_FORWARDS.
+const options = { autoCompact: false, autoCollect: false, now: () => new Date(NOW) } as const;
 const releasedBuilds: ReleasedBuild[] = [
   {
     version: "0.10.0",
@@ -193,8 +194,10 @@ async function writeCurrent(store: IndexedDbBlockStore, database: MinnowDatabase
   await database.insertBatch("items", range(1_000, 3_000).map(item));
   await database.execute("CREATE TABLE after_upgrade (id INTEGER PRIMARY KEY, value TEXT)");
   await database.execute("INSERT INTO after_upgrade VALUES (1, 'retained')");
+  // A real rekey through the ordinary API: it creates the key-forwards table, moves the row,
+  // and stores the forward, all on data the released writer wrote.
   const before = await store.getCatalogProbe();
-  await store.addTable(KEY_FORWARDS);
+  await database.execute("UPDATE items SET id = 900650 WHERE id = 650");
   const after = await store.getCatalogProbe();
   expect(after.catalogEpoch).toBeGreaterThan(before.catalogEpoch);
   expect(after.schemaEpoch).toBe(before.schemaEpoch);
@@ -209,6 +212,11 @@ async function expectCurrentWrites(store: IndexedDbBlockStore, database: MinnowD
   ).toEqual([{ id: 2_999 }]);
   expect(await store.getTable(KEY_FORWARDS.id)).toEqual(KEY_FORWARDS);
   expect(await store.getTableByName(KEY_FORWARDS.name)).toEqual(KEY_FORWARDS);
+  // The retired key still reaches the moved row, by SQL and by resolveKey.
+  expect(
+    (await database.query("SELECT id, label FROM items WHERE id = ?", { params: [650] })).rows,
+  ).toEqual([{ id: 900650, label: "item-650" }]);
+  expect(await database.resolveKey("items", 650)).toBe(900650);
 }
 
 describe.each(releasedBuilds)("IndexedDB schema 5 upgrade from the $version writer", (build) => {

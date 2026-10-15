@@ -138,7 +138,9 @@ Commits that change a table without changing a query's rows never reach the comp
 engine compares before it invalidates, so neither hook sees a new snapshot.
 
 A commit that changes several queries updates them in the same turn, so a component reading a list
-and a detail view renders once with both up to date. After a rekey, a detail view can keep
+and a detail view renders once with both up to date. That holds for queries whose adapter decodes
+the engine's result, such as the Kysely wrapper given its `db`; a query that re-executes itself
+updates when its own run finishes. After a rekey, a detail view can keep
 querying by the key it holds: `WHERE order_id = ?` with the old key still returns the row, and the
 row's `order_id` is the new key. See [Offline sync and rekeying](/docs/engine/rekeying).
 

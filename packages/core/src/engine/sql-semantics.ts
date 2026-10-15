@@ -27,12 +27,14 @@ import {
  */
 
 const SQL_TIMESTAMP_TEXT =
-  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/;
+  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(?: ?([Zz]|[+-]\d{2}(?::?\d{2})?))?$/;
 
 /**
  * The standard's datetime text — `2026-01-02`, `2026-01-02 03:04:05`, `2026-01-02T03:04:05.250Z`,
- * an optional zone offset — read as an instant. A zoneless spelling is UTC, the reading every
- * datetime in a Minnow database has; `undefined` for text in any other shape.
+ * an optional zone — read as an instant. A zone is `Z`, or an offset in any spelling PostgreSQL
+ * accepts: `+05`, `+0530`, `+05:30`, `-08`, optionally after a space, up to ±15:59. A zoneless
+ * spelling is UTC, the reading every datetime in a Minnow database has; `undefined` for text in
+ * any other shape.
  */
 export function parseSqlTimestampText(text: string): Date | undefined {
   const match = SQL_TIMESTAMP_TEXT.exec(text.trim());
@@ -40,19 +42,22 @@ export function parseSqlTimestampText(text: string): Date | undefined {
   const [, day, time = "00:00:00", zone = "Z"] = match;
   dateDomainValue(day);
   const [hour, minute, second = "0"] = time.split(":");
-  const zoneParts =
-    zone === "Z" ? [0, 0] : [Number(zone.slice(1, 3)), Number(zone.replace(":", "").slice(3, 5))];
+  const offset = /^[Zz]$/.test(zone) ? "" : zone.replace(":", "");
+  const offsetHours = offset === "" ? 0 : Number(offset.slice(1, 3));
+  const offsetMinutes = offset === "" ? 0 : Number(offset.slice(3, 5) || "0");
   if (
     Number(hour) > 23 ||
     Number(minute) > 59 ||
     Number(second) >= 60 ||
-    (zoneParts[0] ?? 0) > 15 ||
-    (zoneParts[1] ?? 0) > 59
+    offsetHours > 15 ||
+    offsetMinutes > 59
   ) {
     throw new TypeError(`Invalid TIMESTAMP fields: ${text}`);
   }
   const seconds = time.length === 5 ? `${time}:00` : time;
-  const date = new Date(`${String(day)}T${seconds}${zone === "Z" ? "Z" : zone}`);
+  const isoZone =
+    offset === "" ? "Z" : `${offset.slice(0, 3)}:${String(offsetMinutes).padStart(2, "0")}`;
+  const date = new Date(`${String(day)}T${seconds}${isoZone}`);
   if (!Number.isFinite(dateMilliseconds(date))) throw new TypeError(`Invalid TIMESTAMP: ${text}`);
   return date;
 }

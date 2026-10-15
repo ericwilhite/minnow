@@ -46,6 +46,12 @@ const failure = new DOMException("injected upgrade I/O failure", "QuotaExceededE
 
 /** The engine's internal key-forwards table, as the engine creates it on its first rekey. */
 const KEY_FORWARDS: TableRecord = keyForwardsTableRecord("2026-10-01T12:00:00.000Z");
+/** An engine on the fixture's clock, so the forwards table a rekey creates is KEY_FORWARDS. */
+const ENGINE_OPTIONS = {
+  autoCompact: false,
+  autoCollect: false,
+  now: () => new Date("2026-10-01T12:00:00.000Z"),
+} as const;
 
 interface Fixture {
   files: Record<string, string>;
@@ -220,6 +226,33 @@ describe.each([
     store._crashForTests();
     const reopened = await verifyFixture(shim, source, ["after-upgrade", KEY_FORWARDS.name]);
     expect(await reopened.getTable(KEY_FORWARDS.id)).toEqual(KEY_FORWARDS);
+    reopened._crashForTests();
+  });
+
+  it("rekeys a row through the ordinary API after the upgrade, and the forward survives", async () => {
+    const shim = hydrate(source);
+    const store = await verifyFixture(shim, source);
+    const database = new MinnowDatabase(store, ENGINE_OPTIONS);
+    await database.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, note TEXT)");
+    await database.execute(
+      "CREATE TABLE lines (id INTEGER PRIMARY KEY, order_id INTEGER REFERENCES orders(id))",
+    );
+    await database.execute("INSERT INTO orders VALUES (-1, 'offline')");
+    await database.execute("INSERT INTO lines VALUES (1, -1)");
+    const before = await store.getCatalogProbe();
+    await database.execute("UPDATE orders SET id = 500 WHERE id = -1");
+    expect((await store.getCatalogProbe()).schemaEpoch).toBe(before.schemaEpoch);
+    await database.close();
+    store._crashForTests();
+    const reopened = await verifyFixture(shim, source, ["lines", "orders", KEY_FORWARDS.name]);
+    expect(await reopened.getTable(KEY_FORWARDS.id)).toEqual(KEY_FORWARDS);
+    const again = new MinnowDatabase(reopened, ENGINE_OPTIONS);
+    expect((await again.query("SELECT id, note FROM orders WHERE id = -1")).rows).toEqual([
+      { id: 500, note: "offline" },
+    ]);
+    expect((await again.query("SELECT order_id FROM lines")).rows).toEqual([{ order_id: 500 }]);
+    expect(await again.resolveKey("orders", -1)).toBe(500);
+    await again.close();
     reopened._crashForTests();
   });
 

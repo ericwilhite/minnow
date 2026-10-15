@@ -103,8 +103,9 @@ an ordinary `TableRecord` with `keyForwards: true`, and its name starts with
 the schema epoch alone. The table changes no other table's write rules, and a write scope that
 rekeys creates it while its own transaction is open; advancing the epoch would make that scope's
 commit fail with `SchemaConflictError`. Store and return `keyForwards` like any other field. It
-is either absent or exactly `true`, and a record is at most one of a view, an enum type, a
-sequence, or the key-forwards table. An adapter built on the storage toolkit's `RecordCore` gets
+is either absent or exactly `true`, only the record with ID `minnow-key-forwards` may carry it,
+and a record is at most one of a view, an enum type, a sequence, or the key-forwards table.
+Refuse anything else: a second marked table would hide the real one from the engine. An adapter built on the storage toolkit's `RecordCore` gets
 this rule automatically. The conformance kit checks it.
 
 Catalog cleanup follows the same rule. When `updateTable` removes a column or secondary index,

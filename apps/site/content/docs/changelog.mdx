@@ -27,19 +27,24 @@ Release packages: `@minnowdb/core@0.15.0`, `@minnowdb/kysely@0.5.0`, `@minnowdb/
   upsert naming it updates the row, a child written with it stores the current key, and a plain
   insert of it, or a rekey onto it, is refused as a duplicate. Forwards are stored in an internal
   table, so they reach other tabs and survive a reload, and background maintenance deletes them
-  once they expire. `resolveKey(table, key)` returns a held key's current value.
+  once they expire. `resolveKey(table, key)` returns a held key's current value. Each connection
+  keeps the forwards in memory and updates them from each commit's own rows, so a rekey costs a
+  reader the forwards it wrote, not every forward held; a database that never rekeys pays nothing.
 
 - **One commit, one live update.** A live-query sweep now hands every changed subscription its
   result in the same turn, after the last affected query ran, and a worker sends them to its
   client as one message. A component reading several queries renders a commit once, rather than
   once per query with the others still on the previous version — which is how a list and a detail
-  form could disagree on a key for up to a second after a sync. `liveQueries({ onSweepDelivered })`
-  reports the end of each sweep.
+  form could disagree on a key for up to a second after a sync. The cost is that a quick query
+  waits for the slowest one the same commit changed. A subscriber whose callback throws hears it
+  through its own `onError` and the rest of the sweep is still delivered.
+  `liveQueries({ onSweepDelivered })` reports the end of each sweep.
 
 - **Live deliveries report rekeyed rows.** `LiveQueryDelivery.keyChanges` (and the same field on
   typed `ready` snapshots) lists `{ table, from, to }` for the rows the commits moved, read from the
-  stored forwards so a tab that missed the notification still gets it. A keyed live query reports
-  a rekeyed row as one `{ type: "rekey" }` change instead of a delete and an insert.
+  stored forwards so a tab that missed the notification still gets it. A keyed live query given its
+  table — `live.changes(query, { key: "order_id", table: "orders" })` — reports a rekeyed row as
+  one `{ type: "rekey" }` change instead of a delete and an insert.
 
 - **Foreign keys.** `REFERENCES … NOT ENFORCED` declares an unchecked reference in SQL, as
   `enforced: false` does in the schema API. `ON UPDATE CASCADE` is accepted. **Breaking:**
@@ -49,15 +54,23 @@ Release packages: `@minnowdb/core@0.15.0`, `@minnowdb/kysely@0.5.0`, `@minnowdb/
 
 - **Fixes found on the way.** A destructive `migrate()` dropped tables that reference each other
   in an order the catalog refused. An IndexedDB snapshot import left an empty keyed table's key
-  membership in a state the next export refused as corruption.
+  membership in a state the next export refused as corruption. Timestamp text with a short
+  offset — `'2026-10-15 08:00:00+00'`, `-08`, `+0530` — failed to parse; it now reads as
+  PostgreSQL reads it, and an offset past ±15:59 is refused. `WHERE col IN (…)` with more than 32
+  values over an indexed column failed with `Full-text query terms cannot exceed 32 items`. A write
+  scope or transaction whose statements changed no rows, or that rolled back to a savepoint, could
+  fail to commit with `Level-zero segment limits must exactly cover pending level-zero tables`.
 
 - **API changes.** `MinnowDatabase.resolveKey` and `MinnowDatabaseClient.resolveKey`; the
   `keyForwardRetentionMs` option (also accepted by the stock worker); `LiveQueryDelivery.keyChanges`,
   `LiveQueryInvalidation.keyChanges`, `LiveSnapshot.keyChanges`, `LiveChangesSnapshot.keyChanges`,
-  and the `rekey` `LiveResultChange`; `LiveQuerySetOptions.onSweepDelivered`, `LiveQuerySweep`,
+  and the `rekey` `LiveResultChange`; `KeyedLiveQueryOptions.table` and the Kysely `changes` and
+  `window` `table` option; `LiveQuerySetOptions.onSweepDelivered`, `LiveQuerySweep`,
   `KeyChange`, and the optional `LiveQueryHost.keyChanges`. `InferUpdateChanges` and the Kysely
   `Updateable` types now include primary-key columns. `TableRecord.keyForwards` marks the internal
-  table. The worker protocol is version 8: deploy the client and worker from the same build.
+  table; the storage contract exports `KEY_FORWARDS_RECORD_ID` and `keyForwardsMarkerProblem` for
+  custom adapters that validate it, and `DatabaseTransaction.resumeLevelZeroSegment` records a
+  resumed transaction's staged segments. The worker protocol is version 8: deploy the client and worker from the same build.
   Kysely 0.5.0 and devtools 0.3.5 need core 0.15.0.
 
 **Migration and stored formats:** no application migration is needed. IndexedDB schema 5 and OPFS
@@ -70,10 +83,12 @@ marker rewritten behind a flushed `upgrade-9-10` witness, so a crash or power lo
 finishes on the next open; layout 6 is still converted first. After the upgrade, 0.14.1 and older
 refuse the database with `StorageFormatVersionError` and change nothing, so pin 0.15.0 everywhere
 that opens the same database. A snapshot is written as format 2 only when it holds the
-key-forwards table; otherwise it is format 1, byte for byte, and older builds still import it.
-Core 0.14.1 and older refuse format 2. Block format 2 is unchanged. Custom storage adapters must
-store `keyForwards` and must not advance the schema epoch when `addTable` adds the key-forwards
-table; adapters built on the storage toolkit's `RecordCore` already do.
+key-forwards table, which the first rekey creates — even one that fails — and which then stays;
+otherwise it is format 1, byte for byte, and older builds still import it. Core 0.14.1 and older
+refuse format 2. Block format 2 is unchanged. Custom storage adapters must store `keyForwards`,
+must refuse it on any table but `minnow-key-forwards` or with any value but `true`, and must not
+advance the schema epoch when `addTable` adds the key-forwards table; adapters built on the
+storage toolkit's `RecordCore` already do, and the conformance suite checks all three.
 
 ## 0.14.1 — October 8, 2026
 

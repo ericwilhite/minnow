@@ -2,6 +2,7 @@ import { dateMilliseconds } from "../date-value.js";
 import type { TableColumnRecord, TableRecord } from "../storage/types.js";
 import type { BatchValue } from "./batch.js";
 import { getUniqueKeyColumn, keyToken, secondaryTupleComponent } from "./index-terms.js";
+import { maybeYieldToEventLoop } from "../work-slicer.js";
 import { KEY_FORWARDS_TABLE_ID } from "./key-change.js";
 
 export { KEY_FORWARDS_TABLE_ID, type KeyChange } from "./key-change.js";
@@ -34,7 +35,7 @@ export const KEY_FORWARD_COLUMNS = {
   to: "to_key",
   fromValues: "from_values",
   toValues: "to_values",
-  retiredAt: "retired_at",
+  expiresAt: "expires_at",
 } as const;
 
 /** The internal table's catalog record: a constant apart from its creation time. */
@@ -56,9 +57,12 @@ export function keyForwardsTableRecord(createdAt: string): TableRecord {
       column(KEY_FORWARD_COLUMNS.to, "string"),
       column(KEY_FORWARD_COLUMNS.fromValues, "string"),
       column(KEY_FORWARD_COLUMNS.toValues, "string"),
-      column(KEY_FORWARD_COLUMNS.retiredAt, "number"),
+      column(KEY_FORWARD_COLUMNS.expiresAt, "number"),
     ],
     uniqueKeyColumnId: keyColumn.id,
+    // Like any table created with a key: writes check keys through the store's key index
+    // instead of reading the table.
+    uniqueKeyLookupReady: true,
     primaryKeyColumnIds: [keyColumn.id],
     managed: false,
     keyForwards: true,
@@ -79,7 +83,11 @@ export interface KeyForward {
   /** The current public key, one value per primary-key column. */
   readonly toValues: readonly BatchValue[];
   /** When the key was retired, in epoch milliseconds. */
-  readonly retiredAt: number;
+  /**
+   * When the forward stops, in epoch milliseconds: the retirement time plus the retention of
+   * the database that retired the key. Fixed when written, so every connection agrees on it.
+   */
+  readonly expiresAt: number;
 }
 
 /**
@@ -169,7 +177,7 @@ export function forwardFromRow(row: Readonly<Record<string, unknown>>): KeyForwa
   const to = row[KEY_FORWARD_COLUMNS.to];
   const fromValues = row[KEY_FORWARD_COLUMNS.fromValues];
   const toValues = row[KEY_FORWARD_COLUMNS.toValues];
-  const retiredAt = row[KEY_FORWARD_COLUMNS.retiredAt];
+  const expiresAt = row[KEY_FORWARD_COLUMNS.expiresAt];
   if (
     typeof key !== "string" ||
     typeof tableId !== "string" ||
@@ -178,7 +186,7 @@ export function forwardFromRow(row: Readonly<Record<string, unknown>>): KeyForwa
     typeof to !== "string" ||
     typeof fromValues !== "string" ||
     typeof toValues !== "string" ||
-    typeof retiredAt !== "number"
+    typeof expiresAt !== "number"
   ) {
     throw new TypeError("A key forward row is invalid");
   }
@@ -193,7 +201,7 @@ export function forwardFromRow(row: Readonly<Record<string, unknown>>): KeyForwa
     to: toKey,
     fromValues: decodeKeyValues(fromValues),
     toValues: decodeKeyValues(toValues),
-    retiredAt,
+    expiresAt,
   };
 }
 
@@ -260,6 +268,10 @@ export class KeyForwardSet {
     return this.#byTable.has(tableId);
   }
 
+  tableIds(): IterableIterator<string> {
+    return this.#byTable.keys();
+  }
+
   isEmpty(): boolean {
     return this.#byTable.size === 0;
   }
@@ -281,43 +293,366 @@ export class KeyForwardSet {
   *entries(): IterableIterator<KeyForward> {
     for (const forwards of this.#byTable.values()) yield* forwards.values();
   }
+
+  /** An independent copy, for a savepoint to restore. */
+  clone(): KeyForwardSet {
+    const copy = new KeyForwardSet();
+    for (const forward of this.entries()) copy.add(forward);
+    return copy;
+  }
 }
 
-/** Committed forwards as of one generation of the internal table, minus expired ones. */
-export class CommittedKeyForwards implements KeyForwardLookup {
-  constructor(
-    readonly generation: string,
-    readonly forwards: KeyForwardSet,
-    readonly expiresBefore: () => number,
-  ) {}
+/** Counts for tests: how often a connection read the forwards table whole. */
+export const keyForwardTestHooks = { wholeReads: 0 };
 
-  #live(forward: KeyForward | undefined): KeyForward | undefined {
-    return forward !== undefined && forward.retiredAt >= this.expiresBefore() ? forward : undefined;
+/** One forward a commit window wrote (`forward`) or deleted (`forward: null`), by its row. */
+export interface KeyForwardChange {
+  readonly tableId: string;
+  /** The retired storage key's token. */
+  readonly token: string;
+  readonly forward: KeyForward | null;
+}
+
+/** The forwards one commit window changed, layered over the generation before it. */
+interface KeyForwardLayer {
+  readonly written: KeyForwardSet;
+  /** Row keys the window deleted and did not write again. */
+  readonly deleted: ReadonlySet<string>;
+  /** Expiries the window added and removed, ascending, so expired forwards count cheaply. */
+  readonly addedExpiries: Float64Array;
+  readonly removedExpiries: Float64Array;
+}
+
+/** A generation folds its layers into a new base past this many layers… */
+const KEY_FORWARD_MAX_LAYERS = 16;
+/** …or once they hold this many forwards, or an eighth of the base if that is more. */
+const KEY_FORWARD_MIN_LAYERED = 1024;
+/** How many generations back a key-change diff may walk before it compares in full. */
+const KEY_FORWARD_HISTORY = 32;
+
+function countAtOrBelow(sorted: Float64Array, limit: number): number {
+  let low = 0;
+  let high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((sorted[middle] ?? 0) <= limit) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function sortedExpiries(values: readonly number[]): Float64Array {
+  return Float64Array.from(values).sort();
+}
+
+/**
+ * A fold's expiries: the base's, with every layer's additions merged in and removals taken
+ * out, in one linear pass over arrays that are already sorted rather than a sort of them all.
+ * Undefined if the removals do not match, which a consistent history never produces.
+ */
+function foldedExpiries(
+  base: Float64Array,
+  layers: readonly KeyForwardLayer[],
+): Float64Array | undefined {
+  const added = sortedExpiries(layers.flatMap((layer) => [...layer.addedExpiries]));
+  const removed = sortedExpiries(layers.flatMap((layer) => [...layer.removedExpiries]));
+  const folded = new Float64Array(base.length + added.length - removed.length);
+  let fromBase = 0;
+  let fromAdded = 0;
+  let nextRemoved = 0;
+  let length = 0;
+  while (fromBase < base.length || fromAdded < added.length) {
+    const baseValue = base[fromBase] ?? Number.POSITIVE_INFINITY;
+    const addedValue = added[fromAdded] ?? Number.POSITIVE_INFINITY;
+    let value: number;
+    if (baseValue <= addedValue) {
+      value = baseValue;
+      fromBase += 1;
+    } else {
+      value = addedValue;
+      fromAdded += 1;
+    }
+    if (nextRemoved < removed.length && removed[nextRemoved] === value) {
+      nextRemoved += 1;
+      continue;
+    }
+    if (length === folded.length) return undefined;
+    folded[length] = value;
+    length += 1;
+  }
+  return nextRemoved === removed.length && length === folded.length ? folded : undefined;
+}
+
+/**
+ * Committed forwards as of one generation of the internal table, minus expired ones.
+ *
+ * A generation is a base, built by reading the whole table, plus a layer per commit window
+ * since, built from just the rows that window changed. A rekey therefore costs the reader the
+ * forwards it wrote, not every forward held. Layers fold into a new base, a slice at a time,
+ * once they are many or large. Every generation is immutable once built: a query still reading
+ * an older manifest version keeps the forwards that version had.
+ */
+export class CommittedKeyForwards implements KeyForwardLookup {
+  readonly #base: KeyForwardSet;
+  /** Every base forward's expiry, ascending. */
+  readonly #baseExpiries: Float64Array;
+  /** Oldest first. */
+  readonly #layers: readonly KeyForwardLayer[];
+  /** The generation this one was layered over, with the forwards written since; for diffs. */
+  #previous: CommittedKeyForwards | undefined;
+  readonly #written: readonly KeyForward[];
+
+  private constructor(
+    readonly generation: string,
+    readonly now: () => number,
+    base: KeyForwardSet,
+    baseExpiries: Float64Array,
+    layers: readonly KeyForwardLayer[],
+    previous: CommittedKeyForwards | undefined,
+    written: readonly KeyForward[],
+  ) {
+    this.#base = base;
+    this.#baseExpiries = baseExpiries;
+    this.#layers = layers;
+    this.#previous = previous;
+    this.#written = written;
   }
 
+  /** A generation read whole from the table, offering the event loop turns as it indexes. */
+  static async load(
+    generation: string,
+    forwards: Iterable<KeyForward>,
+    now: () => number,
+  ): Promise<CommittedKeyForwards> {
+    const expiries: number[] = [];
+    const base = await CommittedKeyForwards.#index(forwards, expiries);
+    return new CommittedKeyForwards(
+      generation,
+      now,
+      base,
+      sortedExpiries(expiries),
+      [],
+      undefined,
+      [],
+    );
+  }
+
+  /** Indexes forwards a slice at a time, collecting their expiries as it goes. */
+  static async #index(forwards: Iterable<KeyForward>, expiries: number[]): Promise<KeyForwardSet> {
+    const base = new KeyForwardSet();
+    let count = 0;
+    for (const forward of forwards) {
+      base.add(forward);
+      expiries.push(forward.expiresAt);
+      count += 1;
+      if (count % 256 === 0) await maybeYieldToEventLoop();
+    }
+    return base;
+  }
+
+  /**
+   * The next generation: this one with one commit window's changes layered on. Folds the
+   * layers into a new base, yielding between slices, once they outgrow their bounds.
+   */
+  async next(
+    generation: string,
+    changes: readonly KeyForwardChange[],
+  ): Promise<CommittedKeyForwards> {
+    const written = new KeyForwardSet();
+    const deleted = new Set<string>();
+    const added: number[] = [];
+    const removed: number[] = [];
+    const writtenList: KeyForward[] = [];
+    for (const { tableId, token, forward } of changes) {
+      const before = this.#raw(tableId, token);
+      if (before !== undefined) removed.push(before.expiresAt);
+      const rowKey = forwardRowKey(tableId, token);
+      if (forward === null) {
+        written.delete(tableId, token);
+        if (before !== undefined) deleted.add(rowKey);
+        continue;
+      }
+      deleted.delete(rowKey);
+      written.add(forward);
+      added.push(forward.expiresAt);
+      writtenList.push(forward);
+    }
+    const layers = [
+      ...this.#layers,
+      {
+        written,
+        deleted,
+        addedExpiries: sortedExpiries(added),
+        removedExpiries: sortedExpiries(removed),
+      },
+    ];
+    let layered = 0;
+    for (const layer of layers) layered += layer.written.size + layer.deleted.size;
+    let next: CommittedKeyForwards;
+    if (
+      layers.length <= KEY_FORWARD_MAX_LAYERS &&
+      layered <= Math.max(KEY_FORWARD_MIN_LAYERED, this.#baseExpiries.length / 8)
+    ) {
+      next = new CommittedKeyForwards(
+        generation,
+        this.now,
+        this.#base,
+        this.#baseExpiries,
+        layers,
+        this,
+        writtenList,
+      );
+    } else {
+      const layeredView = new CommittedKeyForwards(
+        generation,
+        this.now,
+        this.#base,
+        this.#baseExpiries,
+        layers,
+        undefined,
+        [],
+      );
+      const expiries: number[] = [];
+      const base = await CommittedKeyForwards.#index(layeredView.entries(), expiries);
+      next = new CommittedKeyForwards(
+        generation,
+        this.now,
+        base,
+        foldedExpiries(this.#baseExpiries, layers) ?? sortedExpiries(expiries),
+        [],
+        this,
+        writtenList,
+      );
+    }
+    // Keep a bounded history, so old generations do not stay reachable forever.
+    let cursor: CommittedKeyForwards | undefined = next;
+    for (let depth = 0; depth < KEY_FORWARD_HISTORY && cursor !== undefined; depth += 1) {
+      cursor = cursor.#previous;
+    }
+    if (cursor !== undefined) cursor.#previous = undefined;
+    return next;
+  }
+
+  /**
+   * The forwards written between `prior` and this generation that are still current, or
+   * undefined when `prior` is too far back to walk to and the caller must compare in full.
+   */
+  writtenSince(prior: CommittedKeyForwards): KeyForward[] | undefined {
+    const windows: Array<readonly KeyForward[]> = [];
+    if (this !== prior) {
+      windows.push(this.#written);
+      let cursor = this.#previous;
+      while (cursor !== prior) {
+        if (cursor === undefined) return undefined;
+        windows.push(cursor.#written);
+        cursor = cursor.#previous;
+      }
+    }
+    const seen = new Set<KeyForward>();
+    const current: KeyForward[] = [];
+    for (const window of windows.reverse()) {
+      for (const forward of window) {
+        if (seen.has(forward)) continue;
+        seen.add(forward);
+        if (this.#raw(forward.tableId, storageKeyToken(forward.from)) === forward) {
+          current.push(forward);
+        }
+      }
+    }
+    return current;
+  }
+
+  /** The stored forward for a retired key, expired or not. */
+  #raw(tableId: string, token: string): KeyForward | undefined {
+    for (let index = this.#layers.length - 1; index >= 0; index -= 1) {
+      const layer = this.#layers[index];
+      if (layer === undefined) continue;
+      const written = layer.written.get(tableId, token);
+      if (written !== undefined) return written;
+      if (layer.deleted.has(forwardRowKey(tableId, token))) return undefined;
+    }
+    return this.#base.get(tableId, token);
+  }
+
+  /** The stored forward for a retired key, expired or not; what a diff compares. */
+  stored(tableId: string, token: string): KeyForward | undefined {
+    return this.#raw(tableId, token);
+  }
+
+  /** How many stored forwards have expired by now; it only grows until the table next changes. */
+  expiredCount(): number {
+    const now = this.now();
+    let count = countAtOrBelow(this.#baseExpiries, now);
+    for (const layer of this.#layers) {
+      count += countAtOrBelow(layer.addedExpiries, now);
+      count -= countAtOrBelow(layer.removedExpiries, now);
+    }
+    return count;
+  }
+
+  #live(forward: KeyForward | undefined): KeyForward | undefined {
+    return forward !== undefined && forward.expiresAt > this.now() ? forward : undefined;
+  }
+
+  /** True when the table may have forwards; a deletion since the last fold can leave it true. */
   hasTable(tableId: string): boolean {
-    return this.forwards.hasTable(tableId);
+    return (
+      this.#base.hasTable(tableId) || this.#layers.some((layer) => layer.written.hasTable(tableId))
+    );
   }
 
   isEmpty(): boolean {
-    return this.forwards.isEmpty();
+    return this.#base.isEmpty() && this.#layers.every((layer) => layer.written.isEmpty());
+  }
+
+  /** The tables that may have forwards; like `hasTable`, a superset after deletions. */
+  tableIds(): Set<string> {
+    const ids = new Set(this.#base.tableIds());
+    for (const layer of this.#layers) for (const id of layer.written.tableIds()) ids.add(id);
+    return ids;
   }
 
   get(tableId: string, token: string): KeyForward | undefined {
-    return this.#live(this.forwards.get(tableId, token));
+    return this.#live(this.#raw(tableId, token));
   }
 
   sourcesOf(tableId: string, toToken: string): KeyForward[] {
-    const cutoff = this.expiresBefore();
-    return this.forwards
-      .sourcesOf(tableId, toToken)
-      .filter((forward) => forward.retiredAt >= cutoff);
+    const now = this.now();
+    const sources = new Set<KeyForward>();
+    const candidates = [
+      ...this.#base.sourcesOf(tableId, toToken),
+      ...this.#layers.flatMap((layer) => layer.written.sourcesOf(tableId, toToken)),
+    ];
+    for (const forward of candidates) {
+      if (forward.expiresAt <= now) continue;
+      if (this.#raw(tableId, storageKeyToken(forward.from)) === forward) sources.add(forward);
+    }
+    return [...sources];
   }
 
-  /** Forwards past retention, which maintenance deletes. */
-  expired(): KeyForward[] {
-    const cutoff = this.expiresBefore();
-    return [...this.forwards.entries()].filter((forward) => forward.retiredAt < cutoff);
+  /** Every stored forward, expired or not, newest layer first. */
+  *entries(): IterableIterator<KeyForward> {
+    const seen = new Set<string>();
+    for (let index = this.#layers.length - 1; index >= 0; index -= 1) {
+      const layer = this.#layers[index];
+      if (layer === undefined) continue;
+      for (const forward of layer.written.entries()) {
+        const rowKey = forwardRowKey(forward.tableId, storageKeyToken(forward.from));
+        if (seen.has(rowKey)) continue;
+        seen.add(rowKey);
+        yield forward;
+      }
+      for (const rowKey of layer.deleted) seen.add(rowKey);
+    }
+    for (const forward of this.#base.entries()) {
+      if (
+        seen.size > 0 &&
+        seen.has(forwardRowKey(forward.tableId, storageKeyToken(forward.from)))
+      ) {
+        continue;
+      }
+      yield forward;
+    }
   }
 }
 
@@ -326,9 +661,7 @@ export class CommittedKeyForwards implements KeyForwardLookup {
  * committed one with the same retired key, which is how a chain collapses inside a scope.
  */
 export class ScopedKeyForwards implements KeyForwardLookup {
-  readonly staged = new KeyForwardSet();
-  /** The rows each rekey moved, in order, for the commit's key-change notice. */
-  readonly changes: KeyForward[] = [];
+  staged = new KeyForwardSet();
 
   constructor(readonly committed: () => KeyForwardLookup | undefined) {}
 

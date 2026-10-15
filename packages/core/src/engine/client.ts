@@ -1496,13 +1496,23 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
         const { events } = response.payload as {
           events: Array<{ handleId: string; event: string; payload: unknown }>;
         };
+        // A callback that throws affects its own subscription only: it hears the error through
+        // onError, as a direct live set reports one, and the rest of the batch still goes out.
         for (const item of events) {
-          this.#receive({
-            ...response,
-            handleId: item.handleId,
-            event: item.event,
-            payload: item.payload,
-          });
+          try {
+            this.#receive({
+              ...response,
+              handleId: item.handleId,
+              event: item.event,
+              payload: item.payload,
+            });
+          } catch (error) {
+            try {
+              this.#events.get(item.handleId)?.onError?.(error);
+            } catch {
+              // An onError that throws as well has nowhere further to report to.
+            }
+          }
         }
         return;
       }

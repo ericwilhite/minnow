@@ -122,11 +122,16 @@ export function createKyselyLiveQueries(config: CreateKyselyLiveQueriesConfig): 
   return Object.assign(live, {
     changes: <TQuery extends KyselyLiveSelectable, TKey extends LiveKeyOf<KyselyLiveRow<TQuery>>>(
       query: TQuery,
-      options: { readonly key: TKey },
+      options: { readonly key: TKey; readonly table?: string },
     ) => new KeyedLiveQuery(live(query), options),
     window: <TQuery extends KyselyWindowSelectable, TKey extends LiveKeyOf<KyselyLiveRow<TQuery>>>(
       query: TQuery,
-      options: { readonly key: TKey; readonly limit: number; readonly offset?: number },
+      options: {
+        readonly key: TKey;
+        readonly limit: number;
+        readonly offset?: number;
+        readonly table?: string;
+      },
     ) => {
       if (!Number.isSafeInteger(options.limit) || options.limit <= 0) {
         throw new RangeError("Live query window limit must be a positive whole number");
@@ -153,6 +158,7 @@ export function createKyselyLiveQueries(config: CreateKyselyLiveQueriesConfig): 
       return new KeyedLiveQuery(live(windowed as TQuery), {
         key: options.key,
         maxRows: options.limit,
+        ...(options.table === undefined ? {} : { table: options.table }),
       });
     },
     refresh: () => manager.refresh(),

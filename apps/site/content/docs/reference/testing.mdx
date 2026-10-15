@@ -374,10 +374,13 @@ logs a commit whose frame spans continuation frames and whose index changes exce
 chunk, reopens from the log and from a checkpoint, and checks that 0.13.1 then refuses the
 database; `indexeddb-schema4.test.ts` does the same for schema 4 with every older writer. A fourth
 alias, of core 0.14.1, is the last IndexedDB schema-4 and OPFS layout-9 writer:
-`marker-upgrade.test.ts` upgrades layouts 7, 8, and 9 to layout 10, adds the key-forwards table,
-reopens, and checks that every released reader then refuses the database;
-`indexeddb-schema5.test.ts` does the same for schema 5, and `snapshot-format2.test.ts` checks that
-only a snapshot holding the key-forwards table is written as format 2. The marker upgrade is cut at
+`marker-upgrade.test.ts` upgrades layouts 7, 8, and 9 to layout 10, rekeys a row through the
+ordinary API, reopens, and checks that the retired key still resolves and that every released
+reader then refuses the database; `indexeddb-schema5.test.ts` does the same for schema 5 from
+every released IndexedDB writer, and `snapshot-format2.test.ts` checks that only a snapshot
+holding the key-forwards table is written as format 2. `format-compatibility.test.ts` restores the
+forward the frozen format-2 fixture stored, checks it resolves until it expires, and rekeys data
+an older writer exported. The marker upgrade is cut at
 each of its eight I/O boundaries by tab death and by power loss, from every older layout. Unsupported pre-contract prototypes are refused without changing their bytes.
 The layout-7 tests also zero or truncate acknowledged WAL bytes and
 damage either acknowledgement slot; recovery must report corruption rather than roll back.

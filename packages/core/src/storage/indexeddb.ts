@@ -218,6 +218,7 @@ import {
   uniqueKeyBuildChunkRetainedBytes,
   WriteConflictError,
   type WriteTransactionInput,
+  keyForwardsMarkerProblem,
 } from "./types.js";
 import { crc32, verifyStoredBlock } from "../block-format/index.js";
 import { dateIsoString } from "../date-value.js";
@@ -13863,11 +13864,8 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
   ) {
     throw corruption(location, "catalog object kinds are mutually exclusive");
   }
-  // Stored data is untrusted: the type says `true`, the record may say anything.
-  const keyForwards: unknown = record.keyForwards;
-  if (keyForwards !== undefined && keyForwards !== true) {
-    throw corruption(location, "key forwards marker is invalid");
-  }
+  const keyForwardsProblem = keyForwardsMarkerProblem(record);
+  if (keyForwardsProblem !== undefined) throw corruption(location, keyForwardsProblem);
   if (record.enumType !== undefined) {
     if (isRecord(record.enumType)) {
       assertKnownFields(record.enumType, ["name", "values"], `${location}/enumType`);

@@ -167,6 +167,7 @@ import {
   assertSnapshotImportAcceleratorUsage,
   SchemaConflictError,
   WriteConflictError,
+  keyForwardsMarkerProblem,
 } from "../types.js";
 import { dateIsoString } from "../../date-value.js";
 import {
@@ -8325,6 +8326,10 @@ function validateTableRuntimeRecord(record: TableRecord, label: string): void {
   validateTableColumns(record.columns);
   validateSecondaryIndexes(record);
   validateTableView(record.view);
+  const keyForwardsProblem = keyForwardsMarkerProblem(record);
+  if (keyForwardsProblem !== undefined) {
+    throw new TypeError(`${label} ${keyForwardsProblem}`);
+  }
 }
 
 function assertCounterEndInRange(endExclusive: bigint, limit: bigint, label: string): void {

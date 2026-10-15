@@ -283,6 +283,8 @@ export interface LiveQueryHost {
   keyChanges?(
     previous: { readonly value: unknown } | undefined,
     probe: CatalogProbe,
+    /** False when the caller only needs the new state, not the list. */
+    report?: boolean,
   ): Promise<{ changes: readonly KeyChange[]; state: unknown }>;
 }
 
@@ -644,11 +646,13 @@ export class LiveQuerySet {
     try {
       const opened = await this.#getOrOpenGroup(query);
       group = opened.group;
-      await baseline;
       this.#throwIfClosed();
       group.subscribers.add(subscriber);
       group.pendingSubscriptions -= 1;
       installed = true;
+      // Awaited once the subscriber is in place, so a sweep meanwhile visits its group.
+      await baseline;
+      this.#throwIfClosed();
       await this.#settleGroup(
         group,
         opened.fresh,
@@ -731,6 +735,9 @@ export class LiveQuerySet {
     group.maintenance = undefined;
     this.#lagging.delete(group);
     this.#unindexGroup(group, group.dependencies);
+    // With no queries the set stops sweeping, so its key baseline would go stale; the next
+    // subscription takes a fresh one.
+    if (this.#groups.size === 0) this.#keyState = undefined;
   }
 
   async #getOrOpenGroup(query: LiveQueryInput): Promise<{ group: QueryGroup; fresh: boolean }> {
@@ -1178,11 +1185,23 @@ export class LiveQuerySet {
     // the engine's catalog snapshot and block cache, and running them together tripled the
     // latency on IndexedDB rather than overlapping anything.
     const deliveries: SweepDelivery[] = [];
-    for (const group of candidates) {
-      if (!this.#stillOpen()) return;
-      await this.#sweepGroup(group, last, current, changedSince, deliveries);
+    try {
+      for (const group of candidates) {
+        if (!this.#stillOpen()) return;
+        await this.#sweepGroup(group, last, current, changedSince, deliveries);
+      }
+    } catch (error) {
+      // Groups swept before the failure are settled at this probe and will not be visited again;
+      // their results go out now, and the rest retry with the failed group.
+      for (const deliver of deliveries) deliver([]);
+      throw error;
     }
-    const keyChanges = await this.#sweepKeyChanges(last, current, changedSince);
+    const keyChanges = await this.#sweepKeyChanges(
+      last,
+      current,
+      changedSince,
+      deliveries.length > 0,
+    );
     if (!this.#stillOpen()) return;
     this.#lastProbe = current;
     this.#stats.rerunsAvoided += this.#groups.size - (this.#stats.reruns - rerunsBefore);
@@ -1216,6 +1235,7 @@ export class LiveQuerySet {
     last: CatalogProbe,
     current: CatalogProbe,
     changedSince: (after: number | null) => Promise<Set<string> | "all">,
+    report: boolean,
   ): Promise<readonly KeyChange[]> {
     const state = this.#keyState;
     if (state === undefined || this.#host.keyChanges === undefined) return [];
@@ -1224,7 +1244,8 @@ export class LiveQuerySet {
       if (changed !== "all" && !changed.has(KEY_FORWARDS_TABLE_ID)) return [];
     }
     try {
-      const next = await this.#host.keyChanges(state, current);
+      // With nothing to deliver, the baseline only moves forward; nobody needs the list.
+      const next = await this.#host.keyChanges(state, current, report);
       state.value = next.state;
       return next.changes;
     } catch {

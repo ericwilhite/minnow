@@ -133,8 +133,10 @@ scans re-verify, so either case costs a rebuild, never a wrong answer.
 
 A snapshot is a bounded frame stream, not one database-sized metadata object. Format 2 is format
 1 with one addition: it may carry the engine's internal key-forwards table, which records where
-each [rekeyed](/docs/engine/rekeying) row now lives. A snapshot without that table is written as
-format 1, byte for byte, so older builds still import it; core 0.14.1 and older refuse format 2.
+each [rekeyed](/docs/engine/rekeying) row now lives. The engine creates that table on the first
+rekey — even one that fails — and keeps it, so from then on every snapshot of that database is
+format 2. A snapshot without the table is written as format 1, byte for byte, so older builds still
+import it; core 0.14.1 and older refuse format 2.
 All integers in envelopes are little-endian.
 
 The file starts with a 20-byte prefix:

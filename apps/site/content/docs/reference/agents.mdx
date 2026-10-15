@@ -96,7 +96,8 @@ machines: https://minnowdb.com/llms.txt
   (`keyForwardRetentionMs`). Do not add a second "stable id" column or keep a key map; join on the
   primary key. Use temporary keys that can never equal a server key (negative numbers, or an `o:`
   prefix), declare references with `.references(...)` (`{ enforced: false }` when the parent may
-  not be present), and give every referencing table a primary key.
+  not be present), and give every referencing table a primary key. A keyed live list that should
+  keep a rekeyed row's component passes `table`: `live.changes(query, { key: "id", table: "t" })`.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers, and `/` between two
   integers (columns, constants, `COUNT`, integer aggregates) truncates toward zero as in
   PostgreSQL: `7 / 2` is `3`. Divide by `2.0` or a `DOUBLE PRECISION`/`NUMERIC` operand for a

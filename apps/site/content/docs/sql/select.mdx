@@ -84,7 +84,10 @@ classes and ASCII POSIX classes, anchors, and greedy repetition. Pattern backref
 lookaround, inline flags, and non-greedy quantifiers throw; replacement backreferences still work.
 The [SQL limits](/docs/sql) bound pattern size, compilation, matching, and replacement output.
 
-Timestamp inputs and `MAKE_TIMESTAMP` validate calendar dates, clock fields, and timezone offsets.
+Timestamp text is read as an instant: `2026-10-15 08:00:00`, `2026-10-15T08:00:00.250Z`, and an
+optional zone after the time, `Z` or an offset in PostgreSQL's spellings (`+00`, `-08`, `+0530`,
+`+05:30`, with or without a space before it). Text without a zone is UTC. Timestamp inputs and
+`MAKE_TIMESTAMP` validate calendar dates, clock fields, and offsets up to ±15:59.
 Invalid dates such as February 30 throw. Supported calendar years are 1–9999; years below 100
 keep their requested year. Explicit TEXT casts retain text comparison semantics: comparing
 `'1'::TEXT` to the number `1` throws rather than interpreting the text as a number.

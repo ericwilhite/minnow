@@ -253,6 +253,8 @@ export class DatabaseTransaction {
   readonly #compactionSourceBlockIds = new Set<string>();
   readonly #changedTableIds = new Set<string>();
   readonly #levelZeroSegmentLimits = new Map<string, number>();
+  /** Tables whose level-zero segments a resumed transaction had staged before it resumed. */
+  readonly #resumedLevelZeroTables = new Set<string>();
   #logicallyUnchanged = false;
   /**
    * One storage-sized artifact batch may stay process-local until commit. This lets the common
@@ -853,14 +855,7 @@ export class DatabaseTransaction {
           ? {}
           : { uniqueKeyChanges: this.#uniqueKeyChanges }),
         ...(ftsChanges.length === 0 ? {} : { ftsChanges }),
-        ...(this.#levelZeroSegmentLimits.size === 0
-          ? {}
-          : {
-              levelZeroSegmentLimits: [...this.#levelZeroSegmentLimits].map(([tableId, limit]) => ({
-                tableId,
-                limit,
-              })),
-            }),
+        ...this.#commitLevelZeroLimits(),
         committedAt,
       });
       this.#record = {
@@ -1223,6 +1218,30 @@ export class DatabaseTransaction {
     );
   }
 
+  /**
+   * The level-zero ceilings for the tables this commit adds level-zero segments to. A statement
+   * reserves its table's ceiling before it stages anything, and one that then stages nothing —
+   * it failed and the scope caught the error, or it changed no row — leaves a ceiling with no
+   * segment under it, which the store refuses to commit.
+   */
+  #commitLevelZeroLimits(): { levelZeroSegmentLimits?: Array<{ tableId: string; limit: number }> } {
+    const tables = new Set(this.#resumedLevelZeroTables);
+    for (const segment of this.#knownSegments.values()) {
+      if (segment.level === 0) tables.add(segment.tableId);
+    }
+    const limits = [...this.#levelZeroSegmentLimits]
+      .filter(([tableId]) => tables.has(tableId))
+      .map(([tableId, limit]) => ({ tableId, limit }));
+    return limits.length === 0 ? {} : { levelZeroSegmentLimits: limits };
+  }
+
+  /** Records a level-zero segment staged before this transaction object resumed it. */
+  resumeLevelZeroSegment(segment: SegmentRecord): void {
+    if (segment.level !== 0) return;
+    this.#resumedLevelZeroTables.add(segment.tableId);
+    this.#registerLevelZeroSegments([segment]);
+  }
+
   #registerLevelZeroSegments(segments: readonly SegmentRecord[]): void {
     for (const segment of segments) {
       if (segment.level !== 0) continue;
@@ -1276,14 +1295,7 @@ export class DatabaseTransaction {
           ? {}
           : { uniqueKeyChanges: this.#uniqueKeyChanges }),
         ...(ftsChanges.length === 0 ? {} : { ftsChanges }),
-        ...(this.#levelZeroSegmentLimits.size === 0
-          ? {}
-          : {
-              levelZeroSegmentLimits: [...this.#levelZeroSegmentLimits].map(([tableId, limit]) => ({
-                tableId,
-                limit,
-              })),
-            }),
+        ...this.#commitLevelZeroLimits(),
         committedAt,
       });
       this.#record = {
@@ -1849,9 +1861,7 @@ export class TransactionManager {
     );
     for (const segmentId of record.pendingSegmentIds) {
       const segment = await this.store.getSegment(segmentId);
-      if (segment?.level === 0) {
-        transaction.limitLevelZeroSegments(segment.tableId, MAX_LEVEL_ZERO_SEGMENTS);
-      }
+      if (segment !== undefined) transaction.resumeLevelZeroSegment(segment);
     }
     await transaction.renew();
     return transaction;

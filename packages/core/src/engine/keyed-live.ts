@@ -66,6 +66,12 @@ export interface KeyedLiveQueryOptions<TRow extends object, TKey extends LiveKey
   readonly key: TKey;
   /** A window refuses a result larger than this instead of retaining an accidentally unbounded query. */
   readonly maxRows?: number;
+  /**
+   * The table whose primary key `key` is. Naming it turns a row that table rekeyed into one
+   * `rekey` change; without it a rekey shows as the delete and insert it looks like, since a key
+   * value alone cannot say which table's rekey it was.
+   */
+  readonly table?: string;
 }
 
 /**
@@ -146,6 +152,7 @@ function diffRows<TRow extends object, TKey extends keyof TRow>(
   rows: readonly TRow[],
   key: TKey,
   keyChanges: readonly KeyChange[] = [],
+  table?: string,
 ): Diff<TRow, TKey> {
   const current = indexRows(rows, key);
   const changes: Array<LiveResultChange<TRow, TKey>> = [];
@@ -188,7 +195,14 @@ function diffRows<TRow extends object, TKey extends keyof TRow>(
     return { changes, rows: previousRows, index: current };
   }
   return {
-    changes: keyChanges.length === 0 ? changes : pairRekeys(changes, keyChanges, key),
+    changes:
+      table === undefined || keyChanges.length === 0
+        ? changes
+        : pairRekeys(
+            changes,
+            keyChanges.filter((change) => change.table === table),
+            key,
+          ),
     rows: reused === 0 ? rows : Object.freeze(reconciled),
     index: current,
   };
@@ -257,6 +271,7 @@ export class KeyedLiveQuery<TRow extends object, TKey extends LiveKeyOf<TRow>> {
   readonly #source: LiveQuery<TRow>;
   readonly #key: TKey;
   readonly #maxRows: number | undefined;
+  readonly #table: string | undefined;
   readonly #listeners = new Set<() => void>();
   #sourceUnsubscribe: (() => void) | undefined;
   #rows: readonly TRow[] = [];
@@ -277,6 +292,7 @@ export class KeyedLiveQuery<TRow extends object, TKey extends LiveKeyOf<TRow>> {
     this.#source = source;
     this.#key = options.key;
     this.#maxRows = options.maxRows;
+    this.#table = options.table;
   }
 
   getSnapshot = (): LiveChangesSnapshot<TRow, TKey> => this.#snapshot;
@@ -370,6 +386,7 @@ export class KeyedLiveQuery<TRow extends object, TKey extends LiveKeyOf<TRow>> {
           snapshot.rows,
           this.#key,
           snapshot.keyChanges,
+          this.#table,
         );
         this.#index = diff.index;
         rows = diff.rows;

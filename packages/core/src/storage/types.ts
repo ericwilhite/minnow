@@ -615,6 +615,31 @@ export interface TableForeignKeyRecord {
   enforced?: boolean;
 }
 
+/**
+ * The internal key-forwards table's fixed ID (the engine's `KEY_FORWARDS_TABLE_ID`, which a test
+ * holds equal to this). A store refuses the marker anywhere else, so a damaged catalog cannot
+ * hold a second forwards table, or one the engine would never find.
+ */
+export const KEY_FORWARDS_RECORD_ID = "minnow-key-forwards";
+
+/** Why a table record's key-forwards marker is invalid, or undefined when it is valid. */
+export function keyForwardsMarkerProblem(record: {
+  readonly id: unknown;
+  readonly keyForwards?: unknown;
+  readonly view?: unknown;
+  readonly enumType?: unknown;
+  readonly sequence?: unknown;
+}): string | undefined {
+  // Stored data is untrusted: the type says `true`, the record may say anything.
+  if (record.keyForwards === undefined) return undefined;
+  if (record.keyForwards !== true) return "key forwards marker is invalid";
+  if (record.id !== KEY_FORWARDS_RECORD_ID) return "key forwards marker is on the wrong table";
+  if (record.view !== undefined || record.enumType !== undefined || record.sequence !== undefined) {
+    return "catalog object kinds are mutually exclusive";
+  }
+  return undefined;
+}
+
 export interface TableRecord {
   id: string;
   name: string;

@@ -18,24 +18,43 @@ import { externalSqlTextValue } from "./sql-domains.js";
  * names — before planning, so the keyed point read, index probes, and zone pruning all see the
  * current key. Stored rows only ever hold current keys, so joins and ranges need nothing here.
  *
- * Recognized: `column = value`, `value = column`, `column IN (values)`, `column = ANY (values)`
- * and `IS NOT DISTINCT FROM`, wherever they appear in a block's WHERE, HAVING, or ON, nested
- * under AND, OR, and NOT. A composite key is followed when one block's top-level conjunction
- * pins every one of its columns with `=`.
+ * Recognized: `column = value`, `value = column`, `column IN (values)`, and
+ * `IS NOT DISTINCT FROM`, wherever they appear in a block's WHERE, HAVING, or ON, nested under
+ * AND, OR, and NOT, in every block of the statement — subqueries, derived tables, CTEs, and view
+ * bodies included. A value is a constant or a bound parameter, negated or not (`-1`, `-$1`). A
+ * column of a derived table or view that passes a key column through counts as that key column.
+ * A composite key is followed when one block's top-level conjunction pins every one of its
+ * columns, on one source, with `=`.
  */
 
 type LiteralExpression = Extract<Expression, { kind: "literal" }>;
 
-/** One equality the rewrite can follow: the literals of a key, in key-column order. */
+/**
+ * A key constant in the plan: a literal, or a negated one, which the parser spells
+ * `-1 * literal` and which constant folding only collapses later, at execution.
+ */
+interface KeyConstant {
+  readonly node: Expression;
+  readonly literal: LiteralExpression;
+}
+
+/** One equality the rewrite can follow: the constants of a key, in key-column order. */
 interface KeySite {
   readonly tableId: string;
   readonly address: TableAddress;
   readonly columns: readonly TableColumnRecord[];
-  /** Each entry is one alternative key: one literal per key column. */
-  readonly tuples: ReadonlyArray<readonly LiteralExpression[]>;
+  /** Each entry is one alternative key: one constant per key column. */
+  readonly tuples: ReadonlyArray<readonly KeyConstant[]>;
 }
 
-const EQUALITY_OPERATORS = new Set(["=", "IS NOT DISTINCT FROM", "IN", "= ANY"]);
+/** A column reference resolved to the catalog column it reads, and the source it reads from. */
+interface ResolvedColumn {
+  readonly table: TableRecord;
+  readonly column: TableColumnRecord;
+  readonly source: TableSource;
+}
+
+const EQUALITY_OPERATORS = new Set(["=", "IS NOT DISTINCT FROM", "IN"]);
 
 /** Whether a source is a catalog table rather than a derived, set, windowed, or recursive one. */
 function isTableSource(source: TableSource): boolean {
@@ -45,6 +64,34 @@ function isTableSource(source: TableSource): boolean {
     source.windowed === undefined &&
     source.recursive === undefined
   );
+}
+
+/** The key constant an expression is, if it is one. */
+function keyConstant(expression: Expression): KeyConstant | undefined {
+  if (expression.kind === "literal") return { node: expression, literal: expression };
+  if (
+    expression.kind === "binary" &&
+    expression.operator === "*" &&
+    expression.left.kind === "literal" &&
+    expression.left.value === -1 &&
+    expression.right.kind === "literal" &&
+    typeof expression.right.value === "number" &&
+    expression.right.internalSqlValue !== true
+  ) {
+    return { node: expression, literal: { kind: "literal", value: -expression.right.value } };
+  }
+  return undefined;
+}
+
+/** Turns a key constant's node, in place, into a literal holding `value`. */
+function setKeyConstant(constant: KeyConstant, value: LiteralExpression["value"]): void {
+  if (constant.node.kind === "literal") {
+    constant.node.value = value;
+    return;
+  }
+  const node = constant.node as Record<string, unknown>;
+  for (const key of Object.keys(node)) Reflect.deleteProperty(node, key);
+  Object.assign(node, { kind: "literal", value } satisfies LiteralExpression);
 }
 
 /** What a key column's equality resolves through: its own table's key, or a parent's. */
@@ -110,9 +157,24 @@ function keyLiteralValue(column: TableColumnRecord, value: BatchValue): BatchVal
   return value;
 }
 
+/** Calls `visit` for every subquery block an expression contains, at any depth. */
+function forEachSubquery(value: unknown, visit: (block: CompiledQuery) => void): void {
+  if (typeof value !== "object" || value === null || value instanceof Date) return;
+  if (Array.isArray(value)) {
+    for (const item of value) forEachSubquery(item, visit);
+    return;
+  }
+  const node = value as { kind?: unknown; block?: CompiledQuery };
+  if ((node.kind === "subquery" || node.kind === "exists") && node.block !== undefined) {
+    visit(node.block);
+    return;
+  }
+  for (const child of Object.values(node)) forEachSubquery(child, visit);
+}
+
 /**
- * Calls `visit` for every key equality in the plan whose literals could name a retired key. The
- * literal nodes it passes belong to the plan walked, so a visit may rewrite them in place.
+ * Calls `visit` for every key equality in the plan whose constants could name a retired key.
+ * The nodes it passes belong to the plan walked, so a visit may rewrite them in place.
  */
 function visitKeySites(
   plan: CompiledQuery,
@@ -128,6 +190,53 @@ function visitKeySites(
     }
     return targets;
   };
+
+  /** Resolves a reference among one block's sources, then its enclosing blocks'. */
+  const resolveIn = (
+    sources: readonly TableSource[],
+    outer: readonly TableSource[],
+    reference: string,
+  ): ResolvedColumn | undefined => {
+    const columnOf = (source: TableSource, name: string): ResolvedColumn | undefined => {
+      if (isTableSource(source)) {
+        const table = tables.get(source.table);
+        const column = table?.columns.find(
+          (candidate) => candidate.name === name && candidate.hidden !== true,
+        );
+        return table === undefined || column === undefined ? undefined : { table, column, source };
+      }
+      // A derived table or view: its column counts when it passes a catalog column through.
+      const block = source.derived;
+      if (block === undefined || source.union !== undefined) return undefined;
+      const index = source.columnAliases?.indexOf(name) ?? -1;
+      const items = block.select.filter((item, position) =>
+        index === -1 ? item.alias === name : position === index,
+      );
+      const item = items.length === 1 ? items[0] : undefined;
+      if (item?.expression.kind !== "column") return undefined;
+      const inner = resolveIn([block.base, ...block.joins], [], item.expression.reference);
+      return inner === undefined ? undefined : { ...inner, source };
+    };
+    /** Whether a source may expose the name: a derived source may expose any name. */
+    const exposes = (source: TableSource, name: string): boolean =>
+      !isTableSource(source) || columnOf(source, name) !== undefined;
+    const separator = reference.indexOf(".");
+    if (separator !== -1) {
+      const alias = reference.slice(0, separator);
+      const source = [...sources, ...outer].find((candidate) => candidate.alias === alias);
+      return source === undefined ? undefined : columnOf(source, reference.slice(separator + 1));
+    }
+    // The innermost block that has the name decides it, as SQL resolves names; a name two of
+    // its sources could expose is ambiguous here and left alone.
+    for (const level of [sources, outer]) {
+      const candidates = level.filter((source) => exposes(source, reference));
+      if (candidates.length === 0) continue;
+      const only = candidates.length === 1 ? candidates[0] : undefined;
+      return only === undefined ? undefined : columnOf(only, reference);
+    }
+    return undefined;
+  };
+
   const walkBlock = (block: CompiledQuery, outer: readonly TableSource[]): void => {
     const sources = [block.base, ...block.joins];
     for (const source of sources) {
@@ -141,46 +250,22 @@ function visitKeySites(
       }
     }
     const scope = [...sources, ...outer];
-    const resolve = (
-      reference: string,
-    ): { table: TableRecord; column: TableColumnRecord } | undefined => {
-      const columnOf = (source: TableSource, name: string) => {
-        if (!isTableSource(source)) return undefined;
-        const table = tables.get(source.table);
-        const column = table?.columns.find(
-          (candidate) => candidate.name === name && candidate.hidden !== true,
-        );
-        return table === undefined || column === undefined ? undefined : { table, column };
-      };
-      const separator = reference.indexOf(".");
-      if (separator !== -1) {
-        const alias = reference.slice(0, separator);
-        const source = scope.find((candidate) => candidate.alias === alias);
-        return source === undefined ? undefined : columnOf(source, reference.slice(separator + 1));
-      }
-      // The innermost block that has the name decides it, as SQL resolves names.
-      for (const level of [sources, outer]) {
-        const matches = level.flatMap((source) => {
-          const found = columnOf(source, reference);
-          // A derived source may also expose the name; then it is not a catalog column at all.
-          if (found === undefined && !isTableSource(source)) return [undefined];
-          return found === undefined ? [] : [found];
-        });
-        if (matches.length === 1) return matches[0];
-        if (matches.length > 1) return undefined;
-      }
-      return undefined;
-    };
+    const resolve = (reference: string): ResolvedColumn | undefined =>
+      resolveIn(sources, outer, reference);
     const scalarSite = (columnSide: Expression, valueSide: Expression, operator: string): void => {
       if (columnSide.kind !== "column") return;
-      const literals: LiteralExpression[] = [];
-      if (operator === "IN" || operator === "= ANY") {
+      const constants: KeyConstant[] = [];
+      if (operator === "IN") {
         if (valueSide.kind !== "list") return;
-        for (const item of valueSide.items) if (item.kind === "literal") literals.push(item);
-      } else if (valueSide.kind === "literal") {
-        literals.push(valueSide);
+        for (const item of valueSide.items) {
+          const constant = keyConstant(item);
+          if (constant !== undefined) constants.push(constant);
+        }
+      } else {
+        const constant = keyConstant(valueSide);
+        if (constant !== undefined) constants.push(constant);
       }
-      if (literals.length === 0) return;
+      if (constants.length === 0) return;
       const resolved = resolve(columnSide.reference);
       if (resolved === undefined) return;
       for (const target of targetsOf(resolved.table)) {
@@ -189,81 +274,85 @@ function visitKeySites(
           tableId: target.tableId,
           address: target.address,
           columns: target.columns,
-          tuples: literals.map((literal) => [literal]),
+          tuples: constants.map((constant) => [constant]),
         });
       }
     };
-    const walkExpression = (expression: Expression | undefined): void => {
+    const walkPredicate = (expression: Expression | undefined): void => {
       if (expression === undefined) return;
       switch (expression.kind) {
         case "condition":
           if (EQUALITY_OPERATORS.has(expression.operator)) {
             scalarSite(expression.left, expression.right, expression.operator);
-            if (expression.operator === "=" || expression.operator === "IS NOT DISTINCT FROM") {
+            if (expression.operator !== "IN") {
               scalarSite(expression.right, expression.left, expression.operator);
             }
           }
-          walkExpression(expression.left);
-          walkExpression(expression.right);
           return;
         case "logical":
-          walkExpression(expression.left);
-          walkExpression(expression.right);
+          walkPredicate(expression.left);
+          walkPredicate(expression.right);
           return;
         case "not":
-          walkExpression(expression.operand);
-          return;
-        case "subquery":
-        case "exists":
-          walkBlock(expression.block, scope);
-          return;
-        case "list":
-          for (const item of expression.items) walkExpression(item);
+          walkPredicate(expression.operand);
           return;
         default:
           return;
       }
     };
     for (const predicate of [...block.predicates, ...block.having]) {
-      walkExpression({ kind: "condition", ...predicate });
+      walkPredicate({ kind: "condition", ...predicate });
     }
-    for (const join of block.joins) walkExpression(join.on);
-    for (const item of block.select) {
-      if (item.expression.kind === "subquery" || item.expression.kind === "exists") {
-        walkExpression(item.expression);
-      }
-    }
-    // Composite keys: every column pinned by `=` in the block's own conjunction.
-    const pinned = new Map<string, Map<string, LiteralExpression>>();
+    for (const join of block.joins) walkPredicate(join.on);
+    // Every subquery in the block, wherever it sits, is a block of its own.
+    forEachSubquery(
+      [
+        block.select,
+        block.predicates,
+        block.having,
+        block.groupBy,
+        block.orderBy,
+        block.joins.map(({ left, right, on }) => [left, right, on]),
+      ],
+      (subquery) => {
+        walkBlock(subquery, scope);
+      },
+    );
+    // Composite keys: every column pinned by `=` on one source in the block's own conjunction.
+    const pinned = new Map<
+      TableSource,
+      { table: TableRecord; columns: Map<string, KeyConstant> }
+    >();
     for (const predicate of block.predicates) {
       if (predicate.operator !== "=") continue;
       for (const [columnSide, valueSide] of [
         [predicate.left, predicate.right],
         [predicate.right, predicate.left],
       ] as const) {
-        if (columnSide.kind !== "column" || valueSide.kind !== "literal") continue;
+        if (columnSide.kind !== "column") continue;
+        const constant = keyConstant(valueSide);
+        if (constant === undefined) continue;
         const resolved = resolve(columnSide.reference);
         if (resolved === undefined) continue;
-        let columns = pinned.get(resolved.table.id);
-        if (columns === undefined) {
-          columns = new Map();
-          pinned.set(resolved.table.id, columns);
+        let entry = pinned.get(resolved.source);
+        if (entry === undefined) {
+          entry = { table: resolved.table, columns: new Map() };
+          pinned.set(resolved.source, entry);
         }
-        columns.set(resolved.column.id, valueSide);
+        // A view may pass through columns of several joined tables; pin each table's own.
+        if (entry.table.id === resolved.table.id) entry.columns.set(resolved.column.id, constant);
       }
     }
-    for (const [tableId, columns] of pinned) {
-      const table = [...tables.values()].find((candidate) => candidate.id === tableId);
-      if (table === undefined) continue;
+    for (const { table, columns } of pinned.values()) {
       for (const target of targetsOf(table)) {
         if (target.columns.length < 2) continue;
-        const literals = target.columns.map((column) => columns.get(column.id));
-        if (literals.some((literal) => literal === undefined)) continue;
+        const constants = target.columns.map((column) => columns.get(column.id));
+        if (constants.some((constant) => constant === undefined)) continue;
         visit({
           tableId: target.tableId,
           address: target.address,
           columns: target.columns,
-          tuples: [literals as LiteralExpression[]],
+          tuples: [constants as KeyConstant[]],
         });
       }
     }
@@ -274,13 +363,13 @@ function visitKeySites(
 /** The forward a site's tuple names, if it names a retired key. */
 function siteForward(
   lookup: KeyForwardLookup,
-  site: KeySite,
-  tuple: readonly LiteralExpression[],
+  site: Pick<KeySite, "tableId" | "address" | "columns">,
+  tuple: readonly KeyConstant[],
 ): KeyForward | undefined {
   const values: Array<Exclude<BatchValue, null>> = [];
-  for (const [position, literal] of tuple.entries()) {
+  for (const [position, constant] of tuple.entries()) {
     const column = site.columns[position];
-    const value = column === undefined ? undefined : storedKeyLiteral(column, literal);
+    const value = column === undefined ? undefined : storedKeyLiteral(column, constant.literal);
     if (value === undefined) return undefined;
     values.push(value);
   }
@@ -306,8 +395,9 @@ export function planHasKeyLiterals(
 }
 
 /**
- * The plan with every key literal naming a retired key replaced by the current key. A plan with
- * nothing to follow is returned as is, so the shared compiled plan is only cloned when needed.
+ * The plan with every key constant naming a retired key replaced by the current key. A plan
+ * with nothing to follow is returned as is, so the shared compiled plan is only cloned when
+ * needed.
  */
 export function forwardPlanKeyLiterals(
   plan: CompiledQuery,
@@ -334,8 +424,8 @@ export function forwardPlanKeyLiterals(
           : keyLiteralValue(column, forward.toValues[position] ?? null);
       });
       if (replacements.some((value) => value === undefined)) continue;
-      for (const [position, literal] of tuple.entries()) {
-        literal.value = replacements[position] as LiteralExpression["value"];
+      for (const [position, constant] of tuple.entries()) {
+        setKeyConstant(constant, replacements[position] as LiteralExpression["value"]);
       }
     }
   });
@@ -362,15 +452,14 @@ export function forwardKeyEqualities<
       (forwarded ?? equalities).findIndex((equality) => equality.column === column.name),
     );
     if (positions.some((position) => position === -1)) continue;
-    const literals = positions.map((position): LiteralExpression => ({
-      kind: "literal",
-      value: (forwarded ?? equalities)[position]?.value as LiteralExpression["value"],
-    }));
-    const forward = siteForward(
-      lookup,
-      { tableId: target.tableId, address: target.address, columns: target.columns, tuples: [] },
-      literals,
-    );
+    const constants = positions.map((position): KeyConstant => {
+      const literal: LiteralExpression = {
+        kind: "literal",
+        value: (forwarded ?? equalities)[position]?.value as LiteralExpression["value"],
+      };
+      return { node: literal, literal };
+    });
+    const forward = siteForward(lookup, target, constants);
     if (forward === undefined) continue;
     const replacements = target.columns.map((column, index) =>
       keyLiteralValue(column, forward.toValues[index] ?? null),

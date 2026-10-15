@@ -69,14 +69,6 @@ export type LiveSnapshot<TRow> =
       readonly version: number | null;
     };
 
-/** The key changes a delivery carried, as a snapshot spreads them. */
-function keyChangesOf(invalidation: { readonly keyChanges?: readonly KeyChange[] }): {
-  keyChanges?: readonly KeyChange[];
-} {
-  const changes = invalidation.keyChanges;
-  return changes === undefined || changes.length === 0 ? {} : { keyChanges: changes };
-}
-
 /**
  * The next snapshot's rows, or `undefined` when nothing changed. A row that is structurally
  * equal to the row at the same position keeps the previous object, so a renderer that keys on
@@ -130,6 +122,8 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   #subscription: Promise<LiveQuerySubscriptionLike> | undefined;
   #observationGeneration = 0;
   #queued: QueuedWork | undefined;
+  /** Key changes from deliveries not yet carried by a snapshot; see `#collectKeyChanges`. */
+  readonly #pendingKeyChanges: KeyChange[] = [];
   /** The engine's last delivered result, so a decode failure can be retried without a commit. */
   #lastDelivered: Extract<QueuedWork, { result: QueryResult }> | undefined;
   /** Deliveries received, and the one whose rows the snapshot currently holds (0 for none). */
@@ -231,6 +225,7 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
         onChange: (result, delivery) => {
           if (generation !== this.#observationGeneration || this.#closed) return;
           this.#deliveriesReceived += 1;
+          this.#collectKeyChanges(delivery.keyChanges);
           this.#schedule({ result, delivery, sequence: this.#deliveriesReceived });
         },
         onError: (error) => {
@@ -257,6 +252,7 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
       suppressUnchanged: true,
       onInvalidate: (invalidation) => {
         if (generation !== this.#observationGeneration || this.#closed) return;
+        this.#collectKeyChanges(invalidation.keyChanges);
         this.#schedule(invalidation);
       },
       onError: (error) => {
@@ -284,6 +280,19 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     if (subscription !== undefined) {
       void subscription.then((handle) => handle.close()).catch(() => undefined);
     }
+  }
+
+  /**
+   * Key changes wait here until a snapshot carries them: deliveries that coalesce into one
+   * snapshot hand it all of theirs, not only the last one's.
+   */
+  #collectKeyChanges(changes: readonly KeyChange[] | undefined): void {
+    if (changes !== undefined) this.#pendingKeyChanges.push(...changes);
+  }
+
+  #takeKeyChanges(): { keyChanges?: readonly KeyChange[] } {
+    if (this.#pendingKeyChanges.length === 0) return {};
+    return { keyChanges: this.#pendingKeyChanges.splice(0) };
   }
 
   #schedule(work: QueuedWork): void {
@@ -341,14 +350,14 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
             status: "ready",
             rows: this.#snapshot.status === "loading" ? Object.freeze([...previous]) : previous,
             version: invalidation.manifestVersion,
-            ...keyChangesOf(invalidation),
+            ...this.#takeKeyChanges(),
           };
         } else {
           this.#snapshot = {
             status: "ready",
             rows,
             version: invalidation.manifestVersion,
-            ...keyChangesOf(invalidation),
+            ...this.#takeKeyChanges(),
           };
         }
         this.#emit();

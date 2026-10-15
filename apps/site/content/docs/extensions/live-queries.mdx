@@ -97,11 +97,20 @@ linear in the current row count: the previous snapshot's key index is retained, 
 is indexed once. A row whose values did not change keeps its previous object in `rows`, and the
 `update` record for a changed row carries both objects.
 
-A row whose primary key was changed comes through as one `rekey` change —
-`{ type: "rekey", from, key, row, previous, previousIndex, index }` — instead of a `delete` of the
-old key and an `insert` of the new one, so a list can keep the row's component and its selection.
-This works when the result key is the table's primary key; see
-[Offline sync and rekeying](/docs/engine/rekeying).
+Name the table whose primary key the result key is, and a row that table rekeyed comes through
+as one `rekey` change — `{ type: "rekey", from, key, row, previous, previousIndex, index }` —
+instead of a `delete` of the old key and an `insert` of the new one, so a list can keep the row's
+component and its selection:
+
+```ts
+live.changes(db.selectFrom("orders").select(["order_id", "status"]), {
+  key: "order_id",
+  table: "orders",
+});
+```
+
+Without `table`, a rekey shows as the delete and insert it looks like: a key value alone cannot say
+which table's rekey it was. See [Offline sync and rekeying](/docs/engine/rekeying).
 
 ## Ordered, bounded windows
 
@@ -141,14 +150,25 @@ incorrectly.
 A sweep hands out its results together. Every subscription a commit changed gets its new result
 in the same synchronous turn, after the last affected query has run, and a worker sends them to
 its client as one message. A component that reads several queries therefore renders once per
-commit, never a state where some queries show the commit and others do not. The cost is that a
-quick query waits for the slowest query the same commit changed. The low-level
-`liveQueries({ onSweepDelivered })` option is called right after a sweep's last delivery.
+commit, never a state where some show the commit and others do not. This covers low-level
+subscriptions and typed queries whose adapter decodes the engine's result — the Kysely wrapper
+given its `db`. A typed query that re-executes itself instead updates when its own execution
+finishes.
+
+The cost is that a quick query waits for the slowest query the same commit changed. Measured on
+the memory store, a small maintained query that re-renders in about 2 ms waits about 20 ms beside
+a window-function query over 20,000 rows, and about 100 ms beside one over 100,000. Keep queries
+that must stay quick in a live set of their own: each set sweeps and delivers independently.
+
+A subscriber whose callback throws hears it through its own `onError`; the rest of the sweep is
+still delivered. If a sweep fails partway, what it already settled is delivered before the rest
+retries. The low-level `liveQueries({ onSweepDelivered })` option is called right after a sweep's
+last delivery.
 
 Deliveries that follow a rekey carry `keyChanges`, the rows the commits moved:
 `[{ table, from, to }]`, with a composite key given as an array. Typed snapshots carry the same
-list. It is read from the stored key forwards, so a tab that missed every cross-tab notification
-still reports it on its next sweep.
+list, gathered across every delivery the snapshot stands for. It is read from the stored key
+forwards, so a tab that missed every cross-tab notification still reports it on its next sweep.
 
 A typed query asks the engine to compare before anything reaches it. On a relevant commit the
 engine brings the statement's result up to date where the data is, compares it with the rows it

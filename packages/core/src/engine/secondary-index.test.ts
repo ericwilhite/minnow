@@ -1903,3 +1903,44 @@ describe("NULL-aware composite index terms", () => {
     }
   });
 });
+
+describe("index probes with many values", () => {
+  for (const implementation of implementations()) {
+    it(`${implementation.name} serves IN lists and rekeys longer than one postings read`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 64 });
+      try {
+        await database.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)");
+        await database.execute(
+          "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER REFERENCES p(id))",
+        );
+        await database.execute("CREATE INDEX c_p ON c(p_id)");
+        await database.insertBatch(
+          "p",
+          Array.from({ length: 100 }, (_, id) => ({ id })),
+        );
+        // Several commits, so pruning has more than one segment to choose among.
+        for (let batch = 0; batch < 4; batch += 1) {
+          await database.insertBatch(
+            "c",
+            Array.from({ length: 500 }, (_, index) => {
+              const id = batch * 500 + index;
+              return { id, p_id: id % 100 };
+            }),
+          );
+        }
+        const forty = Array.from({ length: 40 }, (_, id) => id).join(", ");
+        expect(
+          (await database.query(`SELECT count(*) AS n FROM c WHERE p_id IN (${forty})`)).rows,
+        ).toEqual([{ n: 800 }]);
+        await database.execute("UPDATE p SET id = id + 1000 WHERE id < 40");
+        expect(
+          (await database.query("SELECT count(*) AS n FROM c WHERE p_id >= 1000")).rows,
+        ).toEqual([{ n: 800 }]);
+      } finally {
+        await database.close();
+        store.close();
+      }
+    });
+  }
+});

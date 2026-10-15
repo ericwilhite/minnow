@@ -7,6 +7,8 @@ import { describe, expect, it } from "vitest";
 import { MemoryBlockStore, type BlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { MissingKeyError, UniqueConstraintError } from "./errors.js";
+import { keyForwardTestHooks } from "./key-forwards.js";
+import { pointReadTestHooks } from "./point-read.js";
 import { KeyedLiveQuery } from "./keyed-live.js";
 import type { QueryResult } from "./query.js";
 import { column, schema, table } from "./schema.js";
@@ -546,13 +548,21 @@ describe("rekeying with the rest of the engine", () => {
     ).toEqual([{ id: "b1ffcd00-0d1c-4f09-8c7e-7cc0ce491b22" }]);
 
     await database.execute("CREATE TABLE shifts (starts TIMESTAMPTZ PRIMARY KEY, crew TEXT)");
-    await database.execute("INSERT INTO shifts VALUES ('2026-10-15T08:00:00.000Z', 'a')");
+    await database.execute("INSERT INTO shifts VALUES ('2026-10-15 08:00:00+00', 'a')");
     await database.execute(
-      "UPDATE shifts SET starts = '2026-10-15T09:00:00.000Z' WHERE starts = '2026-10-15T08:00:00.000Z'",
+      "UPDATE shifts SET starts = '2026-10-15 09:00:00+00' WHERE starts = '2026-10-15 08:00:00+00'",
     );
     expect(
-      await rows(database, "SELECT crew FROM shifts WHERE starts = '2026-10-15T08:00:00.000Z'"),
+      await rows(database, "SELECT crew FROM shifts WHERE starts = '2026-10-15 08:00:00+00'"),
     ).toEqual([{ crew: "a" }]);
+    // The same instant spelled with another offset names the same retired key.
+    expect(
+      await rows(database, "SELECT crew FROM shifts WHERE starts = '2026-10-15 10:00:00+02'"),
+    ).toEqual([{ crew: "a" }]);
+    // Text that is no timestamp at all is a type error naming the column, not a key error.
+    await expect(database.execute("INSERT INTO shifts VALUES ('not a time', 'b')")).rejects.toThrow(
+      "starts[0] must be datetime",
+    );
   });
 });
 
@@ -680,10 +690,14 @@ describe("following a rekey", () => {
     });
     await database.execute("UPDATE orders SET id = '48214' WHERE id = '48213'");
     await quiet.refresh();
-    expect(notices.at(-1)).toEqual([
-      { table: "orders", from: "o:7f3a", to: "48214" },
-      { table: "orders", from: "48213", to: "48214" },
-    ]);
+    // One notice per moved key; their order is not part of the contract.
+    expect(notices.at(-1)).toHaveLength(2);
+    expect(notices.at(-1)).toEqual(
+      expect.arrayContaining([
+        { table: "orders", from: "o:7f3a", to: "48214" },
+        { table: "orders", from: "48213", to: "48214" },
+      ]),
+    );
     quiet.close();
   });
 
@@ -697,7 +711,7 @@ describe("following a rekey", () => {
         (await database.query(sql)).rows as unknown as Array<{ id: string; customer: string }>,
       decode: (result) => result.rows as unknown as Array<{ id: string; customer: string }>,
     });
-    const keyed = new KeyedLiveQuery(query, { key: "id" });
+    const keyed = new KeyedLiveQuery(query, { key: "id", table: "orders" });
     const unsubscribe = keyed.subscribe(() => undefined);
     await keyed.refresh();
     await database.execute("UPDATE orders SET id = '48213' WHERE id = 'o:7f3a'");
@@ -764,5 +778,370 @@ describe("live queries over a key that a rekey redirects", () => {
     expect(counts).toEqual([0, 1]);
     expect(ids).toEqual([[], [1]]);
     live.close();
+  });
+});
+
+describe("retired keys in every SQL shape (read-path audit)", () => {
+  async function negative(): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, note TEXT)");
+    await database.execute(
+      "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER REFERENCES orders(id))",
+    );
+    await database.execute("INSERT INTO orders VALUES (-1, 'offline'), (5, 'five')");
+    await database.execute("INSERT INTO items VALUES (1, -1), (2, -1), (3, 5)");
+    await database.execute("UPDATE orders SET id = 900 WHERE id = -1");
+    return database;
+  }
+
+  it("follows a negative key in ON, derived tables, CTEs, and negated parameters", async () => {
+    const database = await negative();
+    for (const sql of [
+      "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id AND o.id = -1",
+      "SELECT count(*) AS n FROM orders o JOIN items i ON o.id = i.order_id AND i.order_id IN (-1)",
+      "SELECT count(*) AS n FROM (SELECT * FROM items WHERE order_id = -1) d",
+      "WITH x AS (SELECT * FROM items WHERE order_id = -1) SELECT count(*) AS n FROM x",
+    ]) {
+      expect(await rows(database, sql), sql).toEqual([{ n: 2 }]);
+    }
+    expect(
+      await rows(database, "SELECT count(*) AS n FROM items WHERE order_id = -$1", [1]),
+    ).toEqual([{ n: 2 }]);
+    expect(
+      await rows(database, "SELECT coalesce((SELECT note FROM orders WHERE id = -1), 'none') AS n"),
+    ).toEqual([{ n: "offline" }]);
+  });
+
+  it("pins a composite key per source, not per table", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE r (shop INTEGER, receipt INTEGER, t INTEGER, PRIMARY KEY (shop, receipt))",
+    );
+    await database.execute("INSERT INTO r VALUES (1, -1, 10), (2, -1, 20), (2, 7, 99)");
+    await database.execute("UPDATE r SET receipt = 5 WHERE shop = 1 AND receipt = -1");
+    expect(
+      await rows(
+        database,
+        "SELECT a.t AS at, b.t AS bt FROM r a, r b WHERE a.shop = 1 AND b.receipt = -1",
+      ),
+    ).toEqual([{ at: 10, bt: 20 }]);
+    expect(
+      await rows(
+        database,
+        "SELECT a.t AS at FROM r a, r b WHERE a.shop = 1 AND a.receipt = -1 AND b.shop = 2 AND b.receipt = 7",
+      ),
+    ).toEqual([{ at: 10 }]);
+  });
+
+  it("follows a key through a view, and a cached or live answer over the view moves too", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE tickets (id TEXT PRIMARY KEY, note TEXT)");
+    await database.execute(
+      "CREATE TABLE revisions (id INTEGER PRIMARY KEY, ticket_id TEXT REFERENCES tickets(id) NOT ENFORCED)",
+    );
+    await database.execute("INSERT INTO tickets VALUES ('o:1', 'n')");
+    await database.execute("INSERT INTO revisions VALUES (1, '77')");
+    await database.execute("CREATE VIEW open_tickets AS SELECT id, note FROM tickets");
+    await database.execute(
+      "CREATE VIEW counted AS SELECT count(*) AS n FROM revisions WHERE ticket_id = 'o:1'",
+    );
+    const live = database.liveQueries();
+    const counts: unknown[] = [];
+    await live.subscribe("SELECT n FROM counted", {
+      onChange: (result) => counts.push(result.rows[0]?.n),
+    });
+    expect(await rows(database, "SELECT n FROM counted")).toEqual([{ n: 0 }]);
+    await database.execute("UPDATE tickets SET id = '77' WHERE id = 'o:1'");
+    await live.refresh();
+    expect(await rows(database, "SELECT n FROM counted")).toEqual([{ n: 1 }]);
+    expect(counts).toEqual([0, 1]);
+    expect(await rows(database, "SELECT id FROM open_tickets WHERE id = 'o:1'")).toEqual([
+      { id: "77" },
+    ]);
+    expect(
+      await rows(database, "SELECT v.note FROM open_tickets v WHERE v.id = ?", ["o:1"]),
+    ).toEqual([{ note: "n" }]);
+    live.close();
+  });
+
+  it("stops following an expired key even for a cached answer", async () => {
+    const time = clock();
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      now: time.now,
+      keyForwardRetentionMs: 10 * DAY,
+    });
+    await database.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)");
+    await database.execute(
+      "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER REFERENCES orders(id))",
+    );
+    await database.execute("INSERT INTO orders VALUES (-1)");
+    await database.execute("INSERT INTO items VALUES (1, -1)");
+    await database.execute("UPDATE orders SET id = 900 WHERE id = -1");
+    const sql = "SELECT count(*) AS n FROM items WHERE order_id = -1";
+    expect(await rows(database, sql)).toEqual([{ n: 1 }]);
+    time.advance(11 * DAY);
+    expect(await rows(database, sql)).toEqual([{ n: 0 }]);
+  });
+});
+
+describe("rekeying under savepoints, constraints, retention, and maintenance (write-path audit)", () => {
+  it("rolls a savepoint back with the forwards the rekey staged", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE orders (id TEXT PRIMARY KEY, customer TEXT)");
+    await database.execute(
+      "CREATE TABLE notes (id TEXT PRIMARY KEY, order_id TEXT REFERENCES orders(id) NOT ENFORCED)",
+    );
+    await database.execute("INSERT INTO orders VALUES ('a', 'ada'), ('b', 'bo')");
+    await database.execute("BEGIN");
+    await database.execute("SAVEPOINT s");
+    await database.execute("UPDATE orders SET id = 'x' WHERE id = 'a'");
+    await database.execute("ROLLBACK TO s");
+    expect(await rows(database, "SELECT id, customer FROM orders WHERE id = 'a'")).toEqual([
+      { id: "a", customer: "ada" },
+    ]);
+    await database.execute("INSERT INTO notes VALUES ('n1', 'a')");
+    await database.execute("UPDATE orders SET id = 'y' WHERE id = 'a'");
+    await database.execute("COMMIT");
+    expect(await rows(database, "SELECT id FROM orders ORDER BY id")).toEqual([
+      { id: "b" },
+      { id: "y" },
+    ]);
+    expect(await rows(database, "SELECT order_id FROM notes")).toEqual([{ order_id: "y" }]);
+  });
+
+  it("forwards a key before generated columns and CHECK constraints read it", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, who TEXT)");
+    await database.execute(
+      "CREATE TABLE l (id INTEGER PRIMARY KEY, o_id INTEGER REFERENCES o(id), label TEXT GENERATED ALWAYS AS ('line of ' || o_id) STORED)",
+    );
+    await database.execute(
+      "CREATE TABLE neg (id INTEGER PRIMARY KEY, o_id INTEGER REFERENCES o(id) NOT ENFORCED, CHECK (o_id < 0))",
+    );
+    await database.execute("INSERT INTO o (id, who) VALUES (-1, 'ada')");
+    await database.execute("UPDATE o SET id = 900 WHERE id = -1");
+    await database.execute("INSERT INTO l (id, o_id) VALUES (1, -1)");
+    await database.insert("l", { id: 2, o_id: -1 });
+    expect(await rows(database, "SELECT id, o_id, label FROM l ORDER BY id")).toEqual([
+      { id: 1, o_id: 900, label: "line of 900" },
+      { id: 2, o_id: 900, label: "line of 900" },
+    ]);
+    await expect(database.execute("INSERT INTO neg VALUES (1, -1)")).rejects.toThrow("CHECK");
+  });
+
+  it("keeps an expired forward expired whatever retention a later connection uses", async () => {
+    const time = clock();
+    const store = new MemoryBlockStore();
+    const first = new MinnowDatabase(store, { now: time.now, keyForwardRetentionMs: DAY });
+    await first.execute("CREATE TABLE o (id TEXT PRIMARY KEY, who TEXT)");
+    await first.execute("INSERT INTO o VALUES ('a', 'old')");
+    await first.execute("UPDATE o SET id = 'x' WHERE id = 'a'");
+    time.advance(2 * DAY);
+    await first.execute("INSERT INTO o VALUES ('a', 'new')");
+    const second = new MinnowDatabase(store, { now: time.now, keyForwardRetentionMs: 10 * DAY });
+    expect(await rows(second, "SELECT id, who FROM o WHERE id = 'a'")).toEqual([
+      { id: "a", who: "new" },
+    ]);
+    await second.execute("UPDATE o SET who = 'touched' WHERE id = 'a'");
+    expect(await rows(second, "SELECT id, who FROM o ORDER BY id")).toEqual([
+      { id: "a", who: "touched" },
+      { id: "x", who: "old" },
+    ]);
+  });
+
+  it("never trims a forward written again after the trim looked", async () => {
+    const time = clock();
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { now: time.now, keyForwardRetentionMs: DAY });
+    const other = new MinnowDatabase(store, { now: time.now, keyForwardRetentionMs: DAY });
+    await database.execute("CREATE TABLE o (id TEXT PRIMARY KEY)");
+    await database.execute("INSERT INTO o VALUES ('a')");
+    await database.execute("UPDATE o SET id = 'x' WHERE id = 'a'");
+    time.advance(2 * DAY);
+    await database.execute("INSERT INTO o VALUES ('a')");
+    let collecting: Promise<unknown> | undefined;
+    await database.write(async (session) => {
+      await session.execute("UPDATE o SET id = 'z' WHERE id = 'a'");
+      collecting = other.collectGarbage();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    await collecting;
+    expect(await rows(database, "SELECT id FROM o WHERE id = 'a'")).toEqual([{ id: "z" }]);
+    expect(await database.resolveKey("o", "a")).toBe("z");
+  });
+
+  it("follows a child whose key contains its composite reference, through literals", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE receipt (shop INTEGER, receipt INTEGER, PRIMARY KEY (shop, receipt))",
+    );
+    await database.execute(
+      "CREATE TABLE line (shop INTEGER, receipt INTEGER, n INTEGER, qty INTEGER, PRIMARY KEY (shop, receipt, n), FOREIGN KEY (shop, receipt) REFERENCES receipt (shop, receipt))",
+    );
+    await database.execute("INSERT INTO receipt VALUES (1, -1)");
+    await database.execute("INSERT INTO line VALUES (1, -1, 2, 5)");
+    await database.execute("UPDATE receipt SET receipt = 7 WHERE shop = 1 AND receipt = -1");
+    expect(
+      await rows(
+        database,
+        "SELECT receipt, qty FROM line WHERE shop = 1 AND receipt = -1 AND n = 2",
+      ),
+    ).toEqual([{ receipt: 7, qty: 5 }]);
+    expect(await rows(database, "SELECT n FROM line WHERE shop = 1 AND receipt = -1")).toEqual([
+      { n: 2 },
+    ]);
+  });
+});
+
+describe("statements that stage nothing (level-zero ceilings)", () => {
+  it("commits an update that names a retired key and sets the key the row already has", async () => {
+    const database = await orders();
+    await database.execute("UPDATE orders SET id = '48213' WHERE id = 'o:7f3a'");
+    const result = await database.execute("UPDATE orders SET id = '48213' WHERE id = 'o:7f3a'");
+    expect(result).toMatchObject({ kind: "update", rowCount: 1 });
+    expect(await rows(database, "SELECT id FROM orders ORDER BY id")).toEqual([
+      { id: "41" },
+      { id: "48213" },
+    ]);
+  });
+
+  it("commits a scope whose statements changed nothing or rolled back to a savepoint", async () => {
+    const database = await orders();
+    await database.execute("UPDATE orders SET id = '48213' WHERE id = 'o:7f3a'");
+    await database.write(async (session) => {
+      await session.execute("UPDATE orders SET id = '48213' WHERE id = 'o:7f3a'");
+      await session.execute("UPDATE orders SET id = 'z' WHERE id = 'missing'");
+      await session.execute("DELETE FROM orders WHERE id = 'missing'");
+    });
+    await database.execute("BEGIN");
+    await database.execute("SAVEPOINT s");
+    await expect(
+      database.execute("UPDATE orders SET id = '41' WHERE id = '48213'"),
+    ).rejects.toThrow();
+    await database.execute("ROLLBACK TO s");
+    await database.execute("UPDATE orders SET id = '48213' WHERE id = 'o:7f3a'");
+    await database.execute("COMMIT");
+    expect(await rows(database, "SELECT id FROM orders ORDER BY id")).toEqual([
+      { id: "41" },
+      { id: "48213" },
+    ]);
+  });
+});
+
+describe("point reads beside forwards (performance audit)", () => {
+  it("keeps a foreign-key point read on its fast path unless its parent has forwards", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    await database.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)");
+    await database.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY)");
+    await database.execute(
+      "CREATE TABLE lines (order_id INTEGER REFERENCES orders(id), n INTEGER, sku TEXT, PRIMARY KEY (order_id, n))",
+    );
+    await database.execute("INSERT INTO orders VALUES (-1), (7)");
+    await database.execute("INSERT INTO tags VALUES (1)");
+    await database.execute("INSERT INTO lines VALUES (-1, 1, 'pen'), (7, 1, 'ink')");
+    const served = async (sql: string): Promise<{ rows: unknown[]; fast: boolean }> => {
+      const before = pointReadTestHooks.served;
+      const result = await rows(database, sql);
+      return { rows: result, fast: pointReadTestHooks.served > before };
+    };
+    // A rekey of an unrelated table leaves the lines read on the fast path.
+    await database.execute("UPDATE tags SET id = 2 WHERE id = 1");
+    expect(await served("SELECT sku FROM lines WHERE order_id = 7 AND n = 1")).toEqual({
+      rows: [{ sku: "ink" }],
+      fast: true,
+    });
+    // Once the parent has forwards, a retired parent key still finds the moved lines.
+    await database.execute("UPDATE orders SET id = 900 WHERE id = -1");
+    expect(await served("SELECT sku FROM lines WHERE order_id = -1 AND n = 1")).toEqual({
+      rows: [{ sku: "pen" }],
+      fast: false,
+    });
+  });
+});
+
+describe("the forwards mirror another connection keeps (performance audit)", () => {
+  it("layers each commit's forwards and agrees with a whole read throughout", async () => {
+    const time = clock();
+    const store = new MemoryBlockStore();
+    // Maintenance runs only when the test asks, so the clock jumps below never land in the
+    // middle of a background job; compaction is then exercised on purpose.
+    const options = {
+      compression: "raw" as const,
+      now: time.now,
+      keyForwardRetentionMs: 5 * DAY,
+      autoCompact: false,
+      autoCollect: false,
+    };
+    const writer = new MinnowDatabase(store, options);
+    const reader = new MinnowDatabase(store, options);
+    await writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)");
+    await writer.insertBatch(
+      "t",
+      Array.from({ length: 200 }, (_, id) => ({ id, label: `row ${String(id)}` })),
+    );
+    let seed = 0x5eed;
+    const random = (limit: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return seed % limit;
+    };
+    const current = Array.from({ length: 200 }, (_, id) => id);
+    const retired: number[] = [];
+    let next = 1000;
+    let readerWholeReads = 0;
+    let compactions = 0;
+    for (let step = 0; step < 120; step += 1) {
+      // Every tenth step folds the forwards table, which leaves the next window unprovable.
+      const action = step % 10 === 9 ? 19 : random(19);
+      if (action < 14) {
+        const slot = random(current.length);
+        const from = current[slot] ?? 0;
+        const to = next++;
+        await writer.execute(`UPDATE t SET id = ${String(to)} WHERE id = ${String(from)}`);
+        current[slot] = to;
+        retired.push(from);
+      } else if (action < 17) {
+        time.advance((1 + random(3)) * DAY);
+        await writer.collectGarbage();
+      } else if (action < 19) {
+        // A batch of rekeys in one statement: one window, many forwards.
+        await writer.execute(
+          `UPDATE t SET id = id + 100000 WHERE id < ${String(next)} AND id % 7 = ${String(random(7))}`,
+        );
+        current.splice(
+          0,
+          current.length,
+          ...(await rows(writer, "SELECT id FROM t ORDER BY id")).map((row) => row.id as number),
+        );
+        next += 100000;
+      } else {
+        if ((await writer.compactTable("\u0000minnow_key_forwards")).compacted) compactions += 1;
+      }
+      const probes = [...retired.slice(-12), ...current.slice(0, 4)];
+      const before = keyForwardTestHooks.wholeReads;
+      const incremental = await Promise.all(probes.map((key) => reader.resolveKey("t", key)));
+      const viaSql = await Promise.all(
+        probes.map(
+          async (key) =>
+            (await rows(reader, `SELECT id FROM t WHERE id = ${String(key)}`))[0]?.id ?? null,
+        ),
+      );
+      readerWholeReads += keyForwardTestHooks.wholeReads - before;
+      const fresh = new MinnowDatabase(store, options);
+      const whole = await Promise.all(probes.map((key) => fresh.resolveKey("t", key)));
+      const wholeSql = await Promise.all(
+        probes.map(
+          async (key) =>
+            (await rows(fresh, `SELECT id FROM t WHERE id = ${String(key)}`))[0]?.id ?? null,
+        ),
+      );
+      await fresh.close();
+      expect(incremental).toEqual(whole);
+      expect(viaSql).toEqual(wholeSql);
+    }
+    // The reader read the table whole once, plus once per window compaction folded away.
+    expect(compactions).toBeGreaterThan(0);
+    expect(readerWholeReads).toBeLessThanOrEqual(1 + compactions);
+    await reader.close();
+    await writer.close();
   });
 });

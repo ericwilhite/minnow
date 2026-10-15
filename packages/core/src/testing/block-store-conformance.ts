@@ -21,6 +21,7 @@ import {
   type SegmentRecord,
   type TableRecord,
   type TransactionRecord,
+  KEY_FORWARDS_RECORD_ID,
 } from "../storage/types.js";
 
 /**
@@ -223,7 +224,7 @@ function table(name: string, keyed = false): TableRecord {
  */
 function keyForwardsTable(): TableRecord {
   return {
-    id: "table-key-forwards",
+    id: KEY_FORWARDS_RECORD_ID,
     name: "\u0000minnow_key_forwards",
     columns: [
       { id: "col-retired", name: "retired", type: "string", nullable: false },
@@ -2333,6 +2334,24 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       async run(target) {
         let store = await target.create();
         await store.addTable(table("t", true));
+        // The marker belongs to one table only, and is exactly `true`: anything else is a damaged
+        // record that would hide the real forwards table from the engine.
+        for (const [label, record] of [
+          ["a key-forwards marker on another table", { ...table("v"), keyForwards: true }],
+          ["a key-forwards marker that is not true", { ...keyForwardsTable(), keyForwards: 1 }],
+          [
+            "a key-forwards marker on a view",
+            { ...keyForwardsTable(), view: { sql: "SELECT 1", managed: false } },
+          ],
+        ] as const) {
+          let refused = false;
+          try {
+            await store.addTable(record as unknown as TableRecord);
+          } catch {
+            refused = true;
+          }
+          check(refused, `${label} must be refused`);
+        }
         /** Begins a transaction and stages one segment, so its commit checks its guard. */
         const prepare = async (id: string) => {
           const { snapshotVersion: _pinned, ...record } = transaction(id, null);
@@ -2400,7 +2419,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         if (target.reopen !== undefined) {
           store = await target.reopen(store);
           checkEqual(
-            (await store.getTable("table-key-forwards"))?.keyForwards,
+            (await store.getTable(KEY_FORWARDS_RECORD_ID))?.keyForwards,
             true,
             "the key-forwards marker must survive a reopen",
           );
