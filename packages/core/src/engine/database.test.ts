@@ -1303,7 +1303,7 @@ for (const implementation of implementations()) {
       ).rejects.toThrow("receipts.(shop, receipt)");
       await expect(
         restored.execute("UPDATE receipts SET receipt = 3 WHERE shop = 1"),
-      ).rejects.toThrow("Primary key column cannot be updated");
+      ).rejects.toThrow("receipts.(shop, receipt)");
       const physical = await restoredStore.getTableByName("receipts");
       expect(physical?.columns.filter(({ hidden }) => hidden === true)).toHaveLength(1);
       expect(physical?.primaryKeyColumnIds).toHaveLength(2);
@@ -3735,9 +3735,9 @@ for (const implementation of implementations()) {
       await expect(
         database.updateBatch("accounts", {
           keys: ["ada@example.com"],
-          changes: { email: ["changed@example.com"] },
+          changes: { email: [null] },
         }),
-      ).rejects.toThrow("Unique key cannot be updated");
+      ).rejects.toThrow(/null/i);
       await expect(
         database.updateBatch("accounts", {
           keys: ["ada@example.com", "ada@example.com"],

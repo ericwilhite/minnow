@@ -89,6 +89,7 @@ export type WireDatabaseOptions = Pick<
   | "spillOwnerLeaseMs"
   | "transactionOwnerLeaseMs"
   | "transactionIdleTimeoutMs"
+  | "keyForwardRetentionMs"
   | "bufferPoolBytes"
   | "executionMemoryBudgetBytes"
   | "autoCollectDebtLimitCommits"
@@ -139,6 +140,7 @@ const directRootMethods = [
   "buildFtsIndex",
   "introspect",
   "listTables",
+  "resolveKey",
   "insertBatch",
   "insert",
   "upsertBatch",
@@ -445,8 +447,20 @@ type Handle =
     }
   | { type: "writer"; writer: BufferedTableWriter }
   | { type: "query-cursor"; iterator: AsyncIterator<import("./query.js").QueryResult, undefined> }
-  | { type: "live-set"; set: LiveQuerySet; subscriptionIds: Set<string> }
+  | {
+      type: "live-set";
+      set: LiveQuerySet;
+      subscriptionIds: Set<string>;
+      /** One sweep's deliveries, held until the sweep ends so they cross as one frame. */
+      pending: LiveSweepEvents;
+    }
   | { type: "live-subscription"; subscription: LiveQuerySubscription; setId: string };
+
+/** A sweep's events for one live set, waiting to cross the channel together. */
+interface LiveSweepEvents {
+  events: Array<{ handleId: string; event: string; payload: unknown }>;
+  transfer: ArrayBuffer[];
+}
 
 /** Hard per-connection ceiling for resident worker resources abandoned by a client. */
 export const MAX_WORKER_HANDLES_PER_CONNECTION = 256;
@@ -768,15 +782,29 @@ class DatabaseRpcServer {
         };
         // The database owns channelName resolution (and closes the channel with the set).
         let set: LiveQuerySet | undefined;
+        const pending: LiveSweepEvents = { events: [], transfer: [] };
         try {
           // Results are encoded for the channel synchronously inside onChange, so the set's
-          // retained result serves as it is and no per-subscriber copy is made.
+          // retained result serves as it is and no per-subscriber copy is made. A sweep's
+          // deliveries collect in `pending` and cross as one frame when the sweep ends, so the
+          // client hands them out in one turn and a renderer updates once per commit.
           set = this.database.liveQueries({
             ...(channelName === undefined ? {} : { channelName }),
             ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
             sharedResults: true,
+            onSweepDelivered: () => {
+              if (pending.events.length === 0) return;
+              const events = pending.events.splice(0);
+              const transfer = pending.transfer.splice(0);
+              this.scope.postMessage(rpcEvent(handleId, "batch", { events }), { transfer });
+            },
           });
-          this.#publishHandle(handleId, { type: "live-set", set, subscriptionIds: new Set() });
+          this.#publishHandle(handleId, {
+            type: "live-set",
+            set,
+            subscriptionIds: new Set(),
+            pending,
+          });
         } catch (error) {
           set?.close();
           this.#releaseHandleId(handleId);
@@ -1179,13 +1207,20 @@ class DatabaseRpcServer {
               // transfers its own copy rather than detaching the set's.
               const retained = delivery.retained?.slice();
               if (retained !== undefined) encoded.transfer.push(retained.buffer);
-              this.scope.postMessage(
-                rpcEvent(subscriptionId, patch ? "patch" : "change", {
-                  result: encoded.payload,
-                  delivery: retained === undefined ? delivery : { ...delivery, retained },
-                }),
-                { transfer: encoded.transfer },
-              );
+              const payload = {
+                result: encoded.payload,
+                delivery: retained === undefined ? delivery : { ...delivery, retained },
+              };
+              const event = patch ? "patch" : "change";
+              if (delivery.initial) {
+                // The first result routes ahead of the subscribe call's own result frame.
+                this.scope.postMessage(rpcEvent(subscriptionId, event, payload), {
+                  transfer: encoded.transfer,
+                });
+                return;
+              }
+              handle.pending.events.push({ handleId: subscriptionId, event, payload });
+              handle.pending.transfer.push(...encoded.transfer);
             },
             onError: (error) => {
               this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));
@@ -1219,7 +1254,15 @@ class DatabaseRpcServer {
           subscription = await handle.set.observe(query, {
             ...(suppressUnchanged === true ? { suppressUnchanged: true } : {}),
             onInvalidate: (invalidation) => {
-              this.scope.postMessage(rpcEvent(subscriptionId, "invalidate", invalidation));
+              if (invalidation.initial) {
+                this.scope.postMessage(rpcEvent(subscriptionId, "invalidate", invalidation));
+                return;
+              }
+              handle.pending.events.push({
+                handleId: subscriptionId,
+                event: "invalidate",
+                payload: invalidation,
+              });
             },
             onError: (error) => {
               this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));

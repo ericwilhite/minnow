@@ -1,0 +1,213 @@
+---
+title: Offline sync and rekeying
+description: Changing a row's primary key when a record created offline gets its server key, and what the engine does so nothing holding the old key loses the row.
+---
+
+An app that works offline creates records before the server has seen them. The record needs a
+key right away, so the app makes up a temporary one. When the record syncs, the server answers with
+its own key, and the row has to move to it. Everything that held the old key — child rows, open
+forms, list selections, queued requests, other tabs — has to keep finding the row.
+
+Minnow handles this with one rule: **a row has one key, its primary key, and you can change it
+with an ordinary `UPDATE`.** The engine moves the row, moves every reference to it in the same
+commit, and remembers the old key so it keeps working for a while. There is no second id column to
+join on and no key map to keep.
+
+## A record made offline
+
+The examples use the [retail dataset](/#console). In it, `order_items.order_id` and
+`returns.order_id` are declared to reference `orders.order_id`. They are declared with
+`enforced: false`, which keeps the relationship without requiring the parent row to exist; see
+[declaring references](#declaring-references).
+
+A customer places an order while the device is offline. The app gives it a temporary key that can
+never be a real server key — here a negative number:
+
+```sql
+INSERT INTO orders (order_id, customer_id, store_id, channel, status, payment_method,
+  item_count, subtotal, discount, tax, shipping, total, placed_at)
+VALUES (-1, 1, 1, 'online', 'placed', 'card', 1, 20, 0, 1.6, 0, 21.6, now());
+
+INSERT INTO order_items (order_item_id, order_id, product_id, quantity, unit_price, discount, line_total)
+VALUES (-1, -1, 1, 1, 20, 0, 20);
+```
+
+## The sync
+
+The device comes back online, pushes the order, and the server answers that the order's real key
+is `900001`. The app rekeys the row:
+
+```sql
+UPDATE orders SET order_id = 900001 WHERE order_id = -1;
+```
+
+That is the whole sync step. The line item now says `order_id = 900001` too:
+
+```sql
+SELECT order_item_id, order_id FROM order_items WHERE order_item_id = -1;
+```
+
+The batch API and Kysely do the same thing: `db.update("orders", -1, { order_id: 900001 })`, or
+`db.updateTable("orders").set({ order_id: 900001 }).where("order_id", "=", -1)`.
+
+## What the engine does
+
+For that one `UPDATE`, in order:
+
+1. **Takes the writer turn.** The rekey is one write scope, like any other write. No other write,
+   in this tab or another, runs in the middle of it.
+2. **Finds the row and checks the new key.** The new key must not be taken by another row, must
+   not be null, and must not be a key that was itself retired by an earlier rekey (see below). If
+   any check fails, nothing is written.
+3. **Fires `BEFORE UPDATE` triggers**, with the old row as `OLD` and the moved row as `NEW`.
+4. **Moves the row.** Underneath, a row lives at its key, so the engine removes it from the old key
+   and writes it at the new one, with every other column unchanged. Indexes, `UNIQUE` columns,
+   full-text indexes, and stored generated columns follow, exactly as for a delete and an insert.
+5. **Moves every reference.** For each declared foreign key that points at the table — enforced or
+   not — the engine finds the rows holding the old key and updates them to the new key. If that
+   column is also part of the child's own primary key, the child is rekeyed the same way, and its
+   own references follow. A row that refers to its own table, or to itself, is handled too.
+6. **Records a forward** from the old key to the new one, in an internal table. If some older key
+   already forwarded to the old key, it now forwards straight to the new one, so following a key is
+   always one step.
+7. **Fires `AFTER UPDATE` triggers.** `INSERT` and `DELETE` triggers do not fire: to the
+   application this is one update.
+8. **Commits once.** The row, its references, and the forward publish together. A crash before the
+   commit leaves none of them; after it, all of them.
+9. **Other tabs catch up.** The commit reaches other tabs and workers the way every commit does.
+   Because the forward is stored data, a tab that missed the notification — a sleeping tab, a
+   dropped message — still sees it the next time it reads.
+10. **Live queries update together.** Every live query the commit changed gets its new result in the
+    same turn, with a `keyChanges` list naming the rekeyed row. See
+    [live queries](#live-queries-and-held-keys).
+
+## The old key keeps working
+
+For 10 days after the rekey (the `keyForwardRetentionMs` option), the old key is an alias of the
+row. Whenever a key value is compared by equality or written — a primary key or a foreign key, in
+SQL or through the batch API — the engine swaps a retired key for the current one first.
+
+```sql
+SELECT order_id, total FROM orders WHERE order_id = -1;
+UPDATE orders SET status = 'shipped' WHERE order_id = -1;
+SELECT count(*) FROM order_items WHERE order_id = -1;
+```
+
+The first query returns the order, with `order_id` 900001. The update changes order 900001, and
+the count finds its line item.
+
+| What happens after the rekey                               | Result                                            |
+| ---------------------------------------------------------- | ------------------------------------------------- |
+| `SELECT`, `UPDATE`, `DELETE` with `WHERE order_id = -1`    | Acts on row `900001`                              |
+| `update`, `delete`, `updateBatch`, `deleteBatch` with `-1` | Acts on row `900001`                              |
+| An upsert, or `INSERT … ON CONFLICT`, naming `-1`          | Updates row `900001`; never a second row          |
+| A plain `INSERT` of an order with key `-1`                 | Refused as a duplicate: the old key is still held |
+| A new line item written with `order_id = -1`               | Stored as `order_id = 900001`                     |
+| Rekeying any row onto `-1`                                 | Refused as a duplicate                            |
+| A row evicted and synced back as `900001`                  | `-1` still reaches it                             |
+
+Some things to know:
+
+- **Stored rows only hold current keys.** The swap happens when a value is written, so joins,
+  ranges, and `LIKE` work on the stored keys and never need the forwards. Only equality with a
+  constant or a parameter (`=`, `IN`, `= ANY`, `IS NOT DISTINCT FROM`) follows a retired key.
+- **A composite key** is followed when the query pins every one of its columns with `=`, as in
+  `WHERE shop = 1 AND receipt = -1`.
+- **The result shows the current key.** `WHERE order_id = -1` returns a row whose `order_id` is
+  `900001`. That is on purpose, like a redirect, and it is how a screen holding the old key learns
+  the new one.
+- **Tables that are never rekeyed** have no forwards and behave as plain SQL. Checking for a
+  forward costs one in-memory lookup, and nothing at all until the first rekey.
+- **A swap is allowed.** Rekeying two rows onto each other's keys in one statement moves both rows,
+  and neither key forwards, since both are still in use.
+
+### How long forwards last
+
+`keyForwardRetentionMs` sets how long an old key forwards; the default is 10 days. After that, the
+old key is unknown again: a read finds nothing, and the key may be used for a new row. Background
+maintenance deletes expired forwards; `collectGarbage()` deletes them too.
+
+A forward takes about 100 bytes, and only rows that were rekeyed have one. A database that is
+written to constantly but never rekeys keeps none.
+
+## Live queries and held keys
+
+**One commit, one update.** When a commit changes several live queries, they all get their new
+results in the same turn. A React component that reads a list and a detail form therefore never
+renders a moment where the list shows the new key and the form the old one. Across a worker, the
+results cross as one message.
+
+**`keyChanges`.** A delivery that follows a rekey carries the rows it moved:
+
+```ts
+live.subscribe("SELECT order_id, status FROM orders WHERE customer_id = 1", {
+  onChange(result, delivery) {
+    // [{ table: "orders", from: -1, to: 900001 }]
+    for (const change of delivery.keyChanges ?? []) rename(change.from, change.to);
+  },
+});
+```
+
+The list is read from the stored forwards, so it is complete even for a tab that missed the
+cross-tab notification. Typed live queries carry the same `keyChanges` on their `ready` snapshot.
+
+**Keyed diffs.** A keyed live query reports a rekeyed row as one change,
+`{ type: "rekey", from, key, row, previous, previousIndex, index }`, instead of a delete and an
+insert. A list renderer can keep the row's component, and its selection, under the new key.
+
+**Holding a key in a screen.** The simplest way to follow a record is to keep querying it by the
+key you have. A detail view running `SELECT * FROM orders WHERE order_id = ?` with `-1` keeps
+showing the order after the rekey, and the row's `order_id` column tells you the current key.
+
+**Keys held outside a query** — a URL, a cache, a queued request — resolve with `resolveKey`:
+
+```ts
+await db.resolveKey("orders", -1); // 900001
+await db.resolveKey("receipts", [1, -1]); // a composite key, in primary-key order
+```
+
+## Declaring references
+
+A rekey moves the references the catalog knows about, so declare them. A reference always follows
+a rekey; there is no option to turn that off.
+
+```ts
+// Checked: the parent row must exist.
+order_id: column.number().references("orders", "order_id"),
+
+// Unchecked: the parent may not be in this database.
+order_id: column.number().references("orders", "order_id", { enforced: false }),
+```
+
+|                               | Checked (default)         | Unchecked (`enforced: false`) |
+| ----------------------------- | ------------------------- | ----------------------------- |
+| A row whose parent is missing | Refused                   | Allowed                       |
+| The parent is deleted         | Its `onDelete` action     | Nothing happens to the rows   |
+| The parent is rekeyed         | The rows follow           | The rows follow               |
+| A value naming a retired key  | Stored as the current key | Stored as the current key     |
+
+Use unchecked references when the database holds only part of the parent table. An app that syncs
+orders for a date window may hold line items whose order is outside the window.
+
+In SQL the same choices are `REFERENCES orders (order_id)` and
+`REFERENCES orders (order_id) NOT ENFORCED`. `ON UPDATE CASCADE` is accepted, since it states what
+happens anyway. `ON UPDATE RESTRICT`, `NO ACTION`, `SET NULL`, and `SET DEFAULT` are refused,
+because a reference always follows. This differs from PostgreSQL, where a referenced key cannot
+change by default.
+
+A table that references a rekeyed table needs a primary key of its own, so the engine can update
+its rows. A rekey whose references cannot be moved is refused, and nothing is written.
+
+## Choosing temporary keys
+
+- **A temporary key must never equal a real one.** Use a range the server never hands out:
+  negative numbers for integer keys, or a prefix such as `o:` for text keys. If a temporary key
+  could equal a server key, the server's row would collide with it.
+- **Fix old temporary keys with a rekey.** If an app already stored offline keys that look like
+  server keys, rekey them into the safe range once: `UPDATE tickets SET id = 'o:' || id WHERE …`.
+  Their references follow.
+- **Point queued work at rows through references.** An outbox row that references the order through
+  a declared foreign key is moved by the rekey itself and never depends on the forward. Payloads
+  that keep a key as plain text can resolve it with `resolveKey` before sending.
+- **Forwards are local.** They live in this device's database and are not synced. Each device keeps
+  the forwards for the rekeys it ran or received.

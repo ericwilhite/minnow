@@ -1239,4 +1239,78 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
       },
     ],
   },
+  {
+    featureId: "ddl.foreign-key-on-update",
+    steps: [
+      {
+        kind: "mutation",
+        sql: "INSERT INTO keyed (name, score) VALUES ('tmp', 1)",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO child (id, parent) VALUES (1, 'tmp')",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "UPDATE keyed SET name = 'final' WHERE name = 'tmp'",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "query",
+        sql: "SELECT id, parent FROM child",
+        expected: { columns: ["id", "parent"], rows: [[1, "final"]] },
+      },
+      {
+        kind: "query",
+        sql: "SELECT name, score FROM keyed WHERE name = 'tmp'",
+        expected: { columns: ["name", "score"], rows: [["final", 1]] },
+      },
+    ],
+  },
+  {
+    featureId: "ddl.foreign-key-not-enforced",
+    steps: [
+      {
+        kind: "mutation",
+        sql: "INSERT INTO loose_child (id, parent) VALUES (1, 'not-here')",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO keyed (name, score) VALUES ('loose', 2)",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO loose_child (id, parent) VALUES (2, 'loose')",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "UPDATE keyed SET name = 'tight' WHERE name = 'loose'",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "query",
+        sql: "SELECT id, parent FROM loose_child ORDER BY id",
+        expected: {
+          columns: ["id", "parent"],
+          rows: [
+            [1, "not-here"],
+            [2, "tight"],
+          ],
+          ordered: true,
+        },
+      },
+    ],
+  },
 ];

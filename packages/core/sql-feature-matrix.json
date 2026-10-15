@@ -312,6 +312,13 @@
       "notes": "Requires a unique-key table. A standalone statement reads and publishes inside one retryable write scope; an explicit transaction stages it with the transaction's other statements."
     },
     {
+      "id": "mutation.update-primary-key",
+      "status": "supported",
+      "setup": ["INSERT INTO keyed (name, score, bonus) VALUES ('temp', 5, NULL)"],
+      "example": "UPDATE keyed SET name = 'kept' WHERE name = 'temp'",
+      "notes": "Changing a primary key rekeys the row: every declared reference to it moves in the same commit, and for keyForwardRetentionMs (10 days by default) the old key keeps reading and writing the row and stays reserved."
+    },
+    {
       "id": "mutation.delete-keyed",
       "status": "supported",
       "example": "DELETE FROM keyed WHERE score < 0",
@@ -1427,7 +1434,7 @@
       "id": "ddl.composite-primary-key",
       "status": "supported",
       "example": "CREATE TABLE composite_key (shop INTEGER, receipt INTEGER, PRIMARY KEY (shop, receipt))",
-      "notes": "Composite keys use a hidden scalar row locator; primary-key components are immutable."
+      "notes": "Composite keys use a hidden scalar row locator. Updating a key column rekeys the row: references follow it and the old key forwards to the new one."
     },
     {
       "id": "ddl.composite-foreign-key",
@@ -2084,10 +2091,22 @@
     },
     {
       "id": "ddl.foreign-key-on-update",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE TABLE child (id INTEGER PRIMARY KEY, parent TEXT REFERENCES keyed (name) ON UPDATE CASCADE)",
-      "error": "ON UPDATE CASCADE has nothing to act on: a unique key cannot change",
-      "notes": "ON UPDATE actions are not supported because primary-key values cannot be updated; ON DELETE CASCADE, SET NULL, RESTRICT, and NO ACTION are."
+      "notes": "A reference always follows its parent's rekey, in the same commit, so ON UPDATE CASCADE states what happens anyway. Unlike PostgreSQL, a reference declared without an ON UPDATE clause follows too, instead of refusing the key change."
+    },
+    {
+      "id": "ddl.foreign-key-on-update-restrict",
+      "status": "unsupported",
+      "example": "CREATE TABLE child (id INTEGER PRIMARY KEY, parent TEXT REFERENCES keyed (name) ON UPDATE RESTRICT)",
+      "error": "a rekey always moves its references",
+      "notes": "ON UPDATE RESTRICT, NO ACTION, SET NULL, and SET DEFAULT are refused: a reference always follows its parent's rekey. Use ON UPDATE CASCADE or leave the clause out."
+    },
+    {
+      "id": "ddl.foreign-key-not-enforced",
+      "status": "supported",
+      "example": "CREATE TABLE loose_child (id INTEGER PRIMARY KEY, parent TEXT REFERENCES keyed (name) NOT ENFORCED)",
+      "notes": "The relationship is kept without requiring the parent row to exist, for a table that holds only part of its parent's rows. It still follows a rekey of the parent, and takes no ON DELETE action."
     },
     {
       "id": "ddl.deferrable-constraints",

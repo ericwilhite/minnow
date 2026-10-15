@@ -705,12 +705,6 @@ describe("AFTER triggers", () => {
     ).rejects.toThrow("UPDATE column does not exist: missing");
     await expect(
       database.execute(
-        "CREATE TRIGGER bad_key_update AFTER INSERT ON audit BEGIN " +
-          "UPDATE accounts SET id = 2 WHERE id = 1; END",
-      ),
-    ).rejects.toThrow("cannot update a key column: id");
-    await expect(
-      database.execute(
         "CREATE TRIGGER bad_update_predicate AFTER INSERT ON audit BEGIN " +
           "UPDATE accounts SET balance = 1 WHERE abs(missing) = 1; END",
       ),

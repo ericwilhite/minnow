@@ -50,9 +50,11 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // Staged UNIQUE builds, index capacity, and sliced OPFS recovery: 944.2 KiB raw / 276.3 KiB gzip.
 // Sliced commits and checkpoint parsing (0.13.1): 945.4 KiB raw / 276.8 KiB gzip. Bounded
 // replay of large unmerged deltas, staged commit deltas, and masked key publication (0.14.0):
-// 965.5 KiB raw / 284.1 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 967 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 285 * 1024;
+// 965.5 KiB raw / 284.1 KiB gzip. Rekeying (0.15.0: primary-key updates, references that
+// follow, key forwards and their SQL rewrite, batched live delivery): 987.6 KiB raw / 291.1 KiB
+// gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 988 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 292 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -65,7 +67,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 285 * 1024;
 // index capacity, and sliced OPFS recovery: 1304.6 KiB raw. Sliced commits and checkpoint
 // parsing (0.13.1): 1309.4 KiB raw. Bounded delta replay, staged commit deltas, WAL
 // continuation frames, the lease lane, and follower pieces (0.14.0): 1345.0 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1347 * 1024;
+// Rekeying (0.15.0): 1367.4 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1368 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -74,7 +77,8 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1347 * 1024;
 // capacity, and sliced OPFS recovery: 368.0 KiB measured. Sliced commits and checkpoint
 // parsing (0.13.1): 369.8 KiB measured. Bounded delta replay, staged commit deltas, WAL
 // continuation frames, the lease lane, and follower pieces (0.14.0): 382.2 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 383 * 1024;
+// Rekeying (0.15.0): 389.4 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 390 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
@@ -83,9 +87,10 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 383 * 1024;
 // (0.13.0): 1310.5 KiB raw / 368.2 KiB gzip; with staged UNIQUE builds, index capacity, and
 // sliced OPFS recovery, 1313.8 KiB raw / 369.3 KiB gzip; with sliced commits (0.13.1),
 // 1315.0 KiB raw / 369.7 KiB gzip; with bounded delta replay, staged commit deltas, and
-// schema-4 delta parts (0.14.0), 1339.8 KiB raw / 378.9 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1341 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 380 * 1024;
+// schema-4 delta parts (0.14.0), 1339.8 KiB raw / 378.9 KiB gzip; with rekeying (0.15.0),
+// 1362.8 KiB raw / 386.3 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1363 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 387 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
@@ -206,10 +211,11 @@ describe("core packaging", () => {
     const output = result.outputFiles[0];
     expect(output).toBeDefined();
     if (output === undefined) throw new Error("Missing live bundle");
-    // Measured 8.1 KiB gzip with typed coordination errors and bounded live recovery.
+    // Measured 8.1 KiB gzip with typed coordination errors and bounded live recovery; 8.75 KiB
+    // with batched sweep delivery, key changes, and rekey diffs (0.15.0).
     expect(
       gzipSync(output.contents, { level: constants.Z_BEST_COMPRESSION }).byteLength,
-    ).toBeLessThanOrEqual(8.25 * 1024);
+    ).toBeLessThanOrEqual(9 * 1024);
   });
 
   it("keeps the optional typed-table renderer on the schema entry", async () => {

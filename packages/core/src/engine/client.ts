@@ -639,6 +639,15 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     await this.#call("buildFtsIndex", [tableName, columnName]);
   }
 
+  /** A key's current value, following a rekey; see `MinnowDatabase.resolveKey()`. */
+  async resolveKey(
+    tableName: string,
+    key: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<Exclude<BatchValue, null> | BatchValue[]> {
+    return (await this.#call("resolveKey", [tableName, key])) as
+      Exclude<BatchValue, null> | BatchValue[];
+  }
+
   /** The published catalog; see `MinnowDatabase.introspect()`. */
   async introspect(): Promise<Catalog> {
     return (await this.#call("introspect", [])) as Catalog;
@@ -1477,6 +1486,22 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
             kind: response.payload.kind,
             context: response.payload.context,
             error: rehydrateError(response.payload.error),
+          });
+        }
+        return;
+      }
+      if (response.event === "batch") {
+        // One live sweep's deliveries, handed out back to back in one turn, so whatever they
+        // update renders once.
+        const { events } = response.payload as {
+          events: Array<{ handleId: string; event: string; payload: unknown }>;
+        };
+        for (const item of events) {
+          this.#receive({
+            ...response,
+            handleId: item.handleId,
+            event: item.event,
+            payload: item.payload,
           });
         }
         return;

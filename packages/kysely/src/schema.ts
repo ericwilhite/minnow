@@ -1,4 +1,4 @@
-import type { AnyTable, AnyView, PrimaryKeyKeys, SchemaDefinition } from "@minnowdb/core";
+import type { AnyTable, AnyView, SchemaDefinition } from "@minnowdb/core";
 import type {
   BinaryOperator,
   CaseThenBuilder,
@@ -474,7 +474,7 @@ export type InferKyselyTable<
   [K in keyof TTable["columns"]]: MinnowColumnType<
     SelectValue<TTable["columns"][K], TDecoding>,
     InsertValue<TTable["columns"][K]>,
-    K extends PrimaryKeyKeys<TTable> ? never : UpdateValue<TTable["columns"][K]>,
+    UpdateValue<TTable["columns"][K]>,
     UpdateValue<TTable["columns"][K]>,
     TDecoding
   >;
@@ -497,7 +497,7 @@ export type InferKyselyView<
 /**
  * Derives Kysely's complete `DB` map from a Minnow schema declaration. Defaults and nullable
  * columns become optional inserts, enum literals stay narrow, logical SQL domains keep their
- * boundary types, primary keys are read-only on update, and views are read-only.
+ * boundary types, updating a primary key rekeys the row, and views are read-only.
  */
 export type InferKyselyDatabase<
   TSchema extends SchemaDefinition<readonly AnyTable[]>,

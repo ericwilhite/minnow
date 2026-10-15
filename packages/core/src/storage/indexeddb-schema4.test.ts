@@ -36,7 +36,8 @@ import type { FtsPosting, FtsPostingQuery, ManifestSummary, TableRecord } from "
 
 vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
-const CURRENT_SCHEMA = 4;
+/** The schema this build writes: schema 5 (the key-forwards record) followed schema 4. */
+const CURRENT_SCHEMA = 5;
 const PART = "fts-delta-part";
 /** The per-part ceilings the store writes; a test that needs several parts exceeds them. */
 const PART_POSTINGS = 8_192;
@@ -1055,7 +1056,7 @@ function abortNextUpgrade(indexedDB: IDBFactory): { aborted: () => boolean } {
   return { aborted: () => aborted };
 }
 
-describe("IndexedDB schema 3 to 4 upgrade", () => {
+describe("IndexedDB schema 3 to current upgrade", () => {
   const released = releasedBuilds.find((build) => build.schema === 3);
   if (released === undefined) throw new Error("The schema-3 writer is missing");
 
@@ -1099,7 +1100,7 @@ describe("IndexedDB schema 3 to 4 upgrade", () => {
     ]);
     expect(first.status).toBe("fulfilled");
     expect(second.status).toBe("fulfilled");
-    // A released opener that arrives behind the upgrade is refused, never served schema 4.
+    // A released opener that arrives behind the upgrade is refused, never served the current schema.
     expect(late).toMatchObject({
       status: "rejected",
       reason: { name: "StorageFormatVersionError", actualVersion: CURRENT_SCHEMA },

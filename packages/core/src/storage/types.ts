@@ -660,6 +660,12 @@ export interface TableRecord {
   enumType?: { name: string; values: string[] };
   /** Internal catalog object backing a durable PostgreSQL sequence. */
   sequence?: { name: string; start: number; columnId: string };
+  /**
+   * Internal table holding every rekeyed row's forward from its retired key to its current one.
+   * Adding it changes no other table's write contract, so `addTable` leaves the schema epoch
+   * alone for it: a write scope that rekeys can create it without failing its own commit.
+   */
+  keyForwards?: true;
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution. */
   revision: number;
@@ -2508,7 +2514,8 @@ export function assertSnapshotImportAcceleratorUsage(bytes: number, entries: num
  * below contain counts and byte totals only, never record descriptors, keys, or postings.
  */
 export interface SnapshotFrameStreamHeader {
-  readonly formatVersion: 1;
+  /** 2 when the snapshot holds the internal key-forwards catalog record; otherwise 1. */
+  readonly formatVersion: 1 | 2;
   readonly databaseVersion: number;
   readonly createdAt: string;
   readonly kinds: Readonly<Record<SnapshotFrameKind, SnapshotKindSummary>>;
@@ -3865,7 +3872,11 @@ export interface BlockPayloadStore {
  * aborted transactions leave gaps.
  */
 export interface CatalogStore {
-  /** Fails on a duplicate id or name. Advances the catalog epoch. */
+  /**
+   * Fails on a duplicate id or name. Advances the catalog epoch, and the schema epoch unless the
+   * record is the internal `keyForwards` table: an open write scope may create that one and must
+   * still commit.
+   */
   addTable(record: TableRecord, options?: CatalogMutationOptions): Promise<void>;
   getTable(id: string): Promise<TableRecord | undefined>;
   getTableByName(name: string): Promise<TableRecord | undefined>;

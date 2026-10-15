@@ -3115,7 +3115,14 @@ describe("MinnowDatabaseClient", () => {
     const frames: Array<{ event: string; payload: unknown }> = [];
     clientSide.addEventListener("message", (event) => {
       const frame = parseRpcResponse(event.data);
-      if (frame?.kind === "rpc-event") frames.push({ event: frame.event, payload: frame.payload });
+      if (frame?.kind !== "rpc-event") return;
+      // A sweep's deliveries cross in one batch frame; count the events inside it.
+      if (frame.event === "batch") {
+        for (const item of (frame.payload as { events: Array<{ event: string; payload: unknown }> })
+          .events) {
+          frames.push({ event: item.event, payload: item.payload });
+        }
+      } else frames.push({ event: frame.event, payload: frame.payload });
     });
     const db = new MinnowDatabase(new MemoryBlockStore());
     exposeDatabase(db, workerSide);

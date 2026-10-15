@@ -74,7 +74,7 @@ export const retailTables = [
   }),
   table("order_items", {
     order_item_id: column.number().unique(),
-    order_id: column.number(),
+    order_id: column.number().references("orders", "order_id", { enforced: false }),
     product_id: column.number(),
     quantity: column.number(),
     unit_price: column.number(),
@@ -83,8 +83,8 @@ export const retailTables = [
   }),
   table("returns", {
     return_id: column.number().unique(),
-    order_item_id: column.number(),
-    order_id: column.number(),
+    order_item_id: column.number().references("order_items", "order_item_id", { enforced: false }),
+    order_id: column.number().references("orders", "order_id", { enforced: false }),
     product_id: column.number(),
     quantity: column.number(),
     reason: column.string(),

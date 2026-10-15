@@ -149,8 +149,10 @@ type FunctionDatabase = InferKyselyDatabase<typeof functionSchema>;
 
 function invalidDerivedWritesAreRejected(): void {
   const lineChange: Updateable<DeclaredDatabase["order_lines"]> = {};
-  // @ts-expect-error composite primary-key columns are not updateable
+  // Primary-key columns are updateable: the update rekeys the row.
   lineChange.order_id = 2;
+  // @ts-expect-error but only with a value of the column's type
+  lineChange.order_id = "2";
   const viewInsert: Insertable<DeclaredDatabase["open_orders"]> = {};
   // @ts-expect-error a view column accepts no insert value
   viewInsert.id = 1;
@@ -660,6 +662,7 @@ describe("schema-derived Kysely types", () => {
       note?: string | null | undefined;
     }>();
     expectTypeOf<Updateable<DeclaredDatabase["orders"]>>().toEqualTypeOf<{
+      id?: number | undefined;
       total?: string | number | undefined;
       status?: "open" | "closed" | undefined;
       note?: string | null | undefined;

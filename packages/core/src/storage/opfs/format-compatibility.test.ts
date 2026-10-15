@@ -192,7 +192,10 @@ describe("frozen native OPFS layout", () => {
 
       const reopened = await OpfsBlockStore.open({ name: "native-fixture", root: shim.root });
       expect((await reopened.listTables()).map(({ name }) => name)).toEqual(
-        [...fixture.expectations.tables, "after-fixture"].sort(),
+        // `listTables` order: names compared with `localeCompare`, as the store sorts them.
+        [...fixture.expectations.tables, "after-fixture"].sort((left, right) =>
+          left.localeCompare(right),
+        ),
       );
       expect(await reopened.getBlock("continued-block")).toEqual(block);
       reopened.close();

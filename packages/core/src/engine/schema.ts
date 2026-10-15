@@ -1177,16 +1177,14 @@ export type PrimaryKeyKeys<TTable extends AnyTable> =
   | TTable["primaryKey"][number];
 
 /**
- * Update changes may cover any column except the unique key. An explicit `undefined` entry is
- * allowed and means "leave this column untouched", so a spread-patch built from optional fields
- * stays assignable under `exactOptionalPropertyTypes`.
+ * Update changes may cover any column except a generated one. Changing the primary key rekeys
+ * the row: references follow it and the old key forwards to the new one. An explicit
+ * `undefined` entry is allowed and means "leave this column untouched", so a spread-patch built
+ * from optional fields stays assignable under `exactOptionalPropertyTypes`.
  */
 export type InferUpdateChanges<TTable extends AnyTable> = {
-  [
-    K in keyof TTable["columns"] as K extends PrimaryKeyKeys<TTable> | GeneratedKeys<TTable>
-      ? never
-      : K
-  ]?: ColumnInputValue<TTable["columns"][K]> | undefined;
+  [K in keyof TTable["columns"] as K extends GeneratedKeys<TTable> ? never : K]?:
+    ColumnInputValue<TTable["columns"][K]> | undefined;
 };
 
 // --- Schema-inferred batch API types ------------------------------------------------------------
@@ -1283,7 +1281,7 @@ export type BatchKeyValue<TSchema extends AnySchema, TName extends TableName<TSc
     ? Exclude<BatchValue, null>
     : BatchKey<TableOf<TSchema, TName>>;
 
-/** The changes object `update` takes: every non-key, non-generated column, each optional. */
+/** The changes object `update` takes: every non-generated column, each optional. */
 export type BatchUpdateChanges<TSchema extends AnySchema, TName extends TableName<TSchema>> =
   ErasedSchema<TSchema> extends true
     ? Readonly<Record<string, BatchValue>>
@@ -1393,6 +1391,36 @@ export type MigrationStep =
 
 export interface MigrationPlan {
   steps: MigrationStep[];
+}
+
+/**
+ * Orders table drops so a table goes after every dropped table that references it. A cycle,
+ * which no drop order satisfies, keeps the order it had; the catalog then reports it.
+ */
+function dependentsFirst<TStep extends { kind: "drop-table"; tableName: string }>(
+  drops: readonly TStep[],
+  tables: Catalog["tables"],
+): TStep[] {
+  const pending = new Map(drops.map((step) => [step.tableName, step]));
+  const referencedBy = (name: string): boolean =>
+    tables.some(
+      (table) =>
+        table.name !== name &&
+        pending.has(table.name) &&
+        table.foreignKeys.some((key) => key.parentTable === name),
+    );
+  const ordered: TStep[] = [];
+  while (pending.size > 0) {
+    const ready = [...pending.keys()].find((name) => !referencedBy(name));
+    if (ready === undefined) {
+      ordered.push(...pending.values());
+      break;
+    }
+    const step = pending.get(ready);
+    if (step !== undefined) ordered.push(step);
+    pending.delete(ready);
+  }
+  return ordered;
 }
 
 /**
@@ -1937,7 +1965,11 @@ export function planMigration(
   // dependents first; the SQL engine correctly refuses the reverse order. Replacements stay
   // after table-creation steps so a newly declared body can resolve its sources.
   const droppedViews = steps.filter((step) => step.kind === "drop-view");
-  const droppedTables = steps.filter((step) => step.kind === "drop-table");
+  // Tables referencing one another drop dependents first, as the catalog refuses a parent drop.
+  const droppedTables = dependentsFirst(
+    steps.filter((step) => step.kind === "drop-table"),
+    catalog.tables,
+  );
   return {
     steps: [
       ...steps.filter((step) => step.kind !== "drop-view" && step.kind !== "drop-table"),

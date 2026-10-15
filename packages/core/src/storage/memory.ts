@@ -107,6 +107,10 @@ import {
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
 import {
+  snapshotMetadataItemFormatVersion,
+  type SnapshotFormatVersion,
+} from "./snapshot-format.js";
+import {
   blockBytesChecksum,
   RecordCore,
   validateFtsPostingChunks,
@@ -1142,7 +1146,11 @@ export class MemoryBlockStore implements BlockStore {
         summary.itemCount += 1;
         summary.storedBytes = safeSnapshotByteSum(summary.storedBytes, payload.byteLength);
       };
-      for (const item of this.#core.snapshotFrameMetadataItems()) append(item);
+      let formatVersion: SnapshotFormatVersion = 1;
+      for (const item of this.#core.snapshotFrameMetadataItems()) {
+        if (snapshotMetadataItemFormatVersion(item) === 2) formatVersion = 2;
+        append(item);
+      }
       for (const item of this.#core.snapshotFramePostingItems()) append(item);
       summaries.block = {
         frameCount: manifest.liveBlockCount,
@@ -1150,7 +1158,7 @@ export class MemoryBlockStore implements BlockStore {
         storedBytes: manifest.liveBlockBytes,
       };
       const header = prepareSnapshotFrameStreamHeader({
-        formatVersion: 1,
+        formatVersion,
         databaseVersion: manifest.version,
         createdAt: input.createdAt,
         kinds: summaries,

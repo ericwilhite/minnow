@@ -230,8 +230,12 @@ import {
   snapshotFrameEnvelopeParts,
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
+import {
+  snapshotMetadataItemFormatVersion,
+  type SnapshotFormatVersion,
+} from "./snapshot-format.js";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -535,6 +539,14 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     // version is the barrier that keeps a schema-3 reader, which would miss every later part and
     // refuse the part count in the delta index, from opening a database that may hold one.
     targetVersion: 4,
+    migrate: () => undefined,
+  },
+  {
+    // Schema 5 admits the internal key-forwards catalog record (`keyForwards: true`), which maps
+    // each rekeyed row's retired key to its current one. No stored record changes: the version
+    // is the barrier that keeps a schema-4 reader, which would read that record as an ordinary
+    // table and ignore its forwards, from opening a database that may hold one.
+    targetVersion: 5,
     migrate: () => undefined,
   },
 ];
@@ -1259,7 +1271,7 @@ export class IndexedDbBlockStore implements BlockStore {
       store.add(normalizedRecord, idKey);
       store.add(normalizedRecord.id, nameKey);
       await bumpCatalogEpoch(store);
-      await bumpSchemaEpoch(store);
+      if (normalizedRecord.keyForwards !== true) await bumpSchemaEpoch(store);
       await transactionDone(transaction);
     } catch (error) {
       abortIfActive(transaction);
@@ -8284,27 +8296,30 @@ export class IndexedDbBlockStore implements BlockStore {
       const manifest = asStoredManifestRecord(manifestValue, version);
       this.#snapshotPeakRetainedItems = 0;
       this.#snapshotPeakRetainedBytes = 0;
-      const { summaries, frameCount: metadataFrameCount } =
-        await writeSnapshotMetadataFramesInTransaction({
-          transaction,
-          manifest,
-          version,
-          direction: "export",
-          identity: sessionId,
-          observeRetainedItems: (count) => {
-            this.#snapshotPeakRetainedItems = Math.max(this.#snapshotPeakRetainedItems, count);
-          },
-          observeRetainedBytes: (bytes) => {
-            this.#snapshotPeakRetainedBytes = Math.max(this.#snapshotPeakRetainedBytes, bytes);
-          },
-        });
+      const {
+        summaries,
+        frameCount: metadataFrameCount,
+        formatVersion,
+      } = await writeSnapshotMetadataFramesInTransaction({
+        transaction,
+        manifest,
+        version,
+        direction: "export",
+        identity: sessionId,
+        observeRetainedItems: (count) => {
+          this.#snapshotPeakRetainedItems = Math.max(this.#snapshotPeakRetainedItems, count);
+        },
+        observeRetainedBytes: (bytes) => {
+          this.#snapshotPeakRetainedBytes = Math.max(this.#snapshotPeakRetainedBytes, bytes);
+        },
+      });
       summaries.block = {
         frameCount: manifest.liveBlockCount,
         itemCount: manifest.liveBlockCount,
         storedBytes: manifest.liveBlockBytes,
       };
       const header = prepareSnapshotFrameStreamHeader({
-        formatVersion: 1,
+        formatVersion,
         databaseVersion: version,
         createdAt: input.createdAt,
         kinds: summaries,
@@ -12186,13 +12201,16 @@ async function validateAndPromoteStagedSnapshot(
       ) {
         throw corruption(key, "snapshot UNIQUE generation is incomplete");
       }
+      // An empty table's generation staged no parts; its membership has no base to read.
       catalog.put(
-        {
-          versions: [],
-          hasBase: true,
-          baseGenerationId: generationId,
-          tokenCount: staging.tokenCount,
-        } satisfies UniqueKeyChunkIndex,
+        (staging.descriptor.chunkCount > 0
+          ? {
+              versions: [],
+              hasBase: true,
+              baseGenerationId: generationId,
+              tokenCount: staging.tokenCount,
+            }
+          : { versions: [], hasBase: false }) satisfies UniqueKeyChunkIndex,
         uniqueKeyChunkIndexKey(staging.descriptor.namespaceId),
       );
       catalog.delete(snapshotUniqueOwnerKey(staging.descriptor.namespaceId));
@@ -12492,11 +12510,14 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
     { frameCount: number; itemCount: number; storedBytes: number }
   >;
   frameCount: number;
+  /** 2 when a key-forwards catalog record was written; otherwise 1. */
+  formatVersion: SnapshotFormatVersion;
 }> {
   const catalog = input.transaction.objectStore("catalog");
   const frameStore = input.transaction.objectStore(SNAPSHOT_HEADER_STORE);
   const summaries = emptySnapshotKindSummaries();
   let sequence = 0;
+  let formatVersion: SnapshotFormatVersion = 1;
   const writeItem = (kind: Exclude<SnapshotFrameKind, "block">, item: unknown): void => {
     const payload = encodeSnapshotMetadataPage([item]);
     if (payload.byteLength > MAX_SNAPSHOT_METADATA_FRAME_BYTES) {
@@ -12540,14 +12561,16 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
   };
 
   await visitTables(async (table) => {
-    writeItem("catalog-page", {
+    const item = {
       kind: "table",
       record: table.record,
       nextRowId: table.nextRowId,
       autoIncrement: [...table.autoIncrement].sort((left, right) =>
         left.columnId.localeCompare(right.columnId),
       ),
-    } satisfies SnapshotCatalogItem);
+    } satisfies SnapshotCatalogItem;
+    if (snapshotMetadataItemFormatVersion(item) === 2) formatVersion = 2;
+    writeItem("catalog-page", item);
   });
   await visitObjectStoreSequentially(input.transaction.objectStore("segments"), async (value) => {
     const record = asSegmentRecord(value);
@@ -12694,7 +12717,7 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
     }
   });
   void input.manifest;
-  return { summaries, frameCount: sequence };
+  return { summaries, frameCount: sequence, formatVersion };
 }
 
 function blockMetadataKey(id: string): string {
@@ -13477,6 +13500,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
       "view",
       "enumType",
       "sequence",
+      "keyForwards",
       "createdAt",
       "revision",
     ],
@@ -13833,10 +13857,16 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
     }
   }
   if (
-    [record.view, record.enumType, record.sequence].filter((entry) => entry !== undefined).length >
-    1
+    [record.view, record.enumType, record.sequence, record.keyForwards].filter(
+      (entry) => entry !== undefined,
+    ).length > 1
   ) {
     throw corruption(location, "catalog object kinds are mutually exclusive");
+  }
+  // Stored data is untrusted: the type says `true`, the record may say anything.
+  const keyForwards: unknown = record.keyForwards;
+  if (keyForwards !== undefined && keyForwards !== true) {
+    throw corruption(location, "key forwards marker is invalid");
   }
   if (record.enumType !== undefined) {
     if (isRecord(record.enumType)) {

@@ -4,7 +4,8 @@
  *
  * 1. **The contract owes nothing to anyone.** `types.ts`, `snapshot.ts`, and
  *    `snapshot-stream.ts` are the whole
- *    vocabulary between engine and store; they may reach the block-format utilities and each
+ *    vocabulary between engine and store, with `snapshot-format.ts` as their internal helper for
+ *    which snapshot format a record needs; they may reach the block-format utilities and each
  *    other, never an adapter or the toolkit.
  * 2. **The toolkit is built on the contract alone.** `storage/toolkit/` may not import from
  *    any adapter — an adapter uses the toolkit, never the reverse.
@@ -40,8 +41,8 @@ function importsOf(path: string): string[] {
 
 describe("storage contract boundaries", () => {
   it("the contract imports nothing from adapters or the toolkit", () => {
-    for (const file of ["types.ts", "snapshot.ts", "snapshot-stream.ts"].map((name) =>
-      join(SRC, "storage", name),
+    for (const file of ["types.ts", "snapshot.ts", "snapshot-stream.ts", "snapshot-format.ts"].map(
+      (name) => join(SRC, "storage", name),
     )) {
       for (const specifier of importsOf(file)) {
         expect(
@@ -49,6 +50,7 @@ describe("storage contract boundaries", () => {
             "./types.js",
             "./snapshot.js",
             "./snapshot-stream.js",
+            "./snapshot-format.js",
             "../block-format/index.js",
             "../block-format/physical.js",
             "../date-value.js",

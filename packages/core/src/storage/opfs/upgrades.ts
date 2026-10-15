@@ -15,17 +15,20 @@ import { MAX_OPFS_CHECKPOINT_BYTES, MAX_OPFS_WAL_BYTES, OpfsLeader } from "./lea
 
 export const FIRST_SUPPORTED_OPFS_LAYOUT = 6;
 /**
- * The layout this build writes. Layouts 8 and 9 store layout 7's bytes — checkpoints, WAL, and
- * extents still carry encoding version 7 — and each admits records an older reader cannot
- * parse: layout 8, compaction jobs with replayed merge plans; layout 9, a WAL frame whose
- * payload spans continuation frames and checkpointed index deltas of any size. The marker is
- * the barrier: an older reader refuses the database before it reads a record.
+ * The layout this build writes. Layouts 8, 9, and 10 store layout 7's bytes — checkpoints, WAL,
+ * and extents still carry encoding version 7 — and each admits records an older reader cannot
+ * handle: layout 8, compaction jobs with replayed merge plans; layout 9, a WAL frame whose
+ * payload spans continuation frames and checkpointed index deltas of any size; layout 10, the
+ * internal key-forwards catalog record (`keyForwards: true`), which an older build would read as
+ * an ordinary table and whose forwards it would ignore. The marker is the barrier: an older
+ * reader refuses the database before it reads a record.
  */
-export const OPFS_LAYOUT_VERSION = 9;
+export const OPFS_LAYOUT_VERSION = 10;
 export const OPFS_UPGRADES = [
   { from: 6, to: 7 },
   { from: 7, to: 8 },
   { from: 8, to: 9 },
+  { from: 9, to: 10 },
 ] as const;
 const DIRECTORY = "upgrade-6-7";
 const READY = "ready";
@@ -35,15 +38,34 @@ const MARKER = new TextEncoder().encode(JSON.stringify({ formatVersion: OPFS_LAY
 const MARKER_TEXT = new TextDecoder().decode(MARKER);
 const LAYOUT7_MARKER_TEXT = '{"formatVersion":7}';
 const LAYOUT8_MARKER_TEXT = '{"formatVersion":8}';
+const LAYOUT9_MARKER_TEXT = '{"formatVersion":9}';
+/** Markers of the layouts that store this build's bytes and upgrade by the marker alone. */
+const MARKER_ONLY_OLDER_TEXTS: readonly string[] = [
+  LAYOUT7_MARKER_TEXT,
+  LAYOUT8_MARKER_TEXT,
+  LAYOUT9_MARKER_TEXT,
+];
 /**
  * Present only while a layout-7 marker was being rewritten as layout 8, by a 0.13 build. This
- * build finishes such a rewrite at layout 9 and removes the witness.
+ * build finishes such a rewrite at the current layout and removes the witness.
  */
 const LAYOUT8_WITNESS = "upgrade-7-8";
 const LAYOUT8_WITNESS_BYTES = new TextEncoder().encode('{"from":7,"to":8}');
-/** Present only while a layout-7 or layout-8 marker is being rewritten as layout 9. */
+/**
+ * Present only while an older marker was being rewritten as layout 9, by a 0.14 build. This build
+ * finishes such a rewrite at the current layout and removes the witness.
+ */
 const LAYOUT9_WITNESS = "upgrade-8-9";
 const LAYOUT9_WITNESS_BYTES = new TextEncoder().encode('{"from":8,"to":9}');
+/** Present only while a layout-7, 8, or 9 marker is being rewritten as layout 10. */
+const LAYOUT10_WITNESS = "upgrade-9-10";
+const LAYOUT10_WITNESS_BYTES = new TextEncoder().encode('{"from":9,"to":10}');
+/** Every marker-rewrite witness this build finishes, newest first. */
+const MARKER_WITNESSES = [
+  { name: LAYOUT10_WITNESS, bytes: LAYOUT10_WITNESS_BYTES, layout: 10 },
+  { name: LAYOUT9_WITNESS, bytes: LAYOUT9_WITNESS_BYTES, layout: 9 },
+  { name: LAYOUT8_WITNESS, bytes: LAYOUT8_WITNESS_BYTES, layout: 8 },
+] as const;
 
 interface Fingerprint {
   size: number;
@@ -313,7 +335,7 @@ function readReady(bytes: Uint8Array): ReadyRecord {
 
 /**
  * Brings the database to the current layout under the held locks: layout 6 through the
- * validated conversion, layout 7 through the marker. Returns whether stored bytes were
+ * validated conversion, layouts 7 to 9 through the marker. Returns whether stored bytes were
  * converted, which the caller follows with a full integrity check; an ordinary current-layout
  * open returns false without mutation.
  */
@@ -337,34 +359,37 @@ async function markerWitness(
   return true;
 }
 
-/** Whether a marker rewrite — to layout 8 by a 0.13 build, or to 9 by this one — is underway. */
+/**
+ * Whether a marker rewrite is underway — to layout 8 by a 0.13 build, to 9 by a 0.14 build, or
+ * to 10 by this one.
+ */
 async function markerRewriteWitness(tree: OpfsTree): Promise<boolean> {
-  return (
-    (await markerWitness(tree, LAYOUT9_WITNESS, LAYOUT9_WITNESS_BYTES, 9)) ||
-    (await markerWitness(tree, LAYOUT8_WITNESS, LAYOUT8_WITNESS_BYTES, 8))
-  );
+  for (const { name, bytes, layout } of MARKER_WITNESSES) {
+    if (await markerWitness(tree, name, bytes, layout)) return true;
+  }
+  return false;
 }
 
 /**
- * Layouts 7 and 8 store layout 9's bytes, so the upgrade is the marker. The witness goes first
- * and is flushed before the marker is touched: a crash that tears the marker while it is
+ * Layouts 7, 8, and 9 store layout 10's bytes, so the upgrade is the marker. The witness goes
+ * first and is flushed before the marker is touched: a crash that tears the marker while it is
  * rewritten leaves a durable witness behind, and the next open finishes the rewrite instead of
  * refusing a marker it cannot read. Only a torn marker needs a witness to be intact; beside a
  * whole older marker a half-written witness is simply written again. Witnesses are removed last,
- * once the layout-9 marker is durable — including one a 0.13 build left mid-rewrite to layout 8
- * — and a witness that outlives its removal is cleaned up on the next open.
+ * once the layout-10 marker is durable — including one an older build left mid-rewrite to layout
+ * 8 or 9 — and a witness that outlives its removal is cleaned up on the next open.
  */
 async function upgradeMarker(tree: OpfsTree): Promise<void> {
   const text = new TextDecoder().decode(await tree.readFile(["format.json"], { maxBytes: 1024 }));
   if (text !== MARKER_TEXT) {
-    const older = text === LAYOUT7_MARKER_TEXT || text === LAYOUT8_MARKER_TEXT;
+    const older = MARKER_ONLY_OLDER_TEXTS.includes(text);
     if (!older && !(await markerRewriteWitness(tree))) return;
-    await tree.writeFile([LAYOUT9_WITNESS], LAYOUT9_WITNESS_BYTES, { flush: true });
+    await tree.writeFile([LAYOUT10_WITNESS], LAYOUT10_WITNESS_BYTES, { flush: true });
     await tree.writeFile(["format.json"], MARKER, { flush: true });
   }
-  for (const witness of [LAYOUT9_WITNESS, LAYOUT8_WITNESS]) {
-    if ((await tree.readFile([witness], { maxBytes: 4096 })) !== undefined) {
-      await tree.deleteFile([witness]);
+  for (const { name } of MARKER_WITNESSES) {
+    if ((await tree.readFile([name], { maxBytes: 4096 })) !== undefined) {
+      await tree.deleteFile([name]);
     }
   }
 }
@@ -373,15 +398,14 @@ async function upgradeMarker(tree: OpfsTree): Promise<void> {
 async function upgradeLayout6(tree: OpfsTree, handles: UpgradeHandles): Promise<boolean> {
   const marker = await tree.readFile(["format.json"], { maxBytes: 1024 });
   const text = new TextDecoder().decode(marker);
-  // A layout-7 or layout-8 marker is as published as the current one: an older build may have
+  // A layout-7, 8, or 9 marker is as published as the current one: an older build may have
   // finished this conversion's publication and stopped before its cleanup.
-  const current =
-    text === MARKER_TEXT || text === LAYOUT7_MARKER_TEXT || text === LAYOUT8_MARKER_TEXT;
+  const current = text === MARKER_TEXT || MARKER_ONLY_OLDER_TEXTS.includes(text);
   const legacy = text === '{"formatVersion":6}';
   const readyBytes = await tree.readFile([DIRECTORY, READY], { maxBytes: 4096 });
   if (current && readyBytes === undefined) return false;
   if (!current && !legacy && readyBytes === undefined) {
-    // A marker torn while it was rewritten as layout 8 or 9 is the marker step's to finish.
+    // A marker torn while it was rewritten as layout 8, 9, or 10 is the marker step's to finish.
     if (await markerRewriteWitness(tree)) return false;
     throw corrupt("Missing upgrade witness for a torn marker");
   }
@@ -535,7 +559,7 @@ export async function hasPreparedOpfsUpgrade(tree: OpfsTree): Promise<boolean> {
     lockedMeansAbsent: true,
   });
   if (bytes === undefined) {
-    for (const name of [LAYOUT9_WITNESS, LAYOUT8_WITNESS]) {
+    for (const { name } of MARKER_WITNESSES) {
       const witness = await tree.readFile([name], { maxBytes: 64, lockedMeansAbsent: true });
       if (witness !== undefined) return true;
     }

@@ -1377,7 +1377,7 @@ export interface ForeignKeyDefinition {
   parentColumn?: string;
   parentColumns?: string[];
   onDelete: "restrict" | "cascade" | "set null";
-  /** False is reserved for schema/catalog declarations; SQL-created keys are enforced. */
+  /** False keeps the relationship without requiring the parent row: `NOT ENFORCED`. */
   enforced?: boolean;
 }
 
@@ -7103,9 +7103,11 @@ class Parser {
   }
 
   /**
-   * `REFERENCES parent(column) [ON DELETE action] [ON UPDATE action]` (E141-04, T191). A parent
-   * key cannot change in this engine, so ON UPDATE has nothing to act on and only the
-   * no-op actions parse; ON DELETE takes the three the engine can carry out.
+   * `REFERENCES parent(column) [ON DELETE action] [ON UPDATE CASCADE] [NOT ENFORCED]` (E141-04,
+   * T191). A reference always follows its parent's rekey, so `ON UPDATE CASCADE` states what
+   * happens anyway and every other `ON UPDATE` action is refused rather than silently ignored.
+   * `NOT ENFORCED` keeps the relationship without requiring the parent row to exist, the way
+   * `enforced: false` does in the schema API.
    */
   #references(name: string, columns: string[]): ForeignKeyDefinition {
     this.#keyword("REFERENCES");
@@ -7123,20 +7125,46 @@ class Parser {
       throw new TypeError("FOREIGN KEY and REFERENCES must name the same number of columns");
     }
     let onDelete: ForeignKeyDefinition["onDelete"] = "restrict";
-    while (this.#isKeyword("ON")) {
-      this.#keyword("ON");
-      const event = this.#isKeyword("DELETE") ? "delete" : "update";
-      this.#keyword(event === "delete" ? "DELETE" : "UPDATE");
-      const action = this.#referentialAction();
-      if (event === "update") {
-        if (action !== "restrict") {
-          throw new TypeError(
-            `ON UPDATE ${action.toUpperCase()} has nothing to act on: a unique key cannot change`,
-          );
+    let enforced = true;
+    for (;;) {
+      if (this.#isKeyword("ON")) {
+        this.#keyword("ON");
+        const event = this.#isKeyword("DELETE") ? "delete" : "update";
+        this.#keyword(event === "delete" ? "DELETE" : "UPDATE");
+        if (event === "update") {
+          if (!this.#isKeyword("CASCADE")) {
+            const action = this.#referentialAction();
+            throw new TypeError(
+              `ON UPDATE ${action === "restrict" ? "RESTRICT / NO ACTION" : action.toUpperCase()} is not supported: a rekey always moves its references (use ON UPDATE CASCADE or omit the clause)`,
+            );
+          }
+          this.#keyword("CASCADE");
+          continue;
         }
+        onDelete = this.#referentialAction();
         continue;
       }
-      onDelete = action;
+      if (this.#isKeyword("ENFORCED")) {
+        this.#keyword("ENFORCED");
+        continue;
+      }
+      // NOT ENFORCED, but not the NOT NULL a column definition may continue with.
+      const next = this.tokens[this.#index + 1];
+      if (
+        this.#isKeyword("NOT") &&
+        next?.kind === "identifier" &&
+        next.quoted !== true &&
+        next.text.toUpperCase() === "ENFORCED"
+      ) {
+        this.#keyword("NOT");
+        this.#keyword("ENFORCED");
+        enforced = false;
+        continue;
+      }
+      break;
+    }
+    if (!enforced && onDelete !== "restrict") {
+      throw new TypeError("A NOT ENFORCED foreign key cannot declare an ON DELETE action");
     }
     return {
       name,
@@ -7145,6 +7173,7 @@ class Parser {
       parentTable,
       ...(parentColumns === undefined ? {} : { parentColumn: parentColumns[0], parentColumns }),
       onDelete,
+      ...(enforced ? {} : { enforced: false }),
     };
   }
 

@@ -95,6 +95,18 @@ trigger, and write-semantic index changes. Do not advance it for ordinary manife
 accelerator build progress such as building/ready/invalid stamps: those do not change row
 validation, and treating them as schema DDL would make unrelated writers conflict.
 
+One table is the exception to "a new table advances the schema epoch": the engine's internal
+key-forwards table. When a primary key changes, the engine keeps a forward from the old key to
+the new one in that table, and it creates the table the first time a row is rekeyed. Its record is
+an ordinary `TableRecord` with `keyForwards: true`, and its name starts with
+`"\u0000minnow_key_forwards"`. `addTable` for that record must advance the catalog epoch but leave
+the schema epoch alone. The table changes no other table's write rules, and a write scope that
+rekeys creates it while its own transaction is open; advancing the epoch would make that scope's
+commit fail with `SchemaConflictError`. Store and return `keyForwards` like any other field. It
+is either absent or exactly `true`, and a record is at most one of a view, an enum type, a
+sequence, or the key-forwards table. An adapter built on the storage toolkit's `RecordCore` gets
+this rule automatically. The conformance kit checks it.
+
 Catalog cleanup follows the same rule. When `updateTable` removes a column or secondary index,
 that operation also deletes all of its postings base chunks, staged generations, and commit
 deltas. A dropped `UNIQUE` index also removes its membership namespace. `removeFtsColumn` provides

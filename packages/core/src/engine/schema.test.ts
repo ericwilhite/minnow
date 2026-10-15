@@ -83,6 +83,7 @@ describe("schema DSL", () => {
       { name: string; score: number } & { joined?: Date | null }
     >();
     expectTypeOf<InferUpdateChanges<typeof people>>().toEqualTypeOf<{
+      name?: string;
       score?: number;
       joined?: Date | null;
     }>();
@@ -103,6 +104,7 @@ describe("schema DSL", () => {
       version: number;
     }>();
     expectTypeOf<InferUpdateChanges<typeof generatedRows>>().toEqualTypeOf<{
+      id?: number;
       field_id?: string;
       ticket_number?: number;
       version?: number;
@@ -188,7 +190,7 @@ describe("SQL-domain and composite-key schema declarations", () => {
     { primaryKey: ["tenant_id", "account_no"] },
   );
 
-  it("retains exact read/write types and excludes every primary-key column from updates", () => {
+  it("retains exact read/write types and lets updates rekey the primary key", () => {
     expectTypeOf<InferRow<typeof accounts>>().toEqualTypeOf<{
       tenant_id: string;
       account_no: number;
@@ -209,6 +211,8 @@ describe("SQL-domain and composite-key schema declarations", () => {
       }
     >();
     expectTypeOf<InferUpdateChanges<typeof accounts>>().toEqualTypeOf<{
+      tenant_id?: string;
+      account_no?: number;
       balance?: string | number;
       profile?: string | null;
       state?: "open" | "closed";
@@ -842,6 +846,7 @@ describe("enum columns", () => {
       }
     >();
     expectTypeOf<InferUpdateChanges<typeof machines>>().toEqualTypeOf<{
+      name?: string;
       state?: "off" | "idle" | "running";
       mode?: "auto" | "manual" | null;
     }>();

@@ -34,6 +34,7 @@ import {
   validateTableRecordBounds,
   validateStorageId,
 } from "./types.js";
+import { snapshotFormatVersion, snapshotMetadataItemFormatVersion } from "./snapshot-format.js";
 
 const MAGIC = Uint8Array.of(0x4d, 0x49, 0x4e, 0x53, 0x4e, 0x41, 0x50, 0x31); // MINSNAP1
 const HEADER_PREFIX_BYTES = 20;
@@ -86,7 +87,7 @@ export function prepareSnapshotFrameStreamHeader(
   }
   sameKeys(runtime, ["formatVersion", "databaseVersion", "createdAt", "kinds"], "Snapshot header");
   const fields = runtime as Record<string, unknown>;
-  if (fields.formatVersion !== 1) throw new TypeError("Unsupported snapshot format version");
+  const formatVersion = snapshotFormatVersion(fields.formatVersion);
   const databaseVersion = safeWhole(fields.databaseVersion, "Snapshot database version");
   const createdAt = canonicalTimestamp(fields.createdAt, "Snapshot creation time");
   if (typeof fields.kinds !== "object" || fields.kinds === null) {
@@ -117,13 +118,13 @@ export function prepareSnapshotFrameStreamHeader(
     }
     kinds[kind] = { frameCount, itemCount, storedBytes };
   }
-  return { formatVersion: 1, databaseVersion, createdAt, kinds };
+  return { formatVersion, databaseVersion, createdAt, kinds };
 }
 
 function canonicalHeaderJson(header: SnapshotFrameStreamHeader): string {
   const prepared = prepareSnapshotFrameStreamHeader(header);
   return JSON.stringify({
-    formatVersion: 1,
+    formatVersion: prepared.formatVersion,
     databaseVersion: prepared.databaseVersion,
     createdAt: prepared.createdAt,
     kinds: Object.fromEntries(SNAPSHOT_FRAME_KINDS.map((kind) => [kind, prepared.kinds[kind]])),
@@ -131,12 +132,13 @@ function canonicalHeaderJson(header: SnapshotFrameStreamHeader): string {
 }
 
 export function encodeSnapshotFrameStreamHeader(header: SnapshotFrameStreamHeader): Uint8Array {
+  const formatVersion = snapshotFormatVersion(header.formatVersion);
   const bytes = textEncoder.encode(canonicalHeaderJson(header));
   if (bytes.byteLength > MAX_HEADER_BYTES) throw new RangeError("Snapshot header is too large");
   const encoded = new Uint8Array(HEADER_PREFIX_BYTES + bytes.byteLength);
   encoded.set(MAGIC, 0);
   const view = new DataView(encoded.buffer);
-  view.setUint32(8, 1, true);
+  view.setUint32(8, formatVersion, true);
   view.setUint32(12, bytes.byteLength, true);
   view.setUint32(16, crc32(bytes), true);
   encoded.set(bytes, HEADER_PREFIX_BYTES);
@@ -145,7 +147,7 @@ export function encodeSnapshotFrameStreamHeader(header: SnapshotFrameStreamHeade
 
 export function snapshotFrameStreamHeaderIdentity(header: SnapshotFrameStreamHeader): string {
   const bytes = encodeSnapshotFrameStreamHeader(header);
-  return `snapshot-v1/${String(bytes.byteLength)}/${crc32(bytes).toString(16).padStart(8, "0")}`;
+  return `snapshot-v${String(header.formatVersion)}/${String(bytes.byteLength)}/${crc32(bytes).toString(16).padStart(8, "0")}`;
 }
 
 function utf8Bytes(value: string, label: string): Uint8Array {
@@ -845,7 +847,10 @@ export async function* decodeSnapshotFrameStream(
     if (!MAGIC.every((byte, index) => prefix[index] === byte))
       throw new Error("Not a Minnow snapshot");
     const prefixView = new DataView(prefix.buffer);
-    if (prefixView.getUint32(8, true) !== 1) throw new Error("Unsupported snapshot format version");
+    const containerVersion = prefixView.getUint32(8, true);
+    if (containerVersion !== 1 && containerVersion !== 2) {
+      throw new Error("Unsupported snapshot format version");
+    }
     const headerLength = prefixView.getUint32(12, true);
     if (headerLength < 1 || headerLength > MAX_HEADER_BYTES)
       throw new RangeError("Snapshot header is too large");
@@ -859,7 +864,10 @@ export async function* decodeSnapshotFrameStream(
       throw new TypeError("Snapshot header is not canonical JSON");
     }
     const header = prepareSnapshotFrameStreamHeader(parsed as SnapshotFrameStreamHeader);
-    if (canonicalHeaderJson(header) !== textDecoder.decode(headerBytes)) {
+    if (
+      canonicalHeaderJson(header) !== textDecoder.decode(headerBytes) ||
+      header.formatVersion !== containerVersion
+    ) {
       throw new TypeError("Snapshot header is not canonically encoded");
     }
     yield { type: "header", header };
@@ -935,8 +943,16 @@ export async function* decodeSnapshotFrameStream(
         if (encodedItems !== frameItems) {
           throw new Error("Snapshot metadata frame item count does not match its payload");
         }
-        if (decodeSnapshotMetadataItems(kind, payload).length !== frameItems) {
+        const items = decodeSnapshotMetadataItems(kind, payload);
+        if (items.length !== frameItems) {
           throw new Error("Snapshot metadata frame item count is invalid");
+        }
+        // A format-1 snapshot cannot hold a key-forwards record: no writer of that format made
+        // one, and restoring it under format 1's rules would be a guess.
+        if (items.some((item) => snapshotMetadataItemFormatVersion(item) > header.formatVersion)) {
+          throw new TypeError(
+            `Snapshot format ${String(header.formatVersion)} cannot hold a key-forwards record`,
+          );
         }
       }
       checksum = extendSnapshotFrameStreamChecksum(checksum, [framePrefix, keyBytes, payload]);

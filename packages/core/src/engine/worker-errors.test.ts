@@ -1,3 +1,4 @@
+import { protocolVersion } from "../worker-protocol/index.js";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/memory.js";
 import { MinnowDatabaseClient, type ClientTransport } from "./client.js";
@@ -167,7 +168,12 @@ it("keeps the Worker error event's message, location, and cause on the failure",
       if (request.kind !== "rpc-init") return;
       queueMicrotask(() => {
         messageListener?.({
-          data: { version: 7, requestId: request.requestId, kind: "rpc-result", result: {} },
+          data: {
+            version: protocolVersion,
+            requestId: request.requestId,
+            kind: "rpc-result",
+            result: {},
+          },
         } as MessageEvent<unknown>);
       });
     },
@@ -269,7 +275,12 @@ function keepaliveTransport(): {
         last = request.requestId;
         if (request.kind === "rpc-init") {
           queueMicrotask(() =>
-            deliver({ version: 7, requestId: request.requestId, kind: "rpc-result", result: {} }),
+            deliver({
+              version: protocolVersion,
+              requestId: request.requestId,
+              kind: "rpc-result",
+              result: {},
+            }),
           );
         }
       },
@@ -279,7 +290,7 @@ function keepaliveTransport(): {
     },
     keepalive: (requestId) =>
       deliver({
-        version: 7,
+        version: protocolVersion,
         requestId,
         kind: "rpc-event",
         handleId: "$worker",

@@ -867,11 +867,6 @@ describe("MERGE", () => {
       ),
     ).rejects.toThrow("MERGE ON must equate s.sku with a source value");
     await expect(
-      database.execute(
-        "MERGE INTO stock s USING delivery d ON s.sku = d.sku WHEN MATCHED THEN UPDATE SET sku = 5",
-      ),
-    ).rejects.toThrow("MERGE cannot update the unique key: sku");
-    await expect(
       database.execute("MERGE INTO stock s USING delivery d ON s.sku = d.sku"),
     ).rejects.toThrow("MERGE needs at least one WHEN clause");
     await expect(
@@ -1760,10 +1755,22 @@ describe("schema statements", () => {
         "CREATE TABLE c (a INTEGER NOT NULL REFERENCES customers(id) ON DELETE SET NULL)",
       ),
     ).rejects.toThrow("cannot SET NULL a NOT NULL column");
-    // A unique key never changes here, so an ON UPDATE action would have nothing to act on.
+    // A reference always follows its parent's rekey, so only ON UPDATE CASCADE states it;
+    // any other ON UPDATE action is refused rather than silently ignored.
     await expect(
-      database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(id) ON UPDATE CASCADE)"),
-    ).rejects.toThrow("has nothing to act on");
+      database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(id) ON UPDATE RESTRICT)"),
+    ).rejects.toThrow("a rekey always moves its references");
+    await expect(
+      database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(id) ON UPDATE NO ACTION)"),
+    ).rejects.toThrow("a rekey always moves its references");
+    await expect(
+      database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(id) ON UPDATE SET NULL)"),
+    ).rejects.toThrow("a rekey always moves its references");
+    await expect(
+      database.execute(
+        "CREATE TABLE c (a INTEGER REFERENCES customers(id) NOT ENFORCED ON DELETE CASCADE)",
+      ),
+    ).rejects.toThrow("NOT ENFORCED foreign key cannot declare an ON DELETE action");
   });
 
   it("checks a foreign key against the parent's key index, not its rows", async () => {

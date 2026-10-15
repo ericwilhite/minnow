@@ -4,6 +4,9 @@ import { fileURLToPath } from "node:url";
 import { expect } from "@playwright/test";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
+/** The OPFS layout this build writes; layout 10 admits the internal key-forwards table. */
+const OPFS_LAYOUT = 10;
+
 const directory = new URL("../format-fixtures/", import.meta.url);
 for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
   /^opfs-layout[0-9]+\.json$/u.test(name),
@@ -26,18 +29,46 @@ for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
       tables: fixture.expectations.tables,
       blockValues: fixture.expectations.blockValues,
       walOnlyPreserved: true,
-      rows: [{ id: 1, value: "retained" }],
-      format: 9,
+      rows: [{ id: 2, value: "retained" }],
+      keyForwards: true,
+      format: OPFS_LAYOUT,
       integrity: true,
       olderReaderRefused: true,
     });
   });
 }
 
-/** The IndexedDB schema this build writes; schema 4 stores postings deltas as ordered parts. */
-const INDEXEDDB_SCHEMA = 4;
+test("automatic upgrade: OPFS written by 0.14.1 keeps its rows, index, and sequence, rekeys, and refuses the released readers", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await page.goto("/packages/core/browser/");
+  await requireWorkerOpfs(page);
+  const result = await page.evaluate(async () => {
+    const url = "/packages/core/browser/upgrade-run.ts";
+    const module = (await import(url)) as typeof import("../browser/upgrade-run.js");
+    return module.runReleasedOpfsUpgrade();
+  });
+  expect(result).toEqual({
+    releasedFormat: 9,
+    format: OPFS_LAYOUT,
+    answersPreserved: true,
+    nextValue: [{ id: 4 }],
+    rekeyed: [{ id: 90_000 }],
+    keyForwards: true,
+    integrity: true,
+    olderReadersRefused: true,
+    finalFormat: OPFS_LAYOUT,
+  });
+});
 
-for (const writer of ["0.10.0", "0.12.1", "0.13.1"] as const) {
+/**
+ * The IndexedDB schema this build writes; schema 5 admits the internal key-forwards table a
+ * rekey creates.
+ */
+const INDEXEDDB_SCHEMA = 5;
+
+for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1"] as const) {
   test(`automatic upgrade: IndexedDB written by ${writer} keeps its index deltas, writes past the old delta limit, and refuses the released reader`, async ({
     page,
   }) => {
@@ -49,12 +80,14 @@ for (const writer of ["0.10.0", "0.12.1", "0.13.1"] as const) {
       return module.runIndexedDbUpgrade(version);
     }, writer);
     expect(result).toEqual({
-      releasedSchema: writer === "0.13.1" ? 3 : 2,
+      releasedSchema: { "0.10.0": 2, "0.12.1": 2, "0.13.1": 3, "0.14.1": 4 }[writer],
       schema: INDEXEDDB_SCHEMA,
       answersPreserved: true,
       newRow: [{ id: 70_000 }],
       matches: [[{ n: 2_000 }], [{ n: 1 }], [{ n: 1 }], [{ n: 1 }]],
       reopenedSame: true,
+      rekeyed: [{ id: 90_000 }],
+      keyForwards: true,
       integrity: true,
       olderReadersRefused: true,
       finalSchema: INDEXEDDB_SCHEMA,

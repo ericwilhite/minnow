@@ -89,8 +89,14 @@ machines: https://minnowdb.com/llms.txt
   https://minnowdb.com/docs/sql/. Keep the 64 MiB execution budget unless the application has a
   measured reason to change it; `null` explicitly opts into unbounded execution memory.
 - `UPDATE` and `DELETE` require scalar or composite row identity: a `PRIMARY KEY`, or the
-  single inline `UNIQUE` form. A table without one can only be appended to. Primary-key components
-  cannot be updated.
+  single inline `UNIQUE` form. A table without one can only be appended to.
+- A primary key can change. For a record created offline under a temporary key, run
+  `UPDATE t SET id = <server key> WHERE id = <temporary key>` when it syncs: declared references
+  follow in the same commit, and the old key keeps reading and writing the row for 10 days
+  (`keyForwardRetentionMs`). Do not add a second "stable id" column or keep a key map; join on the
+  primary key. Use temporary keys that can never equal a server key (negative numbers, or an `o:`
+  prefix), declare references with `.references(...)` (`{ enforced: false }` when the parent may
+  not be present), and give every referencing table a primary key.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers, and `/` between two
   integers (columns, constants, `COUNT`, integer aggregates) truncates toward zero as in
   PostgreSQL: `7 / 2` is `3`. Divide by `2.0` or a `DOUBLE PRECISION`/`NUMERIC` operand for a
@@ -246,7 +252,8 @@ machines: https://minnowdb.com/llms.txt
   interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `version()` and other
   server introspection, `TABLESAMPLE`, `SET column = DEFAULT` and `SET (a, b) = (…)` in
   `UPDATE`, data-modifying CTEs, `ALTER TABLE` beyond ADD/DROP COLUMN, `CREATE TABLE … (LIKE …)`,
-  `SERIAL` on a non-key column, `ON UPDATE` and `DEFERRABLE` foreign-key options, partial and
+  `SERIAL` on a non-key column, `ON UPDATE` actions other than `CASCADE`, `DEFERRABLE`
+  foreign keys, partial and
   expression indexes, `ON CONFLICT` on a non-key UNIQUE column, `DROP TABLE a, b`, view column
   lists and materialized views, `setval`, domains, functions, `EXCLUDE` constraints, schemas,
   schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set

@@ -112,6 +112,21 @@ When you already hold the keys, the batch APIs skip the parser and the lookup:
 await db.deleteBatch("orders", { keys: [1001, 1002, 1003] });
 ```
 
+### Changing a primary key
+
+An `UPDATE` may set the primary key itself. The row moves to the new key, every declared reference
+to it follows in the same commit, and the old key keeps reading and writing the row for
+`keyForwardRetentionMs` (10 days by default):
+
+```sql
+UPDATE orders SET order_id = 900001 WHERE order_id = -1
+```
+
+A new key that another row holds, or that an earlier rekey retired, is refused with
+`UniqueConstraintError`, and nothing is written. `UPDATE` triggers fire for the move; `INSERT` and
+`DELETE` triggers do not. [Offline sync and rekeying](/docs/engine/rekeying) walks through every
+step.
+
 ## Upsert
 
 `ON CONFLICT` is Minnow's PostgreSQL-compatible upsert form.
@@ -197,8 +212,9 @@ statement wrote — no window in which something else changes them.
 ## Unique keys
 
 A `PRIMARY KEY` column is enforced: inserting a key that already exists throws
-`UniqueConstraintError` rather than duplicating the row. Membership is tracked separately from the
-data blocks, so the check does not scan the table.
+`UniqueConstraintError` rather than duplicating the row. A key retired by a rekey counts as taken
+while it still forwards to its row. Membership is tracked separately from the data blocks, so the
+check does not scan the table.
 
 ```ts
 import { UniqueConstraintError } from "@minnowdb/core";

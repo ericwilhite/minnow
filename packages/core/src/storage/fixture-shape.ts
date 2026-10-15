@@ -140,6 +140,11 @@ export async function buildFixtureDatabase(database: MinnowDatabase): Promise<vo
   await database.execute("DELETE FROM records WHERE id > ?", [396]);
   await database.execute("UPDATE keyed_by_name SET score = ? WHERE name = ?", [999, "name-0007"]);
   await database.execute("DELETE FROM keyed_by_name WHERE name = ?", ["name-0008"]);
+  // A rekey, which writes the internal key-forwards table: snapshot format 2 carries it.
+  await database.execute("UPDATE keyed_by_name SET name = ? WHERE name = ?", [
+    "name-renamed",
+    "name-0009",
+  ]);
 }
 
 /**

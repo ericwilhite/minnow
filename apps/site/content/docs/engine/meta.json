@@ -1,4 +1,1 @@
-{
-  "title": "Engine",
-  "pages": ["index", "transactions", "workers", "errors", "memory"]
-}
+{ "title": "Engine", "pages": ["index", "transactions", "rekeying", "workers", "errors", "memory"] }

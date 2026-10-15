@@ -36,10 +36,10 @@ describe("compressed download budgets", () => {
     // capacity, and sliced OPFS recovery: 470.1 KiB measured. Sliced commits and checkpoint
     // parsing (0.13.1): 472.2 KiB measured. Bounded delta replay, staged commit deltas, WAL
     // continuation frames, the lease lane, follower pieces, and schema-4 parts (0.14.0):
-    // 486.0 KiB measured.
+    // 486.0 KiB measured. Rekeying (0.15.0): 493.5 KiB measured.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(487 * 1024);
+    ).toBeLessThanOrEqual(494 * 1024);
   });
 });

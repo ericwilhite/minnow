@@ -468,6 +468,30 @@ import {
   type PointReadEquality,
   type PointReadShape,
 } from "./point-read.js";
+import {
+  CommittedKeyForwards,
+  DEFAULT_KEY_FORWARD_RETENTION_MS,
+  KEY_FORWARD_COLUMNS,
+  KEY_FORWARDS_TABLE,
+  KEY_FORWARDS_TABLE_ID,
+  KeyForwardSet,
+  ScopedKeyForwards,
+  addressStorageKey,
+  encodeKeyValues,
+  forwardFromRow,
+  forwardRowKey,
+  keyForwardsTableRecord,
+  storageKeyToken,
+  tableAddress,
+  type KeyChange,
+  type KeyForward,
+  type KeyForwardLookup,
+} from "./key-forwards.js";
+import {
+  forwardKeyEqualities,
+  forwardPlanKeyLiterals,
+  planHasKeyLiterals,
+} from "./key-forward-plan.js";
 
 // The on-disk format is little-endian; the bulk Float64 copy reads platform order.
 const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
@@ -1386,6 +1410,12 @@ export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema
    */
   transactionIdleTimeoutMs?: number;
   /**
+   * How long a retired primary key keeps forwarding to its row's current key after a rekey;
+   * 10 days by default. Within that window a read or write naming the old key reaches the row,
+   * and the old key stays reserved. Background maintenance deletes forwards older than this.
+   */
+  keyForwardRetentionMs?: number;
+  /**
    * Retained bytes for the block buffer pool: decoded physical blocks, their vectorized
    * per-block column forms, zone-map block descriptions, and derived/subquery block
    * results. Every entry is keyed by an immutable identity (a block id, or an exact
@@ -1453,6 +1483,20 @@ export interface QuerySpillCleanupResult {
  * tables; the bound stops a cycle from recursing, the same way the trigger chain is bounded.
  */
 const REFERENTIAL_CASCADES = 8;
+/** No catalog, for a point read that forwards only its own table's key. */
+const NO_TABLES: ReadonlyMap<string, TableRecord> = new Map();
+
+/** Expired key forwards one maintenance pass deletes. */
+const KEY_FORWARD_TRIM_PAGE = 512;
+/** Parent keys per lookup when a rekey finds the rows referencing them. */
+const REKEY_REFERENCE_WINDOW = 256;
+/** The alias a rekey's reference lookup gives the child's own key. */
+const REKEY_CHILD_KEY = "\u0000rekey_child_key";
+
+/** What a write follows retired keys through. */
+interface WriteForwards {
+  readonly lookup: KeyForwardLookup;
+}
 
 /** One foreign key and the table that declares it, indexed by the parent it points at. */
 interface ChildForeignKey {
@@ -1476,6 +1520,10 @@ interface CatalogFacts {
   integers: ReadonlyMap<string, ReadonlySet<string>>;
   /** Physical table names to their primary-key columns, for GROUP BY functional dependency. */
   keys: ReadonlyMap<string, readonly string[]>;
+  /** Every table record by name, so a write can resolve a foreign key's parent without a read. */
+  tables: ReadonlyMap<string, TableRecord>;
+  /** The internal key-forwards table, once the first rekey has created it. */
+  keyForwardsTableId: string | undefined;
 }
 
 /** Thrown into a held write scope to make it abort; never surfaces to a caller. */
@@ -2233,6 +2281,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * staged blocks and a transaction record the collector cannot reclaim while it is open.
    */
   readonly #transactionIdleTimeoutMs: number;
+  /** How long a retired key keeps forwarding; see `MinnowDatabaseOptions.keyForwardRetentionMs`. */
+  readonly #keyForwardRetentionMs: number;
+  /** Committed forwards as of the last generation of the internal table this database read. */
+  #committedKeyForwards: CommittedKeyForwards | undefined;
+  /**
+   * The probe the committed forwards were last proved current at. Forwards change only in a
+   * commit, and a commit moves the manifest version and the catalog epoch, so a read at the same
+   * pair reuses them without asking the generation tracker.
+   */
+  #committedKeyForwardsAt: { manifestVersion: number | null; catalogEpoch: number } | undefined;
+  /** The plan that reads the forwards table itself; the forwarding rewrite leaves it alone. */
+  readonly #keyForwardsReads = new WeakSet<CompiledQuery>();
+  /** Set once the forwards table is seen; it is never dropped, so the answer never changes. */
+  #keyForwardsTableSeen = false;
+  /** The one read of the forwards table in flight, keyed by the generation it reads. */
+  #keyForwardsLoad: { generation: string; promise: Promise<CommittedKeyForwards> } | undefined;
+  /** Forwards a write scope staged, layered over the committed ones; created on its first rekey. */
+  readonly #scopeKeyForwards = new WeakMap<DatabaseTransaction, ScopedKeyForwards>();
+  /** The transaction behind each scope's statement writer, so SQL paths see its forwards. */
+  readonly #writerTransactions = new WeakMap<StatementWriter, DatabaseTransaction>();
   /** What the catalog says, derived once per epoch; see `#catalogFacts`. */
   #catalogCache: { epoch: number; facts: CatalogFacts } | undefined;
   /** CURRVAL is connection-local, matching PostgreSQL session semantics. */
@@ -2432,6 +2500,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     }
     this.#transactionIdleTimeoutMs = options.transactionIdleTimeoutMs ?? 30_000;
+    this.#keyForwardRetentionMs = positiveWholeNumber(
+      options.keyForwardRetentionMs ?? DEFAULT_KEY_FORWARD_RETENTION_MS,
+      "Key forward retention",
+    );
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
       createId: this.#createId,
@@ -2626,10 +2698,63 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
   }
 
+  /**
+   * The current key of the row a key names. A key retired by a rekey within
+   * `keyForwardRetentionMs` resolves to the key its row moved to; any other key comes back as
+   * given. A composite key is passed and returned as an array of values in primary-key order.
+   * For keys held outside a query — a URL, a cache, a queued request — since queries and writes
+   * already follow retired keys on their own.
+   */
+  async resolveKey(
+    tableName: string,
+    key: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<Exclude<BatchValue, null> | BatchValue[]> {
+    return this.#foreground(async () => {
+      const table = await this.#findTable(tableName);
+      const address = tableAddress(table);
+      if (address === undefined) throw new TypeError(`Table has no primary key: ${table.name}`);
+      const composite = Array.isArray(key);
+      const tuple: readonly BatchValue[] = composite
+        ? (key as readonly BatchValue[])
+        : [key as Exclude<BatchValue, null>];
+      if (tuple.length !== address.columns.length) {
+        throw new TypeError(
+          `${table.name} has ${String(address.columns.length)} primary-key column(s); the key has ${String(tuple.length)} value(s)`,
+        );
+      }
+      const stored = tuple.map((value, index) => {
+        const column = address.columns[index];
+        return column === undefined || value === null
+          ? value
+          : normalizeColumnLogicalValue(column, value);
+      });
+      const lookup = await this.#committedForwards();
+      const forward =
+        lookup === undefined ? undefined : lookupAddressForward(lookup, table.id, address, stored);
+      if (forward === undefined) {
+        return composite ? [...tuple] : (key as Exclude<BatchValue, null>);
+      }
+      const current = forward.toValues.map(
+        (value, index) =>
+          (address.columns[index]?.sqlDomain === undefined
+            ? value
+            : externalSqlDomainValue(value)) as BatchValue,
+      );
+      const only = current[0];
+      if (composite || only === undefined || only === null) return current;
+      return only;
+    });
+  }
+
   async listTables(): Promise<TableDefinition[]> {
     return this.#foreground(async () => {
       return (await this.store.listTables())
-        .filter((table) => table.enumType === undefined && table.sequence === undefined)
+        .filter(
+          (table) =>
+            table.enumType === undefined &&
+            table.sequence === undefined &&
+            table.keyForwards !== true,
+        )
         .map((table) => {
           const uniqueKey = table.columns.find(
             (column) => column.id === table.uniqueKeyColumnId,
@@ -2927,8 +3052,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: InsertBatchInputLike,
   ): Promise<InsertBatchResult> {
     const completed = await this.#runWrite(async (admission) => {
+      const forwards = this.#startWriteForwards();
       const table = await this.#findTable(tableName);
       const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
+      await this.#forwardInsertBatch("insert", table, batch, rowCount, undefined, forwards);
       const keys =
         autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
           ? await batchKeys(table, batch)
@@ -3086,12 +3213,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options: UpsertOptions,
   ): Promise<UpsertBatchResult> {
     const completed = await this.#runWrite(async (admission) => {
+      const forwards = this.#startWriteForwards();
       const table = await this.#findTable(tableName);
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
         throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
       }
-      const { batch, generated, autoIncrement } = await this.#fillDefaults(table, input);
+      const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
+      await this.#forwardInsertBatch("upsert", table, batch, rowCount, undefined, forwards);
       const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
       const keys = deferred ? undefined : await batchKeys(table, batch);
       const current = await this.store.getTable(table.id);
@@ -3158,13 +3287,50 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: UpdateBatchInput,
   ): Promise<UpdateBatchResult> {
     return this.#runWrite(async (admission) => {
+      const forwards = this.#startWriteForwards();
       const table = await this.#findTable(tableName);
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
         throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
       }
-      const normalizedInput = normalizeDomainUpdate(table, input);
+      const normalizedInput = await this.#forwardUpdateBatch(
+        table,
+        normalizeDomainUpdate(table, input),
+        undefined,
+        forwards,
+      );
       rejectGeneratedUpdateAssignments(table, normalizedInput);
+      if (changesTableAddress(table, normalizedInput)) {
+        // The row move, the references that follow it, and its forwards publish as one commit.
+        const started = performance.now();
+        const { result, version } = await this.#openWriteScope(admission, (session) =>
+          session.updateBatch(tableName, normalizedInput),
+        );
+        return {
+          tableName: table.name,
+          segmentId: result.segmentId ?? "",
+          requestedRowCount: normalizedInput.keys.length,
+          updatedRowCount: result.rowCount,
+          changedColumns: Object.keys(normalizedInput.changes).sort(),
+          blockCount: 0,
+          storedBytes: 0,
+          version: version ?? 0,
+          metrics: {
+            logicalBytes: 0,
+            storedBytes: 0,
+            writeAmplification: 0,
+            encodeMs: 0,
+            stageMs: 0,
+            commitMs: 0,
+            totalMs: performance.now() - started,
+            retries: 0,
+            rowsPerSecond: 0,
+          },
+          ...(result.generatedColumns === undefined
+            ? {}
+            : { generatedColumns: result.generatedColumns }),
+        };
+      }
       const keys = validateUpdateBatch(table, keyColumn, normalizedInput);
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new UnknownTableError(tableName);
@@ -3226,13 +3392,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: DeleteBatchInput,
   ): Promise<DeleteBatchResult> {
     return this.#runWrite(async (admission) => {
+      const forwards = this.#startWriteForwards();
       const table = await this.#findTable(tableName);
       const keyColumn = getUniqueKeyColumn(table);
       const keyDomain = keyColumn?.sqlDomain;
-      const normalizedInput =
+      const normalizedInput = await this.#forwardDeleteBatch(
+        table,
         keyDomain === undefined
           ? input
-          : { keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)) };
+          : { keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)) },
+        undefined,
+        forwards,
+      );
       const dependents = await this.#childForeignKeys(tableName);
       if (dependents.length === 0) {
         return this.#deleteBatchOnce(admission, tableName, normalizedInput);
@@ -5189,9 +5360,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       { dependencies: string[]; deterministic: boolean } | undefined;
     if (proof === undefined) {
       const rewritten = await this.#applyCatalogRewrites(plan, before);
-      const dependencies = [...(await this.#findRealBlockTables(rewritten)).values()]
-        .map((table) => table.id)
-        .sort();
+      const dependencies = [...(await this.#findRealBlockTables(rewritten)).values()].map(
+        (table) => table.id,
+      );
+      // A key constant may name a retired key, so a rekey anywhere can change the answer.
+      if (planHasKeyLiterals(plan, (await this.#catalogFacts(before)).tables)) {
+        dependencies.push(KEY_FORWARDS_TABLE_ID);
+      }
+      dependencies.sort();
       proof = {
         dependencies,
         deterministic: !blockCallsFunctions(rewritten, nonDeterministicFunctionNames),
@@ -5244,7 +5420,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * (E051-09), and a NATURAL join becomes the equality over the columns its sides share
    * (F401-01). Reads the catalog only for the statements that ask for one of them.
    */
-  async #applyCatalogRewrites(plan: CompiledQuery, probe?: CatalogProbe): Promise<CompiledQuery> {
+  async #applyCatalogRewrites(
+    plan: CompiledQuery,
+    probe?: CatalogProbe,
+    /** Inside a write scope, the forwards it staged count too. */
+    transaction?: DatabaseTransaction,
+  ): Promise<CompiledQuery> {
     const aliased = planHasSourceColumnAliases(plan);
     const natural = planHasNaturalJoins(plan);
     // Whether a name is a view cannot be read off the statement, so this is the one thing every
@@ -5258,6 +5439,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       integers,
       keys,
       columns: catalogColumns,
+      tables,
+      keyForwardsTableId,
     } = await this.#catalogFacts(probe);
     let rewritten = plan.usesSequenceCalls === true ? await this.#resolveSequenceCalls(plan) : plan;
     // Unquoted identifiers that resolve only case-insensitively are read as PostgreSQL folds
@@ -5278,6 +5461,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains, types);
+    }
+    // A key constant naming a retired key reads the row's current key; see key-forward-plan.ts.
+    if (keyForwardsTableId !== undefined && !this.#keyForwardsReads.has(plan)) {
+      const lookup =
+        (transaction === undefined ? undefined : this.#scopeKeyForwards.get(transaction)) ??
+        (await this.#committedForwards(probe));
+      if (lookup !== undefined && !lookup.isEmpty()) {
+        rewritten = forwardPlanKeyLiterals(rewritten, tables, lookup);
+      }
     }
     // Integer division needs the catalog: `qty / 2` truncates only once `qty` is known to be
     // an INTEGER column. The probe is one walk; a plan with a candidate is cloned so the shared
@@ -5504,7 +5696,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const types = new Map<string, ReadonlyMap<string, SimpleDataType>>();
     const integers = new Map<string, ReadonlySet<string>>();
     const keys = new Map<string, readonly string[]>();
+    const tables = new Map<string, TableRecord>();
+    let keyForwardsTableId: string | undefined;
     for (const table of await this.store.listTables()) {
+      tables.set(table.name, table);
+      if (table.keyForwards === true) keyForwardsTableId = table.id;
       const visible = table.columns.filter(({ hidden }) => hidden !== true);
       const keyColumn = getUniqueKeyColumn(table);
       const keyNames =
@@ -5537,7 +5733,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         else existing.push({ table, key });
       }
     }
-    const facts: CatalogFacts = { views, childKeys, domains, columns, types, integers, keys };
+    const facts: CatalogFacts = {
+      views,
+      childKeys,
+      domains,
+      columns,
+      types,
+      integers,
+      keys,
+      tables,
+      keyForwardsTableId,
+    };
     this.#catalogCache = { epoch, facts };
     return facts;
   }
@@ -5545,6 +5751,644 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /** Every foreign key pointing at one table, with the table that declares it. */
   async #childForeignKeys(parentName: string): Promise<readonly ChildForeignKey[]> {
     return (await this.#catalogFacts()).childKeys.get(parentName) ?? [];
+  }
+
+  // --- Rekeying and key forwards --------------------------------------------------------------
+
+  /**
+   * The committed forwards, read once per generation of the internal table. Undefined while no
+   * rekey has created that table — the common case, which costs one epoch-cached catalog lookup.
+   */
+  async #committedForwards(probe?: CatalogProbe): Promise<CommittedKeyForwards | undefined> {
+    probe ??= await this.store.getCatalogProbe();
+    const current = this.#committedKeyForwards;
+    const provedAt = this.#committedKeyForwardsAt;
+    if (
+      current !== undefined &&
+      provedAt?.manifestVersion === probe.manifestVersion &&
+      provedAt.catalogEpoch === probe.catalogEpoch
+    ) {
+      return current;
+    }
+    if (!(await this.#keyForwardsTableExists())) return undefined;
+    const generation = await this.#queryGenerations.key(
+      [KEY_FORWARDS_TABLE_ID],
+      probe.manifestVersion,
+    );
+    const proved = { manifestVersion: probe.manifestVersion, catalogEpoch: probe.catalogEpoch };
+    if (current?.generation === generation) {
+      this.#committedKeyForwardsAt = proved;
+      return current;
+    }
+    const loading = this.#keyForwardsLoad;
+    if (loading?.generation === generation) return loading.promise;
+    const version = probe.manifestVersion;
+    const promise = (async () => {
+      const read: CompiledQuery = {
+        sql: "(key forwards)",
+        base: { table: KEY_FORWARDS_TABLE, alias: KEY_FORWARDS_TABLE },
+        joins: [],
+        select: Object.values(KEY_FORWARD_COLUMNS).map((name) => ({
+          expression: { kind: "column" as const, reference: name },
+          alias: name,
+        })),
+        predicates: [],
+        groupBy: [],
+        having: [],
+        orderBy: [],
+      };
+      this.#keyForwardsReads.add(read);
+      const result = await this.#queries.run(read, {
+        memoize: false,
+        ...(version === null ? {} : { version }),
+      });
+      const forwards = new KeyForwardSet();
+      for (const row of result.rows) forwards.add(forwardFromRow(row));
+      return new CommittedKeyForwards(
+        generation,
+        forwards,
+        () => dateMilliseconds(this.#now()) - this.#keyForwardRetentionMs,
+      );
+    })();
+    this.#keyForwardsLoad = { generation, promise };
+    try {
+      const loaded = await promise;
+      this.#committedKeyForwards = loaded;
+      this.#committedKeyForwardsAt = proved;
+      return loaded;
+    } finally {
+      this.#settleKeyForwardsLoad(promise);
+    }
+  }
+
+  /** Forgets a finished read of the forwards, unless a newer one has replaced it. */
+  #settleKeyForwardsLoad(promise: Promise<CommittedKeyForwards>): void {
+    if (this.#keyForwardsLoad?.promise === promise) this.#keyForwardsLoad = undefined;
+  }
+
+  /**
+   * The forwards a write resolves through — its scope's own view once it rekeyed, else the
+   * committed ones — or undefined when there is nothing to follow, which is every write before
+   * the first rekey. A scope reads nothing for this: it reuses the probe it began with, since no
+   * other tab can create forwards while it holds the writer turn. A standalone write makes one
+   * catalog probe, which its caller starts beside the table lookup it does anyway.
+   */
+  async #writeForwards(transaction?: DatabaseTransaction): Promise<WriteForwards | undefined> {
+    const scoped = transaction === undefined ? undefined : this.#scopeKeyForwards.get(transaction);
+    if (scoped !== undefined) return { lookup: scoped };
+    if (!(await this.#keyForwardsTableExists())) return undefined;
+    const committed = await this.#committedForwards(transaction?.initialCatalogProbe);
+    return committed === undefined || committed.isEmpty() ? undefined : { lookup: committed };
+  }
+
+  /**
+   * Whether any rekey has created the forwards table: one keyed catalog read until it has, then
+   * nothing, since the table is never dropped. Writes ask this rather than reading the whole
+   * catalog, whose cached form every commit invalidates.
+   */
+  async #keyForwardsTableExists(): Promise<boolean> {
+    if (this.#keyForwardsTableSeen) return true;
+    if ((await this.store.getTable(KEY_FORWARDS_TABLE_ID))?.keyForwards !== true) return false;
+    this.#keyForwardsTableSeen = true;
+    return true;
+  }
+
+  /** Starts `#writeForwards` early, so its catalog read overlaps the caller's own reads. */
+  #startWriteForwards(): Promise<WriteForwards | undefined> {
+    const pending = this.#writeForwards();
+    // Awaited later by the caller; an early failure must not surface as unhandled meanwhile.
+    pending.catch(() => undefined);
+    return pending;
+  }
+
+  /** The scope's view, created on its first rekey over the committed forwards it started from. */
+  async #scopedForwards(transaction: DatabaseTransaction): Promise<ScopedKeyForwards> {
+    const existing = this.#scopeKeyForwards.get(transaction);
+    if (existing !== undefined) return existing;
+    const committed = await this.#committedForwards();
+    const created =
+      this.#scopeKeyForwards.get(transaction) ?? new ScopedKeyForwards(() => committed);
+    this.#scopeKeyForwards.set(transaction, created);
+    return created;
+  }
+
+  /**
+   * Creates the internal forwards table on the first rekey. Its ID is fixed, so a tab that loses
+   * the race sees its own record already there. Adding it leaves the schema epoch alone, so the
+   * write scope doing the rekey still commits.
+   */
+  async #ensureKeyForwardsTable(): Promise<void> {
+    if (await this.#keyForwardsTableExists()) return;
+    try {
+      await this.store.addTable(keyForwardsTableRecord(dateIsoString(this.#now())));
+    } catch (error) {
+      if ((await this.store.getTable(KEY_FORWARDS_TABLE_ID))?.keyForwards !== true) throw error;
+    }
+  }
+
+  /** Keys naming a retired row replaced with the row's current key; the same array if none did. */
+  #forwardKeyValues(
+    lookup: KeyForwardLookup | undefined,
+    table: TableRecord,
+    keys: readonly BatchValue[],
+  ): readonly BatchValue[] {
+    if (!lookup?.hasTable(table.id)) return keys;
+    let forwarded: BatchValue[] | undefined;
+    for (let index = 0; index < keys.length; index += 1) {
+      const value = keys[index] ?? null;
+      const forward = lookupForward(lookup, table.id, value);
+      if (forward === undefined) continue;
+      forwarded ??= [...keys];
+      forwarded[index] = forward.to;
+    }
+    return forwarded ?? keys;
+  }
+
+  /**
+   * Foreign-key values naming a retired parent key, rewritten to the parent's current key, so
+   * stored rows only ever hold current keys and a join never needs the forwards. Returns
+   * undefined when nothing changed. A composite key is followed only when every one of its
+   * columns is present.
+   */
+  async #forwardReferenceColumns(
+    forwards: WriteForwards,
+    table: TableRecord,
+    columns: Readonly<Record<string, readonly BatchValue[]>>,
+    rowCount: number,
+    transaction?: DatabaseTransaction,
+  ): Promise<Record<string, readonly BatchValue[]> | undefined> {
+    const keys = table.foreignKeys ?? [];
+    if (keys.length === 0) return undefined;
+    const { lookup } = forwards;
+    let forwarded: Record<string, BatchValue[] | readonly BatchValue[]> | undefined;
+    for (const key of keys) {
+      if (key.columns.some((column) => columns[column] === undefined)) continue;
+      const parent = await this.#findTable(key.parentTable, transaction);
+      if (!lookup.hasTable(parent.id)) continue;
+      const address = tableAddress(parent);
+      if (address === undefined) continue;
+      for (let row = 0; row < rowCount; row += 1) {
+        const tuple = key.columns.map((column) => (forwarded ?? columns)[column]?.[row] ?? null);
+        const forward = lookupAddressForward(lookup, parent.id, address, tuple);
+        if (forward === undefined) continue;
+        forwarded ??= { ...columns };
+        for (const [position, column] of key.columns.entries()) {
+          let values = forwarded[column] as BatchValue[];
+          if (values === columns[column]) {
+            values = [...values];
+            forwarded[column] = values;
+          }
+          values[row] = forward.toValues[position] ?? null;
+        }
+      }
+    }
+    return forwarded;
+  }
+
+  /**
+   * Applies forwards to an insert or upsert batch after its defaults are filled. An insert naming
+   * a retired key is refused — the key is held by its row's alias — while an upsert names that
+   * row and is redirected to its current key. Foreign-key values follow their parent's forward.
+   */
+  async #forwardInsertBatch(
+    kind: "insert" | "upsert",
+    table: TableRecord,
+    batch: ColumnarBatch,
+    rowCount: number,
+    transaction?: DatabaseTransaction,
+    started?: Promise<WriteForwards | undefined>,
+  ): Promise<void> {
+    const forwards = await (started ?? this.#writeForwards(transaction));
+    if (forwards === undefined) return;
+    const { lookup } = forwards;
+    const columns = batch.columns as Record<string, readonly BatchValue[]>;
+    const address = tableAddress(table);
+    if (address !== undefined && lookup.hasTable(table.id)) {
+      let moved = false;
+      for (let row = 0; row < rowCount; row += 1) {
+        const tuple = address.columns.map((column) => columns[column.name]?.[row] ?? null);
+        const forward = lookupAddressForward(lookup, table.id, address, tuple);
+        if (forward === undefined) continue;
+        if (kind === "insert") {
+          throw new UniqueConstraintError(
+            table.name,
+            publicKeyName(table, address.keyColumn),
+            shownKey(tuple),
+          );
+        }
+        for (const [position, column] of address.columns.entries()) {
+          const values = [...(columns[column.name] ?? [])];
+          values[row] = forward.toValues[position] ?? null;
+          columns[column.name] = values;
+        }
+        moved = true;
+      }
+      if (moved) fillCompositePrimaryKey(table, batch, rowCount);
+    }
+    const references = await this.#forwardReferenceColumns(
+      forwards,
+      table,
+      columns,
+      rowCount,
+      transaction,
+    );
+    if (references !== undefined) Object.assign(columns, references);
+  }
+
+  /** Applies forwards to an update batch's keys and to the foreign-key values it writes. */
+  async #forwardUpdateBatch(
+    table: TableRecord,
+    input: UpdateBatchInput,
+    transaction?: DatabaseTransaction,
+    started?: Promise<WriteForwards | undefined>,
+  ): Promise<UpdateBatchInput> {
+    const forwards = await (started ?? this.#writeForwards(transaction));
+    if (forwards === undefined) return input;
+    const keys = this.#forwardKeyValues(forwards.lookup, table, input.keys);
+    const changes = await this.#forwardReferenceColumns(
+      forwards,
+      table,
+      input.changes,
+      input.keys.length,
+      transaction,
+    );
+    return keys === input.keys && changes === undefined
+      ? input
+      : { keys, changes: changes ?? input.changes };
+  }
+
+  /** Applies forwards to a delete batch; two keys naming the same row delete it once. */
+  async #forwardDeleteBatch(
+    table: TableRecord,
+    input: DeleteBatchInput,
+    transaction?: DatabaseTransaction,
+    started?: Promise<WriteForwards | undefined>,
+  ): Promise<DeleteBatchInput> {
+    const forwards = await (started ?? this.#writeForwards(transaction));
+    const keys = this.#forwardKeyValues(forwards?.lookup, table, input.keys);
+    if (keys === input.keys) return input;
+    const seen = new Set<string>();
+    return {
+      keys: keys.filter((key) => {
+        if (key === null) return true;
+        const token = safeStorageKeyToken(key);
+        if (token === undefined) return true;
+        if (seen.has(token)) return false;
+        seen.add(token);
+        return true;
+      }),
+    };
+  }
+
+  /**
+   * Changes the primary key of the rows `input` names: each row moves to its new key, every
+   * declared reference to it follows, and the retired key forwards to the new one — all staged
+   * in this one transaction, so they publish together. UPDATE triggers fire for the move, not
+   * the delete and insert that carry it out.
+   */
+  async #sessionRekey(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    input: UpdateBatchInput,
+    cascadeBudget: number,
+    referentialBudget: number,
+  ): Promise<StagedWriteResult> {
+    const address = tableAddress(table);
+    if (address === undefined) {
+      throw new TypeError(`Table has no primary key to change: ${table.name}`);
+    }
+    const keys = validateUpdateBatch(table, keyColumn, input, true);
+    const overlay = this.#stagedKeyOverlay(transaction, table.id);
+    for (const [token, value] of keys) {
+      if (overlay.removed.has(token)) throw new MissingKeyError(table.name, keyColumn.name, value);
+    }
+    const committedKeys = new Map([...keys].filter(([token]) => !overlay.added.has(token)));
+    if (committedKeys.size > 0) {
+      await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
+    }
+    const oldKeys = input.keys as ReadonlyArray<Exclude<BatchValue, null>>;
+    const preImages = await this.#triggerPreImages(
+      table,
+      keyColumn,
+      oldKeys,
+      "update",
+      undefined,
+      true,
+      this.#scopeKeyLookup(transaction, table, keyColumn),
+    );
+    // The moved row in full: every column the caller can write, from the change or the old row.
+    const writable = table.columns.filter(
+      (column) => column.hidden !== true && column.generatedValue === undefined,
+    );
+    const rowCount = oldKeys.length;
+    const next: Record<string, BatchValue[]> = Object.create(null) as Record<string, BatchValue[]>;
+    for (const column of writable) {
+      const changed = input.changes[column.name];
+      next[column.name] = preImages.map((row, index) =>
+        changed !== undefined
+          ? (changed[index] ?? null)
+          : storedSqlValueFromExecution(column, row?.[column.name] ?? null),
+      );
+    }
+    const oldValues = preImages.map((row) =>
+      address.columns.map((column) =>
+        storedSqlValueFromExecution(column, row?.[column.name] ?? null),
+      ),
+    );
+    const newValues = oldValues.map((_, index) =>
+      address.columns.map((column) => next[column.name]?.[index] ?? null),
+    );
+    for (const values of newValues) {
+      const nullAt = values.findIndex((value) => value === null);
+      if (nullAt !== -1) {
+        throw new TypeError(
+          `PRIMARY KEY cannot be null: ${address.columns[nullAt]?.name ?? keyColumn.name}`,
+        );
+      }
+    }
+    const newKeys = newValues.map((values) => addressStorageKey(address, values));
+    // A row whose key does not actually change is an ordinary update.
+    const moved: number[] = [];
+    const kept: number[] = [];
+    for (let index = 0; index < rowCount; index += 1) {
+      const from = oldKeys[index];
+      const to = newKeys[index];
+      if (from === undefined || to === undefined) throw new Error("Rekey row disappeared");
+      if (keyToken(keyColumn.type, from) === keyToken(keyColumn.type, to)) kept.push(index);
+      else moved.push(index);
+    }
+    let segmentId: string | null = null;
+    if (kept.length > 0) {
+      const changes = Object.fromEntries(
+        Object.entries(input.changes)
+          .filter(([name]) => !address.columns.some((column) => column.name === name))
+          .map(([name, values]) => [name, kept.map((index) => values[index] ?? null)]),
+      );
+      if (Object.keys(changes).length > 0) {
+        const updated = await this.#sessionUpdate(
+          transaction,
+          table.name,
+          { keys: kept.map((index) => oldKeys[index] ?? null), changes },
+          cascadeBudget,
+          true,
+          referentialBudget,
+        );
+        segmentId = updated.segmentId;
+      }
+    }
+    if (moved.length === 0) return { tableName: table.name, segmentId, rowCount };
+    if (referentialBudget < 0) {
+      throw new Error(`Rekey cascade depth exceeded at table: ${table.name}`);
+    }
+    // New keys must be distinct, and none may be a retired key: an alias still holds it.
+    const lookup = (await this.#writeForwards(transaction))?.lookup;
+    const targets = new Set<string>();
+    for (const index of moved) {
+      const to = presentAt(newKeys, index);
+      const token = keyToken(keyColumn.type, to);
+      const tuple = newValues[index] ?? [];
+      if (targets.has(token) || lookup?.get(table.id, token) !== undefined) {
+        throw new UniqueConstraintError(
+          table.name,
+          publicKeyName(table, keyColumn),
+          shownKey(tuple),
+        );
+      }
+      targets.add(token);
+    }
+    const valueAt = (source: "new" | "old", column: string, position: number): BatchValue => {
+      const index = moved[position] ?? -1;
+      if (source === "old") return preImages[index]?.[column] ?? null;
+      return next[column]?.[index] ?? preImages[index]?.[column] ?? null;
+    };
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "update",
+      moved.length,
+      valueAt,
+      "before",
+      cascadeBudget,
+    );
+    await this.#sessionDelete(
+      transaction,
+      table.name,
+      { keys: moved.map((index) => oldKeys[index] ?? null) },
+      cascadeBudget,
+      referentialBudget,
+      true,
+    );
+    // Old storage token to the moved row's keys, for references and forwards.
+    const renamed = new Map<
+      string,
+      {
+        from: Exclude<BatchValue, null>;
+        to: Exclude<BatchValue, null>;
+        fromValues: BatchValue[];
+        toValues: BatchValue[];
+      }
+    >();
+    for (const index of moved) {
+      const from = presentAt(oldKeys, index);
+      renamed.set(keyToken(keyColumn.type, from), {
+        from,
+        to: presentAt(newKeys, index),
+        fromValues: oldValues[index] ?? [],
+        toValues: newValues[index] ?? [],
+      });
+    }
+    // A moved row that refers to another moved row of its own table points at the new key.
+    for (const key of table.foreignKeys ?? []) {
+      if (key.parentTable !== table.name) continue;
+      for (const index of moved) {
+        const tuple = key.columns.map((column) => next[column]?.[index] ?? null);
+        if (tuple.some((value) => value === null)) continue;
+        const target = renamed.get(keyToken(keyColumn.type, addressStorageKey(address, tuple)));
+        if (target === undefined) continue;
+        for (const [position, column] of key.columns.entries()) {
+          const values = next[column];
+          if (values !== undefined) values[index] = target.toValues[position] ?? null;
+        }
+      }
+    }
+    const inserted = await this.#sessionInsert(
+      transaction,
+      table.name,
+      {
+        columns: Object.fromEntries(
+          Object.entries(next).map(([name, values]) => [
+            name,
+            moved.map((index) => values[index] ?? null),
+          ]),
+        ),
+        rowCount: moved.length,
+      },
+      "insert",
+      undefined,
+      cascadeBudget,
+      true,
+    );
+    await this.#moveReferences(
+      transaction,
+      table,
+      address,
+      renamed,
+      cascadeBudget,
+      referentialBudget,
+    );
+    await this.#stageKeyForwards(transaction, table, [...renamed.values()]);
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "update",
+      moved.length,
+      valueAt,
+      "after",
+      cascadeBudget,
+    );
+    return {
+      tableName: table.name,
+      segmentId: inserted.segmentId ?? segmentId,
+      rowCount,
+      ...(inserted.generatedColumns === undefined
+        ? {}
+        : { generatedColumns: inserted.generatedColumns }),
+    };
+  }
+
+  /**
+   * Points every declared reference to a rekeyed row at its new key — enforced or not, since a
+   * reference that kept the old key would silently stop joining. A reference column that is
+   * also part of the child's own key rekeys the child in turn.
+   */
+  async #moveReferences(
+    transaction: DatabaseTransaction,
+    parent: TableRecord,
+    address: ReturnType<typeof tableAddress> & object,
+    renamed: ReadonlyMap<string, { fromValues: BatchValue[]; toValues: BatchValue[] }>,
+    cascadeBudget: number,
+    referentialBudget: number,
+  ): Promise<void> {
+    const quote = quoteSqlIdentifier;
+    const sources = [...renamed.values()];
+    for (const { table: declared, key } of await this.#childForeignKeys(parent.name)) {
+      const child = await this.#findTable(declared.name, transaction);
+      const childKey = getUniqueKeyColumn(child);
+      const childColumns = key.columns.map((name) => findColumn(child, name));
+      const rows: QueryRow[] = [];
+      for (let start = 0; start < sources.length; start += REKEY_REFERENCE_WINDOW) {
+        const window = sources.slice(start, start + REKEY_REFERENCE_WINDOW);
+        const predicate = window
+          .map(() => `(${key.columns.map((column) => `${quote(column)} = ?`).join(" AND ")})`)
+          .join(" OR ");
+        const selected = [
+          ...(childKey === undefined
+            ? []
+            : [`${quote(childKey.name)} AS ${quote(REKEY_CHILD_KEY)}`]),
+          ...key.columns.map(quote),
+        ].join(", ");
+        const result = await this.#sessionQuery(
+          transaction,
+          `SELECT ${selected} FROM ${quote(child.name)} WHERE ${predicate}`,
+          { params: window.flatMap((source) => source.fromValues as QueryValue[]) },
+        );
+        rows.push(...result.rows);
+      }
+      if (rows.length === 0) continue;
+      if (childKey === undefined) {
+        throw new TypeError(
+          `FOREIGN KEY ${key.name} needs a unique key on ${child.name} to follow a rekey`,
+        );
+      }
+      const changes: Record<string, BatchValue[]> = Object.fromEntries(
+        key.columns.map((column) => [column, [] as BatchValue[]]),
+      );
+      const keys: BatchValue[] = [];
+      for (const row of rows) {
+        const tuple = childColumns.map((column) =>
+          storedSqlValueFromExecution(column, row[column.name] ?? null),
+        );
+        const target = renamed.get(
+          keyToken(address.keyColumn.type, addressStorageKey(address, tuple)),
+        );
+        if (target === undefined) continue;
+        keys.push(storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null));
+        for (const [position, column] of key.columns.entries()) {
+          changes[column]?.push(target.toValues[position] ?? null);
+        }
+      }
+      if (keys.length === 0) continue;
+      await this.#sessionUpdate(
+        transaction,
+        child.name,
+        { keys, changes },
+        cascadeBudget,
+        true,
+        referentialBudget - 1,
+      );
+    }
+  }
+
+  /**
+   * Records each moved row's forward in the same transaction as the move. A key that already
+   * forwarded to a moved row now forwards to its new key, so a chain is always one hop.
+   */
+  async #stageKeyForwards(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    moved: ReadonlyArray<{
+      from: Exclude<BatchValue, null>;
+      to: Exclude<BatchValue, null>;
+      fromValues: BatchValue[];
+      toValues: BatchValue[];
+    }>,
+  ): Promise<void> {
+    await this.#ensureKeyForwardsTable();
+    const scoped = await this.#scopedForwards(transaction);
+    const retiredAt = dateMilliseconds(this.#now());
+    // A key another moved row now holds — a swap or rotation — is not retired, so it gets no
+    // forward; one would shadow the row that holds it.
+    const reused = new Set(moved.map((row) => storageKeyToken(row.to)));
+    const forwards: KeyForward[] = [];
+    for (const row of moved) {
+      const fromToken = storageKeyToken(row.from);
+      if (!reused.has(fromToken)) forwards.push({ tableId: table.id, ...row, retiredAt });
+      for (const source of scoped.sourcesOf(table.id, fromToken)) {
+        forwards.push({ ...source, to: row.to, toValues: row.toValues });
+      }
+    }
+    if (forwards.length === 0) {
+      scoped.changes.push(...moved.map((row) => ({ tableId: table.id, ...row, retiredAt })));
+      return;
+    }
+    await this.#sessionInsert(
+      transaction,
+      KEY_FORWARDS_TABLE,
+      {
+        columns: {
+          [KEY_FORWARD_COLUMNS.key]: forwards.map((forward) =>
+            forwardRowKey(forward.tableId, storageKeyToken(forward.from)),
+          ),
+          [KEY_FORWARD_COLUMNS.table]: forwards.map((forward) => forward.tableId),
+          [KEY_FORWARD_COLUMNS.from]: forwards.map((forward) => encodeKeyValues([forward.from])),
+          [KEY_FORWARD_COLUMNS.to]: forwards.map((forward) => encodeKeyValues([forward.to])),
+          [KEY_FORWARD_COLUMNS.fromValues]: forwards.map((forward) =>
+            encodeKeyValues(forward.fromValues),
+          ),
+          [KEY_FORWARD_COLUMNS.toValues]: forwards.map((forward) =>
+            encodeKeyValues(forward.toValues),
+          ),
+          [KEY_FORWARD_COLUMNS.retiredAt]: forwards.map((forward) => forward.retiredAt),
+        },
+        rowCount: forwards.length,
+      },
+      "upsert",
+    );
+    for (const forward of forwards) scoped.staged.add(forward);
+    // A reused key's stale staged forward, from earlier in this scope, would shadow its row.
+    for (const token of reused) scoped.staged.delete(table.id, token);
+    scoped.changes.push(...moved.map((row) => ({ tableId: table.id, ...row, retiredAt })));
   }
 
   /**
@@ -5561,10 +6405,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options: QueryOptions,
   ): Promise<QueryResult | undefined> {
     pointReadTestHooks.attempted += 1;
+    const probe = await this.store.getCatalogProbe();
+    const forwards = await this.#pointReadForwards(probe);
     const result = await this.#withSharedCatalogSnapshot(
       [shape.table],
       (snapshot, realTables, visibility) =>
-        this.#pointReadAtSnapshot(shape, snapshot, realTables, visibility, options),
+        this.#pointReadAtSnapshot(shape, snapshot, realTables, visibility, options, forwards),
+      probe,
     );
     if (result !== undefined) {
       pointReadTestHooks.served += 1;
@@ -5573,15 +6420,37 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return result;
   }
 
+  /** What a point read forwards through, or undefined while no rekey has created forwards. */
+  async #pointReadForwards(
+    probe?: CatalogProbe,
+    transaction?: DatabaseTransaction,
+  ): Promise<KeyForwardLookup | undefined> {
+    const scoped = transaction === undefined ? undefined : this.#scopeKeyForwards.get(transaction);
+    if (scoped !== undefined) return scoped;
+    if (!(await this.#keyForwardsTableExists())) return undefined;
+    const committed = await this.#committedForwards(probe);
+    return committed === undefined || committed.isEmpty() ? undefined : committed;
+  }
+
   async #pointReadAtSnapshot(
     shape: PointReadShape,
     snapshot: LeasedSnapshot,
     realTables: Map<string, TableRecord>,
     visibility: SegmentVisibilityCatalog,
     options: QueryOptions,
+    forwards?: KeyForwardLookup,
   ): Promise<QueryResult | undefined> {
     const table = realTables.get(shape.table);
     if (table === undefined || table.view !== undefined) return undefined;
+    if (forwards !== undefined) {
+      // A pinned foreign-key column may name a retired parent key; the general path follows it.
+      const pinned = new Set(shape.equalities.map(({ column }) => column));
+      if ((table.foreignKeys ?? []).some((key) => key.columns.some((name) => pinned.has(name)))) {
+        return undefined;
+      }
+      const equalities = forwardKeyEqualities(table, shape.equalities, NO_TABLES, forwards);
+      if (equalities !== shape.equalities) shape = { ...shape, equalities: [...equalities] };
+    }
     // Short projections cost fewer allocations as direct lookups. Wide projections keep
     // a name map so SELECT * never turns catalog binding into quadratic work.
     const byName =
@@ -6154,7 +7023,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // A live query over a view depends on the tables behind it, not on the view's name.
           const plan = await this.#applyCatalogRewrites(compiled, probe);
           const tables = await this.#findRealBlockTables(plan);
-          return new Set([...tables.values()].map((record) => record.id));
+          const ids = new Set([...tables.values()].map((record) => record.id));
+          // The forwards table's ID is fixed, so this holds before the first rekey creates it.
+          if (planHasKeyLiterals(compiled, (await this.#catalogFacts(probe)).tables)) {
+            ids.add(KEY_FORWARDS_TABLE_ID);
+          }
+          return ids;
         },
         execute: (query, context) => this.#liveExecute(query, context),
         memoize: (query, result, probe) => this.#memoizeLiveResult(query, result, probe),
@@ -6164,6 +7038,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#liveMaintain(result, state as LiveMaintenanceState, tableIds, after, until, probe),
         changeCanAffect: (query, tableIds, after, until) =>
           this.#liveChangeCanAffect(query, tableIds, after, until),
+        keyChanges: (previous, probe) => this.#liveKeyChanges(previous, probe),
       },
       {
         ...options,
@@ -6176,6 +7051,50 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     this.#liveSets.add(set);
     return set;
+  }
+
+  /**
+   * The rows rekeyed since a live set last looked: forwards new since its previous state, or
+   * redirected by a later rekey. Read from the stored forwards, so a tab that missed every
+   * cross-tab hint still reports them when it next sweeps.
+   */
+  async #liveKeyChanges(
+    previous: { readonly value: unknown } | undefined,
+    probe: CatalogProbe,
+  ): Promise<{ changes: readonly KeyChange[]; state: unknown }> {
+    const committed = await this.#committedForwards(probe);
+    if (previous === undefined) return { changes: [], state: committed };
+    const prior = previous.value as CommittedKeyForwards | undefined;
+    if (committed === undefined || committed === prior) return { changes: [], state: committed };
+    const { tables } = await this.#catalogFacts(probe);
+    const byId = new Map([...tables.values()].map((table) => [table.id, table]));
+    const changes: KeyChange[] = [];
+    for (const forward of committed.forwards.entries()) {
+      const token = storageKeyToken(forward.from);
+      if (committed.get(forward.tableId, token) === undefined) continue;
+      const before = prior?.forwards.get(forward.tableId, token);
+      if (before !== undefined && storageKeyToken(before.to) === storageKeyToken(forward.to)) {
+        continue;
+      }
+      const table = byId.get(forward.tableId);
+      const address = table === undefined ? undefined : tableAddress(table);
+      if (table === undefined || address === undefined) continue;
+      const external = (values: readonly BatchValue[]): BatchValue | BatchValue[] => {
+        const shown = values.map(
+          (value, index) =>
+            (address.columns[index]?.sqlDomain === undefined
+              ? value
+              : externalSqlDomainValue(value)) as BatchValue,
+        );
+        return shown.length === 1 ? (shown[0] ?? null) : shown;
+      };
+      changes.push({
+        table: table.name,
+        from: external(forward.fromValues),
+        to: external(forward.toValues),
+      });
+    }
+    return { changes, state: committed };
   }
 
   #compileLiveQuery(query: LiveQueryInput): CompiledQuery {
@@ -7677,7 +8596,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const materialized = await this.#materializeInsertExpressions(
       { ...compiled, columns, rows: derivedRows },
       statementNow,
-      async (plan) => this.#sessionQueryPlan(transaction, await this.#applyCatalogRewrites(plan)),
+      async (plan) =>
+        this.#sessionQueryPlan(
+          transaction,
+          await this.#applyCatalogRewrites(plan, undefined, transaction),
+        ),
     );
     const input = insertStatementBatch(materialized);
     coerceSqlWriteBatch(target, input);
@@ -8180,7 +9103,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             !this.#hasPendingScopeWrites(transaction) &&
             probe !== undefined
             ? this.#queries.run(plan, {}, probe)
-            : this.#sessionQueryPlan(transaction, await this.#applyCatalogRewrites(plan));
+            : this.#sessionQueryPlan(
+                transaction,
+                await this.#applyCatalogRewrites(plan, undefined, transaction),
+              );
         }),
       queryFirstColumn: (plan) =>
         this.#withReadReservation(async () => {
@@ -8283,6 +9209,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         enqueue(async () => writer.stagedKeyPresence?.(table, keyColumn, keys), "read"),
       rollbackTo: (checkpoint) => enqueue(() => writer.rollbackTo(checkpoint), "rollback"),
     };
+    this.#writerTransactions.set(writer, transaction);
+    this.#writerTransactions.set(queuedWriter, transaction);
     try {
       const result = await untilAborted(() => action(session, transaction, queuedWriter), signal);
       accepting = false;
@@ -8370,12 +9298,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           try {
             pointReadTestHooks.attempted += 1;
             const table = await this.#findTable(shape.table, transaction);
+            const forwards = await this.#pointReadForwards(undefined, transaction);
             point = await this.#withSessionVisibility(
               transaction,
               [table],
               options,
               (snapshot, visibility, realTables) =>
-                this.#pointReadAtSnapshot(shape, snapshot, realTables, visibility, options),
+                this.#pointReadAtSnapshot(
+                  shape,
+                  snapshot,
+                  realTables,
+                  visibility,
+                  options,
+                  forwards,
+                ),
             );
           } catch (error) {
             // A table name that only folds case-insensitively is unknown to the fast path;
@@ -8393,7 +9329,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const bound = bindPlanParameters(compiled, options.params);
     // The same catalog rewrites a read outside a scope gets: a scope that could not see a view
     // would make the scope's reads a different language from everyone else's.
-    const plan = await this.#applyCatalogRewrites(bound);
+    const plan = await this.#applyCatalogRewrites(bound, undefined, transaction);
     throwIfAborted(options.signal);
     return this.#sessionQueryPlan(transaction, plan, options);
   }
@@ -9493,8 +10429,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     beforeMutation: () => void,
   ): Promise<ExecuteResult> {
     const { table, keyColumn } = keyed;
+    const forwardedKeys = this.#forwardKeyValues(
+      (await this.#writeForwards(transaction))?.lookup,
+      table,
+      keyed.keys,
+    ) as ReadonlyArray<Exclude<BatchValue, null>>;
     const byToken = new Map<string, Exclude<BatchValue, null>>();
-    for (const key of keyed.keys) byToken.set(keyToken(keyColumn.type, key), key);
+    for (const key of forwardedKeys) byToken.set(keyToken(keyColumn.type, key), key);
     const presence = await this.#scopeKeyPresence(transaction, table, keyColumn, [
       ...byToken.values(),
     ]);
@@ -9528,6 +10469,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     kind: "insert" | "upsert",
     options?: UpsertOptions,
     cascadeBudget = 1,
+    /** The insert half of a rekey: its UPDATE triggers fire around it, not INSERT triggers. */
+    rekey = false,
   ): Promise<StagedUpsertResult> {
     const table = await this.#findTable(tableName);
     // Session upserts classify against the scope's own staged state, so a row inserted
@@ -9544,6 +10487,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const { generated, autoIncrement } = filled;
     let batch = filled.batch;
     let rowCount = filled.rowCount;
+    await this.#forwardInsertBatch(kind, table, batch, rowCount, transaction);
     if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
         table.id,
@@ -9630,9 +10574,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const buffered =
       this.#scopeWrites.has(transaction) &&
       rowCount < SCOPE_DIRECT_STAGE_ROWS &&
-      !(table.triggers ?? []).some(
-        (trigger) => trigger.event === "insert" || trigger.event === "update",
-      );
+      (rekey ||
+        !(table.triggers ?? []).some(
+          (trigger) => trigger.event === "insert" || trigger.event === "update",
+        ));
     if (buffered) {
       await this.#bufferScopeRows(transaction, table, batch, rowCount, kind);
       collectAutoIncrementGenerated(batch, generated, autoIncrement);
@@ -9646,7 +10591,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     await this.#stageScopeDirectly(transaction, table);
     const rowIds = await this.store.reserveRowIds(table.id, rowCount);
-    if (kind === "insert") {
+    if (rekey) {
+      // The rekey fires its UPDATE triggers around the move.
+    } else if (kind === "insert") {
       await this.#stageTriggerDerivedInserts(
         transaction,
         table,
@@ -9674,7 +10621,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       kind,
       rowIds,
     );
-    if (kind === "insert") {
+    if (rekey) {
+      // As above: the move's UPDATE triggers stand in for INSERT triggers.
+    } else if (kind === "insert") {
       await this.#stageTriggerDerivedInserts(
         transaction,
         table,
@@ -9711,6 +10660,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     cascadeBudget = 1,
     /** The caller already proved every key present against the overlay and the snapshot. */
     keysVerified = false,
+    referentialBudget = REFERENTIAL_CASCADES,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName, transaction);
     await this.#assertCompactionCapacity(table, this.#admissionOf(transaction), transaction);
@@ -9719,7 +10669,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
     }
     input = normalizeDomainUpdate(table, input);
+    const forwarded = await this.#forwardUpdateBatch(table, input, transaction);
+    // A key the caller proved present may have been a retired one; prove its row instead.
+    if (forwarded.keys !== input.keys) keysVerified = false;
+    input = forwarded;
     rejectGeneratedUpdateAssignments(table, input);
+    if (changesTableAddress(table, input)) {
+      return this.#sessionRekey(
+        transaction,
+        table,
+        keyColumn,
+        input,
+        cascadeBudget,
+        referentialBudget,
+      );
+    }
     const keys = validateUpdateBatch(table, keyColumn, input);
     // Read-your-writes membership: keys staged by this scope pass, keys the scope removed
     // fail, and everything else checks against the committed snapshot as usual.
@@ -9861,6 +10825,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: DeleteBatchInput,
     cascadeBudget = 1,
     referentialBudget = REFERENTIAL_CASCADES,
+    /** The delete half of a rekey: no triggers, and references move rather than act. */
+    rekey = false,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName, transaction);
     await this.#assertCompactionCapacity(table, this.#admissionOf(transaction), transaction);
@@ -9874,19 +10840,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)),
       };
     }
-    // The dependents go first and in this same scope, so a cascade publishes with its cause.
-    await this.#applyReferentialActions(
-      table,
-      [...input.keys],
-      {
-        query: (sql, options) => this.#sessionQuery(transaction, sql, options ?? {}),
-        updateBatch: (name, update) =>
-          this.#sessionUpdate(transaction, name, update, cascadeBudget),
-        deleteBatch: (name, remove) =>
-          this.#sessionDelete(transaction, name, remove, cascadeBudget, referentialBudget - 1),
-      },
-      referentialBudget,
-    );
+    if (!rekey) {
+      input = await this.#forwardDeleteBatch(table, input, transaction);
+      // The dependents go first and in this same scope, so a cascade publishes with its cause.
+      await this.#applyReferentialActions(
+        table,
+        [...input.keys],
+        {
+          query: (sql, options) => this.#sessionQuery(transaction, sql, options ?? {}),
+          updateBatch: (name, update) =>
+            this.#sessionUpdate(transaction, name, update, cascadeBudget),
+          deleteBatch: (name, remove) =>
+            this.#sessionDelete(transaction, name, remove, cascadeBudget, referentialBudget - 1),
+        },
+        referentialBudget,
+      );
+    }
     if (input.keys.length === 0) throw new TypeError("A delete batch needs at least one key");
     const keys = new Map<string, Exclude<BatchValue, null>>();
     const keyStringByteLengths =
@@ -9933,19 +10902,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       column: string,
       rowIndex: number,
     ): BatchValue => (source === "old" ? (preImages[rowIndex]?.[column] ?? null) : null);
-    await this.#stageTriggerDerivedInserts(
-      transaction,
-      table,
-      "delete",
-      preImages.length,
-      sessionDeleteValueAt,
-      "before",
-      cascadeBudget,
-    );
+    if (!rekey) {
+      await this.#stageTriggerDerivedInserts(
+        transaction,
+        table,
+        "delete",
+        preImages.length,
+        sessionDeleteValueAt,
+        "before",
+        cascadeBudget,
+      );
+    }
     const buffered =
       this.#scopeWrites.has(transaction) &&
       keys.size < SCOPE_DIRECT_STAGE_ROWS &&
-      !(table.triggers ?? []).some((trigger) => trigger.event === "delete");
+      (rekey || !(table.triggers ?? []).some((trigger) => trigger.event === "delete"));
     let segmentId: string | null = null;
     if (buffered) {
       await this.#bufferScopeDelete(transaction, table, keys);
@@ -9957,15 +10928,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       segmentId = await this.#stageDeleteSegment(transaction, table, keyColumn, values);
     }
-    await this.#stageTriggerDerivedInserts(
-      transaction,
-      table,
-      "delete",
-      preImages.length,
-      sessionDeleteValueAt,
-      "after",
-      cascadeBudget,
-    );
+    if (!rekey) {
+      await this.#stageTriggerDerivedInserts(
+        transaction,
+        table,
+        "delete",
+        preImages.length,
+        sessionDeleteValueAt,
+        "after",
+        cascadeBudget,
+      );
+    }
     return { tableName: table.name, segmentId, rowCount: keys.size };
   }
 
@@ -10879,6 +11852,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           const tuple = values as QueryValue[];
           tuples.set(sqlTupleToken(tuple), tuple);
         }
+        // A row this same statement writes may be the parent — itself, or another row in the
+        // batch — as PostgreSQL checks the constraint once the statement is done.
+        if (key.parentTable === table.name) {
+          const parents = parentNames.map(rowsByColumn);
+          for (let row = 0; row < (parents[0]?.length ?? 0); row += 1) {
+            tuples.delete(sqlTupleToken(parents.map((vector) => vector[row] ?? null)));
+          }
+        }
         if (tuples.size === 0) continue;
         const parent = await this.store.getTableByName(key.parentTable);
         if (parent === undefined) {
@@ -10946,7 +11927,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         throw new TypeError(`FOREIGN KEY ${key.name} has no columns`);
       }
       const values = rowsByColumn(childColumn);
-      const distinct = [...new Set(values.filter((value): value is QueryValue => value !== null))];
+      // Compared by the same token the keyed paths use, so 1 and '1' cannot pass for each other.
+      const token = (value: QueryValue): string =>
+        value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value}:${String(value)}`;
+      // A parent this same statement writes counts, as in the composite case above.
+      const written =
+        key.parentTable === table.name
+          ? new Set(
+              rowsByColumn(parentColumn).flatMap((value) => (value === null ? [] : [token(value)])),
+            )
+          : undefined;
+      const distinct = [
+        ...new Set(
+          values.filter(
+            (value): value is QueryValue => value !== null && written?.has(token(value)) !== true,
+          ),
+        ),
+      ];
       if (distinct.length === 0) continue;
       // A NULL reference names no parent, which the standard leaves satisfied.
       const parent = await this.store.getTableByName(key.parentTable);
@@ -10965,9 +11962,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         )} WHERE ${quoteSqlIdentifier(parentColumn)} IN (${wanted.map(() => "?").join(", ")})`,
         wanted,
       );
-      // Compared by the same token the keyed paths use, so 1 and '1' cannot pass for each other.
-      const token = (value: QueryValue): string =>
-        value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value}:${String(value)}`;
       const present = new Set(
         found.rows.flatMap((row) => {
           const value = row.parent_key ?? null;
@@ -11362,6 +12356,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       filledProposed.generated,
     );
     fillCompositePrimaryKey(table, filledProposed.batch, statement.rows.length);
+    // A retired key names its row: the conflict is with that row, under its current key.
+    await this.#forwardInsertBatch(
+      "upsert",
+      table,
+      filledProposed.batch,
+      statement.rows.length,
+      options.writer === undefined ? undefined : this.#writerTransactions.get(options.writer),
+    );
     const proposed = filledProposed.batch;
     // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
     // even when every proposed row happens to find an existing key.
@@ -11673,6 +12675,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     normalizeDomainBatch(table, filled.batch);
     fillStoredGeneratedColumns(table, filled.batch, statement.rows.length, filled.generated);
     fillCompositePrimaryKey(table, filled.batch, statement.rows.length);
+    // A retired key names its row, so it conflicts the way the row's current key would.
+    await this.#forwardInsertBatch(
+      "upsert",
+      table,
+      filled.batch,
+      statement.rows.length,
+      writer === undefined ? undefined : this.#writerTransactions.get(writer),
+    );
     const columns = visibleTableColumns(table).map(({ name }) => name);
     const deferredAutoIncrement = new Set(filled.autoIncrement?.missingIndexes ?? []);
     const generatedColumns = new Set(
@@ -15911,6 +16921,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /** Runs restart-safe lease-aware reclamation to completion in bounded durable steps. */
   async collectGarbage(options: CollectGarbageOptions = {}): Promise<GarbageCollectionResult> {
     return this.#foreground(async () => {
+      while (await this.#trimExpiredKeyForwards()) {
+        // Each page is one small delete; an explicit call finishes them all.
+      }
       const maxItems = boundedMaintenanceBatchItems(
         options.maxItemsPerStep ?? 64,
         "Garbage collection items per step",
@@ -16057,6 +17070,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #runAutoCollection(): Promise<{ moreWork: boolean; reclaimed: boolean }> {
+    const trimMoreWork = await this.#trimExpiredKeyForwards();
     const reconciliationMoreWork = await this.#reconcileCompactionMaintenance();
     // A discovery cycle may span many bounded jobs. Finish its durable continuation, then
     // wait for a fresh trigger; restarting full discovery just because a job reclaimed records
@@ -16103,7 +17117,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await this.#yieldMaintenance();
     }
     await this.#pruneFinishedJobRecords();
-    return { moreWork: moreWork || reconciliationMoreWork, reclaimed };
+    return { moreWork: moreWork || reconciliationMoreWork || trimMoreWork, reclaimed };
+  }
+
+  /**
+   * Deletes a bounded page of forwards past `keyForwardRetentionMs`. Reads already treat them as
+   * gone; this reclaims their rows. Returns whether expired forwards remain.
+   */
+  async #trimExpiredKeyForwards(): Promise<boolean> {
+    const committed = await this.#committedForwards();
+    const expired = committed?.expired() ?? [];
+    if (expired.length === 0) return false;
+    const page = expired.slice(0, KEY_FORWARD_TRIM_PAGE);
+    await this.#erased.deleteBatch(KEY_FORWARDS_TABLE, {
+      keys: page.map((forward) => forwardRowKey(forward.tableId, storageKeyToken(forward.from))),
+    });
+    return expired.length > page.length;
   }
 
   /**
@@ -23389,9 +24418,6 @@ function classifyMergeRows(input: {
         if (key === null || token === undefined) return;
         const changes = Object.create(null) as Record<string, BatchValue>;
         for (const assignment of branch.action.assignments) {
-          if (assignment.column === keyColumn.name) {
-            throw new TypeError(`MERGE cannot update the unique key: ${keyColumn.name}`);
-          }
           const column = target.columns.find((candidate) => candidate.name === assignment.column);
           if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
           changes[assignment.column] = storedSqlValueFromExecution(
@@ -23525,12 +24551,6 @@ function assertTriggerBodyTargetSchema(
       }
       if (assignedColumn.generatedValue !== undefined) {
         throw new TypeError(`Trigger body UPDATE assigns generated column: ${assignment.column}`);
-      }
-      if (
-        assignedColumn.id === target.uniqueKeyColumnId ||
-        (target.primaryKeyColumnIds ?? []).includes(assignedColumn.id)
-      ) {
-        throw new TypeError(`Trigger body UPDATE cannot update a key column: ${assignment.column}`);
       }
       for (const reference of expressionColumnNames(assignment.expression)) {
         assertReference(reference);
@@ -23902,6 +24922,8 @@ function validateUpdateBatch(
   table: TableRecord,
   keyColumn: TableColumnRecord,
   input: UpdateBatchInput,
+  /** A rekey writes the primary-key columns; every other update leaves them alone. */
+  allowKeyChanges = false,
 ): Map<string, Exclude<BatchValue, null>> {
   if (input.keys.length === 0) throw new TypeError("An update batch needs at least one key");
   const changeNames = Object.keys(input.changes);
@@ -23924,9 +24946,13 @@ function validateUpdateBatch(
   for (const name of changeNames) {
     const column = table.columns.find((candidate) => candidate.name === name);
     if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
-    if (column.id === keyColumn.id) throw new TypeError(`Unique key cannot be updated: ${name}`);
-    if ((table.primaryKeyColumnIds ?? []).includes(column.id)) {
-      throw new TypeError(`Primary key column cannot be updated: ${name}`);
+    if (!allowKeyChanges) {
+      if (column.id === keyColumn.id) throw new TypeError(`Unique key cannot be updated: ${name}`);
+      if ((table.primaryKeyColumnIds ?? []).includes(column.id)) {
+        throw new TypeError(`Primary key column cannot be updated: ${name}`);
+      }
+    } else if (column.hidden === true) {
+      throw new TypeError(`Unknown column: ${name}`);
     }
     const values = input.changes[name] ?? [];
     if (values.length !== input.keys.length) {
@@ -24173,6 +25199,63 @@ function publicKeyName(table: TableRecord, keyColumn: TableColumnRecord): string
     (columnId) => table.columns.find((column) => column.id === columnId)?.name ?? columnId,
   );
   return `(${names.join(", ")})`;
+}
+
+/** One entry of an array the caller built with a value at every index it asks about. */
+function presentAt<T>(values: readonly T[], index: number): NonNullable<T> {
+  const value = values[index];
+  if (value === undefined || value === null) throw new Error("Rekey row disappeared");
+  return value;
+}
+
+/** A key tuple as an error reports it: the value itself, or the tuple for a composite key. */
+function shownKey(tuple: readonly BatchValue[]): Exclude<BatchValue, null> {
+  const only = tuple[0];
+  return tuple.length === 1 && only !== null && only !== undefined ? only : JSON.stringify(tuple);
+}
+
+/** Whether an update writes any of the table's primary-key columns, which makes it a rekey. */
+function changesTableAddress(table: TableRecord, input: UpdateBatchInput): boolean {
+  return (
+    tableAddress(table)?.columns.some((column) => input.changes[column.name] !== undefined) === true
+  );
+}
+
+/** A storage key's token, or undefined for a value no key could hold. */
+function safeStorageKeyToken(value: BatchValue): string | undefined {
+  if (value === null) return undefined;
+  try {
+    return storageKeyToken(value);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The forward for one storage key, if it names a retired row. */
+function lookupForward(
+  lookup: KeyForwardLookup,
+  tableId: string,
+  value: BatchValue,
+): KeyForward | undefined {
+  const token = safeStorageKeyToken(value);
+  return token === undefined ? undefined : lookup.get(tableId, token);
+}
+
+/** The forward for one public key tuple, if it names a retired row. */
+function lookupAddressForward(
+  lookup: KeyForwardLookup,
+  tableId: string,
+  address: NonNullable<ReturnType<typeof tableAddress>>,
+  tuple: readonly BatchValue[],
+): KeyForward | undefined {
+  if (tuple.some((value) => value === null)) return undefined;
+  let storage: Exclude<BatchValue, null>;
+  try {
+    storage = addressStorageKey(address, tuple);
+  } catch {
+    return undefined;
+  }
+  return lookupForward(lookup, tableId, storage);
 }
 
 function primaryKeyColumns(table: TableRecord): TableColumnRecord[] {

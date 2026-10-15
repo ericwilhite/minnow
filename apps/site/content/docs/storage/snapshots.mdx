@@ -131,17 +131,20 @@ scans re-verify, so either case costs a rebuild, never a wrong answer.
 
 ## The framed container
 
-Snapshot format 1 is a bounded frame stream, not one database-sized metadata object. All integers
-in envelopes are little-endian.
+A snapshot is a bounded frame stream, not one database-sized metadata object. Format 2 is format
+1 with one addition: it may carry the engine's internal key-forwards table, which records where
+each [rekeyed](/docs/engine/rekeying) row now lives. A snapshot without that table is written as
+format 1, byte for byte, so older builds still import it; core 0.14.1 and older refuse format 2.
+All integers in envelopes are little-endian.
 
 The file starts with a 20-byte prefix:
 
-| Offset | Width | Field                         |
-| -----: | ----: | ----------------------------- |
-|      0 |     8 | ASCII magic `MINSNAP1`        |
-|      8 |     4 | snapshot format version (`1`) |
-|     12 |     4 | canonical header byte length  |
-|     16 |     4 | CRC-32 of the header bytes    |
+| Offset | Width | Field                                |
+| -----: | ----: | ------------------------------------ |
+|      0 |     8 | ASCII magic `MINSNAP1`               |
+|      8 |     4 | snapshot format version (`1` or `2`) |
+|     12 |     4 | canonical header byte length         |
+|     16 |     4 | CRC-32 of the header bytes           |
 
 The header is at most 64 KiB of canonical UTF-8 JSON. It contains only the database version,
 creation time, and exact frame/item/byte totals for six ordered families:
@@ -197,8 +200,8 @@ cannot change the answer. UNIQUE membership is authoritative rather than optiona
 exports it in deterministic lexical chunks through the fixed 36 MiB merge bound and restore
 re-enables duplicate enforcement before publication.
 
-Snapshot format 1 and its embedded block-format-2 bytes are frozen by a fixture and opened on
-every test run. A future incompatible writer uses a new format number; it does not reinterpret
+Snapshot formats 1 and 2 and their embedded block-format-2 bytes are frozen by fixtures and opened
+on every test run. A future incompatible writer uses a new format number; it does not reinterpret
 these bytes. The compatibility check compares compressed blocks by their canonical uncompressed
 payload because native gzip encoders may emit different valid stored streams. A snapshot is still
 only as durable as the media and origin that holds it, so keep independent copies for

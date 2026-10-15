@@ -1821,7 +1821,10 @@ export class RecordCore {
       }
     }
     const nextCatalogEpoch = safeWholeIncrement(this.#catalogEpoch, "Catalog epoch");
-    const nextSchemaEpoch = safeWholeIncrement(this.#schemaEpoch, "Schema epoch");
+    const nextSchemaEpoch =
+      record.keyForwards === true
+        ? this.#schemaEpoch
+        : safeWholeIncrement(this.#schemaEpoch, "Schema epoch");
     this.#installTableRecord(record);
     this.#catalogEpoch = nextCatalogEpoch;
     this.#schemaEpoch = nextSchemaEpoch;

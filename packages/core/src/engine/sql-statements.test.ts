@@ -695,9 +695,10 @@ describe("CREATE TABLE", () => {
       (await database.query("SELECT * FROM receipts WHERE MATCH(*) AGAINST 'bff*'")).rows,
     ).toEqual([]);
     await database.execute("UPDATE receipts SET total = total + 5 WHERE shop = 1 AND receipt = 2");
+    // Moving both shop-1 receipts onto one key is refused as a duplicate, and writes nothing.
     await expect(
       database.execute("UPDATE receipts SET receipt = 3 WHERE shop = 1"),
-    ).rejects.toThrow("Primary key column cannot be updated");
+    ).rejects.toThrow("receipts.(shop, receipt)");
     await database.execute("DELETE FROM receipts WHERE shop = 2 AND receipt = 1");
     expect(
       (await database.query("SELECT shop, receipt, total FROM receipts ORDER BY shop, receipt"))

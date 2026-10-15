@@ -2,14 +2,36 @@ export interface NativeUpgradeResult {
   tables: string[];
   blockValues: unknown[];
   walOnlyPreserved: boolean;
+  /** The row written after the upgrade, read back at the key a rekey moved it to. */
   rows: Array<Record<string, unknown>>;
+  /** Whether the internal key-forwards table the rekey created is marked as such. */
+  keyForwards: boolean;
   format: number;
   integrity: boolean;
   olderReaderRefused: boolean;
 }
 
+/** A released OPFS writer's own database through the automatic upgrade. */
+export interface ReleasedOpfsUpgradeResult {
+  /** The layout the released writer left. */
+  releasedFormat: number;
+  /** The layout after the current build's first open. */
+  format: number;
+  /** The released writer's rows, index lookups, and sequence read the same after the upgrade. */
+  answersPreserved: boolean;
+  /** The sequence's next value: the released writer took three. */
+  nextValue: unknown;
+  /** A row found by its new key after a rekey, after a reopen. */
+  rekeyed: unknown;
+  keyForwards: boolean;
+  integrity: boolean;
+  olderReadersRefused: boolean;
+  /** The layout after every released reader was refused: they must not change it. */
+  finalFormat: number;
+}
+
 /** Every released build that writes an IndexedDB schema this build upgrades. */
-export type IndexedDbWriterVersion = "0.10.0" | "0.12.1" | "0.13.1";
+export type IndexedDbWriterVersion = "0.10.0" | "0.12.1" | "0.13.1" | "0.14.1";
 
 export interface IndexedDbUpgradeResult {
   /** The schema the released writer left. */
@@ -22,6 +44,9 @@ export interface IndexedDbUpgradeResult {
   newRow: unknown;
   matches: unknown[];
   reopenedSame: boolean;
+  /** A row found through its index by its new key after a rekey, after a reopen. */
+  rekeyed: unknown;
+  keyForwards: boolean;
   integrity: boolean;
   olderReadersRefused: boolean;
   /** The schema after every released reader was refused: they must not change it. */
@@ -47,6 +72,14 @@ function runUpgradeWorker<T>(message: Record<string, unknown>, timeoutMs: number
 
 export function runNativeUpgrade(files: Record<string, string>): Promise<NativeUpgradeResult> {
   return runUpgradeWorker({ files, name: `native-upgrade-${crypto.randomUUID()}` }, 30_000);
+}
+
+/** The released 0.14.1 writer's OPFS database through the automatic upgrade. */
+export function runReleasedOpfsUpgrade(): Promise<ReleasedOpfsUpgradeResult> {
+  return runUpgradeWorker(
+    { kind: "opfs-released", name: `opfs-released-upgrade-${crypto.randomUUID()}` },
+    60_000,
+  );
 }
 
 /** A released writer's IndexedDB database through the automatic upgrade, in a real browser. */

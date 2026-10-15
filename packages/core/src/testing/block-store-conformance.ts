@@ -7,6 +7,7 @@ import {
   MAX_MANIFEST_BLOCK_PRESENCE_IDS,
   MAX_STORAGE_BULK_READ_ITEMS,
   PostingBuildConflictError,
+  SchemaConflictError,
   SnapshotManifestMissingError,
   TableInUseError,
   TableRecordConflictError,
@@ -211,6 +212,28 @@ function table(name: string, keyed = false): TableRecord {
     revision: 0,
     createdAt: T0,
     ...(keyed ? { uniqueKeyColumnId: "col-id" } : {}),
+  };
+}
+
+/**
+ * The engine's internal key-forwards table: each rekeyed row's retired key and its current one.
+ * Storage treats it as an ordinary catalog record except for the schema epoch: creating it leaves
+ * the epoch where it was, because a write scope that rekeys for the first time creates it while
+ * its own transaction is open and must still commit.
+ */
+function keyForwardsTable(): TableRecord {
+  return {
+    id: "table-key-forwards",
+    name: "\u0000minnow_key_forwards",
+    columns: [
+      { id: "col-retired", name: "retired", type: "string", nullable: false },
+      { id: "col-current", name: "current", type: "string", nullable: false },
+    ],
+    uniqueKeyColumnId: "col-retired",
+    keyForwards: true,
+    managed: false,
+    revision: 0,
+    createdAt: T0,
   };
 }
 
@@ -2302,6 +2325,91 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           ["lease-m"],
           "a move must keep the one record, not create a second",
         );
+        store.close();
+      },
+    },
+    {
+      name: "the key-forwards table moves the catalog epoch but not the schema epoch",
+      async run(target) {
+        let store = await target.create();
+        await store.addTable(table("t", true));
+        /** Begins a transaction and stages one segment, so its commit checks its guard. */
+        const prepare = async (id: string) => {
+          const { snapshotVersion: _pinned, ...record } = transaction(id, null);
+          void _pinned;
+          const begun = await store.beginTransaction({ record });
+          check(
+            begun.record.schemaEpochGuard !== undefined,
+            "an active transaction must carry the schema epoch it was begun at",
+          );
+          const blockId = `block-${id}`;
+          const staged = await store.stageTransactionArtifacts({
+            transactionId: id,
+            expectedRevision: begun.record.revision,
+            blocks: [{ id: blockId, bytes: Uint8Array.of(1, 2, 3, 4) }],
+            segments: [segment(`segment-${id}`, "table-t", id, blockId)],
+            updatedAt: T0,
+          });
+          return async () =>
+            store.commitTransaction({
+              transactionId: id,
+              expectedTransactionRevision: staged.revision,
+              expectedManifestVersion: await store.getCurrentManifestVersion(),
+              levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
+              committedAt: LATER,
+            });
+        };
+        const commitOpen = await prepare("txn-forwards");
+        const before = await store.getCatalogProbe();
+        await store.addTable(keyForwardsTable());
+        const after = await store.getCatalogProbe();
+        check(
+          after.catalogEpoch > before.catalogEpoch,
+          "adding the key-forwards table is a catalog mutation and must advance the catalog epoch",
+        );
+        checkEqual(
+          after.schemaEpoch,
+          before.schemaEpoch,
+          "adding the key-forwards table must not advance the schema epoch",
+        );
+        checkEqual(
+          (await store.getTableByName(keyForwardsTable().name))?.keyForwards,
+          true,
+          "the key-forwards marker must read back exactly",
+        );
+        const committed = await commitOpen();
+        checkEqual(
+          committed.version,
+          0,
+          "a transaction begun before the key-forwards table was added must still commit",
+        );
+
+        // Every other new table is structural and still moves the schema epoch.
+        const commitStale = await prepare("txn-stale");
+        const beforeTable = await store.getCatalogProbe();
+        await store.addTable(table("u"));
+        check(
+          (await store.getCatalogProbe()).schemaEpoch > beforeTable.schemaEpoch,
+          "adding an ordinary table must advance the schema epoch",
+        );
+        await checkThrows(
+          commitStale,
+          SchemaConflictError,
+          "a transaction begun before an ordinary table was added must refuse its stale guard",
+        );
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          checkEqual(
+            (await store.getTable("table-key-forwards"))?.keyForwards,
+            true,
+            "the key-forwards marker must survive a reopen",
+          );
+          checkEqual(
+            (await store.listTables()).map(({ name }) => name).sort(),
+            [keyForwardsTable().name, "t", "u"].sort(),
+            "the key-forwards table must be listed with the rest of the catalog",
+          );
+        }
         store.close();
       },
     },

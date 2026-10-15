@@ -1,3 +1,4 @@
+import type { KeyChange } from "./key-change.js";
 import { sameLiveValue } from "./live-equal.js";
 import type {
   LiveQueryDelivery,
@@ -55,6 +56,11 @@ export type LiveSnapshot<TRow> =
       readonly status: "ready";
       readonly rows: readonly TRow[];
       readonly version: number | null;
+      /**
+       * Rows the commits behind this snapshot rekeyed, so a component holding an old key can
+       * follow its row. Absent when nothing was rekeyed.
+       */
+      readonly keyChanges?: readonly KeyChange[];
     }
   | {
       readonly status: "error";
@@ -62,6 +68,14 @@ export type LiveSnapshot<TRow> =
       readonly error: unknown;
       readonly version: number | null;
     };
+
+/** The key changes a delivery carried, as a snapshot spreads them. */
+function keyChangesOf(invalidation: { readonly keyChanges?: readonly KeyChange[] }): {
+  keyChanges?: readonly KeyChange[];
+} {
+  const changes = invalidation.keyChanges;
+  return changes === undefined || changes.length === 0 ? {} : { keyChanges: changes };
+}
 
 /**
  * The next snapshot's rows, or `undefined` when nothing changed. A row that is structurally
@@ -327,12 +341,14 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
             status: "ready",
             rows: this.#snapshot.status === "loading" ? Object.freeze([...previous]) : previous,
             version: invalidation.manifestVersion,
+            ...keyChangesOf(invalidation),
           };
         } else {
           this.#snapshot = {
             status: "ready",
             rows,
             version: invalidation.manifestVersion,
+            ...keyChangesOf(invalidation),
           };
         }
         this.#emit();

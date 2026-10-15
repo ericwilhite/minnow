@@ -86,7 +86,7 @@ orderChanges.subscribe(() => {
   const snapshot = orderChanges.getSnapshot();
   if (snapshot.status !== "ready") return;
   for (const change of snapshot.changes) {
-    // insert | update | delete | move — all fully typed
+    // insert | update | delete | move | rekey — all fully typed
   }
 });
 ```
@@ -96,6 +96,12 @@ Duplicate or null keys fail at runtime instead of producing an ambiguous diff. D
 linear in the current row count: the previous snapshot's key index is retained, so each snapshot
 is indexed once. A row whose values did not change keeps its previous object in `rows`, and the
 `update` record for a changed row carries both objects.
+
+A row whose primary key was changed comes through as one `rekey` change —
+`{ type: "rekey", from, key, row, previous, previousIndex, index }` — instead of a `delete` of the
+old key and an `insert` of the new one, so a list can keep the row's component and its selection.
+This works when the result key is the table's primary key; see
+[Offline sync and rekeying](/docs/engine/rekeying).
 
 ## Ordered, bounded windows
 
@@ -131,6 +137,18 @@ some same-table inserts cannot affect a predicate. Equal low-level SQL subscript
 execution and dependency work. Typed adapters share dependency/invalidation work; each typed store
 still executes through its own adapter so different result-plugin stacks cannot be merged
 incorrectly.
+
+A sweep hands out its results together. Every subscription a commit changed gets its new result
+in the same synchronous turn, after the last affected query has run, and a worker sends them to
+its client as one message. A component that reads several queries therefore renders once per
+commit, never a state where some queries show the commit and others do not. The cost is that a
+quick query waits for the slowest query the same commit changed. The low-level
+`liveQueries({ onSweepDelivered })` option is called right after a sweep's last delivery.
+
+Deliveries that follow a rekey carry `keyChanges`, the rows the commits moved:
+`[{ table, from, to }]`, with a composite key given as an array. Typed snapshots carry the same
+list. It is read from the stored key forwards, so a tab that missed every cross-tab notification
+still reports it on its next sweep.
 
 A typed query asks the engine to compare before anything reaches it. On a relevant commit the
 engine brings the statement's result up to date where the data is, compares it with the rows it

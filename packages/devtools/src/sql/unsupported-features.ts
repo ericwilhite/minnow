@@ -90,10 +90,10 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     notes: "Expression indexes are not supported; index a stored generated column instead.",
   },
   {
-    id: "ddl.foreign-key-on-update",
-    error: "ON UPDATE CASCADE has nothing to act on: a unique key cannot change",
+    id: "ddl.foreign-key-on-update-restrict",
+    error: "a rekey always moves its references",
     notes:
-      "ON UPDATE actions are not supported because primary-key values cannot be updated; ON DELETE CASCADE, SET NULL, RESTRICT, and NO ACTION are.",
+      "ON UPDATE RESTRICT, NO ACTION, SET NULL, and SET DEFAULT are refused: a reference always follows its parent's rekey. Use ON UPDATE CASCADE or leave the clause out.",
   },
   {
     id: "ddl.foreign-key-set-default",

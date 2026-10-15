@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { encodeBlock } from "../packages/core/src/block-format/index.ts";
 import { MemoryOpfs } from "../packages/core/src/testing/opfs-shim.ts";
+import { keyForwardsTableRecord } from "../packages/core/src/engine/key-forwards.ts";
 import { OpfsBlockStore } from "../packages/core/src/storage/opfs/index.ts";
 import { walStagingTestHooks } from "../packages/core/src/storage/opfs/leader.ts";
 import { OPFS_LAYOUT_VERSION } from "../packages/core/src/storage/opfs/upgrades.ts";
@@ -127,10 +128,19 @@ const keyedTransaction = await store.beginTransaction({
     committedVersion: null,
   },
 });
+// Layout 10's own shape, also in the log's tail: the internal key-forwards table, added while the
+// keyed transaction is open. It leaves the schema epoch alone, so that transaction's commit,
+// logged after it, keeps its guard. The commit stages and publishes in one entry, which keeps
+// the tail short enough that no second checkpoint absorbs it.
+await store.addTable(keyForwardsTableRecord("2026-08-24T12:00:05.500Z"));
 const keyedBlock = await encodeBlock({ type: "number", values: [1] }, "raw");
-const keyedStaged = await store.stageTransactionArtifacts({
-  transactionId: keyedTransaction.record.id,
-  expectedRevision: keyedTransaction.record.revision,
+if (store.writeTransaction === undefined)
+  throw new Error("The OPFS store has no single-shot write");
+await store.writeTransaction({
+  transaction: {
+    id: keyedTransaction.record.id,
+    expectedRevision: keyedTransaction.record.revision,
+  },
   blocks: [{ id: "fixture-keyed-block", bytes: keyedBlock }],
   segments: [
     {
@@ -149,11 +159,6 @@ const keyedStaged = await store.stageTransactionArtifacts({
       createdAt: "2026-08-24T12:00:06.000Z",
     },
   ],
-  updatedAt: "2026-08-24T12:00:06.000Z",
-});
-await store.commitTransaction({
-  transactionId: keyedTransaction.record.id,
-  expectedTransactionRevision: keyedStaged.revision,
   expectedManifestVersion: (await store.getCurrentManifestVersion()) ?? null,
   levelZeroSegmentLimits: [{ tableId: "fixture-keyed", limit: 4096 }],
   uniqueKeyChanges: [
@@ -191,7 +196,8 @@ const fixture = {
   writerPackageVersion,
   files,
   expectations: {
-    tables: ["checkpoint-b", "data", "keyed", "wal-tail"],
+    // In \`listTables\` order, which compares names with \`localeCompare\`.
+    tables: ["checkpoint-b", "data", "keyed", "\u0000minnow_key_forwards", "wal-tail"],
     blockId: "fixture-block",
     blockValues: ["native", null, "fixture"],
   },

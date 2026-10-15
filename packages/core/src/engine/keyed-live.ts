@@ -1,3 +1,4 @@
+import type { KeyChange } from "./key-change.js";
 import { dateMilliseconds } from "../date-value.js";
 import { sameLiveValue } from "./live-equal.js";
 import type { LiveQuery, LiveSnapshot } from "./typed-live.js";
@@ -28,6 +29,19 @@ export type LiveResultChange<TRow extends object, TKey extends keyof TRow> =
       readonly row: TRow;
       readonly from: number;
       readonly to: number;
+    }
+  /**
+   * The same row under a new key: its primary key was changed (rekeyed). Reported in place of
+   * the delete and insert it would otherwise look like, so a renderer keeps the row's state.
+   */
+  | {
+      readonly type: "rekey";
+      readonly from: TRow[TKey];
+      readonly key: TRow[TKey];
+      readonly row: TRow;
+      readonly previous: TRow;
+      readonly previousIndex: number;
+      readonly index: number;
     };
 
 export type LiveChangesSnapshot<TRow extends object, TKey extends keyof TRow> =
@@ -38,6 +52,8 @@ export type LiveChangesSnapshot<TRow extends object, TKey extends keyof TRow> =
       readonly changes: ReadonlyArray<LiveResultChange<TRow, TKey>>;
       readonly initial: boolean;
       readonly version: number | null;
+      /** As on `LiveSnapshot`: rows the commits behind this snapshot rekeyed. */
+      readonly keyChanges?: readonly KeyChange[];
     }
   | {
       readonly status: "error";
@@ -129,6 +145,7 @@ function diffRows<TRow extends object, TKey extends keyof TRow>(
   previousRows: readonly TRow[],
   rows: readonly TRow[],
   key: TKey,
+  keyChanges: readonly KeyChange[] = [],
 ): Diff<TRow, TKey> {
   const current = indexRows(rows, key);
   const changes: Array<LiveResultChange<TRow, TKey>> = [];
@@ -171,10 +188,65 @@ function diffRows<TRow extends object, TKey extends keyof TRow>(
     return { changes, rows: previousRows, index: current };
   }
   return {
-    changes,
+    changes: keyChanges.length === 0 ? changes : pairRekeys(changes, keyChanges, key),
     rows: reused === 0 ? rows : Object.freeze(reconciled),
     index: current,
   };
+}
+
+/**
+ * Replaces each delete and insert that a key change connects with one `rekey` entry. Only a
+ * scalar key can be matched: the result's key column is compared with the change's values.
+ */
+function pairRekeys<TRow extends object, TKey extends keyof TRow>(
+  changes: Array<LiveResultChange<TRow, TKey>>,
+  keyChanges: readonly KeyChange[],
+  key: TKey,
+): Array<LiveResultChange<TRow, TKey>> {
+  const tokenOf = (value: unknown): KeyToken | undefined => {
+    try {
+      return keyToken(value, key);
+    } catch {
+      return undefined;
+    }
+  };
+  const targets = new Map<KeyToken, KeyToken>();
+  for (const change of keyChanges) {
+    if (Array.isArray(change.from) || Array.isArray(change.to)) continue;
+    const from = tokenOf(change.from);
+    const to = tokenOf(change.to);
+    if (from !== undefined && to !== undefined) targets.set(from, to);
+  }
+  const inserts = new Map<KeyToken, Extract<LiveResultChange<TRow, TKey>, { type: "insert" }>>();
+  for (const change of changes) {
+    if (change.type === "insert") {
+      const token = tokenOf(change.row[key]);
+      if (token !== undefined) inserts.set(token, change);
+    }
+  }
+  const paired = new Set<LiveResultChange<TRow, TKey>>();
+  const rekeys: Array<LiveResultChange<TRow, TKey>> = [];
+  for (const change of changes) {
+    if (change.type !== "delete") continue;
+    const from = tokenOf(change.key);
+    const to = from === undefined ? undefined : targets.get(from);
+    const insert = to === undefined ? undefined : inserts.get(to);
+    if (insert === undefined || paired.has(insert)) continue;
+    paired.add(change);
+    paired.add(insert);
+    rekeys.push({
+      type: "rekey",
+      from: change.key,
+      key: insert.row[key],
+      row: insert.row,
+      previous: change.previous,
+      previousIndex: change.index,
+      index: insert.index,
+    });
+  }
+  return rekeys.length === 0
+    ? changes
+    : [...changes.filter((change) => !paired.has(change)), ...rekeys];
 }
 
 /** Keyed exact diffs over a typed live query, with optional bounded-window enforcement. */
@@ -292,7 +364,13 @@ export class KeyedLiveQuery<TRow extends object, TKey extends LiveKeyOf<TRow>> {
         rows = this.#rows;
         changes = [];
       } else {
-        const diff = diffRows(this.#index, this.#rows, snapshot.rows, this.#key);
+        const diff = diffRows(
+          this.#index,
+          this.#rows,
+          snapshot.rows,
+          this.#key,
+          snapshot.keyChanges,
+        );
         this.#index = diff.index;
         rows = diff.rows;
         changes = diff.changes;
@@ -306,6 +384,7 @@ export class KeyedLiveQuery<TRow extends object, TKey extends LiveKeyOf<TRow>> {
         changes: Object.freeze(changes),
         initial,
         version: snapshot.version,
+        ...(snapshot.keyChanges === undefined ? {} : { keyChanges: snapshot.keyChanges }),
       };
       this.#emit();
     } catch (error) {

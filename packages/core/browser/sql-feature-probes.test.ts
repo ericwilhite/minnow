@@ -78,13 +78,15 @@ const expectedFeatureIds = [
   "ddl.alter-table-drop-column",
   "ddl.drop-table",
   "ddl.drop-view",
+  "ddl.foreign-key-on-update",
+  "ddl.foreign-key-not-enforced",
 ] as const;
 
 describe("browser SQL feature behavior probes", () => {
   it("keeps the independently authored feature and step populations fixed", () => {
     expect(featureBehaviorProbes.map(({ featureId }) => featureId)).toEqual(expectedFeatureIds);
     expect(new Set(expectedFeatureIds).size).toBe(expectedFeatureIds.length);
-    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(137);
+    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(147);
     expect(
       featureBehaviorProbes
         .flatMap(({ steps }) => steps)

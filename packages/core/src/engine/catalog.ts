@@ -145,7 +145,13 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
   const tables: CatalogTable[] = [];
   const views: CatalogView[] = [];
   for (const record of byName) {
-    if (record.enumType !== undefined || record.sequence !== undefined) continue;
+    if (
+      record.enumType !== undefined ||
+      record.sequence !== undefined ||
+      record.keyForwards === true
+    ) {
+      continue;
+    }
     const columns = record.columns.filter((column) => !column.hidden).map(toCatalogColumn);
     if (record.view !== undefined) {
       views.push({

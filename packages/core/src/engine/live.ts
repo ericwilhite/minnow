@@ -11,6 +11,8 @@ import {
 } from "../storage/types.js";
 import { LiveQueryLimitError } from "./errors.js";
 import { type CompiledQuery, type QueryResult, type QueryValue } from "./query.js";
+import { KEY_FORWARDS_TABLE_ID, type KeyChange } from "./key-change.js";
+export type { KeyChange } from "./key-change.js";
 
 /**
  * Live-query invalidation is a hint-driven cache-coherence problem, not a notification problem.
@@ -59,6 +61,20 @@ export interface LiveQuerySetOptions {
   readonly incremental?: boolean;
   /** Called once when the set closes; the owner uses this to drop its reference. */
   readonly onClosed?: () => void;
+  /**
+   * Called once a sweep has handed out every delivery it made, right after the last one, in the
+   * same synchronous turn. A host that forwards deliveries elsewhere — the worker, to its client —
+   * uses it to send one sweep's deliveries together.
+   */
+  readonly onSweepDelivered?: (sweep: LiveQuerySweep) => void;
+}
+
+/** One sweep, as `onSweepDelivered` reports it. */
+export interface LiveQuerySweep {
+  readonly manifestVersion: number | null;
+  readonly catalogEpoch: number;
+  /** Rows the commits in this sweep rekeyed; see `LiveQueryDelivery.keyChanges`. */
+  readonly keyChanges: readonly KeyChange[];
 }
 
 export const DEFAULT_LIVE_QUERY_MAX_GROUPS = 256;
@@ -87,6 +103,12 @@ export interface LiveQueryDelivery {
    * first delivery. A consumer that keys on row identity substitutes its own previous objects.
    */
   readonly retained?: Int32Array;
+  /**
+   * Rows the commits behind this delivery rekeyed, read from the stored key forwards, so a
+   * subscriber holding an old key can follow its row. Absent when nothing was rekeyed. Every
+   * delivery of one sweep carries the same list.
+   */
+  readonly keyChanges?: readonly KeyChange[];
 }
 
 export interface LiveQuerySubscribeOptions {
@@ -102,6 +124,8 @@ export interface LiveQueryInvalidation {
   readonly manifestVersion: number | null;
   readonly catalogEpoch: number;
   readonly initial: boolean;
+  /** As on `LiveQueryDelivery`. */
+  readonly keyChanges?: readonly KeyChange[];
 }
 
 export interface LiveQueryObserveOptions {
@@ -251,6 +275,15 @@ export interface LiveQueryHost {
     after: number | null,
     until: number,
   ): Promise<boolean>;
+  /**
+   * The rows rekeyed since `previous` — holding an opaque state this method returned before —
+   * and the state to compare against next. Undefined `previous` asks for the baseline, which
+   * reports nothing.
+   */
+  keyChanges?(
+    previous: { readonly value: unknown } | undefined,
+    probe: CatalogProbe,
+  ): Promise<{ changes: readonly KeyChange[]; state: unknown }>;
 }
 
 interface ResultSubscriber {
@@ -270,6 +303,14 @@ interface ObserverSubscriber {
 }
 
 type Subscriber = ResultSubscriber | ObserverSubscriber;
+
+/** One deferred delivery of a sweep, handed the sweep's key changes when it goes out. */
+type SweepDelivery = (keyChanges: readonly KeyChange[]) => void;
+
+/** A sweep's delivery metadata: the probe it reflects, and key changes when there are any. */
+function sweepNotice(probe: CatalogProbe, keyChanges: readonly KeyChange[]): LiveQueryInvalidation {
+  return { ...probe, initial: false, ...(keyChanges.length === 0 ? {} : { keyChanges }) };
+}
 
 interface Execution {
   readonly result: QueryResult;
@@ -455,6 +496,9 @@ export class LiveQuerySet {
   #retainedBytes = 0;
   readonly #ownsChannel: boolean;
   readonly #onClosed: (() => void) | undefined;
+  readonly #onSweepDelivered: ((sweep: LiveQuerySweep) => void) | undefined;
+  /** The host's key-forward state as of the last sweep; undefined until the first subscription. */
+  #keyState: { value: unknown } | undefined;
 
   constructor(host: LiveQueryHost, options: LiveQuerySetOptions = {}) {
     if (
@@ -490,6 +534,7 @@ export class LiveQuerySet {
       this.#ownsChannel = false;
     }
     this.#onClosed = options.onClosed;
+    this.#onSweepDelivered = options.onSweepDelivered;
     this.#channel?.addEventListener("message", this.#channelListener);
     if (options.pollIntervalMs !== undefined) {
       this.#pollTimer = setInterval(() => {
@@ -589,12 +634,17 @@ export class LiveQuerySet {
   /** Registration and cleanup use one ownership path for observers and result subscribers. */
   async #register(query: LiveQueryInput, subscriber: Subscriber): Promise<LiveQuerySubscription> {
     this.#throwIfClosed();
+    // Key changes are reported relative to a baseline taken alongside the first result. It
+    // starts here but is awaited only after the group has captured the query, which callers may
+    // change once subscribe() returns.
+    const baseline = this.#keyState === undefined ? this.#takeKeyBaseline() : undefined;
     this.#reserveSubscription();
     let group: QueryGroup | undefined;
     let installed = false;
     try {
       const opened = await this.#getOrOpenGroup(query);
       group = opened.group;
+      await baseline;
       this.#throwIfClosed();
       group.subscribers.add(subscriber);
       group.pendingSubscriptions -= 1;
@@ -1127,13 +1177,60 @@ export class LiveQuerySet {
     // One group at a time. Interleaving groups was measured and rejected: their patches share
     // the engine's catalog snapshot and block cache, and running them together tripled the
     // latency on IndexedDB rather than overlapping anything.
+    const deliveries: SweepDelivery[] = [];
     for (const group of candidates) {
       if (!this.#stillOpen()) return;
-      await this.#sweepGroup(group, last, current, changedSince);
+      await this.#sweepGroup(group, last, current, changedSince, deliveries);
     }
+    const keyChanges = await this.#sweepKeyChanges(last, current, changedSince);
+    if (!this.#stillOpen()) return;
     this.#lastProbe = current;
     this.#stats.rerunsAvoided += this.#groups.size - (this.#stats.reruns - rerunsBefore);
     this.#stats.lastSweepMs = performance.now() - started;
+    // Every delivery the sweep made, handed out together in one synchronous turn: a commit that
+    // changes several queries reaches a renderer as one update, not one per query.
+    for (const deliver of deliveries) deliver(keyChanges);
+    if (deliveries.length > 0 || keyChanges.length > 0) {
+      const sweep: LiveQuerySweep = {
+        manifestVersion: current.manifestVersion,
+        catalogEpoch: current.catalogEpoch,
+        keyChanges,
+      };
+      callLiveCallback(() => this.#onSweepDelivered?.(sweep));
+    }
+  }
+
+  /** Reads the forwards every later sweep reports key changes against; never rejects. */
+  async #takeKeyBaseline(): Promise<void> {
+    if (this.#host.keyChanges === undefined) return;
+    try {
+      const baseline = await this.#host.keyChanges(undefined, await this.#freshProbe());
+      this.#keyState ??= { value: baseline.state };
+    } catch {
+      // Without a baseline the set reports no key changes; results stay correct.
+    }
+  }
+
+  /** The rows the sweep's commits rekeyed, when the forwards changed in its window. */
+  async #sweepKeyChanges(
+    last: CatalogProbe,
+    current: CatalogProbe,
+    changedSince: (after: number | null) => Promise<Set<string> | "all">,
+  ): Promise<readonly KeyChange[]> {
+    const state = this.#keyState;
+    if (state === undefined || this.#host.keyChanges === undefined) return [];
+    if (!catalogChangedBetween(last, current)) {
+      const changed = await changedSince(last.manifestVersion);
+      if (changed !== "all" && !changed.has(KEY_FORWARDS_TABLE_ID)) return [];
+    }
+    try {
+      const next = await this.#host.keyChanges(state, current);
+      state.value = next.state;
+      return next.changes;
+    } catch {
+      // A notice is a convenience over results that are already correct; never fail a sweep.
+      return [];
+    }
   }
 
   /** One candidate group's share of a sweep: see `#sweep`. */
@@ -1142,6 +1239,7 @@ export class LiveQuerySet {
     last: CatalogProbe,
     current: CatalogProbe,
     changedSince: (after: number | null) => Promise<Set<string> | "all">,
+    deliveries: SweepDelivery[],
   ): Promise<void> {
     if (!this.#stillOpen()) return;
     if (group.subscribers.size === 0 || this.#groups.get(group.key) !== group) return;
@@ -1245,8 +1343,9 @@ export class LiveQuerySet {
           if (!this.#stillOpen() || this.#groups.get(group.key) !== group) return;
         }
       }
-      const invalidation: LiveQueryInvalidation = { ...current, initial: false };
       if (execution?.changed === true) group.deliveries += 1;
+      const result = execution?.result;
+      const retained = execution?.retained;
       for (const subscriber of [...group.subscribers]) {
         if (isObserver(subscriber)) {
           if (
@@ -1257,28 +1356,33 @@ export class LiveQuerySet {
             this.#stats.notificationsSuppressed += 1;
             continue;
           }
-          try {
-            this.#deliverInvalidation(subscriber, invalidation);
-            this.#stats.invalidations += 1;
-          } catch (error) {
-            callLiveCallback(() => subscriber.options.onError?.(error));
-          }
+          deliveries.push((keyChanges) => {
+            try {
+              this.#deliverInvalidation(subscriber, sweepNotice(current, keyChanges));
+              this.#stats.invalidations += 1;
+            } catch (error) {
+              callLiveCallback(() => subscriber.options.onError?.(error));
+            }
+          });
         } else if (isResultSubscriber(subscriber) && execution !== undefined) {
           if (!execution.changed) {
             this.#stats.notificationsSuppressed += 1;
             continue;
           }
-          try {
-            this.#deliverResult(
-              group,
-              subscriber,
-              execution.result,
-              invalidation,
-              execution.retained,
-            );
-          } catch (error) {
-            callLiveCallback(() => subscriber.options.onError?.(error));
-          }
+          deliveries.push((keyChanges) => {
+            if (result === undefined) return;
+            try {
+              this.#deliverResult(
+                group,
+                subscriber,
+                result,
+                sweepNotice(current, keyChanges),
+                retained,
+              );
+            } catch (error) {
+              callLiveCallback(() => subscriber.options.onError?.(error));
+            }
+          });
         }
       }
       this.#settleProbe(group, current);

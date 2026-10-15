@@ -13,8 +13,11 @@ import { IndexedDbBlockStore as ReleasedIndexedDbStore } from "@minnowdb/core-la
 import { MinnowDatabase } from "../engine/database.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 
-/** The schema this build writes; schema 4 (multi-part postings deltas) followed schema 3. */
-const CURRENT_SCHEMA = 4;
+/**
+ * The schema this build writes; schema 4 (multi-part postings deltas) and schema 5 (the internal
+ * key-forwards catalog record) followed schema 3.
+ */
+const CURRENT_SCHEMA = 5;
 
 function rows(version: number, count = 600) {
   return Array.from({ length: count }, (_, id) => ({

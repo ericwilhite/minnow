@@ -75,7 +75,8 @@ The inferred Kysely columns retain Minnow's separate select, insert, and update 
   `case().when`, `MERGE` conditions, and aggregate `filterWhere`. A column read through a derived
   table (`selectFrom(subquery.as("sub"))`) and an aggregate compared in `having` carry only the
   select type, so compare those with a string such as `"25"`;
-- scalar and composite primary-key columns cannot be updated;
+- primary-key columns accept updates of their own type, and setting one rekeys the row (see
+  [Offline sync and rekeying](/docs/engine/rekeying));
 - declared views select normally and accept no column values on insert or update.
 
 If an existing factory constructs Kysely, use the exported type directly:

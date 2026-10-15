@@ -126,6 +126,10 @@ import {
   snapshotFrameStreamHeaderIdentity,
 } from "../snapshot-stream.js";
 import {
+  snapshotMetadataItemFormatVersion,
+  type SnapshotFormatVersion,
+} from "../snapshot-format.js";
+import {
   RecordCore,
   type RecordCoreState,
   validateBeginTransactionInput,
@@ -4841,8 +4845,10 @@ export class OpfsLeader {
       const ledger = await SnapshotFrameLedger.open(this.#tree, "export", ledgerId, 0, true);
       const summaries = emptySnapshotFrameSummaries();
       let sequence = 0;
+      let formatVersion: SnapshotFormatVersion = 1;
       try {
         for (const item of this.#core.snapshotFrameMetadataItems()) {
+          if (snapshotMetadataItemFormatVersion(item) === 2) formatVersion = 2;
           sequence = appendSnapshotMetadataItems(
             ledger,
             snapshotMetadataFrameKind(item),
@@ -4866,7 +4872,7 @@ export class OpfsLeader {
           storedBytes: manifest.liveBlockBytes,
         };
         const header = prepareSnapshotFrameStreamHeader({
-          formatVersion: 1,
+          formatVersion,
           databaseVersion: manifest.version,
           createdAt: input.createdAt,
           kinds: summaries,

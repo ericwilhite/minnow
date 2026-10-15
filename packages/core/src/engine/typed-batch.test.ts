@@ -102,14 +102,15 @@ async function rejectedAtCompileTime(
   });
   // @ts-expect-error the key is an integer, not a string
   await database.update("orders", "1", { note: "x" });
-  // @ts-expect-error the unique key cannot be changed
-  await database.update("orders", 1, { order_id: 2 });
+  // Changing the key is a rekey, and typed like any other column.
+  // @ts-expect-error the new key must match the key column's type
+  await database.update("orders", 1, { order_id: "2" });
   // @ts-expect-error a change must match its column's type
   await database.update("orders", 1, { total: true });
   // @ts-expect-error keys are typed in the batch form as well
   await database.updateBatch("orders", { keys: ["1"], changes: { note: ["x"] } });
-  // @ts-expect-error the key column is not a change
-  await database.updateBatch("orders", { keys: [1], changes: { order_id: [2] } });
+  // @ts-expect-error a new key is typed in the batch form as well
+  await database.updateBatch("orders", { keys: [1], changes: { order_id: ["2"] } });
   // @ts-expect-error delete keys are typed
   await database.delete("orders", "1");
   // @ts-expect-error and so are batch delete keys

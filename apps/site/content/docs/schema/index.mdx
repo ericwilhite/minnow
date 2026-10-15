@@ -81,13 +81,17 @@ The column modifiers are:
   unique key. `migrate()` creates it as a real constraint, so a write naming a parent row that
   does not exist is rejected. `onDelete` is `"restrict"` (the default), `"cascade"`, or
   `"set null"`; the last requires a nullable column.
-- **`.references(table, column, { enforced: false })`** — records the relationship in catalog
-  introspection without validating child writes or acting on parent deletes. Informational keys
-  cannot specify `onDelete` because they never perform a referential action.
+- **`.references(table, column, { enforced: false })`** — records the relationship without
+  validating child writes or acting on parent deletes. Informational keys cannot specify
+  `onDelete`.
+
+Every reference, enforced or not, follows its parent's rekey: when a parent's primary key changes,
+the referencing rows move to the new key in the same commit. See
+[Offline sync and rekeying](/docs/engine/rekeying).
 
 The complete select, insert, and update types are available as `InferRow<T>`, `InferInsertRow<T>`,
-and `InferUpdateChanges<T>`. Defaults and nullable columns are optional on insert; primary-key
-columns are excluded from updates. The [Kysely adapter](/docs/adapters/kysely) converts the same
+and `InferUpdateChanges<T>`. Defaults and nullable columns are optional on insert. Updates may
+include primary-key columns, which rekeys the row; stored generated columns are excluded. The [Kysely adapter](/docs/adapters/kysely) converts the same
 metadata to Kysely's `ColumnType<Select, Insert, Update>` automatically.
 
 ### Enum columns
@@ -218,7 +222,8 @@ const tickets = table("tickets", {
 
 Minnow still validates that the child and parent key domains line up, and `introspect()` returns
 the relationship with `enforced: false`. It does not reject a missing customer, cascade a delete,
-or set the child to NULL. Informational relationships may be added, removed, or remapped on an
+or set the child to NULL. It does follow a rekey: when the customer's key changes, the tickets
+move to the new key, and a ticket written later with the old key stores the new one. Informational relationships may be added, removed, or remapped on an
 existing table as metadata-only migration steps; changing between enforced and informational is
 rejected. A composite entry in `table(..., { foreignKeys })` accepts the same `enforced: false`
 flag.

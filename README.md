@@ -11,8 +11,8 @@ npm install @minnowdb/core
 and benchmarks that run in your browser.
 
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
-> changes. Stored data is stable: block format 2, snapshot format 1, IndexedDB schema 4, and OPFS
-> layout 9 are versioned separately and locked — an incompatible future writer must use a new
+> changes. Stored data is stable: block format 2, snapshot formats 1 and 2, IndexedDB schema 5, and
+> OPFS layout 10 are versioned separately and locked — an incompatible future writer must use a new
 > format number.
 > Pin exact package versions. See
 > [Versioning](https://minnowdb.com/docs/reference/versioning/), the
@@ -38,7 +38,7 @@ and benchmarks that run in your browser.
   read anything, so concurrent writes land in a serial order without an application-side queue
   or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
   bypassed.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 382 KiB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 389 KiB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so
@@ -49,7 +49,12 @@ and benchmarks that run in your browser.
   sorts and aggregates keep large working sets under a configurable budget.
 - **Search and reactive views.** Full-text search uses `MATCH` and BM25 without index DDL. Live
   queries refresh after relevant commits, including commits from other tabs, with typed Kysely,
-  keyed-change, bounded-window, and Suspense/SWR-friendly React adapters.
+  keyed-change, bounded-window, and Suspense/SWR-friendly React adapters. A commit updates every
+  affected query in the same turn, so a screen renders it once.
+- **Keys that can change.** A record created offline under a temporary key moves to its server key
+  with one `UPDATE`. References follow in the same commit, and the old key keeps reading and writing
+  the row for 10 days, so nothing that held it loses the record. See
+  [Offline sync and rekeying](https://minnowdb.com/docs/engine/rekeying/).
 - **Portable and extensible.** Snapshots move a committed database between stores. The public
   storage interface includes a shared test kit for custom adapters.
 

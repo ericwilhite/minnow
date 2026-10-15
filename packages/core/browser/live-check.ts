@@ -16,10 +16,19 @@ export async function runLiveCorrectness(store: "indexeddb" | "opfs"): Promise<{
     const frame = event.data as {
       kind?: string;
       event?: string;
-      payload?: { result: { rowCount: number } };
+      payload?: unknown;
     };
-    if (frame.kind === "rpc-event" && frame.event === "patch" && frame.payload !== undefined)
-      patchRows.push(frame.payload.result.rowCount);
+    if (frame.kind !== "rpc-event") return;
+    // A sweep's deliveries cross in one batch frame; count the patches inside it.
+    const events =
+      frame.event === "batch"
+        ? (frame.payload as { events: Array<{ event: string; payload: unknown }> }).events
+        : [{ event: frame.event ?? "", payload: frame.payload }];
+    for (const item of events) {
+      if (item.event === "patch" && item.payload !== undefined) {
+        patchRows.push((item.payload as { result: { rowCount: number } }).result.rowCount);
+      }
+    }
   });
   const live = client.liveQueries();
   let rows: QueryRow[] = [];

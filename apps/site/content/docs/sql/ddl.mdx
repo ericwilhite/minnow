@@ -34,8 +34,9 @@ CREATE TABLE order_items (
 )
 ```
 
-Primary-key components are immutable. Composite identity uses an internal scalar locator, so it
-does not add tuple comparison work to ordinary scans.
+A primary key can change: `UPDATE ... SET` on a key column rekeys the row, and every reference to
+it follows. See [Offline sync and rekeying](/docs/engine/rekeying). Composite identity uses an
+internal scalar locator, so it does not add tuple comparison work to ordinary scans.
 
 A `SERIAL`, `BIGSERIAL`, or `SMALLSERIAL` column, a column declared `GENERATED { ALWAYS | BY
 DEFAULT } AS IDENTITY`, and SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT` all read as the table's
@@ -105,13 +106,29 @@ CREATE TABLE order_notes (
 ```
 
 Every write of a referencing column checks that the parent row exists, reading through the writing
-transaction, so a child inserted beside its parent in one scope sees it. A NULL reference names no
-parent and is satisfied.
+transaction, so a child inserted beside its parent in one scope sees it. A row may also reference
+itself, or another row the same statement writes. A NULL reference names no parent and is
+satisfied.
 
 `ON DELETE` takes `RESTRICT` (the default), `CASCADE`, and `SET NULL`, and the action runs inside
 the deleting transaction — a parent and its dependents publish together or not at all.
 `ON DELETE SET DEFAULT` is rejected with an explicit error; use `SET NULL` or `CASCADE`.
-`ON UPDATE` has nothing to act on, because primary-key columns cannot change.
+
+A reference always follows its parent's rekey, in the same commit. `ON UPDATE CASCADE` is accepted
+because it says what happens anyway; `ON UPDATE RESTRICT`, `NO ACTION`, `SET NULL`, and
+`SET DEFAULT` are rejected. Unlike PostgreSQL, a reference with no `ON UPDATE` clause follows too,
+instead of refusing the key change.
+
+`NOT ENFORCED` keeps the relationship without requiring the parent row to exist, for a table that
+holds only part of its parent's rows. Such a reference takes no `ON DELETE` action but still
+follows a rekey:
+
+```sql
+CREATE TABLE revisions (
+  id INTEGER PRIMARY KEY,
+  ticket_id TEXT REFERENCES tickets (id) NOT ENFORCED
+)
+```
 
 A table without a row-addressing `PRIMARY KEY` or single inline `UNIQUE` column is append-only. That is a
 reasonable choice for an event log, and a mistake for anything a user edits, because the key

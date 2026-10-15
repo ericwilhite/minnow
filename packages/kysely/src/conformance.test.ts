@@ -807,6 +807,35 @@ describe("mutations", () => {
     expect(inserted).toEqual({ scaled: 5 });
   });
 
+  it("rekeys a row by setting its primary key, and its references follow", async () => {
+    const rekeySchema = schema([
+      table("orders", { orderId: column.integer().unique(), note: column.string() }),
+      table("lines", {
+        lineId: column.integer().unique(),
+        orderId: column.integer().references("orders", "orderId"),
+      }),
+    ]);
+    const local = new MinnowDatabase(new MemoryBlockStore());
+    await local.migrate(rekeySchema);
+    const k = createKysely({ driver: local, schema: rekeySchema });
+    await k.insertInto("orders").values({ orderId: -1, note: "offline" }).execute();
+    await k.insertInto("lines").values({ lineId: 1, orderId: -1 }).execute();
+    const moved = await k
+      .updateTable("orders")
+      .set({ orderId: 900 })
+      .where("orderId", "=", -1)
+      .executeTakeFirstOrThrow();
+    expect(moved.numUpdatedRows).toBe(1n);
+    expect(await k.selectFrom("lines").select(["lineId", "orderId"]).execute()).toEqual([
+      { lineId: 1, orderId: 900 },
+    ]);
+    // The retired key still names the row.
+    expect(
+      await k.selectFrom("orders").select(["orderId", "note"]).where("orderId", "=", -1).execute(),
+    ).toEqual([{ orderId: 900, note: "offline" }]);
+    await local.close();
+  });
+
   it("updates through expressions and subquery predicates", async () => {
     const bumped = db
       .updateTable("scores")
