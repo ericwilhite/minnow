@@ -1,5 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IndexedDbBlockStore,
   MemoryBlockStore,
@@ -11,6 +11,11 @@ import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import { compileQuery, executeRowQuery } from "./query.js";
 import { toColumnarBatch } from "./batch.js";
 import { pointReadTestHooks } from "./point-read.js";
+import { heavyTestTimeout } from "./storage-test-helpers.js";
+
+// The memory-budget case loads 160 MB of text per store: about 3 s in a developer run and 15 s
+// or more under coverage, too near the 20-second default.
+vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
 const stores = [
   { name: "memory", create: async (): Promise<BlockStore> => new MemoryBlockStore() },

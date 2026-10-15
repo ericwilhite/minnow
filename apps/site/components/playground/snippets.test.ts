@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import * as core from "@minnowdb/core";
 import { MinnowDatabase } from "@minnowdb/core";
 import * as coreClient from "@minnowdb/core/client";
@@ -14,6 +14,10 @@ import { playgroundDeclarations } from "./declarations";
 import { runSnippet, unsupportedRuntimeImports } from "./run";
 import { PLAYGROUND_RUNTIME_MODULES, type PlaygroundRuntimeModule } from "./runtime-modules";
 import { snippets } from "./snippets";
+
+// The first diagnosis starts the TypeScript language service over every published declaration:
+// about 11 s in a developer run and 45 s or more under coverage, past the 20-second default.
+vi.setConfig({ testTimeout: process.env.CI === undefined ? 90_000 : 300_000 });
 
 /**
  * Both halves of the console's promise, checked without a browser.
