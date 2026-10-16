@@ -241,9 +241,10 @@ Storage                IndexedDB or OPFS, block codecs, manifests, leases, GC
 
 - Each tab owns its own engine worker when it uses the worker client.
 - Buffers cross the boundary as transferable `ArrayBuffer`s — no shared memory, which is why no
-  cross-origin isolation is needed. Query results and live change events cross as one array per
-  column (typed arrays transferred, strings as one flat text), and the proxy rebuilds the row
-  objects on the page side; row objects are the API, never the wire.
+  cross-origin isolation is needed. Query results, statement results, and live change events
+  cross as one array per column (typed arrays transferred, strings as one flat text; a small
+  result as one plain value array), and the proxy rebuilds the row objects on the page side; row
+  objects are the API, never the wire.
 - The [worker protocol](/docs/engine/workers) is versioned RPC; each handle answers a fixed list of
   methods, nothing else.
 - Inside `@minnowdb/core`, the layers are separate modules — `block-format`, `storage`,

@@ -81,8 +81,10 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
   in column order, `Date` instances, booleans, `null`s, and numbers exactly as the engine produced
   them, plus the aligned `columnDomains` vector for logical SQL types and ad-hoc JSON projections.
   Only the cost of a large result crossing changes: structured-cloning 20,000 row objects is
-  several times slower than rebuilding them from columns. Live-query change events take the same
-  path.
+  several times slower than rebuilding them from columns. The rows of an `execute()` SELECT and
+  of a `RETURNING` clause — what the Kysely adapter reads — and live-query change events take the
+  same path. A result under 32 rows, such as a point read, travels instead as one plain array of
+  values with nothing to transfer, which is cheaper than setting up a buffer per column.
 - **Cursors transfer one page per pull.** `client.queryCursor()` keeps scan work in the worker,
   applies backpressure across the RPC handle, and reconstructs only the current columnar page on
   the main thread. See [Cursors and exports](/docs/extensions/exports).
@@ -91,7 +93,7 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
   cancellation frame; stats return as an ordered event before the result. Ordinary queries,
   cursor queries, buffered `execute()` statements, and reads inside `client.write()` support the
   same controls as the direct engine. The client and worker must speak the same protocol version
-  (8 since core 0.15.0); a mismatch fails every call loudly with "Unsupported protocol version"
+  (currently 9); a mismatch fails every call loudly with "Unsupported protocol version"
   rather than silently dropping a newer argument, so deploy the client and worker from the same
   package build and make sure a cached older worker cannot outlive its client.
 - **Queues and handles are bounded.** One connection admits at most 256 in-flight requests and

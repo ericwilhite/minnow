@@ -37,9 +37,11 @@ describe("compressed download budgets", () => {
     // parsing (0.13.1): 472.2 KiB measured. Bounded delta replay, staged commit deltas, WAL
     // continuation frames, the lease lane, follower pieces, and schema-4 parts (0.14.0):
     // 486.0 KiB measured. Rekeying (0.15.0): 493.5 KiB measured; with its audit, 496.4 KiB.
+    // The application-path pass (columnar statement results decoded by the client, live
+    // skips in the worker): 498.3 KiB.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(497 * 1024);
+    ).toBeLessThanOrEqual(499 * 1024);
   });
 });
