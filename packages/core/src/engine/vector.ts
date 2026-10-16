@@ -582,7 +582,7 @@ type MultiCodeColumn =
 const NUMBER_KEY_CODE_CAP = 1 << 20;
 
 interface FastAggregateSpec {
-  readonly kind: "star" | "column" | "conditional" | "extreme";
+  readonly kind: "star" | "column" | "conditional" | "extreme" | "distinct";
   readonly sums: boolean;
 }
 
@@ -601,7 +601,7 @@ interface GroupState {
    * carries its own set, so they no longer compete for the single deduplicating GROUP BY that
    * `COUNT(DISTINCT x)` used to be rewritten into.
    */
-  readonly distincts: Array<Set<unknown> | undefined> | undefined;
+  readonly distincts: Array<DistinctValues | undefined> | undefined;
 }
 
 interface BoundPlan {
@@ -5172,8 +5172,13 @@ class GroupAccumulator {
   #fastAggregates(): FastAggregateSpec[] | undefined {
     const specs: FastAggregateSpec[] = [];
     for (const spec of this.#plan.aggregates) {
-      // The kernel counts every row it is given; deduplication needs the per-row path.
-      if (spec.distinct === true) return undefined;
+      // COUNT(DISTINCT number) deduplicates through the slot's numeric table; any other
+      // DISTINCT aggregate needs the per-row path.
+      if (spec.distinct === true) {
+        if (spec.name !== "COUNT" || spec.rawNumber === undefined) return undefined;
+        specs.push({ kind: "distinct", sums: false });
+        continue;
+      }
       if (spec.argument.kind === "wildcard" && spec.name === "COUNT") {
         specs.push({ kind: "star", sums: false });
         continue;
@@ -5279,11 +5284,36 @@ class GroupAccumulator {
       readonly length: number;
       readonly slots: number;
     }> = [];
+    // COUNT(DISTINCT number): a row counts when its value is new to the group's slot table.
+    const distincts: Array<{
+      readonly index: number;
+      readonly rows: Int32Array | undefined;
+      readonly values: Float64Array;
+      readonly validity: Uint8Array;
+      readonly windowStart: number;
+      readonly length: number;
+      readonly slots: number;
+    }> = [];
+    let firstSeen = 0;
     let stars = 0;
     for (let index = 0; index < specs.length; index += 1) {
       const spec = specs[index];
       if (spec === undefined || spec.kind === "star") {
         stars += 1;
+        continue;
+      }
+      if (spec.kind === "distinct") {
+        const raw = plan.aggregates[index]?.rawNumber;
+        if (raw === undefined) return false;
+        distincts.push({
+          index,
+          rows: batch.rowsBySource[raw.source],
+          values: raw.vector.values,
+          validity: raw.vector.validity,
+          windowStart: raw.vector.window?.start ?? 0,
+          length: raw.vector.length,
+          slots: raw.vector.values.length,
+        });
         continue;
       }
       if (spec.kind === "extreme") {
@@ -5386,6 +5416,20 @@ class GroupAccumulator {
           state.sums[column.index] = (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
         }
       }
+      for (const distinct of distincts) {
+        const sourceRow = distinct.rows?.[row] ?? -1;
+        if (sourceRow < 0 || sourceRow >= distinct.length) continue;
+        const slot = sourceRow - distinct.windowStart;
+        if (slot < 0 || slot >= distinct.slots) {
+          throw new RangeError("Streamed vector row is outside the resident window");
+        }
+        if (!isValid(distinct.validity, slot)) continue;
+        const seen = state.distincts?.[distinct.index];
+        if (seen === undefined) return false;
+        if (!seen.addNumber(distinct.values[slot] ?? 0)) continue;
+        counts[distinct.index] = (counts[distinct.index] ?? 0) + 1;
+        firstSeen += 1;
+      }
       for (const extreme of extremes) {
         const sourceRow = extreme.rows?.[row] ?? -1;
         if (sourceRow < 0 || sourceRow >= extreme.length) continue;
@@ -5445,6 +5489,21 @@ class GroupAccumulator {
           state.sums[conditional.index] = (state.sums[conditional.index] ?? 0) + value;
         }
       }
+    }
+    // Distinct values are tallied as the per-row path tallies them, once per batch.
+    if (firstSeen > 0) {
+      this.#memory.tally(
+        safeMemoryProduct(
+          firstSeen,
+          safeMemorySum(
+            QUERY_REFERENCE_BYTES,
+            queryValuePayloadBytes(0),
+            "Distinct aggregate value",
+          ),
+          "Distinct aggregate value",
+        ),
+        "Distinct aggregate value",
+      );
     }
     return true;
   }
@@ -5798,11 +5857,11 @@ function createGroupState(
   }
   // Only DISTINCT slots get a set, and only when the plan has one at all — an ordinary grouped
   // query allocates nothing extra for a feature it does not use.
-  let distincts: Array<Set<unknown> | undefined> | undefined;
+  let distincts: Array<DistinctValues | undefined> | undefined;
   for (let index = 0; index < plan.aggregates.length; index += 1) {
     if (plan.aggregates[index]?.distinct !== true) continue;
-    distincts ??= new Array<Set<unknown> | undefined>(plan.aggregates.length);
-    distincts[index] = new Set<unknown>();
+    distincts ??= new Array<DistinctValues | undefined>(plan.aggregates.length);
+    distincts[index] = new DistinctValues();
   }
   return {
     groupValues,
@@ -5816,6 +5875,73 @@ function createGroupState(
     valueReservationBytes: new Float64Array(plan.aggregates.length),
     distincts,
   };
+}
+
+const distinctBits = new Float64Array(1);
+const distinctWords = new Uint32Array(distinctBits.buffer);
+
+/**
+ * The values one DISTINCT aggregate slot has seen, with exactly a Set's SameValueZero identity.
+ * Numbers — the common DISTINCT input — live in an open-addressing table of raw float64s, which
+ * costs a hash and a probe per value instead of a boxed Set entry; anything else uses a Set.
+ */
+class DistinctValues {
+  #slots = new Float64Array(16);
+  #used = new Uint8Array(16);
+  #numbers = 0;
+  #nan = false;
+  #others: Set<unknown> | undefined;
+
+  /** Adds the value; false when an equal one was already present. */
+  add(value: unknown): boolean {
+    if (typeof value === "number") return this.addNumber(value);
+    this.#others ??= new Set<unknown>();
+    if (this.#others.has(value)) return false;
+    this.#others.add(value);
+    return true;
+  }
+
+  addNumber(value: number): boolean {
+    if (value !== value) {
+      if (this.#nan) return false;
+      this.#nan = true;
+      return true;
+    }
+    // +0 and -0 are one value, as in a Set.
+    const key = value === 0 ? 0 : value;
+    distinctBits[0] = key;
+    const mask = this.#slots.length - 1;
+    // Murmur3's finalizer over both words: small integers differ only in the high word's high
+    // bits, which a plain multiply would never carry down into the masked low bits.
+    let hash = (distinctWords[0] ?? 0) ^ (distinctWords[1] ?? 0);
+    hash ^= hash >>> 16;
+    hash = Math.imul(hash, 0x85ebca6b);
+    hash ^= hash >>> 13;
+    hash = Math.imul(hash, 0xc2b2ae35);
+    hash ^= hash >>> 16;
+    let probe = hash & mask;
+    for (;;) {
+      if (this.#used[probe] === 0) break;
+      if (this.#slots[probe] === key) return false;
+      probe = (probe + 1) & mask;
+    }
+    this.#used[probe] = 1;
+    this.#slots[probe] = key;
+    this.#numbers += 1;
+    if (this.#numbers * 2 > this.#slots.length) this.#grow();
+    return true;
+  }
+
+  #grow(): void {
+    const slots = this.#slots;
+    const used = this.#used;
+    this.#slots = new Float64Array(slots.length * 2);
+    this.#used = new Uint8Array(slots.length * 2);
+    this.#numbers = 0;
+    for (let index = 0; index < slots.length; index += 1) {
+      if (used[index] === 1) this.addNumber(slots[index] ?? 0);
+    }
+  }
 }
 
 /**
@@ -5843,8 +5969,7 @@ function firstOfItsKind(
   const seen = state.distincts?.[index];
   if (seen === undefined) return true;
   const key = distinctKey(value);
-  if (seen.has(key)) return false;
-  seen.add(key);
+  if (!seen.add(key)) return false;
   memory.tally(
     safeMemorySum(
       QUERY_REFERENCE_BYTES,
