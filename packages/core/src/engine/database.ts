@@ -6987,7 +6987,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return undefined;
       }
     }
-    if (plan.kind === "index") return this.#indexReadAtSnapshot(plan, shape, snapshot, options);
+    if (plan.kind === "index") {
+      // A scope's staged rows are in no index until it commits, so its reads scan.
+      if (visibility.overlayTransactionId !== undefined) return undefined;
+      return this.#indexReadAtSnapshot(plan, shape, snapshot, options);
+    }
     if (plan.kind === "delta") {
       // Update and delete deltas are replayed for the one key instead of the whole table: a
       // scalar key identifies its row in every segment, so the row's history is a handful of

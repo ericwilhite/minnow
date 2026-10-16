@@ -130,6 +130,36 @@ describe("index read", () => {
     }
   });
 
+  it("sees a transaction's own staged rows, which no index holds yet", async () => {
+    const database = await ordersDatabase();
+    try {
+      await database.execute("BEGIN");
+      await database.execute(
+        "INSERT INTO orders (id, customer, status, total, placed, rush) VALUES (?, ?, ?, ?, ?, ?)",
+        [20_000, 7, "new", "2.00", new Date(Date.UTC(2026, 0, 3)), false],
+      );
+      const inside = await database.query("SELECT id FROM orders WHERE customer = ?", {
+        params: [7],
+        memoize: false,
+      });
+      expect(inside.rows.some((row) => row.id === 20_000)).toBe(true);
+      const counted = await database.query("SELECT COUNT(*) AS n FROM orders WHERE customer = ?", {
+        params: [7],
+        memoize: false,
+      });
+      expect(counted.rows[0]?.n).toBe(inside.rows.length);
+      await database.execute("ROLLBACK");
+      const { rows } = await differential(
+        database,
+        "SELECT id FROM orders WHERE customer = ?",
+        [7],
+      );
+      expect(rows.some((row) => row.id === 20_000)).toBe(false);
+    } finally {
+      await database.close();
+    }
+  });
+
   it("sees rows appended after the index was built", async () => {
     const database = await ordersDatabase();
     try {
