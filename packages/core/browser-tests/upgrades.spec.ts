@@ -4,8 +4,11 @@ import { fileURLToPath } from "node:url";
 import { expect } from "@playwright/test";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
-/** The OPFS layout this build writes; layout 10 admits the internal key-forwards table. */
-const OPFS_LAYOUT = 10;
+/**
+ * The OPFS layout this build writes; layout 11 admits compaction plans whose sources lack a column
+ * added after them.
+ */
+const OPFS_LAYOUT = 11;
 
 const directory = new URL("../format-fixtures/", import.meta.url);
 for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
@@ -63,12 +66,12 @@ test("automatic upgrade: OPFS written by 0.14.1 keeps its rows, index, and seque
 });
 
 /**
- * The IndexedDB schema this build writes; schema 5 admits the internal key-forwards table a
- * rekey creates.
+ * The IndexedDB schema this build writes; schema 6 admits compaction plans whose sources lack a
+ * column added after them.
  */
-const INDEXEDDB_SCHEMA = 5;
+const INDEXEDDB_SCHEMA = 6;
 
-for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1"] as const) {
+for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0"] as const) {
   test(`automatic upgrade: IndexedDB written by ${writer} keeps its index deltas, writes past the old delta limit, and refuses the released reader`, async ({
     page,
   }) => {
@@ -80,7 +83,7 @@ for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1"] as const) {
       return module.runIndexedDbUpgrade(version);
     }, writer);
     expect(result).toEqual({
-      releasedSchema: { "0.10.0": 2, "0.12.1": 2, "0.13.1": 3, "0.14.1": 4 }[writer],
+      releasedSchema: { "0.10.0": 2, "0.12.1": 2, "0.13.1": 3, "0.14.1": 4, "0.15.0": 5 }[writer],
       schema: INDEXEDDB_SCHEMA,
       answersPreserved: true,
       newRow: [{ id: 70_000 }],
@@ -88,6 +91,10 @@ for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1"] as const) {
       reopenedSame: true,
       rekeyed: [{ id: 90_000 }],
       keyForwards: true,
+      foldedAcrossAddColumn: [
+        { tag: "new", n: 1 },
+        { tag: "old", n: 70_700 },
+      ],
       integrity: true,
       olderReadersRefused: true,
       finalSchema: INDEXEDDB_SCHEMA,

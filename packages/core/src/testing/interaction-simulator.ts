@@ -396,11 +396,11 @@ export interface InteractionPlanOptions {
   /**
    * Adds `ALTER TABLE` interleaved with the writes: `ADD COLUMN` with a constant `DEFAULT`
    * (sometimes reusing a dropped column's name), `DROP COLUMN`, `RENAME COLUMN`, and
-   * `CREATE` / `DROP INDEX`, including changes the engine must refuse. Columns are added and
-   * dropped only on tables nothing has written yet; `"populated"` lifts that, which currently
-   * reproduces tables that can no longer fold (see the generator's `addColumn`).
+   * `CREATE` / `DROP INDEX`, including changes the engine must refuse. Columns are added to and
+   * dropped from tables whether or not they hold rows, so folds meet segments written before a
+   * column existed and updates left holding only their key.
    */
-  readonly schemaChanges?: boolean | "populated";
+  readonly schemaChanges?: boolean;
   /** Adds full-text `MATCH` queries, over keyed tables and over append-only tables it indexes. */
   readonly fullText?: boolean;
   /**
@@ -594,10 +594,7 @@ export function generateInteractionPlan(
   const constraintRandom =
     options.constraints === true ? createRandom((seed ^ 0x434f4e53) >>> 0) : undefined;
   const schemaRandom =
-    options.schemaChanges === true || options.schemaChanges === "populated"
-      ? createRandom((seed ^ 0x414c5452) >>> 0)
-      : undefined;
-  const populatedSchemaChanges = options.schemaChanges === "populated";
+    options.schemaChanges === true ? createRandom((seed ^ 0x414c5452) >>> 0) : undefined;
   const textRandom =
     options.fullText === true ? createRandom((seed ^ 0x46545331) >>> 0) : undefined;
   const burstCommits = options.burstCommits;
@@ -616,9 +613,6 @@ export function generateInteractionPlan(
   const children = new Map<string, Set<string>>();
   const droppedColumns = new Map<string, string[]>();
   const logs = new Map<string, PlanTable>();
-  // Tables some generated step has written to, brought up to date from `scanned` on demand.
-  const written = new Set<string>();
-  let scanned = 0;
   let columnSerial = 0;
   let indexSerial = 0;
   let logSerial = 0;
@@ -704,38 +698,19 @@ export function generateInteractionPlan(
         expectExisting: true,
       });
     }
-    // A fresh table is where ADD COLUMN may go (see addColumn), so it often gets one at once.
+    // A fresh table often gets a column at once, before any row predates it.
     if (schemaRandom?.chance(0.5) === true) addColumn(schemaRandom, table.name);
   };
 
   /**
    * `ALTER TABLE ... ADD COLUMN`, sometimes reusing a dropped column's name, `NOT NULL` with a
-   * constant default, nullable with one, or nullable without.
-   *
-   * Unless `schemaChanges` is `"populated"`, a column is added -- or dropped -- only on a table
-   * nothing has written yet. On a written table both currently leave it unable to fold: a fold
-   * refuses a full-row source segment that predates an added column, and an update segment
-   * whose only changed column was dropped, so its level-zero segments grow until writes are
-   * refused. Both fixes change what a stored compaction plan may hold or how a column drop
-   * retires segments; `"populated"` reproduces them until they land.
+   * constant default, nullable with one, or nullable without. On a table that holds rows, the
+   * segments already written have no blocks for the column: reads and folds give their rows
+   * the constant default, or NULL.
    */
-  const refreshWritten = (): void => {
-    for (; scanned < interactions.length; scanned++) {
-      const interaction = interactions[scanned];
-      if (
-        interaction !== undefined &&
-        "table" in interaction &&
-        typeof interaction.table === "string" &&
-        WRITING_KINDS.has(interaction.kind)
-      ) {
-        written.add(interaction.table);
-      }
-    }
-  };
   const addColumn = (stream: Random, name: string): void => {
-    refreshWritten();
     const table = live.get(name);
-    if (table === undefined || (written.has(name) && !populatedSchemaChanges)) return;
+    if (table === undefined) return;
     const dropped = (droppedColumns.get(name) ?? []).filter(
       (column) => !table.columns.some((candidate) => candidate.name === column),
     );
@@ -899,8 +874,6 @@ export function generateInteractionPlan(
       const column = stream.pick(candidates);
       const refused =
         column.unique === true || column.references !== undefined || indexed.has(column.name);
-      refreshWritten();
-      if (!refused && written.has(table.name) && !populatedSchemaChanges) return;
       alter({ kind: "dropColumn", column: column.name }, refused);
       if (!refused) {
         live.set(table.name, {
@@ -1535,20 +1508,6 @@ function generateRekey(
     assignments,
   };
 }
-
-/** Interaction kinds that can store rows in their table. */
-const WRITING_KINDS: ReadonlySet<Interaction["kind"]> = new Set([
-  "insert",
-  "update",
-  "delete",
-  "rekey",
-  "transaction",
-  "concurrent",
-  "fault",
-  "queuedWrite",
-  "upsertUnique",
-  "burst",
-]);
 
 /** An index the generator created: `definite` unless its build may meet a duplicate. */
 interface GeneratedIndex {

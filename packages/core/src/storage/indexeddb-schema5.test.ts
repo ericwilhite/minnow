@@ -31,8 +31,8 @@ import { StorageCorruptionError, type TableRecord } from "./types.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
-/** The schema this build writes. */
-const CURRENT_SCHEMA = 5;
+/** The schema this build writes: schema 6 (fills in compaction plans) followed schema 5. */
+const CURRENT_SCHEMA = 6;
 
 /** The engine's internal key-forwards table, as the engine creates it on its first rekey. */
 const KEY_FORWARDS: TableRecord = keyForwardsTableRecord(NOW);
@@ -304,7 +304,7 @@ function abortNextUpgrade(indexedDB: IDBFactory): { aborted: () => boolean } {
   return { aborted: () => aborted };
 }
 
-describe("IndexedDB schema 4 to 5 upgrade", () => {
+describe("IndexedDB schema 4 to current upgrade", () => {
   const released = releasedBuilds.find((build) => build.schema === 4);
   if (released === undefined) throw new Error("The schema-4 writer is missing");
 
@@ -348,7 +348,7 @@ describe("IndexedDB schema 4 to 5 upgrade", () => {
     ]);
     expect(first.status).toBe("fulfilled");
     expect(second.status).toBe("fulfilled");
-    // A released opener that arrives behind the upgrade is refused, never served schema 5.
+    // A released opener that arrives behind the upgrade is refused, never served the current schema.
     expect(late).toMatchObject({
       status: "rejected",
       reason: { name: "StorageFormatVersionError", actualVersion: CURRENT_SCHEMA },

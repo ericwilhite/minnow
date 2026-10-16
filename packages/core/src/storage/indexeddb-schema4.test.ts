@@ -36,8 +36,11 @@ import type { FtsPosting, FtsPostingQuery, ManifestSummary, TableRecord } from "
 
 vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
-/** The schema this build writes: schema 5 (the key-forwards record) followed schema 4. */
-const CURRENT_SCHEMA = 5;
+/**
+ * The schema this build writes: schema 5 (the key-forwards record) and schema 6 (fills in
+ * compaction plans) followed schema 4.
+ */
+const CURRENT_SCHEMA = 6;
 const PART = "fts-delta-part";
 /** The per-part ceilings the store writes; a test that needs several parts exceeds them. */
 const PART_POSTINGS = 8_192;

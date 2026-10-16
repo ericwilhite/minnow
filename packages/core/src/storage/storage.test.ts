@@ -130,8 +130,12 @@ const frozenIndexedDbSchemas: ReadonlyArray<{
   // postings deltas.
   { version: 4, writerPackageVersion: "0.14.0", install: installFrozenIndexedDbV2 },
   // Schema 5 is schema 4's stores too; the version bars schema-4 readers from the internal
-  // key-forwards catalog record. Its first writer is the release that ships it, this package.
-  { version: 5, writerPackageVersion: currentPackageVersion, install: installFrozenIndexedDbV2 },
+  // key-forwards catalog record.
+  { version: 5, writerPackageVersion: "0.15.0", install: installFrozenIndexedDbV2 },
+  // Schema 6 is schema 5's stores too; the version bars schema-5 readers from compaction plans
+  // whose sources lack columns added after them or keep only their key. Its first writer is the
+  // release that ships it, this package.
+  { version: 6, writerPackageVersion: currentPackageVersion, install: installFrozenIndexedDbV2 },
 ];
 
 /** Schema 2 adds the chunked transaction journal store; everything else is schema 1. */
@@ -4343,10 +4347,44 @@ for (const implementation of stores()) {
 
       const invalidDelete = mergeCompactionJob("merge-invalid-delete");
       if (invalidDelete.rewritePlan.kind !== "merge-v1") throw new Error("Expected merge plan");
-      (invalidDelete.rewritePlan.sourceSegments[1] as { kind: "update" }).kind = "update";
+      (invalidDelete.rewritePlan.sourceSegments[1]?.columns[0] as { columnId: string }).columnId =
+        "value-column";
+      (invalidDelete.rewritePlan.sourceSegments[1]?.columns[0] as { type: string }).type = "string";
       await expect(store.createCompactionJob(invalidDelete)).rejects.toThrow(
-        "update segment requires",
+        "delete segment must contain only its key column",
       );
+
+      // A replayed plan may describe sources without columns added after them, and an update
+      // left holding only its key; every source but a delete must still name its key.
+      const keylessUpdate = mergeCompactionJob("merge-keyless-update");
+      const merged = keylessUpdate.rewritePlan;
+      if (merged.kind !== "merge-v1") throw new Error("Expected merge plan");
+      const update = merged.sourceSegments[1];
+      if (update === undefined) throw new Error("Expected a delete source");
+      await expect(
+        store.createCompactionJob({
+          ...keylessUpdate,
+          rewritePlan: {
+            ...merged,
+            kind: "merge-v2",
+            columns: merged.columns.map(({ columnId, type }) => ({ columnId, type })),
+            resolution: { runs: 1, patches: 0, checksum: 0 },
+            sourceSegments: merged.sourceSegments.map((segment) =>
+              segment !== update
+                ? segment
+                : {
+                    ...segment,
+                    kind: "update",
+                    columns: segment.columns.map((column) => ({
+                      ...column,
+                      columnId: "value-column",
+                      type: "string",
+                    })),
+                  },
+            ),
+          },
+        }),
+      ).rejects.toThrow("update segment must contain its key column");
 
       expect(await store.listCompactionJobs()).toEqual([]);
       store.close();
@@ -5451,7 +5489,7 @@ it("retains, migrates, and writes every stable IndexedDB schema fixture", async 
 it("rejects a newer IndexedDB schema without mutating it", async () => {
   const indexedDB = new IDBFactory();
   const name = crypto.randomUUID();
-  const newer = await openNativeIndexedDb(indexedDB, name, 6, (request) => {
+  const newer = await openNativeIndexedDb(indexedDB, name, 7, (request) => {
     request.result.createObjectStore("future");
   });
   await new Promise<void>((resolve, reject) => {
@@ -5470,11 +5508,11 @@ it("rejects a newer IndexedDB schema without mutating it", async () => {
     name: "StorageFormatVersionError",
     backend: "indexeddb",
     location: name,
-    actualVersion: 6,
-    supportedVersion: 5,
+    actualVersion: 7,
+    supportedVersion: 6,
     relation: "newer",
   });
-  const unchanged = await openNativeIndexedDb(indexedDB, name, 6);
+  const unchanged = await openNativeIndexedDb(indexedDB, name, 7);
   expect(unchanged.objectStoreNames.contains("future")).toBe(true);
   unchanged.close();
 });
@@ -5503,7 +5541,7 @@ it("closes an IndexedDB connection when a newer schema version arrives", async (
   const name = crypto.randomUUID();
   const store = await IndexedDbBlockStore.open({ name, indexedDB });
   const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(name, 6);
+    const request = indexedDB.open(name, 7);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
   });

@@ -11,8 +11,8 @@ npm install @minnowdb/core
 and benchmarks that run in your browser.
 
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
-> changes. Stored data is stable: block format 2, snapshot formats 1 and 2, IndexedDB schema 5, and
-> OPFS layout 10 are versioned separately and locked — an incompatible future writer must use a new
+> changes. Stored data is stable: block format 2, snapshot formats 1 and 2, IndexedDB schema 6, and
+> OPFS layout 11 are versioned separately and locked — an incompatible future writer must use a new
 > format number.
 > Pin exact package versions. See
 > [Versioning](https://minnowdb.com/docs/reference/versioning/), the

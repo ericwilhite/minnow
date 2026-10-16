@@ -23,6 +23,7 @@ import {
   MAX_TABLE_RECORD_CHARACTERS,
   MAX_TEMP_RUN_PAGE_BYTES,
   MAX_TEMP_RUN_PAGES_PER_BATCH,
+  normalizeCompactionJobRecord,
   normalizeGarbageCollectionJobRecord,
   StorageFormatVersionError,
   updateGarbageCollectionPlanningRecord,
@@ -744,6 +745,87 @@ describe("compaction output provenance", () => {
           ),
         label,
       ).toThrow();
+    }
+  });
+});
+
+describe("compaction plans across schema changes", () => {
+  const block = (blockId: string, rowStart: number, rowCount: number) => ({
+    blockId,
+    rowStart,
+    rowCount,
+    storedBytes: 100,
+    encodedBytes: 80,
+    checksum: 1,
+  });
+  /** A rechunk of three two-row sources; the middle one predates column `b`. */
+  const rechunk = (bBlocks: Array<ReturnType<typeof block>>): CompactionJobRecord => ({
+    id: "rechunk-across-add-column",
+    tableId: "events",
+    sourceManifestVersion: 7,
+    sourceSegmentIds: ["s1", "s2", "s3"],
+    sourceBlockIds: ["a1", "a2", "a3", ...bBlocks.map(({ blockId }) => blockId)].sort(),
+    outputBlockIds: [],
+    cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+    processedRows: 0,
+    sourceStoredBytes: 100 * (3 + bBlocks.length),
+    outputStoredBytes: 0,
+    logicalBytes: 80 * (3 + bBlocks.length),
+    rewritePlan: {
+      kind: "rechunk-v1",
+      targetBlockBytes: 1024 * 1024,
+      outputCompression: "raw",
+      totalRows: 6,
+      rowIdStart: 1n,
+      rowIdEndExclusive: 7n,
+      logicalOrder: 1,
+      columns: [
+        {
+          columnId: "a",
+          type: "number",
+          sourceBlocks: [block("a1", 0, 2), block("a2", 2, 2), block("a3", 4, 2)],
+        },
+        { columnId: "b", type: "string", sourceBlocks: bBlocks },
+      ],
+      outputs: [{ rowStart: 0, rowCount: 6 }],
+    },
+    outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+    memoryBudgetBytes: 1024 * 1024,
+    minimumMemoryBytes: 1024,
+    level0SourceStoredBytes: 100 * (3 + bBlocks.length),
+    anchorSourceStoredBytes: 0,
+    peakWorkingBytes: 0,
+    outputLogicalBytes: 0,
+    targetLevel: 1,
+    state: "planned",
+    transactionId: null,
+    outputSegmentId: "rechunk-across-add-column/output",
+    publishedVersion: null,
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+
+  it("admits rechunk columns with gaps where sources predate the column", () => {
+    for (const blocks of [
+      [block("b1", 0, 2), block("b3", 4, 2)],
+      [block("b3", 4, 2)],
+      [block("b1", 0, 2)],
+      [],
+    ]) {
+      const normalized = normalizeCompactionJobRecord(rechunk(blocks));
+      if (normalized.rewritePlan.kind !== "rechunk-v1") throw new Error("Expected a rechunk");
+      expect(normalized.rewritePlan.columns[1]?.sourceBlocks).toEqual(blocks);
+    }
+  });
+
+  it("refuses rechunk blocks that overlap, run backwards, or pass the planned rows", () => {
+    for (const [blocks, message] of [
+      [[block("b1", 0, 3), block("b3", 2, 2)], "ordered and disjoint"],
+      [[block("b3", 4, 2), block("b1", 0, 2)], "ordered and disjoint"],
+      [[block("b1", 0, 2), block("b3", 5, 2)], "within the planned rows"],
+    ] as const) {
+      expect(() => normalizeCompactionJobRecord(rechunk([...blocks]))).toThrow(message);
     }
   });
 });

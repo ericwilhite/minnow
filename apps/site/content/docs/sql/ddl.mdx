@@ -415,6 +415,8 @@ ALTER TABLE orders ADD COLUMN channel TEXT NOT NULL DEFAULT 'web'
 An expression default such as `NOW()` is evaluated per write, so it fills only the rows written
 afterwards; a column with one, or with no default at all, is added nullable and the rows already
 stored read `NULL`. `ADD COLUMN IF NOT EXISTS` leaves an existing column of that name as it is.
+When [compaction](/docs/storage/maintenance#schema-changes) next folds the table, it writes those
+rows with exactly the value they read.
 
 ```sql
 ALTER TABLE orders RENAME COLUMN channel TO sales_channel

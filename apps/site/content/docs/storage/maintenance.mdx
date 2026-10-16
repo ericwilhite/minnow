@@ -72,6 +72,23 @@ it splits the touched keys into groups and replays each group in turn. Both path
 the rows the in-memory replay returns, in the same order — they cost time, not correctness — and
 both queue the fold that removes the delta. A reload alone preserves the stored mutation history.
 
+### Schema changes
+
+Folds work across `ALTER TABLE`. `ADD COLUMN` rewrites nothing, so segments written before it
+have no blocks for the new column; a fold writes their rows with the value they read — the
+column's constant default, or `NULL`. After `DROP COLUMN`, an update whose only changed column was
+the dropped one keeps just its key and changes nothing; a fold retires it. `RENAME COLUMN` changes
+no stored data. A fold that was planned before an `ALTER TABLE` and had not yet published is
+abandoned, and the next fold plans against the new schema.
+
+Through 0.15.0, a fold refused a table with either kind of segment, so every commit to it added a
+level-zero segment until the 4,096-segment ceiling refused its writes. Opening such a database with
+a later build fixes it without any call: the first write at the ceiling, or the first read of a
+heavily fragmented table, starts a fold, and automatic compaction keeps going until the table is
+back to a few segments. The data is unchanged. This build stores fold plans an older build
+cannot read, so opening the database upgrades it to IndexedDB schema 6 or OPFS layout 11, and
+0.15.0 then refuses it (see [versioning](/docs/reference/versioning)).
+
 ### Partitioned folds
 
 A folded table is a run of level-one partitions of at most `partitionRows` rows (16,384 by
