@@ -307,6 +307,13 @@ export interface JoinPlan extends TableSource {
   on?: Expression;
   full?: boolean;
   natural?: boolean;
+  /**
+   * Constraints a LEFT join's own key inherits from WHERE constants on the preserved key it
+   * equals (`WHERE c.id = 5` with `ON d.customer_id = c.id` gives `d.customer_id = 5`). Every
+   * surviving outer row satisfies the constant, so no row of this side outside it can match one.
+   * They are never evaluated: input preparation may use them to read fewer rows of this side.
+   */
+  inputHints?: Predicate[];
 }
 
 /**

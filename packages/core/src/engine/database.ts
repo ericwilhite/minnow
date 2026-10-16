@@ -15009,7 +15009,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 snapshot,
                 requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
                 visibility,
-                plan,
+                await this.#withJoinInputHints(plan, table),
               ),
             );
             throwIfAborted(options.signal);
@@ -15103,6 +15103,73 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       return runStreamedExecution({ spill: true });
     }
+  }
+
+  /**
+   * The plan a LEFT join side is prepared under: its key's inherited constants (`inputHints`)
+   * join the predicates that index and key pruning read, so the side is read for the pinned keys
+   * only. The hints are never evaluated, and a superset is harmless — a side row outside them
+   * matches no surviving outer row — so only hints whose literal is exactly the column's storage
+   * type are used; anything a coercion could make equal to a pruned row stays out. Key forwards
+   * are left to the ordinary read: a constant naming a retired key forwards in WHERE, not here.
+   */
+  async #withJoinInputHints(plan: CompiledQuery, table: TableRecord): Promise<CompiledQuery> {
+    const joins = plan.joins.filter((join) => join.table === table.name);
+    const join = joins[0];
+    const hints = join?.inputHints;
+    if (
+      join === undefined ||
+      hints === undefined ||
+      joins.length !== 1 ||
+      plan.base.table === table.name ||
+      join.derived !== undefined ||
+      join.union !== undefined ||
+      join.recursive !== undefined ||
+      join.windowed !== undefined ||
+      join.columnAliases !== undefined
+    ) {
+      return plan;
+    }
+    if (
+      this.#keyForwardsTableSeen ||
+      (await this.#catalogFacts()).keyForwardsTableId !== undefined
+    ) {
+      return plan;
+    }
+    const usable = hints.filter((hint) => {
+      const column = hint.left.kind === "column" ? hint.left : hint.right;
+      const value = hint.left.kind === "column" ? hint.right : hint.left;
+      if (column.kind !== "column" || !column.reference.startsWith(`${join.alias}.`)) return false;
+      const record = table.columns.find(
+        (candidate) => candidate.name === column.reference.slice(join.alias.length + 1),
+      );
+      if (record === undefined || record.sqlDomain !== undefined || record.hidden === true) {
+        return false;
+      }
+      const literals =
+        value.kind === "literal" ? [value] : value.kind === "list" ? value.items : undefined;
+      return (
+        literals !== undefined &&
+        literals.length > 0 &&
+        literals.every(
+          (literal) =>
+            literal.kind === "literal" &&
+            literal.internalSqlValue !== true &&
+            literal.sqlDomain === undefined &&
+            ((record.type === "number" &&
+              typeof literal.value === "number" &&
+              Number.isFinite(literal.value)) ||
+              (record.type === "string" &&
+                typeof literal.value === "string" &&
+                !literal.value.startsWith("\u0000")) ||
+              (record.type === "boolean" && typeof literal.value === "boolean") ||
+              (record.type === "datetime" &&
+                literal.value instanceof Date &&
+                Number.isFinite(dateMilliseconds(literal.value)))),
+        )
+      );
+    });
+    return usable.length === 0 ? plan : { ...plan, predicates: [...plan.predicates, ...usable] };
   }
 
   /**
@@ -24871,8 +24938,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     expectedRows?: ReadonlyMap<string, number>,
   ): Promise<ColumnVector> {
     const poolable = storedBlocks === undefined && expectedRows === undefined;
+    // Keyed by the blocks themselves, not only the segments: index pruning hands this a
+    // segment narrowed to the blocks holding one lookup's candidates, under the segment's own
+    // id. Two lookups whose kept blocks differ but add up to the same row count shared one
+    // pooled vector, and the second answered from the first one's rows.
     const key = poolable
-      ? `mav\0${column.id}\0${String(rowCount)}\0${segments.map((segment) => segment.id).join("\0")}`
+      ? `mav\0${column.id}\0${String(rowCount)}\0${segments
+          .map((segment) => `${segment.id}:${(segment.columnBlockIds[column.id] ?? []).join("+")}`)
+          .join("\0")}`
       : undefined;
     if (key !== undefined) {
       const cached = this.#cacheGet(key) as ColumnVector | undefined;

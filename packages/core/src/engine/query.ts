@@ -2589,6 +2589,10 @@ function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
     join.left = bindExpression(join.left, values);
     join.right = bindExpression(join.right, values);
     if (join.on !== undefined) join.on = bindExpression(join.on, values);
+    for (const hint of join.inputHints ?? []) {
+      hint.left = bindExpression(hint.left, values);
+      hint.right = bindExpression(hint.right, values);
+    }
   }
   for (const source of [block.base, ...block.joins]) {
     if (source.derived !== undefined) bindBlock(source.derived, values);

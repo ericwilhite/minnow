@@ -732,8 +732,25 @@ function addCalendarUnit(start: Date, unit: string): Date {
 function propagateJoinKeyConstants(block: CompiledQuery): void {
   const earlier = new Set([block.base.alias]);
   const pairs: Array<{ inner: string; outer: string; toInner: boolean; toOuter: boolean }> = [];
+  // A LEFT join's key equal to a constant-pinned preserved key: a pruning hint, not a predicate.
+  const hinted: Array<{ inner: string; outer: string; join: JoinPlan }> = [];
   for (const join of block.joins) {
     const ownAlias = join.alias;
+    if (
+      join.on === undefined &&
+      join.kind === "left" &&
+      join.full !== true &&
+      join.left.kind === "column" &&
+      join.right.kind === "column"
+    ) {
+      const leftOwn = join.left.reference.startsWith(`${ownAlias}.`);
+      const rightOwn = join.right.reference.startsWith(`${ownAlias}.`);
+      if (leftOwn !== rightOwn) {
+        const inner = leftOwn ? join.left.reference : join.right.reference;
+        const outer = leftOwn ? join.right.reference : join.left.reference;
+        if (earlier.has(outer.slice(0, outer.indexOf(".")))) hinted.push({ inner, outer, join });
+      }
+    }
     // Only joins that drop an unmatched outer row qualify: a mirrored predicate is applied to
     // the join's output, where a LEFT or anti join's null-extended row would fail it.
     if (
@@ -755,7 +772,7 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
     }
     earlier.add(ownAlias);
   }
-  if (pairs.length === 0) return;
+  if (pairs.length === 0 && hinted.length === 0) return;
   const signature = (predicate: Predicate): string => encodeQueryIdentity(predicate);
   const present = new Set(block.predicates.map(signature));
   const implied: Predicate[] = [];
@@ -794,6 +811,15 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
       if (present.has(key)) continue;
       present.add(key);
       implied.push(mirrored);
+    }
+    for (const hint of hinted) {
+      if (column.reference !== hint.outer) continue;
+      const replacement: Expression = { kind: "column", reference: hint.inner };
+      (hint.join.inputHints ??= []).push(
+        side === "right"
+          ? { ...predicate, left: replacement, right: clonePlanTree(predicate.right) }
+          : { ...predicate, left: clonePlanTree(predicate.left), right: replacement },
+      );
     }
   }
   block.predicates.push(...implied);
