@@ -70,6 +70,22 @@ describe("prepared read plans", () => {
     await database.close();
   });
 
+  it("scans a repeated statement's text for literals once", async () => {
+    const database = await seeded();
+    const sql = "SELECT grp, COUNT(*) AS n FROM items WHERE grp = 2 GROUP BY grp";
+    const first = await database.query(sql);
+    const scans = preparedPlanTestHooks.literalScans;
+    // A memo hit is a few microseconds; lifting the literals again would cost a third of that.
+    for (let run = 0; run < 3; run += 1) {
+      expect((await database.query(sql)).rows).toEqual(first.rows);
+      expect((await database.query(sql, { memoize: false })).rows).toEqual(first.rows);
+    }
+    expect(preparedPlanTestHooks.literalScans - scans).toBe(0);
+    await database.query("SELECT grp, COUNT(*) AS n FROM items WHERE grp = 3 GROUP BY grp");
+    expect(preparedPlanTestHooks.literalScans - scans).toBe(1);
+    await database.close();
+  });
+
   it("replays domain coercion and declines what only the ordinary binder can coerce", async () => {
     const database = await seeded();
     // DATE and NUMERIC domains normalize the bound value as they would a literal.

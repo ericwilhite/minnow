@@ -21,6 +21,7 @@ import {
 } from "./query.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
 import { normalizeSqlLiterals } from "./literal-normalization.js";
+import { preparedPlanTestHooks } from "./prepared-plan.js";
 import { encodeQueryIdentity } from "./query-identity.js";
 import {
   type CatalogProbe,
@@ -238,6 +239,14 @@ export class QueryExecution {
   readonly #planCache = new Map<string, CompiledQuery>();
   /** Literal statement shapes, keyed by lifted-literal kinds and normalized text. */
   readonly #literalShapes = new Map<string, CompiledQuery | null>();
+  /**
+   * literalShape's answer per exact statement text. Lifting scans the whole text, which a
+   * repeated statement (a memo hit above all) would otherwise pay on every call.
+   */
+  readonly #literalTexts = new Map<
+    string,
+    { readonly compiled: CompiledQuery; readonly values: readonly QueryValue[] } | null
+  >();
   readonly #statementCache = new Map<string, CompiledStatement>();
   readonly #effectiveQueryOptions: QueryExecutionHost["effectiveQueryOptions"];
   readonly #now: QueryExecutionHost["now"];
@@ -278,11 +287,13 @@ export class QueryExecution {
   clearPlans(): void {
     this.#planCache.clear();
     this.#literalShapes.clear();
+    this.#literalTexts.clear();
   }
   clear(): void {
     this.#planCache.clear();
     this.#statementCache.clear();
     this.#literalShapes.clear();
+    this.#literalTexts.clear();
   }
 
   /**
@@ -295,6 +306,25 @@ export class QueryExecution {
     sql: string,
   ): { readonly compiled: CompiledQuery; readonly values: readonly QueryValue[] } | undefined {
     if (sql.length > MAX_CACHEABLE_TEXT_CHARACTERS) return undefined;
+    const known = this.#literalTexts.get(sql);
+    if (known !== undefined) {
+      this.#literalTexts.delete(sql);
+      this.#literalTexts.set(sql, known);
+      return known ?? undefined;
+    }
+    const resolved = this.#resolveLiteralShape(sql);
+    this.#literalTexts.set(sql, resolved ?? null);
+    if (this.#literalTexts.size > PLAN_CACHE_LIMIT) {
+      const oldest = this.#literalTexts.keys().next().value;
+      if (oldest !== undefined) this.#literalTexts.delete(oldest);
+    }
+    return resolved;
+  }
+
+  #resolveLiteralShape(
+    sql: string,
+  ): { readonly compiled: CompiledQuery; readonly values: readonly QueryValue[] } | undefined {
+    preparedPlanTestHooks.literalScans += 1;
     const normalized = normalizeSqlLiterals(sql);
     if (normalized === undefined) return undefined;
     const key = `${normalized.kinds}\u0000${normalized.text}`;

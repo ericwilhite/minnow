@@ -74,6 +74,8 @@ export const preparedPlanTestHooks = {
   analysisHits: 0,
   /** Runs of the catalog-rewrite passes, prepared or not: a served execution adds none. */
   catalogRewrites: 0,
+  /** Scans of a statement's text for liftable literals: a repeated text adds none. */
+  literalScans: 0,
 };
 
 type PathKey = string | number;
