@@ -81,9 +81,23 @@ function isTableSource(source: TableSource): boolean {
   );
 }
 
-/** The key constant an expression is, if it is one. */
-function keyConstant(expression: Expression): KeyConstant | undefined {
+/**
+ * The key constant an expression is, if it is one. With `placeholders`, an unbound parameter
+ * counts too: a prepared template asks where a bound value could name a key.
+ */
+function keyConstant(expression: Expression, placeholders = false): KeyConstant | undefined {
   if (expression.kind === "literal") return { node: expression, literal: expression };
+  if (
+    placeholders &&
+    (expression.kind === "parameter" ||
+      (expression.kind === "binary" &&
+        expression.operator === "*" &&
+        expression.left.kind === "literal" &&
+        expression.left.value === -1 &&
+        expression.right.kind === "parameter"))
+  ) {
+    return { node: expression, literal: { kind: "literal", value: null } };
+  }
   if (
     expression.kind === "binary" &&
     expression.operator === "*" &&
@@ -195,6 +209,7 @@ function visitKeySites(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, TableRecord>,
   visit: (site: KeySite) => void,
+  placeholders = false,
 ): void {
   const targetsByTable = new Map<string, KeyTarget[]>();
   const targetsOf = (table: TableRecord): KeyTarget[] => {
@@ -273,11 +288,11 @@ function visitKeySites(
       if (LIST_OPERATORS.has(operator)) {
         if (valueSide.kind !== "list") return;
         for (const item of valueSide.items) {
-          const constant = keyConstant(item);
+          const constant = keyConstant(item, placeholders);
           if (constant !== undefined) constants.push(constant);
         }
       } else {
-        const constant = keyConstant(valueSide);
+        const constant = keyConstant(valueSide, placeholders);
         if (constant !== undefined) constants.push(constant);
       }
       if (constants.length === 0) return;
@@ -351,7 +366,7 @@ function visitKeySites(
         [predicate.right, predicate.left],
       ] as const) {
         if (columnSide.kind !== "column") continue;
-        const constant = keyConstant(valueSide);
+        const constant = keyConstant(valueSide, placeholders);
         if (constant === undefined) continue;
         const resolved = resolve(columnSide.reference);
         if (resolved === undefined) continue;
@@ -403,15 +418,24 @@ function siteForward(
   return lookup.get(site.tableId, token);
 }
 
-/** Whether the plan compares any primary-key or foreign-key column to a constant. */
+/**
+ * Whether the plan compares any primary-key or foreign-key column to a constant — or, with
+ * `placeholders`, to an unbound parameter that will become one.
+ */
 export function planHasKeyLiterals(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, TableRecord>,
+  placeholders = false,
 ): boolean {
   let found = false;
-  visitKeySites(plan, tables, () => {
-    found = true;
-  });
+  visitKeySites(
+    plan,
+    tables,
+    () => {
+      found = true;
+    },
+    placeholders,
+  );
   return found;
 }
 

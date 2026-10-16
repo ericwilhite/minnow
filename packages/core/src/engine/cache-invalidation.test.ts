@@ -6,10 +6,12 @@
  * and DDL that must bust them, across two engines on one store, and prove with the pool's own
  * counters and store spies that the caches are in fact being hit in between.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { pointReadTestHooks } from "./point-read.js";
+import { preparedPlanTestHooks } from "./prepared-plan.js";
+import { both, seeded as preparedFixture } from "./prepared-test-helpers.js";
 
 async function seeded(
   options: { rowsPerBlock?: number; store?: MemoryBlockStore } = {},
@@ -306,6 +308,111 @@ describe("cache invalidation", () => {
     );
     expect(await served(5)).toEqual([{ id: 5, amount: 2, status: "paid" }]);
     expect(await rows(database, point, [5])).toEqual([{ id: 5, amount: 2, status: "paid" }]);
+    await database.close();
+  });
+});
+
+/**
+ * Prepared read templates are keyed by the structural catalog epoch and bind values per
+ * execution, so they must rebuild on every change the epoch tracks — across engines sharing a
+ * store too — and decline what only a per-execution rewrite can follow (live key forwards). The
+ * statement clock and volatile functions stay per execution.
+ */
+describe("prepared plan invalidation", () => {
+  afterEach(() => {
+    preparedPlanTestHooks.disabled = false;
+    preparedPlanTestHooks.eager = false;
+    pointReadTestHooks.disabled = false;
+  });
+
+  it("rebuilds after DDL changes the columns a template expanded", async () => {
+    const store = new MemoryBlockStore();
+    const database = await preparedFixture(store);
+    const other = new MinnowDatabase(store, { autoCompact: false });
+    const sql = "SELECT * FROM items WHERE grp = ? AND id < ? ORDER BY id";
+    expect((await both(database, sql, [1, 6])).served).toBe(true);
+    await database.execute("ALTER TABLE items ADD COLUMN note TEXT DEFAULT 'x'");
+    const { prepared, served } = await both(database, sql, [1, 6]);
+    expect(served).toBe(true);
+    expect(prepared.columns).toContain("note");
+    // Another engine's DDL on the shared store moves the epoch this engine's template keys on.
+    expect((await both(other, sql, [2, 8])).served).toBe(true);
+    await database.execute("ALTER TABLE items DROP COLUMN note");
+    expect((await both(other, sql, [2, 8])).prepared.columns).not.toContain("note");
+    await other.close();
+    await database.close();
+  });
+
+  it("follows a view redefinition and index DDL", async () => {
+    const database = await preparedFixture();
+    await database.execute("CREATE VIEW cheap AS SELECT id, grp FROM items WHERE price < 10");
+    const sql = "SELECT COUNT(*) AS n FROM cheap WHERE grp = ?";
+    expect((await both(database, sql, [1])).prepared.rows).toEqual([{ n: 3 }]);
+    await database.execute("DROP VIEW cheap");
+    await database.execute("CREATE VIEW cheap AS SELECT id, grp FROM items WHERE price < 30");
+    expect((await both(database, sql, [1])).prepared.rows).toEqual([{ n: 8 }]);
+    await database.execute("CREATE INDEX items_name ON items (name)");
+    const named = "SELECT id FROM items WHERE name = ? AND grp = ? ORDER BY id";
+    expect((await both(database, named, ["n2", 1])).prepared.rows).toEqual([
+      { id: 10 },
+      { id: 38 },
+    ]);
+    await database.execute("DROP INDEX items_name");
+    expect((await both(database, named, ["n2", 1])).prepared.rows).toEqual([
+      { id: 10 },
+      { id: 38 },
+    ]);
+    await database.close();
+  });
+
+  it("declines while a key forward is live, so retired keys still forward", async () => {
+    const database = await preparedFixture();
+    pointReadTestHooks.disabled = true;
+    const sql = "SELECT id, name FROM items WHERE id = ? AND grp >= ?";
+    expect((await both(database, sql, [5, 0])).served).toBe(true);
+    await database.execute("UPDATE items SET id = 500 WHERE id = 5");
+    const declined = preparedPlanTestHooks.declined;
+    const { prepared } = await both(database, sql, [5, 0]);
+    expect(prepared.rows).toEqual([{ id: 500, name: "n4" }]);
+    expect(preparedPlanTestHooks.declined).toBeGreaterThan(declined);
+    // A literal key names the retired key the same way.
+    expect(
+      (await both(database, "SELECT id FROM items WHERE id = 5 AND grp >= 0")).prepared.rows,
+    ).toEqual([{ id: 500 }]);
+    // A statement that compares no key keeps its template.
+    expect(
+      (await both(database, "SELECT COUNT(*) AS n FROM items WHERE grp = ?", [0])).served,
+    ).toBe(true);
+    await database.close();
+  });
+
+  it("resolves the statement clock and volatile functions per execution", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+    await database.execute("CREATE TABLE ticks (id INTEGER PRIMARY KEY, grp INTEGER)");
+    await database.execute("INSERT INTO ticks VALUES (1, 1), (2, 1)");
+    const sql = "SELECT id, CURRENT_TIMESTAMP AS at FROM ticks WHERE grp = ? ORDER BY id";
+    const at = async (): Promise<number> => {
+      preparedPlanTestHooks.eager = true;
+      try {
+        const result = await database.query(sql, { params: [1], memoize: false });
+        return (result.rows[0]?.at as Date).getTime();
+      } finally {
+        preparedPlanTestHooks.eager = false;
+      }
+    };
+    const served = preparedPlanTestHooks.served;
+    const first = await at();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(await at()).toBeGreaterThan(first);
+    expect(preparedPlanTestHooks.served - served).toBe(2);
+    const randoms = new Set<unknown>();
+    for (let index = 0; index < 5; index += 1) {
+      randoms.add(
+        (await database.query("SELECT RANDOM() AS r FROM ticks WHERE grp = ?", { params: [1] }))
+          .rows[0]?.r,
+      );
+    }
+    expect(randoms.size).toBeGreaterThan(1);
     await database.close();
   });
 });

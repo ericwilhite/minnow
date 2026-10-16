@@ -117,7 +117,20 @@ so a row read right after it was updated still answers in microseconds. A compos
 pending deltas, a cross-type comparison, a view, or a domain-typed column in the `WHERE` clause
 falls back to the ordinary executor, which stays the authority on answers and errors. `EXPLAIN`
 reports eligibility as `key-covering equality answers as a point read when the visible history
-allows`. A lone `COUNT(*)` over the same equalities is answered the same way.
+allows`. A lone `COUNT(*)` over the same equalities is answered the same way. One equality may be
+a membership — `id IN (…)` or `id = ANY($1)` with up to 4,096 members — and each member is then
+one lookup: a hundred keys cost about a hundred point reads rather than a scan. Duplicate members
+are read once and rows come back in ascending key order; a NULL member matches nothing.
+
+**Prepared plans.** A statement's catalog rewrites run once per structural catalog epoch, on its
+second execution, with its placeholders still open; every later run binds its values into that
+template. A value that a rewrite would have read — text compared with a non-text column, a
+non-text value compared with `TEXT`, a placeholder in a division or beside `DATE_TRUNC`/`EXTRACT`
+— sends that run down the ordinary path instead, which stays the authority on answers and errors.
+Literal statements share one template when they differ only in integers or plain strings that are
+comparison operands, BETWEEN bounds, or IN-list items: `WHERE id = 42` and `WHERE id = 43` plan
+once. Decimals, typed literals, casts, LIKE patterns, LIMIT/OFFSET, and ordinals keep their
+spelling and their own plan.
 
 **Index lookups.** Equalities that do not cover the key but pin the leading columns of a ready
 [secondary index](/docs/sql/ddl#secondary-indexes) — `SELECT … FROM orders WHERE customer_id = ?`,

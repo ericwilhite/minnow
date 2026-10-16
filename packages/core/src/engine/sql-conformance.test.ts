@@ -30,6 +30,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { mulberry32, seedsFor } from "../testing/seeds.js";
 import { positionalToNumbered } from "../testing/oracle.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
+import { preparedPlanTestHooks } from "./prepared-plan.js";
 import {
   annotatePlanIntegerDivision,
   bindPlanParameters,
@@ -2865,6 +2866,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
       const failures: string[] = [];
       let unoptimizedCompared = 0;
       let unoptimizedLowered = 0;
+      let preparedServed = 0;
       try {
         for (const [index, testCase] of corpus.entries()) {
           const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
@@ -2884,6 +2886,8 @@ describe("SQL conformance against SQLite and PGlite", () => {
           let vectorized: QueryResult;
           let rowExecutor: QueryResult;
           try {
+            // The ordinary path: compiled as written, bound and rewritten per execution.
+            preparedPlanTestHooks.disabled = true;
             vectorized = await database.query(
               testCase.sql,
               testCase.params === undefined ? {} : { params: testCase.params },
@@ -2895,6 +2899,37 @@ describe("SQL conformance against SQLite and PGlite", () => {
           } catch (error) {
             failures.push(`${caseLabel}\n  minnow threw: ${String(error)}`);
             continue;
+          } finally {
+            preparedPlanTestHooks.disabled = false;
+          }
+          // The prepared path: the literal shape and its catalog-rewritten template, bound per
+          // execution. It must answer exactly as the ordinary path does, or decline to it.
+          const preparedBefore = preparedPlanTestHooks.served;
+          const retriedBefore = preparedPlanTestHooks.retried;
+          preparedPlanTestHooks.eager = true;
+          try {
+            const prepared = await database.query(testCase.sql, {
+              memoize: false,
+              ...(testCase.params === undefined ? {} : { params: testCase.params }),
+            });
+            const expected = exactResultKeys(vectorized.rows, testCase.ordered).join("\n");
+            const actual = exactResultKeys(prepared.rows, testCase.ordered).join("\n");
+            if (actual !== expected || !sameColumns(prepared.columns, vectorized.columns)) {
+              failures.push(
+                `${caseLabel}\n  prepared plan diverged from the ordinary path:\n` +
+                  `    ordinary: ${vectorized.columns.join(", ")}\n${expected.slice(0, 400)}\n` +
+                  `    prepared: ${prepared.columns.join(", ")}\n${actual.slice(0, 400)}`,
+              );
+            }
+            if (preparedPlanTestHooks.served > preparedBefore) preparedServed += 1;
+            // A retry hides a prepared failure behind the ordinary path's answer.
+            if (preparedPlanTestHooks.retried > retriedBefore) {
+              failures.push(`${caseLabel}\n  prepared plan failed and was re-run`);
+            }
+          } catch (error) {
+            failures.push(`${caseLabel}\n  prepared plan threw: ${String(error)}`);
+          } finally {
+            preparedPlanTestHooks.eager = false;
           }
           const vectorKeys = exactResultKeys(vectorized.rows, testCase.ordered);
           const rowKeys = exactResultKeys(rowExecutor.rows, testCase.ordered);
@@ -2999,6 +3034,12 @@ describe("SQL conformance against SQLite and PGlite", () => {
       // unrunnable without the optimizer -- fails here instead of quietly becoming a no-op.
       expect(unoptimizedCompared + unoptimizedLowered).toBe(corpus.length);
       expect(unoptimizedCompared / corpus.length).toBeGreaterThan(0.9);
+      // Likewise the prepared comparison: most of the corpus must actually bind a template, or
+      // a change that quietly declines everything would leave the diff above comparing nothing.
+      expect(
+        preparedServed / corpus.length,
+        `${String(preparedServed)} of ${String(corpus.length)}`,
+      ).toBeGreaterThan(0.9);
     },
     240_000,
   );

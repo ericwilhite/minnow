@@ -2529,7 +2529,10 @@ function blockHasParameters(block: CompiledQuery): boolean {
   );
 }
 
-function validateParameters(count: number, params: readonly QueryParameter[] | undefined): void {
+export function validateParameters(
+  count: number,
+  params: readonly QueryParameter[] | undefined,
+): void {
   const given = params?.length ?? 0;
   if (given !== count) {
     throw new TypeError(
@@ -2659,29 +2662,49 @@ function bindPredicate(
     const parameter =
       cast === undefined ? right : right.kind === "call" ? right.arguments[0] : right;
     if (parameter?.kind === "parameter") {
-      const members = arrayParameterMembers(values[parameter.index] ?? null, parameter.index);
-      if (members === null) {
-        predicate.operator = quantified.comparison;
-        predicate.right = { kind: "literal", value: null };
-        return;
-      }
-      const list: Expression = {
-        kind: "list",
-        items: members.map((member) => arrayMemberLiteral(member, cast)),
-      };
-      predicate.right = list;
-      if (quantified.comparison === "=" && quantified.quantifier === "any") {
-        predicate.operator = "IN";
-      } else if (
-        (quantified.comparison === "<>" || quantified.comparison === "!=") &&
-        quantified.quantifier === "all"
-      ) {
-        predicate.operator = "NOT IN";
-      }
+      const bound = bindQuantifiedArray(
+        predicate.operator,
+        values[parameter.index] ?? null,
+        parameter.index,
+      );
+      predicate.operator = bound.operator;
+      predicate.right =
+        bound.members === null
+          ? { kind: "literal", value: null }
+          : {
+              kind: "list",
+              items: bound.members.map((member) => arrayMemberLiteral(member, cast)),
+            };
       return;
     }
   }
   predicate.right = bindExpression(predicate.right, values);
+}
+
+/**
+ * What `x op ANY($n)` / `x op ALL($n)` becomes once its array is known: the comparison over the
+ * array's members, `= ANY` and `<> ALL` spelled IN and NOT IN, or the bare comparison against
+ * NULL (members null) for a NULL array. Shared with the prepared-plan binder.
+ */
+export function bindQuantifiedArray(
+  operator: PredicateOperator,
+  value: QueryParameter,
+  index: number,
+): { operator: PredicateOperator; members: readonly QueryValue[] | null } {
+  const quantified = parseQuantified(operator);
+  if (quantified === undefined) throw new TypeError(`Not a quantified comparison: ${operator}`);
+  const members = arrayParameterMembers(value, index);
+  if (members === null) return { operator: quantified.comparison, members: null };
+  if (quantified.comparison === "=" && quantified.quantifier === "any") {
+    return { operator: "IN", members };
+  }
+  if (
+    (quantified.comparison === "<>" || quantified.comparison === "!=") &&
+    quantified.quantifier === "all"
+  ) {
+    return { operator: "NOT IN", members };
+  }
+  return { operator, members };
 }
 
 /** The members of an array placeholder: a JavaScript array, or Minnow's JSON array text. */
@@ -2743,7 +2766,11 @@ function arrayMemberLiteral(member: QueryValue, cast: string | undefined): Expre
   };
 }
 
-function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): void {
+/**
+ * Binds one block's own LIMIT/OFFSET placeholders into its fields, validating relocated ones.
+ * Mutates the block: callers pass a copy, never the compile cache's plan.
+ */
+export function bindBlockLimits(block: CompiledQuery, values: readonly QueryParameter[]): void {
   if (block.limitParameter !== undefined) {
     block.limit = validateLimit(numeric(values[block.limitParameter] ?? null));
     delete block.limitParameter;
@@ -2760,6 +2787,10 @@ function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): voi
   }
   delete block.limitValidationParameters;
   delete block.offsetValidationParameters;
+}
+
+function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): void {
+  bindBlockLimits(block, values);
   for (const item of block.select) item.expression = bindExpression(item.expression, values);
   for (const predicate of [...block.predicates, ...block.having]) bindPredicate(predicate, values);
   block.groupBy = block.groupBy.map((expression) => bindExpression(expression, values));
@@ -2799,8 +2830,12 @@ function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): voi
  * structuredClone for that value, so the copy is exact whatever arrives.
  */
 export function clonePlanTree<T>(value: T): T {
+  planCloneStats.clones += 1;
   return cloneTreeValue(value) as T;
 }
+
+/** Test-only count of whole-plan copies, which prepared executions are meant never to make. */
+export const planCloneStats = { clones: 0 };
 
 function cloneTreeValue(value: unknown): unknown {
   if (typeof value !== "object" || value === null) return value;
