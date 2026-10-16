@@ -4782,6 +4782,19 @@ export function expandRowReferences(
     if (pass.probing && pass.needed) return;
     forEachNestedBlock(block, rewriteBlock);
     const sources = [block.base, ...block.joins];
+    // A bare ORDER BY name is an output column first, as in PostgreSQL: `SELECT a.n AS a FROM t a
+    // ORDER BY a` orders by the selected value, not by the row of the source aliased a.
+    const outputNames = new Set(block.select.map((item) => item.alias));
+    const orderOutputs = new Set<Expression>(
+      block.orderBy
+        .map((order) => order.expression)
+        .filter(
+          (expression) =>
+            expression.kind === "column" &&
+            !expression.reference.includes(".") &&
+            outputNames.has(expression.reference),
+        ),
+    );
     const rowObject = (reference: string): Expression | undefined => {
       if (reference.includes(".")) return undefined;
       const source = sources.find((candidate) => candidate.alias === reference);
@@ -4807,7 +4820,9 @@ export function expandRowReferences(
       const probe = (expression: Expression): void => {
         if (pass.needed) return;
         if (expression.kind === "column") {
-          if (rowObject(expression.reference) !== undefined) pass.needed = true;
+          if (!orderOutputs.has(expression) && rowObject(expression.reference) !== undefined) {
+            pass.needed = true;
+          }
           return;
         }
         if (expression.kind === "subquery" || expression.kind === "exists") {
@@ -4821,6 +4836,7 @@ export function expandRowReferences(
     }
     const rewrite = (expression: Expression): Expression => {
       if (expression.kind === "column") {
+        if (orderOutputs.has(expression)) return expression;
         return rowObject(expression.reference) ?? expression;
       }
       if (expression.kind === "subquery" || expression.kind === "exists") {
