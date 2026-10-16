@@ -25,8 +25,10 @@ literal or placeholder: filtering before the window would change which rows the 
 
 **Same-column OR becomes IN.** An OR of equalities on one column against literals or parameters —
 `status = 'a' OR status = 'b'` — rewrites to `status IN ('a', 'b')`, which runs as a vectorized
-membership test and can skip blocks by value range. Any other OR keeps its shape and is evaluated
-per row.
+membership test and can skip blocks by value range. An OR across columns whose every branch a
+[secondary index](/docs/sql/ddl#secondary-indexes) serves — `customer_id = ? OR email = ?` —
+reads the union of the branches' index candidates instead of the whole table. Any other OR
+keeps its shape and is evaluated per row.
 
 **Constants cross join keys.** An inner equi-join or a semi-join (a decorrelated `EXISTS`)
 makes its two key columns equal, so an equality, `IN` list, or range on one side reaches the
@@ -34,7 +36,11 @@ other: `WHERE c.customer_id = 42` with `ON o.customer = c.customer_id` also filt
 `customer = 42` before the join, through a [secondary index](/docs/sql/ddl#secondary-indexes)
 when one exists, or through the unique key when the constant names it. A placeholder is a
 constant here too: `WHERE c.customer_id >= ?` mirrors the bound value the same way. A `LEFT`
-join keeps its null-extended rows, which a mirrored predicate would fail, so it gets none.
+join keeps its null-extended rows, which a mirrored predicate would fail, so it gets no
+predicate; the constant still narrows how its joined side is read. With `WHERE c.customer_id =
+42` and `LEFT JOIN orders o ON o.customer = c.customer_id`, only the orders with `customer = 42`
+are read, through the same index or key, and customers without orders still come back
+null-extended.
 
 **Calendar equalities become ranges.** `DATE_TRUNC('month', placed_at) = TIMESTAMP '2025-06-01
 00:00:00'` and `EXTRACT(YEAR FROM placed_at) = 2025` are planned as `placed_at >= start AND
@@ -83,6 +89,16 @@ decorrelation. See the [feature matrix](/docs/sql/feature-matrix).
 whole input, while `n` is under a tenth of the rows scanned. A page deeper than that keeps every
 row and sorts once, which is faster than maintaining the bound.
 
+**Reading only the rows at one end.** A statement decided by the extreme values of one number
+or datetime column reads only the rows that can hold them: `ORDER BY col [DESC] LIMIT n`, a
+keyset page (`WHERE id > ? ORDER BY id LIMIT 50`), and `MIN(col)` / `MAX(col)`, optionally under
+range predicates on that same column. Block minimums and maximums order the walk and stop it once
+no further block can beat the rows already held; a block whose values are already in order is
+bisected rather than scanned. When the column's blocks are in order with one another — an
+increasing key or insertion timestamp — a deep `OFFSET` page counts the rows ahead of it instead
+of reading them. Any other predicate, grouping, or a mutation history not yet compacted keeps the
+ordinary scan.
+
 **Sorting.** Numbers, datetimes, booleans, and strings sort as typed keys, not by comparing
 values: strings are ranked through their distinct set first. Input that already arrives in order
 is recognized and not sorted again.
@@ -101,7 +117,15 @@ so a row read right after it was updated still answers in microseconds. A compos
 pending deltas, a cross-type comparison, a view, or a domain-typed column in the `WHERE` clause
 falls back to the ordinary executor, which stays the authority on answers and errors. `EXPLAIN`
 reports eligibility as `key-covering equality answers as a point read when the visible history
-allows`.
+allows`. A lone `COUNT(*)` over the same equalities is answered the same way.
+
+**Index lookups.** Equalities that do not cover the key but pin the leading columns of a ready
+[secondary index](/docs/sql/ddl#secondary-indexes) — `SELECT … FROM orders WHERE customer_id = ?`,
+or `SELECT COUNT(*)` of the same — skip the batch pipeline the same way on a table whose history
+holds only inserts: the index names the candidate rows, each is checked against every equality,
+and the rows come back in the order a scan would return them. A table with pending updates or
+deletes, a domain-typed equality, or more than about a thousand candidates takes the ordinary
+indexed scan.
 
 **One value at a time, not one row.** A predicate that reads exactly one string column —
 `LOWER(status) = 'paid'`, `COALESCE(region, 'none') = 'none'`, a `CASE` over one column — is

@@ -15468,6 +15468,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return kind === "insert" || kind === "base";
     });
     if (appends.length + mutations.length !== segments.length) return undefined;
+    // One row group in all can only be dropped whole, which the scan's own predicate pass
+    // settles as cheaply as its header would; the small tables most OLTP reads hit skip the work.
+    const anchor = table.columns[0];
+    if (
+      mutations.length === 0 &&
+      anchor !== undefined &&
+      appends.reduce(
+        (total, segment) => total + (segment.columnBlockIds[anchor.id]?.length ?? 0),
+        0,
+      ) <= 1
+    ) {
+      return undefined;
+    }
     const predicates = zonePredicates(plan, table);
     if (predicates.length === 0) return undefined;
     if (planContainsFts(plan, "bm25") && !this.#ftsIndexServesScoring(plan, table, segments)) {

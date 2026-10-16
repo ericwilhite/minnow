@@ -148,7 +148,10 @@ CREATE UNIQUE INDEX orders_customer_time ON orders (customer_id, placed_at);
 ```
 
 Composite planning follows the leftmost-prefix rule: equality or `IN` can constrain the leading
-columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. `ASC` and `DESC` are part
+columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. A case-sensitive `LIKE`
+whose pattern starts with literal text (`email LIKE 'ann%'`) reads that prefix's range of an
+index on a text column, and an `OR` whose every branch an index serves reads the union of their
+candidates. `ASC` and `DESC` are part
 of the physical tuple order. On a keyed table the postings name the matching rows exactly: an
 equality or `IN` lookup visits those rows and no others, and when the indexed table is the
 other side of a join, only those rows are read before the join. Minnow still evaluates the SQL
