@@ -180,7 +180,10 @@ A resumer reconciles replaced sources only after confirming that the durable job
 
 Background compaction reselects active work after each yield. If another tab abandons a fold
 after a schema change, the next step plans against the current schema. A job abandoned between
-selection and execution reports a `CompactionJobConflictError` with its ID and changed revision.
+selection and execution refuses the step with a `CompactionJobConflictError` that names its ID
+and changed revision. An explicit step rejects with it; a background fold retries it quietly
+(see below). Every tab may step a table's one job, and they take turns at publication: a tab
+that finds the job already published by another adopts that result instead of failing.
 Explicitly resuming an already aborted job still reports its recorded failure; unexpected I/O
 and corruption remain errors.
 Resuming a ready job preserves its publication readiness. Automatic folds retry schema conflicts
@@ -280,12 +283,33 @@ with sequence, context, name, message and time. Each text field is capped at 1,0
 The snapshot is defensive and stays available after close. Observers still receive the original
 error. Collection-specific counters and `lastError` describe collection only.
 
-One failure is retried without a report. When another tab holding OPFS leadership closes or
-crashes in the middle of a collection or compaction step, that step fails with
-`OpfsUncertainOutcomeError`. Every maintenance job is durable and revision-guarded, and the retry
-reads it back before stepping, so there is nothing for an application to reconcile. Collection
-still counts the failure in `consecutiveFailures` and `lastError`. A store that stops answering
-(`StorageUnresponsiveError`) is still reported, because only reloading the tab clears it.
+Some failures are retried without a report, because they are not failures of the app's data or
+store, and the retry resolves them on its own:
+
+- **A lost OPFS leader.** When another tab holding OPFS leadership closes or crashes in the
+  middle of a collection or compaction step, that step fails with `OpfsUncertainOutcomeError`.
+  Every maintenance job is durable and revision-guarded, and the retry reads it back before
+  stepping, so there is nothing for an application to reconcile. Collection still counts the
+  failure in `consecutiveFailures` and `lastError`.
+- **A schema change mid-fold.** A fold that keeps losing to `CREATE INDEX` or `ALTER` is planned
+  again against the new schema.
+- **A race another tab won.** With several tabs writing, their commits make the same table due
+  for a fold and the same index tail due for a rebuild at the same moment. Every tab may step a
+  table's one compaction job, so a step can find that another tab moved the job or its shared
+  transaction first (`CompactionJobConflictError`, `TransactionRecordConflictError`). The job
+  advanced, just not here; the fold retries after its backoff. An index build first claims the
+  index's build session: while another tab's build of the same index is live, the claim is
+  refused and this tab leaves the work to it. The next commit past the tail bound, or the next
+  query that finds the index not ready, asks again, so a build that fails in the other tab is
+  retried here. A build whose index was dropped, invalidated, or taken over while it ran stops
+  quietly for the same reason.
+
+Quiet does not mean hidden when nothing improves. A table whose automatic fold fails quietly
+eight times in a row, with no completed fold in between, reports the latest failure with the
+context `automatic compaction for <table> (8 attempts in a row without progress)`. A store that
+stops answering (`StorageUnresponsiveError`) is always reported, because only reloading the tab
+clears it, and so is every I/O, quota, or corruption error. `backgroundFailureCount` and
+`backgroundErrors` count reported failures only.
 
 Foreground failures reject their owning call; a successful fallback still reports the unexpected
 accelerator failure.
@@ -348,6 +372,7 @@ refused at the ceiling by its 4,200th statement. A bulk update through `updateBa
 `UPDATE … FROM` a VALUES source is still cheaper: it lands as one segment.
 
 Background work can lose its build ownership or job revision to maintenance in another tab.
-Those typed refusals also reach the diagnostic hook; they do not imply that an acknowledged
+Those races are retried quietly, as described above; they never imply that an acknowledged
 application write was lost. Index readers use the correct scan fallback while the accelerator
-is rebuilt. An I/O or corruption failure remains a failure and is reported through the same hook.
+is rebuilt. An I/O or corruption failure remains a failure and is reported through the
+diagnostic hook.

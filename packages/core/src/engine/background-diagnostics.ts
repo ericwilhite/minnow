@@ -1,4 +1,42 @@
-import { OpfsUncertainOutcomeError, SchemaConflictError } from "../storage/types.js";
+import {
+  CompactionJobConflictError,
+  OpfsUncertainOutcomeError,
+  PostingBuildConflictError,
+  SchemaConflictError,
+  TransactionRecordConflictError,
+} from "../storage/types.js";
+import { TransactionClosedError } from "../transactions/index.js";
+
+/**
+ * A compaction step that lost its job to another connection: the shared job record or the
+ * transaction every driver of it stages into had moved by the time this step wrote it, or that
+ * transaction was already closed. Revisions only move when a writer succeeds, so the job made
+ * progress -- just not here. The controller retries after its backoff and re-reads the job.
+ */
+export function isLostCompactionRace(error: unknown): boolean {
+  return (
+    error instanceof CompactionJobConflictError ||
+    error instanceof TransactionRecordConflictError ||
+    error instanceof TransactionClosedError
+  );
+}
+
+/** What each store says when a build session cannot begin because another one is live. */
+const LIVE_POSTING_BUILD_REASONS = new Set([
+  "another live build owns the column",
+  "another live build exists",
+  "owned by another caller",
+]);
+
+/**
+ * A posting build session refused at its start because another connection's build of the same
+ * index holds the column's live session. That build is doing the work; it is not a failure of
+ * this connection. Only meaningful for the begin call — later steps that lose their session are
+ * reported.
+ */
+export function isLivePostingBuildRefusal(error: unknown): boolean {
+  return error instanceof PostingBuildConflictError && LIVE_POSTING_BUILD_REASONS.has(error.reason);
+}
 
 /**
  * A maintenance mutation whose OPFS leader vanished before acknowledging it — another tab closed

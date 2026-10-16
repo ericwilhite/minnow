@@ -1,5 +1,12 @@
 import type { TableRecord } from "../storage/types.js";
-import { isReconciledByMaintenanceRetry } from "./background-diagnostics.js";
+import { isLostCompactionRace, isReconciledByMaintenanceRetry } from "./background-diagnostics.js";
+
+/**
+ * Consecutive quiet failures -- races another connection won, lost OPFS leaders, schema changes
+ * -- after which a table's fold is reported anyway. Each one is retried and normally resolves on
+ * its own; a run of this many without a fold in between means the job is not making progress.
+ */
+export const QUIET_COMPACTION_FAILURE_LIMIT = 8;
 
 interface Backoff {
   minimumSegments: number;
@@ -24,6 +31,8 @@ export class CompactionController {
   readonly #continuations = new Set<Promise<void>>();
   readonly #requested = new Set<string>();
   readonly #backoff = new Map<string, Backoff>();
+  /** Quiet failures in a row per table, reset by any run that ends without one. */
+  readonly #quietFailures = new Map<string, number>();
   readonly #idleTables = new Set<string>();
   readonly #commits = new Map<string, number>();
   #idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -36,6 +45,7 @@ export class CompactionController {
     for (const entry of this.#backoff.values())
       if (entry.retryTimer !== undefined) clearTimeout(entry.retryTimer);
     this.#backoff.clear();
+    this.#quietFailures.clear();
     this.#idleTables.clear();
     this.#requested.clear();
     this.#commits.clear();
@@ -48,6 +58,7 @@ export class CompactionController {
     const run = this.#runs.get(id);
     if (run !== undefined) this.#cancelledRuns.add(run);
     this.#clearBackoff(id);
+    this.#quietFailures.delete(id);
     this.#idleTables.delete(id);
     this.#commits.delete(id);
     this.#requested.delete(id);
@@ -89,14 +100,28 @@ export class CompactionController {
       .run(table)
       .then((folded) => {
         if (this.#cancelledRuns.has(run)) return;
+        this.#quietFailures.delete(table.id);
         if (folded) this.#clearBackoff(table.id);
         else this.backOff(table.id, visible);
       })
       .catch((error: unknown) => {
-        // A fold step lost with its OPFS leader is retried after the same backoff; the retry
-        // re-reads the durable job, so only other failures reach the app's error hook.
-        if (!isReconciledByMaintenanceRetry(error))
+        // A step lost with its OPFS leader, overtaken by a schema change, or beaten to the
+        // shared job by another connection is retried after the same backoff; the retry re-reads
+        // the durable job. None of them is the app's to act on -- unless they keep coming.
+        if (isReconciledByMaintenanceRetry(error) || isLostCompactionRace(error)) {
+          const quiet = (this.#quietFailures.get(table.id) ?? 0) + 1;
+          if (quiet < QUIET_COMPACTION_FAILURE_LIMIT) this.#quietFailures.set(table.id, quiet);
+          else {
+            this.#quietFailures.delete(table.id);
+            this.ports.report(
+              error,
+              `automatic compaction for ${table.name} (${String(quiet)} attempts in a row without progress)`,
+            );
+          }
+        } else {
+          this.#quietFailures.delete(table.id);
           this.ports.report(error, `automatic compaction for ${table.name}`);
+        }
         if (!this.#cancelledRuns.has(run)) this.backOff(table.id, visible, "failed");
       })
       .finally(() => {
