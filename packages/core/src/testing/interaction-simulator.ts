@@ -29,6 +29,9 @@
  *   - fault-atomicity: a mutation interrupted by a storage fault or a crash lands entirely or
  *     not at all, and a reported success is durable
  *   - agreement: at every checkpoint every connection reads the same database as the model
+ *   - rekey-forward (plans with `rekeying`): a rekey onto a live, repeated, or retired key is
+ *     refused whole; references follow the moved rows; a retired key reads, writes, and compares
+ *     as its row's current key on every connection, and stays reserved against inserts
  *
  * The runner is driver-agnostic. `SimulationDriver` opens connections over one shared database;
  * the Node driver wraps `MinnowDatabase` over any block store, and the Playwright driver wraps
@@ -47,6 +50,11 @@ export interface PlanColumn {
   readonly name: string;
   readonly type: ColumnType;
   readonly nullable: boolean;
+  /**
+   * `"self"` declares the column `REFERENCES <its table> (id) NOT ENFORCED`: an integer column
+   * that a rekey of the row it names moves, and whose written values follow retired keys.
+   */
+  readonly references?: "self";
 }
 
 export interface PlanTable {
@@ -78,6 +86,15 @@ export type Assignment =
   | { readonly kind: "set"; readonly column: string; readonly value: PlanValue }
   | { readonly kind: "increment"; readonly column: string; readonly by: number };
 
+/**
+ * The new primary key a rekey gives each row it matches: a constant, the old key shifted, or
+ * the old key reflected about a point (`around - id`), which swaps two keys that sum to it.
+ */
+export type KeyAssignment =
+  | { readonly kind: "to"; readonly value: number }
+  | { readonly kind: "shift"; readonly by: number }
+  | { readonly kind: "reflect"; readonly around: number };
+
 export type KeyedMutation =
   | { readonly kind: "insert"; readonly row: PlanRow }
   | { readonly kind: "upsert"; readonly row: PlanRow }
@@ -91,7 +108,13 @@ export type TransactionStatement =
       readonly predicate: Predicate;
       readonly assignments: readonly Assignment[];
     }
-  | { readonly kind: "delete"; readonly predicate: Predicate };
+  | { readonly kind: "delete"; readonly predicate: Predicate }
+  | {
+      readonly kind: "rekey";
+      readonly predicate: Predicate;
+      readonly key: KeyAssignment;
+      readonly assignments: readonly Assignment[];
+    };
 
 export type Interaction =
   | {
@@ -119,6 +142,18 @@ export type Interaction =
       readonly connection: number;
       readonly table: string;
       readonly predicate: Predicate;
+    }
+  | {
+      /**
+       * `UPDATE t SET id = <key>[, assignments] WHERE predicate`: every matched row moves to its
+       * new key, references to it follow, and each key it gave up forwards to the new one.
+       */
+      readonly kind: "rekey";
+      readonly connection: number;
+      readonly table: string;
+      readonly predicate: Predicate;
+      readonly key: KeyAssignment;
+      readonly assignments: readonly Assignment[];
     }
   | {
       readonly kind: "select";
@@ -223,6 +258,12 @@ export interface InteractionPlanOptions {
    * browser) generates crash faults only, so every fault step is one it can exercise.
    */
   readonly faultPoints?: readonly FaultPointName[];
+  /**
+   * Adds primary-key changes: rekey statements and transactions that rekey, and tables with a
+   * self-referencing column. They are drawn from a second random stream, and only when this is
+   * set, so every plan generated without it is unchanged and every recorded seed replays.
+   */
+  readonly rekeying?: boolean;
 }
 
 // --- Driver ----------------------------------------------------------------------------------------
@@ -391,6 +432,10 @@ export function generateInteractionPlan(
   checkRange("keySpace", keySpace, 2, 10_000);
 
   const random = createRandom(seed);
+  // Rekeying draws from its own stream, so the primary stream -- and every plan generated
+  // without rekeying -- stays exactly what it was.
+  const rekeyRandom =
+    options.rekeying === true ? createRandom((seed ^ 0x4e4b4559) >>> 0) : undefined;
   const interactions: Interaction[] = [];
   // The generator keeps its own shadow of the schema so predicates name real columns and keyed
   // rounds target keys that can commute. Values are not tracked: the runner's model does that.
@@ -412,6 +457,9 @@ export function generateInteractionPlan(
         type: random.pick<ColumnType>(["integer", "real", "text", "boolean"]),
         nullable: random.chance(0.5),
       });
+    }
+    if (rekeyRandom?.chance(0.6) === true) {
+      columns.push({ name: "p", type: "integer", nullable: true, references: "self" });
     }
     const table: PlanTable = { name: `t${String(tableSerial++)}`, columns };
     live.set(table.name, table);
@@ -594,6 +642,53 @@ export function generateInteractionPlan(
     } else {
       interactions.push({ kind: "checkpoint" });
     }
+    if (rekeyRandom !== undefined && live.size > 0 && rekeyRandom.chance(0.15)) {
+      const target = rekeyRandom.pick([...live.values()]);
+      if (rekeyRandom.chance(0.75)) {
+        const connection = rekeyRandom.int(connections);
+        interactions.push({
+          ...generateRekey(rekeyRandom, target, keySpace),
+          connection,
+          table: target.name,
+        });
+      } else {
+        const statements: TransactionStatement[] = [];
+        const count = 1 + rekeyRandom.int(3);
+        for (let index = 0; index < count; index++) {
+          const inner = rekeyRandom.next();
+          if (inner < 0.5) statements.push(generateRekey(rekeyRandom, target, keySpace));
+          else if (inner < 0.7) {
+            statements.push({
+              kind: "insert",
+              rows: distinctIds([generateRow(rekeyRandom, target, keySpace)]),
+            });
+          } else if (inner < 0.9) {
+            statements.push({
+              kind: "update",
+              predicate: generatePredicate(rekeyRandom, target, keySpace, 1),
+              assignments: generateAssignments(rekeyRandom, target),
+            });
+          } else {
+            statements.push({
+              kind: "delete",
+              predicate: generatePredicate(rekeyRandom, target, keySpace, 1),
+            });
+          }
+        }
+        const owner = rekeyRandom.int(connections);
+        interactions.push({
+          kind: "transaction",
+          connection: owner,
+          observer:
+            connections === 1
+              ? owner
+              : (owner + 1 + rekeyRandom.int(connections - 1)) % connections,
+          table: target.name,
+          statements,
+          outcome: rekeyRandom.chance(0.6) ? "commit" : "rollback",
+        });
+      }
+    }
     if (step % 25 === 24) interactions.push({ kind: "checkpoint" });
   }
   // Random fault steps deliberately retain mutation diversity, including duplicates and
@@ -751,6 +846,72 @@ function generateAssignments(random: Random, table: PlanTable): Assignment[] {
   return assignments;
 }
 
+/**
+ * A rekey statement. New keys come from `[-2k, k]`, which overlaps the keys inserts use, so
+ * rekeys collide with live rows and with keys earlier rekeys retired, and from the negative
+ * range an offline app gives its temporary keys. None reaches the fault probes past `k`.
+ */
+function generateRekey(
+  random: Random,
+  table: PlanTable,
+  keySpace: number,
+): Extract<TransactionStatement, { kind: "rekey" }> {
+  const key = (): number => {
+    const value = random.int(keySpace * 3) - keySpace * 2;
+    return value >= 0 ? value + 1 : value;
+  };
+  const idIs = (value: number): Predicate => ({
+    kind: "compare",
+    column: "id",
+    op: "=",
+    value,
+  });
+  const plain = { ...table, columns: table.columns.filter((column) => !column.references) };
+  const assignments =
+    plain.columns.length > 0 && random.chance(0.3) ? generateAssignments(random, plain) : [];
+  const roll = random.next();
+  if (roll < 0.4) {
+    return {
+      kind: "rekey",
+      predicate: idIs(key()),
+      key: { kind: "to", value: key() },
+      assignments,
+    };
+  }
+  if (roll < 0.6) {
+    // A range moving up or down by a step: every row but the last lands on a key another
+    // matched row gives up, so nothing forwards from those keys.
+    const by = (1 + random.int(3)) * (random.chance(0.5) ? 1 : -1);
+    const predicate: Predicate = random.chance(0.6)
+      ? {
+          kind: "compare",
+          column: "id",
+          op: random.pick<CompareOperator>(["<", "<=", ">", ">="]),
+          value: key(),
+        }
+      : generatePredicate(random, table, keySpace, 1);
+    return { kind: "rekey", predicate, key: { kind: "shift", by }, assignments };
+  }
+  if (roll < 0.75) {
+    // Every matched key negated: the shape of moving server keys into the temporary range.
+    return {
+      kind: "rekey",
+      predicate: generatePredicate(random, table, keySpace, 1),
+      key: { kind: "reflect", around: 0 },
+      assignments,
+    };
+  }
+  const left = key();
+  let right = key();
+  if (right === left) right = left === 1 ? 2 : 1;
+  return {
+    kind: "rekey",
+    predicate: { kind: "or", left: idIs(left), right: idIs(right) },
+    key: { kind: "reflect", around: left + right },
+    assignments,
+  };
+}
+
 function generateKeyedMutation(random: Random, table: PlanTable, id: number): KeyedMutation {
   const roll = random.next();
   if (roll < 0.35) return { kind: "insert", row: { ...generateRow(random, table, 1), id } };
@@ -845,6 +1006,12 @@ function validateInteraction(value: unknown, connections: number, index: number)
       validatePredicate(value.predicate, where, 0);
       return;
     }
+    case "rekey": {
+      checkConnection("connection");
+      checkTableName();
+      validateRekey(value, where);
+      return;
+    }
     case "select": {
       checkConnection("connection");
       checkTableName();
@@ -924,6 +1091,8 @@ function validateInteraction(value: unknown, connections: number, index: number)
           validateAssignments(statement.assignments, where);
         } else if (statement.kind === "delete") {
           validatePredicate(statement.predicate, where, 0);
+        } else if (statement.kind === "rekey") {
+          validateRekey(statement, where);
         } else throw new TypeError(`${where} statement kind is invalid`);
       }
       if (value.outcome !== "commit" && value.outcome !== "rollback") {
@@ -994,6 +1163,23 @@ function validateInteraction(value: unknown, connections: number, index: number)
   }
 }
 
+function validateRekey(value: Record<string, unknown>, where: string): void {
+  validatePredicate(value.predicate, where, 0);
+  const key = value.key;
+  if (
+    !isRecord(key) ||
+    !(
+      (key.kind === "to" && Number.isSafeInteger(key.value)) ||
+      (key.kind === "shift" && Number.isSafeInteger(key.by)) ||
+      (key.kind === "reflect" && Number.isSafeInteger(key.around))
+    )
+  ) {
+    throw new TypeError(`${where} rekey key is invalid`);
+  }
+  if (!Array.isArray(value.assignments)) throw new TypeError(`${where} assignments are invalid`);
+  if (value.assignments.length > 0) validateAssignments(value.assignments, where);
+}
+
 function validateTable(value: unknown, where: string): void {
   if (
     !isRecord(value) ||
@@ -1012,7 +1198,9 @@ function validateTable(value: unknown, where: string): void {
       !/^[a-z][a-z0-9_]*$/u.test(column.name) ||
       column.name === "id" ||
       !["integer", "real", "text", "boolean"].includes(column.type as string) ||
-      typeof column.nullable !== "boolean"
+      typeof column.nullable !== "boolean" ||
+      (column.references !== undefined &&
+        (column.references !== "self" || column.type !== "integer" || !column.nullable))
     ) {
       throw new TypeError(`${where} table column is invalid`);
     }
@@ -1111,6 +1299,19 @@ type Truth = true | false | null;
 interface ModelTable {
   readonly definition: PlanTable;
   readonly rows: Map<number, PlanRow>;
+  /**
+   * Retired key to the key its row moved to, one step per rekey, never rewritten. A retired key
+   * names the row at the end of its chain, stays reserved, and outlives the row it led to.
+   */
+  readonly forwards: Map<number, number>;
+}
+
+/** What a rekey statement does to the model, or why the engine must refuse it. */
+interface RekeyOutcome {
+  readonly accepted: boolean;
+  readonly matched: number;
+  /** Each key the statement retired, with the key its row moved to. */
+  readonly retired: ReadonlyArray<readonly [number, number]>;
 }
 
 class ShadowModel {
@@ -1119,9 +1320,139 @@ class ShadowModel {
   clone(): ShadowModel {
     const copy = new ShadowModel();
     for (const [name, table] of this.tables) {
-      copy.tables.set(name, { definition: table.definition, rows: new Map(table.rows) });
+      copy.tables.set(name, {
+        definition: table.definition,
+        rows: new Map(table.rows),
+        forwards: new Map(table.forwards),
+      });
     }
     return copy;
+  }
+
+  /** The current key a key names: itself, or the end of the chain of forwards it starts. */
+  resolve(name: string, key: number): number {
+    const forwards = this.table(name).forwards;
+    let current = key;
+    const visited = new Set<number>([key]);
+    for (;;) {
+      const next = forwards.get(current);
+      if (next === undefined || visited.has(next)) return current;
+      visited.add(next);
+      current = next;
+    }
+  }
+
+  /**
+   * The predicate as the engine runs it: a key equality or inequality against a constant -- on
+   * the primary key or a column referencing it -- names the row a retired key forwards to.
+   */
+  resolvePredicate(name: string, predicate: Predicate): Predicate {
+    if (this.table(name).forwards.size === 0) return predicate;
+    const keyColumns = new Set([
+      "id",
+      ...this.table(name)
+        .definition.columns.filter((column) => column.references === "self")
+        .map((column) => column.name),
+    ]);
+    const rewrite = (node: Predicate): Predicate => {
+      switch (node.kind) {
+        case "compare":
+          return keyColumns.has(node.column) &&
+            (node.op === "=" || node.op === "<>") &&
+            typeof node.value === "number"
+            ? { ...node, value: this.resolve(name, node.value) }
+            : node;
+        case "not":
+          return { kind: "not", inner: rewrite(node.inner) };
+        case "and":
+        case "or":
+          return { kind: node.kind, left: rewrite(node.left), right: rewrite(node.right) };
+        default:
+          return node;
+      }
+    };
+    return rewrite(predicate);
+  }
+
+  evaluate(name: string, predicate: Predicate, row: PlanRow): Truth {
+    return evaluate(this.resolvePredicate(name, predicate), row);
+  }
+
+  /** A row as the engine stores it: a referencing value written as a retired key is resolved. */
+  #stored(name: string, row: PlanRow): PlanRow {
+    const table = this.table(name);
+    if (table.forwards.size === 0) return row;
+    let stored: Record<string, PlanValue> | undefined;
+    for (const column of table.definition.columns) {
+      const value = row[column.name];
+      if (column.references !== "self" || typeof value !== "number") continue;
+      const resolved = this.resolve(name, value);
+      if (resolved === value) continue;
+      stored ??= { ...row };
+      stored[column.name] = resolved;
+    }
+    return stored ?? row;
+  }
+
+  /**
+   * `UPDATE t SET id = <key>[, assignments] WHERE predicate`. Every matched row moves at once:
+   * the new keys must be distinct, free of rows the statement does not move, and not retired.
+   * References to a moved row follow it, all at once, and each key no row holds any more
+   * forwards to the key its row moved to.
+   */
+  rekey(
+    name: string,
+    predicate: Predicate,
+    key: KeyAssignment,
+    assignments: readonly Assignment[],
+  ): RekeyOutcome {
+    const table = this.table(name);
+    const matched = this.matching(name, predicate);
+    const oldKeys = new Set(matched.map(idOf));
+    const moves = matched.map((row) => {
+      const from = idOf(row);
+      const to =
+        key.kind === "to" ? key.value : key.kind === "shift" ? from + key.by : key.around - from;
+      return { row, from, to };
+    });
+    const targets = new Set<number>();
+    for (const { from, to } of moves) {
+      if (targets.has(to)) return { accepted: false, matched: matched.length, retired: [] };
+      targets.add(to);
+      if (to === from) continue;
+      if (table.rows.has(to) && !oldKeys.has(to)) {
+        return { accepted: false, matched: matched.length, retired: [] };
+      }
+      if (table.forwards.has(to)) return { accepted: false, matched: matched.length, retired: [] };
+    }
+    const renamed = new Map<number, number>();
+    for (const { from, to } of moves) if (from !== to) renamed.set(from, to);
+    for (const { from } of moves) table.rows.delete(from);
+    for (const { row, to } of moves) {
+      const next = this.#stored(name, { ...assign(row, assignments), id: to });
+      table.rows.set(to, next);
+    }
+    const references = table.definition.columns.filter((column) => column.references === "self");
+    if (references.length > 0 && renamed.size > 0) {
+      for (const [id, row] of table.rows) {
+        let moved: Record<string, PlanValue> | undefined;
+        for (const column of references) {
+          const value = row[column.name];
+          const target = typeof value === "number" ? renamed.get(value) : undefined;
+          if (target === undefined) continue;
+          moved ??= { ...row };
+          moved[column.name] = target;
+        }
+        if (moved !== undefined) table.rows.set(id, moved);
+      }
+    }
+    const retired: Array<readonly [number, number]> = [];
+    for (const [from, to] of renamed) {
+      if (targets.has(from)) continue;
+      table.forwards.set(from, to);
+      retired.push([from, to]);
+    }
+    return { accepted: true, matched: matched.length, retired };
   }
 
   table(name: string): ModelTable {
@@ -1136,22 +1467,26 @@ class ShadowModel {
 
   /** Rows matching the predicate, in ascending id order. */
   matching(name: string, predicate: Predicate): PlanRow[] {
-    return this.sorted(name).filter((row) => evaluate(predicate, row) === true);
+    const resolved = this.resolvePredicate(name, predicate);
+    return this.sorted(name).filter((row) => evaluate(resolved, row) === true);
   }
 
   sorted(name: string): PlanRow[] {
     return [...this.table(name).rows.values()].sort((left, right) => idOf(left) - idOf(right));
   }
 
+  /** A retired key stays reserved: inserting it is a duplicate, like inserting a live key. */
   insert(name: string, rows: readonly PlanRow[]): boolean {
     const table = this.table(name);
     const staged = new Set<number>();
     for (const row of rows) {
       const id = idOf(row);
-      if (table.rows.has(id) || staged.has(id)) return false;
+      if (table.rows.has(id) || table.forwards.has(id) || staged.has(id)) return false;
       staged.add(id);
     }
-    for (const row of rows) table.rows.set(idOf(row), completeRow(table.definition, row));
+    for (const row of rows) {
+      table.rows.set(idOf(row), this.#stored(name, completeRow(table.definition, row)));
+    }
     return true;
   }
 
@@ -1159,7 +1494,7 @@ class ShadowModel {
     const table = this.table(name);
     let count = 0;
     for (const row of this.matching(name, predicate)) {
-      table.rows.set(idOf(row), assign(row, assignments));
+      table.rows.set(idOf(row), this.#stored(name, assign(row, assignments)));
       count++;
     }
     return count;
@@ -1175,24 +1510,43 @@ class ShadowModel {
     return count;
   }
 
-  /** Applies a keyed mutation; `false` means the engine must reject it (duplicate insert). */
+  /**
+   * Applies a keyed mutation; `false` means the engine must reject it (duplicate insert). A key
+   * that was retired names its row's current key, so an upsert of it writes that key.
+   */
   applyKeyed(name: string, mutation: KeyedMutation): boolean {
     const table = this.table(name);
     switch (mutation.kind) {
       case "insert":
         return this.insert(name, [mutation.row]);
-      case "upsert":
-        table.rows.set(idOf(mutation.row), completeRow(table.definition, mutation.row));
+      case "upsert": {
+        const id = this.resolve(name, idOf(mutation.row));
+        table.rows.set(
+          id,
+          this.#stored(name, completeRow(table.definition, { ...mutation.row, id })),
+        );
         return true;
+      }
       case "updateKey": {
-        const row = table.rows.get(mutation.id);
-        if (row !== undefined) table.rows.set(mutation.id, assign(row, mutation.assignments));
+        const id = this.resolve(name, mutation.id);
+        const row = table.rows.get(id);
+        if (row !== undefined) {
+          table.rows.set(id, this.#stored(name, assign(row, mutation.assignments)));
+        }
         return true;
       }
       case "deleteKey":
-        table.rows.delete(mutation.id);
+        table.rows.delete(this.resolve(name, mutation.id));
         return true;
     }
+  }
+
+  /** The row a keyed mutation reaches: its key, followed through any forwards. */
+  keyedTarget(name: string, mutation: KeyedMutation): number {
+    return this.resolve(
+      name,
+      mutation.kind === "insert" || mutation.kind === "upsert" ? idOf(mutation.row) : mutation.id,
+    );
   }
 }
 
@@ -1335,6 +1689,31 @@ function renderAssignments(assignments: readonly Assignment[]): string {
     .join(", ");
 }
 
+function renderKeyAssignment(key: KeyAssignment): string {
+  switch (key.kind) {
+    case "to":
+      return `id = ${renderLiteral(key.value)}`;
+    case "shift":
+      return key.by < 0 ? `id = id - ${String(-key.by)}` : `id = id + ${String(key.by)}`;
+    case "reflect":
+      return `id = ${renderLiteral(key.around)} - id`;
+  }
+}
+
+function renderRekey(
+  table: string,
+  statement: Pick<
+    Extract<TransactionStatement, { kind: "rekey" }>,
+    "predicate" | "key" | "assignments"
+  >,
+): string {
+  const assignments = [
+    renderKeyAssignment(statement.key),
+    ...(statement.assignments.length === 0 ? [] : [renderAssignments(statement.assignments)]),
+  ].join(", ");
+  return `UPDATE ${quote(table)} SET ${assignments} WHERE ${renderPredicate(statement.predicate)}`;
+}
+
 function sqlType(type: ColumnType): string {
   switch (type) {
     case "integer":
@@ -1351,7 +1730,8 @@ function sqlType(type: ColumnType): string {
 function renderCreateTable(table: PlanTable): string {
   const columns = table.columns.map(
     (column) =>
-      `${quote(column.name)} ${sqlType(column.type)}${column.nullable ? "" : " NOT NULL"}`,
+      `${quote(column.name)} ${sqlType(column.type)}${column.nullable ? "" : " NOT NULL"}` +
+      (column.references === "self" ? ` REFERENCES ${quote(table.name)} (id) NOT ENFORCED` : ""),
   );
   return `CREATE TABLE ${quote(table.name)} (id INTEGER PRIMARY KEY, ${columns.join(", ")})`;
 }
@@ -1550,6 +1930,8 @@ class PlanRunner {
         return this.#update(interaction);
       case "delete":
         return this.#delete(interaction);
+      case "rekey":
+        return this.#rekey(interaction);
       case "select":
         return this.#select(interaction);
       case "partition":
@@ -1601,6 +1983,7 @@ class PlanRunner {
     this.#model.tables.set(interaction.table.name, {
       definition: interaction.table,
       rows: new Map(),
+      forwards: new Map(),
     });
   }
 
@@ -1701,6 +2084,67 @@ class PlanRunner {
       this.#fail(`delete-select: ${String(survivors)} rows still match ${where}`);
   }
 
+  /**
+   * rekey-forward: a rekey the model accepts moves exactly the matched rows, every reference
+   * follows, and each retired key then reads the moved row on another connection -- through
+   * the stored forwards, not a notification. One the model refuses (a new key that is taken,
+   * repeated, or retired) fails as a duplicate and changes nothing.
+   */
+  async #rekey(interaction: Extract<Interaction, { kind: "rekey" }>): Promise<void> {
+    const before = this.#model.clone();
+    const outcome = this.#model.rekey(
+      interaction.table,
+      interaction.predicate,
+      interaction.key,
+      interaction.assignments,
+    );
+    const sql = renderRekey(interaction.table, interaction);
+    const result = await this.#attempt(interaction.connection, sql);
+    if (!outcome.accepted) {
+      this.#model = before;
+      if (result.error === undefined) {
+        this.#fail(
+          `rekey-forward: a rekey onto a taken, repeated, or retired key was accepted\n  model rows before: ${canonicalRows(before.sorted(interaction.table), before.columns(interaction.table))}`,
+        );
+      }
+      if (!isUniqueViolation(result.error)) {
+        this.#fail(
+          `a refused rekey failed with the wrong error: ${describeError(result.error)}`,
+          result.error,
+        );
+      }
+      this.#expectedFailures++;
+    } else {
+      if (result.error !== undefined) {
+        this.#fail(`rekey failed: ${describeError(result.error)}`, result.error);
+      }
+      if (result.result?.rowCount !== outcome.matched) {
+        this.#fail(
+          `update-count: a rekey reported ${String(result.result?.rowCount)} rows, model matched ${String(outcome.matched)}\n  model rows before: ${canonicalRows(before.sorted(interaction.table), before.columns(interaction.table))}`,
+        );
+      }
+      this.#acceptedWrites++;
+    }
+    await this.#expectRows(
+      interaction.connection,
+      interaction.table,
+      this.#model.sorted(interaction.table),
+      outcome.accepted ? "after a rekey" : "after a refused rekey",
+    );
+    const reader = (interaction.connection + 1) % this.#plan.connections;
+    for (const [from] of outcome.retired.slice(0, 3)) {
+      const target = this.#model.resolve(interaction.table, from);
+      const row = this.#model.table(interaction.table).rows.get(target);
+      await this.#expectRows(
+        reader,
+        interaction.table,
+        row === undefined ? [] : [row],
+        `rekey-forward: reading retired key ${String(from)}`,
+        `id = ${String(from)}`,
+      );
+    }
+  }
+
   async #select(interaction: Extract<Interaction, { kind: "select" }>): Promise<void> {
     const matching = this.#model.matching(interaction.table, interaction.predicate);
     if (interaction.descending) matching.reverse();
@@ -1736,9 +2180,11 @@ class PlanRunner {
     }
     const rows = this.#model.sorted(interaction.table);
     const modelPositive = rows.filter(
-      (row) => evaluate(interaction.predicate, row) === true,
+      (row) => this.#model.evaluate(interaction.table, interaction.predicate, row) === true,
     ).length;
-    const modelUnknown = rows.filter((row) => evaluate(interaction.predicate, row) === null).length;
+    const modelUnknown = rows.filter(
+      (row) => this.#model.evaluate(interaction.table, interaction.predicate, row) === null,
+    ).length;
     if (total !== rows.length || positive !== modelPositive || unknown !== modelUnknown) {
       this.#fail(
         `where-true-false-null: engine ${String(positive)}/${String(negative)}/${String(unknown)} of ${String(total)}, model ${String(modelPositive)}/${String(rows.length - modelPositive - modelUnknown)}/${String(modelUnknown)} of ${String(rows.length)} for ${where}`,
@@ -1987,6 +2433,36 @@ class PlanRunner {
           poisoned = true;
           break;
         }
+      } else if (statement.kind === "rekey") {
+        const staged = this.#model.clone();
+        const outcome = this.#model.rekey(
+          interaction.table,
+          statement.predicate,
+          statement.key,
+          statement.assignments,
+        );
+        const result = await this.#attempt(
+          interaction.connection,
+          renderRekey(interaction.table, statement),
+        );
+        if (outcome.accepted && result.error !== undefined)
+          this.#refuseTransaction("a rekey inside a transaction", result.error);
+        if (!outcome.accepted) {
+          this.#model = staged;
+          if (result.error === undefined)
+            this.#fail(
+              "a rekey onto a taken, repeated, or retired key was accepted inside a transaction",
+            );
+          if (!isUniqueViolation(result.error)) {
+            this.#fail(
+              `a refused rekey inside a transaction failed with the wrong error: ${describeError(result.error)}`,
+              result.error,
+            );
+          }
+          this.#expectedFailures++;
+          poisoned = true;
+          break;
+        }
       } else if (statement.kind === "update") {
         this.#model.update(interaction.table, statement.predicate, statement.assignments);
         const sql = `UPDATE ${quote(interaction.table)} SET ${renderAssignments(statement.assignments)} WHERE ${renderPredicate(statement.predicate)}`;
@@ -2043,27 +2519,42 @@ class PlanRunner {
   async #concurrent(interaction: Extract<Interaction, { kind: "concurrent" }>): Promise<void> {
     const columns = this.#model.columns(interaction.table);
     const before = this.#model.clone();
-    const writes = interaction.operations.map(async (operation) => {
+    // The plan's keys are distinct, but after a rekey two of them can name one row. Writes to
+    // one row do not commute, so such a round runs its writes one at a time, in plan order.
+    const targets = interaction.operations.map((operation) =>
+      before.keyedTarget(interaction.table, operation.mutation),
+    );
+    const serial = new Set(targets).size !== targets.length;
+    const run = async (operation: (typeof interaction.operations)[number]) => {
       const sql = renderKeyed(interaction.table, columns, operation.mutation);
       const outcome = await this.#attempt(operation.connection, sql);
       return { operation, outcome };
-    });
-    const reads = interaction.readers.map(async (reader) => ({
+    };
+    const writes: Promise<Array<Awaited<ReturnType<typeof run>>>> = serial
+      ? (async () => {
+          const settled: Array<Awaited<ReturnType<typeof run>>> = [];
+          for (const operation of interaction.operations) settled.push(await run(operation));
+          return settled;
+        })()
+      : Promise.all(interaction.operations.map(run));
+    const read = async (reader: number) => ({
       reader,
       outcome: await this.#attemptQuery(
         reader,
         `SELECT * FROM ${quote(interaction.table)} ORDER BY id`,
       ),
-    }));
-    const [writeOutcomes, readOutcomes] = await Promise.all([
-      Promise.all(writes),
-      Promise.all(reads),
-    ]);
+    });
+    const [writeOutcomes, readOutcomes] = serial
+      ? [await writes, await Promise.all(interaction.readers.map(read))]
+      : await Promise.all([writes, Promise.all(interaction.readers.map(read))]);
     const touched = new Set<number>();
-    for (const { operation, outcome } of writeOutcomes) {
+    for (const [index, { operation, outcome }] of writeOutcomes.entries()) {
       const id = keyOf(operation.mutation);
-      touched.add(id);
-      const wouldAccept = before.clone().applyKeyed(interaction.table, operation.mutation);
+      touched.add(targets[index] ?? id);
+      // A serial round's writes each see the ones before it.
+      const wouldAccept = (serial ? this.#model : before)
+        .clone()
+        .applyKeyed(interaction.table, operation.mutation);
       if (outcome.error === undefined) {
         if (!wouldAccept)
           this.#fail(`concurrent insert of an existing key ${String(id)} was accepted`);

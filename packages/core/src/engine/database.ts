@@ -862,6 +862,11 @@ interface LiveProofContext {
   readonly until: number;
   /** Versions in (after, until] that recorded a change to each table. */
   readonly changedVersions: ReadonlyMap<string, ReadonlySet<number>>;
+  /**
+   * False when a manifest in the window is gone (garbage collection removes old ones), so
+   * `changedVersions` may omit a version that changed any table: nothing can be proven.
+   */
+  readonly complete: boolean;
   readonly tables: Map<string, Promise<LiveProofTable | undefined>>;
 }
 
@@ -5905,6 +5910,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   async #keyForwardChanges(after: number, until: number): Promise<KeyForwardChange[] | undefined> {
     const context = await this.#liveProofContext(after, until);
+    // A collected manifest may have been the one that wrote forwards: read the table whole.
+    if (!context.complete) return undefined;
     const versions = context.changedVersions.get(KEY_FORWARDS_TABLE_ID);
     if (versions === undefined || versions.size === 0) return [];
     const entry = await this.#liveProofTable(context, KEY_FORWARDS_TABLE_ID);
@@ -6386,6 +6393,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       cascadeBudget,
       true,
     );
+    // The moved rows' own references were pointed at the new keys above; a new key can also
+    // be a key another moved row gave up (a shift or a swap), so the pass over the table's
+    // referencing rows must leave the moved rows alone or it would move them a second time.
+    const movedRows = new Set(
+      moved.map((index) => keyToken(keyColumn.type, presentAt(newKeys, index))),
+    );
     await this.#moveReferences(
       transaction,
       table,
@@ -6393,6 +6406,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       renamed,
       cascadeBudget,
       referentialBudget,
+      movedRows,
     );
     await this.#stageKeyForwards(transaction, table, [...renamed.values()]);
     await this.#stageTriggerDerivedInserts(
@@ -6426,6 +6440,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     renamed: ReadonlyMap<string, { fromValues: BatchValue[]; toValues: BatchValue[] }>,
     cascadeBudget: number,
     referentialBudget: number,
+    /** Key tokens of the parent's moved rows, whose references to their own table already moved. */
+    movedRows: ReadonlySet<string>,
   ): Promise<void> {
     const quote = quoteSqlIdentifier;
     const sources = [...renamed.values()];
@@ -6470,7 +6486,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           keyToken(address.keyColumn.type, addressStorageKey(address, tuple)),
         );
         if (target === undefined) continue;
-        keys.push(storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null));
+        const childRowKey = storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null);
+        if (
+          child.id === parent.id &&
+          childRowKey !== null &&
+          movedRows.has(keyToken(childKey.type, childRowKey))
+        ) {
+          continue;
+        }
+        keys.push(childRowKey);
         for (const [position, column] of key.columns.entries()) {
           changes[column]?.push(target.toValues[position] ?? null);
         }
@@ -7449,6 +7473,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     const table = await this.#findTable(base.table);
+    // A patch re-evaluates only the base rows whose keys a commit touched, which is sound only
+    // while a change to the lookup side always runs the statement in full. When the lookup is
+    // the base table itself, every change looks like a base-only change, and a row joined to a
+    // changed row (a child whose parent was deleted, say) would keep its old partner.
+    for (const join of plan.joins) {
+      if ((await this.#findTable(join.table)).id === table.id) {
+        return decline("self-join; the lookup side is the base table");
+      }
+    }
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) return decline(`${table.name} has no unique key`);
     if (keyColumn.hidden === true) return decline(`${table.name} has a composite unique key`);
@@ -7651,6 +7684,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<LiveMaintainedChange | undefined> {
     if (tableIds.length !== 1 || tableIds[0] !== state.tableId) return undefined;
     const context = await this.#liveProofContext(after, until);
+    if (!context.complete) return undefined;
     const entry = await this.#liveProofTable(context, state.tableId);
     if (entry === undefined) return undefined;
     for (const version of context.changedVersions.get(state.tableId) ?? []) {
@@ -7852,13 +7886,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     after: number | null,
     until: number,
   ): Promise<boolean> {
-    const plan = this.#compileLiveQuery(query);
+    let plan = this.#compileLiveQuery(query);
     if (planContainsFts(plan)) return true;
+    // The zone proof must test the statement as it runs: a key constant naming a retired key
+    // reads the row at the forward's target, and a row written there is one the statement
+    // returns, whatever the constant as written says. The current forwards are the right ones:
+    // a later rekey changes the forwards table, which this statement depends on and re-runs for.
+    const { tables, keyForwardsTableId } = await this.#catalogFacts();
+    if (keyForwardsTableId !== undefined && planHasKeyLiterals(plan, tables)) {
+      const forwards = await this.#committedForwards();
+      if (forwards !== undefined && !forwards.isEmpty()) {
+        plan = forwardPlanKeyLiterals(plan, tables, forwards);
+      }
+    }
     // Base-scan zone proofs are unsound when the plan reads the table anywhere else — a
     // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
     // predicates reject (e.g. `value > (SELECT AVG(value) FROM t)`).
     if (planReadsBeyondSingleScan(plan)) return true;
     const context = await this.#liveProofContext(after, until);
+    if (!context.complete) return true;
     for (const tableId of tableIds) {
       const entry = await this.#liveProofTable(context, tableId);
       if (entry === undefined) return true;
@@ -7948,12 +7994,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Proof requires every version to be accounted for by a surviving, inspected segment:
       // garbage collection deletes reclaimed segments outright, so "no segment in the window"
       // is absence of evidence, not evidence of neutrality.
+      //
+      // The same holds for the manifests themselves: a collected one leaves no record of the
+      // tables it changed. Versions are consecutive (`createManifest` publishes
+      // `expectedVersion + 1`), so a gap in the window is detectable.
       const changedVersions = new Map<string, Set<number>>();
+      let expected = after === null ? 0 : after + 1;
+      let complete = true;
       let cursor = after;
       pages: for (;;) {
         const page = await this.store.listManifestPage(cursor, 64);
         for (const manifest of page.records) {
           if (manifest.version > until) break pages;
+          if (manifest.version !== expected) complete = false;
+          expected = manifest.version + 1;
           for (const tableId of manifest.changedTableIds) {
             const versions = changedVersions.get(tableId) ?? new Set<number>();
             versions.add(manifest.version);
@@ -7964,7 +8018,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (page.nextCursor === null) break;
         cursor = page.nextCursor;
       }
-      return { after, until, changedVersions, tables: new Map() };
+      if (expected !== until + 1) complete = false;
+      return { after, until, changedVersions, complete, tables: new Map() };
     })();
     this.#liveProofContexts.set(key, context);
     if (this.#liveProofContexts.size > LIVE_PROOF_CONTEXT_LIMIT) {
@@ -14762,7 +14817,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibleByTable.get(freshBaseTable.name) ??
         (await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility));
       this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments);
-      const indexed = await this.#indexPrunedSegments(
+      let indexed = await this.#indexPrunedSegments(
         freshBaseTable,
         visibleBaseSegments,
         plan,
@@ -14770,6 +14825,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibility,
       );
       throwIfAborted(options.signal);
+      // An exact row selection comes with only the deltas of the selected rows: a row outside
+      // it may sit in a kept block with its update or delete dropped. Only the buffered
+      // streamed executor visits exactly the selected rows. A cursor (and the key read a DELETE
+      // runs) and the spilling executors sweep every row of the kept blocks, so for them the
+      // selection falls back to block pruning, which replays every delta.
+      if (
+        indexed.rows !== undefined &&
+        (cursor !== undefined ||
+          (options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined))
+      ) {
+        indexed = {
+          segments: withEveryDelta(visibleBaseSegments, indexed.segments),
+          pruned: indexed.pruned,
+        };
+      }
       const baseSegments = indexed.segments;
       // Zone-map elimination composes after index pruning: whole row groups whose statistics
       // reject the plan's predicates never stream at all. An exact index row selection is
@@ -22946,8 +23016,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const ftsSegments = await this.#ftsPrunedSegments(table, committed, plan, snapshot);
     const indexed = await this.#secondaryIndexPrunedSegments(table, ftsSegments, plan, snapshot);
     // An exact row selection is numbered without the scope's rows; block pruning is all that
-    // carries over.
-    return { segments: [...indexed.segments, ...own], pruned: indexed.pruned };
+    // carries over. Block pruning replays every delta: an exact selection keeps only the deltas
+    // of its candidate rows, and a kept block also holds rows whose dropped delta changed them.
+    const pruned =
+      indexed.rows === undefined ? indexed.segments : withEveryDelta(committed, indexed.segments);
+    return { segments: [...pruned, ...own], pruned: indexed.pruned };
   }
 
   async #secondaryIndexPrunedSegments(

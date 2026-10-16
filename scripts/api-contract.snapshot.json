@@ -8239,7 +8239,7 @@
               "name": "Interaction",
               "kind": "type",
               "declarations": [
-                "export type Interaction = {\n    readonly kind: \"createTable\";\n    readonly connection: number;\n    readonly table: PlanTable;\n    readonly expectExisting: boolean;\n} | {\n    readonly kind: \"insert\";\n    readonly connection: number;\n    readonly table: string;\n    readonly rows: readonly PlanRow[];\n    readonly viaParameters: boolean;\n} | {\n    readonly kind: \"update\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"delete\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"select\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly limit: number | null;\n    readonly descending: boolean;\n} | {\n    readonly kind: \"partition\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"unionAll\";\n    readonly connection: number;\n    readonly table: string;\n    readonly left: Predicate;\n    readonly right: Predicate;\n} | {\n    readonly kind: \"createIndex\";\n    readonly connection: number;\n    readonly table: string;\n    readonly name: string;\n    readonly columns: readonly string[];\n} | {\n    readonly kind: \"dropTable\";\n    readonly connection: number;\n    readonly table: string;\n    readonly expectMissing: boolean;\n} | {\n    readonly kind: \"transaction\";\n    readonly connection: number;\n    readonly observer: number;\n    readonly table: string;\n    readonly statements: readonly TransactionStatement[];\n    readonly outcome: \"commit\" | \"rollback\";\n} | {\n    readonly kind: \"concurrent\";\n    readonly table: string;\n    readonly operations: ReadonlyArray<{\n        readonly connection: number;\n        readonly mutation: KeyedMutation;\n    }>;\n    readonly readers: readonly number[];\n} | {\n    readonly kind: \"fault\";\n    readonly connection: number;\n    readonly table: string;\n    readonly mutation: KeyedMutation;\n    readonly point: FaultPointName;\n} | {\n    readonly kind: \"queuedWrite\";\n    readonly connection: number;\n    readonly waiter: number;\n    readonly table: string;\n    readonly rows: readonly PlanRow[];\n    readonly mutation: KeyedMutation;\n    readonly outcome: \"commit\" | \"rollback\";\n} | {\n    readonly kind: \"reopen\";\n    readonly connection: number;\n} | {\n    readonly kind: \"maintenance\";\n    readonly connection: number;\n    readonly table: string;\n} | {\n    readonly kind: \"checkpoint\";\n};"
+                "export type Interaction = {\n    readonly kind: \"createTable\";\n    readonly connection: number;\n    readonly table: PlanTable;\n    readonly expectExisting: boolean;\n} | {\n    readonly kind: \"insert\";\n    readonly connection: number;\n    readonly table: string;\n    readonly rows: readonly PlanRow[];\n    readonly viaParameters: boolean;\n} | {\n    readonly kind: \"update\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"delete\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"rekey\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly key: KeyAssignment;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"select\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n    readonly limit: number | null;\n    readonly descending: boolean;\n} | {\n    readonly kind: \"partition\";\n    readonly connection: number;\n    readonly table: string;\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"unionAll\";\n    readonly connection: number;\n    readonly table: string;\n    readonly left: Predicate;\n    readonly right: Predicate;\n} | {\n    readonly kind: \"createIndex\";\n    readonly connection: number;\n    readonly table: string;\n    readonly name: string;\n    readonly columns: readonly string[];\n} | {\n    readonly kind: \"dropTable\";\n    readonly connection: number;\n    readonly table: string;\n    readonly expectMissing: boolean;\n} | {\n    readonly kind: \"transaction\";\n    readonly connection: number;\n    readonly observer: number;\n    readonly table: string;\n    readonly statements: readonly TransactionStatement[];\n    readonly outcome: \"commit\" | \"rollback\";\n} | {\n    readonly kind: \"concurrent\";\n    readonly table: string;\n    readonly operations: ReadonlyArray<{\n        readonly connection: number;\n        readonly mutation: KeyedMutation;\n    }>;\n    readonly readers: readonly number[];\n} | {\n    readonly kind: \"fault\";\n    readonly connection: number;\n    readonly table: string;\n    readonly mutation: KeyedMutation;\n    readonly point: FaultPointName;\n} | {\n    readonly kind: \"queuedWrite\";\n    readonly connection: number;\n    readonly waiter: number;\n    readonly table: string;\n    readonly rows: readonly PlanRow[];\n    readonly mutation: KeyedMutation;\n    readonly outcome: \"commit\" | \"rollback\";\n} | {\n    readonly kind: \"reopen\";\n    readonly connection: number;\n} | {\n    readonly kind: \"maintenance\";\n    readonly connection: number;\n    readonly table: string;\n} | {\n    readonly kind: \"checkpoint\";\n};"
               ]
             },
             {
@@ -8260,7 +8260,7 @@
               "name": "InteractionPlanOptions",
               "kind": "type",
               "declarations": [
-                "export interface InteractionPlanOptions {\n    readonly length?: number;\n    readonly connections?: number;\n    readonly tables?: number;\n    readonly keySpace?: number;\n    readonly faultPoints?: readonly FaultPointName[];\n}"
+                "export interface InteractionPlanOptions {\n    readonly length?: number;\n    readonly connections?: number;\n    readonly tables?: number;\n    readonly keySpace?: number;\n    readonly faultPoints?: readonly FaultPointName[];\n    readonly rekeying?: boolean;\n}"
               ]
             },
             {
@@ -8275,6 +8275,13 @@
               "kind": "type",
               "declarations": [
                 "export interface InteractionRunResult {\n    readonly seed: number;\n    readonly interactions: number;\n    readonly statements: number;\n    readonly queries: number;\n    readonly acceptedWrites: number;\n    readonly rejectedConflicts: number;\n    readonly expectedFailures: number;\n    readonly faultsInjected: number;\n    readonly faultsSkipped: number;\n    readonly reopens: number;\n    readonly checkpoints: number;\n    readonly tablesAtEnd: number;\n    readonly rowsAtEnd: number;\n    readonly transientsAccepted: number;\n    readonly stoppedBy: string | undefined;\n}"
+              ]
+            },
+            {
+              "name": "KeyAssignment",
+              "kind": "type",
+              "declarations": [
+                "export type KeyAssignment = {\n    readonly kind: \"to\";\n    readonly value: number;\n} | {\n    readonly kind: \"shift\";\n    readonly by: number;\n} | {\n    readonly kind: \"reflect\";\n    readonly around: number;\n};"
               ]
             },
             {
@@ -8330,7 +8337,7 @@
               "name": "PlanColumn",
               "kind": "type",
               "declarations": [
-                "export interface PlanColumn {\n    readonly name: string;\n    readonly type: ColumnType;\n    readonly nullable: boolean;\n}"
+                "export interface PlanColumn {\n    readonly name: string;\n    readonly type: ColumnType;\n    readonly nullable: boolean;\n    readonly references?: \"self\";\n}"
               ]
             },
             {
@@ -8624,7 +8631,7 @@
               "name": "TransactionStatement",
               "kind": "type",
               "declarations": [
-                "export type TransactionStatement = {\n    readonly kind: \"insert\";\n    readonly rows: readonly PlanRow[];\n} | {\n    readonly kind: \"update\";\n    readonly predicate: Predicate;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"delete\";\n    readonly predicate: Predicate;\n};"
+                "export type TransactionStatement = {\n    readonly kind: \"insert\";\n    readonly rows: readonly PlanRow[];\n} | {\n    readonly kind: \"update\";\n    readonly predicate: Predicate;\n    readonly assignments: readonly Assignment[];\n} | {\n    readonly kind: \"delete\";\n    readonly predicate: Predicate;\n} | {\n    readonly kind: \"rekey\";\n    readonly predicate: Predicate;\n    readonly key: KeyAssignment;\n    readonly assignments: readonly Assignment[];\n};"
               ]
             },
             {
