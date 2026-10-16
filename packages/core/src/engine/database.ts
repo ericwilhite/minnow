@@ -14530,7 +14530,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
     const projectedBaseColumns =
       requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
-    if (cursor === undefined && plan.sql === "(update)" && !pointReadTestHooks.disabled) {
+    // A keyed DELETE reads only the keys it removes, through the first-column consumer; the
+    // point reader answers it as it answers a keyed UPDATE, instead of a scan of the key's block
+    // and a replay of the table's whole delta history.
+    const keyedDelete =
+      plan.sql === "(delete)" &&
+      cursor?.consumeFirstColumn !== undefined &&
+      plan.select.length === 1;
+    if (
+      (keyedDelete || (cursor === undefined && plan.sql === "(update)")) &&
+      !pointReadTestHooks.disabled
+    ) {
       const point = await this.#queryKeyedUpdateAtSnapshot(
         plan,
         options,
@@ -14540,7 +14550,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         projectedBaseColumns,
         typedSchemas,
       );
-      if (point !== undefined) return point;
+      if (point !== undefined) {
+        if (cursor === undefined) return point;
+        const column = point.columns[0] ?? "";
+        const keys = point.rows.map((row) => row[column] ?? null);
+        if (keys.length > 0) await cursor.consumeFirstColumn?.(keys);
+        else await cursor.consume({ ...point, rows: [] });
+        return { ...point, rows: [] };
+      }
     }
     if (secondaryIndexOrderForPlan(plan, baseTable, projectedBaseColumns, false) !== undefined) {
       return undefined;

@@ -224,6 +224,56 @@ describe.each(stores)("keyed mutation and correlated-query correctness on $name"
     expect(fast[6]).toMatchObject({ rowCount: 0 });
   });
 
+  it("reads a keyed DELETE's keys exactly like forced ordinary execution", async () => {
+    const run = async (disabled: boolean) => {
+      pointReadTestHooks.disabled = disabled;
+      const database = new MinnowDatabase(await create(), { autoCompact: false });
+      const outcomes: unknown[] = [];
+      try {
+        await database.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)");
+        await database.execute("CREATE TABLE tags (name TEXT PRIMARY KEY, uses INTEGER)");
+        await database.insertBatch(
+          "items",
+          Array.from({ length: 80 }, (_, id) => ({ id, label: `label-${String(id)}` })),
+        );
+        await database.insertBatch(
+          "tags",
+          Array.from({ length: 20 }, (_, index) => ({ name: `tag-${String(index)}`, uses: index })),
+        );
+        // A delta history the keys have to be read through.
+        await database.execute("UPDATE items SET label = 'changed' WHERE id = 7");
+        await database.execute("DELETE FROM items WHERE id = 8");
+        await database.execute("UPDATE tags SET uses = 99 WHERE name = 'tag-3'");
+        const servedBefore = pointReadTestHooks.served;
+        for (const sql of [
+          "DELETE FROM items WHERE id = 7",
+          "DELETE FROM items WHERE id = 8",
+          "DELETE FROM items WHERE id = 999",
+          "DELETE FROM items WHERE id = 9 AND label = 'other'",
+          "DELETE FROM items WHERE id = 9 AND label = 'label-9'",
+          "DELETE FROM tags WHERE name = 'tag-3'",
+          "DELETE FROM tags WHERE name = 'missing'",
+          "INSERT INTO items VALUES (7, 'again')",
+          "DELETE FROM items WHERE id = 7",
+        ]) {
+          const result = await database.execute(sql);
+          outcomes.push(result.kind === "delete" ? result.rowCount : result.kind);
+        }
+        if (!disabled) expect(pointReadTestHooks.served).toBeGreaterThan(servedBefore);
+        outcomes.push(
+          (await database.query("SELECT * FROM items ORDER BY id", { memoize: false })).rows,
+          (await database.query("SELECT * FROM tags ORDER BY name", { memoize: false })).rows,
+        );
+        return outcomes;
+      } finally {
+        await database.close();
+      }
+    };
+    const fast = await run(false);
+    expect(fast).toEqual(await run(true));
+    expect(fast.slice(0, 9)).toEqual([1, 0, 0, 0, 1, 1, 0, "insert", 1]);
+  });
+
   it("updates a __proto__ column through the keyed preparation path", async () => {
     const database = new MinnowDatabase(await create(), { autoCompact: false });
     try {
