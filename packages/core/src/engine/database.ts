@@ -265,6 +265,8 @@ import {
   createRecursiveCteState,
   annotateAvgArgumentScales,
   compileStatement,
+  compileDefaultExpression,
+  isUpdateDefaultAssignment,
   comparisonHolds,
   createPreparedColumnarQuery,
   evaluateJoinedRowExpression,
@@ -1581,6 +1583,7 @@ function isCatalogStatement(statement: CompiledStatement): boolean {
     case "create-table-as":
     case "drop-index":
     case "add-column":
+    case "rename-column":
     case "drop-column":
     case "create-view":
     case "drop-view":
@@ -1626,6 +1629,7 @@ export type ExecuteResult =
     }
   | { kind: "drop-index"; index: string; dropped: boolean }
   | { kind: "add-column"; table: string; column: string }
+  | { kind: "rename-column"; table: string; from: string; to: string }
   | { kind: "drop-column"; table: string; column: string; dropped: boolean }
   | { kind: "drop-table"; table: string; dropped: boolean }
   | { kind: "merge"; table: string; rowCount: number; version?: number }
@@ -5559,8 +5563,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return result;
     }
     const table = await this.#findTable(statement.table);
-    const alias =
-      statement.kind !== "insert" && statement.alias !== undefined ? statement.alias : table.name;
+    const alias = statement.alias ?? table.name;
     const facts = await this.#catalogFacts();
     return {
       ...result,
@@ -12547,22 +12550,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const keyColumn = getUniqueKeyColumn(table);
     const onConflict = statement.onConflict;
     if (onConflict === undefined) throw new Error("ON CONFLICT update metadata is missing");
-    const conflictColumns = onConflict.columns ?? [onConflict.column];
-    const addressColumns =
-      keyColumn?.hidden === true
-        ? primaryKeyColumns(table).map(({ name }) => name)
-        : keyColumn === undefined
-          ? []
-          : [keyColumn.name];
-    if (
-      keyColumn === undefined ||
-      conflictColumns.length !== addressColumns.length ||
-      conflictColumns.some((name, index) => name !== addressColumns[index])
-    ) {
-      throw new TypeError(
-        `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-      );
+    if (keyColumn === undefined) {
+      throw new TypeError("ON CONFLICT needs a table with a primary or unique key");
     }
+    const arbiter = conflictArbiter(table, keyColumn, onConflict.columns ?? [onConflict.column]);
     statement = foldInsertColumns(table, statement);
     for (const name of statement.columns) {
       if (!table.columns.some((column) => column.name === name)) {
@@ -12602,7 +12593,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const keyToken = (value: QueryValue): string =>
       value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value} ${String(value)}`;
     const proposedKeys = new Set<string>();
-    for (const key of keyValues) {
+    // Under a UNIQUE arbiter the proposals' own keys decide nothing: a repeated key among rows
+    // that update existing holders is harmless, and among fresh rows the insert refuses it.
+    for (const key of arbiter.kind === "key" ? keyValues : []) {
       if (key === null) continue;
       const token = keyToken(key);
       if (proposedKeys.has(token)) {
@@ -12611,6 +12604,30 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
       }
       proposedKeys.add(token);
+    }
+    // PostgreSQL proposes rows one at a time, so a second proposal of the same UNIQUE tuple
+    // conflicts with the first — whether that one updated a stored row or was inserted — and
+    // the statement would affect one row twice.
+    const arbiterTuple = (rowIndex: number): BatchValue[] | undefined => {
+      if (arbiter.kind !== "unique") return undefined;
+      const tuple = arbiter.columns.map(({ name }) => proposed.columns[name]?.[rowIndex] ?? null);
+      return tuple.some((value) => value === null) ? undefined : tuple;
+    };
+    if (arbiter.kind === "unique") {
+      const proposedTuples = new Set<string>();
+      for (const rowIndex of statement.rows.keys()) {
+        const tuple = arbiterTuple(rowIndex);
+        if (tuple === undefined) continue;
+        const token = sqlTupleToken(tuple);
+        if (proposedTuples.has(token)) {
+          throw new TypeError(
+            `ON CONFLICT DO UPDATE cannot affect the row holding ${arbiter.name} (${tuple
+              .map(String)
+              .join(", ")}) twice`,
+          );
+        }
+        proposedTuples.add(token);
+      }
     }
     const returningColumns =
       options.returning === undefined
@@ -12659,6 +12676,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (column) => !(table.primaryKeyColumnIds ?? [keyColumn.id]).includes(column.id),
     );
     const wholeRowReplacement =
+      arbiter.kind === "key" &&
       conflictWhere === undefined &&
       assignments.length === replacementColumns.length &&
       replacementColumns.every((column) =>
@@ -12730,20 +12748,46 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const apply = async (
       transaction: WriteSession,
     ): Promise<{ affectedRows: number[]; returnedRows?: QueryRow[] }> => {
-      const present = await transaction.query(
-        `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(
-          table.name,
-        )} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keyValues.map(() => "?").join(", ")})`,
-        { params: keyValues },
-      );
-      const existing = new Set(present.rows.map((row) => keyToken(row.key ?? null)));
+      // The stored row each conflicting proposal targets, by its row-addressing key: the
+      // proposal's own key for a primary-key arbiter, the holder of its tuple for a UNIQUE one.
+      const conflictKeys = new Map<number, QueryValue>();
+      if (arbiter.kind === "key") {
+        const present = await transaction.query(
+          `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(
+            table.name,
+          )} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keyValues.map(() => "?").join(", ")})`,
+          { params: keyValues },
+        );
+        const existing = new Set(present.rows.map((row) => keyToken(row.key ?? null)));
+        for (const rowIndex of statement.rows.keys()) {
+          const key = keyValues[rowIndex] ?? null;
+          if (key !== null && existing.has(keyToken(key))) conflictKeys.set(rowIndex, key);
+        }
+      } else {
+        const tuples = [...statement.rows.keys()].flatMap((rowIndex) => {
+          const tuple = arbiterTuple(rowIndex);
+          return tuple === undefined ? [] : [tuple];
+        });
+        const holders = await this.#uniqueTupleHolders(
+          table,
+          keyColumn,
+          arbiter.columns,
+          tuples,
+          transaction,
+        );
+        for (const rowIndex of statement.rows.keys()) {
+          const tuple = arbiterTuple(rowIndex);
+          const holder = tuple === undefined ? undefined : holders.get(sqlTupleToken(tuple));
+          if (holder !== undefined) conflictKeys.set(rowIndex, holder);
+        }
+      }
       const freshRows: number[] = [];
       const conflictingRows: number[] = [];
       const updatedRows: number[] = [];
       const seenConflicts = new Set<string>();
       for (const rowIndex of statement.rows.keys()) {
-        const key = keyValues[rowIndex] ?? null;
-        if (key !== null && existing.has(keyToken(key))) {
+        const key = conflictKeys.get(rowIndex);
+        if (key !== undefined) {
           const token = keyToken(key);
           if (seenConflicts.has(token)) {
             throw new TypeError(
@@ -12756,7 +12800,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       if (conflictingRows.length > 0) {
         const keys = conflictingRows.map((rowIndex) => {
-          const value = keyValues[rowIndex] ?? null;
+          const value = conflictKeys.get(rowIndex) ?? null;
           if (value === null) {
             throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
           }
@@ -12825,7 +12869,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       const affectedRows = [...freshRows, ...updatedRows].sort((left, right) => left - right);
       if (returningColumns === undefined) return { affectedRows };
-      const keys = affectedRows.map((rowIndex) => keyValues[rowIndex] ?? null);
+      const keys = affectedRows.map(
+        (rowIndex) => conflictKeys.get(rowIndex) ?? keyValues[rowIndex] ?? null,
+      );
       if (keys.length === 0) return { affectedRows, returnedRows: [] };
       const selectedColumns = [...new Set([keyColumn.name, ...returningColumns])];
       const selected = selectedColumns.map(quoteSqlIdentifier).join(", ");
@@ -12865,34 +12911,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     };
   }
 
-  /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
+  /**
+   * ON CONFLICT DO NOTHING: drops insert rows that would violate an arbiter constraint at the
+   * statement's snapshot — the table's key, the one UNIQUE constraint a target names, or, for a
+   * targetless DO NOTHING, every unique constraint the table has, as in PostgreSQL.
+   */
   async #filterConflictingInsertRows(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
     writer?: StatementWriter,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     const table = await this.#findTable(statement.table);
     const keyColumn = getUniqueKeyColumn(table);
-    const addressColumns =
-      keyColumn?.hidden === true
-        ? primaryKeyColumns(table).map(({ name }) => name)
-        : keyColumn === undefined
-          ? []
-          : [keyColumn.name];
-    // A targetless DO NOTHING means "any unique key", which for a Minnow table is its key.
-    const conflictColumns =
-      statement.onConflict?.anyTarget === true
-        ? addressColumns
-        : (statement.onConflict?.columns ??
-          (statement.onConflict === undefined ? [] : [statement.onConflict.column]));
-    if (
-      keyColumn === undefined ||
-      conflictColumns.length !== addressColumns.length ||
-      conflictColumns.some((name, index) => name !== addressColumns[index])
-    ) {
-      throw new TypeError(
-        `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-      );
+    const onConflict = statement.onConflict;
+    if (keyColumn === undefined || onConflict === undefined) {
+      throw new TypeError("ON CONFLICT needs a table with a primary or unique key");
     }
+    const arbiters =
+      onConflict.anyTarget === true
+        ? [{ kind: "key" } as const, ...uniqueConflictArbiters(table)]
+        : [conflictArbiter(table, keyColumn, onConflict.columns ?? [onConflict.column])];
+    const checksKey = arbiters.some((arbiter) => arbiter.kind === "key");
     const proposed = insertStatementBatch(statement);
     coerceSqlWriteBatch(table, proposed);
     const statementNow = this.#now();
@@ -12929,6 +12967,68 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
     );
     const keys = filled.batch.columns[keyColumn.name] ?? [];
+    // Each arbiter answers "is this proposal taken?" and records a retained proposal: UPSERT
+    // makes its choice per proposed row, so a later duplicate in the same VALUES list conflicts
+    // with the first retained proposal and takes DO NOTHING too. A proposal that conflicts on
+    // any arbiter is dropped without claiming anything.
+    const keyCheck = checksKey
+      ? await this.#doNothingKeyCheck(table, keyColumn, keys, writer)
+      : undefined;
+    // A UNIQUE arbiter's tuple per proposal (undefined when any component is NULL, which never
+    // conflicts), and the tuples already held — stored, staged, or retained earlier in this list.
+    const uniqueChecks: Array<{ tokens: Array<string | undefined>; taken: Set<string> }> = [];
+    for (const arbiter of arbiters) {
+      if (arbiter.kind !== "unique") continue;
+      const tuples = materializedRows.map((_, index) => {
+        const tuple = arbiter.columns.map(
+          ({ name }) => filled.batch.columns[name]?.[index] ?? null,
+        );
+        return tuple.some((value) => value === null) ? undefined : tuple;
+      });
+      const present = tuples.filter((tuple): tuple is BatchValue[] => tuple !== undefined);
+      const holders = await this.#uniqueTupleHolders(
+        table,
+        keyColumn,
+        arbiter.columns,
+        present,
+        writer,
+      );
+      uniqueChecks.push({
+        tokens: tuples.map((tuple) => (tuple === undefined ? undefined : sqlTupleToken(tuple))),
+        taken: new Set(holders.keys()),
+      });
+    }
+    return {
+      ...statement,
+      columns,
+      rows: materializedRows.filter((_, index) => {
+        const key = keys[index] ?? null;
+        if (key !== null && keyCheck?.taken(key) === true) return false;
+        const collides = uniqueChecks.some(({ tokens, taken }) => {
+          const token = tokens[index];
+          return token !== undefined && taken.has(token);
+        });
+        if (collides) return false;
+        if (key !== null) keyCheck?.claim(key);
+        for (const { tokens, taken } of uniqueChecks) {
+          const token = tokens[index];
+          if (token !== undefined) taken.add(token);
+        }
+        return true;
+      }),
+    };
+  }
+
+  /** DO NOTHING's key arbiter: which proposed keys the scope already holds, as a claimable set. */
+  async #doNothingKeyCheck(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: readonly BatchValue[],
+    writer: StatementWriter | undefined,
+  ): Promise<{
+    taken(key: Exclude<BatchValue, null>): boolean;
+    claim(key: Exclude<BatchValue, null>): void;
+  }> {
     const presence = await writer?.stagedKeyPresence?.(
       table,
       keyColumn,
@@ -12937,18 +13037,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (presence !== undefined) {
       const taken = new Set(presence);
       return {
-        ...statement,
-        columns,
-        rows: materializedRows.filter((_, index) => {
-          const value = keys[index] ?? null;
-          if (value === null) return true;
-          const token = keyToken(keyColumn.type, value);
-          if (taken.has(token)) return false;
-          // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
-          // therefore conflicts with the first retained proposal and takes DO NOTHING too.
-          taken.add(token);
-          return true;
-        }),
+        taken: (key) => taken.has(keyToken(keyColumn.type, key)),
+        claim: (key) => taken.add(keyToken(keyColumn.type, key)),
       };
     }
     const plan: CompiledQuery = {
@@ -12977,20 +13067,64 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return value instanceof Date ? dateIsoString(value) : value;
       }),
     );
+    const normalized = (key: Exclude<BatchValue, null>): QueryValue | string =>
+      key instanceof Date ? dateIsoString(key) : key;
     return {
-      ...statement,
-      columns,
-      rows: materializedRows.filter((_, index) => {
-        const value = keys[index] ?? null;
-        if (value === null) return true;
-        const normalized = value instanceof Date ? dateIsoString(value) : value;
-        if (existing.has(normalized)) return false;
-        // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
-        // therefore conflicts with the first retained proposal and takes DO NOTHING too.
-        existing.add(normalized);
-        return true;
-      }),
+      taken: (key) => existing.has(normalized(key)),
+      claim: (key) => existing.add(normalized(key)),
     };
+  }
+
+  /**
+   * The stored rows holding any of the given non-null tuples over a UNIQUE constraint's
+   * columns, read through the statement's writer so rows it staged count: tuple token (as
+   * `sqlTupleToken` spells it for the proposal) to the holder's row-addressing key.
+   */
+  async #uniqueTupleHolders(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    columns: readonly TableColumnRecord[],
+    tuples: ReadonlyArray<readonly BatchValue[]>,
+    writer: Pick<WriteSession, "query"> | undefined,
+  ): Promise<Map<string, QueryValue>> {
+    const holders = new Map<string, QueryValue>();
+    const first = columns[0];
+    if (first === undefined || tuples.length === 0) return holders;
+    const leading = [
+      ...new Map(
+        tuples.map((tuple) => [sqlTupleToken([tuple[0] ?? null]), tuple[0] ?? null] as const),
+      ).values(),
+    ];
+    const keyColumns = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
+    const selected = [...keyColumns, ...columns];
+    const projection = selected
+      .map((column, index) => `${quoteSqlIdentifier(column.name)} AS c${String(index)}`)
+      .join(", ");
+    // The leading column narrows the read (and can use the index); the full tuple decides.
+    const chunk = Math.max(1, MAX_SQL_PARAMETERS - 1);
+    for (let start = 0; start < leading.length; start += chunk) {
+      const params = leading.slice(start, start + chunk);
+      const sql =
+        `SELECT ${projection} FROM ${quoteSqlIdentifier(table.name)} ` +
+        `WHERE ${quoteSqlIdentifier(first.name)} IN (${params.map(() => "?").join(", ")})`;
+      const result =
+        writer === undefined
+          ? await this.query(sql, { params })
+          : await writer.query(sql, { params });
+      for (const row of result.rows) {
+        const values = selected.map((column, index) =>
+          normalizeColumnLogicalValue(column, row[`c${String(index)}`] ?? null),
+        );
+        const keyValues = values.slice(0, keyColumns.length);
+        const key =
+          keyColumn.hidden === true
+            ? compositeKeyValue(keyColumns, keyValues)
+            : (keyValues[0] ?? null);
+        if (key === null) continue;
+        holders.set(sqlTupleToken(values.slice(keyColumns.length)), key);
+      }
+    }
+    return holders;
   }
 
   /** Rejects an INSERT staged into a scope whose keys already exist there or in committed rows. */
@@ -13219,6 +13353,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (this.#statementTransactionExpired && statement.kind !== "transaction")
         throw new TransactionExpiredError();
       const statementNow = this.#now();
+      if (
+        statement.kind === "update" &&
+        statement.assignments.some(({ expression }) => isUpdateDefaultAssignment(expression))
+      ) {
+        statement = {
+          ...statement,
+          assignments: resolveUpdateDefaults(
+            await this.#findTable(statement.table),
+            statement.assignments,
+          ),
+        };
+      }
       statement = resolveMutationStatementDatetimes(statement, statementNow);
       if (statement.kind === "select") {
         return { kind: "rows", result: await this.query(statement.sql) };
@@ -13606,6 +13752,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               );
             }
             if (record.columns.some(({ name }) => name === added.name)) {
+              if (addColumnStatement.ifNotExists === true) {
+                return { kind: "add-column", table: addColumnStatement.table, column: added.name };
+              }
               throw new TypeError(
                 `Column already exists: ${addColumnStatement.table}.${added.name}`,
               );
@@ -13666,6 +13815,54 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               expectedCatalogEpoch: proof.catalogEpoch,
             });
             return { kind: "add-column", table: addColumnStatement.table, column: added.name };
+          } catch (error) {
+            if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+              throw error;
+            }
+          }
+        }
+      }
+      if (statement.kind === "rename-column") {
+        // A metadata-only step: stored blocks and every index, key, and unique constraint name
+        // the column by its id, so only the catalog record's name changes. What names it by
+        // text — a CHECK, a generated column, a foreign key, a trigger, a view — would be left
+        // pointing at nothing, so a rename those depend on is refused instead.
+        const rename = statement;
+        let pinnedTableId: string | undefined;
+        for (let attempt = 0; ; attempt += 1) {
+          const proof = await this.#catalogMutations.readProof();
+          try {
+            const record = proof.records.find((candidate) => candidate.name === rename.table);
+            if (record === undefined) throw new UnknownTableError(rename.table);
+            if (record.view !== undefined) {
+              throw new TypeError(`${rename.table} is a view, not a table`);
+            }
+            pinnedTableId ??= record.id;
+            if (record.id !== pinnedTableId) {
+              throw new TableRecordConflictError(pinnedTableId, 0, record.revision);
+            }
+            const column = record.columns.find(({ name }) => name === rename.from);
+            if (column === undefined) {
+              throw new TypeError(`Column not found: ${rename.table}.${rename.from}`);
+            }
+            if (record.columns.some(({ name }) => name === rename.to)) {
+              throw new TypeError(`Column already exists: ${rename.table}.${rename.to}`);
+            }
+            assertColumnRenameSafe(proof.records, record, column);
+            const columns = record.columns.map((candidate) =>
+              candidate.id === column.id
+                ? { ...structuredClone(candidate), name: rename.to }
+                : structuredClone(candidate),
+            );
+            assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
+            const candidateSchemas = catalogQuerySchemas(proof.records);
+            candidateSchemas.set(record.name, columns);
+            assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
+            await this.store.updateTable(record.id, record.revision, {
+              columns,
+              expectedCatalogEpoch: proof.catalogEpoch,
+            });
+            return { kind: "rename-column", table: rename.table, from: rename.from, to: rename.to };
           } catch (error) {
             if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
               throw error;
@@ -13784,10 +13981,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const columns = visibleTableColumns(table).map((column) => column.name);
         if (statement.defaultValues === true) {
           // Keep the empty column list: omission, not NULL, is what invokes catalog defaults.
-        } else if (statement.rows.some((row) => row.length !== columns.length)) {
-          throw new TypeError("Each INSERT row must match the table column count");
         } else {
-          statement = { ...statement, columns };
+          // Without a column list the values fill the table's leading columns in declaration
+          // order, and any columns after them take their defaults, as in PostgreSQL.
+          const width = statement.rows[0]?.length ?? 0;
+          if (statement.rows.some((row) => row.length !== width)) {
+            throw new TypeError("VALUES lists must all be the same length");
+          }
+          if (width > columns.length) {
+            throw new TypeError(
+              `INSERT has ${String(width)} values but ${statement.table} has ${String(columns.length)} columns`,
+            );
+          }
+          statement = { ...statement, columns: columns.slice(0, width) };
         }
       }
       if (statement.kind === "insert") {
@@ -13831,23 +14037,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const viaUpsert = statement.onConflict?.action === "replace";
         if (viaUpsert) {
           const keyColumn = getUniqueKeyColumn(table);
+          if (keyColumn === undefined) {
+            throw new TypeError("ON CONFLICT needs a table with a primary or unique key");
+          }
           const conflictColumns =
             statement.onConflict?.columns ??
             (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
-          const addressColumns =
-            keyColumn?.hidden === true
-              ? primaryKeyColumns(table).map(({ name }) => name)
-              : keyColumn === undefined
-                ? []
-                : [keyColumn.name];
-          if (
-            keyColumn === undefined ||
-            conflictColumns.length !== addressColumns.length ||
-            conflictColumns.some((name, index) => name !== addressColumns[index])
-          ) {
-            throw new TypeError(
-              `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-            );
+          if (conflictArbiter(table, keyColumn, conflictColumns).kind !== "key") {
+            throw new TypeError("ON CONFLICT DO REPLACE targets the table's primary key");
           }
         }
         // Narrowing does not survive a reassignment inside the closures below, so the folded
@@ -13967,7 +14164,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 return spelled;
               }
               const { domains } = await this.#catalogFacts();
-              if (!domains.has(table.name)) return statement.assignments;
+              if (!domains.has(table.name)) return spelled;
               const normalized = normalizePlanDomainLiterals(
                 {
                   sql: `UPDATE ${table.name}`,
@@ -14143,7 +14340,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // the column's type. RETURNING echoes the same form, as PostgreSQL returns the typed value.
           const stored = storedSqlValueFromExecution(column, value);
           executionValues?.push(
-            column.type === "string" && column.sqlDomain === undefined ? value : stored,
+            column.type === "string" && column.sqlDomain === undefined && typeof value === "string"
+              ? value
+              : // A number or boolean assigned to TEXT echoes the text it was stored as.
+                executionSqlValueFromStorage(column, stored),
           );
           return stored;
         });
@@ -20107,6 +20307,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
       transaction.setCompactionIntent(job.id, job.sourceBlockIds);
       transaction.markLogicallyUnchanged();
+      stageCompactionUniqueCoverage(transaction, table);
       let publicationConflict: WriteConflictError | undefined;
       const publish = async (): Promise<ManifestSummary | undefined> => {
         try {
@@ -20162,6 +20363,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         transaction.setCompactionIntent(job.id, job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
+        stageCompactionUniqueCoverage(transaction, table);
       };
       // Publication is a writer's turn like any other (#withCompactionPublicationSlot): the
       // rebase and the commit run with no coordinated writer in flight anywhere, so the
@@ -25416,29 +25618,38 @@ function storedSqlValueFromExecution(
  * a string bound to `$1` — as PostgreSQL types an unknown-typed literal by its target. Text that
  * does not parse is left for validation to refuse. Domain columns (DATE, NUMERIC, …) already
  * normalize their text through the domain, and the typed programmatic API never passes here.
+ *
+ * The other direction is PostgreSQL's assignment cast to text: a number or boolean written to a
+ * plain TEXT column — `VALUES (42)`, `SET label = quantity`, a number bound to `$1` — stores its
+ * text form, `'42'` or `'true'`.
  */
 function coerceSqlWriteValue(
   column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
   value: BatchValue,
 ): BatchValue {
-  if (
-    column === undefined ||
-    column.sqlDomain !== undefined ||
-    column.type === "string" ||
-    typeof value !== "string" ||
-    isSqlDomainValue(value)
-  ) {
+  if (column === undefined || column.sqlDomain !== undefined) return value;
+  if (column.type === "string") {
+    if (typeof value === "boolean") return value ? "true" : "false";
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
     return value;
   }
+  if (typeof value !== "string" || isSqlDomainValue(value)) return value;
   return readUntypedText(column.type, value) as BatchValue;
 }
 
 /** Applies `coerceSqlWriteValue` to every typed column of a SQL INSERT batch, in place. */
 function coerceSqlWriteBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
-    if (column.type === "string" || column.sqlDomain !== undefined) continue;
+    if (column.sqlDomain !== undefined) continue;
     const values = input.columns[column.name];
-    if (!values?.some((value) => typeof value === "string")) continue;
+    if (
+      values === undefined ||
+      (column.type === "string"
+        ? !values.some((value) => typeof value === "number" || typeof value === "boolean")
+        : !values.some((value) => typeof value === "string"))
+    ) {
+      continue;
+    }
     (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
       coerceSqlWriteValue(column, value),
     );
@@ -25589,6 +25800,115 @@ function foldColumnName(table: TableRecord, name: string): string {
   return matches.length === 1 ? (matches[0]?.name ?? name) : name;
 }
 
+/**
+ * A compaction rewrite changes no row, so it changes no UNIQUE membership. The store still
+ * requires every commit that stages segments for a table to name each of its enforced UNIQUE
+ * namespaces — its guard against a writer that never saw the index — so the fold names each one
+ * with an empty change. Without it every fold of such a table was refused, and once its
+ * level-zero segments reached the ceiling every write to the table was refused too.
+ */
+function stageCompactionUniqueCoverage(transaction: DatabaseTransaction, table: TableRecord): void {
+  const covered = new Set(transaction.accumulatedUniqueKeyChanges.map(({ tableId }) => tableId));
+  for (const { indexId } of readyUniqueSecondaryIndexes(table)) {
+    const namespaceId = secondaryUniqueKeyNamespace(table.id, indexId);
+    if (covered.has(namespaceId)) continue;
+    transaction.setUniqueKeyChanges({ tableId: namespaceId, keyTokens: [], requireAbsent: false });
+  }
+}
+
+/**
+ * Refuses a column rename that would leave a dependent naming the old spelling. Indexes, keys,
+ * and UNIQUE constraints hold column ids and follow the rename; CHECK constraints, generated
+ * columns, foreign keys (either side), and triggers hold names, so they block it. Views are
+ * checked by the caller against the renamed schema.
+ */
+function assertColumnRenameSafe(
+  records: readonly TableRecord[],
+  table: TableRecord,
+  column: TableColumnRecord,
+): void {
+  const where = `${table.name}.${column.name}`;
+  const names = (sql: string, label: string): readonly string[] => {
+    try {
+      return expressionColumnNames(compileCheckExpression(sql, label)).map(
+        (name) => name.split(".").at(-1) ?? name,
+      );
+    } catch {
+      // An expression that can no longer be read cannot prove it does not use the column.
+      return [column.name];
+    }
+  };
+  for (const check of table.checks ?? []) {
+    if (names(check.sql, check.name).includes(column.name)) {
+      throw new TypeError(`Cannot rename ${where}: CHECK ${check.name} uses it`);
+    }
+  }
+  for (const dependent of table.columns) {
+    if (dependent.generatedValue === undefined) continue;
+    if (names(dependent.generatedValue.sql, dependent.name).includes(column.name)) {
+      throw new TypeError(`Cannot rename ${where}: generated column ${dependent.name} uses it`);
+    }
+  }
+  for (const owner of records) {
+    for (const key of owner.foreignKeys ?? []) {
+      const uses =
+        (owner.id === table.id && foreignKeyColumns(key).includes(column.name)) ||
+        (key.parentTable === table.name && foreignKeyParentColumns(key).includes(column.name));
+      if (uses) throw new TypeError(`Cannot rename ${where}: FOREIGN KEY ${key.name} uses it`);
+    }
+    for (const trigger of owner.triggers ?? []) {
+      if (triggerReferencesColumn(owner, trigger, table, column.name, false)) {
+        throw new TypeError(`Cannot rename ${where}: trigger ${trigger.name} references it`);
+      }
+    }
+  }
+}
+
+/**
+ * The constraint an ON CONFLICT target names. PostgreSQL infers the arbiter from the target's
+ * column set, in any order: the row-addressing primary key, or one UNIQUE constraint or unique
+ * index over exactly those columns.
+ */
+type ConflictArbiter =
+  | { readonly kind: "key" }
+  | { readonly kind: "unique"; readonly name: string; readonly columns: TableColumnRecord[] };
+
+function uniqueConflictArbiters(table: TableRecord): ConflictArbiter[] {
+  const arbiters: ConflictArbiter[] = [];
+  for (const index of Object.values(table.secondaryIndexes ?? {})) {
+    if (index.unique !== true) continue;
+    const columns = secondaryIndexColumnIds(index).map((columnId) =>
+      table.columns.find((column) => column.id === columnId),
+    );
+    if (columns.some((column) => column === undefined)) continue;
+    arbiters.push({ kind: "unique", name: index.name, columns: columns as TableColumnRecord[] });
+  }
+  return arbiters;
+}
+
+function conflictArbiter(
+  table: TableRecord,
+  keyColumn: TableColumnRecord,
+  target: readonly string[],
+): ConflictArbiter {
+  const names = target.map((name) => foldColumnName(table, name));
+  const wanted = new Set(names);
+  const matches = (columns: readonly string[]): boolean =>
+    wanted.size === names.length &&
+    columns.length === wanted.size &&
+    columns.every((name) => wanted.has(name));
+  const addressColumns =
+    keyColumn.hidden === true ? primaryKeyColumns(table).map(({ name }) => name) : [keyColumn.name];
+  if (matches(addressColumns)) return { kind: "key" };
+  const unique = uniqueConflictArbiters(table).find(
+    (arbiter) => arbiter.kind === "unique" && matches(arbiter.columns.map(({ name }) => name)),
+  );
+  if (unique !== undefined) return unique;
+  throw new TypeError(
+    `ON CONFLICT (${target.join(", ")}) matches no primary key or UNIQUE constraint of ${table.name}`,
+  );
+}
+
 function foldInsertColumns<T extends { columns: readonly string[] }>(
   table: TableRecord,
   statement: T,
@@ -25597,6 +25917,43 @@ function foldInsertColumns<T extends { columns: readonly string[] }>(
   return columns.some((name, index) => name !== statement.columns[index])
     ? { ...statement, columns }
     : statement;
+}
+
+/**
+ * Replaces each `SET column = DEFAULT` with what an omitted INSERT slot would receive: the
+ * column's literal or expression default, or NULL when it has none. A stored generated column
+ * recomputes on every update anyway, so assigning it DEFAULT is dropped, as PostgreSQL allows.
+ */
+function resolveUpdateDefaults(
+  table: TableRecord,
+  assignments: ReadonlyArray<{ column: string; expression: Expression }>,
+): Array<{ column: string; expression: Expression }> {
+  return assignments.flatMap((assignment) => {
+    if (!isUpdateDefaultAssignment(assignment.expression)) return [assignment];
+    const name = foldColumnName(table, assignment.column);
+    const column = table.columns.find((candidate) => candidate.name === name);
+    if (column === undefined) throw new TypeError(`Column not found: ${table.name}.${name}`);
+    if (column.generatedValue !== undefined) return [];
+    const defaultValue = column.defaultValue;
+    if (defaultValue?.kind === "autoincrement") {
+      throw new TypeError(
+        `SET ${column.name} = DEFAULT is not supported for an auto-increment column`,
+      );
+    }
+    const expression: Expression =
+      defaultValue === undefined
+        ? { kind: "literal", value: null }
+        : defaultValue.kind === "literal"
+          ? {
+              kind: "literal",
+              value:
+                defaultValue.value instanceof Date
+                  ? new Date(defaultValue.value.getTime())
+                  : defaultValue.value,
+            }
+          : compileDefaultExpression(defaultValue.sql);
+    return [{ column: assignment.column, expression }];
+  });
 }
 
 function foldAssignmentColumns<T extends { column: string }>(

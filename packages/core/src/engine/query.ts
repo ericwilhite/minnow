@@ -1421,6 +1421,8 @@ export type CompiledStatement =
   | {
       kind: "insert";
       table: string;
+      /** `INSERT INTO t AS a`: the name ON CONFLICT and RETURNING may qualify the target by. */
+      alias?: string;
       columns: string[];
       rows: InsertValue[][];
       /** PostgreSQL's one-row `DEFAULT VALUES` form; execution expands it to omitted columns. */
@@ -1599,6 +1601,15 @@ export type CompiledStatement =
       };
       /** Schema migrations may add a proven non-null column by supplying a backfill. */
       allowNonNullableWithBackfill?: boolean;
+      /** ADD COLUMN IF NOT EXISTS: an existing column of that name is left alone. */
+      ifNotExists?: true;
+      parameterCount?: number;
+    }
+  | {
+      kind: "rename-column";
+      table: string;
+      from: string;
+      to: string;
       parameterCount?: number;
     }
   | {
@@ -1823,6 +1834,27 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
     throw new TypeError("Expected START TRANSACTION");
   }
   return { kind: "transaction", action: action as "begin" | "commit" | "rollback" };
+}
+
+/**
+ * `UPDATE … SET column = DEFAULT`, as the parser leaves it: a reference no identifier can spell,
+ * which execution replaces with the column's catalog default before anything evaluates it. A
+ * path that missed the replacement fails on an unknown column rather than writing a value.
+ */
+export const UPDATE_DEFAULT_MARKER = "\u0000default";
+
+/** Whether an UPDATE assignment is SQL `DEFAULT` rather than an expression. */
+export function isUpdateDefaultAssignment(expression: Expression): boolean {
+  return expression.kind === "column" && expression.reference === UPDATE_DEFAULT_MARKER;
+}
+
+/**
+ * Compiles a stored catalog default — already validated by `validateDefaultExpression` when it
+ * was declared — into the expression an UPDATE's `SET column = DEFAULT` assigns.
+ */
+export function compileDefaultExpression(sql: string): Expression {
+  const parser = new Parser(tokenize(sql), sql);
+  return resolveExactNumericConstants(parser.parseExpression());
 }
 
 /**
@@ -6505,7 +6537,11 @@ export function externalizeQueryResult(result: QueryResult): QueryResult {
 }
 
 /** Gives bare conflict-update columns the target-row meaning SQL assigns them. */
-function rewriteUpsertExpression(expression: Expression, table: string): Expression {
+function rewriteUpsertExpression(
+  expression: Expression,
+  table: string,
+  alias?: string,
+): Expression {
   if (hasAggregate(expression)) {
     throw new TypeError("ON CONFLICT DO UPDATE expressions cannot contain aggregates");
   }
@@ -6516,7 +6552,11 @@ function rewriteUpsertExpression(expression: Expression, table: string): Express
       if (parts.length === 2 && parts[0]?.toUpperCase() === "EXCLUDED") {
         return { ...node, reference: `EXCLUDED.${parts[1] ?? ""}` };
       }
-      if (parts.length === 2 && parts[0]?.toUpperCase() === table.toUpperCase()) {
+      if (
+        parts.length === 2 &&
+        (parts[0]?.toUpperCase() === table.toUpperCase() ||
+          (alias !== undefined && parts[0] === alias))
+      ) {
         return { ...node, reference: `${table}.${parts[1] ?? ""}` };
       }
       return node;
@@ -7339,11 +7379,28 @@ class Parser {
     return { kind: "drop-table", table, ...(ifExists ? { ifExists: true } : {}) };
   }
 
-  /** ALTER TABLE name ADD/DROP [COLUMN] (F031). */
+  /** ALTER TABLE name ADD/DROP [COLUMN] (F031), or RENAME [COLUMN] a TO b. */
   parseAlterTable(): CompiledStatement {
     this.#keyword("ALTER");
     this.#keyword("TABLE");
     const table = this.#identifier();
+    if (this.#isKeyword("RENAME")) {
+      this.#keyword("RENAME");
+      if (this.#isKeyword("TO")) {
+        throw new TypeError(
+          "ALTER TABLE RENAME TO is not supported; create the new table and copy the rows with INSERT … SELECT",
+        );
+      }
+      if (this.#isKeyword("CONSTRAINT")) {
+        throw new TypeError("ALTER TABLE RENAME CONSTRAINT is not supported");
+      }
+      if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
+      const from = this.#identifier();
+      this.#keyword("TO");
+      const to = this.#identifier();
+      this.#take("eof");
+      return { kind: "rename-column", table, from, to };
+    }
     if (this.#isKeyword("DROP")) {
       this.#keyword("DROP");
       if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
@@ -7370,6 +7427,13 @@ class Parser {
     }
     this.#keyword("ADD");
     if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
+    let ifNotExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("NOT");
+      this.#keyword("EXISTS");
+      ifNotExists = true;
+    }
     const name = this.#identifier();
     const columnType = this.#columnType();
     let nullable = true;
@@ -7409,6 +7473,7 @@ class Parser {
         ...(backfill === undefined ? {} : { backfill }),
       },
       ...(backfill === undefined ? {} : { allowNonNullableWithBackfill: true }),
+      ...(ifNotExists ? { ifNotExists: true } : {}),
     };
   }
 
@@ -7552,6 +7617,14 @@ class Parser {
     this.#keyword("INSERT");
     this.#keyword("INTO");
     const table = this.#identifier();
+    // PostgreSQL's `INSERT INTO t AS alias`: the name ON CONFLICT and RETURNING may qualify the
+    // target row by. Unlike UPDATE and DELETE, the AS is required, as it is in PostgreSQL.
+    let alias: string | undefined;
+    if (this.#isKeyword("AS")) {
+      this.#keyword("AS");
+      alias = this.#identifier();
+    }
+    const aliased = alias === undefined ? {} : { alias };
     const columns: string[] = [];
     if (this.#punctuation("(")) {
       for (;;) {
@@ -7572,8 +7645,9 @@ class Parser {
         columns,
         rows: [[]],
         defaultValues: true,
-        ...this.#onConflictClause(table),
-        ...this.#returningClause(table),
+        ...aliased,
+        ...this.#onConflictClause(table, alias),
+        ...this.#returningClause(table, alias),
       };
     }
     if (this.#isKeyword("SELECT") || this.#isKeyword("WITH") || this.#peek().text === "(") {
@@ -7601,8 +7675,9 @@ class Parser {
         columns,
         rows: [],
         query,
-        ...this.#onConflictClause(table),
-        ...this.#returningClause(table),
+        ...aliased,
+        ...this.#onConflictClause(table, alias),
+        ...this.#returningClause(table, alias),
       };
     }
     this.#keyword("VALUES");
@@ -7626,12 +7701,16 @@ class Parser {
       table,
       columns,
       rows,
-      ...this.#onConflictClause(table),
-      ...this.#returningClause(table),
+      ...aliased,
+      ...this.#onConflictClause(table, alias),
+      ...this.#returningClause(table, alias),
     };
   }
 
-  #onConflictClause(table: string): {
+  #onConflictClause(
+    table: string,
+    alias?: string,
+  ): {
     onConflict?: {
       column: string;
       columns?: string[];
@@ -7644,6 +7723,11 @@ class Parser {
     if (!this.#isKeyword("ON")) return {};
     this.#keyword("ON");
     this.#keyword("CONFLICT");
+    if (this.#isKeyword("ON")) {
+      throw new TypeError(
+        "ON CONFLICT ON CONSTRAINT is not supported; name the constraint's columns: ON CONFLICT (column, …)",
+      );
+    }
     if (this.#isKeyword("DO")) {
       // PostgreSQL lets DO NOTHING omit the conflict target (any unique key); DO UPDATE has to
       // name one. Kysely's `onConflict((oc) => oc.doNothing())` emits exactly this spelling.
@@ -7688,14 +7772,14 @@ class Parser {
       assigned.add(target);
       assignments.push({
         column: target,
-        expression: rewriteUpsertExpression(this.#expression(), table),
+        expression: rewriteUpsertExpression(this.#expression(), table, alias),
       });
       if (!this.#punctuation(",")) break;
     }
     let where: Expression | undefined;
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
-      where = rewriteUpsertExpression(this.#expression(), table);
+      where = rewriteUpsertExpression(this.#expression(), table, alias);
     }
     return {
       onConflict: {
@@ -7759,7 +7843,12 @@ class Parser {
         else if (parts.length === 2 && (parts[0] === table || parts[0] === alias))
           column = parts[1];
         else {
-          throw new TypeError(`RETURNING qualifier must name the target table: ${alias ?? table}`);
+          // PostgreSQL's RETURNING may also read UPDATE … FROM and DELETE … USING sources;
+          // Minnow returns the target's rows only, so say which qualifier was refused.
+          throw new TypeError(
+            `RETURNING qualifier must name the target table: ${alias ?? table} ` +
+              `(RETURNING reads only the target's rows, not ${parts.slice(0, -1).join(".")})`,
+          );
         }
       }
       if (column === undefined || explicit) plain = false;
@@ -7915,16 +8004,42 @@ class Parser {
     this.#keyword("SET");
     const assignments: Array<{ column: string; expression: Expression }> = [];
     for (;;) {
-      const column = this.#mutationTargetColumn(table, alias);
-      this.#operator("=");
-      const expression = this.#expression();
-      if (hasAggregate(expression)) {
-        throw new TypeError("Aggregate functions are not allowed in UPDATE assignments");
+      if (this.#punctuation("(")) {
+        // The row-value form, SET (a, b) = (x, y) or = ROW(x, y): one assignment per column.
+        const columns: string[] = [];
+        for (;;) {
+          columns.push(this.#mutationTargetColumn(table, alias));
+          if (!this.#punctuation(",")) break;
+        }
+        this.#expectPunctuation(")");
+        this.#operator("=");
+        if (this.#isKeyword("ROW")) this.#keyword("ROW");
+        this.#expectPunctuation("(");
+        if (this.#isKeyword("SELECT") || this.#isKeyword("WITH") || this.#isKeyword("VALUES")) {
+          throw new TypeError(
+            "UPDATE SET (columns) = (SELECT …) is not supported; assign each column its own scalar subquery",
+          );
+        }
+        const values: Expression[] = [];
+        for (;;) {
+          values.push(this.#updateAssignmentValue());
+          if (!this.#punctuation(",")) break;
+        }
+        this.#expectPunctuation(")");
+        if (values.length !== columns.length) {
+          throw new TypeError(
+            `UPDATE SET assigns ${String(columns.length)} columns from ${String(values.length)} values`,
+          );
+        }
+        columns.forEach((column, index) => {
+          const expression = values[index];
+          if (expression !== undefined) assignments.push({ column, expression });
+        });
+      } else {
+        const column = this.#mutationTargetColumn(table, alias);
+        this.#operator("=");
+        assignments.push({ column, expression: this.#updateAssignmentValue() });
       }
-      if (containsWindow(expression)) {
-        throw new TypeError("Window functions are not allowed in UPDATE assignments");
-      }
-      assignments.push({ column, expression });
       if (!this.#punctuation(",")) break;
     }
     if (new Set(assignments.map(({ column }) => column)).size !== assignments.length) {
@@ -7941,6 +8056,26 @@ class Parser {
       ...(from === undefined ? {} : { from }),
       ...this.#returningClause(table, alias),
     };
+  }
+
+  /**
+   * One UPDATE assignment's value: an expression, or the bare keyword DEFAULT, which stands for
+   * the column's catalog default and is resolved once the statement meets its table.
+   */
+  #updateAssignmentValue(): Expression {
+    const token = this.#peek();
+    if (token.kind === "identifier" && token.quoted !== true && this.#isKeyword("DEFAULT")) {
+      this.#keyword("DEFAULT");
+      return { kind: "column", reference: UPDATE_DEFAULT_MARKER };
+    }
+    const expression = this.#expression();
+    if (hasAggregate(expression)) {
+      throw new TypeError("Aggregate functions are not allowed in UPDATE assignments");
+    }
+    if (containsWindow(expression)) {
+      throw new TypeError("Window functions are not allowed in UPDATE assignments");
+    }
+    return expression;
   }
 
   /** `FROM sources` after UPDATE's SET list, or `USING sources` after DELETE's target. */

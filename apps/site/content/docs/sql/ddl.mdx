@@ -403,7 +403,16 @@ ALTER TABLE orders ADD COLUMN channel TEXT NOT NULL DEFAULT 'web'
 
 An expression default such as `NOW()` is evaluated per write, so it fills only the rows written
 afterwards; a column with one, or with no default at all, is added nullable and the rows already
-stored read `NULL`.
+stored read `NULL`. `ADD COLUMN IF NOT EXISTS` leaves an existing column of that name as it is.
+
+```sql
+ALTER TABLE orders RENAME COLUMN channel TO sales_channel
+```
+
+Renaming a column is a catalog-only step too: stored rows, indexes, keys, and `UNIQUE`
+constraints refer to the column by a stable id and follow it. PostgreSQL also rewrites a `CHECK`,
+generated column, foreign key, trigger, or view that names the column; Minnow refuses the rename
+instead, naming the dependent. Renaming a table (`ALTER TABLE … RENAME TO`) is not supported.
 
 `ALTER TABLE orders DROP COLUMN channel` performs the same guarded metadata step as an explicitly
 authorized schema migration. It refuses the unique key, the last column, and anything a check,

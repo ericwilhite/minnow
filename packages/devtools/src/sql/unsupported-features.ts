@@ -23,12 +23,6 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
       "information_schema, pg_catalog, and sqlite_master are not supported; the catalog is read through the API (listTables, describe).",
   },
   {
-    id: "ddl.add-column-if-not-exists",
-    error: "Expected eof, found EXISTS",
-    notes:
-      "ADD COLUMN IF NOT EXISTS is not supported; check the catalog first or let the duplicate-column error stand.",
-  },
-  {
     id: "ddl.add-constraint",
     error: "Expected eof, found CHECK",
     notes:
@@ -41,9 +35,9 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
   },
   {
     id: "ddl.alter-table-rename",
-    error: "Expected ADD, found RENAME",
+    error: "ALTER TABLE RENAME TO is not supported",
     notes:
-      "ALTER TABLE RENAME COLUMN, RENAME TO, ALTER COLUMN TYPE / SET DEFAULT / SET NOT NULL / DROP NOT NULL, ADD CONSTRAINT, and DROP CONSTRAINT are not supported as SQL. ALTER TABLE ADD COLUMN and DROP COLUMN are. The schema DSL's migrate() renames columns and widens nullability through the catalog.",
+      "ALTER TABLE RENAME TO, RENAME CONSTRAINT, ALTER COLUMN TYPE / SET DEFAULT / SET NOT NULL / DROP NOT NULL, ADD CONSTRAINT, and DROP CONSTRAINT are not supported as SQL. ALTER TABLE ADD COLUMN, RENAME COLUMN, and DROP COLUMN are. The schema DSL's migrate() widens nullability through the catalog.",
   },
   {
     id: "ddl.alter-type",
@@ -259,27 +253,28 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     notes: "A data-modifying statement inside WITH is not supported; run the write, then the read.",
   },
   {
+    id: "mutation.returning-source-columns",
+    error: "RETURNING qualifier must name the target table",
+    notes:
+      "PostgreSQL's RETURNING may also read the sources UPDATE … FROM and DELETE … USING join; Minnow's RETURNING reads the target's rows only. Select the source values in a separate query.",
+  },
+  {
     id: "mutation.update-keyless",
     error: "UPDATE requires a table with a unique key",
     notes:
       "Deliberate: mutation segments address rows by unique key, so tables without one cannot be updated or deleted through any API.",
   },
   {
-    id: "mutation.update-row-value",
-    error: "Expected identifier, found (",
-    notes: "The row-value assignment SET (a, b) = (…) is not supported; assign each column.",
+    id: "mutation.update-row-value-subquery",
+    error: "UPDATE SET (columns) = (SELECT …) is not supported",
+    notes:
+      "A row-value assignment from a sub-SELECT is not supported; assign each column from its own scalar subquery, or join the source with UPDATE … FROM.",
   },
   {
-    id: "mutation.update-set-default",
-    error: "Ambiguous or missing column: DEFAULT",
+    id: "mutation.upsert-on-constraint",
+    error: "ON CONFLICT ON CONSTRAINT is not supported",
     notes:
-      "SET column = DEFAULT and the row-value form SET (a, b) = (…) are not supported; assign the value explicitly.",
-  },
-  {
-    id: "mutation.upsert-non-key-unique",
-    error: "ON CONFLICT targets the table's primary or unique key columns: name",
-    notes:
-      "ON CONFLICT targets the table's primary or row-addressing unique key; a secondary UNIQUE column, a constraint name (ON CONSTRAINT), or a partial-index predicate cannot be the target.",
+      "Naming the arbiter by constraint name, and a partial-index predicate after the target, are not supported; name the constraint's columns instead, as in ON CONFLICT (score).",
   },
   {
     id: "predicate.regex-backreferences",

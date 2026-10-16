@@ -1197,12 +1197,6 @@ describe("compile-time refusals for engine-unsupported forms", () => {
         .addColumn("id", "integer", (col) => col.primaryKey().identity())
         .compile(),
     ).toThrow("Minnow does not support the T-SQL IDENTITY column modifier");
-    expect(() =>
-      db.schema
-        .alterTable("users")
-        .addColumn("extra", "text", (col) => col.ifNotExists())
-        .compile(),
-    ).toThrow("Minnow does not support ADD COLUMN IF NOT EXISTS");
     expect(() => create().addColumn("id", "integer").addIndex("t_id", ["id"]).compile()).toThrow(
       "Minnow does not support MySQL's inline INDEX in CREATE TABLE",
     );
@@ -1360,6 +1354,62 @@ describe("supported DDL executes end to end", () => {
     // ON DELETE CASCADE flows from the referenced user.
     await db.deleteFrom("users").where("userId", "=", 4).execute();
     expect(await raw.selectFrom("projects").selectAll().execute()).toEqual([]);
+  });
+
+  it("renames columns, adds columns if missing, and upserts on a UNIQUE column", async () => {
+    await db.schema
+      .createTable("accounts")
+      .addColumn("id", "serial", (col) => col.primaryKey())
+      .addColumn("email", "text", (col) => col.notNull().unique())
+      .addColumn("visits", "integer", (col) => col.notNull().defaultTo(0))
+      .execute();
+    await db.schema.alterTable("accounts").renameColumn("visits", "logins").execute();
+    await db.schema
+      .alterTable("accounts")
+      .addColumn("logins", "text", (col) => col.ifNotExists())
+      .execute();
+    await db.schema
+      .alterTable("accounts")
+      .addColumn("plan", "text", (col) => col.ifNotExists().defaultTo("free"))
+      .execute();
+    const accounts = db as unknown as Kysely<
+      ConformanceDatabase & {
+        accounts: {
+          id: Generated<number>;
+          email: string;
+          logins: Generated<number>;
+          plan: Generated<string>;
+        };
+      }
+    >;
+    const visit = (email: string) =>
+      accounts
+        .insertInto("accounts")
+        .values({ email })
+        .onConflict((conflict) =>
+          conflict.column("email").doUpdateSet({ logins: sql<number>`accounts.logins + 1` }),
+        )
+        .returning(["id", "logins"])
+        .executeTakeFirstOrThrow();
+    expect(await visit("ada@x")).toEqual({ id: 1, logins: 0 });
+    expect(await visit("ada@x")).toEqual({ id: 1, logins: 1 });
+    expect(await visit("bo@x")).toEqual({ id: 3, logins: 0 });
+    await accounts
+      .insertInto("accounts")
+      .values([{ email: "bo@x" }, { email: "cy@x" }])
+      .onConflict((conflict) => conflict.doNothing())
+      .execute();
+    expect(
+      await accounts
+        .selectFrom("accounts")
+        .select(["email", "logins", "plan"])
+        .orderBy("id")
+        .execute(),
+    ).toEqual([
+      { email: "ada@x", logins: 1, plan: "free" },
+      { email: "bo@x", logins: 0, plan: "free" },
+      { email: "cy@x", logins: 0, plan: "free" },
+    ]);
   });
 
   it("creates and drops indexes, views, and enum types", async () => {

@@ -16,6 +16,13 @@
  * The script sticks to the shared semantic surface: quarter-valued amounts keep arithmetic
  * exact, unique keys collide deliberately to exercise conflict paths, and failed statements
  * must leave every engine untouched (per-statement atomicity on all sides).
+ *
+ * A second table, `accounts`, carries a secondary UNIQUE column and column defaults, so the
+ * script also reaches the upsert arbiters PostgreSQL infers beyond the primary key (ON CONFLICT
+ * on a UNIQUE column, a targetless DO NOTHING over every unique constraint), the INSERT target
+ * alias, the row-value and DEFAULT forms of UPDATE SET, positional VALUES shorter than the
+ * table, and numbers assigned to TEXT. A TxStep runs several of those statements inside one
+ * BEGIN … COMMIT, so an upsert has to see rows the same transaction staged.
  */
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
@@ -50,6 +57,20 @@ const TRIGGERS = [
     "INSERT INTO audit (action, item_id, amount) VALUES ('del', OLD.id, OLD.amount); END",
 ];
 
+/**
+ * Shared by all three engines verbatim. `email` is the secondary UNIQUE arbiter; `tier` and
+ * `balance` carry defaults for `SET … = DEFAULT` and short positional VALUES; `note` is TEXT, so
+ * a number written to it must arrive as its text form.
+ */
+const ACCOUNTS_DDL =
+  "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT UNIQUE, " +
+  "balance DOUBLE PRECISION NOT NULL DEFAULT 0, tier TEXT NOT NULL DEFAULT 'basic', note TEXT)";
+const EMAILS = ["ada@x", "bob@x", "cy@x", "di@x", "ed@x", "flo@x"] as const;
+const TABLE_STATES = [
+  `SELECT id, region, amount, active, label FROM items ORDER BY id`,
+  `SELECT id, email, balance, tier, note FROM accounts ORDER BY id`,
+];
+
 async function minnowFixture(): Promise<MinnowDatabase> {
   // autoCompact stays on (the shipped default) so this harness exercises write scopes with
   // background compaction publishing underneath them, which is how it caught the spurious
@@ -75,6 +96,7 @@ async function minnowFixture(): Promise<MinnowDatabase> {
     ],
   });
   for (const trigger of TRIGGERS) await database.execute(trigger);
+  await database.execute(ACCOUNTS_DDL);
   return database;
 }
 
@@ -85,6 +107,7 @@ function sqliteFixture(): DatabaseSync {
   );
   database.exec(`CREATE TABLE audit ("action" TEXT, "item_id" REAL, "amount" REAL)`);
   for (const trigger of TRIGGERS) database.exec(trigger);
+  database.exec(ACCOUNTS_DDL);
   return database;
 }
 
@@ -115,17 +138,24 @@ interface PgliteOracle {
 }
 
 async function pgliteFixture(): Promise<PgliteOracle> {
-  const { PGlite } = await import("@electric-sql/pglite");
-  const database = await PGlite.create();
-  await database.exec(
+  const oracle = await pgliteOracle();
+  await oracle.exec(
     `CREATE TABLE items ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "label" TEXT)`,
   );
-  await database.exec(
+  await oracle.exec(
     `CREATE TABLE audit ("action" TEXT, "item_id" DOUBLE PRECISION, "amount" DOUBLE PRECISION)`,
   );
-  for (const statement of PGLITE_TRIGGERS) await database.exec(statement);
-  // int8 and numeric arrive as numbers so counts and numeric math compare directly; the fixture
-  // has no datetime columns, so no timestamp parser is needed.
+  for (const statement of PGLITE_TRIGGERS) await oracle.exec(statement);
+  await oracle.exec(ACCOUNTS_DDL);
+  return oracle;
+}
+
+/** An empty PostgreSQL database behind the oracle interface. */
+async function pgliteOracle(): Promise<PgliteOracle> {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const database = await PGlite.create();
+  // int8 and numeric arrive as numbers so counts and numeric math compare directly; the
+  // fixtures have no datetime columns, so no timestamp parser is needed.
   const parsers = {
     20: (value: string) => Number(value),
     1700: (value: string) => Number(value),
@@ -184,10 +214,21 @@ interface PairStep {
   sqlite: Array<{ sql: string; params?: QueryValue[] }>;
 }
 
-type Step = SqlStep | ScopeStep | PairStep;
+/**
+ * Several statements inside one BEGIN … COMMIT on every engine. PostgreSQL aborts a transaction
+ * at its first failed statement where Minnow and SQLite only undo that statement, so the first
+ * failure anywhere ends the step: its outcome is compared, and every engine rolls back.
+ */
+interface TxStep {
+  kind: "tx";
+  statements: SqlStep[];
+}
+
+type Step = SqlStep | ScopeStep | PairStep | TxStep;
 
 interface ScriptState {
   nextId: number;
+  nextAccountId: number;
   rng: () => number;
 }
 
@@ -455,10 +496,146 @@ const stepTemplates: StepTemplate[] = [
     deletes: [1 + Math.floor(state.rng() * state.nextId)],
     absentDeletes: [8_000_001 + Math.floor(state.rng() * 1000), 8_500_001],
   }),
+  // --- accounts: arbiters beyond the primary key, and the PostgreSQL write spellings ---------
+  // ON CONFLICT (email) arbitrates by the UNIQUE column: a colliding proposal updates the row
+  // holding that email, under its own key, through the target alias. Ids stay fresh so the only
+  // conflict is the email; one statement never proposes an email twice, where PostgreSQL
+  // refuses to touch a row a second time and SQLite applies both.
+  (state) => {
+    const count = 1 + Math.floor(state.rng() * 2);
+    const emails = [...EMAILS].sort(() => state.rng() - 0.5).slice(0, count);
+    const rows = emails.map((email) => {
+      const id = state.nextAccountId;
+      state.nextAccountId += 1;
+      return `(${String(id)}, '${email}', ${String(quarter(state.rng))})`;
+    });
+    return {
+      kind: "sql",
+      sql:
+        `INSERT INTO accounts AS a (id, email, balance) VALUES ${rows.join(", ")} ` +
+        `ON CONFLICT (email) DO UPDATE SET balance = a.balance + EXCLUDED.balance, note = 'merged' ` +
+        `WHERE a.balance < ? RETURNING id, email, balance, note`,
+      params: [quarter(state.rng) + 25],
+    };
+  },
+  // A targetless DO NOTHING skips a proposal that collides on any unique constraint — the key or
+  // the email — including a repeat of an earlier proposal in the same VALUES list.
+  (state) => {
+    const rows = Array.from({ length: 3 }, () => {
+      const reuse = state.rng() < 0.4 && state.nextAccountId > 1;
+      const id = reuse
+        ? 1 + Math.floor(state.rng() * (state.nextAccountId - 1))
+        : state.nextAccountId++;
+      const email = state.rng() < 0.15 ? "NULL" : `'${pick(state.rng, EMAILS)}'`;
+      return `(${String(id)}, ${email}, ${String(quarter(state.rng))})`;
+    });
+    return {
+      kind: "sql",
+      sql: `INSERT INTO accounts (id, email, balance) VALUES ${rows.join(", ")} ON CONFLICT DO NOTHING RETURNING id, email`,
+    };
+  },
+  // DO NOTHING targeted at the email: an id collision with a fresh email is still an error.
+  (state) => {
+    const reuse = state.rng() < 0.3 && state.nextAccountId > 1;
+    const id = reuse
+      ? 1 + Math.floor(state.rng() * (state.nextAccountId - 1))
+      : state.nextAccountId++;
+    return {
+      kind: "sql",
+      sql: `INSERT INTO accounts (id, email, balance) VALUES (?, ?, ?) ON CONFLICT (email) DO NOTHING`,
+      params: [id, pick(state.rng, EMAILS), quarter(state.rng)],
+    };
+  },
+  // SET (a, b) = (…): the row-value assignment, reading the pre-update row, with a number
+  // written to the TEXT column as its text form.
+  (state) => ({
+    kind: "sql",
+    sql: `UPDATE accounts SET (balance, note) = (balance + ?, id * 3) WHERE id % ? = ? RETURNING id, balance, note`,
+    params: [quarter(state.rng) - 50, 2 + Math.floor(state.rng() * 3), Math.floor(state.rng() * 2)],
+  }),
+  // SET column = DEFAULT, which SQLite spells with the default's value.
+  (state) => {
+    const modulus = 2 + Math.floor(state.rng() * 3);
+    const tier = pick(state.rng, ["gold", "silver"]);
+    return state.rng() < 0.5
+      ? {
+          kind: "pair",
+          minnow: {
+            sql: `UPDATE accounts SET tier = DEFAULT, note = NULL WHERE id % ${String(modulus)} = 0`,
+          },
+          sqlite: [
+            {
+              sql: `UPDATE accounts SET tier = 'basic', note = NULL WHERE id % ${String(modulus)} = 0`,
+            },
+          ],
+        }
+      : {
+          kind: "sql",
+          sql: `UPDATE accounts SET tier = '${tier}' WHERE id % ${String(modulus)} = 1`,
+        };
+  },
+  // Positional VALUES shorter than the table fill its leading columns; the rest take their
+  // defaults. SQLite requires the column list for the same row. A number constant written to the
+  // TEXT column stores its text form (a constant, because node:sqlite binds every JavaScript
+  // number as REAL, which SQLite's TEXT affinity would spell '28.0').
+  (state) => {
+    const id = state.nextAccountId;
+    state.nextAccountId += 1;
+    const email = `u${String(id)}@x`;
+    return state.rng() < 0.5
+      ? {
+          kind: "pair",
+          minnow: { sql: `INSERT INTO accounts VALUES (?, ?)`, params: [id, email] },
+          sqlite: [{ sql: `INSERT INTO accounts (id, email) VALUES (?, ?)`, params: [id, email] }],
+        }
+      : {
+          kind: "sql",
+          sql: `INSERT INTO accounts (id, email, note) VALUES (?, ?, ${String(id * 7)})`,
+          params: [id, email],
+        };
+  },
+  // One transaction: an upsert and a DO NOTHING have to see the rows the same transaction
+  // staged — including one it deleted — not only committed state.
+  (state) => {
+    const email = pick(state.rng, EMAILS);
+    const first = state.nextAccountId;
+    state.nextAccountId += 3;
+    return {
+      kind: "tx",
+      statements: [
+        { kind: "sql", sql: `DELETE FROM accounts WHERE email = ?`, params: [email] },
+        {
+          kind: "sql",
+          sql: `INSERT INTO accounts (id, email, balance) VALUES (?, ?, 1) ON CONFLICT (email) DO UPDATE SET balance = accounts.balance + 1`,
+          params: [first, email],
+        },
+        {
+          kind: "sql",
+          sql: `INSERT INTO accounts (id, email, balance) VALUES (?, ?, 2) ON CONFLICT (email) DO UPDATE SET balance = accounts.balance + 10 RETURNING id, balance`,
+          params: [first + 1, email],
+        },
+        {
+          kind: "sql",
+          sql: `INSERT INTO accounts (id, email) VALUES (?, ?) ON CONFLICT DO NOTHING`,
+          params: [first + 2, email],
+        },
+        {
+          kind: "sql",
+          sql: `UPDATE accounts SET email = NULL WHERE id = ?`,
+          params: [first],
+        },
+        {
+          kind: "sql",
+          sql: `INSERT INTO accounts (id, email) VALUES (?, ?) ON CONFLICT DO NOTHING RETURNING id`,
+          params: [first + 2, email],
+        },
+      ],
+    };
+  },
 ];
 
 function buildScript(seed: number): Step[] {
-  const state: ScriptState = { nextId: 1, rng: mulberry32(seed) };
+  const state: ScriptState = { nextId: 1, nextAccountId: 1, rng: mulberry32(seed) };
   const script: Step[] = [];
   // Seed rows so the first predicates have something to chew on.
   for (let index = 0; index < 8; index += 1) {
@@ -562,19 +739,16 @@ describe("DML conformance against SQLite and PGlite", () => {
       let pgliteCompared = 0;
 
       const compareState = async (label: string): Promise<void> => {
-        const stateSql = `SELECT id, region, amount, active, label FROM items ORDER BY id`;
-        const minnowState = keys((await minnow.query(stateSql)).rows, true);
-        const sqliteState = keys(sqlite.prepare(stateSql).all(), true);
-        if (minnowState.join("\n") !== sqliteState.join("\n")) {
-          failures.push(
-            `${label}\n${diffSummary("table state", "sqlite", minnowState, sqliteState)}`,
-          );
-        }
-        const pgliteState = keys((await pglite.run(stateSql)).rows, true);
-        if (minnowState.join("\n") !== pgliteState.join("\n")) {
-          failures.push(
-            `${label}\n${diffSummary("table state", "pglite", minnowState, pgliteState)}`,
-          );
+        for (const stateSql of TABLE_STATES) {
+          const minnowState = keys((await minnow.query(stateSql)).rows, true);
+          const sqliteState = keys(sqlite.prepare(stateSql).all(), true);
+          if (minnowState.join("\n") !== sqliteState.join("\n")) {
+            failures.push(`${label}\n${diffSummary(stateSql, "sqlite", minnowState, sqliteState)}`);
+          }
+          const pgliteState = keys((await pglite.run(stateSql)).rows, true);
+          if (minnowState.join("\n") !== pgliteState.join("\n")) {
+            failures.push(`${label}\n${diffSummary(stateSql, "pglite", minnowState, pgliteState)}`);
+          }
         }
         const auditSql = `SELECT action, item_id, amount FROM audit`;
         const minnowAudit = keys((await minnow.query(auditSql)).rows, false);
@@ -592,7 +766,8 @@ describe("DML conformance against SQLite and PGlite", () => {
         }
       };
 
-      const runSql = async (step: SqlStep, label: string): Promise<void> => {
+      /** Runs one statement on every engine and compares; true when any engine rejected it. */
+      const runSql = async (step: SqlStep, label: string): Promise<boolean> => {
         const returning = step.sql.includes("RETURNING");
         let minnowError: unknown;
         let minnowCount: number | undefined;
@@ -692,6 +867,27 @@ describe("DML conformance against SQLite and PGlite", () => {
         };
         compareOracle("sqlite", sqliteError, sqliteCount, sqliteReturned, sqliteReturnedColumns);
         compareOracle("pglite", pgliteError, pgliteCount, pgliteReturned, pgliteReturnedColumns);
+        return minnowError !== undefined || sqliteError !== undefined || pgliteError !== undefined;
+      };
+
+      const runTx = async (step: TxStep, label: string): Promise<void> => {
+        await minnow.execute("BEGIN");
+        sqlite.exec("BEGIN");
+        await pglite.exec("BEGIN");
+        let failed = false;
+        for (const [position, statement] of step.statements.entries()) {
+          const statementLabel = `${label} [${String(position)}] ${statement.sql} :: ${JSON.stringify(
+            statement.params ?? [],
+          )}`;
+          if (await runSql(statement, statementLabel)) {
+            failed = true;
+            break;
+          }
+        }
+        const finish = failed ? "ROLLBACK" : "COMMIT";
+        await minnow.execute(finish);
+        sqlite.exec(finish);
+        await pglite.exec(finish);
       };
 
       const runPair = async (step: PairStep, label: string): Promise<void> => {
@@ -838,14 +1034,17 @@ describe("DML conformance against SQLite and PGlite", () => {
               ? `#${String(index)} ${step.sql} :: ${JSON.stringify(step.params ?? [])}`
               : step.kind === "pair"
                 ? `#${String(index)} ${step.minnow.sql}`
-                : `#${String(index)} write-scope ${JSON.stringify({
-                    updates: step.updates,
-                    inserts: step.inserts.map((row) => row.id),
-                    deletes: step.deletes,
-                    poisonKey: step.poisonKey,
-                  })}`;
+                : step.kind === "tx"
+                  ? `#${String(index)} transaction`
+                  : `#${String(index)} write-scope ${JSON.stringify({
+                      updates: step.updates,
+                      inserts: step.inserts.map((row) => row.id),
+                      deletes: step.deletes,
+                      poisonKey: step.poisonKey,
+                    })}`;
           if (step.kind === "sql") await runSql(step, label);
           else if (step.kind === "pair") await runPair(step, label);
+          else if (step.kind === "tx") await runTx(step, label);
           else await runScope(step, label);
           await compareState(label);
           if (failures.length >= 10) break; // Divergence cascades; stop at a useful sample.
@@ -867,5 +1066,216 @@ describe("DML conformance against SQLite and PGlite", () => {
       expect(pgliteCompared).toBeGreaterThan(60);
     },
     180_000,
+  );
+});
+
+// --- Hand-written scenarios ---------------------------------------------------------------------
+
+/**
+ * One statement of a scenario. A string runs verbatim everywhere; an object respells it for an
+ * oracle that lacks the form, or leaves that oracle out (`null`) — only for a step whose effect
+ * the scenario never reads back from that oracle, so the engines' states stay comparable.
+ */
+type ScenarioStatement = string | { sql: string; sqlite?: string | null; pg?: string | null };
+
+interface Scenario {
+  name: string;
+  statements: ScenarioStatement[];
+}
+
+/**
+ * Shapes the generated script cannot reach: composite conflict targets written in another
+ * column order, a target that names no constraint, a targetless DO NOTHING over several unique
+ * constraints, column renames and the statements that read the new name, ADD COLUMN IF NOT
+ * EXISTS, the INSERT alias in RETURNING, and UPDATE's row-value and DEFAULT assignments. Every
+ * statement is diffed against SQLite and PostgreSQL for its outcome, affected rows, and returned
+ * rows; a SELECT's rows are compared in order, so each one has an ORDER BY.
+ */
+const SCENARIOS: Scenario[] = [
+  {
+    name: "a conflict target names its constraint in any column order",
+    statements: [
+      "CREATE TABLE pairs (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))",
+      "CREATE TABLE codes (id INTEGER PRIMARY KEY, x INTEGER, y TEXT, v INTEGER, UNIQUE (x, y))",
+      "INSERT INTO pairs VALUES (1, 1, 'x'), (1, 2, 'y')",
+      "INSERT INTO codes VALUES (1, 1, 'a', 0), (2, 1, 'b', 0)",
+      "INSERT INTO pairs VALUES (1, 1, 'z') ON CONFLICT (b, a) DO UPDATE SET v = EXCLUDED.v RETURNING a, b, v",
+      "INSERT INTO pairs VALUES (1, 2, 'q'), (2, 1, 'r') ON CONFLICT (b, a) DO NOTHING RETURNING a, b",
+      "INSERT INTO codes VALUES (3, 1, 'a', 5) ON CONFLICT (y, x) DO UPDATE SET v = EXCLUDED.v RETURNING id, v",
+      "INSERT INTO codes VALUES (4, 1, 'c', 6), (5, 2, 'a', 7) ON CONFLICT (y, x) DO UPDATE SET v = codes.v + 100",
+      "INSERT INTO codes VALUES (6, NULL, 'a', 8) ON CONFLICT (x, y) DO NOTHING",
+      "INSERT INTO codes VALUES (7, 1, 'b', 9) ON CONFLICT (x) DO NOTHING",
+      "INSERT INTO codes VALUES (8, 1, 'b', 9) ON CONFLICT (v) DO NOTHING",
+      // Under a UNIQUE arbiter the proposals' own keys decide nothing for rows that update.
+      "INSERT INTO codes VALUES (9, 1, 'a', 1), (9, 1, 'b', 2) ON CONFLICT (x, y) DO UPDATE SET v = EXCLUDED.v",
+      "INSERT INTO codes VALUES (20, 5, 'q', 1), (20, 6, 'q', 2) ON CONFLICT (x, y) DO UPDATE SET v = 0",
+      "SELECT a, b, v FROM pairs ORDER BY a, b",
+      "SELECT id, x, y, v FROM codes ORDER BY id",
+    ],
+  },
+  {
+    name: "a targetless DO NOTHING arbitrates every unique constraint",
+    statements: [
+      "CREATE TABLE people (id INTEGER PRIMARY KEY, email TEXT UNIQUE, x INTEGER, y INTEGER, UNIQUE (x, y))",
+      "INSERT INTO people VALUES (1, 'a', 1, 1)",
+      "INSERT INTO people VALUES (2, 'a', 2, 2), (3, 'b', 1, 1), (1, 'c', 3, 3), (4, 'd', 4, 4) ON CONFLICT DO NOTHING RETURNING id",
+      "INSERT INTO people VALUES (5, 'e', NULL, 1), (6, 'f', NULL, 1), (7, 'e', 7, 7) ON CONFLICT DO NOTHING RETURNING id",
+      "SELECT id, email, x, y FROM people ORDER BY id",
+    ],
+  },
+  {
+    name: "the INSERT target alias qualifies conflict expressions and RETURNING",
+    statements: [
+      "CREATE TABLE stock (sku TEXT PRIMARY KEY, qty INTEGER NOT NULL)",
+      "INSERT INTO stock VALUES ('a', 1)",
+      "INSERT INTO stock AS s VALUES ('a', 5), ('b', 2) ON CONFLICT (sku) DO UPDATE SET qty = s.qty + EXCLUDED.qty WHERE s.qty < 10 RETURNING sku, qty * 2 AS doubled",
+      {
+        sql: "INSERT INTO stock AS s VALUES ('c', 3) RETURNING s.sku, s.qty",
+        sqlite: "INSERT INTO stock AS s VALUES ('c', 3) RETURNING sku, qty",
+      },
+      {
+        sql: "INSERT INTO stock AS s VALUES ('d', 4) RETURNING s.*",
+        sqlite: "INSERT INTO stock AS s VALUES ('d', 4) RETURNING *",
+      },
+      "SELECT sku, qty FROM stock ORDER BY sku",
+    ],
+  },
+  {
+    name: "a renamed column keeps its rows, index, uniqueness, and key",
+    statements: [
+      "CREATE TABLE things (id INTEGER PRIMARY KEY, a INTEGER, b TEXT UNIQUE)",
+      "CREATE INDEX things_a ON things (a)",
+      "INSERT INTO things VALUES (1, 10, 'x'), (2, 20, 'y')",
+      "ALTER TABLE things RENAME COLUMN a TO amount",
+      "SELECT id, amount FROM things WHERE amount = 20 ORDER BY id",
+      "SELECT a FROM things ORDER BY id",
+      "INSERT INTO things (id, amount, b) VALUES (3, 30, 'x')",
+      "UPDATE things SET amount = amount + 1 WHERE amount > 15 RETURNING id, amount",
+      "ALTER TABLE things RENAME b TO label",
+      "ALTER TABLE things RENAME COLUMN id TO thing_id",
+      "INSERT INTO things VALUES (2, 0, 'z') ON CONFLICT (thing_id) DO UPDATE SET label = EXCLUDED.label",
+      "ALTER TABLE things RENAME COLUMN missing TO other",
+      "ALTER TABLE things RENAME COLUMN amount TO label",
+      { sql: "ALTER TABLE things ADD COLUMN IF NOT EXISTS amount INTEGER", sqlite: null },
+      {
+        sql: "ALTER TABLE things ADD COLUMN IF NOT EXISTS note TEXT DEFAULT 'n'",
+        sqlite: "ALTER TABLE things ADD COLUMN note TEXT DEFAULT 'n'",
+      },
+      "SELECT thing_id, amount, label, note FROM things ORDER BY thing_id",
+    ],
+  },
+  {
+    name: "UPDATE takes the row-value and DEFAULT assignments",
+    statements: [
+      "CREATE TABLE tasks (id INTEGER PRIMARY KEY, state TEXT NOT NULL DEFAULT 'open', owner TEXT, n INTEGER DEFAULT 7)",
+      "INSERT INTO tasks (id, state, owner, n) VALUES (1, 'done', 'ann', 1), (2, 'done', 'bo', 2)",
+      "UPDATE tasks SET (owner, n) = (owner || '!', n + 10) WHERE id = 1 RETURNING id, owner, n",
+      {
+        sql: "UPDATE tasks SET (owner, n) = ROW('cy', 3) WHERE id = 2",
+        sqlite: "UPDATE tasks SET (owner, n) = ('cy', 3) WHERE id = 2",
+      },
+      "UPDATE tasks SET (owner, n) = ROW('x') WHERE id = 2",
+      {
+        sql: "UPDATE tasks SET state = DEFAULT, n = DEFAULT WHERE id = 2 RETURNING state, n",
+        sqlite: "UPDATE tasks SET state = 'open', n = 7 WHERE id = 2 RETURNING state, n",
+      },
+      {
+        sql: "UPDATE tasks SET owner = DEFAULT WHERE id = 1",
+        sqlite: "UPDATE tasks SET owner = NULL WHERE id = 1",
+      },
+      "SELECT id, state, owner, n FROM tasks ORDER BY id",
+    ],
+  },
+];
+
+interface ScenarioEngines {
+  minnow: MinnowDatabase;
+  sqlite: DatabaseSync;
+  pglite: PgliteOracle;
+}
+
+/** One statement's observable outcome on one engine, spelled so engines compare as strings. */
+async function scenarioOutcome(
+  engine: keyof ScenarioEngines,
+  sql: string,
+  engines: ScenarioEngines,
+): Promise<string> {
+  const select = /^\s*SELECT\b/i.test(sql);
+  const returning = /\bRETURNING\b/i.test(sql);
+  const counted = /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql);
+  try {
+    if (engine === "minnow") {
+      const result = await engines.minnow.execute(sql);
+      if (result.kind === "rows") return `rows ${keys(result.result.rows, true).join(" ")}`;
+      if (result.kind === "insert" || result.kind === "update" || result.kind === "delete") {
+        const returned = returning
+          ? ` returned ${keys(result.returnedRows ?? [], false).join(" ")}`
+          : "";
+        return `count ${String(result.rowCount)}${returned}`;
+      }
+      return "ok";
+    }
+    if (engine === "sqlite") {
+      const prepared = engines.sqlite.prepare(sql);
+      if (select) return `rows ${keys(prepared.all(), true).join(" ")}`;
+      if (returning) {
+        const rows = prepared.all();
+        return `count ${String(rows.length)} returned ${keys(rows, false).join(" ")}`;
+      }
+      const changes = Number(prepared.run().changes);
+      return counted ? `count ${String(changes)}` : "ok";
+    }
+    const result = await engines.pglite.run(sql);
+    if (select) return `rows ${keys(result.rows, true).join(" ")}`;
+    if (returning) {
+      return `count ${String(result.rows.length)} returned ${keys(result.rows, false).join(" ")}`;
+    }
+    return counted ? `count ${String(result.count)}` : "ok";
+  } catch {
+    // Error texts differ between engines; whether the statement was refused has to agree.
+    return "error";
+  }
+}
+
+describe("DML and DDL scenarios against SQLite and PGlite", () => {
+  it.each(SCENARIOS.map((scenario) => [scenario.name, scenario] as const))(
+    "%s",
+    async (_name, scenario) => {
+      const engines: ScenarioEngines = {
+        minnow: new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 16 }),
+        sqlite: new DatabaseSync(":memory:"),
+        pglite: await pgliteOracle(),
+      };
+      engines.sqlite.exec("PRAGMA foreign_keys = ON");
+      const failures: string[] = [];
+      try {
+        for (const statement of scenario.statements) {
+          const sql = typeof statement === "string" ? statement : statement.sql;
+          const spelled = (oracle: "sqlite" | "pg"): string | null =>
+            typeof statement === "string" || statement[oracle] === undefined
+              ? sql
+              : statement[oracle];
+          const minnowOutcome = await scenarioOutcome("minnow", sql, engines);
+          for (const [oracle, oracleSql] of [
+            ["sqlite", spelled("sqlite")],
+            ["pglite", spelled("pg")],
+          ] as const) {
+            if (oracleSql === null) continue;
+            const oracleOutcome = await scenarioOutcome(oracle, oracleSql, engines);
+            if (oracleOutcome !== minnowOutcome) {
+              failures.push(
+                `${sql}\n    minnow: ${minnowOutcome}\n    ${oracle}: ${oracleOutcome}`,
+              );
+            }
+          }
+        }
+      } finally {
+        await engines.minnow.close();
+        engines.sqlite.close();
+        await engines.pglite.close();
+      }
+      if (failures.length > 0) expect.fail(failures.join("\n\n"));
+    },
+    60_000,
   );
 });

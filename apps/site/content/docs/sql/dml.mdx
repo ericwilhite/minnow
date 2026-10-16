@@ -33,14 +33,17 @@ INSERT INTO invoices (invoice_no, customer_id)
 VALUES ((SELECT MAX(invoice_no) + 1 FROM invoices), $1)
 ```
 
-The column list may be omitted when every table column is supplied in declaration order:
+The column list may be omitted. The values then fill the table's columns in declaration order,
+and a row shorter than the table leaves the columns after it to their defaults, as PostgreSQL
+does:
 
 ```sql
 INSERT INTO shipments VALUES ('A-1', 1, CURRENT_TIMESTAMP)
 ```
 
-The value count must then equal the table's full column count. Prefer an explicit list in
-application code so a later schema change cannot silently change the positional meaning.
+Every row of one `VALUES` list has the same length, and no row may be longer than the table.
+Prefer an explicit list in application code so a later schema change cannot silently change the
+positional meaning.
 Statement-time and volatile values are evaluated when the statement runs, not when its cached
 plan is compiled: `CURRENT_DATE`, `CURRENT_TIMESTAMP` (also spelled `NOW()`,
 `transaction_timestamp()`, `statement_timestamp()`, or `clock_timestamp()`), and `LOCALTIME` are
@@ -75,6 +78,20 @@ UPDATE customers AS c
 SET order_count = (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.customer_id)
 WHERE c.signed_up_on < $1
 ```
+
+`SET` also takes PostgreSQL's row-value form, which assigns several columns at once, and the
+keyword `DEFAULT`, which assigns what an omitted `INSERT` slot would get — the column's default,
+or `NULL` when it has none:
+
+```sql
+UPDATE orders SET (status, discount) = ('refunded', 0) WHERE order_id = $1;
+UPDATE orders SET status = DEFAULT WHERE order_id = $1;
+```
+
+`= ROW(…)` spells the row value too. Every value reads the row as it was before the statement,
+so `SET (a, b) = (b, a)` swaps two columns. A sub-`SELECT` source, `SET (a, b) = (SELECT …)`, is
+not supported; give each column its own scalar subquery. `DEFAULT` is refused for an
+auto-increment column.
 
 Both statements take PostgreSQL's table alias (`UPDATE customers AS c`, `DELETE FROM orders o`),
 which the assignments, predicates, and `RETURNING` may qualify by. Subquery predicates work the
@@ -141,12 +158,36 @@ A string constant or bound parameter written into a datetime, number, or boolean
 in the column's type, the way PostgreSQL types an unknown literal by its target:
 `INSERT INTO orders (placed_at) VALUES ('2026-04-01T00:00:00Z')`, `SET quantity = '7'`, and a
 string bound to `$1` all store the typed value, and `RETURNING` echoes it. Text that does not
-parse in that type is refused with the column's type error. This is a property of SQL statements;
-the typed programmatic API still takes values of the column's JavaScript type.
+parse in that type is refused with the column's type error. In the other direction, a number or
+boolean written to a `TEXT` column stores its text form, `'42'` or `'true'`, PostgreSQL's
+assignment cast to text. A fractional number written to an `INTEGER` column is refused where
+PostgreSQL would round it; round it yourself with `ROUND()` or a cast. These are properties of
+SQL statements; the typed programmatic API still takes values of the column's JavaScript type.
+
+The conflict target names a constraint by its columns, in any order: the primary key, or a
+`UNIQUE` constraint or unique index. A proposal that collides on a `UNIQUE` column updates the
+row that holds the value, under that row's own key:
+
+```sql
+CREATE TABLE accounts (
+  account_id SERIAL PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  logins INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO accounts AS a (email) VALUES ($1)
+ON CONFLICT (email) DO UPDATE SET logins = a.logins + 1
+RETURNING account_id, logins
+```
+
+`INSERT INTO accounts AS a` names the target row for the assignments, the conflict predicate,
+and `RETURNING`; as in PostgreSQL, the `AS` is required there. A collision on a constraint other
+than the target is still an error. `ON CONFLICT ON CONSTRAINT name` is not supported; name the
+constraint's columns instead.
 
 `DO NOTHING` is also available, with or without a conflict target — a bare `ON CONFLICT DO
-NOTHING` skips rows that collide on the table's unique key — and a later duplicate key in the same
-`VALUES` list is skipped after the first proposal is retained. `EXCLUDED` refers to the row that would have been inserted,
+NOTHING` skips rows that collide on any unique constraint, the key or a `UNIQUE` column — and a
+later duplicate in the same `VALUES` list is skipped after the first proposal is retained. `EXCLUDED` refers to the row that would have been inserted,
 including its defaults; a bare column refers to the stored row. Assignments can combine both with
 parameters, constants, `CASE`, arithmetic, and scalar functions:
 
@@ -169,8 +210,9 @@ non-key column from `EXCLUDED`, and it remains well-defined for a table whose ke
 column.
 
 Conflict updates and fresh inserts from one statement publish atomically. One statement cannot
-update the same existing key twice. The conflict key itself cannot be reassigned, and aggregates,
-windows, and subqueries are not allowed in the assignment. A predicate after the assignment list
+update the same existing row twice, so it cannot propose the same target value twice either. The
+conflict target's columns cannot be reassigned, and aggregates, windows, and subqueries are not
+allowed in the assignment. A predicate after the assignment list
 can turn a conflict into a no-op:
 
 ```sql
@@ -199,7 +241,9 @@ The target qualifier is optional for columns and `*`, so PostgreSQL-builder outp
 `RETURNING products.product_id` and `RETURNING products.*` is equivalent. Any scalar expression
 works too, with the semantics it has in a `SELECT`: `RETURNING product_id, list_price * 1.05 AS
 next_price, UPPER(name) AS label` reads the post-update row for `UPDATE`, the written row for
-`INSERT`, and the removed row for `DELETE`. Aggregates are not allowed in `RETURNING`.
+`INSERT`, and the removed row for `DELETE`. Aggregates are not allowed in `RETURNING`, and it
+reads the target's rows only: a column of an `UPDATE … FROM` or `DELETE … USING` source is
+refused, where PostgreSQL would return it.
 
 ```ts
 const result = await db.execute(sql, [productId]);
