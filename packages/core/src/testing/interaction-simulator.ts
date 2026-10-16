@@ -32,6 +32,18 @@
  *   - rekey-forward (plans with `rekeying`): a rekey onto a live, repeated, or retired key is
  *     refused whole; references follow the moved rows; a retired key reads, writes, and compares
  *     as its row's current key on every connection, and stays reserved against inserts
+ *   - constraints (plans with `constraints`): each statement a UNIQUE column or index, or an
+ *     enforced foreign key, refuses fails with that constraint's error and changes nothing;
+ *     deletes cascade, set NULL, or are restricted down the tree of children
+ *   - upsert-arbiter: a proposal colliding on its conflict target updates the row holding the
+ *     value under that row's own key, and any other collision is refused
+ *   - unique-race: concurrent writes contending for one unique value land as some serial order
+ *   - index-lookup: selects shaped for the secondary-index path return the model's rows
+ *   - schema-change (plans with `schemaChanges`): an accepted ALTER TABLE lands for every
+ *     connection, and one the engine must refuse changes nothing
+ *   - full-text (plans with `fullText`): MATCH returns exactly the rows holding every term
+ *   - fold-progress (plans with `burstCommits`): a long run of single-row commits keeps the
+ *     table's visible segments bounded, so automatic folds keep up
  *
  * The runner is driver-agnostic. `SimulationDriver` opens connections over one shared database;
  * the Node driver wraps `MinnowDatabase` over any block store, and the Playwright driver wraps
@@ -52,15 +64,37 @@ export interface PlanColumn {
   readonly nullable: boolean;
   /**
    * `"self"` declares the column `REFERENCES <its table> (id) NOT ENFORCED`: an integer column
-   * that a rekey of the row it names moves, and whose written values follow retired keys.
+   * that a rekey of the row it names moves, and whose written values follow retired keys. A
+   * foreign key declares an enforced `REFERENCES <table> (id) ON DELETE <action>` column, which
+   * every write checks against the parent and which follows the parent's rekeys too.
    */
-  readonly references?: "self";
+  readonly references?: "self" | PlanForeignKey;
+  /** Declared `UNIQUE` inline: no two rows hold one non-null value. */
+  readonly unique?: boolean;
+  /**
+   * Generated values come from `0 .. domain - 1` (as numbers, or `k<n>` as text) instead of the
+   * type's small default range, so a column meant to be unique collides now and then rather
+   * than on almost every write, and a foreign key names a parent key most of the time.
+   */
+  readonly domain?: number;
+  /** A constant `DEFAULT`; only columns added by `ALTER TABLE ... ADD COLUMN` carry one. */
+  readonly default?: PlanValue;
+}
+
+export interface PlanForeignKey {
+  readonly table: string;
+  readonly onDelete: "cascade" | "set null" | "restrict";
 }
 
 export interface PlanTable {
   readonly name: string;
   /** Every table has `id INTEGER PRIMARY KEY`; these are the other columns. */
   readonly columns: readonly PlanColumn[];
+  /**
+   * A keyless table (`id INTEGER` with no key): rows are only ever appended, which is what lets
+   * a full-text index cover it. Plans give every appended row a distinct `id`.
+   */
+  readonly appendOnly?: boolean;
 }
 
 export type PlanValue = number | string | boolean | null;
@@ -77,6 +111,8 @@ export type Predicate =
       readonly value: PlanValue;
     }
   | { readonly kind: "isNull"; readonly column: string; readonly negated: boolean }
+  /** `column IN (values)`; the values are never NULL. */
+  | { readonly kind: "in"; readonly column: string; readonly values: readonly PlanValue[] }
   | { readonly kind: "and"; readonly left: Predicate; readonly right: Predicate }
   | { readonly kind: "or"; readonly left: Predicate; readonly right: Predicate }
   | { readonly kind: "not"; readonly inner: Predicate }
@@ -182,12 +218,86 @@ export type Interaction =
       readonly table: string;
       readonly name: string;
       readonly columns: readonly string[];
+      /**
+       * `CREATE UNIQUE INDEX`: refused when the rows already hold a duplicate, enforced on every
+       * write once built. Absent on an ordinary index.
+       */
+      readonly unique?: boolean;
+    }
+  | {
+      readonly kind: "dropIndex";
+      readonly connection: number;
+      readonly table: string;
+      readonly name: string;
+      /** `DROP INDEX IF EXISTS`, for an index whose build the generator cannot know succeeded. */
+      readonly ifExists: boolean;
     }
   | {
       readonly kind: "dropTable";
       readonly connection: number;
       readonly table: string;
       readonly expectMissing: boolean;
+      /** Another table's enforced foreign key references this one, so the drop is refused. */
+      readonly expectRefused?: boolean;
+    }
+  | {
+      /** `ALTER TABLE`: a schema change interleaved with the writes around it. */
+      readonly kind: "alterTable";
+      readonly connection: number;
+      readonly table: string;
+      readonly change: SchemaChange;
+      /** The engine must refuse the change (an index or foreign key still uses the column). */
+      readonly expectRefused: boolean;
+    }
+  | {
+      /**
+       * `INSERT ... ON CONFLICT (<unique columns>) DO UPDATE | DO NOTHING`, or a targetless
+       * `ON CONFLICT DO NOTHING` when `target` is null. A collision on the target updates the
+       * row that holds the value, under its own key; a collision on any other constraint is an
+       * error.
+       */
+      readonly kind: "upsertUnique";
+      readonly connection: number;
+      readonly table: string;
+      readonly row: PlanRow;
+      readonly target: readonly string[] | null;
+      /** Null for `DO NOTHING`; otherwise how each assigned column takes its new value. */
+      readonly assignments: readonly UpsertAssignment[] | null;
+    }
+  | {
+      /**
+       * A select shaped for an index: equality, `IN`, or a range on an indexed column, ordered by
+       * that column, so the answer comes through the secondary-index path as well as a scan.
+       */
+      readonly kind: "lookup";
+      readonly connection: number;
+      readonly table: string;
+      readonly predicate: Predicate;
+      /** Ordered by this column, then `id`; null orders by `id` alone. */
+      readonly orderBy: string | null;
+      readonly descending: boolean;
+      readonly limit: number | null;
+    }
+  | {
+      /** `SELECT * ... WHERE MATCH(columns) AGAINST 'query' [AND predicate] ORDER BY id`. */
+      readonly kind: "match";
+      readonly connection: number;
+      readonly table: string;
+      readonly columns: readonly string[];
+      readonly query: string;
+      readonly and: Predicate | null;
+    }
+  | {
+      /**
+       * A long run of single-row commits to one table from random connections: enough of them
+       * that automatic folds run underneath, so the rows and the table's segment count are
+       * judged across them. The commits are drawn from `seed` and the table as it stands.
+       */
+      readonly kind: "burst";
+      readonly table: string;
+      readonly seed: number;
+      readonly commits: number;
+      readonly keySpace: number;
     }
   | {
       readonly kind: "transaction";
@@ -231,6 +341,17 @@ export type Interaction =
   | { readonly kind: "maintenance"; readonly connection: number; readonly table: string }
   | { readonly kind: "checkpoint" };
 
+export type SchemaChange =
+  | { readonly kind: "addColumn"; readonly column: PlanColumn }
+  | { readonly kind: "dropColumn"; readonly column: string }
+  | { readonly kind: "renameColumn"; readonly column: string; readonly to: string };
+
+/** `column = EXCLUDED.column`, or `column = <alias>.column + 1` from the stored row. */
+export interface UpsertAssignment {
+  readonly column: string;
+  readonly from: "excluded" | "increment";
+}
+
 export type FaultPointName =
   | "beforeBlockWrite"
   | "afterBlockWrite"
@@ -264,6 +385,29 @@ export interface InteractionPlanOptions {
    * set, so every plan generated without it is unchanged and every recorded seed replays.
    */
   readonly rekeying?: boolean;
+  /**
+   * Adds constraints: tables with an inline `UNIQUE` column and a wide-domain column that may
+   * get a `UNIQUE` index, composite unique indexes, upserts that target a unique column, child
+   * tables with an enforced foreign key (`ON DELETE CASCADE`, `SET NULL`, or `RESTRICT`), and
+   * selects shaped for the secondary-index path. Like every option below, it draws from its own
+   * random stream and leaves plans generated without it unchanged.
+   */
+  readonly constraints?: boolean;
+  /**
+   * Adds `ALTER TABLE` interleaved with the writes: `ADD COLUMN` with a constant `DEFAULT`
+   * (sometimes reusing a dropped column's name), `DROP COLUMN`, `RENAME COLUMN`, and
+   * `CREATE` / `DROP INDEX`, including changes the engine must refuse. Columns are added and
+   * dropped only on tables nothing has written yet; `"populated"` lifts that, which currently
+   * reproduces tables that can no longer fold (see the generator's `addColumn`).
+   */
+  readonly schemaChanges?: boolean | "populated";
+  /** Adds full-text `MATCH` queries, over keyed tables and over append-only tables it indexes. */
+  readonly fullText?: boolean;
+  /**
+   * Adds write bursts of up to this many single-row commits to one table, enough to drive it
+   * through automatic folds; every plan with this set holds at least one burst.
+   */
+  readonly burstCommits?: number;
 }
 
 // --- Driver ----------------------------------------------------------------------------------------
@@ -285,6 +429,10 @@ export interface SimulatedConnection {
   reopen(): Promise<void>;
   /** Runs the store's maintenance (compaction and collection) for one table. */
   maintain?(table: string): Promise<void>;
+  /** The engine's plan text for a SELECT; used to count the reads a secondary index served. */
+  explain?(sql: string): Promise<string>;
+  /** Visible segments of one table now: what automatic folding keeps bounded. */
+  visibleSegments?(table: string): Promise<number>;
   /**
    * Kills the connection's process while a call may be in flight; the pending call must fail
    * with an unknown-outcome or lost-connection error, and `reopen` must bring the connection
@@ -337,6 +485,12 @@ export interface InteractionRunResult {
   readonly checkpoints: number;
   readonly tablesAtEnd: number;
   readonly rowsAtEnd: number;
+  /** Index-shaped lookups whose plan, where the driver can explain one, used a secondary index. */
+  readonly indexPathQueries: number;
+  /** Single-row commits that write bursts attempted. */
+  readonly burstCommits: number;
+  /** The most visible segments any table held at the end of a burst. */
+  readonly peakBurstSegments: number;
   /**
    * The one transient that ends a run instead of being modelled: a store that stopped answering.
    * A browser can wedge a whole database beyond any engine's reach (a worker terminated with a
@@ -436,16 +590,54 @@ export function generateInteractionPlan(
   // without rekeying -- stays exactly what it was.
   const rekeyRandom =
     options.rekeying === true ? createRandom((seed ^ 0x4e4b4559) >>> 0) : undefined;
+  // Each later option draws from a stream of its own in the same way.
+  const constraintRandom =
+    options.constraints === true ? createRandom((seed ^ 0x434f4e53) >>> 0) : undefined;
+  const schemaRandom =
+    options.schemaChanges === true || options.schemaChanges === "populated"
+      ? createRandom((seed ^ 0x414c5452) >>> 0)
+      : undefined;
+  const populatedSchemaChanges = options.schemaChanges === "populated";
+  const textRandom =
+    options.fullText === true ? createRandom((seed ^ 0x46545331) >>> 0) : undefined;
+  const burstCommits = options.burstCommits;
+  if (burstCommits !== undefined) checkRange("burstCommits", burstCommits, 1, 100_000);
+  const burstRandom =
+    burstCommits === undefined ? undefined : createRandom((seed ^ 0x42525354) >>> 0);
   const interactions: Interaction[] = [];
   // The generator keeps its own shadow of the schema so predicates name real columns and keyed
   // rounds target keys that can commute. Values are not tracked: the runner's model does that.
   const live = new Map<string, PlanTable>();
   const indexCount = new Map<string, number>();
+  // Schema the options add, tracked without drawing from any stream: the indexes on each table
+  // (an index whose build may meet a duplicate is not `definite`), which tables reference each
+  // table, the names a table's dropped columns had, and the append-only tables `MATCH` reads.
+  const indexes = new Map<string, GeneratedIndex[]>();
+  const children = new Map<string, Set<string>>();
+  const droppedColumns = new Map<string, string[]>();
+  const logs = new Map<string, PlanTable>();
+  // Tables some generated step has written to, brought up to date from `scanned` on demand.
+  const written = new Set<string>();
+  let scanned = 0;
+  let columnSerial = 0;
+  let indexSerial = 0;
+  let logSerial = 0;
+  let logRowSerial = 0;
+  let bursts = 0;
   let tableSerial = 0;
   const connection = (): number => random.int(connections);
   const anyTable = (): PlanTable | undefined => {
     const tables = [...live.values()];
     return tables.length === 0 ? undefined : random.pick(tables);
+  };
+  const trackIndex = (table: string, index: GeneratedIndex): void => {
+    indexes.set(table, [...(indexes.get(table) ?? []), index]);
+  };
+  const forgetTable = (name: string): void => {
+    indexes.delete(name);
+    children.delete(name);
+    droppedColumns.delete(name);
+    for (const set of children.values()) set.delete(name);
   };
 
   const createTable = (): void => {
@@ -461,7 +653,42 @@ export function generateInteractionPlan(
     if (rekeyRandom?.chance(0.6) === true) {
       columns.push({ name: "p", type: "integer", nullable: true, references: "self" });
     }
-    const table: PlanTable = { name: `t${String(tableSerial++)}`, columns };
+    const name = `t${String(tableSerial++)}`;
+    if (constraintRandom !== undefined) {
+      if (constraintRandom.chance(0.6)) {
+        columns.push({
+          name: "u",
+          type: constraintRandom.pick<ColumnType>(["integer", "text"]),
+          nullable: constraintRandom.chance(0.5),
+          unique: true,
+          domain: keySpace * 3,
+        });
+      }
+      if (constraintRandom.chance(0.4)) {
+        columns.push({
+          name: "v",
+          type: constraintRandom.pick<ColumnType>(["integer", "text"]),
+          nullable: true,
+          domain: keySpace * 4,
+        });
+      }
+      const parents = [...live.values()];
+      if (parents.length > 0 && constraintRandom.chance(0.6)) {
+        const parent = constraintRandom.pick(parents);
+        columns.push({
+          name: "f",
+          type: "integer",
+          nullable: true,
+          references: {
+            table: parent.name,
+            onDelete: constraintRandom.pick(["cascade", "set null", "restrict"] as const),
+          },
+          domain: keySpace + 2,
+        });
+        children.set(parent.name, (children.get(parent.name) ?? new Set()).add(name));
+      }
+    }
+    const table: PlanTable = { name, columns };
     live.set(table.name, table);
     interactions.push({
       kind: "createTable",
@@ -477,6 +704,353 @@ export function generateInteractionPlan(
         expectExisting: true,
       });
     }
+    // A fresh table is where ADD COLUMN may go (see addColumn), so it often gets one at once.
+    if (schemaRandom?.chance(0.5) === true) addColumn(schemaRandom, table.name);
+  };
+
+  /**
+   * `ALTER TABLE ... ADD COLUMN`, sometimes reusing a dropped column's name, `NOT NULL` with a
+   * constant default, nullable with one, or nullable without.
+   *
+   * Unless `schemaChanges` is `"populated"`, a column is added -- or dropped -- only on a table
+   * nothing has written yet. On a written table both currently leave it unable to fold: a fold
+   * refuses a full-row source segment that predates an added column, and an update segment
+   * whose only changed column was dropped, so its level-zero segments grow until writes are
+   * refused. Both fixes change what a stored compaction plan may hold or how a column drop
+   * retires segments; `"populated"` reproduces them until they land.
+   */
+  const refreshWritten = (): void => {
+    for (; scanned < interactions.length; scanned++) {
+      const interaction = interactions[scanned];
+      if (
+        interaction !== undefined &&
+        "table" in interaction &&
+        typeof interaction.table === "string" &&
+        WRITING_KINDS.has(interaction.kind)
+      ) {
+        written.add(interaction.table);
+      }
+    }
+  };
+  const addColumn = (stream: Random, name: string): void => {
+    refreshWritten();
+    const table = live.get(name);
+    if (table === undefined || (written.has(name) && !populatedSchemaChanges)) return;
+    const dropped = (droppedColumns.get(name) ?? []).filter(
+      (column) => !table.columns.some((candidate) => candidate.name === column),
+    );
+    const column = dropped.length > 0 && stream.chance(0.4) ? stream.pick(dropped) : undefined;
+    const added = column ?? `a${String(columnSerial++)}`;
+    const type = stream.pick<ColumnType>(["integer", "real", "text", "boolean"]);
+    const mode = stream.next();
+    const value = generateValue(stream, { name: added, type, nullable: false });
+    const definition: PlanColumn =
+      mode < 0.4
+        ? { name: added, type, nullable: false, default: value }
+        : mode < 0.7
+          ? { name: added, type, nullable: true, default: value }
+          : { name: added, type, nullable: true };
+    interactions.push({
+      kind: "alterTable",
+      connection: stream.int(connections),
+      table: name,
+      change: { kind: "addColumn", column: definition },
+      expectRefused: false,
+    });
+    live.set(name, { ...table, columns: [...table.columns, definition] });
+  };
+
+  /** Column sets an index serves on a table: its tracked indexes and its inline unique columns. */
+  const indexedColumnSets = (table: PlanTable): Array<readonly string[]> => [
+    ...(indexes.get(table.name) ?? []).map((index) => index.columns),
+    ...table.columns.filter((column) => column.unique === true).map((column) => [column.name]),
+  ];
+
+  const constraintStep = (stream: Random, table: PlanTable): void => {
+    const owner = stream.int(connections);
+    const roll = stream.next();
+    const uniqueColumns = table.columns.filter((column) => column.unique === true);
+    if (roll < 0.35 && uniqueColumns.length > 0) {
+      const target = stream.chance(0.15) ? null : [stream.pick(uniqueColumns).name];
+      const assignments: UpsertAssignment[] | null =
+        target === null || stream.chance(0.25)
+          ? null
+          : table.columns
+              .filter((column) => !target.includes(column.name))
+              .map((column) => ({
+                column: column.name,
+                from:
+                  column.type === "integer" && column.references === undefined && stream.chance(0.3)
+                    ? "increment"
+                    : "excluded",
+              }));
+      interactions.push({
+        kind: "upsertUnique",
+        connection: owner,
+        table: table.name,
+        row: generateRow(stream, table, keySpace),
+        target,
+        assignments,
+      });
+      return;
+    }
+    const sets = indexedColumnSets(table);
+    const columns = (): readonly string[] =>
+      sets.length > 0 ? stream.pick(sets) : [stream.pick(table.columns).name];
+    if (roll < 0.65) {
+      interactions.push({
+        kind: "lookup",
+        connection: owner,
+        table: table.name,
+        ...generateLookup(stream, table, columns(), keySpace),
+      });
+      return;
+    }
+    if (roll < 0.75) {
+      // A UNIQUE index on a wide column may meet a duplicate the rows already hold, so whether
+      // it exists is the runner's to know; one that includes the key always builds.
+      const name = `${table.name}_ux${String(indexSerial++)}`;
+      const wide = table.columns.filter(
+        (column) =>
+          column.domain !== undefined && column.unique !== true && column.references === undefined,
+      );
+      const indexed =
+        wide.length > 0 && stream.chance(0.5)
+          ? { columns: [stream.pick(wide).name], definite: false }
+          : { columns: [stream.pick(table.columns).name, "id"], definite: true };
+      interactions.push({
+        kind: "createIndex",
+        connection: owner,
+        table: table.name,
+        name,
+        columns: indexed.columns,
+        unique: true,
+      });
+      trackIndex(table.name, { name, unique: true, ...indexed });
+      return;
+    }
+    if (roll < 0.9) {
+      const predicate = indexPredicate(stream, table, columns(), keySpace);
+      if (stream.chance(0.6)) {
+        interactions.push({
+          kind: "update",
+          connection: owner,
+          table: table.name,
+          predicate,
+          assignments: generateAssignments(stream, table),
+        });
+      } else {
+        interactions.push({ kind: "delete", connection: owner, table: table.name, predicate });
+      }
+      return;
+    }
+    interactions.push({ kind: "maintenance", connection: owner, table: table.name });
+  };
+
+  /** Some inserts this step made omit the columns that have a default, which then fills them. */
+  const omitDefaults = (stream: Random, stepStart: number): void => {
+    for (let index = stepStart; index < interactions.length; index++) {
+      const interaction = interactions[index];
+      if (interaction?.kind !== "insert") continue;
+      const table = live.get(interaction.table);
+      const defaulted = (table?.columns ?? []).filter((column) => column.default !== undefined);
+      if (defaulted.length === 0 || !stream.chance(0.3)) continue;
+      interactions[index] = {
+        ...interaction,
+        rows: interaction.rows.map((row) =>
+          Object.fromEntries(
+            Object.entries(row).filter(
+              ([name]) => !defaulted.some((column) => column.name === name),
+            ),
+          ),
+        ),
+      };
+    }
+  };
+
+  const schemaStep = (stream: Random, table: PlanTable): void => {
+    const owner = stream.int(connections);
+    const roll = stream.next();
+    const alter = (change: SchemaChange, expectRefused: boolean): void => {
+      interactions.push({
+        kind: "alterTable",
+        connection: owner,
+        table: table.name,
+        change,
+        expectRefused,
+      });
+    };
+    const tableIndexes = indexes.get(table.name) ?? [];
+    if (roll < 0.25) {
+      addColumn(stream, table.name);
+      return;
+    }
+    if (roll < 0.55) {
+      if (table.columns.length <= 1) return;
+      // An index whose build may have failed leaves the drop's outcome unknown here; skip it.
+      const uncertain = new Set(
+        tableIndexes.filter((index) => !index.definite).flatMap((index) => index.columns),
+      );
+      const indexed = new Set(
+        tableIndexes.filter((index) => index.definite).flatMap((index) => index.columns),
+      );
+      const candidates = table.columns.filter((column) => !uncertain.has(column.name));
+      if (candidates.length === 0) return;
+      const column = stream.pick(candidates);
+      const refused =
+        column.unique === true || column.references !== undefined || indexed.has(column.name);
+      refreshWritten();
+      if (!refused && written.has(table.name) && !populatedSchemaChanges) return;
+      alter({ kind: "dropColumn", column: column.name }, refused);
+      if (!refused) {
+        live.set(table.name, {
+          ...table,
+          columns: table.columns.filter((candidate) => candidate !== column),
+        });
+        droppedColumns.set(table.name, [...(droppedColumns.get(table.name) ?? []), column.name]);
+      }
+      return;
+    }
+    if (roll < 0.75) {
+      const column = stream.pick(table.columns);
+      const refused = column.references !== undefined;
+      const dropped = (droppedColumns.get(table.name) ?? []).filter(
+        (name) => !table.columns.some((candidate) => candidate.name === name),
+      );
+      const to =
+        dropped.length > 0 && stream.chance(0.3)
+          ? stream.pick(dropped)
+          : `r${String(columnSerial++)}`;
+      alter({ kind: "renameColumn", column: column.name, to }, refused);
+      if (!refused) {
+        live.set(table.name, {
+          ...table,
+          columns: table.columns.map((candidate) =>
+            candidate === column ? { ...candidate, name: to } : candidate,
+          ),
+        });
+        indexes.set(
+          table.name,
+          tableIndexes.map((index) => ({
+            ...index,
+            columns: index.columns.map((name) => (name === column.name ? to : name)),
+          })),
+        );
+      }
+      return;
+    }
+    if (roll < 0.9) {
+      const first = stream.pick(table.columns).name;
+      const others = table.columns.filter((column) => column.name !== first);
+      const columns =
+        others.length > 0 && stream.chance(0.4) ? [first, stream.pick(others).name] : [first];
+      const name = `${table.name}_ax${String(indexSerial++)}`;
+      interactions.push({
+        kind: "createIndex",
+        connection: owner,
+        table: table.name,
+        name,
+        columns,
+      });
+      trackIndex(table.name, { name, columns, unique: false, definite: true });
+      return;
+    }
+    if (tableIndexes.length === 0) return;
+    const index = stream.pick(tableIndexes);
+    interactions.push({
+      kind: "dropIndex",
+      connection: owner,
+      table: table.name,
+      name: index.name,
+      ifExists: !index.definite,
+    });
+    indexes.set(
+      table.name,
+      tableIndexes.filter((candidate) => candidate !== index),
+    );
+  };
+
+  const textStep = (stream: Random): void => {
+    const owner = stream.int(connections);
+    if (logs.size === 0 || (logs.size < 2 && stream.chance(0.04))) {
+      const log: PlanTable = {
+        name: `l${String(logSerial++)}`,
+        appendOnly: true,
+        columns: [
+          { name: "body", type: "text", nullable: true },
+          { name: "tag", type: "text", nullable: true },
+          { name: "n", type: "integer", nullable: true },
+        ],
+      };
+      logs.set(log.name, log);
+      interactions.push({
+        kind: "createTable",
+        connection: owner,
+        table: log,
+        expectExisting: false,
+      });
+      return;
+    }
+    const log = stream.pick([...logs.values()]);
+    const roll = stream.next();
+    if (roll < 0.45) {
+      const rows = Array.from({ length: 1 + stream.int(6) }, () => ({
+        id: ++logRowSerial,
+        body: generatePhrase(stream),
+        tag: generatePhrase(stream),
+        n: stream.chance(0.2) ? null : stream.int(101) - 50,
+      }));
+      interactions.push({
+        kind: "insert",
+        connection: owner,
+        table: log.name,
+        rows,
+        viaParameters: stream.chance(0.5),
+      });
+      return;
+    }
+    const keyed = [...live.values()].filter((table) =>
+      table.columns.some((column) => column.type === "text"),
+    );
+    if (roll < 0.85 || keyed.length === 0) {
+      interactions.push({
+        kind: "match",
+        connection: owner,
+        table: log.name,
+        columns: stream.pick([["body"], ["tag"], ["body", "tag"]]),
+        query: generateTextQuery(stream),
+        and: stream.chance(0.25)
+          ? { kind: "compare", column: "id", op: ">", value: stream.int(logRowSerial + 1) }
+          : null,
+      });
+      return;
+    }
+    const table = stream.pick(keyed);
+    const text = table.columns
+      .filter((column) => column.type === "text")
+      .map((column) => column.name);
+    const first = stream.pick(text);
+    const second = stream.pick(text);
+    interactions.push({
+      kind: "match",
+      connection: owner,
+      table: table.name,
+      columns: first === second ? [first] : [first, second],
+      query: generateTextQuery(stream),
+      and: stream.chance(0.25) ? generatePredicate(stream, table, keySpace, 0) : null,
+    });
+  };
+
+  const burst = (stream: Random, table: PlanTable): void => {
+    const maximum = burstCommits ?? 1;
+    interactions.push({
+      kind: "burst",
+      table: table.name,
+      seed: stream.int(0x7fff_ffff),
+      commits: Math.ceil(maximum / 2) + stream.int(Math.floor(maximum / 2) + 1),
+      keySpace,
+    });
+    bursts++;
   };
 
   createTable();
@@ -486,6 +1060,7 @@ export function generateInteractionPlan(
       createTable();
       continue;
     }
+    const stepStart = interactions.length;
     const roll = random.next();
     if (roll < 0.2) {
       const rows = Array.from({ length: 1 + random.int(4) }, () =>
@@ -559,8 +1134,26 @@ export function generateInteractionPlan(
         name: `${table.name}_ix${String(serial)}`,
         columns,
       });
+      trackIndex(table.name, {
+        name: `${table.name}_ix${String(serial)}`,
+        columns,
+        unique: false,
+        definite: true,
+      });
+    } else if (roll < 0.72 && live.size > 1 && (children.get(table.name)?.size ?? 0) > 0) {
+      // Another table's enforced foreign key references this one: the drop is refused and the
+      // table stays. The draws match the unrefused branch's.
+      interactions.push({
+        kind: "dropTable",
+        connection: connection(),
+        table: table.name,
+        expectMissing: false,
+        expectRefused: true,
+      });
+      random.chance(0.4);
     } else if (roll < 0.72 && live.size > 1) {
       live.delete(table.name);
+      forgetTable(table.name);
       interactions.push({
         kind: "dropTable",
         connection: connection(),
@@ -689,6 +1282,19 @@ export function generateInteractionPlan(
         });
       }
     }
+    if (constraintRandom !== undefined && live.size > 0 && constraintRandom.chance(0.12)) {
+      constraintStep(constraintRandom, constraintRandom.pick([...live.values()]));
+    }
+    if (schemaRandom !== undefined) {
+      omitDefaults(schemaRandom, stepStart);
+      if (live.size > 0 && schemaRandom.chance(0.07)) {
+        schemaStep(schemaRandom, schemaRandom.pick([...live.values()]));
+      }
+    }
+    if (textRandom?.chance(0.08) === true) textStep(textRandom);
+    if (burstRandom !== undefined && live.size > 0 && burstRandom.chance(0.004)) {
+      burst(burstRandom, burstRandom.pick([...live.values()]));
+    }
     if (step % 25 === 24) interactions.push({ kind: "checkpoint" });
   }
   // Random fault steps deliberately retain mutation diversity, including duplicates and
@@ -697,6 +1303,7 @@ export function generateInteractionPlan(
   // These suffix steps consume no RNG, preserving the random prefix for every recorded seed.
   const faultTable = live.values().next().value;
   if (faultTable === undefined) throw new Error("Plan generation ended without a live table");
+  if (burstRandom !== undefined && bursts === 0) burst(burstRandom, faultTable);
   // With two or more connections, one transaction holds the writer turn while another
   // connection's write queues behind it; the keys sit past every fault probe's.
   if (connections >= 2) {
@@ -755,6 +1362,10 @@ function distinctIds(rows: readonly PlanRow[]): PlanRow[] {
 
 function generateValue(random: Random, column: PlanColumn): PlanValue {
   if (column.nullable && random.chance(0.15)) return null;
+  if (column.domain !== undefined && (column.type === "integer" || column.type === "text")) {
+    const value = random.int(column.domain);
+    return column.type === "integer" ? value : `k${String(value)}`;
+  }
   switch (column.type) {
     case "integer":
       return random.int(101) - 50;
@@ -777,6 +1388,19 @@ function generateRow(random: Random, table: PlanTable, keySpace: number): PlanRo
 function faultProbeRow(table: PlanTable, id: number): PlanRow {
   const row: Record<string, PlanValue> = { id };
   for (const column of table.columns) {
+    // A probe must be an effective write: it names no parent, and its value in a column that
+    // is or may become unique is its own, outside every generated domain.
+    if (column.references !== undefined && column.references !== "self") {
+      row[column.name] = null;
+      continue;
+    }
+    if (
+      (column.domain !== undefined || column.unique === true) &&
+      (column.type === "integer" || column.type === "text")
+    ) {
+      row[column.name] = column.type === "integer" ? 1_000_000 + id : `probe-${String(id)}`;
+      continue;
+    }
     switch (column.type) {
       case "integer":
       case "real":
@@ -912,6 +1536,159 @@ function generateRekey(
   };
 }
 
+/** Interaction kinds that can store rows in their table. */
+const WRITING_KINDS: ReadonlySet<Interaction["kind"]> = new Set([
+  "insert",
+  "update",
+  "delete",
+  "rekey",
+  "transaction",
+  "concurrent",
+  "fault",
+  "queuedWrite",
+  "upsertUnique",
+  "burst",
+]);
+
+/** An index the generator created: `definite` unless its build may meet a duplicate. */
+interface GeneratedIndex {
+  readonly name: string;
+  readonly columns: readonly string[];
+  readonly unique: boolean;
+  readonly definite: boolean;
+}
+
+/**
+ * A predicate the secondary-index path can serve: equality, `IN`, or a range on the leading
+ * column, or equality on it and a range on the next, sometimes with an unindexed conjunct.
+ */
+function indexPredicate(
+  random: Random,
+  table: PlanTable,
+  columns: readonly string[],
+  keySpace: number,
+): Predicate {
+  const columnOf = (name: string | undefined): PlanColumn =>
+    table.columns.find((column) => column.name === name) ?? {
+      name: "id",
+      type: "integer",
+      nullable: false,
+    };
+  const value = (column: PlanColumn): PlanValue =>
+    column.name === "id"
+      ? 1 + random.int(keySpace)
+      : generateValue(random, { ...column, nullable: false });
+  const compare = (column: PlanColumn, op: CompareOperator, at: PlanValue): Predicate => ({
+    kind: "compare",
+    column: column.name,
+    op,
+    value: at,
+  });
+  const leading = columnOf(columns[0]);
+  const roll = random.next();
+  let predicate: Predicate;
+  if (roll < 0.4 || (leading.type === "boolean" && roll < 0.65)) {
+    predicate = compare(leading, "=", value(leading));
+  } else if (roll < 0.65) {
+    const values = new Map<string, PlanValue>();
+    const count = 1 + random.int(4);
+    for (let index = 0; index < count; index++) {
+      const at = value(leading);
+      values.set(canonicalValue(at), at);
+    }
+    predicate = { kind: "in", column: leading.name, values: [...values.values()] };
+  } else if (roll < 0.9 || columns.length < 2) {
+    if (leading.type === "boolean") {
+      predicate = { kind: "in", column: leading.name, values: [true, false] };
+    } else {
+      const [low, high] = [value(leading), value(leading)].sort(compareValues);
+      const lower = compare(leading, random.pick<CompareOperator>([">", ">="]), low ?? null);
+      const upper = compare(leading, random.pick<CompareOperator>(["<", "<="]), high ?? null);
+      const shape = random.next();
+      predicate =
+        shape < 0.3 ? lower : shape < 0.6 ? upper : { kind: "and", left: lower, right: upper };
+    }
+  } else {
+    const next = columnOf(columns[1]);
+    predicate = {
+      kind: "and",
+      left: compare(leading, "=", value(leading)),
+      right:
+        next.type === "boolean"
+          ? compare(next, "=", value(next))
+          : compare(next, random.pick<CompareOperator>(["<", "<=", ">", ">="]), value(next)),
+    };
+  }
+  if (random.chance(0.3)) {
+    predicate = {
+      kind: "and",
+      left: predicate,
+      right: generatePredicate(random, table, keySpace, 1),
+    };
+  }
+  return predicate;
+}
+
+function generateLookup(
+  random: Random,
+  table: PlanTable,
+  columns: readonly string[],
+  keySpace: number,
+): Pick<
+  Extract<Interaction, { kind: "lookup" }>,
+  "predicate" | "orderBy" | "descending" | "limit"
+> {
+  const predicate = indexPredicate(random, table, columns, keySpace);
+  const leading = columns[0] ?? "id";
+  return {
+    predicate,
+    orderBy: leading !== "id" && random.chance(0.6) ? leading : null,
+    descending: random.chance(0.3),
+    limit: random.chance(0.3) ? 1 + random.int(5) : null,
+  };
+}
+
+/** Words a full-text column holds and a query asks for: cases, punctuation, and NFKC forms. */
+const TEXT_VOCABULARY = [
+  "alpha",
+  "alphabet",
+  "alp",
+  "bravo",
+  "Charlie",
+  "delta",
+  "echo",
+  "Echo-location",
+  "fox trot",
+  "Golf",
+  "ＧＯＬＦ",
+  "hotel",
+  "o'clock",
+  "zulu",
+  "42",
+] as const;
+
+function generatePhrase(random: Random): string | null {
+  if (random.chance(0.1)) return null;
+  const words = Array.from({ length: 1 + random.int(3) }, (): string =>
+    random.pick(TEXT_VOCABULARY),
+  );
+  return words.reduce(
+    (phrase, word) => `${phrase}${random.pick([" ", " ", ", ", "-", "/"])}${word}`,
+  );
+}
+
+/** One or two terms, sometimes a prefix (`go*`), sometimes a word no row holds. */
+function generateTextQuery(random: Random): string {
+  const chunks = Array.from({ length: 1 + random.int(2) }, () => {
+    const roll = random.next();
+    if (roll < 0.1) return "xylophone";
+    const word = random.pick(random.pick(TEXT_VOCABULARY).split(" "));
+    const cased = random.chance(0.3) ? word.toUpperCase() : word;
+    return roll < 0.35 ? `${cased.slice(0, 1 + random.int(3))}*` : cased;
+  });
+  return chunks.join(" ");
+}
+
 function generateKeyedMutation(random: Random, table: PlanTable, id: number): KeyedMutation {
   const roll = random.next();
   if (roll < 0.35) return { kind: "insert", row: { ...generateRow(random, table, 1), id } };
@@ -970,6 +1747,11 @@ function validateInteraction(value: unknown, connections: number, index: number)
   const checkTableName = (field = "table"): void => {
     if (typeof value[field] !== "string" || !/^[a-z][a-z0-9_]*$/u.test(value[field])) {
       throw new TypeError(`${where} has an invalid ${field}`);
+    }
+  };
+  const checkOptionalBoolean = (field: string): void => {
+    if (value[field] !== undefined && typeof value[field] !== "boolean") {
+      throw new TypeError(`${where} ${field} must be boolean`);
     }
   };
   switch (kind) {
@@ -1038,9 +1820,23 @@ function validateInteraction(value: unknown, connections: number, index: number)
       checkConnection("connection");
       checkTableName();
       checkTableName("name");
-      if (!Array.isArray(value.columns) || value.columns.length === 0 || value.columns.length > 4) {
+      if (
+        !Array.isArray(value.columns) ||
+        value.columns.length === 0 ||
+        value.columns.length > 4 ||
+        !value.columns.every((column) => isName(column))
+      ) {
         throw new TypeError(`${where} index columns are invalid`);
       }
+      checkOptionalBoolean("unique");
+      return;
+    }
+    case "dropIndex": {
+      checkConnection("connection");
+      checkTableName();
+      checkTableName("name");
+      if (typeof value.ifExists !== "boolean")
+        throw new TypeError(`${where} ifExists must be boolean`);
       return;
     }
     case "dropTable": {
@@ -1048,6 +1844,99 @@ function validateInteraction(value: unknown, connections: number, index: number)
       checkTableName();
       if (typeof value.expectMissing !== "boolean")
         throw new TypeError(`${where} expectMissing must be boolean`);
+      checkOptionalBoolean("expectRefused");
+      return;
+    }
+    case "alterTable": {
+      checkConnection("connection");
+      checkTableName();
+      if (typeof value.expectRefused !== "boolean")
+        throw new TypeError(`${where} expectRefused must be boolean`);
+      const change = value.change;
+      if (!isRecord(change)) throw new TypeError(`${where} change must be an object`);
+      if (change.kind === "addColumn") validateColumn(change.column, where);
+      else if (change.kind === "dropColumn") {
+        if (!isName(change.column)) throw new TypeError(`${where} column is invalid`);
+      } else if (change.kind === "renameColumn") {
+        if (!isName(change.column) || !isName(change.to) || change.to === "id") {
+          throw new TypeError(`${where} rename is invalid`);
+        }
+      } else throw new TypeError(`${where} change kind is invalid`);
+      return;
+    }
+    case "upsertUnique": {
+      checkConnection("connection");
+      checkTableName();
+      validateRow(value.row, where);
+      if (
+        value.target !== null &&
+        (!Array.isArray(value.target) ||
+          value.target.length === 0 ||
+          !value.target.every((column) => isName(column)))
+      ) {
+        throw new TypeError(`${where} conflict target is invalid`);
+      }
+      if (value.assignments !== null) {
+        if (value.target === null || !Array.isArray(value.assignments)) {
+          throw new TypeError(`${where} upsert assignments are invalid`);
+        }
+        for (const assignment of value.assignments as unknown[]) {
+          if (
+            !isRecord(assignment) ||
+            !isName(assignment.column) ||
+            assignment.column === "id" ||
+            (assignment.from !== "excluded" && assignment.from !== "increment")
+          ) {
+            throw new TypeError(`${where} upsert assignment is invalid`);
+          }
+        }
+      }
+      return;
+    }
+    case "lookup": {
+      checkConnection("connection");
+      checkTableName();
+      validatePredicate(value.predicate, where, 0);
+      if (value.orderBy !== null && !isName(value.orderBy))
+        throw new TypeError(`${where} orderBy is invalid`);
+      if (typeof value.descending !== "boolean")
+        throw new TypeError(`${where} descending must be boolean`);
+      const limit = value.limit;
+      if (
+        limit !== null &&
+        (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 0)
+      ) {
+        throw new TypeError(`${where} limit is invalid`);
+      }
+      return;
+    }
+    case "match": {
+      checkConnection("connection");
+      checkTableName();
+      if (
+        !Array.isArray(value.columns) ||
+        value.columns.length === 0 ||
+        value.columns.length > 8 ||
+        !value.columns.every((column) => isName(column))
+      ) {
+        throw new TypeError(`${where} MATCH columns are invalid`);
+      }
+      if (typeof value.query !== "string" || value.query.length > 256)
+        throw new TypeError(`${where} MATCH query is invalid`);
+      if (value.and !== null) validatePredicate(value.and, where, 0);
+      return;
+    }
+    case "burst": {
+      checkTableName();
+      for (const field of ["seed", "commits", "keySpace"] as const) {
+        const number = value[field];
+        if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 0) {
+          throw new TypeError(`${where} burst ${field} is invalid`);
+        }
+      }
+      if ((value.commits as number) > 100_000 || (value.keySpace as number) < 1) {
+        throw new TypeError(`${where} burst is out of range`);
+      }
       return;
     }
     case "queuedWrite": {
@@ -1191,20 +2080,45 @@ function validateTable(value: unknown, where: string): void {
   if (!Array.isArray(value.columns) || value.columns.length === 0 || value.columns.length > 32) {
     throw new TypeError(`${where} table columns are invalid`);
   }
-  for (const column of value.columns as unknown[]) {
-    if (
-      !isRecord(column) ||
-      typeof column.name !== "string" ||
-      !/^[a-z][a-z0-9_]*$/u.test(column.name) ||
-      column.name === "id" ||
-      !["integer", "real", "text", "boolean"].includes(column.type as string) ||
-      typeof column.nullable !== "boolean" ||
-      (column.references !== undefined &&
-        (column.references !== "self" || column.type !== "integer" || !column.nullable))
-    ) {
-      throw new TypeError(`${where} table column is invalid`);
-    }
+  if (value.appendOnly !== undefined && typeof value.appendOnly !== "boolean") {
+    throw new TypeError(`${where} appendOnly must be boolean`);
   }
+  for (const column of value.columns as unknown[]) validateColumn(column, where);
+}
+
+function isName(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_]*$/u.test(value);
+}
+
+function validateColumn(column: unknown, where: string): void {
+  if (
+    !isRecord(column) ||
+    !isName(column.name) ||
+    column.name === "id" ||
+    !["integer", "real", "text", "boolean"].includes(column.type as string) ||
+    typeof column.nullable !== "boolean" ||
+    (column.unique !== undefined && typeof column.unique !== "boolean") ||
+    (column.domain !== undefined &&
+      (typeof column.domain !== "number" ||
+        !Number.isSafeInteger(column.domain) ||
+        column.domain < 1))
+  ) {
+    throw new TypeError(`${where} table column is invalid`);
+  }
+  // A reference names a key: an integer column, nullable so a delete can clear it.
+  const references = column.references;
+  if (
+    references !== undefined &&
+    (column.type !== "integer" ||
+      !column.nullable ||
+      (references !== "self" &&
+        (!isRecord(references) ||
+          !isName(references.table) ||
+          !["cascade", "set null", "restrict"].includes(references.onDelete as string))))
+  ) {
+    throw new TypeError(`${where} column reference is invalid`);
+  }
+  if (column.default !== undefined) validateValue(column.default, where);
 }
 
 function validateRow(value: unknown, where: string): void {
@@ -1236,6 +2150,20 @@ function validatePredicate(value: unknown, where: string, depth: number): void {
     case "isNull":
       if (typeof value.column !== "string" || typeof value.negated !== "boolean") {
         throw new TypeError(`${where} IS NULL predicate is invalid`);
+      }
+      return;
+    case "in":
+      if (
+        typeof value.column !== "string" ||
+        !Array.isArray(value.values) ||
+        value.values.length === 0 ||
+        value.values.length > 64
+      ) {
+        throw new TypeError(`${where} IN predicate is invalid`);
+      }
+      for (const item of value.values as unknown[]) {
+        validateValue(item, where);
+        if (item === null) throw new TypeError(`${where} IN list holds NULL`);
       }
       return;
     case "and":
@@ -1296,6 +2224,13 @@ function validateKeyedMutation(value: unknown, where: string): number {
 
 type Truth = true | false | null;
 
+/**
+ * Why the engine must refuse a statement. A statement can break several constraints at once and
+ * the engine reports whichever it checks first, so any listed identity is the right answer.
+ */
+type RefusalKind = "unique" | "foreignKey" | "restrict";
+type Refusal = readonly RefusalKind[] | undefined;
+
 interface ModelTable {
   readonly definition: PlanTable;
   readonly rows: Map<number, PlanRow>;
@@ -1306,16 +2241,32 @@ interface ModelTable {
   readonly forwards: Map<number, number>;
 }
 
+/** A secondary index by name: what a `DROP COLUMN` must refuse, and a UNIQUE one enforces. */
+interface ModelIndex {
+  readonly table: string;
+  readonly columns: readonly string[];
+  readonly unique: boolean;
+}
+
 /** What a rekey statement does to the model, or why the engine must refuse it. */
 interface RekeyOutcome {
   readonly accepted: boolean;
+  readonly refusal: Refusal;
   readonly matched: number;
   /** Each key the statement retired, with the key its row moved to. */
   readonly retired: ReadonlyArray<readonly [number, number]>;
 }
 
+/** An enforced foreign key, seen from its parent. */
+interface ModelChild {
+  readonly table: string;
+  readonly column: string;
+  readonly onDelete: PlanForeignKey["onDelete"];
+}
+
 class ShadowModel {
   readonly tables = new Map<string, ModelTable>();
+  readonly indexes = new Map<string, ModelIndex>();
 
   clone(): ShadowModel {
     const copy = new ShadowModel();
@@ -1326,7 +2277,22 @@ class ShadowModel {
         forwards: new Map(table.forwards),
       });
     }
+    for (const [name, index] of this.indexes) copy.indexes.set(name, index);
     return copy;
+  }
+
+  /** Every table's rows, to put back when a statement turns out to be refused. */
+  #saveRows(): Map<string, Map<number, PlanRow>> {
+    return new Map([...this.tables].map(([name, table]) => [name, new Map(table.rows)]));
+  }
+
+  #restoreRows(saved: ReadonlyMap<string, ReadonlyMap<number, PlanRow>>): void {
+    for (const [name, rows] of saved) {
+      const table = this.tables.get(name);
+      if (table === undefined) continue;
+      table.rows.clear();
+      for (const [id, row] of rows) table.rows.set(id, row);
+    }
   }
 
   /** The current key a key names: itself, or the end of the chain of forwards it starts. */
@@ -1342,26 +2308,47 @@ class ShadowModel {
     }
   }
 
+  /** The table whose key a column of `name` holds, if it holds one. */
+  #referenced(name: string, column: PlanColumn): string | undefined {
+    if (column.references === undefined) return undefined;
+    return column.references === "self" ? name : column.references.table;
+  }
+
   /**
-   * The predicate as the engine runs it: a key equality or inequality against a constant -- on
-   * the primary key or a column referencing it -- names the row a retired key forwards to.
+   * The predicate as the engine runs it: a key equality, inequality, or `IN` against constants
+   * -- on the primary key or a column referencing a key -- names the row a retired key forwards
+   * to in the table that key belongs to.
    */
   resolvePredicate(name: string, predicate: Predicate): Predicate {
-    if (this.table(name).forwards.size === 0) return predicate;
-    const keyColumns = new Set([
-      "id",
-      ...this.table(name)
-        .definition.columns.filter((column) => column.references === "self")
-        .map((column) => column.name),
-    ]);
+    const keyColumns = new Map<string, string>([["id", name]]);
+    for (const column of this.table(name).definition.columns) {
+      const target = this.#referenced(name, column);
+      if (target !== undefined && this.tables.has(target)) keyColumns.set(column.name, target);
+    }
+    if (![...keyColumns.values()].some((table) => this.table(table).forwards.size > 0)) {
+      return predicate;
+    }
     const rewrite = (node: Predicate): Predicate => {
       switch (node.kind) {
-        case "compare":
-          return keyColumns.has(node.column) &&
+        case "compare": {
+          const target = keyColumns.get(node.column);
+          return target !== undefined &&
             (node.op === "=" || node.op === "<>") &&
             typeof node.value === "number"
-            ? { ...node, value: this.resolve(name, node.value) }
+            ? { ...node, value: this.resolve(target, node.value) }
             : node;
+        }
+        case "in": {
+          const target = keyColumns.get(node.column);
+          return target === undefined
+            ? node
+            : {
+                ...node,
+                values: node.values.map((value) =>
+                  typeof value === "number" ? this.resolve(target, value) : value,
+                ),
+              };
+        }
         case "not":
           return { kind: "not", inner: rewrite(node.inner) };
         case "and":
@@ -1380,18 +2367,110 @@ class ShadowModel {
 
   /** A row as the engine stores it: a referencing value written as a retired key is resolved. */
   #stored(name: string, row: PlanRow): PlanRow {
-    const table = this.table(name);
-    if (table.forwards.size === 0) return row;
     let stored: Record<string, PlanValue> | undefined;
-    for (const column of table.definition.columns) {
+    for (const column of this.table(name).definition.columns) {
+      const target = this.#referenced(name, column);
       const value = row[column.name];
-      if (column.references !== "self" || typeof value !== "number") continue;
-      const resolved = this.resolve(name, value);
+      if (target === undefined || typeof value !== "number") continue;
+      const table = this.tables.get(target);
+      if (table === undefined || table.forwards.size === 0) continue;
+      const resolved = this.resolve(target, value);
       if (resolved === value) continue;
       stored ??= { ...row };
       stored[column.name] = resolved;
     }
     return stored ?? row;
+  }
+
+  /** Column sets no two rows may share a non-null value of: inline UNIQUE and UNIQUE indexes. */
+  uniqueSets(name: string): Array<readonly string[]> {
+    return [
+      ...this.table(name)
+        .definition.columns.filter((column) => column.unique === true)
+        .map((column) => [column.name]),
+      ...[...this.indexes.values()]
+        .filter((index) => index.table === name && index.unique)
+        .map((index) => index.columns),
+    ];
+  }
+
+  #duplicates(rows: Iterable<PlanRow>, columns: readonly string[]): boolean {
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const values = columns.map((column) => row[column] ?? null);
+      if (values.some((value) => value === null)) continue;
+      const key = values.map(canonicalValue).join("\u0000");
+      if (seen.has(key)) return true;
+      seen.add(key);
+    }
+    return false;
+  }
+
+  #violatesUnique(name: string): boolean {
+    const rows = [...this.table(name).rows.values()];
+    return this.uniqueSets(name).some((columns) => this.#duplicates(rows, columns));
+  }
+
+  /** Whether a written row names a parent row that does not exist. */
+  #missingParent(name: string, rows: readonly PlanRow[]): boolean {
+    for (const column of this.table(name).definition.columns) {
+      if (column.references === undefined || column.references === "self") continue;
+      const parent = this.tables.get(column.references.table);
+      for (const row of rows) {
+        const value = row[column.name] ?? null;
+        if (value !== null && (typeof value !== "number" || parent?.rows.has(value) !== true)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** The enforced foreign keys that reference `name`. */
+  children(name: string): ModelChild[] {
+    const children: ModelChild[] = [];
+    for (const [table, model] of this.tables) {
+      for (const column of model.definition.columns) {
+        if (typeof column.references === "object" && column.references.table === name) {
+          children.push({ table, column: column.name, onDelete: column.references.onDelete });
+        }
+      }
+    }
+    return children;
+  }
+
+  /** The constraints a statement that wrote `written` into `name` breaks, if any. */
+  #check(name: string, written: readonly PlanRow[], kinds: Set<RefusalKind>): Refusal {
+    if (this.#missingParent(name, written)) kinds.add("foreignKey");
+    if (this.#violatesUnique(name)) kinds.add("unique");
+    return kinds.size === 0 ? undefined : [...kinds];
+  }
+
+  /**
+   * Removes rows by key and runs every `ON DELETE` action they set off, down the tree of
+   * enforced foreign keys: a `RESTRICT` child still naming a removed row refuses the statement.
+   */
+  #removeRows(name: string, ids: readonly number[]): Refusal {
+    const queue: Array<readonly [string, readonly number[]]> = [[name, ids]];
+    for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+      const [table, keys] = next;
+      const rows = this.table(table).rows;
+      for (const key of keys) rows.delete(key);
+      const removed = new Set(keys);
+      for (const child of this.children(table)) {
+        const childRows = this.table(child.table).rows;
+        const cascaded: number[] = [];
+        for (const [id, row] of childRows) {
+          const value = row[child.column];
+          if (typeof value !== "number" || !removed.has(value)) continue;
+          if (child.onDelete === "restrict") return ["restrict"];
+          if (child.onDelete === "cascade") cascaded.push(id);
+          else childRows.set(id, { ...row, [child.column]: null });
+        }
+        if (cascaded.length > 0) queue.push([child.table, cascaded]);
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -1408,6 +2487,12 @@ class ShadowModel {
   ): RekeyOutcome {
     const table = this.table(name);
     const matched = this.matching(name, predicate);
+    const refused = (refusal: Refusal): RekeyOutcome => ({
+      accepted: false,
+      refusal,
+      matched: matched.length,
+      retired: [],
+    });
     const oldKeys = new Set(matched.map(idOf));
     const moves = matched.map((row) => {
       const from = idOf(row);
@@ -1417,34 +2502,45 @@ class ShadowModel {
     });
     const targets = new Set<number>();
     for (const { from, to } of moves) {
-      if (targets.has(to)) return { accepted: false, matched: matched.length, retired: [] };
+      if (targets.has(to)) return refused(["unique"]);
       targets.add(to);
       if (to === from) continue;
-      if (table.rows.has(to) && !oldKeys.has(to)) {
-        return { accepted: false, matched: matched.length, retired: [] };
-      }
-      if (table.forwards.has(to)) return { accepted: false, matched: matched.length, retired: [] };
+      if (table.rows.has(to) && !oldKeys.has(to)) return refused(["unique"]);
+      if (table.forwards.has(to)) return refused(["unique"]);
     }
+    const saved = this.#saveRows();
     const renamed = new Map<number, number>();
     for (const { from, to } of moves) if (from !== to) renamed.set(from, to);
     for (const { from } of moves) table.rows.delete(from);
+    const written: PlanRow[] = [];
     for (const { row, to } of moves) {
       const next = this.#stored(name, { ...assign(row, assignments), id: to });
       table.rows.set(to, next);
+      written.push(next);
     }
-    const references = table.definition.columns.filter((column) => column.references === "self");
-    if (references.length > 0 && renamed.size > 0) {
-      for (const [id, row] of table.rows) {
-        let moved: Record<string, PlanValue> | undefined;
-        for (const column of references) {
-          const value = row[column.name];
-          const target = typeof value === "number" ? renamed.get(value) : undefined;
-          if (target === undefined) continue;
-          moved ??= { ...row };
-          moved[column.name] = target;
+    if (renamed.size > 0) {
+      for (const [other, model] of this.tables) {
+        const references = model.definition.columns.filter(
+          (column) => this.#referenced(other, column) === name,
+        );
+        if (references.length === 0) continue;
+        for (const [id, row] of model.rows) {
+          let moved: Record<string, PlanValue> | undefined;
+          for (const column of references) {
+            const value = row[column.name];
+            const target = typeof value === "number" ? renamed.get(value) : undefined;
+            if (target === undefined) continue;
+            moved ??= { ...row };
+            moved[column.name] = target;
+          }
+          if (moved !== undefined) model.rows.set(id, moved);
         }
-        if (moved !== undefined) table.rows.set(id, moved);
       }
+    }
+    const refusal = this.#check(name, written, new Set());
+    if (refusal !== undefined) {
+      this.#restoreRows(saved);
+      return refused(refusal);
     }
     const retired: Array<readonly [number, number]> = [];
     for (const [from, to] of renamed) {
@@ -1452,7 +2548,7 @@ class ShadowModel {
       table.forwards.set(from, to);
       retired.push([from, to]);
     }
-    return { accepted: true, matched: matched.length, retired };
+    return { accepted: true, refusal: undefined, matched: matched.length, retired };
   }
 
   table(name: string): ModelTable {
@@ -1475,70 +2571,83 @@ class ShadowModel {
     return [...this.table(name).rows.values()].sort((left, right) => idOf(left) - idOf(right));
   }
 
-  /** A retired key stays reserved: inserting it is a duplicate, like inserting a live key. */
-  insert(name: string, rows: readonly PlanRow[]): boolean {
+  /**
+   * A retired key stays reserved: inserting it is a duplicate, like inserting a live key. An
+   * append-only table has no key to collide on. The statement lands whole or not at all.
+   */
+  insert(name: string, rows: readonly PlanRow[]): Refusal {
     const table = this.table(name);
+    const kinds = new Set<RefusalKind>();
     const staged = new Set<number>();
     for (const row of rows) {
       const id = idOf(row);
-      if (table.rows.has(id) || table.forwards.has(id) || staged.has(id)) return false;
+      if (table.definition.appendOnly === true) continue;
+      if (table.rows.has(id) || table.forwards.has(id) || staged.has(id)) kinds.add("unique");
       staged.add(id);
     }
-    for (const row of rows) {
-      table.rows.set(idOf(row), this.#stored(name, completeRow(table.definition, row)));
-    }
-    return true;
+    const saved = this.#saveRows();
+    const written = rows.map((row) => this.#stored(name, completeRow(table.definition, row)));
+    if (kinds.size === 0) for (const row of written) table.rows.set(idOf(row), row);
+    const refusal = this.#check(name, written, kinds);
+    if (refusal !== undefined) this.#restoreRows(saved);
+    return refusal;
   }
 
-  update(name: string, predicate: Predicate, assignments: readonly Assignment[]): number {
+  update(
+    name: string,
+    predicate: Predicate,
+    assignments: readonly Assignment[],
+  ): { count: number; refusal: Refusal } {
     const table = this.table(name);
-    let count = 0;
-    for (const row of this.matching(name, predicate)) {
-      table.rows.set(idOf(row), this.#stored(name, assign(row, assignments)));
-      count++;
-    }
-    return count;
+    const saved = this.#saveRows();
+    const matched = this.matching(name, predicate);
+    const written = matched.map((row) => this.#stored(name, assign(row, assignments)));
+    for (const row of written) table.rows.set(idOf(row), row);
+    const refusal = this.#check(name, written, new Set());
+    if (refusal !== undefined) this.#restoreRows(saved);
+    return { count: matched.length, refusal };
   }
 
-  delete(name: string, predicate: Predicate): number {
-    const table = this.table(name);
-    let count = 0;
-    for (const row of this.matching(name, predicate)) {
-      table.rows.delete(idOf(row));
-      count++;
-    }
-    return count;
+  delete(name: string, predicate: Predicate): { count: number; refusal: Refusal } {
+    const saved = this.#saveRows();
+    const matched = this.matching(name, predicate);
+    const refusal = this.#removeRows(name, matched.map(idOf));
+    if (refusal !== undefined) this.#restoreRows(saved);
+    return { count: matched.length, refusal };
   }
 
   /**
-   * Applies a keyed mutation; `false` means the engine must reject it (duplicate insert). A key
-   * that was retired names its row's current key, so an upsert of it writes that key.
+   * Applies a keyed mutation, or reports why the engine must refuse it. A key that was retired
+   * names its row's current key, so an upsert of it writes that key.
    */
-  applyKeyed(name: string, mutation: KeyedMutation): boolean {
+  applyKeyed(name: string, mutation: KeyedMutation): Refusal {
     const table = this.table(name);
+    if (mutation.kind === "insert") return this.insert(name, [mutation.row]);
+    const id = this.resolve(name, mutation.kind === "upsert" ? idOf(mutation.row) : mutation.id);
+    const saved = this.#saveRows();
+    let refusal: Refusal;
     switch (mutation.kind) {
-      case "insert":
-        return this.insert(name, [mutation.row]);
       case "upsert": {
-        const id = this.resolve(name, idOf(mutation.row));
-        table.rows.set(
-          id,
-          this.#stored(name, completeRow(table.definition, { ...mutation.row, id })),
-        );
-        return true;
+        const row = this.#stored(name, completeRow(table.definition, { ...mutation.row, id }));
+        table.rows.set(id, row);
+        refusal = this.#check(name, [row], new Set());
+        break;
       }
       case "updateKey": {
-        const id = this.resolve(name, mutation.id);
         const row = table.rows.get(id);
-        if (row !== undefined) {
-          table.rows.set(id, this.#stored(name, assign(row, mutation.assignments)));
-        }
-        return true;
+        if (row === undefined) return undefined;
+        const next = this.#stored(name, assign(row, mutation.assignments));
+        table.rows.set(id, next);
+        refusal = this.#check(name, [next], new Set());
+        break;
       }
       case "deleteKey":
-        table.rows.delete(this.resolve(name, mutation.id));
-        return true;
+        if (!table.rows.has(id)) return undefined;
+        refusal = this.#removeRows(name, [id]);
+        break;
     }
+    if (refusal !== undefined) this.#restoreRows(saved);
+    return refusal;
   }
 
   /** The row a keyed mutation reaches: its key, followed through any forwards. */
@@ -1548,6 +2657,147 @@ class ShadowModel {
       mutation.kind === "insert" || mutation.kind === "upsert" ? idOf(mutation.row) : mutation.id,
     );
   }
+
+  /**
+   * `INSERT ... ON CONFLICT (target) DO UPDATE | DO NOTHING`. A row holding the proposal's
+   * non-null target values is updated under its own key, the proposal's key ignored; with no such
+   * row the proposal inserts, and any other collision is an error. A targetless `DO NOTHING`
+   * skips a proposal that collides on the key or on any unique constraint. A retired proposal
+   * key names the key its row moved to, whether or not that row still exists.
+   */
+  upsertUnique(
+    name: string,
+    row: PlanRow,
+    target: readonly string[] | null,
+    assignments: readonly UpsertAssignment[] | null,
+  ): { count: number; refusal: Refusal } {
+    const table = this.table(name);
+    // Like every INSERT ... ON CONFLICT, the proposal's key is followed through its forwards
+    // first: a retired key proposes the row at the key it moved to.
+    const resolved: PlanRow = { ...row, id: this.resolve(name, idOf(row)) };
+    const proposal = this.#stored(name, completeRow(table.definition, resolved));
+    const holderOf = (columns: readonly string[]): PlanRow | undefined =>
+      [...table.rows.values()].find((stored) =>
+        columns.every((column) => {
+          const value = proposal[column] ?? null;
+          return value !== null && canonicalValue(stored[column] ?? null) === canonicalValue(value);
+        }),
+      );
+    const inserted = (): { count: number; refusal: Refusal } => {
+      const refusal = this.insert(name, [resolved]);
+      return { count: refusal === undefined ? 1 : 0, refusal };
+    };
+    if (target === null) {
+      const id = idOf(proposal);
+      const collides =
+        table.rows.has(id) ||
+        table.forwards.has(id) ||
+        this.uniqueSets(name).some((columns) => holderOf(columns) !== undefined);
+      return collides ? { count: 0, refusal: undefined } : inserted();
+    }
+    const holder = holderOf(target);
+    if (holder === undefined) return inserted();
+    // With nothing to assign the statement renders as DO NOTHING.
+    if (assignments === null || assignments.length === 0) return { count: 0, refusal: undefined };
+    const next: Record<string, PlanValue> = { ...holder };
+    for (const assignment of assignments) {
+      const stored = holder[assignment.column] ?? null;
+      next[assignment.column] =
+        assignment.from === "excluded"
+          ? (proposal[assignment.column] ?? null)
+          : typeof stored === "number"
+            ? stored + 1
+            : null;
+    }
+    const saved = this.#saveRows();
+    const written = this.#stored(name, next);
+    table.rows.set(idOf(holder), written);
+    const refusal = this.#check(name, [written], new Set());
+    if (refusal !== undefined) this.#restoreRows(saved);
+    return { count: 1, refusal };
+  }
+
+  /** Creates a table, or names the enforced foreign key that refuses a drop. */
+  createTable(definition: PlanTable): void {
+    this.tables.set(definition.name, { definition, rows: new Map(), forwards: new Map() });
+  }
+
+  dropTable(name: string): void {
+    this.tables.delete(name);
+    for (const [index, model] of this.indexes) if (model.table === name) this.indexes.delete(index);
+  }
+
+  /** Whether `CREATE [UNIQUE] INDEX` is refused (a UNIQUE one over rows holding a duplicate). */
+  createIndex(name: string, table: string, columns: readonly string[], unique: boolean): boolean {
+    const known = new Set(this.columns(table));
+    if (columns.some((column) => !known.has(column))) {
+      throw new Error(`Model has no column ${columns.join(", ")} on ${table}`);
+    }
+    if (unique && this.#duplicates(this.table(table).rows.values(), columns)) return true;
+    this.indexes.set(name, { table, columns, unique });
+    return false;
+  }
+
+  /** Whether the engine must refuse the change; when it may, the change is applied. */
+  alter(name: string, change: SchemaChange): boolean {
+    const table = this.table(name);
+    const definition = table.definition;
+    const replace = (columns: readonly PlanColumn[], rewrite: (row: PlanRow) => PlanRow): void => {
+      const rows = new Map([...table.rows].map(([id, row]) => [id, rewrite(row)]));
+      this.tables.set(name, {
+        definition: { ...definition, columns },
+        rows,
+        forwards: table.forwards,
+      });
+    };
+    if (change.kind === "addColumn") {
+      if (this.columns(name).includes(change.column.name)) {
+        throw new Error(`Model already has column ${change.column.name} on ${name}`);
+      }
+      replace([...definition.columns, change.column], (row) => ({
+        ...row,
+        [change.column.name]: change.column.default ?? null,
+      }));
+      return false;
+    }
+    const column = definition.columns.find((candidate) => candidate.name === change.column);
+    if (column === undefined) throw new Error(`Model has no column ${change.column} on ${name}`);
+    if (change.kind === "dropColumn") {
+      if (definition.columns.length <= 1) throw new Error("Plan drops a table's last column");
+      const indexed = [...this.indexes.values()].some(
+        (index) => index.table === name && index.columns.includes(column.name),
+      );
+      if (column.unique === true || column.references !== undefined || indexed) return true;
+      replace(
+        definition.columns.filter((candidate) => candidate !== column),
+        (row) => Object.fromEntries(Object.entries(row).filter(([key]) => key !== column.name)),
+      );
+      return false;
+    }
+    if (column.references !== undefined) return true;
+    if (this.columns(name).includes(change.to)) {
+      throw new Error(`Model already has column ${change.to} on ${name}`);
+    }
+    replace(
+      definition.columns.map((candidate) =>
+        candidate === column ? { ...candidate, name: change.to } : candidate,
+      ),
+      (row) =>
+        Object.fromEntries(
+          Object.entries(row).map(([key, value]) => [key === column.name ? change.to : key, value]),
+        ),
+    );
+    for (const [index, model] of this.indexes) {
+      if (model.table !== name) continue;
+      this.indexes.set(index, {
+        ...model,
+        columns: model.columns.map((candidate) =>
+          candidate === column.name ? change.to : candidate,
+        ),
+      });
+    }
+    return false;
+  }
 }
 
 function idOf(row: PlanRow): number {
@@ -1556,9 +2806,14 @@ function idOf(row: PlanRow): number {
   return id;
 }
 
+/** A row as written: a column it leaves out takes the column's default, or NULL. */
 function completeRow(definition: PlanTable, row: PlanRow): PlanRow {
   const complete: Record<string, PlanValue> = { id: idOf(row) };
-  for (const column of definition.columns) complete[column.name] = row[column.name] ?? null;
+  for (const column of definition.columns) {
+    complete[column.name] = Object.hasOwn(row, column.name)
+      ? (row[column.name] ?? null)
+      : (column.default ?? null);
+  }
   return complete;
 }
 
@@ -1572,6 +2827,40 @@ function assign(row: PlanRow, assignments: readonly Assignment[]): PlanRow {
     }
   }
   return next;
+}
+
+/** Full-text terms: NFKC, lowercased, runs of letters and digits. */
+function textTokens(text: string): string[] {
+  return (
+    text
+      .normalize("NFKC")
+      .toLowerCase()
+      .match(/[\p{L}\p{N}]+/gu) ?? []
+  );
+}
+
+/**
+ * Whether a row matches `MATCH(columns) AGAINST query`: every query term -- a chunk ending in
+ * `*` makes its last term a prefix -- is a token of some listed column. No terms match nothing.
+ */
+function matchesText(row: PlanRow, columns: readonly string[], query: string): boolean {
+  const terms: Array<{ term: string; prefix: boolean }> = [];
+  for (const chunk of query.split(/\s+/u)) {
+    if (chunk === "") continue;
+    const prefix = chunk.endsWith("*");
+    const tokens = textTokens(prefix ? chunk.slice(0, -1) : chunk);
+    tokens.forEach((term, index) => {
+      terms.push({ term, prefix: prefix && index === tokens.length - 1 });
+    });
+  }
+  if (terms.length === 0) return false;
+  const tokens = columns.flatMap((column) => {
+    const value = row[column];
+    return typeof value === "string" ? textTokens(value) : [];
+  });
+  return terms.every(({ term, prefix }) =>
+    tokens.some((token) => (prefix ? token.startsWith(term) : token === term)),
+  );
 }
 
 function compareValues(left: PlanValue, right: PlanValue): number {
@@ -1624,6 +2913,11 @@ export function evaluate(predicate: Predicate, row: PlanRow): Truth {
       }
     }
     // eslint-disable-next-line no-fallthrough -- every operator above returns
+    case "in": {
+      const value = row[predicate.column] ?? null;
+      if (value === null) return null;
+      return predicate.values.some((candidate) => compareValues(value, candidate) === 0);
+    }
     case "not": {
       const inner = evaluate(predicate.inner, row);
       return inner === null ? null : !inner;
@@ -1670,6 +2964,8 @@ export function renderPredicate(predicate: Predicate): string {
       return `${quote(predicate.column)} IS ${predicate.negated ? "NOT " : ""}NULL`;
     case "compare":
       return `${quote(predicate.column)} ${predicate.op} ${renderLiteral(predicate.value)}`;
+    case "in":
+      return `${quote(predicate.column)} IN (${predicate.values.map(renderLiteral).join(", ")})`;
     case "not":
       return `NOT (${renderPredicate(predicate.inner)})`;
     case "and":
@@ -1727,21 +3023,78 @@ function sqlType(type: ColumnType): string {
   }
 }
 
-function renderCreateTable(table: PlanTable): string {
-  const columns = table.columns.map(
-    (column) =>
-      `${quote(column.name)} ${sqlType(column.type)}${column.nullable ? "" : " NOT NULL"}` +
-      (column.references === "self" ? ` REFERENCES ${quote(table.name)} (id) NOT ENFORCED` : ""),
+function renderColumn(table: string, column: PlanColumn): string {
+  const references = column.references;
+  return (
+    `${quote(column.name)} ${sqlType(column.type)}${column.nullable ? "" : " NOT NULL"}` +
+    (column.default === undefined ? "" : ` DEFAULT ${renderLiteral(column.default)}`) +
+    (column.unique === true ? " UNIQUE" : "") +
+    (references === undefined
+      ? ""
+      : references === "self"
+        ? ` REFERENCES ${quote(table)} (id) NOT ENFORCED`
+        : ` REFERENCES ${quote(references.table)} (id) ON DELETE ${references.onDelete.toUpperCase()}`)
   );
-  return `CREATE TABLE ${quote(table.name)} (id INTEGER PRIMARY KEY, ${columns.join(", ")})`;
+}
+
+function renderCreateTable(table: PlanTable): string {
+  const columns = table.columns.map((column) => renderColumn(table.name, column));
+  const key = table.appendOnly === true ? "id INTEGER NOT NULL" : "id INTEGER PRIMARY KEY";
+  return `CREATE TABLE ${quote(table.name)} (${key}, ${columns.join(", ")})`;
+}
+
+function renderAlter(table: string, change: SchemaChange): string {
+  const target = `ALTER TABLE ${quote(table)}`;
+  switch (change.kind) {
+    case "addColumn":
+      return `${target} ADD COLUMN ${renderColumn(table, change.column)}`;
+    case "dropColumn":
+      return `${target} DROP COLUMN ${quote(change.column)}`;
+    case "renameColumn":
+      return `${target} RENAME COLUMN ${quote(change.column)} TO ${quote(change.to)}`;
+  }
+}
+
+function renderUpsertUnique(
+  interaction: Extract<Interaction, { kind: "upsertUnique" }>,
+  columns: readonly string[],
+): string {
+  const insert = renderInsert(interaction.table, columns, [interaction.row], false).sql.replace(
+    /^INSERT INTO "[^"]*"/u,
+    `INSERT INTO ${quote(interaction.table)} AS existing`,
+  );
+  if (interaction.target === null) return `${insert} ON CONFLICT DO NOTHING`;
+  const conflict = `${insert} ON CONFLICT (${interaction.target.map(quote).join(", ")})`;
+  if (interaction.assignments === null || interaction.assignments.length === 0) {
+    return `${conflict} DO NOTHING`;
+  }
+  const set = interaction.assignments
+    .map((assignment) =>
+      assignment.from === "excluded"
+        ? `${quote(assignment.column)} = excluded.${quote(assignment.column)}`
+        : `${quote(assignment.column)} = existing.${quote(assignment.column)} + 1`,
+    )
+    .join(", ");
+  return `${conflict} DO UPDATE SET ${set}`;
+}
+
+/**
+ * Columns a statement names: every column the rows all hold. A column every row leaves out is
+ * omitted, so its default fills it.
+ */
+function insertColumns(columns: readonly string[], rows: readonly PlanRow[]): string[] {
+  return columns.filter(
+    (column) => column === "id" || rows.every((row) => Object.hasOwn(row, column)),
+  );
 }
 
 function renderInsert(
   table: string,
-  columns: readonly string[],
+  allColumns: readonly string[],
   rows: readonly PlanRow[],
   viaParameters: boolean,
 ): { sql: string; params: PlanValue[] } {
+  const columns = insertColumns(allColumns, rows);
   const params: PlanValue[] = [];
   const tuples = rows.map((row) => {
     const cells = columns.map((column) => {
@@ -1810,6 +3163,9 @@ class PlanRunner {
   #faultsSkipped = 0;
   #reopens = 0;
   #checkpoints = 0;
+  #indexPathQueries = 0;
+  #burstCommits = 0;
+  #peakBurstSegments = 0;
 
   constructor(plan: InteractionPlan, driver: SimulationDriver, traceLength: number) {
     this.#plan = plan;
@@ -1853,6 +3209,9 @@ class PlanRunner {
       checkpoints: this.#checkpoints,
       tablesAtEnd: this.#model.tables.size,
       rowsAtEnd: rows,
+      indexPathQueries: this.#indexPathQueries,
+      burstCommits: this.#burstCommits,
+      peakBurstSegments: this.#peakBurstSegments,
       transientsAccepted: stoppedBy === undefined ? 0 : 1,
       stoppedBy,
     };
@@ -1956,7 +3315,43 @@ class PlanRunner {
         return this.#maintenance(interaction);
       case "checkpoint":
         return this.#checkpoint();
+      case "dropIndex":
+        return this.#dropIndex(interaction);
+      case "alterTable":
+        return this.#alterTable(interaction);
+      case "upsertUnique":
+        return this.#upsertUnique(interaction);
+      case "lookup":
+        return this.#lookup(interaction);
+      case "match":
+        return this.#match(interaction);
+      case "burst":
+        return this.#burst(interaction);
     }
+  }
+
+  /**
+   * Judges a statement the model refused: it must fail with one of the refusal's identities,
+   * and nothing of it may land. Returns the outcome so callers can add their own checks.
+   */
+  #expectRefusal(
+    refusal: NonNullable<Refusal>,
+    outcome: Outcome<unknown>,
+    what: string,
+    context = "",
+  ): void {
+    if (outcome.error === undefined) {
+      this.#fail(
+        `${what} was accepted, but the model refuses it (${refusal.join(" or ")})${context}`,
+      );
+    }
+    if (!matchesRefusal(outcome.error, refusal)) {
+      this.#fail(
+        `${what} failed with the wrong error, expected ${refusal.join(" or ")}: ${describeError(outcome.error)}`,
+        outcome.error,
+      );
+    }
+    this.#expectedFailures++;
   }
 
   async #createTable(interaction: Extract<Interaction, { kind: "createTable" }>): Promise<void> {
@@ -1980,11 +3375,7 @@ class PlanRunner {
     }
     if (outcome.error !== undefined)
       this.#fail(`CREATE TABLE failed: ${describeError(outcome.error)}`, outcome.error);
-    this.#model.tables.set(interaction.table.name, {
-      definition: interaction.table,
-      rows: new Map(),
-      forwards: new Map(),
-    });
+    this.#model.createTable(interaction.table);
   }
 
   async #insert(interaction: Extract<Interaction, { kind: "insert" }>): Promise<void> {
@@ -1995,20 +3386,15 @@ class PlanRunner {
       interaction.rows,
       interaction.viaParameters,
     );
-    const before = this.#model.clone();
-    const accepted = this.#model.insert(interaction.table, interaction.rows);
+    const refusal = this.#model.insert(interaction.table, interaction.rows);
     const outcome = await this.#attempt(interaction.connection, rendered.sql, rendered.params);
-    if (!accepted) {
-      this.#model = before;
-      if (outcome.error === undefined)
-        this.#fail("insert-select: a duplicate primary key was accepted");
-      if (!isUniqueViolation(outcome.error)) {
-        this.#fail(
-          `duplicate insert failed with the wrong error: ${describeError(outcome.error)}`,
-          outcome.error,
-        );
-      }
-      this.#expectedFailures++;
+    if (refusal !== undefined) {
+      this.#expectRefusal(
+        refusal,
+        outcome,
+        refusal.includes("unique") ? "duplicate insert" : "refused insert",
+        ` (insert-select)`,
+      );
       // Statement atomicity: none of the rows may have landed, including the non-duplicates.
       await this.#expectRows(
         interaction.connection,
@@ -2042,12 +3428,27 @@ class PlanRunner {
 
   async #update(interaction: Extract<Interaction, { kind: "update" }>): Promise<void> {
     const before = this.#model.sorted(interaction.table);
-    const expected = this.#model.update(
+    const { count: expected, refusal } = this.#model.update(
       interaction.table,
       interaction.predicate,
       interaction.assignments,
     );
     const sql = `UPDATE ${quote(interaction.table)} SET ${renderAssignments(interaction.assignments)} WHERE ${renderPredicate(interaction.predicate)}`;
+    if (refusal !== undefined) {
+      this.#expectRefusal(
+        refusal,
+        await this.#attempt(interaction.connection, sql),
+        "a refused UPDATE",
+        `\n  model rows before: ${canonicalRows(before, this.#model.columns(interaction.table))}`,
+      );
+      await this.#expectRows(
+        interaction.connection,
+        interaction.table,
+        this.#model.sorted(interaction.table),
+        "after a refused UPDATE",
+      );
+      return;
+    }
     const result = await this.#execute(interaction.connection, sql).catch((error: unknown) =>
       this.#fail(`UPDATE failed: ${describeError(error)}`, error),
     );
@@ -2067,12 +3468,30 @@ class PlanRunner {
 
   async #delete(interaction: Extract<Interaction, { kind: "delete" }>): Promise<void> {
     const before = this.#model.sorted(interaction.table);
-    const expected = this.#model.delete(interaction.table, interaction.predicate);
+    const { count: expected, refusal } = this.#model.delete(
+      interaction.table,
+      interaction.predicate,
+    );
     const where = renderPredicate(interaction.predicate);
-    const result = await this.#execute(
-      interaction.connection,
-      `DELETE FROM ${quote(interaction.table)} WHERE ${where}`,
-    ).catch((error: unknown) => this.#fail(`DELETE failed: ${describeError(error)}`, error));
+    const sql = `DELETE FROM ${quote(interaction.table)} WHERE ${where}`;
+    if (refusal !== undefined) {
+      this.#expectRefusal(
+        refusal,
+        await this.#attempt(interaction.connection, sql),
+        "a refused DELETE",
+        `\n  model rows before: ${canonicalRows(before, this.#model.columns(interaction.table))}`,
+      );
+      await this.#expectRows(
+        interaction.connection,
+        interaction.table,
+        this.#model.sorted(interaction.table),
+        "after a refused DELETE",
+      );
+      return;
+    }
+    const result = await this.#execute(interaction.connection, sql).catch((error: unknown) =>
+      this.#fail(`DELETE failed: ${describeError(error)}`, error),
+    );
     if (result.rowCount !== expected) {
       this.#fail(
         `delete-count: DELETE reported ${String(result.rowCount)} rows, model matched ${String(expected)}\n  model rows before: ${canonicalRows(before, this.#model.columns(interaction.table))}`,
@@ -2102,18 +3521,12 @@ class PlanRunner {
     const result = await this.#attempt(interaction.connection, sql);
     if (!outcome.accepted) {
       this.#model = before;
-      if (result.error === undefined) {
-        this.#fail(
-          `rekey-forward: a rekey onto a taken, repeated, or retired key was accepted\n  model rows before: ${canonicalRows(before.sorted(interaction.table), before.columns(interaction.table))}`,
-        );
-      }
-      if (!isUniqueViolation(result.error)) {
-        this.#fail(
-          `a refused rekey failed with the wrong error: ${describeError(result.error)}`,
-          result.error,
-        );
-      }
-      this.#expectedFailures++;
+      this.#expectRefusal(
+        outcome.refusal ?? ["unique"],
+        result,
+        "rekey-forward: a rekey onto a taken, repeated, or retired key",
+        `\n  model rows before: ${canonicalRows(before.sorted(interaction.table), before.columns(interaction.table))}`,
+      );
     } else {
       if (result.error !== undefined) {
         this.#fail(`rekey failed: ${describeError(result.error)}`, result.error);
@@ -2211,10 +3624,36 @@ class PlanRunner {
   }
 
   async #createIndex(interaction: Extract<Interaction, { kind: "createIndex" }>): Promise<void> {
-    const sql = `CREATE INDEX ${quote(interaction.name)} ON ${quote(interaction.table)} (${interaction.columns.map(quote).join(", ")})`;
-    await this.#execute(interaction.connection, sql).catch((error: unknown) =>
-      this.#fail(`CREATE INDEX failed: ${describeError(error)}`, error),
+    const unique = interaction.unique === true;
+    const sql = `CREATE ${unique ? "UNIQUE " : ""}INDEX ${quote(interaction.name)} ON ${quote(interaction.table)} (${interaction.columns.map(quote).join(", ")})`;
+    const refused = this.#model.createIndex(
+      interaction.name,
+      interaction.table,
+      interaction.columns,
+      unique,
     );
+    const outcome = await this.#attempt(interaction.connection, sql);
+    if (refused) {
+      if (outcome.error === undefined) {
+        this.#fail("a UNIQUE index was built over rows that hold a duplicate");
+      }
+      if (
+        !errorChainSome(
+          outcome.error,
+          (name, message) =>
+            name === "TypeError" &&
+            message === `UNIQUE index ${interaction.name} has a duplicate key`,
+        )
+      ) {
+        this.#fail(
+          `a UNIQUE index over a duplicate failed with the wrong error: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      }
+      this.#expectedFailures++;
+    } else if (outcome.error !== undefined) {
+      this.#fail(`CREATE INDEX failed: ${describeError(outcome.error)}`, outcome.error);
+    }
     await this.#expectRows(
       interaction.connection,
       interaction.table,
@@ -2243,9 +3682,43 @@ class PlanRunner {
       this.#expectedFailures++;
       return;
     }
+    const children = this.#model.children(interaction.table);
+    if ((interaction.expectRefused === true) !== children.length > 0) {
+      this.#fail(
+        `Plan expects dropping ${interaction.table} to be ${children.length > 0 ? "accepted" : "refused"}`,
+      );
+    }
+    if (children.length > 0) {
+      if (outcome.error === undefined) {
+        this.#fail(
+          `DROP TABLE removed ${interaction.table} while ${children[0]?.table ?? ""} references it`,
+        );
+      }
+      if (
+        !errorChainSome(
+          outcome.error,
+          (name, message) =>
+            name === "TypeError" &&
+            message?.startsWith(`Cannot drop ${interaction.table}: foreign key `) === true,
+        )
+      ) {
+        this.#fail(
+          `dropping a referenced table failed with the wrong error: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      }
+      this.#expectedFailures++;
+      await this.#expectRows(
+        interaction.connection,
+        interaction.table,
+        this.#model.sorted(interaction.table),
+        "after a refused DROP TABLE",
+      );
+      return;
+    }
     if (outcome.error !== undefined)
       this.#fail(`DROP TABLE failed: ${describeError(outcome.error)}`, outcome.error);
-    this.#model.tables.delete(interaction.table);
+    this.#model.dropTable(interaction.table);
     const select = await this.#attemptQuery(
       interaction.connection,
       `SELECT * FROM ${quote(interaction.table)}`,
@@ -2309,15 +3782,14 @@ class PlanRunner {
       this.#refuseTransaction("BEGIN", error);
     }
     let poisoned = false;
-    const accepted = this.#model.insert(interaction.table, interaction.rows);
+    const refused = this.#model.insert(interaction.table, interaction.rows);
     const rendered = renderInsert(interaction.table, columns, interaction.rows, true);
     const staged = await this.#attempt(interaction.connection, rendered.sql, rendered.params);
-    if (accepted && staged.error !== undefined) {
+    if (refused === undefined && staged.error !== undefined) {
       this.#refuseTransaction("INSERT inside a transaction", staged.error);
     }
-    if (!accepted) {
-      if (staged.error === undefined) this.#fail("a duplicate primary key was accepted");
-      this.#expectedFailures++;
+    if (refused !== undefined) {
+      this.#expectRefusal(refused, staged, "a refused insert inside a transaction");
       poisoned = true;
     }
     const sql = renderKeyed(interaction.table, columns, interaction.mutation);
@@ -2349,18 +3821,18 @@ class PlanRunner {
     if (end === "ROLLBACK") this.#model = committed;
     else this.#acceptedWrites++;
     const outcome = await queued;
-    const wouldAccept = this.#model.clone().applyKeyed(interaction.table, interaction.mutation);
+    const refusal = this.#model.applyKeyed(interaction.table, interaction.mutation);
     if (outcome.error === undefined) {
-      if (!wouldAccept) this.#fail("writer-turns: a queued write of an existing key was accepted");
-      this.#model.applyKeyed(interaction.table, interaction.mutation);
-      this.#acceptedWrites++;
-    } else if (isUniqueViolation(outcome.error)) {
-      if (wouldAccept) {
-        this.#fail(
-          `writer-turns: a queued write was refused as a duplicate: ${describeError(outcome.error)}`,
-        );
+      if (refusal !== undefined) {
+        this.#fail("writer-turns: a queued write the model refuses was accepted");
       }
+      this.#acceptedWrites++;
+    } else if (refusal !== undefined && matchesRefusal(outcome.error, refusal)) {
       this.#expectedFailures++;
+    } else if (refusal === undefined && isUniqueViolation(outcome.error)) {
+      this.#fail(
+        `writer-turns: a queued write was refused as a duplicate: ${describeError(outcome.error)}`,
+      );
     } else {
       this.#fail(
         `writer-turns: a queued write failed after the transaction ended: ${describeError(outcome.error)}`,
@@ -2412,70 +3884,62 @@ class PlanRunner {
     );
     let poisoned = false;
     for (const statement of interaction.statements) {
-      if (statement.kind === "insert") {
-        const accepted = this.#model.insert(interaction.table, statement.rows);
-        const rendered = renderInsert(interaction.table, columns, statement.rows, true);
-        const outcome = await this.#attempt(interaction.connection, rendered.sql, rendered.params);
-        if (accepted && outcome.error !== undefined)
-          this.#refuseTransaction("INSERT inside a transaction", outcome.error);
-        if (!accepted) {
-          if (outcome.error === undefined)
-            this.#fail("a duplicate primary key was accepted inside a transaction");
-          if (!isUniqueViolation(outcome.error)) {
-            this.#fail(
-              `duplicate insert inside a transaction failed with the wrong error: ${describeError(outcome.error)}`,
-              outcome.error,
-            );
-          }
-          this.#expectedFailures++;
-          // A failed statement inside a SQL transaction leaves the transaction unusable; the
-          // engine must refuse further statements and COMMIT must roll back, like PostgreSQL.
-          poisoned = true;
+      // Each statement is judged against the model as it runs: one the model refuses must fail
+      // with its identity, and leaves the transaction unusable -- the engine must refuse further
+      // statements and COMMIT must roll back, like PostgreSQL.
+      let refusal: Refusal;
+      let label: string;
+      let refused: string;
+      let sql: string;
+      let params: PlanValue[] | undefined;
+      switch (statement.kind) {
+        case "insert": {
+          refusal = this.#model.insert(interaction.table, statement.rows);
+          ({ sql, params } = renderInsert(interaction.table, columns, statement.rows, true));
+          label = "INSERT";
+          refused = `${refusal?.includes("unique") === true ? "duplicate" : "refused"} insert`;
           break;
         }
-      } else if (statement.kind === "rekey") {
-        const staged = this.#model.clone();
-        const outcome = this.#model.rekey(
-          interaction.table,
-          statement.predicate,
-          statement.key,
-          statement.assignments,
-        );
-        const result = await this.#attempt(
-          interaction.connection,
-          renderRekey(interaction.table, statement),
-        );
-        if (outcome.accepted && result.error !== undefined)
-          this.#refuseTransaction("a rekey inside a transaction", result.error);
-        if (!outcome.accepted) {
-          this.#model = staged;
-          if (result.error === undefined)
-            this.#fail(
-              "a rekey onto a taken, repeated, or retired key was accepted inside a transaction",
-            );
-          if (!isUniqueViolation(result.error)) {
-            this.#fail(
-              `a refused rekey inside a transaction failed with the wrong error: ${describeError(result.error)}`,
-              result.error,
-            );
-          }
-          this.#expectedFailures++;
-          poisoned = true;
+        case "rekey": {
+          const outcome = this.#model.rekey(
+            interaction.table,
+            statement.predicate,
+            statement.key,
+            statement.assignments,
+          );
+          refusal = outcome.accepted ? undefined : (outcome.refusal ?? ["unique"]);
+          sql = renderRekey(interaction.table, statement);
+          label = "a rekey";
+          refused = "a rekey onto a taken, repeated, or retired key";
           break;
         }
-      } else if (statement.kind === "update") {
-        this.#model.update(interaction.table, statement.predicate, statement.assignments);
-        const sql = `UPDATE ${quote(interaction.table)} SET ${renderAssignments(statement.assignments)} WHERE ${renderPredicate(statement.predicate)}`;
-        await this.#execute(interaction.connection, sql).catch((error: unknown) =>
-          this.#refuseTransaction("UPDATE inside a transaction", error),
-        );
-      } else {
-        this.#model.delete(interaction.table, statement.predicate);
-        await this.#execute(
-          interaction.connection,
-          `DELETE FROM ${quote(interaction.table)} WHERE ${renderPredicate(statement.predicate)}`,
-        ).catch((error: unknown) => this.#refuseTransaction("DELETE inside a transaction", error));
+        case "update":
+          refusal = this.#model.update(
+            interaction.table,
+            statement.predicate,
+            statement.assignments,
+          ).refusal;
+          sql = `UPDATE ${quote(interaction.table)} SET ${renderAssignments(statement.assignments)} WHERE ${renderPredicate(statement.predicate)}`;
+          label = "UPDATE";
+          refused = "a refused UPDATE";
+          break;
+        case "delete":
+          refusal = this.#model.delete(interaction.table, statement.predicate).refusal;
+          sql = `DELETE FROM ${quote(interaction.table)} WHERE ${renderPredicate(statement.predicate)}`;
+          label = "DELETE";
+          refused = "a refused DELETE";
+          break;
       }
+      const outcome = await this.#attempt(interaction.connection, sql, params);
+      if (refusal === undefined) {
+        if (outcome.error !== undefined) {
+          this.#refuseTransaction(`${label} inside a transaction`, outcome.error);
+        }
+        continue;
+      }
+      this.#expectRefusal(refusal, outcome, `${refused} inside a transaction`);
+      poisoned = true;
+      break;
     }
     if (!poisoned) {
       // transaction-isolation: the owner sees its own pending rows; an observer sees none.
@@ -2525,6 +3989,10 @@ class PlanRunner {
       before.keyedTarget(interaction.table, operation.mutation),
     );
     const serial = new Set(targets).size !== targets.length;
+    // Writes to distinct rows can still contend for one unique value. They run concurrently
+    // all the same, and are judged by the serial order that explains their outcomes.
+    const contended =
+      !serial && !uniqueValuesCommute(before, interaction.table, interaction.operations, targets);
     const run = async (operation: (typeof interaction.operations)[number]) => {
       const sql = renderKeyed(interaction.table, columns, operation.mutation);
       const outcome = await this.#attempt(operation.connection, sql);
@@ -2547,25 +4015,31 @@ class PlanRunner {
     const [writeOutcomes, readOutcomes] = serial
       ? [await writes, await Promise.all(interaction.readers.map(read))]
       : await Promise.all([writes, Promise.all(interaction.readers.map(read))]);
-    const touched = new Set<number>();
-    for (const [index, { operation, outcome }] of writeOutcomes.entries()) {
+    const touched = new Set<number>(targets);
+    if (contended) this.#explainContendedRound(interaction.table, before, writeOutcomes);
+    for (const [index, { operation, outcome }] of contended ? [] : writeOutcomes.entries()) {
       const id = keyOf(operation.mutation);
       touched.add(targets[index] ?? id);
       // A serial round's writes each see the ones before it.
-      const wouldAccept = (serial ? this.#model : before)
+      const refusal = (serial ? this.#model : before)
         .clone()
         .applyKeyed(interaction.table, operation.mutation);
       if (outcome.error === undefined) {
-        if (!wouldAccept)
-          this.#fail(`concurrent insert of an existing key ${String(id)} was accepted`);
-        this.#model.applyKeyed(interaction.table, operation.mutation);
-        this.#acceptedWrites++;
-      } else if (isUniqueViolation(outcome.error)) {
-        if (wouldAccept)
+        if (refusal !== undefined) {
           this.#fail(
-            `concurrent write on key ${String(id)} was refused as a duplicate: ${describeError(outcome.error)}`,
+            `concurrent write on key ${String(id)} was accepted, but the model refuses it (${refusal.join(" or ")})`,
           );
+        }
+        if (this.#model.applyKeyed(interaction.table, operation.mutation) !== undefined) {
+          this.#fail(`concurrent writes on key ${String(id)} did not commute in the model`);
+        }
+        this.#acceptedWrites++;
+      } else if (refusal !== undefined && matchesRefusal(outcome.error, refusal)) {
         this.#expectedFailures++;
+      } else if (refusal === undefined && isUniqueViolation(outcome.error)) {
+        this.#fail(
+          `concurrent write on key ${String(id)} was refused as a duplicate: ${describeError(outcome.error)}`,
+        );
       } else if (isConflict(outcome.error)) {
         this.#rejectedConflicts++;
       } else {
@@ -2620,25 +4094,87 @@ class PlanRunner {
     }
   }
 
+  /**
+   * unique-race: writes to distinct rows that contend for one unique value ran concurrently.
+   * Their outcomes must be those of some serial order -- of two writes claiming one free value,
+   * exactly one lands -- and the model becomes the state that order leaves. Lost commit races
+   * are counted, and any other error is a defect.
+   */
+  #explainContendedRound(
+    table: string,
+    before: ShadowModel,
+    settled: ReadonlyArray<{
+      readonly operation: { readonly mutation: KeyedMutation };
+      readonly outcome: Outcome<SimulatedExecuteResult>;
+    }>,
+  ): void {
+    const pending: number[] = [];
+    for (const [index, { outcome }] of settled.entries()) {
+      if (outcome.error === undefined) pending.push(index);
+      else if (isConflict(outcome.error)) this.#rejectedConflicts++;
+      else if (matchesRefusal(outcome.error, ["unique", "foreignKey", "restrict"])) {
+        pending.push(index);
+      } else {
+        this.#fail(
+          `a contended concurrent write failed unexpectedly: ${describeError(outcome.error)}`,
+        );
+      }
+    }
+    let budget = 20_000;
+    const search = (model: ShadowModel, remaining: readonly number[]): ShadowModel | undefined => {
+      if (remaining.length === 0) return model;
+      for (const index of remaining) {
+        if (--budget < 0) return undefined;
+        const entry = settled[index];
+        if (entry === undefined) continue;
+        const next = model.clone();
+        const refusal = next.applyKeyed(table, entry.operation.mutation);
+        const error = entry.outcome.error;
+        const explained =
+          error === undefined
+            ? refusal === undefined
+            : refusal !== undefined && matchesRefusal(error, refusal);
+        if (!explained) continue;
+        const found = search(
+          next,
+          remaining.filter((candidate) => candidate !== index),
+        );
+        if (found !== undefined) return found;
+      }
+      return undefined;
+    };
+    const explained = search(before.clone(), pending);
+    if (explained === undefined) {
+      this.#fail(
+        `unique-race: no serial order of the round's writes explains their outcomes\n  ${settled
+          .map(
+            ({ operation, outcome }) =>
+              `${JSON.stringify(operation.mutation)} -> ${outcome.error === undefined ? "accepted" : describeError(outcome.error)}`,
+          )
+          .join("\n  ")}`,
+      );
+    }
+    for (const index of pending) {
+      if (settled[index]?.outcome.error === undefined) this.#acceptedWrites++;
+      else this.#expectedFailures++;
+    }
+    this.#model = explained;
+  }
+
   async #fault(interaction: Extract<Interaction, { kind: "fault" }>): Promise<void> {
     const connection = this.#connection(interaction.connection);
     const columns = this.#model.columns(interaction.table);
     const sql = renderKeyed(interaction.table, columns, interaction.mutation);
     const before = this.#model.clone();
     const after = this.#model.clone();
-    const accepted = after.applyKeyed(interaction.table, interaction.mutation);
-    if (!accepted) {
-      // A duplicate insert is refused before any storage write; nothing to interrupt.
-      const outcome = await this.#attempt(interaction.connection, sql);
-      if (outcome.error === undefined)
-        this.#fail("a duplicate insert was accepted during a fault step");
-      if (!isUniqueViolation(outcome.error)) {
-        this.#fail(
-          `duplicate insert during a fault step failed with the wrong error: ${describeError(outcome.error)}`,
-          outcome.error,
-        );
-      }
-      this.#expectedFailures++;
+    const refusal = after.applyKeyed(interaction.table, interaction.mutation);
+    if (refusal !== undefined) {
+      // A refused write is refused before any storage write; nothing to interrupt.
+      this.#expectRefusal(
+        refusal,
+        await this.#attempt(interaction.connection, sql),
+        `${refusal.includes("unique") ? "duplicate" : "refused"} ${interaction.mutation.kind} during a fault step`,
+      );
       return;
     }
     let outcome: Outcome<SimulatedExecuteResult>;
@@ -2723,6 +4259,233 @@ class PlanRunner {
     } else {
       this.#fail(
         `fault-atomicity: after ${interaction.point} the table is neither before nor after the mutation\n  observed ${observed}\n  before   ${beforeRows}\n  after    ${afterRows}`,
+      );
+    }
+  }
+
+  /**
+   * schema-change: an `ALTER TABLE` the model accepts lands for every connection -- the rows
+   * read back under the new columns, a dropped column gone, an added one at its default -- and
+   * one it refuses (a column an index or foreign key still uses) changes nothing.
+   */
+  async #alterTable(interaction: Extract<Interaction, { kind: "alterTable" }>): Promise<void> {
+    const { change } = interaction;
+    const refused = this.#model.alter(interaction.table, change);
+    if (refused !== interaction.expectRefused) {
+      this.#fail(
+        `Plan expects ALTER TABLE ${change.kind} on ${interaction.table} to be ${interaction.expectRefused ? "refused" : "accepted"}`,
+      );
+    }
+    const outcome = await this.#attempt(
+      interaction.connection,
+      renderAlter(interaction.table, change),
+    );
+    if (refused) {
+      if (outcome.error === undefined) {
+        this.#fail(`schema-change: ALTER TABLE ${change.kind} of a column in use was accepted`);
+      }
+      const column = change.kind === "addColumn" ? change.column.name : change.column;
+      const expected = (name: string | undefined, message: string | undefined): boolean =>
+        name === "TypeError" &&
+        (change.kind === "dropColumn"
+          ? message?.endsWith(` still uses this column: ${interaction.table}.${column}`) === true
+          : message?.startsWith(`Cannot rename ${interaction.table}.${column}: `) === true);
+      if (!errorChainSome(outcome.error, expected)) {
+        this.#fail(
+          `a refused ALTER TABLE ${change.kind} failed with the wrong error: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      }
+      this.#expectedFailures++;
+    } else if (outcome.error !== undefined) {
+      this.#fail(
+        `ALTER TABLE ${change.kind} failed: ${describeError(outcome.error)}`,
+        outcome.error,
+      );
+    }
+    const context = refused ? "after a refused ALTER TABLE" : "after ALTER TABLE";
+    await this.#expectRows(
+      interaction.connection,
+      interaction.table,
+      this.#model.sorted(interaction.table),
+      context,
+    );
+    await this.#expectRows(
+      (interaction.connection + 1) % this.#plan.connections,
+      interaction.table,
+      this.#model.sorted(interaction.table),
+      `${context} (another connection)`,
+    );
+  }
+
+  async #dropIndex(interaction: Extract<Interaction, { kind: "dropIndex" }>): Promise<void> {
+    if (!interaction.ifExists && !this.#model.indexes.has(interaction.name)) {
+      this.#fail(`Plan drops index ${interaction.name}, which the model does not hold`);
+    }
+    const sql = `DROP INDEX ${interaction.ifExists ? "IF EXISTS " : ""}${quote(interaction.name)}`;
+    await this.#execute(interaction.connection, sql).catch((error: unknown) =>
+      this.#fail(`DROP INDEX failed: ${describeError(error)}`, error),
+    );
+    this.#model.indexes.delete(interaction.name);
+    await this.#expectRows(
+      interaction.connection,
+      interaction.table,
+      this.#model.sorted(interaction.table),
+      "after DROP INDEX",
+    );
+  }
+
+  /**
+   * upsert-arbiter: a proposal colliding on its conflict target updates the row holding the
+   * value, under that row's own key; one colliding on anything else is refused; the reported
+   * count is the rows written.
+   */
+  async #upsertUnique(interaction: Extract<Interaction, { kind: "upsertUnique" }>): Promise<void> {
+    const columns = this.#model.columns(interaction.table);
+    const before = this.#model.sorted(interaction.table);
+    const sql = renderUpsertUnique(interaction, columns);
+    const { count, refusal } = this.#model.upsertUnique(
+      interaction.table,
+      interaction.row,
+      interaction.target,
+      interaction.assignments,
+    );
+    const outcome = await this.#attempt(interaction.connection, sql);
+    const rowsBefore = `\n  model rows before: ${canonicalRows(before, columns)}`;
+    if (refusal !== undefined) {
+      this.#expectRefusal(refusal, outcome, "upsert-arbiter: a refused upsert", rowsBefore);
+    } else {
+      if (outcome.error !== undefined) {
+        this.#fail(`upsert failed: ${describeError(outcome.error)}${rowsBefore}`, outcome.error);
+      }
+      if (outcome.result?.rowCount !== count) {
+        this.#fail(
+          `upsert-arbiter: the upsert reported ${String(outcome.result?.rowCount)} rows, the model wrote ${String(count)}${rowsBefore}`,
+        );
+      }
+      this.#acceptedWrites++;
+    }
+    await this.#expectRows(
+      interaction.connection,
+      interaction.table,
+      this.#model.sorted(interaction.table),
+      refusal === undefined ? "after an upsert" : "after a refused upsert",
+    );
+  }
+
+  /** index-lookup: a select shaped for the secondary-index path returns the model's rows. */
+  async #lookup(interaction: Extract<Interaction, { kind: "lookup" }>): Promise<void> {
+    const columns = this.#model.columns(interaction.table);
+    const { orderBy, descending } = interaction;
+    const matching = this.#model.matching(interaction.table, interaction.predicate);
+    if (orderBy !== null) {
+      matching.sort((left, right) => {
+        const leftValue = left[orderBy] ?? null;
+        const rightValue = right[orderBy] ?? null;
+        // NULL sorts after every value ascending, as PostgreSQL orders it.
+        const order =
+          leftValue === null || rightValue === null
+            ? Number(leftValue === null) - Number(rightValue === null)
+            : compareValues(leftValue, rightValue);
+        return order !== 0 ? order : idOf(left) - idOf(right);
+      });
+    }
+    if (descending) matching.reverse();
+    const expected = interaction.limit === null ? matching : matching.slice(0, interaction.limit);
+    const direction = descending ? " DESC" : "";
+    const order =
+      orderBy === null
+        ? `ORDER BY id${direction}`
+        : `ORDER BY ${quote(orderBy)}${direction}, id${direction}`;
+    const limit = interaction.limit === null ? "" : ` LIMIT ${String(interaction.limit)}`;
+    const sql = `SELECT * FROM ${quote(interaction.table)} WHERE ${renderPredicate(interaction.predicate)} ${order}${limit}`;
+    const result = await this.#query(interaction.connection, sql).catch((error: unknown) =>
+      this.#fail(`SELECT failed: ${describeError(error)}`, error),
+    );
+    this.#compareRows(result, expected, columns, "index-lookup");
+    const connection = this.#connection(interaction.connection);
+    if (connection.explain !== undefined) {
+      const plan = await connection
+        .explain(sql)
+        .catch((error: unknown) => this.#fail(`EXPLAIN failed: ${describeError(error)}`, error));
+      if (plan.includes("secondary index")) this.#indexPathQueries++;
+    }
+  }
+
+  /** full-text: `MATCH ... AGAINST` returns exactly the rows holding every query term. */
+  async #match(interaction: Extract<Interaction, { kind: "match" }>): Promise<void> {
+    const columns = this.#model.columns(interaction.table);
+    const expected = this.#model
+      .sorted(interaction.table)
+      .filter(
+        (row) =>
+          matchesText(row, interaction.columns, interaction.query) &&
+          (interaction.and === null ||
+            this.#model.evaluate(interaction.table, interaction.and, row) === true),
+      );
+    const and = interaction.and === null ? "" : ` AND ${renderPredicate(interaction.and)}`;
+    const sql = `SELECT * FROM ${quote(interaction.table)} WHERE MATCH(${interaction.columns.map(quote).join(", ")}) AGAINST ${renderLiteral(interaction.query)}${and} ORDER BY id`;
+    const result = await this.#query(interaction.connection, sql).catch((error: unknown) =>
+      this.#fail(`MATCH failed: ${describeError(error)}`, error),
+    );
+    this.#compareRows(result, expected, columns, "full-text");
+  }
+
+  /**
+   * fold-progress: a long run of single-row commits from every connection, each judged as it
+   * lands, keeps the table's visible segments bounded -- automatic folds absorb what the
+   * commits add -- and leaves every connection reading the model's rows.
+   */
+  async #burst(interaction: Extract<Interaction, { kind: "burst" }>): Promise<void> {
+    const random = createRandom(interaction.seed);
+    const { table } = interaction;
+    for (let index = 0; index < interaction.commits; index++) {
+      const connection = random.int(this.#plan.connections);
+      const mutation = generateKeyedMutation(
+        random,
+        this.#model.table(table).definition,
+        1 + random.int(interaction.keySpace),
+      );
+      const sql = renderKeyed(table, this.#model.columns(table), mutation);
+      const refusal = this.#model.applyKeyed(table, mutation);
+      const outcome = await this.#attempt(connection, sql);
+      this.#burstCommits++;
+      if (refusal !== undefined) {
+        this.#expectRefusal(refusal, outcome, `a refused ${mutation.kind} in a burst`);
+      } else if (outcome.error !== undefined) {
+        this.#fail(
+          `a ${mutation.kind} in a burst failed after ${String(index)} commits: ${describeError(outcome.error)}`,
+          outcome.error,
+        );
+      } else {
+        this.#acceptedWrites++;
+      }
+      if (index % 128 === 127) {
+        const key = 1 + random.int(interaction.keySpace);
+        const row = this.#model.table(table).rows.get(this.#model.resolve(table, key));
+        await this.#expectRows(
+          random.int(this.#plan.connections),
+          table,
+          row === undefined ? [] : [row],
+          `in a burst after ${String(index + 1)} commits, reading key ${String(key)}`,
+          `id = ${String(key)}`,
+        );
+      }
+    }
+    for (let connection = 0; connection < this.#plan.connections; connection++) {
+      await this.#expectRows(connection, table, this.#model.sorted(table), "after a burst");
+    }
+    const inspector = this.#connection(0);
+    if (inspector.visibleSegments === undefined) return;
+    const segments = await inspector
+      .visibleSegments(table)
+      .catch((error: unknown) =>
+        this.#fail(`listing visible segments failed: ${describeError(error)}`, error),
+      );
+    this.#peakBurstSegments = Math.max(this.#peakBurstSegments, segments);
+    if (interaction.commits >= BURST_SEGMENT_CEILING && segments > BURST_SEGMENT_CEILING) {
+      this.#fail(
+        `fold-progress: ${table} holds ${String(segments)} visible segments after ${String(interaction.commits)} single-row commits`,
       );
     }
   }
@@ -2900,6 +4663,91 @@ function isUnknownTable(error: unknown, table: string): boolean {
 
 function isUniqueViolation(error: unknown): boolean {
   return errorChainSome(error, (name) => name === "UniqueConstraintError");
+}
+
+/** A write naming a parent row that does not exist: `FOREIGN KEY <name> has no <parent> row ...`. */
+function isMissingParent(error: unknown): boolean {
+  return errorChainSome(
+    error,
+    (name, message) =>
+      name === "TypeError" && /^FOREIGN KEY \S+ has no \S+ row with /u.test(message ?? ""),
+  );
+}
+
+/** A delete a `RESTRICT` child refuses: `FOREIGN KEY <name> still has <n> <child> row(s) ...`. */
+function isRestricted(error: unknown): boolean {
+  return errorChainSome(
+    error,
+    (name, message) =>
+      name === "TypeError" &&
+      /^FOREIGN KEY \S+ still has \d+ \S+ row\(s\) referencing /u.test(message ?? ""),
+  );
+}
+
+function matchesRefusal(error: unknown, refusal: readonly RefusalKind[]): boolean {
+  return refusal.some((kind) =>
+    kind === "unique"
+      ? isUniqueViolation(error)
+      : kind === "foreignKey"
+        ? isMissingParent(error)
+        : isRestricted(error),
+  );
+}
+
+/**
+ * Visible segments a table may hold after a burst of single-row commits. A writer that outruns
+ * the background fold lends it its own turn past 512 level-zero segments, so a table that folds
+ * at all stays well under this; one whose folds are refused gains a segment per commit.
+ */
+const BURST_SEGMENT_CEILING = 640;
+
+/**
+ * Whether a round's keyed writes, each to its own row, reach the same outcome in any order: no
+ * write gives a unique constraint a value another write in the round gives it, or that a row
+ * other than its own holds now. Contended rounds run their writes one at a time instead.
+ */
+function uniqueValuesCommute(
+  model: ShadowModel,
+  table: string,
+  operations: ReadonlyArray<{ readonly mutation: KeyedMutation }>,
+  targets: readonly number[],
+): boolean {
+  const sets = model.uniqueSets(table);
+  if (sets.length === 0) return true;
+  const { definition, rows } = model.table(table);
+  const tuple = (row: PlanRow, columns: readonly string[]): string | undefined => {
+    const values = columns.map((column) => row[column] ?? null);
+    return values.some((value) => value === null)
+      ? undefined
+      : values.map(canonicalValue).join("\u0000");
+  };
+  const written = operations.map(({ mutation }, index): PlanRow | undefined => {
+    const target = targets[index] ?? keyOf(mutation);
+    const current = rows.get(target);
+    switch (mutation.kind) {
+      case "insert":
+        return current === undefined ? completeRow(definition, mutation.row) : undefined;
+      case "upsert":
+        return completeRow(definition, { ...mutation.row, id: target });
+      case "updateKey":
+        return current === undefined ? undefined : assign(current, mutation.assignments);
+      case "deleteKey":
+        return undefined;
+    }
+  });
+  for (const columns of sets) {
+    const claimed = new Set<string>();
+    for (const [index, row] of written.entries()) {
+      const key = row === undefined ? undefined : tuple(row, columns);
+      if (key === undefined) continue;
+      if (claimed.has(key)) return false;
+      claimed.add(key);
+      for (const [id, held] of rows) {
+        if (id !== targets[index] && tuple(held, columns) === key) return false;
+      }
+    }
+  }
+  return true;
 }
 
 function isConflict(error: unknown): boolean {
@@ -3093,6 +4941,17 @@ export function createDatabaseDriver(
         maintain: async (table) => {
           await database.compactTable(table);
           await database.collectGarbage();
+        },
+        explain: (sql) => database.explain(sql),
+        visibleSegments: async (table) => {
+          let count = 0;
+          let page = await database.listVisibleSegmentPage(table);
+          count += page.records.length;
+          while (page.nextCursor !== null) {
+            page = await database.listVisibleSegmentPage(table, { cursor: page.nextCursor });
+            count += page.records.length;
+          }
+          return count;
         },
       };
     },

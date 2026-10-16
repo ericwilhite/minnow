@@ -3223,6 +3223,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * foreground latency, and a write is refused only after an assisted pass still fails.
    */
   /** Turns a storage namespace/token UNIQUE conflict into the public table/constraint error. */
+  /**
+   * Runs a synchronous UNIQUE staging step on a path without a translating catch of its own, so
+   * a term the statement gives two rows reports as `UniqueConstraintError`, like any collision.
+   */
+  async #uniqueStaging<T>(step: () => T): Promise<T> {
+    try {
+      return step();
+    } catch (error) {
+      throw await this.#translateUniqueConflict(error);
+    }
+  }
+
   async #translateUniqueConflict(error: unknown): Promise<unknown> {
     if (!(error instanceof UniqueKeyConflictError)) return error;
     for (const table of await this.store.listTables()) {
@@ -9819,7 +9831,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     batch: ColumnarBatch,
     rowCount: number,
   ): Promise<void> {
-    stageSecondaryUniqueInsertChanges(transaction, table, batch);
+    await this.#uniqueStaging(() => {
+      stageSecondaryUniqueInsertChanges(transaction, table, batch);
+    });
     await this.#stageInsertSegment(transaction, table, batch, rowCount, "insert");
   }
 
@@ -11399,7 +11413,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
         if (term !== undefined) terms.push(term);
       }
-      assertNoDuplicateUniqueTerms(index, terms);
+      await this.#uniqueStaging(() => {
+        assertNoDuplicateUniqueTerms(namespaceId, terms);
+      });
       const overlay = this.#stagedKeyOverlay(transaction, namespaceId);
       const unresolved: string[] = [];
       for (const term of terms) {
@@ -11454,7 +11470,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (before !== undefined) released.add(before);
         if (after !== undefined) taken.push(after);
       });
-      assertNoDuplicateUniqueTerms(index, taken);
+      await this.#uniqueStaging(() => {
+        assertNoDuplicateUniqueTerms(namespaceId, taken);
+      });
       const overlay = this.#stagedKeyOverlay(transaction, namespaceId);
       const unresolved: string[] = [];
       for (const term of taken) {
@@ -11656,7 +11674,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // before it registers anything, so the scope stays usable; commit re-validates atomically.
     // An upsert replaces rows, so only a term the batch repeats within itself refuses it here.
     if (kind === "insert") await this.#assertInsertKeysAbsent(transaction, table, batch, keys);
-    else assertBatchSecondaryTermsDistinct(table, batch);
+    else {
+      await this.#uniqueStaging(() => {
+        assertBatchSecondaryTermsDistinct(table, batch);
+      });
+    }
     if (keys !== undefined) {
       transaction.setUniqueKeyChanges(
         { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: kind === "insert" },
@@ -11665,12 +11687,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
-    stageSecondaryUniqueInsertChanges(
-      transaction,
-      table,
-      batch,
-      kind === "upsert" ? sessionUpsertFirings?.oldImages : undefined,
-    );
+    await this.#uniqueStaging(() => {
+      stageSecondaryUniqueInsertChanges(
+        transaction,
+        table,
+        batch,
+        kind === "upsert" ? sessionUpsertFirings?.oldImages : undefined,
+      );
+    });
     const buffered =
       this.#scopeWrites.has(transaction) &&
       rowCount < SCOPE_DIRECT_STAGE_ROWS &&
@@ -11834,7 +11858,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (this.#scopeWrites.has(transaction)) {
       await this.#assertUpdateUniqueTermsAbsent(transaction, table, input, preImages);
     }
-    stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
+    await this.#uniqueStaging(() => {
+      stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
+    });
     const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
     if (secondaryDeltas.length > 0) {
       await transaction.setFtsChangesSliced(

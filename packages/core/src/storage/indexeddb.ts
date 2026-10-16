@@ -2159,10 +2159,13 @@ export class IndexedDbBlockStore implements BlockStore {
       if (actualVersion !== input.expectedManifestVersion) {
         throw new WriteConflictError(input.expectedManifestVersion, actualVersion);
       }
+      // A column drop keeps the table, so a foreign key that references it is no obstacle: what
+      // a foreign key reads is the parent's key, which a drop refuses on its own.
       const tableState = await assertTableRemovalAllowed(
         transaction,
         input.tableId,
         input.expectedTableRevision,
+        { referenced: true },
       );
       const { record: table } = tableState;
       const column = table.columns.find((candidate) => candidate.id === input.columnId);
@@ -10322,6 +10325,7 @@ async function assertTableRemovalAllowed(
   transaction: IDBTransaction,
   tableId: string,
   expectedRevision: number,
+  allow: { readonly referenced?: boolean } = {},
 ): Promise<{ record: TableRecord; segments: SegmentRecord[] }> {
   const catalog = transaction.objectStore("catalog");
   const tableKey = `${TABLE_ID_PREFIX}${tableId}`;
@@ -10331,35 +10335,41 @@ async function assertTableRemovalAllowed(
   if (record === undefined || actualRevision !== expectedRevision) {
     throw new TableRecordConflictError(tableId, expectedRevision, actualRevision);
   }
-  await visitObjectStoreSequentially(catalog, (candidateValue, key) => {
-    if (typeof key !== "string" || !key.startsWith(TABLE_ID_PREFIX) || key === tableKey) return;
-    const candidate = asTableRecord(candidateValue, key);
-    const foreignKey = (candidate.foreignKeys ?? []).find(
-      (constraint) => constraint.parentTable === record.name,
-    );
-    if (foreignKey !== undefined) {
-      throw new TableInUseError(tableId, "foreign key", `${candidate.id}/${foreignKey.name}`);
-    }
-  });
+  if (allow.referenced !== true) {
+    await visitObjectStoreSequentially(catalog, (candidateValue, key) => {
+      if (typeof key !== "string" || !key.startsWith(TABLE_ID_PREFIX) || key === tableKey) return;
+      const candidate = asTableRecord(candidateValue, key);
+      const foreignKey = (candidate.foreignKeys ?? []).find(
+        (constraint) => constraint.parentTable === record.name,
+      );
+      if (foreignKey !== undefined) {
+        throw new TableInUseError(tableId, "foreign key", `${candidate.id}/${foreignKey.name}`);
+      }
+    });
+  }
   const segments = await readTableSegmentsForRemoval(
     transaction.objectStore("segments").index(SEGMENT_TABLE_INDEX),
     tableId,
   );
-  const transactionStore = transaction.objectStore("transactions");
-  await visitObjectStoreSequentially(transactionStore, (candidateValue, key) => {
-    const candidate = asStoredTransactionRecord(candidateValue, storageKeyLocation(key));
-    const pendingTable = candidate.status === "active" ? candidate.pendingTable : undefined;
-    const foreignKey = (pendingTable?.foreignKeys ?? []).find(
-      (constraint) => constraint.parentTable === record.name,
+  if (allow.referenced !== true) {
+    await visitObjectStoreSequentially(
+      transaction.objectStore("transactions"),
+      (candidateValue, key) => {
+        const candidate = asStoredTransactionRecord(candidateValue, storageKeyLocation(key));
+        const pendingTable = candidate.status === "active" ? candidate.pendingTable : undefined;
+        const foreignKey = (pendingTable?.foreignKeys ?? []).find(
+          (constraint) => constraint.parentTable === record.name,
+        );
+        if (foreignKey !== undefined) {
+          throw new TableInUseError(
+            tableId,
+            "pending foreign key",
+            `${candidate.id}/${foreignKey.name}`,
+          );
+        }
+      },
     );
-    if (foreignKey !== undefined) {
-      throw new TableInUseError(
-        tableId,
-        "pending foreign key",
-        `${candidate.id}/${foreignKey.name}`,
-      );
-    }
-  });
+  }
   const owners = new Map<string, StoredTransactionRecord>();
   const activeTransactionIds = new Set<string>();
   for (const segment of segments) {

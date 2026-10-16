@@ -1337,6 +1337,20 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
  * every other variable-free SQL expression is preserved as authored for catalog introspection.
  */
 function columnDefaultFor(expression: Expression, sql: string): ColumnDefault {
+  // A negative number is a constant too: the parser reads `-36` as `-1 * 36`, and left as an
+  // expression it would not fill the rows an ADD COLUMN finds, and could not be NOT NULL.
+  if (
+    expression.kind === "binary" &&
+    expression.operator === "*" &&
+    expression.left.kind === "literal" &&
+    expression.left.value === -1 &&
+    expression.right.kind === "literal" &&
+    expression.right.internalSqlValue !== true &&
+    typeof expression.right.value === "number"
+  ) {
+    const magnitude = expression.right.value;
+    return { kind: "literal", value: magnitude === 0 ? 0 : -magnitude };
+  }
   if (expression.kind === "literal") {
     const value = expression.value;
     if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {

@@ -1826,7 +1826,7 @@ describe("NULL-aware composite index terms", () => {
             { id: 7, owner: "bo", slot: 2 },
             { id: 8, owner: "bo", slot: 2 },
           ]),
-        ).rejects.toThrow(/UNIQUE index badges_owner_slot has a duplicate key/);
+        ).rejects.toThrow(new UniqueConstraintError("badges", "(owner, slot)", "(bo, 2)"));
         // Two NULL-component rows in one batch are not a duplicate at all.
         await database.insertBatch("badges", [
           { id: 8, owner: "bo", slot: null },

@@ -110,6 +110,97 @@ describe("interaction plans", () => {
     ).toBe("8d289aca9f86156e4f8768d50c249e89bfe2fa2256b414c5577beaa96a1578bc");
   });
 
+  it("adds constraints, schema changes, full text, and bursts from their own streams", () => {
+    const options = { length: 300, connections: 4, tables: 3, keySpace: 24 } as const;
+    const plain = generateInteractionPlan(0x5c4e, options);
+    const extended = generateInteractionPlan(0x5c4e, {
+      ...options,
+      constraints: true,
+      schemaChanges: true,
+      fullText: true,
+      burstCommits: 50,
+    });
+    expect(parseInteractionPlan(JSON.stringify(extended))).toEqual(extended);
+    const kinds = new Set(extended.interactions.map((interaction) => interaction.kind));
+    for (const kind of [
+      "upsertUnique",
+      "lookup",
+      "alterTable",
+      "dropIndex",
+      "match",
+      "burst",
+    ] satisfies Array<Interaction["kind"]>) {
+      expect(kinds, kind).toContain(kind);
+      expect(plain.interactions.some((interaction) => interaction.kind === kind)).toBe(false);
+    }
+    const tables = extended.interactions.flatMap((interaction) =>
+      interaction.kind === "createTable" ? [interaction.table] : [],
+    );
+    expect(tables.some((table) => table.columns.some((column) => column.unique))).toBe(true);
+    expect(tables.some((table) => table.appendOnly === true)).toBe(true);
+    expect(
+      tables.some((table) => table.columns.some((column) => typeof column.references === "object")),
+    ).toBe(true);
+    // Each option draws from its own stream, so turning one on leaves the others' steps alone:
+    // the primary stream's steps are what a plan without any of them holds.
+    const primary = (plan: InteractionPlan) =>
+      plan.interactions.filter((interaction) => interaction.kind === "partition").length;
+    expect(primary(generateInteractionPlan(0x5c4e, { ...options, fullText: true }))).toBe(
+      primary(plain),
+    );
+    // A burst always appears, even when the stream never drew one.
+    const short = generateInteractionPlan(7, { length: 5, burstCommits: 10 });
+    expect(short.interactions.filter((interaction) => interaction.kind === "burst")).toHaveLength(
+      1,
+    );
+  });
+
+  it("adds and drops columns only on tables nothing has written, unless populated", () => {
+    const writes = new Set<Interaction["kind"]>([
+      "insert",
+      "update",
+      "delete",
+      "transaction",
+      "concurrent",
+      "fault",
+      "upsertUnique",
+      "burst",
+    ]);
+    const unwrittenOnly = (plan: InteractionPlan): boolean => {
+      const written = new Set<string>();
+      return plan.interactions.every((interaction) => {
+        if (
+          interaction.kind === "alterTable" &&
+          !interaction.expectRefused &&
+          interaction.change.kind !== "renameColumn" &&
+          written.has(interaction.table)
+        ) {
+          return false;
+        }
+        if (
+          writes.has(interaction.kind) &&
+          "table" in interaction &&
+          typeof interaction.table === "string"
+        ) {
+          written.add(interaction.table);
+        }
+        return true;
+      });
+    };
+    const options = { length: 600, connections: 4, tables: 3, keySpace: 24 } as const;
+    for (const seed of [1, 2, 3]) {
+      expect(
+        unwrittenOnly(generateInteractionPlan(seed, { ...options, schemaChanges: true })),
+      ).toBe(true);
+    }
+    expect(
+      [1, 2, 3].some(
+        (seed) =>
+          !unwrittenOnly(generateInteractionPlan(seed, { ...options, schemaChanges: "populated" })),
+      ),
+    ).toBe(true);
+  });
+
   it("appends an effective fresh insert for every configured fault point", () => {
     const points = [
       "beforeBlockWrite",
@@ -847,6 +938,42 @@ describe.each(stores)("interaction simulator with rekeying over $name", ({ sourc
     }
   });
 });
+
+describe.each(stores)(
+  "interaction simulator with constraints and schema changes over $name",
+  ({ source }) => {
+    it.each(seedsFor("interaction-simulator-schema", [0x5c4e, 0xd00d]))("seed %i", async (seed) => {
+      const store = source();
+      try {
+        const plan = generateInteractionPlan(seed, {
+          length: 200,
+          connections: 3,
+          tables: 3,
+          keySpace: 16,
+          constraints: true,
+          schemaChanges: true,
+          fullText: true,
+          burstCommits: 60,
+        });
+        const result = await runInteractionPlan(
+          plan,
+          createDatabaseDriver(store, {
+            databaseOptions: { rowsPerBlock: 8, ftsAutoIndexRows: 8 },
+          }),
+        );
+        expect(result.interactions).toBe(plan.interactions.length);
+        expect(result.acceptedWrites).toBeGreaterThan(20);
+        expect(result.expectedFailures).toBeGreaterThan(0);
+        expect(result.rejectedConflicts).toBe(0);
+        expect(result.burstCommits).toBeGreaterThanOrEqual(30);
+        // The lookups are shaped for the secondary-index path; some must have taken it.
+        expect(result.indexPathQueries).toBeGreaterThan(0);
+      } finally {
+        if (typeof store !== "function") store.close();
+      }
+    });
+  },
+);
 
 describe.each(stores)("interaction simulator over $name", ({ source }) => {
   it.each(seedsFor("interaction-simulator", [0x5eed, 0xc0ffee]))("seed %i", async (seed) => {

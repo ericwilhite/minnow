@@ -16,7 +16,8 @@
     "The full Chromium, Firefox and WebKit campaign seeds exposed compaction planning/publication races; deterministic three-store reductions are in simulator-regressions.test.ts.",
     "WebKit full seed 2779093776 also exposed automatic compaction resuming a shared job another tab had aborted after DDL; the three-store reduction checks fresh planning, changed revision evidence, I/O propagation and reopening.",
     "Node soak seeds 720016, 740013, 740037, 750001 and 89 (--length 1500 --connections 6 --tables 3 --key-space 48) exposed cursors, DELETE key reads, spilling executors and write-scope reads sweeping rows outside an exact index selection; reduced in simulator-regressions.test.ts.",
-    "Rekeying seeds 800002, 800011, 800017, 800024, 800027, 800037 and 800040 (--length 800 --connections 4 --key-space 24 --rekeying true) exposed a connection's key forwards losing a forward once another connection collected the manifest that wrote it; reduced in simulator-regressions.test.ts."
+    "Rekeying seeds 800002, 800011, 800017, 800024, 800027, 800037 and 800040 (--length 800 --connections 4 --key-space 24 --rekeying true) exposed a connection's key forwards losing a forward once another connection collected the manifest that wrote it; reduced in simulator-regressions.test.ts.",
+    "Schema seeds 4, 2 and 9 (--length 400 --connections 6 --tables 3 --key-space 48 --constraints true --schema-changes true --full-text true --burst-commits 200) exposed a statement giving two rows one UNIQUE value refused as a TypeError instead of UniqueConstraintError, a negative constant DEFAULT that neither filled existing rows nor allowed NOT NULL, and DROP COLUMN refused on a table another table references. The suite's own default seeds 23630 and 53261 exposed OPFS refusing to reopen after DROP INDEX of a UNIQUE index, or after a UNIQUE accelerator was invalidated. All are reduced in simulator-regressions.test.ts."
   ],
   "suites": {
     "sql-conformance": [12648430],
@@ -33,6 +34,7 @@
       2654435807, 2779118408, 2779075658, 16053, 2779093776, 720016, 740013, 740037, 750001, 89
     ],
     "interaction-simulator-rekeying": [800002, 800011, 800017, 800024, 800027, 800037, 800040],
+    "interaction-simulator-schema": [4, 2, 9],
     "block-format-properties": []
   }
 }
