@@ -452,8 +452,11 @@ import {
   type LiveMaintenanceOrderTerm,
   type LiveMaintenanceState,
   filterLiveRows,
+  liveKeyPins,
+  liveKeyPinsAdmit,
   liveKeyToken,
   liveMaintainedOutcome,
+  liveMaintenanceTestHooks,
   liveOrderComparator,
   liveRowStateBytes,
   mergeLiveRows,
@@ -7533,6 +7536,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ? 0
         : Math.max(LIVE_WINDOW_MARGIN_MIN, Math.min(plan.limit, LIVE_WINDOW_MARGIN_MAX));
     if (margin > 0) fullPlan.limit = (plan.limit ?? 0) + margin;
+    // Pins come from the plan after catalog rewrites, so a retired key literal already names the
+    // row it forwards to; a rekey moves the forwards table, re-running and re-planning this.
+    const keyPins = liveKeyPins(plan, base.alias, keyColumn.name);
     return {
       tableId: table.id,
       keyColumnId: keyColumn.id,
@@ -7550,6 +7556,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       keys: [],
       positions: new Map(),
       order: [],
+      ...(keyPins === undefined ? {} : { keyPins }),
     };
   }
 
@@ -7692,6 +7699,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // shifts the window onto a row this result never held.
       for (const token of existingKeys) if (!retainedTokens.has(token)) return undefined;
     }
+    // No retained row changed, and the WHERE pins the key to values no changed key has: the
+    // delta query below would match nothing, so the result stands without running it.
+    if (
+      affected.size === 0 &&
+      state.keyPins !== undefined &&
+      !liveKeyPinsAdmit(state.keyPins, changedKeys)
+    ) {
+      return { result: retained, state, changed: false };
+    }
     const deltaPlan: CompiledQuery = {
       ...state.deltaPlan,
       predicates: [
@@ -7707,7 +7723,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ],
     };
     const delta = splitLiveHiddenColumns(
-      await this.#withReadReservation(() => this.#queries.run(deltaPlan, {}, probe)),
+      await this.#withReadReservation(() => {
+        liveMaintenanceTestHooks.deltaQueries += 1;
+        return this.#queries.run(deltaPlan, {}, probe);
+      }),
       state,
     );
     if (affected.size === 0 && delta.result.rows.length === 0)

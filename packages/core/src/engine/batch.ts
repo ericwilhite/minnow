@@ -106,32 +106,87 @@ export function* toColumnarBatchSteps(input: InsertBatchInputLike): Generator<vo
   if (input.length === 0) throw new TypeError("A batch needs at least one row");
   // One pass over the rows, discovering columns in first-seen order. Values and omission are
   // separate so an explicit NULL can never accidentally invoke a default.
-  const columnsByName = new Map<string, BatchValue[]>();
-  const omittedByName = new Map<string, boolean[]>();
-  for (let index = 0; index < input.length; index += 1) {
+  const rowCount = input.length;
+  const names: string[] = [];
+  const positions = new Map<string, number>();
+  const vectors: BatchValue[][] = [];
+  /** Allocated on a column's first omission; most batches never omit anything. */
+  const omissions: Array<boolean[] | undefined> = [];
+  /** The last row each column was present in, to find the columns a row left out. */
+  const seenIn: number[] = [];
+  const omit = (position: number, index: number): void => {
+    let omitted = omissions[position];
+    if (omitted === undefined) {
+      omitted = new Array<boolean>(rowCount).fill(false);
+      omissions[position] = omitted;
+    }
+    omitted[index] = true;
+  };
+  for (let index = 0; index < rowCount; index += 1) {
     if ((index & PIVOT_SLICE_MASK) === PIVOT_SLICE_MASK) yield;
     const row = input[index];
-    if (row === undefined) continue;
-    for (const name of Object.keys(row)) {
+    if (row === undefined) {
+      for (let position = 0; position < names.length; position += 1) omit(position, index);
+      continue;
+    }
+    const keys = Object.keys(row);
+    // Rows of one batch nearly always carry the same keys in the same order; then each value
+    // goes straight to its column without a name lookup.
+    let sameShape = keys.length === names.length;
+    for (let position = 0; sameShape && position < keys.length; position += 1) {
+      sameShape = keys[position] === names[position];
+    }
+    if (sameShape) {
+      for (let position = 0; position < keys.length; position += 1) {
+        const value: unknown = row[names[position] as string];
+        if (value === undefined) omit(position, index);
+        else (vectors[position] as BatchValue[])[index] = value as BatchValue;
+      }
+      continue;
+    }
+    for (const name of keys) {
       const value: unknown = row[name];
       if (value === undefined) continue;
-      let values = columnsByName.get(name);
-      if (values === undefined) {
-        values = new Array<BatchValue>(input.length).fill(null);
-        columnsByName.set(name, values);
-        omittedByName.set(name, new Array<boolean>(input.length).fill(true));
+      let position = positions.get(name);
+      if (position === undefined) {
+        position = names.length;
+        names.push(name);
+        positions.set(name, position);
+        vectors.push(new Array<BatchValue>(rowCount).fill(null));
+        seenIn.push(-1);
+        if (index > 0) {
+          const omitted = new Array<boolean>(rowCount).fill(false);
+          omitted.fill(true, 0, index);
+          omissions.push(omitted);
+        } else omissions.push(undefined);
       }
-      values[index] = value as BatchValue;
-      const omitted = omittedByName.get(name);
-      if (omitted !== undefined) omitted[index] = false;
+      (vectors[position] as BatchValue[])[index] = value as BatchValue;
+      seenIn[position] = index;
+    }
+    for (let position = 0; position < names.length; position += 1) {
+      if (seenIn[position] !== index) omit(position, index);
     }
   }
-  const omitted = Object.fromEntries(
-    [...omittedByName].filter(([, values]) => values.some(Boolean)),
-  );
+  const columns: Record<string, BatchValue[]> = {};
+  const omitted: Record<string, boolean[]> = {};
+  for (const [position, name] of names.entries()) {
+    defineVector(columns, name, vectors[position] as BatchValue[]);
+    const omittedVector = omissions[position];
+    if (omittedVector !== undefined) defineVector(omitted, name, omittedVector);
+  }
   return {
-    columns: Object.fromEntries(columnsByName),
+    columns,
     ...(Object.keys(omitted).length === 0 ? {} : { omitted }),
-    rowCount: input.length,
+    rowCount,
   };
+}
+
+/** Stores a column vector under its name, `__proto__` included, as an own property. */
+function defineVector<T>(target: Record<string, T>, name: string, vector: T): void {
+  Object.defineProperty(target, name, {
+    value: vector,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
 }

@@ -12,6 +12,7 @@ import { planMemoKey, sameQueryRow as sameLiveRow } from "./query-cache.js";
 import {
   externalizeQueryResult,
   type CompiledQuery,
+  type Expression,
   type QueryResult,
   type QueryRow,
   type QueryValue,
@@ -29,6 +30,15 @@ export const LIVE_MAINTENANCE_MAX_DELTA_ROWS = 2_048;
 /** Rows a window keeps beyond its visible edge: at least this many, at most the window itself. */
 export const LIVE_WINDOW_MARGIN_MIN = 16;
 export const LIVE_WINDOW_MARGIN_MAX = 64;
+
+/**
+ * Test-only counters, exported from no public entry point: suites import this module directly
+ * to assert how much work a commit cost, which a wall-clock assertion could not pin down.
+ */
+export const liveMaintenanceTestHooks = {
+  /** Delta queries the row-patching path executed. */
+  deltaQueries: 0,
+};
 
 export interface LiveMaintenanceOrderTerm {
   /** The result column the term's value is read from, public or hidden. */
@@ -73,6 +83,85 @@ export interface LiveMaintenanceState {
   readonly positions: ReadonlyMap<string, number>;
   /** One array per ORDER BY term, each holding that term's value for every retained row. */
   readonly order: ReadonlyArray<readonly QueryValue[]>;
+  /** The key values the statement's WHERE pins its key to, when it does; see `liveKeyPins`. */
+  readonly keyPins?: LiveKeyPins;
+}
+
+/**
+ * The only key values a row can have and still pass a statement's WHERE: `key = 5`, or
+ * `key IN ('a', 'b')`, as a top-level conjunct. A commit whose changed keys are all outside
+ * this set cannot bring a row into the result, so a live set of per-row queries — a detail view
+ * for each of two hundred rows — answers a one-row commit without running two hundred delta
+ * queries that would each come back empty.
+ */
+export interface LiveKeyPins {
+  /** One JavaScript type for every pinned value, so tokens compare as SQL equality would. */
+  readonly kind: "number" | "string";
+  readonly tokens: ReadonlySet<string>;
+}
+
+/**
+ * Reads the key pins off a planned statement, or undefined when there are none it can prove.
+ * Deliberately narrow: plain literals only (no domain, tag, or exact-decimal spelling), whole
+ * numbers or strings outside the engine's protected NUL namespace, and a bare column name only
+ * when no join could make it ambiguous. Anything else leaves the delta query as the authority.
+ */
+export function liveKeyPins(
+  plan: CompiledQuery,
+  alias: string,
+  keyColumn: string,
+): LiveKeyPins | undefined {
+  const qualified = `${alias}.${keyColumn}`;
+  const isKey = (expression: Expression): boolean =>
+    expression.kind === "column" &&
+    (expression.reference === qualified ||
+      (plan.joins.length === 0 && expression.reference === keyColumn));
+  const pinValue = (expression: Expression): number | string | undefined => {
+    if (
+      expression.kind !== "literal" ||
+      expression.internalSqlValue === true ||
+      expression.sqlDomain !== undefined ||
+      expression.exactText !== undefined
+    ) {
+      return undefined;
+    }
+    const value = expression.value;
+    if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+    if (typeof value === "string") return value.startsWith("\u0000") ? undefined : value;
+    return undefined;
+  };
+  for (const predicate of plan.predicates) {
+    if (predicate.escape !== undefined) continue;
+    let values: Array<number | string | undefined> | undefined;
+    if (predicate.operator === "=") {
+      if (isKey(predicate.left)) values = [pinValue(predicate.right)];
+      else if (isKey(predicate.right)) values = [pinValue(predicate.left)];
+    } else if (
+      predicate.operator === "IN" &&
+      isKey(predicate.left) &&
+      predicate.right.kind === "list"
+    ) {
+      values = predicate.right.items.map(pinValue);
+    }
+    if (values === undefined) continue;
+    const kind = typeof values[0];
+    if (kind !== "number" && kind !== "string") continue;
+    if (!values.every((value) => typeof value === kind)) continue;
+    return { kind, tokens: new Set(values.map((value) => liveKeyToken(value ?? null))) };
+  }
+  return undefined;
+}
+
+/** Whether any changed key could satisfy the pins: same type, same value. */
+export function liveKeyPinsAdmit(
+  pins: LiveKeyPins,
+  changedKeys: ReadonlyMap<string, QueryValue>,
+): boolean {
+  for (const [token, value] of changedKeys) {
+    // A key of another type compares under coercion rules this check does not model.
+    if (typeof value !== pins.kind || pins.tokens.has(token)) return true;
+  }
+  return false;
 }
 
 export interface LiveMaintainedRows {
