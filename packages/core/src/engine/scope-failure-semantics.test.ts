@@ -154,7 +154,7 @@ describe.each(implementations)("scope failure semantics on $name", ({ create }) 
           { id: 4, amount: 5, code: 6 },
           { id: 5, amount: 5, code: 6 },
         ]),
-      ).rejects.toThrow(/UNIQUE index items_code has a duplicate key/);
+      ).rejects.toThrow(new UniqueConstraintError("items", "code", 6));
       await tx.insertBatch("items", [{ id: 8, amount: 5, code: 8 }]);
     });
     expect((await db.query("SELECT id FROM items WHERE id >= 4 ORDER BY id")).rows).toEqual([

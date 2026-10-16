@@ -20,6 +20,7 @@ import {
   secondaryIndexColumnIds,
   secondaryIndexDirections,
   secondaryUniqueKeyNamespace,
+  UniqueKeyConflictError,
   type FtsColumnDelta,
   type FtsPosting,
   type RowIdSpan,
@@ -879,13 +880,16 @@ export function secondaryUniqueTerm(
   return secondaryTupleIndexTerm(index, columns, values);
 }
 
-export function assertNoDuplicateUniqueTerms(
-  index: SecondaryIndexRecord,
-  terms: readonly string[],
-): void {
+/**
+ * Refuses a statement that gives two of its rows one UNIQUE index term. This is a write's
+ * constraint violation, not a failed index build: it surfaces as the `UniqueKeyConflictError`
+ * of the index's membership namespace, which the engine reports as `UniqueConstraintError`
+ * naming the column and the value, exactly as a collision with a committed row is reported.
+ */
+export function assertNoDuplicateUniqueTerms(namespaceId: string, terms: readonly string[]): void {
   const seen = new Set<string>();
   for (const term of terms) {
-    if (seen.has(term)) throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
+    if (seen.has(term)) throw new UniqueKeyConflictError(namespaceId, term);
     seen.add(term);
   }
 }
@@ -897,7 +901,7 @@ export function assertNoDuplicateUniqueTerms(
  */
 export function assertBatchSecondaryTermsDistinct(table: TableRecord, input: ColumnarBatch): void {
   const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
-  for (const { index, columns } of readyUniqueSecondaryIndexes(table)) {
+  for (const { indexId, index, columns } of readyUniqueSecondaryIndexes(table)) {
     const terms: string[] = [];
     for (let row = 0; row < rowCount; row += 1) {
       const term = secondaryUniqueTerm(
@@ -907,7 +911,7 @@ export function assertBatchSecondaryTermsDistinct(table: TableRecord, input: Col
       );
       if (term !== undefined) terms.push(term);
     }
-    assertNoDuplicateUniqueTerms(index, terms);
+    assertNoDuplicateUniqueTerms(secondaryUniqueKeyNamespace(table.id, indexId), terms);
   }
 }
 
@@ -946,7 +950,7 @@ export function stageSecondaryUniqueInsertChanges(
       );
       if (term !== undefined) added.push(term);
     }
-    assertNoDuplicateUniqueTerms(index, added);
+    assertNoDuplicateUniqueTerms(namespaceId, added);
     // The empty entry is deliberate coverage: a stale writer that never saw this enforced unique
     // index supplies no namespace entry, which the atomic store rejects instead of accepting an
     // unenforced commit.
@@ -997,7 +1001,7 @@ export function stageSecondaryUniqueMutationChanges(
       );
       return term === undefined ? [] : [term];
     });
-    assertNoDuplicateUniqueTerms(index, added);
+    assertNoDuplicateUniqueTerms(namespaceId, added);
     transaction.setUniqueKeyChanges({
       tableId: namespaceId,
       keyTokens: added,

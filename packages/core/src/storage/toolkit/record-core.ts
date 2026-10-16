@@ -2029,6 +2029,13 @@ export class RecordCore {
       if (previous.unique === true && nextSecondary?.[indexId]?.unique !== true) {
         this.#membershipChanged();
         this.#uniqueKeys.delete(secondaryUniqueKeyNamespace(record.id, indexId));
+        // The index's build record goes with it, as a dropped table's do: a completed build
+        // whose index is gone is an inconsistency a checkpoint refuses to load.
+        for (const [buildId, build] of [...this.#uniqueKeyBuilds]) {
+          if (build.record.tableId === record.id && build.record.indexId === indexId) {
+            this.#setUniqueKeyBuild(undefined, buildId);
+          }
+        }
       }
     }
     if (update.uniqueKeySeed !== undefined) {
@@ -2189,7 +2196,9 @@ export class RecordCore {
         actualRevision,
       );
     }
-    this.#assertTableNotInUse(input.tableId);
+    // A column drop keeps the table, so a foreign key that references it is no obstacle: what
+    // a foreign key reads is the parent's key, which a drop refuses on its own.
+    this.#assertTableNotInUse(input.tableId, { referenced: true });
 
     const column = table.columns.find((candidate) => candidate.id === input.columnId);
     if (column === undefined) {
@@ -2272,9 +2281,9 @@ export class RecordCore {
     return cloneRecord(manifest);
   }
 
-  #assertTableNotInUse(id: string): void {
+  #assertTableNotInUse(id: string, allow: { readonly referenced?: boolean } = {}): void {
     const target = this.#tables.get(id);
-    if (target !== undefined) {
+    if (target !== undefined && allow.referenced !== true) {
       const publishedChild = [...this.#tables.values()].find(
         (table) =>
           table.id !== id &&
@@ -6465,7 +6474,9 @@ export class RecordCore {
     this.#activeUniqueKeyBuildCount = 0;
     this.#uniqueKeyBuildStagedBytes = 0;
     this.#uniqueKeyBuildStagedEntries = 0;
+    const loadedTables = new Map(cloned.tables.map((table) => [table.id, table] as const));
     for (const [record, chunks, completedInput] of cloned.uniqueKeyBuilds) {
+      if (isOrphanCompletedUniqueBuild(record, loadedTables)) continue;
       const tokens = new OrderedStringSet(chunks.flat());
       this.#uniqueKeyBuilds.set(record.buildId, { record, chunks, tokens, completedInput });
       if (record.state === "active") {
@@ -8295,6 +8306,9 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
     const table = tablesById.get(record.tableId);
     const index = table?.secondaryIndexes?.[record.indexId];
     const buildState: unknown = record.state;
+    // A completed build whose index is gone was left behind by a DROP INDEX before that drop
+    // removed it; it has no effect, and loading discards it.
+    if (isOrphanCompletedUniqueBuild(record, tablesById)) continue;
     if (buildState === "active") {
       if (
         record.completedAt !== undefined ||
@@ -8323,7 +8337,9 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
         record.retainedBytes !== 0 ||
         chunks.length !== 0 ||
         index?.unique !== true ||
-        index.state !== "ready" ||
+        // Only enforcement depends on the build. The postings it built are an accelerator a
+        // commit that cannot cover them flips to "invalid" (and a rebuild back), while the
+        // membership the build completed stays authoritative throughout.
         index.uniqueEnforced !== true ||
         !membershipNamespaces.has(record.namespaceId)
       ) {
@@ -8842,4 +8858,15 @@ function varuintByteLength(value: bigint): number {
     length += 1;
   }
   return length;
+}
+
+/** A completed UNIQUE build whose table or index no longer exists. */
+function isOrphanCompletedUniqueBuild(
+  record: UniqueKeyBuildRecord,
+  tablesById: ReadonlyMap<string, TableRecord>,
+): boolean {
+  return (
+    record.state === "completed" &&
+    tablesById.get(record.tableId)?.secondaryIndexes?.[record.indexId] === undefined
+  );
 }

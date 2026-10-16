@@ -20,8 +20,13 @@ import {
   type BlockStore,
 } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
-import { CompactionJobCancelledError, UnknownTableError } from "./errors.js";
+import { CompactionJobCancelledError, UniqueConstraintError, UnknownTableError } from "./errors.js";
 import { allTransactionRecords } from "./storage-test-helpers.js";
+import {
+  createDatabaseDriver,
+  runInteractionPlan,
+  type InteractionPlan,
+} from "../testing/interaction-simulator.js";
 
 const stores: ReadonlyArray<{ name: string; open: () => Promise<BlockStore> }> = [
   { name: "memory", open: async () => new MemoryBlockStore() },
@@ -1201,3 +1206,423 @@ describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
     });
   },
 );
+
+describe.each(stores)("constraint and schema-change reductions on $name", ({ open }) => {
+  it("reports a statement giving two rows one UNIQUE value as UniqueConstraintError", async () => {
+    // Schema-change interaction seed 4 (--constraints --schema-changes --full-text, length 400):
+    // a transaction's UPDATE gave two rows the same value of a UNIQUE column. The statement was
+    // refused, but as `TypeError: UNIQUE index t2_u_key has a duplicate key` -- the message of a
+    // failed CREATE UNIQUE INDEX -- so code catching UniqueConstraintError, which every other
+    // collision raises, let it through. Standalone statements, scopes, and batches all did it.
+    const store = await open();
+    const database = new MinnowDatabase(store);
+    try {
+      await database.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER, u INTEGER UNIQUE)",
+      );
+      await database.execute("INSERT INTO t VALUES (1, 1, 1), (2, 2, 2)");
+      const duplicate = new UniqueConstraintError("t", "u", 119);
+      await expect(database.execute("UPDATE t SET u = 119")).rejects.toThrow(duplicate);
+      await expect(database.execute("UPDATE t SET u = 119")).rejects.toBeInstanceOf(
+        UniqueConstraintError,
+      );
+      await expect(
+        database.execute("INSERT INTO t VALUES (3, 3, 119), (4, 4, 119)"),
+      ).rejects.toBeInstanceOf(UniqueConstraintError);
+      await database.execute("BEGIN");
+      await database.execute("INSERT INTO t VALUES (8, 44, 96), (3, 33, 11)");
+      await expect(database.execute("UPDATE t SET u = 119 WHERE id IN (3, 8)")).rejects.toThrow(
+        duplicate,
+      );
+      await database.execute("ROLLBACK");
+      await database.write(async (tx) => {
+        await expect(
+          tx.upsertBatch("t", [
+            { id: 5, c: 5, u: 6 },
+            { id: 6, c: 6, u: 6 },
+          ]),
+        ).rejects.toBeInstanceOf(UniqueConstraintError);
+      });
+      expect((await database.query("SELECT id, u FROM t ORDER BY id")).rows).toEqual([
+        { id: 1, u: 1 },
+        { id: 2, u: 2 },
+      ]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
+  it("fills existing rows from a negative constant DEFAULT", async () => {
+    // Schema-change interaction seed 2: `ADD COLUMN a INTEGER NOT NULL DEFAULT -36` was refused
+    // as a nullable add, and the same column without NOT NULL left the rows already stored NULL.
+    // The parser reads `-36` as `-1 * 36`, so the default was kept as an expression to evaluate
+    // per write instead of the constant that fills the rows an ADD COLUMN finds.
+    const store = await open();
+    const database = new MinnowDatabase(store);
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)");
+      await database.execute("INSERT INTO t VALUES (1, 1)");
+      await database.execute("ALTER TABLE t ADD COLUMN a INTEGER NOT NULL DEFAULT -36");
+      await database.execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT -36");
+      await database.execute("ALTER TABLE t ADD COLUMN r DOUBLE PRECISION DEFAULT (-2.5)");
+      await database.execute("INSERT INTO t (id, c) VALUES (2, 2)");
+      expect((await database.query("SELECT * FROM t ORDER BY id")).rows).toEqual([
+        { id: 1, c: 1, a: -36, b: -36, r: -2.5 },
+        { id: 2, c: 2, a: -36, b: -36, r: -2.5 },
+      ]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
+  it("drops a column of a table another table references", async () => {
+    // Schema-change interaction seeds 1, 9, and 10: DROP COLUMN on a parent table failed with
+    // `Cannot remove t1: referenced by t2`. The column drop ran the guard that protects a whole
+    // table from removal while a foreign key references it; a foreign key reads only the
+    // parent's key, which a column drop refuses on its own.
+    const store = await open();
+    const database = new MinnowDatabase(store);
+    try {
+      await database.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, note TEXT, extra INTEGER)");
+      await database.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, f INTEGER REFERENCES p (id) ON DELETE CASCADE)",
+      );
+      await database.execute("ALTER TABLE p DROP COLUMN extra");
+      await database.execute("INSERT INTO p VALUES (1, 'one')");
+      await database.execute("INSERT INTO c VALUES (10, 1)");
+      await expect(database.execute("DROP TABLE p")).rejects.toThrow(/foreign key/u);
+      await database.execute("DELETE FROM p WHERE id = 1");
+      expect((await database.query("SELECT * FROM p")).rows).toEqual([]);
+      expect((await database.query("SELECT * FROM c")).rows).toEqual([]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+});
+
+describe.each([
+  {
+    name: "indexeddb",
+    durable: () => {
+      const indexedDB = new IDBFactory();
+      const name = crypto.randomUUID();
+      return () => IndexedDbBlockStore.open({ name, indexedDB });
+    },
+  },
+  {
+    name: "opfs",
+    durable: () => {
+      const root = new MemoryOpfs().root;
+      const name = crypto.randomUUID();
+      return () => OpfsBlockStore.open({ name, root });
+    },
+  },
+])("a dropped UNIQUE index on $name", ({ durable }) => {
+  it("leaves a database that reopens", async () => {
+    // Schema-change interaction seeds 23630 and 53261 (the suite's own options, OPFS): after
+    // CREATE UNIQUE INDEX and DROP INDEX, the next connection to open the database found it
+    // corrupt -- `Completed UNIQUE build ... is inconsistent`. Dropping the index removed its
+    // membership but kept its completed build record, which a checkpoint refuses once the
+    // index is gone. The drop now removes the record, and loading discards one an earlier
+    // drop left behind.
+    const open = durable();
+    const store = await open();
+    const database = new MinnowDatabase(store);
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT)");
+    await database.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    await database.execute("CREATE UNIQUE INDEX t_c ON t (c, id)");
+    await database.execute("DROP INDEX t_c");
+    await database.execute("INSERT INTO t VALUES (3, 'a')");
+    await database.close();
+    store.close();
+    const reopenedStore = await open();
+    const reopened = new MinnowDatabase(reopenedStore);
+    try {
+      expect((await reopened.query("SELECT * FROM t ORDER BY id")).rows).toEqual([
+        { id: 1, c: "a" },
+        { id: 2, c: "b" },
+        { id: 3, c: "a" },
+      ]);
+      // The name is free again, and a rebuild judges the rows as they stand.
+      await expect(reopened.execute("CREATE UNIQUE INDEX t_c ON t (c)")).rejects.toThrow(
+        /UNIQUE index t_c has a duplicate key/u,
+      );
+      await reopened.execute("CREATE UNIQUE INDEX t_c ON t (c, id)");
+    } finally {
+      await reopened.close();
+      reopenedStore.close();
+    }
+  });
+});
+
+describe("an invalidated UNIQUE accelerator on opfs", () => {
+  it("leaves a database that reopens", async () => {
+    // Schema-change interaction seed 53261 (the suite's own options), reduced. Separate OPFS
+    // adapters write one table with an enforced UNIQUE column; a commit that cannot cover the
+    // index's postings flips the accelerator to "invalid", as it should -- enforcement lives in
+    // the membership set, not the postings. The checkpoint loader then refused the database:
+    // it required the completed UNIQUE build's index to be "ready", so the next connection to
+    // open it reported `Completed UNIQUE build ... is inconsistent`, and reopening failed.
+    const root = new MemoryOpfs().root;
+    const name = crypto.randomUUID();
+    const plan: InteractionPlan = {
+      version: 1,
+      seed: 53_261,
+      connections: 3,
+      interactions: [
+        {
+          kind: "createTable",
+          connection: 0,
+          table: {
+            name: "t0",
+            columns: [
+              {
+                name: "c0",
+                type: "real",
+                nullable: false,
+              },
+              {
+                name: "c1",
+                type: "integer",
+                nullable: true,
+              },
+              {
+                name: "c2",
+                type: "integer",
+                nullable: false,
+              },
+              {
+                name: "u",
+                type: "text",
+                nullable: false,
+                unique: true,
+                domain: 48,
+              },
+              {
+                name: "v",
+                type: "integer",
+                nullable: true,
+                domain: 64,
+              },
+            ],
+          },
+          expectExisting: false,
+        },
+        {
+          kind: "upsertUnique",
+          connection: 1,
+          table: "t0",
+          row: {
+            id: 6,
+            c0: -10.5,
+            c1: 4,
+            c2: -7,
+            u: "k30",
+            v: null,
+          },
+          target: ["u"],
+          assignments: [
+            {
+              column: "c0",
+              from: "excluded",
+            },
+            {
+              column: "c1",
+              from: "increment",
+            },
+            {
+              column: "c2",
+              from: "excluded",
+            },
+            {
+              column: "v",
+              from: "excluded",
+            },
+          ],
+        },
+        {
+          kind: "insert",
+          connection: 1,
+          table: "t0",
+          rows: [
+            {
+              id: 3,
+              c0: -6.25,
+              c1: 42,
+              c2: 9,
+              u: "k24",
+              v: null,
+            },
+            {
+              id: 16,
+              c0: 12.75,
+              c1: null,
+              c2: 6,
+              u: "k19",
+              v: 48,
+            },
+            {
+              id: 12,
+              c0: 19.75,
+              c1: 10,
+              c2: -17,
+              u: "k21",
+              v: 48,
+            },
+          ],
+          viaParameters: false,
+        },
+        {
+          kind: "lookup",
+          connection: 1,
+          table: "t0",
+          predicate: {
+            kind: "compare",
+            column: "u",
+            op: ">=",
+            value: "k0",
+          },
+          orderBy: null,
+          descending: false,
+          limit: null,
+        },
+        {
+          kind: "transaction",
+          connection: 0,
+          observer: 2,
+          table: "t0",
+          statements: [
+            {
+              kind: "update",
+              predicate: {
+                kind: "compare",
+                column: "c0",
+                op: "<>",
+                value: 0,
+              },
+              assignments: [
+                {
+                  kind: "set",
+                  column: "c0",
+                  value: -16.5,
+                },
+                {
+                  kind: "set",
+                  column: "c1",
+                  value: 8,
+                },
+              ],
+            },
+            {
+              kind: "update",
+              predicate: {
+                kind: "compare",
+                column: "id",
+                op: ">=",
+                value: 3,
+              },
+              assignments: [
+                {
+                  kind: "set",
+                  column: "c2",
+                  value: 36,
+                },
+                {
+                  kind: "set",
+                  column: "c1",
+                  value: null,
+                },
+              ],
+            },
+            {
+              kind: "insert",
+              rows: [
+                {
+                  id: 15,
+                  c0: 15.5,
+                  c1: -3,
+                  c2: -10,
+                  u: "k3",
+                  v: 28,
+                },
+              ],
+            },
+          ],
+          outcome: "rollback",
+        },
+        {
+          kind: "insert",
+          connection: 0,
+          table: "t0",
+          rows: [
+            {
+              id: 15,
+              c0: -16,
+              c1: 31,
+              c2: 14,
+              u: "k22",
+              v: 11,
+            },
+          ],
+          viaParameters: false,
+        },
+        {
+          kind: "alterTable",
+          connection: 2,
+          table: "t0",
+          change: {
+            kind: "renameColumn",
+            column: "c2",
+            to: "r5",
+          },
+          expectRefused: false,
+        },
+        {
+          kind: "delete",
+          connection: 1,
+          table: "t0",
+          predicate: {
+            kind: "compare",
+            column: "c0",
+            op: "<>",
+            value: 12.25,
+          },
+        },
+        {
+          kind: "burst",
+          table: "t0",
+          seed: 1142615806,
+          commits: 43,
+          keySpace: 16,
+        },
+        {
+          kind: "fault",
+          connection: 0,
+          table: "t0",
+          mutation: {
+            kind: "insert",
+            row: {
+              id: 17,
+              c0: 0,
+              c1: 0,
+              r5: 0,
+              u: "probe-17",
+              v: 1000017,
+            },
+          },
+          point: "beforeBlockWrite",
+        },
+      ],
+    };
+    const result = await runInteractionPlan(
+      plan,
+      createDatabaseDriver(() => OpfsBlockStore.open({ name, root }), {
+        databaseOptions: { rowsPerBlock: 8, ftsAutoIndexRows: 8 },
+      }),
+    );
+    expect(result.interactions).toBe(plan.interactions.length);
+  });
+});

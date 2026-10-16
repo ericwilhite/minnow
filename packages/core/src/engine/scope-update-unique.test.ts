@@ -86,7 +86,7 @@ describe.each(implementations)("scoped UNIQUE updates on $name", ({ create }) =>
     await db.write(async (tx) => {
       await expect(
         tx.updateBatch("items", { keys: [1, 2], changes: { code: [9, 9] } }),
-      ).rejects.toThrow(/duplicate key/);
+      ).rejects.toThrow(new UniqueConstraintError("items", "code", 9));
       await tx.execute("UPDATE items SET code = 9 WHERE id = 1");
     });
     expect((await db.query("SELECT code FROM items WHERE id = 1")).rows).toEqual([{ code: 9 }]);

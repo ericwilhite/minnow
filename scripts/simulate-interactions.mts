@@ -18,6 +18,7 @@ import {
   generateInteractionPlan,
   parseInteractionPlan,
   runInteractionPlan,
+  type DriverStoreSource,
   type InteractionPlan,
 } from "../packages/core/src/testing/interaction-simulator.js";
 import { MemoryOpfs } from "../packages/core/src/testing/opfs-shim.js";
@@ -30,6 +31,10 @@ const known = new Set([
   "--tables",
   "--key-space",
   "--rekeying",
+  "--constraints",
+  "--schema-changes",
+  "--full-text",
+  "--burst-commits",
   "--store",
   "--plan",
   "--write-plan",
@@ -55,9 +60,23 @@ const generationFlags = [
   "--tables",
   "--key-space",
   "--rekeying",
+  "--constraints",
+  "--schema-changes",
+  "--full-text",
+  "--burst-commits",
 ].filter((flag) => values.has(flag));
-const rekeying = values.get("--rekeying") ?? "false";
-if (rekeying !== "true" && rekeying !== "false") failUsage("--rekeying must be true or false");
+const rekeying = booleanOption("--rekeying");
+const constraints = booleanOption("--constraints");
+const schemaChangesFlag = values.get("--schema-changes") ?? "false";
+if (!["true", "false", "populated"].includes(schemaChangesFlag)) {
+  failUsage("--schema-changes must be true, false, or populated");
+}
+const schemaChanges: boolean | "populated" =
+  schemaChangesFlag === "populated" ? "populated" : schemaChangesFlag === "true";
+const fullText = booleanOption("--full-text");
+const burstCommits = values.has("--burst-commits")
+  ? numericOption("--burst-commits", 0, 1, 100_000)
+  : undefined;
 if (planFile !== undefined && generationFlags.length > 0) {
   failUsage(`--plan cannot be combined with ${generationFlags.join(", ")}`);
 }
@@ -75,23 +94,36 @@ const replay =
     ? `npm run simulate:interactions -- --seed ${String(plan.seed)} --length ${String(numericOption("--length", 300, 1, 100_000))} ` +
       `--connections ${String(plan.connections)} --tables ${String(numericOption("--tables", 3, 1, 8))} ` +
       `--key-space ${String(numericOption("--key-space", 24, 2, 10_000))}` +
-      `${rekeying === "true" ? " --rekeying true" : ""} --store ${storeName}`
+      `${rekeying ? " --rekeying true" : ""}${constraints ? " --constraints true" : ""}` +
+      `${schemaChanges === false ? "" : ` --schema-changes ${String(schemaChanges)}`}${fullText ? " --full-text true" : ""}` +
+      `${burstCommits === undefined ? "" : ` --burst-commits ${String(burstCommits)}`} --store ${storeName}`
     : `npm run simulate:interactions -- --plan ${JSON.stringify(planFile)} --store ${storeName}`;
 
-const store =
-  storeName === "memory"
-    ? new MemoryBlockStore()
-    : storeName === "indexeddb"
-      ? await IndexedDbBlockStore.open({
-          name: "simulate-interactions",
-          indexedDB: new IDBFactory(),
-        })
-      : await OpfsBlockStore.open({ name: "simulate-interactions", root: new MemoryOpfs().root });
+// Memory has no durable identity to share, so its connections share one instance. IndexedDB and
+// OPFS open a separate adapter per connection over one database, as separate tabs do, and as
+// the Vitest suite does: a cross-tab cache or a recovery path that another tab's records
+// confuse only shows that way.
+const memory = storeName === "memory" ? new MemoryBlockStore() : undefined;
+const indexedDB = new IDBFactory();
+const opfsRoot = new MemoryOpfs().root;
+const source: DriverStoreSource =
+  memory ??
+  (storeName === "indexeddb"
+    ? () => IndexedDbBlockStore.open({ name: "simulate-interactions", indexedDB })
+    : () => OpfsBlockStore.open({ name: "simulate-interactions", root: opfsRoot }));
 try {
   const started = performance.now();
   const result = await runInteractionPlan(
     plan,
-    createDatabaseDriver(store, { databaseOptions: { rowsPerBlock: 8 } }),
+    createDatabaseDriver(source, {
+      // A low full-text threshold lets MATCH build the index the append-only tables can hold.
+      databaseOptions: {
+        rowsPerBlock: 8,
+        ...(plan.interactions.some((interaction) => interaction.kind === "match")
+          ? { ftsAutoIndexRows: 8 }
+          : {}),
+      },
+    }),
   );
   const elapsed = ((performance.now() - started) / 1_000).toFixed(2);
   console.log(
@@ -104,7 +136,9 @@ try {
       `${String(result.faultsSkipped)} faults skipped; ${String(result.reopens)} reopens; ${String(result.checkpoints)} checkpoints`,
   );
   console.log(
-    `${String(result.tablesAtEnd)} tables and ${String(result.rowsAtEnd)} rows at the end`,
+    `${String(result.tablesAtEnd)} tables and ${String(result.rowsAtEnd)} rows at the end; ` +
+      `${String(result.indexPathQueries)} index-path lookups; ${String(result.burstCommits)} burst commits ` +
+      `(peak ${String(result.peakBurstSegments)} visible segments)`,
   );
   console.log(`replay: ${replay}`);
 } catch (error) {
@@ -113,7 +147,7 @@ try {
   console.error(`replay: ${replay}`);
   process.exitCode = 1;
 } finally {
-  store.close();
+  memory?.close();
 }
 
 async function loadPlan(file: string | undefined): Promise<InteractionPlan> {
@@ -123,8 +157,18 @@ async function loadPlan(file: string | undefined): Promise<InteractionPlan> {
     connections: numericOption("--connections", 4, 1, 16),
     tables: numericOption("--tables", 3, 1, 8),
     keySpace: numericOption("--key-space", 24, 2, 10_000),
-    rekeying: rekeying === "true",
+    rekeying,
+    constraints,
+    schemaChanges,
+    fullText,
+    ...(burstCommits === undefined ? {} : { burstCommits }),
   });
+}
+
+function booleanOption(flag: string): boolean {
+  const value = values.get(flag) ?? "false";
+  if (value !== "true" && value !== "false") failUsage(`${flag} must be true or false`);
+  return value === "true";
 }
 
 function numericOption(flag: string, fallback: number, minimum: number, maximum: number): number {
@@ -153,6 +197,15 @@ Generate and run:
   --tables NUMBER        Tables the plan may hold at once (default: 3)
   --key-space NUMBER     Primary-key space per table (default: 24)
   --rekeying true|false  Add primary-key changes and self-references (default: false)
+  --constraints true|false
+                         Add UNIQUE columns and indexes, upserts on them, enforced foreign
+                         keys, and index-shaped lookups (default: false)
+  --schema-changes true|false|populated
+                         Add ALTER TABLE ADD/DROP/RENAME COLUMN and CREATE/DROP INDEX
+                         interleaved with the writes; populated also adds and drops columns
+                         on tables that hold rows (default: false)
+  --full-text true|false Add MATCH queries and append-only tables they index (default: false)
+  --burst-commits NUMBER Add bursts of up to this many single-row commits to one table
   --store NAME           memory, indexeddb, or opfs (default: memory)
 
 Replay:

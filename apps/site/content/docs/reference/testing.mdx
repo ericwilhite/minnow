@@ -542,6 +542,45 @@ refused. These steps come from a second random stream, so a plan generated witho
 exactly what it always was and every recorded seed still replays the plan that failed. The Vitest
 suite runs rekeying plans over every store under the `interaction-simulator-rekeying` seeds.
 
+Four more options widen the schema a plan works against, each from a random stream of its own,
+so turning any of them on leaves the others' steps where they were:
+
+- **`constraints`** (`--constraints true`) gives tables an inline `UNIQUE` column, a wide-domain
+  column that may later get a `UNIQUE` index (whose build the model refuses when the rows already
+  hold a duplicate), composite unique indexes, and child tables with an enforced foreign key that
+  is `ON DELETE CASCADE`, `SET NULL`, or `RESTRICT`. The model predicts which statement each
+  constraint refuses, and with which error: a duplicate is `UniqueConstraintError`, a missing
+  parent or a restricting child is the foreign key's own refusal, and a statement that breaks
+  one changes nothing. Uniqueness is judged per statement, so a swap is allowed. Deletes cascade
+  down the tree of children, dropping a referenced table is refused, and with `rekeying` a
+  parent's rekey moves its children's references. Plans also add `INSERT … ON CONFLICT (unique
+column) DO UPDATE | DO NOTHING` (the row holding the value is updated under its own key; any
+  other collision is an error), a targetless `ON CONFLICT DO NOTHING`, and selects shaped for the
+  secondary-index path — equality, `IN`, and ranges on an indexed column, ordered by it — whose
+  plans the Node driver explains to count the reads an index served. A concurrent round whose
+  writes contend for one unique value runs concurrently all the same, and its outcomes must be
+  those of some serial order: of two writes claiming one free value, exactly one lands.
+- **`schemaChanges`** (`--schema-changes true`) interleaves `ALTER TABLE` with the writes:
+  `ADD COLUMN` with a constant `DEFAULT` (sometimes reusing a dropped column's name), `DROP
+COLUMN`, `RENAME COLUMN`, and `CREATE`/`DROP INDEX`, including drops and renames the engine must
+  refuse because an index or foreign key uses the column. Some inserts then leave the defaulted
+  columns out. Columns are added and dropped only on tables nothing has written yet, because
+  today a table that holds segments from before an `ADD COLUMN`, or an update segment whose only
+  changed column was dropped, can no longer fold; `--schema-changes populated` lifts that
+  restriction and reproduces it.
+- **`fullText`** (`--full-text true`) adds `MATCH … AGAINST` queries, with prefixes, several
+  columns, and an extra predicate, over keyed tables and over append-only tables a full-text
+  index can cover. The model tokenizes as the engine documents: NFKC, lowercased, runs of letters
+  and digits.
+- **`burstCommits`** (`--burst-commits N`) adds bursts of up to `N` single-row commits to one
+  table from every connection, each judged as it lands. Every plan with the option holds at least
+  one. After a burst of 640 commits or more the table must hold at most 640 visible segments:
+  automatic folds have to keep up, which is how a table that can never compact shows up long
+  before its writes are refused.
+
+The Vitest suite runs plans with all four over every store under the
+`interaction-simulator-schema` seeds.
+
 Two refusals inside a transaction are engine behaviour rather than defects, so the runner counts
 them and continues: a `COMMIT` that lost the race to another connection's data commit, and a
 transaction the engine rolled back after `transactionIdleTimeoutMs` of idleness. Both discard the
@@ -589,6 +628,9 @@ npm run simulate:interactions -- --seed 24301 --length 300 --connections 4 --sto
 npm run simulate:interactions -- --seed 24301 --write-plan /tmp/minnow-interactions.json
 npm run simulate:interactions -- --plan /tmp/minnow-interactions.json --store opfs
 npm run soak -- --suite interaction-simulator
+npm run simulate:interactions -- --seed 1 --length 1500 --connections 6 --tables 3 --key-space 48 \
+  --constraints true --schema-changes true --full-text true --burst-commits 1500 --store opfs
+npm run soak -- --suite interaction-simulator-schema
 ```
 
 A failure names the interaction, the property, the model's rows, and the SQL leading up to it.
@@ -614,7 +656,14 @@ soaks (1,500 steps over six connections) later found cursors, `DELETE`, spilling
 reads inside a transaction seeing rows outside an exact index selection at stale values, so a
 `DELETE` removed a row its `WHERE` did not match. The first rekeying soaks found a connection losing a key forward once another tab
 collected the manifest that wrote it, retired keys not followed under `OR` and `NOT`, and a
-self-referencing table's references moved twice by a shift or swap.
+self-referencing table's references moved twice by a shift or swap. The first constraint and
+schema-change soaks found a statement giving two rows one `UNIQUE` value refused with the error a
+failed index build raises instead of `UniqueConstraintError`, a negative constant `DEFAULT` that
+neither filled the rows an `ADD COLUMN` found nor allowed `NOT NULL`, `DROP COLUMN` refused on any
+table another table references, and two OPFS databases that would not reopen: one after
+`DROP INDEX` of a `UNIQUE` index, whose finished build record outlived it, and one after a commit
+invalidated a `UNIQUE` index's postings, which the checkpoint loader wrongly required to be
+ready.
 
 `live-differential.test.ts` holds live queries to a fresh execution. A fast-check property runs
 keyed and predicate writes, upserts, rekeys, transactions that commit or roll back, writes from a
