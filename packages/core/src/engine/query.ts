@@ -11418,7 +11418,18 @@ function pendingSelectBlock(parts: SelectBlockParts): CompiledQuery {
 export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
-  columnsOf?: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  return lowerSelectBlock(parts, nextSequence, undefined);
+}
+
+/**
+ * assembleSelectBlock with the source schemas, when they are known: schema binding passes them so
+ * a GROUP BY name that is both an alias and an input column can resolve.
+ */
+function lowerSelectBlock(
+  parts: SelectBlockParts,
+  nextSequence: () => number,
+  columnsOf: ((tableName: string) => readonly string[] | undefined) | undefined,
 ): CompiledQuery {
   if (parts.select.some((item) => item.expression.kind === "wildcard")) {
     // A wildcard's width and names come from source schemas, but ordinals, hidden ORDER BY
@@ -11934,7 +11945,7 @@ export function bindPendingSelectShapes(
       void pendingSelectShape;
       void pendingOutputAliases;
       void distinctWildcard;
-      lowered = assembleSelectBlock(
+      lowered = lowerSelectBlock(
         {
           sql: rest.sql,
           base: rest.base,
