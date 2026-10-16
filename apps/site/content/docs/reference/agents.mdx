@@ -144,8 +144,8 @@ machines: https://minnowdb.com/llms.txt
   `DELETE` statements coalesce into a few segments per table. Chunking only multiplies commits. Worker calls have a 60-second default `requestTimeoutMs` that counts
   silence, not wall time; close has a five-second default silence `timeoutMs` and the same
   ten-timeout absolute cap. An unknown mutation outcome requires reconciliation by durable
-  application ID, never blind replay. Deploy matching client/worker builds (wire protocol 7 in
-  core 0.9.0).
+  application ID, never blind replay. Deploy matching client/worker builds: the wire protocol
+  is versioned and refuses a mismatch on every call.
 - An idle SQL transaction rolls back and rejects subsequent statements with
   `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. The 30-second default counts from
   the connection's last statement, and no other connection's crash, reopen, or maintenance ends

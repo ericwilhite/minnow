@@ -10,8 +10,10 @@ import { dateMilliseconds } from "../date-value.js";
 import { estimateValuesBytes } from "./byte-estimates.js";
 import { planMemoKey, sameQueryRow as sameLiveRow } from "./query-cache.js";
 import {
+  childExpressions,
   externalizeQueryResult,
   type CompiledQuery,
+  type Expression,
   type QueryResult,
   type QueryRow,
   type QueryValue,
@@ -29,6 +31,15 @@ export const LIVE_MAINTENANCE_MAX_DELTA_ROWS = 2_048;
 /** Rows a window keeps beyond its visible edge: at least this many, at most the window itself. */
 export const LIVE_WINDOW_MARGIN_MIN = 16;
 export const LIVE_WINDOW_MARGIN_MAX = 64;
+
+/**
+ * Test-only counters, exported from no public entry point: suites import this module directly
+ * to assert how much work a commit cost, which a wall-clock assertion could not pin down.
+ */
+export const liveMaintenanceTestHooks = {
+  /** Delta queries the row-patching path executed. */
+  deltaQueries: 0,
+};
 
 export interface LiveMaintenanceOrderTerm {
   /** The result column the term's value is read from, public or hidden. */
@@ -73,6 +84,214 @@ export interface LiveMaintenanceState {
   readonly positions: ReadonlyMap<string, number>;
   /** One array per ORDER BY term, each holding that term's value for every retained row. */
   readonly order: ReadonlyArray<readonly QueryValue[]>;
+  /** The key values the statement's WHERE pins its key to, when it does; see `liveKeyPins`. */
+  readonly keyPins?: LiveKeyPins;
+  /** The columns its WHERE and ORDER BY read, when they resolve; see `liveReadColumns`. */
+  readonly readColumns?: LiveReadColumns;
+}
+
+/**
+ * The only key values a row can have and still pass a statement's WHERE: `key = 5`, or
+ * `key IN ('a', 'b')`, as a top-level conjunct. A commit whose changed keys are all outside
+ * this set cannot bring a row into the result, so a live set of per-row queries — a detail view
+ * for each of two hundred rows — answers a one-row commit without running two hundred delta
+ * queries that would each come back empty.
+ */
+export interface LiveKeyPins {
+  /** One JavaScript type for every pinned value, so tokens compare as SQL equality would. */
+  readonly kind: "number" | "string";
+  readonly tokens: ReadonlySet<string>;
+}
+
+/**
+ * Reads the key pins off a planned statement, or undefined when there are none it can prove.
+ * Deliberately narrow: plain literals only (no domain, tag, or exact-decimal spelling), whole
+ * numbers or strings outside the engine's protected NUL namespace, and a bare column name only
+ * when no join could make it ambiguous. Anything else leaves the delta query as the authority.
+ */
+export function liveKeyPins(
+  plan: CompiledQuery,
+  alias: string,
+  keyColumn: string,
+): LiveKeyPins | undefined {
+  const qualified = `${alias}.${keyColumn}`;
+  const isKey = (expression: Expression): boolean =>
+    expression.kind === "column" &&
+    (expression.reference === qualified ||
+      (plan.joins.length === 0 && expression.reference === keyColumn));
+  const pinValue = (expression: Expression): number | string | undefined => {
+    if (
+      expression.kind !== "literal" ||
+      expression.internalSqlValue === true ||
+      expression.sqlDomain !== undefined ||
+      expression.exactText !== undefined
+    ) {
+      return undefined;
+    }
+    const value = expression.value;
+    if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+    if (typeof value === "string") return value.startsWith("\u0000") ? undefined : value;
+    return undefined;
+  };
+  for (const predicate of plan.predicates) {
+    if (predicate.escape !== undefined) continue;
+    let values: Array<number | string | undefined> | undefined;
+    if (predicate.operator === "=") {
+      if (isKey(predicate.left)) values = [pinValue(predicate.right)];
+      else if (isKey(predicate.right)) values = [pinValue(predicate.left)];
+    } else if (
+      predicate.operator === "IN" &&
+      isKey(predicate.left) &&
+      predicate.right.kind === "list"
+    ) {
+      values = predicate.right.items.map(pinValue);
+    }
+    if (values === undefined) continue;
+    const kind = typeof values[0];
+    if (kind !== "number" && kind !== "string") continue;
+    if (!values.every((value) => typeof value === kind)) continue;
+    return { kind, tokens: new Set(values.map((value) => liveKeyToken(value ?? null))) };
+  }
+  return undefined;
+}
+
+/**
+ * The columns that decide whether a row is in a statement's result and where: every column its
+ * WHERE and ORDER BY read, by column ID — and for an aggregate, every column it reads at all. An
+ * update that writes none of them leaves every row's membership, position, and contribution as
+ * it was, so a commit of such updates — a title edited on a card in another list — needs no
+ * delta query. Undefined when a reference cannot be resolved to one base-table column, which
+ * leaves the delta query in charge.
+ */
+export interface LiveReadColumns {
+  readonly columnIds: ReadonlySet<string>;
+  /** An ORDER BY term is the unique key itself, so the order has no ties to break. */
+  readonly totalOrder: boolean;
+  /** An aggregate: every row it reads contributes, so a delete always reaches it. */
+  readonly aggregate: boolean;
+}
+
+export function liveReadColumns(
+  plan: CompiledQuery,
+  alias: string,
+  keyColumn: string,
+  columnIds: ReadonlyMap<string, string>,
+  aggregate = false,
+): LiveReadColumns | undefined {
+  // A join's ON and the lookup side's columns would need their own accounting.
+  if (plan.joins.length > 0) return undefined;
+  const read = new Set<string>();
+  const resolve = (reference: string): string | undefined => {
+    const dot = reference.indexOf(".");
+    // A column whose own name holds a dot could be either reading; leave it to the delta query.
+    if (dot >= 0 && (reference.slice(0, dot) !== alias || columnIds.has(reference))) {
+      return undefined;
+    }
+    return columnIds.get(dot >= 0 ? reference.slice(dot + 1) : reference);
+  };
+  const visit = (expression: Expression): boolean => {
+    switch (expression.kind) {
+      case "column": {
+        const id = resolve(expression.reference);
+        if (id === undefined) return false;
+        read.add(id);
+        return true;
+      }
+      case "literal":
+      case "parameter":
+        return true;
+      case "call":
+        // COUNT(*) counts rows; it reads no column.
+        if (
+          expression.name === "COUNT" &&
+          expression.arguments.every(
+            (argument) => argument.kind === "wildcard" && argument.table === undefined,
+          ) &&
+          expression.arguments.length <= 1
+        ) {
+          return true;
+        }
+        return (
+          childExpressions(expression).every(visit) &&
+          (expression.aggregateOrderBy ?? []).every((term) => visit(term.expression))
+        );
+      case "binary":
+      case "list":
+      case "condition":
+      case "logical":
+      case "not":
+      case "case":
+        return childExpressions(expression).every(visit);
+      default:
+        // A wildcard, subquery, window, or search reads more than its children show.
+        return false;
+    }
+  };
+  for (const predicate of plan.predicates) {
+    if (!visit(predicate.left) || !visit(predicate.right)) return undefined;
+  }
+  if (aggregate) {
+    for (const item of plan.select) if (!visit(item.expression)) return undefined;
+    for (const expression of plan.groupBy) if (!visit(expression)) return undefined;
+    for (const predicate of plan.having) {
+      if (!visit(predicate.left) || !visit(predicate.right)) return undefined;
+    }
+  }
+  let totalOrder = false;
+  for (const term of plan.orderBy) {
+    let expression = term.expression;
+    // ORDER BY may name an output column or its ordinal; what it reads is that item's expression.
+    if (expression.kind === "column" && !expression.reference.includes(".")) {
+      const name = expression.reference;
+      const output = plan.select.find((item) => item.alias === name);
+      if (output !== undefined) expression = output.expression;
+    } else if (expression.kind === "literal" && typeof expression.value === "number") {
+      const output = plan.select[expression.value - 1];
+      if (output === undefined) return undefined;
+      expression = output.expression;
+    }
+    if (!visit(expression)) return undefined;
+    if (
+      expression.kind === "column" &&
+      resolve(expression.reference) === columnIds.get(keyColumn)
+    ) {
+      totalOrder = true;
+    }
+  }
+  return { columnIds: read, totalOrder, aggregate };
+}
+
+/**
+ * Whether a commit window's segments are all updates that write none of the read columns, or —
+ * for a statement that is not an aggregate — deletes. Inserts and upserts carry every column, so
+ * any of them may bring a row in.
+ */
+export function liveWindowLeavesReadColumns(
+  segments: ReadonlyArray<{ readonly kind: string; readonly columnBlockIds: object }>,
+  read: LiveReadColumns,
+  keyColumnId: string,
+): boolean {
+  for (const segment of segments) {
+    if (segment.kind === "base") continue;
+    if (segment.kind === "delete" && !read.aggregate) continue;
+    if (segment.kind !== "update") return false;
+    for (const columnId of Object.keys(segment.columnBlockIds)) {
+      if (columnId !== keyColumnId && read.columnIds.has(columnId)) return false;
+    }
+  }
+  return true;
+}
+
+/** Whether any changed key could satisfy the pins: same type, same value. */
+export function liveKeyPinsAdmit(
+  pins: LiveKeyPins,
+  changedKeys: ReadonlyMap<string, QueryValue>,
+): boolean {
+  for (const [token, value] of changedKeys) {
+    // A key of another type compares under coercion rules this check does not model.
+    if (typeof value !== pins.kind || pins.tokens.has(token)) return true;
+  }
+  return false;
 }
 
 export interface LiveMaintainedRows {

@@ -1,5 +1,6 @@
 import { dateMilliseconds } from "../date-value.js";
 import { validateSqlDomain, type SqlDomain } from "../storage/types.js";
+import type { ExecuteResult } from "./database.js";
 import type { QueryResult, QueryRow, QueryValue } from "./query.js";
 import { unknownColumnDomains } from "./query.js";
 
@@ -38,7 +39,14 @@ export interface WireQueryResult {
   readonly columns: string[];
   readonly columnDomains: Array<SqlDomain | null>;
   readonly rowCount: number;
+  /** One encoded vector per column; empty when `cells` carries the rows instead. */
   readonly values: WireResultColumn[];
+  /**
+   * A small result's values, row-major: `rowCount × columns.length` of them in one plain array.
+   * One array clones faster than a vector per column, and building a handful of rows from it
+   * is cheaper than any typed form; see `TYPED_COLUMN_MIN_ROWS`.
+   */
+  readonly cells?: QueryValue[];
 }
 
 export interface EncodedQueryResult {
@@ -47,18 +55,101 @@ export interface EncodedQueryResult {
   transfer: ArrayBuffer[];
 }
 
-export function encodeQueryResult(result: QueryResult): EncodedQueryResult {
-  return encodeRows(result.columns, result.rows, result.columnDomains);
+/**
+ * Below this many rows a result travels as one row-major array of plain values. Typed arrays
+ * win on bulk, but each one is an allocation and a transfer-list entry, and for a point read
+ * that bookkeeping costs several times what cloning the handful of values outright does.
+ */
+export const TYPED_COLUMN_MIN_ROWS = 32;
+
+export interface ResultEncodingOptions {
+  /** The row count from which columns take their typed form; see `TYPED_COLUMN_MIN_ROWS`. */
+  readonly typedColumnMinRows?: number;
+}
+
+export function encodeQueryResult(
+  result: QueryResult,
+  options: ResultEncodingOptions = {},
+): EncodedQueryResult {
+  return encodeRows(result.columns, result.rows, result.columnDomains, options);
 }
 
 /**
  * Encodes a bare row array (`run()` returns rows without a column list). Every row of one result
  * carries the same keys in the same order, so the first row names the columns.
  */
-export function encodeQueryRows(rows: readonly QueryRow[]): EncodedQueryResult {
+export function encodeQueryRows(
+  rows: readonly QueryRow[],
+  options: ResultEncodingOptions = {},
+): EncodedQueryResult {
   const first = rows[0];
   const columns = first === undefined ? [] : Object.keys(first);
-  return encodeRows(columns, rows, unknownColumnDomains(columns));
+  return encodeRows(columns, rows, unknownColumnDomains(columns), options);
+}
+
+/**
+ * `execute()`'s result on the channel: identical to the engine's, except that the rows of a
+ * SELECT and the rows a RETURNING clause produced travel as columnar frames. A statement result
+ * is what the Kysely dialect reads, so without this a large SELECT through Kysely paid the
+ * row-object structured clone that `query()` was built to avoid.
+ */
+export interface WireExecuteResult {
+  readonly kind: string;
+  /** `result` (a SELECT's rows) and `returnedRows` (RETURNING) hold `WireQueryResult` frames. */
+  readonly [field: string]: unknown;
+}
+
+export interface EncodedExecuteResult {
+  payload: WireExecuteResult;
+  transfer: ArrayBuffer[];
+}
+
+export function encodeExecuteResult(
+  result: ExecuteResultLike,
+  options: ResultEncodingOptions = {},
+): EncodedExecuteResult {
+  if (result.kind === "rows" && result.result !== undefined) {
+    const encoded = encodeQueryResult(result.result, options);
+    return { payload: { ...result, result: encoded.payload }, transfer: encoded.transfer };
+  }
+  const returned = result.returnedRows;
+  if (returned === undefined) {
+    return { payload: result as unknown as WireExecuteResult, transfer: [] };
+  }
+  const columns = result.returnedColumns ?? Object.keys(returned[0] ?? {});
+  const domains = result.returnedColumnDomains;
+  const encoded = encodeRows(
+    columns,
+    returned,
+    domains?.length === columns.length ? domains : unknownColumnDomains(columns),
+    options,
+  );
+  return { payload: { ...result, returnedRows: encoded.payload }, transfer: encoded.transfer };
+}
+
+/** Rebuilds `execute()`'s result from its channel form; see `encodeExecuteResult`. */
+export function decodeExecuteResult(payload: unknown): ExecuteResult {
+  if (typeof payload !== "object" || payload === null) {
+    throw new TypeError("Expected a statement result frame");
+  }
+  const frame = payload as { kind?: unknown; result?: unknown; returnedRows?: unknown };
+  if (frame.kind === "rows") {
+    return { ...frame, result: decodeQueryResult(frame.result) } as ExecuteResult;
+  }
+  if (frame.returnedRows === undefined) return payload as ExecuteResult;
+  return {
+    ...frame,
+    returnedRows: decodeQueryResult(frame.returnedRows).rows,
+  } as ExecuteResult;
+}
+
+/** The fields of an `ExecuteResult` the encoder reads; the rest crosses as it is. */
+interface ExecuteResultLike {
+  readonly kind: string;
+  readonly result?: QueryResult;
+  readonly returnedRows?: readonly QueryRow[];
+  readonly returnedColumns?: readonly string[];
+  readonly returnedColumnDomains?: ReadonlyArray<SqlDomain | null>;
 }
 
 export function decodeQueryResult(payload: unknown): QueryResult {
@@ -67,7 +158,11 @@ export function decodeQueryResult(payload: unknown): QueryResult {
   }
   validateResultShape(payload.rowCount, payload.columns.length);
   const columns = [...payload.columns];
-  if (payload.values.length !== columns.length || payload.columnDomains.length !== columns.length) {
+  const cells = payload.cells;
+  if (
+    payload.values.length !== (cells === undefined ? columns.length : 0) ||
+    payload.columnDomains.length !== columns.length
+  ) {
     throw new TypeError("Columnar result frame metadata is not aligned");
   }
   for (const name of columns) {
@@ -86,9 +181,16 @@ export function decodeQueryResult(payload: unknown): QueryResult {
     }
     validateSqlDomain(domain as SqlDomain, "worker result");
   }
+  if (cells !== undefined) {
+    return {
+      columns,
+      columnDomains: copyDomains(payload.columnDomains),
+      rows: rowsFromCells(columns, cells, payload.rowCount),
+    };
+  }
   // Validate lengths before allocating rows: a missing vector must never fabricate SQL values.
   for (const column of payload.values) validateColumn(column, payload.rowCount);
-  const columnDomains = structuredClone(payload.columnDomains);
+  const columnDomains = copyDomains(payload.columnDomains);
   const rows: QueryRow[] = [];
   for (let index = 0; index < payload.rowCount; index += 1) rows.push({});
   // Column by column: each fill loop stores one property name into every row, which the engine
@@ -99,6 +201,58 @@ export function decodeQueryResult(payload: unknown): QueryResult {
     fillColumn(rows, name, column);
   }
   return { columns, columnDomains, rows };
+}
+
+/** Rebuilds a small result's rows from its row-major cells, validating every value. */
+function rowsFromCells(columns: readonly string[], cells: unknown, rowCount: number): QueryRow[] {
+  const width = columns.length;
+  if (!Array.isArray(cells) || cells.length !== rowCount * width) {
+    throw new TypeError("Invalid columnar result column encoding");
+  }
+  for (const value of cells as readonly unknown[]) {
+    if (!isQueryValue(value)) throw new TypeError("Invalid columnar result column encoding");
+  }
+  const values = cells as readonly QueryValue[];
+  const protoColumn = columns.includes("__proto__");
+  const rows = new Array<QueryRow>(rowCount);
+  let cell = 0;
+  for (let index = 0; index < rowCount; index += 1) {
+    const row: QueryRow = {};
+    for (const name of columns) {
+      const value = values[cell] ?? null;
+      cell += 1;
+      // See fillColumn: assignment through this one name would set the prototype.
+      if (protoColumn && name === "__proto__") {
+        Object.defineProperty(row, name, {
+          value,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      } else row[name] = value;
+    }
+    rows[index] = row;
+  }
+  return rows;
+}
+
+function isQueryValue(value: unknown): value is QueryValue {
+  return (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    value instanceof Date
+  );
+}
+
+/**
+ * A private copy of a result's domain list. Most columns have no domain, and a structured clone
+ * of an all-null list costs more than a small result's whole frame, so only real domain objects
+ * are cloned.
+ */
+function copyDomains(domains: ReadonlyArray<SqlDomain | null>): Array<SqlDomain | null> {
+  return domains.map((domain) => (domain === null ? null : structuredClone(domain)));
 }
 
 function validateResultShape(rowCount: number, columnCount: number): void {
@@ -172,14 +326,7 @@ function validateColumn(input: unknown, rowCount: number): void {
     case "mixed":
       if (!Array.isArray(column.values) || column.values.length !== rowCount) return fail();
       for (const value of column.values as readonly unknown[]) {
-        if (
-          value !== null &&
-          typeof value !== "number" &&
-          typeof value !== "string" &&
-          typeof value !== "boolean" &&
-          !(value instanceof Date)
-        )
-          return fail();
+        if (!isQueryValue(value)) return fail();
       }
       return;
     default:
@@ -203,12 +350,28 @@ function encodeRows(
   columns: readonly string[],
   rows: readonly QueryRow[],
   columnDomains: ReadonlyArray<SqlDomain | null>,
+  options: ResultEncodingOptions,
 ): EncodedQueryResult {
   if (columnDomains.length !== columns.length) {
     throw new TypeError("Query result column domains must align with the result columns");
   }
   validateResultShape(rows.length, columns.length);
   const transfer: ArrayBuffer[] = [];
+  if (rows.length < (options.typedColumnMinRows ?? TYPED_COLUMN_MIN_ROWS)) {
+    const cells: QueryValue[] = [];
+    for (const row of rows) for (const name of columns) cells.push(row[name] ?? null);
+    return {
+      payload: {
+        kind: "columnar-result",
+        columns: [...columns],
+        columnDomains: copyDomains(columnDomains),
+        rowCount: rows.length,
+        values: [],
+        cells,
+      },
+      transfer,
+    };
+  }
   const values = columns.map((name) => {
     const column = encodeColumn(name, rows);
     if (column.kind === "number" || column.kind === "boolean" || column.kind === "datetime") {
@@ -224,7 +387,7 @@ function encodeRows(
     payload: {
       kind: "columnar-result",
       columns: [...columns],
-      columnDomains: structuredClone([...columnDomains]),
+      columnDomains: copyDomains(columnDomains),
       rowCount: rows.length,
       values,
     },

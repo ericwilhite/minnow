@@ -3,6 +3,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { mulberry32 } from "../testing/seeds.js";
 import { MinnowDatabase } from "./database.js";
 import { type LiveQuerySet } from "./live.js";
+import { liveMaintenanceTestHooks } from "./live-maintenance.js";
 import { type QueryResult, type QueryValue } from "./query.js";
 
 /**
@@ -93,6 +94,17 @@ async function seededDatabase(
       id += 1;
       return id;
     },
+  };
+}
+
+function itemColumns(rows: readonly Item[]): Record<keyof Item, Array<Item[keyof Item]>> {
+  return {
+    id: rows.map((row) => row.id),
+    region: rows.map((row) => row.region),
+    amount: rows.map((row) => row.amount),
+    active: rows.map((row) => row.active),
+    label: rows.map((row) => row.label),
+    seen: rows.map((row) => row.seen),
   };
 }
 
@@ -203,6 +215,22 @@ const MAINTAINABLE = [
   "SELECT id, amount FROM items ORDER BY 2 DESC, 1",
   "SELECT COUNT(*) AS n, SUM(amount) AS total, AVG(amount) AS average FROM items WHERE active = TRUE",
   "SELECT region, COUNT(*) AS n FROM items GROUP BY region ORDER BY region",
+  // Key-pinned shapes, which skip the delta query for commits that touch no pinned key. Ids
+  // past 120 do not exist yet; the script's inserts create them.
+  "SELECT * FROM items WHERE id = 7",
+  "SELECT id FROM items WHERE 9 = id",
+  "SELECT id, amount FROM items WHERE id IN (3, 11, 122, 125) ORDER BY id",
+  "SELECT i.id, i.amount FROM items AS i WHERE i.id = 5 AND i.amount > 20",
+  "SELECT i.id, o.amount FROM items AS i JOIN other AS o ON o.id = i.id WHERE i.id = 1",
+  "SELECT id, amount FROM items WHERE id IN (2, 4, 6, 8, 10, 121) ORDER BY amount DESC, id LIMIT 3",
+  // Shapes whose WHERE and ORDER BY never read the columns the script updates (amount, region),
+  // which skip the delta query for updates to rows they do not hold.
+  "SELECT id, amount FROM items WHERE label IN ('L1', 'L2') ORDER BY id",
+  "SELECT id, region FROM items WHERE active = TRUE ORDER BY id LIMIT 7",
+  "SELECT id, amount FROM items WHERE label = 'L3' ORDER BY seen DESC, id LIMIT 5",
+  "SELECT id, amount, region FROM items WHERE seen < '2026-01-20' AND label <> 'L0'",
+  "SELECT COUNT(*) AS n FROM items WHERE active = TRUE AND label <> 'L5'",
+  "SELECT label, COUNT(*) AS n, SUM(id) AS ids FROM items GROUP BY label ORDER BY label",
 ] as const;
 
 const NOT_MAINTAINABLE = [
@@ -268,6 +296,177 @@ describe("live query incremental maintenance", () => {
       expect(live.stats.reruns, sql).toBe(1);
       live.close();
     }
+    await database.close();
+  });
+
+  it("answers a commit outside every pinned key without running a delta query", async () => {
+    const { database } = await seededDatabase(5, 300);
+    await database.createTable({
+      name: "skus",
+      uniqueKey: "sku",
+      columns: [
+        { name: "sku", type: "string" },
+        { name: "stock", type: "number" },
+      ],
+    });
+    await database.insertBatch("skus", { columns: { sku: ["a", "b", "c"], stock: [1, 2, 3] } });
+    const live = database.liveQueries();
+    const deliveries = new Map<string, number>();
+    const statements = [
+      ...Array.from(
+        { length: 200 },
+        (_, index) => `SELECT id, amount FROM items WHERE id = ${String(index + 1)}`,
+      ),
+      "SELECT sku, stock FROM skus WHERE sku = 'b'",
+    ];
+    for (const sql of statements) {
+      await live.subscribe(sql, {
+        onChange: () => deliveries.set(sql, (deliveries.get(sql) ?? 0) + 1),
+      });
+    }
+    // A parameterized pin binds like a literal one.
+    let bound = 0;
+    await live.subscribe(
+      { kind: "sql-query", sql: "SELECT id, amount FROM items WHERE id = $1", params: [150] },
+      { onChange: () => (bound += 1) },
+    );
+    const before = liveMaintenanceTestHooks.deltaQueries;
+    await database.updateBatch("items", { keys: [42], changes: { amount: [1_000] } });
+    await live.refresh();
+    // One delta query — the subscription pinned to 42 — instead of one per subscription.
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1);
+    expect(deliveries.get("SELECT id, amount FROM items WHERE id = 42")).toBe(2);
+    expect(deliveries.get("SELECT id, amount FROM items WHERE id = 41")).toBe(1);
+    expect(live.stats.reruns).toBe(0);
+
+    // A key no subscription pins, inserted and then updated: nothing to run either time.
+    await database.insertBatch("items", {
+      columns: { ...itemColumns([item(mulberry32(1), 900)]) },
+    });
+    await live.refresh();
+    await database.updateBatch("items", { keys: [900], changes: { amount: [3] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1);
+    await database.updateBatch("items", { keys: [150], changes: { amount: [3] } });
+    await live.refresh();
+    expect(bound).toBe(2);
+
+    // String keys: another sku changes nothing; the pinned one is patched.
+    const skuSql = "SELECT sku, stock FROM skus WHERE sku = 'b'";
+    const baseline = liveMaintenanceTestHooks.deltaQueries;
+    await database.updateBatch("skus", { keys: ["c"], changes: { stock: [30] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries).toBe(baseline);
+    expect(deliveries.get(skuSql)).toBe(1);
+    await database.updateBatch("skus", { keys: ["b"], changes: { stock: [20] } });
+    await live.refresh();
+    expect(deliveries.get(skuSql)).toBe(2);
+    live.close();
+    await database.close();
+  });
+
+  it("skips the delta query for updates that leave every column its WHERE and ORDER BY read", async () => {
+    const { database } = await seededDatabase(21, 1_200);
+    const live = database.liveQueries();
+    const labels = Array.from({ length: 12 }, (_, index) => `L${String(index)}`);
+    const latest = new Map<string, QueryResult>();
+    const sqlFor = (label: string): string =>
+      `SELECT id, amount FROM items WHERE label = '${label}' ORDER BY id LIMIT 3`;
+    for (const label of labels) {
+      await live.subscribe(sqlFor(label), {
+        onChange: (result) => latest.set(label, result),
+      });
+    }
+    // Per-label counts read only label: an update elsewhere leaves every one of them alone.
+    const counts = new Map<string, QueryResult>();
+    const countFor = (label: string): string =>
+      `SELECT COUNT(*) AS n FROM items WHERE label = '${label}'`;
+    for (const label of labels) {
+      await live.subscribe(countFor(label), {
+        onChange: (result) => counts.set(label, result),
+      });
+    }
+    // The newest row is about the hundredth of its label: past every window and its margin.
+    const outside = 1_200;
+    const held = new Set(
+      [...latest.values()].flatMap((result) => result.rows.map((row) => row.id as number)),
+    );
+    const before = liveMaintenanceTestHooks.deltaQueries;
+    // amount is projected but never filtered or ordered on: twelve windows, no delta query.
+    await database.updateBatch("items", { keys: [outside], changes: { amount: [-1] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(0);
+    // A held row still patches its own window, and only that one runs a delta query.
+    const [heldRow] = held;
+    await database.updateBatch("items", { keys: [heldRow ?? 0], changes: { amount: [-2] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1);
+    // label is what every window and count filters on: each of them has to look.
+    await database.updateBatch("items", { keys: [outside], changes: { label: ["L4"] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1 + 2 * labels.length);
+    // A delete leaves the windows that do not hold the row, but every count must look.
+    await database.deleteBatch("items", { keys: [outside - 1] });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1 + 3 * labels.length);
+    for (const label of labels) {
+      const fresh = await database.query(sqlFor(label), { memoize: false });
+      expect(plain(latest.get(label) ?? fresh)).toEqual(plain(fresh));
+      const count = await database.query(countFor(label), { memoize: false });
+      expect(plain(counts.get(label) ?? count)).toEqual(plain(count));
+    }
+    live.close();
+    await database.close();
+  });
+
+  it("treats a generated column as read through the columns it is computed from", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    await database.execute(
+      "CREATE TABLE acct (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, note TEXT, " +
+        "doubled INTEGER GENERATED ALWAYS AS (balance * 2) STORED)",
+    );
+    await database.execute(
+      "INSERT INTO acct (id, balance, note) VALUES (1, 10, 'a'), (2, 70, 'b')",
+    );
+    const live = database.liveQueries();
+    const sql = "SELECT id, note FROM acct WHERE doubled > 100 ORDER BY id";
+    const results: QueryResult[] = [];
+    await live.subscribe(sql, { onChange: (result) => results.push(result) });
+    expect(plain(last(results))).toEqual([{ id: 2, note: "b" }]);
+    // The update writes balance, not doubled; the row it moves into the result must still arrive.
+    await database.updateBatch("acct", { keys: [1], changes: { balance: [60] } });
+    await live.refresh();
+    expect(plain(last(results))).toEqual(plain(await database.query(sql, { memoize: false })));
+    expect(plain(last(results))).toEqual([
+      { id: 1, note: "a" },
+      { id: 2, note: "b" },
+    ]);
+    live.close();
+    await database.close();
+  });
+
+  it("follows a retired key: a pin on it must not hide the row it forwards to", async () => {
+    const { database } = await seededDatabase(9, 20);
+    const live = database.liveQueries();
+    const sql = "SELECT id, amount FROM items WHERE id = 5 AND amount > 50";
+    const results: QueryResult[] = [];
+    await live.subscribe(sql, { onChange: (result) => results.push(result) });
+    // Rekey 5 to 900 with an amount the filter rejects; 5 now names row 900.
+    await database.execute("UPDATE items SET id = 900, amount = 10 WHERE id = 5");
+    await live.refresh();
+    expect(plain(last(results))).toEqual([]);
+    // The re-planned statement pins the forwarded key: another row's commit runs nothing.
+    const before = liveMaintenanceTestHooks.deltaQueries;
+    await database.updateBatch("items", { keys: [6], changes: { amount: [99] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries).toBe(before);
+    // Row 900 enters the result through its retired key: no pin on 5 may skip this commit.
+    await database.updateBatch("items", { keys: [900], changes: { amount: [60] } });
+    await live.refresh();
+    const fresh = await database.query(sql, { memoize: false });
+    expect(plain(fresh)).toEqual([{ id: 900, amount: 60 }]);
+    expect(plain(last(results))).toEqual(plain(fresh));
+    live.close();
     await database.close();
   });
 

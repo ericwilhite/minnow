@@ -32,7 +32,12 @@ import {
 import { internalsOf } from "./internals.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
 import type { CompiledQuery, QueryRow, QueryValue } from "./query.js";
-import { encodeQueryResult, encodeQueryRows, type EncodedQueryResult } from "./result-wire.js";
+import {
+  encodeExecuteResult,
+  encodeQueryResult,
+  encodeQueryRows,
+  type EncodedQueryResult,
+} from "./result-wire.js";
 import { deserializeSchema, serializeMigrationSteps, type WireSchema } from "./schema-wire.js";
 
 /**
@@ -149,7 +154,6 @@ const directRootMethods = [
   "update",
   "deleteBatch",
   "delete",
-  "runStatement",
   "explain",
   "listVisibleSegmentPage",
   "cleanupQuerySpill",
@@ -176,12 +180,12 @@ function isDirectRootMethod(value: string): value is DirectRootMethod {
 }
 
 /**
- * A call result that travels as a columnar frame with its buffers transferred. Only query
- * results take this path: rows of objects are what structured clone is slowest at, so they are
- * pivoted into per-column arrays here and rebuilt by the client.
+ * A call result that travels as a columnar frame with its buffers transferred. Query results and
+ * statement results take this path: rows of objects are what structured clone is slowest at, so
+ * they are pivoted into per-column arrays here and rebuilt by the client.
  */
 class ColumnarResult {
-  constructor(readonly encoded: EncodedQueryResult) {}
+  constructor(readonly encoded: { payload: unknown; transfer: ArrayBuffer[] }) {}
 }
 
 class CursorBatchResult {
@@ -643,17 +647,27 @@ class DatabaseRpcServer {
           ExecuteOptions | undefined,
           boolean | undefined,
         ];
-        return this.database.execute(sql, params, {
-          ...options,
-          signal: context.signal,
-          ...(reportStats
-            ? {
-                onStats: (stats: QueryExecutionStats) => {
-                  this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
-                },
-              }
-            : {}),
-        });
+        return new ColumnarResult(
+          encodeExecuteResult(
+            await this.database.execute(sql, params, {
+              ...options,
+              signal: context.signal,
+              ...(reportStats
+                ? {
+                    onStats: (stats: QueryExecutionStats) => {
+                      this.scope.postMessage(rpcEvent(context.requestId, "stats", stats));
+                    },
+                  }
+                : {}),
+            }),
+          ),
+        );
+      }
+      case "runStatement": {
+        const [statement, options] = args as Parameters<MinnowDatabase["runStatement"]>;
+        return new ColumnarResult(
+          encodeExecuteResult(await this.database.runStatement(statement, options)),
+        );
       }
       case "queryCursorOpen": {
         const handleId = this.#claimHandleId(args[0]);
@@ -1070,7 +1084,7 @@ class DatabaseRpcServer {
     if (method === "query") return this.#querySession(handle.session, args, context);
     if (method === "execute") {
       const [sql, params] = args as [string, readonly QueryValue[] | undefined];
-      return handle.session.execute(sql, params);
+      return new ColumnarResult(encodeExecuteResult(await handle.session.execute(sql, params)));
     }
     if (method === "stage") {
       const [op, tableName, input, options] = args as [
