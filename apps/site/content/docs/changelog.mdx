@@ -8,6 +8,162 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.16.0 — October 16, 2026
+
+Release packages: `@minnowdb/core@0.16.0`, `@minnowdb/kysely@0.6.0`, `@minnowdb/devtools@0.3.7`.
+
+This release comes from a correctness, conformance, and performance audit. Every fix below was
+reproduced first and ships with a test that fails without it.
+
+### Fixed: data and availability
+
+- **Tables that changed shape could stop accepting writes.** A table that gained a column after
+  rows were written, or lost a column an earlier `UPDATE` had changed, could never be compacted
+  again. Each commit then added one more unmerged segment, and after about 4,100 commits every
+  write to the table was refused. Compaction now fills a missing column with exactly what reads
+  showed (the constant `DEFAULT`, or NULL) and retires updates whose only column was dropped.
+  Databases already in that state recover on open: the first write or read starts the folds. A
+  fold planned before an `ALTER TABLE` is cancelled and planned again, and OPFS no longer refuses
+  to reopen after an `ALTER TABLE` that follows a fold.
+- **Tables with a UNIQUE column could stop accepting writes.** Compaction never declared the
+  table's unique indexes, so every fold of such a table was refused, and after 4,096 single-row
+  commits every write to it was refused too.
+- **`DELETE` could remove rows its `WHERE` did not match.** On a table with a secondary index and
+  earlier updates, an index that named the matching rows exactly was combined with deltas the
+  delete's key read did not apply. The same mismatch made `queryCursor`, spilling sorts and groups,
+  and reads inside a transaction return stale or deleted rows.
+- **An inner join with a constant on the join key** over an indexed table with update or delete
+  history could return another lookup's rows from a pooled column cache.
+- **An index lookup after `ADD COLUMN`** on a folded table could return a stale row.
+- **Rekeying.** Retired keys are now followed under `OR`, `NOT`, and `IS` tests and through `<>`,
+  `NOT IN`, and `IS DISTINCT FROM`; before, `WHERE id = -1 OR …` missed the rekeyed row and an
+  `UPDATE` or `DELETE` with such a `WHERE` silently changed nothing. Shifting or swapping keys on a
+  self-referencing table moves each reference once instead of twice. A connection no longer loses
+  a key forward when another tab collects old manifests, which had let that connection insert the
+  retired key again.
+- **Live queries.** A live query over a self-join re-runs instead of patching rows joined to a
+  changed or deleted row. A live query on a retired key updates when a row is written at the key it
+  forwards to.
+- **OPFS reopen.** A database where a UNIQUE index was dropped, or where a commit invalidated a
+  UNIQUE index's postings, opens again instead of reporting corruption.
+- **Quiet multi-tab maintenance.** Background index builds and folds shared by several tabs no
+  longer report races another tab won. An index build claims its build session before marking the
+  index, so it no longer displaces and invalidates a live build in another tab. A fold that finds
+  its shared job already published adopts it. A table whose automatic fold fails 8 times in a row
+  without progress still reports the latest failure.
+
+### Fixed: SQL conformance
+
+Each form below now matches PostgreSQL (and SQLite where they agree), checked by the conformance
+suites against both.
+
+- `GROUP BY` a name that is both an output alias and a source column groups by the column:
+  `SELECT LOWER(status) AS status … GROUP BY status`.
+- Integer division truncates over integer-returning functions (`LENGTH`, `POSITION`, `STRPOS`,
+  `ASCII`), integer window columns (`ROW_NUMBER`, `RANK`, `COUNT`, `SUM` of an integer),
+  recursive CTE columns, and `CASE`/`COALESCE`/`NULLIF` with `NULL` branches. A constant cast to
+  `DOUBLE PRECISION`, `REAL`, or `NUMERIC` no longer truncates. `VARIANCE` and `STDDEV` over an
+  integer column no longer truncate.
+- A `DATE` compared with a `TIMESTAMP` constant is midnight of its day. `DATE` input (casts,
+  comparisons, and writes) accepts a timestamp's text and keeps its day.
+- `JOIN … USING` and `NATURAL JOIN` merge their join columns: an unqualified `id` names the merged
+  column, `SELECT *` lists it once and first, and a later `USING` may name a column an earlier join
+  supplied.
+- Repeated output names (`SELECT a AS c, b AS c`, `SELECT *, total`) are returned instead of
+  refused; later repeats are numbered `c_2`. Unlabeled select items take PostgreSQL's names:
+  `ARRAY_AGG(id)` is `array_agg`, `COUNT(*)::int` is `count`.
+- `ORDER BY a.n` when an output alias equals a table alias (`SELECT a.n AS a FROM t a`).
+- Constant `timestamp - timestamp` no longer folds to a number of milliseconds.
+- A statement or batch that gives two rows the same UNIQUE value fails with
+  `UniqueConstraintError` instead of a `TypeError`.
+- A negative constant `DEFAULT` (`DEFAULT -36`) is a constant, so `ADD COLUMN … NOT NULL DEFAULT
+-36` works and existing rows read it instead of NULL.
+- `ALTER TABLE … DROP COLUMN` works on a table another table's foreign key references.
+- A number or boolean written to a `TEXT` column stores its text form, as PostgreSQL's assignment
+  cast does. Positional `VALUES` shorter than the table fill the leading columns and default the
+  rest.
+- `explain()` no longer throws on a placeholder compared with a `TEXT` column.
+
+### Added: SQL
+
+- `ON CONFLICT (columns)` may name a UNIQUE constraint or unique index, in any column order. A
+  targetless `ON CONFLICT DO NOTHING` skips collisions on every unique constraint.
+- `INSERT INTO t AS alias`, `UPDATE … SET (a, b) = (…)` and `= ROW(…)`, and `SET column = DEFAULT`.
+- `ALTER TABLE … RENAME [COLUMN] a TO b` (a catalog change; nothing is rewritten) and
+  `ADD COLUMN IF NOT EXISTS`.
+- Date arithmetic: `date - date` returns days, `date ± integer` returns a date,
+  `timestamp - timestamp` returns an interval, and dates and timestamps accept `±` an interval
+  value.
+- `x op ANY/ALL(array)` over `ARRAY[…]`, array columns, and a single array parameter
+  (`= ANY($1)`, `$1::int[]`), which binds to the same plan as an `IN` list.
+- `generate_series(start, stop[, step])` in `FROM`, over integers and timestamps.
+- `PERCENTILE_CONT`, `PERCENTILE_DISC`, and `MODE() WITHIN GROUP (ORDER BY …)`.
+- Kysely 0.6.0 accepts `renameColumn()`, `ifNotExists()` on `addColumn`, and array parameters for
+  `fn.any`.
+- Devtools 0.3.7 confirms and reports `RENAME COLUMN` like the other catalog statements, and its
+  console no longer warns about the SQL forms this release supports.
+
+### Performance
+
+Measured at 200,000 rows on the in-memory store against `node:sqlite` with matching indexes.
+
+- **Point reads** resolve their plan once per catalog state: a keyed lookup is about 4× faster
+  (5–17× slower than SQLite before, 2–5× now), and a lookup written with an inline literal
+  is faster than SQLite. Repeated SELECTs run their catalog rewrites once per schema change and
+  only re-bind parameters after that, and literal SELECTs that differ only in compared values
+  share one plan.
+- **`key IN (…)` and `key = ANY($1)`** are answered as point reads: 100 keys fall from about 6 ms
+  to 0.12 ms.
+- **`ORDER BY … LIMIT/OFFSET`, keyset pages, and `MIN`/`MAX`** read only the rows that can decide
+  the answer: `ORDER BY id DESC LIMIT` fell from 3 ms to 0.05 ms, `MAX(id)` from 10 ms to 0.03 ms,
+  and a deep `OFFSET` page from 9 ms to 0.07 ms (now faster than SQLite).
+- **Secondary indexes** serve equality lookups and `COUNT(*)` without the batch pipeline, an `OR`
+  whose every branch an index serves, a `LIKE` with a literal prefix, and a `LEFT JOIN` with a
+  constant on the preserved key.
+- **Writes.** A single-row `UPDATE` is about 2.3× faster and range or filtered updates 1.6–2×. A
+  point update makes 3 store calls instead of 9 (one IndexedDB transaction each), a single-row
+  `DELETE` 4 instead of 11, and an `INSERT` 6 instead of 8. A write no longer re-checks every
+  visible block or recounts unmerged segments, so its cost no longer grows with unfolded history.
+- **Worker client.** `execute()`, `runStatement()`, and write-scope `execute()` results cross the
+  worker as columnar frames, so Kysely and raw SQL selects through a worker are 1.4–1.5× faster at
+  10,000–100,000 rows, and results under 32 rows travel as one plain array (point reads about 30%
+  faster).
+- **Live queries.** A query that pins its key (`WHERE id = 5`, `id IN (…)`) ignores commits to
+  other keys, and an update that writes no column a query reads no longer re-runs it. 200 per-row
+  live queries answer a one-row commit about 10× faster, and 100 filtered lists about 8×.
+- `MIN`/`MAX`, `COUNT(DISTINCT)` of numbers, and arithmetic compared with a literal run in the
+  batch code. `insertBatch(rows)` turns row objects into columns about 2× faster.
+
+Writes are still slower than SQLite's in-place B-tree, and bulk deletes about 8× slower; see the
+[storage guide](/docs/storage/maintenance) for how folds work.
+
+### Size
+
+The engine with the OPFS adapter is 416 KiB gzipped (392 KiB in 0.15.0).
+
+### API changes
+
+New `QueryParameter` type (`QueryValue | readonly QueryValue[]`) widens `params` across the
+database, client, worker, live queries, and Kysely. `ExecuteResult` gains a `rename-column`
+member, so an exhaustive `switch` over `ExecuteResult.kind` needs a new case. New
+`compactionPlanMatchesTableSchema` export for custom adapters. The plan model gains
+`JoinPlan.using`, `JoinPlan.inputHints`, the literal `timestamp` flag, `RecursiveCte.series`, and
+three `AggregateName` values. The testing simulator adds `constraints`, `schemaChanges`,
+`fullText`, `burstCommits`, and `rekeying` options. The worker protocol is version 9: deploy the
+client and worker from the same build. Kysely 0.6.0 and devtools 0.3.7 need core 0.16.0.
+
+**Migration and stored formats:** no application migration is needed. IndexedDB schema 6 and OPFS
+layout 11 let a compaction job read a source segment that lacks a column added after it was
+written, which 0.15.0 and older treat as corruption. Upgrades run automatically on open and
+rewrite no data: an IndexedDB database at schema 1 to 5 is raised to 6 in one `versionchange`
+transaction, and an OPFS database at layout 7 to 10 has only its format marker rewritten behind a
+flushed `upgrade-10-11` witness, so a crash or power loss at any step finishes on the next open;
+layout 6 is still converted first. After the upgrade, 0.15.0 and older refuse the database with
+`StorageFormatVersionError` and change nothing, so pin 0.16.0 everywhere that opens the same
+database. Snapshot and block formats are unchanged. Custom storage adapters built on the storage
+toolkit's `RecordCore` accept the new compaction plans already; others must accept merge sources
+that hold only their key column and rechunk plans whose columns have gaps.
+
 ## Devtools 0.3.6 — October 16, 2026
 
 Published packages: `@minnowdb/devtools@0.3.6`.

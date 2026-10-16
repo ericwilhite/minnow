@@ -57,8 +57,10 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // 994.6 KiB raw / 293.6 KiB gzip. The read-path work (resolved point-read plans, index reads,
 // ordered row selection, index-served OR and LIKE prefixes, LEFT join input hints, unboxed
 // arithmetic and DISTINCT kernels): 1017.2 KiB raw / 301.4 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1018 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 302 * 1024;
+// The 0.16.0 audit (prepared read templates, ordered selection, index reads, columnar statement
+// results, PostgreSQL forms, schema-change folds): 1067.0 KiB raw / 317.3 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1068 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 318 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -73,7 +75,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 302 * 1024;
 // continuation frames, the lease lane, and follower pieces (0.14.0): 1345.0 KiB raw.
 // Rekeying (0.15.0): 1367.4 KiB raw. With its audit: 1374.8 KiB raw. The read-path work:
 // 1397.8 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1398 * 1024;
+// The 0.16.0 audit: 1448.7 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1449 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -84,7 +87,8 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1398 * 1024;
 // continuation frames, the lease lane, and follower pieces (0.14.0): 382.2 KiB measured.
 // Rekeying (0.15.0): 389.4 KiB measured. With its audit: 392.0 KiB measured. The read-path
 // work: 399.9 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 400 * 1024;
+// The 0.16.0 audit: 416.2 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 417 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
@@ -97,8 +101,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 400 * 1024;
 // 1362.8 KiB raw / 386.3 KiB gzip; with the rekeying audit, 1370.4 KiB raw / 388.9 KiB gzip;
 // with chained forwards and lapsed-lease re-pinning, 389.05 KiB gzip; with the read-path work
 // (point-read plans, index reads, ordered selection), 1393.0 KiB raw / 396.7 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1394 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 397 * 1024;
+// The 0.16.0 audit: 1443.8 KiB raw / 412.7 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1444 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 413 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
