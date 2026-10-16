@@ -76,3 +76,28 @@ it("reads a guarded upsert's pre-images by point read over a long committed hist
   ]);
   await db.close();
 });
+
+it("carries a table's visible segments across its own commits instead of re-proving them", async () => {
+  const { store, calls, reset } = countingStore();
+  const db = new MinnowDatabase(store, { autoCompact: false });
+  await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)");
+  for (let batch = 0; batch < 4; batch += 1) {
+    await db.insertBatch(
+      "items",
+      Array.from({ length: 50 }, (_, index) => ({ id: batch * 50 + index, amount: 0 })),
+    );
+  }
+  for (let index = 0; index < 30; index += 1) {
+    await db.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [index]);
+  }
+  reset();
+  // Each read-first keyed UPDATE reads the table's visible segments. A commit that retires no
+  // block only adds its own, so the list carries forward: re-proving it asked the store about
+  // every block of every segment on every statement, a cost that grew with the history.
+  for (let index = 0; index < 20; index += 1) {
+    await db.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [index]);
+  }
+  expect(calls.get("hasManifestBlocks") ?? 0).toBe(0);
+  expect((await db.query("SELECT SUM(amount) AS total FROM items")).rows).toEqual([{ total: 50 }]);
+  await db.close();
+});

@@ -981,7 +981,22 @@ export class RecordCore {
   #retiredHistoryBytes = 0;
   readonly #retiredManifestVersions = new OrderedKeyIndex<number>(compareOrderedKeys);
   readonly #retiredManifestBlocksByVersion = new Map<number, OrderedKeyIndex<RetiredManifestKey>>();
+  /**
+   * Visible committed level-zero segments per table, as the level-zero ceiling counts them, for
+   * the current manifest version. Every commit that adds level-zero work checks the ceiling, and
+   * counting walked every segment of the table and every block of each. A count stays exact
+   * while its version is current and `#levelZeroGeneration` — bumped by any change to segment
+   * records, manifest block records, or committed transaction records — has not moved; an
+   * ordinary commit that retires no block carries it forward by the level-zero segments it
+   * publishes (see `#applyCommit`).
+   */
+  readonly #levelZeroCounts = new Map<
+    string,
+    { version: number; generation: number; count: number }
+  >();
+  #levelZeroGeneration = 0;
   readonly #manifestBlocks = new OrderedRecordMap<string, ManifestBlockRecord>((previous, next) => {
+    this.#levelZeroGeneration += 1;
     if (previous !== undefined && previous.removedVersion !== null) {
       this.#retiredHistoryBytes -= previous.byteLength;
       this.#changeRetiredManifestBlock(previous, -1);
@@ -1016,6 +1031,9 @@ export class RecordCore {
   readonly #activeTransactionExpiries = new OrderedKeyIndex<ExpiryKey>(compareExpiryKeys);
   readonly #activeTransactionExpiryKeys = new Map<string, ExpiryKey>();
   readonly #transactions = new OrderedRecordMap<string, TransactionRecord>((previous, next) => {
+    if (previous?.status === "committed" || next?.status === "committed") {
+      this.#levelZeroGeneration += 1;
+    }
     this.#changeTransactionReferences(previous, next);
   });
   readonly #triggerOwnersByName = new Map<string, { tableId: string; triggerId: string }>();
@@ -1541,6 +1559,7 @@ export class RecordCore {
 
   #replaceSegments(records: readonly SegmentRecord[], removeIds: readonly string[] = []): void {
     const { retainedBytes, changes } = this.#segmentUsageAfter(records, removeIds);
+    this.#levelZeroGeneration += 1;
     for (const [id, record] of changes) {
       if (record === undefined) this.#segments.delete(id);
       else this.#segments.set(id, record);
@@ -3405,6 +3424,34 @@ export class RecordCore {
     return this.#currentVersion;
   }
 
+  /** Committed level-zero segments of a table whose blocks are all visible at `version`. */
+  #visibleLevelZeroCount(tableId: string, version: number | null): number {
+    const memoizable = version !== null && version === this.#currentVersion;
+    const memo = memoizable ? this.#levelZeroCounts.get(tableId) : undefined;
+    if (memo?.version === version && memo.generation === this.#levelZeroGeneration) {
+      return memo.count;
+    }
+    let count = 0;
+    for (const segment of this.#segments.tableValues(tableId)) {
+      if (segment.level !== 0) continue;
+      const owner = this.#transactions.get(segment.transactionId);
+      if (owner?.status !== "committed") continue;
+      const blocks = segmentBlockIds(segment);
+      if (blocks.length > 0 && blocks.some((id) => !this.#isManifestBlockVisible(version, id))) {
+        continue;
+      }
+      count += 1;
+    }
+    if (memoizable) {
+      this.#levelZeroCounts.set(tableId, {
+        version,
+        generation: this.#levelZeroGeneration,
+        count,
+      });
+    }
+    return count;
+  }
+
   #isManifestBlockVisible(version: number | null, id: string): boolean {
     if (version === null) return false;
     const record = this.#manifestBlocks.get(id);
@@ -4319,8 +4366,11 @@ export class RecordCore {
     } = {},
   ): ManifestSummary {
     const plan = this.#planWriteTransaction(input, options);
+    // Staging the journal's own segments (owned by a transaction that is not yet committed)
+    // changes no level-zero count, so the counts current before it carry through the commit.
+    const levelZeroGeneration = this.#levelZeroGeneration;
     this.#replaceSegments([...plan.segments.values()]);
-    return this.#applyCommit(plan.commit);
+    return this.#applyCommit(plan.commit, levelZeroGeneration);
   }
 
   /** Complete, non-mutating preflight used before a persistent adapter allocates block bytes. */
@@ -4670,24 +4720,9 @@ export class RecordCore {
       pendingSegments,
     );
     if (levelZeroAdmissions.size > 0) {
-      const visibleCounts = new Map<string, number>();
-      for (const tableId of levelZeroAdmissions.keys()) {
-        for (const segment of this.#segments.tableValues(tableId)) {
-          if (segment.level !== 0) continue;
-          const owner = this.#transactions.get(segment.transactionId);
-          if (owner?.status !== "committed") continue;
-          const blocks = segmentBlockIds(segment);
-          if (
-            blocks.length > 0 &&
-            blocks.some((id) => !this.#isManifestBlockVisible(input.expectedManifestVersion, id))
-          ) {
-            continue;
-          }
-          visibleCounts.set(tableId, (visibleCounts.get(tableId) ?? 0) + 1);
-        }
-      }
       for (const [tableId, entry] of levelZeroAdmissions) {
-        const count = (visibleCounts.get(tableId) ?? 0) + entry.added;
+        const count =
+          this.#visibleLevelZeroCount(tableId, input.expectedManifestVersion) + entry.added;
         const table =
           this.#tables.get(tableId) ?? (pendingTable?.id === tableId ? pendingTable : undefined);
         if (table === undefined) {
@@ -4795,9 +4830,19 @@ export class RecordCore {
     };
   }
 
-  #applyCommit(plan: CommitPlan): ManifestSummary {
+  #applyCommit(plan: CommitPlan, levelZeroGeneration = this.#levelZeroGeneration): ManifestSummary {
     const { manifest, addedManifestBlocks, removedManifestBlocks, committed, pendingSegments } =
       plan;
+    // An ordinary commit retires no block and its only newly committed owner is its own, so a
+    // table's visible level-zero count moves by exactly the level-zero segments it publishes.
+    const carriedLevelZeroCounts: Array<[string, number]> = [];
+    if (removedManifestBlocks.length === 0 && this.#currentVersion !== null) {
+      for (const [tableId, memo] of this.#levelZeroCounts) {
+        if (memo.version === this.#currentVersion && memo.generation === levelZeroGeneration) {
+          carriedLevelZeroCounts.push([tableId, memo.count]);
+        }
+      }
+    }
     const nextCatalogEpoch = safeWholeIncrement(this.#catalogEpoch, "Catalog epoch");
     const nextSchemaEpoch =
       plan.pendingTable === undefined
@@ -4845,6 +4890,22 @@ export class RecordCore {
     );
     this.#catalogEpoch = nextCatalogEpoch;
     this.#schemaEpoch = nextSchemaEpoch;
+    this.#levelZeroCounts.clear();
+    if (carriedLevelZeroCounts.length > 0) {
+      const published = new Map<string, number>();
+      for (const segment of pendingSegments) {
+        if (segment.level === 0) {
+          published.set(segment.tableId, (published.get(segment.tableId) ?? 0) + 1);
+        }
+      }
+      for (const [tableId, count] of carriedLevelZeroCounts) {
+        this.#levelZeroCounts.set(tableId, {
+          version: manifest.version,
+          generation: this.#levelZeroGeneration,
+          count: count + (published.get(tableId) ?? 0),
+        });
+      }
+    }
     const ftsDeltaCounts = (plan.ftsChanges ?? []).flatMap((changes) =>
       changes.columns.map((column) => ({
         tableId: changes.tableId,

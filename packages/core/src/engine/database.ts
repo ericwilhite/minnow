@@ -2397,6 +2397,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     SegmentVisibilityCatalog,
     Map<string, SegmentRecord[]>
   >();
+  /** Zone map ranges of a segment's blocks, per column (see #segmentKeyZones). */
+  readonly #segmentZoneCache = new WeakMap<SegmentRecord, Map<string, Float64Array>>();
   /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
   readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
@@ -4547,19 +4549,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (table === undefined) throw new UnknownTableError(name);
           realTables.set(table.name, table);
         });
-        const segmentsByTable = new Map<string, SegmentRecord[]>();
-        for (const segment of state.segments) {
-          const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
-          tableSegments.push(segment);
-          segmentsByTable.set(segment.tableId, tableSegments);
-        }
-        prepared = {
-          realTables,
-          visibility: {
-            transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
-            segmentsByTable,
-          },
-        };
+        prepared = { realTables, visibility: catalogStateVisibility(state) };
         this.#preparedCatalogStates.set(state, prepared);
       }
       const entry = await this.#acquireSharedLease(state.manifestVersion);
@@ -6920,28 +6910,32 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let decodedBlocks = 0;
     // Read bounded batches of headers once, including single-block deltas. Unrelated keys
     // cannot affect this row and must not exhaust its unchanged decoded-block replay cap.
-    let descriptions: Map<string, ReturnType<typeof inspectBlock>> | undefined;
+    let zones: Float64Array[] | undefined;
     if (typeof target === "number") {
-      const ids: string[] = [];
+      let headerBlocks = 0;
       for (const segment of segments) {
-        for (const id of segment.columnBlockIds[keyColumn.id] ?? []) {
-          if (ids.length === MAX_POINT_READ_DELTA_HEADER_BLOCKS) return undefined;
-          ids.push(id);
-        }
+        headerBlocks += segment.columnBlockIds[keyColumn.id]?.length ?? 0;
+        if (headerBlocks > MAX_POINT_READ_DELTA_HEADER_BLOCKS) return undefined;
       }
-      descriptions = await this.#zoneDescriptions(ids, snapshot);
+      zones = await this.#segmentKeyZones(segments, keyColumn.id, snapshot);
     }
-    for (const segment of segments) {
+    for (const [segmentIndex, segment] of segments.entries()) {
       throwIfAborted(options.signal);
       if (segment.rowCount === 0) continue;
       const keyBlockIds = segment.columnBlockIds[keyColumn.id] ?? [];
       if (keyBlockIds.length === 0) return undefined;
-      let blockIndexes = keyBlockIds.map((_, index) => index);
-      if (typeof target === "number" && descriptions !== undefined) {
-        blockIndexes = blockIndexes.filter((blockIndex) => {
-          const zone = descriptions.get(keyBlockIds[blockIndex] ?? "")?.metadata.zoneMap;
-          return zone === undefined || (zone.min <= target && target <= zone.max);
-        });
+      let blockIndexes: number[];
+      const segmentZones = zones?.[segmentIndex];
+      if (typeof target === "number" && segmentZones !== undefined) {
+        // Most deltas in a long history hold other keys: rule them out before allocating.
+        blockIndexes = [];
+        for (let blockIndex = 0; blockIndex < keyBlockIds.length; blockIndex += 1) {
+          const min = segmentZones[blockIndex * 2] ?? Number.NEGATIVE_INFINITY;
+          const max = segmentZones[blockIndex * 2 + 1] ?? Number.POSITIVE_INFINITY;
+          if (min <= target && target <= max) blockIndexes.push(blockIndex);
+        }
+      } else {
+        blockIndexes = keyBlockIds.map((_, index) => index);
       }
       if (blockIndexes.length === 0) continue;
       decodedBlocks += blockIndexes.length;
@@ -8233,6 +8227,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       manifest.changedTableIds.every((tableId) => contributedTableIds.has(tableId))
     ) {
       const nextEpoch = initial.catalogEpoch + 1;
+      // An ordinary commit publishes level-zero segments and retires no block, so every segment
+      // visible before it stays visible and its own segments join them: the visible-segment lists
+      // carry forward instead of re-proving every block of every segment on the next statement.
+      // A compaction's commit retires its sources and never takes this path.
+      const carryVisibility =
+        transaction?.compactionSourceBlockIds.length === 0 &&
+        contribution.segments.every((segment) => segment.level === 0);
       for (const state of this.#catalogStateCache.values()) {
         if (
           state.catalogEpoch !== initial.catalogEpoch ||
@@ -8243,6 +8244,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // The state object is retained so cache/LRU identity stays stable, but its derived maps
         // are immutable snapshots. Drop them before appending the newly committed owner/segment;
         // otherwise the same database instance keeps reading the pre-commit visibility graph.
+        const previousPrepared = this.#preparedCatalogStates.get(state);
         this.#preparedCatalogStates.delete(state);
         const tableIds = new Set(
           state.tables.flatMap((table) => (table === undefined ? [] : [table.id])),
@@ -8270,8 +8272,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             state.segments[index] = replacement;
             additionsById.delete(current.id);
           }
-          state.segments.push(...additionsById.values());
-          state.segments.sort((left, right) => left.id.localeCompare(right.id));
+          // The list is kept in id order; the few new records go in by binary search rather than
+          // re-sorting the table's whole history on every commit.
+          for (const segment of additionsById.values()) {
+            let low = 0;
+            let high = state.segments.length;
+            while (low < high) {
+              const middle = (low + high) >>> 1;
+              const current = state.segments[middle];
+              if (current !== undefined && current.id.localeCompare(segment.id) < 0) {
+                low = middle + 1;
+              } else {
+                high = middle;
+              }
+            }
+            state.segments.splice(low, 0, segment);
+          }
           const ownerIndex = state.transactions.findIndex(
             (record) => record.id === contribution.transaction.id,
           );
@@ -8283,6 +8299,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         state.manifestVersion = manifest.version;
         state.catalogEpoch = nextEpoch;
+        if (carryVisibility && previousPrepared !== undefined) {
+          this.#carryVisibleSegments(
+            state,
+            previousPrepared,
+            initial.manifestVersion,
+            manifest.version,
+            contribution.transaction,
+            additions,
+          );
+        }
       }
       this.#catalogStateEpoch = nextEpoch;
     }
@@ -15331,6 +15357,53 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * no payload validation. Descriptions are immutable per block id, so a repeated query pays
    * nothing — including the await, which is why the misses are batched rather than looped.
    */
+  /**
+   * Each segment's zone map ranges for one column's blocks, as `[min, max]` pairs; a block with
+   * no zone map spans everything. A segment's blocks never change, so the ranges live on the
+   * record itself rather than behind one buffer-pool lookup per block: a keyed read over a long
+   * delta history would otherwise build a key and probe the pool for every delta it skips.
+   */
+  async #segmentKeyZones(
+    segments: readonly SegmentRecord[],
+    columnId: string,
+    snapshot: LeasedSnapshot,
+  ): Promise<Float64Array[]> {
+    const zones = new Array<Float64Array>(segments.length);
+    const missing: number[] = [];
+    const missingIds: string[] = [];
+    for (const [index, segment] of segments.entries()) {
+      const cached = this.#segmentZoneCache.get(segment);
+      const known = cached?.get(columnId);
+      if (known !== undefined) {
+        zones[index] = known;
+        continue;
+      }
+      missing.push(index);
+      for (const id of segment.columnBlockIds[columnId] ?? []) missingIds.push(id);
+    }
+    if (missing.length === 0) return zones;
+    const descriptions = await this.#zoneDescriptions(missingIds, snapshot);
+    for (const index of missing) {
+      const segment = segments[index];
+      if (segment === undefined) continue;
+      const blockIds = segment.columnBlockIds[columnId] ?? [];
+      const ranges = new Float64Array(blockIds.length * 2);
+      for (const [blockIndex, blockId] of blockIds.entries()) {
+        const zone = descriptions.get(blockId)?.metadata.zoneMap;
+        ranges[blockIndex * 2] = zone === undefined ? Number.NEGATIVE_INFINITY : zone.min;
+        ranges[blockIndex * 2 + 1] = zone === undefined ? Number.POSITIVE_INFINITY : zone.max;
+      }
+      let byColumn = this.#segmentZoneCache.get(segment);
+      if (byColumn === undefined) {
+        byColumn = new Map();
+        this.#segmentZoneCache.set(segment, byColumn);
+      }
+      byColumn.set(columnId, ranges);
+      zones[index] = ranges;
+    }
+    return zones;
+  }
+
   async #zoneDescriptions(
     blockIds: readonly string[],
     snapshot: LeasedSnapshot,
@@ -24352,6 +24425,77 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  /**
+   * Prepares an advanced catalog state from the one it replaces after a local commit that
+   * retired no block: each table's memoized visible segments at the old version, plus the
+   * segments the commit published, are exactly its visible segments at the new version.
+   */
+  #carryVisibleSegments(
+    state: QueryCatalogState,
+    previous: {
+      readonly realTables: Map<string, TableRecord>;
+      readonly visibility: SegmentVisibilityCatalog;
+    },
+    previousVersion: number | null,
+    version: number,
+    owner: TransactionRecord,
+    published: readonly SegmentRecord[],
+  ): void {
+    // The state changed by exactly this owner and its segments, so the lookup maps are the
+    // previous ones with those replaced, rather than rebuilt from the table's whole history.
+    let visibility: SegmentVisibilityCatalog = {
+      transactions: previous.visibility.transactions,
+      segmentsByTable: previous.visibility.segmentsByTable,
+    };
+    if (published.length > 0) {
+      const publishedIds = new Set(published.map((segment) => segment.id));
+      const segmentsByTable = new Map(previous.visibility.segmentsByTable);
+      for (const segment of published) {
+        const tableSegments = segmentsByTable.get(segment.tableId);
+        segmentsByTable.set(
+          segment.tableId,
+          tableSegments === undefined
+            ? [segment]
+            : previous.visibility.segmentsByTable.get(segment.tableId) === tableSegments
+              ? [...tableSegments.filter((current) => !publishedIds.has(current.id)), segment]
+              : [...tableSegments, segment],
+        );
+      }
+      const transactions = new Map(previous.visibility.transactions);
+      transactions.set(owner.id, owner);
+      visibility = { transactions, segmentsByTable };
+    }
+    this.#preparedCatalogStates.set(state, { realTables: previous.realTables, visibility });
+    const previousMemo = this.#visibleSegmentsMemo.get(previous.visibility);
+    if (previousMemo === undefined) return;
+    const memo = new Map<string, SegmentRecord[]>();
+    for (const table of state.tables) {
+      if (table === undefined) continue;
+      const visible = previousMemo.get(visibleSegmentsMemoKey(table.id, previousVersion));
+      if (visible === undefined) continue;
+      const added = published
+        .filter((segment) => segment.tableId === table.id)
+        .sort((left, right) => compareVisibleSegments(visibility.transactions, left, right));
+      let next: SegmentRecord[] = visible;
+      if (added.length > 0) {
+        const addedIds = new Set(added.map((segment) => segment.id));
+        const kept = visible.filter((segment) => !addedIds.has(segment.id));
+        const last = kept.at(-1);
+        const first = added[0];
+        next = [...kept, ...added];
+        if (
+          last !== undefined &&
+          first !== undefined &&
+          compareVisibleSegments(visibility.transactions, last, first) > 0
+        ) {
+          next.sort((left, right) => compareVisibleSegments(visibility.transactions, left, right));
+        }
+      }
+      memo.set(visibleSegmentsMemoKey(table.id, version), next);
+    }
+    this.#visibleSegmentsMemo.set(visibility, memo);
+  }
+
   async #visibleSegmentRecords(
     table: TableRecord,
     snapshot: Snapshot,
@@ -24366,7 +24510,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         memo = new Map<string, SegmentRecord[]>();
         this.#visibleSegmentsMemo.set(catalog, memo);
       }
-      const key = `${table.id}\u0000${String(snapshot.version ?? -1)}`;
+      const key = visibleSegmentsMemoKey(table.id, snapshot.version);
       const cached = memo.get(key);
       if (cached !== undefined) return cached;
       const computed = await this.#visibleSegmentRecordsUncached(table, snapshot, catalog);
@@ -24414,18 +24558,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     });
     const visible = [...(await filterSnapshotSegments(snapshot, versionEligible)), ...overlay];
-    return visible.sort((left, right) => {
-      const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
-      const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
-      const leftOrder = left.logicalOrder;
-      const rightOrder = right.logicalOrder;
-      return (
-        leftOrder - rightOrder ||
-        leftVersion - rightVersion ||
-        left.commitOrdinal - right.commitOrdinal ||
-        left.id.localeCompare(right.id)
-      );
-    });
+    return visible.sort((left, right) => compareVisibleSegments(transactions, left, right));
   }
 
   async #transactionRecordsForSegments(
@@ -26105,6 +26238,41 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
  * Partitions compaction itself published (level one and above) are the folded state, not
  * fragmentation, and do not count — a large keyed table is many partitions by design.
  */
+/** The immutable lookup maps one catalog state's queries share. */
+function catalogStateVisibility(state: QueryCatalogState): SegmentVisibilityCatalog {
+  const segmentsByTable = new Map<string, SegmentRecord[]>();
+  for (const segment of state.segments) {
+    const tableSegments = segmentsByTable.get(segment.tableId);
+    if (tableSegments === undefined) segmentsByTable.set(segment.tableId, [segment]);
+    else tableSegments.push(segment);
+  }
+  return {
+    transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
+    segmentsByTable,
+  };
+}
+
+/** The read order of visible segments: logical order, then publication, then staging order. */
+function compareVisibleSegments(
+  transactions: SegmentVisibilityCatalog["transactions"],
+  left: SegmentRecord,
+  right: SegmentRecord,
+): number {
+  const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
+  const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
+  return (
+    left.logicalOrder - right.logicalOrder ||
+    leftVersion - rightVersion ||
+    left.commitOrdinal - right.commitOrdinal ||
+    left.id.localeCompare(right.id)
+  );
+}
+
+/** Memo key of one table's visible segments at one snapshot version. */
+function visibleSegmentsMemoKey(tableId: string, version: number | null): string {
+  return `${tableId}\u0000${String(version ?? -1)}`;
+}
+
 function autoCompactionHint(
   version: number | null,
   segments: readonly SegmentRecord[],
