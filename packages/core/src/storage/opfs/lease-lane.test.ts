@@ -257,8 +257,11 @@ describe("lease lane during a large commit", () => {
     const shim = new MemoryOpfs();
     const name = "staged-commit";
     const store = await OpfsBlockStore.open({ name, root: shim.root });
-    const createdAt = new Date().toISOString();
-    const later = new Date(Date.now() + 60 * 60_000).toISOString();
+    // One clock reading for both: read separately, a millisecond tick between them put the
+    // expiry just past the store's one-hour maximum.
+    const started = Date.now();
+    const createdAt = new Date(started).toISOString();
+    const later = new Date(started + 50 * 60_000).toISOString();
     await store.addTable({
       id: "keyed",
       name: "keyed",

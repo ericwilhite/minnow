@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { CompactionController } from "./compaction-controller.js";
 import {
   OpfsUncertainOutcomeError,
+  SchemaConflictError,
   StorageUnresponsiveError,
   type TableRecord,
 } from "../storage/types.js";
@@ -97,6 +98,34 @@ it("retries a fold lost with its OPFS leader without reporting it, but reports a
   expect(run).toHaveBeenCalledTimes(2);
   expect(report).toHaveBeenCalledExactlyOnceWith(wedged, "automatic compaction for table");
   expect(controller.retryPending("t")).toBe(true);
+  controller.stop();
+});
+
+it("replans a fold that kept losing to schema changes on its retry, without reporting it", async () => {
+  vi.useFakeTimers();
+  const run = vi
+    .fn()
+    .mockRejectedValueOnce(new SchemaConflictError(18, 19))
+    .mockResolvedValueOnce(true);
+  const report = vi.fn();
+  const controller = new CompactionController({
+    enabled: true,
+    maximumLevelZeroSegments: 256,
+    dropping: () => false,
+    run,
+    check: async () => undefined,
+    yield: async () => undefined,
+    report,
+  });
+  controller.schedule(table, 48);
+  await controller.drain();
+  expect(report).not.toHaveBeenCalled();
+  expect(controller.retryPending("t")).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  controller.schedule(table, 48);
+  await controller.drain();
+  expect(run).toHaveBeenCalledTimes(2);
+  expect(report).not.toHaveBeenCalled();
   controller.stop();
 });
 

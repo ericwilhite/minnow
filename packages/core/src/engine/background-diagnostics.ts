@@ -1,14 +1,15 @@
-import { OpfsUncertainOutcomeError } from "../storage/types.js";
+import { OpfsUncertainOutcomeError, SchemaConflictError } from "../storage/types.js";
 
 /**
  * A maintenance mutation whose OPFS leader vanished before acknowledging it — another tab closed
- * or crashed mid-step. Each maintenance job is durable and revision-guarded, and its next run
- * re-reads it before stepping, so the scheduled retry reconciles the outcome; reporting it would
- * only tell the app that a tab went away. A wedged store (`StorageUnresponsiveError`) and every
- * other failure are still reported.
+ * or crashed mid-step — or a fold that kept losing to schema changes (`CREATE INDEX`, `ALTER`)
+ * through its immediate retries. Each maintenance job is durable and revision-guarded, and its
+ * next run re-reads it and plans against the current schema, so the scheduled retry reconciles
+ * the outcome; reporting it would only tell the app that a tab went away or that DDL ran. A
+ * wedged store (`StorageUnresponsiveError`) and every other failure are still reported.
  */
 export function isReconciledByMaintenanceRetry(error: unknown): boolean {
-  return error instanceof OpfsUncertainOutcomeError;
+  return error instanceof OpfsUncertainOutcomeError || error instanceof SchemaConflictError;
 }
 
 /** One bounded owner of background evidence. Observers receive the original error; history
