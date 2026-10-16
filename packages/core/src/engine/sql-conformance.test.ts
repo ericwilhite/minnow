@@ -2000,6 +2000,10 @@ function groupByPrecedenceCases(): Case[] {
       `SELECT LENGTH(label) AS label, COUNT(*) AS n FROM data GROUP BY ROLLUP(label) ORDER BY 1, 2`,
       ["sqlite"],
     ),
+    // An output alias that is also a table alias: ORDER BY reads the output column, never the
+    // source row the alias names.
+    ordered(`SELECT d.id AS d FROM data d ORDER BY d.id`),
+    ordered(`SELECT d.id AS d, d.label FROM data d ORDER BY d DESC`),
   ];
 }
 
