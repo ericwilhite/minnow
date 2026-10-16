@@ -31,14 +31,17 @@ import {
   isScalarFunctionName,
   likeMatches,
   orderOutputName,
+  orderedSetAggregateValue,
   parseQuantified,
   quantifiedComparison,
+  quantifiedMembers,
   scalarFunctionEvaluator,
   scalarFunctionValue,
   unknownColumnDomains,
   integerQuotient,
 } from "./query.js";
 import { jsonConstructor } from "./sql-json.js";
+import { datetimeArithmeticValue } from "./sql-datetime-arithmetic.js";
 import {
   bm25DocumentScore,
   cachedQueryTerms,
@@ -553,6 +556,8 @@ interface AggregateSpec {
   }>;
   /** `COUNT(DISTINCT x)`: the accumulator sees each distinct value once per group. */
   readonly distinct?: boolean;
+  /** An ordered-set aggregate sorted `WITHIN GROUP (ORDER BY x DESC)`. */
+  readonly descending?: boolean;
   /** Set for MIN/MAX/COUNT over a bare datetime column: aggregate on raw epoch milliseconds. */
   readonly rawDatetime?: { source: number; vector: DateTimeVector };
   /** Set for any aggregate over a bare number column: read the typed vector directly. */
@@ -1366,7 +1371,10 @@ function bindPlan(
     groupIndexBySignature,
     aggregates: aggregateSpecs,
     hasListAggregate: aggregateSpecs.some(
-      (aggregate) => aggregate.name === "JSON_ARRAYAGG" || aggregate.name === "STRING_AGG",
+      (aggregate) =>
+        aggregate.name === "JSON_ARRAYAGG" ||
+        aggregate.name === "STRING_AGG" ||
+        orderedSetAggregate(aggregate.name),
     ),
     select,
     orderBy,
@@ -1954,22 +1962,28 @@ function bindExpression(
       ...(expression.name === "STRING_AGG"
         ? { delimiter: required(arguments_[1], "STRING_AGG delimiter is missing") }
         : {}),
-      ...(expression.aggregateOrderBy === undefined
-        ? {}
-        : {
-            orderBy: expression.aggregateOrderBy.map((order) => ({
-              ...order,
-              expression: bindExpression(
-                order.expression,
-                sources,
-                aggregateSpecs,
-                aggregateIndexes,
-                memory,
-                ftsBySignature,
-                ftsStats,
-              ),
-            })),
-          }),
+      // An ordered-set aggregate sorts its own input, so its one ORDER BY term is only a
+      // direction: nothing per row beyond the argument itself.
+      ...(orderedSetAggregate(expression.name)
+        ? expression.aggregateOrderBy?.[0]?.direction === "desc"
+          ? { descending: true }
+          : {}
+        : expression.aggregateOrderBy === undefined
+          ? {}
+          : {
+              orderBy: expression.aggregateOrderBy.map((order) => ({
+                ...order,
+                expression: bindExpression(
+                  order.expression,
+                  sources,
+                  aggregateSpecs,
+                  aggregateIndexes,
+                  memory,
+                  ftsBySignature,
+                  ftsStats,
+                ),
+              })),
+            }),
       // The signature this slot was keyed by is the JSON of the compiled call, which carries the
       // flag — so COUNT(x) and COUNT(DISTINCT x) in one select land in separate slots.
       ...(expression.distinct === true ? { distinct: true } : {}),
@@ -6128,6 +6142,10 @@ function rawFloat64Value(vector: NumberVector | DateTimeVector, rowIndex: number
   return vector.values[slot] ?? 0;
 }
 
+function orderedSetAggregate(name: AggregateName): boolean {
+  return name === "PERCENTILE_CONT" || name === "PERCENTILE_DISC" || name === "MODE";
+}
+
 function updateAggregatesFromValues(
   plan: BoundPlan,
   state: GroupState,
@@ -6226,6 +6244,23 @@ function applyAggregateValue(
         "JSON_ARRAYAGG member",
       ),
       "JSON_ARRAYAGG member",
+    );
+    return;
+  }
+  if (orderedSetAggregate(spec.name)) {
+    if (value === null || value === undefined) return;
+    const member = asQueryValue(value);
+    state.counts[index] = (state.counts[index] ?? 0) + 1;
+    const lists = required(state.lists, "Ordered-set aggregate list state is missing");
+    let list = lists[index];
+    if (list === undefined) {
+      list = [];
+      lists[index] = list;
+    }
+    list.push(member);
+    memory.tally(
+      safeMemorySum(QUERY_REFERENCE_BYTES, queryValuePayloadBytes(member), `${spec.name} input`),
+      `${spec.name} input`,
     );
     return;
   }
@@ -6387,6 +6422,19 @@ function evaluateFinalExpression(
   const count = group.counts[aggregateIndex];
   if (count === undefined) throw new Error("Aggregate state is missing");
   if (expression.name === "COUNT") return count;
+  if (
+    expression.name === "PERCENTILE_CONT" ||
+    expression.name === "PERCENTILE_DISC" ||
+    expression.name === "MODE"
+  ) {
+    const fraction = expression.arguments[1];
+    return orderedSetAggregateValue(
+      expression.name,
+      required(group.lists, "Ordered-set aggregate list state is missing")[aggregateIndex] ?? [],
+      plan.aggregates[aggregateIndex]?.descending === true,
+      fraction === undefined ? undefined : evaluateFinalExpression(plan, fraction, group),
+    );
+  }
   if (count === 0) return null;
   if (expression.name === "JSON_ARRAYAGG") {
     const retained =
@@ -7049,15 +7097,11 @@ function booleanTruth(
     {
       const quantified = parseQuantified(operator);
       if (quantified !== undefined) {
-        if (expression.right.kind !== "list") {
-          throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
-        }
-        return quantifiedComparison(
-          quantified.comparison,
-          quantified.quantifier,
-          evaluateValue(expression.left),
-          expression.right.items.map((item) => evaluateValue(item)),
-        );
+        const left = evaluateValue(expression.left);
+        const members = quantifiedMembers(expression.right, evaluateValue);
+        return members === null
+          ? null
+          : quantifiedComparison(quantified.comparison, quantified.quantifier, left, members);
       }
     }
     if (
@@ -7476,7 +7520,7 @@ function binaryValue(
   left: unknown,
   right: unknown,
   integer = false,
-): number | string | null {
+): number | string | Date | null {
   if (left === null || left === undefined || right === null || right === undefined) return null;
   if (typeof left === "number" && typeof right === "number") {
     if (operator === "+") return left + right;
@@ -7498,6 +7542,8 @@ function binaryValue(
     const read = readUntypedText("number", right);
     if (typeof read === "number") return binaryValue(operator, left, read, integer);
   }
+  const temporal = datetimeArithmeticValue(operator, left, right);
+  if (temporal !== undefined) return temporal as Date | number | string;
   const exact = exactNumericBinary(operator, left, right);
   if (exact !== undefined) return exact;
   const a = numeric(left);

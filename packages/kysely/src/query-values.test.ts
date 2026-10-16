@@ -31,6 +31,15 @@ describe("kyselyQueryValues", () => {
     expect(() => kyselyQueryValues(sparse)).toThrow("Kysely parameter 2");
   });
 
+  it("keeps a one-dimensional array of scalars for ANY/ALL, copying its Dates", () => {
+    const at = new Date("2026-08-25T12:34:56.789Z");
+    const [values] = kyselyQueryValues([[1, "a", null, true, at]]);
+    expect(values).toEqual([1, "a", null, true, at]);
+    expect((values as unknown[])[4]).not.toBe(at);
+    expect(() => kyselyQueryValues([[[1]]])).toThrow("Kysely parameter 1 is an array");
+    expect(() => kyselyQueryValues([[1n]])).toThrow("Kysely parameter 1 is an array");
+  });
+
   it("keeps using the captured intrinsic after Date.prototype changes", () => {
     const input = new Date("2026-08-25T12:34:56.789Z");
     const getTime = vi.spyOn(Date.prototype, "getTime").mockImplementation(() => {

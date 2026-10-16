@@ -80,5 +80,7 @@ function encodeParameter(value: unknown): readonly unknown[] {
   }
   if (typeof value === "string") return [3, value];
   if (value instanceof Date) return [4, dateMilliseconds(value)];
+  // An ANY/ALL array: its members in order, each encoded the same way.
+  if (Array.isArray(value)) return [5, (value as readonly unknown[]).map(encodeParameter)];
   throw new TypeError("Query parameter has an unsupported value");
 }

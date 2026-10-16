@@ -5,7 +5,7 @@ import type {
   QueryCursorOptions,
   QueryOptions,
 } from "./database.js";
-import type { QueryResult, QueryValue } from "./query.js";
+import type { QueryParameter, QueryResult } from "./query.js";
 
 /**
  * The stable SQL boundary used by clients and third-party adapters.
@@ -24,7 +24,7 @@ export interface MinnowSqlExecutor {
   queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult>;
   execute(
     sql: string,
-    params?: readonly QueryValue[],
+    params?: readonly QueryParameter[],
     options?: ExecuteOptions,
   ): Promise<ExecuteResult>;
 }

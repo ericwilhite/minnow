@@ -29,6 +29,7 @@ export type {
   Predicate,
   PredicateOperator,
   QueryResult,
+  QueryParameter,
   QueryRow,
   QueryValue,
   SelectItem,

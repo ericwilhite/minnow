@@ -29,6 +29,7 @@ import type {
   Predicate,
   PredicateOperator,
   QueryResult,
+  QueryParameter,
   QueryRow,
   QueryValue,
   RecursiveCte,
@@ -53,6 +54,7 @@ export type {
   Predicate,
   PredicateOperator,
   QueryResult,
+  QueryParameter,
   QueryRow,
   QueryValue,
   RecursiveCte,
@@ -96,6 +98,11 @@ import {
   readUntypedText,
 } from "./sql-semantics.js";
 import { simpleScalarFunctions } from "./sql-functions.js";
+import {
+  datetimeArithmeticKind,
+  datetimeArithmeticValue,
+  type DatetimeOperandKind,
+} from "./sql-datetime-arithmetic.js";
 import { JsonNumber, parseJsonValue } from "./json-values.js";
 import {
   jsonArrowStep,
@@ -114,7 +121,11 @@ import {
   roundSqlNumber,
 } from "./sql-semantics.js";
 import {
+  arrayDomainText,
   arrayDomainValue,
+  intervalDomainCompare,
+  intervalDomainFromParts,
+  intervalDomainParts,
   boundedJsonText,
   collatedDomainValue,
   concatenatedSqlValue,
@@ -128,6 +139,7 @@ import {
   exactNumericValue,
   externalSqlDomainColumnValue,
   externalSqlDomainValue,
+  externalSqlTextValue,
   intervalDomainValue,
   temporalDomainPart,
   isDateDomainValue,
@@ -1209,6 +1221,9 @@ const aggregateNames = new Set<AggregateName>([
   "MAX",
   "JSON_ARRAYAGG",
   "STRING_AGG",
+  "PERCENTILE_CONT",
+  "PERCENTILE_DISC",
+  "MODE",
   "MINNOW_SINGLE_VALUE",
 ]);
 /** Set functions the parser builds from COUNT/SUM rather than from their own accumulator. */
@@ -2500,7 +2515,7 @@ function blockHasParameters(block: CompiledQuery): boolean {
   );
 }
 
-function validateParameters(count: number, params: readonly QueryValue[] | undefined): void {
+function validateParameters(count: number, params: readonly QueryParameter[] | undefined): void {
   const given = params?.length ?? 0;
   if (given !== count) {
     throw new TypeError(
@@ -2522,13 +2537,15 @@ function validateParameters(count: number, params: readonly QueryValue[] | undef
       }
       return;
     }
+    // An array's members are checked where it binds: only ANY and ALL take one.
+    if (Array.isArray(value)) return;
     throw new TypeError(`Parameter ${label} must be null, boolean, number, string, or Date`);
   });
 }
 
-function bindExpression(expression: Expression, values: readonly QueryValue[]): Expression {
+function bindExpression(expression: Expression, values: readonly QueryParameter[]): Expression {
   if (expression.kind === "parameter") {
-    return { kind: "literal", value: values[expression.index] ?? null };
+    return { kind: "literal", value: scalarParameter(values, expression.index) };
   }
   if (expression.kind === "fts" && expression.queryParameter !== undefined) {
     const value = values[expression.queryParameter] ?? null;
@@ -2544,11 +2561,11 @@ function bindExpression(expression: Expression, values: readonly QueryValue[]): 
     bindBlock(expression.block, values);
     return expression;
   }
-  if (
-    expression.kind === "binary" ||
-    expression.kind === "condition" ||
-    expression.kind === "logical"
-  ) {
+  if (expression.kind === "condition") {
+    bindPredicate(expression, values);
+    return expression;
+  }
+  if (expression.kind === "binary" || expression.kind === "logical") {
     expression.left = bindExpression(expression.left, values);
     expression.right = bindExpression(expression.right, values);
     return expression;
@@ -2591,7 +2608,128 @@ function bindExpression(expression: Expression, values: readonly QueryValue[]): 
   return expression;
 }
 
-function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
+/** One placeholder's value where a scalar is required; an array binds only under ANY/ALL. */
+function scalarParameter(values: readonly QueryParameter[], index: number): QueryValue {
+  const value = values[index] ?? null;
+  if (Array.isArray(value)) {
+    throw new TypeError(
+      `Parameter $${String(index + 1)} is an array; an array binds only as the operand of ANY or ALL, as in = ANY($${String(index + 1)})`,
+    );
+  }
+  return value as QueryValue;
+}
+
+/**
+ * Binds one comparison. `x op ANY($n)` and `x op ALL($n)` take their array here: the members
+ * become a literal list, and `= ANY` / `<> ALL` become IN / NOT IN, so the bound plan is exactly
+ * the one an IN list with the same values produces and takes every IN fast path — key and
+ * secondary-index lookups, zone-map pruning, the vectorized membership kernel. A NULL array
+ * compares to NULL, as in PostgreSQL. `$n::type[]` casts each member.
+ */
+function bindPredicate(
+  predicate: { left: Expression; operator: PredicateOperator; right: Expression },
+  values: readonly QueryParameter[],
+): void {
+  predicate.left = bindExpression(predicate.left, values);
+  const quantified = parseQuantified(predicate.operator);
+  if (quantified !== undefined) {
+    const right = predicate.right;
+    const cast =
+      right.kind === "call" &&
+      right.name === "CAST" &&
+      right.arguments[0]?.kind === "parameter" &&
+      right.arguments[1]?.kind === "literal" &&
+      typeof right.arguments[1].value === "string"
+        ? right.arguments[1].value
+        : undefined;
+    const parameter =
+      cast === undefined ? right : right.kind === "call" ? right.arguments[0] : right;
+    if (parameter?.kind === "parameter") {
+      const members = arrayParameterMembers(values[parameter.index] ?? null, parameter.index);
+      if (members === null) {
+        predicate.operator = quantified.comparison;
+        predicate.right = { kind: "literal", value: null };
+        return;
+      }
+      const list: Expression = {
+        kind: "list",
+        items: members.map((member) => arrayMemberLiteral(member, cast)),
+      };
+      predicate.right = list;
+      if (quantified.comparison === "=" && quantified.quantifier === "any") {
+        predicate.operator = "IN";
+      } else if (
+        (quantified.comparison === "<>" || quantified.comparison === "!=") &&
+        quantified.quantifier === "all"
+      ) {
+        predicate.operator = "NOT IN";
+      }
+      return;
+    }
+  }
+  predicate.right = bindExpression(predicate.right, values);
+}
+
+/** The members of an array placeholder: a JavaScript array, or Minnow's JSON array text. */
+function arrayParameterMembers(value: QueryParameter, index: number): readonly QueryValue[] | null {
+  const label = `$${String(index + 1)}`;
+  if (value === null) return null;
+  let members: readonly unknown[];
+  if (Array.isArray(value)) {
+    members = value as readonly unknown[];
+  } else if (typeof value === "string") {
+    const text = arrayDomainText(
+      normalizeSqlDomainValue({ kind: "array", element: "TEXT" }, value),
+    );
+    members = JSON.parse(text ?? "[]") as unknown[];
+  } else {
+    throw new TypeError(`Parameter ${label} must be an array for ANY or ALL`);
+  }
+  return members.map((member, position) => {
+    if (
+      member === null ||
+      typeof member === "boolean" ||
+      typeof member === "string" ||
+      (typeof member === "number" && Number.isFinite(member)) ||
+      (member instanceof Date && Number.isFinite(dateMilliseconds(member)))
+    ) {
+      return member;
+    }
+    if (Array.isArray(member)) {
+      throw new TypeError(`Parameter ${label} must be a one-dimensional array`);
+    }
+    throw new TypeError(
+      `Parameter ${label}[${String(position)}] must be null, boolean, finite number, string, or valid Date`,
+    );
+  });
+}
+
+/** One bound array member as a literal, cast to `$n::type[]`'s element type when one is given. */
+function arrayMemberLiteral(member: QueryValue, cast: string | undefined): Expression {
+  if (cast === undefined) return { kind: "literal", value: member };
+  // `::text[]` members are ordinary text: drop the explicit-TEXT wrapper the cast adds, so
+  // they compare and hash exactly as the plain strings an IN list would hold.
+  const value = asQueryValue(externalSqlTextValue(scalarFunctionValue("CAST", [member, cast])));
+  if (!isSqlDomainValue(value)) return { kind: "literal", value };
+  const sqlDomain: SqlDomain | undefined = cast.startsWith("numeric:")
+    ? { kind: "numeric" }
+    : cast === "json" ||
+        cast === "jsonb" ||
+        cast === "uuid" ||
+        cast === "date" ||
+        cast === "time" ||
+        cast === "interval"
+      ? { kind: cast }
+      : undefined;
+  return {
+    kind: "literal",
+    value,
+    internalSqlValue: true,
+    ...(sqlDomain === undefined ? {} : { sqlDomain }),
+  };
+}
+
+function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): void {
   if (block.limitParameter !== undefined) {
     block.limit = validateLimit(numeric(values[block.limitParameter] ?? null));
     delete block.limitParameter;
@@ -2609,10 +2747,7 @@ function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
   delete block.limitValidationParameters;
   delete block.offsetValidationParameters;
   for (const item of block.select) item.expression = bindExpression(item.expression, values);
-  for (const predicate of [...block.predicates, ...block.having]) {
-    predicate.left = bindExpression(predicate.left, values);
-    predicate.right = bindExpression(predicate.right, values);
-  }
+  for (const predicate of [...block.predicates, ...block.having]) bindPredicate(predicate, values);
   block.groupBy = block.groupBy.map((expression) => bindExpression(expression, values));
   for (const order of block.orderBy) {
     order.expression = bindExpression(order.expression, values);
@@ -2633,6 +2768,11 @@ function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
     if (source.recursive !== undefined) {
       bindBlock(source.recursive.base, values);
       bindBlock(source.recursive.step, values);
+      // A step bound to zero is refused as a written one is; the recursion would yield nothing.
+      const step = source.recursive.base.select[2]?.expression;
+      if (source.recursive.series !== undefined && step !== undefined && seriesStepIsZero(step)) {
+        throw new TypeError("GENERATE_SERIES step size cannot equal zero");
+      }
     }
   }
 }
@@ -2674,7 +2814,7 @@ function cloneTreeValue(value: unknown): unknown {
  */
 export function bindPlanParameters(
   plan: CompiledQuery,
-  params: readonly QueryValue[] | undefined,
+  params: readonly QueryParameter[] | undefined,
 ): CompiledQuery {
   const count = plan.parameterCount ?? 0;
   validateParameters(count, params);
@@ -2697,7 +2837,7 @@ function isParameterSlot(value: InsertValue): value is { parameter: number } {
 /** The mutation-statement counterpart of bindPlanParameters; SELECTs bind through their plan. */
 export function bindStatementParameters(
   statement: CompiledStatement,
-  params: readonly QueryValue[] | undefined,
+  params: readonly QueryParameter[] | undefined,
 ): CompiledStatement {
   const count = statement.parameterCount ?? 0;
   validateParameters(count, params);
@@ -2720,7 +2860,9 @@ export function bindStatementParameters(
   if (clone.kind === "insert") {
     if (clone.query !== undefined) bindBlock(clone.query, values);
     clone.rows = clone.rows.map((row) =>
-      row.map((value) => (isParameterSlot(value) ? (values[value.parameter] ?? null) : value)),
+      row.map((value) =>
+        isParameterSlot(value) ? scalarParameter(values, value.parameter) : value,
+      ),
     );
     if (clone.onConflict?.assignments !== undefined) {
       for (const assignment of clone.onConflict.assignments) {
@@ -2766,10 +2908,7 @@ export function bindStatementParameters(
       assignment.expression = bindExpression(assignment.expression, values);
     }
   }
-  for (const predicate of clone.predicates) {
-    predicate.left = bindExpression(predicate.left, values);
-    predicate.right = bindExpression(predicate.right, values);
-  }
+  for (const predicate of clone.predicates) bindPredicate(predicate, values);
   bindReturningItems(clone.returningItems, values);
   return clone;
 }
@@ -2777,7 +2916,7 @@ export function bindStatementParameters(
 /** RETURNING expression items share the statement's placeholder numbering with its predicates. */
 function bindReturningItems(
   items: ReturningItem[] | undefined,
-  values: readonly QueryValue[],
+  values: readonly QueryParameter[],
 ): void {
   if (items === undefined) return;
   for (const item of items) item.expression = bindExpression(item.expression, values);
@@ -2931,6 +3070,10 @@ export function inferBlockSchema(
     if (expression.kind === "column") return resolveColumnDomain(expression.reference);
     if (expression.kind === "binary") {
       if (expression.operator === "||") return undefined;
+      const temporal = binaryDatetimeKind(expression);
+      if (temporal === "date") return { kind: "date" };
+      if (temporal === "interval") return { kind: "interval" };
+      if (temporal !== undefined) return undefined;
       const left = inferDomain(expression.left);
       const right = inferDomain(expression.right);
       if (left?.kind !== "numeric" && right?.kind !== "numeric") return undefined;
@@ -3031,6 +3174,8 @@ export function inferBlockSchema(
       expression.name === "AVG" ||
       expression.name === "MIN" ||
       expression.name === "MAX" ||
+      expression.name === "PERCENTILE_DISC" ||
+      expression.name === "MODE" ||
       expression.name === "MINNOW_SINGLE_VALUE" ||
       expression.name === "COALESCE" ||
       expression.name === "NULLIF" ||
@@ -3041,6 +3186,28 @@ export function inferBlockSchema(
     }
     return undefined;
   };
+  /** How datetime arithmetic sees one operand: its inferred type, refined by its domain. */
+  const datetimeOperandKind = (expression: Expression): DatetimeOperandKind => {
+    try {
+      const type = infer(expression);
+      if (type === "null") return "null";
+      if (type === "datetime") return "datetime";
+      if (type === "number") return "number";
+      const domain = inferDomain(expression)?.kind;
+      return domain === "date" ? "date" : domain === "interval" ? "interval" : "other";
+    } catch {
+      return "other";
+    }
+  };
+  /** The result kind when PostgreSQL resolves this +/- as date or timestamp arithmetic. */
+  const binaryDatetimeKind = (expression: Extract<Expression, { kind: "binary" }>) =>
+    expression.operator === "+" || expression.operator === "-"
+      ? datetimeArithmeticKind(
+          expression.operator,
+          datetimeOperandKind(expression.left),
+          datetimeOperandKind(expression.right),
+        )
+      : undefined;
   /**
    * Whether a value-choosing expression (CASE, COALESCE, NULLIF, GREATEST, LEAST) mixes an
    * exact NUMERIC branch with a plain number one. PostgreSQL resolves that mix to NUMERIC, so
@@ -3125,6 +3292,11 @@ export function inferBlockSchema(
         }
         return "string";
       }
+      const temporal = binaryDatetimeKind(expression);
+      if (temporal !== undefined) {
+        // DATE and INTERVAL results are logical domains carried as strings.
+        return temporal === "number" || temporal === "datetime" ? temporal : "string";
+      }
       const exactNumeric = inferDomain(expression)?.kind === "numeric";
       for (const side of [expression.left, expression.right]) {
         const type = infer(side);
@@ -3134,7 +3306,7 @@ export function inferBlockSchema(
       }
       return exactNumeric ? "string" : "number";
     }
-    if (expression.name === "COUNT") {
+    if (expression.name === "COUNT" || expression.name === "PERCENTILE_CONT") {
       return "number";
     }
     if (expression.name === "SUM" || expression.name === "AVG") {
@@ -3346,6 +3518,13 @@ export function queryResultNeedsExternalization(
   // prefix check, and only domain-bearing schemas or expressions pay it.
   const createsDomain = (expression: Expression): boolean => {
     if (expression.kind === "literal" && expression.internalSqlValue === true) return true;
+    // A date shifted by days is a DATE, and a timestamp difference an INTERVAL.
+    if (
+      expression.kind === "binary" &&
+      (expression.operator === "+" || expression.operator === "-")
+    ) {
+      return true;
+    }
     if (expression.kind === "call") {
       if (expression.name === "ARRAY" || expression.name === "MINNOW_COLLATE") return true;
       if (expression.name === "CAST") {
@@ -4128,6 +4307,9 @@ export function integerTypedExpression(
       }
       if (name === "SUM" || name === "MIN" || name === "MAX" || name === "ABS") {
         return args.length === 1 && args[0] !== undefined && typed(args[0]);
+      }
+      if (name === "PERCENTILE_DISC" || name === "MODE") {
+        return args[0] !== undefined && typed(args[0]);
       }
       if (integerResultFunctionNames.has(name)) return true;
       if (name === "MOD" || name === "GCD" || name === "LCM") {
@@ -5232,8 +5414,13 @@ function resolveDerivedRowTables(
   if (needsDual) resolved.set(DUAL_TABLE, dualTableRows());
   for (const source of sources) {
     if (source.recursive !== undefined) {
-      const { reference, base, step, all } = source.recursive;
-      const state = createRecursiveCteState(executeRowQueryInternal(base, tables, memory), all);
+      const { reference, base, step, all, series } = source.recursive;
+      const first = executeRowQueryInternal(base, tables, memory);
+      if (series !== undefined) {
+        resolved.set(source.table, generateSeriesRows(series, first.rows, first.columns));
+        continue;
+      }
+      const state = createRecursiveCteState(first, all);
       while (state.frontier.length > 0) {
         const stepTables = new Map(tables);
         stepTables.set(reference, state.frontier);
@@ -5675,12 +5862,10 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)
           ? readUntypedText("number", right)
           : right;
-      if (
-        expression.integer === true &&
-        expression.operator === "/" &&
-        typeof leftValue === "number" &&
-        typeof rightValue === "number"
-      ) {
+      if (typeof leftValue !== "number" || typeof rightValue !== "number") {
+        const temporal = datetimeArithmeticValue(expression.operator, leftValue, rightValue);
+        if (temporal !== undefined) return temporal;
+      } else if (expression.integer === true && expression.operator === "/") {
         return integerQuotient(leftValue, rightValue);
       }
       const exact = exactNumericBinary(expression.operator, leftValue, rightValue);
@@ -5801,6 +5986,21 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
                 ),
               );
         }
+        if (
+          expression.name === "PERCENTILE_CONT" ||
+          expression.name === "PERCENTILE_DISC" ||
+          expression.name === "MODE"
+        ) {
+          const fraction = expression.arguments[1];
+          return orderedSetAggregateValue(
+            expression.name,
+            group
+              .map((row) => evaluate(argument, row))
+              .filter((value) => value !== null && value !== undefined),
+            expression.aggregateOrderBy?.[0]?.direction === "desc",
+            fraction === undefined ? undefined : evaluate(fraction, context, group),
+          );
+        }
         let values =
           argument.kind === "wildcard"
             ? group.map(() => 1)
@@ -5911,15 +6111,14 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
   {
     const quantified = parseQuantified(predicate.operator);
     if (quantified !== undefined) {
-      if (predicate.right.kind !== "list") {
-        throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
-      }
+      const members = quantifiedMembers(predicate.right, (item) => evaluate(item, context));
       return (
+        members !== null &&
         quantifiedComparison(
           quantified.comparison,
           quantified.quantifier,
           evaluate(predicate.left, context),
-          predicate.right.items.map((item) => evaluate(item, context)),
+          members,
         ) === true
       );
     }
@@ -6108,6 +6307,382 @@ export function likeMatches(
   return compileLikePattern(pattern, caseInsensitive, escape).test(value);
 }
 
+/**
+ * `left op ANY(array)` / `left op ALL(array)` over an array operand. An ARRAY constructor's
+ * members are known at compile time, so `= ANY` is an IN list and `<> ALL` a NOT IN list —
+ * PostgreSQL defines them as the same test — and any other comparison keeps its quantifier
+ * over the member list. Any other operand stays quantified over a value: a placeholder becomes
+ * a member list at bind time, and an array-valued expression is read when it evaluates.
+ */
+function quantifiedArrayCondition(
+  operator: ComparisonOperator,
+  all: boolean,
+  left: Expression,
+  array: Expression,
+): Expression {
+  if (array.kind === "call" && array.name === "ARRAY") {
+    const right: Expression = { kind: "list", items: array.arguments };
+    if (operator === "=" && !all) return { kind: "condition", operator: "IN", left, right };
+    if ((operator === "<>" || operator === "!=") && all) {
+      return { kind: "condition", operator: "NOT IN", left, right };
+    }
+    return { kind: "condition", operator: `${operator} ${all ? "ALL" : "ANY"}`, left, right };
+  }
+  if (array.kind === "subquery" || array.kind === "list" || array.kind === "wildcard") {
+    throw new TypeError("ANY/ALL take a subquery or an array");
+  }
+  return { kind: "condition", operator: `${operator} ${all ? "ALL" : "ANY"}`, left, right: array };
+}
+
+/** Whether an expression is typed INTERVAL where it is written: a literal or an explicit cast. */
+function intervalTyped(expression: Expression): boolean {
+  if (expression.kind === "literal") return expression.sqlDomain?.kind === "interval";
+  return (
+    expression.kind === "call" &&
+    expression.name === "CAST" &&
+    expression.arguments[1]?.kind === "literal" &&
+    expression.arguments[1].value === "interval"
+  );
+}
+
+/** Whether an expression is a date or timestamp where it is written. */
+function datetimeTyped(expression: Expression): boolean {
+  if (expression.kind === "literal") {
+    return expression.value instanceof Date || expression.sqlDomain?.kind === "date";
+  }
+  if (expression.kind !== "call") return false;
+  if (expression.name === "CAST") {
+    const target = expression.arguments[1];
+    return target?.kind === "literal" && (target.value === "datetime" || target.value === "date");
+  }
+  return (
+    expression.name === "CURRENT_TIMESTAMP" ||
+    expression.name === "CURRENT_DATE" ||
+    expression.name === "DATE_TRUNC" ||
+    expression.name === "DATE_ADD" ||
+    expression.name === "TO_TIMESTAMP" ||
+    expression.name === "MAKE_TIMESTAMP"
+  );
+}
+
+/** The hidden columns a GENERATE_SERIES recursion carries its bounds in, beside the value. */
+const SERIES_STOP = "(series stop)";
+const SERIES_STEP = "(series step)";
+
+/**
+ * GENERATE_SERIES(start, stop[, step]) in FROM. The rows come from a recursive CTE — start, then
+ * the previous value plus the step while it stays within stop — so every pass that understands a
+ * recursive source (binding, the statement clock, catalog typing, optimization, both executors)
+ * understands this one. The CTE carries stop and step as two hidden columns beside the value, and
+ * a derived block projects the value alone. Because the arguments live only in the base block,
+ * an executor that sees the `series` mark can run that block once and produce every row in one
+ * loop instead of one step-block execution per row. Integer series step by 1 by default; a
+ * timestamp series takes an INTERVAL step, applied cumulatively as PostgreSQL does, so a month
+ * step from 31 January runs 28 February, 28 March.
+ */
+function generateSeriesSource(
+  args: readonly Expression[],
+  alias: string,
+  column: string,
+  nextSequence: () => number,
+): TableSource {
+  const [start, stop, given] = args;
+  if (start === undefined || stop === undefined || args.length > 3) {
+    throw new TypeError("GENERATE_SERIES takes a start, a stop, and an optional step");
+  }
+  if (
+    args.some(
+      (argument) =>
+        argument.kind === "wildcard" ||
+        argument.kind === "list" ||
+        expressionColumns(argument).length > 0 ||
+        hasAggregate(argument) ||
+        containsWindow(argument),
+    )
+  ) {
+    throw new TypeError("GENERATE_SERIES arguments cannot refer to table rows");
+  }
+  const timestamps = given !== undefined && intervalTyped(given);
+  if (!timestamps && (datetimeTyped(start) || datetimeTyped(stop))) {
+    throw new TypeError("GENERATE_SERIES over timestamps takes an INTERVAL step");
+  }
+  for (const argument of timestamps ? [] : args) {
+    if (
+      argument.kind === "literal" &&
+      (argument.decimal === true ||
+        (typeof argument.value === "number" && !Number.isSafeInteger(argument.value)) ||
+        argument.sqlDomain !== undefined)
+    ) {
+      throw new TypeError("GENERATE_SERIES takes integer or timestamp arguments");
+    }
+  }
+  const step: Expression = given ?? { kind: "literal", value: 1 };
+  if (seriesStepIsZero(step)) throw new TypeError("GENERATE_SERIES step size cannot equal zero");
+  const typed = (expression: Expression): Expression =>
+    timestamps
+      ? {
+          kind: "call",
+          name: "CAST",
+          arguments: [expression, { kind: "literal", value: "datetime" }],
+        }
+      : expression;
+  const zero: Expression = timestamps
+    ? {
+        kind: "literal",
+        value: intervalDomainFromParts(0, 0, 0),
+        internalSqlValue: true,
+        sqlDomain: { kind: "interval" },
+      }
+    : { kind: "literal", value: 0 };
+  // (step > 0 AND value <= stop) OR (step < 0 AND value >= stop): a NULL argument, or a step
+  // pointing away from stop, admits nothing.
+  const within = (value: Expression, last: Expression, by: Expression): Predicate => ({
+    left: {
+      kind: "logical",
+      operator: "or",
+      left: {
+        kind: "logical",
+        operator: "and",
+        left: { kind: "condition", operator: ">", left: by, right: zero },
+        right: { kind: "condition", operator: "<=", left: value, right: last },
+      },
+      right: {
+        kind: "logical",
+        operator: "and",
+        left: { kind: "condition", operator: "<", left: by, right: zero },
+        right: { kind: "condition", operator: ">=", left: value, right: last },
+      },
+    },
+    operator: "IS TRUE",
+    right: { kind: "literal", value: true },
+  });
+  const sequence = nextSequence();
+  const reference = `(recursive generate_series ${String(sequence)})`;
+  const first = typed(start);
+  const last = typed(stop);
+  const carriedStop: Expression = { kind: "column", reference: SERIES_STOP };
+  const carriedStep: Expression = { kind: "column", reference: SERIES_STEP };
+  const next: Expression = {
+    kind: "binary",
+    operator: "+",
+    left: { kind: "column", reference: column },
+    right: carriedStep,
+  };
+  const block = (
+    sql: string,
+    source: TableSource,
+    values: readonly [Expression, Expression, Expression],
+  ): CompiledQuery => ({
+    sql,
+    base: source,
+    joins: [],
+    select: [
+      { expression: values[0], alias: column },
+      { expression: values[1], alias: SERIES_STOP },
+      { expression: values[2], alias: SERIES_STEP },
+    ],
+    predicates: [within(values[0], values[1], values[2])],
+    groupBy: [],
+    having: [],
+    orderBy: [],
+  });
+  const recursive: TableSource = {
+    table: `(recursive ${String(sequence)}) generate_series`,
+    alias: "(generate_series)",
+    recursive: {
+      reference,
+      base: block("(generate_series)", { table: DUAL_TABLE, alias: DUAL_TABLE }, [
+        first,
+        last,
+        step,
+      ]),
+      step: block("(generate_series step)", { table: reference, alias: reference }, [
+        next,
+        carriedStop,
+        carriedStep,
+      ]),
+      all: true,
+      series: timestamps ? "timestamp" : "integer",
+    },
+  };
+  return derivedTableSource(
+    {
+      sql: "(generate_series)",
+      base: recursive,
+      joins: [],
+      select: [{ expression: { kind: "column", reference: column }, alias: column }],
+      predicates: [],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    },
+    alias,
+    nextSequence,
+  );
+}
+
+/** A step written or bound as a constant zero, which PostgreSQL refuses. */
+function seriesStepIsZero(step: Expression): boolean {
+  const value =
+    step.kind === "literal"
+      ? step.value
+      : step.kind === "call" && step.name === "CAST" && step.arguments[0]?.kind === "literal"
+        ? step.arguments[0].value
+        : undefined;
+  if (value === 0) return true;
+  const parts = intervalDomainParts(value);
+  return parts?.every((part) => part === 0) === true;
+}
+
+/**
+ * Every row of a GENERATE_SERIES recursion from its base row — the evaluated start, stop, and
+ * step — produced in one loop: the same rows the step block reaches one execution at a time.
+ * No base row (a NULL argument or an empty range) is no rows.
+ */
+export function generateSeriesRows(
+  kind: NonNullable<RecursiveCte["series"]>,
+  base: readonly QueryRow[],
+  columns: readonly string[],
+): QueryRow[] {
+  const first = base[0];
+  const [column, stopColumn, stepColumn] = columns;
+  if (
+    base.length > 1 ||
+    columns.length !== 3 ||
+    column === undefined ||
+    stopColumn === undefined ||
+    stepColumn === undefined
+  ) {
+    throw new Error("GENERATE_SERIES base row is malformed");
+  }
+  if (first === undefined) return [];
+  const start = first[column] ?? null;
+  const stop = first[stopColumn] ?? null;
+  const step = first[stepColumn] ?? null;
+  const rows: QueryRow[] = [];
+  const push = (value: QueryValue): void => {
+    if (rows.length >= MAX_RECURSIVE_ROWS) {
+      throw new RangeError(`GENERATE_SERIES exceeded ${String(MAX_RECURSIVE_ROWS)} rows`);
+    }
+    rows.push({ [column]: value, [stopColumn]: stop, [stepColumn]: step });
+  };
+  if (kind === "timestamp") {
+    if (
+      !(start instanceof Date) ||
+      !(stop instanceof Date) ||
+      intervalDomainParts(step) === undefined
+    ) {
+      throw new TypeError("GENERATE_SERIES over timestamps takes timestamps and an INTERVAL step");
+    }
+    const direction = intervalDomainCompare(step, intervalDomainFromParts(0, 0, 0)) ?? 0;
+    const end = dateMilliseconds(stop);
+    let current: Date = start;
+    while (direction > 0 ? dateMilliseconds(current) <= end : dateMilliseconds(current) >= end) {
+      push(current);
+      current = datetimeArithmeticValue("+", current, step) as Date;
+    }
+    return rows;
+  }
+  if (typeof start !== "number" || typeof stop !== "number" || typeof step !== "number") {
+    throw new TypeError("GENERATE_SERIES takes integer or timestamp arguments");
+  }
+  for (let value = start; step > 0 ? value <= stop : value >= stop; value += step) push(value);
+  return rows;
+}
+
+/**
+ * The final value of an ordered-set aggregate over one group's non-NULL inputs, shared by both
+ * executors. The inputs are sorted in the WITHIN GROUP direction, then:
+ * PERCENTILE_CONT interpolates linearly between the two inputs around position f × (n − 1);
+ * PERCENTILE_DISC returns the first input whose position reaches f × n; MODE returns the most
+ * frequent input, a tie going to the one that sorts first. Empty input is NULL, as is a NULL
+ * fraction; a fraction outside [0, 1] is an error, as in PostgreSQL.
+ */
+export function orderedSetAggregateValue(
+  name: "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MODE",
+  values: readonly unknown[],
+  descending: boolean,
+  fraction: unknown,
+): unknown {
+  let percentile = 0;
+  if (name !== "MODE") {
+    if (fraction === null || fraction === undefined) return null;
+    const read = isExactNumeric(fraction) ? Number(externalSqlDomainValue(fraction)) : fraction;
+    if (typeof read !== "number") throw new TypeError(`${name} takes a numeric fraction`);
+    if (!(read >= 0 && read <= 1)) {
+      throw new RangeError(`percentile value ${String(read)} is not between 0 and 1`);
+    }
+    percentile = read;
+  }
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) =>
+    descending ? compareValues(right, left) : compareValues(left, right),
+  );
+  if (name === "MODE") {
+    let best = sorted[0];
+    let bestCount = 0;
+    let run = 0;
+    for (let index = 0; index < sorted.length; index += 1) {
+      run = index > 0 && compareValues(sorted[index], sorted[index - 1]) === 0 ? run + 1 : 1;
+      if (run > bestCount) {
+        bestCount = run;
+        best = sorted[index];
+      }
+    }
+    return best;
+  }
+  if (name === "PERCENTILE_DISC") {
+    const position = Math.max(Math.ceil(percentile * sorted.length), 1);
+    return sorted[position - 1];
+  }
+  const number = (value: unknown): number => {
+    const read = isExactNumeric(value) ? Number(externalSqlDomainValue(value)) : value;
+    if (typeof read !== "number") throw new TypeError("PERCENTILE_CONT requires numeric input");
+    return read;
+  };
+  const position = percentile * (sorted.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  const low = number(sorted[lower]);
+  if (lower === upper) return low;
+  const high = number(sorted[upper]);
+  return low + (high - low) * (position - lower);
+}
+
+let lastQuantifiedArray: { text: string; members: unknown[] } | undefined;
+
+/**
+ * The values a quantified comparison ranges over: a resolved subquery or ARRAY constructor's
+ * list, or the members of an array value — NULL when the array itself is NULL, which makes
+ * the comparison unknown, as in PostgreSQL. Consecutive rows usually read the same array (a
+ * CTE constant, a repeated column value), so the last decoded one is kept.
+ */
+export function quantifiedMembers<E extends { readonly kind: string }>(
+  right: E,
+  evaluateValue: (expression: E) => unknown,
+): unknown[] | null {
+  if (right.kind === "list") {
+    return (right as unknown as { items: E[] }).items.map((item) => evaluateValue(item));
+  }
+  if (right.kind === "subquery") {
+    throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
+  }
+  const value = evaluateValue(right);
+  if (value === null || value === undefined) return null;
+  const text = arrayDomainText(value);
+  if (text === undefined) throw new TypeError("ANY/ALL take a subquery or an array");
+  if (lastQuantifiedArray?.text === text) return lastQuantifiedArray.members;
+  const members = (JSON.parse(text) as unknown[]).map((member) => {
+    if (typeof member === "string") return protectedSqlTextValue(member);
+    if (typeof member === "object" && member !== null) {
+      throw new TypeError("ANY/ALL take a one-dimensional array of scalar values");
+    }
+    return member;
+  });
+  lastQuantifiedArray = { text, members };
+  return members;
+}
+
 /** Splits a quantified operator like "> ANY" into its comparison and quantifier. */
 export function parseQuantified(
   operator: PredicateOperator,
@@ -6213,15 +6788,11 @@ export function evaluateBooleanExpression(
     {
       const quantified = parseQuantified(operator);
       if (quantified !== undefined) {
-        if (expression.right.kind !== "list") {
-          throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
-        }
-        return quantifiedComparison(
-          quantified.comparison,
-          quantified.quantifier,
-          evaluateValue(expression.left),
-          expression.right.items.map((item) => evaluateValue(item)),
-        );
+        const left = evaluateValue(expression.left);
+        const members = quantifiedMembers(expression.right, evaluateValue);
+        return members === null
+          ? null
+          : quantifiedComparison(quantified.comparison, quantified.quantifier, left, members);
       }
     }
     if (
@@ -9256,6 +9827,18 @@ class Parser {
         if (this.#punctuation("(")) this.#applyColumnAliases(derived);
         return this.#derivedSource(derived, alias);
       }
+      if (upper === "GENERATE_SERIES") {
+        this.#expectPunctuation("(");
+        const args = this.#expressionList();
+        this.#expectPunctuation(")");
+        const alias = this.#sourceAlias() ?? "generate_series";
+        let column = alias;
+        if (this.#punctuation("(")) {
+          column = this.#identifier();
+          this.#expectPunctuation(")");
+        }
+        return generateSeriesSource(args, alias, column, this.nextDerivedSequence);
+      }
       if (upper === "JSON_TABLE") {
         this.#expectPunctuation("(");
         const document = this.#expression();
@@ -9801,10 +10384,14 @@ class Parser {
         this.#keyword(this.#isKeyword("ANY") ? "ANY" : all ? "ALL" : "SOME");
         this.#expectPunctuation("(");
         // Kysely's fn.any(subquery) emits PostgreSQL's valid ANY((SELECT ...)) spelling.
+        const operandStart = this.#index;
         let wrapped = 0;
         while (this.#punctuation("(")) wrapped += 1;
         if (!this.#isKeyword("SELECT")) {
-          throw new TypeError("ANY/ALL take a subquery");
+          this.#index = operandStart;
+          const array = this.#arrayOperand();
+          this.#expectPunctuation(")");
+          return quantifiedArrayCondition(operator, all, left, array);
         }
         const block = this.#selectBlock("(quantified subquery)");
         while (wrapped > 0) {
@@ -9822,6 +10409,30 @@ class Parser {
       return { kind: "condition", operator, left, right: this.#additive() };
     }
     return left;
+  }
+
+  /**
+   * The array operand of ANY or ALL. A placeholder may carry PostgreSQL's array cast,
+   * `$1::int[]`, which types each bound member; any other operand is an ordinary expression
+   * that evaluates to an array (an ARRAY constructor, an array column).
+   */
+  #arrayOperand(): Expression {
+    if (this.#peek().kind === "parameter" && this.tokens[this.#index + 1]?.text === "::") {
+      const parameter = this.#parameterExpression();
+      this.#index += 1;
+      const target = this.#castTarget();
+      if (this.#peek().text !== "[") {
+        throw new TypeError("An ANY/ALL placeholder cast names an array type, as in $1::int[]");
+      }
+      this.#expectPunctuation("[");
+      this.#expectPunctuation("]");
+      return {
+        kind: "call",
+        name: "CAST",
+        arguments: [parameter, { kind: "literal", value: target }],
+      };
+    }
+    return this.#additive();
   }
 
   #additive(minimumPrecedence = 0): Expression {
@@ -10425,6 +11036,9 @@ class Parser {
           arguments: [operand, { kind: "literal", value: "date" }],
         };
       }
+      if (upper === "PERCENTILE_CONT" || upper === "PERCENTILE_DISC" || upper === "MODE") {
+        return this.#orderedSetAggregate(upper);
+      }
       if (statisticalAggregates.has(upper)) return this.#statisticalAggregate(upper);
       if (upper === "EVERY" || upper === "BOOL_AND" || upper === "BOOL_OR") {
         return this.#booleanAggregate(upper);
@@ -10700,6 +11314,54 @@ class Parser {
    * rules fall out — COUNT skips NULLs, and a sample variance of one row divides by zero,
    * which this engine reads as NULL.
    */
+  /**
+   * PERCENTILE_CONT(f), PERCENTILE_DISC(f), and MODE(), each followed by
+   * `WITHIN GROUP (ORDER BY x [ASC | DESC])`. The fraction is evaluated once per group.
+   */
+  #orderedSetAggregate(name: "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MODE"): Expression {
+    // The opening parenthesis is already consumed by the call dispatch.
+    const direct: Expression[] = [];
+    if (!this.#punctuation(")")) {
+      direct.push(...this.#expressionList());
+      this.#expectPunctuation(")");
+    }
+    if (name === "MODE" ? direct.length !== 0 : direct.length !== 1) {
+      throw new TypeError(
+        name === "MODE" ? "MODE() takes no arguments" : `${name} takes one fraction argument`,
+      );
+    }
+    if (direct.some((argument) => argument.kind === "wildcard" || hasAggregate(argument))) {
+      throw new TypeError(`${name} takes a constant fraction`);
+    }
+    if (!this.#isKeyword("WITHIN")) {
+      throw new TypeError(`${name} requires WITHIN GROUP (ORDER BY ...)`);
+    }
+    this.#keyword("WITHIN");
+    this.#keyword("GROUP");
+    this.#expectPunctuation("(");
+    if (!this.#isKeyword("ORDER")) {
+      throw new TypeError(`${name} requires WITHIN GROUP (ORDER BY ...)`);
+    }
+    const order = this.#orderByClause();
+    this.#expectPunctuation(")");
+    const sorted = order[0];
+    if (sorted === undefined || order.length !== 1) {
+      throw new TypeError(`${name} takes exactly one ORDER BY expression`);
+    }
+    if (hasAggregate(sorted.expression) || containsWindow(sorted.expression)) {
+      throw new TypeError(`${name} cannot order by another aggregate`);
+    }
+    if (this.#isKeyword("FILTER") || this.#isKeyword("OVER")) {
+      throw new TypeError(`${name} does not support FILTER or OVER`);
+    }
+    return {
+      kind: "call",
+      name,
+      arguments: [structuredClone(sorted.expression), ...direct],
+      aggregateOrderBy: [sorted],
+    };
+  }
+
   #statisticalAggregate(name: string): Expression {
     // The opening parenthesis is already consumed by the call dispatch.
     const argument = this.#expression();

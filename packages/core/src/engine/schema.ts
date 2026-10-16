@@ -20,6 +20,7 @@ import {
   hasAggregate,
   validateDefaultExpression,
   type Expression,
+  type QueryParameter,
   type QueryValue,
 } from "./query.js";
 import { externalSqlDomainValue, normalizeSqlDomainValue } from "./sql-domains.js";
@@ -2001,10 +2002,10 @@ export type PrimaryKeyValue<TTable extends AnyTable> = TTable["primaryKey"] exte
 type ColumnArrays<TShape> = { [K in keyof TShape]: ReadonlyArray<TShape[K]> };
 
 interface TypedTableDatabase {
-  execute(sql: string, params?: readonly QueryValue[]): Promise<unknown>;
+  execute(sql: string, params?: readonly QueryParameter[]): Promise<unknown>;
   query(
     sql: string,
-    options?: { params?: readonly QueryValue[] },
+    options?: { params?: readonly QueryParameter[] },
   ): Promise<{ rows: Array<Record<string, unknown>> }>;
 }
 

@@ -5,10 +5,10 @@ import type { UnsupportedFeatureRecord } from "./feature-matrix.js";
 /** Every feature the engine records as unsupported, with the error fragment that names it. */
 export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
   {
-    id: "aggregate.ordered-set",
-    error: "Unsupported function: percentile_cont",
+    id: "aggregate.corr",
+    error: "Unsupported function: corr",
     notes:
-      "Ordered-set aggregates (percentile_cont, percentile_disc, mode) and corr are not supported; a window over ROW_NUMBER() and COUNT() OVER () computes a median.",
+      "The two-argument statistical aggregates (corr, covar_pop, covar_samp, regr_*) are not supported; VAR_POP, VAR_SAMP, STDDEV_POP, and STDDEV_SAMP are.",
   },
   {
     id: "array.concat",
@@ -154,27 +154,16 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
       "The bitwise operators &, |, #, ~, <<, and >> and the prefix operators |/ and @ are not supported.",
   },
   {
-    id: "expression.date-minus-date",
-    error: "Arithmetic and numeric aggregates require numbers",
-    notes:
-      "date - date and timestamp - timestamp are not supported; see expression.interval-values.",
-  },
-  {
     id: "expression.interval-values",
     error: "Date arithmetic requires a date or datetime value",
     notes:
-      "Interval-valued arithmetic — interval + interval, timestamp - timestamp, date - date, date + integer, justify_days — is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH …) readings for a duration in seconds.",
+      "Interval-valued arithmetic between intervals — interval + interval, interval * number, justify_days — is not supported. timestamp - timestamp, date - date, date ± integer, and a date or timestamp ± an interval are; see expression.timestamp-minus-timestamp.",
   },
   {
     id: "expression.row-constructor-value",
     error: "Unsupported function: ROW",
     notes:
       "A row constructor as a value is not supported; row comparisons ((a, b) = (1, 2), (a, b) IN (…)) are.",
-  },
-  {
-    id: "function.generate-series",
-    error: "Expected identifier, found 1",
-    notes: "generate_series is not supported; a recursive CTE produces a series.",
   },
   {
     id: "function.regexp-arrays",
@@ -346,21 +335,10 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
       "LOCK TABLE is not supported; a single-session engine has no other session to lock against.",
   },
   {
-    id: "type.array-any",
-    error: "ANY/ALL take a subquery",
-    notes:
-      "PostgreSQL's ANY, ALL, and SOME accept an array operand as well as a subquery. Minnow implements only the subquery form, so the array variant is refused at compile time.",
-  },
-  {
-    id: "type.array-any-parameter",
-    error: "ANY/ALL take a subquery",
-    notes: "= ANY(array) is not supported; use IN (…) with a list or a subquery.",
-  },
-  {
     id: "type.interval-arithmetic",
     error: "Date arithmetic requires a date or datetime value",
     notes:
-      "PostgreSQL adds intervals into a combined interval and subtracts timestamps into an interval. Minnow's interval arithmetic only shifts a date or datetime by + or - INTERVAL, so an interval-valued result is refused.",
+      "PostgreSQL adds intervals into a combined interval and scales them by numbers. Minnow produces intervals from timestamp subtraction and applies them to dates and timestamps, but an interval + interval result is refused.",
   },
   {
     id: "window.distinct-aggregate",

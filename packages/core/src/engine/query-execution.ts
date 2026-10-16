@@ -14,6 +14,7 @@ import {
   type CompiledStatement,
   type PreparedQuery,
   type QueryResult,
+  type QueryParameter,
   type QueryValue,
   type SqlColumnSchema,
 } from "./query.js";
@@ -84,7 +85,7 @@ export interface QueryOptions {
    * statement has placeholders; the compiled plan is cached on the SQL text and re-bound per
    * execution, so parameterized queries skip re-parsing.
    */
-  readonly params?: readonly QueryValue[];
+  readonly params?: readonly QueryParameter[];
   /**
    * Budget for the documented modeled vector, row-index, group/result payload, and ordering buffers.
    * Boxed snapshot preparation, JavaScript container overhead, returned-result lifetime, and browser

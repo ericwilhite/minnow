@@ -456,6 +456,14 @@ describe("typed correlated subqueries", () => {
     >();
     expect(await nestedAny.execute()).toEqual([{ aaKey: 1 }, { aaKey: 2 }]);
 
+    // fn.any over a bound array: one placeholder carries the whole list.
+    const anyArray = db
+      .selectFrom("aa")
+      .select("aa.aaKey")
+      .where((eb) => eb("aa.bbKey", "=", eb.fn.any(eb.val([20, 30]))));
+    expect(anyArray.compile().parameters).toEqual([[20, 30]]);
+    expect(await anyArray.execute()).toEqual([{ aaKey: 2 }]);
+
     await db
       .insertInto("widgets")
       .values([{ widgetKey: 1 }, { widgetKey: 2 }])

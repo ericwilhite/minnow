@@ -280,15 +280,18 @@ UUID values validate and normalize. Arrays use canonical JSON at the JavaScript 
 An unquoted number in ARRAY input must retain its decimal value when converted to a JavaScript
 number; otherwise insertion is refused. Encode exact values as JSON strings to retain their
 digits, as the `ARRAY` constructor does for exact NUMERIC members. Minnow
-supports one-based scalar array subscripts, `ARRAY_AGG` with ordering and `DISTINCT`, and typed
-`UNNEST(ARRAY[...])` constructor sources with optional `WITH ORDINALITY`. Array slices,
+supports one-based scalar array subscripts, `ARRAY_AGG` with ordering and `DISTINCT`, typed
+`UNNEST(ARRAY[...])` constructor sources with optional `WITH ORDINALITY`, and `x = ANY(array)` /
+`x <> ALL(array)` over an array column, constructor, or parameter. Array slices,
 multidimensional access, correlated UNNEST inputs, and PostgreSQL array operators such as `||`
 remain unsupported. Arrays compare their represented scalar elements lexicographically, with
 NULL elements last; JSONB compares structural values, using numeric comparison for JSON numbers.
 JSON continues to compare its text representation. `||` remains text concatenation and is
 refused on two array or JSONB operands. Intervals retain separate
-month, day, and microsecond fields, and a date or datetime accepts `+ INTERVAL` and
-`- INTERVAL`; interval-valued arithmetic such as interval-plus-interval is unsupported.
+month, day, and microsecond fields. A date or datetime accepts `+ INTERVAL` and `- INTERVAL`,
+`timestamp - timestamp` returns an interval, `date - date` returns whole days, and
+`date ± integer` returns a date; arithmetic between intervals, such as interval-plus-interval, is
+unsupported.
 
 Declare an enum before using it as a column type:
 

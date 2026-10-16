@@ -31,7 +31,7 @@ import {
 } from "./database.js";
 import { internalsOf } from "./internals.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
-import type { CompiledQuery, QueryRow, QueryValue } from "./query.js";
+import type { CompiledQuery, QueryParameter, QueryRow } from "./query.js";
 import {
   encodeExecuteResult,
   encodeQueryResult,
@@ -643,7 +643,7 @@ class DatabaseRpcServer {
       case "execute": {
         const [sql, params, options, reportStats = false] = args as [
           string,
-          readonly QueryValue[] | undefined,
+          readonly QueryParameter[] | undefined,
           ExecuteOptions | undefined,
           boolean | undefined,
         ];
@@ -1083,7 +1083,7 @@ class DatabaseRpcServer {
   ): Promise<unknown> {
     if (method === "query") return this.#querySession(handle.session, args, context);
     if (method === "execute") {
-      const [sql, params] = args as [string, readonly QueryValue[] | undefined];
+      const [sql, params] = args as [string, readonly QueryParameter[] | undefined];
       return new ColumnarResult(encodeExecuteResult(await handle.session.execute(sql, params)));
     }
     if (method === "stage") {

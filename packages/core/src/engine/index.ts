@@ -46,6 +46,7 @@ export type {
   QueryResult,
   QueryRow,
   QueryExecutionOptions,
+  QueryParameter,
   QueryValue,
   SqlColumnSchema,
   SqlColumnType,

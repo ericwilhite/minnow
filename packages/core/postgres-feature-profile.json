@@ -180,6 +180,11 @@
       "reason": "AGE computes PostgreSQL's calendar difference but returns Minnow's canonical months/days/usecs interval text rather than PostgreSQL's '1 mon 14 days 12:00:00' rendering."
     },
     {
+      "id": "expression.date-plus-integer",
+      "classification": "different",
+      "reason": "The shifted DATE agrees with PostgreSQL's, but Minnow returns it as zoneless YYYY-MM-DD text while PostgreSQL clients commonly materialize a midnight Date (see type.date)."
+    },
+    {
       "id": "type.date",
       "classification": "different",
       "reason": "Minnow returns zoneless DATE values as canonical YYYY-MM-DD text while PostgreSQL clients commonly materialize them as midnight Date objects."
