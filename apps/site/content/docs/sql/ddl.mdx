@@ -231,9 +231,13 @@ Integer division is PostgreSQL's. When both operands of `/` are integers — int
 integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them,
 including a `CASE`, `COALESCE`, or `NULLIF` whose non-`NULL` values are all integers —
 the quotient truncates toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, and `SUM(qty) / COUNT(*)`
-is a whole number. Write `7 / 2.0`, divide by a `DOUBLE PRECISION` or `NUMERIC` column, or cast
-an operand when a fractional quotient is wanted. A bound parameter takes the type of its integer
-partner, so `qty / $1` truncates when `$1` is bound to an integer.
+is a whole number. The same holds for functions that return an integer (`LENGTH`, `POSITION`,
+`STRPOS`, `ASCII`, `OCTET_LENGTH`), for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, and `COUNT`
+windows, for `SUM`, `MIN`, `MAX`, `LAG`, and `FIRST_VALUE` windows over an integer, and for the
+columns of a recursive CTE whose first member selects integers. Write `7 / 2.0`, divide by a
+`DOUBLE PRECISION` or `NUMERIC` column, or cast an operand (`qty / 2::float`) when a fractional
+quotient is wanted. A bound parameter takes the type of its integer partner, so `qty / $1`
+truncates when `$1` is bound to an integer.
 
 Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
 comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.

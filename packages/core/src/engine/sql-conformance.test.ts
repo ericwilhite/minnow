@@ -1613,6 +1613,23 @@ function divisionCases(): Case[] {
     ordered(
       `SELECT COUNT(*) / CASE WHEN COUNT(*) > 0 THEN NULL ELSE 7 END AS none, SUM(id) / CASE MIN(id) WHEN 0 THEN NULL ELSE 7 END AS sevenths FROM data ORDER BY 1`,
     ),
+    // Functions PostgreSQL declares as returning integer, every integer-typed window column,
+    // and a recursive CTE's columns (typed by its non-recursive term) all divide as integers.
+    ordered(`SELECT id, LENGTH(label) / 3 AS a, LENGTH(label) * id / 4 AS b FROM data ORDER BY id`),
+    {
+      sql: `SELECT id, POSITION('a' IN label) / 2 AS a, STRPOS(label, 'o') / 2 AS b, ASCII(label) / 7 AS c, OCTET_LENGTH(label) / 3 AS d FROM data ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    ordered(
+      `SELECT id, ROW_NUMBER() OVER (ORDER BY id) / 3 AS rn, RANK() OVER (ORDER BY label) / 3 AS rk, DENSE_RANK() OVER (ORDER BY label) / 2 AS dr, NTILE(4) OVER (ORDER BY id) / 3 AS nt, COUNT(*) OVER (PARTITION BY region) / 4 AS c FROM data ORDER BY id`,
+    ),
+    ordered(
+      `SELECT id, SUM(id) OVER (ORDER BY id) / 7 AS s, MAX(id) OVER (PARTITION BY region) / 3 AS m, LAG(id, 1, 0) OVER (ORDER BY id) / 2 AS lg, FIRST_VALUE(id) OVER (PARTITION BY label ORDER BY id) / 2 AS fv, AVG(id) OVER (PARTITION BY label) / 2 AS mean FROM data ORDER BY id`,
+    ),
+    ordered(
+      `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 9) SELECT n, n / 2 AS half, n / 3 AS third FROM r ORDER BY n`,
+    ),
     // A constant cast to a float type keeps that type when the cast is folded away.
     ordered(
       `SELECT id, id / CAST(2 AS DOUBLE PRECISION) AS a, id / CAST(2 AS REAL) AS b, id / CAST('2' AS FLOAT) AS c, id / CAST(2 AS INTEGER) AS d, SUM(id) / CAST(4 AS FLOAT) AS e FROM data GROUP BY id ORDER BY id`,

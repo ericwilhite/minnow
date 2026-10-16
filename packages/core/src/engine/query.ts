@@ -4092,7 +4092,10 @@ export function integerTypedExpression(
       if (name === "SUM" || name === "MIN" || name === "MAX" || name === "ABS") {
         return args.length === 1 && args[0] !== undefined && typed(args[0]);
       }
-      if (name === "MOD") return args.length === 2 && args.every(typed);
+      if (integerResultFunctionNames.has(name)) return true;
+      if (name === "MOD" || name === "GCD" || name === "LCM") {
+        return args.length === 2 && args.every(typed);
+      }
       if (name === "COALESCE" || name === "NULLIF" || name === "GREATEST" || name === "LEAST") {
         return unifiesToInteger(args);
       }
@@ -4103,6 +4106,51 @@ export function integerTypedExpression(
         ...expression.branches.map((branch) => branch.then),
         ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
       ]);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Scalar functions PostgreSQL declares as returning `integer` whatever their arguments:
+ * `LENGTH(name) / 2` truncates there and in SQLite. INSTR is POSITION's compiled form.
+ */
+const integerResultFunctionNames: ReadonlySet<string> = new Set([
+  "LENGTH",
+  "OCTET_LENGTH",
+  "INSTR",
+  "STRPOS",
+  "ASCII",
+  "NUM_NULLS",
+  "NUM_NONNULLS",
+  "WIDTH_BUCKET",
+]);
+
+/**
+ * Whether a window column is integer-typed, PostgreSQL's way: the ranking functions and COUNT
+ * always are, and SUM, MIN, MAX and the value functions are when their argument is.
+ */
+function windowIntegerTyped(window: WindowSpec, inputIntegers: ReadonlySet<string>): boolean {
+  switch (window.name) {
+    case "ROW_NUMBER":
+    case "RANK":
+    case "DENSE_RANK":
+    case "NTILE":
+    case "COUNT":
+      return true;
+    case "SUM":
+    case "MIN":
+    case "MAX":
+    case "LAG":
+    case "LEAD":
+    case "FIRST_VALUE":
+    case "LAST_VALUE":
+    case "NTH_VALUE":
+      return (
+        window.argumentAlias !== undefined &&
+        inputIntegers.has(window.argumentAlias) &&
+        (typeof window.fallback !== "number" || Number.isSafeInteger(window.fallback))
+      );
     default:
       return false;
   }
@@ -4198,9 +4246,22 @@ function sourceIntegerColumns(
       : blockIntegerOutputs(first, tableIntegerColumns, source.columnAliases);
   }
   if (source.windowed !== undefined) {
-    return blockIntegerOutputs(source.windowed.block, tableIntegerColumns, source.columnAliases);
+    const inputs = blockIntegerOutputs(
+      source.windowed.block,
+      tableIntegerColumns,
+      source.columnAliases,
+    );
+    if (inputs === true || source.columnAliases !== undefined) return inputs;
+    const outputs = new Set(inputs);
+    for (const window of source.windowed.windows) {
+      if (windowIntegerTyped(window, inputs)) outputs.add(window.alias);
+    }
+    return outputs;
   }
-  if (source.recursive !== undefined) return new Set();
+  if (source.recursive !== undefined) {
+    // A recursive CTE's columns take their types from its non-recursive term.
+    return blockIntegerOutputs(source.recursive.base, tableIntegerColumns, source.columnAliases);
+  }
   return tableIntegerColumns?.(source.table) ?? new Set();
 }
 
