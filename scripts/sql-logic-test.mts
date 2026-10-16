@@ -128,7 +128,9 @@ function createDatabase(): SqlLogicDatabase {
   const database = new MinnowDatabase(store, {
     compression: "raw",
     autoCompact: false,
-    autoCollect: false,
+    // Upstream index/* files commit one row at a time far past the 4,096-commit collection
+    // debt limit, which refuses writes when collection is left to the caller.
+    autoCollect: true,
     createId: sequentialIds(),
   });
   return {
