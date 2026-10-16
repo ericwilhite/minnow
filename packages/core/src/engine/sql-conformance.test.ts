@@ -1515,6 +1515,7 @@ function buildCorpus(seed: number): Case[] {
   corpus.push(...divisionCases());
   corpus.push(...resolutionCases());
   corpus.push(...groupByPrecedenceCases());
+  corpus.push(...outputNameCases());
   corpus.push(...jsonSpellingCases());
   corpus.push(...distinctOnCases());
   return corpus;
@@ -1640,6 +1641,34 @@ function divisionCases(): Case[] {
       ordered: true,
       skip: ["sqlite"],
     },
+  ];
+}
+
+/**
+ * Unaliased select items take PostgreSQL's output names: a function call is named for the
+ * function as written, whatever it compiles to, and a cast for what it casts. SQLite names a
+ * column by its source text, so only PGlite judges the names.
+ */
+function outputNameCases(): Case[] {
+  const named = (sql: string, ordered: boolean): Case => ({ sql, ordered, skip: ["sqlite"] });
+  return [
+    named(`SELECT COUNT(*)::int, SUM(id)::bigint, MAX(id)::text FROM data`, false),
+    named(
+      `SELECT id::text, CAST(label AS TEXT), UPPER(label)::text, CAST(LOWER(label) AS VARCHAR) FROM data ORDER BY id`,
+      true,
+    ),
+    named(
+      `SELECT VARIANCE(id), STDDEV_POP(id), BOOL_AND(active), EVERY(active), BOOL_OR(active) FROM data`,
+      false,
+    ),
+    named(
+      `SELECT id, POSITION('a' IN label), SUBSTRING(label FROM 2), CHAR_LENGTH(label), ROW_NUMBER() OVER (ORDER BY id), COUNT(*) OVER () FROM data ORDER BY id`,
+      true,
+    ),
+    named(
+      `SELECT region, COUNT(*) FILTER (WHERE active), STRING_AGG(label, ',' ORDER BY id) FROM data WHERE region IS NOT NULL GROUP BY region ORDER BY region`,
+      true,
+    ),
   ];
 }
 

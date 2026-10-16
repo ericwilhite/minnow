@@ -8811,8 +8811,9 @@ class Parser {
   #selectList(): SelectItem[] {
     const items: SelectItem[] = [];
     for (;;) {
+      const start = this.#index;
       const expression = this.#expression();
-      let alias = defaultAlias(expression);
+      let alias = this.#spelledCallName(start, expression) ?? defaultAlias(expression);
       if (this.#isKeyword("AS")) {
         this.#keyword("AS");
         alias = this.#identifier();
@@ -8835,6 +8836,66 @@ class Parser {
       ),
     );
     return items;
+  }
+
+  /**
+   * The output name PostgreSQL gives a select item that is one function call: the function's
+   * name as written, whatever the call compiles to. `ARRAY_AGG(id)` is `array_agg`,
+   * `POSITION('a' IN s)` is `position`, `ROW_NUMBER() OVER w` is `row_number`, and
+   * `COUNT(*)::int` is `count`, so a row read by those keys finds its value. Anything after
+   * the call other than FILTER, WITHIN GROUP, OVER, or a `::` cast makes it an expression.
+   */
+  #spelledCallName(start: number, expression: Expression): string | undefined {
+    const head = this.tokens[start];
+    const open = this.tokens[start + 1];
+    if (head?.kind !== "identifier" || open?.kind !== "punctuation" || open.text !== "(") {
+      return undefined;
+    }
+    if (head.quoted !== true && ["CAST", "NOT"].includes(head.text.toUpperCase())) {
+      return undefined;
+    }
+    const end = this.#index;
+    const closing = (index: number): number => {
+      let depth = 0;
+      for (let at = index; at < end; at += 1) {
+        const token = this.tokens[at];
+        if (token?.kind !== "punctuation") continue;
+        if (token.text === "(") depth += 1;
+        else if (token.text === ")" && --depth === 0) return at + 1;
+      }
+      return end + 1;
+    };
+    let at = closing(start + 1);
+    while (at < end) {
+      const token = this.tokens[at];
+      const word = token?.kind === "identifier" && token.quoted !== true ? token.text : "";
+      const next = this.tokens[at + 1];
+      if (word.toUpperCase() === "FILTER" && next?.text === "(") {
+        at = closing(at + 1);
+      } else if (
+        word.toUpperCase() === "WITHIN" &&
+        next?.text.toUpperCase() === "GROUP" &&
+        this.tokens[at + 2]?.text === "("
+      ) {
+        at = closing(at + 2);
+      } else if (word.toUpperCase() === "OVER" && next?.text === "(") {
+        at = closing(at + 1);
+      } else if (word.toUpperCase() === "OVER" && next?.kind === "identifier") {
+        at += 2;
+      } else if (
+        token?.kind === "operator" &&
+        token.text === "::" &&
+        expression.kind === "call" &&
+        expression.name === "CAST"
+      ) {
+        // `::` binds tighter than every operator, so a top-level CAST here casts the call.
+        at = end;
+      } else {
+        return undefined;
+      }
+    }
+    if (at !== end) return undefined;
+    return head.quoted === true ? head.text : head.text.toLowerCase();
   }
 
   /**
@@ -12813,6 +12874,11 @@ function numberRepeatedOutputs(items: readonly SelectItem[]): void {
 function defaultAlias(expression: Expression): string {
   if (expression.kind === "column")
     return expression.reference.split(".").at(-1) ?? expression.reference;
+  if (expression.kind === "call" && expression.name === "CAST") {
+    // PostgreSQL names `CAST(placed AS DATE)` and `placed::date` after what they cast.
+    const operand = expression.arguments[0];
+    if (operand?.kind === "column" || operand?.kind === "call") return defaultAlias(operand);
+  }
   if (expression.kind === "call") return expression.name.toLowerCase();
   if (expression.kind === "wildcard")
     return expression.table === undefined ? "*" : `${expression.table}.*`;

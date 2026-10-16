@@ -112,8 +112,14 @@ column names, as PostgreSQL returns them; only a name that two sources both cont
 `SELECT *` over a join on `id` — is returned as `alias.column`, since one result row cannot
 carry two columns of the same name. For the same reason, when two select items share an output
 name (`SELECT a AS c, b AS c`, or `SELECT *, total FROM orders`), both columns are returned and
-each later one is numbered: `c` and `c_2`, `total` and `total_2`. Unnamed expressions are
-numbered the same way (`expression`, `expression_2`).
+each later one is numbered: `c` and `c_2`, `total` and `total_2`.
+
+A select item without a label is named the way PostgreSQL names it: a column keeps its name, a
+function call takes the function's name as written (`COUNT(*)` is `count`, `ARRAY_AGG(id)` is
+`array_agg`, `ROW_NUMBER() OVER w` is `row_number`), and a cast takes the name of what it casts
+(`placed_at::date` is `placed_at`, `COUNT(*)::int` is `count`). Any other expression is
+`expression`, numbered like any repeated name (`expression`, `expression_2`), where PostgreSQL
+would say `?column?`.
 
 ## Joins
 
