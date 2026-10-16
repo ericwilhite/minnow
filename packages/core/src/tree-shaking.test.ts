@@ -54,9 +54,11 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // follow, key forwards and their SQL rewrite, batched live delivery): 987.6 KiB raw / 291.1 KiB
 // gzip. The 0.15.0 rekeying audit (layered key forwards replayed from commit windows, live delivery
 // recovery, grouped postings reads, marker validation):
-// 994.6 KiB raw / 293.6 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 995 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 294 * 1024;
+// 994.6 KiB raw / 293.6 KiB gzip. Quiet multi-tab maintenance (index builds claim their session
+// before marking the catalog, compaction adopts another tab's publication, consecutive lost
+// races are reported): 996.1 KiB raw / 294.4 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 997 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 295 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -69,8 +71,9 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 294 * 1024;
 // index capacity, and sliced OPFS recovery: 1304.6 KiB raw. Sliced commits and checkpoint
 // parsing (0.13.1): 1309.4 KiB raw. Bounded delta replay, staged commit deltas, WAL
 // continuation frames, the lease lane, and follower pieces (0.14.0): 1345.0 KiB raw.
-// Rekeying (0.15.0): 1367.4 KiB raw. With its audit: 1374.8 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1375 * 1024;
+// Rekeying (0.15.0): 1367.4 KiB raw. With its audit: 1374.8 KiB raw. Quiet multi-tab
+// maintenance: 1376.3 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1377 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -79,7 +82,8 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1375 * 1024;
 // capacity, and sliced OPFS recovery: 368.0 KiB measured. Sliced commits and checkpoint
 // parsing (0.13.1): 369.8 KiB measured. Bounded delta replay, staged commit deltas, WAL
 // continuation frames, the lease lane, and follower pieces (0.14.0): 382.2 KiB measured.
-// Rekeying (0.15.0): 389.4 KiB measured. With its audit: 392.0 KiB measured.
+// Rekeying (0.15.0): 389.4 KiB measured. With its audit: 392.0 KiB measured. Quiet multi-tab
+// maintenance: 392.7 KiB measured.
 const ENGINE_WITH_OPFS_GZIP_BUDGET = 393 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
@@ -91,8 +95,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 393 * 1024;
 // 1315.0 KiB raw / 369.7 KiB gzip; with bounded delta replay, staged commit deltas, and
 // schema-4 delta parts (0.14.0), 1339.8 KiB raw / 378.9 KiB gzip; with rekeying (0.15.0),
 // 1362.8 KiB raw / 386.3 KiB gzip; with the rekeying audit, 1370.4 KiB raw / 388.9 KiB gzip;
-// with chained forwards and lapsed-lease re-pinning, 389.05 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1371 * 1024;
+// with chained forwards and lapsed-lease re-pinning, 389.05 KiB gzip; with quiet multi-tab
+// maintenance, 1371.9 KiB raw / 389.6 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1372 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 390 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");

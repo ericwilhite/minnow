@@ -25,7 +25,7 @@ import {
 export type { ColumnDefinition } from "./catalog-mutations.js";
 export type { CreateTableInput } from "./catalog-mutations.js";
 import { CompactionController } from "./compaction-controller.js";
-import { BackgroundDiagnostics } from "./background-diagnostics.js";
+import { BackgroundDiagnostics, isLivePostingBuildRefusal } from "./background-diagnostics.js";
 import { CollectionController } from "./collection-controller.js";
 import { databaseInternals } from "./internals.js";
 import {
@@ -225,6 +225,7 @@ import {
   type TableRecord,
   type TransactionRecord,
   validateStorageId,
+  PostingBuildConflictError,
   SnapshotManifestMissingError,
   SchemaConflictError,
   TableInUseError,
@@ -1549,6 +1550,17 @@ class CompactionSourceChangedError extends Error {
   }
 }
 
+/**
+ * The manifest a job planned against is gone. An active job roots it, so this means the job
+ * ended -- another tab published or abandoned it -- after this step selected it, unless the job
+ * record says otherwise.
+ */
+class CompactionSourceManifestUnavailableError extends Error {
+  constructor(version: number) {
+    super(`Compaction source manifest is unavailable: ${String(version)}`);
+  }
+}
+
 function isCompactionCoordinationRefusal(error: unknown): boolean {
   return (
     error instanceof CompactionSourceChangedError ||
@@ -2366,6 +2378,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
   /** Highest authoritative commit hint observed while a postings fold is in flight. */
   readonly #postingDeltaTailCounts = new Map<string, number>();
+  /**
+   * Build sessions this engine claimed and has not yet finished or aborted, by build ID. A
+   * secondary-index build claims its session before it marks the catalog; the writer that
+   * streams the base begins the same session again with the identical lifetime, which every
+   * store accepts as a replay.
+   */
+  readonly #postingBuildSessions = new Map<string, { createdAt: string; expiresAt: string }>();
 
   readonly #compaction: CompactionController;
   readonly #accountedCompactionVersions = new Set<number>();
@@ -19948,7 +19967,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           latestOwner?.status !== "active" ||
           Date.parse(latestOwner.expiresAt) <= dateMilliseconds(this.#now())
         ) {
-          return await this.#runCompactionJob(table, latestJob, maxBlocks);
+          // Pass the active record this step held, as above: the fresh read then sees a job
+          // another coordinator abandoned (a schema change) as the revision race it is, not as
+          // this step's own failure.
+          return await this.#runCompactionJob(table, job, maxBlocks);
         }
       }
       throw error;
@@ -20175,6 +20197,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             conflicts > 0 ||
             (await this.store.getCurrentManifestVersion()) !== transaction.snapshotVersion
           ) {
+            // Every tab driving this job shares its transaction, and they take the turn one at
+            // a time: the manifest a later one finds moved may be the job's own publication.
+            // Its sources are gone then because the fold already replaced them -- adopt that
+            // outcome rather than abandon the job over it.
+            const publishedElsewhere = await transaction.committedElsewhere();
+            if (publishedElsewhere !== undefined) {
+              this.#afterCompactionCommit(publishedElsewhere, table.id);
+              return publishedElsewhere;
+            }
             await rebaseOverConcurrentCommits();
           }
           const published = await publish();
@@ -20729,9 +20760,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
     const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
     if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
-      throw new Error(
-        `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
-      );
+      throw new CompactionSourceManifestUnavailableError(job.sourceManifestVersion);
     }
     const plannedVisible = await this.#visibleSegmentRecords(
       table,
@@ -20827,9 +20856,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (table === undefined) throw new CompactionSourceChangedError(job.tableId, true);
     const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
     if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
-      throw new Error(
-        `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
-      );
+      throw new CompactionSourceManifestUnavailableError(job.sourceManifestVersion);
     }
     const plannedSnapshot = new Snapshot(this.store, sourceManifest.version);
     const plannedVisible = await this.#visibleSegmentRecords(table, plannedSnapshot);
@@ -20936,7 +20963,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     } catch (error) {
       if (candidate.status === "active") await candidate.abort();
       const latest = await this.store.getCompactionJob(job.id);
-      if (error instanceof CompactionSourceChangedError) {
+      // A source or the planning manifest gone because the job itself moved on -- another tab
+      // advanced, published, or abandoned it after this step selected it -- is that tab's
+      // outcome to report: run again from the newer record.
+      if (
+        error instanceof CompactionSourceChangedError ||
+        error instanceof CompactionSourceManifestUnavailableError
+      ) {
         if (latest === undefined) throw new CompactionJobConflictError(job.id, job.revision, null);
         if (latest.revision !== job.revision) return { job: latest, transaction: null };
       }
@@ -21549,13 +21582,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     indexId: string,
     index: SecondaryIndexRecord,
     ownedBuildId?: string,
-  ): Promise<void> {
+  ): Promise<"deferred" | undefined> {
     // Marking and publishing are catalog steps, each taken as one writer turn; the build in
     // between reads a leased snapshot outside any turn, so a large table never holds every
     // other writer for the whole scan.
     const entered = await this.#admissions.admit(
       "catalog",
-      async (): Promise<{ marked: TableRecord; buildId: string } | undefined> => {
+      async (): Promise<{ marked: TableRecord; buildId: string } | "deferred" | undefined> => {
         // (background: the maintenance signal below keeps this turn available during close)
         const current = await this.store.getTable(table.id);
         if (current === undefined) return undefined;
@@ -21563,21 +21596,68 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (held === undefined) return undefined;
         const ownsMarkedBuild =
           ownedBuildId !== undefined && held.state === "building" && held.buildId === ownedBuildId;
-        const buildId = ownsMarkedBuild ? ownedBuildId : this.#createId();
-        const marked = ownsMarkedBuild
-          ? current
-          : await this.store.updateTable(current.id, current.revision, {
-              secondaryIndexes: {
-                ...current.secondaryIndexes,
-                [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
-              },
-            });
-        return { marked, buildId };
+        if (ownsMarkedBuild) return { marked: current, buildId: ownedBuildId };
+        const buildId = this.#createId();
+        // Claim the build session before taking the catalog mark. A claim refused because
+        // another connection's build of this index is live means that connection is doing this
+        // work right now: marking over it would only make its publication miss, and the two
+        // builds would undo each other. Whoever crosses the trigger next -- a commit past the
+        // delta-tail bound, a query over an index that is not ready -- tries again, and a build
+        // whose owner died stops blocking the claim once its session expires. An invalid index
+        // has no session to claim until the mark makes it active again. Any other refusal is
+        // left to the build itself: it begins the session again after the mark, and a failure
+        // there invalidates the index and is reported, as a failed build always is.
+        if (held.state !== "invalid") {
+          try {
+            await this.#beginPostingBuild(current.id, held.storageColumnId, buildId);
+          } catch (error) {
+            if (isLivePostingBuildRefusal(error)) return "deferred";
+          }
+        }
+        try {
+          const marked = await this.store.updateTable(current.id, current.revision, {
+            secondaryIndexes: {
+              ...current.secondaryIndexes,
+              [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
+            },
+          });
+          return { marked, buildId };
+        } catch (error) {
+          await this.#releaseClaimedPostingBuild(current.id, held.storageColumnId, buildId);
+          throw error;
+        }
       },
       this.#maintenanceSignal,
     );
-    if (entered === undefined) return;
+    if (entered === undefined || entered === "deferred") return entered;
     const { marked, buildId } = entered;
+    try {
+      return await this.#buildMarkedSecondaryIndexBase(table, indexId, index, marked, buildId);
+    } finally {
+      // A build that returned before streaming (its columns are gone) never used its claim.
+      await this.#releaseClaimedPostingBuild(table.id, index.storageColumnId, buildId);
+    }
+  }
+
+  /** Aborts a session this engine claimed but never finished or aborted. */
+  async #releaseClaimedPostingBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+  ): Promise<void> {
+    if (!this.#postingBuildSessions.has(buildId)) return;
+    await this.#abortPostingBuild(tableId, columnId, buildId).catch(
+      this.#postingCleanupFailure(tableId, columnId),
+    );
+  }
+
+  async #buildMarkedSecondaryIndexBase(
+    table: TableRecord,
+    indexId: string,
+    index: SecondaryIndexRecord,
+    marked: TableRecord,
+    buildId: string,
+  ): Promise<"deferred" | undefined> {
     // Set while a UNIQUE key set is staged and not yet published; written inside the snapshot.
     const uniqueBuild = { staged: false };
     try {
@@ -21685,41 +21765,52 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
       // Still staged after the publication turn: the index was dropped or rebuilt meanwhile.
       if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
+      return undefined;
     } catch (error) {
       if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
-      const fresh = await this.store
-        .getTable(table.id)
+      const superseded = Symbol("superseded");
+      // Read the record inside the turn that rewrites it: read outside, any catalog step that
+      // lands between the two (another index's build publishing) refuses the rewrite.
+      const invalidatedColumnId = await this.#admissions
+        .admit(
+          "catalog",
+          async () => {
+            const fresh = await this.store.getTable(table.id);
+            const freshIndex = fresh?.secondaryIndexes?.[indexId];
+            if (
+              fresh === undefined ||
+              freshIndex?.state !== "building" ||
+              freshIndex.buildId !== buildId
+            ) {
+              return superseded;
+            }
+            const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
+            void _failedBuild;
+            await this.store.updateTable(fresh.id, fresh.revision, {
+              secondaryIndexes: {
+                ...fresh.secondaryIndexes,
+                [indexId]: { ...invalidIndex, state: "invalid" },
+              },
+            });
+            return freshIndex.storageColumnId;
+          },
+          this.#maintenanceSignal,
+        )
         .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
-      const freshIndex = fresh?.secondaryIndexes?.[indexId];
-      if (
-        fresh !== undefined &&
-        freshIndex?.state === "building" &&
-        freshIndex.buildId === buildId
-      ) {
-        const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
-        void _failedBuild;
-        const invalidated = await this.#admissions
-          .admit(
-            "catalog",
-            () =>
-              this.store.updateTable(fresh.id, fresh.revision, {
-                secondaryIndexes: {
-                  ...fresh.secondaryIndexes,
-                  [indexId]: { ...invalidIndex, state: "invalid" },
-                },
-              }),
-            this.#maintenanceSignal,
-          )
-          .then(() => true)
+      // The catalog no longer names this build -- the index was dropped, its oversized tail cut,
+      // or another connection's build took it over -- and that same change took the build's
+      // session away. The build lost a race with whatever owns the index now; there is nothing
+      // to clean up, and a query that finds the index not ready schedules the next build.
+      if (invalidatedColumnId === superseded && error instanceof PostingBuildConflictError) {
+        return "deferred";
+      }
+      // Catalog first: every intermediate reader scans. Once invalid, postings are neither
+      // truth nor maintained; removing their base and deltas bounds a persistently failing
+      // rebuild without touching a UNIQUE index's separate membership namespace.
+      if (typeof invalidatedColumnId === "string") {
+        await this.store
+          .removeFtsColumn(table.id, invalidatedColumnId)
           .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
-        // Catalog first: every intermediate reader scans. Once invalid, postings are neither
-        // truth nor maintained; removing their base and deltas bounds a persistently failing
-        // rebuild without touching a UNIQUE index's separate membership namespace.
-        if (invalidated) {
-          await this.store
-            .removeFtsColumn(fresh.id, freshIndex.storageColumnId)
-            .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
-        }
       }
       throw error;
     }
@@ -21806,15 +21897,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #beginPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    const now = this.#now();
+    let lifetime = this.#postingBuildSessions.get(buildId);
+    if (lifetime === undefined) {
+      const now = this.#now();
+      lifetime = { createdAt: dateIsoString(now), expiresAt: this.#postingBuildExpiry(now) };
+    }
     await this.store.beginFtsBaseBuild({
       tableId,
       columnId,
       buildId,
       ownerId: this.#internalLeaseOwnerId,
-      createdAt: dateIsoString(now),
-      expiresAt: this.#postingBuildExpiry(now),
+      ...lifetime,
     });
+    this.#postingBuildSessions.set(buildId, lifetime);
   }
 
   async #writePostingBuildChunk(
@@ -21845,25 +21940,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: { coversVersion: number; chunkCount: number; totalTokens: number },
   ): Promise<void> {
     const now = this.#now();
-    await this.store.finishFtsBaseBuild({
-      tableId,
-      columnId,
-      buildId,
-      ownerId: this.#internalLeaseOwnerId,
-      expiresAtCutoff: dateIsoString(now),
-      ...input,
-      completedAt: dateIsoString(now),
-    });
+    try {
+      await this.store.finishFtsBaseBuild({
+        tableId,
+        columnId,
+        buildId,
+        ownerId: this.#internalLeaseOwnerId,
+        expiresAtCutoff: dateIsoString(now),
+        ...input,
+        completedAt: dateIsoString(now),
+      });
+    } finally {
+      this.#postingBuildSessions.delete(buildId);
+    }
   }
 
   async #abortPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    await this.store.abortFtsBaseBuild({
-      tableId,
-      columnId,
-      buildId,
-      ownerId: this.#internalLeaseOwnerId,
-      expiresAtCutoff: dateIsoString(this.#now()),
-    });
+    try {
+      await this.store.abortFtsBaseBuild({
+        tableId,
+        columnId,
+        buildId,
+        ownerId: this.#internalLeaseOwnerId,
+        expiresAtCutoff: dateIsoString(this.#now()),
+      });
+    } finally {
+      this.#postingBuildSessions.delete(buildId);
+    }
   }
 
   /**
@@ -22905,9 +23008,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (index === undefined) return;
     const key = `${table.id}/${index.storageColumnId}`;
     if (this.#ftsBuildsInFlight.has(key)) return;
+    // A build deferred to another connection's live one settles quietly; the key is released
+    // either way, so the next query that finds the index still not ready tries again.
     const build = this.#buildSecondaryIndexBase(table, indexId, index)
-      .catch((error: unknown) =>
-        this.#reportBackgroundError(error, `secondary index build for ${table.name}/${indexId}`),
+      .then(
+        () => undefined,
+        (error: unknown) =>
+          this.#reportBackgroundError(error, `secondary index build for ${table.name}/${indexId}`),
       )
       .finally(() => {
         if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
@@ -22961,6 +23068,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let observedCount: number | undefined;
     let invalidated = false;
     const build = (async () => {
+      let folded: boolean;
       try {
         const table = await this.store.getTable(tableId);
         // Once scheduled, finish even if close() starts: close joins this promise specifically so
@@ -22974,34 +23082,44 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (state !== undefined && state.state !== "invalid") {
           const column = table.columns.find((candidate) => candidate.id === columnId);
           if (column !== undefined) await this.#buildFtsIndex(table, column);
+          folded = true;
         } else {
           const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
             ([, index]) => index.storageColumnId === columnId && index.state !== "invalid",
           );
-          if (secondary !== undefined) {
-            await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1]);
-          } else {
+          if (secondary === undefined) {
             invalidated = true;
             this.#postingDeltaTailCounts.delete(key);
             return;
           }
+          // "deferred": another connection's build is folding this tail already -- with several
+          // tabs writing, every commit past the bound lands here. Nothing failed, so nothing is
+          // reported; if that build fails, the next commit past the bound asks again.
+          folded =
+            (await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1])) !== "deferred";
         }
-        const version = (await this.store.getCurrentManifestVersion()) ?? -1;
-        observedCount = (await this.store.readFtsCandidates(tableId, columnId, [], version))
-          .deltaChunkCount;
-        this.#postingDeltaTailCounts.set(key, observedCount);
+        if (folded) {
+          const version = (await this.store.getCurrentManifestVersion()) ?? -1;
+          observedCount = (await this.store.readFtsCandidates(tableId, columnId, [], version))
+            .deltaChunkCount;
+          this.#postingDeltaTailCounts.set(key, observedCount);
+        }
       } catch (error) {
+        folded = false;
         this.#reportBackgroundError(error, `posting delta fold for ${key}`);
-        if ((this.#postingDeltaTailCounts.get(key) ?? 0) >= FTS_HARD_DELTA_CHUNKS) {
-          try {
-            await this.#invalidateOversizedPostingTail(tableId, columnId);
-            invalidated = true;
-            this.#postingDeltaTailCounts.delete(key);
-          } catch (error) {
-            this.#reportBackgroundError(error, `posting tail invalidation for ${key}`);
-            // Keep the hard-threshold marker. A later commit or relevant read will retry; losing
-            // it here would turn a transient catalog/cleanup refusal into silent unbounded growth.
-          }
+      }
+      // A tail that reached the hard bound without this fold bringing it down is cut, whether
+      // the fold failed or another connection's has not caught up: the index falls back to scans
+      // rather than append one durable delta per commit.
+      if (!folded && (this.#postingDeltaTailCounts.get(key) ?? 0) >= FTS_HARD_DELTA_CHUNKS) {
+        try {
+          await this.#invalidateOversizedPostingTail(tableId, columnId);
+          invalidated = true;
+          this.#postingDeltaTailCounts.delete(key);
+        } catch (error) {
+          this.#reportBackgroundError(error, `posting tail invalidation for ${key}`);
+          // Keep the hard-threshold marker. A later commit or relevant read will retry; losing
+          // it here would turn a transient catalog/cleanup refusal into silent unbounded growth.
         }
       }
     })().finally(() => {

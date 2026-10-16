@@ -1458,18 +1458,31 @@ export class DatabaseTransaction {
 
   /** A commit whose acknowledgement was lost still committed: answer from the persisted record. */
   async #recoverCommitted(error: unknown): Promise<ManifestSummary> {
-    const persisted = await this.store.getTransaction(this.id);
-    if (persisted?.status === "committed" && persisted.committedVersion !== null) {
-      const manifest = await this.store.getManifest(persisted.committedVersion);
-      if (manifest !== undefined) {
-        this.#record = persisted;
-        this.#persisted = true;
-        this.#stopHeartbeat();
-        await this.#releaseSnapshotLease().catch(() => undefined);
-        return manifest;
-      }
-    }
+    const manifest = await this.#adoptPersistedCommit();
+    if (manifest !== undefined) return manifest;
     throw error;
+  }
+
+  /**
+   * The manifest this transaction's durable record says it committed, when another coordinator
+   * sharing the record committed it -- a tab driving the same compaction job published first.
+   * Adopts that outcome as a lost acknowledgement would be; `undefined` while it is uncommitted.
+   */
+  async committedElsewhere(): Promise<ManifestSummary | undefined> {
+    if (!this.#persisted || this.#record.status !== "active") return undefined;
+    return this.#adoptPersistedCommit();
+  }
+
+  async #adoptPersistedCommit(): Promise<ManifestSummary | undefined> {
+    const persisted = await this.store.getTransaction(this.id);
+    if (persisted?.status !== "committed" || persisted.committedVersion === null) return undefined;
+    const manifest = await this.store.getManifest(persisted.committedVersion);
+    if (manifest === undefined) return undefined;
+    this.#record = persisted;
+    this.#persisted = true;
+    this.#stopHeartbeat();
+    await this.#releaseSnapshotLease().catch(() => undefined);
+    return manifest;
   }
 
   async #renewOwnership(force = false): Promise<void> {
