@@ -535,6 +535,14 @@ function visibleSegmentsMemoKey(table: TableRecord, snapshot: Snapshot): string 
   return `${table.id}\u0000${String(snapshot.version ?? -1)}`;
 }
 
+/** A `COUNT(*)` answer over the rows a point or index read matched. */
+function countResult(alias: string, count: number): QueryResult {
+  const row: QueryRow = {};
+  if (alias === "__proto__") defineSqlResultProperty(row, alias, count);
+  else row[alias] = count;
+  return { columns: [alias], columnDomains: [null], rows: [row] };
+}
+
 /**
  * The catalog-state cache key of a table-name set. Table names are only trimmed, never
  * charset-restricted, so no join separator is collision-free; JSON encoding is. A lone name is
@@ -655,8 +663,18 @@ interface ResolvedPointReadCommon {
   /** Storage type of each equality's column, in equality order. */
   readonly equalityTypes: ReadonlyArray<TableColumnRecord["type"]>;
   readonly projected: ReadonlyArray<{ column: TableColumnRecord; alias: string }>;
+  /** Set for `SELECT COUNT(*)`: the answer is the matched rows' count under this alias. */
+  readonly count?: string;
   readonly columns: readonly string[];
   readonly columnDomains: ReadonlyArray<SqlDomain | null>;
+}
+
+/** One append segment of an index read: its key blocks and every needed column's blocks. */
+interface ResolvedIndexReadSegment {
+  readonly segment: SegmentRecord;
+  readonly anchorIds: readonly string[];
+  /** Block ids per needed column (`neededColumns` order), aligned with `anchorIds`. */
+  readonly blockIds: ReadonlyArray<readonly string[]>;
 }
 
 /**
@@ -669,6 +687,22 @@ type ResolvedPointRead =
   | (ResolvedPointReadCommon & {
       readonly kind: "delta";
       readonly segments: readonly SegmentRecord[];
+    })
+  | (ResolvedPointReadCommon & {
+      readonly kind: "index";
+      readonly table: TableRecord;
+      readonly indexId: string;
+      readonly index: SecondaryIndexRecord;
+      /** The index's leading columns the equalities pin, with the equality pinning each. */
+      readonly prefixColumns: readonly TableColumnRecord[];
+      readonly prefixEqualities: readonly number[];
+      /** Whether the pinned columns leave trailing index columns open (a prefix term). */
+      readonly partial: boolean;
+      /** Equality and projected columns, read per candidate block. */
+      readonly neededColumns: readonly TableColumnRecord[];
+      readonly equalityVectors: readonly number[];
+      readonly projectedVectors: readonly number[];
+      readonly segments: readonly ResolvedIndexReadSegment[];
     })
   | (ResolvedPointReadCommon & {
       readonly kind: "base";
@@ -6925,6 +6959,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       plans.set(signature, plan);
     }
     if (plan.kind === "ineligible") return undefined;
+    const result = await this.#servePointRead(plan, shape, snapshot, visibility, options);
+    if (result === undefined || plan.count === undefined) return result;
+    return countResult(plan.count, result.rows.length);
+  }
+
+  /** Executes a resolved point read: a key search, a keyed delta replay, or an index lookup. */
+  async #servePointRead(
+    plan: Exclude<ResolvedPointRead, { kind: "ineligible" }>,
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
     // Each execution's literals must match their columns' storage types exactly; any coercion
     // case belongs to the ordinary executor.
     const equalities = shape.equalities;
@@ -6940,6 +6987,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return undefined;
       }
     }
+    if (plan.kind === "index") return this.#indexReadAtSnapshot(plan, shape, snapshot, options);
     if (plan.kind === "delta") {
       // Update and delete deltas are replayed for the one key instead of the whole table: a
       // scalar key identifies its row in every segment, so the row's history is a handful of
@@ -7105,8 +7153,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const ineligible: ResolvedPointRead = { kind: "ineligible", version };
     // Short projections cost fewer allocations as direct lookups. Wide projections keep
     // a name map so SELECT * never turns catalog binding into quadratic work.
+    const select = shape.select;
     const byName =
-      shape.select === "*" || shape.select.length + shape.equalities.length > 8
+      !Array.isArray(select) || select.length + shape.equalities.length > 8
         ? new Map(table.columns.map((column) => [column.name, column]))
         : undefined;
     const findColumn = (name: string): TableColumnRecord | undefined =>
@@ -7123,24 +7172,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       equalityColumns.set(column.name, column);
       equalityTypes.push(column.type);
     }
-    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
-    // per-row candidate verification cannot degrade into an unvectorized table scan.
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) return ineligible;
-    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
-    if (keyComponents.length === 0) return ineligible;
-    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
-      return ineligible;
-    }
     // A logical-domain projection is served too: the stored scalar is the tagged internal
     // value the ordinary executor's pipeline carries for a bare column reference, and both
     // paths cross the result boundary through the same externalizeQueryResult call, so
     // reporting the column's domain below makes the answers identical by construction.
     const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
-    const selected =
-      shape.select === "*"
+    const selected = Array.isArray(select)
+      ? select
+      : select === "*"
         ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
-        : shape.select;
+        : [];
     for (const item of selected) {
       const column = findColumn(item.column);
       if (column === undefined || column.hidden === true) return ineligible;
@@ -7152,9 +7195,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       equalityColumns,
       equalityTypes,
       projected,
+      ...(!Array.isArray(select) && select !== "*" ? { count: select.count } : {}),
       columns: projected.map((item) => item.alias),
       columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
     };
+    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
+    // per-row candidate verification cannot degrade into an unvectorized table scan. Without
+    // it, a ready secondary index on the pinned columns names the candidate rows instead.
+    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
+    if (keyComponents.length === 0) return ineligible;
+    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
+      return this.#resolveIndexRead(shape, table, common, await visibleSegments());
+    }
     const segments = await visibleSegments();
     if (
       segments.some((segment) => {
@@ -7231,6 +7283,219 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       projectedVectors,
       segments: resolvedSegments,
     };
+  }
+
+  /**
+   * The value-independent half of an index read: a conjunction of equalities that does not cover
+   * the key, over an append-only history, served through a ready key-locator secondary index whose
+   * leading columns it pins. The postings name candidate keys; each candidate row is verified
+   * against every equality, so a stale posting or a locator collision costs a check, never an
+   * answer. Ineligible whenever the general path's index pruning would not apply either.
+   */
+  #resolveIndexRead(
+    shape: PointReadShape,
+    table: TableRecord,
+    common: ResolvedPointReadCommon,
+    segments: readonly SegmentRecord[],
+  ): ResolvedPointRead {
+    const ineligible: ResolvedPointRead = { kind: "ineligible", version: common.version };
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return ineligible;
+    }
+    // The longest pinned prefix of any ready key-locator index, as index pruning would choose.
+    let best:
+      { indexId: string; index: SecondaryIndexRecord; columns: TableColumnRecord[] } | undefined;
+    for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+      if (index.state !== "ready" || index.locator !== "key-hash-v1") continue;
+      const indexColumns = secondaryIndexColumnIds(index).map((columnId) =>
+        table.columns.find((column) => column.id === columnId),
+      );
+      if (indexColumns.some((column) => column === undefined)) continue;
+      const columns: TableColumnRecord[] = [];
+      for (const column of indexColumns as TableColumnRecord[]) {
+        if (!common.equalityColumns.has(column.name)) break;
+        columns.push(column);
+      }
+      if (columns.length === 0) continue;
+      // tuple-v1 postings omit rows NULL in a trailing column, so a prefix read through such an
+      // index could miss a matching row; the general path refuses the same lookup.
+      if (
+        columns.length < indexColumns.length &&
+        !secondaryIndexTermsCoverNulls(index) &&
+        (indexColumns as TableColumnRecord[])
+          .slice(columns.length)
+          .some((column) => column.nullable)
+      ) {
+        continue;
+      }
+      if (best === undefined || columns.length > best.columns.length) {
+        best = { indexId, index, columns };
+      }
+    }
+    if (best === undefined) return ineligible;
+    const prefixEqualities = best.columns.map((column) =>
+      shape.equalities.findIndex((equality) => equality.column === column.name),
+    );
+    if (prefixEqualities.some((position) => position < 0)) return ineligible;
+    const neededColumns = [
+      ...new Set([
+        ...common.equalityColumns.values(),
+        ...common.projected.map((item) => item.column),
+      ]),
+    ];
+    const vectorIndex = (column: TableColumnRecord): number =>
+      neededColumns.findIndex((candidate) => candidate.id === column.id);
+    const resolved: ResolvedIndexReadSegment[] = [];
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const anchorIds = segment.columnBlockIds[common.keyColumn.id] ?? [];
+      if (anchorIds.length === 0) return ineligible;
+      if (Object.values(segment.columnBlockIds).some((ids) => ids.length !== anchorIds.length)) {
+        return ineligible;
+      }
+      const blockIds = neededColumns.map((column) => segment.columnBlockIds[column.id]);
+      if (blockIds.some((ids) => ids === undefined)) return ineligible;
+      resolved.push({ segment, anchorIds, blockIds: blockIds as string[][] });
+    }
+    const indexColumnCount = secondaryIndexColumnIds(best.index).length;
+    return {
+      kind: "index",
+      ...common,
+      table,
+      indexId: best.indexId,
+      index: best.index,
+      prefixColumns: best.columns,
+      prefixEqualities,
+      partial: best.columns.length < indexColumnCount,
+      neededColumns,
+      equalityVectors: shape.equalities.map((equality) =>
+        vectorIndex(common.equalityColumns.get(equality.column) ?? common.keyColumn),
+      ),
+      projectedVectors: common.projected.map((item) => vectorIndex(item.column)),
+      segments: resolved,
+    };
+  }
+
+  /** Executes an index read: postings for the pinned prefix, then exact checks per candidate. */
+  async #indexReadAtSnapshot(
+    plan: Extract<ResolvedPointRead, { kind: "index" }>,
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    const equalities = shape.equalities;
+    let term = "";
+    try {
+      for (const [position, column] of plan.prefixColumns.entries()) {
+        const value = equalities[plan.prefixEqualities[position] ?? -1]?.value;
+        if (value === undefined) return undefined;
+        term += secondaryIndexComponentTerm(plan.index, column, position, value);
+      }
+    } catch {
+      return undefined;
+    }
+    const upToVersion = snapshot.version ?? -1;
+    const result = await this.#readFtsCandidatesMemoized(
+      snapshot,
+      plan.table.id,
+      plan.index.storageColumnId,
+      [{ term, prefix: plan.partial }],
+      upToVersion,
+    );
+    if (result.overflow || !result.hasBase || result.coversVersion > upToVersion) return undefined;
+    const candidates = result.rowIdsByTerm[0] ?? [];
+    if (candidates.length > MAX_POINT_READ_CANDIDATES) return undefined;
+    const rows: QueryRow[] = [];
+    if (candidates.length === 0) {
+      return { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
+    }
+    const locatorNumbers = candidates.map((candidate) =>
+      candidate <= 0xffff_ffffn ? Number(candidate) : -1,
+    );
+    let budget = MAX_POINT_READ_CANDIDATES;
+    const vectors: ColumnVector[] = [];
+    for (const entry of plan.segments) {
+      throwIfAborted(options.signal);
+      const locators = await this.#segmentKeyLocators(
+        entry.segment,
+        entry.anchorIds,
+        plan.keyColumn,
+        snapshot,
+      );
+      if (locators === undefined) return undefined;
+      const hits: number[] = [];
+      for (const locator of locatorNumbers) {
+        if (locator >= 0) probeSegmentKeyLocators(locators, locator, (row) => hits.push(row));
+      }
+      if (hits.length === 0) continue;
+      budget -= hits.length;
+      if (budget < 0) return undefined;
+      // Scan order within the segment, as the ordinary executor would return the rows.
+      const ordered = Uint32Array.from(hits).sort();
+      let blockIndex = -1;
+      for (let position = 0; position < ordered.length; position += 1) {
+        const row = ordered[position] ?? 0;
+        if (position > 0 && row === ordered[position - 1]) continue;
+        let block = blockIndex < 0 ? 0 : blockIndex;
+        while (
+          block + 1 < entry.anchorIds.length &&
+          (locators.blockStarts[block + 1] ?? 0) <= row
+        ) {
+          block += 1;
+        }
+        if (block !== blockIndex) {
+          blockIndex = block;
+          vectors.length = 0;
+          for (const [column, ids] of entry.blockIds.entries()) {
+            const blockId = ids[block] ?? "";
+            const vector =
+              (this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+                ColumnVector | undefined) ?? (await this.#pointReadVectors([blockId], snapshot))[0];
+            if (vector === undefined || vector.kind !== plan.neededColumns[column]?.type) {
+              return undefined;
+            }
+            vectors.push(vector);
+          }
+        }
+        const slot = row - (locators.blockStarts[block] ?? 0);
+        let matches = true;
+        for (let index = 0; index < equalities.length; index += 1) {
+          const columnVector = vectors[plan.equalityVectors[index] ?? -1];
+          if (columnVector === undefined) return undefined;
+          const stored = vectorValue(columnVector, slot);
+          const wanted = equalities[index]?.value;
+          const equal =
+            wanted instanceof Date
+              ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
+              : stored === wanted;
+          if (!equal) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) continue;
+        const output: QueryRow = {};
+        for (let index = 0; index < plan.projected.length; index += 1) {
+          const item = plan.projected[index];
+          const columnVector = vectors[plan.projectedVectors[index] ?? -1];
+          if (item === undefined || columnVector === undefined) return undefined;
+          const value = vectorValue(columnVector, slot);
+          if (typeof value === "string" && value.charCodeAt(0) === 0) {
+            // As for a key read: only a domain column's tagged scalar is provably reproduced.
+            if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return undefined;
+          }
+          if (item.alias === "__proto__") defineSqlResultProperty(output, item.alias, value);
+          else output[item.alias] = value;
+        }
+        rows.push(output);
+      }
+    }
+    return { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
   }
 
   /**
@@ -12273,6 +12538,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         if (secondaryIndexPredicates(reported, record).length > 0) {
           notes.push("a ready secondary index prunes the scan to candidate row groups");
+        }
+        if (secondaryIndexDisjunctions(reported, record).length > 0) {
+          notes.push("ready secondary indexes serve every branch of an OR");
         }
         const referenced = referencedColumns(
           reported,

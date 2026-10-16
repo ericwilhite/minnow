@@ -590,7 +590,6 @@ describe("point-read fast path", () => {
       ["SELECT b FROM keyless WHERE a = ?", [1]],
       ["SELECT payload FROM orders WHERE tenant = ? AND id > ?", ["tenant-2", 2]],
       ["SELECT payload FROM orders WHERE tenant = ? OR id = ?", ["tenant-2", 3]],
-      ["SELECT COUNT(*) AS n FROM orders WHERE tenant = ? AND id = ?", ["tenant-2", 3]],
       ["SELECT payload FROM orders WHERE tenant = ? AND id = ? LIMIT 1", ["tenant-2", 3]],
       ["SELECT payload FROM orders WHERE tenant = ? AND id = ? ORDER BY id", ["tenant-2", 3]],
       ["SELECT DISTINCT payload FROM orders WHERE tenant = ? AND id = ?", ["tenant-2", 3]],
@@ -601,6 +600,15 @@ describe("point-read fast path", () => {
     for (const [sql, params] of ineligible) {
       const { served } = await differential(database, sql, params);
       expect(served).toBe(false);
+    }
+    // A lone COUNT(*) over a key-covering equality counts the one row the lookup finds.
+    for (const id of [3, 4, 9999]) {
+      const counted = await differential(
+        database,
+        "SELECT COUNT(*) AS n FROM orders WHERE tenant = ? AND id = ?",
+        ["tenant-3", id],
+      );
+      expect(counted.served).toBe(true);
     }
     // The commonest point lookup spelling: the wildcard expands from the catalog at serving
     // time, in declaration order, with the same columns the ordinary executor projects.
