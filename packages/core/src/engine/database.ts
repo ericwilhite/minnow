@@ -10699,15 +10699,35 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // The committed probe reads the store's current unique-key index, as #assertKeysExist
       // does: a key another writer committed meanwhile counts as present here, and the scope's
       // commit then fails on that writer's conflict rather than publishing over it.
-      const existing = await this.#existingKeyTokens(
-        table,
-        transaction.snapshotVersion,
-        unresolved,
-      );
-      for (const token of existing) present.add(token);
+      //
+      // An INSERT asks twice in a row — the statement before it builds its batch, the session
+      // write before it registers keys — with nothing staged in between. The second asks about
+      // the same keys, so it is answered from the first rather than from another store read.
+      const generation = this.#scopeWriteState(transaction)?.generation ?? -1;
+      const staged = transaction.stagedWorkCount;
+      let memo = this.#committedKeyProbes.get(transaction);
+      if (memo?.tableId !== table.id || memo.generation !== generation || memo.staged !== staged) {
+        memo = { tableId: table.id, generation, staged, present: new Map() };
+      }
+      const known = memo.present;
+      const probe = unresolved.filter((token) => !known.has(token));
+      if (probe.length > 0) {
+        const existing = new Set(
+          await this.#existingKeyTokens(table, transaction.snapshotVersion, probe),
+        );
+        for (const token of probe) known.set(token, existing.has(token));
+      }
+      this.#committedKeyProbes.set(transaction, memo);
+      for (const token of unresolved) if (known.get(token) === true) present.add(token);
     }
     return present;
   }
+
+  /** The last committed key probe of each scope, while nothing has been staged since. */
+  readonly #committedKeyProbes = new WeakMap<
+    DatabaseTransaction,
+    { tableId: string; generation: number; staged: number; present: Map<string, boolean> }
+  >();
 
   async #runScopeKeyedMutation(
     transaction: DatabaseTransaction,
@@ -10759,7 +10779,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     /** The insert half of a rekey: its UPDATE triggers fire around it, not INSERT triggers. */
     rekey = false,
   ): Promise<StagedUpsertResult> {
-    const table = await this.#findTable(tableName);
+    const table = await this.#findTable(tableName, transaction);
     // Session upserts classify against the scope's own staged state, so a row inserted
     // earlier in the scope makes a later upsert of its key fire as an UPDATE.
     const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
