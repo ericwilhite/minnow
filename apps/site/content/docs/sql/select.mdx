@@ -138,6 +138,12 @@ ORDER BY revenue DESC
 lookup table from the smaller side. Equality joins can use the unique-key lookup when one side has
 one.
 
+A `USING` or `NATURAL` join merges its join columns, as PostgreSQL and SQLite do: an unqualified
+`customer_id` after `JOIN customers USING (customer_id)` is one column — the left side's value for
+an inner or left join, the right side's for a right join, and the first non-null of the two for a
+full join — and `SELECT *` lists it once, first. A later `USING` may name a column any earlier
+source supplies. The qualified `o.customer_id` and `c.customer_id` still name each side.
+
 A parenthesized join group — `FROM (orders o CROSS JOIN stores s)` — is accepted as the first
 source or as the operand of a comma, `CROSS JOIN`, or `INNER JOIN`, whose `ON` condition then
 filters the product. A group cannot take an alias, and a `LEFT`, `RIGHT`, `FULL`, `NATURAL`, or

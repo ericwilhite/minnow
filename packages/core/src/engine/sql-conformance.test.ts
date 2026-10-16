@@ -1516,6 +1516,7 @@ function buildCorpus(seed: number): Case[] {
   corpus.push(...resolutionCases());
   corpus.push(...groupByPrecedenceCases());
   corpus.push(...outputNameCases());
+  corpus.push(...joinUsingCases());
   corpus.push(...jsonSpellingCases());
   corpus.push(...distinctOnCases());
   return corpus;
@@ -1641,6 +1642,48 @@ function divisionCases(): Case[] {
       ordered: true,
       skip: ["sqlite"],
     },
+  ];
+}
+
+/**
+ * USING and NATURAL join columns merge: an unqualified reference names the left side's value
+ * (the right side's for RIGHT, COALESCE of both for FULL), and `SELECT *` lists it once, first.
+ * The column order of `SELECT *` differs in SQLite, so those shapes keep the merged column first
+ * on the left, where both oracles agree.
+ */
+function joinUsingCases(): Case[] {
+  const ordered = (sql: string, skip?: readonly OracleName[]): Case => ({
+    sql,
+    ordered: true,
+    ...(skip === undefined ? {} : { skip }),
+  });
+  return [
+    ordered(`SELECT id, region, rank FROM data JOIN dims USING (region) ORDER BY id`),
+    ordered(`SELECT id, region, rank FROM data LEFT JOIN dims USING (region) ORDER BY id`),
+    ordered(`SELECT id FROM data JOIN dims USING (region) WHERE region <> 'west' ORDER BY id`),
+    ordered(
+      `SELECT region, COUNT(*) AS n, SUM(rank) AS r FROM data JOIN dims USING (region) GROUP BY region HAVING COUNT(*) > 1 ORDER BY region`,
+    ),
+    ordered(`SELECT region, rank, id FROM data RIGHT JOIN dims USING (region) ORDER BY region, id`),
+    ordered(
+      `SELECT region, COUNT(id) AS n, MAX(rank) AS r FROM data FULL JOIN dims USING (region) WHERE region IS NOT NULL GROUP BY region ORDER BY region`,
+    ),
+    ordered(
+      `SELECT id, region, label FROM data JOIN (SELECT region, label FROM data WHERE id % 5 = 0) s USING (region, label) ORDER BY id, region, label`,
+    ),
+    // The second USING names a column of the second source, not the first.
+    ordered(
+      `SELECT id, region, rank, n FROM data JOIN dims USING (region) JOIN (SELECT rank, COUNT(*) AS n FROM dims GROUP BY rank) r USING (rank) ORDER BY id`,
+    ),
+    ordered(
+      `SELECT * FROM (SELECT region, rank FROM dims) m JOIN (SELECT id, region, amount FROM data) d USING (region) ORDER BY id`,
+    ),
+    ordered(
+      `SELECT region, rank, amount FROM (SELECT id, region, amount FROM data) d NATURAL JOIN (SELECT region, rank FROM dims) m ORDER BY id`,
+    ),
+    ordered(
+      `SELECT * FROM (SELECT region, rank FROM dims) m NATURAL LEFT JOIN (SELECT id, region, amount FROM data) d ORDER BY region, id`,
+    ),
   ];
 }
 

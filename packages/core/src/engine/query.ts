@@ -3493,6 +3493,7 @@ export function createPreparedQuery(
   assertTailParametersBound(plan);
   plan = resolveStatementDatetimes(plan);
   plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  plan = mergeJoinColumns(plan, wildcardRowColumns(tables));
   plan = unifyPlanGroupedReferences(plan, wildcardRowColumns(tables));
   validateGrouping(plan);
   // The schema-dependent rewrites run before derived sources materialize, because both can
@@ -5261,6 +5262,7 @@ export function executeRowQueryInternal(
   assertTailParametersBound(plan);
   plan = resolveStatementDatetimes(plan);
   plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  plan = mergeJoinColumns(plan, wildcardRowColumns(tables));
   plan = unifyPlanGroupedReferences(plan, wildcardRowColumns(tables));
   validateGrouping(plan);
   plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
@@ -6364,7 +6366,11 @@ function resolveColumn(context: RowContext, reference: string): unknown {
     return context[alias]?.[parts[1] ?? ""];
   }
   const name = parts[0] ?? "";
-  const matches = Object.values(context).filter((row) => row !== undefined && name in row);
+  const rows = Object.values(context);
+  const matches = rows.filter((row) => row !== undefined && name in row);
+  // An outer join's missing side has no row to name its columns; a bare name no present row
+  // has is that side's NULL, as the vectorized executor resolves it from the schema.
+  if (matches.length === 0 && rows.includes(undefined)) return null;
   if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
   return matches[0]?.[name];
 }
@@ -8699,9 +8705,12 @@ class Parser {
         });
         continue;
       }
-      const condition = this.#isKeyword("USING")
-        ? this.#usingCondition(base.alias, source.alias)
-        : (this.#keyword("ON"), this.#expression());
+      const using = this.#isKeyword("USING") ? this.#usingColumns() : undefined;
+      const condition =
+        using === undefined
+          ? (this.#keyword("ON"), this.#expression())
+          : usingCondition(base.alias, source.alias, using);
+      const merged = using === undefined ? {} : { using };
       if (condition.kind === "condition" && condition.operator === "=") {
         joins.push({
           ...source,
@@ -8709,6 +8718,7 @@ class Parser {
           left: condition.left,
           right: condition.right,
           ...(full ? { full } : {}),
+          ...merged,
         });
       } else {
         // Any other boolean condition becomes a nested-loop join.
@@ -8719,6 +8729,7 @@ class Parser {
           right: { kind: "literal", value: null },
           on: condition,
           ...(full ? { full } : {}),
+          ...merged,
         });
       }
       if (right) {
@@ -8731,16 +8742,19 @@ class Parser {
         }
         const [only] = joins;
         if (only !== undefined) {
-          const { kind: joinKind, left, right: rightSide, ...joinSource } = only;
+          const { kind: joinKind, left, right: rightSide, using, ...joinSource } = only;
           void joinKind;
           const previousBase = base;
           base = joinSource;
+          // The merged USING columns are the right side's values, which is now the base: the
+          // marker stays on the join, whose left owner binding finds in the new base.
           joins[0] = {
             ...previousBase,
             kind: "left",
             left,
             right: rightSide,
             ...(only.on === undefined ? {} : { on: only.on }),
+            ...(using === undefined ? {} : { using }),
           };
         }
       }
@@ -9004,12 +9018,8 @@ class Parser {
     renameBlockOutputs(derived, names, "derived table");
   }
 
-  /**
-   * `JOIN t USING (a, b)`: the named columns must exist on both sides, and the join condition
-   * is their conjunction (F401-04). Unlike the standard, the joined columns still appear once
-   * per side in a `SELECT *`, because this engine names wildcard outputs per source anyway.
-   */
-  #usingCondition(leftAlias: string, rightAlias: string): Expression {
+  /** The column list of `USING (a, b)`. */
+  #usingColumns(): string[] {
     this.#keyword("USING");
     this.#expectPunctuation("(");
     const names: string[] = [];
@@ -9018,19 +9028,7 @@ class Parser {
       if (!this.#punctuation(",")) break;
     }
     this.#expectPunctuation(")");
-    return names
-      .map<Expression>((name) => ({
-        kind: "condition",
-        operator: "=",
-        left: { kind: "column", reference: `${leftAlias}.${name}` },
-        right: { kind: "column", reference: `${rightAlias}.${name}` },
-      }))
-      .reduce((accumulated, condition) => ({
-        kind: "logical",
-        operator: "and",
-        left: accumulated,
-        right: condition,
-      }));
+    return names;
   }
 
   #source(): TableSource {
@@ -11416,6 +11414,7 @@ function desugarComposedFullJoin(
 }
 
 function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
+  if (parts.joins[0]?.using !== undefined) parts = mergeFullJoinUsing(parts);
   const join = parts.joins[0];
   if (parts.joins.length !== 1 || join?.full !== true) {
     throw new TypeError("FULL JOIN is only supported as the sole join");
@@ -12013,6 +12012,11 @@ export function bindPendingSelectShapes(
     if (unknown !== undefined) {
       throw new TypeError(`SELECT * requires known columns for: ${unknown.source.table}`);
     }
+    const merged = mergedWildcardColumns(
+      block,
+      (source) => source.columnAliases ?? sourceWildcardColumns(source, columnsOf),
+    );
+    if (merged !== undefined) return mergedWildcardSelect(block, merged, shaped);
     // Wildcard outputs keep their bare column names, as PostgreSQL returns them; only a name
     // that two sources both contribute (`SELECT *` over a join on `id`) is alias-qualified, since
     // a result row cannot carry two columns named `id`.
@@ -12286,6 +12290,46 @@ function expandQualifiedWildcards(
   const expanded = structuredClone(plan);
   expandBlock(expanded);
   return expanded;
+}
+
+/**
+ * The select list of a block whose joins merge columns: an unqualified `*` is the merged column
+ * list, `alias.*` that source's own columns. A name more than one item contributes is
+ * alias-qualified, the rule a plain `*` over a join follows.
+ */
+function mergedWildcardSelect(
+  block: CompiledQuery,
+  merged: ReadonlyArray<{ name: string; reference: string }>,
+  shaped: ReadonlyArray<{ source: TableSource; columns: readonly string[] | undefined }>,
+): SelectItem[] {
+  const expanded = block.select.map((item) => {
+    if (item.expression.kind !== "wildcard") return [{ item }];
+    const table = item.expression.table;
+    if (table === undefined) return merged.map((column) => ({ column }));
+    const selected = shaped.filter(({ source }) => source.alias === table);
+    if (selected.length === 0) throw new TypeError(`Unknown table for ${table}.*: ${table}`);
+    return selected.flatMap(({ source, columns }) =>
+      (columns ?? []).map((name) => ({
+        column: { name, reference: `${source.alias}.${name}` },
+      })),
+    );
+  });
+  const contributed = new Map<string, number>();
+  for (const entry of expanded.flat()) {
+    if ("column" in entry) {
+      contributed.set(entry.column.name, (contributed.get(entry.column.name) ?? 0) + 1);
+    }
+  }
+  const items = expanded.flat().map((entry): SelectItem => {
+    if ("item" in entry) return entry.item;
+    const { name, reference } = entry.column;
+    return {
+      expression: { kind: "column", reference },
+      alias: (contributed.get(name) ?? 0) > 1 ? reference : name,
+    };
+  });
+  numberRepeatedOutputs(items);
+  return items;
 }
 
 /** Wraps compound members into the set-operation source the executor folds left to right. */
@@ -12850,6 +12894,237 @@ export function splitCondition(expression: Expression): Predicate[] {
     ];
   }
   return [{ left: expression, operator: "IS TRUE", right: { kind: "literal", value: null } }];
+}
+
+/**
+ * Rewrites a block's unqualified references to merged join columns. A select-list name is left
+ * alone in ORDER BY, which reads output columns first; nested query blocks keep their own scope.
+ */
+function rewriteMergedReferences(
+  parts: Pick<CompiledQuery, "select" | "predicates" | "groupBy" | "having" | "orderBy" | "joins">,
+  replacements: ReadonlyMap<string, Expression>,
+): void {
+  const rewrite = (expression: Expression): Expression => {
+    if (expression.kind === "column") {
+      const replacement = expression.reference.includes(".")
+        ? undefined
+        : replacements.get(expression.reference);
+      return replacement === undefined ? expression : structuredClone(replacement);
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") return expression;
+    return mapChildExpressions(expression, rewrite);
+  };
+  const aliases = new Set(parts.select.map((item) => item.alias));
+  for (const item of parts.select) {
+    if (item.expression.kind !== "wildcard") item.expression = rewrite(item.expression);
+  }
+  for (const predicate of [...parts.predicates, ...parts.having]) {
+    predicate.left = rewrite(predicate.left);
+    predicate.right = rewrite(predicate.right);
+  }
+  parts.groupBy = parts.groupBy.map(rewrite);
+  for (const order of parts.orderBy) {
+    const expression = order.expression;
+    if (expression.kind === "column" && aliases.has(expression.reference)) continue;
+    order.expression = rewrite(expression);
+  }
+  for (const join of parts.joins) {
+    join.left = rewrite(join.left);
+    join.right = rewrite(join.right);
+    if (join.on !== undefined) join.on = rewrite(join.on);
+  }
+}
+
+/** `FULL JOIN t USING (a)`: the merged `a` is `COALESCE(left.a, t.a)`, PostgreSQL's rule. */
+function mergeFullJoinUsing(parts: SelectBlockParts): SelectBlockParts {
+  const [join] = parts.joins;
+  if (join?.using === undefined) return parts;
+  const { using, ...plain } = join;
+  const merged = structuredClone({ ...parts, joins: [plain] });
+  const replacements = new Map<string, Expression>(
+    using.map((name) => [
+      name,
+      {
+        kind: "call",
+        name: "COALESCE",
+        arguments: [
+          { kind: "column", reference: `${parts.base.alias}.${name}` },
+          { kind: "column", reference: `${join.alias}.${name}` },
+        ],
+      },
+    ]),
+  );
+  rewriteMergedReferences(merged, replacements);
+  return merged;
+}
+
+/** Whether any block joins with USING or NATURAL, whose shared columns merge. */
+function planHasMergedJoins(plan: CompiledQuery): boolean {
+  if (plan.joins.some((join) => join.using !== undefined || join.natural === true)) return true;
+  let found = false;
+  forEachNestedBlock(plan, (nested) => {
+    found ||= planHasMergedJoins(nested);
+  });
+  const inspect = (expression: Expression): void => {
+    if (found) return;
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      found = planHasMergedJoins(expression.block);
+      return;
+    }
+    childExpressions(expression).forEach(inspect);
+  };
+  forEachBlockExpression(plan, inspect);
+  return found;
+}
+
+/**
+ * The merged column names of the join at `index` of `sources` (the block's base first): USING's
+ * list, or the names a NATURAL join's source shares with the sources before it.
+ */
+function joinMergedNames(
+  sources: readonly TableSource[],
+  index: number,
+  columnsFor: (source: TableSource) => readonly string[] | undefined,
+): string[] {
+  const join = sources[index] as JoinPlan | undefined;
+  if (join === undefined) return [];
+  if (join.using !== undefined) return join.using;
+  if (join.natural !== true) return [];
+  const preceding = sources.slice(0, index);
+  return (columnsFor(join) ?? []).filter((name) =>
+    preceding.some((source) => columnsFor(source)?.includes(name) === true),
+  );
+}
+
+/**
+ * `SELECT *` over USING and NATURAL joins, PostgreSQL's way: each join puts its merged columns
+ * first, once, then the rest of its left side, then the rest of its right side. Undefined for a
+ * block that merges nothing.
+ */
+function mergedWildcardColumns(
+  block: Pick<CompiledQuery, "base" | "joins">,
+  columnsFor: (source: TableSource) => readonly string[] | undefined,
+): Array<{ name: string; reference: string }> | undefined {
+  if (!block.joins.some((join) => join.using !== undefined || join.natural === true)) {
+    return undefined;
+  }
+  const sources = [block.base, ...block.joins];
+  const own = (source: TableSource): Array<{ name: string; reference: string }> =>
+    (columnsFor(source) ?? []).map((name) => ({ name, reference: `${source.alias}.${name}` }));
+  let columns = own(block.base);
+  block.joins.forEach((join, index) => {
+    const right = own(join);
+    const names = joinMergedNames(sources, index + 1, columnsFor);
+    if (names.length === 0) {
+      columns = [...columns, ...right];
+      return;
+    }
+    const merged = names.flatMap((name) => {
+      const column = columns.find((candidate) => candidate.name === name);
+      return column === undefined ? [] : [column];
+    });
+    columns = [
+      ...merged,
+      ...columns.filter((column) => !names.includes(column.name)),
+      ...right.filter((column) => !names.includes(column.name)),
+    ];
+  });
+  return columns;
+}
+
+/**
+ * USING and NATURAL join columns merge, as in PostgreSQL and SQLite: an unqualified reference to
+ * one names the left side's value (`SELECT id … JOIN customers USING (id)`), which for an inner
+ * or left join is the column of the earlier source that has it. Each name's left owner needs the
+ * schemas, so binding resolves it here, and rewrites a USING condition the parser wrote against
+ * the first source when an earlier join supplied the column instead.
+ */
+export function mergeJoinColumns(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (!planHasMergedJoins(plan)) return plan;
+  const columnsFor = (source: TableSource): readonly string[] | undefined =>
+    source.columnAliases ?? sourceWildcardColumns(source, columnsOf);
+  const mergeBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, mergeBlock);
+    const nested = (expression: Expression): void => {
+      if (expression.kind === "subquery" || expression.kind === "exists") {
+        mergeBlock(expression.block);
+        return;
+      }
+      childExpressions(expression).forEach(nested);
+    };
+    forEachBlockExpression(block, nested);
+    const sources = [block.base, ...block.joins];
+    const replacements = new Map<string, Expression>();
+    block.joins.forEach((join, index) => {
+      if (join.using === undefined && join.natural !== true) return;
+      const names = joinMergedNames(sources, index + 1, columnsFor);
+      const owners = names.map((name) => {
+        const owner = sources
+          .slice(0, index + 1)
+          .find((source) => columnsFor(source)?.includes(name) === true);
+        if (owner === undefined) {
+          throw new TypeError(`Join column ${name} is not a column of the join's left side`);
+        }
+        if (columnsFor(join)?.includes(name) !== true) {
+          throw new TypeError(`Join column ${name} is not a column of ${join.alias}`);
+        }
+        if (!replacements.has(name)) {
+          replacements.set(name, { kind: "column", reference: `${owner.alias}.${name}` });
+        }
+        return owner;
+      });
+      if (join.using !== undefined && owners.some((owner) => owner !== block.base)) {
+        const condition = usingCondition(
+          "",
+          join.alias,
+          names,
+          owners.map((owner) => owner.alias),
+        );
+        if (condition.kind === "condition") {
+          join.left = condition.left;
+          join.right = condition.right;
+          delete join.on;
+        } else {
+          join.left = { kind: "literal", value: null };
+          join.right = { kind: "literal", value: null };
+          join.on = condition;
+        }
+      }
+    });
+    if (replacements.size > 0) rewriteMergedReferences(block, replacements);
+  };
+  const merged = structuredClone(plan);
+  mergeBlock(merged);
+  return merged;
+}
+
+/**
+ * `JOIN t USING (a, b)` (F401-04): the conjunction of `left.a = t.a` per name. The parser writes
+ * it against the block's first source; schema binding rewrites it when an earlier join supplied
+ * the column instead (mergeJoinColumns).
+ */
+function usingCondition(
+  leftAlias: string,
+  rightAlias: string,
+  names: readonly string[],
+  leftAliases?: readonly string[],
+): Expression {
+  return names
+    .map<Expression>((name, index) => ({
+      kind: "condition",
+      operator: "=",
+      left: { kind: "column", reference: `${leftAliases?.[index] ?? leftAlias}.${name}` },
+      right: { kind: "column", reference: `${rightAlias}.${name}` },
+    }))
+    .reduce((accumulated, condition) => ({
+      kind: "logical",
+      operator: "and",
+      left: accumulated,
+      right: condition,
+    }));
 }
 
 /**

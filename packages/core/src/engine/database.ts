@@ -282,6 +282,7 @@ import {
   mapChildExpressions,
   expandFtsColumns,
   expandNaturalJoins,
+  mergeJoinColumns,
   expandSourceColumnAliases,
   expandViewSources,
   forEachBlockExpression,
@@ -5534,6 +5535,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return columns;
     };
     rewritten = bindPendingSelectShapes(rewritten, columnsOf);
+    rewritten = mergeJoinColumns(rewritten, columnsOf);
     if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
     if (natural) rewritten = expandNaturalJoins(rewritten, columnsOf);
     // With every subquery name resolved, the rewrites compilation had to hold back can run:

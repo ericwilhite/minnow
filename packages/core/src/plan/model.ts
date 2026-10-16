@@ -307,6 +307,12 @@ export interface JoinPlan extends TableSource {
   on?: Expression;
   full?: boolean;
   natural?: boolean;
+  /**
+   * `JOIN t USING (a, b)`: the named columns. Each is one merged column of the join, as in
+   * PostgreSQL, so an unqualified `a` names the left side's value; schema binding resolves the
+   * references and the left owner of each name (mergeJoinColumns).
+   */
+  using?: string[];
 }
 
 /**

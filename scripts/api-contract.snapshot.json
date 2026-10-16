@@ -2116,7 +2116,7 @@
               "name": "JoinPlan",
               "kind": "type",
               "declarations": [
-                "export interface JoinPlan extends TableSource {\n    kind: \"inner\" | \"left\" | \"semi\" | \"anti\";\n    left: Expression;\n    right: Expression;\n    on?: Expression;\n    full?: boolean;\n    natural?: boolean;\n}"
+                "export interface JoinPlan extends TableSource {\n    kind: \"inner\" | \"left\" | \"semi\" | \"anti\";\n    left: Expression;\n    right: Expression;\n    on?: Expression;\n    full?: boolean;\n    natural?: boolean;\n    using?: string[];\n}"
               ]
             },
             {
