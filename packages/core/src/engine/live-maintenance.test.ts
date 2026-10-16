@@ -223,6 +223,14 @@ const MAINTAINABLE = [
   "SELECT i.id, i.amount FROM items AS i WHERE i.id = 5 AND i.amount > 20",
   "SELECT i.id, o.amount FROM items AS i JOIN other AS o ON o.id = i.id WHERE i.id = 1",
   "SELECT id, amount FROM items WHERE id IN (2, 4, 6, 8, 10, 121) ORDER BY amount DESC, id LIMIT 3",
+  // Shapes whose WHERE and ORDER BY never read the columns the script updates (amount, region),
+  // which skip the delta query for updates to rows they do not hold.
+  "SELECT id, amount FROM items WHERE label IN ('L1', 'L2') ORDER BY id",
+  "SELECT id, region FROM items WHERE active = TRUE ORDER BY id LIMIT 7",
+  "SELECT id, amount FROM items WHERE label = 'L3' ORDER BY seen DESC, id LIMIT 5",
+  "SELECT id, amount, region FROM items WHERE seen < '2026-01-20' AND label <> 'L0'",
+  "SELECT COUNT(*) AS n FROM items WHERE active = TRUE AND label <> 'L5'",
+  "SELECT label, COUNT(*) AS n, SUM(id) AS ids FROM items GROUP BY label ORDER BY label",
 ] as const;
 
 const NOT_MAINTAINABLE = [
@@ -353,6 +361,86 @@ describe("live query incremental maintenance", () => {
     await database.updateBatch("skus", { keys: ["b"], changes: { stock: [20] } });
     await live.refresh();
     expect(deliveries.get(skuSql)).toBe(2);
+    live.close();
+    await database.close();
+  });
+
+  it("skips the delta query for updates that leave every column its WHERE and ORDER BY read", async () => {
+    const { database } = await seededDatabase(21, 1_200);
+    const live = database.liveQueries();
+    const labels = Array.from({ length: 12 }, (_, index) => `L${String(index)}`);
+    const latest = new Map<string, QueryResult>();
+    const sqlFor = (label: string): string =>
+      `SELECT id, amount FROM items WHERE label = '${label}' ORDER BY id LIMIT 3`;
+    for (const label of labels) {
+      await live.subscribe(sqlFor(label), {
+        onChange: (result) => latest.set(label, result),
+      });
+    }
+    // Per-label counts read only label: an update elsewhere leaves every one of them alone.
+    const counts = new Map<string, QueryResult>();
+    const countFor = (label: string): string =>
+      `SELECT COUNT(*) AS n FROM items WHERE label = '${label}'`;
+    for (const label of labels) {
+      await live.subscribe(countFor(label), {
+        onChange: (result) => counts.set(label, result),
+      });
+    }
+    // The newest row is about the hundredth of its label: past every window and its margin.
+    const outside = 1_200;
+    const held = new Set(
+      [...latest.values()].flatMap((result) => result.rows.map((row) => row.id as number)),
+    );
+    const before = liveMaintenanceTestHooks.deltaQueries;
+    // amount is projected but never filtered or ordered on: twelve windows, no delta query.
+    await database.updateBatch("items", { keys: [outside], changes: { amount: [-1] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(0);
+    // A held row still patches its own window, and only that one runs a delta query.
+    const [heldRow] = held;
+    await database.updateBatch("items", { keys: [heldRow ?? 0], changes: { amount: [-2] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1);
+    // label is what every window and count filters on: each of them has to look.
+    await database.updateBatch("items", { keys: [outside], changes: { label: ["L4"] } });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1 + 2 * labels.length);
+    // A delete leaves the windows that do not hold the row, but every count must look.
+    await database.deleteBatch("items", { keys: [outside - 1] });
+    await live.refresh();
+    expect(liveMaintenanceTestHooks.deltaQueries - before).toBe(1 + 3 * labels.length);
+    for (const label of labels) {
+      const fresh = await database.query(sqlFor(label), { memoize: false });
+      expect(plain(latest.get(label) ?? fresh)).toEqual(plain(fresh));
+      const count = await database.query(countFor(label), { memoize: false });
+      expect(plain(counts.get(label) ?? count)).toEqual(plain(count));
+    }
+    live.close();
+    await database.close();
+  });
+
+  it("treats a generated column as read through the columns it is computed from", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    await database.execute(
+      "CREATE TABLE acct (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, note TEXT, " +
+        "doubled INTEGER GENERATED ALWAYS AS (balance * 2) STORED)",
+    );
+    await database.execute(
+      "INSERT INTO acct (id, balance, note) VALUES (1, 10, 'a'), (2, 70, 'b')",
+    );
+    const live = database.liveQueries();
+    const sql = "SELECT id, note FROM acct WHERE doubled > 100 ORDER BY id";
+    const results: QueryResult[] = [];
+    await live.subscribe(sql, { onChange: (result) => results.push(result) });
+    expect(plain(last(results))).toEqual([{ id: 2, note: "b" }]);
+    // The update writes balance, not doubled; the row it moves into the result must still arrive.
+    await database.updateBatch("acct", { keys: [1], changes: { balance: [60] } });
+    await live.refresh();
+    expect(plain(last(results))).toEqual(plain(await database.query(sql, { memoize: false })));
+    expect(plain(last(results))).toEqual([
+      { id: 1, note: "a" },
+      { id: 2, note: "b" },
+    ]);
     live.close();
     await database.close();
   });

@@ -49,7 +49,7 @@ describe("live query renders through a worker client", () => {
       addEventListener: port1.addEventListener.bind(port1),
       removeEventListener: port1.removeEventListener.bind(port1),
     };
-    const client = new MinnowDatabaseClient(transport as never, {
+    const client = new MinnowDatabaseClient(transport, {
       store: { kind: "memory" },
       onWorkerError: () => undefined,
     });

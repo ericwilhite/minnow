@@ -454,6 +454,8 @@ import {
   filterLiveRows,
   liveKeyPins,
   liveKeyPinsAdmit,
+  liveReadColumns,
+  liveWindowLeavesReadColumns,
   liveKeyToken,
   liveMaintainedOutcome,
   liveMaintenanceTestHooks,
@@ -7450,8 +7452,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (keyColumn.sqlDomain !== undefined) {
       return decline(`the unique key of ${table.name} has a SQL domain`);
     }
+    // A generated column changes with the columns it is computed from, not only when written.
+    const readableColumns = new Map(
+      visibleTableColumns(table)
+        .filter((column) => column.generatedValue === undefined)
+        .map((column) => [column.name, column.id]),
+    );
     const aggregate = LiveAggregate.plan(plan, `${base.alias}.${keyColumn.name}`);
-    if (aggregate !== undefined)
+    if (aggregate !== undefined) {
+      const readColumns = liveReadColumns(plan, base.alias, keyColumn.name, readableColumns, true);
       return {
         tableId: table.id,
         keyColumnId: keyColumn.id,
@@ -7470,7 +7479,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         positions: new Map(),
         order: [],
         aggregate,
+        ...(readColumns === undefined ? {} : { readColumns }),
       };
+    }
     if (plan.groupBy.length > 0 || plan.having.length > 0) {
       return decline(
         "GROUP BY or HAVING without additive aggregates (COUNT, SUM, AVG of one row-local argument)",
@@ -7539,6 +7550,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // Pins come from the plan after catalog rewrites, so a retired key literal already names the
     // row it forwards to; a rekey moves the forwards table, re-running and re-planning this.
     const keyPins = liveKeyPins(plan, base.alias, keyColumn.name);
+    const readColumns = liveReadColumns(plan, base.alias, keyColumn.name, readableColumns);
     return {
       tableId: table.id,
       keyColumnId: keyColumn.id,
@@ -7557,6 +7569,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       positions: new Map(),
       order: [],
       ...(keyPins === undefined ? {} : { keyPins }),
+      ...(readColumns === undefined ? {} : { readColumns }),
     };
   }
 
@@ -7644,6 +7657,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (changed === undefined) return undefined;
     const { changedKeys, existingKeys } = changed;
     if (changedKeys.size === 0) return { result: retained, state, changed: false };
+    // Updates that write no column the statement reads leave every row where it was: in or out
+    // of the result, at its place, contributing what it did. Deletes qualify too, except to an
+    // aggregate (a deleted row's contribution leaves it) or a row the result holds (below).
+    const leavesReadColumns =
+      state.readColumns !== undefined &&
+      liveWindowLeavesReadColumns(entry.windowSegments, state.readColumns, state.keyColumnId);
+    if (state.aggregate !== undefined && leavesReadColumns) {
+      return { result: retained, state, changed: false };
+    }
     if (state.aggregate !== undefined) {
       const deltaPlan: CompiledQuery = {
         ...state.deltaPlan,
@@ -7659,7 +7681,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           },
         ],
       };
-      const input = await this.#withReadReservation(() => this.#queries.run(deltaPlan, {}, probe));
+      const input = await this.#withReadReservation(() => {
+        liveMaintenanceTestHooks.deltaQueries += 1;
+        return this.#queries.run(deltaPlan, {}, probe);
+      });
       const aggregate = await state.aggregate.patch(
         input,
         new Set(changedKeys.keys()),
@@ -7705,6 +7730,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       affected.size === 0 &&
       state.keyPins !== undefined &&
       !liveKeyPinsAdmit(state.keyPins, changedKeys)
+    ) {
+      return { result: retained, state, changed: false };
+    }
+    // Nor does it when the window only updated columns the WHERE and ORDER BY never read, or
+    // deleted rows: a row the result does not hold kept its membership and its place. A complete
+    // result holds every row that matched; a truncated one ordered by its key holds a prefix.
+    if (
+      affected.size === 0 &&
+      leavesReadColumns &&
+      (state.complete || state.readColumns.totalOrder)
     ) {
       return { result: retained, state, changed: false };
     }

@@ -10,6 +10,7 @@ import { dateMilliseconds } from "../date-value.js";
 import { estimateValuesBytes } from "./byte-estimates.js";
 import { planMemoKey, sameQueryRow as sameLiveRow } from "./query-cache.js";
 import {
+  childExpressions,
   externalizeQueryResult,
   type CompiledQuery,
   type Expression,
@@ -85,6 +86,8 @@ export interface LiveMaintenanceState {
   readonly order: ReadonlyArray<readonly QueryValue[]>;
   /** The key values the statement's WHERE pins its key to, when it does; see `liveKeyPins`. */
   readonly keyPins?: LiveKeyPins;
+  /** The columns its WHERE and ORDER BY read, when they resolve; see `liveReadColumns`. */
+  readonly readColumns?: LiveReadColumns;
 }
 
 /**
@@ -150,6 +153,133 @@ export function liveKeyPins(
     return { kind, tokens: new Set(values.map((value) => liveKeyToken(value ?? null))) };
   }
   return undefined;
+}
+
+/**
+ * The columns that decide whether a row is in a statement's result and where: every column its
+ * WHERE and ORDER BY read, by column ID — and for an aggregate, every column it reads at all. An
+ * update that writes none of them leaves every row's membership, position, and contribution as
+ * it was, so a commit of such updates — a title edited on a card in another list — needs no
+ * delta query. Undefined when a reference cannot be resolved to one base-table column, which
+ * leaves the delta query in charge.
+ */
+export interface LiveReadColumns {
+  readonly columnIds: ReadonlySet<string>;
+  /** An ORDER BY term is the unique key itself, so the order has no ties to break. */
+  readonly totalOrder: boolean;
+  /** An aggregate: every row it reads contributes, so a delete always reaches it. */
+  readonly aggregate: boolean;
+}
+
+export function liveReadColumns(
+  plan: CompiledQuery,
+  alias: string,
+  keyColumn: string,
+  columnIds: ReadonlyMap<string, string>,
+  aggregate = false,
+): LiveReadColumns | undefined {
+  // A join's ON and the lookup side's columns would need their own accounting.
+  if (plan.joins.length > 0) return undefined;
+  const read = new Set<string>();
+  const resolve = (reference: string): string | undefined => {
+    const dot = reference.indexOf(".");
+    // A column whose own name holds a dot could be either reading; leave it to the delta query.
+    if (dot >= 0 && (reference.slice(0, dot) !== alias || columnIds.has(reference))) {
+      return undefined;
+    }
+    return columnIds.get(dot >= 0 ? reference.slice(dot + 1) : reference);
+  };
+  const visit = (expression: Expression): boolean => {
+    switch (expression.kind) {
+      case "column": {
+        const id = resolve(expression.reference);
+        if (id === undefined) return false;
+        read.add(id);
+        return true;
+      }
+      case "literal":
+      case "parameter":
+        return true;
+      case "call":
+        // COUNT(*) counts rows; it reads no column.
+        if (
+          expression.name === "COUNT" &&
+          expression.arguments.every(
+            (argument) => argument.kind === "wildcard" && argument.table === undefined,
+          ) &&
+          expression.arguments.length <= 1
+        ) {
+          return true;
+        }
+        return (
+          childExpressions(expression).every(visit) &&
+          (expression.aggregateOrderBy ?? []).every((term) => visit(term.expression))
+        );
+      case "binary":
+      case "list":
+      case "condition":
+      case "logical":
+      case "not":
+      case "case":
+        return childExpressions(expression).every(visit);
+      default:
+        // A wildcard, subquery, window, or search reads more than its children show.
+        return false;
+    }
+  };
+  for (const predicate of plan.predicates) {
+    if (!visit(predicate.left) || !visit(predicate.right)) return undefined;
+  }
+  if (aggregate) {
+    for (const item of plan.select) if (!visit(item.expression)) return undefined;
+    for (const expression of plan.groupBy) if (!visit(expression)) return undefined;
+    for (const predicate of plan.having) {
+      if (!visit(predicate.left) || !visit(predicate.right)) return undefined;
+    }
+  }
+  let totalOrder = false;
+  for (const term of plan.orderBy) {
+    let expression = term.expression;
+    // ORDER BY may name an output column or its ordinal; what it reads is that item's expression.
+    if (expression.kind === "column" && !expression.reference.includes(".")) {
+      const name = expression.reference;
+      const output = plan.select.find((item) => item.alias === name);
+      if (output !== undefined) expression = output.expression;
+    } else if (expression.kind === "literal" && typeof expression.value === "number") {
+      const output = plan.select[expression.value - 1];
+      if (output === undefined) return undefined;
+      expression = output.expression;
+    }
+    if (!visit(expression)) return undefined;
+    if (
+      expression.kind === "column" &&
+      resolve(expression.reference) === columnIds.get(keyColumn)
+    ) {
+      totalOrder = true;
+    }
+  }
+  return { columnIds: read, totalOrder, aggregate };
+}
+
+/**
+ * Whether a commit window's segments are all updates that write none of the read columns, or —
+ * for a statement that is not an aggregate — deletes. Inserts and upserts carry every column, so
+ * any of them may bring a row in.
+ */
+export function liveWindowLeavesReadColumns(
+  segments: ReadonlyArray<{ readonly kind: string; readonly columnBlockIds: object }>,
+  read: LiveReadColumns,
+  keyColumnId: string,
+): boolean {
+  for (const segment of segments) {
+    if (segment.kind === "base") continue;
+    if (segment.kind === "delete" && !read.aggregate) continue;
+    if (segment.kind !== "update") return false;
+    for (const columnId of Object.keys(segment.columnBlockIds)) {
+      if (columnId !== keyColumnId && read.columnIds.has(columnId)) return false;
+    }
+  }
+  return true;
 }
 
 /** Whether any changed key could satisfy the pins: same type, same value. */
