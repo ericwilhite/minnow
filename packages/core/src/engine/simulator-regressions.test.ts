@@ -1277,6 +1277,44 @@ describe.each(stores)("constraint and schema-change reductions on $name", ({ ope
     }
   });
 
+  it("reads an index selection from a folded base after ADD COLUMN", async () => {
+    // Interaction seed 109 (--length 1500 --connections 6 --tables 3 --key-space 48 --constraints
+    // --schema-changes --full-text --burst-commits 300), once ADD COLUMN reached populated
+    // tables: an index lookup returned a row its update had moved out of range. The index's
+    // exact row selection keeps only the deltas of the rows it selects; reading those rows gave
+    // up on the folded base, which has no blocks for the added column, and the fallback read the
+    // whole kept block -- a row outside the selection with its update dropped.
+    const store = await open();
+    const database = new MinnowDatabase(store, {
+      autoCompact: false,
+      autoCollect: false,
+      rowsPerBlock: 8,
+    });
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c0 INTEGER, c1 REAL)");
+      await database.execute("INSERT INTO t VALUES (29, 27, -3.5), (7, -43, -16.75)");
+      await database.execute("UPDATE t SET c1 = -19.75 WHERE c1 > -17.25 AND c1 <= 6");
+      await database.compactTable("t", { minimumLevel0Segments: 1 });
+      await database.execute("UPDATE t SET c0 = c0 + 2, c1 = 12 WHERE id <= 26");
+      await database.execute("CREATE INDEX t_c1 ON t (c1, id)");
+      await database.execute("ALTER TABLE t ADD COLUMN a BOOLEAN DEFAULT TRUE");
+      for (const sql of [
+        "SELECT * FROM t WHERE c1 <= -12.25 ORDER BY id DESC LIMIT 3",
+        "SELECT * FROM t WHERE c1 <= -12.25",
+      ]) {
+        expect((await database.query(sql, { memoize: false })).rows).toEqual([
+          { id: 29, c0: 27, c1: -19.75, a: true },
+        ]);
+      }
+      expect(
+        (await database.query("SELECT id, c1 FROM t WHERE c1 = 12", { memoize: false })).rows,
+      ).toEqual([{ id: 7, c1: 12 }]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
   it("drops a column of a table another table references", async () => {
     // Schema-change interaction seeds 1, 9, and 10: DROP COLUMN on a parent table failed with
     // `Cannot remove t1: referenced by t2`. The column drop ran the guard that protects a whole

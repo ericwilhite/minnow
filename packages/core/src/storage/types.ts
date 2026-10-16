@@ -1609,6 +1609,30 @@ export function compactionOutputSegmentIds(
 }
 
 /**
+ * Whether a rewrite plan was made for the table's current schema: the same columns, in order,
+ * with the same types, and for a merge the same key. ALTER TABLE ADD or DROP COLUMN after
+ * planning breaks it. A plan that no longer matches can never publish — publication proves its
+ * output against the current table — so a durable-state check of an unpublished job skips such
+ * a job's provenance, and so does one of a published job whose table changed afterwards.
+ */
+export function compactionPlanMatchesTableSchema(
+  plan: CompactionRewritePlan,
+  table: Pick<TableRecord, "columns" | "uniqueKeyColumnId">,
+): boolean {
+  if (plan.kind === "copy-v1") return true;
+  if (
+    table.columns.length !== plan.columns.length ||
+    table.columns.some((column, index) => {
+      const planned = plan.columns.at(index);
+      return planned?.columnId !== column.id || planned.type !== column.type;
+    })
+  ) {
+    return false;
+  }
+  return !isMergeCompactionPlan(plan) || plan.keyColumnId === table.uniqueKeyColumnId;
+}
+
+/**
  * Proves that a compaction transaction stages exactly the immutable job output. This is kept in
  * the storage contract (rather than only in the engine) so adapters reject forged, reordered, or
  * partially journaled output before publication and while loading durable state.
@@ -1659,18 +1683,8 @@ export function assertCompactionOutputProvenance(
       `Compaction job ${job.id} output block plan`,
     );
   } else {
-    if (
-      table.columns.length !== plan.columns.length ||
-      table.columns.some((column, index) => {
-        const planned = plan.columns.at(index);
-        if (planned?.columnId !== column.id) return true;
-        return planned.type !== column.type;
-      })
-    ) {
+    if (!compactionPlanMatchesTableSchema(plan, table)) {
       throw new Error(`Compaction job ${job.id} table schema differs from its rewrite plan`);
-    }
-    if (isMergeCompactionPlan(plan) && plan.keyColumnId !== table.uniqueKeyColumnId) {
-      throw new Error(`Compaction job ${job.id} table key differs from its rewrite plan`);
     }
     const expectedOutputBlockIds = plan.outputs.flatMap((_output, outputIndex) =>
       plan.columns.map((_column, columnIndex) =>
@@ -6088,9 +6102,13 @@ function normalizeRechunkSourceColumn(
   if (typeof value !== "object" || value === null) {
     throw new TypeError(`Rechunk source column ${String(columnIndex)} must be an object`);
   }
+  // A column has no blocks for the rows of a source written before the column was added; those
+  // rows are filled with the column's backfill, or NULL, exactly as reads show them. So the
+  // blocks are ordered and disjoint but may leave gaps — every row, when no source has the
+  // column.
   const sourceBlocksValue: unknown = Reflect.get(value, "sourceBlocks");
-  if (!Array.isArray(sourceBlocksValue) || sourceBlocksValue.length === 0) {
-    throw new TypeError(`Rechunk source column ${String(columnIndex)} requires source blocks`);
+  if (!Array.isArray(sourceBlocksValue)) {
+    throw new TypeError(`Rechunk source column ${String(columnIndex)} blocks must be an array`);
   }
   const sourceBlocks = sourceBlocksValue.map((block, blockIndex) => {
     if (typeof block !== "object" || block === null) {
@@ -6125,7 +6143,7 @@ function normalizeRechunkSourceColumn(
       ),
     };
   });
-  validateContiguousRows(
+  validateOrderedRows(
     sourceBlocks,
     totalRows,
     `Rechunk source column ${String(columnIndex)} blocks`,
@@ -6595,23 +6613,15 @@ function validateMergeSourceShapes(
     if (canonicalIds.some((id, index) => sourceIds[index] !== id)) {
       throw new TypeError(`Merge source segment ${segment.segmentId} columns are not canonical`);
     }
-    if (segment.kind === "insert" || segment.kind === "upsert" || segment.kind === "base") {
-      if (
-        sourceIds.length !== outputIds.length ||
-        sourceIds.some((id, index) => outputIds[index] !== id)
-      ) {
-        throw new TypeError(`Merge ${segment.kind} segment must contain every output column`);
-      }
-    } else if (segment.kind === "delete") {
+    // A row-bearing source written before a column was added has no blocks for it; its rows
+    // take the column's backfill, or NULL, as reads give them. An update whose changed columns
+    // were all dropped keeps only its key and changes nothing; the fold retires it.
+    if (segment.kind === "delete") {
       if (sourceIds.length !== 1 || sourceIds[0] !== keyColumnId) {
         throw new TypeError("A merge delete segment must contain only its key column");
       }
-    } else if (
-      sourceIds.length < 2 ||
-      !sourceIds.includes(keyColumnId) ||
-      sourceIds.every((id) => id === keyColumnId)
-    ) {
-      throw new TypeError("A merge update segment requires its key and a changed column");
+    } else if (!sourceIds.includes(keyColumnId)) {
+      throw new TypeError(`Merge ${segment.kind} segment must contain its key column`);
     }
   }
 }
@@ -6739,6 +6749,20 @@ function normalizeCompactionOutputCursor(
     throw new RangeError("Rechunk output cursor row start does not match its output window");
   }
   return cursor;
+}
+
+/** Ranges in row order that never overlap and end within `totalRows`; gaps are allowed. */
+function validateOrderedRows(
+  ranges: ReadonlyArray<{ rowStart: number; rowCount: number }>,
+  totalRows: number,
+  label: string,
+): void {
+  let rowStart = 0;
+  for (const range of ranges) {
+    if (range.rowStart < rowStart) throw new RangeError(`${label} must be ordered and disjoint`);
+    rowStart = safeSum([range.rowStart, range.rowCount], `${label} row count`);
+  }
+  if (rowStart > totalRows) throw new RangeError(`${label} must lie within the planned rows`);
 }
 
 function validateContiguousRows(

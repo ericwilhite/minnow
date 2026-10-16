@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { encodeBlock } from "../packages/core/src/block-format/index.ts";
+import { encodeBlock, inspectBlock } from "../packages/core/src/block-format/index.ts";
 import { MemoryOpfs } from "../packages/core/src/testing/opfs-shim.ts";
 import { keyForwardsTableRecord } from "../packages/core/src/engine/key-forwards.ts";
 import { OpfsBlockStore } from "../packages/core/src/storage/opfs/index.ts";
@@ -29,10 +29,102 @@ const store = await OpfsBlockStore.open({
   root: shim.root,
   // Eight entries land the first follower request in the checkpoint; the follower's staging
   // call, its withheld answer, and the last table stay in the write-ahead log's tail.
-  checkpointEntries: 8,
+  // Nine with layout 11's job first: the same eight later entries as before join it there.
+  checkpointEntries: 9,
   // A row-id reservation's answer is kept; a staging call's answer (a transaction record) is
   // too large for this ceiling and is withheld, so the fixture holds both ledger shapes.
   servedLedgerResultBytes: 160,
+});
+// Layout 11's own shape, in the checkpoint: a fold of the keyed table (written below) planned
+// after a column was added, so its source has no blocks for that column, beside an update left
+// holding only its key by DROP COLUMN. An older build refuses this plan. The attempt is recorded
+// as aborted — a diagnostic that roots nothing — so every table and block below stays as it was.
+const keyedSourceBlock = await encodeBlock({ type: "number", values: [1] }, "raw");
+const keyedSourceDescription = inspectBlock(keyedSourceBlock);
+const keyedSource = {
+  blockId: "fixture-keyed-block",
+  rowStart: 0,
+  rowCount: 1,
+  storedBytes: keyedSourceBlock.byteLength,
+  encodedBytes: keyedSourceDescription.encodedLength,
+  checksum: keyedSourceDescription.checksum,
+};
+const inertSource = { ...keyedSource, blockId: "fixture-inert-update-block" };
+await store.createCompactionJob({
+  id: "fixture-layout11-fold",
+  tableId: "fixture-keyed",
+  sourceManifestVersion: 2,
+  sourceSegmentIds: ["fixture-keyed-segment", "fixture-inert-update"],
+  sourceBlockIds: [inertSource.blockId, keyedSource.blockId].sort(),
+  outputBlockIds: [],
+  cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+  processedRows: 0,
+  sourceStoredBytes: keyedSource.storedBytes * 2,
+  outputStoredBytes: 0,
+  logicalBytes: keyedSource.encodedBytes * 2,
+  rewritePlan: {
+    kind: "merge-v2",
+    targetBlockBytes: 1024 * 1024,
+    outputCompression: "raw",
+    keyColumnId: "id",
+    totalRows: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    rowIdSpans: [{ rowStart: 0, rowCount: 1, rowIdStart: 1n }],
+    logicalOrder: 0,
+    sourceSegments: [
+      {
+        segmentId: "fixture-keyed-segment",
+        transactionId: "fixture-keyed-transaction",
+        committedVersion: 2,
+        kind: "insert",
+        keyColumnId: "id",
+        level: 0,
+        logicalOrder: 0,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        rowIdSpans: [{ rowStart: 0, rowCount: 1, rowIdStart: 1n }],
+        columns: [{ columnId: "id", type: "number", sourceBlocks: [keyedSource] }],
+      },
+      {
+        segmentId: "fixture-inert-update",
+        transactionId: "fixture-inert-update-transaction",
+        committedVersion: 3,
+        kind: "update",
+        keyColumnId: "id",
+        level: 0,
+        logicalOrder: 1,
+        rowCount: 1,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        rowIdSpans: [],
+        columns: [{ columnId: "id", type: "number", sourceBlocks: [inertSource] }],
+      },
+    ],
+    columns: [
+      { columnId: "id", type: "number" },
+      { columnId: "note", type: "string" },
+    ],
+    outputs: [{ rowStart: 0, rowCount: 1 }],
+    resolution: { runs: 1, patches: 0, checksum: 0 },
+  },
+  outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+  memoryBudgetBytes: 1024 * 1024,
+  minimumMemoryBytes: 4096,
+  level0SourceStoredBytes: keyedSource.storedBytes * 2,
+  anchorSourceStoredBytes: 0,
+  peakWorkingBytes: 0,
+  outputLogicalBytes: 0,
+  targetLevel: 1,
+  state: "aborted",
+  transactionId: null,
+  outputSegmentId: "fixture-layout11-fold/output",
+  publishedVersion: null,
+  revision: 0,
+  createdAt: "2026-08-24T11:59:59.000Z",
+  updatedAt: "2026-08-24T11:59:59.000Z",
+  error: "fixture: an aborted fold attempt",
 });
 await store.addTable(table("fixture-data", "data"));
 await store.addTable(table("fixture-checkpoint-b", "checkpoint-b"));

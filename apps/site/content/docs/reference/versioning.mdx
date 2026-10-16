@@ -92,29 +92,35 @@ merge plans, so a schema-2 build, which cannot read them, refuses the database. 
 part records, so a commit's index changes have no size limit, and a schema-3 build refuses the
 database. Schema 5 rewrites nothing as well: the catalog may hold the engine's internal
 key-forwards table, which a schema-4 build (core 0.14.1 and older) would read as an ordinary
-table, so that build refuses the database. No pre-contract
+table, so that build refuses the database. Schema 6 rewrites nothing either: it admits
+compaction jobs that fold a table across `ALTER TABLE` — a source written before a column was
+added, whose rows the fold fills with the column's default, or an update left holding only its
+key after `DROP COLUMN`. A schema-5 build (core 0.15.0) refuses such a job as corruption, so
+that build refuses the database. No pre-contract
 schema readers or recreation policy ship. Every future integer schema
 version must add one ordered migration to the explicit registry and a frozen fixture for the
 version it supersedes. The browser runs the complete chain
 inside one `versionchange` transaction, so either every schema and data step commits or the old
 database remains intact. An older application build refuses a newer database without mutation.
 
-OPFS native layout 10 is the current contract. Like layouts 8 (core 0.13.0) and 9 (core 0.14.0)
-it keeps layout 7's bytes — the checkpoint, WAL, and extents still carry encoding version 7.
-Layout 8 admits compaction jobs with replayed merge plans, which a layout-7 build cannot read.
-Layout 9 admits a WAL entry whose payload spans several frames, for a commit too large for one,
-and checkpointed index changes of any size, which a layout-8 build cannot read. Layout 10 admits
-the engine's internal key-forwards table, which a layout-9 build (core 0.14.1 and older) would
-read as an ordinary table. The format marker is the barrier, and upgrading a layout-7, 8, or 9
-database rewrites only that marker. Layout 7's fixture freezes the format
+OPFS native layout 11 is the current contract. Like layouts 8 (core 0.13.0), 9 (core 0.14.0),
+and 10 (core 0.15.0) it keeps layout 7's bytes — the checkpoint, WAL, and extents still carry
+encoding version 7. Layout 8 admits compaction jobs with replayed merge plans, which a layout-7
+build cannot read. Layout 9 admits a WAL entry whose payload spans several frames, for a commit
+too large for one, and checkpointed index changes of any size, which a layout-8 build cannot
+read. Layout 10 admits the engine's internal key-forwards table, which a layout-9 build (core
+0.14.1 and older) would read as an ordinary table. Layout 11 admits compaction jobs that fold a
+table across `ALTER TABLE ADD` or `DROP COLUMN`, which a layout-10 build refuses as corruption.
+The format marker is the barrier, and upgrading a layout-7, 8, 9, or 10 database rewrites only
+that marker. Layout 7's fixture freezes the format
 marker, checkpoint, WAL tail, extent payloads, and a separate checksummed acknowledgement file. That file records
 which WAL boundary completed a strict flush, so recovery can distinguish an unwritten suffix
 from damage to an acknowledged write. Missing or corrupt acknowledgement bytes stop recovery.
 
 **Supported upgrades are automatic, including during 0.x.** Opening a layout-6 database with
 the current build validates its native data and converts it under exclusive ownership; a layout-7,
-layout-8, or layout-9 database only has its marker rewritten. All of them end at layout 10. An
-IndexedDB database at schema 1 to 4 is also upgraded to schema 5 when it is opened; only the step
+8, 9, or 10 database only has its marker rewritten. All of them end at layout 11. An
+IndexedDB database at schema 1 to 5 is also upgraded to schema 6 when it is opened; only the step
 from schema 1 rewrites records. No export/import or separate migration call is needed. Block
 format 2 is unchanged. Frozen older
 immutable posting envelopes remain readable. Older application builds refuse the upgraded

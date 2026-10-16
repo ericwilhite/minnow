@@ -155,7 +155,7 @@ describe("interaction plans", () => {
     );
   });
 
-  it("adds and drops columns only on tables nothing has written, unless populated", () => {
+  it("adds and drops columns on tables that already hold rows", () => {
     const writes = new Set<Interaction["kind"]>([
       "insert",
       "update",
@@ -191,14 +191,8 @@ describe("interaction plans", () => {
     for (const seed of [1, 2, 3]) {
       expect(
         unwrittenOnly(generateInteractionPlan(seed, { ...options, schemaChanges: true })),
-      ).toBe(true);
+      ).toBe(false);
     }
-    expect(
-      [1, 2, 3].some(
-        (seed) =>
-          !unwrittenOnly(generateInteractionPlan(seed, { ...options, schemaChanges: "populated" })),
-      ),
-    ).toBe(true);
   });
 
   it("appends an effective fresh insert for every configured fault point", () => {

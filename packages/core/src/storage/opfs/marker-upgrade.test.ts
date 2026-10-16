@@ -1,18 +1,21 @@
 /* eslint-disable no-restricted-imports -- Released-writer and failure-injection tests run only in Node. */
 /**
- * Layouts 7, 8, and 9 to 10: the store's bytes stay as they are and only the marker moves.
- * Layout 8 admits compaction jobs with replayed merge plans, which a layout-7 reader cannot
- * parse; layout 9 admits WAL frames whose payload spans continuation frames and checkpointed
- * index deltas of any size, which a layout-8 reader cannot; layout 10 admits the internal
- * key-forwards catalog record, which a layout-9 reader would read as an ordinary table while
- * ignoring its forwards. For each older layout these tests use its frozen fixture and its last
- * released writer — 0.12.1 for layout 7, 0.13.1 for layout 8, 0.14.1 for layout 9 — upgrade
- * through the ordinary open API, keep writing, reopen, and check that the released reader is
- * refused afterwards without a byte changing. Every I/O boundary of the marker publication is
- * cut, by tab death and by power loss, and retried.
+ * Layouts 7 to 10 to 11: the store's bytes stay as they are and only the marker moves. Layout 8
+ * admits compaction jobs with replayed merge plans, which a layout-7 reader cannot parse;
+ * layout 9 admits WAL frames whose payload spans continuation frames and checkpointed index
+ * deltas of any size, which a layout-8 reader cannot; layout 10 admits the internal key-forwards
+ * catalog record, which a layout-9 reader would read as an ordinary table while ignoring its
+ * forwards; layout 11 admits compaction plans whose sources lack columns added after them or
+ * keep only their key, which a layout-10 reader refuses as corruption. For each older layout
+ * these tests use its frozen fixture and its last released writer — 0.12.1 for layout 7, 0.13.1
+ * for layout 8, 0.14.1 for layout 9, 0.15.0 for layout 10 (schema-change-fold-upgrade.test.ts)
+ * — upgrade through the ordinary open API, keep writing, reopen, and check that the released
+ * reader is refused afterwards without a byte changing. Every I/O boundary of the marker
+ * publication is cut, by tab death and by power loss, and retried.
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { OpfsBlockStore as Layout10OpfsStore } from "@minnowdb/core-layout10/storage/opfs";
 import { MinnowDatabase as ReleasedDatabase } from "@minnowdb/core-layout7";
 import { OpfsBlockStore as ReleasedOpfsStore } from "@minnowdb/core-layout7/storage/opfs";
 import { MinnowDatabase as Layout8Database } from "@minnowdb/core-layout8";
@@ -33,14 +36,20 @@ const PREFIX = `minnowdb/${NAME}/`;
 const LAYOUT7 = '{"formatVersion":7}';
 const LAYOUT8 = '{"formatVersion":8}';
 const LAYOUT9 = '{"formatVersion":9}';
-const CURRENT = '{"formatVersion":10}';
+const LAYOUT10 = '{"formatVersion":10}';
+const CURRENT_LAYOUT = 11;
+const CURRENT = '{"formatVersion":11}';
 /** The witness this build writes while it rewrites an older marker. */
-const WITNESS = "upgrade-9-10";
-/** Every marker-rewrite witness: a 0.13 build's, a 0.14 build's, and this build's. */
+const WITNESS = "upgrade-10-11";
+/**
+ * Every marker-rewrite witness: a 0.13 build's, a 0.14 build's, a 0.15.0 build's, and this
+ * build's.
+ */
 const WITNESSES = [
   ["upgrade-7-8", '{"from":7,"to":8}'],
   ["upgrade-8-9", '{"from":8,"to":9}'],
-  [WITNESS, '{"from":9,"to":10}'],
+  ["upgrade-9-10", '{"from":9,"to":10}'],
+  [WITNESS, '{"from":10,"to":11}'],
 ] as const;
 const failure = new DOMException("injected upgrade I/O failure", "QuotaExceededError");
 
@@ -67,7 +76,7 @@ function readFixture(layout: number): Fixture {
   ) as Fixture;
 }
 
-const fixtures = new Map([7, 8, 9].map((layout) => [layout, readFixture(layout)]));
+const fixtures = new Map([7, 8, 9, 10].map((layout) => [layout, readFixture(layout)]));
 function fixtureFor(layout: number): Fixture {
   const fixture = fixtures.get(layout);
   if (fixture === undefined) throw new Error(`No layout-${String(layout)} fixture`);
@@ -214,18 +223,25 @@ describe.each([
   { layout: 7, text: LAYOUT7 },
   { layout: 8, text: LAYOUT8 },
   { layout: 9, text: LAYOUT9 },
-])("OPFS frozen layout $layout to 10", ({ layout, text }) => {
+  { layout: 10, text: LAYOUT10 },
+])("OPFS frozen layout $layout to the current layout", ({ layout, text }) => {
   const source = fixtureFor(layout);
+  // Layout 10 and later froze the key-forwards table into the fixture itself.
+  const forwardsFrozen = source.expectations.tables.includes(KEY_FORWARDS.name);
+  const forwardsAdded = forwardsFrozen ? [] : [KEY_FORWARDS.name];
+  const addForwards = async (store: OpfsBlockStore) => {
+    if (!forwardsFrozen) await addKeyForwards(store);
+  };
 
   it("upgrades the frozen fixture through the ordinary open API, then writes and reopens", async () => {
     const shim = hydrate(source);
     expect(marker(shim)).toBe(text);
     const store = await verifyFixture(shim, source);
     await store.addTable(table("after-upgrade"));
-    await addKeyForwards(store);
+    await addForwards(store);
     store._crashForTests();
-    const reopened = await verifyFixture(shim, source, ["after-upgrade", KEY_FORWARDS.name]);
-    expect(await reopened.getTable(KEY_FORWARDS.id)).toEqual(KEY_FORWARDS);
+    const reopened = await verifyFixture(shim, source, ["after-upgrade", ...forwardsAdded]);
+    expect((await reopened.getTable(KEY_FORWARDS.id))?.keyForwards).toBe(true);
     reopened._crashForTests();
   });
 
@@ -244,8 +260,8 @@ describe.each([
     expect((await store.getCatalogProbe()).schemaEpoch).toBe(before.schemaEpoch);
     await database.close();
     store._crashForTests();
-    const reopened = await verifyFixture(shim, source, ["lines", "orders", KEY_FORWARDS.name]);
-    expect(await reopened.getTable(KEY_FORWARDS.id)).toEqual(KEY_FORWARDS);
+    const reopened = await verifyFixture(shim, source, ["lines", "orders", ...forwardsAdded]);
+    expect((await reopened.getTable(KEY_FORWARDS.id))?.keyForwards).toBe(true);
     const again = new MinnowDatabase(reopened, ENGINE_OPTIONS);
     expect((await again.query("SELECT id, note FROM orders WHERE id = -1")).rows).toEqual([
       { id: 500, note: "offline" },
@@ -253,6 +269,37 @@ describe.each([
     expect((await again.query("SELECT order_id FROM lines")).rows).toEqual([{ order_id: 500 }]);
     expect(await again.resolveKey("orders", -1)).toBe(500);
     await again.close();
+    reopened._crashForTests();
+  });
+
+  it("folds a table across ADD and DROP COLUMN after the upgrade, and reopens", async () => {
+    const shim = hydrate(source);
+    const store = await verifyFixture(shim, source);
+    const database = new MinnowDatabase(store, ENGINE_OPTIONS);
+    await database.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, old INTEGER)");
+    await database.execute("INSERT INTO notes VALUES (1, 'a', 1), (2, 'b', 2)");
+    await database.execute("UPDATE notes SET old = 20 WHERE id = 2");
+    await database.execute("ALTER TABLE notes ADD COLUMN tag TEXT DEFAULT 'none'");
+    await database.execute("ALTER TABLE notes DROP COLUMN old");
+    await database.execute("INSERT INTO notes VALUES (3, 'c', 'new')");
+    const expected = [
+      { id: 1, body: "a", tag: "none" },
+      { id: 2, body: "b", tag: "none" },
+      { id: 3, body: "c", tag: "new" },
+    ];
+    // Layout 11's record: a fold whose sources lack the added column or keep only their key.
+    const folded = await database.compactTable("notes", { minimumLevel0Segments: 1 });
+    expect(folded.compacted).toBe(true);
+    const job = folded.jobId === undefined ? undefined : await store.getCompactionJob(folded.jobId);
+    if (job?.rewritePlan.kind !== "merge-v2") throw new Error("Expected a replayed merge fold");
+    expect(job.rewritePlan.sourceSegments.some(({ columns }) => columns.length === 1)).toBe(true);
+    expect((await database.query("SELECT * FROM notes ORDER BY id")).rows).toEqual(expected);
+    await database.close();
+    store._crashForTests();
+    const reopened = await verifyFixture(shim, source, ["notes"]);
+    const reader = new MinnowDatabase(reopened, ENGINE_OPTIONS);
+    expect((await reader.query("SELECT * FROM notes ORDER BY id")).rows).toEqual(expected);
+    await reader.close();
     reopened._crashForTests();
   });
 
@@ -269,14 +316,14 @@ describe.each([
         );
       }
       await stores[3]?.addTable(table("concurrent-write"));
-      await stores[1]?.addTable(KEY_FORWARDS);
+      if (!forwardsFrozen) await stores[1]?.addTable(KEY_FORWARDS);
       expect((await stores[0]?.listTables())?.map(({ name }) => name)).toEqual(
-        listed([...source.expectations.tables, "concurrent-write", KEY_FORWARDS.name]),
+        listed([...source.expectations.tables, "concurrent-write", ...forwardsAdded]),
       );
     } finally {
       for (const store of stores) store._crashForTests();
     }
-    (await verifyFixture(shim, source, ["concurrent-write", KEY_FORWARDS.name]))._crashForTests();
+    (await verifyFixture(shim, source, ["concurrent-write", ...forwardsAdded]))._crashForTests();
   });
 
   for (const mode of ["tab-death", "power-loss"] as const) {
@@ -334,16 +381,17 @@ describe.each([
         stopRecording(shim);
         const resumed = await verifyFixture(shim, source);
         await resumed.addTable(table("after-retry"));
-        await addKeyForwards(resumed);
+        await addForwards(resumed);
         resumed._crashForTests();
-        (await verifyFixture(shim, source, ["after-retry", KEY_FORWARDS.name]))._crashForTests();
+        (await verifyFixture(shim, source, ["after-retry", ...forwardsAdded]))._crashForTests();
       }
     });
   }
 
   it("finishes a marker torn mid-rewrite when any build's witness survived", async () => {
     // A 0.13 build tearing the marker on its way to layout 8 left the first witness, a 0.14
-    // build on its way to 9 the second, this build the third. Each finishes at layout 10.
+    // build on its way to 9 the second, a 0.15.0 build on its way to 10 the third, this build
+    // the fourth. Each finishes at the current layout.
     for (const [name, bytes] of WITNESSES) {
       const shim = hydrate(source);
       shim.writeFileBytes(`${PREFIX}${name}`, new TextEncoder().encode(bytes));
@@ -374,8 +422,9 @@ describe.each([
       [WITNESS, undefined],
       ["upgrade-7-8", new TextEncoder().encode('{"from":7,"to":9}')],
       ["upgrade-8-9", new TextEncoder().encode('{"from":8,"to":10}')],
-      [WITNESS, new TextEncoder().encode('{"from":9,"to":11}')],
-      [WITNESS, new TextEncoder().encode('{"from":9,"to":1')],
+      ["upgrade-9-10", new TextEncoder().encode('{"from":9,"to":11}')],
+      [WITNESS, new TextEncoder().encode('{"from":10,"to":12}')],
+      [WITNESS, new TextEncoder().encode('{"from":10,"to":1')],
     ] as const) {
       const shim = hydrate(source);
       if (witness !== undefined) shim.writeFileBytes(`${PREFIX}${name}`, witness);
@@ -392,16 +441,16 @@ describe.each([
     }
   });
 
-  it("refuses a layout newer than 10 without changing files", async () => {
+  it("refuses a layout newer than the current one without changing files", async () => {
     const shim = hydrate(source);
-    shim.writeFileBytes(`${PREFIX}format.json`, new TextEncoder().encode('{"formatVersion":11}'));
+    shim.writeFileBytes(`${PREFIX}format.json`, new TextEncoder().encode('{"formatVersion":12}'));
     const writes = recordWrites(shim);
     await expect(OpfsBlockStore.open({ name: NAME, root: shim.root })).rejects.toBeInstanceOf(
       StorageFormatVersionError,
     );
     stopRecording(shim);
     expect(writes).toEqual([]);
-    expect(marker(shim)).toBe('{"formatVersion":11}');
+    expect(marker(shim)).toBe('{"formatVersion":12}');
   });
 });
 
@@ -409,7 +458,7 @@ describe.each([
 // Released writers
 // ---------------------------------------------------------------------------------------------
 
-describe("OPFS layout 7 to 10 from the released 0.12.1 writer", () => {
+describe("OPFS layout 7 to current from the released 0.12.1 writer", () => {
   it("finishes the released writer's fold in flight, then writes and reopens", async () => {
     const shim = new MemoryOpfs();
     const { jobId, expected } = await releasedFoldInFlight(shim);
@@ -452,7 +501,7 @@ describe("OPFS layout 7 to 10 from the released 0.12.1 writer", () => {
     const writes = recordWrites(shim);
     await expect(ReleasedOpfsStore.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 10,
+      actualVersion: CURRENT_LAYOUT,
       supportedVersion: 7,
       relation: "newer",
     });
@@ -490,7 +539,7 @@ async function amountLookup(database: MinnowDatabase, amount: number): Promise<u
   return (await database.query("SELECT id FROM items WHERE amount = ?", { params: [amount] })).rows;
 }
 
-describe("OPFS layout 8 to 10 from the released 0.13.1 writer", () => {
+describe("OPFS layout 8 to current from the released 0.13.1 writer", () => {
   it("upgrades the released writer's database, then logs a commit too large for one frame", async () => {
     const shim = new MemoryOpfs();
     const expected = await releasedLayout8Database(shim);
@@ -544,7 +593,7 @@ describe("OPFS layout 8 to 10 from the released 0.13.1 writer", () => {
     const writes = recordWrites(shim);
     await expect(Layout8OpfsStore.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 10,
+      actualVersion: CURRENT_LAYOUT,
       supportedVersion: 8,
       relation: "newer",
     });
@@ -590,7 +639,7 @@ async function releasedLayout9Database(shim: MemoryOpfs) {
   return expected;
 }
 
-describe("OPFS layout 9 to 10 from the released 0.14.1 writer", () => {
+describe("OPFS layout 9 to current from the released 0.14.1 writer", () => {
   it("upgrades the released writer's database, writes the key-forwards table, and reopens", async () => {
     const shim = new MemoryOpfs();
     const expected = await releasedLayout9Database(shim);
@@ -654,18 +703,18 @@ describe("OPFS layout 9 to 10 from the released 0.14.1 writer", () => {
     const writes = recordWrites(shim);
     await expect(Layout9OpfsStore.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 10,
+      actualVersion: CURRENT_LAYOUT,
       supportedVersion: 9,
       relation: "newer",
     });
     // Every older released reader refuses it the same way.
     await expect(Layout8OpfsStore.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 10,
+      actualVersion: CURRENT_LAYOUT,
     });
     await expect(ReleasedOpfsStore.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 10,
+      actualVersion: CURRENT_LAYOUT,
     });
     expect(writes).toEqual([]);
     stopRecording(shim);
@@ -711,9 +760,9 @@ describe("OPFS layout 9 to 10 from the released 0.14.1 writer", () => {
   });
 });
 
-describe("OPFS layout 10 fixture", () => {
-  it("refuses a layout-10 database to every released reader without changing a byte", async () => {
-    const current = readFixture(10);
+describe("OPFS current layout fixture", () => {
+  it("refuses a current-layout database to every released reader without changing a byte", async () => {
+    const current = readFixture(CURRENT_LAYOUT);
     const shim = hydrate(current);
     expect(marker(shim)).toBe(CURRENT);
     const writes = recordWrites(shim);
@@ -721,10 +770,11 @@ describe("OPFS layout 10 fixture", () => {
       [(root: FileSystemDirectoryHandle) => ReleasedOpfsStore.open({ name: NAME, root }), 7],
       [(root: FileSystemDirectoryHandle) => Layout8OpfsStore.open({ name: NAME, root }), 8],
       [(root: FileSystemDirectoryHandle) => Layout9OpfsStore.open({ name: NAME, root }), 9],
+      [(root: FileSystemDirectoryHandle) => Layout10OpfsStore.open({ name: NAME, root }), 10],
     ] as const) {
       await expect(open(shim.root)).rejects.toMatchObject({
         name: "StorageFormatVersionError",
-        actualVersion: 10,
+        actualVersion: CURRENT_LAYOUT,
         supportedVersion: supported,
         relation: "newer",
       });
@@ -733,6 +783,19 @@ describe("OPFS layout 10 fixture", () => {
     stopRecording(shim);
     const store = await verifyFixture(shim, current);
     expect((await store.getTableByName(KEY_FORWARDS.name))?.keyForwards).toBe(true);
+    // Layout 11's record: a fold whose source lacks a column added after it, beside an update
+    // left holding only its key.
+    const job = await store.getCompactionJob("fixture-layout11-fold");
+    expect(job?.state).toBe("aborted");
+    const plan = job?.rewritePlan;
+    if (plan?.kind !== "merge-v2") throw new Error("The layout-11 fold is missing");
+    expect(plan.columns.map(({ columnId }) => columnId)).toEqual(["id", "note"]);
+    expect(
+      plan.sourceSegments.map(({ kind, columns }) => [kind, columns.map((c) => c.columnId)]),
+    ).toEqual([
+      ["insert", ["id"]],
+      ["update", ["id"]],
+    ]);
     store._crashForTests();
   });
 });

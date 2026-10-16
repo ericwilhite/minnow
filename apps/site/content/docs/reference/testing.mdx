@@ -374,11 +374,18 @@ logs a commit whose frame spans continuation frames and whose index changes exce
 chunk, reopens from the log and from a checkpoint, and checks that 0.13.1 then refuses the
 database; `indexeddb-schema4.test.ts` does the same for schema 4 with every older writer. A fourth
 alias, of core 0.14.1, is the last IndexedDB schema-4 and OPFS layout-9 writer:
-`marker-upgrade.test.ts` upgrades layouts 7, 8, and 9 to layout 10, rekeys a row through the
+`marker-upgrade.test.ts` upgrades layouts 7, 8, and 9 to the current layout, rekeys a row through the
 ordinary API, reopens, and checks that the retired key still resolves and that every released
 reader then refuses the database; `indexeddb-schema5.test.ts` does the same for schema 5 from
 every released IndexedDB writer, and `snapshot-format2.test.ts` checks that only a snapshot
-holding the key-forwards table is written as format 2. `format-compatibility.test.ts` restores the
+holding the key-forwards table is written as format 2. A fifth alias, of core 0.15.0, is the last
+IndexedDB schema-5 and OPFS layout-10 writer, and the last build that could not fold a table
+across `ALTER TABLE`: `schema-change-fold-upgrade.test.ts` lets it add and drop columns of a
+populated table until the level-zero ceiling refuses its writes, then upgrades the database to
+schema 6 or layout 11 through the ordinary open API, checks that the first write folds the table
+and succeeds, interrupts and retries the IndexedDB upgrade, races current and released openers,
+and checks that 0.15.0 then refuses the database. `marker-upgrade.test.ts` upgrades layouts 7 to
+10 to layout 11 and folds a table across `ADD` and `DROP COLUMN` there. `format-compatibility.test.ts` restores the
 forward the frozen format-2 fixture stored, checks it resolves until it expires, and rekeys data
 an older writer exported. The marker upgrade is cut at
 each of its eight I/O boundaries by tab death and by power loss, from every older layout. Unsupported pre-contract prototypes are refused without changing their bytes.
@@ -564,10 +571,9 @@ column) DO UPDATE | DO NOTHING` (the row holding the value is updated under its 
   `ADD COLUMN` with a constant `DEFAULT` (sometimes reusing a dropped column's name), `DROP
 COLUMN`, `RENAME COLUMN`, and `CREATE`/`DROP INDEX`, including drops and renames the engine must
   refuse because an index or foreign key uses the column. Some inserts then leave the defaulted
-  columns out. Columns are added and dropped only on tables nothing has written yet, because
-  today a table that holds segments from before an `ADD COLUMN`, or an update segment whose only
-  changed column was dropped, can no longer fold; `--schema-changes populated` lifts that
-  restriction and reproduces it.
+  columns out. Columns are added to and dropped from tables that already hold rows, so folds meet
+  segments written before a column existed and updates whose only changed column was dropped,
+  and reads meet them through every path, the secondary-index selections among them.
 - **`fullText`** (`--full-text true`) adds `MATCH … AGAINST` queries, with prefixes, several
   columns, and an extra predicate, over keyed tables and over append-only tables a full-text
   index can cover. The model tokenizes as the engine documents: NFKC, lowercased, runs of letters

@@ -31,7 +31,7 @@ export interface ReleasedOpfsUpgradeResult {
 }
 
 /** Every released build that writes an IndexedDB schema this build upgrades. */
-export type IndexedDbWriterVersion = "0.10.0" | "0.12.1" | "0.13.1" | "0.14.1";
+export type IndexedDbWriterVersion = "0.10.0" | "0.12.1" | "0.13.1" | "0.14.1" | "0.15.0";
 
 export interface IndexedDbUpgradeResult {
   /** The schema the released writer left. */
@@ -47,6 +47,11 @@ export interface IndexedDbUpgradeResult {
   /** A row found through its index by its new key after a rekey, after a reopen. */
   rekeyed: unknown;
   keyForwards: boolean;
+  /**
+   * Rows by `tag` after a column was added to the released writer's populated table and the
+   * table was folded: the older rows take the column's default.
+   */
+  foldedAcrossAddColumn: unknown;
   integrity: boolean;
   olderReadersRefused: boolean;
   /** The schema after every released reader was refused: they must not change it. */

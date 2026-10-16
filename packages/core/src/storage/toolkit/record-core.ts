@@ -22,6 +22,7 @@ import {
   CompactionBacklogError,
   CompactionJobConflictError,
   assertCompactionOutputProvenance,
+  compactionPlanMatchesTableSchema,
   compactionOutputSegmentIds,
   type CompactionJobRecordUpdate,
   createManifest,
@@ -8019,9 +8020,12 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
       const table = tablesById.get(job.tableId);
       const sourceSegments = job.sourceSegmentIds.map((id) => segmentsById.get(id));
       const outputSegments = compactionOutputSegmentIds(job).map((id) => segmentsById.get(id));
+      // ALTER TABLE after publication leaves the plan describing the old schema (and DROP COLUMN
+      // rewrites the outputs), so only a published job whose table is unchanged is re-proven.
       const artifactsRetained =
         transaction !== undefined &&
         table !== undefined &&
+        compactionPlanMatchesTableSchema(job.rewritePlan, table) &&
         sourceSegments.every((segment) => segment !== undefined) &&
         outputSegments.every((segment) => segment !== undefined) &&
         job.outputBlockIds.every((id) => physical.hasBlock(id));
@@ -8078,9 +8082,14 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
     if (job.transactionId !== null) {
       const transaction = transactionsById.get(job.transactionId);
       if (transaction === undefined) throw new Error(`Compaction job ${job.id} has no transaction`);
-      if (job.state === "ready" || transaction.pendingSegmentIds.length > 0) {
-        const table = tablesById.get(job.tableId);
-        if (table === undefined) throw new Error(`Compaction job ${job.id} has no table`);
+      const table =
+        job.state === "ready" || transaction.pendingSegmentIds.length > 0
+          ? tablesById.get(job.tableId)
+          : null;
+      if (table === undefined) throw new Error(`Compaction job ${job.id} has no table`);
+      // A job planned before ALTER TABLE can never publish (publication proves the output
+      // against the current table) and the engine abandons it; its staged output is not proven.
+      if (table !== null && compactionPlanMatchesTableSchema(job.rewritePlan, table)) {
         const sourceSegments = job.sourceSegmentIds.map((id) => {
           const segment = segmentsById.get(id);
           if (segment === undefined) {

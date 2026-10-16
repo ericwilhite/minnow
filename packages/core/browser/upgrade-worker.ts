@@ -2,6 +2,9 @@ import { MinnowDatabase } from "@minnowdb/core";
 import { decodeBlock } from "@minnowdb/core/block-format";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
 import { OpfsBlockStore } from "@minnowdb/core/storage/opfs";
+import { MinnowDatabase as Layout10Database } from "@minnowdb/core-layout10";
+import { IndexedDbBlockStore as Layout10IndexedDb } from "@minnowdb/core-layout10/storage/indexeddb";
+import { OpfsBlockStore as Layout10Store } from "@minnowdb/core-layout10/storage/opfs";
 import { MinnowDatabase as Layout6Database } from "@minnowdb/core-layout6";
 import { IndexedDbBlockStore as Layout6IndexedDb } from "@minnowdb/core-layout6/storage/indexeddb";
 import { OpfsBlockStore as Layout6Store } from "@minnowdb/core-layout6/storage/opfs";
@@ -27,7 +30,7 @@ type UpgradeMessage =
   | { kind: "indexeddb"; writer: IndexedDbWriterVersion; name: string };
 
 /** The OPFS layout this build writes. */
-const OPFS_LAYOUT = 10;
+const OPFS_LAYOUT = 11;
 /** The engine's internal key-forwards table, created by the first rekey. */
 const KEY_FORWARDS_TABLE = "\u0000minnow_key_forwards";
 
@@ -128,6 +131,7 @@ async function olderOpfsReadersRefused(name: string): Promise<boolean> {
     { open: (options: { name: string }) => Layout7Store.open(options), supported: 7 },
     { open: (options: { name: string }) => Layout8Store.open(options), supported: 8 },
     { open: (options: { name: string }) => Layout9Store.open(options), supported: 9 },
+    { open: (options: { name: string }) => Layout10Store.open(options), supported: 10 },
   ];
   let refusals = 0;
   for (const reader of olderReaders) {
@@ -233,7 +237,7 @@ async function runReleasedOpfs(name: string): Promise<ReleasedOpfsUpgradeResult>
 // ---------------------------------------------------------------------------------------------
 
 /** The IndexedDB schema this build writes. */
-const INDEXEDDB_SCHEMA = 5;
+const INDEXEDDB_SCHEMA = 6;
 
 interface IndexedHistoryDatabase {
   createTable(definition: unknown): Promise<unknown>;
@@ -272,6 +276,11 @@ const releasedIndexedDb: Record<
     schema: 4,
     open: (name) => Layout9IndexedDb.open({ name }),
     database: (store: Layout9IndexedDb) => new Layout9Database(store, databaseOptions),
+  },
+  "0.15.0": {
+    schema: 5,
+    open: (name) => Layout10IndexedDb.open({ name }),
+    database: (store: Layout10IndexedDb) => new Layout10Database(store, databaseOptions),
   },
 };
 
@@ -369,6 +378,14 @@ async function runIndexedDb(
   const rekeyed = (await database.query("SELECT id FROM items WHERE code = ?", { params: [35] }))
     .rows;
   const keyForwards = (await store.getTableByName(KEY_FORWARDS_TABLE))?.keyForwards === true;
+  // Schema 6's record: a fold of the released writer's populated table across ADD COLUMN, whose
+  // older sources have no blocks for the column and fold to its default.
+  await database.execute("ALTER TABLE items ADD COLUMN tag TEXT DEFAULT 'old'");
+  await database.execute("INSERT INTO items VALUES (95000, 1, 'after', 'new')");
+  await database.compactTable("items", { minimumLevel0Segments: 1 });
+  const foldedAcrossAddColumn = (
+    await database.query("SELECT tag, COUNT(*) AS n FROM items GROUP BY tag ORDER BY tag")
+  ).rows;
   const integrity = (await store.checkIntegrity({ mode: "full" })).ok;
   await database.close();
   store.close();
@@ -399,6 +416,7 @@ async function runIndexedDb(
     reopenedSame: JSON.stringify(reopened) === JSON.stringify(written),
     rekeyed,
     keyForwards,
+    foldedAcrossAddColumn,
     integrity,
     olderReadersRefused: refusals === Object.keys(releasedIndexedDb).length,
     finalSchema: await nativeVersion(name),

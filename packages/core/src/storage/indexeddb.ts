@@ -42,6 +42,7 @@ import {
   type CompactionJobRecord,
   CompactionJobConflictError,
   assertCompactionOutputProvenance,
+  compactionPlanMatchesTableSchema,
   compactionOutputSegmentIds,
   CompactionBacklogError,
   type CompactionJobRecordUpdate,
@@ -236,7 +237,7 @@ import {
   type SnapshotFormatVersion,
 } from "./snapshot-format.js";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -548,6 +549,14 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     // is the barrier that keeps a schema-4 reader, which would read that record as an ordinary
     // table and ignore its forwards, from opening a database that may hold one.
     targetVersion: 5,
+    migrate: () => undefined,
+  },
+  {
+    // Schema 6 admits compaction job records whose sources lack columns added after them (their
+    // rows fold to the column's backfill, or NULL) or keep only their key after DROP COLUMN. No
+    // stored record changes: the version is the barrier that keeps a schema-5 reader, which
+    // refuses such a job as corruption, from opening a database that may hold one.
+    targetVersion: 6,
     migrate: () => undefined,
   },
 ];
@@ -7782,9 +7791,15 @@ export class IndexedDbBlockStore implements BlockStore {
               if (owner === undefined) {
                 throw corruption(`gc/${key}`, "linked transaction is missing");
               }
-              if (job.state === "ready" || owner.pendingSegmentIds.length > 0) {
-                const table = tablesById.get(job.tableId);
-                if (table === undefined) throw corruption(`gc/${key}`, "table is missing");
+              const table =
+                job.state === "ready" || owner.pendingSegmentIds.length > 0
+                  ? tablesById.get(job.tableId)
+                  : null;
+              if (table === undefined) throw corruption(`gc/${key}`, "table is missing");
+              // A job planned before ALTER TABLE can never publish (publication proves the
+              // output against the current table) and the engine abandons it; its staged
+              // output is not proven.
+              if (table !== null && compactionPlanMatchesTableSchema(job.rewritePlan, table)) {
                 const sourceSegments = await Promise.all(
                   job.sourceSegmentIds.map(async (id) => {
                     const source: unknown = await requestResult(segmentStore.get(id));

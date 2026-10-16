@@ -3160,6 +3160,13 @@
               ]
             },
             {
+              "name": "compactionPlanMatchesTableSchema",
+              "kind": "value",
+              "declarations": [
+                "export declare function compactionPlanMatchesTableSchema(plan: CompactionRewritePlan, table: Pick<TableRecord, \"columns\" | \"uniqueKeyColumnId\">): boolean;"
+              ]
+            },
+            {
               "name": "CompactionRewritePlan",
               "kind": "type",
               "declarations": [
@@ -5663,6 +5670,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function compactionOutputSegmentIds(job: Pick<CompactionJobRecord, \"outputSegmentId\" | \"rewritePlan\">): string[];"
+              ]
+            },
+            {
+              "name": "compactionPlanMatchesTableSchema",
+              "kind": "value",
+              "declarations": [
+                "export declare function compactionPlanMatchesTableSchema(plan: CompactionRewritePlan, table: Pick<TableRecord, \"columns\" | \"uniqueKeyColumnId\">): boolean;"
               ]
             },
             {
@@ -8274,7 +8288,7 @@
               "name": "InteractionPlanOptions",
               "kind": "type",
               "declarations": [
-                "export interface InteractionPlanOptions {\n    readonly length?: number;\n    readonly connections?: number;\n    readonly tables?: number;\n    readonly keySpace?: number;\n    readonly faultPoints?: readonly FaultPointName[];\n    readonly rekeying?: boolean;\n    readonly constraints?: boolean;\n    readonly schemaChanges?: boolean | \"populated\";\n    readonly fullText?: boolean;\n    readonly burstCommits?: number;\n}"
+                "export interface InteractionPlanOptions {\n    readonly length?: number;\n    readonly connections?: number;\n    readonly tables?: number;\n    readonly keySpace?: number;\n    readonly faultPoints?: readonly FaultPointName[];\n    readonly rekeying?: boolean;\n    readonly constraints?: boolean;\n    readonly schemaChanges?: boolean;\n    readonly fullText?: boolean;\n    readonly burstCommits?: number;\n}"
               ]
             },
             {

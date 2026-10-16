@@ -67,12 +67,7 @@ const generationFlags = [
 ].filter((flag) => values.has(flag));
 const rekeying = booleanOption("--rekeying");
 const constraints = booleanOption("--constraints");
-const schemaChangesFlag = values.get("--schema-changes") ?? "false";
-if (!["true", "false", "populated"].includes(schemaChangesFlag)) {
-  failUsage("--schema-changes must be true, false, or populated");
-}
-const schemaChanges: boolean | "populated" =
-  schemaChangesFlag === "populated" ? "populated" : schemaChangesFlag === "true";
+const schemaChanges = booleanOption("--schema-changes");
 const fullText = booleanOption("--full-text");
 const burstCommits = values.has("--burst-commits")
   ? numericOption("--burst-commits", 0, 1, 100_000)
@@ -200,10 +195,10 @@ Generate and run:
   --constraints true|false
                          Add UNIQUE columns and indexes, upserts on them, enforced foreign
                          keys, and index-shaped lookups (default: false)
-  --schema-changes true|false|populated
+  --schema-changes true|false
                          Add ALTER TABLE ADD/DROP/RENAME COLUMN and CREATE/DROP INDEX
-                         interleaved with the writes; populated also adds and drops columns
-                         on tables that hold rows (default: false)
+                         interleaved with the writes, on tables with and without rows
+                         (default: false)
   --full-text true|false Add MATCH queries and append-only tables they index (default: false)
   --burst-commits NUMBER Add bursts of up to this many single-row commits to one table
   --store NAME           memory, indexeddb, or opfs (default: memory)
