@@ -205,21 +205,62 @@ export function forwardFromRow(row: Readonly<Record<string, unknown>>): KeyForwa
   };
 }
 
-/** Lookup over forwards: retired token to its forward, and current token to its sources. */
+/**
+ * Lookup over forwards. Forwards are immutable: a rekey writes one forward from the key it
+ * retired to the key it gave the row, and never rewrites an older one. A row rekeyed twice,
+ * A to B and then B to C, keeps both, and A reaches the row by following A → B → C.
+ */
 export interface KeyForwardLookup {
   /** True when there are no forwards at all, so nothing can be followed. */
   isEmpty(): boolean;
   /** True when any unexpired forward exists for the table. */
   hasTable(tableId: string): boolean;
+  /** The one unexpired forward stored for a retired key: a single step of a chain. */
+  hop(tableId: string, token: string): KeyForward | undefined;
+  /**
+   * Where a retired key leads: its chain of unexpired forwards followed to the row's current
+   * key, as one forward from the key asked about to that current key. Undefined when the key
+   * was never retired or its first step has expired.
+   */
   get(tableId: string, token: string): KeyForward | undefined;
-  /** Every unexpired forward whose target is this token. */
-  sourcesOf(tableId: string, toToken: string): KeyForward[];
 }
 
-/** A set of forwards indexed both ways. */
+/** Longest chain followed; a row rekeyed this often in one retention window is unheard of. */
+const MAX_FORWARD_HOPS = 64;
+
+/**
+ * Follows a retired key's chain of single steps. A chain ends at a key with no unexpired forward
+ * of its own: the row's current key, or the last key it held before a later step expired. A
+ * step back to a key already visited — possible only once some forward has expired and its key
+ * was used again — ends the chain there too.
+ */
+export function followForwards(
+  hop: (tableId: string, token: string) => KeyForward | undefined,
+  tableId: string,
+  token: string,
+): KeyForward | undefined {
+  const first = hop(tableId, token);
+  if (first === undefined) return undefined;
+  let last = first;
+  let expiresAt = first.expiresAt;
+  let visited: Set<string> | undefined;
+  for (let step = 1; step < MAX_FORWARD_HOPS; step += 1) {
+    const next = storageKeyToken(last.to);
+    const forward = hop(tableId, next);
+    if (forward === undefined) break;
+    visited ??= new Set([token]);
+    if (visited.has(next)) break;
+    visited.add(next);
+    last = forward;
+    expiresAt = Math.min(expiresAt, forward.expiresAt);
+  }
+  if (last === first) return first;
+  return { ...first, to: last.to, toValues: last.toValues, expiresAt };
+}
+
+/** A set of forwards, indexed by table and retired key. */
 export class KeyForwardSet {
   readonly #byTable = new Map<string, Map<string, KeyForward>>();
-  readonly #byTarget = new Map<string, Map<string, Set<string>>>();
 
   get size(): number {
     let size = 0;
@@ -236,18 +277,6 @@ export class KeyForwardSet {
       this.#byTable.set(forward.tableId, forwards);
     }
     forwards.set(fromToken, forward);
-    let targets = this.#byTarget.get(forward.tableId);
-    if (targets === undefined) {
-      targets = new Map();
-      this.#byTarget.set(forward.tableId, targets);
-    }
-    const toToken = storageKeyToken(forward.to);
-    let sources = targets.get(toToken);
-    if (sources === undefined) {
-      sources = new Set();
-      targets.set(toToken, sources);
-    }
-    sources.add(fromToken);
   }
 
   delete(tableId: string, fromToken: string): void {
@@ -256,12 +285,6 @@ export class KeyForwardSet {
     if (forwards === undefined || existing === undefined) return;
     forwards.delete(fromToken);
     if (forwards.size === 0) this.#byTable.delete(tableId);
-    const targets = this.#byTarget.get(tableId);
-    const toToken = storageKeyToken(existing.to);
-    const sources = targets?.get(toToken);
-    sources?.delete(fromToken);
-    if (sources?.size === 0) targets?.delete(toToken);
-    if (targets?.size === 0) this.#byTarget.delete(tableId);
   }
 
   hasTable(tableId: string): boolean {
@@ -278,16 +301,6 @@ export class KeyForwardSet {
 
   get(tableId: string, token: string): KeyForward | undefined {
     return this.#byTable.get(tableId)?.get(token);
-  }
-
-  sourcesOf(tableId: string, toToken: string): KeyForward[] {
-    const forwards = this.#byTable.get(tableId);
-    const sources = this.#byTarget.get(tableId)?.get(toToken);
-    if (forwards === undefined || sources === undefined) return [];
-    return [...sources].flatMap((token) => {
-      const forward = forwards.get(token);
-      return forward === undefined ? [] : [forward];
-    });
   }
 
   *entries(): IterableIterator<KeyForward> {
@@ -612,22 +625,31 @@ export class CommittedKeyForwards implements KeyForwardLookup {
     return ids;
   }
 
-  get(tableId: string, token: string): KeyForward | undefined {
+  hop(tableId: string, token: string): KeyForward | undefined {
     return this.#live(this.#raw(tableId, token));
   }
 
-  sourcesOf(tableId: string, toToken: string): KeyForward[] {
+  get(tableId: string, token: string): KeyForward | undefined {
+    return followForwards((table, key) => this.hop(table, key), tableId, token);
+  }
+
+  /**
+   * Up to `limit` stored forwards past their expiry, for maintenance to delete. Reads the
+   * forwards this generation already holds, a slice at a time, instead of scanning the table.
+   */
+  async expired(limit: number): Promise<KeyForward[]> {
     const now = this.now();
-    const sources = new Set<KeyForward>();
-    const candidates = [
-      ...this.#base.sourcesOf(tableId, toToken),
-      ...this.#layers.flatMap((layer) => layer.written.sourcesOf(tableId, toToken)),
-    ];
-    for (const forward of candidates) {
-      if (forward.expiresAt <= now) continue;
-      if (this.#raw(tableId, storageKeyToken(forward.from)) === forward) sources.add(forward);
+    const found: KeyForward[] = [];
+    let visited = 0;
+    for (const forward of this.entries()) {
+      if (forward.expiresAt <= now) {
+        found.push(forward);
+        if (found.length >= limit) break;
+      }
+      visited += 1;
+      if (visited % 1024 === 0) await maybeYieldToEventLoop();
     }
-    return [...sources];
+    return found;
   }
 
   /** Every stored forward, expired or not, newest layer first. */
@@ -657,8 +679,8 @@ export class CommittedKeyForwards implements KeyForwardLookup {
 }
 
 /**
- * A write scope's view: forwards it staged over the committed ones. A staged forward replaces a
- * committed one with the same retired key, which is how a chain collapses inside a scope.
+ * A write scope's view: forwards it staged over the committed ones. A chain may run through
+ * both — a committed A → B and a B → C this scope staged.
  */
 export class ScopedKeyForwards implements KeyForwardLookup {
   staged = new KeyForwardSet();
@@ -673,19 +695,12 @@ export class ScopedKeyForwards implements KeyForwardLookup {
     return this.staged.isEmpty() && this.committed()?.isEmpty() !== false;
   }
 
-  get(tableId: string, token: string): KeyForward | undefined {
-    return this.staged.get(tableId, token) ?? this.committed()?.get(tableId, token);
+  hop(tableId: string, token: string): KeyForward | undefined {
+    return this.staged.get(tableId, token) ?? this.committed()?.hop(tableId, token);
   }
 
-  sourcesOf(tableId: string, toToken: string): KeyForward[] {
-    const staged = this.staged.sourcesOf(tableId, toToken);
-    const seen = new Set(staged.map((forward) => storageKeyToken(forward.from)));
-    const committed = (this.committed()?.sourcesOf(tableId, toToken) ?? []).filter(
-      (forward) =>
-        !seen.has(storageKeyToken(forward.from)) &&
-        this.staged.get(tableId, storageKeyToken(forward.from)) === undefined,
-    );
-    return [...staged, ...committed];
+  get(tableId: string, token: string): KeyForward | undefined {
+    return followForwards((table, key) => this.hop(table, key), tableId, token);
   }
 }
 

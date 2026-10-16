@@ -146,6 +146,8 @@ export class Snapshot {
 export class LeasedSnapshot extends Snapshot {
   #record: LeaseRecord;
   #released = false;
+  /** How many times a lapsed lease was pinned again; names each replacement record. */
+  #repins = 0;
   /** The record's ISO expiry, parsed once: expiry is checked before every batched block read. */
   #expiresAtIso: string | undefined;
   #expiresAtMs = Number.NaN;
@@ -185,12 +187,36 @@ export class LeasedSnapshot extends Snapshot {
     this.#assertOpen();
     const now = this.now();
     const expiresAt = expiryAfter(now, ttlMs);
-    this.#record = await this.#store.renewLease({
-      id: this.#record.id,
-      expectedRevision: this.#record.revision,
-      expiresAtCutoff: dateIsoString(now),
-      expiresAt,
-    });
+    try {
+      this.#record = await this.#store.renewLease({
+        id: this.#record.id,
+        expectedRevision: this.#record.revision,
+        expiresAtCutoff: dateIsoString(now),
+        expiresAt,
+      });
+    } catch (error) {
+      if (!(error instanceof LeaseExpiredError) && !(error instanceof LeaseConflictError)) {
+        throw error;
+      }
+      // The lease lapsed: the thread slept past its expiry (a suspended tab, a clock that
+      // jumped), or a sweep removed it since. The version it pinned is usually still there, so
+      // pin it again under a fresh record — exactly what opening a lease at that version does.
+      // If collection reclaimed the version meanwhile, the store refuses with
+      // SnapshotManifestMissingError and the work fails as it would on any vanished snapshot.
+      // The lapsed record is left to the sweep.
+      this.#repins += 1;
+      const record: LeaseRecord = {
+        id: `${this.#record.id.split("~")[0] ?? this.#record.id}~${String(this.#repins)}`,
+        kind: this.#record.kind,
+        manifestVersion: this.version,
+        ownerId: this.#record.ownerId,
+        createdAt: dateIsoString(now),
+        expiresAt,
+        revision: 0,
+      };
+      await this.#store.createLease(record);
+      this.#record = record;
+    }
     return new Date(this.#record.expiresAt);
   }
 

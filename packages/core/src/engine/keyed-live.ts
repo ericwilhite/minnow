@@ -209,8 +209,9 @@ function diffRows<TRow extends object, TKey extends keyof TRow>(
 }
 
 /**
- * Replaces each delete and insert that a key change connects with one `rekey` entry. Only a
- * scalar key can be matched: the result's key column is compared with the change's values.
+ * Replaces each delete and insert that a key change, or a chain of them, connects with one
+ * `rekey` entry. Only a scalar key can be matched: the result's key column is compared with the
+ * change's values.
  */
 function pairRekeys<TRow extends object, TKey extends keyof TRow>(
   changes: Array<LiveResultChange<TRow, TKey>>,
@@ -243,7 +244,14 @@ function pairRekeys<TRow extends object, TKey extends keyof TRow>(
   for (const change of changes) {
     if (change.type !== "delete") continue;
     const from = tokenOf(change.key);
-    const to = from === undefined ? undefined : targets.get(from);
+    // Several rekeys of one row can land in one delivery, each reported as its own step:
+    // follow them to the key the row now has.
+    let to = from === undefined ? undefined : targets.get(from);
+    const seen = new Set<KeyToken | undefined>([from]);
+    while (to !== undefined && !inserts.has(to) && !seen.has(to)) {
+      seen.add(to);
+      to = targets.get(to);
+    }
     const insert = to === undefined ? undefined : inserts.get(to);
     if (insert === undefined || paired.has(insert)) continue;
     paired.add(change);

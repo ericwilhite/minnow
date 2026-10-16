@@ -68,9 +68,9 @@ For that one `UPDATE`, in order:
    column is also part of the child's own primary key, the child is rekeyed the same way, and its
    own references follow, up to eight levels deep; a deeper chain is refused and nothing is
    written. A row that refers to its own table, or to itself, is handled too.
-6. **Records a forward** from the old key to the new one, in an internal table. If some older key
-   already forwarded to the old key, it now forwards straight to the new one, so following a key is
-   always one step.
+6. **Records a forward** from the old key to the new one, in an internal table. A forward is never
+   changed once written. If the row was rekeyed before, its older forwards stay as they are and
+   lead here through this one: `-1 → 900001`, then `900001 → 900002`, and `-1` follows both.
 7. **Fires `AFTER UPDATE` triggers.** `INSERT` and `DELETE` triggers do not fire: to the
    application this is one update.
 8. **Commits once.** The row, its references, and the forward publish together. A crash before the
@@ -133,14 +133,21 @@ maintenance deletes expired forwards; `collectGarbage()` deletes them too. A liv
 an expired key keeps its last result until one of its tables changes or maintenance deletes the
 forward.
 
+A row rekeyed more than once is reached from every key it had. Each rekey keeps its own forward
+with its own expiry, and a lookup follows them one after another while each is still within
+retention. An old key stops forwarding when its own forward expires; a later key keeps forwarding
+until its forward expires.
+
 A forward outlives its row. If order `900001` is deleted and a different row is later written with
 key `900001`, the old key `-1` names that row until the forward expires. Temporary keys that are
 never reused, as below, keep this from mattering.
 
 A forward takes about 100 bytes on disk, and only rows that were rekeyed have one. A database that
 is written to constantly but never rekeys keeps none. Each connection also keeps the forwards in
-memory, about 0.75 KB each: 7 MB for 10,000. It updates them from the rows each commit wrote, so a
-rekey costs the forwards it made, not every forward held.
+memory, about 0.75 KB each: 7 MB for 10,000. A connection reads them once, the first time it needs
+them, in slices that leave the page responsive (about 0.35 s for 100,000). After that it updates
+them from the rows each commit wrote, so a rekey costs the forwards it made, not every forward
+held, and deleting expired ones reads no more than they are.
 
 The retention is fixed on each forward when it is written. Changing `keyForwardRetentionMs`
 affects forwards written afterwards; forwards already stored keep the expiry they were given, so
@@ -155,7 +162,8 @@ results cross as one message. This covers low-level subscriptions and typed quer
 decodes the engine's result; see [live queries](/docs/extensions/live-queries) for the details and
 the cost.
 
-**`keyChanges`.** A delivery that follows a rekey carries the rows it moved:
+**`keyChanges`.** A delivery that follows a rekey carries each rekey it covers, as the step it
+made:
 
 ```ts
 live.subscribe("SELECT order_id, status FROM orders WHERE customer_id = 1", {
@@ -167,12 +175,15 @@ live.subscribe("SELECT order_id, status FROM orders WHERE customer_id = 1", {
 ```
 
 The list is read from the stored forwards, so it is complete even for a tab that missed the
-cross-tab notification. Typed live queries carry the same `keyChanges` on their `ready` snapshot.
+cross-tab notification. A row rekeyed twice between two deliveries appears as two steps, in commit
+order (`-1 → 900001`, `900001 → 900002`); applying them in order renames a held key all the way.
+Typed live queries carry the same `keyChanges` on their `ready` snapshot.
 
 **Keyed diffs.** A keyed live query that names its table —
 `live.changes(query, { key: "order_id", table: "orders" })` — reports a rekeyed row as one change,
 `{ type: "rekey", from, key, row, previous, previousIndex, index }`, instead of a delete and an
-insert. A list renderer can keep the row's component, and its selection, under the new key.
+insert, following several steps when the row moved more than once. A list renderer can keep the
+row's component, and its selection, under the new key.
 
 **Holding a key in a screen.** The simplest way to follow a record is to keep querying it by the
 key you have. A detail view running `SELECT * FROM orders WHERE order_id = ?` with `-1` keeps

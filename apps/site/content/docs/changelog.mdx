@@ -27,9 +27,11 @@ Release packages: `@minnowdb/core@0.15.0`, `@minnowdb/kysely@0.5.0`, `@minnowdb/
   upsert naming it updates the row, a child written with it stores the current key, and a plain
   insert of it, or a rekey onto it, is refused as a duplicate. Forwards are stored in an internal
   table, so they reach other tabs and survive a reload, and background maintenance deletes them
-  once they expire. `resolveKey(table, key)` returns a held key's current value. Each connection
-  keeps the forwards in memory and updates them from each commit's own rows, so a rekey costs a
-  reader the forwards it wrote, not every forward held; a database that never rekeys pays nothing.
+  once they expire. `resolveKey(table, key)` returns a held key's current value. A forward is never
+  rewritten: a row rekeyed more than once keeps one forward per rekey, and an old key follows them
+  in turn, each within its own retention. Each connection reads the forwards once, in slices, then
+  updates them from each commit's own rows, so a rekey costs a reader the forwards it wrote, not
+  every forward held; a database that never rekeys pays nothing.
 
 - **One commit, one live update.** A live-query sweep now hands every changed subscription its
   result in the same turn, after the last affected query ran, and a worker sends them to its
@@ -41,8 +43,8 @@ Release packages: `@minnowdb/core@0.15.0`, `@minnowdb/kysely@0.5.0`, `@minnowdb/
   `liveQueries({ onSweepDelivered })` reports the end of each sweep.
 
 - **Live deliveries report rekeyed rows.** `LiveQueryDelivery.keyChanges` (and the same field on
-  typed `ready` snapshots) lists `{ table, from, to }` for the rows the commits moved, read from the
-  stored forwards so a tab that missed the notification still gets it. A keyed live query given its
+  typed `ready` snapshots) lists `{ table, from, to }` for each rekey the commits made, in commit
+  order, read from the stored forwards so a tab that missed the notification still gets it. A keyed live query given its
   table — `live.changes(query, { key: "order_id", table: "orders" })` — reports a rekeyed row as
   one `{ type: "rekey" }` change instead of a delete and an insert.
 
@@ -60,6 +62,12 @@ Release packages: `@minnowdb/core@0.15.0`, `@minnowdb/kysely@0.5.0`, `@minnowdb/
   values over an indexed column failed with `Full-text query terms cannot exceed 32 items`. A write
   scope or transaction whose statements changed no rows, or that rolled back to a savepoint, could
   fail to commit with `Level-zero segment limits must exactly cover pending level-zero tables`.
+  A tab that slept past an internal read lease — a closed laptop, a backgrounded phone — failed
+  the query or compaction it was in the middle of with `LeaseExpiredError` when it woke; the
+  lease is now pinned again at the same version, and only a version that collection reclaimed
+  meanwhile is refused, with `SnapshotManifestMissingError`. Compaction decodes its source
+  blocks, and large commits apply their key changes, in shorter slices, so background maintenance
+  no longer holds the page for tens of milliseconds at a time.
 
 - **API changes.** `MinnowDatabase.resolveKey` and `MinnowDatabaseClient.resolveKey`; the
   `keyForwardRetentionMs` option (also accepted by the stock worker); `LiveQueryDelivery.keyChanges`,

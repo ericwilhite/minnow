@@ -182,7 +182,9 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
 - **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
   expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
   pinned becomes reclaimable. Correctness depends on the durable lease record, not an in-memory
-  heartbeat or a lifecycle notification.
+  heartbeat or a lifecycle notification. A tab that sleeps past its lease and wakes pins the same
+  version again if it is still there and carries on; if collection reclaimed it meanwhile, the
+  read fails with `SnapshotManifestMissingError` and can simply be run again.
 
 ## How queries run
 

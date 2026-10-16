@@ -25,7 +25,8 @@ const rowKey = (tableId: string, from: number): string => `${tableId}:${String(f
 const change = fc.record({
   table: fc.constantFrom(...TABLES),
   from: fc.integer({ min: 0, max: 40 }),
-  to: fc.integer({ min: 100, max: 106 }),
+  // Targets overlap retired keys, so forwards chain: 3 → 7 and then 7 → 12.
+  to: fc.integer({ min: 0, max: 45 }),
   expiresAt: fc.integer({ min: 0, max: 20 }),
   deleted: fc.boolean(),
 });
@@ -70,22 +71,35 @@ describe("layered key forwards", () => {
               [...model.values()].filter((f) => f.expiresAt <= now).length,
             );
             for (const table of TABLES) {
-              for (let from = 0; from <= 40; from += 1) {
+              const liveStep = (from: number): KeyForward | undefined => {
                 const stored = model.get(rowKey(table, from));
-                const live = stored !== undefined && stored.expiresAt > now ? stored : undefined;
-                expect(view.get(table, storageKeyToken(from))).toEqual(live);
-                expect(view.stored(table, storageKeyToken(from))).toEqual(stored);
-              }
-              for (let to = 100; to <= 106; to += 1) {
-                const expected = [...model.values()]
-                  .filter((f) => f.tableId === table && f.to === to && f.expiresAt > now)
-                  .map((f) => f.from)
-                  .sort();
-                const actual = view
-                  .sourcesOf(table, storageKeyToken(to))
-                  .map((f) => f.from)
-                  .sort();
-                expect(actual).toEqual(expected);
+                return stored !== undefined && stored.expiresAt > now ? stored : undefined;
+              };
+              for (let from = 0; from <= 45; from += 1) {
+                expect(view.stored(table, storageKeyToken(from))).toEqual(
+                  model.get(rowKey(table, from)),
+                );
+                expect(view.hop(table, storageKeyToken(from))).toEqual(liveStep(from));
+                // The chain, followed in the model: live steps until none, or a key seen twice.
+                const first = liveStep(from);
+                let expected: KeyForward | undefined = first;
+                if (first !== undefined) {
+                  const seen = new Set([from]);
+                  let last = first;
+                  let expiresAt = first.expiresAt;
+                  for (;;) {
+                    const at = Number(last.to);
+                    const next = liveStep(at);
+                    if (next === undefined || seen.has(at)) break;
+                    seen.add(at);
+                    last = next;
+                    expiresAt = Math.min(expiresAt, next.expiresAt);
+                  }
+                  if (last !== first) {
+                    expected = { ...first, to: last.to, toValues: last.toValues, expiresAt };
+                  }
+                }
+                expect(view.get(table, storageKeyToken(from))).toEqual(expected);
               }
             }
           }

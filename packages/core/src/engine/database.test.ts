@@ -8625,6 +8625,7 @@ it("pages a streamed scan the same at every depth, ties kept in arrival order", 
 });
 
 for (const implementation of implementations()) {
+  // About 3.5 s in a developer run on IndexedDB and close to 20 s under coverage.
   it(`${implementation.name} streams append scans through a budget too small to materialize`, async () => {
     const store = await implementation.create();
     const database = new MinnowDatabase(store, { rowsPerBlock: 512, compression: "raw" });
@@ -8747,7 +8748,7 @@ for (const implementation of implementations()) {
 
     expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
     store.close();
-  });
+  }, 60_000);
 }
 
 for (const implementation of implementations()) {

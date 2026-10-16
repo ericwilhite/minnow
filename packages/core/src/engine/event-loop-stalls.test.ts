@@ -249,4 +249,41 @@ describe("background work never holds the event loop", () => {
     expect(stall).toBeLessThan(STALL_BOUND_MS);
     await database.close();
   });
+
+  it("loads and trims 50,000 key forwards in short slices", async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    let current = Date.parse("2026-10-15T12:00:00.000Z");
+    const now = (): Date => new Date(current);
+    const store = new MemoryBlockStore();
+    const options = { now, keyForwardRetentionMs: 5 * DAY, autoCollect: false } as const;
+    const database = new MinnowDatabase(store, options);
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+      await database.insertBatch(
+        "t",
+        Array.from({ length: 50_000 }, (_, id) => ({ id, v: id })),
+      );
+      await database.execute("UPDATE t SET id = id + 1000000");
+      // A connection that opens later reads every forward once, a slice at a time.
+      const fresh = new MinnowDatabase(store, options);
+      const loadStall = await longestStall(async () => {
+        expect((await fresh.query("SELECT v FROM t WHERE id = 7")).rows).toEqual([{ v: 7 }]);
+      });
+      expect(loadStall).toBeLessThan(STALL_BOUND_MS);
+      await fresh.close();
+      current += 6 * DAY;
+      let elapsed = 0;
+      const trimStall = await longestStall(async () => {
+        const start = performance.now();
+        await database.collectGarbage();
+        elapsed = performance.now() - start;
+      });
+      expect(trimStall).toBeLessThan(STALL_BOUND_MS);
+      // Each page used to re-read every forward: 50,000 took about ten seconds.
+      expect(elapsed).toBeLessThan(process.env.CI === undefined ? 4_000 : 12_000);
+      expect(await database.resolveKey("t", 7)).toBe(7);
+    } finally {
+      await database.close();
+    }
+  });
 });

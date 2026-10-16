@@ -690,14 +690,8 @@ describe("following a rekey", () => {
     });
     await database.execute("UPDATE orders SET id = '48214' WHERE id = '48213'");
     await quiet.refresh();
-    // One notice per moved key; their order is not part of the contract.
-    expect(notices.at(-1)).toHaveLength(2);
-    expect(notices.at(-1)).toEqual(
-      expect.arrayContaining([
-        { table: "orders", from: "o:7f3a", to: "48214" },
-        { table: "orders", from: "48213", to: "48214" },
-      ]),
-    );
+    // Each rekey is reported once, as the step it made: o:7f3a → 48213 was the first commit's.
+    expect(notices.at(-1)).toEqual([{ table: "orders", from: "48213", to: "48214" }]);
     quiet.close();
   });
 
@@ -990,6 +984,62 @@ describe("rekeying under savepoints, constraints, retention, and maintenance (wr
     expect(await rows(database, "SELECT n FROM line WHERE shop = 1 AND receipt = -1")).toEqual([
       { n: 2 },
     ]);
+  });
+});
+
+describe("chained forwards", () => {
+  it("reaches a row rekeyed several times from every key it ever had", async () => {
+    const database = await orders();
+    await database.execute("UPDATE orders SET id = 'b' WHERE id = 'o:7f3a'");
+    await database.execute("UPDATE orders SET id = 'c' WHERE id = 'b'");
+    // Rekeying by an older key follows the chain to the row first.
+    await database.execute("UPDATE orders SET id = 'd' WHERE id = 'o:7f3a'");
+    for (const key of ["o:7f3a", "b", "c", "d"]) {
+      expect(await rows(database, "SELECT id, total FROM orders WHERE id = ?", [key])).toEqual([
+        { id: "d", total: 30 },
+      ]);
+      expect(await database.resolveKey("orders", key)).toBe("d");
+    }
+    // A child written with the oldest key stores the current one.
+    await database.execute("INSERT INTO order_lines VALUES ('l9', 'o:7f3a', 'nib')");
+    expect(await rows(database, "SELECT order_id FROM order_lines WHERE id = 'l9'")).toEqual([
+      { order_id: "d" },
+    ]);
+    // Every retired key stays reserved.
+    for (const key of ["o:7f3a", "b", "c"]) {
+      await expect(
+        database.execute("INSERT INTO orders VALUES (?, 'x', 1)", [key]),
+      ).rejects.toThrow(UniqueConstraintError);
+    }
+    // One stored forward per rekey; none was rewritten.
+    expect(await database.resolveKey("orders", "41")).toBe("41");
+  });
+
+  it("follows a chain that runs through a scope's own staged step", async () => {
+    const database = await orders();
+    await database.execute("UPDATE orders SET id = 'b' WHERE id = 'o:7f3a'");
+    await database.write(async (session) => {
+      await session.execute("UPDATE orders SET id = 'c' WHERE id = 'b'");
+      expect((await session.query("SELECT id FROM orders WHERE id = 'o:7f3a'")).rows).toEqual([
+        { id: "c" },
+      ]);
+      await session.execute("UPDATE orders SET total = 7 WHERE id = 'o:7f3a'");
+    });
+    expect(await rows(database, "SELECT id, total FROM orders WHERE id = 'o:7f3a'")).toEqual([
+      { id: "c", total: 7 },
+    ]);
+  });
+
+  it("stops at a step that expired, so an old key stops forwarding on schedule", async () => {
+    const time = clock();
+    const database = await orders({ now: time.now, keyForwardRetentionMs: 10 * DAY });
+    await database.execute("UPDATE orders SET id = 'b' WHERE id = 'o:7f3a'");
+    time.advance(4 * DAY);
+    await database.execute("UPDATE orders SET id = 'c' WHERE id = 'b'");
+    time.advance(7 * DAY);
+    // The first step expired at day 10; the second lasts until day 14.
+    expect(await rows(database, "SELECT id FROM orders WHERE id = 'o:7f3a'")).toEqual([]);
+    expect(await rows(database, "SELECT id FROM orders WHERE id = 'b'")).toEqual([{ id: "c" }]);
   });
 });
 

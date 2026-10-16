@@ -5836,9 +5836,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       keyForwardTestHooks.wholeReads += 1;
       const rows = await this.#readKeyForwardRows([], version);
+      // Parsed as the load indexes them, so its slices cover the parsing too.
       return CommittedKeyForwards.load(
         generation,
-        rows.map((row) => forwardFromRow(row)),
+        (function* () {
+          for (const row of rows) yield forwardFromRow(row);
+        })(),
         () => dateMilliseconds(this.#now()),
       );
     })();
@@ -6496,41 +6499,55 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // A key another moved row now holds — a swap or rotation — is not retired, so it gets no
     // forward; one would shadow the row that holds it.
     const reused = new Set(moved.map((row) => storageKeyToken(row.to)));
+    // Forwards are immutable: each rekey adds the one step it made, and an older key that led
+    // to the key retired here reaches the row by following the chain through it.
     const forwards: KeyForward[] = [];
     for (const row of moved) {
-      const fromToken = storageKeyToken(row.from);
-      if (!reused.has(fromToken)) forwards.push({ tableId: table.id, ...row, expiresAt });
-      for (const source of scoped.sourcesOf(table.id, fromToken)) {
-        forwards.push({ ...source, to: row.to, toValues: row.toValues });
+      if (!reused.has(storageKeyToken(row.from))) {
+        forwards.push({ tableId: table.id, ...row, expiresAt });
       }
     }
     if (forwards.length === 0) {
       return;
+    }
+    // A bulk rekey stages a forward per row: build the columns a slice at a time.
+    const columns = {
+      key: [] as string[],
+      table: [] as string[],
+      from: [] as string[],
+      to: [] as string[],
+      fromValues: [] as string[],
+      toValues: [] as string[],
+      expiresAt: [] as number[],
+    };
+    for (const [index, forward] of forwards.entries()) {
+      if (index % 1024 === 1023) await maybeYieldToEventLoop();
+      columns.key.push(forwardRowKey(forward.tableId, storageKeyToken(forward.from)));
+      columns.table.push(forward.tableId);
+      columns.from.push(encodeKeyValues([forward.from]));
+      columns.to.push(encodeKeyValues([forward.to]));
+      columns.fromValues.push(encodeKeyValues(forward.fromValues));
+      columns.toValues.push(encodeKeyValues(forward.toValues));
+      columns.expiresAt.push(forward.expiresAt);
+      scoped.staged.add(forward);
     }
     await this.#sessionInsert(
       transaction,
       KEY_FORWARDS_TABLE,
       {
         columns: {
-          [KEY_FORWARD_COLUMNS.key]: forwards.map((forward) =>
-            forwardRowKey(forward.tableId, storageKeyToken(forward.from)),
-          ),
-          [KEY_FORWARD_COLUMNS.table]: forwards.map((forward) => forward.tableId),
-          [KEY_FORWARD_COLUMNS.from]: forwards.map((forward) => encodeKeyValues([forward.from])),
-          [KEY_FORWARD_COLUMNS.to]: forwards.map((forward) => encodeKeyValues([forward.to])),
-          [KEY_FORWARD_COLUMNS.fromValues]: forwards.map((forward) =>
-            encodeKeyValues(forward.fromValues),
-          ),
-          [KEY_FORWARD_COLUMNS.toValues]: forwards.map((forward) =>
-            encodeKeyValues(forward.toValues),
-          ),
-          [KEY_FORWARD_COLUMNS.expiresAt]: forwards.map((forward) => forward.expiresAt),
+          [KEY_FORWARD_COLUMNS.key]: columns.key,
+          [KEY_FORWARD_COLUMNS.table]: columns.table,
+          [KEY_FORWARD_COLUMNS.from]: columns.from,
+          [KEY_FORWARD_COLUMNS.to]: columns.to,
+          [KEY_FORWARD_COLUMNS.fromValues]: columns.fromValues,
+          [KEY_FORWARD_COLUMNS.toValues]: columns.toValues,
+          [KEY_FORWARD_COLUMNS.expiresAt]: columns.expiresAt,
         },
         rowCount: forwards.length,
       },
       "upsert",
     );
-    for (const forward of forwards) scoped.staged.add(forward);
     // A reused key's stale staged forward, from earlier in this scope, would shadow its row.
     for (const token of reused) scoped.staged.delete(table.id, token);
   }
@@ -10370,6 +10387,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return this.#withLeasedSnapshot(transaction.snapshotVersion, async (snapshot) => {
       const rows: QueryRow[] = [];
       for (const value of values) {
+        // A cached point read settles without a macrotask; thousands in a row would hold the
+        // thread through the whole statement.
+        await maybeYieldToEventLoop();
         const result = await this.#pointReadAtSnapshot(
           { table: table.name, equalities: [{ column: keyColumn.name, value }], select },
           snapshot,
@@ -17346,24 +17366,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (!checked && ((await this.#committedForwards())?.expiredCount() ?? 0) === 0) return false;
     // The turn directly, not #runWrite: maintenance calls this, and #runWrite assists maintenance.
     return this.#admissions.admit("autocommit", async (admission) => {
-      // Read inside the writer turn: a key retired again since the check above carries a new
-      // expiry under the same row, and no other writer can change the table until this ends.
-      // The scan reads one column's blocks, so a page costs the same however many forwards live.
-      const expired = await this.#readKeyForwardRows(
-        [
-          {
-            left: { kind: "column", reference: KEY_FORWARD_COLUMNS.expiresAt },
-            operator: "<=",
-            right: { kind: "literal", value: dateMilliseconds(this.#now()) },
-          },
-        ],
-        null,
-        KEY_FORWARD_TRIM_PAGE + 1,
-      );
-      if (expired.length === 0) return false;
+      // Read inside the writer turn, which no other writer can change the forwards under: a
+      // key retired again since the check above carries a new expiry under the same row. The
+      // connection's forwards name the expired rows, so no scan of the table is needed.
+      const expired = await (await this.#committedForwards())?.expired(KEY_FORWARD_TRIM_PAGE + 1);
+      if (expired === undefined || expired.length === 0) return false;
       const page = expired.slice(0, KEY_FORWARD_TRIM_PAGE);
       await this.#deleteBatchOnce(admission, KEY_FORWARDS_TABLE, {
-        keys: page.map((row) => row[KEY_FORWARD_COLUMNS.key] as string),
+        keys: page.map((forward) => forwardRowKey(forward.tableId, storageKeyToken(forward.from))),
       });
       return expired.length > page.length;
     });
@@ -20521,15 +20531,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const group = blocks.slice(start, end);
       if (snapshot !== undefined) await this.#renewInternalLeaseIfNeeded(snapshot);
       const bytes = await this.#readBlockWindow(group.map((block) => block.blockId));
-      const decoded = await Promise.all(
-        group.map((block, index) => {
-          const stored = bytes[index];
-          if (stored === undefined) {
-            throw new Error(`A compaction source block is missing: ${block.blockId}`);
-          }
-          return decode(stored, block);
-        }),
-      );
+      // One block at a time, offering the event loop a turn between them: a window decoded
+      // all at once is one synchronous burst as long as the whole window.
+      const decoded: T[] = [];
+      for (const [index, block] of group.entries()) {
+        const stored = bytes[index];
+        if (stored === undefined) {
+          throw new Error(`A compaction source block is missing: ${block.blockId}`);
+        }
+        await maybeYieldToEventLoop();
+        decoded.push(await decode(stored, block));
+      }
       peakBytes = Math.max(peakBytes, retainedBytes + transientBytes);
       for (const [index, block] of group.entries()) {
         const value = decoded[index];
@@ -24540,6 +24552,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     belowMinimum: boolean,
     encode: (compression: Compression) => Promise<Uint8Array>,
   ): Promise<Uint8Array> {
+    // Encoding is synchronous work per block; a large write encodes many blocks back to back.
+    await maybeYieldToEventLoop();
     if (preferred !== "gzip") return encode(preferred);
     if (belowMinimum) return encode("raw");
     const verdict = this.#gzipVerdicts.get(columnId);

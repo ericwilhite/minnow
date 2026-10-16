@@ -90,9 +90,10 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 393 * 1024;
 // sliced OPFS recovery, 1313.8 KiB raw / 369.3 KiB gzip; with sliced commits (0.13.1),
 // 1315.0 KiB raw / 369.7 KiB gzip; with bounded delta replay, staged commit deltas, and
 // schema-4 delta parts (0.14.0), 1339.8 KiB raw / 378.9 KiB gzip; with rekeying (0.15.0),
-// 1362.8 KiB raw / 386.3 KiB gzip; with the rekeying audit, 1370.4 KiB raw / 388.9 KiB gzip.
+// 1362.8 KiB raw / 386.3 KiB gzip; with the rekeying audit, 1370.4 KiB raw / 388.9 KiB gzip;
+// with chained forwards and lapsed-lease re-pinning, 389.05 KiB gzip.
 const INDEXEDDB_WORKER_RAW_BUDGET = 1371 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 389 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 390 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

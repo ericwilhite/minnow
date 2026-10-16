@@ -7115,7 +7115,7 @@ type PreparedFtsChanges = { core: RecordCore } & ({ changes: FtsChanges[] } | { 
 const preparedFtsChanges = new WeakMap<readonly FtsChanges[], PreparedFtsChanges>();
 
 /** Tokens one slice of a sliced membership change adds or removes. */
-const MEMBERSHIP_CHANGE_SLICE = 16_384;
+const MEMBERSHIP_CHANGE_SLICE = 4_096;
 
 /** A set's values as arrays of at most `MEMBERSHIP_CHANGE_SLICE`. */
 function* setSlices(values: ReadonlySet<string>): Generator<string[]> {
@@ -7148,7 +7148,7 @@ export function blockBytesChecksum(bytes: Uint8Array): number {
 const preparedUniqueKeyDeltas = new WeakMap<readonly UniqueKeyChanges[], PreparedUniqueKeyDeltas>();
 
 /** Key changes `uniqueKeyDeltaSteps` checks between yields. */
-const UNIQUE_KEY_DELTA_SLICE = 16_384;
+const UNIQUE_KEY_DELTA_SLICE = 4_096;
 
 /**
  * The membership delta a commit's UNIQUE key changes make, per namespace, refusing a key an

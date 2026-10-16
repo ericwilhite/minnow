@@ -165,8 +165,9 @@ still delivered. If a sweep fails partway, what it already settled is delivered 
 retries. The low-level `liveQueries({ onSweepDelivered })` option is called right after a sweep's
 last delivery.
 
-Deliveries that follow a rekey carry `keyChanges`, the rows the commits moved:
-`[{ table, from, to }]`, with a composite key given as an array. Typed snapshots carry the same
+Deliveries that follow a rekey carry `keyChanges`, one entry per rekey the commits made, in commit
+order: `[{ table, from, to }]`, with a composite key given as an array. A row rekeyed twice shows
+as two steps. Typed snapshots carry the same
 list, gathered across every delivery the snapshot stands for. It is read from the stored key
 forwards, so a tab that missed every cross-tab notification still reports it on its next sweep.
 
