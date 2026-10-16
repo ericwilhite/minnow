@@ -358,6 +358,53 @@ describe("references follow a rekey", () => {
     ]);
   });
 
+  it("moves each reference once when a rekey reuses keys of its own table (shift, swap)", async () => {
+    // A moved row's reference to another moved row is pointed at the new key before the row is
+    // written; the pass over referencing rows must not move it a second time when that new key
+    // is also a key another moved row gave up.
+    for (const enforced of ["", " NOT ENFORCED"]) {
+      const database = new MinnowDatabase(new MemoryBlockStore());
+      await database.execute(
+        `CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes(id)${enforced}, label TEXT)`,
+      );
+      await database.execute(
+        "CREATE TABLE tags (id INTEGER PRIMARY KEY, node_id INTEGER REFERENCES nodes(id))",
+      );
+      await database.execute(
+        "INSERT INTO nodes VALUES (1, 1, 'one'), (2, 1, 'two'), (3, 2, 'three'), (9, NULL, 'nine')",
+      );
+      await database.execute("INSERT INTO tags VALUES (10, 1), (20, 2), (30, 3)");
+      const parents = async (): Promise<unknown> =>
+        await rows(
+          database,
+          "SELECT n.label, p.label AS parent FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id ORDER BY n.label",
+        );
+      const before = await parents();
+      // A shift: 1 → 2, 2 → 3, 3 → 4.
+      await database.execute("UPDATE nodes SET id = id + 1 WHERE id <= 3");
+      expect(await parents(), `shift${enforced}`).toEqual(before);
+      expect(await rows(database, "SELECT id, parent_id FROM nodes ORDER BY id")).toEqual([
+        { id: 2, parent_id: 2 },
+        { id: 3, parent_id: 2 },
+        { id: 4, parent_id: 3 },
+        { id: 9, parent_id: null },
+      ]);
+      // A swap: 2 ↔ 3.
+      await database.execute("UPDATE nodes SET id = 5 - id WHERE id IN (2, 3)");
+      expect(await parents(), `swap${enforced}`).toEqual(before);
+      expect(
+        await rows(
+          database,
+          "SELECT t.id, n.label FROM tags t JOIN nodes n ON n.id = t.node_id ORDER BY t.id",
+        ),
+      ).toEqual([
+        { id: 10, label: "one" },
+        { id: 20, label: "two" },
+        { id: 30, label: "three" },
+      ]);
+    }
+  });
+
   it("follows a composite key, through predicates that pin every column", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(

@@ -6378,6 +6378,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       cascadeBudget,
       true,
     );
+    // The moved rows' own references were pointed at the new keys above; a new key can also
+    // be a key another moved row gave up (a shift or a swap), so the pass over the table's
+    // referencing rows must leave the moved rows alone or it would move them a second time.
+    const movedRows = new Set(
+      moved.map((index) => keyToken(keyColumn.type, presentAt(newKeys, index))),
+    );
     await this.#moveReferences(
       transaction,
       table,
@@ -6385,6 +6391,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       renamed,
       cascadeBudget,
       referentialBudget,
+      movedRows,
     );
     await this.#stageKeyForwards(transaction, table, [...renamed.values()]);
     await this.#stageTriggerDerivedInserts(
@@ -6418,6 +6425,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     renamed: ReadonlyMap<string, { fromValues: BatchValue[]; toValues: BatchValue[] }>,
     cascadeBudget: number,
     referentialBudget: number,
+    /** Key tokens of the parent's moved rows, whose references to their own table already moved. */
+    movedRows: ReadonlySet<string>,
   ): Promise<void> {
     const quote = quoteSqlIdentifier;
     const sources = [...renamed.values()];
@@ -6462,7 +6471,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           keyToken(address.keyColumn.type, addressStorageKey(address, tuple)),
         );
         if (target === undefined) continue;
-        keys.push(storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null));
+        const childRowKey = storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null);
+        if (
+          child.id === parent.id &&
+          childRowKey !== null &&
+          movedRows.has(keyToken(childKey.type, childRowKey))
+        ) {
+          continue;
+        }
+        keys.push(childRowKey);
         for (const [position, column] of key.columns.entries()) {
           changes[column]?.push(target.toValues[position] ?? null);
         }
