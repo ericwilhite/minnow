@@ -251,11 +251,12 @@ machines: https://minnowdb.com/llms.txt
   `jsonb_set`/`jsonb_typeof`/`json_object_agg`, `regexp_match` and the other array-returning
   regex functions, `ROW(…)` as a value, bit-string literals, interval-valued arithmetic such as
   interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `version()` and other
-  server introspection, `TABLESAMPLE`, `SET column = DEFAULT` and `SET (a, b) = (…)` in
-  `UPDATE`, data-modifying CTEs, `ALTER TABLE` beyond ADD/DROP COLUMN, `CREATE TABLE … (LIKE …)`,
+  server introspection, `TABLESAMPLE`, `SET (a, b) = (SELECT …)` in `UPDATE`, `RETURNING` a
+  column of an `UPDATE … FROM` or `DELETE … USING` source, data-modifying CTEs, `ALTER TABLE`
+  beyond ADD/RENAME/DROP COLUMN (no table rename), `CREATE TABLE … (LIKE …)`,
   `SERIAL` on a non-key column, `ON UPDATE` actions other than `CASCADE`, `DEFERRABLE`
   foreign keys, partial and
-  expression indexes, `ON CONFLICT` on a non-key UNIQUE column, `DROP TABLE a, b`, view column
+  expression indexes, `ON CONFLICT ON CONSTRAINT`, `DROP TABLE a, b`, view column
   lists and materialized views, `setval`, domains, functions, `EXCLUDE` constraints, schemas,
   schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set
   aggregates, bitwise operators, `bytea`, enum evolution, sequence options, `RIGHT JOIN` or

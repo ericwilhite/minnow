@@ -300,10 +300,11 @@ describe("atomic write scopes", () => {
       const database = await bank(store);
       await database.createTable({
         name: "audit",
-        columns: [{ name: "label", type: "string" }],
+        columns: [{ name: "label", type: "boolean" }],
       });
-      // The body writes the numeric balance into a string column: the insert registers its
-      // unique key first, then fails while staging the derivation — partial work landed.
+      // The body writes the numeric balance into a boolean column, which has no assignment
+      // cast: the insert registers its unique key first, then fails while staging the
+      // derivation — partial work landed.
       await database.execute(
         "CREATE TRIGGER bad_audit AFTER INSERT ON accounts BEGIN " +
           "INSERT INTO audit (label) VALUES (NEW.balance); END",

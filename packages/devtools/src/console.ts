@@ -73,6 +73,9 @@ function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "create-trigger") return `created trigger ${result.name} on ${result.table}`;
   if (result.kind === "drop-trigger") return `dropped trigger ${result.name}`;
   if (result.kind === "add-column") return `added column ${result.table}.${result.column}`;
+  if (result.kind === "rename-column") {
+    return `renamed column ${result.table}.${result.from} to ${result.to}`;
+  }
   if (result.kind === "create-view") return `created view ${result.view}`;
   if (result.kind === "drop-view") {
     return result.dropped ? `dropped view ${result.view}` : `no view ${result.view}`;

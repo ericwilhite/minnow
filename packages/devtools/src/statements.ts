@@ -196,6 +196,16 @@ export function classifyStatement(sql: string): StatementIntent {
         ],
         confirmLabel: "Add column",
       });
+    case "rename-column":
+      return executeIntent(statement.kind, {
+        title: `Rename column ${statement.table}.${statement.from} to ${statement.to}`,
+        facts: [
+          ["table", statement.table],
+          ["column", statement.from],
+          ["new name", statement.to],
+        ],
+        confirmLabel: "Rename column",
+      });
     case "drop-column":
       return executeIntent(statement.kind, {
         title: `Drop column ${statement.table}.${statement.column}`,
@@ -239,6 +249,7 @@ const catalogOperations: ReadonlySet<string> = new Set([
   "create-index",
   "drop-index",
   "add-column",
+  "rename-column",
   "drop-column",
   "drop-table",
   "create-view",

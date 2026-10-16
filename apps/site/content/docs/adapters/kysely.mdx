@@ -487,13 +487,13 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
   - Mutations: multi-table `updateTable([...])` and `deleteFrom([...])`, MySQL
     `ORDER BY`/`LIMIT` on updates and deletes, `replaceInto()`, `onDuplicateKeyUpdate()`, SQLite
     `orIgnore()`/`orAbort()` and friends, `ON CONFLICT` with a constraint or index-expression
-    target (name the unique key's columns instead),
+    target (name the columns of the primary key or `UNIQUE` constraint instead),
     `MERGE ... THEN DO NOTHING` (narrow the `WHEN` condition instead),
     `MERGE ... WHEN NOT MATCHED BY SOURCE`, and data-modifying CTEs (run the mutation first, then
     query).
   - DDL: schema-qualified names including `WithSchemaPlugin`, `CREATE`/`DROP SCHEMA`,
-    `ALTER TABLE` beyond adding and dropping columns (renames, constraint changes, column
-    alterations, `ADD COLUMN IF NOT EXISTS`), the T-SQL `identity()` column modifier (use
+    `ALTER TABLE` beyond adding, renaming, and dropping columns (`renameTo()`, constraint
+    changes, column alterations), the T-SQL `identity()` column modifier (use
     `autoIncrement()`, the `serial` type, or `generatedAlwaysAsIdentity()`), inline
     `addIndex()` in `createTable()`, `onCommit()` on a temporary table and MySQL's
     `dropTable().temporary()` (a temporary table is an ordinary table here; drop it with
