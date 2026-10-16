@@ -531,6 +531,17 @@ commuting writes shows every untouched key exactly and every touched key at its 
 value; a mutation interrupted by a fault lands entirely or not at all and a reported success is
 durable; and at every checkpoint every connection reads the same database as the model.
 
+With `rekeying: true` (`--rekeying true` on the command line) a plan also changes primary keys:
+`UPDATE … SET id = …` to a constant, shifted by a step, negated, or swapped between two rows,
+alone or inside a transaction, and some tables get a self-referencing
+`REFERENCES … NOT ENFORCED` column. The model keeps every retired key's forward, so it checks the
+[rekeying](/docs/engine/rekeying) rules too: a rekey onto a live, repeated, or retired key fails
+as a duplicate and writes nothing; references follow the moved rows; a retired key reads, updates,
+upserts, and is compared through its forward on every connection; and inserting a retired key is
+refused. These steps come from a second random stream, so a plan generated without the option is
+exactly what it always was and every recorded seed still replays the plan that failed. The Vitest
+suite runs rekeying plans over every store under the `interaction-simulator-rekeying` seeds.
+
 Two refusals inside a transaction are engine behaviour rather than defects, so the runner counts
 them and continues: a `COMMIT` that lost the race to another connection's data commit, and a
 transaction the engine rolled back after `transactionIdleTimeoutMs` of idleness. Both discard the
@@ -598,7 +609,12 @@ crash, because its checkpoint held a staged index build for an index a stale wri
 marked invalid; a fold that reported a failure when another tab dropped its table just before
 the fold began; and background collection reporting a crashed leader tab's lost step, which its
 own retry reconciles. Each is pinned in Node: `checkpoint-interruption.test.ts`,
-`simulator-regressions.test.ts`, and the collection and compaction controller tests.
+`simulator-regressions.test.ts`, and the collection and compaction controller tests. Longer Node
+soaks (1,500 steps over six connections) later found cursors, `DELETE`, and spilling queries
+reading rows outside an exact index selection, so a `DELETE` removed a row its `WHERE` did not
+match. The first rekeying soaks found a connection losing a key forward once another tab
+collected the manifest that wrote it, retired keys not followed under `OR` and `NOT`, and a
+self-referencing table's references moved twice by a shift or swap.
 
 ## Background maintenance, size, and memory
 

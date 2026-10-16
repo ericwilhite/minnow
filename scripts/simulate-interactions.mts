@@ -29,6 +29,7 @@ const known = new Set([
   "--connections",
   "--tables",
   "--key-space",
+  "--rekeying",
   "--store",
   "--plan",
   "--write-plan",
@@ -47,9 +48,16 @@ for (let index = 2; index < process.argv.length; index++) {
 }
 
 const planFile = values.get("--plan");
-const generationFlags = ["--seed", "--length", "--connections", "--tables", "--key-space"].filter(
-  (flag) => values.has(flag),
-);
+const generationFlags = [
+  "--seed",
+  "--length",
+  "--connections",
+  "--tables",
+  "--key-space",
+  "--rekeying",
+].filter((flag) => values.has(flag));
+const rekeying = values.get("--rekeying") ?? "false";
+if (rekeying !== "true" && rekeying !== "false") failUsage("--rekeying must be true or false");
 if (planFile !== undefined && generationFlags.length > 0) {
   failUsage(`--plan cannot be combined with ${generationFlags.join(", ")}`);
 }
@@ -66,7 +74,8 @@ const replay =
   planFile === undefined
     ? `npm run simulate:interactions -- --seed ${String(plan.seed)} --length ${String(numericOption("--length", 300, 1, 100_000))} ` +
       `--connections ${String(plan.connections)} --tables ${String(numericOption("--tables", 3, 1, 8))} ` +
-      `--key-space ${String(numericOption("--key-space", 24, 2, 10_000))} --store ${storeName}`
+      `--key-space ${String(numericOption("--key-space", 24, 2, 10_000))}` +
+      `${rekeying === "true" ? " --rekeying true" : ""} --store ${storeName}`
     : `npm run simulate:interactions -- --plan ${JSON.stringify(planFile)} --store ${storeName}`;
 
 const store =
@@ -114,6 +123,7 @@ async function loadPlan(file: string | undefined): Promise<InteractionPlan> {
     connections: numericOption("--connections", 4, 1, 16),
     tables: numericOption("--tables", 3, 1, 8),
     keySpace: numericOption("--key-space", 24, 2, 10_000),
+    rekeying: rekeying === "true",
   });
 }
 
@@ -142,6 +152,7 @@ Generate and run:
   --connections NUMBER   Connections sharing the database (default: 4)
   --tables NUMBER        Tables the plan may hold at once (default: 3)
   --key-space NUMBER     Primary-key space per table (default: 24)
+  --rekeying true|false  Add primary-key changes and self-references (default: false)
   --store NAME           memory, indexeddb, or opfs (default: memory)
 
 Replay:

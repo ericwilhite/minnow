@@ -82,6 +82,34 @@ describe("interaction plans", () => {
     }
   });
 
+  it("adds rekeying from its own stream, leaving every plan without it unchanged", async () => {
+    const options = { length: 200, connections: 4 } as const;
+    const plain = generateInteractionPlan(0x1a7e, options);
+    const rekeying = generateInteractionPlan(0x1a7e, { ...options, rekeying: true });
+    expect(parseInteractionPlan(JSON.stringify(rekeying))).toEqual(rekeying);
+    expect(plain.interactions.some((interaction) => interaction.kind === "rekey")).toBe(false);
+    expect(
+      rekeying.interactions.filter((interaction) => interaction.kind === "rekey").length,
+    ).toBeGreaterThan(10);
+    expect(
+      rekeying.interactions.some(
+        (interaction) =>
+          interaction.kind === "createTable" &&
+          interaction.table.columns.some((column) => column.references === "self"),
+      ),
+    ).toBe(true);
+    // A plan without rekeying is exactly what the generator produced before rekeying existed,
+    // so every recorded seed still replays the plan that failed. The digest was taken from
+    // that generator; a change to it here means the recorded seeds now test something else.
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(JSON.stringify(plain)),
+    );
+    expect(
+      [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join(""),
+    ).toBe("8d289aca9f86156e4f8768d50c249e89bfe2fa2256b414c5577beaa96a1578bc");
+  });
+
   it("appends an effective fresh insert for every configured fault point", () => {
     const points = [
       "beforeBlockWrite",
@@ -791,6 +819,31 @@ describe("simulator result-shape oracle", () => {
       ).rejects.toThrow(/malformed query row|query result.*columns/);
     } finally {
       store.close();
+    }
+  });
+});
+
+describe.each(stores)("interaction simulator with rekeying over $name", ({ source }) => {
+  it.each(seedsFor("interaction-simulator-rekeying", [0x4e4b, 0xbeef]))("seed %i", async (seed) => {
+    const store = source();
+    try {
+      const plan = generateInteractionPlan(seed, {
+        length: 200,
+        connections: 3,
+        tables: 2,
+        keySpace: 16,
+        rekeying: true,
+      });
+      expect(plan.interactions.some((interaction) => interaction.kind === "rekey")).toBe(true);
+      const result = await runInteractionPlan(
+        plan,
+        createDatabaseDriver(store, { databaseOptions: { rowsPerBlock: 8 } }),
+      );
+      expect(result.interactions).toBe(plan.interactions.length);
+      expect(result.acceptedWrites).toBeGreaterThan(20);
+      expect(result.rejectedConflicts).toBe(0);
+    } finally {
+      if (typeof store !== "function") store.close();
     }
   });
 });

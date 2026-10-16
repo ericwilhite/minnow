@@ -15,7 +15,8 @@
     "Base 38 Chromium seed 2654435807 exposed a collector finishing and pruning a job between another collector's conflict and reread; reduced in simulator-regressions.test.ts.",
     "The full Chromium, Firefox and WebKit campaign seeds exposed compaction planning/publication races; deterministic three-store reductions are in simulator-regressions.test.ts.",
     "WebKit full seed 2779093776 also exposed automatic compaction resuming a shared job another tab had aborted after DDL; the three-store reduction checks fresh planning, changed revision evidence, I/O propagation and reopening.",
-    "Node soak seeds 720016, 740013 and 740037 (--length 1500 --connections 6 --tables 3 --key-space 48) exposed cursors, DELETE key reads and spilling executors sweeping rows outside an exact index selection; reduced in simulator-regressions.test.ts."
+    "Node soak seeds 720016, 740013 and 740037 (--length 1500 --connections 6 --tables 3 --key-space 48) exposed cursors, DELETE key reads and spilling executors sweeping rows outside an exact index selection; reduced in simulator-regressions.test.ts.",
+    "Rekeying seeds 800002, 800011, 800017, 800024, 800027 and 800037 (--length 800 --connections 4 --key-space 24 --rekeying true) exposed a connection's key forwards losing a forward once another connection collected the manifest that wrote it; reduced in simulator-regressions.test.ts."
   ],
   "suites": {
     "sql-conformance": [12648430],
@@ -31,6 +32,7 @@
       24301, 61935, 608135839, 3084996986, 2654435792, 608135840, 3084996987, 1349451771,
       2654435807, 2779118408, 2779075658, 16053, 2779093776, 720016, 740013, 740037
     ],
+    "interaction-simulator-rekeying": [800002, 800011, 800017, 800024, 800027, 800037],
     "block-format-properties": []
   }
 }
