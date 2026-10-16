@@ -23,6 +23,8 @@ export interface Menu {
 export function createMenu(): Menu {
   const node = el("div", { class: "menu", attrs: { role: "menu", tabindex: "-1" } });
   node.hidden = true;
+  /** What had focus when the menu opened, which is where Escape hands it back. */
+  let opener: HTMLElement | undefined;
 
   function close(): void {
     if (node.hidden) return;
@@ -32,15 +34,21 @@ export function createMenu(): Menu {
 
   node.addEventListener("keydown", (event) => {
     const items = [...node.querySelectorAll<HTMLButtonElement>(".menu-item")];
-    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    const root = node.getRootNode() as Document | ShadowRoot;
+    const at = items.indexOf(root.activeElement as HTMLButtonElement);
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
+      const back = opener;
       close();
+      if (back?.isConnected === true) back.focus({ preventScroll: true });
     } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       const step = event.key === "ArrowDown" ? 1 : -1;
       items[(at + step + items.length) % items.length]?.focus();
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      (event.key === "Home" ? items[0] : items.at(-1))?.focus();
     }
   });
   node.addEventListener("focusout", (event) => {
@@ -51,6 +59,8 @@ export function createMenu(): Menu {
     node,
     close,
     open: (items, at) => {
+      const root = node.getRootNode() as Document | ShadowRoot;
+      opener = root.activeElement instanceof HTMLElement ? root.activeElement : undefined;
       node.replaceChildren(
         ...items.map((item) => {
           const button = el(

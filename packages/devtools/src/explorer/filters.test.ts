@@ -217,6 +217,16 @@ describe("describeFilter", () => {
       ),
     ).toBe("score between 1 and 9");
     expect(describeFilter(filter({ operator: "in", values: ["a", "b"] }))).toBe("name in (a, b)");
+    expect(
+      describeFilter(
+        filter({
+          column: "at",
+          type: "datetime",
+          operator: ">=",
+          values: [new Date(Date.UTC(2026, 0, 5))],
+        }),
+      ),
+    ).toBe("at ≥ 2026-01-05T00:00:00.000Z");
   });
 });
 

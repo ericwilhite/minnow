@@ -1,4 +1,4 @@
-import { button, el, iconButton, icons } from "../dom.js";
+import { button, el, iconButton, icons, keepingFocus } from "../dom.js";
 import { readFlag, writeFlag } from "../storage.js";
 import { describeAge, describeOutcome, historyLimit, type HistoryEntry } from "./store.js";
 
@@ -84,6 +84,7 @@ export function createHistoryRail(deps: HistoryRailDeps): HistoryRail {
             ]),
           ],
         );
+        pick.dataset.focusKey = `pick:${entry.id}`;
         pick.addEventListener("click", () => {
           deps.onPick(entry);
         });
@@ -92,6 +93,7 @@ export function createHistoryRail(deps: HistoryRailDeps): HistoryRail {
           title: saved ? "Forget this query" : "Save this query",
           attrs: { "aria-pressed": String(saved), "aria-label": "Save this query" },
         });
+        star.dataset.focusKey = `star:${entry.id}`;
         star.addEventListener("click", () => {
           deps.onToggleSaved(entry);
         });
@@ -99,17 +101,19 @@ export function createHistoryRail(deps: HistoryRailDeps): HistoryRail {
       };
       const saved = entries.filter((entry) => entry.saved === true);
       const recent = entries.filter((entry) => entry.saved !== true);
-      list.replaceChildren(
-        ...(saved.length === 0
-          ? []
-          : [el("div", { class: "hgroup", text: "Saved" }), ...saved.map(item)]),
-        ...(recent.length === 0
-          ? []
-          : [
-              ...(saved.length === 0 ? [] : [el("div", { class: "hgroup", text: "Recent" })]),
-              ...recent.map(item),
-            ]),
-      );
+      keepingFocus(list, () => {
+        list.replaceChildren(
+          ...(saved.length === 0
+            ? []
+            : [el("div", { class: "hgroup", text: "Saved" }), ...saved.map(item)]),
+          ...(recent.length === 0
+            ? []
+            : [
+                ...(saved.length === 0 ? [] : [el("div", { class: "hgroup", text: "Recent" })]),
+                ...recent.map(item),
+              ]),
+        );
+      });
     },
   };
 }

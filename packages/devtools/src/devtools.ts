@@ -38,21 +38,43 @@ export interface DevtoolsHandle {
   destroy(): void;
 }
 
-/** Constructable stylesheets where available, a `<style>` node where not. */
-function adoptStyles(root: ShadowRoot): void {
-  if (typeof CSSStyleSheet === "function" && "adoptedStyleSheets" in root) {
-    try {
-      const sheet = new CSSStyleSheet();
-      sheet.replaceSync(styles);
-      root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
-      return;
-    } catch {
-      // Fall through to the style element below.
+/** One parsed sheet for every panel on the page; `null` once construction has been refused. */
+let sharedSheet: CSSStyleSheet | null | undefined;
+
+/**
+ * Constructable stylesheets where available, a `<style>` node where not. The sheet is parsed once
+ * and shared, added to a root only when it is not already there, and taken off again on destroy,
+ * so a panel that remounts — every attribute change on the element does — never stacks copies.
+ * Returns what undoes it.
+ */
+function adoptStyles(root: ShadowRoot): () => void {
+  if (sharedSheet === undefined) {
+    sharedSheet = null;
+    if (typeof CSSStyleSheet === "function" && "adoptedStyleSheets" in root) {
+      try {
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(styles);
+        sharedSheet = sheet;
+      } catch {
+        // Left null: the style element below is used instead.
+      }
     }
+  }
+  const sheet = sharedSheet;
+  if (sheet !== null) {
+    if (!root.adoptedStyleSheets.includes(sheet)) {
+      root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+    }
+    return () => {
+      root.adoptedStyleSheets = root.adoptedStyleSheets.filter((entry) => entry !== sheet);
+    };
   }
   const node = document.createElement("style");
   node.textContent = styles;
   root.append(node);
+  return () => {
+    node.remove();
+  };
 }
 
 /**
@@ -67,7 +89,7 @@ export function createDevtools(
 ): DevtoolsHandle {
   const resolved = resolveOptions(options);
   const target = resolveTarget(attachable);
-  adoptStyles(root);
+  const dropStyles = adoptStyles(root);
 
   // The two things the panel needs from its own host element: which layout it is in, so an inline
   // host can be a block with a height, and which palette to paint in. Both are read by the
@@ -239,12 +261,18 @@ export function createDevtools(
   });
 
   /** Read once for the whole panel: the rail, the explorer, and completion share one catalog. */
+  let catalogGeneration = 0;
   async function loadCatalog(): Promise<void> {
+    // A refresh, a DDL statement, and a restore can each start a read, and they can finish in
+    // any order; only the newest may land, or an older catalog could replace a newer one.
+    catalogGeneration += 1;
+    const token = catalogGeneration;
     try {
       const [tables, introspection] = await Promise.all([
         target.listTables(),
         target.introspect?.(),
       ]);
+      if (token !== catalogGeneration) return;
       const catalog = toCatalog(tables, introspection);
       rail.setCatalog(catalog);
       view.setSchema(
@@ -254,7 +282,9 @@ export function createDevtools(
       );
       await explorer.setCatalog(catalog);
     } catch (error) {
-      rail.setError(error instanceof Error ? error.message : String(error));
+      if (token === catalogGeneration) {
+        rail.setError(error instanceof Error ? error.message : String(error));
+      }
     }
   }
 
@@ -298,8 +328,14 @@ export function createDevtools(
     }
   }
 
+  /**
+   * Closing from inside the panel — its Close button, Escape — hands focus to the launcher, so
+   * the next Tab does not start again from the top of the page. (A pressed button is not always
+   * focused — WebKit does not focus on click — so this does not ask where focus was.)
+   */
   function close(): void {
     setOpen(false);
+    launcher?.node.focus();
   }
 
   function toggle(): void {
@@ -322,10 +358,13 @@ export function createDevtools(
    */
   panel.node.addEventListener("keydown", (event) => {
     if (event.defaultPrevented) return;
-    if (event.key === "Escape" && resolved.mode === "launcher") {
+    // Escape in a text box belongs to the box — clearing a search, abandoning a value — not to
+    // the panel; closing everything over a half-typed filter is never what it meant.
+    const typing =
+      event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement;
+    if (event.key === "Escape" && resolved.mode === "launcher" && !typing) {
       event.preventDefault();
       close();
-      launcher?.node.focus();
     } else if (matchesHotkey("mod+k", event)) {
       event.preventDefault();
       rail.focusSearch();
@@ -368,6 +407,7 @@ export function createDevtools(
       // remount reads its options back off the element.
       host.removeAttribute("data-minnow-devtools");
       root.replaceChildren();
+      dropStyles();
     },
   };
 }

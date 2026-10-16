@@ -120,3 +120,37 @@ describe("createInsertForm", () => {
     expect(form.node.querySelector<HTMLInputElement>('input[aria-label="total"]')?.value).toBe("3");
   });
 });
+
+describe("insert form keys", () => {
+  it("submits on Enter in a field, taking the press so it cannot go on to answer the prompt", () => {
+    const onSubmit = vi.fn();
+    const form = createInsertForm({ onSubmit });
+    document.body.append(form.node);
+    form.open(table, { status: "new", total: 5 });
+    const total = form.node.querySelectorAll("input")[1];
+    const press = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    total?.dispatchEvent(press);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(press.defaultPrevented).toBe(true);
+    form.node.remove();
+  });
+
+  it("leaves Enter on a button to that button, so Enter on Cancel cancels", () => {
+    const onSubmit = vi.fn();
+    const onDismiss = vi.fn();
+    const form = createInsertForm({ onSubmit, onDismiss });
+    document.body.append(form.node);
+    form.open(table, { status: "new", total: 5 });
+    const cancel = [...form.node.querySelectorAll("button")].find(
+      (button) => button.textContent === "Cancel",
+    );
+    cancel?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    expect(onSubmit).not.toHaveBeenCalled();
+    cancel?.click();
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(form.node.hidden).toBe(true);
+    form.node.remove();
+  });
+});

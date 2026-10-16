@@ -54,10 +54,17 @@ export interface Grid {
   setRows(rows: readonly QueryRow[]): void;
   /** Adds rows to the end, keeping the scroll position — the paging path. */
   appendRows(rows: readonly QueryRow[]): void;
+  /**
+   * Replaces the rows where they stand — the live path. The scroll position stays put, and the
+   * selection follows its rows by `keyOf` when one is given, or by position when not.
+   */
+  replaceRows(rows: readonly QueryRow[], keyOf?: (row: QueryRow) => string): void;
   /** Replaces the body with a message, for the empty and error states. */
   setMessage(message: string): void;
   rowCount(): number;
   rowAt(index: number): QueryRow | undefined;
+  /** The position of the first row matching `predicate`, or -1. */
+  findIndex(predicate: (row: QueryRow) => boolean): number;
   columnNames(): string[];
   setSelected(index: number | undefined): void;
   /** The anchor of the selection: the row clicked last. */
@@ -71,6 +78,7 @@ export interface Grid {
   /** Opens an input over a cell, aligned to the column by the grid template itself. */
   editCell(index: number, column: string, editor: CellEditor): void;
   closeEdit(): void;
+  isEditing(): boolean;
   /**
    * Re-derives the window from the viewport's current size. The grid watches its own viewport
    * where the browser can report a resize; this is for a host that showed a hidden grid and
@@ -81,8 +89,12 @@ export interface Grid {
 
 /** Row height is fixed so the scroll position maps to an index by division, not measurement. */
 const rowHeight = 26;
-/** Rows rendered beyond the viewport at each end, to cover fast scrolling between frames. */
-const overscan = 8;
+/**
+ * The fewest rows rendered beyond the viewport at each end. The browser scrolls on its own thread
+ * and paints whatever is already laid out, so this margin is what a fast fling shows before the
+ * next frame fills the window; it grows with the viewport to half a screen.
+ */
+const minOverscan = 8;
 /** How close to the end the viewport gets before the next page is asked for. */
 const loadThresholdRows = 20;
 
@@ -121,6 +133,14 @@ export function createGrid(deps: GridDeps = {}): Grid {
   let slotRow: number[] = [];
   let frame = 0;
   let template = "";
+  /** The first row whose top edge is in view, as of the last render. */
+  let firstShown = 0;
+  /**
+   * The cell keyboard focus lives on. The grid is one tab stop, not one per row: this cell carries
+   * the only `tabindex="0"`, and the arrow keys move it.
+   */
+  const active = { row: 0, column: 0 };
+  let tabStop: HTMLElement | undefined;
   let notifiedForCount = -1;
   /** The row clicked last, which is what row actions act on and where a shift-click extends from. */
   let selected: number | undefined;
@@ -140,6 +160,14 @@ export function createGrid(deps: GridDeps = {}): Grid {
     if (column.type === "datetime") return "minmax(160px, 200px)";
     if (column.type === "boolean") return "minmax(70px, 90px)";
     return "minmax(120px, 260px)";
+  }
+
+  /**
+   * A key in the first column stays in view when a wide table scrolls sideways, so every row
+   * still says which row it is.
+   */
+  function pinsFirst(): boolean {
+    return columns[0]?.isKey === true;
   }
 
   function applyTemplate(): void {
@@ -183,7 +211,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     applyTemplate();
     node.setAttribute("aria-colcount", String(columns.length));
     head.replaceChildren(
-      ...columns.map((column) => {
+      ...columns.map((column, index) => {
         const label = el("span", { class: "grid-name", text: column.name });
         const children: Array<Node | string> = [label];
         const typeText = column.label ?? column.type;
@@ -196,28 +224,42 @@ export function createGrid(deps: GridDeps = {}): Grid {
           );
         }
         const sortable = column.sortable === true && deps.onSort !== undefined;
+        // The header cell is the columnheader; a sortable one holds a real button. Giving the
+        // button the columnheader role instead would hide that it can be pressed.
+        const content = sortable
+          ? el(
+              "button",
+              {
+                class: "grid-th-label",
+                type: "button",
+                attrs: {
+                  "aria-label": `Sort by ${column.name}${column.sorted === undefined ? "" : column.sorted === "asc" ? ", sorted ascending" : ", sorted descending"}`,
+                },
+              },
+              children,
+            )
+          : el("span", { class: "grid-th-label" }, children);
+        if (sortable) {
+          content.addEventListener("click", () => {
+            deps.onSort?.(column.name);
+          });
+        }
         const cell = el(
-          sortable ? "button" : "div",
+          "div",
           {
-            class: `grid-th${column.sortable === true ? " sortable" : ""}${column.sorted === undefined ? "" : " sorted"}`,
-            ...(sortable ? { type: "button" } : { title: `${column.name} cannot be sorted` }),
+            class: `grid-th${sortable ? " sortable" : ""}${column.sorted === undefined ? "" : " sorted"}${index === 0 && pinsFirst() ? " pinned" : ""}`,
+            ...(deps.onSort !== undefined && !sortable
+              ? { title: `${column.name} cannot be sorted` }
+              : {}),
             attrs: {
               role: "columnheader",
               ...(column.sorted === undefined
                 ? {}
                 : { "aria-sort": column.sorted === "asc" ? "ascending" : "descending" }),
-              ...(sortable ? { "aria-label": `Sort by ${column.name}` } : {}),
             },
           },
-          children,
+          [content],
         );
-        // A real button rather than a div with a click handler, so sorting is reachable by
-        // keyboard and announced as something that can be pressed.
-        if (sortable) {
-          cell.addEventListener("click", () => {
-            deps.onSort?.(column.name);
-          });
-        }
         cell.append(resizeHandle(column, cell));
         return cell;
       }),
@@ -233,11 +275,13 @@ export function createGrid(deps: GridDeps = {}): Grid {
     while (pool.length < needed) {
       const row = el("div", { class: "grid-row", attrs: { role: "row" } });
       row.style.gridTemplateColumns = template;
+      // What a cell is never changes with the row it shows, so it is said once, here, rather
+      // than rewritten on every scroll.
       row.append(
         ...columns.map((_column, index) =>
           el("div", {
             class: "cell",
-            attrs: { role: "gridcell", tabindex: index === 0 ? "0" : "-1" },
+            attrs: { role: "gridcell", "aria-colindex": String(index + 1), tabindex: "-1" },
           }),
         ),
       );
@@ -247,6 +291,27 @@ export function createGrid(deps: GridDeps = {}): Grid {
     }
     // Ring positions changed, so every slot has to be re-derived.
     slotRow = slotRow.map(() => -1);
+  }
+
+  /** The pooled node showing `index`, if that row is in the window. */
+  function nodeFor(index: number): HTMLElement | undefined {
+    if (pool.length === 0) return undefined;
+    const slot = index % pool.length;
+    return slotRow[slot] === index ? pool[slot] : undefined;
+  }
+
+  /**
+   * Keeps exactly one cell tabbable: the active one, or — when it has scrolled out of the
+   * window — the same column in the first row in view, so Tab always lands in the grid.
+   */
+  function syncTabStop(): void {
+    const node = nodeFor(active.row) ?? nodeFor(firstShown);
+    const target = node?.children[Math.min(active.column, columns.length - 1)];
+    const next = target as HTMLElement | undefined;
+    if (next === tabStop) return;
+    if (tabStop !== undefined) tabStop.tabIndex = -1;
+    if (next !== undefined) next.tabIndex = 0;
+    tabStop = next;
   }
 
   /** Writes one row's values into a pooled node. Text only — no markup is ever parsed. */
@@ -259,16 +324,14 @@ export function createGrid(deps: GridDeps = {}): Grid {
     node.setAttribute("aria-rowindex", String(index + 2));
     node.setAttribute("aria-selected", String(selection.has(index)));
     const cells = node.children;
+    const pinned = pinsFirst();
     for (let column = 0; column < columns.length; column += 1) {
       const cell = cells[column];
       const name = columns[column]?.name;
       if (cell === undefined || name === undefined) continue;
       const value = row[name] ?? null;
       const { text, className } = formatValue(value);
-      cell.className = className;
-      cell.setAttribute("role", "gridcell");
-      cell.setAttribute("aria-colindex", String(column + 1));
-      cell.setAttribute("tabindex", column === 0 ? "0" : "-1");
+      cell.className = column === 0 && pinned ? `${className} pinned` : className;
       // NULL is rendered as its own marker rather than as the word, so a string reading "NULL"
       // cannot be mistaken for the absence of a value.
       if (value === null) cell.replaceChildren(el("span", { text: "NULL" }));
@@ -281,7 +344,9 @@ export function createGrid(deps: GridDeps = {}): Grid {
   function render(): void {
     if (columns.length === 0) return;
     const visible = Math.ceil(viewport.clientHeight / rowHeight);
-    const first = Math.max(0, Math.floor(viewport.scrollTop / rowHeight) - overscan);
+    const overscan = Math.max(minOverscan, Math.ceil(visible / 2));
+    firstShown = Math.min(Math.max(0, rows.length - 1), Math.floor(viewport.scrollTop / rowHeight));
+    const first = Math.max(0, firstShown - overscan);
     const last = Math.min(rows.length, first + visible + overscan * 2);
 
     growPool(Math.min(rows.length, visible + overscan * 2 + 1));
@@ -300,11 +365,15 @@ export function createGrid(deps: GridDeps = {}): Grid {
       slotRow[slot] = index;
     }
     // Near the ends the window is shorter than the ring, leaving slots with stale rows behind.
+    // A hidden slot must also forget its row: the guard above would otherwise take it for
+    // already showing that row when the row scrolls back in, and leave a blank gap there.
     for (let slot = 0; slot < pool.length; slot += 1) {
       if (inWindow.has(slot)) continue;
       const node = pool[slot];
+      slotRow[slot] = -1;
       if (node !== undefined && !node.hidden) node.hidden = true;
     }
+    syncTabStop();
 
     if (
       deps.onNearEnd !== undefined &&
@@ -428,17 +497,75 @@ export function createGrid(deps: GridDeps = {}): Grid {
       deps.onEditCell(hit.row, hit.column, hit.index);
       return;
     }
-    const rowOffset = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
-    const columnOffset = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
-    if (rowOffset === 0 && columnOffset === 0) return;
+    const target = moveFrom(event, hit.index, column);
+    if (target === undefined) return;
     event.preventDefault();
-    const targetRow = sizer.querySelector<HTMLElement>(
-      `.grid-row[data-index="${String(hit.index + rowOffset)}"]`,
+    focusCell(target.row, target.column);
+  });
+
+  /** Where a navigation key moves the active cell from `row`, `column`, if it is one. */
+  function moveFrom(
+    event: KeyboardEvent,
+    row: number,
+    column: number,
+  ): { row: number; column: number } | undefined {
+    const page = Math.max(
+      1,
+      Math.floor((viewport.clientHeight - head.offsetHeight) / rowHeight) - 1,
     );
-    const targetCell = (targetRow ?? rowNode).children[
-      Math.max(0, Math.min(columns.length - 1, column + columnOffset))
-    ];
-    if (targetCell instanceof HTMLElement) targetCell.focus();
+    const jump = event.metaKey || event.ctrlKey;
+    const lastRow = rows.length - 1;
+    const lastColumn = columns.length - 1;
+    const moves: Record<string, { row: number; column: number }> = {
+      ArrowUp: { row: jump ? 0 : row - 1, column },
+      ArrowDown: { row: jump ? lastRow : row + 1, column },
+      ArrowLeft: { row, column: jump ? 0 : column - 1 },
+      ArrowRight: { row, column: jump ? lastColumn : column + 1 },
+      PageUp: { row: row - page, column },
+      PageDown: { row: row + page, column },
+      Home: jump ? { row: 0, column } : { row, column: 0 },
+      End: jump ? { row: lastRow, column } : { row, column: lastColumn },
+    };
+    const next = moves[event.key];
+    if (next === undefined) return undefined;
+    return {
+      row: Math.max(0, Math.min(rows.length - 1, next.row)),
+      column: Math.max(0, Math.min(columns.length - 1, next.column)),
+    };
+  }
+
+  /** Scrolls a row fully into view below the sticky header. */
+  function revealRow(index: number): void {
+    const top = index * rowHeight;
+    const room = viewport.clientHeight - head.offsetHeight;
+    if (top < viewport.scrollTop) viewport.scrollTop = top;
+    else if (top + rowHeight > viewport.scrollTop + room) {
+      viewport.scrollTop = top + rowHeight - room;
+    }
+  }
+
+  /**
+   * Moves keyboard focus to a cell, scrolling it in and rendering it first: the row a key moves
+   * to is often outside the window, where there is no node to focus yet.
+   */
+  function focusCell(row: number, column: number): void {
+    active.row = row;
+    active.column = column;
+    revealRow(row);
+    render();
+    const cell = nodeFor(row)?.children[column];
+    if (cell instanceof HTMLElement) cell.focus();
+  }
+
+  sizer.addEventListener("focusin", (event) => {
+    const cell = (event.target as Element | null)?.closest<HTMLElement>(".cell");
+    const rowNode = cell?.closest<HTMLElement>(".grid-row");
+    if (cell === null || cell === undefined || rowNode === null || rowNode === undefined) return;
+    const index = Number(rowNode.dataset.index ?? "-1");
+    if (index < 0) return;
+    active.row = index;
+    active.column = Array.prototype.indexOf.call(rowNode.children, cell);
+    syncTabStop();
   });
 
   sizer.addEventListener("dblclick", (event) => {
@@ -487,6 +614,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
   function reset(): void {
     pool = [];
     slotRow = [];
+    tabStop = undefined;
     sizer.replaceChildren();
   }
 
@@ -498,6 +626,8 @@ export function createGrid(deps: GridDeps = {}): Grid {
     node,
     rowCount: () => rows.length,
     rowAt: (index) => rows[index],
+    findIndex: (predicate) => rows.findIndex(predicate),
+    isEditing: () => editing !== undefined,
     columnNames: () => columns.map((column) => column.name),
     selectedIndex: () => selected,
     selectedIndexes: () => [...selection].sort((a, b) => a - b),
@@ -506,6 +636,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     layout: schedule,
     setColumns: (next) => {
       columns = [...next];
+      active.column = 0;
       closeEdit();
       reset();
       renderHead();
@@ -517,10 +648,45 @@ export function createGrid(deps: GridDeps = {}): Grid {
       notifiedForCount = -1;
       selected = undefined;
       selection.clear();
+      active.row = 0;
       closeEdit();
       reset();
       setHeight();
       viewport.scrollTop = 0;
+      render();
+    },
+    replaceRows: (next, keyOf) => {
+      const before = rows;
+      rows = [...next];
+      node.setAttribute("aria-rowcount", String(rows.length + 1));
+      notifiedForCount = -1;
+      const picked = [...selection];
+      selection.clear();
+      if (keyOf === undefined) {
+        for (const at of picked) if (at < rows.length) selection.add(at);
+        if (selected !== undefined && selected >= rows.length) selected = undefined;
+      } else if (picked.length > 0) {
+        const keyAt = (at: number | undefined): string | undefined => {
+          const row = at === undefined ? undefined : before[at];
+          return row === undefined ? undefined : keyOf(row);
+        };
+        const keys = new Set(picked.map(keyAt));
+        const anchor = keyAt(selected);
+        selected = undefined;
+        rows.forEach((row, at) => {
+          const key = keyOf(row);
+          if (!keys.has(key)) return;
+          selection.add(at);
+          if (key === anchor) selected = at;
+        });
+      }
+      if (selected === undefined && selection.size > 0) selected = [...selection].at(-1);
+      active.row = Math.min(active.row, Math.max(0, rows.length - 1));
+      closeEdit();
+      if (sizer.querySelector(".grid-message") !== null) reset();
+      setHeight();
+      // Every row may have changed under its slot; the nodes themselves are reused as they are.
+      slotRow = slotRow.map(() => -1);
       render();
     },
     appendRows: (next) => {
@@ -561,6 +727,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
       closeEdit();
       reset();
       sizer.style.height = "auto";
+      viewport.scrollTop = 0;
       sizer.append(el("div", { class: "grid-message", text: message, attrs: { role: "status" } }));
     },
     editCell: (index, column, editor) => {

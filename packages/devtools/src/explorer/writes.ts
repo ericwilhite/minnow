@@ -32,6 +32,17 @@ export function rowKey(table: TableInfo, row: QueryRow): QueryValue | undefined 
   return row[table.uniqueKey] ?? undefined;
 }
 
+/**
+ * A row's key as a string that is equal exactly when the keys are, so rows can be matched across
+ * two reads of the same table — a Date compared by its instant, never by object identity.
+ */
+export function rowIdentity(table: TableInfo, row: QueryRow): string | undefined {
+  const key = rowKey(table, row);
+  if (key === undefined) return undefined;
+  if (key instanceof Date) return `date:${String(key.getTime())}`;
+  return `${typeof key}:${String(key)}`;
+}
+
 export interface CellEdit {
   table: TableInfo;
   column: ColumnInfo;

@@ -39,7 +39,9 @@ if (import.meta.env.DEV) {
 ```
 
 That adds a launcher button in the corner. Click it, or press `Cmd/Ctrl + Shift + D`. `Escape`
-closes the panel again from anywhere inside it, once nothing inside it wants the key.
+closes the panel again from anywhere inside it, once nothing inside it wants the key. In a text
+box, `Escape` belongs to the box: it clears the table search or drops the filter you were writing,
+and leaves the panel open.
 
 Keep the mount behind a development check. The devtools are a separate package precisely so they
 can be left out of a production bundle.
@@ -61,8 +63,10 @@ document.querySelector("minnow-devtools").target = db;
 ```
 
 The database is a property rather than an attribute, because it is an object. Attributes are live:
-change `theme` and the panel repaints in place, change any other and it remounts with the new
-value, so a framework that re-renders them works without a remount of its own.
+change `theme` and the panel repaints in place, change `open` and it opens or closes in place, change
+any other and it remounts with the new value. So a framework that re-renders them works without a
+remount of its own, and binding `open` to your own state never throws away the query being written.
+Assigning `options` an object with the same values as before does nothing.
 
 ## Options
 
@@ -108,7 +112,12 @@ the toolbar.
 **Sorting.** Click a column header to sort ascending, again for descending, again to return to the
 table's own order. The unique key is appended to every sort, so rows with equal values keep a
 stable order instead of shuffling between pages. Drag a header's trailing edge to resize the
-column.
+column. When the unique key is the first column, it stays pinned to the left edge as a wide table
+scrolls sideways, so every row still says which row it is.
+
+Reloading the tables (the ⟳ in the rail, a schema statement in the console, a restore) keeps the
+table you are on, with its filters and sort. Only a filter or sort on a column that no longer
+exists is dropped.
 
 **Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `contains`, `starts with`, `<`, `≤`,
 `>`, `≥`, `like`, `in`, `between`, `is null`, and `is not null`, offered per column type. Values are
@@ -139,8 +148,11 @@ Both give the same rows; one just gets slower the further in you go.
 delaying it, and only when the answer can have changed — a new table or a new filter, never a sort.
 While it runs, the status bar says how many rows are loaded.
 
-**Live.** The **Live** toggle in the toolbar reloads the first page whenever the database commits
-something the table can see — a row the app just wrote shows up without a click. It uses the same
+**Live.** The **Live** toggle in the toolbar reloads the rows whenever the database commits
+something the table can see — a row the app just wrote shows up without a click. It follows every
+row you have loaded, not just the first page, and updates them where they stand: the scroll
+position and the selected rows stay put. A commit that arrives while you are editing a cell waits
+until you save or discard the edit. It uses the same
 [live queries](/docs/extensions/live-queries) an application subscribes with, so the engine decides
 which commits matter and skips the ones that cannot change the rows.
 
@@ -271,13 +283,18 @@ cap. A `SELECT` with its own `LIMIT` is left alone. **Cancel** replaces **Run** 
 running and stops it between batches, where the target can be interrupted.
 
 The status bar shows the timing and, where the engine reports it, the peak memory the statement
-used. **Copy CSV** and **Copy JSON** above the rows copy what is shown; **Download CSV** saves every
-row of the last query as a file, reading it again through the target's cursor when the grid holds
-only the capped part.
+used. **Copy CSV** and **Copy JSON** above the rows copy what is shown, in the order shown;
+**Download CSV** saves every row of the last query as a file, reading it again through the
+target's cursor when the grid holds only the capped part.
+
+**Sorting.** Click a column header to sort the rows you have, ascending, then descending, then back
+to the order the statement returned. This sorts in memory and runs nothing, so it covers the rows
+in the grid — the first 1,000 of a capped result. Write an `ORDER BY` to sort the whole result.
+NULLs sort last both ways.
 
 **Live.** The **Live** toggle follows the last `SELECT` the way the data tab follows a table: the
-rows re-render whenever the database commits something they can see. A statement that changes data
-stops the following until the next `SELECT`.
+rows update whenever the database commits something they can see, keeping your scroll position,
+selection, and sort. A statement that changes data stops the following until the next `SELECT`.
 
 Queries return rows; anything that changes data is described and confirmed first:
 
@@ -285,6 +302,8 @@ Queries return rows; anything that changes data is described and confirmed first
   or `DELETE` counts the rows its `WHERE` clause matches and shows the number beside the
   statement, so a clause that matches the whole table is caught before it runs.
 - An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
+- A prompt that removes something starts with focus on **Cancel**, so a stray `Enter` declines it.
+  While a prompt is open, the rest of the panel cannot be clicked or tabbed to.
 - With `permissions.write: false`, the statement is refused outright and never reaches the database.
 
 That confirmation step covers every statement that changes the database: `INSERT`, `UPDATE`,
@@ -326,8 +345,14 @@ time: select the one you mean inside a script. Non-query statements say that a S
 instead of passing DDL to the query planner.
 
 The Query/Data/Storage and Rows/Plan tab bars use the standard arrow, Home, and End keys. The
-editor divider is keyboard-resizable with Up and Down. In the data grid, arrow keys move between
-visible cells, Space selects a row, and Enter starts editing a cell when editing is available.
+editor divider is keyboard-resizable with Up and Down. `Ctrl + Enter` runs on every platform,
+including macOS, alongside `Cmd + Enter`.
+
+A grid is one stop for `Tab`. Inside it, the arrow keys move between cells, `Page Up` and
+`Page Down` move a screen at a time, `Home` and `End` go to the first and last column, and
+`Cmd/Ctrl` with an arrow, `Home`, or `End` goes to the first or last row loaded. The grid scrolls
+to keep the focused cell in view. Space selects a row, and Enter starts editing a cell when editing
+is available.
 
 ## History
 

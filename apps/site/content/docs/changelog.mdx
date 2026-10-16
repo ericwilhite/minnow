@@ -8,6 +8,78 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Devtools 0.3.6 — October 16, 2026
+
+Published packages: `@minnowdb/devtools@0.3.6`.
+
+A devtools-only release: `@minnowdb/core` stays at 0.15.0, stored formats are unchanged, and no
+migration is needed.
+
+### Fixed
+
+- **Blank gaps in the grid.** Rows could go missing from the middle or the top of a grid, leaving a
+  white band. It happened after scrolling to the end of the rows and back up, and after switching
+  to another tab and back while scrolled. The grid hid the row nodes it did not need but still
+  counted them as showing their old rows, so when one of those rows came back into view, nothing
+  drew it. Both tabs had this.
+- **Enter in the Add row form inserted the row without asking.** The press that submitted the form
+  went on to click the confirmation's button the moment it appeared. Enter on the form's Cancel
+  button did the same. Confirmations now take focus only after the key press that opened them, and
+  Enter on a button presses that button. Enter in the filter editor no longer reopens it.
+- **Live mode lost your place.** Turning Live on, and every commit after that, cut the Data tab
+  back to the first 200 rows, scrolled to the top, cleared the selection, and closed a cell editor
+  mid-edit. Live now follows every loaded row and updates them where they stand. A commit during an
+  edit waits for the edit to finish, and writes find their row by key, so a commit during a
+  confirmation cannot make the grid drop or refresh the wrong row. On the Query tab, a live update
+  keeps the scroll position, selection, and sort. A burst of commits runs one row count, not one
+  per commit.
+- **A catalog reload reset the Data tab.** The rail's refresh, a schema statement in the console,
+  or a restore cleared the open table's filters and sort, and re-expanded a table you had
+  collapsed in the rail. Both are kept now. An older catalog read that finishes after a newer one
+  is dropped.
+- **Confirmations.** A long statement pushed the title and the "affects N rows" count out of reach.
+  The statement now scrolls inside the prompt. While a prompt is open, the rest of the panel is
+  inert, so `Tab` cannot reach it and `Escape` there cannot close the panel under an unanswered
+  prompt. A prompt that removes something starts on **Cancel**.
+- **Escape in a text box closed the panel.** It now clears the table search or drops the filter
+  being written.
+- **Sortable headers were not announced as buttons.** The header button carried the
+  `columnheader` role, which hid that it could be pressed. Each header is now a `columnheader` that
+  holds a button.
+- **Keyboard focus fell to the page body** after toggling a table in the rail, starring a query,
+  closing a context menu with `Escape`, adding a filter, dismissing the Add row form, and closing
+  the panel. Each now hands focus to the control you were on, or to the one that reopens what
+  closed.
+- **`<minnow-devtools>` rebuilt itself too often.** Changing `open`, or assigning `options` an
+  object with the same values, remounted the panel and discarded the query being written. `open`
+  now opens and closes the panel in place, and equal options do nothing. Every remount used to add
+  another copy of the stylesheet; one is shared now.
+- **Smaller fixes.** A date filter chip showed the browser's local rendering of the instant, which
+  can name a different day; it shows the ISO date. Long filter chips are clipped with the full text
+  on hover. `Ctrl + Enter` runs on macOS as well as `Cmd + Enter`. A forced dark theme had the light
+  selection colour and light native scrollbars and menus. On a narrow panel, the Details toggle no
+  longer shows pressed with no sidebar, and the toolbar's key label gives way before the row
+  actions clip. The snapshot "saved" chip clears itself after a few seconds.
+
+### Added
+
+- **Sorting on the Query tab.** Click a result's column header to sort the rows in memory:
+  ascending, descending, then the order the statement returned. Copy CSV and Copy JSON follow the
+  order shown.
+- **Grid keyboard navigation.** A grid is one `Tab` stop. `Page Up` and `Page Down` move a screen,
+  `Home` and `End` go to the first and last column, and `Cmd/Ctrl` with an arrow, `Home`, or `End`
+  goes to the first or last loaded row. Arrows now reach rows outside the rendered window, and the
+  grid scrolls to keep the focused cell in view.
+- **A pinned key column.** When a table's first column is its unique key, it stays at the left edge
+  while a wide table scrolls sideways.
+
+### Performance
+
+- Grid rows are no longer each promoted to their own GPU layer. On a wide table that cost
+  megabytes of layer memory per row and saved nothing, since a recycled row repaints anyway. The
+  rows rendered beyond the viewport now grow to half a screen, so a fast fling shows fewer blank
+  frames. A cell's fixed attributes are written once, not on every scroll.
+
 ## 0.15.0 — October 15, 2026
 
 Release packages: `@minnowdb/core@0.15.0`, `@minnowdb/kysely@0.5.0`, `@minnowdb/devtools@0.3.5`.

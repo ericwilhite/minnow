@@ -6,6 +6,7 @@
  */
 export const styles = `
 :host {
+  color-scheme: light;
   --mdt-bg: #ffffff;
   --mdt-bg-secondary: #f7f7f5;
   --mdt-bg-hover: rgba(55, 53, 47, 0.06);
@@ -41,6 +42,7 @@ export const styles = `
 
 @media (prefers-color-scheme: dark) {
   :host(:not([theme="light"])) {
+    color-scheme: dark;
     --mdt-bg: #1e1e1e;
     --mdt-bg-secondary: #202020;
     --mdt-bg-hover: rgba(255, 255, 255, 0.055);
@@ -65,7 +67,9 @@ export const styles = `
   }
 }
 
+/* Native controls — scrollbars, select menus — follow the panel's palette, not the host page's. */
 :host([theme="dark"]) {
+  color-scheme: dark;
   --mdt-bg: #1e1e1e;
   --mdt-bg-secondary: #202020;
   --mdt-bg-hover: rgba(255, 255, 255, 0.055);
@@ -78,6 +82,7 @@ export const styles = `
   --mdt-border-strong: rgba(255, 255, 255, 0.2);
   --mdt-accent: #529cca;
   --mdt-accent-bg: rgba(82, 156, 202, 0.14);
+  --mdt-selection: rgba(82, 156, 202, 0.42);
   --mdt-danger: #ff7369;
   --mdt-danger-bg: rgba(255, 115, 105, 0.14);
   --mdt-warn: #d9a33f;
@@ -454,7 +459,18 @@ button { font: inherit; color: inherit; }
 .index-badge.building { background: var(--mdt-warn-bg); color: var(--mdt-warn); }
 .index-badge.invalid { background: var(--mdt-danger-bg); color: var(--mdt-danger); }
 
-.crumb-meta { font-family: var(--mdt-mono); font-size: 11px; color: var(--mdt-text-faint); }
+/* The crumb gives way first on a narrow toolbar, so the row actions never clip off the edge. */
+.crumb-meta {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mdt-mono);
+  font-size: 11px;
+  color: var(--mdt-text-faint);
+}
+.toolbar > .btn, .toolbar > select { flex: none; }
 .table-picker { max-width: 180px; }
 
 .filters {
@@ -468,7 +484,9 @@ button { font: inherit; color: inherit; }
   background: var(--mdt-bg-secondary);
 }
 .chips { display: contents; }
+.chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip {
+  max-width: 40ch;
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -522,14 +540,8 @@ input.mini.value { width: 110px; }
   border-bottom: 1px solid var(--mdt-border-strong);
 }
 .grid-th {
-  font: inherit;
-  text-align: left;
-  background: transparent;
-  border: none;
   display: flex;
-  align-items: baseline;
-  gap: 5px;
-  padding: 6px 10px;
+  min-width: 0;
   font-family: var(--mdt-mono);
   font-size: 11.5px;
   font-weight: 500;
@@ -537,6 +549,22 @@ input.mini.value { width: 110px; }
   white-space: nowrap;
   overflow: hidden;
 }
+.grid-th-label {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 6px 10px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: none;
+  overflow: hidden;
+}
+button.grid-th-label { cursor: pointer; }
+button.grid-th-label:focus-visible { outline-offset: -2px; }
 .grid-th.sortable { cursor: pointer; }
 .grid-th.sortable:hover { background: var(--mdt-bg-hover); color: var(--mdt-text); }
 .grid-th.sorted { color: var(--mdt-text); }
@@ -567,7 +595,8 @@ input.mini.value { width: 110px; }
 }
 .grid-resize:hover::after, .grid-resize.dragging::after { background: var(--mdt-accent); width: 2px; }
 
-.grid-viewport { flex: 1; overflow: auto; min-height: 0; }
+/* The padding keeps a cell that keyboard focus scrolls to from landing under the sticky header. */
+.grid-viewport { flex: 1; overflow: auto; min-height: 0; scroll-padding-top: 31px; }
 .grid-surface { position: relative; width: max-content; min-width: 100%; }
 .grid-sizer { position: relative; }
 .grid-row {
@@ -578,9 +607,30 @@ input.mini.value { width: 110px; }
   height: 26px;
   display: grid;
   border-bottom: 1px solid var(--mdt-border);
-  will-change: transform;
 }
 .grid-row:hover { background: var(--mdt-bg-hover); }
+/*
+ * A key in the first column stays put while a wide table scrolls sideways. It needs an opaque
+ * background to cover the cells sliding under it, so the row's translucent tints are layered over
+ * the panel colour rather than inherited.
+ */
+.grid-th.pinned, .cell.pinned {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--mdt-bg);
+  box-shadow: inset -1px 0 0 var(--mdt-border);
+}
+.grid-row:hover > .cell.pinned {
+  background: linear-gradient(var(--mdt-bg-hover), var(--mdt-bg-hover)) var(--mdt-bg);
+}
+.grid-row.sel > .cell.pinned {
+  background: linear-gradient(var(--mdt-accent-bg), var(--mdt-accent-bg)) var(--mdt-bg);
+}
+.grid-th.pinned { z-index: 2; }
+.grid-th.pinned.sortable:hover {
+  background: linear-gradient(var(--mdt-bg-hover), var(--mdt-bg-hover)) var(--mdt-bg);
+}
 .cell {
   padding: 0 10px;
   font-family: var(--mdt-mono);
@@ -591,6 +641,8 @@ input.mini.value { width: 110px; }
   text-overflow: ellipsis;
   color: var(--mdt-text);
 }
+/* Inset, so the neighbouring cells and rows, painted later, cannot cover the focus ring. */
+.cell:focus-visible { outline-offset: -2px; }
 .grid-row.sel { background: var(--mdt-accent-bg); }
 .grid-row.sel:hover { background: var(--mdt-accent-bg); }
 .grid-row.editing { background: var(--mdt-bg); z-index: 2; border-bottom-color: transparent; }
@@ -1050,8 +1102,9 @@ input.mini.value { width: 110px; }
   font-size: 11px;
   color: var(--mdt-text-secondary);
 }
+/* Too narrow for the sidebar, so its toggle goes too: a pressed button showing nothing misleads. */
 @container mdt-panel (max-width: 760px) {
-  .detail { display: none; }
+  .detail, .detail-toggle { display: none; }
 }
 
 .storage { flex: 1; display: flex; flex-direction: column; min-height: 0; }
@@ -1071,9 +1124,13 @@ input.mini.value { width: 110px; }
   background: rgba(15, 15, 15, 0.3);
 }
 
+/* A long statement scrolls inside the prompt; the title, the count, and the buttons stay in view. */
 .dialog {
   width: 100%;
   max-width: 440px;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
   background: var(--mdt-bg);
   border: 1px solid var(--mdt-border-strong);
   border-radius: 10px;
@@ -1082,7 +1139,17 @@ input.mini.value { width: 110px; }
 }
 .dialog h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .dialog-head { display: flex; align-items: center; gap: 9px; padding: 13px 16px 0; }
-.dialog-body { padding: 10px 16px 14px; display: flex; flex-direction: column; gap: 10px; }
+.dialog-body {
+  padding: 10px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+}
+.dialog-head, .dialog-foot { flex: none; }
+.dialog-body > .plate { flex: none; }
+.dialog-body > .plate.statement { max-height: 220px; overflow: auto; }
 .dialog-warning {
   display: flex;
   gap: 7px;

@@ -1,4 +1,4 @@
-import { el, icon, iconButton, icons } from "../dom.js";
+import { el, icon, iconButton, icons, keepingFocus } from "../dom.js";
 import { readFlag, writeFlag } from "../storage.js";
 import {
   isEditable,
@@ -239,6 +239,7 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
         "aria-expanded": String(open),
       },
     });
+    chevron.dataset.focusKey = `toggle:${table.name}`;
     chevron.addEventListener("click", () => {
       expanded = open ? undefined : table.name;
       render();
@@ -269,6 +270,7 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
               }),
             ]),
     ]);
+    name.dataset.focusKey = `open:${table.name}`;
     name.addEventListener("click", () => {
       expanded = table.name;
       deps.onPickTable(table);
@@ -283,6 +285,10 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
   }
 
   function render(): void {
+    keepingFocus(list, renderList);
+  }
+
+  function renderList(): void {
     const needle = filter.trim().toLowerCase();
     const shown = catalog.filter((table) => table.name.toLowerCase().includes(needle));
     if (shown.length === 0) {
@@ -322,6 +328,13 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
     filter = search.value;
     render();
   });
+  search.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || search.value.length === 0) return;
+    event.preventDefault();
+    search.value = "";
+    filter = "";
+    render();
+  });
 
   render();
   applyCollapsed();
@@ -333,8 +346,10 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
       render();
     },
     setSelected: (table) => {
+      // Opening a table shows its columns; hearing again about the table already open — a catalog
+      // reload reopens it — leaves a table the reader collapsed collapsed.
+      if (table !== undefined && table !== selected) expanded = table;
       selected = table;
-      if (table !== undefined) expanded = table;
       render();
     },
     setError: (message) => {

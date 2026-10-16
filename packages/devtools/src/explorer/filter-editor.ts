@@ -133,8 +133,9 @@ export function createFilterBar(onChange: () => void): FilterBar {
           renderChips();
           onChange();
         });
-        return el("span", { class: "chip" }, [
-          el("span", { text: describeFilter(filter) }),
+        const text = describeFilter(filter);
+        return el("span", { class: "chip", title: text }, [
+          el("span", { class: "chip-text", text }),
           remove,
         ]);
       }),
@@ -164,6 +165,8 @@ export function createFilterBar(onChange: () => void): FilterBar {
     editor.hidden = true;
     showError(undefined);
     renderChips();
+    // The editor that had focus is gone; the button that opens it again is where focus belongs.
+    open.focus();
     onChange();
   }
 
@@ -176,7 +179,19 @@ export function createFilterBar(onChange: () => void): FilterBar {
   add.addEventListener("click", submit);
   for (const input of [valueInput, secondInput]) {
     input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") submit();
+      if (event.key === "Enter") {
+        // Taken, or the rest of the press clicks "+ filter" — focused by a successful submit —
+        // and opens the editor straight back up.
+        event.preventDefault();
+        submit();
+      }
+      if (event.key === "Escape") {
+        // Abandons the filter being written, and only that.
+        event.preventDefault();
+        editor.hidden = true;
+        showError(undefined);
+        open.focus();
+      }
     });
     input.addEventListener("input", () => {
       showError(undefined);

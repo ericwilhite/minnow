@@ -174,6 +174,15 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
               return true;
             },
           },
+          // The hint says Ctrl or Cmd; on macOS Mod is Cmd alone, so Ctrl needs its own binding.
+          {
+            key: "Ctrl-Enter",
+            preventDefault: true,
+            run: () => {
+              deps.onRun();
+              return true;
+            },
+          },
           ...commands.defaultKeymap,
           ...commands.historyKeymap,
           ...autocomplete.completionKeymap,

@@ -103,7 +103,8 @@ function viewportOf(grid: Grid): FakeElement {
 }
 
 const rowHeight = 26;
-const overscan = 8;
+/** Rows rendered past each end of a viewport `visible` rows tall: at least 8, else half a screen. */
+const overscan = (visible: number): number => Math.max(8, Math.ceil(visible / 2));
 
 function fixture(): Grid {
   const grid = createGrid();
@@ -131,8 +132,8 @@ describe("grid windowing", () => {
   it("pools only the overscan while the viewport is hidden", () => {
     // A hidden tab measures 0px tall, which is how the explorer's first page usually arrives.
     const grid = fixture();
-    expect(shown(grid)).toBe(overscan * 2);
-    expect(pooled(grid)).toBe(overscan * 2 + 1);
+    expect(shown(grid)).toBe(overscan(0) * 2);
+    expect(pooled(grid)).toBe(overscan(0) * 2 + 1);
   });
 
   it("grows the pool when its viewport reports a new height", () => {
@@ -144,17 +145,17 @@ describe("grid windowing", () => {
     viewport.clientHeight = 20 * rowHeight;
     observer?.callback();
     // The render is coalesced onto a frame, like a scroll.
-    expect(shown(grid)).toBe(overscan * 2);
+    expect(shown(grid)).toBe(overscan(0) * 2);
     flushFrames();
 
-    expect(shown(grid)).toBe(20 + overscan * 2);
-    expect(pooled(grid)).toBe(20 + overscan * 2 + 1);
+    expect(shown(grid)).toBe(20 + overscan(20) * 2);
+    expect(pooled(grid)).toBe(20 + overscan(20) * 2 + 1);
     // Every pooled row shows a real, distinct row.
     const indexes = rowsOf(grid)
       .filter((row) => !row.hidden)
       .map((row) => Number(row.dataset.index));
     expect(new Set(indexes).size).toBe(indexes.length);
-    expect(Math.max(...indexes)).toBe(20 + overscan * 2 - 1);
+    expect(Math.max(...indexes)).toBe(20 + overscan(20) * 2 - 1);
   });
 
   it("lays out on request when the environment has no ResizeObserver", () => {
@@ -166,7 +167,7 @@ describe("grid windowing", () => {
     grid.layout();
     flushFrames();
 
-    expect(shown(grid)).toBe(30 + overscan * 2);
+    expect(shown(grid)).toBe(30 + overscan(30) * 2);
   });
 
   it("never shows more rows than there are", () => {

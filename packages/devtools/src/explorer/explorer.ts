@@ -7,6 +7,7 @@ import { createFollower, isLiveTarget, type Follower } from "../live.js";
 import { createMenu, type MenuItem } from "../menu.js";
 import { createGrid, type CellHit, type GridColumn } from "../results/grid.js";
 import { rowToJson, toInsertSql } from "../results/serialize.js";
+import { nextSort } from "../results/sort.js";
 import {
   buildBrowseQuery,
   buildCountQuery,
@@ -41,6 +42,7 @@ import {
   confirmDeleteMany,
   confirmInsert,
   editingBlockedReason,
+  rowIdentity,
   rowKey,
 } from "./writes.js";
 
@@ -103,7 +105,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   });
   live.hidden = follower === undefined;
   let liveOn = false;
-  const detailToggle = button("btn mini", "Details", {
+  const detailToggle = button("btn mini detail-toggle", "Details", {
     title: "Read the selected row in full beside the grid",
     attrs: { "aria-pressed": "false" },
   });
@@ -141,6 +143,9 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   const insertForm = createInsertForm({
     onSubmit: (values) => {
       void commitInsert(values);
+    },
+    onDismiss: () => {
+      addRow.focus();
     },
   });
   const detail = createRowDetail({
@@ -191,6 +196,15 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   /** Rising token: a response from a superseded view is dropped rather than rendered. */
   let generation = 0;
   let total: number | undefined;
+  /** How many rows the live subscription reads: every row loaded when it was last (re)started. */
+  let liveLimit = pageSize;
+  /** A live result that arrived while a cell was being edited, applied once the edit closes. */
+  let pendingLive: { current: TableInfo; rows: QueryRow[] } | undefined;
+  /** Counting is a full scan; while one runs, further requests fold into a single re-count. */
+  let counting = false;
+  let recountQueued = false;
+  /** A live result was dropped because a page was loading; the subscription restarts after it. */
+  let liveMissed = false;
 
   const detailKey = `${deps.storageKey}:detail`;
   let detailOpen = readFlag(detailKey, false);
@@ -232,9 +246,29 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     }));
   }
 
-  /** Counting is a full scan, so it runs beside the first page and never blocks it. */
+  /**
+   * Counting is a full scan, so it runs beside the first page and never blocks it. A burst of
+   * live commits asks for many counts; only one runs at a time, and the burst costs one more.
+   */
   async function count(current: TableInfo, token: number): Promise<void> {
-    total = undefined;
+    if (counting) {
+      recountQueued = true;
+      return;
+    }
+    counting = true;
+    try {
+      await countOnce(current, token);
+    } finally {
+      counting = false;
+    }
+    if (recountQueued) {
+      recountQueued = false;
+      if (table !== undefined) void count(table, generation);
+    }
+  }
+
+  async function countOnce(current: TableInfo, token: number): Promise<void> {
+    if (token === generation) total = undefined;
     try {
       const result = await target.query(buildCountQuery(current, filterBar.filters()));
       if (token !== generation) return;
@@ -253,10 +287,33 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
       : "counting from the start";
   }
 
-  /** Puts a page's rows in the grid and remembers where the next page starts. */
-  function accept(current: TableInfo, rows: QueryRow[], append: boolean): void {
-    if (append) grid.appendRows(rows);
-    else if (rows.length === 0) {
+  /** Matches rows across two reads by their key, for a table that has one. */
+  function keyOf(current: TableInfo): ((row: QueryRow) => string) | undefined {
+    if (current.uniqueKey === undefined) return undefined;
+    return (row) => rowIdentity(current, row) ?? "";
+  }
+
+  /** Where the row with this key is in the grid now, which may not be where it was. */
+  function indexOfKey(current: TableInfo, key: QueryValue): number {
+    const wanted = rowIdentity(current, { [current.uniqueKey ?? ""]: key });
+    if (wanted === undefined) return -1;
+    return grid.findIndex((row) => rowIdentity(current, row) === wanted);
+  }
+
+  /**
+   * Puts rows in the grid and remembers where the next page starts. A live result replaces the
+   * rows where they stand, so whoever is reading row 300 is still reading it after a commit.
+   */
+  function accept(
+    current: TableInfo,
+    rows: QueryRow[],
+    mode: "replace" | "append" | "live",
+    limit = pageSize,
+  ): void {
+    if (mode === "append") grid.appendRows(rows);
+    else if (mode === "live" && rows.length > 0 && grid.rowCount() > 0) {
+      grid.replaceRows(rows, keyOf(current));
+    } else if (rows.length === 0) {
       // An empty grid with only a small "0 rows" in the status bar reads as something having
       // gone wrong. Say which of the two empties it is, since one of them has an obvious fix.
       grid.setRows([]);
@@ -270,7 +327,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     // Delete row stays enabled with nothing to delete.
     updateRowActions();
     showDetail();
-    exhausted = rows.length < pageSize;
+    exhausted = rows.length < limit;
     const last = rows[rows.length - 1];
     cursor = last === undefined ? cursor : cursorFrom(last, current, sort);
   }
@@ -289,7 +346,14 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
       });
       const page = await target.query(sql);
       if (token !== generation) return;
-      accept(current, page.rows, append);
+      accept(current, page.rows, append ? "append" : "replace");
+      // Live follows every loaded row, so a page that grew them grows the subscription too. A
+      // live result dropped while the page loaded may be newer than the page; restarting the
+      // subscription delivers the current rows again.
+      if (liveOn && (append || liveMissed)) {
+        liveMissed = false;
+        follow(current, grid.rowCount());
+      }
       const elapsed = Math.round(performance.now() - started);
       setStatus(describeCount(), pagingLabel(current), `${String(elapsed)}ms`);
     } catch (error) {
@@ -313,6 +377,9 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     const token = generation;
     cursor = undefined;
     exhausted = false;
+    pendingLive = undefined;
+    liveMissed = false;
+    liveLimit = pageSize;
     grid.setColumns(columnsFor(current));
     setStatus("loading…");
     follow(current);
@@ -328,27 +395,39 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     await fetchPage(current, generation, true);
   }
 
-  /** Follows the first page, so a commit elsewhere in the app shows up here without a click. */
-  function follow(current: TableInfo): void {
+  /**
+   * Follows every loaded row, so a commit elsewhere in the app shows up here without a click — and
+   * without cutting a grid scrolled past the first page back to it.
+   */
+  function follow(current: TableInfo, loaded = pageSize): void {
     if (follower === undefined) return;
     if (!liveOn) {
       follower.stop();
       return;
     }
     const token = generation;
+    const limit = Math.max(pageSize, loaded);
+    liveLimit = limit;
     follower.follow(
       buildPageQuery({
         table: current,
         filters: filterBar.filters(),
         ...(sort === undefined ? {} : { sort }),
-        limit: pageSize,
+        limit,
       }),
       (result: QueryResult) => {
-        if (token !== generation) return;
-        cursor = undefined;
-        accept(current, result.rows, false);
-        void count(current, token);
-        setStatus(describeCount(), `live · ${new Date().toLocaleTimeString()}`);
+        if (token !== generation || limit !== liveLimit) return;
+        // Applied over a page in flight, the page would land on top of it; the subscription is
+        // restarted once the page is in instead.
+        if (inFlight !== undefined) {
+          liveMissed = true;
+          return;
+        }
+        if (grid.isEditing()) {
+          pendingLive = { current, rows: result.rows };
+          return;
+        }
+        applyLive(current, result.rows, token);
       },
       (error) => {
         setStatus(`live update failed: ${messageOf(error)}`);
@@ -356,11 +435,26 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     );
   }
 
+  function applyLive(current: TableInfo, rows: QueryRow[], token: number): void {
+    pendingLive = undefined;
+    cursor = undefined;
+    accept(current, rows, "live", liveLimit);
+    void count(current, token);
+    setStatus(describeCount(), `live · ${new Date().toLocaleTimeString()}`);
+  }
+
+  /** Applies the live result held back while a cell was edited. */
+  function flushLive(): void {
+    const held = pendingLive;
+    if (held === undefined || held.current !== table) return;
+    applyLive(held.current, held.rows, generation);
+  }
+
   live.addEventListener("click", () => {
     liveOn = !liveOn;
     live.setAttribute("aria-pressed", String(liveOn));
     live.classList.toggle("on", liveOn);
-    if (table !== undefined) follow(table);
+    if (table !== undefined) follow(table, grid.rowCount());
   });
   detailToggle.addEventListener("click", () => {
     setDetailOpen(!detailOpen);
@@ -410,19 +504,31 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     const key = rowKey(current, row);
     if (column === undefined || key === undefined || column.generated !== undefined) return;
 
+    // A menu opened before a live update holds the row's old position; the key says where it is.
+    const at = grid.rowAt(index) === row ? index : indexOfKey(current, key);
+    if (at < 0) return;
     const from = row[columnName] ?? null;
-    grid.editCell(index, columnName, {
+    grid.editCell(at, columnName, {
       initial: formatForInput(from),
       placeholder: inputHint(column.type, column.nullable),
       ...(column.enumValues === undefined ? {} : { choices: column.enumValues }),
-      onCancel: () => undefined,
+      onCancel: flushLive,
       onCommit: (text) => {
         const parsed = parseInput(text, column.type, column.nullable, column.enumValues);
         if (!parsed.ok) {
           setStatus(parsed.message);
+          flushLive();
           return;
         }
-        if (parsed.value === from) return;
+        if (
+          parsed.value === from ||
+          (parsed.value instanceof Date &&
+            from instanceof Date &&
+            parsed.value.getTime() === from.getTime())
+        ) {
+          flushLive();
+          return;
+        }
         void withWrite(
           confirmCellEdit({ table: current, column, key, from, to: parsed.value }),
           async () => {
@@ -435,16 +541,16 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
             });
             // Keyed updates read then mutate, so the row is refetched rather than patched — the
             // grid shows what actually landed, not what was asked for.
-            await refreshRow(current, key, index);
+            await refreshRow(current, key);
             return `updated ${String(changed)} row`;
           },
-        );
+        ).finally(flushLive);
       },
     });
   }
 
   /** Rereads one row after a write, so the grid never shows an optimistic guess. */
-  async function refreshRow(current: TableInfo, key: QueryValue, index: number): Promise<void> {
+  async function refreshRow(current: TableInfo, key: QueryValue): Promise<void> {
     const keyColumn = current.columns.find((column) => column.isUniqueKey);
     if (keyColumn === undefined) return;
     const result = await target.query(
@@ -460,9 +566,14 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
         limit: 1,
       }),
     );
+    if (table !== current) return;
+    // Found again by key: a live update while the write ran may have moved the row.
+    const index = indexOfKey(current, key);
     const row = result.rows[0];
+    if (index < 0) return;
     if (row === undefined) grid.removeRow(index);
     else grid.replaceRow(index, row);
+    updateRowActions();
     showDetail();
   }
 
@@ -494,8 +605,15 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
               current,
               picked.map((entry) => entry.key),
             );
-      // Highest first, so each removal leaves the lower indexes where they were.
-      for (const { index } of [...picked].sort((a, b) => b.index - a.index)) grid.removeRow(index);
+      // Found again by key — the confirmation was open long enough for a live update to move
+      // them — and removed highest first, so each removal leaves the lower indexes where they were.
+      if (table === current) {
+        const indexes = picked
+          .map((entry) => indexOfKey(current, entry.key))
+          .filter((index) => index >= 0)
+          .sort((a, b) => b - a);
+        for (const index of indexes) grid.removeRow(index);
+      }
       if (total !== undefined) total -= removed;
       updateRowActions();
       showDetail();
@@ -509,6 +627,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     await withWrite(confirmInsert(current, values), async () => {
       const inserted = await applyInsert(editor, current, values);
       insertForm.close();
+      addRow.focus();
       await reload({ recount: true });
       return `inserted ${String(inserted)} row`;
     });
@@ -516,9 +635,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
 
   /** Clicking a header cycles ascending, descending, then back to the table's own order. */
   function toggleSort(column: string): void {
-    if (sort?.column !== column) sort = { column, direction: "asc" };
-    else if (sort.direction === "asc") sort = { column, direction: "desc" };
-    else sort = undefined;
+    sort = nextSort(sort, column);
     void reload({ recount: false });
   }
 
@@ -636,14 +753,22 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     return items;
   }
 
-  async function open(name: string, filters?: readonly Filter[]): Promise<void> {
+  async function open(
+    name: string,
+    filters?: readonly Filter[],
+    keep?: { filters: readonly Filter[]; sort: Sort | undefined },
+  ): Promise<void> {
     const current = findTable(catalog, name);
     if (current === undefined) return;
     table = current;
     deps.onOpen?.(current.name);
-    sort = undefined;
+    const has = (column: string): boolean => current.columns.some(({ name }) => name === column);
+    sort = keep?.sort !== undefined && has(keep.sort.column) ? keep.sort : undefined;
     filterBar.setTable(current);
     if (filters !== undefined) filterBar.setFilters(filters);
+    else if (keep !== undefined) {
+      filterBar.setFilters(keep.filters.filter((filter) => has(filter.column)));
+    }
     insertForm.close();
     menu.close();
     updateRowActions();
@@ -677,6 +802,12 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     );
     tablePicker.hidden = catalog.length === 0;
     const reopen = tableToReopen(catalog, table?.name);
+    // The same table, re-read — after a refresh, a DDL statement, a restore — keeps what the
+    // reader set up on it: the filters and the sort, less any on a column that has gone.
+    const keep =
+      reopen !== undefined && reopen === table?.name
+        ? { filters: filterBar.filters(), sort }
+        : undefined;
     if (reopen === undefined) {
       table = undefined;
       deps.onOpen?.(undefined);
@@ -684,7 +815,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
       setStatus("no tables");
       return;
     }
-    await open(reopen);
+    await open(reopen, undefined, keep);
   }
 
   addRow.addEventListener("click", () => {
