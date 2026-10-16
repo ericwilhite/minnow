@@ -3261,12 +3261,51 @@ export function collectFtsCandidates(
       `Full-text candidate limit must be between 1 and ${String(MAX_FTS_CANDIDATE_ROW_IDS)}`,
     );
   }
-  const sets = terms.map(() => new Set<bigint>());
-  let retainedRowIds = 0;
   // Every chunk is strictly sorted by term (the write path refuses anything else), so each
   // query seeks to its first possible posting by binary search and walks forward only while
   // postings can still match: an exact term touches one posting, a prefix or range its run.
-  for (const postings of chunkLists) {
+  // The common case gathers each term's row ids into a list and sorts it as unsigned 64-bit
+  // integers, which is a native numeric sort; hashing every id into a Set and sorting boxed
+  // BigInts through a comparator cost most of a wide range lookup. Only a gather larger than
+  // the limit — duplicates included — needs the exact distinct count, which the Set path keeps.
+  const chunks = [...chunkLists];
+  const lists = terms.map((): bigint[] => []);
+  let gathered = 0;
+  gather: for (const postings of chunks) {
+    for (let index = 0; index < terms.length; index += 1) {
+      const term = terms[index];
+      const list = lists[index];
+      if (term === undefined || list === undefined) continue;
+      for (
+        let position = seekFtsPostingQuery(postings, term);
+        position < postings.length;
+        position += 1
+      ) {
+        const posting = postings[position];
+        if (posting === undefined || !ftsPostingQueryMatches(posting.term, term)) break;
+        gathered += posting.rowIds.length;
+        if (gathered > maxRowIds) break gather;
+        for (const rowId of posting.rowIds) list.push(rowId);
+      }
+    }
+  }
+  if (gathered <= maxRowIds) {
+    return {
+      rowIdsByTerm: lists.map((list) => {
+        const sorted = BigUint64Array.from(list).sort();
+        const unique: bigint[] = [];
+        for (let index = 0; index < sorted.length; index += 1) {
+          const rowId = sorted[index] ?? 0n;
+          if (index === 0 || rowId !== sorted[index - 1]) unique.push(rowId);
+        }
+        return unique;
+      }),
+      overflow: false,
+    };
+  }
+  const sets = terms.map(() => new Set<bigint>());
+  let retainedRowIds = 0;
+  for (const postings of chunks) {
     for (let index = 0; index < terms.length; index += 1) {
       const term = terms[index];
       const set = sets[index];

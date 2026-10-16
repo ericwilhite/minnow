@@ -2621,6 +2621,10 @@ function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
     join.left = bindExpression(join.left, values);
     join.right = bindExpression(join.right, values);
     if (join.on !== undefined) join.on = bindExpression(join.on, values);
+    for (const hint of join.inputHints ?? []) {
+      hint.left = bindExpression(hint.left, values);
+      hint.right = bindExpression(hint.right, values);
+    }
   }
   for (const source of [block.base, ...block.joins]) {
     if (source.derived !== undefined) bindBlock(source.derived, values);
@@ -5312,7 +5316,7 @@ export function executeRowQueryInternal(
   // executions against different rows.
   plan =
     resolution.plan === plan && planContainsFts(plan, "bm25")
-      ? structuredClone(plan)
+      ? clonePlanTree(plan)
       : resolution.plan;
   tables = resolveDerivedRowTables(plan, tables, memory);
   plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
@@ -9377,7 +9381,7 @@ class Parser {
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
     if (cte !== undefined) {
-      const source = structuredClone(cte);
+      const source = clonePlanTree(cte);
       if (this.#peek().text === "(") {
         this.#expectPunctuation("(");
         this.#applyColumnAliases(source);
@@ -9389,7 +9393,7 @@ class Parser {
       return {
         table: `(recursive ${String(this.nextDerivedSequence())}) ${table}`,
         alias,
-        recursive: structuredClone(recursive),
+        recursive: clonePlanTree(recursive),
       };
     }
     if (this.#peek().text === "(") {
@@ -9489,8 +9493,8 @@ class Parser {
     const pair = (index: number, op: ComparisonOperator): Expression => ({
       kind: "condition",
       operator: op,
-      left: structuredClone(left[index] ?? { kind: "literal", value: null }),
-      right: structuredClone(right[index] ?? { kind: "literal", value: null }),
+      left: clonePlanTree(left[index] ?? { kind: "literal", value: null }),
+      right: clonePlanTree(right[index] ?? { kind: "literal", value: null }),
     });
     if (operator === "=" || operator === "!=" || operator === "<>") {
       const join = operator === "=" ? "and" : "or";
@@ -9696,8 +9700,8 @@ class Parser {
       const rangeOver = (low: Expression, high: Expression): Expression => ({
         kind: "logical",
         operator: "and",
-        left: { kind: "condition", operator: ">=", left: structuredClone(left), right: low },
-        right: { kind: "condition", operator: "<=", left: structuredClone(left), right: high },
+        left: { kind: "condition", operator: ">=", left: clonePlanTree(left), right: low },
+        right: { kind: "condition", operator: "<=", left: clonePlanTree(left), right: high },
       });
       // SYMMETRIC also accepts the bounds reversed.
       const range: Expression = symmetric
@@ -9705,7 +9709,7 @@ class Parser {
             kind: "logical",
             operator: "or",
             left: rangeOver(lower, upper),
-            right: rangeOver(structuredClone(upper), structuredClone(lower)),
+            right: rangeOver(clonePlanTree(upper), clonePlanTree(lower)),
           }
         : rangeOver(lower, upper);
       return negated ? { kind: "not", operand: range } : range;
@@ -10063,7 +10067,7 @@ class Parser {
         let when = this.#expression();
         // The simple form CASE x WHEN v desugars to searched equality comparisons.
         if (operand !== undefined) {
-          when = { kind: "condition", operator: "=", left: structuredClone(operand), right: when };
+          when = { kind: "condition", operator: "=", left: clonePlanTree(operand), right: when };
         }
         this.#keyword("THEN");
         branches.push({ when, then: this.#expression() });
@@ -10706,13 +10710,13 @@ class Parser {
     const aggregate = (fn: AggregateName, operand: Expression): Expression => ({
       kind: "call",
       name: fn,
-      arguments: [structuredClone(operand)],
+      arguments: [clonePlanTree(operand)],
     });
     const squares = aggregate("SUM", {
       kind: "binary",
       operator: "*",
-      left: structuredClone(argument),
-      right: structuredClone(argument),
+      left: clonePlanTree(argument),
+      right: clonePlanTree(argument),
     });
     const total = aggregate("SUM", argument);
     // COUNT is an integer, and over an integer argument so are both sums: left integer-typed, the
@@ -10736,9 +10740,9 @@ class Parser {
           kind: "binary",
           operator: "*",
           left: total,
-          right: structuredClone(total),
+          right: clonePlanTree(total),
         },
-        right: structuredClone(count),
+        right: clonePlanTree(count),
       },
     };
     // Bare VARIANCE and STDDEV are the sample forms, as in PostgreSQL.
@@ -10747,10 +10751,10 @@ class Parser {
       ? {
           kind: "binary",
           operator: "-",
-          left: structuredClone(count),
+          left: clonePlanTree(count),
           right: { kind: "literal", value: 1 },
         }
-      : structuredClone(count);
+      : clonePlanTree(count);
     const variance: Expression = { kind: "binary", operator: "/", left: spread, right: divisor };
     if (name.startsWith("VAR")) return variance;
     return { kind: "call", name: "SQRT", arguments: [variance] };
@@ -11093,12 +11097,12 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
             return {
               kind: "call",
               name: "NULLIF",
-              arguments: [structuredClone(expression), structuredClone(expression)],
+              arguments: [clonePlanTree(expression), clonePlanTree(expression)],
             };
           }
           return mapChildExpressions(expression, nullify);
         };
-        const nullified = nullify(structuredClone(item.expression));
+        const nullified = nullify(clonePlanTree(item.expression));
         if (away.count === 0) return item;
         return {
           alias: item.alias,
@@ -11110,7 +11114,7 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
         ...blockParts,
         sql: "(grouping set)",
         select,
-        groupBy: structuredClone(set),
+        groupBy: clonePlanTree(set),
         orderBy: [],
       },
       nextSequence,
@@ -11225,7 +11229,7 @@ function resolveGroupByReferences(
       if (hasAggregate(item.expression) || containsWindow(item.expression)) {
         throw new TypeError("GROUP BY ordinals cannot name an aggregate or window column");
       }
-      resolved.push(structuredClone(item.expression));
+      resolved.push(clonePlanTree(item.expression));
       continue;
     }
     if (expression.kind !== "column" || expression.reference.includes(".")) {
@@ -11247,7 +11251,7 @@ function resolveGroupByReferences(
     }
     const inputColumn = sourceHasColumn(expression.reference);
     if (inputColumn === undefined) return undefined;
-    resolved.push(inputColumn ? expression : structuredClone(item.expression));
+    resolved.push(inputColumn ? expression : clonePlanTree(item.expression));
   }
   return resolved;
 }
@@ -11669,7 +11673,7 @@ function pendingSelectBlock(parts: SelectBlockParts): CompiledQuery {
       distinct: parts.distinct,
       ...(parts.groupingSets === undefined
         ? {}
-        : { groupingSets: structuredClone(parts.groupingSets) }),
+        : { groupingSets: clonePlanTree(parts.groupingSets) }),
     },
     ...(parts.distinct && wildcard ? { distinctWildcard: true } : {}),
   };
@@ -11942,7 +11946,7 @@ export function expandViewSources(
       if (source.derived !== undefined || source.union !== undefined) continue;
       const body = viewFor(source.table);
       if (body === undefined) continue;
-      const expanded = structuredClone(body);
+      const expanded = clonePlanTree(body);
       expandBlock(expanded, depth + 1);
       Object.assign(source, derivedTableSource(expanded, source.alias, nextSequence));
     }
@@ -11950,7 +11954,7 @@ export function expandViewSources(
       expandBlock(inner, depth);
     });
   };
-  const resolved = structuredClone(plan);
+  const resolved = clonePlanTree(plan);
   expandBlock(resolved, 0);
   return resolved;
 }
@@ -12090,7 +12094,7 @@ export function bindPendingSelectShapes(
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (!planHasPendingSelectShapes(plan)) return plan;
-  const bound = structuredClone(plan);
+  const bound = clonePlanTree(plan);
   const preserveUnoptimizedShape = bound.preserveUnoptimizedShape === true;
   delete bound.preserveUnoptimizedShape;
   let sequence = 0;
@@ -12315,7 +12319,7 @@ export function expandNaturalJoins(
       }));
     });
   };
-  const expanded = structuredClone(plan);
+  const expanded = clonePlanTree(plan);
   expandBlock(expanded);
   return expanded;
 }
@@ -12346,7 +12350,7 @@ export function expandSourceColumnAliases(
     }
     // The projection reads from the source exactly as it stands — which for an expanded view is
     // a derived block, not a table name — so the rename wraps it rather than replacing it.
-    const inner: TableSource = structuredClone(source);
+    const inner: TableSource = clonePlanTree(source);
     delete inner.columnAliases;
     const projection: CompiledQuery = {
       sql: "(column aliases)",
@@ -12373,7 +12377,7 @@ export function expandSourceColumnAliases(
     forEachNestedBlock(block, renameBlock);
     for (const source of [block.base, ...block.joins]) rename(source);
   };
-  const expanded = structuredClone(plan);
+  const expanded = clonePlanTree(plan);
   renameBlock(expanded);
   return expanded;
 }
@@ -12426,7 +12430,7 @@ function expandQualifiedWildcards(
     });
     numberRepeatedOutputs(block.select);
   };
-  const expanded = structuredClone(plan);
+  const expanded = clonePlanTree(plan);
   expandBlock(expanded);
   return expanded;
 }
@@ -13048,7 +13052,7 @@ function rewriteMergedReferences(
       const replacement = expression.reference.includes(".")
         ? undefined
         : replacements.get(expression.reference);
-      return replacement === undefined ? expression : structuredClone(replacement);
+      return replacement === undefined ? expression : clonePlanTree(replacement);
     }
     if (expression.kind === "subquery" || expression.kind === "exists") return expression;
     return mapChildExpressions(expression, rewrite);
@@ -13079,7 +13083,7 @@ function mergeFullJoinUsing(parts: SelectBlockParts): SelectBlockParts {
   const [join] = parts.joins;
   if (join?.using === undefined) return parts;
   const { using, ...plain } = join;
-  const merged = structuredClone({ ...parts, joins: [plain] });
+  const merged = clonePlanTree({ ...parts, joins: [plain] });
   const replacements = new Map<string, Expression>(
     using.map((name) => [
       name,
@@ -13235,7 +13239,7 @@ export function mergeJoinColumns(
     });
     if (replacements.size > 0) rewriteMergedReferences(block, replacements);
   };
-  const merged = structuredClone(plan);
+  const merged = clonePlanTree(plan);
   mergeBlock(merged);
   return merged;
 }

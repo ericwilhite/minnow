@@ -48,7 +48,7 @@ import {
   type InsertBatchInput,
   type InsertBatchInputLike,
 } from "./batch.js";
-import { ArtifactCache } from "./artifact-cache.js";
+import { ArtifactCache, ArtifactFamily } from "./artifact-cache.js";
 import {
   estimateBatchBytes,
   estimateBatchBytesSliced,
@@ -262,6 +262,7 @@ import {
   compileCheckExpression,
   compileQuery,
   hasAggregate,
+  splitCondition,
   createRecursiveCteState,
   annotateAvgArgumentScales,
   compileStatement,
@@ -438,6 +439,7 @@ import {
   secondaryIndexTermsCoverNulls,
   secondaryIndexUpdateNeedsPreImages,
   secondaryKeyLocator,
+  secondaryKeyLocatorNumber,
   secondaryTupleComponent,
   secondaryUniqueTerm,
   sortedFtsPostings,
@@ -469,8 +471,18 @@ import {
   trimLiveRows,
 } from "./live-maintenance.js";
 import {
+  ascendingRangeSlots,
+  inOrderedRange,
+  orderedSelectionShape,
+  orderedSelectionTestHooks,
+  zoneMeetsOrderedRange,
+  zoneWithinOrderedRange,
+  type OrderedRange,
+} from "./ordered-selection.js";
+import {
   cachedPointReadTemplate,
   equalRunRange,
+  pointReadSignature,
   pointReadTestHooks,
   resolvePointReadShape,
   valuesAreAscending,
@@ -518,6 +530,200 @@ const MAX_POINT_READ_CANDIDATES = 1_024;
 /** A keyed replay decoding more blocks than this leaves the read to the ordinary path. */
 const MAX_POINT_READ_DELTA_BLOCKS = 256;
 const MAX_POINT_READ_DELTA_HEADER_BLOCKS = 1_024;
+/** An OR with more branches than this is scanned rather than unioned through indexes. */
+const MAX_INDEXED_DISJUNCTION_BRANCHES = 16;
+/**
+ * Resolved point-read plans kept per visible history. Each distinct statement shape over the
+ * table is one entry; a workload with more shapes than this simply re-resolves.
+ */
+const POINT_READ_PLANS_PER_HISTORY = 64;
+
+/** The per-prepare key of one table's visible segments at one snapshot version. */
+function visibleSegmentsMemoKey(table: TableRecord, snapshot: Snapshot): string {
+  return `${table.id}\u0000${String(snapshot.version ?? -1)}`;
+}
+
+/** A `COUNT(*)` answer over the rows a point or index read matched. */
+function countResult(alias: string, count: number): QueryResult {
+  const row: QueryRow = {};
+  if (alias === "__proto__") defineSqlResultProperty(row, alias, count);
+  else row[alias] = count;
+  return { columns: [alias], columnDomains: [null], rows: [row] };
+}
+
+/**
+ * The catalog-state cache key of a table-name set. Table names are only trimmed, never
+ * charset-restricted, so no join separator is collision-free; JSON encoding is. A lone name is
+ * its own key unless it could be mistaken for an encoded list.
+ */
+function catalogStateCacheKey(names: readonly string[]): string {
+  const only = names.length === 1 ? names[0] : undefined;
+  return only !== undefined && !only.startsWith("[") ? only : JSON.stringify(names);
+}
+
+/** One block of an ordered-selection column: its scan position and header statistics. */
+interface OrderedSelectionBlock {
+  readonly id: string;
+  readonly rowStart: number;
+  readonly rowCount: number;
+  readonly nullCount: number;
+  readonly zone: { readonly min: number; readonly max: number } | undefined;
+}
+
+/**
+ * The `take`-th best in-range value of a block (the worst of them when fewer qualify) under the
+ * given direction, or undefined when no slot qualifies: a bounded heap holds the best `take`
+ * values seen, so one pass decides which rows can matter.
+ */
+function boundedOrderedEdge(
+  values: Float64Array,
+  length: number,
+  valid: ((slot: number) => boolean) | undefined,
+  range: OrderedRange,
+  take: number,
+  descending: boolean,
+): number | undefined {
+  // A heap whose root is the worst kept value: the minimum when keeping the largest.
+  const heap = new Float64Array(take);
+  let size = 0;
+  const worse = (left: number, right: number): boolean =>
+    descending ? left < right : left > right;
+  for (let slot = 0; slot < length; slot += 1) {
+    const value = values[slot] ?? 0;
+    if (size === take && !worse(heap[0] ?? 0, value)) continue;
+    if (!inOrderedRange(range, value) || valid?.(slot) === false) continue;
+    let position: number;
+    if (size < take) {
+      position = size;
+      size += 1;
+      // Sift up.
+      while (position > 0) {
+        const parent = (position - 1) >>> 1;
+        if (!worse(value, heap[parent] ?? 0)) break;
+        heap[position] = heap[parent] ?? 0;
+        position = parent;
+      }
+      heap[position] = value;
+      continue;
+    }
+    // Replace the root and sift down.
+    position = 0;
+    for (;;) {
+      const left = position * 2 + 1;
+      if (left >= size) break;
+      const right = left + 1;
+      const child = right < size && worse(heap[right] ?? 0, heap[left] ?? 0) ? right : left;
+      if (!worse(heap[child] ?? 0, value)) break;
+      heap[position] = heap[child] ?? 0;
+      position = child;
+    }
+    heap[position] = value;
+  }
+  return size === 0 ? undefined : heap[0];
+}
+
+/**
+ * A segment's key locators: each row's 32-bit locator and an open-addressing table from
+ * locator to row (slot value row + 1, zero empty), so a candidate probes once per segment.
+ */
+interface SegmentKeyLocators {
+  readonly anchorIds: readonly string[];
+  readonly rowCount: number;
+  /** Row offset of each key block within the segment; the last entry is the row count. */
+  readonly blockStarts: Uint32Array;
+  readonly locators: Uint32Array;
+  /** Rows whose key is NULL, which no locator names; absent when there are none. */
+  readonly nullRows?: Uint8Array;
+  readonly slots: Int32Array;
+  readonly mask: number;
+}
+
+/** Calls `hit` with every row whose key locator is `locator`, in insertion (row) order. */
+function probeSegmentKeyLocators(
+  index: SegmentKeyLocators,
+  locator: number,
+  hit: (row: number) => void,
+): void {
+  let probe = locator & index.mask;
+  for (;;) {
+    const entry = index.slots[probe] ?? 0;
+    if (entry === 0) return;
+    if (index.locators[entry - 1] === locator) hit(entry - 1);
+    probe = (probe + 1) & index.mask;
+  }
+}
+
+/** One append segment of a resolved point read: its search blocks and their zone bounds. */
+interface ResolvedPointReadSegment {
+  readonly searchBlockIds: readonly string[];
+  /** Zone bounds per search block (NaN where a header has none); absent for one block. */
+  readonly zoneMin?: Float64Array;
+  readonly zoneMax?: Float64Array;
+  /** Block ids of every other column the read touches, per block. */
+  readonly otherBlockIds: ReadonlyArray<readonly string[]>;
+}
+
+interface ResolvedPointReadCommon {
+  /** The snapshot version whose visible history this plan resolved. */
+  readonly version: number | null;
+  readonly keyColumn: TableColumnRecord;
+  readonly equalityColumns: ReadonlyMap<string, TableColumnRecord>;
+  /** Storage type of each equality's column, in equality order. */
+  readonly equalityTypes: ReadonlyArray<TableColumnRecord["type"]>;
+  readonly projected: ReadonlyArray<{ column: TableColumnRecord; alias: string }>;
+  /** Set for `SELECT COUNT(*)`: the answer is the matched rows' count under this alias. */
+  readonly count?: string;
+  readonly columns: readonly string[];
+  readonly columnDomains: ReadonlyArray<SqlDomain | null>;
+}
+
+/** One append segment of an index read: its key blocks and every needed column's blocks. */
+interface ResolvedIndexReadSegment {
+  readonly segment: SegmentRecord;
+  readonly anchorIds: readonly string[];
+  /** Block ids per needed column (`neededColumns` order), aligned with `anchorIds`. */
+  readonly blockIds: ReadonlyArray<readonly string[]>;
+}
+
+/**
+ * The value-independent half of a point read over one visible history: either proof that the
+ * shape cannot be served, a keyed replay through mutation deltas, or the append-only search
+ * plan with every block id, zone bound, and buffer-pool key the probes need.
+ */
+type ResolvedPointRead =
+  | { readonly kind: "ineligible"; readonly version: number | null }
+  | (ResolvedPointReadCommon & {
+      readonly kind: "delta";
+      readonly segments: readonly SegmentRecord[];
+    })
+  | (ResolvedPointReadCommon & {
+      readonly kind: "index";
+      readonly table: TableRecord;
+      readonly indexId: string;
+      readonly index: SecondaryIndexRecord;
+      /** The index's leading columns the equalities pin, with the equality pinning each. */
+      readonly prefixColumns: readonly TableColumnRecord[];
+      readonly prefixEqualities: readonly number[];
+      /** Whether the pinned columns leave trailing index columns open (a prefix term). */
+      readonly partial: boolean;
+      /** Equality and projected columns, read per candidate block. */
+      readonly neededColumns: readonly TableColumnRecord[];
+      readonly equalityVectors: readonly number[];
+      readonly projectedVectors: readonly number[];
+      readonly segments: readonly ResolvedIndexReadSegment[];
+    })
+  | (ResolvedPointReadCommon & {
+      readonly kind: "base";
+      readonly searchColumn: TableColumnRecord;
+      /** Index of the equality naming the search column. */
+      readonly searchEquality: number;
+      /** Needed columns other than the search column, in vector order after it. */
+      readonly otherColumns: readonly TableColumnRecord[];
+      /** Per equality and per projection: 0 for the search vector, else 1 + otherColumns index. */
+      readonly equalityVectors: readonly number[];
+      readonly projectedVectors: readonly number[];
+      readonly segments: readonly ResolvedPointReadSegment[];
+    });
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
 /** Candidate lists wider than this scan their blocks instead of probing for exact rows. */
@@ -2412,6 +2618,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     SegmentVisibilityCatalog,
     Map<string, SegmentRecord[]>
   >();
+  /**
+   * Resolved point reads per (visibility catalog, table record, statement signature), checked
+   * against the snapshot version. A visibility catalog is immutable and shared by every
+   * statement until the catalog moves; the weak key retires its plans with it.
+   */
+  readonly #pointReadPlans = new WeakMap<
+    SegmentVisibilityCatalog,
+    Map<TableRecord, Map<string, ResolvedPointRead>>
+  >();
   /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
   readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
@@ -2432,6 +2647,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   readonly #catalogStateCache = new Map<string, QueryCatalogState>();
   #catalogStateEpoch: number | undefined;
+  /** The most recently used key of #catalogStateCache, which a repeat hit need not re-insert. */
+  #catalogStateNewest: string | undefined;
   /**
    * Immutable maps derived from one epoch-gated catalog state. A settled table can retain many
    * historical segment and transaction records after their payloads are reclaimed; rebuilding
@@ -4552,6 +4769,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // but must not give equivalent join permutations different cache identities. Keep the
     // positional table records aligned with this canonical order when reading and unpacking it.
     const catalogNames = names.length > 1 ? [...names].sort() : names;
+    // Steady state: the catalog is unchanged since the last statement and the shared lease
+    // still pins its version with time to spare. Nothing here needs storage, so nothing awaits
+    // before the action itself.
+    if (probe !== undefined) {
+      const state = this.#cachedCatalogStateHit(catalogNames, probe.catalogEpoch);
+      const prepared = state === undefined ? undefined : this.#preparedCatalogStates.get(state);
+      const entry =
+        state === undefined || prepared === undefined
+          ? undefined
+          : this.#acquireCurrentSharedLease(state.manifestVersion);
+      if (entry !== undefined && prepared !== undefined) {
+        try {
+          return await action(entry.lease, prepared.realTables, prepared.visibility);
+        } finally {
+          this.#releaseSharedLease(entry);
+        }
+      }
+    }
     for (;;) {
       const state = await this.#cachedCatalogState(catalogNames, probe);
       let prepared = this.#preparedCatalogStates.get(state);
@@ -4607,17 +4842,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // A probe the caller read moments earlier in the same statement serves: a state read under
     // it is at least as fresh, and the cache is only consulted under its epoch.
     const { catalogEpoch } = probe ?? (await this.store.getCatalogProbe());
-    // Table names are only trimmed, never charset-restricted, so no join separator is
-    // collision-free; JSON encoding is.
-    const key = JSON.stringify(names);
-    if (catalogEpoch === this.#catalogStateEpoch) {
-      const cached = this.#catalogStateCache.get(key);
-      if (cached !== undefined) {
-        this.#catalogStateCache.delete(key);
-        this.#catalogStateCache.set(key, cached);
-        return cached;
-      }
-    }
+    const cached = this.#cachedCatalogStateHit(names, catalogEpoch);
+    if (cached !== undefined) return cached;
+    const key = catalogStateCacheKey(names);
     const state = await this.#queryCatalogState(names);
     // Only a state carrying its own epoch (read atomically with the records) can be cached;
     // the sequential fallback shape cannot prove which epoch it observed.
@@ -4627,11 +4854,31 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       this.#catalogStateEpoch = state.catalogEpoch;
     }
     this.#catalogStateCache.set(key, state);
+    this.#catalogStateNewest = key;
     if (this.#catalogStateCache.size > CATALOG_STATE_CACHE_LIMIT) {
       const oldest = this.#catalogStateCache.keys().next().value;
       if (oldest !== undefined) this.#catalogStateCache.delete(oldest);
     }
     return state;
+  }
+
+  /** The cached catalog state for these names when it is provably current at this epoch. */
+  #cachedCatalogStateHit(
+    names: readonly string[],
+    catalogEpoch: number,
+  ): QueryCatalogState | undefined {
+    if (catalogEpoch !== this.#catalogStateEpoch) return undefined;
+    const key = catalogStateCacheKey(names);
+    const cached = this.#catalogStateCache.get(key);
+    if (cached === undefined) return undefined;
+    // Recency: the oldest entry is the one evicted when the cache is full. Touching the most
+    // recent entry again would only re-hash its key.
+    if (this.#catalogStateNewest !== key) {
+      this.#catalogStateCache.delete(key);
+      this.#catalogStateCache.set(key, cached);
+      this.#catalogStateNewest = key;
+    }
+    return cached;
   }
 
   /** One coherent catalog read assembled from bounded pages under a stable epoch probe. */
@@ -4669,8 +4916,29 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * version and the old one retires as they finish. Returns undefined when the version's
    * manifest disappeared between the catalog read and the lease, so the caller can re-read.
    */
-  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+  /**
+   * The shared lease, taken without storage work: only when it already pins `version`, no
+   * re-pin is in flight, and it has more than half its time left, so no renewal is due.
+   */
+  #acquireCurrentSharedLease(version: number | null): SharedLeaseEntry | undefined {
     if (this.#closed) throw new DatabaseClosedError();
+    const current = this.#sharedLease;
+    if (
+      current?.version !== version ||
+      this.#sharedLeaseMove !== undefined ||
+      current.lease.expiresAtMilliseconds - dateMilliseconds(this.#now()) <=
+        INTERNAL_READ_LEASE_TTL_MS / 2
+    ) {
+      return undefined;
+    }
+    current.refCount += 1;
+    this.#sharedLeaseUses += 1;
+    return current;
+  }
+
+  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+    const reused = this.#acquireCurrentSharedLease(version);
+    if (reused !== undefined) return reused;
     this.#sharedLeaseAcquisitions += 1;
     try {
       for (;;) {
@@ -4683,7 +4951,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const current = this.#sharedLease;
         if (
           current?.version === version &&
-          dateMilliseconds(current.lease.expiresAt) - dateMilliseconds(this.#now()) > 0
+          current.lease.expiresAtMilliseconds - dateMilliseconds(this.#now()) > 0
         ) {
           current.refCount += 1;
           this.#sharedLeaseUses += 1;
@@ -5190,7 +5458,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             if (!(error instanceof UnknownTableError)) throw error;
           }
           throwIfAborted(options.signal);
-          if (point !== undefined) return externalizeQueryResult(point);
+          // A point read never returns a NUL-prefixed value outside a domain column, so a
+          // result with no domain columns is already public, and stays so under re-reading.
+          if (point !== undefined) {
+            return point.columnDomains.every((domain) => domain === null)
+              ? point
+              : externalizeQueryResult(point);
+          }
         }
       }
     }
@@ -6601,7 +6875,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<QueryResult | undefined> {
     pointReadTestHooks.attempted += 1;
     const probe = await this.store.getCatalogProbe();
-    const forwards = await this.#pointReadForwards(probe);
+    // A database that has never rekeyed proves the absence of forwards once per catalog epoch.
+    const forwards =
+      !this.#keyForwardsTableSeen && this.#keyForwardsTableAbsentAt === probe.catalogEpoch
+        ? undefined
+        : await this.#pointReadForwards(probe);
     const forwardedTables =
       forwards === undefined ? undefined : await this.#forwardedTableNames(forwards, probe);
     const result = await this.#withSharedCatalogSnapshot(
@@ -6691,75 +6969,76 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const equalities = forwardKeyEqualities(table, shape.equalities, NO_TABLES, forwards);
       if (equalities !== shape.equalities) shape = { ...shape, equalities: [...equalities] };
     }
-    // Short projections cost fewer allocations as direct lookups. Wide projections keep
-    // a name map so SELECT * never turns catalog binding into quadratic work.
-    const byName =
-      shape.select === "*" || shape.select.length + shape.equalities.length > 8
-        ? new Map(table.columns.map((column) => [column.name, column]))
-        : undefined;
-    const findColumn = (name: string): TableColumnRecord | undefined =>
-      byName === undefined
-        ? table.columns.find((column) => column.name === name)
-        : byName.get(name);
-    const matchesStorageType = (
-      column: TableColumnRecord,
-      value: PointReadEquality["value"],
-    ): boolean =>
-      column.sqlDomain === undefined &&
-      column.hidden !== true &&
-      ((column.type === "number" && typeof value === "number") ||
-        (column.type === "string" && typeof value === "string") ||
-        (column.type === "boolean" && typeof value === "boolean") ||
-        (column.type === "datetime" && value instanceof Date));
-    const equalityColumns = new Map<string, TableColumnRecord>();
-    for (const equality of shape.equalities) {
-      const column = findColumn(equality.column);
-      if (column === undefined || !matchesStorageType(column, equality.value)) return undefined;
-      equalityColumns.set(column.name, column);
+    // Visible history is a function of (visibility catalog, table, snapshot version), and the
+    // resolved plan of that history plus the statement's value-free signature.
+    const signature = pointReadSignature(shape);
+    let byTable = this.#pointReadPlans.get(visibility);
+    let plans = byTable?.get(table);
+    let plan = plans?.get(signature);
+    if (plan?.version !== snapshot.version) {
+      // The history is listed only once the statement's columns prove it a point read.
+      plan = await this.#resolvePointRead(shape, table, snapshot, () =>
+        this.#visibleSegmentRecords(table, snapshot, visibility),
+      );
+      if (byTable === undefined) {
+        byTable = new Map();
+        this.#pointReadPlans.set(visibility, byTable);
+      }
+      if (plans === undefined) {
+        plans = new Map();
+        byTable.set(table, plans);
+      } else if (plans.size >= POINT_READ_PLANS_PER_HISTORY) {
+        plans.clear();
+      }
+      plans.set(signature, plan);
     }
-    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
-    // per-row candidate verification cannot degrade into an unvectorized table scan.
-    const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined) return undefined;
-    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
-    if (keyComponents.length === 0) return undefined;
-    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
-      return undefined;
+    if (plan.kind === "ineligible") return undefined;
+    const result = await this.#servePointRead(plan, shape, snapshot, visibility, options);
+    if (result === undefined || plan.count === undefined) return result;
+    return countResult(plan.count, result.rows.length);
+  }
+
+  /** Executes a resolved point read: a key search, a keyed delta replay, or an index lookup. */
+  async #servePointRead(
+    plan: Exclude<ResolvedPointRead, { kind: "ineligible" }>,
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    // Each execution's literals must match their columns' storage types exactly; any coercion
+    // case belongs to the ordinary executor.
+    const equalities = shape.equalities;
+    for (let index = 0; index < equalities.length; index += 1) {
+      const type = plan.equalityTypes[index];
+      const value = equalities[index]?.value;
+      if (!(
+        (type === "number" && typeof value === "number") ||
+        (type === "string" && typeof value === "string") ||
+        (type === "boolean" && typeof value === "boolean") ||
+        (type === "datetime" && value instanceof Date)
+      )) {
+        return undefined;
+      }
     }
-    // A logical-domain projection is served too: the stored scalar is the tagged internal
-    // value the ordinary executor's pipeline carries for a bare column reference, and both
-    // paths cross the result boundary through the same externalizeQueryResult call, so
-    // reporting the column's domain below makes the answers identical by construction.
-    const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
-    const selected =
-      shape.select === "*"
-        ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
-        : shape.select;
-    for (const item of selected) {
-      const column = findColumn(item.column);
-      if (column === undefined || column.hidden === true) return undefined;
-      projected.push({ column, alias: item.alias });
+    if (plan.kind === "index") {
+      // A scope's staged rows are in no index until it commits, so its reads scan.
+      if (visibility.overlayTransactionId !== undefined) return undefined;
+      return this.#indexReadAtSnapshot(plan, shape, snapshot, options);
     }
-    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
-    if (
-      segments.some((segment) => {
-        const kind = segment.kind;
-        return kind !== "insert" && kind !== "base";
-      })
-    ) {
+    if (plan.kind === "delta") {
       // Update and delete deltas are replayed for the one key instead of the whole table: a
       // scalar key identifies its row in every segment, so the row's history is a handful of
       // small blocks. A composite (hidden) key keeps the ordinary replay.
-      if (keyColumn.hidden === true) return undefined;
       // Outside a scope, a history too long to replay cheaply is one compaction should have
       // folded, and the scan is the honest answer. Inside one, the staged segments cannot fold
       // before the commit and the scan would walk the same segments in full: replay them all.
       return this.#pointReadThroughDeltas(
         shape,
-        keyColumn,
-        segments,
-        equalityColumns,
-        projected,
+        plan.keyColumn,
+        plan.segments,
+        plan.equalityColumns,
+        plan.projected,
         snapshot,
         options,
         visibility.overlayTransactionId === undefined
@@ -6767,84 +7046,70 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           : Number.POSITIVE_INFINITY,
       );
     }
-    // The most selective searchable component wins nothing provable without statistics, so
-    // prefer a numeric component (zone-map pruning plus binary search) over a string one
-    // (per-block reverse dictionary), and fall back to any equality column on the key.
-    const searchColumn =
-      keyComponents.find(
-        (component) => component.type === "number" || component.type === "datetime",
-      ) ??
-      keyComponents.find((component) => component.type === "string") ??
-      keyComponents[0];
-    if (searchColumn === undefined) return undefined;
-    const searchEquality = shape.equalities.find(
-      (equality) => equality.column === searchColumn.name,
-    );
-    if (searchEquality === undefined) return undefined;
-    const searchTarget =
-      searchEquality.value instanceof Date
-        ? dateMilliseconds(searchEquality.value)
-        : searchEquality.value;
-    const neededColumns = [
-      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
-    ];
+    const searchValue = equalities[plan.searchEquality]?.value;
+    if (searchValue === undefined) return undefined;
+    const searchTarget = searchValue instanceof Date ? dateMilliseconds(searchValue) : searchValue;
+    const numericTarget = typeof searchTarget === "number";
     const rows: QueryRow[] = [];
     let candidateBudget = MAX_POINT_READ_CANDIDATES;
-    for (const segment of segments) {
+    const vectors: ColumnVector[] = [];
+    for (const segment of plan.segments) {
       throwIfAborted(options.signal);
-      if (segment.rowCount === 0) continue;
-      const searchBlockIds = segment.columnBlockIds[searchColumn.id] ?? [];
-      if (searchBlockIds.length === 0) return undefined;
-      for (const column of neededColumns) {
-        if ((segment.columnBlockIds[column.id]?.length ?? 0) !== searchBlockIds.length) {
-          return undefined;
+      const blockCount = segment.searchBlockIds.length;
+      let blockIndexes: number[] | undefined;
+      for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+        // A block whose zone map excludes the key cannot hold it. A header without a zone map
+        // carries NaN bounds, which exclude nothing.
+        if (
+          numericTarget &&
+          segment.zoneMin !== undefined &&
+          segment.zoneMax !== undefined &&
+          (searchTarget < (segment.zoneMin[blockIndex] ?? Number.NaN) ||
+            searchTarget > (segment.zoneMax[blockIndex] ?? Number.NaN))
+        ) {
+          continue;
         }
+        (blockIndexes ??= []).push(blockIndex);
       }
-      let blockIndexes = searchBlockIds.map((_, index) => index);
-      // A single block cannot be pruned, so skip the zone lookup entirely for the hot
-      // one-block OLTP table shape.
-      if (typeof searchTarget === "number" && searchBlockIds.length > 1) {
-        const descriptions = await this.#zoneDescriptions(searchBlockIds, snapshot);
-        blockIndexes = blockIndexes.filter((blockIndex) => {
-          const zone = descriptions.get(searchBlockIds[blockIndex] ?? "")?.metadata.zoneMap;
-          return zone === undefined || (zone.min <= searchTarget && searchTarget <= zone.max);
-        });
-      }
-      if (blockIndexes.length === 0) continue;
-      const searchBlocks = await this.#pointReadVectors(
-        blockIndexes.map((blockIndex) => searchBlockIds[blockIndex] ?? ""),
+      if (blockIndexes === undefined) continue;
+      const searchBlocks = await this.#pointReadBlockVectors(
+        segment.searchBlockIds,
+        blockIndexes,
         snapshot,
       );
-      for (const [position, blockIndex] of blockIndexes.entries()) {
+      for (let position = 0; position < blockIndexes.length; position += 1) {
         throwIfAborted(options.signal);
+        const blockIndex = blockIndexes[position] ?? 0;
         const vector = searchBlocks[position];
         if (vector === undefined) return undefined;
-        const blockId = searchBlockIds[blockIndex] ?? "";
-        if (vector.kind !== searchColumn.type) return undefined;
-        const candidates = this.#keySlotsInBlock(blockId, vector, searchTarget);
+        if (vector.kind !== plan.searchColumn.type) return undefined;
+        const candidates = this.#keySlotsInBlock(
+          segment.searchBlockIds[blockIndex] ?? "",
+          vector,
+          searchTarget,
+        );
         if (candidates === undefined) return undefined;
         if (candidates.length === 0) continue;
         candidateBudget -= candidates.length;
         if (candidateBudget < 0) return undefined;
-        const remainingColumns = neededColumns.filter((column) => column.id !== searchColumn.id);
-        const rowBlockIds = remainingColumns.map(
-          (column) => segment.columnBlockIds[column.id]?.[blockIndex] ?? "",
-        );
-        const rowBlocks = await this.#pointReadVectors(rowBlockIds, snapshot);
-        const vectors = new Map<string, ColumnVector>([[searchColumn.name, vector]]);
-        for (const [index, column] of remainingColumns.entries()) {
-          const columnVector = rowBlocks[index];
+        vectors.length = 0;
+        vectors.push(vector);
+        for (let column = 0; column < plan.otherColumns.length; column += 1) {
+          const blockId = segment.otherBlockIds[column]?.[blockIndex] ?? "";
+          const columnVector =
+            (this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+              ColumnVector | undefined) ?? (await this.#pointReadVectors([blockId], snapshot))[0];
           if (columnVector === undefined) return undefined;
-          if (columnVector.kind !== column.type) return undefined;
-          vectors.set(column.name, columnVector);
+          if (columnVector.kind !== plan.otherColumns[column]?.type) return undefined;
+          vectors.push(columnVector);
         }
         for (const slot of candidates) {
           let matches = true;
-          for (const equality of shape.equalities) {
-            const columnVector = vectors.get(equality.column);
+          for (let index = 0; index < equalities.length; index += 1) {
+            const columnVector = vectors[plan.equalityVectors[index] ?? 0];
             if (columnVector === undefined) return undefined;
             const stored = vectorValue(columnVector, slot);
-            const wanted = equality.value;
+            const wanted = equalities[index]?.value;
             const equal =
               wanted instanceof Date
                 ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
@@ -6856,9 +7121,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           if (!matches) continue;
           const row: QueryRow = {};
-          for (const item of projected) {
-            const columnVector = vectors.get(item.column.name);
-            if (columnVector === undefined) return undefined;
+          for (let index = 0; index < plan.projected.length; index += 1) {
+            const item = plan.projected[index];
+            const columnVector = vectors[plan.projectedVectors[index] ?? 0];
+            if (item === undefined || columnVector === undefined) return undefined;
             const value = vectorValue(columnVector, slot);
             if (typeof value === "string" && value.charCodeAt(0) === 0) {
               // A domain column's stored scalar is expected here: it carries the internal
@@ -6878,10 +7144,396 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     return {
-      columns: projected.map((item) => item.alias),
-      columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
+      columns: [...plan.columns],
+      columnDomains: [...plan.columnDomains],
       rows,
     };
+  }
+
+  /**
+   * Vectors for some blocks of one column, from the buffer pool where resident. Misses are
+   * decoded in one batch, so a cold lookup still costs one storage round trip.
+   */
+  async #pointReadBlockVectors(
+    ids: readonly string[],
+    blockIndexes: readonly number[],
+    snapshot: LeasedSnapshot,
+  ): Promise<Array<ColumnVector | undefined>> {
+    const vectors: Array<ColumnVector | undefined> = [];
+    let missing = false;
+    for (const blockIndex of blockIndexes) {
+      const vector = this.#blockCacheGet(ArtifactFamily.blockVector, ids[blockIndex] ?? "") as
+        ColumnVector | undefined;
+      if (vector === undefined) missing = true;
+      vectors.push(vector);
+    }
+    if (!missing) return vectors;
+    return this.#pointReadVectors(
+      blockIndexes.map((blockIndex) => ids[blockIndex] ?? ""),
+      snapshot,
+    );
+  }
+
+  /**
+   * Everything about a point read that does not depend on its values, resolved once per
+   * (visible history, statement shape): the columns its equalities and projection name, the
+   * key proof, and for each segment the search blocks with their zone bounds and the
+   * buffer-pool keys of every block the read may touch. Executions then do no catalog work,
+   * no header reads, and no key-string building — only the probes for their own key.
+   */
+  async #resolvePointRead(
+    shape: PointReadShape,
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    visibleSegments: () => Promise<readonly SegmentRecord[]>,
+  ): Promise<ResolvedPointRead> {
+    const version = snapshot.version;
+    const ineligible: ResolvedPointRead = { kind: "ineligible", version };
+    // Short projections cost fewer allocations as direct lookups. Wide projections keep
+    // a name map so SELECT * never turns catalog binding into quadratic work.
+    const select = shape.select;
+    const byName =
+      !Array.isArray(select) || select.length + shape.equalities.length > 8
+        ? new Map(table.columns.map((column) => [column.name, column]))
+        : undefined;
+    const findColumn = (name: string): TableColumnRecord | undefined =>
+      byName === undefined
+        ? table.columns.find((column) => column.name === name)
+        : byName.get(name);
+    const equalityColumns = new Map<string, TableColumnRecord>();
+    const equalityTypes: Array<TableColumnRecord["type"]> = [];
+    for (const equality of shape.equalities) {
+      const column = findColumn(equality.column);
+      if (column === undefined || column.sqlDomain !== undefined || column.hidden === true) {
+        return ineligible;
+      }
+      equalityColumns.set(column.name, column);
+      equalityTypes.push(column.type);
+    }
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) return ineligible;
+    // A logical-domain projection is served too: the stored scalar is the tagged internal
+    // value the ordinary executor's pipeline carries for a bare column reference, and both
+    // paths cross the result boundary through the same externalizeQueryResult call, so
+    // reporting the column's domain below makes the answers identical by construction.
+    const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
+    const selected = Array.isArray(select)
+      ? select
+      : select === "*"
+        ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
+        : [];
+    for (const item of selected) {
+      const column = findColumn(item.column);
+      if (column === undefined || column.hidden === true) return ineligible;
+      projected.push({ column, alias: item.alias });
+    }
+    const common = {
+      version,
+      keyColumn,
+      equalityColumns,
+      equalityTypes,
+      projected,
+      ...(!Array.isArray(select) && select !== "*" ? { count: select.count } : {}),
+      columns: projected.map((item) => item.alias),
+      columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
+    };
+    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
+    // per-row candidate verification cannot degrade into an unvectorized table scan. Without
+    // it, a ready secondary index on the pinned columns names the candidate rows instead.
+    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
+    if (keyComponents.length === 0) return ineligible;
+    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
+      return this.#resolveIndexRead(shape, table, common, await visibleSegments());
+    }
+    const segments = await visibleSegments();
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return keyColumn.hidden === true ? ineligible : { kind: "delta", ...common, segments };
+    }
+    // The most selective searchable component wins nothing provable without statistics, so
+    // prefer a numeric component (zone-map pruning plus binary search) over a string one
+    // (per-block reverse dictionary), and fall back to any equality column on the key.
+    const searchColumn =
+      keyComponents.find(
+        (component) => component.type === "number" || component.type === "datetime",
+      ) ??
+      keyComponents.find((component) => component.type === "string") ??
+      keyComponents[0];
+    if (searchColumn === undefined) return ineligible;
+    const searchEquality = shape.equalities.findIndex(
+      (equality) => equality.column === searchColumn.name,
+    );
+    if (searchEquality < 0) return ineligible;
+    const otherColumns = [
+      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
+    ].filter((column) => column.id !== searchColumn.id);
+    const vectorIndex = (column: TableColumnRecord): number =>
+      column.id === searchColumn.id
+        ? 0
+        : otherColumns.findIndex((other) => other.id === column.id) + 1;
+    const equalityVectors = shape.equalities.map((equality) =>
+      vectorIndex(equalityColumns.get(equality.column) ?? searchColumn),
+    );
+    const projectedVectors = projected.map((item) => vectorIndex(item.column));
+    const resolvedSegments: ResolvedPointReadSegment[] = [];
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const searchBlockIds = segment.columnBlockIds[searchColumn.id] ?? [];
+      if (searchBlockIds.length === 0) return ineligible;
+      for (const column of otherColumns) {
+        if ((segment.columnBlockIds[column.id]?.length ?? 0) !== searchBlockIds.length) {
+          return ineligible;
+        }
+      }
+      let zones: { zoneMin: Float64Array; zoneMax: Float64Array } | undefined;
+      // A single block cannot be pruned, so skip the zone lookup entirely for the hot
+      // one-block OLTP table shape.
+      if (
+        (searchColumn.type === "number" || searchColumn.type === "datetime") &&
+        searchBlockIds.length > 1
+      ) {
+        const descriptions = await this.#zoneDescriptions(searchBlockIds, snapshot);
+        zones = {
+          zoneMin: new Float64Array(searchBlockIds.length).fill(Number.NaN),
+          zoneMax: new Float64Array(searchBlockIds.length).fill(Number.NaN),
+        };
+        for (const [blockIndex, blockId] of searchBlockIds.entries()) {
+          const zone = descriptions.get(blockId)?.metadata.zoneMap;
+          if (zone === undefined) continue;
+          zones.zoneMin[blockIndex] = zone.min;
+          zones.zoneMax[blockIndex] = zone.max;
+        }
+      }
+      const otherBlockIds = otherColumns.map((column) => segment.columnBlockIds[column.id] ?? []);
+      resolvedSegments.push({ searchBlockIds, ...zones, otherBlockIds });
+    }
+    return {
+      kind: "base",
+      ...common,
+      searchColumn,
+      searchEquality,
+      otherColumns,
+      equalityVectors,
+      projectedVectors,
+      segments: resolvedSegments,
+    };
+  }
+
+  /**
+   * The value-independent half of an index read: a conjunction of equalities that does not cover
+   * the key, over an append-only history, served through a ready key-locator secondary index whose
+   * leading columns it pins. The postings name candidate keys; each candidate row is verified
+   * against every equality, so a stale posting or a locator collision costs a check, never an
+   * answer. Ineligible whenever the general path's index pruning would not apply either.
+   */
+  #resolveIndexRead(
+    shape: PointReadShape,
+    table: TableRecord,
+    common: ResolvedPointReadCommon,
+    segments: readonly SegmentRecord[],
+  ): ResolvedPointRead {
+    const ineligible: ResolvedPointRead = { kind: "ineligible", version: common.version };
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return ineligible;
+    }
+    // The longest pinned prefix of any ready key-locator index, as index pruning would choose.
+    let best:
+      { indexId: string; index: SecondaryIndexRecord; columns: TableColumnRecord[] } | undefined;
+    for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+      if (index.state !== "ready" || index.locator !== "key-hash-v1") continue;
+      const indexColumns = secondaryIndexColumnIds(index).map((columnId) =>
+        table.columns.find((column) => column.id === columnId),
+      );
+      if (indexColumns.some((column) => column === undefined)) continue;
+      const columns: TableColumnRecord[] = [];
+      for (const column of indexColumns as TableColumnRecord[]) {
+        if (!common.equalityColumns.has(column.name)) break;
+        columns.push(column);
+      }
+      if (columns.length === 0) continue;
+      // tuple-v1 postings omit rows NULL in a trailing column, so a prefix read through such an
+      // index could miss a matching row; the general path refuses the same lookup.
+      if (
+        columns.length < indexColumns.length &&
+        !secondaryIndexTermsCoverNulls(index) &&
+        (indexColumns as TableColumnRecord[])
+          .slice(columns.length)
+          .some((column) => column.nullable)
+      ) {
+        continue;
+      }
+      if (best === undefined || columns.length > best.columns.length) {
+        best = { indexId, index, columns };
+      }
+    }
+    if (best === undefined) return ineligible;
+    const prefixEqualities = best.columns.map((column) =>
+      shape.equalities.findIndex((equality) => equality.column === column.name),
+    );
+    if (prefixEqualities.some((position) => position < 0)) return ineligible;
+    const neededColumns = [
+      ...new Set([
+        ...common.equalityColumns.values(),
+        ...common.projected.map((item) => item.column),
+      ]),
+    ];
+    const vectorIndex = (column: TableColumnRecord): number =>
+      neededColumns.findIndex((candidate) => candidate.id === column.id);
+    const resolved: ResolvedIndexReadSegment[] = [];
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const anchorIds = segment.columnBlockIds[common.keyColumn.id] ?? [];
+      if (anchorIds.length === 0) return ineligible;
+      if (Object.values(segment.columnBlockIds).some((ids) => ids.length !== anchorIds.length)) {
+        return ineligible;
+      }
+      const blockIds = neededColumns.map((column) => segment.columnBlockIds[column.id]);
+      if (blockIds.some((ids) => ids === undefined)) return ineligible;
+      resolved.push({ segment, anchorIds, blockIds: blockIds as string[][] });
+    }
+    const indexColumnCount = secondaryIndexColumnIds(best.index).length;
+    return {
+      kind: "index",
+      ...common,
+      table,
+      indexId: best.indexId,
+      index: best.index,
+      prefixColumns: best.columns,
+      prefixEqualities,
+      partial: best.columns.length < indexColumnCount,
+      neededColumns,
+      equalityVectors: shape.equalities.map((equality) =>
+        vectorIndex(common.equalityColumns.get(equality.column) ?? common.keyColumn),
+      ),
+      projectedVectors: common.projected.map((item) => vectorIndex(item.column)),
+      segments: resolved,
+    };
+  }
+
+  /** Executes an index read: postings for the pinned prefix, then exact checks per candidate. */
+  async #indexReadAtSnapshot(
+    plan: Extract<ResolvedPointRead, { kind: "index" }>,
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    const equalities = shape.equalities;
+    let term = "";
+    try {
+      for (const [position, column] of plan.prefixColumns.entries()) {
+        const value = equalities[plan.prefixEqualities[position] ?? -1]?.value;
+        if (value === undefined) return undefined;
+        term += secondaryIndexComponentTerm(plan.index, column, position, value);
+      }
+    } catch {
+      return undefined;
+    }
+    const upToVersion = snapshot.version ?? -1;
+    const result = await this.#readFtsCandidatesMemoized(
+      snapshot,
+      plan.table.id,
+      plan.index.storageColumnId,
+      [{ term, prefix: plan.partial }],
+      upToVersion,
+    );
+    if (result.overflow || !result.hasBase || result.coversVersion > upToVersion) return undefined;
+    const candidates = result.rowIdsByTerm[0] ?? [];
+    if (candidates.length > MAX_POINT_READ_CANDIDATES) return undefined;
+    const rows: QueryRow[] = [];
+    if (candidates.length === 0) {
+      return { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
+    }
+    const locatorNumbers = candidates.map((candidate) =>
+      candidate <= 0xffff_ffffn ? Number(candidate) : -1,
+    );
+    let budget = MAX_POINT_READ_CANDIDATES;
+    const vectors: ColumnVector[] = [];
+    for (const entry of plan.segments) {
+      throwIfAborted(options.signal);
+      const locators = await this.#segmentKeyLocators(
+        entry.segment,
+        entry.anchorIds,
+        plan.keyColumn,
+        snapshot,
+      );
+      if (locators === undefined) return undefined;
+      const hits: number[] = [];
+      for (const locator of locatorNumbers) {
+        if (locator >= 0) probeSegmentKeyLocators(locators, locator, (row) => hits.push(row));
+      }
+      if (hits.length === 0) continue;
+      budget -= hits.length;
+      if (budget < 0) return undefined;
+      // Scan order within the segment, as the ordinary executor would return the rows.
+      const ordered = Uint32Array.from(hits).sort();
+      let blockIndex = -1;
+      for (let position = 0; position < ordered.length; position += 1) {
+        const row = ordered[position] ?? 0;
+        if (position > 0 && row === ordered[position - 1]) continue;
+        let block = blockIndex < 0 ? 0 : blockIndex;
+        while (
+          block + 1 < entry.anchorIds.length &&
+          (locators.blockStarts[block + 1] ?? 0) <= row
+        ) {
+          block += 1;
+        }
+        if (block !== blockIndex) {
+          blockIndex = block;
+          vectors.length = 0;
+          for (const [column, ids] of entry.blockIds.entries()) {
+            const blockId = ids[block] ?? "";
+            const vector =
+              (this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+                ColumnVector | undefined) ?? (await this.#pointReadVectors([blockId], snapshot))[0];
+            if (vector === undefined || vector.kind !== plan.neededColumns[column]?.type) {
+              return undefined;
+            }
+            vectors.push(vector);
+          }
+        }
+        const slot = row - (locators.blockStarts[block] ?? 0);
+        let matches = true;
+        for (let index = 0; index < equalities.length; index += 1) {
+          const columnVector = vectors[plan.equalityVectors[index] ?? -1];
+          if (columnVector === undefined) return undefined;
+          const stored = vectorValue(columnVector, slot);
+          const wanted = equalities[index]?.value;
+          const equal =
+            wanted instanceof Date
+              ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
+              : stored === wanted;
+          if (!equal) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) continue;
+        const output: QueryRow = {};
+        for (let index = 0; index < plan.projected.length; index += 1) {
+          const item = plan.projected[index];
+          const columnVector = vectors[plan.projectedVectors[index] ?? -1];
+          if (item === undefined || columnVector === undefined) return undefined;
+          const value = vectorValue(columnVector, slot);
+          if (typeof value === "string" && value.charCodeAt(0) === 0) {
+            // As for a key read: only a domain column's tagged scalar is provably reproduced.
+            if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return undefined;
+          }
+          if (item.alias === "__proto__") defineSqlResultProperty(output, item.alias, value);
+          else output[item.alias] = value;
+        }
+        rows.push(output);
+      }
+    }
+    return { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
   }
 
   /**
@@ -7072,13 +7724,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     vector: ColumnVector & { kind: "string" },
     value: string,
   ): number | undefined {
-    let reverse = this.#cacheGet(`drd ${blockId}`) as Map<string, number> | undefined;
+    let reverse = this.#blockCacheGet(ArtifactFamily.reverseDictionary, blockId) as
+      Map<string, number> | undefined;
     if (reverse === undefined) {
       reverse = new Map<string, number>();
       for (const [code, entry] of vector.dictionary.entries()) reverse.set(entry, code);
       let bytes = 64;
       for (const entry of vector.dictionary) bytes += 32 + entry.length;
-      this.#cachePut(`drd ${blockId}`, reverse, bytes);
+      this.#blockCachePut(ArtifactFamily.reverseDictionary, blockId, reverse, bytes);
     }
     return reverse.get(value);
   }
@@ -7941,7 +8594,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ...new Set(
             predicates.flatMap((predicate) =>
               (segment.columnBlockIds[predicate.column.id] ?? []).filter(
-                (blockId) => this.#cacheGet(`zi ${blockId}`) === undefined,
+                (blockId) =>
+                  this.#blockCacheGet(ArtifactFamily.zoneDescription, blockId) === undefined,
               ),
             ),
           ),
@@ -7951,14 +8605,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           for (const [index, blockId] of uncachedIds.entries()) {
             const bytes = fetched[index];
             if (bytes === undefined) return true;
-            this.#cachePut(`zi ${blockId}`, inspectBlock(bytes), ZONE_DESCRIPTION_CACHE_BYTES);
+            this.#blockCachePut(
+              ArtifactFamily.zoneDescription,
+              blockId,
+              inspectBlock(bytes),
+              ZONE_DESCRIPTION_CACHE_BYTES,
+            );
           }
         }
         for (let blockIndex = 0; blockIndex < firstIds.length; blockIndex += 1) {
           let canMatch = true;
           for (const predicate of predicates) {
             const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
-            const description = this.#cacheGet(`zi ${blockId}`) as
+            const description = this.#blockCacheGet(ArtifactFamily.zoneDescription, blockId) as
               ReturnType<typeof inspectBlock> | undefined;
             if (description === undefined) return true;
             if (description.type !== predicate.column.type) return true;
@@ -11998,6 +12657,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (secondaryIndexPredicates(reported, record).length > 0) {
           notes.push("a ready secondary index prunes the scan to candidate row groups");
         }
+        if (secondaryIndexDisjunctions(reported, record).length > 0) {
+          notes.push("ready secondary indexes serve every branch of an OR");
+        }
         const referenced = referencedColumns(
           reported,
           new Map([[record.name, record.columns.map((column) => column.name)]]),
@@ -14843,11 +15505,29 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         };
       }
       const baseSegments = indexed.segments;
+      // A statement decided by one end of a column's values — a top-N, a keyset page, MIN or
+      // MAX — reads only the rows that can hold those values. The selection is numbered over
+      // the whole (unpruned) append history, as an index selection is over its own segments.
+      const ordered =
+        cursor === undefined &&
+        indexed.rows === undefined &&
+        !indexed.pruned &&
+        visibility.overlayTransactionId === undefined &&
+        !orderedSelectionTestHooks.disabled
+          ? await this.#orderedRowSelection(plan, freshBaseTable, baseSegments, snapshot)
+          : undefined;
+      if (ordered !== undefined) {
+        orderedSelectionTestHooks.served += 1;
+        // Rows counted past rather than selected leave only the rest of the OFFSET to apply.
+        if (ordered.offset !== undefined) plan = { ...plan, offset: ordered.offset };
+      }
+      throwIfAborted(options.signal);
+      const selectedRows = indexed.rows ?? ordered?.rows;
       // Zone-map elimination composes after index pruning: whole row groups whose statistics
-      // reject the plan's predicates never stream at all. An exact index row selection is
-      // numbered over the pruned blocks, so it is used as is.
+      // reject the plan's predicates never stream at all. An exact row selection is numbered
+      // over the segments it was taken from, so it is used as is.
       const zonePruned =
-        indexed.rows === undefined
+        selectedRows === undefined
           ? await this.#zonePrunedStreamSegments(
               plan,
               freshBaseTable,
@@ -14930,7 +15610,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 snapshot,
                 requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
                 visibility,
-                plan,
+                await this.#withJoinInputHints(plan, table),
               ),
             );
             throwIfAborted(options.signal);
@@ -14979,9 +15659,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             try {
               const streamedResult = await prepared.executeAsync({
                 loadScanWindow: streamed.load,
-                ...(indexed.rows === undefined
+                ...(selectedRows === undefined
                   ? {}
-                  : { scanRows: streamed.remapScanRows?.(indexed.rows) ?? indexed.rows }),
+                  : { scanRows: streamed.remapScanRows?.(selectedRows) ?? selectedRows }),
                 ...(options.signal === undefined ? {} : { signal: options.signal }),
               });
               options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -14995,9 +15675,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             ...(spillPageRows === undefined ? {} : { spillPageRows }),
             spillStore: this.#leasedSpillStore(),
             loadScanWindow: streamed.load,
-            ...(indexed.rows === undefined
+            ...(selectedRows === undefined
               ? {}
-              : { scanRows: streamed.remapScanRows?.(indexed.rows) ?? indexed.rows }),
+              : { scanRows: streamed.remapScanRows?.(selectedRows) ?? selectedRows }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -15027,6 +15707,73 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * The plan a LEFT join side is prepared under: its key's inherited constants (`inputHints`)
+   * join the predicates that index and key pruning read, so the side is read for the pinned keys
+   * only. The hints are never evaluated, and a superset is harmless — a side row outside them
+   * matches no surviving outer row — so only hints whose literal is exactly the column's storage
+   * type are used; anything a coercion could make equal to a pruned row stays out. Key forwards
+   * are left to the ordinary read: a constant naming a retired key forwards in WHERE, not here.
+   */
+  async #withJoinInputHints(plan: CompiledQuery, table: TableRecord): Promise<CompiledQuery> {
+    const joins = plan.joins.filter((join) => join.table === table.name);
+    const join = joins[0];
+    const hints = join?.inputHints;
+    if (
+      join === undefined ||
+      hints === undefined ||
+      joins.length !== 1 ||
+      plan.base.table === table.name ||
+      join.derived !== undefined ||
+      join.union !== undefined ||
+      join.recursive !== undefined ||
+      join.windowed !== undefined ||
+      join.columnAliases !== undefined
+    ) {
+      return plan;
+    }
+    if (
+      this.#keyForwardsTableSeen ||
+      (await this.#catalogFacts()).keyForwardsTableId !== undefined
+    ) {
+      return plan;
+    }
+    const usable = hints.filter((hint) => {
+      const column = hint.left.kind === "column" ? hint.left : hint.right;
+      const value = hint.left.kind === "column" ? hint.right : hint.left;
+      if (column.kind !== "column" || !column.reference.startsWith(`${join.alias}.`)) return false;
+      const record = table.columns.find(
+        (candidate) => candidate.name === column.reference.slice(join.alias.length + 1),
+      );
+      if (record === undefined || record.sqlDomain !== undefined || record.hidden === true) {
+        return false;
+      }
+      const literals =
+        value.kind === "literal" ? [value] : value.kind === "list" ? value.items : undefined;
+      return (
+        literals !== undefined &&
+        literals.length > 0 &&
+        literals.every(
+          (literal) =>
+            literal.kind === "literal" &&
+            literal.internalSqlValue !== true &&
+            literal.sqlDomain === undefined &&
+            ((record.type === "number" &&
+              typeof literal.value === "number" &&
+              Number.isFinite(literal.value)) ||
+              (record.type === "string" &&
+                typeof literal.value === "string" &&
+                !literal.value.startsWith("\u0000")) ||
+              (record.type === "boolean" && typeof literal.value === "boolean") ||
+              (record.type === "datetime" &&
+                literal.value instanceof Date &&
+                Number.isFinite(dateMilliseconds(literal.value)))),
+        )
+      );
+    });
+    return usable.length === 0 ? plan : { ...plan, predicates: [...plan.predicates, ...usable] };
+  }
+
+  /**
    * Zone-map row-group pruning for the streamed scan: header-only inspection of the
    * predicate columns' blocks selects the block indexes that can match, and the scan then
    * streams only those row groups — the same elimination the materialized pruned projection
@@ -15051,6 +15798,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return kind === "insert" || kind === "base";
     });
     if (appends.length + mutations.length !== segments.length) return undefined;
+    // One row group in all can only be dropped whole, which the scan's own predicate pass
+    // settles as cheaply as its header would; the small tables most OLTP reads hit skip the work.
+    const anchor = table.columns[0];
+    if (
+      mutations.length === 0 &&
+      anchor !== undefined &&
+      appends.reduce(
+        (total, segment) => total + (segment.columnBlockIds[anchor.id]?.length ?? 0),
+        0,
+      ) <= 1
+    ) {
+      return undefined;
+    }
     const predicates = zonePredicates(plan, table);
     if (predicates.length === 0) return undefined;
     if (planContainsFts(plan, "bm25") && !this.#ftsIndexServesScoring(plan, table, segments)) {
@@ -15127,7 +15887,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // Block descriptions are immutable per id, like decoded blocks, so a repeated pruned
     // query pays zero store reads for elimination once its descriptions are resident.
     const missingIds = predicateBlockIds.filter((id) => {
-      const cached = this.#cacheGet(`zi ${id}`) as ReturnType<typeof inspectBlock> | undefined;
+      const cached = this.#blockCacheGet(ArtifactFamily.zoneDescription, id) as
+        ReturnType<typeof inspectBlock> | undefined;
       if (cached === undefined) return true;
       descriptions.set(id, cached);
       return false;
@@ -15145,7 +15906,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // checksum, and payload-validation cost of blocks it is about to discard.
         const description = inspectBlock(bytes);
         descriptions.set(id, description);
-        this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+        this.#blockCachePut(
+          ArtifactFamily.zoneDescription,
+          id,
+          description,
+          ZONE_DESCRIPTION_CACHE_BYTES,
+        );
       }
     }
     const prunedSegments: SegmentRecord[] = [];
@@ -15445,27 +16211,82 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * own predicate settles such collisions. Hashing a block's keys yields to the event loop, so
    * the first indexed lookup on a large table does not hold it for every block.
    */
-  async #blockKeyLocators(
-    blockId: string,
-    vector: ColumnVector,
-    type: SimpleDataType,
-  ): Promise<Map<bigint, number | number[]>> {
-    const cached = this.#cacheGet(`dkl ${blockId}`) as Map<bigint, number | number[]> | undefined;
-    if (cached !== undefined) return cached;
-    const locators = new Map<bigint, number | number[]>();
-    for (let row = 0; row < vector.length; row += 1) {
-      if ((row & 4095) === 0) await maybeYieldToEventLoop();
-      const value = vectorValue(vector, row);
-      if (value === null) continue;
-      const locator = secondaryKeyLocator(type, value);
-      const existing = locators.get(locator);
-      if (existing === undefined) locators.set(locator, row);
-      else if (typeof existing === "number") locators.set(locator, [existing, row]);
-      else existing.push(row);
+  /**
+   * One segment's key locators as an open-addressing hash table over its rows, pooled per
+   * segment. Undefined when a key block's physical type is not the key column's.
+   */
+  async #segmentKeyLocators(
+    segment: SegmentRecord,
+    anchorIds: readonly string[],
+    keyColumn: TableColumnRecord,
+    snapshot: LeasedSnapshot,
+  ): Promise<SegmentKeyLocators | undefined> {
+    const cached = this.#blockCacheGet(ArtifactFamily.segmentKeyLocators, segment.id) as
+      SegmentKeyLocators | undefined;
+    // Segment ids are unique, but the entry is checked against the blocks it hashed anyway: a
+    // pooled table is only ever reused for exactly the key blocks it was built from.
+    if (
+      cached?.anchorIds.length === anchorIds.length &&
+      cached.anchorIds.every((id, index) => id === anchorIds[index])
+    ) {
+      return cached;
     }
-    // A Map entry for a small bigint and a row number: key, value, hash slot, chain pointer.
-    this.#cachePut(`dkl ${blockId}`, locators, 64 + locators.size * 48);
-    return locators;
+    const decoded = await this.#decodedBlocksThroughCache(anchorIds, snapshot);
+    const vectors: ColumnVector[] = [];
+    const blockStarts = new Uint32Array(anchorIds.length + 1);
+    let rowCount = 0;
+    for (const [blockIndex, block] of decoded.entries()) {
+      if (block.column.type !== keyColumn.type) return undefined;
+      const vector = this.#blockColumnVector(anchorIds[blockIndex] ?? "", block);
+      vectors.push(vector);
+      blockStarts[blockIndex] = rowCount;
+      rowCount += vector.length;
+    }
+    blockStarts[anchorIds.length] = rowCount;
+    const locators = new Uint32Array(rowCount);
+    let nullRows: Uint8Array | undefined;
+    // Load factor at most one half keeps linear probe runs short.
+    let capacity = 2;
+    while (capacity < rowCount * 2) capacity *= 2;
+    const slots = new Int32Array(capacity);
+    const mask = capacity - 1;
+    let row = 0;
+    for (const vector of vectors) {
+      for (let slot = 0; slot < vector.length; slot += 1, row += 1) {
+        if ((row & 4095) === 0) await maybeYieldToEventLoop();
+        const value = vectorValue(vector, slot);
+        if (value === null) {
+          (nullRows ??= new Uint8Array(rowCount))[row] = 1;
+          continue;
+        }
+        const locator = secondaryKeyLocatorNumber(keyColumn.type, value);
+        locators[row] = locator;
+        let probe = locator & mask;
+        while (slots[probe] !== 0) probe = (probe + 1) & mask;
+        slots[probe] = row + 1;
+      }
+    }
+    const index: SegmentKeyLocators = {
+      anchorIds: [...anchorIds],
+      rowCount,
+      blockStarts,
+      locators,
+      ...(nullRows === undefined ? {} : { nullRows }),
+      slots,
+      mask,
+    };
+    this.#blockCachePut(
+      ArtifactFamily.segmentKeyLocators,
+      segment.id,
+      index,
+      64 +
+        anchorIds.reduce((total, id) => total + 32 + id.length * 2, 0) +
+        blockStarts.byteLength +
+        locators.byteLength +
+        (nullRows?.byteLength ?? 0) +
+        slots.byteLength,
+    );
+    return index;
   }
 
   /** Reuse the existing block-vector cache before loading decoded blocks. No second cache
@@ -15474,7 +16295,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ids: readonly string[],
     snapshot: LeasedSnapshot,
   ): Promise<ColumnVector[]> {
-    const vectors = ids.map((id) => this.#cacheGet(`dbv ${id}`) as ColumnVector | undefined);
+    const vectors = ids.map(
+      (id) => this.#blockCacheGet(ArtifactFamily.blockVector, id) as ColumnVector | undefined,
+    );
     const missing: string[] = [];
     const positions: number[] = [];
     for (let index = 0; index < ids.length; index += 1) {
@@ -15492,7 +16315,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   #blockColumnVector(blockId: string, decoded: DecodedPhysicalBlock): ColumnVector {
-    const cached = this.#cacheGet(`dbv ${blockId}`) as ColumnVector | undefined;
+    const cached = this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+      ColumnVector | undefined;
     if (cached !== undefined) return cached;
     const column = decoded.column;
     const rows = column.rowCount;
@@ -15513,7 +16337,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ? { kind: "string", length: rows, validity, codes, dictionary: builder.dictionary }
         : { kind: column.type, length: rows, validity, values }),
     } as ColumnVector;
-    this.#cachePut(`dbv ${blockId}`, vector, blockVectorRetainedBytes(vector));
+    this.#blockCachePut(
+      ArtifactFamily.blockVector,
+      blockId,
+      vector,
+      blockVectorRetainedBytes(vector),
+    );
     return vector;
   }
 
@@ -15664,7 +16493,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const descriptions = new Map<string, ReturnType<typeof inspectBlock>>();
     const missing: string[] = [];
     for (const blockId of blockIds) {
-      const cached = this.#cacheGet(`zi ${blockId}`) as ReturnType<typeof inspectBlock> | undefined;
+      const cached = this.#blockCacheGet(ArtifactFamily.zoneDescription, blockId) as
+        ReturnType<typeof inspectBlock> | undefined;
       if (cached === undefined) missing.push(blockId);
       else descriptions.set(blockId, cached);
     }
@@ -15678,7 +16508,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
         const description = inspectBlock(bytes);
         descriptions.set(id, description);
-        this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+        this.#blockCachePut(
+          ArtifactFamily.zoneDescription,
+          id,
+          description,
+          ZONE_DESCRIPTION_CACHE_BYTES,
+        );
       }
     }
     return descriptions;
@@ -21633,6 +22468,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return this.#artifactCache.get(key);
   }
 
+  /** A per-block (or per-segment) artifact, keyed by the bare id within its family. */
+  #blockCacheGet(family: ArtifactFamily, id: string): unknown {
+    return this.#artifactCache.getIn(family, id);
+  }
+
+  #blockCachePut(family: ArtifactFamily, id: string, payload: unknown, bytes: number): void {
+    this.#artifactCache.putIn(family, id, payload, bytes);
+  }
+
   /**
    * Buffer pool observability: byte budget and residency plus lifetime hit/miss/eviction
    * counters across every entry family (decoded blocks, block vectors, zone descriptions,
@@ -23032,7 +23876,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     snapshot: LeasedSnapshot,
   ): Promise<{ segments: SegmentRecord[]; pruned: boolean; rows?: number[] }> {
     const predicates = secondaryIndexPredicates(plan, table);
-    if (predicates.length === 0) {
+    const disjunctions = secondaryIndexDisjunctions(plan, table);
+    if (predicates.length === 0 && disjunctions.length === 0) {
       // A killed build or a stale-writer invalidation self-heals on the next relevant query.
       for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
         if (index.state === "ready") continue;
@@ -23051,6 +23896,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return { segments, pruned: false };
     }
     const keyColumn = getUniqueKeyColumn(table);
+    const everyPredicate = [...predicates, ...disjunctions.flat(2)];
     if (keyColumn === undefined) {
       if (
         segments.some((segment) => {
@@ -23060,10 +23906,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ) {
         return { segments, pruned: false };
       }
-      if (predicates.some((predicate) => predicate.index.locator !== "row-id")) {
+      if (everyPredicate.some((predicate) => predicate.index.locator !== "row-id")) {
         return { segments, pruned: false };
       }
-    } else if (predicates.some((predicate) => predicate.index.locator !== "key-hash-v1")) {
+    } else if (everyPredicate.some((predicate) => predicate.index.locator !== "key-hash-v1")) {
       return { segments, pruned: false };
     }
 
@@ -23084,8 +23930,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
 
     const upToVersion = snapshot.version ?? -1;
-    let candidates: bigint[] | undefined;
-    for (const predicate of predicates) {
+    /** One predicate's candidate locators, or undefined when the index cannot serve it now. */
+    const candidatesFor = async (
+      predicate: SecondaryIndexPredicate,
+    ): Promise<bigint[] | undefined> => {
       const result = await this.#readFtsCandidatesMemoized(
         snapshot,
         table.id,
@@ -23093,25 +23941,57 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         predicate.queries,
         upToVersion,
       );
-      if (result.overflow) return { segments, pruned: false };
+      if (result.overflow) return undefined;
       if (!result.hasBase) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
-        return { segments, pruned: false };
+        return undefined;
       }
       // A newer rebuild may omit rows an old time-travel snapshot still saw.
-      if (result.coversVersion > upToVersion) return { segments, pruned: false };
+      if (result.coversVersion > upToVersion) return undefined;
       if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
       }
-      const forPredicate = predicate.union
+      return predicate.union
         ? unionSortedRowIds(result.rowIdsByTerm)
         : (result.rowIdsByTerm[0] ?? []);
+    };
+    let candidates: bigint[] | undefined;
+    for (const predicate of predicates) {
+      const forPredicate = await candidatesFor(predicate);
+      if (forPredicate === undefined) return { segments, pruned: false };
       candidates =
         candidates === undefined ? forPredicate : intersectSortedRowIds(candidates, forPredicate);
       if (candidates.length === 0) return { segments: [], pruned: true };
     }
+    // A disjunction every branch of which an index serves matches only rows some branch's
+    // candidates name: the union of the branches, each the intersection of its own predicates.
+    for (const alternatives of disjunctions) {
+      const branches: bigint[][] = [];
+      for (const branch of alternatives) {
+        let forBranch: bigint[] | undefined;
+        for (const predicate of branch) {
+          const forPredicate = await candidatesFor(predicate);
+          if (forPredicate === undefined) return { segments, pruned: false };
+          forBranch =
+            forBranch === undefined ? forPredicate : intersectSortedRowIds(forBranch, forPredicate);
+          if (forBranch.length === 0) break;
+        }
+        branches.push(forBranch ?? []);
+      }
+      const forDisjunction = unionSortedRowIds(branches);
+      if (forDisjunction.length > MAX_FTS_CANDIDATE_ROW_IDS) return { segments, pruned: false };
+      candidates =
+        candidates === undefined
+          ? forDisjunction
+          : intersectSortedRowIds(candidates, forDisjunction);
+      if (candidates.length === 0) return { segments: [], pruned: true };
+    }
     if (candidates === undefined) return { segments, pruned: false };
-    const candidateSet = keyColumn === undefined ? undefined : new Set(candidates);
+    // Key locators are 32-bit hashes; a posting outside that range names no row.
+    const candidateNumbers =
+      keyColumn === undefined
+        ? []
+        : candidates.map((candidate) => (candidate <= 0xffff_ffffn ? Number(candidate) : -1));
     // With a key column and only appended segments, the block locator maps give the exact scan
     // rows, in the streamed scan's numbering over the kept blocks: an equality lookup then
     // visits a handful of rows instead of every block that holds one. Mutation segments replay
@@ -23166,47 +24046,55 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           rowStart += rowCount;
         }
       } else {
-        const decoded = await this.#decodedBlocksThroughCache(anchorIds, snapshot);
-        for (const [blockIndex, block] of decoded.entries()) {
-          if (block.column.type !== keyColumn.type) {
-            return { segments, pruned: false };
+        // A segment's key locators are a pure function of its immutable key blocks, so they
+        // are hashed once into one table per segment; a lookup then probes each (of the few)
+        // candidates once per segment instead of once per block. A candidate list wider than
+        // the segment walks the segment's locators against the candidate set instead.
+        const locators = await this.#segmentKeyLocators(segment, anchorIds, keyColumn, snapshot);
+        if (locators === undefined) return { segments, pruned: false };
+        const blockCount = anchorIds.length;
+        const hits: Array<number[] | undefined> = [];
+        const hitBlock = (row: number): void => {
+          // The last block starting at or before the row.
+          let low = 0;
+          let high = blockCount - 1;
+          while (low < high) {
+            const middle = (low + high + 1) >>> 1;
+            if ((locators.blockStarts[middle] ?? 0) <= row) low = middle;
+            else high = middle - 1;
           }
-          const blockId = anchorIds[blockIndex] ?? "";
-          const vector = this.#blockColumnVector(blockId, block);
-          // A block's key locators are a pure function of its immutable bytes, so they are
-          // hashed once and pooled; a lookup then probes the (few) candidates against the
-          // block's set instead of re-hashing every stored key on every query. A candidate
-          // list wider than the block walks the block's locators against the candidate set.
-          const locators = await this.#blockKeyLocators(blockId, vector, keyColumn.type);
-          const positions: number[] = [];
-          const collect = (hit: number | number[] | undefined): boolean => {
-            if (hit === undefined) return false;
-            if (typeof hit === "number") positions.push(hit);
-            else positions.push(...hit);
-            return rowPositions === undefined;
-          };
-          if (candidates.length <= locators.size) {
-            for (const candidate of candidates) if (collect(locators.get(candidate))) break;
-          } else if (candidateSet !== undefined) {
-            for (const [locator, hit] of locators) {
-              if (candidateSet.has(locator) && collect(hit)) break;
+          (hits[low] ??= []).push(row - (locators.blockStarts[low] ?? 0));
+        };
+        if (candidateNumbers.length <= locators.rowCount) {
+          for (const candidate of candidateNumbers) {
+            if (candidate >= 0) probeSegmentKeyLocators(locators, candidate, hitBlock);
+          }
+        } else {
+          const wanted = new Set(candidateNumbers);
+          for (let row = 0; row < locators.rowCount; row += 1) {
+            if (locators.nullRows?.[row] !== 1 && wanted.has(locators.locators[row] ?? -1)) {
+              hitBlock(row);
             }
           }
-          if (positions.length > 0) {
+        }
+        for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+          const blockRows =
+            (locators.blockStarts[blockIndex + 1] ?? 0) - (locators.blockStarts[blockIndex] ?? 0);
+          const positions = hits[blockIndex];
+          if (positions !== undefined && positions.length > 0) {
             if (
               rowPositions !== undefined &&
               (segment.kind === "insert" || segment.kind === "base")
             ) {
-              positions.sort((a, b) => a - b);
               const keptRows = rowCounts.reduce((total, count) => total + count, 0);
-              for (const position of positions) {
+              for (const position of Uint32Array.from(positions).sort()) {
                 rowPositions.push(selectedRowStart + keptRows + position);
               }
             }
             blockIndexes.push(blockIndex);
-            rowCounts.push(vector.length);
+            rowCounts.push(blockRows);
           }
-          rowStart += vector.length;
+          rowStart += blockRows;
         }
       }
       if (rowStart !== segment.rowCount) return { segments, pruned: false };
@@ -24219,7 +25107,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const fetchIds: string[] = [];
     for (let index = 0; index < ids.length; index += 1) {
       const id = ids[index] ?? "";
-      const cached = this.#cacheGet(`dpb\0${id}`) as DecodedPhysicalBlock | undefined;
+      const cached = this.#blockCacheGet(ArtifactFamily.decodedBlock, id) as
+        DecodedPhysicalBlock | undefined;
       if (cached !== undefined) {
         decodedBlocks[index] = cached;
         continue;
@@ -24245,7 +25134,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const bytes = fetchedBytes.get(id) ?? storedBlocks?.get(id);
       if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
       const decoded = await decodePhysicalBlock(bytes);
-      this.#cachePut(`dpb\0${id}`, decoded, decodedPhysicalBlockRetainedBytes(decoded));
+      this.#blockCachePut(
+        ArtifactFamily.decodedBlock,
+        id,
+        decoded,
+        decodedPhysicalBlockRetainedBytes(decoded),
+      );
       decodedBlocks[index] = decoded;
     }
     return decodedBlocks.map((decoded, index) => {
@@ -24346,6 +25240,278 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * Scan positions of the only rows an ordered-selection statement can return (see
+   * ordered-selection.ts), over append-only segments: for a top-N, the first `take` rows in
+   * column order plus every row tied with the last; for MIN/MAX, one row holding each extreme.
+   * Zone maps order the blocks and stop the walk once no further block can beat what is held;
+   * an ascending block is searched by bisection and any other is scanned once. Undefined when
+   * the statement or the history does not qualify, or the selection would be wide.
+   */
+  async #orderedRowSelection(
+    plan: CompiledQuery,
+    table: TableRecord,
+    segments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+  ): Promise<{ rows: number[]; offset?: number } | undefined> {
+    if (planContainsFts(plan)) return undefined;
+    const shape = orderedSelectionShape(plan, table, SECONDARY_INDEX_ROW_SELECTION_CAP);
+    if (shape === undefined) return undefined;
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return undefined;
+    }
+    const columns =
+      shape.kind === "top"
+        ? [shape.column]
+        : [...new Map(shape.extremes.map(({ column }) => [column.id, column])).values()];
+    const blocksByColumn = new Map<string, OrderedSelectionBlock[]>();
+    for (const column of columns) {
+      const blocks: OrderedSelectionBlock[] = [];
+      let rowStart = 0;
+      for (const segment of segments) {
+        const ids = segment.columnBlockIds[column.id] ?? [];
+        if (ids.length === 0 && segment.rowCount > 0) return undefined;
+        if (Object.values(segment.columnBlockIds).some((other) => other.length !== ids.length)) {
+          return undefined;
+        }
+        const descriptions = await this.#zoneDescriptions(ids, snapshot);
+        let segmentRows = 0;
+        for (const id of ids) {
+          const description = descriptions.get(id);
+          if (description?.type !== column.type) return undefined;
+          blocks.push({
+            id,
+            rowStart: rowStart + segmentRows,
+            rowCount: description.rowCount,
+            nullCount: description.nullCount,
+            zone: description.metadata.zoneMap,
+          });
+          segmentRows += description.rowCount;
+        }
+        if (segmentRows !== segment.rowCount) return undefined;
+        rowStart += segmentRows;
+      }
+      blocksByColumn.set(column.id, blocks);
+    }
+    const blockValues = async (
+      block: OrderedSelectionBlock,
+      column: TableColumnRecord,
+    ): Promise<ColumnVector | undefined> => {
+      const [vector] = await this.#pointReadVectors([block.id], snapshot);
+      return vector?.kind === column.type && vector.length === block.rowCount ? vector : undefined;
+    };
+    const range = shape.range;
+    if (shape.kind === "extremes") {
+      const rows = new Set<number>();
+      for (const { column, max } of shape.extremes) {
+        const blocks = (blocksByColumn.get(column.id) ?? []).filter(
+          (block) =>
+            block.zone !== undefined &&
+            zoneMeetsOrderedRange(range, block.zone.min, block.zone.max),
+        );
+        blocks.sort((left, right) =>
+          max
+            ? (right.zone?.max ?? 0) - (left.zone?.max ?? 0)
+            : (left.zone?.min ?? 0) - (right.zone?.min ?? 0),
+        );
+        let best: { value: number; row: number } | undefined;
+        for (const block of blocks) {
+          const zone = block.zone;
+          if (zone === undefined) continue;
+          if (best !== undefined && (max ? zone.max <= best.value : zone.min >= best.value)) break;
+          const vector = await blockValues(block, column);
+          if (vector === undefined || vector.kind === "string" || vector.kind === "boolean") {
+            return undefined;
+          }
+          const values = vector.values;
+          let slot = -1;
+          if (vector.nullCount === 0 && valuesAreAscending(values)) {
+            const { begin, end } = ascendingRangeSlots(values, vector.length, range);
+            if (begin < end) slot = max ? end - 1 : begin;
+          } else {
+            for (let index = 0; index < vector.length; index += 1) {
+              const value = values[index] ?? 0;
+              if (vector.nullCount !== 0 && vectorValue(vector, index) === null) continue;
+              if (!inOrderedRange(range, value)) continue;
+              if (slot < 0 || (max ? value > (values[slot] ?? 0) : value < (values[slot] ?? 0))) {
+                slot = index;
+              }
+            }
+          }
+          if (slot < 0) continue;
+          const value = values[slot] ?? 0;
+          if (best === undefined || (max ? value > best.value : value < best.value)) {
+            best = { value, row: block.rowStart + slot };
+          }
+        }
+        if (best !== undefined) rows.add(best.row);
+      }
+      return { rows: [...rows].sort((left, right) => left - right) };
+    }
+    const { column, descending } = shape;
+    const blocks = blocksByColumn.get(column.id) ?? [];
+    // A range predicate never admits a NULL; without one, a NULL row can sort into the answer
+    // (or fill a short one), and the zone maps that steer this walk do not describe NULLs.
+    if (!range.constrained && blocks.some((block) => block.nullCount > 0)) return undefined;
+    if (shape.limit === 0) return { rows: [] };
+    const candidates = blocks.filter(
+      (block) =>
+        block.zone !== undefined && zoneMeetsOrderedRange(range, block.zone.min, block.zone.max),
+    );
+    candidates.sort((left, right) =>
+      descending
+        ? (right.zone?.max ?? 0) - (left.zone?.max ?? 0)
+        : (left.zone?.min ?? 0) - (right.zone?.min ?? 0),
+    );
+    let take = shape.take;
+    // A deep page starts past rows that are only counted (see #orderedPageStart).
+    let start: { block: number; slot: number; skipped: number } | undefined;
+    if (shape.offset > 0) {
+      const page = await this.#orderedPageStart(
+        candidates,
+        range,
+        descending,
+        shape.offset,
+        (block) => blockValues(block, column),
+      );
+      if (page === "past") return { rows: [], offset: 0 };
+      if (page !== undefined) {
+        start = page;
+        take -= page.skipped;
+      }
+    }
+    if (take > SECONDARY_INDEX_ROW_SELECTION_CAP) return undefined;
+    let picked: Array<{ value: number; row: number }> = [];
+    let edge: number | undefined;
+    for (let index = start?.block ?? 0; index < candidates.length; index += 1) {
+      const block = candidates[index];
+      const zone = block?.zone;
+      if (block === undefined || zone === undefined) continue;
+      // Ties with the held edge value still belong to the answer's candidates.
+      if (edge !== undefined && (descending ? zone.max < edge : zone.min > edge)) break;
+      const vector = await blockValues(block, column);
+      if (vector === undefined || vector.kind === "string" || vector.kind === "boolean") {
+        return undefined;
+      }
+      const values = vector.values;
+      if (vector.nullCount === 0 && valuesAreAscending(values)) {
+        let { begin, end } = ascendingRangeSlots(values, vector.length, range);
+        if (start?.block === index) {
+          if (descending) end = start.slot + 1;
+          else begin = start.slot;
+        }
+        if (begin >= end) continue;
+        if (descending) {
+          let first = Math.max(begin, end - take);
+          const boundary = values[first];
+          while (first > begin && values[first - 1] === boundary) first -= 1;
+          for (let slot = first; slot < end; slot += 1) {
+            picked.push({ value: values[slot] ?? 0, row: block.rowStart + slot });
+          }
+        } else {
+          let last = Math.min(end, begin + take);
+          const boundary = values[last - 1];
+          while (last < end && values[last] === boundary) last += 1;
+          for (let slot = begin; slot < last; slot += 1) {
+            picked.push({ value: values[slot] ?? 0, row: block.rowStart + slot });
+          }
+        }
+      } else {
+        const valid =
+          vector.nullCount === 0 ? undefined : (slot: number) => vectorValue(vector, slot) !== null;
+        const boundary = boundedOrderedEdge(values, vector.length, valid, range, take, descending);
+        if (boundary === undefined) continue;
+        for (let slot = 0; slot < vector.length; slot += 1) {
+          const value = values[slot] ?? 0;
+          if (descending ? value < boundary : value > boundary) continue;
+          if (!inOrderedRange(range, value) || valid?.(slot) === false) continue;
+          picked.push({ value, row: block.rowStart + slot });
+        }
+      }
+      if (picked.length >= take) {
+        picked.sort((left, right) =>
+          descending ? right.value - left.value : left.value - right.value,
+        );
+        const boundary = picked[take - 1]?.value ?? 0;
+        let keep = take;
+        while (keep < picked.length && picked[keep]?.value === boundary) keep += 1;
+        picked = picked.slice(0, keep);
+        edge = boundary;
+      }
+      if (picked.length > SECONDARY_INDEX_ROW_SELECTION_CAP) return undefined;
+    }
+    return {
+      rows: picked.map(({ row }) => row).sort((left, right) => left - right),
+      ...(start === undefined ? {} : { offset: shape.offset - start.skipped }),
+    };
+  }
+
+  /**
+   * Where a deep page begins when the column's in-range blocks are pairwise disjoint (each one's
+   * values all precede the next one's in ORDER BY order): every row before the page is counted —
+   * a whole block from its header when all of it is in range, otherwise by bisecting its sorted
+   * values — and never selected. The start backs off to the first row of its tie group, since the
+   * executor orders ties by the remaining ORDER BY terms; `skipped` counts only rows strictly
+   * ahead of the page's first value. "past" means the page starts beyond the last row; undefined
+   * means the blocks are not provably in one global order.
+   */
+  async #orderedPageStart(
+    blocks: readonly OrderedSelectionBlock[],
+    range: OrderedRange,
+    descending: boolean,
+    offset: number,
+    load: (block: OrderedSelectionBlock) => Promise<ColumnVector | undefined>,
+  ): Promise<{ block: number; slot: number; skipped: number } | "past" | undefined> {
+    for (let index = 1; index < blocks.length; index += 1) {
+      const previous = blocks[index - 1]?.zone;
+      const current = blocks[index]?.zone;
+      if (previous === undefined || current === undefined) return undefined;
+      if (descending ? current.max >= previous.min : current.min <= previous.max) return undefined;
+    }
+    let skipped = 0;
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index];
+      const zone = block?.zone;
+      if (block === undefined || zone === undefined) return undefined;
+      const remaining = offset - skipped;
+      if (
+        block.nullCount === 0 &&
+        zoneWithinOrderedRange(range, zone.min, zone.max) &&
+        remaining >= block.rowCount
+      ) {
+        skipped += block.rowCount;
+        continue;
+      }
+      const vector = await load(block);
+      if (vector === undefined || vector.kind === "string" || vector.kind === "boolean") {
+        return undefined;
+      }
+      const values = vector.values;
+      if (vector.nullCount !== 0 || !valuesAreAscending(values)) return undefined;
+      const { begin, end } = ascendingRangeSlots(values, vector.length, range);
+      if (remaining >= end - begin) {
+        skipped += end - begin;
+        continue;
+      }
+      if (descending) {
+        let slot = end - 1 - remaining;
+        const first = values[slot];
+        while (slot < end - 1 && values[slot + 1] === first) slot += 1;
+        return { block: index, slot, skipped: skipped + (end - 1 - slot) };
+      }
+      let slot = begin + remaining;
+      const first = values[slot];
+      while (slot > begin && values[slot - 1] === first) slot -= 1;
+      return { block: index, slot, skipped: skipped + (slot - begin) };
+    }
+    return "past";
+  }
+
+  /**
    * Materializes the rows at ascending scan positions over append-only segments, reading only
    * the blocks that hold a selected row. Undefined when the block layout does not line up,
    * which sends the caller to the whole-segment path.
@@ -24422,8 +25588,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     expectedRows?: ReadonlyMap<string, number>,
   ): Promise<ColumnVector> {
     const poolable = storedBlocks === undefined && expectedRows === undefined;
+    // Keyed by the blocks themselves, not only the segments: index pruning hands this a
+    // segment narrowed to the blocks holding one lookup's candidates, under the segment's own
+    // id. Two lookups whose kept blocks differ but add up to the same row count shared one
+    // pooled vector, and the second answered from the first one's rows.
     const key = poolable
-      ? `mav\0${column.id}\0${String(rowCount)}\0${segments.map((segment) => segment.id).join("\0")}`
+      ? `mav\0${column.id}\0${String(rowCount)}\0${segments
+          .map((segment) => `${segment.id}:${(segment.columnBlockIds[column.id] ?? []).join("+")}`)
+          .join("\0")}`
       : undefined;
     if (key !== undefined) {
       const cached = this.#cacheGet(key) as ColumnVector | undefined;
@@ -24697,7 +25869,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         memo = new Map<string, SegmentRecord[]>();
         this.#visibleSegmentsMemo.set(catalog, memo);
       }
-      const key = `${table.id}\u0000${String(snapshot.version ?? -1)}`;
+      const key = visibleSegmentsMemoKey(table, snapshot);
       const cached = memo.get(key);
       if (cached !== undefined) return cached;
       const computed = await this.#visibleSegmentRecordsUncached(table, snapshot, catalog);
@@ -28071,6 +29243,8 @@ function secondaryIndexPredicates(
     members?: BatchValue[];
     lower?: { value: BatchValue; inclusive: boolean };
     upper?: { value: BatchValue; inclusive: boolean };
+    /** A case-sensitive LIKE pattern's literal prefix: every match starts with it. */
+    prefix?: string;
   }
   const constraints = new Map<string, Constraint>();
   const literalValue = (
@@ -28092,6 +29266,22 @@ function secondaryIndexPredicates(
     }
   };
   for (const predicate of plan.predicates) {
+    if (
+      predicate.operator === "LIKE" &&
+      predicate.left.kind === "column" &&
+      predicate.right.kind === "literal" &&
+      predicate.right.internalSqlValue !== true &&
+      typeof predicate.right.value === "string"
+    ) {
+      const column = resolveColumn(predicate.left.reference);
+      if (column?.type !== "string" || column.sqlDomain !== undefined) continue;
+      const prefix = likeLiteralPrefix(predicate.right.value, predicate.escape);
+      if (prefix === undefined || prefix.length === 0 || prefix.startsWith("\u0000")) continue;
+      const current = constraints.get(column.id) ?? {};
+      current.prefix ??= prefix;
+      constraints.set(column.id, current);
+      continue;
+    }
     if (predicate.operator === "IN" && predicate.left.kind === "column") {
       const column = resolveColumn(predicate.left.reference);
       if (column === undefined || predicate.right.kind !== "list") continue;
@@ -28170,7 +29360,24 @@ function secondaryIndexPredicates(
       // (notably exact NUMERIC and declaration-ordered ENUM). Range pruning on them would be
       // unsound, so preserve equality acceleration and let range predicates scan/recheck.
       if (column.sqlDomain !== undefined) break;
-      if (constraint.lower === undefined && constraint.upper === undefined) break;
+      if (constraint.lower === undefined && constraint.upper === undefined) {
+        const prefix = constraint.prefix;
+        if (prefix === undefined) break;
+        // A string component is its UTF-16 code units followed by a terminator, so every value
+        // starting with the prefix encodes to a term starting with the prefix's units.
+        const full = secondaryIndexComponentTerm(index, column, position, prefix);
+        const terminator = secondaryIndexComponentTerm(index, column, position, "");
+        if (!full.endsWith(terminator)) break;
+        const units = full.slice(0, full.length - terminator.length);
+        queries = prefixes.map((term) => ({
+          lower: term + units,
+          lowerInclusive: true,
+          upper: `${term}${units}\uffff`,
+          upperInclusive: false,
+        }));
+        matchedColumns += 1;
+        break;
+      }
       const direction = secondaryIndexDirections(index)[position] ?? "asc";
       const descending = direction === "desc";
       queries = prefixes.map((prefix) => {
@@ -28240,6 +29447,66 @@ function secondaryIndexPredicates(
     if (ids.every((columnId) => usedColumns.has(columnId))) continue;
     ids.forEach((columnId) => usedColumns.add(columnId));
     output.push(candidate);
+  }
+  return output;
+}
+
+/**
+ * The literal text every match of a case-sensitive LIKE pattern starts with: the characters
+ * before its first wildcard. Undefined when an escape character appears before it — the prefix
+ * would then depend on escape rules this reading does not model.
+ */
+function likeLiteralPrefix(pattern: string, escape: string | undefined): string | undefined {
+  let prefix = "";
+  for (const character of pattern) {
+    if (character === "%" || character === "_") return prefix;
+    if (character === "\\" || (escape !== undefined && character === escape)) return undefined;
+    prefix += character;
+  }
+  return prefix;
+}
+
+/**
+ * The OR predicates an index can narrow: for each one whose every branch (a conjunction) has at
+ * least one index-servable predicate, those predicates per branch. A row satisfying the OR
+ * satisfies some branch, so it is among that branch's candidates; a branch no index serves would
+ * leave the union unbounded, so such an OR is skipped whole.
+ */
+function secondaryIndexDisjunctions(
+  plan: CompiledQuery,
+  table: TableRecord,
+): SecondaryIndexPredicate[][][] {
+  const output: SecondaryIndexPredicate[][][] = [];
+  for (const predicate of plan.predicates) {
+    const condition = predicate.left;
+    if (
+      predicate.operator !== "IS TRUE" ||
+      condition.kind !== "logical" ||
+      condition.operator !== "or"
+    ) {
+      continue;
+    }
+    const branches: Expression[] = [];
+    const flatten = (expression: Expression): void => {
+      if (expression.kind === "logical" && expression.operator === "or") {
+        flatten(expression.left);
+        flatten(expression.right);
+      } else {
+        branches.push(expression);
+      }
+    };
+    flatten(condition);
+    if (branches.length > MAX_INDEXED_DISJUNCTION_BRANCHES) continue;
+    const alternatives: SecondaryIndexPredicate[][] = [];
+    for (const branch of branches) {
+      const served = secondaryIndexPredicates(
+        { ...plan, predicates: splitCondition(branch) },
+        table,
+      );
+      if (served.length === 0) break;
+      alternatives.push(served);
+    }
+    if (alternatives.length === branches.length) output.push(alternatives);
   }
   return output;
 }
