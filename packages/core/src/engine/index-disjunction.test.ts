@@ -179,4 +179,26 @@ describe("index-served disjunctions", () => {
       await database.close();
     }
   });
+
+  it("explain unbound placeholders compared with TEXT columns", async () => {
+    const database = await itemsDatabase();
+    try {
+      // explain() reports on the unbound plan; a placeholder has no type to check until bound.
+      expect(await database.explain("SELECT id FROM items WHERE label = ?")).toContain(
+        "where label = $1",
+      );
+      expect(await database.explain("SELECT id FROM items WHERE UPPER(label) = ?")).toContain(
+        "where UPPER(label) = $1",
+      );
+      expect(await database.explain("SELECT id FROM items WHERE owner = ? OR label = ?")).toContain(
+        "streams the base scan",
+      );
+      // The bound statement is still checked: TEXT never compares with a number.
+      await expect(
+        database.query("SELECT id FROM items WHERE label = ?", { params: [1] }),
+      ).rejects.toThrow("comparable SQL types");
+    } finally {
+      await database.close();
+    }
+  });
 });

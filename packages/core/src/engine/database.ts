@@ -261,6 +261,7 @@ import {
   combineUnionResults,
   compileCheckExpression,
   compileQuery,
+  containsParameter,
   hasAggregate,
   splitCondition,
   createRecursiveCteState,
@@ -16004,8 +16005,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       for (const id of ids) {
         if (descriptions.has(id)) continue;
         const cached = this.#blockCacheGet(ArtifactFamily.zoneDescription, id) as
-          | ReturnType<typeof inspectBlock>
-          | undefined;
+          ReturnType<typeof inspectBlock> | undefined;
         if (cached === undefined) missingIds.add(id);
         else descriptions.set(id, cached);
       }
@@ -27800,9 +27800,12 @@ function normalizePlanDomainLiterals(
     const expressionSchema = (expression: Expression): SqlColumnSchema | undefined => {
       // Derived and correlated sources acquire their schemas later in the execution pipeline.
       // Validate only known types here; the completed block is checked when those sources bind.
+      // A placeholder has no type until it is bound (explain() reports on unbound plans); the
+      // bound statement is checked when it executes.
       if (
         expression.kind === "subquery" ||
         expression.kind === "exists" ||
+        containsParameter(expression) ||
         expressionColumns(expression).some((reference) => lookup(reference, types) === undefined)
       )
         return undefined;

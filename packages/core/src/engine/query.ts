@@ -2468,7 +2468,7 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
 }
 
 /** True when any `?`/`$n` placeholder remains anywhere in the expression tree. */
-function containsParameter(expression: Expression): boolean {
+export function containsParameter(expression: Expression): boolean {
   if (expression.kind === "parameter") return true;
   if (expression.kind === "subquery" || expression.kind === "exists") {
     return blockHasParameters(expression.block);
