@@ -80,9 +80,10 @@ machines: https://minnowdb.com/llms.txt
   The optional third argument takes `{ signal?, onStats?, memoize?, executionMemoryBudgetBytes? }`:
   a SELECT honors all of them; other statements check `signal` once before running.
 - Write PostgreSQL-style SQL and bind parameters with `$1`, `$2` by position. `?` in order is
-  also accepted as a Minnow extension. Never concatenate values into SQL: compiled plans are
-  cached on the statement text, so a parameterized statement is planned once and interpolation
-  throws that work away on every call.
+  also accepted as a Minnow extension. Never concatenate values into SQL: a parameterized
+  statement is parsed and planned once and only re-bound per call. Minnow recognizes some inlined
+  literals (comparison operands, IN-list items) and shares their plan, but every other inlined
+  value still makes a new statement that is parsed and planned from scratch.
 - Treat Minnow's fixed SQL safety limits as input validation, not tuning: one statement is capped
   at 1,048,576 characters, 16,384 tokens, 4,096 parameter positions, and 128 syntax levels. Pattern,
   JSON/array, numeric, scalar-result, and full-text inputs have their own documented ceilings in
@@ -315,8 +316,11 @@ it needs to be.
 
 - **`query` versus `execute`.** Handing a write to `query` throws instead of writing, which is a
   confusing failure if you assumed one entry point. See [Running SQL](/docs/sql).
-- **Parameters.** Interpolated values produce a new statement string per call, and the plan cache
-  is keyed on that string, so every call re-parses, re-plans, and re-optimizes.
+- **Parameters.** A parameterized statement is parsed, planned, and catalog-rewritten once, then
+  only re-bound. Interpolated values make a new statement string per call; Minnow shares the plan
+  of literals it can prove are plain values (comparison operands, IN-list items), but a literal
+  anywhere else — LIMIT, a function argument, a cast, a LIKE pattern — still costs a full parse
+  and plan, and even a shared literal pays a scan of the text first.
 - **The unique key.** Mutations address rows by unique key, so `UPDATE` and `DELETE` are rejected
   outright on a keyless table. This is the rejection agents hit most. See
   [Writing data](/docs/sql/dml).

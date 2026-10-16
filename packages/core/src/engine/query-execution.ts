@@ -1,4 +1,5 @@
 import {
+  bindPlanParameters,
   compileQuery,
   annotateAvgArgumentScales,
   compileStatement,
@@ -19,6 +20,8 @@ import {
   type SqlColumnSchema,
 } from "./query.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
+import { normalizeSqlLiterals } from "./literal-normalization.js";
+import { encodeQueryIdentity } from "./query-identity.js";
 import {
   type CatalogProbe,
   type SegmentRecord,
@@ -37,6 +40,42 @@ import type { BlockStore } from "../storage/types.js";
 
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
 const PLAN_CACHE_LIMIT = 512;
+
+/** A plan's structural identity with its statement text left out. */
+function planShapeIdentity(plan: CompiledQuery): string {
+  const strip = (value: unknown): unknown => {
+    if (typeof value !== "object" || value === null || value instanceof Date) return value;
+    if (Array.isArray(value)) return value.map(strip);
+    const copy: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (key !== "sql") copy[key] = strip(child);
+    }
+    return copy;
+  };
+  return encodeQueryIdentity(strip(plan));
+}
+
+/**
+ * The parameterized shape of a literal statement, when binding it to the statement's own
+ * literals compiles to exactly the plan the literal text does. Null when it does not, or when
+ * either text fails to compile — the literal statement then always takes its own plan.
+ */
+function provenLiteralShape(
+  sql: string,
+  text: string,
+  values: readonly QueryValue[],
+): CompiledQuery | null {
+  try {
+    const shape = compileQuery(text);
+    if ((shape.parameterCount ?? 0) !== values.length) return null;
+    const literal = compileQuery(sql);
+    return planShapeIdentity(bindPlanParameters(shape, values)) === planShapeIdentity(literal)
+      ? shape
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface SegmentVisibilityCatalog {
   readonly transactions: ReadonlyMap<string, { readonly committedVersion: number | null }>;
@@ -197,6 +236,8 @@ interface QueryExecutionHost {
  * readers remain host operations; no extra dispatch is introduced inside row/vector loops. */
 export class QueryExecution {
   readonly #planCache = new Map<string, CompiledQuery>();
+  /** Literal statement shapes, keyed by lifted-literal kinds and normalized text. */
+  readonly #literalShapes = new Map<string, CompiledQuery | null>();
   readonly #statementCache = new Map<string, CompiledStatement>();
   readonly #effectiveQueryOptions: QueryExecutionHost["effectiveQueryOptions"];
   readonly #now: QueryExecutionHost["now"];
@@ -236,10 +277,40 @@ export class QueryExecution {
   }
   clearPlans(): void {
     this.#planCache.clear();
+    this.#literalShapes.clear();
   }
   clear(): void {
     this.#planCache.clear();
     this.#statementCache.clear();
+    this.#literalShapes.clear();
+  }
+
+  /**
+   * The compiled shape this literal SELECT shares with every statement that differs from it
+   * only in lifted literals, with its own literals as the shape's parameters. Undefined when the
+   * statement lifts nothing or its shape is not proven equal to its literal plan; the caller
+   * then compiles the text as written. See literal-normalization.ts.
+   */
+  literalShape(
+    sql: string,
+  ): { readonly compiled: CompiledQuery; readonly values: readonly QueryValue[] } | undefined {
+    if (sql.length > MAX_CACHEABLE_TEXT_CHARACTERS) return undefined;
+    const normalized = normalizeSqlLiterals(sql);
+    if (normalized === undefined) return undefined;
+    const key = `${normalized.kinds}\u0000${normalized.text}`;
+    let shape = this.#literalShapes.get(key);
+    if (shape === undefined) {
+      shape = provenLiteralShape(sql, normalized.text, normalized.values);
+      this.#literalShapes.set(key, shape);
+      if (this.#literalShapes.size > PLAN_CACHE_LIMIT) {
+        const oldest = this.#literalShapes.keys().next().value;
+        if (oldest !== undefined) this.#literalShapes.delete(oldest);
+      }
+    } else {
+      this.#literalShapes.delete(key);
+      this.#literalShapes.set(key, shape);
+    }
+    return shape === null ? undefined : { compiled: shape, values: normalized.values };
   }
 
   compile(sql: string): CompiledQuery {
@@ -432,6 +503,8 @@ export class QueryExecution {
     plan: CompiledQuery,
     options: QueryOptions = {},
     probe?: CatalogProbe,
+    /** The plan is a bound prepared template: its catalog rewrites already ran. */
+    rewritten = false,
   ): Promise<QueryResult> {
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
@@ -439,8 +512,10 @@ export class QueryExecution {
     // to the view lookup and the catalog state below, which would otherwise probe again each.
     probe ??= await this.#store.getCatalogProbe();
     throwIfAborted(options.signal);
-    plan = await this.#applyCatalogRewrites(plan, probe);
-    throwIfAborted(options.signal);
+    if (!rewritten) {
+      plan = await this.#applyCatalogRewrites(plan, probe);
+      throwIfAborted(options.signal);
+    }
     const spillPageRows =
       options.spillPageRows === undefined
         ? undefined

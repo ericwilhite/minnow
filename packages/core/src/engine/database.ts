@@ -256,6 +256,7 @@ import {
   bindPendingSelectShapes,
   bindPlanParameters,
   bindStatementParameters,
+  validateParameters,
   DUAL_TABLE,
   dualTableRows,
   blockHasSubqueries,
@@ -495,6 +496,13 @@ import {
   type PointReadShape,
 } from "./point-read.js";
 import {
+  PreparedPlanTemplate,
+  preparedPlanTestHooks,
+  preparedTemplateOf,
+  type AnnotatedParameter,
+  type ParameterPosition,
+} from "./prepared-plan.js";
+import {
   CommittedKeyForwards,
   DEFAULT_KEY_FORWARD_RETENTION_MS,
   KEY_FORWARD_COLUMNS,
@@ -549,6 +557,11 @@ function visibleSegmentsMemoKey(tableId: string, version: number | null): string
 }
 
 /** A `COUNT(*)` answer over the rows a point or index read matched. */
+/** The order a plan's sources are joined in, as one comparable value. */
+function joinOrderKey(plan: CompiledQuery): string {
+  return JSON.stringify([plan.base.alias, ...plan.joins.map((join) => join.alias)]);
+}
+
 function countResult(alias: string, count: number): QueryResult {
   const row: QueryRow = {};
   if (alias === "__proto__") defineSqlResultProperty(row, alias, count);
@@ -664,6 +677,11 @@ interface ResolvedPointReadSegment {
   /** Zone bounds per search block (NaN where a header has none); absent for one block. */
   readonly zoneMin?: Float64Array;
   readonly zoneMax?: Float64Array;
+  /**
+   * Every block has bounds and each block's minimum is at least the previous block's maximum:
+   * the blocks that may hold a key are one run, found by binary search instead of a scan.
+   */
+  readonly zonesAscending?: true;
   /** Block ids of every other column the read touches, per block. */
   readonly otherBlockIds: ReadonlyArray<readonly string[]>;
 }
@@ -2553,6 +2571,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     | undefined;
   /** The plan that reads the forwards table itself; the forwarding rewrite leaves it alone. */
   readonly #keyForwardsReads = new WeakSet<CompiledQuery>();
+  /** Prepared read templates per compiled statement, valid for one structural catalog epoch. */
+  readonly #preparedReads = new WeakMap<
+    CompiledQuery,
+    {
+      readonly schemaEpoch: number;
+      /** Null until the statement runs a second time under this epoch. */
+      readonly template: PreparedPlanTemplate | undefined | null;
+    }
+  >();
   /** Set once the forwards table is seen; it is never dropped, so the answer never changes. */
   #keyForwardsTableSeen = false;
   #forwardedNames:
@@ -5477,7 +5504,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         await this.#duringTransaction(open, () => open.session.query(sql, options)),
       );
     }
-    const compiled = this.#queries.compile(sql);
+    // A literal SELECT shares its compiled shape with every statement that differs from it only
+    // in lifted literals, its own literals becoming the shape's parameters (see
+    // literal-normalization.ts). The text as written stays the authority: it is what the
+    // ordinary path compiles, and what memo keys name.
+    const literals =
+      (options.params === undefined || options.params.length === 0) &&
+      options.version === undefined &&
+      !preparedPlanTestHooks.disabled
+        ? this.#queries.literalShape(sql)
+        : undefined;
+    const compiled = literals?.compiled ?? this.#queries.compile(sql);
+    const params = literals?.values ?? options.params ?? [];
     // The keyed point-read fast path answers an eligible statement before parameter binding
     // ever clones the plan. A shape, parameter, catalog, or physical-history condition it
     // cannot prove falls through to the ordinary executor below, which owns all error
@@ -5489,11 +5527,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       options.spillToStorage === undefined &&
       options.spillPageRows === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
-      (compiled.parameterCount ?? 0) === (options.params?.length ?? 0)
+      (compiled.parameterCount ?? 0) === params.length
     ) {
       const template = cachedPointReadTemplate(compiled);
       if (template !== null) {
-        const shape = resolvePointReadShape(template, options.params ?? []);
+        const shape = resolvePointReadShape(template, params);
         if (shape !== undefined) {
           let point: QueryResult | undefined;
           try {
@@ -5514,7 +5552,40 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
     }
-    const plan = bindPlanParameters(compiled, options.params);
+    // Parameters are checked up front, as binding would; the bound plan itself is built only
+    // when something reads it — a prepared execution binds its template instead.
+    validateParameters(
+      compiled.parameterCount ?? 0,
+      literals === undefined ? options.params : literals.values,
+    );
+    let bound: CompiledQuery | undefined;
+    const plan = (): CompiledQuery =>
+      (bound ??=
+        literals === undefined
+          ? bindPlanParameters(compiled, options.params)
+          : this.#queries.compile(sql));
+    const run = async (before?: CatalogProbe): Promise<QueryResult> => {
+      if (options.version === undefined && !preparedPlanTestHooks.disabled) {
+        before ??= await this.store.getCatalogProbe();
+        throwIfAborted(options.signal);
+        const prepared = await this.#preparedRead(
+          compiled,
+          params,
+          before,
+          literals === undefined ? undefined : sql,
+        );
+        if (prepared !== undefined) {
+          try {
+            return await this.#queries.run(prepared, options, before, true);
+          } catch (error) {
+            // The ordinary path is the authority on errors: it reports this failure itself.
+            if (options.signal?.aborted === true || this.#closed) throw error;
+            preparedPlanTestHooks.retried += 1;
+          }
+        }
+      }
+      return this.#queries.run(plan(), options, before);
+    };
     // Result memoization is proved by schema identity and dependency-table generations, so
     // unrelated writes preserve hits while relevant commits and DDL change the identity. Only
     // plain current-version queries memoize — explicit versions, budgets, and spill options
@@ -5525,25 +5596,28 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       cacheableQueryInput(sql, options.params ?? []) &&
       // A statement that reads the clock is not a function of the data, so the catalog epoch
       // cannot tell a fresh answer from a stale one.
-      plan.usesStatementDatetime !== true &&
-      plan.usesVolatileFunctions !== true &&
+      compiled.usesStatementDatetime !== true &&
+      compiled.usesVolatileFunctions !== true &&
       // A sequence call advances connection state on every execution; a memo hit would both
       // repeat the old value and skip the advance.
-      plan.usesSequenceCalls !== true &&
+      compiled.usesSequenceCalls !== true &&
       options.version === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
       options.spillToStorage === undefined &&
       options.spillPageRows === undefined;
+    let memoKey = "";
+    if (memoizable) {
+      try {
+        memoKey = `res ${queryResultMemoKey(sql, options.params ?? [])}`;
+      } catch (error) {
+        // Binding reports a malformed parameter first, as it did before keying the memo.
+        plan();
+        throw error;
+      }
+    }
     const result = !memoizable
-      ? await this.#queries.run(plan, options, probe)
-      : await this.#memoizedQuery(
-          plan,
-          `res ${queryResultMemoKey(sql, options.params ?? [])}`,
-          options,
-          readProbe,
-          probe,
-          storeMemo,
-        );
+      ? await run(probe)
+      : await this.#memoizedQuery(plan, memoKey, options, readProbe, probe, storeMemo, run);
     throwIfAborted(options.signal);
     return externalizeQueryResult(result);
   }
@@ -5679,18 +5753,104 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * The prepared form of a compiled read for this execution: its catalog-rewritten template,
+   * built once per structural catalog epoch, bound to these parameters. Undefined sends the
+   * execution down the ordinary bind-and-rewrite path, which stays the authority on semantics
+   * and errors. See prepared-plan.ts for what a template may and may not replay.
+   */
+  async #preparedRead(
+    compiled: CompiledQuery,
+    params: readonly QueryParameter[],
+    probe: CatalogProbe,
+    /** The statement as written, when `compiled` is the shape of a literal statement. */
+    text?: string,
+  ): Promise<CompiledQuery | undefined> {
+    if (compiled.usesSequenceCalls === true || this.#keyForwardsReads.has(compiled)) {
+      return undefined;
+    }
+    let entry = this.#preparedReads.get(compiled);
+    if (entry?.schemaEpoch !== probe.schemaEpoch) {
+      entry = { schemaEpoch: probe.schemaEpoch, template: null };
+      this.#preparedReads.set(compiled, entry);
+      // The first execution under an epoch takes the ordinary path; a statement that runs again
+      // builds its template, so a one-off statement never pays for one.
+      if (!preparedPlanTestHooks.eager) return undefined;
+    }
+    if (entry.template === null) {
+      entry = {
+        schemaEpoch: probe.schemaEpoch,
+        template: await this.#buildPreparedTemplate(compiled, probe),
+      };
+      this.#preparedReads.set(compiled, entry);
+    }
+    const template = entry.template;
+    if (template === undefined || template === null) return undefined;
+    // A live key forward rewrites key constants by value, which only the ordinary path does.
+    // Forwards are not structural, so the key sites are re-read against the current catalog.
+    const facts = await this.#catalogFacts(probe);
+    if (facts.keyForwardsTableId !== undefined) {
+      const lookup = await this.#committedForwards(probe);
+      if (
+        lookup !== undefined &&
+        !lookup.isEmpty() &&
+        (template.keySensitive || planHasKeyLiterals(template.plan, facts.tables, true))
+      ) {
+        preparedPlanTestHooks.declined += 1;
+        return undefined;
+      }
+    }
+    const prepared = template.bind(params);
+    if (prepared === undefined) {
+      preparedPlanTestHooks.declined += 1;
+      return undefined;
+    }
+    preparedPlanTestHooks.served += 1;
+    // A bound copy's root is its own; the shape of a literal statement reports the text as
+    // written, as the ordinary path's plan would.
+    if (text !== undefined && prepared !== template.plan) prepared.sql = text;
+    return prepared;
+  }
+
+  /** Runs the catalog passes once over a private, unbound copy of the statement. */
+  async #buildPreparedTemplate(
+    compiled: CompiledQuery,
+    probe: CatalogProbe,
+  ): Promise<PreparedPlanTemplate | undefined> {
+    const state = { unsupported: false, keySensitive: false };
+    let rewritten: CompiledQuery;
+    try {
+      rewritten = await this.#applyCatalogRewrites(
+        clonePlanTree(compiled),
+        probe,
+        undefined,
+        state,
+      );
+    } catch {
+      // The ordinary path reports whatever this statement's rewrite rejects.
+      return undefined;
+    }
+    if (state.unsupported) return undefined;
+    preparedPlanTestHooks.built += 1;
+    return PreparedPlanTemplate.create(rewritten, state.keySensitive);
+  }
+
+  /**
    * The result memo: a pure cache over the freshness probe, keyed by the statement and the
    * structural catalog epoch and dependency-table generations it was answered at. The probe read before execution is handed down to the
    * execution itself — the view lookup and the catalog state would otherwise each probe again,
    * and on IndexedDB every probe is a read transaction, a floor under every small query.
    */
   async #memoizedQuery(
-    plan: CompiledQuery,
+    /** The bound statement, or a thunk binding it: only a dependency-proof miss reads it. */
+    plan: CompiledQuery | (() => CompiledQuery),
     key: string,
     options: QueryOptions,
     probe: () => Promise<CatalogProbe>,
     before?: CatalogProbe,
     store = true,
+    /** Executes on a memo miss; the default runs the bound plan through the ordinary path. */
+    run: (before: CatalogProbe) => Promise<QueryResult> = (probe) =>
+      this.#queries.run(typeof plan === "function" ? plan() : plan, options, probe),
   ): Promise<QueryResult> {
     throwIfAborted(options.signal);
     // A probe the caller read moments ago serves as `before`: a hit under its epoch is exactly
@@ -5699,13 +5859,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     before ??= await probe();
     throwIfAborted(options.signal);
     const resultKey = await this.#resultMemoIdentity(plan, key, before);
-    if (resultKey === undefined) return this.#queries.run(plan, options, before);
+    if (resultKey === undefined) return run(before);
     const cached = this.#cacheGet(resultKey) as QueryResult | undefined;
     if (cached !== undefined) {
       options.onStats?.({ peakMemoryBytes: 0 });
       return copyQueryResult(cached);
     }
-    const result = await this.#queries.run(plan, options, before);
+    const result = await run(before);
     throwIfAborted(options.signal);
     if (!store) return result;
     const bytes = queryResultRetainedBytes(result);
@@ -5720,7 +5880,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #resultMemoIdentity(
-    plan: CompiledQuery,
+    plan: CompiledQuery | (() => CompiledQuery),
     key: string,
     before: CatalogProbe,
   ): Promise<string | undefined> {
@@ -5728,7 +5888,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let proof = this.#cacheGet(dependencyKey) as
       { dependencies: string[]; deterministic: boolean } | undefined;
     if (proof === undefined) {
-      const rewritten = await this.#applyCatalogRewrites(plan, before);
+      const rewritten = await this.#applyCatalogRewrites(
+        typeof plan === "function" ? plan() : plan,
+        before,
+      );
       const dependencies = [...(await this.#findRealBlockTables(rewritten)).values()].map(
         (table) => table.id,
       );
@@ -5799,7 +5962,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     probe?: CatalogProbe,
     /** Inside a write scope, the forwards it staged count too. */
     transaction?: DatabaseTransaction,
+    /**
+     * Prepared-template mode: `plan` is a private, still-unbound copy. Placeholders are
+     * annotated for the binder, key forwarding is left to bind time (the caller declines while
+     * a forward is live), and anything the binder could not replay sets `unsupported`.
+     */
+    template?: { unsupported: boolean; keySensitive: boolean },
   ): Promise<CompiledQuery> {
+    preparedPlanTestHooks.catalogRewrites += 1;
     const aliased = planHasSourceColumnAliases(plan);
     const natural = planHasNaturalJoins(plan);
     // Whether a name is a view cannot be read off the statement, so this is the one thing every
@@ -5834,10 +6004,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
-      rewritten = normalizePlanDomainLiterals(rewritten, domains, types);
+      rewritten = normalizePlanDomainLiterals(rewritten, domains, types, template);
     }
-    // A key constant naming a retired key reads the row's current key; see key-forward-plan.ts.
-    if (
+    if (template !== undefined) {
+      template.keySensitive = planHasKeyLiterals(rewritten, tables, true);
+    } else if (
+      // A key constant naming a retired key reads the row's current key; see key-forward-plan.ts.
       keyForwardsTableId !== undefined &&
       !this.#keyForwardsReads.has(plan) &&
       planHasKeyLiterals(rewritten, tables)
@@ -7000,6 +7172,40 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<QueryResult | undefined> {
     const table = realTables.get(shape.table);
     if (table === undefined || table.view !== undefined) return undefined;
+    const members = shape.members;
+    if (members !== undefined) {
+      // `key IN (…)` is one lookup per member, in ascending member order. Two retired members
+      // could forward to one current key and name its row twice; the general path dedupes.
+      if (forwards !== undefined) return undefined;
+      // Every member's shape has one signature, so one resolved plan serves them all.
+      const equalities = [
+        ...shape.equalities,
+        { column: members.column, value: members.values[0] },
+      ];
+      const single: PointReadShape = {
+        table: shape.table,
+        equalities: equalities as PointReadEquality[],
+        select: shape.select,
+        ...(shape.signature === undefined ? {} : { signature: shape.signature }),
+      };
+      const plan = await this.#pointReadPlan(single, table, snapshot, visibility);
+      if (plan.kind === "ineligible") return undefined;
+      const rows: QueryRow[] = [];
+      let columns: readonly string[] = plan.columns;
+      let columnDomains: ReadonlyArray<SqlDomain | null> = plan.columnDomains;
+      const last = equalities.length - 1;
+      for (const value of members.values) {
+        throwIfAborted(options.signal);
+        equalities[last] = { column: members.column, value };
+        const member = await this.#servePointRead(plan, single, snapshot, visibility, options);
+        if (member === undefined) return undefined;
+        columns = member.columns;
+        columnDomains = member.columnDomains;
+        for (const row of member.rows) rows.push(row);
+      }
+      if (plan.count !== undefined) return countResult(plan.count, rows.length);
+      return { columns: [...columns], columnDomains: [...columnDomains], rows };
+    }
     if (forwards !== undefined) {
       // A pinned foreign-key column may name a retired parent key; the general path follows it.
       const pinned = new Set(shape.equalities.map(({ column }) => column));
@@ -7015,8 +7221,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const equalities = forwardKeyEqualities(table, shape.equalities, NO_TABLES, forwards);
       if (equalities !== shape.equalities) shape = { ...shape, equalities: [...equalities] };
     }
-    // Visible history is a function of (visibility catalog, table, snapshot version), and the
-    // resolved plan of that history plus the statement's value-free signature.
+    const plan = await this.#pointReadPlan(shape, table, snapshot, visibility);
+    if (plan.kind === "ineligible") return undefined;
+    const result = await this.#servePointRead(plan, shape, snapshot, visibility, options);
+    if (result === undefined || plan.count === undefined) return result;
+    return countResult(plan.count, result.rows.length);
+  }
+
+  /**
+   * Visible history is a function of (visibility catalog, table, snapshot version), and the
+   * resolved plan of that history plus the statement's value-free signature.
+   */
+  async #pointReadPlan(
+    shape: PointReadShape,
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+  ): Promise<ResolvedPointRead> {
     const signature = pointReadSignature(shape);
     let byTable = this.#pointReadPlans.get(visibility);
     let plans = byTable?.get(table);
@@ -7038,10 +7259,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       plans.set(signature, plan);
     }
-    if (plan.kind === "ineligible") return undefined;
-    const result = await this.#servePointRead(plan, shape, snapshot, visibility, options);
-    if (result === undefined || plan.count === undefined) return result;
-    return countResult(plan.count, result.rows.length);
+    return plan;
   }
 
   /** Executes a resolved point read: a key search, a keyed delta replay, or an index lookup. */
@@ -7103,7 +7321,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       throwIfAborted(options.signal);
       const blockCount = segment.searchBlockIds.length;
       let blockIndexes: number[] | undefined;
-      for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+      let firstBlock = 0;
+      if (numericTarget && segment.zonesAscending === true && segment.zoneMax !== undefined) {
+        // The first block whose maximum reaches the key; the scan below stops past its run.
+        let high = blockCount;
+        while (firstBlock < high) {
+          const middle = (firstBlock + high) >>> 1;
+          if ((segment.zoneMax[middle] ?? Number.NaN) < searchTarget) firstBlock = middle + 1;
+          else high = middle;
+        }
+      }
+      for (let blockIndex = firstBlock; blockIndex < blockCount; blockIndex += 1) {
+        if (
+          segment.zonesAscending === true &&
+          numericTarget &&
+          searchTarget < (segment.zoneMin?.[blockIndex] ?? Number.NaN)
+        ) {
+          break;
+        }
         // A block whose zone map excludes the key cannot hold it. A header without a zone map
         // carries NaN bounds, which exclude nothing.
         if (
@@ -7355,7 +7590,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       const otherBlockIds = otherColumns.map((column) => segment.columnBlockIds[column.id] ?? []);
-      resolvedSegments.push({ searchBlockIds, ...zones, otherBlockIds });
+      let ascending = zones !== undefined;
+      for (
+        let index = 0;
+        ascending && zones !== undefined && index < searchBlockIds.length;
+        index += 1
+      ) {
+        const min = zones.zoneMin[index] ?? Number.NaN;
+        const max = zones.zoneMax[index] ?? Number.NaN;
+        // NaN fails every comparison, so a block without bounds ends the proof.
+        if (!(min <= max) || (index > 0 && !((zones.zoneMax[index - 1] ?? Number.NaN) <= min))) {
+          ascending = false;
+        }
+      }
+      resolvedSegments.push({
+        searchBlockIds,
+        ...zones,
+        ...(ascending ? { zonesAscending: true as const } : {}),
+        otherBlockIds,
+      });
     }
     return {
       kind: "base",
@@ -9140,18 +9393,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       this.#catalogStateEpoch = nextEpoch;
-      // The epoch moved for this commit's manifest alone; no table record changed with it unless
-      // the commit created one. What the catalog says, and that no rekey has created the forwards
-      // table, therefore still hold at the next epoch — reading them again costs every keyed write
-      // a scan of the whole catalog and a forwards-table read.
-      if (contribution.transaction.pendingTable === undefined) {
-        const facts = this.#catalogCache;
-        if (facts?.epoch === initial.catalogEpoch) {
-          this.#catalogCache = { epoch: nextEpoch, facts: facts.facts };
-        }
-        if (this.#keyForwardsTableAbsentAt === initial.catalogEpoch) {
-          this.#keyForwardsTableAbsentAt = nextEpoch;
-        }
+    }
+    // The epoch moved for this commit's manifest alone; no table record changed with it unless
+    // the commit created one. What the catalog says, and that no rekey has created the forwards
+    // table, therefore still hold at the next epoch — reading them again costs every keyed write
+    // a scan of the whole catalog and a forwards-table read. This needs no cached catalog state:
+    // a write-only loop (single-row INSERTs) reads none, and would otherwise re-read its table
+    // record from the store on every statement.
+    if (
+      initial?.manifestVersion === manifest.previousVersion &&
+      contribution?.transaction.pendingTable === undefined
+    ) {
+      const nextEpoch = initial.catalogEpoch + 1;
+      const facts = this.#catalogCache;
+      if (facts?.epoch === initial.catalogEpoch) {
+        this.#catalogCache = { epoch: nextEpoch, facts: facts.facts };
+      }
+      if (this.#keyForwardsTableAbsentAt === initial.catalogEpoch) {
+        this.#keyForwardsTableAbsentAt = nextEpoch;
       }
     }
     this.#notifyLiveCommit();
@@ -12762,6 +13021,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 ? primaryKeyColumns(record)
                 : [keyColumn];
           const covered = new Set(pointTemplate.equalities.map((equality) => equality.column));
+          if (pointTemplate.membership !== undefined) covered.add(pointTemplate.membership.column);
           if (
             keyComponents.length > 0 &&
             keyComponents.every((component) => covered.has(component.name))
@@ -15517,28 +15777,41 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
     }
+    // A prepared plan's shape is its template's, so what follows from the shape and the catalog
+    // records alone is computed once per template and record set; a bound value never enters.
+    const template = preparedTemplateOf(plan);
+    const analysis = <T>(name: string, compute: () => T): T =>
+      template === undefined ? compute() : template.analysis(name, tables, compute);
+    const containsFts = analysis("fts", () => planContainsFts(plan));
     // Copy-on-write: expansion clones only full-text plans, leaving the compile cache's copy
     // untouched.
-    plan = expandFtsColumns(plan, (tableName) =>
-      searchableFtsColumns(tables.find((table) => table.name === tableName)),
-    );
-    const schemas = new Map(
-      tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
-    );
-    const typedSchemas = new Map<string, SqlColumnSchema[]>(
-      tables.map((table) => [
-        table.name,
-        table.columns.map(({ name, type, integer, sqlDomain }) => ({
-          name,
-          type,
-          ...(integer === true ? { integer: true as const } : {}),
-          ...(sqlDomain === undefined ? {} : { sqlDomain }),
-        })),
-      ]),
-    );
+    if (containsFts) {
+      plan = expandFtsColumns(plan, (tableName) =>
+        searchableFtsColumns(tables.find((table) => table.name === tableName)),
+      );
+    }
+    const { schemas, typedSchemas } = analysis("schemas", () => ({
+      schemas: new Map(tables.map((table) => [table.name, table.columns.map(({ name }) => name)])),
+      typedSchemas: new Map<string, SqlColumnSchema[]>(
+        tables.map((table) => [
+          table.name,
+          table.columns.map(({ name, type, integer, sqlDomain }) => ({
+            name,
+            type,
+            ...(integer === true ? { integer: true as const } : {}),
+            ...(sqlDomain === undefined ? {} : { sqlDomain }),
+          })),
+        ]),
+      ),
+    }));
     // Streamed plans scan real tables only, so the catalog schemas resolve every AVG argument.
-    plan = annotateAvgArgumentScales(plan, typedSchemas);
-    const columns = referencedColumns(plan, schemas);
+    // The scales are a function of the shape: a prepared plan whose template needs none skips
+    // the walk.
+    if (analysis("avg", () => annotateAvgArgumentScales(plan, typedSchemas) !== plan)) {
+      plan = annotateAvgArgumentScales(plan, typedSchemas);
+    }
+    const unordered = plan;
+    const columns = analysis("columns", () => referencedColumns(unordered, schemas));
     // Streaming must choose the scan/build orientation before creating its sliding base view.
     // Plain append histories have exact row counts in segment metadata; mutation histories keep
     // their written order because their visible cardinality requires replay to determine.
@@ -15601,7 +15874,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     {
       // The fts invalidation flip commits atomically with its segments, so a record fetched
       // after the segment reads above cannot claim "ready" for data those segments miss.
-      const freshBaseTable = planContainsFts(plan)
+      const freshBaseTable = containsFts
         ? ((await this.store.getTable(baseTable.id)) ?? baseTable)
         : baseTable;
       // Scoring needs corpus statistics: streamed windows cannot run the scan-side stats pass,
@@ -15760,10 +16033,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             );
             throwIfAborted(options.signal);
           }
+          // Output types follow from the select list: per template, unless a value reaches it.
+          const output =
+            template === undefined || template.selectHasParameters
+              ? undefined
+              : template.analysis("output", [...tables, joinOrderKey(plan)], () => ({
+                  externalize: queryResultNeedsExternalization(plan, typedSchemas),
+                  domains: inferResultColumnDomains(plan, typedSchemas),
+                }));
           prepared = createPreparedColumnarQuery(plan, inputTables, memory, {
             ...(ftsStats === undefined ? {} : { ftsStats }),
-            outputNeedsExternalization: queryResultNeedsExternalization(plan, typedSchemas),
-            outputColumnDomains: inferResultColumnDomains(plan, typedSchemas),
+            outputNeedsExternalization:
+              output?.externalize ?? queryResultNeedsExternalization(plan, typedSchemas),
+            outputColumnDomains: [
+              ...(output?.domains ?? inferResultColumnDomains(plan, typedSchemas)),
+            ],
           });
           if (cursor !== undefined) {
             const emission = { happened: false };
@@ -27883,12 +28167,28 @@ function normalizePlanDomainLiterals(
   input: CompiledQuery,
   domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>,
   types: ReadonlyMap<string, ReadonlyMap<string, SimpleDataType>> = new Map(),
+  /**
+   * Template mode (prepared plans): `input` is a private copy, and every placeholder standing
+   * where a literal would be coerced or type-checked is annotated with what this pass would do
+   * to that literal, for the binder to replay. A placeholder this pass would read in a way the
+   * binder cannot replay sets `unsupported`.
+   */
+  template?: { unsupported: boolean },
 ): CompiledQuery {
   // Most plans have nothing to coerce. A probing pass over the shared (cached) plan finds out
   // without touching it; only a plan that needs a rewrite is cloned and rewritten, so the
   // per-query cost of a plan that compares typed columns to typed literals is one walk, not a
   // structured clone.
   const pass = { probing: true, needed: false };
+  const annotate = (value: Expression, position: ParameterPosition): void => {
+    if (template === undefined) return;
+    const items = value.kind === "list" ? value.items : [value];
+    for (const item of items) {
+      if (item.kind !== "parameter") continue;
+      const node = item as AnnotatedParameter;
+      node.bindPosition = { ...node.bindPosition, ...position };
+    }
+  };
   const coerceText = (type: SimpleDataType, text: string): QueryValue | undefined => {
     const read = readUntypedText(type, text);
     return read === text ? undefined : (read as QueryValue);
@@ -27927,6 +28227,7 @@ function normalizePlanDomainLiterals(
       if (column.kind !== "column") return;
       const type = lookup(column.reference, types);
       if (type === undefined || type === "string") return;
+      annotate(value, { typed: type });
       const literals =
         value.kind === "literal" ? [value] : value.kind === "list" ? value.items : [];
       for (const literal of literals) {
@@ -27982,10 +28283,26 @@ function normalizePlanDomainLiterals(
       return schema?.type === "string" && schema.sqlDomain === undefined && schema.unknown !== true;
     };
     const checkTextComparison = (text: Expression, value: Expression): void => {
+      if (
+        template !== undefined &&
+        (text.kind === "call" || text.kind === "case") &&
+        containsParameter(text)
+      ) {
+        // Whether this side is plain text depends on its bound placeholder's type.
+        template.unsupported = true;
+      }
       if (!plainTextExpression(text)) return;
       if (value.kind === "list") {
         for (const item of value.items) checkTextComparison(text, item);
         return;
+      }
+      if (template !== undefined) {
+        if (value.kind === "parameter") {
+          annotate(value, { text: true });
+          return;
+        }
+        // The type of an expression over a placeholder is the bound value's.
+        if (containsParameter(value)) template.unsupported = true;
       }
       // Unknown string literals take the surrounding SQL type; typed TEXT never takes a numeric type.
       if (
@@ -28007,6 +28324,7 @@ function normalizePlanDomainLiterals(
         coerceTyped(column, value);
         return;
       }
+      annotate(value, { domain });
       // A DATE meeting a TIMESTAMP constant is promoted to midnight of that day, as in
       // PostgreSQL; narrowing the timestamp to its day would make `day < TIMESTAMP '… 00:00:01'`
       // false. A placeholder's Date has no type of its own and reads as the DATE.

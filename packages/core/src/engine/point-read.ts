@@ -1,7 +1,8 @@
 /**
  * Shape analysis for the keyed point-read fast path: a single-table conjunction of
- * column-equals-literal predicates that covers the table's unique key, projecting bare
- * columns — plain or logical-domain typed, since domain scalars externalize through the
+ * column-equals-literal predicates — at most one of them a membership, `key IN (…)` or
+ * `key = ANY($n)`, served as one lookup per member — that covers the table's unique key,
+ * projecting bare columns — plain or logical-domain typed, since domain scalars externalize through the
  * same result boundary. Such a statement addresses at most one row, so execution can skip parameter
  * binding, plan cloning, streamed-view construction, and the vector pipeline entirely and
  * answer from cached decoded blocks. Anything this module cannot prove eligible falls back to
@@ -27,6 +28,12 @@ export interface PointReadShape {
   table: string;
   /** Conjunctive equalities, in predicate order; may repeat a column. */
   equalities: PointReadEquality[];
+  /**
+   * One more equality whose value is any of these: distinct, NULL-free, ascending. Each member
+   * is served as the shape whose equalities end with `column = member`; the signature below is
+   * that per-member shape's.
+   */
+  members?: { column: string; values: PointReadValue[] };
   select: PointReadSelect;
   /**
    * The statement shape without its values: equality columns and projection. Resolved
@@ -35,15 +42,24 @@ export interface PointReadShape {
   signature?: string;
 }
 
+type TemplateValue = { value: PointReadValue } | { parameter: number };
+
 /** The statement-shaped half of the analysis, computed once per cached plan. */
 interface PointReadTemplate {
   table: string;
-  equalities: Array<
-    { column: string; value: PointReadValue } | { column: string; parameter: number }
-  >;
+  equalities: Array<{ column: string } & TemplateValue>;
+  /** An IN list's items (a NULL item matches nothing), or the array placeholder of `= ANY`. */
+  membership?: {
+    column: string;
+    items?: Array<TemplateValue | { null: true }>;
+    arrayParameter?: number;
+  };
   select: PointReadSelect;
   signature: string;
 }
+
+/** Most members one statement serves as separate lookups; longer lists take the executor. */
+export const MAX_POINT_READ_MEMBERS = 4_096;
 
 /**
  * The value-free identity of a point read: which columns it pins and what it projects. Two
@@ -190,8 +206,38 @@ function pointReadTemplate(plan: CompiledQuery): PointReadTemplate | undefined {
     select = columns;
   }
   const equalities: PointReadTemplate["equalities"] = [];
+  let membership: PointReadTemplate["membership"];
   for (const predicate of plan.predicates) {
-    if (predicate.operator !== "=" || predicate.escape !== undefined) return undefined;
+    if (predicate.escape !== undefined) return undefined;
+    if (predicate.operator === "IN" || predicate.operator === "= ANY") {
+      const column = baseColumnReference(predicate.left, base.alias);
+      if (column === undefined || membership !== undefined) return undefined;
+      if (predicate.operator === "= ANY") {
+        if (predicate.right.kind !== "parameter") return undefined;
+        membership = { column, arrayParameter: predicate.right.index };
+        continue;
+      }
+      if (predicate.right.kind !== "list" || predicate.right.items.length === 0) return undefined;
+      if (predicate.right.items.length > MAX_POINT_READ_MEMBERS) return undefined;
+      const items: NonNullable<PointReadTemplate["membership"]>["items"] = [];
+      for (const item of predicate.right.items) {
+        if (
+          item.kind === "literal" &&
+          item.value === null &&
+          item.internalSqlValue !== true &&
+          item.sqlDomain === undefined
+        ) {
+          items.push({ null: true });
+          continue;
+        }
+        const value = templateEquality(item);
+        if (value === undefined) return undefined;
+        items.push(value);
+      }
+      membership = { column, items };
+      continue;
+    }
+    if (predicate.operator !== "=") return undefined;
     const leftColumn = baseColumnReference(predicate.left, base.alias);
     const rightColumn = baseColumnReference(predicate.right, base.alias);
     const operand =
@@ -207,9 +253,65 @@ function pointReadTemplate(plan: CompiledQuery): PointReadTemplate | undefined {
   return {
     table: base.table,
     equalities,
+    ...(membership === undefined ? {} : { membership }),
     select,
-    signature: pointReadSignature({ table: base.table, equalities, select }),
+    // A membership is served one member at a time, as the shape ending with its equality.
+    signature: pointReadSignature({
+      table: base.table,
+      equalities: membership === undefined ? equalities : [...equalities, membership],
+      select,
+    }),
   };
+}
+
+/** Orders members as a key scan meets them, so a lookup per member returns scan order. */
+function compareMembers(left: PointReadValue, right: PointReadValue): number {
+  const a = left instanceof Date ? dateMilliseconds(left) : left;
+  const b = right instanceof Date ? dateMilliseconds(right) : right;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The distinct, ascending, NULL-free members, or undefined for any value the path declines. */
+function resolveMembers(
+  membership: NonNullable<PointReadTemplate["membership"]>,
+  params: readonly QueryParameter[],
+): PointReadValue[] | undefined {
+  const raw: QueryParameter[] = [];
+  if (membership.arrayParameter !== undefined) {
+    const array = params[membership.arrayParameter];
+    // A NULL array, JSON array text, or a scalar: the ordinary binder decides what it means.
+    if (!Array.isArray(array)) return undefined;
+    raw.push(...(array as readonly QueryValue[]));
+  } else {
+    for (const item of membership.items ?? []) {
+      if ("null" in item) continue;
+      if ("value" in item) raw.push(item.value);
+      else raw.push(params[item.parameter] ?? null);
+    }
+  }
+  if (raw.length > MAX_POINT_READ_MEMBERS) return undefined;
+  const values: PointReadValue[] = [];
+  for (const member of raw) {
+    // NULL never equals a key; an array member or anything else is the binder's to reject.
+    if (member === null) continue;
+    if (Array.isArray(member)) return undefined;
+    const value = equalityValue(member as QueryValue);
+    if (value === undefined) return undefined;
+    values.push(value);
+  }
+  if (values.length === 0) return undefined;
+  const kind = typeof values[0];
+  const date = values[0] instanceof Date;
+  if (values.some((value) => typeof value !== kind || value instanceof Date !== date)) {
+    return undefined;
+  }
+  values.sort(compareMembers);
+  const distinct: PointReadValue[] = [];
+  for (const value of values) {
+    const last = distinct[distinct.length - 1];
+    if (last === undefined || compareMembers(last, value) !== 0) distinct.push(value);
+  }
+  return distinct;
 }
 
 const templates = new WeakMap<CompiledQuery, PointReadTemplate | null>();
@@ -245,9 +347,21 @@ export function resolvePointReadShape(
     if (value === undefined) return undefined;
     equalities.push({ column: entry.column, value });
   }
+  const membership = template.membership;
+  if (membership === undefined) {
+    return {
+      table: template.table,
+      equalities,
+      select: template.select,
+      signature: template.signature,
+    };
+  }
+  const values = resolveMembers(membership, params);
+  if (values === undefined) return undefined;
   return {
     table: template.table,
     equalities,
+    members: { column: membership.column, values },
     select: template.select,
     signature: template.signature,
   };

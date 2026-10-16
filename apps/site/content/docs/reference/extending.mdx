@@ -37,9 +37,10 @@ const result = await database.execute(
 
 Emit PostgreSQL's `$1`, `$2` placeholders rather than building SQL strings. Minnow also accepts
 `?` as adapter shorthand, but `$n` is the public dialect target. The compiled plan is cached on
-the statement text and re-bound per execution, so parameters are faster as well as safer — and a
-layer that inlines literals instead defeats that cache, since every distinct value becomes a
-distinct key.
+the statement text and re-bound per execution, so parameters are faster as well as safer. Minnow
+shares a plan between inlined literals only where it can prove them plain values — comparison
+operands and IN-list items — so a layer that inlines values elsewhere (LIMIT, function arguments,
+casts) still makes every distinct value a distinct plan.
 
 Identifiers quote with double quotes, doubling an embedded quote: `"order id"`, `"say ""hi"""`.
 

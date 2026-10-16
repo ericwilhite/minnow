@@ -199,9 +199,17 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.
 - Spill pages are lease-protected, so a query abandoned by a dead tab gets cleaned up.
 - Compiled plans are cached separately, by statement text, so re-issuing a statement doesn't
-  re-parse or re-plan it. Plan, statement, pattern, full-text-term, collation, constraint, and
-  catalog-state caches all have fixed entry or byte bounds; oversized accepted text executes but
-  does not become permanent process state.
+  re-parse or re-plan it. A statement that runs again also keeps its **prepared template**: the
+  plan after the catalog rewrites (view expansion, name folding, constant coercion to column
+  types, wildcard binding, subquery optimization), with its placeholders still open. Later runs
+  bind their values into fresh copies of only the nodes that hold them, so a repeated statement
+  pays no catalog pass and no plan copy. Templates are rebuilt when the structural catalog epoch
+  moves (column, table, and view DDL, from any tab; index choice is made per run) and are
+  bypassed while a primary-key forward is live. Literal statements that differ only in comparison
+  operands or IN-list items share one compiled shape, once the shape bound to the literals is
+  proven to compile to exactly the literal plan. Plan, statement, literal-shape, pattern, full-text-term, collation,
+  constraint, and catalog-state caches all have fixed entry or byte bounds; oversized accepted
+  text executes but does not become permanent process state.
 - Everything else repeated is cached in one byte-bounded buffer pool (`bufferPoolBytes`,
   default 64 MiB): decoded blocks by immutable block id, assembled column vectors and zone
   descriptions by the same, and computed results — whole-block results, the columnar forms of
