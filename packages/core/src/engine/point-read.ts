@@ -21,9 +21,13 @@ export interface PointReadShape {
   table: string;
   /** Conjunctive equalities, in predicate order; may repeat a column. */
   equalities: PointReadEquality[];
-  /** Plain column projections, in select order. */
   /** Projected columns, or "*" for a bare wildcard the catalog expands at execution. */
   select: Array<{ column: string; alias: string }> | "*";
+  /**
+   * The statement shape without its values: equality columns and projection. Resolved
+   * per-table read plans are cached under it, so every execution of one statement shares one.
+   */
+  signature?: string;
 }
 
 /** The statement-shaped half of the analysis, computed once per cached plan. */
@@ -34,6 +38,27 @@ interface PointReadTemplate {
   >;
   /** Projected columns, or "*" for a bare wildcard the catalog expands at execution. */
   select: Array<{ column: string; alias: string }> | "*";
+  signature: string;
+}
+
+/**
+ * The value-free identity of a point read: which columns it pins and what it projects. Two
+ * shapes with one signature over one table resolve to the same columns, blocks, and output.
+ */
+export function pointReadSignature(shape: {
+  readonly table: string;
+  readonly equalities: ReadonlyArray<{ readonly column: string }>;
+  readonly select: ReadonlyArray<{ readonly column: string; readonly alias: string }> | "*";
+  readonly signature?: string;
+}): string {
+  return (
+    shape.signature ??
+    JSON.stringify([
+      shape.table,
+      shape.equalities.map((equality) => equality.column),
+      shape.select === "*" ? "*" : shape.select.map((item) => [item.column, item.alias]),
+    ])
+  );
 }
 
 /**
@@ -152,7 +177,12 @@ function pointReadTemplate(plan: CompiledQuery): PointReadTemplate | undefined {
     if (operand === undefined || column === undefined) return undefined;
     equalities.push({ column, ...operand });
   }
-  return { table: base.table, equalities, select };
+  return {
+    table: base.table,
+    equalities,
+    select,
+    signature: pointReadSignature({ table: base.table, equalities, select }),
+  };
 }
 
 const templates = new WeakMap<CompiledQuery, PointReadTemplate | null>();
@@ -187,7 +217,12 @@ export function resolvePointReadShape(
     if (value === undefined) return undefined;
     equalities.push({ column: entry.column, value });
   }
-  return { table: template.table, equalities, select: template.select };
+  return {
+    table: template.table,
+    equalities,
+    select: template.select,
+    signature: template.signature,
+  };
 }
 
 const ascendingRuns = new WeakMap<Float64Array, boolean>();

@@ -391,6 +391,11 @@ export function decodeSecondaryTupleTerm(
 
 /** Stable 32-bit key locator. Collisions retain extra candidates and are rechecked by SQL. */
 export function secondaryKeyLocator(type: SimpleDataType, value: BatchValue): bigint {
+  return BigInt(secondaryKeyLocatorNumber(type, value));
+}
+
+/** `secondaryKeyLocator` as a plain unsigned 32-bit number, for in-memory locator tables. */
+export function secondaryKeyLocatorNumber(type: SimpleDataType, value: BatchValue): number {
   const token = keyToken(type, value);
   let hash = 0x811c9dc5;
   for (let index = 0; index < token.length; index += 1) {
@@ -398,7 +403,7 @@ export function secondaryKeyLocator(type: SimpleDataType, value: BatchValue): bi
     hash = Math.imul(hash ^ (code & 0xff), 0x01000193) >>> 0;
     hash = Math.imul(hash ^ (code >>> 8), 0x01000193) >>> 0;
   }
-  return BigInt(hash >>> 0);
+  return hash >>> 0;
 }
 
 export function addSecondaryPosting(

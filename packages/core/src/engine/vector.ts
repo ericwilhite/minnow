@@ -582,7 +582,7 @@ type MultiCodeColumn =
 const NUMBER_KEY_CODE_CAP = 1 << 20;
 
 interface FastAggregateSpec {
-  readonly kind: "star" | "column" | "conditional";
+  readonly kind: "star" | "column" | "conditional" | "extreme";
   readonly sums: boolean;
 }
 
@@ -5078,9 +5078,10 @@ class GroupAccumulator {
   }
 
   /**
-   * Fast aggregate specs for the batch kernel: every aggregate is COUNT(*) or a bare numeric
-   * column under COUNT/SUM/AVG. MIN/MAX keep the generic path for its comparison and memory
-   * accounting semantics. Undefined when any aggregate needs the generic path.
+   * Fast aggregate specs for the batch kernel: every aggregate is COUNT(*), a bare numeric
+   * column under COUNT/SUM/AVG/MIN/MAX, or a bare datetime column under COUNT/MIN/MAX. MIN/MAX
+   * compare exactly as the per-row path does (NaN after every finite number) and replace the
+   * kept value through the same reservation. Undefined when any aggregate needs the generic path.
    */
   #fastAggregates(): FastAggregateSpec[] | undefined {
     const specs: FastAggregateSpec[] = [];
@@ -5096,6 +5097,17 @@ class GroupAccumulator {
         (spec.name === "COUNT" || spec.name === "SUM" || spec.name === "AVG")
       ) {
         specs.push({ kind: "column", sums: spec.name !== "COUNT" });
+        continue;
+      }
+      if (spec.rawDatetime !== undefined && spec.name === "COUNT") {
+        specs.push({ kind: "column", sums: false });
+        continue;
+      }
+      if (
+        (spec.rawNumber !== undefined || spec.rawDatetime !== undefined) &&
+        (spec.name === "MIN" || spec.name === "MAX")
+      ) {
+        specs.push({ kind: "extreme", sums: false });
         continue;
       }
       if (spec.conditional !== undefined) {
@@ -5166,11 +5178,44 @@ class GroupAccumulator {
       readonly nullSlot: number;
       readonly truths: Array<(batch: BatchRows, row: number) => boolean | null>;
     }> = [];
+    // MIN/MAX over a bare number or datetime column: unboxed comparisons against the kept
+    // value, which is replaced (and its reservation resized) only when a row improves on it.
+    const extremes: Array<{
+      readonly index: number;
+      readonly max: boolean;
+      /** Datetime epoch milliseconds compare plainly; numbers place NaN after every value. */
+      readonly datetime: boolean;
+      readonly label: string;
+      readonly rows: Int32Array | undefined;
+      readonly values: Float64Array;
+      readonly validity: Uint8Array;
+      readonly windowStart: number;
+      readonly length: number;
+      readonly slots: number;
+    }> = [];
     let stars = 0;
     for (let index = 0; index < specs.length; index += 1) {
       const spec = specs[index];
       if (spec === undefined || spec.kind === "star") {
         stars += 1;
+        continue;
+      }
+      if (spec.kind === "extreme") {
+        const aggregate = plan.aggregates[index];
+        const raw = aggregate?.rawNumber ?? aggregate?.rawDatetime;
+        if (aggregate === undefined || raw === undefined) return false;
+        extremes.push({
+          index,
+          max: aggregate.name === "MAX",
+          datetime: aggregate.rawNumber === undefined,
+          label: `${aggregate.name} aggregate value`,
+          rows: batch.rowsBySource[raw.source],
+          values: raw.vector.values,
+          validity: raw.vector.validity,
+          windowStart: raw.vector.window?.start ?? 0,
+          length: raw.vector.length,
+          slots: raw.vector.values.length,
+        });
         continue;
       }
       if (spec.kind === "conditional") {
@@ -5192,7 +5237,7 @@ class GroupAccumulator {
         });
         continue;
       }
-      const raw = plan.aggregates[index]?.rawNumber;
+      const raw = plan.aggregates[index]?.rawNumber ?? plan.aggregates[index]?.rawDatetime;
       if (raw === undefined) return false;
       columns.push({
         index,
@@ -5254,6 +5299,33 @@ class GroupAccumulator {
         if (column.sums) {
           state.sums[column.index] = (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
         }
+      }
+      for (const extreme of extremes) {
+        const sourceRow = extreme.rows?.[row] ?? -1;
+        if (sourceRow < 0 || sourceRow >= extreme.length) continue;
+        const slot = sourceRow - extreme.windowStart;
+        if (slot < 0 || slot >= extreme.slots) {
+          throw new RangeError("Streamed vector row is outside the resident window");
+        }
+        if (!isValid(extreme.validity, slot)) continue;
+        const value = extreme.values[slot] ?? 0;
+        counts[extreme.index] = (counts[extreme.index] ?? 0) + 1;
+        const current = state.values[extreme.index];
+        const better =
+          typeof current !== "number"
+            ? true
+            : extreme.datetime
+              ? extreme.max
+                ? value > current
+                : value < current
+              : Number.isNaN(value)
+                ? extreme.max && !Number.isNaN(current)
+                : Number.isNaN(current)
+                  ? !extreme.max
+                  : extreme.max
+                    ? value > current
+                    : value < current;
+        if (better) replaceAggregateValue(state, extreme.index, value, extreme.label, this.#memory);
       }
       for (const conditional of conditionals) {
         const code =

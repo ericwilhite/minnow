@@ -170,12 +170,17 @@ export class LeasedSnapshot extends Snapshot {
   }
 
   get expiresAt(): Date {
+    return new Date(this.expiresAtMilliseconds);
+  }
+
+  /** The expiry as epoch milliseconds, without allocating a Date on the read path. */
+  get expiresAtMilliseconds(): number {
     const iso = this.#record.expiresAt;
     if (iso !== this.#expiresAtIso) {
       this.#expiresAtIso = iso;
       this.#expiresAtMs = Date.parse(iso);
     }
-    return new Date(this.#expiresAtMs);
+    return this.#expiresAtMs;
   }
 
   override async getBlock(id: string): Promise<Uint8Array | undefined> {

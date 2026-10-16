@@ -12,7 +12,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase, type QueryOptions } from "./database.js";
 import type { QueryValue } from "./query.js";
 import { pointReadTestHooks } from "./point-read.js";
-import { ArtifactCache } from "./artifact-cache.js";
+import { ArtifactCache, ArtifactFamily } from "./artifact-cache.js";
 
 afterEach(() => {
   pointReadTestHooks.disabled = false;
@@ -170,13 +170,16 @@ describe("point-read fast path", () => {
     try {
       const expected = await database.query(sql, options);
       // eslint-disable-next-line @typescript-eslint/unbound-method -- Called below with each cache instance as its receiver.
-      const original = ArtifactCache.prototype.get;
-      const lookup = vi.spyOn(ArtifactCache.prototype, "get").mockImplementation(function (
+      const original = ArtifactCache.prototype.getIn;
+      const lookup = vi.spyOn(ArtifactCache.prototype, "getIn").mockImplementation(function (
         this: ArtifactCache,
+        family: ArtifactFamily,
         key: string,
       ) {
-        if (key.startsWith("dpb\0")) throw new Error("Warm point read looked up a decoded block");
-        return original.call(this, key);
+        if (family === ArtifactFamily.decodedBlock) {
+          throw new Error("Warm point read looked up a decoded block");
+        }
+        return original.call(this, family, key);
       });
       try {
         expect(await database.query(sql, options)).toEqual(expected);
@@ -225,6 +228,46 @@ describe("point-read fast path", () => {
       }
     },
   );
+
+  it("touches one buffer-pool entry per column it reads once its plan is resolved", async () => {
+    // Several segments of several blocks: the resolved plan carries every zone bound, so a warm
+    // lookup reads the search block's vector and one vector per other column — no header
+    // descriptions, no decoded blocks, no per-block probing of segments that cannot hold the key.
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      rowsPerBlock: 16,
+      autoCompact: false,
+    });
+    try {
+      await database.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, amount REAL NOT NULL, label TEXT NOT NULL)",
+      );
+      for (let batch = 0; batch < 4; batch += 1) {
+        await database.insertBatch(
+          "items",
+          Array.from({ length: 64 }, (_, offset) => {
+            const id = batch * 64 + offset + 1;
+            return { id, amount: id / 4, label: `label-${String(id)}` };
+          }),
+        );
+      }
+      const sql = "SELECT id, amount, label FROM items WHERE id = ?";
+      for (let id = 1; id <= 256; id += 1) {
+        await database.query(sql, { params: [id], memoize: false });
+      }
+      const served = pointReadTestHooks.served;
+      const before = database.bufferPoolStats();
+      for (let id = 1; id <= 256; id += 1) {
+        const result = await database.query(sql, { params: [id], memoize: false });
+        expect(result.rows).toEqual([{ id, amount: id / 4, label: `label-${String(id)}` }]);
+      }
+      const after = database.bufferPoolStats();
+      expect(pointReadTestHooks.served - served).toBe(256);
+      expect(after.misses - before.misses).toBe(0);
+      expect(after.hits - before.hits).toBe(256 * 3);
+    } finally {
+      await database.close();
+    }
+  });
 
   it("keeps wide wildcard and explicit projections exact without retaining extra binding state", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
