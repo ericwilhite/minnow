@@ -110,11 +110,14 @@ the count finds its line item.
 Some things to know:
 
 - **Stored rows only hold current keys.** The swap happens when a value is written, so joins,
-  ranges, and `LIKE` work on the stored keys and never need the forwards. Only equality with a
-  constant or a parameter (`=`, `IN`, `IS NOT DISTINCT FROM`) follows a retired key, negated or
-  not (`-1`, `-$1`), in a `WHERE`, `HAVING`, or `ON` clause of any part of the statement:
-  subqueries, derived tables, CTEs, and views included. A view column that passes a key column
-  through counts as that key column.
+  ranges, and `LIKE` work on the stored keys and never need the forwards. Only a comparison of a
+  key with a constant or a parameter follows a retired key: equality (`=`, `IN`,
+  `IS NOT DISTINCT FROM`) and its opposite (`<>`, `NOT IN`, `IS DISTINCT FROM`), with the value
+  negated or not (`-1`, `-$1`). It is followed anywhere in a `WHERE`, `HAVING`, or `ON` clause —
+  under `AND`, `OR`, `NOT`, and `IS NULL` too, so `WHERE id = -1` and `WHERE NOT (id = -1)`
+  always split the rows between them — and in any part of the statement: subqueries, derived
+  tables, CTEs, and views included. A view column that passes a key column through counts as that
+  key column.
 - **A composite key** is followed when the query pins every one of its columns with `=` on the same
   table reference, as in `WHERE shop = 1 AND receipt = -1`.
 - **The result shows the current key.** `WHERE order_id = -1` returns a row whose `order_id` is

@@ -806,6 +806,46 @@ describe("retired keys in every SQL shape (read-path audit)", () => {
     ).toEqual([{ n: "offline" }]);
   });
 
+  it("follows a key under OR, NOT, and IS in a WHERE and in HAVING", async () => {
+    const database = await negative();
+    // A WHERE that is not a plain conjunction reaches the plan as one `IS TRUE` predicate
+    // wrapping the whole expression; the equality inside it must still follow.
+    for (const [sql, n] of [
+      ["SELECT count(*) AS n FROM orders WHERE id = -1 OR note = 'none'", 1],
+      ["SELECT count(*) AS n FROM orders WHERE note = 'none' OR id IN (-1)", 1],
+      // The optimizer turns `NOT (id = -1)` into `id <> -1`; the negations follow as well.
+      ["SELECT count(*) AS n FROM orders WHERE NOT (id = -1)", 1],
+      ["SELECT count(*) AS n FROM orders WHERE id <> -1", 1],
+      ["SELECT count(*) AS n FROM orders WHERE id NOT IN (-1, 4)", 1],
+      ["SELECT count(*) AS n FROM orders WHERE id IS DISTINCT FROM -1", 1],
+      ["SELECT count(*) AS n FROM items WHERE order_id <> -1", 1],
+      ["SELECT count(*) AS n FROM orders WHERE (id = -1 OR note IS NULL) IS TRUE", 1],
+      ["SELECT count(*) AS n FROM items WHERE order_id = -1 OR id = 3", 3],
+      ["SELECT count(*) AS n FROM items WHERE NOT (order_id = -1 OR id = 3)", 0],
+      [
+        "SELECT count(*) AS n FROM (SELECT order_id FROM items GROUP BY order_id HAVING order_id = -1 OR count(*) > 5) g",
+        1,
+      ],
+    ] as const) {
+      expect(await rows(database, sql), sql).toEqual([{ n }]);
+    }
+    // Writes resolve their WHERE the same way.
+    await database.execute("UPDATE orders SET note = 'synced' WHERE id = -1 OR id = 5");
+    expect(await rows(database, "SELECT id, note FROM orders ORDER BY id")).toEqual([
+      { id: 5, note: "synced" },
+      { id: 900, note: "synced" },
+    ]);
+    // The three-valued partition holds: p, NOT p, and p IS NULL count every row exactly once.
+    await database.execute("INSERT INTO orders VALUES (7, NULL)");
+    await database.execute("UPDATE orders SET note = NULL WHERE id = 900");
+    const p = "(id = -1 OR note = 'synced')";
+    const count = async (where: string): Promise<unknown> =>
+      (await rows(database, `SELECT count(*) AS n FROM orders WHERE ${where}`))[0]?.n;
+    expect([await count(p), await count(`NOT ${p}`), await count(`${p} IS NULL`)]).toEqual([
+      2, 0, 1,
+    ]);
+  });
+
   it("pins a composite key per source, not per table", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(
