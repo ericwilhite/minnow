@@ -610,11 +610,19 @@ marked invalid; a fold that reported a failure when another tab dropped its tabl
 the fold began; and background collection reporting a crashed leader tab's lost step, which its
 own retry reconciles. Each is pinned in Node: `checkpoint-interruption.test.ts`,
 `simulator-regressions.test.ts`, and the collection and compaction controller tests. Longer Node
-soaks (1,500 steps over six connections) later found cursors, `DELETE`, and spilling queries
-reading rows outside an exact index selection, so a `DELETE` removed a row its `WHERE` did not
-match. The first rekeying soaks found a connection losing a key forward once another tab
+soaks (1,500 steps over six connections) later found cursors, `DELETE`, spilling queries, and
+reads inside a transaction seeing rows outside an exact index selection at stale values, so a
+`DELETE` removed a row its `WHERE` did not match. The first rekeying soaks found a connection losing a key forward once another tab
 collected the manifest that wrote it, retired keys not followed under `OR` and `NOT`, and a
 self-referencing table's references moved twice by a shift or swap.
+
+`live-differential.test.ts` holds live queries to a fresh execution. A fast-check property runs
+keyed and predicate writes, upserts, rekeys, transactions that commit or roll back, writes from a
+second connection, compaction, collection, and an index build. After each one it compares every
+subscription's latest delivery, maintained incrementally or re-run, with the statement executed
+again. Set `MINNOW_SEED` and `MINNOW_LIVE_RUNS` to explore further. It found a self-join patched
+as if only its base rows changed, and a live query on a retired key that missed a row written at
+the key it forwards to.
 
 ## Background maintenance, size, and memory
 
